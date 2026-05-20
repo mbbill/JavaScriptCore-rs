@@ -13,5 +13,8 @@ pub use crate::b3::{
 pub use lowering::{
     AirGenerationDescriptor, DfgToB3LoweringBoundary, FtlArtifactDescriptor,
     FtlCompilationDescriptor, FtlCompilationStage, FtlExceptionTarget, FtlLoweringPhase,
-    FtlOsrEntryPlan, FtlPatchpointDescriptor, FtlSlowPathDescriptor, LoweringFailureReason,
+    FtlOsrEntryPlan, FtlPatchpointDescriptor, FtlPlanDescriptorRegistry,
+    FtlPlanRegistryMutationAuthority, FtlPlanSchemaOwner, FtlSlowPathDescriptor, FtlStateAuthority,
+    FtlStateDescriptor, FtlValidationError, LoweringFailureReason, StaticFtlPlanDescriptor,
+    FTL_PLAN_DESCRIPTOR_REGISTRY, STATIC_FTL_PLAN_DESCRIPTORS,
 };

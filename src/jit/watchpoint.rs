@@ -5,8 +5,10 @@
 //! and GC contracts. This skeleton only records the dependency graph; it never
 //! observes or mutates live runtime state.
 
-use crate::object::{AtomId, PropertyOffset, StructureId};
+use crate::gc::StructureId;
+use crate::object::PropertyOffset;
 use crate::runtime::{CodeBlockId, ObjectId, WatchpointGeneration};
+use crate::strings::PropertyKey;
 
 /// Stable identity for a watchpoint dependency in code side data.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -66,7 +68,7 @@ pub enum WatchpointTarget {
     },
     PropertyReplacement {
         object: ObjectId,
-        property: AtomId,
+        property: PropertyKey,
         offset: PropertyOffset,
     },
     PrototypeChain {
@@ -74,7 +76,7 @@ pub enum WatchpointTarget {
     },
     GlobalProperty {
         global: ObjectId,
-        property: AtomId,
+        property: PropertyKey,
     },
     CodeBlockJettison {
         code_block: CodeBlockId,

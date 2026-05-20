@@ -37,6 +37,44 @@ pub enum ApiReferenceOwnership {
     ProtectedGcValue,
     CopiedString,
     WeakObservedValue,
+    ImmortalExternalSource,
+}
+
+/// Backing storage contract for `JSStringRef`.
+///
+/// `JSStringCreateWithCharacters` and `JSStringCreateWithUTF8CString` copy
+/// caller buffers into ref-counted API storage. Pointers returned by
+/// `JSStringGetCharactersPtr` are borrowed from that storage and remain valid
+/// only while the string reference is retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiStringStorageKind {
+    CopiedUtf16,
+    CopiedUtf8,
+    BorrowedCharactersPtr,
+}
+
+/// Source lifetime for reusable `JSScriptRef` values.
+///
+/// `JSScriptCreateReferencingImmortalASCIIText` is intentionally distinct from
+/// normal copied string source: the embedder owns a pure ASCII buffer that must
+/// outlive every global context using the script.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiScriptSourceLifetime {
+    CopiedSourceString,
+    ImmortalAsciiBorrow,
+}
+
+/// Weak API reference state.
+///
+/// Primitive weak values are copied as values. Object and string weak values are
+/// VM-observed weak handles and may clear independently of Rust ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiWeakRefState {
+    NotSet,
+    Primitive,
+    ObjectObserved,
+    StringObserved,
+    Cleared,
 }
 
 /// Shared opaque handle representation for C ABI references.

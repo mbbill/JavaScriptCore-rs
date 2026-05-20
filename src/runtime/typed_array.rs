@@ -1,5 +1,5 @@
 use crate::runtime::exception::JsResult;
-use crate::runtime::property::{PropertyDescriptor, RuntimePropertyKey};
+use crate::runtime::property::{PropertyDescriptor, RuntimePropertyAccessKey};
 use crate::runtime::state::{ObjectId, RuntimeValue, StructureId};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -155,10 +155,89 @@ pub trait TypedArrayOperations {
     fn integer_indexed_define_own_property(
         &mut self,
         object: ObjectId,
-        key: RuntimePropertyKey,
+        key: RuntimePropertyAccessKey,
         descriptor: PropertyDescriptor,
     ) -> JsResult<bool>;
     fn data_view_get(&self, access: DataViewAccess) -> JsResult<RuntimeValue>;
     fn data_view_set(&mut self, access: DataViewAccess, value: RuntimeValue) -> JsResult<bool>;
     fn validate_attached_buffer(&self, buffer: ArrayBufferId) -> JsResult<BufferState>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum IntegerIndexedAccessOutcome {
+    InBounds,
+    DetachedBuffer,
+    OutOfBounds,
+    BigIntContentMismatch,
+    NumberContentMismatch,
+}
+
+pub fn typed_array_element_size(kind: TypedArrayElementKind) -> u8 {
+    match kind {
+        TypedArrayElementKind::Int8
+        | TypedArrayElementKind::Uint8
+        | TypedArrayElementKind::Uint8Clamped => 1,
+        TypedArrayElementKind::Int16
+        | TypedArrayElementKind::Uint16
+        | TypedArrayElementKind::Float16 => 2,
+        TypedArrayElementKind::Int32
+        | TypedArrayElementKind::Uint32
+        | TypedArrayElementKind::Float32 => 4,
+        TypedArrayElementKind::BigInt64
+        | TypedArrayElementKind::BigUint64
+        | TypedArrayElementKind::Float64 => 8,
+    }
+}
+
+pub fn typed_array_element_is_bigint(kind: TypedArrayElementKind) -> bool {
+    matches!(
+        kind,
+        TypedArrayElementKind::BigInt64 | TypedArrayElementKind::BigUint64
+    )
+}
+
+pub fn plan_integer_indexed_access(access: &IntegerIndexedAccess) -> IntegerIndexedAccessOutcome {
+    if access.buffer_state == BufferState::Detached {
+        return IntegerIndexedAccessOutcome::DetachedBuffer;
+    }
+    if access.out_of_bounds {
+        return IntegerIndexedAccessOutcome::OutOfBounds;
+    }
+    IntegerIndexedAccessOutcome::InBounds
+}
+
+pub fn fixed_view_element_length(view: &TypedArrayView) -> Option<u64> {
+    match view.length {
+        ViewLength::Fixed { element_length, .. } => Some(element_length),
+        ViewLength::AutoLength => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gc::CellId;
+
+    #[test]
+    fn integer_indexed_access_rejects_detached_buffer() {
+        let access = IntegerIndexedAccess {
+            object: ObjectId(CellId(1)),
+            buffer_state: BufferState::Detached,
+            ..IntegerIndexedAccess::default()
+        };
+
+        assert_eq!(
+            plan_integer_indexed_access(&access),
+            IntegerIndexedAccessOutcome::DetachedBuffer
+        );
+    }
+
+    #[test]
+    fn typed_array_element_sizes_match_content_kind() {
+        assert_eq!(typed_array_element_size(TypedArrayElementKind::Uint8), 1);
+        assert_eq!(typed_array_element_size(TypedArrayElementKind::BigInt64), 8);
+        assert!(typed_array_element_is_bigint(
+            TypedArrayElementKind::BigUint64
+        ));
+    }
 }

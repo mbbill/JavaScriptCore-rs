@@ -1,7 +1,8 @@
 use crate::bytecode::code_block::{BitVectorRef, BytecodeIndex, Checkpoint, RuntimeSlot};
+use crate::bytecode::gc::{BytecodeRootMapId, BytecodeRootSlotKind};
 use crate::bytecode::origin::CodeOrigin;
 use crate::bytecode::register::VirtualRegister;
-use crate::gc::StructureId;
+use crate::gc::{RootKind, RootSetMutationAuthority, StructureId};
 
 /// Runtime value profile slot indexed from opcode metadata.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -44,11 +45,105 @@ pub enum ProfileUpdatePolicy {
 pub struct ValueProfileTable {
     pub profiles: Vec<ValueProfile>,
     pub unlinked_predictions: Vec<UnlinkedValueProfile>,
+    pub root_metadata: Vec<ValueProfileRootMetadata>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct UnlinkedValueProfile {
     pub prediction: SpeculatedTypeSet,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValueProfileRootMetadata {
+    pub bytecode_index: BytecodeIndex,
+    pub profile_slot: RuntimeSlot,
+    pub root_map: Option<BytecodeRootMapId>,
+    pub slot_kind: BytecodeRootSlotKind,
+    pub root_kind: RootKind,
+    pub mutation_authority: RootSetMutationAuthority,
+    pub may_hold_cell: bool,
+    pub profile_update_policy: ProfileUpdatePolicy,
+}
+
+impl ValueProfileRootMetadata {
+    pub const fn for_profile_slot(
+        bytecode_index: BytecodeIndex,
+        profile_slot: RuntimeSlot,
+        root_map: Option<BytecodeRootMapId>,
+        profile_update_policy: ProfileUpdatePolicy,
+    ) -> Self {
+        Self {
+            bytecode_index,
+            profile_slot,
+            root_map,
+            slot_kind: BytecodeRootSlotKind::ValueProfile,
+            root_kind: RootKind::VMRegister,
+            mutation_authority: RootSetMutationAuthority::VmRegisterFile,
+            may_hold_cell: true,
+            profile_update_policy,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValueProfileRootValidationError {
+    InvalidBytecodeIndex,
+    DuplicateProfileRoot(RuntimeSlot),
+    RootKindAuthorityMismatch {
+        root_kind: RootKind,
+        authority: RootSetMutationAuthority,
+    },
+    ProfileRootMissingProfile {
+        bytecode_index: BytecodeIndex,
+        profile_slot: RuntimeSlot,
+    },
+}
+
+impl ValueProfileTable {
+    pub fn validate_root_metadata(&self) -> Result<(), ValueProfileRootValidationError> {
+        for (index, root) in self.root_metadata.iter().enumerate() {
+            if !root.bytecode_index.is_valid() {
+                return Err(ValueProfileRootValidationError::InvalidBytecodeIndex);
+            }
+            if self.root_metadata[..index]
+                .iter()
+                .any(|previous| previous.profile_slot == root.profile_slot)
+            {
+                return Err(ValueProfileRootValidationError::DuplicateProfileRoot(
+                    root.profile_slot,
+                ));
+            }
+            if !matches!(
+                (root.root_kind, root.mutation_authority),
+                (
+                    RootKind::VMRegister,
+                    RootSetMutationAuthority::VmRegisterFile
+                ) | (RootKind::JitCode, RootSetMutationAuthority::JitCodeRegistry)
+                    | (
+                        RootKind::ExplicitRoot,
+                        RootSetMutationAuthority::ExplicitRootRegistry
+                    )
+            ) {
+                return Err(ValueProfileRootValidationError::RootKindAuthorityMismatch {
+                    root_kind: root.root_kind,
+                    authority: root.mutation_authority,
+                });
+            }
+            if !self.profiles.iter().any(|profile| {
+                profile.bytecode_index == root.bytecode_index
+                    && profile
+                        .buckets
+                        .iter()
+                        .any(|bucket| bucket.slot == root.profile_slot)
+            }) {
+                return Err(ValueProfileRootValidationError::ProfileRootMissingProfile {
+                    bytecode_index: root.bytecode_index,
+                    profile_slot: root.profile_slot,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Array access profile state shared by LLInt, baseline, and optimizing tiers.
@@ -160,4 +255,60 @@ pub struct ControlFlowProfileRecord {
     pub bytecode_index: BytecodeIndex,
     pub block_liveness: Option<BitVectorRef>,
     pub execution_count_slot: Option<RuntimeSlot>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_profile_root_metadata_points_at_profile_bucket() {
+        let index = BytecodeIndex::from_offset(12);
+        let slot = RuntimeSlot(3);
+        let table = ValueProfileTable {
+            profiles: vec![ValueProfile {
+                bytecode_index: index,
+                checkpoint: Checkpoint::NONE,
+                operand: None,
+                buckets: vec![ValueProfileBucket {
+                    slot,
+                    kind: ValueProfileBucketKind::Sample,
+                }],
+                prediction: SpeculatedTypeSet(0),
+                update_policy: ProfileUpdatePolicy::ConcurrentBuckets,
+            }],
+            root_metadata: vec![ValueProfileRootMetadata::for_profile_slot(
+                index,
+                slot,
+                Some(BytecodeRootMapId(1)),
+                ProfileUpdatePolicy::ConcurrentBuckets,
+            )],
+            ..ValueProfileTable::default()
+        };
+
+        assert_eq!(table.validate_root_metadata(), Ok(()));
+    }
+
+    #[test]
+    fn value_profile_root_metadata_rejects_unmapped_slot() {
+        let index = BytecodeIndex::from_offset(12);
+        let table = ValueProfileTable {
+            profiles: Vec::new(),
+            root_metadata: vec![ValueProfileRootMetadata::for_profile_slot(
+                index,
+                RuntimeSlot(3),
+                None,
+                ProfileUpdatePolicy::ConcurrentBuckets,
+            )],
+            ..ValueProfileTable::default()
+        };
+
+        assert_eq!(
+            table.validate_root_metadata(),
+            Err(ValueProfileRootValidationError::ProfileRootMissingProfile {
+                bytecode_index: index,
+                profile_slot: RuntimeSlot(3),
+            })
+        );
+    }
 }

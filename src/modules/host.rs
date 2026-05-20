@@ -1,7 +1,7 @@
 use crate::modules::graph::{GraphLoadPayloadId, GraphLoadPayloadKind, ModuleLoadCompletion};
 use crate::modules::key::{ImportMapResolution, ModuleKey, ResolvedSpecifier};
-use crate::modules::record::ModuleRecordId;
 use crate::modules::request::{ModuleRequest, ModuleRequestPhase};
+use crate::modules::ModuleRecordId;
 
 /// Opaque host payload carried across asynchronous load operations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

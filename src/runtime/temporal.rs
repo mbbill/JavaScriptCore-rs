@@ -135,3 +135,63 @@ pub trait TemporalOperations {
     ) -> JsResult<TemporalDurationSlots>;
     fn reject_object_with_calendar_or_time_zone(&mut self, object: ObjectId) -> JsResult<()>;
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum TemporalSlotValidationError {
+    InvalidDate,
+    InvalidTime,
+    MissingInstantEpoch,
+    MissingDurationSlots,
+    CalendarNotAllowed,
+    TimeZoneNotAllowed,
+}
+
+impl TemporalValueObject {
+    pub fn validate_slots(&self) -> Result<(), TemporalSlotValidationError> {
+        match self.kind {
+            TemporalObjectKind::Instant => {
+                if self.slots.epoch_nanoseconds.is_none() {
+                    return Err(TemporalSlotValidationError::MissingInstantEpoch);
+                }
+            }
+            TemporalObjectKind::Duration => {
+                if self.slots.duration.is_none() {
+                    return Err(TemporalSlotValidationError::MissingDurationSlots);
+                }
+            }
+            TemporalObjectKind::PlainTime => validate_time_slots(&self.slots)?,
+            TemporalObjectKind::PlainDate
+            | TemporalObjectKind::PlainDateTime
+            | TemporalObjectKind::PlainMonthDay
+            | TemporalObjectKind::PlainYearMonth
+            | TemporalObjectKind::ZonedDateTime => {
+                validate_date_slots(&self.slots)?;
+                validate_time_slots(&self.slots)?;
+            }
+            TemporalObjectKind::Calendar | TemporalObjectKind::TimeZone => {}
+        }
+        Ok(())
+    }
+}
+
+fn validate_date_slots(slots: &TemporalSlots) -> Result<(), TemporalSlotValidationError> {
+    if slots.iso_month == 0 || slots.iso_month > 12 || slots.iso_day == 0 || slots.iso_day > 31 {
+        Err(TemporalSlotValidationError::InvalidDate)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_time_slots(slots: &TemporalSlots) -> Result<(), TemporalSlotValidationError> {
+    if slots.hour > 23
+        || slots.minute > 59
+        || slots.second > 59
+        || slots.millisecond > 999
+        || slots.microsecond > 999
+        || slots.nanosecond > 999
+    {
+        Err(TemporalSlotValidationError::InvalidTime)
+    } else {
+        Ok(())
+    }
+}

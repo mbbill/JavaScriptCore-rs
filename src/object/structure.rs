@@ -6,8 +6,10 @@ use crate::gc::{
 };
 
 use crate::object::{
-    PropertyAttributes, PropertyKey, PropertyOffset, PropertyTable, WatchpointKind, WatchpointSet,
+    PropertyAttributes, PropertyDescriptorValidationError, PropertyKey, PropertyLocation,
+    PropertyOffset, PropertyTable, StaticPropertyTableDescriptor, WatchpointKind, WatchpointSet,
 };
+use std::collections::HashSet;
 
 /// Indexed storage representation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -55,6 +57,9 @@ pub struct Structure {
     prototype: WriteBarrier<JsCell>,
     property_table: PropertyTable,
     indexing_mode: IndexingMode,
+    dictionary_kind: StructureDictionaryKind,
+    prototype_storage: StructurePrototypeStorage,
+    transition_metadata: StructureTransitionMetadata,
     watchpoints: WatchpointSet,
     inline_capacity: u16,
     out_of_line_capacity: u16,
@@ -73,6 +78,9 @@ impl Structure {
             prototype: WriteBarrier::empty(),
             property_table: PropertyTable::new(),
             indexing_mode: IndexingMode::None,
+            dictionary_kind: StructureDictionaryKind::None,
+            prototype_storage: StructurePrototypeStorage::Mono,
+            transition_metadata: StructureTransitionMetadata::new_unpublished(id),
             watchpoints: WatchpointSet::default(),
             inline_capacity: 0,
             out_of_line_capacity: 0,
@@ -98,6 +106,18 @@ impl Structure {
 
     pub fn indexing_mode(&self) -> IndexingMode {
         self.indexing_mode
+    }
+
+    pub fn dictionary_kind(&self) -> StructureDictionaryKind {
+        self.dictionary_kind
+    }
+
+    pub fn prototype_storage(&self) -> StructurePrototypeStorage {
+        self.prototype_storage
+    }
+
+    pub fn transition_metadata(&self) -> StructureTransitionMetadata {
+        self.transition_metadata
     }
 
     pub fn inline_capacity(&self) -> u16 {
@@ -137,14 +157,7 @@ impl Structure {
         StructureTransitionPlan {
             base: self.id(),
             transition,
-            invalidates_watchpoints: matches!(
-                transition,
-                StructureTransition::ChangePrototype
-                    | StructureTransition::DeleteProperty { .. }
-                    | StructureTransition::ChangeAttributes { .. }
-                    | StructureTransition::EnterDictionaryMode
-                    | StructureTransition::ChangeIndexingMode(_)
-            ),
+            invalidates_watchpoints: transition_invalidates_watchpoints(transition),
         }
     }
 
@@ -182,7 +195,16 @@ pub enum StructureTransition {
         attributes: PropertyAttributes,
     },
     ChangePrototype,
+    ChangeGlobalProxyTarget,
     EnterDictionaryMode,
+    EnterUncacheableDictionaryMode,
+    Seal,
+    Freeze,
+    PreventExtensions,
+    SetPrivateBrand {
+        key: PropertyKey,
+    },
+    BecomePrototype,
     ChangeIndexingMode(IndexingMode),
 }
 
@@ -193,4 +215,482 @@ pub struct StructureTransitionPlan {
     pub base: StructureId,
     pub transition: StructureTransition,
     pub invalidates_watchpoints: bool,
+}
+
+/// Owner of immutable structure schema metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StructureSchemaOwner {
+    VmStructures,
+    RealmIntrinsics,
+    BuiltinObject,
+    GlobalObject,
+    HostObject,
+    GeneratedStaticData,
+}
+
+/// Provenance for structure descriptors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StructureSchemaProvenance {
+    HandAuthoredRust,
+    GeneratedFromEngineMetadata,
+    Ecma262Intrinsic,
+    HostBinding,
+}
+
+/// Immutable descriptor for one structure shape.
+///
+/// Structure ids are canonical metadata handles owned by the GC/structure table.
+/// The descriptor only names layout facts and borrowed static property metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StructureDescriptor {
+    pub name: &'static str,
+    pub structure: StructureId,
+    pub owner: StructureSchemaOwner,
+    pub provenance: StructureSchemaProvenance,
+    pub indexing_mode: IndexingMode,
+    pub dictionary_kind: StructureDictionaryKind,
+    pub prototype_storage: StructurePrototypeStorage,
+    pub inline_capacity: u16,
+    pub out_of_line_capacity: u16,
+    property_table: Option<&'static StaticPropertyTableDescriptor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StructureDescriptorValidationError {
+    EmptyName,
+    InvalidStructureId,
+    DuplicateStructureId(StructureId),
+    DuplicateName(&'static str),
+    PropertyTable(PropertyDescriptorValidationError),
+    PropertyCapacityExceeded {
+        structure: StructureId,
+        required: u32,
+        available: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StructureTransitionValidationError {
+    BaseMismatch {
+        expected: StructureId,
+        actual: StructureId,
+    },
+    PropertyAlreadyExists(PropertyKey),
+    PropertyMissing(PropertyKey),
+    WatchpointInvalidationMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StructureDescriptorBuilder {
+    descriptor: StructureDescriptor,
+}
+
+impl StructureDescriptorBuilder {
+    pub const fn new(
+        name: &'static str,
+        structure: StructureId,
+        owner: StructureSchemaOwner,
+        provenance: StructureSchemaProvenance,
+    ) -> Self {
+        Self {
+            descriptor: StructureDescriptor {
+                name,
+                structure,
+                owner,
+                provenance,
+                indexing_mode: IndexingMode::None,
+                dictionary_kind: StructureDictionaryKind::None,
+                prototype_storage: StructurePrototypeStorage::Mono,
+                inline_capacity: 0,
+                out_of_line_capacity: 0,
+                property_table: None,
+            },
+        }
+    }
+
+    pub const fn indexing_mode(mut self, indexing_mode: IndexingMode) -> Self {
+        self.descriptor.indexing_mode = indexing_mode;
+        self
+    }
+
+    pub const fn dictionary_kind(mut self, dictionary_kind: StructureDictionaryKind) -> Self {
+        self.descriptor.dictionary_kind = dictionary_kind;
+        self
+    }
+
+    pub const fn prototype_storage(mut self, prototype_storage: StructurePrototypeStorage) -> Self {
+        self.descriptor.prototype_storage = prototype_storage;
+        self
+    }
+
+    pub const fn inline_capacity(mut self, inline_capacity: u16) -> Self {
+        self.descriptor.inline_capacity = inline_capacity;
+        self
+    }
+
+    pub const fn out_of_line_capacity(mut self, out_of_line_capacity: u16) -> Self {
+        self.descriptor.out_of_line_capacity = out_of_line_capacity;
+        self
+    }
+
+    pub const fn property_table(
+        mut self,
+        property_table: &'static StaticPropertyTableDescriptor,
+    ) -> Self {
+        self.descriptor.property_table = Some(property_table);
+        self
+    }
+
+    pub fn build(self) -> Result<StructureDescriptor, StructureDescriptorValidationError> {
+        validate_structure_descriptor(&self.descriptor)?;
+        Ok(self.descriptor)
+    }
+}
+
+impl StructureDescriptor {
+    pub const fn new(
+        name: &'static str,
+        structure: StructureId,
+        owner: StructureSchemaOwner,
+        provenance: StructureSchemaProvenance,
+        indexing_mode: IndexingMode,
+        property_table: Option<&'static StaticPropertyTableDescriptor>,
+    ) -> Self {
+        Self {
+            name,
+            structure,
+            owner,
+            provenance,
+            indexing_mode,
+            dictionary_kind: StructureDictionaryKind::None,
+            prototype_storage: StructurePrototypeStorage::Mono,
+            inline_capacity: 0,
+            out_of_line_capacity: 0,
+            property_table,
+        }
+    }
+
+    /// Returns the borrowed immutable property table for this structure.
+    pub const fn property_table(self) -> Option<&'static StaticPropertyTableDescriptor> {
+        self.property_table
+    }
+
+    pub fn validate(&self) -> Result<(), StructureDescriptorValidationError> {
+        validate_structure_descriptor(self)
+    }
+}
+
+/// Static table of structure descriptors owned by a VM or realm.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StructureDescriptorTable {
+    pub name: &'static str,
+    pub owner: StructureSchemaOwner,
+    descriptors: &'static [StructureDescriptor],
+}
+
+impl StructureDescriptorTable {
+    pub const fn new(
+        name: &'static str,
+        owner: StructureSchemaOwner,
+        descriptors: &'static [StructureDescriptor],
+    ) -> Self {
+        Self {
+            name,
+            owner,
+            descriptors,
+        }
+    }
+
+    /// Returns structure descriptors as immutable static metadata.
+    pub const fn descriptors(&self) -> &'static [StructureDescriptor] {
+        self.descriptors
+    }
+
+    /// Returns one existing structure descriptor by table index.
+    pub const fn descriptor_at(&self, index: usize) -> Option<&'static StructureDescriptor> {
+        if index < self.descriptors.len() {
+            Some(&self.descriptors[index])
+        } else {
+            None
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), StructureDescriptorValidationError> {
+        validate_structure_descriptor_table(self)
+    }
+}
+
+pub fn validate_structure_descriptor(
+    descriptor: &StructureDescriptor,
+) -> Result<(), StructureDescriptorValidationError> {
+    if descriptor.name.is_empty() {
+        return Err(StructureDescriptorValidationError::EmptyName);
+    }
+
+    if descriptor.structure == StructureId::INVALID {
+        return Err(StructureDescriptorValidationError::InvalidStructureId);
+    }
+
+    if let Some(table) = descriptor.property_table {
+        table
+            .validate()
+            .map_err(StructureDescriptorValidationError::PropertyTable)?;
+
+        let available =
+            u32::from(descriptor.inline_capacity) + u32::from(descriptor.out_of_line_capacity);
+        let mut required = 0;
+        for entry in table.entries() {
+            if entry.location == PropertyLocation::InlineOrOutOfLine {
+                required = required.max(entry.offset.raw() as u32 + 1);
+            }
+        }
+
+        if required > available {
+            return Err(
+                StructureDescriptorValidationError::PropertyCapacityExceeded {
+                    structure: descriptor.structure,
+                    required,
+                    available,
+                },
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_structure_descriptor_table(
+    table: &StructureDescriptorTable,
+) -> Result<(), StructureDescriptorValidationError> {
+    if table.name.is_empty() {
+        return Err(StructureDescriptorValidationError::EmptyName);
+    }
+
+    let mut seen_ids = HashSet::new();
+    let mut seen_names = HashSet::new();
+    for descriptor in table.descriptors {
+        validate_structure_descriptor(descriptor)?;
+        if !seen_ids.insert(descriptor.structure) {
+            return Err(StructureDescriptorValidationError::DuplicateStructureId(
+                descriptor.structure,
+            ));
+        }
+        if !seen_names.insert(descriptor.name) {
+            return Err(StructureDescriptorValidationError::DuplicateName(
+                descriptor.name,
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_structure_transition_plan(
+    descriptor: &StructureDescriptor,
+    plan: StructureTransitionPlan,
+) -> Result<(), StructureTransitionValidationError> {
+    if plan.base != descriptor.structure {
+        return Err(StructureTransitionValidationError::BaseMismatch {
+            expected: descriptor.structure,
+            actual: plan.base,
+        });
+    }
+
+    let has_property = |key| {
+        descriptor
+            .property_table
+            .is_some_and(|table| table.entries().iter().any(|entry| entry.key == key))
+    };
+
+    match plan.transition {
+        StructureTransition::AddProperty { key, .. }
+        | StructureTransition::SetPrivateBrand { key }
+            if has_property(key) =>
+        {
+            return Err(StructureTransitionValidationError::PropertyAlreadyExists(
+                key,
+            ));
+        }
+        StructureTransition::DeleteProperty { key }
+        | StructureTransition::ChangeAttributes { key, .. }
+            if !has_property(key) =>
+        {
+            return Err(StructureTransitionValidationError::PropertyMissing(key));
+        }
+        _ => {}
+    }
+
+    if plan.invalidates_watchpoints != transition_invalidates_watchpoints(plan.transition) {
+        return Err(StructureTransitionValidationError::WatchpointInvalidationMismatch);
+    }
+
+    Ok(())
+}
+
+pub fn plan_structure_transition(
+    descriptor: &StructureDescriptor,
+    transition: StructureTransition,
+) -> Result<StructureTransitionPlan, StructureTransitionValidationError> {
+    let plan = StructureTransitionPlan {
+        base: descriptor.structure,
+        transition,
+        invalidates_watchpoints: transition_invalidates_watchpoints(transition),
+    };
+    validate_structure_transition_plan(descriptor, plan)?;
+    Ok(plan)
+}
+
+pub const fn transition_invalidates_watchpoints(transition: StructureTransition) -> bool {
+    matches!(
+        transition,
+        StructureTransition::ChangePrototype
+            | StructureTransition::DeleteProperty { .. }
+            | StructureTransition::ChangeAttributes { .. }
+            | StructureTransition::ChangeGlobalProxyTarget
+            | StructureTransition::EnterDictionaryMode
+            | StructureTransition::EnterUncacheableDictionaryMode
+            | StructureTransition::Seal
+            | StructureTransition::Freeze
+            | StructureTransition::PreventExtensions
+            | StructureTransition::SetPrivateBrand { .. }
+            | StructureTransition::BecomePrototype
+            | StructureTransition::ChangeIndexingMode(_)
+    )
+}
+
+/// Dictionary mode selected for a structure's property table.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StructureDictionaryKind {
+    #[default]
+    None,
+    Cached,
+    Uncached,
+}
+
+/// Prototype representation used by the structure.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StructurePrototypeStorage {
+    #[default]
+    Mono,
+    Poly,
+}
+
+/// Lifecycle state for a structure cell.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StructureLifecycle {
+    #[default]
+    Allocating,
+    FinishingCreation,
+    Published,
+    TransitionedFrom,
+    DictionaryMutated,
+}
+
+/// Concurrency authority for structure lookup or mutation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StructureMutationAuthority {
+    #[default]
+    MainThreadVm,
+    ConcurrentLookupOnly,
+    ExistingStructureTransition,
+    DictionaryMutationWithStructureLock,
+}
+
+/// Metadata carried with structure transitions and rare-data edges.
+///
+/// The previous-structure edge may later be replaced by rare data. C++ uses a
+/// tagged `m_previousOrRareData` field; this contract keeps the distinction
+/// explicit so Rust code does not treat previous IDs and rare-data cells as the
+/// same identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StructureTransitionMetadata {
+    pub previous: Option<StructureId>,
+    pub rare_data: Option<StructureRareDataId>,
+    pub lifecycle: StructureLifecycle,
+    pub mutation_authority: StructureMutationAuthority,
+    pub transition_count_estimate: u16,
+    pub max_offset: PropertyOffset,
+    pub transition_offset: PropertyOffset,
+    pub realm_is_immutable_after_creation: bool,
+}
+
+impl StructureTransitionMetadata {
+    pub const fn new_unpublished(_id: StructureId) -> Self {
+        Self {
+            previous: None,
+            rare_data: None,
+            lifecycle: StructureLifecycle::Allocating,
+            mutation_authority: StructureMutationAuthority::MainThreadVm,
+            transition_count_estimate: 0,
+            max_offset: PropertyOffset::INVALID,
+            transition_offset: PropertyOffset::INVALID,
+            realm_is_immutable_after_creation: true,
+        }
+    }
+}
+
+/// Rare-data cell associated with a structure.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct StructureRareDataId(pub u32);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strings::{AtomId, Identifier};
+
+    fn key(slot: u32) -> PropertyKey {
+        PropertyKey::from_identifier(Identifier::from_atom(AtomId::from_table_slot(slot)))
+    }
+
+    #[test]
+    fn structure_transition_planner_sets_watchpoint_invalidation() {
+        let descriptor = StructureDescriptorBuilder::new(
+            "object",
+            StructureId::new(1),
+            StructureSchemaOwner::VmStructures,
+            StructureSchemaProvenance::HandAuthoredRust,
+        )
+        .build()
+        .unwrap();
+
+        let plan =
+            plan_structure_transition(&descriptor, StructureTransition::ChangePrototype).unwrap();
+
+        assert_eq!(plan.base, StructureId::new(1));
+        assert!(plan.invalidates_watchpoints);
+    }
+
+    #[test]
+    fn structure_transition_planner_rejects_deleting_missing_property() {
+        let descriptor = StructureDescriptorBuilder::new(
+            "object",
+            StructureId::new(1),
+            StructureSchemaOwner::VmStructures,
+            StructureSchemaProvenance::HandAuthoredRust,
+        )
+        .build()
+        .unwrap();
+
+        let error = plan_structure_transition(
+            &descriptor,
+            StructureTransition::DeleteProperty { key: key(7) },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            StructureTransitionValidationError::PropertyMissing(key(7))
+        );
+    }
+}
+
+/// Cacheability decision derived from structure flags and type info.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StructurePropertyCacheability {
+    #[default]
+    Cacheable,
+    UncacheableDictionary,
+    PrototypeQueriesUncacheable,
+    ImpureGetOwnPropertySlot,
+    ImpureAbsenceCheck,
+    NeedsImpurePropertyWatchpoint,
 }

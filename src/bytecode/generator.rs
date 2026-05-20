@@ -1,11 +1,15 @@
 use crate::bytecode::code_block::{
     CodeFeatures, CodeGenerationModeSet, CodeKind, ExecutableInfo, ParseMode, SourceProvenance,
-    UnlinkedCodeBlock, UnlinkedConstantPool, UnlinkedSideTables,
+    UnlinkedCodeBlock, UnlinkedCodeBlockPhase, UnlinkedConstantPool, UnlinkedSideTables,
 };
-use crate::bytecode::instruction::{InstructionBuilder, LabelRef, PackedInstructionStream};
+use crate::bytecode::gc::{build_p6_no_js_call_helper_root_maps, BytecodeRootMapId};
+use crate::bytecode::instruction::{
+    InstructionBuilder, InstructionLinker, LabelRef, PackedInstructionStream,
+};
 use crate::bytecode::register::{
     RegisterFrameShape, SpecialRegisters, TemporaryLifetime, VirtualRegister,
 };
+use crate::syntax::ParserIdentifier;
 
 /// Bytecode-generation orchestration boundary.
 ///
@@ -66,20 +70,70 @@ impl BytecodeGenerator {
     }
 
     pub fn finish(self) -> GenerationOutput {
-        let stream: PackedInstructionStream = self.instructions.finalize();
+        let mut diagnostics = self.diagnostics;
+        let staged_stream: PackedInstructionStream = self.instructions.finalize();
+        let link_output = InstructionLinker::link_schema_stream(&staged_stream);
+        let stream = match link_output.linked {
+            Some(stream) => stream,
+            None => {
+                diagnostics.push(GenerationDiagnostic {
+                    phase: GenerationPhase::LabelResolution,
+                    message: "unresolved labels left in instruction stream",
+                });
+                staged_stream
+            }
+        };
+        let mut side_tables = self.side_tables;
+        let first_generated_root_map_id = next_root_map_id(&side_tables);
+        {
+            let mut decoded_instructions = Vec::with_capacity(stream.instruction_count());
+            for decoded in stream.decoded_instructions() {
+                match decoded {
+                    Ok(instruction) => decoded_instructions.push(instruction),
+                    Err(_) => diagnostics.push(GenerationDiagnostic {
+                        phase: GenerationPhase::Finalization,
+                        message: "failed to decode linked instruction for helper root maps",
+                    }),
+                }
+            }
+            match build_p6_no_js_call_helper_root_maps(
+                decoded_instructions,
+                first_generated_root_map_id,
+            ) {
+                Ok(root_maps) => side_tables.root_maps.extend(root_maps),
+                Err(_) => diagnostics.push(GenerationDiagnostic {
+                    phase: GenerationPhase::Finalization,
+                    message: "failed to generate helper root map",
+                }),
+            }
+        }
         let code_block = UnlinkedCodeBlock::new(self.plan.kind, stream)
             .with_source(self.plan.source)
             .with_executable_info(self.plan.executable_info)
             .with_features(self.plan.features)
             .with_generation_modes(self.plan.modes)
-            .with_frame(self.registers.frame_shape());
+            .with_side_tables(side_tables)
+            .with_frame(self.registers.frame_shape())
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
 
         GenerationOutput {
             code_block,
-            diagnostics: self.diagnostics,
+            diagnostics,
             labels: self.labels,
         }
     }
+}
+
+fn next_root_map_id(side_tables: &UnlinkedSideTables) -> BytecodeRootMapId {
+    let next = side_tables
+        .root_maps
+        .iter()
+        .map(|root_map| root_map.id.0)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(1);
+    BytecodeRootMapId(next)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,6 +146,8 @@ pub struct GenerationPlan {
     pub modes: CodeGenerationModeSet,
     pub registers: RegisterFrameShape,
     pub environment: GenerationEnvironment,
+    pub generator_state: GeneratorStatePlan,
+    pub mutation_authority: GenerationMutationAuthority,
     pub root: GenerationRoot,
 }
 
@@ -109,9 +165,155 @@ impl GenerationPlan {
             modes: CodeGenerationModeSet::default(),
             registers: RegisterFrameShape::default(),
             environment: GenerationEnvironment::default(),
+            generator_state: GeneratorStatePlan::default(),
+            mutation_authority: GenerationMutationAuthority::BytecodeGenerator,
             root: GenerationRoot::Unspecified,
         }
     }
+
+    pub fn validate(&self) -> GenerationValidationReport {
+        let mut findings = Vec::new();
+        if self.executable_info.parse_mode != Some(self.parse_mode) {
+            findings.push(GenerationValidationFinding::ExecutableParseModeMismatch {
+                expected: self.parse_mode,
+                actual: self.executable_info.parse_mode,
+            });
+        }
+        if self.registers.num_callee_locals
+            < self
+                .registers
+                .num_vars
+                .saturating_add(self.registers.num_temporaries)
+        {
+            findings.push(GenerationValidationFinding::FrameShapeTooSmall {
+                num_callee_locals: self.registers.num_callee_locals,
+                required: self
+                    .registers
+                    .num_vars
+                    .saturating_add(self.registers.num_temporaries),
+            });
+        }
+        validate_special_registers(self.registers.special, &mut findings);
+        validate_environment(&self.environment, &mut findings);
+        validate_generator_state(&self.generator_state, &mut findings);
+        GenerationValidationReport { findings }
+    }
+}
+
+fn validate_special_registers(
+    special: SpecialRegisters,
+    findings: &mut Vec<GenerationValidationFinding>,
+) {
+    if !special.this_register.is_valid() {
+        findings.push(GenerationValidationFinding::InvalidSpecialRegister {
+            register: SpecialRegisterKind::This,
+        });
+    }
+    if !special.scope_register.is_valid() {
+        findings.push(GenerationValidationFinding::InvalidSpecialRegister {
+            register: SpecialRegisterKind::Scope,
+        });
+    }
+    for (kind, register) in [
+        (SpecialRegisterKind::Arguments, special.arguments_register),
+        (SpecialRegisterKind::NewTarget, special.new_target_register),
+        (SpecialRegisterKind::Generator, special.generator_register),
+        (SpecialRegisterKind::Promise, special.promise_register),
+    ] {
+        if matches!(register, Some(register) if !register.is_valid()) {
+            findings.push(GenerationValidationFinding::InvalidSpecialRegister { register: kind });
+        }
+    }
+}
+
+fn validate_environment(
+    environment: &GenerationEnvironment,
+    findings: &mut Vec<GenerationValidationFinding>,
+) {
+    validate_slots(
+        &environment.variables_under_tdz,
+        EnvironmentSlotList::Tdz,
+        findings,
+    );
+    validate_slots(
+        &environment.private_names,
+        EnvironmentSlotList::PrivateNames,
+        findings,
+    );
+    validate_slots(
+        &environment.captured_variables,
+        EnvironmentSlotList::CapturedVariables,
+        findings,
+    );
+}
+
+fn validate_slots(
+    slots: &[EnvironmentSlot],
+    list: EnvironmentSlotList,
+    findings: &mut Vec<GenerationValidationFinding>,
+) {
+    for (index, slot) in slots.iter().enumerate() {
+        if slots[..index]
+            .iter()
+            .any(|candidate| candidate.index == slot.index && candidate.kind == slot.kind)
+        {
+            findings
+                .push(GenerationValidationFinding::DuplicateEnvironmentSlot { list, slot: *slot });
+        }
+    }
+}
+
+fn validate_generator_state(
+    state: &GeneratorStatePlan,
+    findings: &mut Vec<GenerationValidationFinding>,
+) {
+    if state.needs_generatorification
+        && (state.state_register.is_none()
+            || state.value_register.is_none()
+            || state.resume_mode_register.is_none()
+            || state.frame_register.is_none())
+    {
+        findings.push(GenerationValidationFinding::GeneratorificationMissingRegisters);
+    }
+    if !state.needs_generatorification && !state.yield_points.is_empty() {
+        findings.push(GenerationValidationFinding::YieldPointsWithoutGeneratorification);
+    }
+    for register in [
+        state.state_register,
+        state.value_register,
+        state.resume_mode_register,
+        state.frame_register,
+        state.promise_register,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !register.is_valid() {
+            findings.push(GenerationValidationFinding::InvalidGeneratorRegister { register });
+        }
+    }
+    for (index, point) in state.yield_points.iter().enumerate() {
+        if state.yield_points[..index]
+            .iter()
+            .any(|candidate| candidate.state == point.state)
+        {
+            findings.push(GenerationValidationFinding::DuplicateYieldState { state: point.state });
+        }
+    }
+}
+
+/// Owner allowed to mutate generation staging state.
+///
+/// This does not grant permission to mutate linked runtime data. It only names
+/// the component currently allowed to append instructions, labels, metadata
+/// plans, constants, and unlinked side tables.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum GenerationMutationAuthority {
+    #[default]
+    BytecodeGenerator,
+    BytecodeRewriter,
+    UnlinkedCodeBlockGenerator,
+    SchemaGenerator,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -120,8 +322,15 @@ pub struct GenerationEnvironment {
     pub variables_under_tdz: Vec<EnvironmentSlot>,
     pub private_names: Vec<EnvironmentSlot>,
     pub captured_variables: Vec<EnvironmentSlot>,
+    pub parent_private_names: Vec<ParserIdentifier>,
+    pub parent_tdz_environment: Option<ParentEnvironmentRef>,
     pub allows_direct_eval_cache: bool,
+    pub needs_full_activation: bool,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[repr(transparent)]
+pub struct ParentEnvironmentRef(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct EnvironmentSlot {
@@ -135,6 +344,40 @@ pub enum EnvironmentSlotKind {
     Lexical,
     PrivateName,
     Module,
+    DirectArgumentsObject,
+}
+
+/// Generator and async-function resume-state contract.
+///
+/// JSC generatorification reserves parameter slots and hidden fields for
+/// resume mode, yielded value, frame storage, promises, and async-generator
+/// suspend reasons. Rust keeps those slots explicit and separate from ordinary
+/// temporaries.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GeneratorStatePlan {
+    pub state_register: Option<VirtualRegister>,
+    pub value_register: Option<VirtualRegister>,
+    pub resume_mode_register: Option<VirtualRegister>,
+    pub frame_register: Option<VirtualRegister>,
+    pub promise_register: Option<VirtualRegister>,
+    pub yield_points: Vec<YieldPointPlan>,
+    pub needs_generatorification: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct YieldPointPlan {
+    pub label: Label,
+    pub state: i32,
+    pub kind: YieldPointKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum YieldPointKind {
+    Yield,
+    Await,
+    DelegateYield,
+    AsyncGeneratorYield,
+    AsyncGeneratorAwait,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -245,6 +488,27 @@ impl LabelArena {
     pub fn labels(&self) -> &[LabelRecord] {
         &self.labels
     }
+
+    pub fn validate(&self) -> GenerationValidationReport {
+        let mut findings = Vec::new();
+        for (index, label) in self.labels.iter().enumerate() {
+            if usize::try_from(label.reference.0).ok() != Some(index) {
+                findings.push(GenerationValidationFinding::LabelReferenceMismatch {
+                    expected: LabelRef(index as u32),
+                    actual: label.reference,
+                });
+            }
+            if self.labels[..index]
+                .iter()
+                .any(|candidate| candidate.reference == label.reference)
+            {
+                findings.push(GenerationValidationFinding::DuplicateLabel {
+                    label: label.reference,
+                });
+            }
+        }
+        GenerationValidationReport { findings }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -259,4 +523,190 @@ pub enum LabelState {
     Unbound,
     BoundToInstruction(u32),
     OutOfLine,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GenerationValidationReport {
+    pub findings: Vec<GenerationValidationFinding>,
+}
+
+impl GenerationValidationReport {
+    pub fn is_valid(&self) -> bool {
+        self.findings.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenerationValidationFinding {
+    ExecutableParseModeMismatch {
+        expected: ParseMode,
+        actual: Option<ParseMode>,
+    },
+    FrameShapeTooSmall {
+        num_callee_locals: u32,
+        required: u32,
+    },
+    InvalidSpecialRegister {
+        register: SpecialRegisterKind,
+    },
+    DuplicateEnvironmentSlot {
+        list: EnvironmentSlotList,
+        slot: EnvironmentSlot,
+    },
+    GeneratorificationMissingRegisters,
+    YieldPointsWithoutGeneratorification,
+    InvalidGeneratorRegister {
+        register: VirtualRegister,
+    },
+    DuplicateYieldState {
+        state: i32,
+    },
+    LabelReferenceMismatch {
+        expected: LabelRef,
+        actual: LabelRef,
+    },
+    DuplicateLabel {
+        label: LabelRef,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpecialRegisterKind {
+    This,
+    Scope,
+    Arguments,
+    NewTarget,
+    Generator,
+    Promise,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnvironmentSlotList {
+    Tdz,
+    PrivateNames,
+    CapturedVariables,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytecode::{
+        BytecodeIndex, BytecodeRootSlotKind, BytecodeRootSlotStorage, CoreOpcode, Operand,
+        OperandWidth,
+    };
+
+    #[test]
+    fn generation_plan_validation_accepts_explicit_frame_and_registers() {
+        let mut plan = GenerationPlan::new(CodeKind::Function, ParseMode::NormalFunction);
+        plan.registers = RegisterFrameShape {
+            num_vars: 1,
+            num_temporaries: 1,
+            num_callee_locals: 2,
+            special: SpecialRegisters {
+                this_register: VirtualRegister::argument_or_header(0),
+                scope_register: VirtualRegister::local(0),
+                ..SpecialRegisters::default()
+            },
+            ..RegisterFrameShape::default()
+        };
+
+        assert!(plan.validate().is_valid());
+    }
+
+    #[test]
+    fn generation_plan_validation_reports_missing_generator_registers() {
+        let mut plan = GenerationPlan::new(CodeKind::Function, ParseMode::GeneratorBody);
+        plan.registers.special.this_register = VirtualRegister::argument_or_header(0);
+        plan.registers.special.scope_register = VirtualRegister::local(0);
+        plan.generator_state.needs_generatorification = true;
+        plan.generator_state.yield_points.push(YieldPointPlan {
+            label: Label(0),
+            state: 1,
+            kind: YieldPointKind::Yield,
+        });
+        plan.generator_state.yield_points.push(YieldPointPlan {
+            label: Label(1),
+            state: 1,
+            kind: YieldPointKind::Yield,
+        });
+
+        let findings = plan.validate().findings;
+        assert!(findings.contains(&GenerationValidationFinding::GeneratorificationMissingRegisters));
+        assert!(findings.contains(&GenerationValidationFinding::DuplicateYieldState { state: 1 }));
+    }
+
+    #[test]
+    fn bytecode_generator_finishes_finalized_unlinked_block() {
+        let mut plan = GenerationPlan::new(CodeKind::Program, ParseMode::Program);
+        plan.registers.special.this_register = VirtualRegister::argument_or_header(0);
+        plan.registers.special.scope_register = VirtualRegister::local(0);
+        let mut generator = BytecodeGenerator::new(plan);
+        let label = generator.instructions_mut().declare_label(Some("done"));
+        assert!(generator
+            .instructions_mut()
+            .bind_label(label, crate::bytecode::BytecodeIndex::from_offset(0)));
+        generator.instructions_mut().declare_instruction(
+            crate::bytecode::Opcode::Reserved,
+            crate::bytecode::OperandWidth::Narrow,
+            vec![crate::bytecode::Operand::Label(label)],
+        );
+
+        let output = generator.finish();
+
+        assert!(output.diagnostics.is_empty());
+        assert_eq!(output.code_block.phase(), UnlinkedCodeBlockPhase::Finalized);
+        assert_eq!(
+            output.code_block.instructions().lifecycle(),
+            crate::bytecode::PackedInstructionLifecycle::Linked
+        );
+    }
+
+    #[test]
+    fn bytecode_generator_finalization_emits_ownerless_helper_root_maps_at_linked_indices() {
+        let mut plan = GenerationPlan::new(CodeKind::Program, ParseMode::Program);
+        plan.registers.special.this_register = VirtualRegister::argument_or_header(0);
+        plan.registers.special.scope_register = VirtualRegister::local(0);
+        let mut generator = BytecodeGenerator::new(plan);
+        let destination = VirtualRegister::local(0);
+        let source = VirtualRegister::argument_or_header(5);
+        generator.instructions_mut().declare_instruction(
+            CoreOpcode::LoadUndefined.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::Register(destination)],
+        );
+        generator.instructions_mut().declare_instruction(
+            CoreOpcode::TypeOf.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::Register(destination), Operand::Register(source)],
+        );
+
+        let output = generator.finish();
+        let root_maps = &output.code_block.side_tables().root_maps;
+
+        assert!(output.diagnostics.is_empty());
+        assert_eq!(root_maps.len(), 1);
+        assert_eq!(root_maps[0].owner, None);
+        assert_eq!(
+            root_maps[0].bytecode_range_start,
+            BytecodeIndex::from_offset(1)
+        );
+        assert_eq!(
+            root_maps[0].bytecode_range_end,
+            BytecodeIndex::from_offset(1)
+        );
+        assert_eq!(root_maps[0].slots.len(), 2);
+        assert_eq!(
+            root_maps[0].slots[0].storage,
+            BytecodeRootSlotStorage::Register(destination)
+        );
+        assert_eq!(
+            root_maps[0].slots[0].kind,
+            BytecodeRootSlotKind::VirtualRegister
+        );
+        assert_eq!(
+            root_maps[0].slots[1].storage,
+            BytecodeRootSlotStorage::Register(source)
+        );
+        assert_eq!(root_maps[0].slots[1].kind, BytecodeRootSlotKind::Argument);
+    }
 }

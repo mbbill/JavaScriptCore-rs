@@ -17,6 +17,15 @@ architecture while implementing.
 Implementation work should begin only after the relevant ownership model,
 module boundary, public API, invariants, and test expectations are documented.
 
+The main agent must manage priority before assigning work. At every stage it
+should ask what the most important missing building block is, what depends on
+it, what can run in parallel, and whether a proposed task is only local tuning.
+
+The main agent is the architect and lead reviewer. Large implementation work
+belongs to sub-agents with clear ownership and verification requirements. The
+main agent should personally implement only trivial glue, small corrections, or
+already-started low-risk fixes.
+
 ## Why Not Start With a Tiny Executable Path?
 
 A small JavaScript program such as:
@@ -49,32 +58,43 @@ interpreter path.
 
 ## Recommended Workflow
 
-1. Inventory the JavaScriptCore subsystem.
+1. Choose the current priority.
+
+   Decide which engine gap matters most now. Prefer missing shared
+   infrastructure over one failing local path. Identify serial dependencies and
+   parallelizable work before editing code.
+
+2. Inventory the JavaScriptCore subsystem.
 
    Read the relevant C++ source and document what the subsystem owns, mutates,
    assumes, and exposes. The output should be a design note, not code.
 
-2. Translate responsibilities into Rust design.
+3. Translate responsibilities into Rust design.
 
    Define the Rust modules, structs, traits, ownership relationships, mutation
    rules, and unsafe boundaries that replace the C++ design.
 
-3. Create skeleton APIs before implementation.
+4. Create skeleton APIs before implementation.
 
    Add files, modules, public types, method names, and comments that explain
    what each part is responsible for. Placeholder methods are acceptable when
    the contract is clear.
 
-4. Freeze component contracts before assigning implementation.
+5. Freeze component contracts before assigning implementation.
 
    Agent implementation tasks should be bounded by documented interfaces.
    Agents should not redesign neighboring systems while filling in one module.
 
-5. Integrate only after enough pieces have stable contracts.
+6. Integrate only after enough pieces have stable contracts.
 
    The first executable JavaScript path should come after core contracts for
    values, heap ownership, runtime objects, bytecode boundaries, and VM frames
    are already sketched.
+
+7. Record sparse progress.
+
+   Add one line to `progress.md` only after a major task is complete and gated.
+   Do not turn the progress log into a second design document.
 
 ## Good Agent Tasks
 
@@ -92,6 +112,10 @@ interpreter path.
 - Port files one by one.
 - Fix compiler errors by changing ownership boundaries opportunistically.
 - Introduce broad `Rc<RefCell<_>>` usage to bypass unresolved design questions.
+- Spend a long time making one small test pass when the missing dependency is a
+  larger subsystem contract.
+- Expand a local feature while GC, handles, jobs, modules, or other shared
+  infrastructure remains the higher priority.
 
 ## Documentation Expectations
 

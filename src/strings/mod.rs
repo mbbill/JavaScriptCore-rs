@@ -10,24 +10,36 @@ mod string;
 mod symbol;
 
 pub use atom::{
-    AtomDomain, AtomId, AtomLifetime, AtomTable, AtomTableId, AtomTableMutation, AtomTableScope,
+    plan_atom_registry_interning, validate_atom_registry_descriptor, AtomDomain, AtomId,
+    AtomInterningAction, AtomInterningPlanEntry, AtomLifetime, AtomRegistryDescriptor,
+    AtomRegistryDescriptorBuilder, AtomRegistryOwner, AtomRegistryProvenance,
+    AtomRegistryValidationError, AtomTable, AtomTableId, AtomTableMutation, AtomTableScope,
     CacheableIdentifier, CacheableIdentifierClassification, CacheableIdentifierOwner,
-    CacheableIdentifierStorage, CommonIdentifier, CommonIdentifierKind, CommonIdentifierSlot,
-    Identifier, UniquedIdentifier,
+    CacheableIdentifierStorage, CommonIdentifier, CommonIdentifierDescriptor, CommonIdentifierKind,
+    CommonIdentifierSlot, Identifier, UniquedIdentifier,
 };
 pub use property_key::{
-    NumericPropertyKeyKind, PrivateSymbolMode, PropertyIndex, PropertyKey,
-    PropertyKeyClassification, PropertyKeyConversion, PropertyKeyConverter, PropertyKeyKind,
-    PropertyNameFilter, PropertyNameMode,
+    classify_property_key, classify_property_name_text, NumericPropertyKeyKind, PrivateSymbolMode,
+    PropertyIndex, PropertyKey, PropertyKeyClassification, PropertyKeyConversion,
+    PropertyKeyConverter, PropertyKeyKind, PropertyNameFilter, PropertyNameMode,
 };
 pub use string::{
-    AtomizationMode, ExternalString, ExternalStringOwner, ExternalStringPinning, FlatString,
-    FlatStringStorage, JsString, RopeArity, RopeFiber, RopeFiberOwnership, RopeKind, RopePiece,
-    RopePieceKind, RopeResolutionMode, RopeResolutionOutcome, RopeString, RuntimeStringKind,
-    StringAtomizationState, StringCellState, StringEncoding, StringInterner, StringLength,
-    StringOwnership, SubstringBase, SubstringString,
+    canonicalize_static_string_registry, validate_external_string, validate_flat_string,
+    validate_static_string_descriptor, validate_string_registry_descriptor,
+    validate_substring_string, AtomizationMode, ExternalString, ExternalStringOwner,
+    ExternalStringPinning, FlatString, FlatStringStorage, JsString, RopeArity, RopeFiber,
+    RopeFiberMutationAuthority, RopeFiberOwnership, RopeKind, RopePiece, RopePieceKind,
+    RopeResolutionMode, RopeResolutionOutcome, RopeString, RuntimeStringKind,
+    StaticStringCanonicalForm, StaticStringCanonicalization, StaticStringDescriptor,
+    StaticStringDescriptorBuilder, StringAtomizationState, StringBorrowOwner, StringBorrowScope,
+    StringCellState, StringEncoding, StringId, StringInterner, StringLength, StringOwnership,
+    StringRegistryDescriptor, StringRegistryDescriptorBuilder, StringRegistryOwner,
+    StringRegistryProvenance, StringValidationError, SubstringBase, SubstringString,
 };
 pub use symbol::{
-    PrivateName, SymbolCell, SymbolDescription, SymbolIdentity, SymbolKind, SymbolRegistryId,
-    SymbolRegistryKind, SymbolUid, SymbolUidAllocator, SymbolUniquenessDomain,
+    validate_symbol_registry_descriptor, validate_symbol_registry_entry, PrivateName, SymbolCell,
+    SymbolDescription, SymbolIdentity, SymbolKind, SymbolRegistryDescriptor,
+    SymbolRegistryDescriptorBuilder, SymbolRegistryEntryDescriptor, SymbolRegistryId,
+    SymbolRegistryKind, SymbolRegistryOwner, SymbolRegistryProvenance,
+    SymbolRegistryValidationError, SymbolUid, SymbolUidAllocator, SymbolUniquenessDomain,
 };

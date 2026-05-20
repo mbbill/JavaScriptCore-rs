@@ -1,16 +1,19 @@
 //! Bytecode, code-block, and executable contracts for the Rust JavaScriptCore
 //! rewrite.
 //!
-//! This module intentionally does not emit, pack, decode, link, or execute real
-//! JavaScript bytecode. It names ownership and mutation boundaries that later
-//! generated schema and runtime work must respect.
+//! This module owns bytecode records, code blocks, executable metadata, and
+//! safe decoded views. Generated JSC bytecode tables are still pending, but the
+//! Rust interpreter can execute a small core opcode set emitted through the
+//! bytecompiler while those generated tables are filled in.
 
 pub(crate) mod code_block;
 pub(crate) mod debug;
 pub(crate) mod executable;
+pub(crate) mod gc;
 pub(crate) mod generator;
 pub(crate) mod ic;
 pub(crate) mod instruction;
+pub(crate) mod integration;
 pub(crate) mod metadata;
 pub(crate) mod opcode;
 pub(crate) mod origin;
@@ -20,16 +23,20 @@ pub(crate) mod register;
 pub use crate::gc::StructureId;
 pub use code_block::{
     BitVectorRef, BytecodeIndex, BytecodeRange, CallSiteIndex, CallSiteRecord, Checkpoint,
-    CodeBlock, CodeBlockEntrypoints, CodeBlockRegisterSummary, CodeBlockTierState, CodeFeatures,
+    CodeBlock, CodeBlockEntrypoints, CodeBlockExecutionSurface, CodeBlockLifecycleState,
+    CodeBlockMutationAuthority, CodeBlockRegisterSummary, CodeBlockTierState, CodeFeatures,
     CodeGenerationModeSet, CodeKind, CodeSpecialization, ConstantOwner, ConstantValue,
-    ConstructorKind, DebugHookKind, DebugHookRecord, EvalContext, ExecutableInfo, HandlerInfo,
-    HandlerKind, HandlerRange, HandlerTarget, JumpTableSet, LinkContext, LinkTimeConstant,
+    ConstructorKind, DebugHookKind, DebugHookRecord, DerivedContextType, EvalContext,
+    EvalContextType, ExecutableInfo, ExecutionTier, HandlerInfo, HandlerKind, HandlerRange,
+    HandlerTarget, InterpreterEntrySlot, JitCodeSlot, JumpTableSet, LinkContext, LinkTimeConstant,
     LinkedConstant, LinkedConstantPool, LinkedMetadataField, LinkedMetadataStorage,
-    LinkedSideTables, MetadataEntry, MetadataTable, ParseMode, ScriptMode,
-    SourceCodeRepresentation, SourceDirectiveTable, SourceNote, SourceNoteTable, SourceOriginId,
-    SourcePosition, SourceProvenance, SourceProviderId, SourceRange, SuperBinding, TierHint,
-    UnlinkedCodeBlock, UnlinkedConstant, UnlinkedConstantPool, UnlinkedHandlerInfo,
-    UnlinkedMetadataEntry, UnlinkedMetadataTable, UnlinkedSideTables, UnlinkedTieringHints,
+    LinkedSideTables, MetadataEntry, MetadataTable, NeedsClassFieldInitializer, ParseMode,
+    PrivateBrandRequirement, RuntimeSlot, ScriptMode, SourceCodeRepresentation,
+    SourceDirectiveTable, SourceNote, SourceNoteTable, SourceOriginId, SourcePosition,
+    SourceProvenance, SourceProviderId, SourceRange, SuperBinding, TierCounterState, TierHint,
+    UnlinkedCodeBlock, UnlinkedCodeBlockPhase, UnlinkedConstant, UnlinkedConstantPool,
+    UnlinkedHandlerInfo, UnlinkedMetadataEntry, UnlinkedMetadataTable, UnlinkedSideTables,
+    UnlinkedTieringHints, UnlinkedToLinkedBytecodeRecord,
 };
 pub use debug::{
     BytecodeHookTable, CatchProfileRecord, DebuggerBytecodeHook, DebuggerPausePolicy,
@@ -38,55 +45,90 @@ pub use debug::{
     ShadowChickenHookKind,
 };
 pub use executable::{
-    CachedCodeValue, CodeCache, CodeCacheEntry, CodeCachePolicy, ConstructAbility,
-    DeferredTieringSlots, EntrypointState, ExecutableBase, ExecutableEntrypoints, ExecutablePolicy,
-    FunctionExecutable, FunctionExecutableRareData, FunctionMode, ImplementationVisibility,
-    InlineAttribute, IntrinsicKind, ParseRecord, ScriptExecutable, ScriptExecutableKind,
-    SourceCodeKey, UnlinkedFunctionExecutable,
+    CachedCodeValue, ClassElementDefinition, ClassElementDefinitionKind, CodeCache, CodeCacheEntry,
+    CodeCachePolicy, ConstructAbility, DeferredTieringSlots, EntrypointState,
+    ExecutableAritySelection, ExecutableBase, ExecutableBaselineNativeEntryRecord,
+    ExecutableBaselineNativeEntrySelection, ExecutableEntryCacheKey, ExecutableEntryCacheRecord,
+    ExecutableEntryMetadata, ExecutableEntryPublicationError, ExecutableEntryPublicationRequest,
+    ExecutableEntrypoints, ExecutableEvalParseMetadata, ExecutableFunctionParseMetadata,
+    ExecutableInfoPlan, ExecutableModuleParseMetadata, ExecutableParseGoal,
+    ExecutableParseSemanticMetadata, ExecutablePolicy, FunctionExecutable,
+    FunctionExecutableRareData, FunctionMode, FunctionSingletonState, ImplementationVisibility,
+    InlineAttribute, InterpreterEntrypointSlot, IntrinsicKind, JitEntrypointSlot,
+    ParentPrivateNameEnvironmentRef, ParentTdzEnvironmentRef, ParseRecord, ScriptExecutable,
+    ScriptExecutableKind, SourceCodeKey, UnlinkedFunctionExecutable,
+    UnlinkedFunctionExecutableRareData, UnlinkedFunctionKind,
+};
+pub use gc::{
+    BytecodeRootMap, BytecodeRootMapId, BytecodeRootMapValidationError, BytecodeRootSlotDescriptor,
+    BytecodeRootSlotKind, BytecodeRootSlotStorage,
 };
 pub use generator::{
-    BytecodeGenerator, EnvironmentSlot, EnvironmentSlotKind, GenerationDiagnostic,
-    GenerationEnvironment, GenerationOutput, GenerationPhase, GenerationPlan, GenerationRoot,
-    Label, LabelArena, RegisterAllocator,
+    BytecodeGenerator, EnvironmentSlot, EnvironmentSlotKind, EnvironmentSlotList,
+    GenerationDiagnostic, GenerationEnvironment, GenerationMutationAuthority, GenerationOutput,
+    GenerationPhase, GenerationPlan, GenerationRoot, GenerationValidationFinding,
+    GenerationValidationReport, GeneratorStatePlan, Label, LabelArena, ParentEnvironmentRef,
+    RegisterAllocator, SpecialRegisterKind, YieldPointKind, YieldPointPlan,
 };
 pub use ic::{
     AccessCaseRef, ArityCheckMode, CallLinkFlags, CallLinkInfo, CallLinkMode, CallSlot, CallTarget,
-    CallType, CodeBlockSlot, GetByIdMode, GetByIdModeMetadata, InlineCacheState, InlineCacheTable,
-    IterationModeMetadata, IterationModes, PropertyCacheKey, PropertyCacheKind,
-    PropertyInlineCache, PropertyOffset, PutByIdMode, PutByIdModeMetadata, StructureStubInfo,
-    StructureStubKind,
+    CallType, GetByIdMode, GetByIdModeMetadata, InlineCacheMutationAuthority, InlineCacheState,
+    InlineCacheTable, IterationModeMetadata, IterationModes, PropertyAccessType, PropertyCacheKey,
+    PropertyCacheKind, PropertyInlineCache, PropertyInlineCacheDispatch, PropertyOffset,
+    PutByIdMode, PutByIdModeMetadata, StructureStubAccessCaseLinkError,
+    StructureStubAccessCaseLinkOutcome, StructureStubAccessCaseLinkRequest,
+    StructureStubAccessCaseLinkResult, StructureStubInfo, StructureStubKind,
 };
 pub use instruction::{
-    BytecodeByteOrder, BytecodeVerifier, CheckpointSpec, InstructionBuilder,
-    InstructionDeclaration, InstructionDeclarationRef, InstructionSchemaRef,
-    InstructionStreamLayout, LabelBinding, LabelDeclaration, LabelRef, OpcodeIdWidth, Operand,
-    PackedByteStorage, PackedInstructionStream, RuntimeTypeRef, TypedInstruction,
-    VerificationFinding, VerificationReport, VerificationResult, WidthPrefixPolicy,
+    BytecodeByteOrder, BytecodeDeclarationOwner, BytecodeDeclarationTable, BytecodeVerifier,
+    CheckpointSpec, DecodedInstruction, DecodedInstructionSource, InstructionBuilder,
+    InstructionBuilderState, InstructionDeclaration, InstructionDeclarationRef,
+    InstructionDecodeError, InstructionDecodeIter, InstructionLinkFinding, InstructionLinkOutput,
+    InstructionLinker, InstructionPatchAuthority, InstructionSchemaRef, InstructionStreamLayout,
+    LabelBinding, LabelDeclaration, LabelRef, OpcodeIdWidth, Operand, OperandAccessError,
+    PackedByteStorage, PackedInstructionLifecycle, PackedInstructionStream, RuntimeTypeRef,
+    StaticInstructionDeclaration, StaticLabelDeclaration, TypedInstruction, VerificationFinding,
+    VerificationReport, VerificationResult, WidthPrefixPolicy,
+};
+pub use integration::{
+    summarize_bytecode_integration, BytecodeIntegrationDiagnostic,
+    BytecodeIntegrationDiagnosticKind, BytecodeIntegrationSummary, BytecodeRootIntegrationSummary,
+    BytecodeTierExecutionSummary, BytecodeToolingSourceMapSummary,
 };
 pub use metadata::{
-    InstructionMetadataFieldPlan, InstructionMetadataPlan, MetadataAlignment, MetadataBinding,
-    MetadataLayout, MetadataLinkingData, MetadataOffsetEncoding, MetadataOffsetEntry,
-    MetadataOffsetTable, MetadataTableMemoryLayout, MetadataTablePhase, MetadataTriState,
-    MetadataValueProfileRegion, OpcodeMetadataLayout, UnlinkedMetadataTableRef,
+    BytecodeMetadataSemanticContract, ExecutionMetadataLookup, InstructionMetadataFieldPlan,
+    InstructionMetadataPlan, MetadataAlignment, MetadataBinding, MetadataExceptionContract,
+    MetadataLayout, MetadataLayoutOwner, MetadataLayoutProvenance, MetadataLayoutRegistry,
+    MetadataLinkingData, MetadataObservableOrder, MetadataOffsetEncoding, MetadataOffsetEntry,
+    MetadataOffsetTable, MetadataSideEffectSet, MetadataTableMemoryLayout, MetadataTablePhase,
+    MetadataTriState, MetadataValidationFinding, MetadataValidationReport,
+    MetadataValueProfileRegion, OpcodeMetadataLayout, StaticMetadataLayout,
+    StaticMetadataOffsetTable, StaticOpcodeMetadataLayout, UnlinkedMetadataTableRef,
     ValueProfileStorageOrder,
 };
 pub use opcode::{
-    CheckpointDescriptor, CheckpointShape, MetadataFieldKind, MetadataFieldSpec,
+    CheckpointDescriptor, CheckpointShape, CoreOpcode, MetadataFieldKind, MetadataFieldSpec,
     MetadataMutability, MetadataShape, Opcode, OpcodeCategory, OpcodeDescriptor, OpcodeEffects,
-    OpcodeId, OpcodeSchema, OpcodeSchemaVersion, OperandKind, OperandPresence, OperandRole,
-    OperandSpec, OperandWidth, TemporaryKind, TemporarySpec,
+    OpcodeId, OpcodeRegistryMutationAuthority, OpcodeSchema, OpcodeSchemaOwner,
+    OpcodeSchemaProvenance, OpcodeSchemaRegistry, OpcodeSchemaVersion, OpcodeValidationFinding,
+    OpcodeValidationReport, OperandKind, OperandPresence, OperandRole, OperandSpec, OperandWidth,
+    StaticCheckpointShape, StaticMetadataShape, StaticOpcodeDescriptor, StaticOpcodeSchema,
+    TemporaryKind, TemporarySpec,
 };
 pub use origin::{
-    BytecodeSourceMapping, CodeBlockRef, CodeOrigin, CodeOriginTable, FullCodeOrigin,
+    BytecodeSourceMapping, CodeOrigin, CodeOriginTable, ExecutionDiagnosticMapping, FullCodeOrigin,
     InlineCallFrameRecord, InlineCallFrameRef, ProgramCounterMappingWidth, ProgramCounterOrigin,
-    SourceNoteLookup, SourcePositionKind,
+    SourceNoteLookup, SourceOriginSemanticEntry, SourceOriginSemanticKind, SourceOriginSemanticMap,
+    SourceOriginSemanticValidationFinding, SourceOriginSemanticValidationReport,
+    SourcePositionKind,
 };
 pub use profiling::{
     ArithProfile, ArrayModes, ArrayProfile, ArrayProfileFlags, BytecodeExecutionCounter,
     ControlFlowProfileRecord, CountingVariant, ExecutionCounterState, LoopOsrCounter,
     ObservedResults, ObservedType, ProfileUpdatePolicy, ProfilingCounterSet, SpeculatedTypeSet,
     TypeProfilerRecord, UnlinkedValueProfile, ValueProfile, ValueProfileBucket,
-    ValueProfileBucketKind, ValueProfileTable,
+    ValueProfileBucketKind, ValueProfileRootMetadata, ValueProfileRootValidationError,
+    ValueProfileTable,
 };
 pub use register::{
     RegisterClass, RegisterFrameShape, RegisterOperandEncoding, RegisterOperandWidth,

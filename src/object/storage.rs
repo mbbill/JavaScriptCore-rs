@@ -56,6 +56,63 @@ pub struct ButterflyLayout {
     pub indexing_payload_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageValidationError {
+    IndexedPayloadWithoutHeader,
+    HeaderWithoutIndexedPayload,
+    IndexingLengthMismatch,
+    ArrayStorageVectorTooSmall,
+    ArrayLengthOffsetInvalid,
+    TypedArrayElementSizeMismatch,
+    TypedArrayContentMismatch,
+    TypedArrayModeBufferMismatch,
+    TypedArrayAutoLengthMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ButterflyLayoutBuilder {
+    layout: ButterflyLayout,
+}
+
+impl ButterflyLayoutBuilder {
+    pub const fn new() -> Self {
+        Self {
+            layout: ButterflyLayout {
+                pre_capacity: 0,
+                property_capacity: 0,
+                has_indexing_header: false,
+                indexing_payload_bytes: 0,
+            },
+        }
+    }
+
+    pub const fn property_capacity(mut self, property_capacity: u32) -> Self {
+        self.layout.property_capacity = property_capacity;
+        self
+    }
+
+    pub const fn indexed_payload(mut self, bytes: usize) -> Self {
+        self.layout.has_indexing_header = true;
+        self.layout.indexing_payload_bytes = bytes;
+        self
+    }
+
+    pub fn build(self) -> Result<ButterflyLayout, StorageValidationError> {
+        validate_butterfly_layout(self.layout)?;
+        Ok(self.layout)
+    }
+}
+
+pub fn validate_butterfly_layout(layout: ButterflyLayout) -> Result<(), StorageValidationError> {
+    if layout.indexing_payload_bytes > 0 && !layout.has_indexing_header {
+        return Err(StorageValidationError::IndexedPayloadWithoutHeader);
+    }
+    if layout.has_indexing_header && layout.indexing_payload_bytes == 0 {
+        return Err(StorageValidationError::HeaderWithoutIndexedPayload);
+    }
+    Ok(())
+}
+
 /// Description of an intended butterfly resize/growth.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ButterflyGrowth {
@@ -79,6 +136,21 @@ pub struct IndexingHeader {
     pub vector_length: u32,
     pub mode: IndexedStorageKind,
     pub history: IndexingHistory,
+}
+
+pub fn validate_indexing_header(header: IndexingHeader) -> Result<(), StorageValidationError> {
+    if header.public_length > header.vector_length {
+        return Err(StorageValidationError::IndexingLengthMismatch);
+    }
+    if header.history.copy_on_write
+        && !matches!(
+            header.mode,
+            IndexedStorageKind::Int32 | IndexedStorageKind::Double | IndexedStorageKind::Contiguous
+        )
+    {
+        return Err(StorageValidationError::IndexingLengthMismatch);
+    }
+    Ok(())
 }
 
 /// Indexed payload family. It deliberately does not expose array storage layout.
@@ -128,6 +200,23 @@ pub struct ArrayStorageMetadata {
     pub length: ArrayLengthContract,
     pub vector_length: u32,
     pub sparse: SparseIndexMetadata,
+}
+
+pub fn validate_array_storage_metadata(
+    metadata: ArrayStorageMetadata,
+) -> Result<(), StorageValidationError> {
+    if metadata.length.length_property_offset == PropertyOffset::INVALID {
+        return Err(StorageValidationError::ArrayLengthOffsetInvalid);
+    }
+    if metadata.vector_length < metadata.length.public_length {
+        return Err(StorageValidationError::ArrayStorageVectorTooSmall);
+    }
+    if let Some(highest) = metadata.sparse.highest_observed_index {
+        if metadata.sparse.sparse_entry_count == 0 || highest < metadata.length.public_length {
+            return Err(StorageValidationError::ArrayStorageVectorTooSmall);
+        }
+    }
+    Ok(())
 }
 
 /// Typed-array element family.
@@ -228,6 +317,101 @@ pub struct TypedArrayStorageContract {
     pub byte_offset: usize,
     pub length: TypedArrayViewLength,
     pub element_size: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypedArrayStorageContractBuilder {
+    contract: TypedArrayStorageContract,
+}
+
+impl TypedArrayStorageContractBuilder {
+    pub const fn new(element_type: TypedArrayElementType, mode: TypedArrayMode) -> Self {
+        Self {
+            contract: TypedArrayStorageContract {
+                element_type,
+                content_type: typed_array_content_type(element_type),
+                mode,
+                buffer_edge: TypedArrayBufferEdge::InlineOwnedVector,
+                byte_offset: 0,
+                length: TypedArrayViewLength::FixedElements(0),
+                element_size: typed_array_element_size(element_type),
+            },
+        }
+    }
+
+    pub const fn buffer_edge(mut self, buffer_edge: TypedArrayBufferEdge) -> Self {
+        self.contract.buffer_edge = buffer_edge;
+        self
+    }
+
+    pub const fn byte_offset(mut self, byte_offset: usize) -> Self {
+        self.contract.byte_offset = byte_offset;
+        self
+    }
+
+    pub const fn length(mut self, length: TypedArrayViewLength) -> Self {
+        self.contract.length = length;
+        self
+    }
+
+    pub fn build(self) -> Result<TypedArrayStorageContract, StorageValidationError> {
+        validate_typed_array_storage_contract(self.contract)?;
+        Ok(self.contract)
+    }
+}
+
+pub const fn typed_array_element_size(element_type: TypedArrayElementType) -> u8 {
+    match element_type {
+        TypedArrayElementType::Int8
+        | TypedArrayElementType::Uint8
+        | TypedArrayElementType::Uint8Clamped => 1,
+        TypedArrayElementType::Int16
+        | TypedArrayElementType::Uint16
+        | TypedArrayElementType::Float16 => 2,
+        TypedArrayElementType::Int32
+        | TypedArrayElementType::Uint32
+        | TypedArrayElementType::Float32 => 4,
+        TypedArrayElementType::Float64
+        | TypedArrayElementType::BigInt64
+        | TypedArrayElementType::BigUint64 => 8,
+    }
+}
+
+pub const fn typed_array_content_type(
+    element_type: TypedArrayElementType,
+) -> TypedArrayContentType {
+    match element_type {
+        TypedArrayElementType::BigInt64 | TypedArrayElementType::BigUint64 => {
+            TypedArrayContentType::BigInt
+        }
+        _ => TypedArrayContentType::Number,
+    }
+}
+
+pub fn validate_typed_array_storage_contract(
+    contract: TypedArrayStorageContract,
+) -> Result<(), StorageValidationError> {
+    if contract.element_size != typed_array_element_size(contract.element_type) {
+        return Err(StorageValidationError::TypedArrayElementSizeMismatch);
+    }
+    if contract.content_type != typed_array_content_type(contract.element_type) {
+        return Err(StorageValidationError::TypedArrayContentMismatch);
+    }
+    if contract.mode.has_array_buffer()
+        != matches!(
+            contract.buffer_edge,
+            TypedArrayBufferEdge::ArrayBufferObject
+                | TypedArrayBufferEdge::SharedArrayBufferObject
+                | TypedArrayBufferEdge::DetachedBuffer
+        )
+    {
+        return Err(StorageValidationError::TypedArrayModeBufferMismatch);
+    }
+    if contract.mode.is_auto_length() != matches!(contract.length, TypedArrayViewLength::AutoLength)
+    {
+        return Err(StorageValidationError::TypedArrayAutoLengthMismatch);
+    }
+    Ok(())
 }
 
 /// Opaque indexed storage payload.

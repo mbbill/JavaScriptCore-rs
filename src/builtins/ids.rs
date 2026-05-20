@@ -1,11 +1,33 @@
 /// Generated builtin table index.
 ///
 /// The index is stable only within the generated builtin metadata set that
-/// created it. Public APIs should refer to names or descriptors instead.
+/// created it. The generated table owns allocation and ordering; VM/runtime
+/// code may borrow the ID while installing descriptors, but it is not string,
+/// executable, or heap-cell identity. Public APIs should refer to names or
+/// descriptors instead.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BuiltinId(u32);
 
 impl BuiltinId {
+    pub const fn from_generated_index(index: u32) -> Self {
+        Self(index)
+    }
+
+    pub const fn generated_index(self) -> u32 {
+        self.0
+    }
+}
+
+/// Generated executable-code index from `BuiltinExecutables`.
+///
+/// This is distinct from `BuiltinId`: a builtin descriptor may name source,
+/// names, and initialization metadata, while this index addresses the lazily
+/// compiled executable slot generated for builtin JavaScript code. It is not a
+/// runtime `ExecutableId`; the VM executable cache owns materialization.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BuiltinCodeIndex(u32);
+
+impl BuiltinCodeIndex {
     pub const fn from_generated_index(index: u32) -> Self {
         Self(index)
     }

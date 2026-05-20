@@ -6,7 +6,8 @@ use std::sync::Arc;
 /// for the whole parse, while URL, taint, source type, and directive metadata
 /// are host/debugger-visible. Bytecode cache callbacks and provider locking are
 /// intentionally not modeled here because they belong to VM/embedder ownership,
-/// not syntax-front-end ownership.
+/// not syntax-front-end ownership. The canonical persistent provider identity
+/// is `bytecode::SourceProviderId`; syntax owns only the parse-time storage.
 #[derive(Clone, Debug)]
 pub struct SourceProvider {
     origin: SourceOrigin,
@@ -84,6 +85,14 @@ impl SourceText {
             Self::Utf16(text) => text.is_empty(),
         }
     }
+
+    pub fn unit_at(&self, offset: SourcePosition) -> Option<u32> {
+        let index = usize::try_from(offset.0).ok()?;
+        match self {
+            Self::Latin1(text) => text.get(index).copied().map(u32::from),
+            Self::Utf16(text) => text.get(index).copied().map(u32::from),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,7 +110,11 @@ impl SourceProviderSourceType {
     }
 }
 
-/// Host and debugger-facing source identity.
+/// Host and debugger-facing source-origin metadata.
+///
+/// This is copied into diagnostics and provenance records, but it is not the
+/// canonical source-provider identity. Provider IDs are assigned outside the
+/// syntax front end.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SourceOrigin {
     /// Canonical origin URL used for relative module paths and diagnostics.
@@ -186,6 +199,33 @@ impl SourceCode {
             encoding: self.provider.encoding(),
         }
     }
+
+    pub fn unit_at(&self, position: SourcePosition) -> Option<u32> {
+        if position < self.range.start || position >= self.range.end {
+            return None;
+        }
+        self.provider.text().unit_at(position)
+    }
+
+    pub fn validate(&self) -> SourceValidationReport {
+        let mut findings = Vec::new();
+        if !self.range.is_ordered() {
+            findings.push(SourceValidationFinding::UnorderedRange { span: self.range });
+        }
+        if self.range.start.0 > self.provider.text().unit_len()
+            || self.range.end.0 > self.provider.text().unit_len()
+        {
+            findings.push(SourceValidationFinding::RangeExceedsProvider {
+                span: self.range,
+                provider_units: self.provider.text().unit_len(),
+            });
+        }
+        if self.first_line == 0 {
+            findings.push(SourceValidationFinding::InvalidFirstLine);
+        }
+
+        SourceValidationReport { findings }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +235,9 @@ pub enum SourceEncoding {
 }
 
 /// Stable byte/code-unit offset into a `SourceCode` range.
+///
+/// This syntax position is parse-local. Bytecode source positions carry
+/// resolved line and column data separately for debugger/profiler tables.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub struct SourcePosition(pub u32);
 
@@ -224,6 +267,33 @@ impl SourceSpan {
     pub fn unit_len(self) -> u32 {
         self.end.0.saturating_sub(self.start.0)
     }
+
+    pub fn is_ordered(self) -> bool {
+        self.start <= self.end
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SourceValidationReport {
+    pub findings: Vec<SourceValidationFinding>,
+}
+
+impl SourceValidationReport {
+    pub fn is_valid(&self) -> bool {
+        self.findings.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceValidationFinding {
+    UnorderedRange {
+        span: SourceSpan,
+    },
+    RangeExceedsProvider {
+        span: SourceSpan,
+        provider_units: u32,
+    },
+    InvalidFirstLine,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -275,4 +345,139 @@ pub enum DiagnosticKind {
 /// VM errors. The syntax module only names that boundary.
 pub trait DiagnosticSink {
     fn report(&mut self, diagnostic: Diagnostic);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceToolingMapEntry {
+    pub boundary: SourceBoundary,
+    pub kind: DiagnosticKind,
+    pub severity: DiagnosticSeverity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceToolingSummary {
+    pub source_type: SourceProviderSourceType,
+    pub encoding: SourceEncoding,
+    pub source_units: u32,
+    pub first_line: u32,
+    pub start_column: u32,
+    pub diagnostic_count: u32,
+    pub error_count: u32,
+    pub warning_count: u32,
+    pub validation: SourceValidationReport,
+    pub entries: Vec<SourceToolingMapEntry>,
+}
+
+impl SourceToolingSummary {
+    pub fn has_blocking_diagnostics(&self) -> bool {
+        !self.validation.is_valid() || self.error_count != 0
+    }
+}
+
+pub fn summarize_source_for_tooling(
+    source: &SourceCode,
+    diagnostics: &[Diagnostic],
+) -> SourceToolingSummary {
+    SourceToolingSummary {
+        source_type: source.provider().source_type(),
+        encoding: source.provider().encoding(),
+        source_units: source.range().unit_len(),
+        first_line: source.first_line(),
+        start_column: source.start_column(),
+        diagnostic_count: diagnostics.len() as u32,
+        error_count: diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+            .count() as u32,
+        warning_count: diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Warning)
+            .count() as u32,
+        validation: source.validate(),
+        entries: diagnostics
+            .iter()
+            .map(|diagnostic| SourceToolingMapEntry {
+                boundary: diagnostic.boundary.clone(),
+                kind: diagnostic.kind,
+                severity: diagnostic.severity,
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn source_validation_accepts_in_provider_range() {
+        let provider = Arc::new(SourceProvider::new(
+            SourceOrigin::default(),
+            SourceText::Latin1(vec![b'a', b'b']),
+        ));
+        let source = SourceCode::new(
+            provider,
+            SourceSpan::new(SourcePosition(0), SourcePosition(2)),
+        );
+
+        assert!(source.validate().is_valid());
+    }
+
+    #[test]
+    fn source_validation_reports_bad_range() {
+        let provider = Arc::new(SourceProvider::new(
+            SourceOrigin::default(),
+            SourceText::Latin1(vec![b'a']),
+        ));
+        let source = SourceCode::with_start_position(
+            provider,
+            SourceSpan::new(SourcePosition(2), SourcePosition(1)),
+            0,
+            0,
+        );
+
+        let report = source.validate();
+        assert_eq!(
+            report.findings,
+            vec![
+                SourceValidationFinding::UnorderedRange {
+                    span: SourceSpan::new(SourcePosition(2), SourcePosition(1)),
+                },
+                SourceValidationFinding::RangeExceedsProvider {
+                    span: SourceSpan::new(SourcePosition(2), SourcePosition(1)),
+                    provider_units: 1,
+                },
+                SourceValidationFinding::InvalidFirstLine,
+            ]
+        );
+    }
+
+    #[test]
+    fn source_tooling_summary_counts_diagnostics_and_validation() {
+        let provider = Arc::new(SourceProvider::new(
+            SourceOrigin::default(),
+            SourceText::Latin1(vec![b'a', b'b']),
+        ));
+        let source = SourceCode::new(
+            provider,
+            SourceSpan::new(SourcePosition(0), SourcePosition(2)),
+        );
+        let boundary = source.boundary(SourceSpan::at(SourcePosition(1)));
+        let diagnostics = vec![Diagnostic {
+            severity: DiagnosticSeverity::Error,
+            boundary,
+            kind: DiagnosticKind::Syntax,
+            message: "expected token".to_string(),
+        }];
+
+        let summary = summarize_source_for_tooling(&source, &diagnostics);
+
+        assert_eq!(summary.source_units, 2);
+        assert_eq!(summary.diagnostic_count, 1);
+        assert_eq!(summary.error_count, 1);
+        assert!(summary.has_blocking_diagnostics());
+        assert_eq!(summary.entries[0].kind, DiagnosticKind::Syntax);
+    }
 }

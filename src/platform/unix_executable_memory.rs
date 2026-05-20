@@ -1,0 +1,288 @@
+//! Private Unix backend for executable-memory mappings.
+//!
+//! This module is the only platform executable-memory code that uses raw
+//! pointers or FFI. The public compartment module wraps these operations in a
+//! safe W^X state machine and never exposes the mapped address.
+
+#![allow(unsafe_code)]
+
+use std::ffi::{c_int, c_void};
+use std::fmt;
+use std::ptr::NonNull;
+
+use super::executable_memory_compartment::ExecutableMemoryPlatformOperation;
+
+const PROT_READ: c_int = 0x1;
+const PROT_WRITE: c_int = 0x2;
+const PROT_EXEC: c_int = 0x4;
+const MAP_PRIVATE: c_int = 0x02;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const MAP_ANON: c_int = 0x20;
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+const MAP_ANON: c_int = 0x1000;
+
+type OffT = i64;
+
+unsafe extern "C" {
+    fn getpagesize() -> c_int;
+    fn mmap(
+        addr: *mut c_void,
+        length: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        offset: OffT,
+    ) -> *mut c_void;
+    fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
+    fn munmap(addr: *mut c_void, len: usize) -> c_int;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExecutableMemoryPlatformError {
+    InvalidPageSize {
+        page_size: i64,
+    },
+    SystemCall {
+        operation: ExecutableMemoryPlatformOperation,
+        errno: Option<i32>,
+    },
+    RangeOutOfBounds,
+    AlreadyReleased,
+}
+
+pub(super) struct ExecutableMemoryMapping {
+    ptr: Option<NonNull<u8>>,
+    byte_len: usize,
+}
+
+impl fmt::Debug for ExecutableMemoryMapping {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecutableMemoryMapping")
+            .field("byte_len", &self.byte_len)
+            .field("mapped", &self.ptr.is_some())
+            .finish()
+    }
+}
+
+impl ExecutableMemoryMapping {
+    pub(super) fn allocate_writable(
+        byte_len: usize,
+    ) -> Result<Self, ExecutableMemoryPlatformError> {
+        if byte_len == 0 {
+            return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
+        }
+
+        // SAFETY: `mmap` is called with a null preferred address, a non-zero
+        // page-rounded length supplied by the safe wrapper, RW permissions, an
+        // anonymous private mapping, and the required fd/offset pair. The
+        // returned address is checked against MAP_FAILED and null before it is
+        // stored in the private mapping owner.
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                byte_len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if ptr == map_failed() || ptr.is_null() {
+            return Err(ExecutableMemoryPlatformError::SystemCall {
+                operation: ExecutableMemoryPlatformOperation::AllocateWritable,
+                errno: last_errno(),
+            });
+        }
+
+        Ok(Self {
+            ptr: NonNull::new(ptr.cast::<u8>()),
+            byte_len,
+        })
+    }
+
+    pub(super) fn copy_from_slice(
+        &self,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), ExecutableMemoryPlatformError> {
+        let ptr = self
+            .ptr
+            .ok_or(ExecutableMemoryPlatformError::AlreadyReleased)?;
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(ExecutableMemoryPlatformError::RangeOutOfBounds)?;
+        if end > self.byte_len {
+            return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
+        }
+
+        // SAFETY: the safe wrapper validates the destination range and the
+        // defensive check above ensures `[offset, offset + bytes.len())` lies
+        // inside this live mapping. Source and destination cannot overlap
+        // because the destination is private mmap-owned executable storage.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().add(offset), bytes.len());
+        }
+        Ok(())
+    }
+
+    pub(super) fn protect_executable(&self) -> Result<(), ExecutableMemoryPlatformError> {
+        let ptr = self
+            .ptr
+            .ok_or(ExecutableMemoryPlatformError::AlreadyReleased)?;
+
+        // SAFETY: `ptr` and `byte_len` describe the live mapping created by
+        // `mmap` and still owned by this object. The safe wrapper prevents
+        // writes after this RX transition.
+        let result = unsafe {
+            mprotect(
+                ptr.as_ptr().cast::<c_void>(),
+                self.byte_len,
+                PROT_READ | PROT_EXEC,
+            )
+        };
+        if result != 0 {
+            return Err(ExecutableMemoryPlatformError::SystemCall {
+                operation: ExecutableMemoryPlatformOperation::ProtectExecutable,
+                errno: last_errno(),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn call_p6_x86_64_entry(
+        &self,
+        entry_offset: usize,
+        vm: NonNull<c_void>,
+        frame_base: NonNull<c_void>,
+    ) -> Result<u64, ExecutableMemoryPlatformError> {
+        let ptr = self
+            .ptr
+            .ok_or(ExecutableMemoryPlatformError::AlreadyReleased)?;
+        let entry_end = entry_offset
+            .checked_add(1)
+            .ok_or(ExecutableMemoryPlatformError::RangeOutOfBounds)?;
+        if entry_end > self.byte_len {
+            return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
+        }
+
+        // SAFETY: the safe compartment wrapper requires RX protection and a
+        // linked executable lifecycle before reaching this backend. The checked
+        // offset above ensures the private entry address lies inside the live
+        // mapping. The P6 byte contract defines this entry as
+        // `extern "C" fn(*mut c_void, *mut c_void) -> u64`.
+        unsafe { call_p6_x86_64_entry(ptr.as_ptr().add(entry_offset).cast_const(), vm, frame_base) }
+    }
+
+    pub(super) fn release(&mut self) -> Result<(), ExecutableMemoryPlatformError> {
+        let ptr = self
+            .ptr
+            .ok_or(ExecutableMemoryPlatformError::AlreadyReleased)?;
+
+        // SAFETY: `ptr` and `byte_len` still describe the live mapping owned by
+        // this object. The pointer is cleared only after a successful unmap so
+        // Drop cannot unmap it twice.
+        let result = unsafe { munmap(ptr.as_ptr().cast::<c_void>(), self.byte_len) };
+        if result != 0 {
+            return Err(ExecutableMemoryPlatformError::SystemCall {
+                operation: ExecutableMemoryPlatformOperation::Release,
+                errno: last_errno(),
+            });
+        }
+        self.ptr = None;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn bytes_for_testing(
+        &self,
+        offset: usize,
+        byte_len: usize,
+    ) -> Result<Vec<u8>, ExecutableMemoryPlatformError> {
+        let ptr = self
+            .ptr
+            .ok_or(ExecutableMemoryPlatformError::AlreadyReleased)?;
+        let end = offset
+            .checked_add(byte_len)
+            .ok_or(ExecutableMemoryPlatformError::RangeOutOfBounds)?;
+        if end > self.byte_len {
+            return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
+        }
+
+        // SAFETY: the range has been checked against the live mapping and this
+        // method copies into an owned Vec without exposing the mapped address.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr.as_ptr().add(offset), byte_len) };
+        Ok(bytes.to_vec())
+    }
+}
+
+impl Drop for ExecutableMemoryMapping {
+    fn drop(&mut self) {
+        if let Some(ptr) = self.ptr {
+            // SAFETY: Drop is the last-resort owner cleanup for a mapping that
+            // has not been explicitly released. Errors cannot be reported here,
+            // but the pointer is cleared to avoid any accidental reuse.
+            let _ = unsafe { munmap(ptr.as_ptr().cast::<c_void>(), self.byte_len) };
+            self.ptr = None;
+        }
+    }
+}
+
+pub(super) fn page_size() -> Result<u32, ExecutableMemoryPlatformError> {
+    // SAFETY: `getpagesize` has no arguments and returns the process page size.
+    let page_size = unsafe { getpagesize() };
+    if page_size <= 0 {
+        return Err(ExecutableMemoryPlatformError::InvalidPageSize {
+            page_size: i64::from(page_size),
+        });
+    }
+    let page_size = page_size as u32;
+    if !page_size.is_power_of_two() {
+        return Err(ExecutableMemoryPlatformError::InvalidPageSize {
+            page_size: i64::from(page_size),
+        });
+    }
+    Ok(page_size)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn call_p6_x86_64_entry(
+    entry: *const u8,
+    vm: NonNull<c_void>,
+    frame_base: NonNull<c_void>,
+) -> Result<u64, ExecutableMemoryPlatformError> {
+    type P6Entry = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64;
+
+    if entry.is_null() {
+        return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
+    }
+
+    // SAFETY: callers pass a non-null address inside a live RX mapping and the
+    // P6 x86_64 contract says the bytes at this address implement the C ABI
+    // entry shape represented by `P6Entry`.
+    let entry: P6Entry = unsafe { std::mem::transmute(entry) };
+    // SAFETY: the function pointer was just formed from the checked RX entry
+    // address above, and the opaque arguments are non-null values supplied by
+    // the VM-owned call boundary.
+    Ok(unsafe { entry(vm.as_ptr(), frame_base.as_ptr()) })
+}
+
+fn map_failed() -> *mut c_void {
+    usize::MAX as *mut c_void
+}
+
+fn last_errno() -> Option<i32> {
+    std::io::Error::last_os_error().raw_os_error()
+}

@@ -1,4 +1,7 @@
-use crate::modules::key::{ImportAttributes, ModuleKey, ModuleType, ResolvedSpecifier};
+use crate::modules::key::{
+    ImportAttributeValidation, ImportAttributes, ImportMapResolution, ModuleKey, ModuleType,
+    ResolvedSpecifier, ResolvedSpecifierKind,
+};
 
 /// Syntactic or dynamic module request category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,5 +145,55 @@ impl ModuleRequest {
 
     pub const fn is_top_level_await_dependency(&self) -> bool {
         self.is_top_level_await_dependency
+    }
+}
+
+/// Resolves a request against immutable import-map descriptors only.
+pub fn resolve_module_request_descriptor(
+    request: &ModuleRequest,
+    import_map_resolutions: &[ImportMapResolution],
+) -> ModuleRequestResolution {
+    if let Some(kind) = unsupported_attribute_failure(request.attributes.validation()) {
+        return ModuleRequestResolution::Failed(ModuleRequestFailure::new(kind, None));
+    }
+
+    let requested = request.specifier.identifier();
+    let mapped = import_map_resolutions
+        .iter()
+        .find(|resolution| resolution.requested_specifier == requested);
+
+    let specifier = mapped
+        .map(|resolution| resolution.resolved_specifier)
+        .unwrap_or(request.specifier);
+    let key = ModuleKey::new(specifier, request.module_type, request.attributes.clone());
+
+    if mapped.is_some_and(|resolution| {
+        !matches!(
+            resolution.kind,
+            ResolvedSpecifierKind::ImportMapResolved
+                | ResolvedSpecifierKind::ImportMapScopeResolved
+        )
+    }) {
+        return ModuleRequestResolution::Failed(ModuleRequestFailure::new(
+            ModuleRequestFailureKind::ImportMap,
+            Some(key),
+        ));
+    }
+
+    ModuleRequestResolution::Resolved(key)
+}
+
+fn unsupported_attribute_failure(
+    validation: ImportAttributeValidation,
+) -> Option<ModuleRequestFailureKind> {
+    match validation {
+        ImportAttributeValidation::UnsupportedKey
+        | ImportAttributeValidation::UnsupportedValue
+        | ImportAttributeValidation::DuplicateKey => {
+            Some(ModuleRequestFailureKind::UnsupportedAttributes)
+        }
+        ImportAttributeValidation::NotRequired
+        | ImportAttributeValidation::Parsed
+        | ImportAttributeValidation::HostValidated => None,
     }
 }

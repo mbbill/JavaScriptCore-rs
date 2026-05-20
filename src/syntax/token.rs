@@ -263,6 +263,85 @@ impl BinaryOperator {
     }
 }
 
+/// Component that owns immutable token classification tables.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TokenTableOwner {
+    #[default]
+    SyntaxFrontend,
+    GeneratedSyntaxData,
+    TestFixture,
+}
+
+/// Authority allowed to replace static token tables.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TokenTableMutationAuthority {
+    #[default]
+    GeneratedSyntaxDataRefresh,
+    CrateInitialization,
+}
+
+/// Static descriptor for a keyword token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeywordDescriptor {
+    pub spelling: &'static str,
+    pub keyword: Keyword,
+    pub strictness: KeywordStrictness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeywordStrictness {
+    AlwaysReserved,
+    StrictReserved,
+    Contextual,
+    Literal,
+}
+
+/// Static descriptor for a punctuator token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PunctuatorDescriptor {
+    pub spelling: &'static str,
+    pub punctuator: Punctuator,
+    pub binary_operator: Option<BinaryOperator>,
+    pub precedence: Option<u8>,
+}
+
+/// Immutable syntax token table.
+///
+/// This table only describes static token spellings and parser-facing
+/// categories. Lexing and operator parsing remain separate execution paths.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StaticTokenTable {
+    pub owner: TokenTableOwner,
+    pub mutation_authority: TokenTableMutationAuthority,
+    pub keywords: &'static [KeywordDescriptor],
+    pub punctuators: &'static [PunctuatorDescriptor],
+}
+
+impl StaticTokenTable {
+    pub const fn keywords(self) -> &'static [KeywordDescriptor] {
+        self.keywords
+    }
+
+    pub const fn punctuators(self) -> &'static [PunctuatorDescriptor] {
+        self.punctuators
+    }
+
+    pub fn descriptor_for_keyword(self, keyword: Keyword) -> Option<&'static KeywordDescriptor> {
+        self.keywords
+            .iter()
+            .find(|descriptor| descriptor.keyword == keyword)
+    }
+
+    pub fn descriptor_for_punctuator(
+        self,
+        punctuator: Punctuator,
+    ) -> Option<&'static PunctuatorDescriptor> {
+        self.punctuators
+            .iter()
+            .find(|descriptor| descriptor.punctuator == punctuator)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenData {
     None,

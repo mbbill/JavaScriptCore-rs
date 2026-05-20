@@ -5,7 +5,7 @@
 //! JSC's Wasm debugger. It does not implement a GDB packet parser, socket
 //! transport, memory reads, register reads, or execution control.
 
-use crate::runtime::SourceProviderId;
+use crate::bytecode::SourceProviderId;
 use crate::wasm::{WasmFunctionIndex, WasmInstanceId, WasmModuleId};
 
 /// Virtual address in the Wasm debugger address space.

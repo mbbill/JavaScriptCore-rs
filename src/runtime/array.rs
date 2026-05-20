@@ -1,5 +1,5 @@
 use crate::runtime::exception::JsResult;
-use crate::runtime::property::{PropertyDescriptor, PutPropertySlot, RuntimePropertyKey};
+use crate::runtime::property::{PropertyDescriptor, PutPropertySlot, RuntimePropertyAccessKey};
 use crate::runtime::state::{ObjectId, RuntimeValue, StructureId, WatchpointGeneration};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -190,7 +190,87 @@ pub enum ArrayPrototypeMethod {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexedExoticDefineRequest {
     pub object: ObjectId,
-    pub key: RuntimePropertyKey,
+    pub key: RuntimePropertyAccessKey,
     pub descriptor: PropertyDescriptor,
     pub should_throw: bool,
+}
+
+pub fn plan_array_length_write(
+    length: ArrayLengthSlot,
+    new_length: u64,
+    highest_non_configurable_index: Option<u64>,
+) -> ArrayLengthWriteOutcome {
+    if new_length > u32::MAX as u64 {
+        return ArrayLengthWriteOutcome::ExceedsMaximumLength;
+    }
+    if !length.writable && new_length != length.public_length {
+        return ArrayLengthWriteOutcome::RejectedReadOnly;
+    }
+    if let Some(index) = highest_non_configurable_index {
+        if new_length <= index {
+            return ArrayLengthWriteOutcome::RejectedNonConfigurableElement;
+        }
+    }
+    if new_length > length.vector_length as u64 {
+        return ArrayLengthWriteOutcome::RequiresSparseStorage;
+    }
+    ArrayLengthWriteOutcome::Accepted
+}
+
+pub fn plan_array_mutation(request: &ArrayMutationRequest) -> ArrayLengthWriteOutcome {
+    let Some(new_length) = request
+        .length_before
+        .checked_sub(request.delete_count)
+        .and_then(|length| length.checked_add(request.insert_count))
+    else {
+        return ArrayLengthWriteOutcome::ExceedsMaximumLength;
+    };
+
+    if request.start > request.length_before || new_length > u32::MAX as u64 {
+        ArrayLengthWriteOutcome::ExceedsMaximumLength
+    } else {
+        ArrayLengthWriteOutcome::Accepted
+    }
+}
+
+pub fn array_indexing_requires_slow_path(profile: &ArrayIndexingProfile) -> bool {
+    profile.holes_forward_to_prototype
+        || profile.may_have_indexed_accessors
+        || matches!(
+            profile.indexing_type,
+            ArrayIndexingType::SlowPutArrayStorage | ArrayIndexingType::Sparse
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn length_write_rejects_truncating_non_configurable_index() {
+        let outcome = plan_array_length_write(
+            ArrayLengthSlot {
+                public_length: 10,
+                vector_length: 10,
+                writable: true,
+            },
+            4,
+            Some(4),
+        );
+
+        assert_eq!(
+            outcome,
+            ArrayLengthWriteOutcome::RejectedNonConfigurableElement
+        );
+    }
+
+    #[test]
+    fn indexed_profile_with_accessors_requires_slow_path() {
+        let profile = ArrayIndexingProfile {
+            may_have_indexed_accessors: true,
+            ..ArrayIndexingProfile::default()
+        };
+
+        assert!(array_indexing_requires_slow_path(&profile));
+    }
 }

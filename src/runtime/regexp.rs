@@ -94,3 +94,33 @@ pub trait RegExpOperations {
         unicode: bool,
     ) -> JsResult<ObjectId>;
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegExpLastIndexPlan {
+    Keep,
+    ResetToZero,
+    Write(RuntimeValue),
+    RejectReadOnly,
+}
+
+impl RegExpObject {
+    pub fn plan_last_index_after_match(&self, result: &RegExpMatchResult) -> RegExpLastIndexPlan {
+        if !(self.flags.global || self.flags.sticky) {
+            return RegExpLastIndexPlan::Keep;
+        }
+        if !self.last_index_writable {
+            return RegExpLastIndexPlan::RejectReadOnly;
+        }
+        if result.matched {
+            if result.end <= i32::MAX as u64 {
+                RegExpLastIndexPlan::Write(RuntimeValue::from_i32(result.end as i32))
+            } else {
+                RegExpLastIndexPlan::Keep
+            }
+        } else if self.flags.sticky {
+            RegExpLastIndexPlan::ResetToZero
+        } else {
+            RegExpLastIndexPlan::Keep
+        }
+    }
+}

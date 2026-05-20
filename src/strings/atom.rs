@@ -1,4 +1,5 @@
 use crate::strings::symbol::{PrivateName, SymbolUid};
+use std::collections::HashSet;
 
 /// Stable identity for an interned string.
 ///
@@ -162,6 +163,235 @@ impl CommonIdentifier {
     pub const fn kind(self) -> CommonIdentifierKind {
         self.kind
     }
+}
+
+/// Owner of immutable atom/common-identifier registry metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtomRegistryOwner {
+    VmAtomTable,
+    CommonIdentifiers,
+    ParserStaticNames,
+    GeneratedBuiltinNames,
+    HostStaticNames,
+}
+
+/// Provenance for atom registry descriptors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtomRegistryProvenance {
+    HandAuthoredRust,
+    GeneratedFromEngineMetadata,
+    Ecma262Names,
+    HostEmbedding,
+}
+
+/// Static descriptor for a common identifier before or after interning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommonIdentifierDescriptor {
+    pub slot: CommonIdentifierSlot,
+    pub kind: CommonIdentifierKind,
+    pub text: &'static str,
+    pub atom: Option<AtomId>,
+}
+
+/// Immutable descriptor for an atom/common-identifier registry.
+///
+/// The VM string table owns mutation and interning. This descriptor only names
+/// generated or hand-authored static data that can be installed by that owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtomRegistryDescriptor {
+    pub name: &'static str,
+    pub table: AtomTableId,
+    pub scope: AtomTableScope,
+    pub owner: AtomRegistryOwner,
+    pub provenance: AtomRegistryProvenance,
+    common_identifiers: &'static [CommonIdentifierDescriptor],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtomRegistryValidationError {
+    EmptyRegistryName,
+    EmptyIdentifierText(CommonIdentifierSlot),
+    DuplicateSlot(CommonIdentifierSlot),
+    DuplicateText(&'static str),
+    DuplicateAtom(AtomId),
+    CommonIdentifierWithoutTable(CommonIdentifierSlot),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtomRegistryDescriptorBuilder {
+    name: &'static str,
+    table: AtomTableId,
+    scope: AtomTableScope,
+    owner: AtomRegistryOwner,
+    provenance: AtomRegistryProvenance,
+    common_identifiers: &'static [CommonIdentifierDescriptor],
+}
+
+impl AtomRegistryDescriptorBuilder {
+    pub const fn new(
+        name: &'static str,
+        table: AtomTableId,
+        scope: AtomTableScope,
+        owner: AtomRegistryOwner,
+        provenance: AtomRegistryProvenance,
+    ) -> Self {
+        Self {
+            name,
+            table,
+            scope,
+            owner,
+            provenance,
+            common_identifiers: &[],
+        }
+    }
+
+    pub const fn common_identifiers(
+        mut self,
+        common_identifiers: &'static [CommonIdentifierDescriptor],
+    ) -> Self {
+        self.common_identifiers = common_identifiers;
+        self
+    }
+
+    pub fn build(self) -> Result<AtomRegistryDescriptor, AtomRegistryValidationError> {
+        let descriptor = AtomRegistryDescriptor::new(
+            self.name,
+            self.table,
+            self.scope,
+            self.owner,
+            self.provenance,
+            self.common_identifiers,
+        );
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+}
+
+impl AtomRegistryDescriptor {
+    pub const fn new(
+        name: &'static str,
+        table: AtomTableId,
+        scope: AtomTableScope,
+        owner: AtomRegistryOwner,
+        provenance: AtomRegistryProvenance,
+        common_identifiers: &'static [CommonIdentifierDescriptor],
+    ) -> Self {
+        Self {
+            name,
+            table,
+            scope,
+            owner,
+            provenance,
+            common_identifiers,
+        }
+    }
+
+    /// Returns immutable common-identifier descriptors for this registry.
+    pub const fn common_identifiers(&self) -> &'static [CommonIdentifierDescriptor] {
+        self.common_identifiers
+    }
+
+    /// Returns one existing common-identifier descriptor by table index.
+    pub const fn common_identifier_at(
+        &self,
+        index: usize,
+    ) -> Option<&'static CommonIdentifierDescriptor> {
+        if index < self.common_identifiers.len() {
+            Some(&self.common_identifiers[index])
+        } else {
+            None
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), AtomRegistryValidationError> {
+        validate_atom_registry_descriptor(self)
+    }
+}
+
+pub fn validate_atom_registry_descriptor(
+    descriptor: &AtomRegistryDescriptor,
+) -> Result<(), AtomRegistryValidationError> {
+    if descriptor.name.is_empty() {
+        return Err(AtomRegistryValidationError::EmptyRegistryName);
+    }
+
+    let mut seen_slots = HashSet::new();
+    let mut seen_text = HashSet::new();
+    let mut seen_atoms = HashSet::new();
+    for entry in descriptor.common_identifiers {
+        if entry.text.is_empty() {
+            return Err(AtomRegistryValidationError::EmptyIdentifierText(entry.slot));
+        }
+        if !seen_slots.insert(entry.slot) {
+            return Err(AtomRegistryValidationError::DuplicateSlot(entry.slot));
+        }
+        if !seen_text.insert(entry.text) {
+            return Err(AtomRegistryValidationError::DuplicateText(entry.text));
+        }
+        if let Some(atom) = entry.atom {
+            if descriptor.table == AtomTableId::UNASSIGNED {
+                return Err(AtomRegistryValidationError::CommonIdentifierWithoutTable(
+                    entry.slot,
+                ));
+            }
+            if !seen_atoms.insert(atom) {
+                return Err(AtomRegistryValidationError::DuplicateAtom(atom));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Non-mutating interning action for a common identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtomInterningAction {
+    AlreadyInterned(AtomId),
+    ReuseExisting(AtomId),
+    InternStatic,
+}
+
+/// One planned atom-table operation for VM initialization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtomInterningPlanEntry {
+    pub slot: CommonIdentifierSlot,
+    pub kind: CommonIdentifierKind,
+    pub text: &'static str,
+    pub action: AtomInterningAction,
+    pub domain: AtomDomain,
+}
+
+/// Builds a deterministic interning plan without mutating an atom table.
+pub fn plan_atom_registry_interning(
+    descriptor: &AtomRegistryDescriptor,
+    existing_atoms: &[(&str, AtomId)],
+) -> Result<Vec<AtomInterningPlanEntry>, AtomRegistryValidationError> {
+    descriptor.validate()?;
+
+    let domain = AtomDomain::common_identifier(descriptor.table);
+    let mut plan = Vec::with_capacity(descriptor.common_identifiers.len());
+    for entry in descriptor.common_identifiers {
+        let action = if let Some(atom) = entry.atom {
+            AtomInterningAction::AlreadyInterned(atom)
+        } else if let Some((_, atom)) = existing_atoms
+            .iter()
+            .find(|(text, _)| *text == entry.text)
+            .copied()
+        {
+            AtomInterningAction::ReuseExisting(atom)
+        } else {
+            AtomInterningAction::InternStatic
+        };
+
+        plan.push(AtomInterningPlanEntry {
+            slot: entry.slot,
+            kind: entry.kind,
+            text: entry.text,
+            action,
+            domain,
+        });
+    }
+
+    Ok(plan)
 }
 
 /// Parser/runtime identifier for a string name.
@@ -369,4 +599,55 @@ pub trait AtomTableMutation {
 
     /// Returns a common identifier by VM slot when it has been initialized.
     fn common_identifier(&self, slot: CommonIdentifierSlot) -> Option<CommonIdentifier>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static COMMON: &[CommonIdentifierDescriptor] = &[
+        CommonIdentifierDescriptor {
+            slot: CommonIdentifierSlot::from_index(0),
+            kind: CommonIdentifierKind::PublicName,
+            text: "length",
+            atom: Some(AtomId::from_table_slot(1)),
+        },
+        CommonIdentifierDescriptor {
+            slot: CommonIdentifierSlot::from_index(1),
+            kind: CommonIdentifierKind::Keyword,
+            text: "await",
+            atom: None,
+        },
+    ];
+
+    #[test]
+    fn atom_interning_plan_reuses_existing_atoms_without_mutating_table() {
+        let registry = AtomRegistryDescriptorBuilder::new(
+            "common",
+            AtomTableId::from_vm_slot(3),
+            AtomTableScope::VmEntryThread,
+            AtomRegistryOwner::CommonIdentifiers,
+            AtomRegistryProvenance::HandAuthoredRust,
+        )
+        .common_identifiers(COMMON)
+        .build()
+        .unwrap();
+
+        let plan =
+            plan_atom_registry_interning(&registry, &[("await", AtomId::from_table_slot(9))])
+                .unwrap();
+
+        assert_eq!(
+            plan[0].action,
+            AtomInterningAction::AlreadyInterned(AtomId::from_table_slot(1))
+        );
+        assert_eq!(
+            plan[1].action,
+            AtomInterningAction::ReuseExisting(AtomId::from_table_slot(9))
+        );
+        assert_eq!(
+            plan[1].domain,
+            AtomDomain::common_identifier(AtomTableId::from_vm_slot(3))
+        );
+    }
 }

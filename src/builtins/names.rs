@@ -19,6 +19,10 @@ impl BuiltinNameSlot {
 }
 
 /// Stable private key reserved for builtin implementation details.
+///
+/// The private-name identity itself is owned by `strings::PrivateName`. Builtin
+/// tables only pair that canonical identity with VM-local slots and optional
+/// public aliases.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BuiltinPrivateName {
     private_name: PrivateName,
@@ -69,6 +73,9 @@ impl BuiltinPrivateName {
 }
 
 /// Well-known builtin name categories.
+///
+/// Each variant borrows canonical string/symbol/private-name identity from the
+/// `strings` layer. Builtins do not allocate parallel name IDs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WellKnownBuiltinName {
     PublicIdentifier(Identifier),
@@ -211,4 +218,148 @@ impl BuiltinNames {
     pub const fn new_uninitialized() -> Self {
         Self { _sealed: () }
     }
+}
+
+/// Component that owns immutable builtin name metadata.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BuiltinNameRegistryOwner {
+    #[default]
+    BuiltinGenerator,
+    VmCommonIdentifiers,
+    HostEmbedder,
+}
+
+/// Authority allowed to append or replace builtin-name registry entries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BuiltinNameMutationAuthority {
+    #[default]
+    GeneratedDataRefresh,
+    VmStartup,
+    ExternalNameRegistration,
+}
+
+/// Immutable generated name table descriptor.
+///
+/// Canonical string, symbol, and private-name identity stays in `strings`.
+/// Builtins only publish generated lookup tables that borrow those identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticBuiltinNameRegistry {
+    pub state: BuiltinNameTableState,
+    pub owner: BuiltinNameRegistryOwner,
+    pub mutation_authority: BuiltinNameMutationAuthority,
+    pub names: &'static [WellKnownBuiltinName],
+    pub public_private_map: &'static [BuiltinNameMapEntry],
+    pub external_names: &'static [ExternalBuiltinName],
+    pub private_table: BuiltinPrivateNameTable,
+}
+
+impl StaticBuiltinNameRegistry {
+    pub const fn names(self) -> &'static [WellKnownBuiltinName] {
+        self.names
+    }
+
+    pub const fn public_private_map(self) -> &'static [BuiltinNameMapEntry] {
+        self.public_private_map
+    }
+
+    pub const fn external_names(self) -> &'static [ExternalBuiltinName] {
+        self.external_names
+    }
+
+    pub fn private_entry_for_public_name(
+        self,
+        public_name: Identifier,
+    ) -> Option<&'static BuiltinNameMapEntry> {
+        self.public_private_map
+            .iter()
+            .find(|entry| entry.public_name() == public_name)
+    }
+
+    pub fn validate(self) -> BuiltinNameValidationReport {
+        let mut findings = Vec::new();
+        for (index, name) in self.names.iter().enumerate() {
+            if self.names[..index]
+                .iter()
+                .any(|candidate| candidate == name)
+            {
+                findings.push(BuiltinNameValidationFinding::DuplicateWellKnownName { name: *name });
+            }
+        }
+
+        for (index, entry) in self.public_private_map.iter().enumerate() {
+            if self.public_private_map[..index]
+                .iter()
+                .any(|candidate| candidate.public_name() == entry.public_name())
+            {
+                findings.push(BuiltinNameValidationFinding::DuplicatePublicPrivateEntry {
+                    public_name: entry.public_name(),
+                });
+            }
+            if entry.lookup() != BuiltinNameLookupKind::PrivateIdentity
+                && entry.private_name().slot().is_none()
+            {
+                findings.push(BuiltinNameValidationFinding::MappedPrivateNameWithoutSlot {
+                    public_name: entry.public_name(),
+                });
+            }
+        }
+
+        if self.private_table.private_name_count
+            < self.names.iter().filter(|name| name.is_private()).count() as u32
+        {
+            findings.push(BuiltinNameValidationFinding::PrivateNameCountTooSmall {
+                declared: self.private_table.private_name_count,
+            });
+        }
+        if self.private_table.external_name_count != self.external_names.len() as u32 {
+            findings.push(BuiltinNameValidationFinding::ExternalNameCountMismatch {
+                declared: self.private_table.external_name_count,
+                actual: self.external_names.len() as u32,
+            });
+        }
+        if !self.external_names.is_empty()
+            && builtin_name_state_rank(self.state)
+                < builtin_name_state_rank(BuiltinNameTableState::ExternalNamesAppended)
+        {
+            findings.push(
+                BuiltinNameValidationFinding::ExternalNamesBeforeRegistryState {
+                    state: self.state,
+                },
+            );
+        }
+
+        BuiltinNameValidationReport { findings }
+    }
+}
+
+fn builtin_name_state_rank(state: BuiltinNameTableState) -> u8 {
+    match state {
+        BuiltinNameTableState::StaticSymbolsReserved => 0,
+        BuiltinNameTableState::CommonIdentifiersReady => 1,
+        BuiltinNameTableState::PrivateNamesInterned => 2,
+        BuiltinNameTableState::PublicPrivateMapReady => 3,
+        BuiltinNameTableState::WellKnownSymbolsReady => 4,
+        BuiltinNameTableState::ExternalNamesAppended => 5,
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BuiltinNameValidationReport {
+    pub findings: Vec<BuiltinNameValidationFinding>,
+}
+
+impl BuiltinNameValidationReport {
+    pub fn is_valid(&self) -> bool {
+        self.findings.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuiltinNameValidationFinding {
+    DuplicateWellKnownName { name: WellKnownBuiltinName },
+    DuplicatePublicPrivateEntry { public_name: Identifier },
+    MappedPrivateNameWithoutSlot { public_name: Identifier },
+    PrivateNameCountTooSmall { declared: u32 },
+    ExternalNameCountMismatch { declared: u32, actual: u32 },
+    ExternalNamesBeforeRegistryState { state: BuiltinNameTableState },
 }

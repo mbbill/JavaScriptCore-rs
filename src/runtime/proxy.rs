@@ -2,7 +2,7 @@ use crate::runtime::exception::JsResult;
 use crate::runtime::function::{CallData, ConstructData};
 use crate::runtime::property::{
     DeletePropertySlot, OwnPropertyKeysResult, PropertyDescriptor, PropertySlot, PutPropertySlot,
-    RuntimePropertyKey,
+    RuntimePropertyAccessKey,
 };
 use crate::runtime::state::{ObjectId, RuntimeValue, StructureId};
 
@@ -58,7 +58,7 @@ pub struct ProxyTrapCall {
     pub trap: ProxyTrap,
     pub handler: ObjectId,
     pub target: ObjectId,
-    pub key: Option<RuntimePropertyKey>,
+    pub key: Option<RuntimePropertyAccessKey>,
     pub value: RuntimeValue,
     pub receiver: RuntimeValue,
 }
@@ -80,7 +80,7 @@ pub struct ProxyInvariantCheck {
     pub proxy: ObjectId,
     pub target: ObjectId,
     pub trap: ProxyTrap,
-    pub key: Option<RuntimePropertyKey>,
+    pub key: Option<RuntimePropertyAccessKey>,
     pub trap_result: ProxyTrapResult,
 }
 
@@ -93,13 +93,13 @@ pub trait ProxyOperations {
     fn proxy_get(
         &mut self,
         proxy: ObjectId,
-        key: RuntimePropertyKey,
+        key: RuntimePropertyAccessKey,
         receiver: RuntimeValue,
     ) -> JsResult<PropertySlot>;
     fn proxy_set(
         &mut self,
         proxy: ObjectId,
-        key: RuntimePropertyKey,
+        key: RuntimePropertyAccessKey,
         value: RuntimeValue,
         receiver: RuntimeValue,
         slot: PutPropertySlot,
@@ -107,7 +107,86 @@ pub trait ProxyOperations {
     fn proxy_delete(
         &mut self,
         proxy: ObjectId,
-        key: RuntimePropertyKey,
+        key: RuntimePropertyAccessKey,
         slot: DeletePropertySlot,
     ) -> JsResult<bool>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ProxyTrapPlan {
+    ForwardToTarget,
+    CallTrap(ProxyTrap),
+    Revoked,
+    NotCallable,
+    NotConstructible,
+}
+
+impl ProxyObject {
+    pub fn plan_trap(&self, trap: ProxyTrap) -> ProxyTrapPlan {
+        if self.revoked {
+            return ProxyTrapPlan::Revoked;
+        }
+        match trap {
+            ProxyTrap::Apply if !self.callable => ProxyTrapPlan::NotCallable,
+            ProxyTrap::Construct if !self.constructible => ProxyTrapPlan::NotConstructible,
+            _ => {
+                if self
+                    .trap_cache
+                    .cached_offsets
+                    .iter()
+                    .any(|cached| cached.trap == trap)
+                {
+                    ProxyTrapPlan::CallTrap(trap)
+                } else {
+                    ProxyTrapPlan::ForwardToTarget
+                }
+            }
+        }
+    }
+}
+
+pub fn proxy_boolean_trap_accepted(result: &ProxyTrapResult) -> Option<bool> {
+    match result {
+        ProxyTrapResult::Boolean(value) => Some(*value),
+        ProxyTrapResult::MissingTrap => None,
+        _ => Some(true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revoked_proxy_rejects_every_trap_plan() {
+        let proxy = ProxyObject {
+            revoked: true,
+            ..ProxyObject::default()
+        };
+
+        assert_eq!(proxy.plan_trap(ProxyTrap::Get), ProxyTrapPlan::Revoked);
+    }
+
+    #[test]
+    fn cached_trap_plans_handler_call() {
+        let proxy = ProxyObject {
+            trap_cache: ProxyTrapCache {
+                cached_offsets: vec![CachedProxyTrap {
+                    trap: ProxyTrap::Set,
+                    offset: 1,
+                }],
+                ..ProxyTrapCache::default()
+            },
+            ..ProxyObject::default()
+        };
+
+        assert_eq!(
+            proxy.plan_trap(ProxyTrap::Set),
+            ProxyTrapPlan::CallTrap(ProxyTrap::Set)
+        );
+        assert_eq!(
+            proxy.plan_trap(ProxyTrap::Get),
+            ProxyTrapPlan::ForwardToTarget
+        );
+    }
 }

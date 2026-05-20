@@ -58,3 +58,27 @@ pub enum TimeClipResult {
     NaN,
     OutOfRange,
 }
+
+pub const MAX_TIME_VALUE_MS: f64 = 8_640_000_000_000_000.0;
+
+pub fn time_clip_result(value: f64) -> TimeClipResult {
+    if value.is_nan() || !value.is_finite() {
+        TimeClipResult::NaN
+    } else if value.abs() > MAX_TIME_VALUE_MS {
+        TimeClipResult::OutOfRange
+    } else {
+        TimeClipResult::Valid
+    }
+}
+
+impl DateInstance {
+    pub fn cache_hit(&self, utc: bool) -> bool {
+        if utc {
+            self.cache.utc_cached_for_ms == Some(self.internal_number)
+                && self.cache.utc_fields.is_some()
+        } else {
+            self.cache.local_cached_for_ms == Some(self.internal_number)
+                && self.cache.local_fields.is_some()
+        }
+    }
+}

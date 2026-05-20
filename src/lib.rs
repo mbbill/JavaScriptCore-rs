@@ -25,6 +25,7 @@ pub mod lol;
 pub mod modules;
 pub mod object;
 pub mod offlineasm;
+pub mod platform;
 pub mod profiler;
 pub mod runtime;
 pub mod shell;

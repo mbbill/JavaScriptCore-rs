@@ -7,6 +7,17 @@ pub struct LLIntOpcodeMaps {
     pub wide16: Vec<LLIntDispatchEntry>,
     pub wide32: Vec<LLIntDispatchEntry>,
     pub bases: LLIntDispatchBases,
+    /// OfflineASM and C-loop setup own population of dispatch maps. Runtime
+    /// dispatch observes these entries but must not rewrite them.
+    pub authority: LLIntDispatchAuthority,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum LLIntDispatchAuthority {
+    #[default]
+    OfflineAsmGenerated,
+    CLoopGenerated,
+    LinkTimeInstalled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

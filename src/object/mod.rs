@@ -13,30 +13,58 @@ mod storage;
 mod structure;
 mod watchpoint;
 
-pub use self::identity::{JsObject, ObjectFlags, ObjectHeader};
+pub use self::identity::{
+    JsObject, ObjectFlags, ObjectHeader, ObjectMutationAuthority, ObjectPublicationState,
+};
 pub use crate::gc::StructureId;
 pub use operations::{
-    DefineOwnPropertyOutcome, DeletePropertyOutcome, ExoticObjectKind, GetPropertyOutcome,
-    HasPropertyOutcome, ObjectInternalMethodContext, ObjectInternalMethodHooks,
-    ObjectInternalMethodKind, ObjectMethodTableCapabilities, ObjectOperationError,
-    ObjectOperationResult, OrdinaryPropertyLookupPlan, PrivateBrandCheck, PrivateBrandCheckResult,
-    PrivateBrandRequirement, PropertyDefinitionPolicy, PropertyMutationContext, PropertyReceiver,
+    adapt_define_own_property_for_execution, adapt_delete_property_for_execution,
+    adapt_get_own_property_for_execution, adapt_has_own_property_for_execution,
+    adapt_put_property_for_execution, ordinary_define_own_property, ordinary_delete_property,
+    ordinary_get_own_property, ordinary_has_property, ordinary_put_property,
+    plan_object_property_mutation_barrier, validate_ordinary_descriptor_compatibility,
+    DefineOwnPropertyOutcome, DeletePropertyOutcome, ExecutionPropertyOperation,
+    ExecutionPropertyOperationRecord, ExoticObjectKind, GetPropertyOutcome, HasPropertyOutcome,
+    ObjectInternalMethodContext, ObjectInternalMethodHooks, ObjectInternalMethodKind,
+    ObjectMethodSideEffect, ObjectMethodSlotDescriptor, ObjectMethodTableCapabilities,
+    ObjectMethodTableDescriptor, ObjectMethodTableOwner, ObjectMethodTableProvenance,
+    ObjectOperationError, ObjectOperationGcBoundary, ObjectOperationResult,
+    ObjectPropertyMutationBarrierRecord, ObjectPropertyMutationBarrierRequest,
+    OrdinaryDefineOwnPropertyPlan, OrdinaryObjectState, OrdinaryPropertyLookupPlan,
+    PrivateBrandCheck, PrivateBrandCheckResult, PrivateBrandRequirement, PropertyDefinitionPolicy,
+    PropertyDescriptorCompatibility, PropertyMutationContext, PropertyReceiver,
     PrototypeTraversalAction, PrototypeTraversalPlan, PrototypeTraversalStep, PutPropertyOutcome,
 };
 pub use property::{
-    AccessorDescriptor, AtomId, CompletePropertyDescriptor, DataDescriptor, EnumerationBucket,
-    EnumerationOrder, EnumerationRecord, PrivateFieldDescriptor, PrivateFieldKind, PrivateNameId,
-    PropertyAttributes, PropertyCacheability, PropertyDescriptor, PropertyDescriptorKind,
-    PropertyDescriptorState, PropertyKey, PropertyLocation, PropertyLookupMode, PropertyOffset,
-    PropertySlot, PropertySlotBase, PropertySlotKind, PropertyTable, PropertyTableMode,
-    PropertyValueDescriptor, SymbolId,
+    analyze_static_property_table, enumerate_static_property_table, validate_property_descriptor,
+    validate_property_descriptors, AccessorDescriptor, AtomId, CompletePropertyDescriptor,
+    DataDescriptor, DomAttributeSlot, EnumerationBucket, EnumerationOrder, EnumerationRecord,
+    ModuleNamespaceSlot, PrivateFieldDescriptor, PrivateFieldKind, PrivateName, PropertyAttributes,
+    PropertyCacheability, PropertyDescriptor, PropertyDescriptorBuilder, PropertyDescriptorKind,
+    PropertyDescriptorState, PropertyDescriptorValidationError, PropertyKey, PropertyLocation,
+    PropertyLookupMode, PropertyOffset, PropertySchemaOwner, PropertySchemaProvenance,
+    PropertySlot, PropertySlotAdditionalData, PropertySlotBase, PropertySlotKind, PropertyTable,
+    PropertyTableBuilder, PropertyTableMode, PropertyValueDescriptor, PutPropertySlotContext,
+    PutPropertySlotKind, StaticPropertyKind, StaticPropertyTableAnalysis,
+    StaticPropertyTableDescriptor,
 };
 pub use storage::{
+    typed_array_content_type, typed_array_element_size, validate_array_storage_metadata,
+    validate_butterfly_layout, validate_indexing_header, validate_typed_array_storage_contract,
     ArrayLengthContract, ArrayStorageMetadata, Butterfly, ButterflyGrowth, ButterflyGrowthReason,
-    ButterflyHandle, ButterflyLayout, IndexedStorage, IndexedStorageKind, IndexingHeader,
-    IndexingHistory, InlineStorage, OutOfLineStorage, SparseIndexMetadata, TypedArrayBufferEdge,
-    TypedArrayContentType, TypedArrayElementType, TypedArrayMode, TypedArrayStorageContract,
+    ButterflyHandle, ButterflyLayout, ButterflyLayoutBuilder, IndexedStorage, IndexedStorageKind,
+    IndexingHeader, IndexingHistory, InlineStorage, OutOfLineStorage, SparseIndexMetadata,
+    StorageValidationError, TypedArrayBufferEdge, TypedArrayContentType, TypedArrayElementType,
+    TypedArrayMode, TypedArrayStorageContract, TypedArrayStorageContractBuilder,
     TypedArrayViewLength,
 };
-pub use structure::{IndexingMode, Structure, StructureTransition, StructureTransitionPlan};
+pub use structure::{
+    plan_structure_transition, transition_invalidates_watchpoints, validate_structure_descriptor,
+    validate_structure_descriptor_table, validate_structure_transition_plan, IndexingMode,
+    Structure, StructureDescriptor, StructureDescriptorBuilder, StructureDescriptorTable,
+    StructureDescriptorValidationError, StructureDictionaryKind, StructureLifecycle,
+    StructureMutationAuthority, StructurePropertyCacheability, StructurePrototypeStorage,
+    StructureRareDataId, StructureSchemaOwner, StructureSchemaProvenance, StructureTransition,
+    StructureTransitionMetadata, StructureTransitionPlan, StructureTransitionValidationError,
+};
 pub use watchpoint::{Watchpoint, WatchpointKind, WatchpointSet, WatchpointState};

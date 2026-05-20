@@ -1,14 +1,39 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use crate::strings::Identifier;
+use crate::runtime::{CodeBlockId, ExecutableId, GlobalObjectId, ScopeId};
+use crate::strings::{AtomId, Identifier, PropertyKey};
 use crate::value::JsValue;
 
 use crate::bytecode::debug::{BytecodeHookTable, ExceptionHandlerTable};
-use crate::bytecode::ic::InlineCacheTable;
-use crate::bytecode::instruction::PackedInstructionStream;
+use crate::bytecode::gc::BytecodeRootMap;
+use crate::bytecode::ic::{
+    CallLinkInfo, CallLinkInlineCacheAttachedMetadata, CallLinkInlineCacheAttachedMetadataError,
+    CallLinkInlineCacheAttachedMetadataMismatchField, CallLinkInlineCacheAttachedMetadataRequest,
+    CallLinkInlineCacheAttachedMetadataResult, CallLinkInlineCacheAttachmentError,
+    CallLinkInlineCacheAttachmentOutcome, CallLinkInlineCacheAttachmentRequest,
+    CallLinkInlineCacheAttachmentResult, CallLinkInlineCacheClearError,
+    CallLinkInlineCacheClearMetadataMismatchField, CallLinkInlineCacheClearOutcome,
+    CallLinkInlineCacheClearRequest, CallLinkInlineCacheClearResult, CallLinkMode, CallTarget,
+    CallType, GetByIdMode, GetByIdModeMetadata, InlineCacheMutationAuthority, InlineCacheState,
+    InlineCacheTable, PropertyCacheKey, PropertyInlineCache, PropertyInlineCacheAttachedMetadata,
+    PropertyInlineCacheAttachedMetadataError, PropertyInlineCacheAttachedMetadataMismatchField,
+    PropertyInlineCacheAttachedMetadataRequest, PropertyInlineCacheAttachedMetadataResult,
+    PropertyInlineCacheAttachmentError, PropertyInlineCacheAttachmentKind,
+    PropertyInlineCacheAttachmentOutcome, PropertyInlineCacheAttachmentRequest,
+    PropertyInlineCacheAttachmentResult, PropertyInlineCacheClearError,
+    PropertyInlineCacheClearMetadataMismatchField, PropertyInlineCacheClearOutcome,
+    PropertyInlineCacheClearRequest, PropertyInlineCacheClearResult, PropertyInlineCacheDispatch,
+    PropertyInlineCacheStubMode, PutByIdMode, PutByIdModeMetadata,
+    StructureStubAccessCaseLinkError, StructureStubAccessCaseLinkOutcome,
+    StructureStubAccessCaseLinkRequest, StructureStubAccessCaseLinkResult, StructureStubInfo,
+    StructureStubKind, StructureStubMetadataMismatchField,
+};
+use crate::bytecode::instruction::{
+    DecodedInstruction, InstructionDecodeError, Operand, PackedInstructionStream,
+};
 use crate::bytecode::metadata::{InstructionMetadataPlan, MetadataLayout, MetadataLinkingData};
-use crate::bytecode::opcode::{MetadataFieldSpec, Opcode, OpcodeSchemaVersion};
-use crate::bytecode::origin::CodeOriginTable;
+use crate::bytecode::opcode::{CoreOpcode, MetadataFieldSpec, Opcode, OpcodeSchemaVersion};
+use crate::bytecode::origin::{CodeOrigin, CodeOriginTable, SourceNoteLookup};
 use crate::bytecode::profiling::{ProfilingCounterSet, ValueProfileTable};
 use crate::bytecode::register::{RegisterFrameShape, SpecialRegisters, VirtualRegister};
 
@@ -97,8 +122,9 @@ pub enum CodeKind {
     Module,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum ParseMode {
+    #[default]
     Program,
     Module,
     Eval,
@@ -113,8 +139,9 @@ pub enum ParseMode {
     AsyncGeneratorBody,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum ScriptMode {
+    #[default]
     Classic,
     Module,
 }
@@ -144,10 +171,19 @@ pub struct SourceProvenance {
     pub pre_redirect_url: Option<String>,
 }
 
+/// Canonical source-provider identity for bytecode, runtime, and cache keys.
+///
+/// The provider registry owns allocation and lifetime. Syntax `SourceProvider`
+/// values are parse-time storage; all persistent cross-component references use
+/// this ID instead of raw pointers or local integer aliases.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct SourceProviderId(pub u64);
 
+/// Source-origin metadata record identity.
+///
+/// This qualifies URL/directive metadata associated with a provider but does
+/// not replace `SourceProviderId` as provider identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct SourceOriginId(pub u64);
@@ -178,6 +214,8 @@ pub struct CodeFeatures {
     pub uses_import_meta: bool,
     pub has_captured_variables: bool,
     pub has_tail_calls: bool,
+    pub has_checkpoints: bool,
+    pub no_eval_cache: bool,
     pub has_non_simple_parameters: bool,
 }
 
@@ -204,6 +242,36 @@ pub enum SuperBinding {
     Needed,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum PrivateBrandRequirement {
+    #[default]
+    None,
+    Needed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum NeedsClassFieldInitializer {
+    #[default]
+    No,
+    Yes,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum DerivedContextType {
+    #[default]
+    None,
+    DerivedConstructor,
+    DerivedMethod,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum EvalContextType {
+    #[default]
+    None,
+    FunctionEval,
+    InstanceFieldEval,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExecutableInfo {
     pub parse_mode: Option<ParseMode>,
@@ -211,9 +279,32 @@ pub struct ExecutableInfo {
     pub eval_context: EvalContext,
     pub constructor_kind: ConstructorKind,
     pub super_binding: SuperBinding,
+    pub private_brand_requirement: PrivateBrandRequirement,
+    pub needs_class_field_initializer: NeedsClassFieldInitializer,
+    pub derived_context: DerivedContextType,
+    pub eval_context_type: EvalContextType,
     pub is_builtin_function: bool,
+    pub is_builtin_default_class_constructor: bool,
     pub is_class_context: bool,
     pub is_arrow_function_context: bool,
+    pub is_constructor: bool,
+}
+
+/// Lifecycle of a source-derived unlinked code block.
+///
+/// Only the bytecompiler and unlinked-code-block generator may move a block
+/// through generation phases. Once finalized, the block is immutable and can be
+/// shared by code cache entries and linked code blocks.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum UnlinkedCodeBlockPhase {
+    #[default]
+    Allocated,
+    RecordingParse,
+    EmittingInstructions,
+    FinalizingSideTables,
+    Finalized,
+    Cached,
+    DetachedForVmTeardown,
 }
 
 /// Source-derived reusable code artifact.
@@ -236,6 +327,7 @@ pub struct UnlinkedCodeBlock {
     features: CodeFeatures,
     generation_modes: CodeGenerationModeSet,
     tiering_hints: UnlinkedTieringHints,
+    phase: UnlinkedCodeBlockPhase,
 }
 
 impl UnlinkedCodeBlock {
@@ -253,6 +345,7 @@ impl UnlinkedCodeBlock {
             features: CodeFeatures::default(),
             generation_modes: CodeGenerationModeSet::default(),
             tiering_hints: UnlinkedTieringHints::default(),
+            phase: UnlinkedCodeBlockPhase::Allocated,
         }
     }
 
@@ -278,6 +371,34 @@ impl UnlinkedCodeBlock {
 
     pub fn with_frame(mut self, frame: RegisterFrameShape) -> Self {
         self.frame = frame;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: UnlinkedMetadataTable) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn with_constants(mut self, constants: UnlinkedConstantPool) -> Self {
+        self.constants = constants;
+        self
+    }
+
+    pub fn with_string_literals(
+        mut self,
+        entries: impl IntoIterator<Item = (u32, String)>,
+    ) -> Self {
+        self.constants.install_string_literals(entries);
+        self
+    }
+
+    pub fn with_side_tables(mut self, side_tables: UnlinkedSideTables) -> Self {
+        self.side_tables = side_tables;
+        self
+    }
+
+    pub fn with_phase(mut self, phase: UnlinkedCodeBlockPhase) -> Self {
+        self.phase = phase;
         self
     }
 
@@ -309,6 +430,14 @@ impl UnlinkedCodeBlock {
         &self.constants
     }
 
+    pub fn string_literals(&self) -> &StringLiteralTable {
+        self.constants.string_literals()
+    }
+
+    pub fn string_literal(&self, identifier_index: u32) -> Option<&str> {
+        self.constants.string_literal(identifier_index)
+    }
+
     pub fn side_tables(&self) -> &UnlinkedSideTables {
         &self.side_tables
     }
@@ -328,6 +457,57 @@ impl UnlinkedCodeBlock {
     pub fn tiering_hints(&self) -> UnlinkedTieringHints {
         self.tiering_hints
     }
+
+    pub fn phase(&self) -> UnlinkedCodeBlockPhase {
+        self.phase
+    }
+
+    pub fn decoded_instruction_at(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Result<DecodedInstruction<'_>, InstructionDecodeError> {
+        self.instructions.decoded_at(bytecode_index)
+    }
+}
+
+/// Runtime mutation authority for linked code-block state.
+///
+/// This is distinct from Rust borrow permissions: linked metadata, ICs,
+/// counters, and entrypoints may require VM locks, GC barriers, or executable
+/// memory coordination even when a Rust reference is available.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum CodeBlockMutationAuthority {
+    #[default]
+    VmMainThread,
+    ConcurrentJsLocker,
+    GcVisitor,
+    JitCodeOwner,
+    ReadOnlyObserver,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodeBlockMutationError {
+    InvalidMutationAuthority {
+        expected: CodeBlockMutationAuthority,
+        actual: CodeBlockMutationAuthority,
+    },
+    InvalidLifecycle {
+        expected: CodeBlockLifecycleState,
+        actual: CodeBlockLifecycleState,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum CodeBlockLifecycleState {
+    #[default]
+    Allocated,
+    Linking,
+    LinkedInterpreter,
+    BaselineInstalled,
+    OptimizingInstalled,
+    Jettisoned,
+    Finalizing,
+    Destructed,
 }
 
 /// Runtime-linked bytecode and mutable execution metadata.
@@ -345,6 +525,8 @@ pub struct CodeBlock {
     side_tables: LinkedSideTables,
     tier_state: CodeBlockTierState,
     entrypoints: CodeBlockEntrypoints,
+    lifecycle: CodeBlockLifecycleState,
+    mutation_authority: CodeBlockMutationAuthority,
 }
 
 impl CodeBlock {
@@ -353,14 +535,17 @@ impl CodeBlock {
     }
 
     pub fn from_shared_unlinked(unlinked: Arc<UnlinkedCodeBlock>, context: LinkContext) -> Self {
+        let side_tables = linked_side_tables_from_unlinked(&unlinked);
         Self {
             unlinked,
             link_context: context,
             metadata: MetadataTable::default(),
             constants: LinkedConstantPool::default(),
-            side_tables: LinkedSideTables::default(),
+            side_tables,
             tier_state: CodeBlockTierState::default(),
             entrypoints: CodeBlockEntrypoints::default(),
+            lifecycle: CodeBlockLifecycleState::Linking,
+            mutation_authority: CodeBlockMutationAuthority::VmMainThread,
         }
     }
 
@@ -384,6 +569,14 @@ impl CodeBlock {
         &self.constants
     }
 
+    pub fn string_literals(&self) -> &StringLiteralTable {
+        self.unlinked.string_literals()
+    }
+
+    pub fn string_literal(&self, identifier_index: u32) -> Option<&str> {
+        self.unlinked.string_literal(identifier_index)
+    }
+
     pub fn side_tables(&self) -> &LinkedSideTables {
         &self.side_tables
     }
@@ -395,6 +588,2150 @@ impl CodeBlock {
     pub fn entrypoints(&self) -> &CodeBlockEntrypoints {
         &self.entrypoints
     }
+
+    pub fn lifecycle(&self) -> CodeBlockLifecycleState {
+        self.lifecycle
+    }
+
+    pub fn mutation_authority(&self) -> CodeBlockMutationAuthority {
+        self.mutation_authority
+    }
+
+    pub fn with_metadata(mut self, metadata: MetadataTable) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn with_entrypoints(mut self, entrypoints: CodeBlockEntrypoints) -> Self {
+        self.entrypoints = entrypoints;
+        self
+    }
+
+    pub fn with_side_tables(mut self, side_tables: LinkedSideTables) -> Self {
+        self.side_tables = side_tables;
+        self
+    }
+
+    pub(crate) fn with_root_map_owner(mut self, owner: CodeBlockId) -> Self {
+        self.stamp_root_map_owner(owner);
+        self
+    }
+
+    pub(crate) fn stamp_root_map_owner(&mut self, owner: CodeBlockId) {
+        for root_map in &mut self.side_tables.root_maps {
+            root_map.owner = Some(owner);
+        }
+    }
+
+    pub fn with_tier_state(mut self, tier_state: CodeBlockTierState) -> Self {
+        self.tier_state = tier_state;
+        self
+    }
+
+    pub fn with_lifecycle(mut self, lifecycle: CodeBlockLifecycleState) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
+    pub fn install_baseline_jit_slot(
+        &mut self,
+        authority: CodeBlockMutationAuthority,
+        slot: JitCodeSlot,
+    ) -> Result<(), CodeBlockMutationError> {
+        let expected_authority = CodeBlockMutationAuthority::VmMainThread;
+        if authority != expected_authority {
+            return Err(CodeBlockMutationError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: authority,
+            });
+        }
+        if self.mutation_authority != expected_authority {
+            return Err(CodeBlockMutationError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: self.mutation_authority,
+            });
+        }
+
+        let expected_lifecycle = CodeBlockLifecycleState::LinkedInterpreter;
+        if self.lifecycle != expected_lifecycle {
+            return Err(CodeBlockMutationError::InvalidLifecycle {
+                expected: expected_lifecycle,
+                actual: self.lifecycle,
+            });
+        }
+
+        self.entrypoints.baseline_jit = Some(slot);
+        self.tier_state.current_tier = ExecutionTier::BaselineJit;
+        self.lifecycle = CodeBlockLifecycleState::BaselineInstalled;
+        Ok(())
+    }
+
+    pub fn attach_property_inline_cache_case(
+        &mut self,
+        authority: CodeBlockMutationAuthority,
+        request: PropertyInlineCacheAttachmentRequest,
+    ) -> PropertyInlineCacheAttachmentResult {
+        let expected_authority = CodeBlockMutationAuthority::VmMainThread;
+        if authority != expected_authority {
+            return Err(
+                PropertyInlineCacheAttachmentError::InvalidMutationAuthority {
+                    expected: expected_authority,
+                    actual: authority,
+                },
+            );
+        }
+        if self.mutation_authority != expected_authority {
+            return Err(
+                PropertyInlineCacheAttachmentError::InvalidMutationAuthority {
+                    expected: expected_authority,
+                    actual: self.mutation_authority,
+                },
+            );
+        }
+
+        match self.lifecycle {
+            CodeBlockLifecycleState::LinkedInterpreter
+            | CodeBlockLifecycleState::BaselineInstalled => {}
+            actual => {
+                return Err(PropertyInlineCacheAttachmentError::InvalidLifecycle { actual });
+            }
+        }
+
+        validate_property_inline_cache_attachment_request(
+            &self.side_tables.inline_caches,
+            &request,
+        )?;
+
+        let (state, dispatch) = {
+            let cache = &mut self.side_tables.inline_caches.property_accesses[request.slot];
+            cache.state = InlineCacheState::Monomorphic;
+            cache.dispatch = request.dispatch;
+            match request.attachment_kind {
+                PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad => {
+                    let offset = request
+                        .offset
+                        .expect("own data load attachment validation requires an offset");
+                    cache.get_by_id = Some(GetByIdModeMetadata {
+                        mode: GetByIdMode::Default,
+                        structure: Some(request.base_structure),
+                        holder_structure: None,
+                        cached_offset: Some(offset),
+                        cached_slot: None,
+                        hit_count_for_llint_caching: 0,
+                    });
+                }
+                PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad => {
+                    let offset = request
+                        .offset
+                        .expect("prototype data load attachment validation requires an offset");
+                    cache.get_by_id = Some(GetByIdModeMetadata {
+                        mode: GetByIdMode::ProtoLoad,
+                        structure: Some(request.base_structure),
+                        holder_structure: request.holder_structure,
+                        cached_offset: Some(offset),
+                        cached_slot: None,
+                        hit_count_for_llint_caching: 0,
+                    });
+                }
+                PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup => {
+                    cache.get_by_id = Some(GetByIdModeMetadata {
+                        mode: GetByIdMode::NegativeLookup,
+                        structure: Some(request.base_structure),
+                        holder_structure: None,
+                        cached_offset: None,
+                        cached_slot: None,
+                        hit_count_for_llint_caching: 0,
+                    });
+                }
+                PropertyInlineCacheAttachmentKind::PutByNameStoreReplace
+                | PropertyInlineCacheAttachmentKind::PutByNameStoreTransition => {
+                    let offset = request
+                        .offset
+                        .expect("store attachment validation requires an offset");
+                    cache.put_by_id = Some(PutByIdModeMetadata {
+                        mode: request
+                            .attachment_kind
+                            .put_by_id_mode()
+                            .expect("store attachment kind has a put-by-id mode"),
+                        old_structure: Some(request.base_structure),
+                        new_structure: request.new_structure,
+                        cached_offset: Some(offset),
+                    });
+                }
+            }
+            (cache.state, cache.dispatch)
+        };
+
+        let structure_stub_index =
+            if request.stub_mode == PropertyInlineCacheStubMode::StructureStub {
+                let index = self.side_tables.inline_caches.structure_stubs.len();
+                self.side_tables.inline_caches.structure_stubs.push(
+                    structure_stub_info_for_property_inline_cache_request(&request),
+                );
+                Some(index)
+            } else {
+                None
+            };
+
+        Ok(PropertyInlineCacheAttachmentOutcome {
+            slot: request.slot,
+            bytecode_index: request.bytecode_index,
+            key: request.key,
+            attachment_kind: request.attachment_kind,
+            state,
+            dispatch,
+            base_structure: request.base_structure,
+            holder_structure: request.holder_structure,
+            new_structure: request.new_structure,
+            offset: request.offset,
+            stub_mode: request.stub_mode,
+            structure_stub_index,
+        })
+    }
+
+    pub fn clear_property_inline_cache_case(
+        &mut self,
+        authority: CodeBlockMutationAuthority,
+        request: PropertyInlineCacheClearRequest,
+    ) -> PropertyInlineCacheClearResult {
+        let expected_authority = CodeBlockMutationAuthority::VmMainThread;
+        if authority != expected_authority {
+            return Err(PropertyInlineCacheClearError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: authority,
+            });
+        }
+        if self.mutation_authority != expected_authority {
+            return Err(PropertyInlineCacheClearError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: self.mutation_authority,
+            });
+        }
+
+        match self.lifecycle {
+            CodeBlockLifecycleState::LinkedInterpreter
+            | CodeBlockLifecycleState::BaselineInstalled => {}
+            actual => {
+                return Err(PropertyInlineCacheClearError::InvalidLifecycle { actual });
+            }
+        }
+
+        validate_property_inline_cache_clear_request(&self.side_tables.inline_caches, &request)?;
+
+        let cache = &mut self.side_tables.inline_caches.property_accesses[request.slot];
+        // Metadata-only clears return the slot to the cold interpreter state. There is
+        // no native patch to disable here, and `Unset` allows a later validated
+        // observation to attach fresh metadata instead of preserving stale guards.
+        cache.state = InlineCacheState::Unset;
+        cache.dispatch = PropertyInlineCacheDispatch::Unlinked;
+        match request.attachment_kind {
+            PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad
+            | PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad
+            | PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup => {
+                cache.get_by_id = Some(GetByIdModeMetadata {
+                    mode: GetByIdMode::Unset,
+                    structure: None,
+                    holder_structure: None,
+                    cached_offset: None,
+                    cached_slot: None,
+                    hit_count_for_llint_caching: 0,
+                });
+            }
+            PropertyInlineCacheAttachmentKind::PutByNameStoreReplace
+            | PropertyInlineCacheAttachmentKind::PutByNameStoreTransition => {
+                cache.put_by_id = Some(PutByIdModeMetadata {
+                    mode: PutByIdMode::Default,
+                    old_structure: None,
+                    new_structure: None,
+                    cached_offset: None,
+                });
+            }
+        }
+        if let Some(structure_stub_index) = request.structure_stub_index {
+            let stub = &mut self.side_tables.inline_caches.structure_stubs[structure_stub_index];
+            stub.cache_state = InlineCacheState::Unset;
+            stub.access_cases.clear();
+        }
+
+        Ok(PropertyInlineCacheClearOutcome {
+            slot: request.slot,
+            bytecode_index: request.bytecode_index,
+            key: request.key,
+            attachment_kind: request.attachment_kind,
+            state: cache.state,
+            dispatch: cache.dispatch,
+            base_structure: request.base_structure,
+            holder_structure: request.holder_structure,
+            new_structure: request.new_structure,
+            offset: request.offset,
+            stub_mode: request.stub_mode,
+            structure_stub_index: request.structure_stub_index,
+        })
+    }
+
+    pub fn link_structure_stub_access_case(
+        &mut self,
+        authority: CodeBlockMutationAuthority,
+        request: StructureStubAccessCaseLinkRequest,
+    ) -> StructureStubAccessCaseLinkResult {
+        let expected_authority = CodeBlockMutationAuthority::VmMainThread;
+        if authority != expected_authority {
+            return Err(StructureStubAccessCaseLinkError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: authority,
+            });
+        }
+        if self.mutation_authority != expected_authority {
+            return Err(StructureStubAccessCaseLinkError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: self.mutation_authority,
+            });
+        }
+
+        match self.lifecycle {
+            CodeBlockLifecycleState::LinkedInterpreter
+            | CodeBlockLifecycleState::BaselineInstalled => {}
+            actual => {
+                return Err(StructureStubAccessCaseLinkError::InvalidLifecycle { actual });
+            }
+        }
+
+        validate_structure_stub_access_case_link_request(
+            &self.side_tables.inline_caches,
+            &request,
+        )?;
+
+        let stub =
+            &mut self.side_tables.inline_caches.structure_stubs[request.structure_stub_index];
+        let inserted = if stub.access_cases.contains(&request.access_case_ref) {
+            false
+        } else {
+            stub.access_cases.push(request.access_case_ref);
+            true
+        };
+
+        Ok(StructureStubAccessCaseLinkOutcome {
+            structure_stub_index: request.structure_stub_index,
+            bytecode_index: request.bytecode_index,
+            slot: request.slot,
+            key: request.key,
+            attachment_kind: request.attachment_kind,
+            base_structure: request.base_structure,
+            holder_structure: request.holder_structure,
+            new_structure: request.new_structure,
+            offset: request.offset,
+            access_case_ref: request.access_case_ref,
+            inserted,
+            access_case_count: stub.access_cases.len(),
+        })
+    }
+
+    pub fn attached_property_inline_cache_metadata(
+        &self,
+        request: PropertyInlineCacheAttachedMetadataRequest,
+    ) -> PropertyInlineCacheAttachedMetadataResult {
+        match self.lifecycle {
+            CodeBlockLifecycleState::LinkedInterpreter
+            | CodeBlockLifecycleState::BaselineInstalled => {}
+            actual => {
+                return Err(PropertyInlineCacheAttachedMetadataError::InvalidLifecycle { actual });
+            }
+        }
+
+        validate_property_inline_cache_attached_metadata_request(
+            &self.side_tables.inline_caches,
+            &request,
+        )?;
+
+        Ok(PropertyInlineCacheAttachedMetadata {
+            slot: request.slot,
+            bytecode_index: request.bytecode_index,
+            key: request.key,
+            attachment_kind: request.attachment_kind,
+            base_structure: request.base_structure,
+            holder_structure: request.holder_structure,
+            new_structure: request.new_structure,
+            offset: request.offset,
+            dispatch: request.dispatch,
+            stub_mode: request.stub_mode,
+        })
+    }
+
+    pub fn attach_call_link_inline_cache(
+        &mut self,
+        authority: CodeBlockMutationAuthority,
+        request: CallLinkInlineCacheAttachmentRequest,
+    ) -> CallLinkInlineCacheAttachmentResult {
+        let expected_authority = CodeBlockMutationAuthority::VmMainThread;
+        if authority != expected_authority {
+            return Err(
+                CallLinkInlineCacheAttachmentError::InvalidMutationAuthority {
+                    expected: expected_authority,
+                    actual: authority,
+                },
+            );
+        }
+        if self.mutation_authority != expected_authority {
+            return Err(
+                CallLinkInlineCacheAttachmentError::InvalidMutationAuthority {
+                    expected: expected_authority,
+                    actual: self.mutation_authority,
+                },
+            );
+        }
+
+        match self.lifecycle {
+            CodeBlockLifecycleState::LinkedInterpreter
+            | CodeBlockLifecycleState::BaselineInstalled => {}
+            actual => {
+                return Err(CallLinkInlineCacheAttachmentError::InvalidLifecycle { actual });
+            }
+        }
+
+        validate_call_link_inline_cache_attachment_request(
+            &self.side_tables.inline_caches,
+            self.unlinked.as_ref(),
+            &request,
+        )?;
+
+        let target = call_target_for_call_link_inline_cache_attachment_request(&request);
+        let (mode, target, slow_path_count, max_argument_count_including_this_for_varargs) = {
+            let call = &mut self.side_tables.inline_caches.calls[request.slot];
+            call.mode = CallLinkMode::Monomorphic;
+            call.target = target;
+            (
+                call.mode,
+                call.target.clone(),
+                call.slow_path_count,
+                call.max_argument_count_including_this_for_varargs,
+            )
+        };
+
+        Ok(CallLinkInlineCacheAttachmentOutcome {
+            slot: request.slot,
+            bytecode_index: request.bytecode_index,
+            call_site: self.side_tables.inline_caches.calls[request.slot].call_site,
+            opcode: self.side_tables.inline_caches.calls[request.slot].opcode,
+            call_type: self.side_tables.inline_caches.calls[request.slot].call_type,
+            mode,
+            specialization: self.side_tables.inline_caches.calls[request.slot].specialization,
+            target,
+            slow_path_count,
+            max_argument_count_including_this_for_varargs,
+        })
+    }
+
+    pub fn clear_call_link_inline_cache(
+        &mut self,
+        authority: CodeBlockMutationAuthority,
+        request: CallLinkInlineCacheClearRequest,
+    ) -> CallLinkInlineCacheClearResult {
+        let expected_authority = CodeBlockMutationAuthority::VmMainThread;
+        if authority != expected_authority {
+            return Err(CallLinkInlineCacheClearError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: authority,
+            });
+        }
+        if self.mutation_authority != expected_authority {
+            return Err(CallLinkInlineCacheClearError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: self.mutation_authority,
+            });
+        }
+
+        match self.lifecycle {
+            CodeBlockLifecycleState::LinkedInterpreter
+            | CodeBlockLifecycleState::BaselineInstalled => {}
+            actual => {
+                return Err(CallLinkInlineCacheClearError::InvalidLifecycle { actual });
+            }
+        }
+
+        validate_call_link_inline_cache_clear_request(
+            &self.side_tables.inline_caches,
+            self.unlinked.as_ref(),
+            &request,
+        )?;
+
+        let (
+            call_site,
+            opcode,
+            call_type,
+            mode,
+            specialization,
+            target,
+            slow_path_count,
+            max_argument_count_including_this_for_varargs,
+        ) = {
+            let call = &mut self.side_tables.inline_caches.calls[request.slot];
+            call.call_type = CallType::Call;
+            call.mode = CallLinkMode::Init;
+            call.specialization = CodeSpecialization::Call;
+            call.target = CallTarget::Unlinked;
+            call.slow_path_count = 0;
+            call.max_argument_count_including_this_for_varargs = 0;
+            call.flags = Default::default();
+            (
+                call.call_site,
+                call.opcode,
+                call.call_type,
+                call.mode,
+                call.specialization,
+                call.target.clone(),
+                call.slow_path_count,
+                call.max_argument_count_including_this_for_varargs,
+            )
+        };
+
+        Ok(CallLinkInlineCacheClearOutcome {
+            slot: request.slot,
+            bytecode_index: request.bytecode_index,
+            call_site,
+            opcode,
+            call_type,
+            mode,
+            specialization,
+            target,
+            slow_path_count,
+            max_argument_count_including_this_for_varargs,
+        })
+    }
+
+    pub fn attached_call_link_inline_cache_metadata(
+        &self,
+        request: CallLinkInlineCacheAttachedMetadataRequest,
+    ) -> CallLinkInlineCacheAttachedMetadataResult {
+        match self.lifecycle {
+            CodeBlockLifecycleState::LinkedInterpreter
+            | CodeBlockLifecycleState::BaselineInstalled => {}
+            actual => {
+                return Err(CallLinkInlineCacheAttachedMetadataError::InvalidLifecycle { actual });
+            }
+        }
+
+        validate_call_link_inline_cache_attached_metadata_request(
+            &self.side_tables.inline_caches,
+            self.unlinked.as_ref(),
+            &request,
+        )?;
+
+        let call = &self.side_tables.inline_caches.calls[request.slot];
+        Ok(CallLinkInlineCacheAttachedMetadata {
+            slot: request.slot,
+            bytecode_index: request.bytecode_index,
+            call_site: call.call_site,
+            opcode: call.opcode,
+            call_type: call.call_type,
+            mode: call.mode,
+            specialization: call.specialization,
+            target: call.target.clone(),
+            slow_path_count: call.slow_path_count,
+            max_argument_count_including_this_for_varargs: call
+                .max_argument_count_including_this_for_varargs,
+        })
+    }
+
+    pub fn decoded_instruction_at(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Result<DecodedInstruction<'_>, InstructionDecodeError> {
+        self.unlinked.decoded_instruction_at(bytecode_index)
+    }
+
+    pub fn metadata_entry_for_bytecode_index(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<&MetadataEntry> {
+        self.metadata.entry_for_bytecode_index(bytecode_index)
+    }
+
+    pub fn execution_surface(&self) -> CodeBlockExecutionSurface<'_> {
+        CodeBlockExecutionSurface { code_block: self }
+    }
+
+    pub fn link_record(&self) -> UnlinkedToLinkedBytecodeRecord {
+        UnlinkedToLinkedBytecodeRecord {
+            context: self.link_context.clone(),
+            unlinked_phase: self.unlinked.phase(),
+            linked_lifecycle: self.lifecycle,
+            instruction_count: self.unlinked.instructions().instruction_count() as u32,
+            unlinked_metadata_entries: self.unlinked.metadata().entries().len() as u32,
+            linked_metadata_entries: self.metadata.entries().len() as u32,
+            root_map_count: self.side_tables.root_maps.len() as u32,
+            value_profile_root_count: self.side_tables.value_profiles.root_metadata.len() as u32,
+            has_interpreter_entry: self.entrypoints.interpreter.is_some(),
+        }
+    }
+}
+
+fn validate_property_inline_cache_attachment_request(
+    inline_caches: &InlineCacheTable,
+    request: &PropertyInlineCacheAttachmentRequest,
+) -> Result<(), PropertyInlineCacheAttachmentError> {
+    let Some(cache) = inline_caches.property_accesses.get(request.slot) else {
+        return Err(PropertyInlineCacheAttachmentError::InvalidSlot {
+            slot: request.slot,
+            len: inline_caches.property_accesses.len(),
+        });
+    };
+
+    if cache.bytecode_index != request.bytecode_index {
+        return Err(PropertyInlineCacheAttachmentError::BytecodeIndexMismatch {
+            slot: request.slot,
+            expected: cache.bytecode_index,
+            actual: request.bytecode_index,
+        });
+    }
+
+    let expected_property = PropertyCacheKey::Key(request.key);
+    if cache.property != expected_property {
+        return Err(PropertyInlineCacheAttachmentError::PropertyKeyMismatch {
+            slot: request.slot,
+            expected: cache.property,
+            actual: request.key,
+        });
+    }
+
+    let expected_access = request.attachment_kind.access_type();
+    let expected_kind = request.attachment_kind.cache_kind();
+    if cache.access != expected_access || cache.kind != expected_kind {
+        return Err(PropertyInlineCacheAttachmentError::AccessKindMismatch {
+            slot: request.slot,
+            expected_access,
+            actual_access: cache.access,
+            expected_kind,
+            actual_kind: cache.kind,
+        });
+    }
+
+    let expected_authority = InlineCacheMutationAuthority::LinkedCodeBlock;
+    if cache.mutation_authority != expected_authority {
+        return Err(
+            PropertyInlineCacheAttachmentError::InvalidExistingMutationAuthority {
+                slot: request.slot,
+                expected: expected_authority,
+                actual: cache.mutation_authority,
+            },
+        );
+    }
+
+    let expected_state = InlineCacheState::Unset;
+    if cache.state != expected_state {
+        return Err(PropertyInlineCacheAttachmentError::InvalidExistingState {
+            slot: request.slot,
+            expected: expected_state,
+            actual: cache.state,
+        });
+    }
+
+    let expected_dispatch = PropertyInlineCacheDispatch::Unlinked;
+    if cache.dispatch != expected_dispatch {
+        return Err(
+            PropertyInlineCacheAttachmentError::InvalidExistingDispatch {
+                slot: request.slot,
+                expected: expected_dispatch,
+                actual: cache.dispatch,
+            },
+        );
+    }
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup => {
+            if cache.get_by_id.is_none() {
+                return Err(PropertyInlineCacheAttachmentError::MissingGetByIdMetadata {
+                    slot: request.slot,
+                });
+            }
+        }
+        PropertyInlineCacheAttachmentKind::PutByNameStoreReplace
+        | PropertyInlineCacheAttachmentKind::PutByNameStoreTransition => {
+            if cache.put_by_id.is_none() {
+                return Err(PropertyInlineCacheAttachmentError::MissingPutByIdMetadata {
+                    slot: request.slot,
+                });
+            }
+        }
+    }
+
+    if request.dispatch == PropertyInlineCacheDispatch::Unlinked {
+        return Err(
+            PropertyInlineCacheAttachmentError::InvalidRequestedDispatch {
+                actual: request.dispatch,
+            },
+        );
+    }
+
+    validate_property_inline_cache_attachment_stub_mode(request)?;
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup
+        | PropertyInlineCacheAttachmentKind::PutByNameStoreReplace
+            if request.new_structure.is_some() =>
+        {
+            return Err(
+                PropertyInlineCacheAttachmentError::IncompatibleNewStructure {
+                    attachment_kind: request.attachment_kind,
+                    new_structure: request.new_structure,
+                },
+            );
+        }
+        PropertyInlineCacheAttachmentKind::PutByNameStoreTransition
+            if request.new_structure.is_none() =>
+        {
+            return Err(
+                PropertyInlineCacheAttachmentError::IncompatibleNewStructure {
+                    attachment_kind: request.attachment_kind,
+                    new_structure: request.new_structure,
+                },
+            );
+        }
+        _ => {}
+    }
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad => {
+            if request.holder_structure.is_none() {
+                return Err(PropertyInlineCacheAttachmentError::MissingHolderStructure {
+                    attachment_kind: request.attachment_kind,
+                });
+            }
+        }
+        _ => {
+            if let Some(holder_structure) = request.holder_structure {
+                return Err(
+                    PropertyInlineCacheAttachmentError::UnexpectedHolderStructure {
+                        attachment_kind: request.attachment_kind,
+                        holder_structure,
+                    },
+                );
+            }
+        }
+    }
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup => {
+            if let Some(offset) = request.offset {
+                return Err(
+                    PropertyInlineCacheAttachmentError::UnexpectedPropertyOffset {
+                        attachment_kind: request.attachment_kind,
+                        offset,
+                    },
+                );
+            }
+        }
+        _ => {
+            let Some(offset) = request.offset else {
+                return Err(PropertyInlineCacheAttachmentError::MissingPropertyOffset {
+                    attachment_kind: request.attachment_kind,
+                });
+            };
+            if offset.0 < 0 {
+                return Err(PropertyInlineCacheAttachmentError::InvalidPropertyOffset { offset });
+            }
+        }
+    }
+
+    let request_requires_guarded_watchpoint = request.attachment_kind.is_guarded_get_by_name();
+    if request.requirements.requires_watchpoint != request_requires_guarded_watchpoint {
+        return Err(
+            PropertyInlineCacheAttachmentError::WatchpointBridgeUnavailable {
+                attachment_kind: request.attachment_kind,
+            },
+        );
+    }
+
+    if request.attachment_kind.is_store() {
+        if !request.requirements.requires_barrier || !request.requirements.has_barrier_evidence {
+            return Err(
+                PropertyInlineCacheAttachmentError::MissingStoreBarrierEvidence {
+                    attachment_kind: request.attachment_kind,
+                },
+            );
+        }
+    } else if request.requirements.requires_barrier {
+        return Err(
+            PropertyInlineCacheAttachmentError::UnexpectedBarrierRequirement {
+                attachment_kind: request.attachment_kind,
+            },
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_attachment_request(
+    inline_caches: &InlineCacheTable,
+    unlinked: &UnlinkedCodeBlock,
+    request: &CallLinkInlineCacheAttachmentRequest,
+) -> Result<(), CallLinkInlineCacheAttachmentError> {
+    let Some(call) = inline_caches.calls.get(request.slot) else {
+        return Err(CallLinkInlineCacheAttachmentError::InvalidSlot {
+            slot: request.slot,
+            len: inline_caches.calls.len(),
+        });
+    };
+
+    if call.bytecode_index != request.bytecode_index {
+        return Err(CallLinkInlineCacheAttachmentError::BytecodeIndexMismatch {
+            slot: request.slot,
+            expected: call.bytecode_index,
+            actual: request.bytecode_index,
+        });
+    }
+    validate_call_link_inline_cache_attachment_opcode(unlinked, request, call)?;
+    validate_call_link_inline_cache_attachment_descriptor(request, call)?;
+    validate_call_link_inline_cache_attachment_target(request)?;
+
+    let expected_mode = CallLinkMode::Init;
+    if call.mode != expected_mode {
+        return Err(CallLinkInlineCacheAttachmentError::InvalidExistingMode {
+            slot: request.slot,
+            expected: expected_mode,
+            actual: call.mode,
+        });
+    }
+    if call.target != CallTarget::Unlinked {
+        return Err(CallLinkInlineCacheAttachmentError::InvalidExistingTarget {
+            slot: request.slot,
+            actual: call.target.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_attachment_opcode(
+    unlinked: &UnlinkedCodeBlock,
+    request: &CallLinkInlineCacheAttachmentRequest,
+    call: &CallLinkInfo,
+) -> Result<(), CallLinkInlineCacheAttachmentError> {
+    let decoded =
+        decoded_instruction_for_call_link_bytecode_index(unlinked, request.bytecode_index).ok_or(
+            CallLinkInlineCacheAttachmentError::InstructionDecodeFailed {
+                slot: request.slot,
+                bytecode_index: request.bytecode_index,
+            },
+        )?;
+    let Some(decoded_opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
+        return Err(
+            CallLinkInlineCacheAttachmentError::InstructionOpcodeUnavailable {
+                slot: request.slot,
+                bytecode_index: request.bytecode_index,
+            },
+        );
+    };
+    if !matches!(decoded_opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+        return Err(CallLinkInlineCacheAttachmentError::UnsupportedOpcode {
+            slot: request.slot,
+            opcode: decoded_opcode,
+        });
+    }
+    let decoded_call_site = call_site_for_decoded_call(&decoded);
+    if call.call_site != decoded_call_site {
+        return Err(CallLinkInlineCacheAttachmentError::CallSiteMismatch {
+            slot: request.slot,
+            expected: decoded_call_site,
+            actual: call.call_site,
+        });
+    }
+    if call.opcode != decoded_opcode {
+        return Err(CallLinkInlineCacheAttachmentError::OpcodeMismatch {
+            slot: request.slot,
+            expected: decoded_opcode,
+            actual: call.opcode,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_attachment_descriptor(
+    request: &CallLinkInlineCacheAttachmentRequest,
+    call: &CallLinkInfo,
+) -> Result<(), CallLinkInlineCacheAttachmentError> {
+    if call.call_type != CallType::Call {
+        return Err(
+            CallLinkInlineCacheAttachmentError::InvalidExistingCallType {
+                slot: request.slot,
+                expected: CallType::Call,
+                actual: call.call_type,
+            },
+        );
+    }
+    if call.specialization != CodeSpecialization::Call {
+        return Err(
+            CallLinkInlineCacheAttachmentError::InvalidExistingSpecialization {
+                slot: request.slot,
+                expected: CodeSpecialization::Call,
+                actual: call.specialization,
+            },
+        );
+    }
+    let expected_origin = CodeOrigin::new(request.bytecode_index);
+    if call.origin != expected_origin {
+        return Err(CallLinkInlineCacheAttachmentError::OriginMismatch {
+            slot: request.slot,
+            expected: expected_origin,
+            actual: call.origin,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_attachment_target(
+    request: &CallLinkInlineCacheAttachmentRequest,
+) -> Result<(), CallLinkInlineCacheAttachmentError> {
+    if !matches!(request.target, CallTarget::MetadataOnlyMonomorphic { .. }) {
+        return Err(CallLinkInlineCacheAttachmentError::InvalidRequestedTarget {
+            actual: request.target.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_clear_request(
+    inline_caches: &InlineCacheTable,
+    unlinked: &UnlinkedCodeBlock,
+    request: &CallLinkInlineCacheClearRequest,
+) -> Result<(), CallLinkInlineCacheClearError> {
+    let Some(call) = inline_caches.calls.get(request.slot) else {
+        return Err(CallLinkInlineCacheClearError::InvalidSlot {
+            slot: request.slot,
+            len: inline_caches.calls.len(),
+        });
+    };
+
+    if call.bytecode_index != request.bytecode_index {
+        return Err(CallLinkInlineCacheClearError::BytecodeIndexMismatch {
+            slot: request.slot,
+            expected: call.bytecode_index,
+            actual: request.bytecode_index,
+        });
+    }
+    validate_call_link_inline_cache_clear_opcode(unlinked, request, call)?;
+    validate_call_link_inline_cache_clear_descriptor(request, call)?;
+    validate_call_link_inline_cache_clear_target(request)?;
+
+    let expected_mode = CallLinkMode::Monomorphic;
+    if call.mode != expected_mode {
+        return Err(CallLinkInlineCacheClearError::InvalidExistingMode {
+            slot: request.slot,
+            expected: expected_mode,
+            actual: call.mode,
+        });
+    }
+
+    validate_call_link_inline_cache_clear_target_matches(request, call)?;
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_clear_opcode(
+    unlinked: &UnlinkedCodeBlock,
+    request: &CallLinkInlineCacheClearRequest,
+    call: &CallLinkInfo,
+) -> Result<(), CallLinkInlineCacheClearError> {
+    let decoded =
+        decoded_instruction_for_call_link_bytecode_index(unlinked, request.bytecode_index).ok_or(
+            CallLinkInlineCacheClearError::InstructionDecodeFailed {
+                slot: request.slot,
+                bytecode_index: request.bytecode_index,
+            },
+        )?;
+    let Some(decoded_opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
+        return Err(
+            CallLinkInlineCacheClearError::InstructionOpcodeUnavailable {
+                slot: request.slot,
+                bytecode_index: request.bytecode_index,
+            },
+        );
+    };
+    if !matches!(decoded_opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+        return Err(CallLinkInlineCacheClearError::UnsupportedOpcode {
+            slot: request.slot,
+            opcode: decoded_opcode,
+        });
+    }
+    let decoded_call_site = call_site_for_decoded_call(&decoded);
+    if call.call_site != decoded_call_site {
+        return Err(CallLinkInlineCacheClearError::CallSiteMismatch {
+            slot: request.slot,
+            expected: decoded_call_site,
+            actual: call.call_site,
+        });
+    }
+    if call.opcode != decoded_opcode {
+        return Err(CallLinkInlineCacheClearError::OpcodeMismatch {
+            slot: request.slot,
+            expected: decoded_opcode,
+            actual: call.opcode,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_clear_descriptor(
+    request: &CallLinkInlineCacheClearRequest,
+    call: &CallLinkInfo,
+) -> Result<(), CallLinkInlineCacheClearError> {
+    if call.call_type != CallType::Call {
+        return Err(CallLinkInlineCacheClearError::InvalidExistingCallType {
+            slot: request.slot,
+            expected: CallType::Call,
+            actual: call.call_type,
+        });
+    }
+    if call.specialization != CodeSpecialization::Call {
+        return Err(
+            CallLinkInlineCacheClearError::InvalidExistingSpecialization {
+                slot: request.slot,
+                expected: CodeSpecialization::Call,
+                actual: call.specialization,
+            },
+        );
+    }
+    let expected_origin = CodeOrigin::new(request.bytecode_index);
+    if call.origin != expected_origin {
+        return Err(CallLinkInlineCacheClearError::OriginMismatch {
+            slot: request.slot,
+            expected: expected_origin,
+            actual: call.origin,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_clear_target(
+    request: &CallLinkInlineCacheClearRequest,
+) -> Result<(), CallLinkInlineCacheClearError> {
+    if !matches!(request.target, CallTarget::MetadataOnlyMonomorphic { .. }) {
+        return Err(CallLinkInlineCacheClearError::InvalidRequestedTarget {
+            actual: request.target.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_clear_target_matches(
+    request: &CallLinkInlineCacheClearRequest,
+    call: &CallLinkInfo,
+) -> Result<(), CallLinkInlineCacheClearError> {
+    let (
+        CallTarget::MetadataOnlyMonomorphic {
+            callee,
+            executable,
+            code_block,
+            boundary,
+        },
+        CallTarget::MetadataOnlyMonomorphic {
+            callee: expected_callee,
+            executable: expected_executable,
+            code_block: expected_code_block,
+            boundary: expected_boundary,
+        },
+    ) = (&call.target, &request.target)
+    else {
+        return Err(call_link_inline_cache_clear_mismatch(
+            request.slot,
+            CallLinkInlineCacheClearMetadataMismatchField::Callee,
+        ));
+    };
+    if callee != expected_callee {
+        return Err(call_link_inline_cache_clear_mismatch(
+            request.slot,
+            CallLinkInlineCacheClearMetadataMismatchField::Callee,
+        ));
+    }
+    if executable != expected_executable {
+        return Err(call_link_inline_cache_clear_mismatch(
+            request.slot,
+            CallLinkInlineCacheClearMetadataMismatchField::Executable,
+        ));
+    }
+    if code_block != expected_code_block {
+        return Err(call_link_inline_cache_clear_mismatch(
+            request.slot,
+            CallLinkInlineCacheClearMetadataMismatchField::TargetCodeBlock,
+        ));
+    }
+    if boundary != expected_boundary {
+        return Err(call_link_inline_cache_clear_mismatch(
+            request.slot,
+            CallLinkInlineCacheClearMetadataMismatchField::Boundary,
+        ));
+    }
+
+    Ok(())
+}
+
+const fn call_link_inline_cache_clear_mismatch(
+    slot: usize,
+    field: CallLinkInlineCacheClearMetadataMismatchField,
+) -> CallLinkInlineCacheClearError {
+    CallLinkInlineCacheClearError::AttachedMetadataMismatch { slot, field }
+}
+
+fn validate_call_link_inline_cache_attached_metadata_request(
+    inline_caches: &InlineCacheTable,
+    unlinked: &UnlinkedCodeBlock,
+    request: &CallLinkInlineCacheAttachedMetadataRequest,
+) -> Result<(), CallLinkInlineCacheAttachedMetadataError> {
+    let Some(call) = inline_caches.calls.get(request.slot) else {
+        return Err(CallLinkInlineCacheAttachedMetadataError::InvalidSlot {
+            slot: request.slot,
+            len: inline_caches.calls.len(),
+        });
+    };
+
+    if call.bytecode_index != request.bytecode_index {
+        return Err(
+            CallLinkInlineCacheAttachedMetadataError::BytecodeIndexMismatch {
+                slot: request.slot,
+                expected: call.bytecode_index,
+                actual: request.bytecode_index,
+            },
+        );
+    }
+    validate_call_link_inline_cache_attached_metadata_opcode(unlinked, request, call)?;
+    validate_call_link_inline_cache_attached_metadata_descriptor(request, call)?;
+    validate_call_link_inline_cache_attached_metadata_target(request)?;
+
+    let expected_mode = CallLinkMode::Monomorphic;
+    if call.mode != expected_mode {
+        return Err(
+            CallLinkInlineCacheAttachedMetadataError::InvalidExistingMode {
+                slot: request.slot,
+                expected: expected_mode,
+                actual: call.mode,
+            },
+        );
+    }
+
+    validate_call_link_inline_cache_attached_metadata_target_matches(request, call)?;
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_attached_metadata_opcode(
+    unlinked: &UnlinkedCodeBlock,
+    request: &CallLinkInlineCacheAttachedMetadataRequest,
+    call: &CallLinkInfo,
+) -> Result<(), CallLinkInlineCacheAttachedMetadataError> {
+    let decoded =
+        decoded_instruction_for_call_link_bytecode_index(unlinked, request.bytecode_index).ok_or(
+            CallLinkInlineCacheAttachedMetadataError::InstructionDecodeFailed {
+                slot: request.slot,
+                bytecode_index: request.bytecode_index,
+            },
+        )?;
+    let Some(decoded_opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
+        return Err(
+            CallLinkInlineCacheAttachedMetadataError::InstructionOpcodeUnavailable {
+                slot: request.slot,
+                bytecode_index: request.bytecode_index,
+            },
+        );
+    };
+    if !matches!(decoded_opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+        return Err(
+            CallLinkInlineCacheAttachedMetadataError::UnsupportedOpcode {
+                slot: request.slot,
+                opcode: decoded_opcode,
+            },
+        );
+    }
+    let decoded_call_site = call_site_for_decoded_call(&decoded);
+    if call.call_site != decoded_call_site {
+        return Err(CallLinkInlineCacheAttachedMetadataError::CallSiteMismatch {
+            slot: request.slot,
+            expected: decoded_call_site,
+            actual: call.call_site,
+        });
+    }
+    if call.opcode != decoded_opcode {
+        return Err(CallLinkInlineCacheAttachedMetadataError::OpcodeMismatch {
+            slot: request.slot,
+            expected: decoded_opcode,
+            actual: call.opcode,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_attached_metadata_descriptor(
+    request: &CallLinkInlineCacheAttachedMetadataRequest,
+    call: &CallLinkInfo,
+) -> Result<(), CallLinkInlineCacheAttachedMetadataError> {
+    if call.call_type != CallType::Call {
+        return Err(
+            CallLinkInlineCacheAttachedMetadataError::InvalidExistingCallType {
+                slot: request.slot,
+                expected: CallType::Call,
+                actual: call.call_type,
+            },
+        );
+    }
+    if call.specialization != CodeSpecialization::Call {
+        return Err(
+            CallLinkInlineCacheAttachedMetadataError::InvalidExistingSpecialization {
+                slot: request.slot,
+                expected: CodeSpecialization::Call,
+                actual: call.specialization,
+            },
+        );
+    }
+    let expected_origin = CodeOrigin::new(request.bytecode_index);
+    if call.origin != expected_origin {
+        return Err(CallLinkInlineCacheAttachedMetadataError::OriginMismatch {
+            slot: request.slot,
+            expected: expected_origin,
+            actual: call.origin,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_attached_metadata_target(
+    request: &CallLinkInlineCacheAttachedMetadataRequest,
+) -> Result<(), CallLinkInlineCacheAttachedMetadataError> {
+    if !matches!(request.target, CallTarget::MetadataOnlyMonomorphic { .. }) {
+        return Err(
+            CallLinkInlineCacheAttachedMetadataError::InvalidRequestedTarget {
+                actual: request.target.clone(),
+            },
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_call_link_inline_cache_attached_metadata_target_matches(
+    request: &CallLinkInlineCacheAttachedMetadataRequest,
+    call: &CallLinkInfo,
+) -> Result<(), CallLinkInlineCacheAttachedMetadataError> {
+    let (
+        CallTarget::MetadataOnlyMonomorphic {
+            callee,
+            executable,
+            code_block,
+            boundary,
+        },
+        CallTarget::MetadataOnlyMonomorphic {
+            callee: expected_callee,
+            executable: expected_executable,
+            code_block: expected_code_block,
+            boundary: expected_boundary,
+        },
+    ) = (&call.target, &request.target)
+    else {
+        return Err(call_link_inline_cache_attached_metadata_mismatch(
+            request.slot,
+            CallLinkInlineCacheAttachedMetadataMismatchField::Callee,
+        ));
+    };
+    if callee != expected_callee {
+        return Err(call_link_inline_cache_attached_metadata_mismatch(
+            request.slot,
+            CallLinkInlineCacheAttachedMetadataMismatchField::Callee,
+        ));
+    }
+    if executable != expected_executable {
+        return Err(call_link_inline_cache_attached_metadata_mismatch(
+            request.slot,
+            CallLinkInlineCacheAttachedMetadataMismatchField::Executable,
+        ));
+    }
+    if code_block != expected_code_block {
+        return Err(call_link_inline_cache_attached_metadata_mismatch(
+            request.slot,
+            CallLinkInlineCacheAttachedMetadataMismatchField::TargetCodeBlock,
+        ));
+    }
+    if boundary != expected_boundary {
+        return Err(call_link_inline_cache_attached_metadata_mismatch(
+            request.slot,
+            CallLinkInlineCacheAttachedMetadataMismatchField::Boundary,
+        ));
+    }
+
+    Ok(())
+}
+
+const fn call_link_inline_cache_attached_metadata_mismatch(
+    slot: usize,
+    field: CallLinkInlineCacheAttachedMetadataMismatchField,
+) -> CallLinkInlineCacheAttachedMetadataError {
+    CallLinkInlineCacheAttachedMetadataError::AttachedMetadataMismatch { slot, field }
+}
+
+fn call_target_for_call_link_inline_cache_attachment_request(
+    request: &CallLinkInlineCacheAttachmentRequest,
+) -> CallTarget {
+    request.target.clone()
+}
+
+fn call_site_for_decoded_call(decoded: &DecodedInstruction<'_>) -> CallSiteIndex {
+    decoded
+        .operands
+        .iter()
+        .find_map(|operand| {
+            if let Operand::CallSite(call_site) = operand {
+                Some(*call_site)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(CallSiteIndex(decoded.bytecode_index.offset()))
+}
+
+fn decoded_instruction_for_call_link_bytecode_index(
+    unlinked: &UnlinkedCodeBlock,
+    bytecode_index: BytecodeIndex,
+) -> Option<DecodedInstruction<'_>> {
+    unlinked
+        .instructions()
+        .decoded_instructions()
+        .flatten()
+        .find(|decoded| decoded.bytecode_index == bytecode_index)
+}
+
+fn validate_property_inline_cache_clear_request(
+    inline_caches: &InlineCacheTable,
+    request: &PropertyInlineCacheClearRequest,
+) -> Result<(), PropertyInlineCacheClearError> {
+    let Some(cache) = inline_caches.property_accesses.get(request.slot) else {
+        return Err(PropertyInlineCacheClearError::InvalidSlot {
+            slot: request.slot,
+            len: inline_caches.property_accesses.len(),
+        });
+    };
+
+    if cache.bytecode_index != request.bytecode_index {
+        return Err(PropertyInlineCacheClearError::BytecodeIndexMismatch {
+            slot: request.slot,
+            expected: cache.bytecode_index,
+            actual: request.bytecode_index,
+        });
+    }
+
+    let expected_property = PropertyCacheKey::Key(request.key);
+    if cache.property != expected_property {
+        return Err(PropertyInlineCacheClearError::PropertyKeyMismatch {
+            slot: request.slot,
+            expected: cache.property,
+            actual: request.key,
+        });
+    }
+
+    let expected_access = request.attachment_kind.access_type();
+    let expected_kind = request.attachment_kind.cache_kind();
+    if cache.access != expected_access || cache.kind != expected_kind {
+        return Err(PropertyInlineCacheClearError::AccessKindMismatch {
+            slot: request.slot,
+            expected_access,
+            actual_access: cache.access,
+            expected_kind,
+            actual_kind: cache.kind,
+        });
+    }
+
+    let expected_authority = InlineCacheMutationAuthority::LinkedCodeBlock;
+    if cache.mutation_authority != expected_authority {
+        return Err(
+            PropertyInlineCacheClearError::InvalidExistingMutationAuthority {
+                slot: request.slot,
+                expected: expected_authority,
+                actual: cache.mutation_authority,
+            },
+        );
+    }
+
+    let expected_state = InlineCacheState::Monomorphic;
+    if cache.state != expected_state {
+        return Err(PropertyInlineCacheClearError::InvalidExistingState {
+            slot: request.slot,
+            expected: expected_state,
+            actual: cache.state,
+        });
+    }
+
+    if request.dispatch == PropertyInlineCacheDispatch::Unlinked {
+        return Err(PropertyInlineCacheClearError::InvalidRequestedDispatch {
+            actual: request.dispatch,
+        });
+    }
+    if cache.dispatch != request.dispatch {
+        return Err(PropertyInlineCacheClearError::InvalidExistingDispatch {
+            slot: request.slot,
+            expected: request.dispatch,
+            actual: cache.dispatch,
+        });
+    }
+
+    validate_property_inline_cache_clear_stub_mode(inline_caches, request)?;
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup
+        | PropertyInlineCacheAttachmentKind::PutByNameStoreReplace
+            if request.new_structure.is_some() =>
+        {
+            return Err(PropertyInlineCacheClearError::IncompatibleNewStructure {
+                attachment_kind: request.attachment_kind,
+                new_structure: request.new_structure,
+            });
+        }
+        PropertyInlineCacheAttachmentKind::PutByNameStoreTransition
+            if request.new_structure.is_none() =>
+        {
+            return Err(PropertyInlineCacheClearError::IncompatibleNewStructure {
+                attachment_kind: request.attachment_kind,
+                new_structure: request.new_structure,
+            });
+        }
+        _ => {}
+    }
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad => {
+            if request.holder_structure.is_none() {
+                return Err(PropertyInlineCacheClearError::MissingHolderStructure {
+                    attachment_kind: request.attachment_kind,
+                });
+            }
+        }
+        _ => {
+            if let Some(holder_structure) = request.holder_structure {
+                return Err(PropertyInlineCacheClearError::UnexpectedHolderStructure {
+                    attachment_kind: request.attachment_kind,
+                    holder_structure,
+                });
+            }
+        }
+    }
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup => {
+            if let Some(offset) = request.offset {
+                return Err(PropertyInlineCacheClearError::UnexpectedPropertyOffset {
+                    attachment_kind: request.attachment_kind,
+                    offset,
+                });
+            }
+        }
+        _ => {
+            let Some(offset) = request.offset else {
+                return Err(PropertyInlineCacheClearError::MissingPropertyOffset {
+                    attachment_kind: request.attachment_kind,
+                });
+            };
+            if offset.0 < 0 {
+                return Err(PropertyInlineCacheClearError::InvalidPropertyOffset { offset });
+            }
+        }
+    }
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup => {
+            let Some(metadata) = cache.get_by_id else {
+                return Err(PropertyInlineCacheClearError::MissingGetByIdMetadata {
+                    slot: request.slot,
+                });
+            };
+            let expected_mode = match request.attachment_kind {
+                PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad => GetByIdMode::Default,
+                PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad => {
+                    GetByIdMode::ProtoLoad
+                }
+                PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup => {
+                    GetByIdMode::NegativeLookup
+                }
+                _ => unreachable!("checked get-by-id attachment kind"),
+            };
+            if metadata.mode != expected_mode {
+                return Err(property_inline_cache_clear_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheClearMetadataMismatchField::GetByIdMode,
+                ));
+            }
+            if metadata.structure != Some(request.base_structure) {
+                return Err(property_inline_cache_clear_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheClearMetadataMismatchField::BaseStructure,
+                ));
+            }
+            if metadata.holder_structure != request.holder_structure {
+                return Err(property_inline_cache_clear_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheClearMetadataMismatchField::HolderStructure,
+                ));
+            }
+            if metadata.cached_offset != request.offset {
+                return Err(property_inline_cache_clear_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheClearMetadataMismatchField::Offset,
+                ));
+            }
+        }
+        PropertyInlineCacheAttachmentKind::PutByNameStoreReplace
+        | PropertyInlineCacheAttachmentKind::PutByNameStoreTransition => {
+            let Some(metadata) = cache.put_by_id else {
+                return Err(PropertyInlineCacheClearError::MissingPutByIdMetadata {
+                    slot: request.slot,
+                });
+            };
+            let expected_mode = request
+                .attachment_kind
+                .put_by_id_mode()
+                .expect("store attachment kind has a put-by-id mode");
+            if metadata.mode != expected_mode {
+                return Err(property_inline_cache_clear_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheClearMetadataMismatchField::PutByIdMode,
+                ));
+            }
+            if metadata.old_structure != Some(request.base_structure) {
+                return Err(property_inline_cache_clear_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheClearMetadataMismatchField::BaseStructure,
+                ));
+            }
+            if metadata.new_structure != request.new_structure {
+                return Err(property_inline_cache_clear_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheClearMetadataMismatchField::NewStructure,
+                ));
+            }
+            if metadata.cached_offset != request.offset {
+                return Err(property_inline_cache_clear_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheClearMetadataMismatchField::Offset,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_property_inline_cache_attached_metadata_request(
+    inline_caches: &InlineCacheTable,
+    request: &PropertyInlineCacheAttachedMetadataRequest,
+) -> Result<(), PropertyInlineCacheAttachedMetadataError> {
+    let Some(cache) = inline_caches.property_accesses.get(request.slot) else {
+        return Err(PropertyInlineCacheAttachedMetadataError::InvalidSlot {
+            slot: request.slot,
+            len: inline_caches.property_accesses.len(),
+        });
+    };
+
+    if cache.bytecode_index != request.bytecode_index {
+        return Err(
+            PropertyInlineCacheAttachedMetadataError::BytecodeIndexMismatch {
+                slot: request.slot,
+                expected: cache.bytecode_index,
+                actual: request.bytecode_index,
+            },
+        );
+    }
+
+    let expected_property = PropertyCacheKey::Key(request.key);
+    if cache.property != expected_property {
+        return Err(
+            PropertyInlineCacheAttachedMetadataError::PropertyKeyMismatch {
+                slot: request.slot,
+                expected: cache.property,
+                actual: request.key,
+            },
+        );
+    }
+
+    let expected_access = request.attachment_kind.access_type();
+    let expected_kind = request.attachment_kind.cache_kind();
+    if cache.access != expected_access || cache.kind != expected_kind {
+        return Err(
+            PropertyInlineCacheAttachedMetadataError::AccessKindMismatch {
+                slot: request.slot,
+                expected_access,
+                actual_access: cache.access,
+                expected_kind,
+                actual_kind: cache.kind,
+            },
+        );
+    }
+
+    let expected_authority = InlineCacheMutationAuthority::LinkedCodeBlock;
+    if cache.mutation_authority != expected_authority {
+        return Err(
+            PropertyInlineCacheAttachedMetadataError::InvalidExistingMutationAuthority {
+                slot: request.slot,
+                expected: expected_authority,
+                actual: cache.mutation_authority,
+            },
+        );
+    }
+
+    let expected_state = InlineCacheState::Monomorphic;
+    if cache.state != expected_state {
+        return Err(
+            PropertyInlineCacheAttachedMetadataError::InvalidExistingState {
+                slot: request.slot,
+                expected: expected_state,
+                actual: cache.state,
+            },
+        );
+    }
+
+    if request.dispatch == PropertyInlineCacheDispatch::Unlinked {
+        return Err(
+            PropertyInlineCacheAttachedMetadataError::InvalidRequestedDispatch {
+                actual: request.dispatch,
+            },
+        );
+    }
+    if cache.dispatch != request.dispatch {
+        return Err(
+            PropertyInlineCacheAttachedMetadataError::InvalidExistingDispatch {
+                slot: request.slot,
+                expected: request.dispatch,
+                actual: cache.dispatch,
+            },
+        );
+    }
+
+    if request.stub_mode != PropertyInlineCacheStubMode::MetadataOnly {
+        return Err(
+            PropertyInlineCacheAttachedMetadataError::UnsupportedStubMode {
+                actual: request.stub_mode,
+            },
+        );
+    }
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup
+        | PropertyInlineCacheAttachmentKind::PutByNameStoreReplace
+            if request.new_structure.is_some() =>
+        {
+            return Err(
+                PropertyInlineCacheAttachedMetadataError::IncompatibleNewStructure {
+                    attachment_kind: request.attachment_kind,
+                    new_structure: request.new_structure,
+                },
+            );
+        }
+        PropertyInlineCacheAttachmentKind::PutByNameStoreTransition
+            if request.new_structure.is_none() =>
+        {
+            return Err(
+                PropertyInlineCacheAttachedMetadataError::IncompatibleNewStructure {
+                    attachment_kind: request.attachment_kind,
+                    new_structure: request.new_structure,
+                },
+            );
+        }
+        _ => {}
+    }
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad => {
+            if request.holder_structure.is_none() {
+                return Err(
+                    PropertyInlineCacheAttachedMetadataError::MissingHolderStructure {
+                        attachment_kind: request.attachment_kind,
+                    },
+                );
+            }
+        }
+        _ => {
+            if let Some(holder_structure) = request.holder_structure {
+                return Err(
+                    PropertyInlineCacheAttachedMetadataError::UnexpectedHolderStructure {
+                        attachment_kind: request.attachment_kind,
+                        holder_structure,
+                    },
+                );
+            }
+        }
+    }
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup => {
+            if let Some(offset) = request.offset {
+                return Err(
+                    PropertyInlineCacheAttachedMetadataError::UnexpectedPropertyOffset {
+                        attachment_kind: request.attachment_kind,
+                        offset,
+                    },
+                );
+            }
+        }
+        _ => {
+            let Some(offset) = request.offset else {
+                return Err(
+                    PropertyInlineCacheAttachedMetadataError::MissingPropertyOffset {
+                        attachment_kind: request.attachment_kind,
+                    },
+                );
+            };
+            if offset.0 < 0 {
+                return Err(
+                    PropertyInlineCacheAttachedMetadataError::InvalidPropertyOffset { offset },
+                );
+            }
+        }
+    }
+
+    match request.attachment_kind {
+        PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad
+        | PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup => {
+            let Some(metadata) = cache.get_by_id else {
+                return Err(
+                    PropertyInlineCacheAttachedMetadataError::MissingGetByIdMetadata {
+                        slot: request.slot,
+                    },
+                );
+            };
+            let expected_mode = match request.attachment_kind {
+                PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad => GetByIdMode::Default,
+                PropertyInlineCacheAttachmentKind::GetByNamePrototypeDataLoad => {
+                    GetByIdMode::ProtoLoad
+                }
+                PropertyInlineCacheAttachmentKind::GetByNameNegativeLookup => {
+                    GetByIdMode::NegativeLookup
+                }
+                _ => unreachable!("checked get-by-id attachment kind"),
+            };
+            if metadata.mode != expected_mode {
+                return Err(property_inline_cache_attached_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheAttachedMetadataMismatchField::GetByIdMode,
+                ));
+            }
+            if metadata.structure != Some(request.base_structure) {
+                return Err(property_inline_cache_attached_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheAttachedMetadataMismatchField::BaseStructure,
+                ));
+            }
+            if metadata.holder_structure != request.holder_structure {
+                return Err(property_inline_cache_attached_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheAttachedMetadataMismatchField::HolderStructure,
+                ));
+            }
+            if metadata.cached_offset != request.offset {
+                return Err(property_inline_cache_attached_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheAttachedMetadataMismatchField::Offset,
+                ));
+            }
+        }
+        PropertyInlineCacheAttachmentKind::PutByNameStoreReplace
+        | PropertyInlineCacheAttachmentKind::PutByNameStoreTransition => {
+            let Some(metadata) = cache.put_by_id else {
+                return Err(
+                    PropertyInlineCacheAttachedMetadataError::MissingPutByIdMetadata {
+                        slot: request.slot,
+                    },
+                );
+            };
+            let expected_mode = request
+                .attachment_kind
+                .put_by_id_mode()
+                .expect("store attachment kind has a put-by-id mode");
+            if metadata.mode != expected_mode {
+                return Err(property_inline_cache_attached_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheAttachedMetadataMismatchField::PutByIdMode,
+                ));
+            }
+            if metadata.old_structure != Some(request.base_structure) {
+                return Err(property_inline_cache_attached_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheAttachedMetadataMismatchField::BaseStructure,
+                ));
+            }
+            if metadata.new_structure != request.new_structure {
+                return Err(property_inline_cache_attached_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheAttachedMetadataMismatchField::NewStructure,
+                ));
+            }
+            if metadata.cached_offset != request.offset {
+                return Err(property_inline_cache_attached_metadata_mismatch(
+                    request.slot,
+                    PropertyInlineCacheAttachedMetadataMismatchField::Offset,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+const fn property_inline_cache_attached_metadata_mismatch(
+    slot: usize,
+    field: PropertyInlineCacheAttachedMetadataMismatchField,
+) -> PropertyInlineCacheAttachedMetadataError {
+    PropertyInlineCacheAttachedMetadataError::AttachedMetadataMismatch { slot, field }
+}
+
+const fn property_inline_cache_clear_metadata_mismatch(
+    slot: usize,
+    field: PropertyInlineCacheClearMetadataMismatchField,
+) -> PropertyInlineCacheClearError {
+    PropertyInlineCacheClearError::AttachedMetadataMismatch { slot, field }
+}
+
+fn validate_property_inline_cache_attachment_stub_mode(
+    request: &PropertyInlineCacheAttachmentRequest,
+) -> Result<(), PropertyInlineCacheAttachmentError> {
+    match request.stub_mode {
+        PropertyInlineCacheStubMode::MetadataOnly => Ok(()),
+        PropertyInlineCacheStubMode::StructureStub
+            if request.attachment_kind
+                == PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad
+                && !request.requirements.requires_barrier
+                && !request.requirements.has_barrier_evidence
+                && !request.requirements.requires_watchpoint
+                && !request.requirements.may_call
+                && !request.requirements.may_allocate =>
+        {
+            Ok(())
+        }
+        PropertyInlineCacheStubMode::StructureStub => {
+            Err(PropertyInlineCacheAttachmentError::UnsupportedStubMode {
+                actual: request.stub_mode,
+            })
+        }
+    }
+}
+
+fn validate_property_inline_cache_clear_stub_mode(
+    inline_caches: &InlineCacheTable,
+    request: &PropertyInlineCacheClearRequest,
+) -> Result<(), PropertyInlineCacheClearError> {
+    match request.stub_mode {
+        PropertyInlineCacheStubMode::MetadataOnly => Ok(()),
+        PropertyInlineCacheStubMode::StructureStub
+            if request.attachment_kind
+                == PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad =>
+        {
+            validate_property_inline_cache_clear_structure_stub(inline_caches, request)
+        }
+        PropertyInlineCacheStubMode::StructureStub => {
+            Err(PropertyInlineCacheClearError::UnsupportedStubMode {
+                actual: request.stub_mode,
+            })
+        }
+    }
+}
+
+fn validate_property_inline_cache_clear_structure_stub(
+    inline_caches: &InlineCacheTable,
+    request: &PropertyInlineCacheClearRequest,
+) -> Result<(), PropertyInlineCacheClearError> {
+    let Some(structure_stub_index) = request.structure_stub_index else {
+        return Err(PropertyInlineCacheClearError::InvalidStructureStubIndex {
+            index: None,
+            len: inline_caches.structure_stubs.len(),
+        });
+    };
+    let Some(stub) = inline_caches.structure_stubs.get(structure_stub_index) else {
+        return Err(PropertyInlineCacheClearError::InvalidStructureStubIndex {
+            index: Some(structure_stub_index),
+            len: inline_caches.structure_stubs.len(),
+        });
+    };
+
+    let mismatch = |field| PropertyInlineCacheClearError::StructureStubMetadataMismatch {
+        index: structure_stub_index,
+        field,
+    };
+    if stub.bytecode_index != request.bytecode_index {
+        return Err(mismatch(StructureStubMetadataMismatchField::BytecodeIndex));
+    }
+    if stub.inline_cache_slot != request.slot {
+        return Err(mismatch(
+            StructureStubMetadataMismatchField::InlineCacheSlot,
+        ));
+    }
+    if stub.attachment_kind != request.attachment_kind {
+        return Err(mismatch(StructureStubMetadataMismatchField::AttachmentKind));
+    }
+    if stub.key != request.key {
+        return Err(mismatch(StructureStubMetadataMismatchField::Key));
+    }
+    if stub.kind != StructureStubKind::GetById {
+        return Err(mismatch(StructureStubMetadataMismatchField::Kind));
+    }
+    if stub.cache_state != InlineCacheState::Monomorphic {
+        return Err(mismatch(StructureStubMetadataMismatchField::CacheState));
+    }
+    if stub.base_structure != request.base_structure {
+        return Err(mismatch(StructureStubMetadataMismatchField::BaseStructure));
+    }
+    if stub.holder_structure != request.holder_structure {
+        return Err(mismatch(
+            StructureStubMetadataMismatchField::HolderStructure,
+        ));
+    }
+    if stub.new_structure != request.new_structure {
+        return Err(mismatch(StructureStubMetadataMismatchField::NewStructure));
+    }
+    if stub.offset != request.offset {
+        return Err(mismatch(StructureStubMetadataMismatchField::Offset));
+    }
+    if stub.requirements.requires_barrier
+        || stub.requirements.has_barrier_evidence
+        || stub.requirements.requires_watchpoint
+        || stub.requirements.may_call
+        || stub.requirements.may_allocate
+    {
+        return Err(mismatch(StructureStubMetadataMismatchField::Requirements));
+    }
+
+    Ok(())
+}
+
+fn validate_structure_stub_access_case_link_request(
+    inline_caches: &InlineCacheTable,
+    request: &StructureStubAccessCaseLinkRequest,
+) -> Result<(), StructureStubAccessCaseLinkError> {
+    let Some(stub) = inline_caches
+        .structure_stubs
+        .get(request.structure_stub_index)
+    else {
+        return Err(
+            StructureStubAccessCaseLinkError::InvalidStructureStubIndex {
+                index: request.structure_stub_index,
+                len: inline_caches.structure_stubs.len(),
+            },
+        );
+    };
+
+    let mismatch = |field| StructureStubAccessCaseLinkError::StructureStubMetadataMismatch {
+        index: request.structure_stub_index,
+        field,
+    };
+    if stub.bytecode_index != request.bytecode_index {
+        return Err(mismatch(StructureStubMetadataMismatchField::BytecodeIndex));
+    }
+    if stub.inline_cache_slot != request.slot {
+        return Err(mismatch(
+            StructureStubMetadataMismatchField::InlineCacheSlot,
+        ));
+    }
+    if request.attachment_kind != PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad
+        || stub.attachment_kind != request.attachment_kind
+    {
+        return Err(mismatch(StructureStubMetadataMismatchField::AttachmentKind));
+    }
+    if stub.key != request.key {
+        return Err(mismatch(StructureStubMetadataMismatchField::Key));
+    }
+    if stub.kind != StructureStubKind::GetById {
+        return Err(mismatch(StructureStubMetadataMismatchField::Kind));
+    }
+    if stub.cache_state != InlineCacheState::Monomorphic {
+        return Err(mismatch(StructureStubMetadataMismatchField::CacheState));
+    }
+    if stub.base_structure != request.base_structure {
+        return Err(mismatch(StructureStubMetadataMismatchField::BaseStructure));
+    }
+    if stub.holder_structure != request.holder_structure {
+        return Err(mismatch(
+            StructureStubMetadataMismatchField::HolderStructure,
+        ));
+    }
+    if stub.new_structure != request.new_structure {
+        return Err(mismatch(StructureStubMetadataMismatchField::NewStructure));
+    }
+    if stub.offset != request.offset {
+        return Err(mismatch(StructureStubMetadataMismatchField::Offset));
+    }
+    if stub.requirements.requires_barrier
+        || stub.requirements.has_barrier_evidence
+        || stub.requirements.requires_watchpoint
+        || stub.requirements.may_call
+        || stub.requirements.may_allocate
+    {
+        return Err(mismatch(StructureStubMetadataMismatchField::Requirements));
+    }
+
+    Ok(())
+}
+
+fn structure_stub_info_for_property_inline_cache_request(
+    request: &PropertyInlineCacheAttachmentRequest,
+) -> StructureStubInfo {
+    StructureStubInfo {
+        bytecode_index: request.bytecode_index,
+        inline_cache_slot: request.slot,
+        attachment_kind: request.attachment_kind,
+        key: request.key,
+        base_structure: request.base_structure,
+        holder_structure: request.holder_structure,
+        new_structure: request.new_structure,
+        offset: request.offset,
+        requirements: request.requirements,
+        kind: StructureStubKind::GetById,
+        cache_state: InlineCacheState::Monomorphic,
+        code_origin: CodeOrigin::new(request.bytecode_index),
+        access_cases: Vec::new(),
+        reset_by_gc: false,
+    }
+}
+
+fn linked_side_tables_from_unlinked(unlinked: &UnlinkedCodeBlock) -> LinkedSideTables {
+    let unlinked_side_tables = unlinked.side_tables();
+    LinkedSideTables {
+        handlers: unlinked_side_tables
+            .handlers
+            .iter()
+            .map(|handler| HandlerInfo {
+                range: HandlerRange::Bytecode(handler.range),
+                target: HandlerTarget::Bytecode(handler.target),
+                kind: handler.kind,
+            })
+            .collect(),
+        code_origins: unlinked_side_tables.code_origins.clone(),
+        exception_handlers: unlinked_side_tables.exception_handlers.clone(),
+        root_maps: unlinked_side_tables.root_maps.clone(),
+        inline_caches: InlineCacheTable {
+            property_accesses: derive_named_property_inline_caches(unlinked),
+            calls: derive_call_link_inline_caches(unlinked),
+            ..InlineCacheTable::default()
+        },
+        ..LinkedSideTables::default()
+    }
+}
+
+fn derive_named_property_inline_caches(unlinked: &UnlinkedCodeBlock) -> Vec<PropertyInlineCache> {
+    let mut caches = Vec::new();
+    for decoded in unlinked.instructions().decoded_instructions().flatten() {
+        match crate::bytecode::opcode::CoreOpcode::from_opcode(decoded.opcode) {
+            Some(crate::bytecode::opcode::CoreOpcode::GetByName) => {
+                let Ok(base) = decoded.register_operand(1) else {
+                    continue;
+                };
+                let Ok(Operand::IdentifierIndex(identifier_index)) = decoded.operand(2) else {
+                    continue;
+                };
+                let property = PropertyKey::from_identifier(Identifier::from_atom(
+                    AtomId::from_table_slot(identifier_index),
+                ));
+                caches.push(PropertyInlineCache::get_by_name_load(
+                    decoded.bytecode_index,
+                    base,
+                    property,
+                ));
+            }
+            Some(crate::bytecode::opcode::CoreOpcode::PutByName) => {
+                let Ok(base) = decoded.register_operand(0) else {
+                    continue;
+                };
+                let Ok(Operand::IdentifierIndex(identifier_index)) = decoded.operand(1) else {
+                    continue;
+                };
+                let property = PropertyKey::from_identifier(Identifier::from_atom(
+                    AtomId::from_table_slot(identifier_index),
+                ));
+                caches.push(PropertyInlineCache::put_by_name_store(
+                    decoded.bytecode_index,
+                    base,
+                    property,
+                ));
+            }
+            _ => {}
+        }
+    }
+    caches
+}
+
+fn derive_call_link_inline_caches(unlinked: &UnlinkedCodeBlock) -> Vec<CallLinkInfo> {
+    let mut calls = Vec::new();
+    for decoded in unlinked.instructions().decoded_instructions().flatten() {
+        let Some(opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
+            continue;
+        };
+        if !matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+            continue;
+        }
+        let call_site = call_site_for_decoded_call(&decoded);
+        calls.push(CallLinkInfo::metadata_only_unlinked_call(
+            call_site,
+            decoded.bytecode_index,
+            opcode,
+        ));
+    }
+    calls
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CodeBlockExecutionSurface<'a> {
+    code_block: &'a CodeBlock,
+}
+
+impl<'a> CodeBlockExecutionSurface<'a> {
+    pub fn code_block(&self) -> &'a CodeBlock {
+        self.code_block
+    }
+
+    pub fn instruction_at(
+        self,
+        bytecode_index: BytecodeIndex,
+    ) -> Result<DecodedInstruction<'a>, InstructionDecodeError> {
+        self.code_block.decoded_instruction_at(bytecode_index)
+    }
+
+    pub fn metadata_entry(self, bytecode_index: BytecodeIndex) -> Option<&'a MetadataEntry> {
+        self.code_block
+            .metadata_entry_for_bytecode_index(bytecode_index)
+    }
+
+    pub fn source_note(self, bytecode_index: BytecodeIndex) -> Option<SourceNoteLookup> {
+        self.code_block
+            .unlinked()
+            .side_tables()
+            .source_notes
+            .lookup(bytecode_index)
+    }
+
+    pub fn link_record(self) -> UnlinkedToLinkedBytecodeRecord {
+        self.code_block.link_record()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnlinkedToLinkedBytecodeRecord {
+    pub context: LinkContext,
+    pub unlinked_phase: UnlinkedCodeBlockPhase,
+    pub linked_lifecycle: CodeBlockLifecycleState,
+    pub instruction_count: u32,
+    pub unlinked_metadata_entries: u32,
+    pub linked_metadata_entries: u32,
+    pub root_map_count: u32,
+    pub value_profile_root_count: u32,
+    pub has_interpreter_entry: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -409,8 +2746,41 @@ pub struct UnlinkedMetadataTable {
 }
 
 impl UnlinkedMetadataTable {
+    pub fn from_entries(
+        entries: Vec<UnlinkedMetadataEntry>,
+        layout: MetadataLayout,
+        instruction_plans: Vec<InstructionMetadataPlan>,
+        schema_version: OpcodeSchemaVersion,
+    ) -> Self {
+        Self {
+            entries,
+            layout,
+            instruction_plans,
+            schema_version,
+            did_optimize_hint: TierHint::Unknown,
+        }
+    }
+
     pub fn entries(&self) -> &[UnlinkedMetadataEntry] {
         &self.entries
+    }
+
+    pub fn entry_for_bytecode_index(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<&UnlinkedMetadataEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.bytecode_index == bytecode_index)
+    }
+
+    pub fn plan_for_bytecode_index(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<&InstructionMetadataPlan> {
+        self.instruction_plans
+            .iter()
+            .find(|plan| plan.bytecode_index == bytecode_index)
     }
 }
 
@@ -425,8 +2795,31 @@ pub struct MetadataTable {
 }
 
 impl MetadataTable {
+    pub fn from_entries(
+        entries: Vec<MetadataEntry>,
+        layout: MetadataLayout,
+        linking_data: MetadataLinkingData,
+        schema_version: OpcodeSchemaVersion,
+    ) -> Self {
+        Self {
+            entries,
+            layout,
+            linking_data,
+            schema_version,
+        }
+    }
+
     pub fn entries(&self) -> &[MetadataEntry] {
         &self.entries
+    }
+
+    pub fn entry_for_bytecode_index(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<&MetadataEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.bytecode_index == bytecode_index)
     }
 }
 
@@ -459,6 +2852,11 @@ pub enum LinkedMetadataStorage {
     OpaqueGenerated(RuntimeSlot),
 }
 
+/// Slot in linked runtime metadata storage.
+///
+/// The owning `CodeBlock` controls allocation and mutation of these slots.
+/// `RuntimeSlot` is not a `CellId`, `StructureId`, or `JsValue`; fields that
+/// need heap identity must import the canonical runtime or GC IDs directly.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct RuntimeSlot(pub u32);
@@ -470,6 +2868,69 @@ pub struct UnlinkedConstantPool {
     pub function_declarations: Vec<UnlinkedFunctionRef>,
     pub function_expressions: Vec<UnlinkedFunctionRef>,
     pub identifier_sets: Vec<IdentifierSetIndex>,
+    string_literals: StringLiteralTable,
+}
+
+impl UnlinkedConstantPool {
+    pub fn with_string_literals(
+        mut self,
+        entries: impl IntoIterator<Item = (u32, String)>,
+    ) -> Self {
+        self.install_string_literals(entries);
+        self
+    }
+
+    pub fn install_string_literals(&mut self, entries: impl IntoIterator<Item = (u32, String)>) {
+        self.string_literals = StringLiteralTable::from_entries(entries);
+    }
+
+    pub fn string_literals(&self) -> &StringLiteralTable {
+        &self.string_literals
+    }
+
+    pub fn string_literal(&self, identifier_index: u32) -> Option<&str> {
+        self.string_literals.literal(identifier_index)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StringLiteralTable {
+    entries: Vec<StringLiteralEntry>,
+}
+
+impl StringLiteralTable {
+    pub fn from_entries(entries: impl IntoIterator<Item = (u32, String)>) -> Self {
+        let mut sorted = BTreeMap::new();
+        for (identifier_index, text) in entries {
+            sorted.entry(identifier_index).or_insert(text);
+        }
+        Self {
+            entries: sorted
+                .into_iter()
+                .map(|(identifier_index, text)| StringLiteralEntry {
+                    identifier_index,
+                    text,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn entries(&self) -> &[StringLiteralEntry] {
+        &self.entries
+    }
+
+    pub fn literal(&self, identifier_index: u32) -> Option<&str> {
+        self.entries
+            .binary_search_by_key(&identifier_index, |entry| entry.identifier_index)
+            .ok()
+            .map(|index| self.entries[index].text.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StringLiteralEntry {
+    pub identifier_index: u32,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -517,6 +2978,7 @@ pub enum SourceCodeRepresentation {
     BigIntLiteral,
     RegExpLiteral,
     TemplateObject,
+    LinkTimeConstant,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -556,6 +3018,7 @@ pub struct UnlinkedSideTables {
     pub control_flow_profile_offsets: Vec<BytecodeIndex>,
     pub jump_tables: JumpTableSet,
     pub bit_vectors: Vec<BitVectorRef>,
+    pub root_maps: Vec<BytecodeRootMap>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -567,6 +3030,7 @@ pub struct LinkedSideTables {
     pub bytecode_hooks: BytecodeHookTable,
     pub inline_caches: InlineCacheTable,
     pub value_profiles: ValueProfileTable,
+    pub root_maps: Vec<BytecodeRootMap>,
     pub direct_eval_cache: Option<DirectEvalCacheRef>,
     pub catch_liveness: Vec<CatchLivenessRecord>,
 }
@@ -618,6 +3082,35 @@ pub enum HandlerTarget {
 pub struct SourceNoteTable {
     pub chapters: Vec<SourceNoteChapter>,
     pub notes: Vec<SourceNote>,
+}
+
+impl SourceNoteTable {
+    pub fn lookup(&self, bytecode_index: BytecodeIndex) -> Option<SourceNoteLookup> {
+        self.notes
+            .iter()
+            .filter(|note| note.bytecode_index <= bytecode_index)
+            .max_by_key(|note| note.bytecode_index)
+            .map(|note| SourceNoteLookup {
+                bytecode_index: note.bytecode_index,
+                position: SourcePosition {
+                    offset: note.divot,
+                    line: note.line,
+                    column: note.column,
+                },
+                range: SourceRange {
+                    start: SourcePosition {
+                        offset: note.divot.saturating_sub(note.start_offset_from_divot),
+                        line: note.line,
+                        column: note.column.saturating_sub(note.start_offset_from_divot),
+                    },
+                    end: SourcePosition {
+                        offset: note.divot.saturating_add(note.end_offset_from_divot),
+                        line: note.line,
+                        column: note.column.saturating_add(note.end_offset_from_divot),
+                    },
+                },
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -721,32 +3214,25 @@ pub struct CatchLivenessRecord {
 /// Runtime state required to link an `UnlinkedCodeBlock`.
 ///
 /// Real linking depends on VM, heap, global object, scope, specialization, and
-/// barriered constant ownership. Those dependencies are named as handles so
-/// sibling modules can later define the actual ownership and rooting API.
+/// barriered constant ownership. Runtime cell identities are imported from the
+/// runtime layer; the VM token remains an opaque borrower because there is no
+/// canonical VM identity type in this skeleton.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LinkContext {
     pub vm: Option<VmHandle>,
-    pub owner_executable: Option<ExecutableHandle>,
-    pub global_object: Option<GlobalObjectHandle>,
-    pub scope: Option<ScopeHandle>,
+    pub owner_executable: Option<ExecutableId>,
+    pub global_object: Option<GlobalObjectId>,
+    pub scope: Option<ScopeId>,
     pub specialization: CodeSpecialization,
 }
 
+/// Borrower token for the VM that performs linking.
+///
+/// This is not heap-cell identity and must not replace `CellId`-backed runtime
+/// IDs. It only records that linked-code mutation requires VM authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct VmHandle(pub u64);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct ExecutableHandle(pub u64);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct GlobalObjectHandle(pub u64);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct ScopeHandle(pub u64);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum CodeSpecialization {
@@ -778,7 +3264,7 @@ pub struct CodeBlockTierState {
     pub optimizing_counter: TierCounterState,
     pub profiling_counters: ProfilingCounterSet,
     pub current_tier: ExecutionTier,
-    pub replacement: Option<ReplacementCodeBlockRef>,
+    pub replacement: Option<CodeBlockId>,
     pub osr_exit_count: u32,
     pub did_fail_jit: bool,
     pub did_fail_ftl: bool,
@@ -799,10 +3285,6 @@ pub enum ExecutionTier {
     FtlJit,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct ReplacementCodeBlockRef(pub u32);
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct UnlinkedTieringHints {
     pub quick_dfg_tier_up: TierHint,
@@ -822,4 +3304,1923 @@ pub enum TierHint {
 pub struct CodeBlockRegisterSummary {
     pub frame: RegisterFrameShape,
     pub special: SpecialRegisters,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytecode::gc::{
+        BytecodeRootMapId, BytecodeRootSlotDescriptor, BytecodeRootSlotKind,
+    };
+    use crate::bytecode::ic::{
+        AccessCaseRef, CallLinkInlineCacheAttachedMetadataRequest,
+        CallLinkInlineCacheAttachmentError as CallLinkAttachmentError,
+        CallLinkInlineCacheAttachmentRequest, CallLinkInlineCacheClearError as CallLinkClearError,
+        CallLinkInlineCacheClearMetadataMismatchField as CallLinkClearMetadataMismatchField,
+        CallLinkInlineCacheClearRequest, CallLinkMode, CallTarget, CallType,
+        PropertyInlineCacheAttachmentError as AttachmentError,
+        PropertyInlineCacheAttachmentKind as AttachmentKind,
+        PropertyInlineCacheAttachmentRequest as AttachmentRequest,
+        PropertyInlineCacheAttachmentRequirements as AttachmentRequirements,
+        PropertyInlineCacheClearError as ClearError,
+        PropertyInlineCacheClearMetadataMismatchField as ClearMetadataMismatchField,
+        PropertyInlineCacheClearRequest as ClearRequest, PropertyInlineCacheStubMode,
+        StructureStubAccessCaseLinkRequest, StructureStubKind,
+    };
+    use crate::bytecode::instruction::{InstructionBuilder, Operand, TypedInstruction};
+    use crate::bytecode::opcode::{
+        CoreOpcode, MetadataFieldKind, MetadataMutability, OpcodeSchemaVersion, OperandWidth,
+    };
+    use crate::bytecode::register::VirtualRegister;
+    use crate::bytecode::{
+        PropertyAccessType, PropertyCacheKey, PropertyCacheKind, PropertyOffset, PutByIdMode,
+        StructureId,
+    };
+    use crate::gc::CellId;
+    use crate::jit::CallBoundaryId;
+    use crate::runtime::ObjectId;
+    use crate::strings::{AtomId, Identifier, PropertyKey};
+
+    fn linked_interpreter_code_block() -> CodeBlock {
+        let mut builder = InstructionBuilder::new();
+        builder.declare_instruction(Opcode::Reserved, OperandWidth::Narrow, Vec::new());
+        let instructions = builder.finalize();
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, instructions)
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+
+        CodeBlock::from_unlinked(unlinked, LinkContext::default())
+            .with_entrypoints(CodeBlockEntrypoints {
+                interpreter: Some(InterpreterEntrySlot(7)),
+                ..CodeBlockEntrypoints::default()
+            })
+            .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    fn identifier_property_key(identifier_index: u32) -> PropertyKey {
+        PropertyKey::from_identifier(Identifier::from_atom(AtomId::from_table_slot(
+            identifier_index,
+        )))
+    }
+
+    fn get_by_name_instruction(
+        offset: u32,
+        result: VirtualRegister,
+        base: VirtualRegister,
+        identifier_index: u32,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: CoreOpcode::GetByName.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![
+                Operand::Register(result),
+                Operand::Register(base),
+                Operand::IdentifierIndex(identifier_index),
+            ],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn put_by_name_instruction(
+        offset: u32,
+        base: VirtualRegister,
+        identifier_index: u32,
+        value: VirtualRegister,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: CoreOpcode::PutByName.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![
+                Operand::Register(base),
+                Operand::IdentifierIndex(identifier_index),
+                Operand::Register(value),
+            ],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn call_instruction(
+        offset: u32,
+        destination: VirtualRegister,
+        callee: VirtualRegister,
+        arguments: Vec<VirtualRegister>,
+    ) -> TypedInstruction {
+        let mut operands = vec![
+            Operand::Register(destination),
+            Operand::Register(callee),
+            Operand::UnsignedImmediate(arguments.len().try_into().unwrap_or(u32::MAX)),
+        ];
+        operands.extend(arguments.into_iter().map(Operand::Register));
+        TypedInstruction {
+            opcode: CoreOpcode::Call.opcode(),
+            width: OperandWidth::Narrow,
+            operands,
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn call_with_this_instruction(
+        offset: u32,
+        destination: VirtualRegister,
+        callee: VirtualRegister,
+        this_value: VirtualRegister,
+        arguments: Vec<VirtualRegister>,
+    ) -> TypedInstruction {
+        let mut operands = vec![
+            Operand::Register(destination),
+            Operand::Register(callee),
+            Operand::Register(this_value),
+            Operand::UnsignedImmediate(arguments.len().try_into().unwrap_or(u32::MAX)),
+        ];
+        operands.extend(arguments.into_iter().map(Operand::Register));
+        TypedInstruction {
+            opcode: CoreOpcode::CallWithThis.opcode(),
+            width: OperandWidth::Narrow,
+            operands,
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn linked_property_ic_code_block(instructions: Vec<TypedInstruction>) -> CodeBlock {
+        let instructions = PackedInstructionStream::from_typed_placeholder(instructions);
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, instructions)
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+
+        CodeBlock::from_unlinked(unlinked, LinkContext::default())
+            .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    fn linked_call_link_code_block(instructions: Vec<TypedInstruction>) -> CodeBlock {
+        let instructions = PackedInstructionStream::from_typed_placeholder(instructions);
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, instructions)
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+
+        CodeBlock::from_unlinked(unlinked, LinkContext::default())
+            .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    fn property_ic_attachment_request(
+        slot: usize,
+        bytecode_index: BytecodeIndex,
+        identifier_index: u32,
+        attachment_kind: AttachmentKind,
+    ) -> AttachmentRequest {
+        let is_store = attachment_kind.is_store();
+        AttachmentRequest {
+            slot,
+            bytecode_index,
+            key: identifier_property_key(identifier_index),
+            attachment_kind,
+            base_structure: StructureId::new(11),
+            holder_structure: if attachment_kind == AttachmentKind::GetByNamePrototypeDataLoad {
+                Some(StructureId::new(21))
+            } else {
+                None
+            },
+            new_structure: if attachment_kind == AttachmentKind::PutByNameStoreTransition {
+                Some(StructureId::new(12))
+            } else {
+                None
+            },
+            offset: if attachment_kind == AttachmentKind::GetByNameNegativeLookup {
+                None
+            } else {
+                Some(PropertyOffset(3))
+            },
+            dispatch: PropertyInlineCacheDispatch::Handler,
+            stub_mode: PropertyInlineCacheStubMode::MetadataOnly,
+            requirements: AttachmentRequirements {
+                requires_barrier: is_store,
+                has_barrier_evidence: is_store,
+                requires_watchpoint: attachment_kind.is_guarded_get_by_name(),
+                may_call: false,
+                may_allocate: false,
+            },
+        }
+    }
+
+    fn property_ic_clear_request(request: AttachmentRequest) -> ClearRequest {
+        ClearRequest {
+            slot: request.slot,
+            bytecode_index: request.bytecode_index,
+            key: request.key,
+            attachment_kind: request.attachment_kind,
+            base_structure: request.base_structure,
+            holder_structure: request.holder_structure,
+            new_structure: request.new_structure,
+            offset: request.offset,
+            dispatch: request.dispatch,
+            stub_mode: request.stub_mode,
+            structure_stub_index: None,
+        }
+    }
+
+    fn call_link_attachment_request(
+        slot: usize,
+        bytecode_index: BytecodeIndex,
+        _opcode: CoreOpcode,
+    ) -> CallLinkInlineCacheAttachmentRequest {
+        CallLinkInlineCacheAttachmentRequest {
+            slot,
+            bytecode_index,
+            target: CallTarget::MetadataOnlyMonomorphic {
+                callee: ObjectId(CellId(60)),
+                executable: ExecutableId(CellId(70)),
+                code_block: CodeBlockId(CellId(71)),
+                boundary: CallBoundaryId(900),
+            },
+        }
+    }
+
+    fn attached_call_link_metadata_request(
+        request: &CallLinkInlineCacheAttachmentRequest,
+    ) -> CallLinkInlineCacheAttachedMetadataRequest {
+        CallLinkInlineCacheAttachedMetadataRequest {
+            slot: request.slot,
+            bytecode_index: request.bytecode_index,
+            target: request.target.clone(),
+        }
+    }
+
+    fn call_link_clear_request(
+        request: &CallLinkInlineCacheAttachmentRequest,
+    ) -> CallLinkInlineCacheClearRequest {
+        CallLinkInlineCacheClearRequest {
+            slot: request.slot,
+            bytecode_index: request.bytecode_index,
+            target: request.target.clone(),
+        }
+    }
+
+    #[test]
+    fn linked_code_block_derives_get_by_name_property_inline_cache_site() {
+        let instructions = PackedInstructionStream::from_typed_placeholder(vec![
+            TypedInstruction {
+                opcode: CoreOpcode::GetByName.opcode(),
+                width: OperandWidth::Narrow,
+                operands: vec![
+                    Operand::Register(VirtualRegister::local(0)),
+                    Operand::Register(VirtualRegister::local(1)),
+                    Operand::IdentifierIndex(17),
+                ],
+                schema: None,
+                bytecode_index: Some(BytecodeIndex::from_offset(0)),
+            },
+            TypedInstruction {
+                opcode: CoreOpcode::Return.opcode(),
+                width: OperandWidth::Narrow,
+                operands: vec![Operand::Register(VirtualRegister::local(0))],
+                schema: None,
+                bytecode_index: Some(BytecodeIndex::from_offset(1)),
+            },
+        ]);
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, instructions)
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+
+        let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
+        let cache = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("GetByName property IC metadata");
+
+        assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(cache.access, PropertyAccessType::GetById);
+        assert_eq!(cache.kind, PropertyCacheKind::GetById);
+        assert_eq!(cache.base, Some(VirtualRegister::local(1)));
+        assert_eq!(
+            cache.property,
+            PropertyCacheKey::Key(PropertyKey::from_identifier(Identifier::from_atom(
+                AtomId::from_table_slot(17),
+            )))
+        );
+        assert!(cache.get_by_id.is_some());
+        assert!(cache.put_by_id.is_none());
+    }
+
+    #[test]
+    fn linked_code_block_derives_put_by_name_property_inline_cache_site() {
+        let instructions = PackedInstructionStream::from_typed_placeholder(vec![
+            TypedInstruction {
+                opcode: CoreOpcode::PutByName.opcode(),
+                width: OperandWidth::Narrow,
+                operands: vec![
+                    Operand::Register(VirtualRegister::local(1)),
+                    Operand::IdentifierIndex(19),
+                    Operand::Register(VirtualRegister::local(2)),
+                ],
+                schema: None,
+                bytecode_index: Some(BytecodeIndex::from_offset(0)),
+            },
+            TypedInstruction {
+                opcode: CoreOpcode::Return.opcode(),
+                width: OperandWidth::Narrow,
+                operands: vec![Operand::Register(VirtualRegister::local(2))],
+                schema: None,
+                bytecode_index: Some(BytecodeIndex::from_offset(1)),
+            },
+        ]);
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, instructions)
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+
+        let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
+        let cache = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("PutByName property IC metadata");
+
+        assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(cache.access, PropertyAccessType::PutByIdSloppy);
+        assert_eq!(cache.kind, PropertyCacheKind::PutById);
+        assert_eq!(cache.base, Some(VirtualRegister::local(1)));
+        assert_eq!(
+            cache.property,
+            PropertyCacheKey::Key(PropertyKey::from_identifier(Identifier::from_atom(
+                AtomId::from_table_slot(19),
+            )))
+        );
+        assert!(cache.get_by_id.is_none());
+        assert!(cache.put_by_id.is_some());
+    }
+
+    #[test]
+    fn linked_code_block_keeps_get_by_name_and_put_by_name_property_metadata_separate() {
+        let instructions = PackedInstructionStream::from_typed_placeholder(vec![
+            TypedInstruction {
+                opcode: CoreOpcode::GetByName.opcode(),
+                width: OperandWidth::Narrow,
+                operands: vec![
+                    Operand::Register(VirtualRegister::local(0)),
+                    Operand::Register(VirtualRegister::local(1)),
+                    Operand::IdentifierIndex(17),
+                ],
+                schema: None,
+                bytecode_index: Some(BytecodeIndex::from_offset(0)),
+            },
+            TypedInstruction {
+                opcode: CoreOpcode::PutByName.opcode(),
+                width: OperandWidth::Narrow,
+                operands: vec![
+                    Operand::Register(VirtualRegister::local(2)),
+                    Operand::IdentifierIndex(19),
+                    Operand::Register(VirtualRegister::local(3)),
+                ],
+                schema: None,
+                bytecode_index: Some(BytecodeIndex::from_offset(1)),
+            },
+        ]);
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, instructions)
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+
+        let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
+        let caches = &code_block.side_tables().inline_caches.property_accesses;
+        assert_eq!(caches.len(), 2);
+
+        let load = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("GetByName property IC metadata");
+        assert_eq!(load.access, PropertyAccessType::GetById);
+        assert_eq!(load.kind, PropertyCacheKind::GetById);
+        assert_eq!(load.base, Some(VirtualRegister::local(1)));
+        assert!(load.get_by_id.is_some());
+        assert!(load.put_by_id.is_none());
+
+        let store = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(1))
+            .expect("PutByName property IC metadata");
+        assert_eq!(store.access, PropertyAccessType::PutByIdSloppy);
+        assert_eq!(store.kind, PropertyCacheKind::PutById);
+        assert_eq!(store.base, Some(VirtualRegister::local(2)));
+        assert!(store.get_by_id.is_none());
+        assert!(store.put_by_id.is_some());
+    }
+
+    #[test]
+    fn linked_code_block_derives_call_link_inline_cache_sites() {
+        let code_block = linked_call_link_code_block(vec![
+            call_instruction(
+                10,
+                VirtualRegister::local(0),
+                VirtualRegister::local(1),
+                vec![VirtualRegister::local(2)],
+            ),
+            call_with_this_instruction(
+                20,
+                VirtualRegister::local(3),
+                VirtualRegister::local(4),
+                VirtualRegister::local(5),
+                Vec::new(),
+            ),
+        ]);
+
+        let caches = &code_block.side_tables().inline_caches.calls;
+        assert_eq!(caches.len(), 2);
+
+        let call = code_block
+            .side_tables()
+            .inline_caches
+            .call_for_bytecode_index(BytecodeIndex::from_offset(10))
+            .expect("Call link IC metadata");
+        assert_eq!(call.call_site, CallSiteIndex(10));
+        assert_eq!(call.bytecode_index, BytecodeIndex::from_offset(10));
+        assert_eq!(call.opcode, CoreOpcode::Call);
+        assert_eq!(call.call_type, CallType::Call);
+        assert_eq!(call.mode, CallLinkMode::Init);
+        assert_eq!(call.specialization, CodeSpecialization::Call);
+        assert_eq!(call.origin, CodeOrigin::new(BytecodeIndex::from_offset(10)));
+        assert_eq!(call.target, CallTarget::Unlinked);
+
+        let (slot, call_with_this) = code_block
+            .side_tables()
+            .inline_caches
+            .call_slot_for_bytecode_index(BytecodeIndex::from_offset(20))
+            .expect("CallWithThis link IC metadata");
+        assert_eq!(slot, 1);
+        assert_eq!(call_with_this.call_site, CallSiteIndex(20));
+        assert_eq!(call_with_this.opcode, CoreOpcode::CallWithThis);
+        assert_eq!(call_with_this.call_type, CallType::Call);
+        assert_eq!(call_with_this.mode, CallLinkMode::Init);
+        assert_eq!(call_with_this.target, CallTarget::Unlinked);
+    }
+
+    #[test]
+    fn code_block_attaches_metadata_only_call_link_inline_cache() {
+        let mut code_block = linked_call_link_code_block(vec![call_instruction(
+            10,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            vec![VirtualRegister::local(2)],
+        )]);
+        let request =
+            call_link_attachment_request(0, BytecodeIndex::from_offset(10), CoreOpcode::Call);
+        let expected_target = request.target.clone();
+
+        let outcome = code_block
+            .attach_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                request.clone(),
+            )
+            .expect("call link metadata attachment succeeds");
+
+        assert_eq!(outcome.slot, 0);
+        assert_eq!(outcome.bytecode_index, BytecodeIndex::from_offset(10));
+        assert_eq!(outcome.call_site, CallSiteIndex(10));
+        assert_eq!(outcome.opcode, CoreOpcode::Call);
+        assert_eq!(outcome.call_type, CallType::Call);
+        assert_eq!(outcome.mode, CallLinkMode::Monomorphic);
+        assert_eq!(outcome.specialization, CodeSpecialization::Call);
+        assert_eq!(outcome.target, expected_target);
+        assert_eq!(outcome.slow_path_count, 0);
+        assert_eq!(outcome.max_argument_count_including_this_for_varargs, 0);
+
+        let metadata = code_block
+            .attached_call_link_inline_cache_metadata(attached_call_link_metadata_request(&request))
+            .expect("attached call link metadata validates");
+        assert_eq!(metadata.mode, CallLinkMode::Monomorphic);
+        assert_eq!(metadata.target, expected_target);
+
+        let call = &code_block.side_tables().inline_caches.calls[0];
+        assert_eq!(call.mode, CallLinkMode::Monomorphic);
+        assert_eq!(call.target, expected_target);
+        assert_eq!(call.slow_path_count, 0);
+        assert_eq!(call.max_argument_count_including_this_for_varargs, 0);
+    }
+
+    #[test]
+    fn code_block_rejects_call_link_inline_cache_attachment_without_mutation() {
+        let mut code_block = linked_call_link_code_block(vec![call_instruction(
+            10,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            vec![VirtualRegister::local(2)],
+        )]);
+        let mut request =
+            call_link_attachment_request(0, BytecodeIndex::from_offset(10), CoreOpcode::Call);
+        request.target = CallTarget::DirectExecutable(ExecutableId(CellId(99)));
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .attach_call_link_inline_cache(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect_err("direct executable target must fail");
+
+        assert_eq!(
+            error,
+            CallLinkAttachmentError::InvalidRequestedTarget {
+                actual: CallTarget::DirectExecutable(ExecutableId(CellId(99))),
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+
+        let request =
+            call_link_attachment_request(0, BytecodeIndex::from_offset(10), CoreOpcode::Call);
+        code_block
+            .attach_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                request.clone(),
+            )
+            .expect("initial call link metadata attachment succeeds");
+        let before_duplicate = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .attach_call_link_inline_cache(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect_err("duplicate attachment must fail");
+
+        assert_eq!(
+            error,
+            CallLinkAttachmentError::InvalidExistingMode {
+                slot: 0,
+                expected: CallLinkMode::Init,
+                actual: CallLinkMode::Monomorphic,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before_duplicate);
+    }
+
+    #[test]
+    fn code_block_clears_metadata_only_call_link_inline_cache() {
+        let mut code_block = linked_call_link_code_block(vec![
+            call_instruction(
+                10,
+                VirtualRegister::local(0),
+                VirtualRegister::local(1),
+                vec![VirtualRegister::local(2)],
+            ),
+            get_by_name_instruction(15, VirtualRegister::local(3), VirtualRegister::local(4), 17),
+            call_with_this_instruction(
+                20,
+                VirtualRegister::local(5),
+                VirtualRegister::local(6),
+                VirtualRegister::local(7),
+                Vec::new(),
+            ),
+        ]);
+        let request =
+            call_link_attachment_request(0, BytecodeIndex::from_offset(10), CoreOpcode::Call);
+        let attached_target = request.target.clone();
+        code_block
+            .attach_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                request.clone(),
+            )
+            .expect("initial call link metadata attachment succeeds");
+
+        let before_clear = code_block.side_tables().inline_caches.clone();
+        assert_eq!(before_clear.calls[0].target, attached_target);
+
+        let outcome = code_block
+            .clear_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                call_link_clear_request(&request),
+            )
+            .expect("call link metadata clear succeeds");
+
+        assert_eq!(outcome.slot, 0);
+        assert_eq!(outcome.bytecode_index, BytecodeIndex::from_offset(10));
+        assert_eq!(outcome.call_site, CallSiteIndex(10));
+        assert_eq!(outcome.opcode, CoreOpcode::Call);
+        assert_eq!(outcome.call_type, CallType::Call);
+        assert_eq!(outcome.mode, CallLinkMode::Init);
+        assert_eq!(outcome.specialization, CodeSpecialization::Call);
+        assert_eq!(outcome.target, CallTarget::Unlinked);
+        assert_eq!(outcome.slow_path_count, 0);
+        assert_eq!(outcome.max_argument_count_including_this_for_varargs, 0);
+
+        let after_clear = &code_block.side_tables().inline_caches;
+        assert_eq!(
+            after_clear.property_accesses,
+            before_clear.property_accesses
+        );
+        assert_eq!(after_clear.structure_stubs, before_clear.structure_stubs);
+        assert_eq!(after_clear.iteration_modes, before_clear.iteration_modes);
+        assert_eq!(after_clear.calls[1], before_clear.calls[1]);
+
+        let call = &after_clear.calls[0];
+        assert_eq!(call.call_site, before_clear.calls[0].call_site);
+        assert_eq!(call.bytecode_index, before_clear.calls[0].bytecode_index);
+        assert_eq!(call.opcode, before_clear.calls[0].opcode);
+        assert_eq!(call.origin, before_clear.calls[0].origin);
+        assert_eq!(call.call_type, CallType::Call);
+        assert_eq!(call.mode, CallLinkMode::Init);
+        assert_eq!(call.specialization, CodeSpecialization::Call);
+        assert_eq!(call.target, CallTarget::Unlinked);
+        assert_eq!(call.slow_path_count, before_clear.calls[0].slow_path_count);
+        assert_eq!(
+            call.max_argument_count_including_this_for_varargs,
+            before_clear.calls[0].max_argument_count_including_this_for_varargs
+        );
+        assert_eq!(call.flags, before_clear.calls[0].flags);
+    }
+
+    #[test]
+    fn code_block_rejects_call_link_inline_cache_clear_with_wrong_authority_or_lifecycle() {
+        let mut code_block = linked_call_link_code_block(vec![call_instruction(
+            10,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            vec![VirtualRegister::local(2)],
+        )]);
+        let request =
+            call_link_attachment_request(0, BytecodeIndex::from_offset(10), CoreOpcode::Call);
+        code_block
+            .attach_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                request.clone(),
+            )
+            .expect("initial call link metadata attachment succeeds");
+        let clear_request = call_link_clear_request(&request);
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .clear_call_link_inline_cache(
+                CodeBlockMutationAuthority::ReadOnlyObserver,
+                clear_request.clone(),
+            )
+            .expect_err("caller authority must fail");
+
+        assert_eq!(
+            error,
+            CallLinkClearError::InvalidMutationAuthority {
+                expected: CodeBlockMutationAuthority::VmMainThread,
+                actual: CodeBlockMutationAuthority::ReadOnlyObserver,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+
+        code_block.mutation_authority = CodeBlockMutationAuthority::ReadOnlyObserver;
+        let error = code_block
+            .clear_call_link_inline_cache(CodeBlockMutationAuthority::VmMainThread, clear_request)
+            .expect_err("current code block authority must fail");
+
+        assert_eq!(
+            error,
+            CallLinkClearError::InvalidMutationAuthority {
+                expected: CodeBlockMutationAuthority::VmMainThread,
+                actual: CodeBlockMutationAuthority::ReadOnlyObserver,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+
+        let mut optimizing_code_block = linked_call_link_code_block(vec![call_instruction(
+            10,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            vec![VirtualRegister::local(2)],
+        )]);
+        optimizing_code_block
+            .attach_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                request.clone(),
+            )
+            .expect("initial call link metadata attachment succeeds");
+        optimizing_code_block.lifecycle = CodeBlockLifecycleState::OptimizingInstalled;
+        let before_lifecycle = optimizing_code_block.side_tables().inline_caches.clone();
+
+        let error = optimizing_code_block
+            .clear_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                call_link_clear_request(&request),
+            )
+            .expect_err("disallowed lifecycle must fail");
+
+        assert_eq!(
+            error,
+            CallLinkClearError::InvalidLifecycle {
+                actual: CodeBlockLifecycleState::OptimizingInstalled,
+            }
+        );
+        assert_eq!(
+            &optimizing_code_block.side_tables().inline_caches,
+            &before_lifecycle
+        );
+    }
+
+    #[test]
+    fn code_block_rejects_call_link_inline_cache_clear_target_mismatches_without_mutation() {
+        let mut code_block = linked_call_link_code_block(vec![call_instruction(
+            10,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            vec![VirtualRegister::local(2)],
+        )]);
+        let request =
+            call_link_attachment_request(0, BytecodeIndex::from_offset(10), CoreOpcode::Call);
+        let before_missing = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .clear_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                call_link_clear_request(&request),
+            )
+            .expect_err("missing attached target must fail");
+
+        assert_eq!(
+            error,
+            CallLinkClearError::InvalidExistingMode {
+                slot: 0,
+                expected: CallLinkMode::Monomorphic,
+                actual: CallLinkMode::Init,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before_missing);
+
+        code_block
+            .attach_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                request.clone(),
+            )
+            .expect("initial call link metadata attachment succeeds");
+        let before_wrong_target = code_block.side_tables().inline_caches.clone();
+        let mut wrong_target = call_link_clear_request(&request);
+        wrong_target.target = CallTarget::MetadataOnlyMonomorphic {
+            callee: ObjectId(CellId(61)),
+            executable: ExecutableId(CellId(70)),
+            code_block: CodeBlockId(CellId(71)),
+            boundary: CallBoundaryId(900),
+        };
+
+        let error = code_block
+            .clear_call_link_inline_cache(CodeBlockMutationAuthority::VmMainThread, wrong_target)
+            .expect_err("wrong attached target must fail");
+
+        assert_eq!(
+            error,
+            CallLinkClearError::AttachedMetadataMismatch {
+                slot: 0,
+                field: CallLinkClearMetadataMismatchField::Callee,
+            }
+        );
+        assert_eq!(
+            &code_block.side_tables().inline_caches,
+            &before_wrong_target
+        );
+
+        code_block
+            .clear_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                call_link_clear_request(&request),
+            )
+            .expect("first call link metadata clear succeeds");
+        let after_clear = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .clear_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                call_link_clear_request(&request),
+            )
+            .expect_err("duplicate clear must fail");
+
+        assert_eq!(
+            error,
+            CallLinkClearError::InvalidExistingMode {
+                slot: 0,
+                expected: CallLinkMode::Monomorphic,
+                actual: CallLinkMode::Init,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &after_clear);
+    }
+
+    #[test]
+    fn code_block_attaches_get_by_name_own_data_load_property_ic_case() {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )]);
+        let request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNameOwnDataLoad,
+        );
+
+        let outcome = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect("load attachment succeeds");
+
+        assert_eq!(outcome.slot, 0);
+        assert_eq!(
+            outcome.attachment_kind,
+            AttachmentKind::GetByNameOwnDataLoad
+        );
+        assert_eq!(outcome.state, InlineCacheState::Monomorphic);
+        assert_eq!(outcome.dispatch, PropertyInlineCacheDispatch::Handler);
+        assert_eq!(outcome.structure_stub_index, None);
+
+        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        assert_eq!(cache.state, InlineCacheState::Monomorphic);
+        assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
+        let get_by_id = cache.get_by_id.expect("get metadata");
+        assert_eq!(get_by_id.mode, GetByIdMode::Default);
+        assert_eq!(get_by_id.structure, Some(request.base_structure));
+        assert_eq!(get_by_id.holder_structure, None);
+        assert_eq!(get_by_id.cached_offset, request.offset);
+        assert_eq!(get_by_id.cached_slot, None);
+        assert!(cache.put_by_id.is_none());
+        assert!(code_block
+            .side_tables()
+            .inline_caches
+            .structure_stubs
+            .is_empty());
+    }
+
+    #[test]
+    fn code_block_property_inline_cache_attachment_attaches_get_by_name_own_data_load_structure_stub_case(
+    ) {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )]);
+        let mut request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNameOwnDataLoad,
+        );
+        request.stub_mode = PropertyInlineCacheStubMode::StructureStub;
+
+        let outcome = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect("structure-stub own data load attachment succeeds");
+
+        assert_eq!(
+            outcome.attachment_kind,
+            AttachmentKind::GetByNameOwnDataLoad
+        );
+        assert_eq!(
+            outcome.stub_mode,
+            PropertyInlineCacheStubMode::StructureStub
+        );
+        assert_eq!(outcome.structure_stub_index, Some(0));
+
+        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        assert_eq!(cache.state, InlineCacheState::Monomorphic);
+        assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
+        let get_by_id = cache.get_by_id.expect("get metadata");
+        assert_eq!(get_by_id.mode, GetByIdMode::Default);
+        assert_eq!(get_by_id.structure, Some(request.base_structure));
+        assert_eq!(get_by_id.holder_structure, None);
+        assert_eq!(get_by_id.cached_offset, request.offset);
+
+        let stubs = &code_block.side_tables().inline_caches.structure_stubs;
+        assert_eq!(stubs.len(), 1);
+        let stub = &stubs[0];
+        assert_eq!(stub.bytecode_index, request.bytecode_index);
+        assert_eq!(stub.inline_cache_slot, request.slot);
+        assert_eq!(stub.attachment_kind, request.attachment_kind);
+        assert_eq!(stub.key, request.key);
+        assert_eq!(stub.base_structure, request.base_structure);
+        assert_eq!(stub.holder_structure, None);
+        assert_eq!(stub.new_structure, None);
+        assert_eq!(stub.offset, request.offset);
+        assert_eq!(stub.requirements, request.requirements);
+        assert_eq!(stub.kind, StructureStubKind::GetById);
+        assert_eq!(stub.cache_state, InlineCacheState::Monomorphic);
+        assert_eq!(stub.code_origin, CodeOrigin::new(request.bytecode_index));
+        assert!(stub.access_cases.is_empty());
+        assert!(!stub.reset_by_gc);
+
+        let access_case_ref = AccessCaseRef((u64::from(u32::MAX)) + 1);
+        let link_request = StructureStubAccessCaseLinkRequest {
+            structure_stub_index: outcome.structure_stub_index.unwrap(),
+            bytecode_index: request.bytecode_index,
+            slot: request.slot,
+            key: request.key,
+            attachment_kind: request.attachment_kind,
+            base_structure: request.base_structure,
+            holder_structure: request.holder_structure,
+            new_structure: request.new_structure,
+            offset: request.offset,
+            access_case_ref,
+        };
+        let link_outcome = code_block
+            .link_structure_stub_access_case(CodeBlockMutationAuthority::VmMainThread, link_request)
+            .expect("structure-stub access case link succeeds");
+        assert!(link_outcome.inserted);
+        assert_eq!(link_outcome.access_case_count, 1);
+        assert_eq!(
+            code_block.side_tables().inline_caches.structure_stubs[0].access_cases,
+            vec![access_case_ref]
+        );
+
+        let duplicate_link_outcome = code_block
+            .link_structure_stub_access_case(CodeBlockMutationAuthority::VmMainThread, link_request)
+            .expect("duplicate structure-stub access case link is idempotent");
+        assert!(!duplicate_link_outcome.inserted);
+        assert_eq!(duplicate_link_outcome.access_case_count, 1);
+        assert_eq!(
+            code_block.side_tables().inline_caches.structure_stubs[0].access_cases,
+            vec![access_case_ref]
+        );
+
+        let mut clear_request = property_ic_clear_request(request);
+        clear_request.structure_stub_index = outcome.structure_stub_index;
+        let clear_outcome = code_block
+            .clear_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                clear_request,
+            )
+            .expect("structure-stub own data load clear succeeds");
+
+        assert_eq!(clear_outcome.structure_stub_index, Some(0));
+        assert_eq!(clear_outcome.state, InlineCacheState::Unset);
+        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        assert_eq!(cache.state, InlineCacheState::Unset);
+        assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Unlinked);
+        assert_eq!(
+            code_block.side_tables().inline_caches.structure_stubs[0].cache_state,
+            InlineCacheState::Unset
+        );
+        assert!(code_block.side_tables().inline_caches.structure_stubs[0]
+            .access_cases
+            .is_empty());
+    }
+
+    #[test]
+    fn code_block_attaches_guarded_get_by_name_prototype_data_property_ic_case() {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )]);
+        let request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNamePrototypeDataLoad,
+        );
+
+        let outcome = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect("prototype data guarded load attachment succeeds");
+
+        assert_eq!(
+            outcome.attachment_kind,
+            AttachmentKind::GetByNamePrototypeDataLoad
+        );
+        assert_eq!(outcome.stub_mode, PropertyInlineCacheStubMode::MetadataOnly);
+        assert_eq!(outcome.structure_stub_index, None);
+        assert_eq!(outcome.offset, request.offset);
+        assert_eq!(outcome.holder_structure, request.holder_structure);
+
+        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        assert_eq!(cache.state, InlineCacheState::Monomorphic);
+        assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
+        let get_by_id = cache.get_by_id.expect("get metadata");
+        assert_eq!(get_by_id.mode, GetByIdMode::ProtoLoad);
+        assert_eq!(get_by_id.structure, Some(request.base_structure));
+        assert_eq!(get_by_id.holder_structure, request.holder_structure);
+        assert_eq!(get_by_id.cached_offset, request.offset);
+        assert_eq!(get_by_id.cached_slot, None);
+        assert!(cache.put_by_id.is_none());
+        assert!(code_block
+            .side_tables()
+            .inline_caches
+            .structure_stubs
+            .is_empty());
+    }
+
+    #[test]
+    fn code_block_attaches_guarded_get_by_name_negative_lookup_property_ic_case_without_offset() {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )]);
+        let request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNameNegativeLookup,
+        );
+
+        let outcome = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect("negative lookup guarded load attachment succeeds");
+
+        assert_eq!(
+            outcome.attachment_kind,
+            AttachmentKind::GetByNameNegativeLookup
+        );
+        assert_eq!(outcome.stub_mode, PropertyInlineCacheStubMode::MetadataOnly);
+        assert_eq!(outcome.structure_stub_index, None);
+        assert_eq!(outcome.offset, None);
+
+        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        assert_eq!(cache.state, InlineCacheState::Monomorphic);
+        assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
+        let get_by_id = cache.get_by_id.expect("get metadata");
+        assert_eq!(get_by_id.mode, GetByIdMode::NegativeLookup);
+        assert_eq!(get_by_id.structure, Some(request.base_structure));
+        assert_eq!(get_by_id.holder_structure, None);
+        assert_eq!(get_by_id.cached_offset, None);
+        assert_eq!(get_by_id.cached_slot, None);
+        assert!(cache.put_by_id.is_none());
+        assert!(code_block
+            .side_tables()
+            .inline_caches
+            .structure_stubs
+            .is_empty());
+    }
+
+    #[test]
+    fn code_block_clears_attached_guarded_get_by_name_prototype_data_property_ic_case() {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )]);
+        let attachment = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNamePrototypeDataLoad,
+        );
+        code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, attachment)
+            .expect("prototype data guarded load attachment succeeds");
+
+        let outcome = code_block
+            .clear_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                property_ic_clear_request(attachment),
+            )
+            .expect("prototype data guarded load clear succeeds");
+
+        assert_eq!(
+            outcome.attachment_kind,
+            AttachmentKind::GetByNamePrototypeDataLoad
+        );
+        assert_eq!(outcome.state, InlineCacheState::Unset);
+        assert_eq!(outcome.dispatch, PropertyInlineCacheDispatch::Unlinked);
+        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        assert_eq!(cache.state, InlineCacheState::Unset);
+        assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Unlinked);
+        let get_by_id = cache.get_by_id.expect("cleared get metadata");
+        assert_eq!(get_by_id.mode, GetByIdMode::Unset);
+        assert_eq!(get_by_id.structure, None);
+        assert_eq!(get_by_id.holder_structure, None);
+        assert_eq!(get_by_id.cached_offset, None);
+        assert!(cache.put_by_id.is_none());
+        assert!(code_block
+            .side_tables()
+            .inline_caches
+            .structure_stubs
+            .is_empty());
+    }
+
+    #[test]
+    fn code_block_clears_attached_guarded_get_by_name_negative_lookup_property_ic_case_without_offset(
+    ) {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )]);
+        let attachment = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNameNegativeLookup,
+        );
+        code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, attachment)
+            .expect("negative lookup guarded load attachment succeeds");
+
+        let outcome = code_block
+            .clear_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                property_ic_clear_request(attachment),
+            )
+            .expect("negative lookup guarded load clear succeeds");
+
+        assert_eq!(
+            outcome.attachment_kind,
+            AttachmentKind::GetByNameNegativeLookup
+        );
+        assert_eq!(outcome.offset, None);
+        assert_eq!(outcome.state, InlineCacheState::Unset);
+        assert_eq!(outcome.dispatch, PropertyInlineCacheDispatch::Unlinked);
+        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        assert_eq!(cache.state, InlineCacheState::Unset);
+        assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Unlinked);
+        let get_by_id = cache.get_by_id.expect("cleared get metadata");
+        assert_eq!(get_by_id.mode, GetByIdMode::Unset);
+        assert_eq!(get_by_id.structure, None);
+        assert_eq!(get_by_id.holder_structure, None);
+        assert_eq!(get_by_id.cached_offset, None);
+        assert!(cache.put_by_id.is_none());
+    }
+
+    #[test]
+    fn code_block_rejects_property_ic_clear_mismatches_without_partial_mutation() {
+        let mut code_block = linked_property_ic_code_block(vec![
+            get_by_name_instruction(0, VirtualRegister::local(0), VirtualRegister::local(1), 17),
+            put_by_name_instruction(1, VirtualRegister::local(2), 19, VirtualRegister::local(3)),
+        ]);
+        let attachment = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNamePrototypeDataLoad,
+        );
+        code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, attachment)
+            .expect("prototype data guarded load attachment succeeds");
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let mut wrong_slot = property_ic_clear_request(attachment);
+        wrong_slot.slot = 1;
+        assert!(matches!(
+            code_block.clear_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                wrong_slot,
+            ),
+            Err(ClearError::BytecodeIndexMismatch { .. })
+        ));
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+
+        let mut wrong_index = property_ic_clear_request(attachment);
+        wrong_index.bytecode_index = BytecodeIndex::from_offset(99);
+        assert!(matches!(
+            code_block.clear_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                wrong_index,
+            ),
+            Err(ClearError::BytecodeIndexMismatch { .. })
+        ));
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+
+        let mut wrong_key = property_ic_clear_request(attachment);
+        wrong_key.key = identifier_property_key(18);
+        assert!(matches!(
+            code_block.clear_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                wrong_key,
+            ),
+            Err(ClearError::PropertyKeyMismatch { .. })
+        ));
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+
+        let mut wrong_kind = property_ic_clear_request(attachment);
+        wrong_kind.attachment_kind = AttachmentKind::GetByNameOwnDataLoad;
+        wrong_kind.holder_structure = None;
+        assert_eq!(
+            code_block.clear_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                wrong_kind,
+            ),
+            Err(ClearError::AttachedMetadataMismatch {
+                slot: 0,
+                field: ClearMetadataMismatchField::GetByIdMode,
+            })
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+
+        code_block
+            .clear_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                property_ic_clear_request(attachment),
+            )
+            .expect("first clear succeeds");
+        let after_clear = code_block.side_tables().inline_caches.clone();
+        assert!(matches!(
+            code_block.clear_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                property_ic_clear_request(attachment),
+            ),
+            Err(ClearError::InvalidExistingState {
+                expected: InlineCacheState::Monomorphic,
+                actual: InlineCacheState::Unset,
+                ..
+            })
+        ));
+        assert_eq!(&code_block.side_tables().inline_caches, &after_clear);
+    }
+
+    #[test]
+    fn code_block_attaches_put_by_name_store_replace_property_ic_case() {
+        let mut code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
+            0,
+            VirtualRegister::local(1),
+            19,
+            VirtualRegister::local(2),
+        )]);
+        let request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            19,
+            AttachmentKind::PutByNameStoreReplace,
+        );
+
+        let outcome = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect("store replace attachment succeeds");
+
+        assert_eq!(
+            outcome.attachment_kind,
+            AttachmentKind::PutByNameStoreReplace
+        );
+        assert_eq!(outcome.structure_stub_index, None);
+
+        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        assert_eq!(cache.state, InlineCacheState::Monomorphic);
+        assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
+        assert!(cache.get_by_id.is_none());
+        let put_by_id = cache.put_by_id.expect("put metadata");
+        assert_eq!(put_by_id.mode, PutByIdMode::Replace);
+        assert_eq!(put_by_id.old_structure, Some(request.base_structure));
+        assert_eq!(put_by_id.new_structure, None);
+        assert_eq!(put_by_id.cached_offset, request.offset);
+        assert!(code_block
+            .side_tables()
+            .inline_caches
+            .structure_stubs
+            .is_empty());
+    }
+
+    #[test]
+    fn code_block_attaches_put_by_name_store_transition_property_ic_case() {
+        let mut code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
+            0,
+            VirtualRegister::local(1),
+            19,
+            VirtualRegister::local(2),
+        )])
+        .with_lifecycle(CodeBlockLifecycleState::BaselineInstalled);
+        let request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            19,
+            AttachmentKind::PutByNameStoreTransition,
+        );
+
+        let outcome = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect("store transition attachment succeeds");
+
+        assert_eq!(
+            outcome.attachment_kind,
+            AttachmentKind::PutByNameStoreTransition
+        );
+        assert_eq!(outcome.new_structure, request.new_structure);
+        assert_eq!(outcome.structure_stub_index, None);
+
+        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        assert_eq!(cache.state, InlineCacheState::Monomorphic);
+        assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
+        let put_by_id = cache.put_by_id.expect("put metadata");
+        assert_eq!(put_by_id.mode, PutByIdMode::Transition);
+        assert_eq!(put_by_id.old_structure, Some(request.base_structure));
+        assert_eq!(put_by_id.new_structure, request.new_structure);
+        assert_eq!(put_by_id.cached_offset, request.offset);
+        assert!(code_block
+            .side_tables()
+            .inline_caches
+            .structure_stubs
+            .is_empty());
+    }
+
+    #[test]
+    fn code_block_property_inline_cache_attachment_rejects_structure_stub_for_guarded_loads_and_stores(
+    ) {
+        let reject_structure_stub =
+            |instruction: TypedInstruction, identifier_index: u32, kind: AttachmentKind| {
+                let mut code_block = linked_property_ic_code_block(vec![instruction]);
+                let mut request = property_ic_attachment_request(
+                    0,
+                    BytecodeIndex::from_offset(0),
+                    identifier_index,
+                    kind,
+                );
+                request.stub_mode = PropertyInlineCacheStubMode::StructureStub;
+                let before = code_block.side_tables().inline_caches.clone();
+
+                let error = code_block
+                    .attach_property_inline_cache_case(
+                        CodeBlockMutationAuthority::VmMainThread,
+                        request,
+                    )
+                    .expect_err("unsupported structure-stub attachment kind must fail");
+
+                assert_eq!(
+                    error,
+                    AttachmentError::UnsupportedStubMode {
+                        actual: PropertyInlineCacheStubMode::StructureStub,
+                    }
+                );
+                assert_eq!(&code_block.side_tables().inline_caches, &before);
+                assert!(code_block
+                    .side_tables()
+                    .inline_caches
+                    .structure_stubs
+                    .is_empty());
+            };
+
+        reject_structure_stub(
+            get_by_name_instruction(0, VirtualRegister::local(0), VirtualRegister::local(1), 17),
+            17,
+            AttachmentKind::GetByNamePrototypeDataLoad,
+        );
+        reject_structure_stub(
+            get_by_name_instruction(0, VirtualRegister::local(0), VirtualRegister::local(1), 17),
+            17,
+            AttachmentKind::GetByNameNegativeLookup,
+        );
+        reject_structure_stub(
+            put_by_name_instruction(0, VirtualRegister::local(1), 19, VirtualRegister::local(2)),
+            19,
+            AttachmentKind::PutByNameStoreReplace,
+        );
+        reject_structure_stub(
+            put_by_name_instruction(0, VirtualRegister::local(1), 19, VirtualRegister::local(2)),
+            19,
+            AttachmentKind::PutByNameStoreTransition,
+        );
+    }
+
+    #[test]
+    fn code_block_rejects_property_ic_attachment_with_wrong_authority() {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )]);
+        let request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNameOwnDataLoad,
+        );
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .attach_property_inline_cache_case(
+                CodeBlockMutationAuthority::ReadOnlyObserver,
+                request,
+            )
+            .expect_err("caller authority must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::InvalidMutationAuthority {
+                expected: CodeBlockMutationAuthority::VmMainThread,
+                actual: CodeBlockMutationAuthority::ReadOnlyObserver,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+
+        code_block.mutation_authority = CodeBlockMutationAuthority::ReadOnlyObserver;
+        let error = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect_err("current code block authority must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::InvalidMutationAuthority {
+                expected: CodeBlockMutationAuthority::VmMainThread,
+                actual: CodeBlockMutationAuthority::ReadOnlyObserver,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+    }
+
+    #[test]
+    fn code_block_rejects_property_ic_attachment_from_disallowed_lifecycle() {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )])
+        .with_lifecycle(CodeBlockLifecycleState::OptimizingInstalled);
+        let request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNameOwnDataLoad,
+        );
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect_err("disallowed lifecycle must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::InvalidLifecycle {
+                actual: CodeBlockLifecycleState::OptimizingInstalled,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+    }
+
+    #[test]
+    fn code_block_rejects_property_ic_attachment_for_slot_mismatch() {
+        let mut code_block = linked_property_ic_code_block(vec![
+            get_by_name_instruction(0, VirtualRegister::local(0), VirtualRegister::local(1), 17),
+            put_by_name_instruction(1, VirtualRegister::local(2), 19, VirtualRegister::local(3)),
+        ]);
+        let request = property_ic_attachment_request(
+            1,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNameOwnDataLoad,
+        );
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect_err("slot mismatch must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::BytecodeIndexMismatch {
+                slot: 1,
+                expected: BytecodeIndex::from_offset(1),
+                actual: BytecodeIndex::from_offset(0),
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+    }
+
+    #[test]
+    fn code_block_rejects_property_ic_attachment_for_key_or_bytecode_mismatch() {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )]);
+        let key_mismatch = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            18,
+            AttachmentKind::GetByNameOwnDataLoad,
+        );
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .attach_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                key_mismatch,
+            )
+            .expect_err("key mismatch must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::PropertyKeyMismatch {
+                slot: 0,
+                expected: PropertyCacheKey::Key(identifier_property_key(17)),
+                actual: identifier_property_key(18),
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+
+        let bytecode_mismatch = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(99),
+            17,
+            AttachmentKind::GetByNameOwnDataLoad,
+        );
+        let error = code_block
+            .attach_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                bytecode_mismatch,
+            )
+            .expect_err("bytecode mismatch must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::BytecodeIndexMismatch {
+                slot: 0,
+                expected: BytecodeIndex::from_offset(0),
+                actual: BytecodeIndex::from_offset(99),
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+    }
+
+    #[test]
+    fn code_block_rejects_property_ic_attachment_for_access_kind_mismatch() {
+        let mut code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
+            0,
+            VirtualRegister::local(1),
+            17,
+            VirtualRegister::local(2),
+        )]);
+        let request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNameOwnDataLoad,
+        );
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect_err("access mismatch must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::AccessKindMismatch {
+                slot: 0,
+                expected_access: PropertyAccessType::GetById,
+                actual_access: PropertyAccessType::PutByIdSloppy,
+                expected_kind: PropertyCacheKind::GetById,
+                actual_kind: PropertyCacheKind::PutById,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+    }
+
+    #[test]
+    fn code_block_rejects_property_ic_attachment_that_requires_watchpoints() {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )]);
+        let mut request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNameOwnDataLoad,
+        );
+        request.requirements.requires_watchpoint = true;
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect_err("watchpoint-required attachment must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::WatchpointBridgeUnavailable {
+                attachment_kind: AttachmentKind::GetByNameOwnDataLoad,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+    }
+
+    #[test]
+    fn code_block_rejects_guarded_property_ic_attachment_without_watchpoint_evidence_or_coherent_metadata(
+    ) {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )]);
+        let mut no_watchpoint = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNamePrototypeDataLoad,
+        );
+        no_watchpoint.requirements.requires_watchpoint = false;
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .attach_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                no_watchpoint,
+            )
+            .expect_err("guarded load without watchpoint bridge evidence must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::WatchpointBridgeUnavailable {
+                attachment_kind: AttachmentKind::GetByNamePrototypeDataLoad,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+
+        let mut missing_holder = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNamePrototypeDataLoad,
+        );
+        missing_holder.holder_structure = None;
+        let error = code_block
+            .attach_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                missing_holder,
+            )
+            .expect_err("prototype data guarded load without holder must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::MissingHolderStructure {
+                attachment_kind: AttachmentKind::GetByNamePrototypeDataLoad,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+
+        let mut fake_offset = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNameNegativeLookup,
+        );
+        fake_offset.offset = Some(PropertyOffset(7));
+        let error = code_block
+            .attach_property_inline_cache_case(
+                CodeBlockMutationAuthority::VmMainThread,
+                fake_offset,
+            )
+            .expect_err("negative lookup guarded load with fake offset must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::UnexpectedPropertyOffset {
+                attachment_kind: AttachmentKind::GetByNameNegativeLookup,
+                offset: PropertyOffset(7),
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+    }
+
+    #[test]
+    fn code_block_rejects_store_property_ic_attachment_without_barrier_evidence() {
+        let mut code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
+            0,
+            VirtualRegister::local(1),
+            19,
+            VirtualRegister::local(2),
+        )]);
+        let mut request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            19,
+            AttachmentKind::PutByNameStoreReplace,
+        );
+        request.requirements.has_barrier_evidence = false;
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect_err("store without barrier evidence must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::MissingStoreBarrierEvidence {
+                attachment_kind: AttachmentKind::PutByNameStoreReplace,
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+    }
+
+    #[test]
+    fn code_block_property_ic_attachment_rejection_does_not_partially_mutate() {
+        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            17,
+        )]);
+        let mut request = property_ic_attachment_request(
+            0,
+            BytecodeIndex::from_offset(0),
+            17,
+            AttachmentKind::GetByNameOwnDataLoad,
+        );
+        request.new_structure = Some(StructureId::new(99));
+        let before = code_block.side_tables().inline_caches.clone();
+
+        let error = code_block
+            .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
+            .expect_err("incompatible request must fail");
+
+        assert_eq!(
+            error,
+            AttachmentError::IncompatibleNewStructure {
+                attachment_kind: AttachmentKind::GetByNameOwnDataLoad,
+                new_structure: Some(StructureId::new(99)),
+            }
+        );
+        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert!(code_block
+            .side_tables()
+            .inline_caches
+            .structure_stubs
+            .is_empty());
+    }
+
+    #[test]
+    fn unlinked_code_block_owns_sorted_string_literal_table() {
+        let mut builder = InstructionBuilder::new();
+        builder.declare_instruction(Opcode::Reserved, OperandWidth::Narrow, Vec::new());
+        let instructions = builder.finalize();
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, instructions)
+            .with_string_literals(vec![
+                (9, "zeta".to_string()),
+                (2, "alpha".to_string()),
+                (5, "middle".to_string()),
+            ])
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+
+        assert_eq!(unlinked.string_literal(2), Some("alpha"));
+        assert_eq!(unlinked.string_literal(9), Some("zeta"));
+        assert_eq!(unlinked.string_literal(7), None);
+        assert_eq!(
+            unlinked
+                .string_literals()
+                .entries()
+                .iter()
+                .map(|entry| entry.identifier_index)
+                .collect::<Vec<_>>(),
+            vec![2, 5, 9]
+        );
+    }
+
+    #[test]
+    fn code_block_execution_surface_decodes_metadata_and_source_notes() {
+        let mut builder = InstructionBuilder::new();
+        builder.declare_instruction(
+            Opcode::Reserved,
+            OperandWidth::Narrow,
+            vec![Operand::MetadataIndex(0)],
+        );
+        let instructions = builder.finalize();
+        let bytecode_index = BytecodeIndex::from_offset(0);
+        let field = MetadataFieldSpec {
+            name: "profile",
+            kind: MetadataFieldKind::ValueProfile,
+            mutability: MetadataMutability::LinkedMutable,
+        };
+        let metadata = MetadataTable::from_entries(
+            vec![MetadataEntry {
+                bytecode_index,
+                opcode: Opcode::Reserved,
+                fields: vec![LinkedMetadataField {
+                    spec: field,
+                    storage: LinkedMetadataStorage::Unallocated,
+                }],
+            }],
+            MetadataLayout::default(),
+            MetadataLinkingData::default(),
+            OpcodeSchemaVersion(1),
+        );
+        let side_tables = UnlinkedSideTables {
+            source_notes: SourceNoteTable {
+                notes: vec![SourceNote {
+                    bytecode_index,
+                    divot: 10,
+                    start_offset_from_divot: 2,
+                    end_offset_from_divot: 3,
+                    line: 4,
+                    column: 6,
+                }],
+                ..SourceNoteTable::default()
+            },
+            ..UnlinkedSideTables::default()
+        };
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, instructions)
+            .with_side_tables(side_tables)
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+        let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default())
+            .with_metadata(metadata)
+            .with_entrypoints(CodeBlockEntrypoints {
+                interpreter: Some(InterpreterEntrySlot(7)),
+                ..CodeBlockEntrypoints::default()
+            })
+            .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter);
+
+        let surface = code_block.execution_surface();
+        let decoded = surface.instruction_at(bytecode_index).expect("instruction");
+        let metadata_entry = surface.metadata_entry(bytecode_index).expect("metadata");
+        let source_note = surface.source_note(bytecode_index).expect("source note");
+        let link_record = surface.link_record();
+
+        assert_eq!(decoded.metadata_index_operand(0), Ok(0));
+        assert_eq!(metadata_entry.fields[0].spec, field);
+        assert_eq!(source_note.position.offset, 10);
+        assert_eq!(link_record.instruction_count, 1);
+        assert_eq!(link_record.root_map_count, 0);
+        assert_eq!(link_record.value_profile_root_count, 0);
+        assert!(link_record.has_interpreter_entry);
+    }
+
+    #[test]
+    fn code_block_links_unlinked_root_maps_and_stamps_owner() {
+        let mut builder = InstructionBuilder::new();
+        builder.declare_instruction(Opcode::Reserved, OperandWidth::Narrow, Vec::new());
+        let bytecode_index = BytecodeIndex::from_offset(0);
+        let root_map = BytecodeRootMap {
+            id: BytecodeRootMapId(7),
+            owner: None,
+            bytecode_range_start: bytecode_index,
+            bytecode_range_end: bytecode_index,
+            slots: vec![BytecodeRootSlotDescriptor::virtual_register(
+                bytecode_index,
+                VirtualRegister::local(0),
+                BytecodeRootSlotKind::VirtualRegister,
+            )],
+            complete: true,
+        };
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, builder.finalize())
+            .with_side_tables(UnlinkedSideTables {
+                root_maps: vec![root_map],
+                ..UnlinkedSideTables::default()
+            })
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+        let owner = CodeBlockId(CellId(12));
+        let code_block =
+            CodeBlock::from_unlinked(unlinked, LinkContext::default()).with_root_map_owner(owner);
+
+        assert_eq!(code_block.side_tables().root_maps.len(), 1);
+        assert_eq!(code_block.side_tables().root_maps[0].owner, Some(owner));
+        assert_eq!(code_block.link_record().root_map_count, 1);
+    }
+
+    #[test]
+    fn code_block_installs_baseline_slot_with_vm_authority() {
+        let mut code_block = linked_interpreter_code_block();
+        let slot = JitCodeSlot(11);
+
+        let result =
+            code_block.install_baseline_jit_slot(CodeBlockMutationAuthority::VmMainThread, slot);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(code_block.entrypoints().baseline_jit, Some(slot));
+        assert_eq!(
+            code_block.tier_state().current_tier,
+            ExecutionTier::BaselineJit
+        );
+        assert_eq!(
+            code_block.lifecycle(),
+            CodeBlockLifecycleState::BaselineInstalled
+        );
+    }
+
+    #[test]
+    fn code_block_rejects_baseline_slot_update_with_wrong_authority() {
+        let mut code_block = linked_interpreter_code_block();
+        let entrypoints = *code_block.entrypoints();
+        let tier_state = code_block.tier_state().clone();
+        let lifecycle = code_block.lifecycle();
+
+        let error = code_block
+            .install_baseline_jit_slot(
+                CodeBlockMutationAuthority::ReadOnlyObserver,
+                JitCodeSlot(12),
+            )
+            .expect_err("wrong authority must fail");
+
+        assert_eq!(
+            error,
+            CodeBlockMutationError::InvalidMutationAuthority {
+                expected: CodeBlockMutationAuthority::VmMainThread,
+                actual: CodeBlockMutationAuthority::ReadOnlyObserver,
+            }
+        );
+        assert_eq!(*code_block.entrypoints(), entrypoints);
+        assert_eq!(code_block.tier_state(), &tier_state);
+        assert_eq!(code_block.lifecycle(), lifecycle);
+    }
+
+    #[test]
+    fn code_block_rejects_baseline_slot_update_from_stale_lifecycle() {
+        let mut code_block = linked_interpreter_code_block()
+            .with_lifecycle(CodeBlockLifecycleState::BaselineInstalled);
+        let entrypoints = *code_block.entrypoints();
+        let tier_state = code_block.tier_state().clone();
+
+        let error = code_block
+            .install_baseline_jit_slot(CodeBlockMutationAuthority::VmMainThread, JitCodeSlot(13))
+            .expect_err("stale lifecycle must fail");
+
+        assert_eq!(
+            error,
+            CodeBlockMutationError::InvalidLifecycle {
+                expected: CodeBlockLifecycleState::LinkedInterpreter,
+                actual: CodeBlockLifecycleState::BaselineInstalled,
+            }
+        );
+        assert_eq!(*code_block.entrypoints(), entrypoints);
+        assert_eq!(code_block.tier_state(), &tier_state);
+        assert_eq!(
+            code_block.lifecycle(),
+            CodeBlockLifecycleState::BaselineInstalled
+        );
+    }
 }

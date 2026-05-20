@@ -1,6 +1,7 @@
 use crate::modules::graph::ModuleGraphLoad;
 use crate::modules::key::{ImportMapId, ImportMapMergePolicy, ModuleKey};
 use crate::modules::registry::{ModuleRegistry, ModuleResolutionFailure};
+use crate::modules::ModuleRecordId;
 
 /// Realm-owned module loading coordinator.
 ///
@@ -98,7 +99,7 @@ impl ModuleLoaderPolicy {
 pub struct DynamicImportPayload {
     pub root: ModuleKey,
     pub promise_slot: crate::modules::registry::ModulePromiseSlot,
-    pub referrer: Option<crate::modules::record::ModuleRecordId>,
+    pub referrer: Option<ModuleRecordId>,
     pub use_import_map: bool,
 }
 
@@ -115,8 +116,8 @@ pub enum TopLevelAwaitState {
 /// Dependency edge used by async module evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TopLevelAwaitDependency {
-    pub parent: crate::modules::record::ModuleRecordId,
-    pub child: crate::modules::record::ModuleRecordId,
+    pub parent: ModuleRecordId,
+    pub child: ModuleRecordId,
     pub state: TopLevelAwaitState,
 }
 

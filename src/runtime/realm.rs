@@ -37,6 +37,8 @@ pub struct GlobalObject {
     pub global_lexical_scope: Option<ScopeId>,
     pub structures: RealmStructures,
     pub host_hooks: HostRealmHooks,
+    pub execution_status: ScriptExecutionStatus,
+    pub trusted_types: TrustedTypesEnforcement,
     pub lifecycle: GlobalObjectLifecycle,
 }
 
@@ -71,6 +73,25 @@ pub enum GlobalObjectLifecycle {
     BuiltinsInstalling,
     Ready,
     Detached,
+}
+
+/// Script execution status for one global object.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum ScriptExecutionStatus {
+    #[default]
+    Running,
+    Suspended,
+    Stopped,
+}
+
+/// Trusted Types enforcement mode installed by an embedding.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum TrustedTypesEnforcement {
+    #[default]
+    None,
+    ReportOnly,
+    Enforced,
+    EnforcedWithEvalEnabled,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -180,6 +201,8 @@ pub struct HostRealmHooks {
     pub code_for_eval: Option<HostHookId>,
     pub can_compile_strings: Option<HostHookId>,
     pub default_language: Option<StringId>,
+    pub trusted_types_policy: Option<HostHookId>,
+    pub module_fetcher_factory: Option<HostHookId>,
 }
 
 #[derive(Clone, Debug, Default)]

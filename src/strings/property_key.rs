@@ -75,8 +75,12 @@ pub enum PropertyKeyConversion {
     Cacheable,
 }
 
-/// Type-level distinction between string names, symbols, private names, and
-/// numeric indices.
+/// Canonical property-name identity.
+///
+/// This type owns the Rust-side distinction between string names, symbols,
+/// private names, and numeric indices. Runtime/object layers may borrow or
+/// re-export it, but they must not define alternate property-key identity
+/// enums for storage, enumeration, or cache keys.
 ///
 /// This avoids the C++ hazard where string-only identifier paths can
 /// accidentally discard symbol-ness.
@@ -204,6 +208,64 @@ impl PropertyKeyClassification {
     }
 }
 
+/// Classifies a key with optional public string text for numeric parsing.
+pub fn classify_property_key(
+    key: PropertyKey,
+    public_string_text: Option<&str>,
+) -> PropertyKeyClassification {
+    let numeric = match key {
+        PropertyKey::Index(index) => NumericPropertyKeyKind::ArrayIndex(index),
+        PropertyKey::String(_) => public_string_text
+            .map(classify_property_name_text)
+            .unwrap_or(NumericPropertyKeyKind::NotNumeric),
+        PropertyKey::Symbol(_) | PropertyKey::PrivateName(_) => NumericPropertyKeyKind::NotNumeric,
+    };
+
+    PropertyKeyClassification::new(key.kind(), numeric, key.is_private())
+}
+
+/// Parses the descriptor-only numeric portion of property-name classification.
+pub fn classify_property_name_text(text: &str) -> NumericPropertyKeyKind {
+    if let Some(index) = parse_array_index(text) {
+        return NumericPropertyKeyKind::ArrayIndex(index);
+    }
+
+    if is_canonical_numeric_index_string(text) {
+        NumericPropertyKeyKind::CanonicalNumericIndex
+    } else {
+        NumericPropertyKeyKind::NotNumeric
+    }
+}
+
+fn parse_array_index(text: &str) -> Option<PropertyIndex> {
+    if text.is_empty() || (text.len() > 1 && text.starts_with('0')) {
+        return None;
+    }
+
+    let Ok(index) = text.parse::<u32>() else {
+        return None;
+    };
+    if index == u32::MAX || index.to_string() != text {
+        return None;
+    }
+
+    Some(PropertyIndex::from_canonical_index(index))
+}
+
+fn is_canonical_numeric_index_string(text: &str) -> bool {
+    if matches!(text, "-0" | "NaN" | "Infinity" | "-Infinity") {
+        return true;
+    }
+    if text.is_empty() || text.starts_with('+') {
+        return false;
+    }
+
+    let Ok(number) = text.parse::<f64>() else {
+        return false;
+    };
+    number.is_finite() && number.to_string() == text
+}
+
 /// Runtime services required for property-key conversion.
 ///
 /// This is not implemented here because conversion may allocate strings,
@@ -229,4 +291,46 @@ pub trait PropertyNameFilter {
         property_name_mode: PropertyNameMode,
         private_symbol_mode: PrivateSymbolMode,
     ) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strings::atom::{AtomId, Identifier};
+
+    #[test]
+    fn property_name_text_classifies_array_indices_and_numeric_indices() {
+        assert_eq!(
+            classify_property_name_text("0"),
+            NumericPropertyKeyKind::ArrayIndex(PropertyIndex::from_canonical_index(0))
+        );
+        assert_eq!(
+            classify_property_name_text("4294967294"),
+            NumericPropertyKeyKind::ArrayIndex(PropertyIndex::from_canonical_index(u32::MAX - 1))
+        );
+        assert_eq!(
+            classify_property_name_text("4294967295"),
+            NumericPropertyKeyKind::CanonicalNumericIndex
+        );
+        assert_eq!(
+            classify_property_name_text("01"),
+            NumericPropertyKeyKind::NotNumeric
+        );
+    }
+
+    #[test]
+    fn property_key_classification_preserves_private_and_symbol_boundaries() {
+        let string_key =
+            PropertyKey::from_identifier(Identifier::from_atom(AtomId::from_table_slot(1)));
+        let private_key =
+            PropertyKey::from_private_name(crate::strings::PrivateName::from_symbol_uid(
+                crate::strings::SymbolUid::from_table_slot(2),
+            ));
+
+        assert_eq!(
+            classify_property_key(string_key, Some("7")).numeric(),
+            NumericPropertyKeyKind::ArrayIndex(PropertyIndex::from_canonical_index(7))
+        );
+        assert!(classify_property_key(private_key, None).is_private());
+    }
 }

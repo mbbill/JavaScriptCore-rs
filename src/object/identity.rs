@@ -13,7 +13,34 @@ pub struct ObjectHeader {
     pub butterfly: Option<ButterflyHandle>,
     pub inline_capacity: u16,
     pub flags: ObjectFlags,
+    /// Monotonic object-storage generation.
+    ///
+    /// Mutations after publication require object/VM authority because inline
+    /// slots, butterfly storage, and structure transitions must remain coherent
+    /// with write barriers and watchpoints.
     pub storage_epoch: u64,
+    pub publication: ObjectPublicationState,
+    pub mutation_authority: ObjectMutationAuthority,
+}
+
+/// Object publication state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ObjectPublicationState {
+    #[default]
+    Allocating,
+    InitializingInlineStorage,
+    Published,
+    Finalizing,
+}
+
+/// Authority required for object-owned storage mutation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ObjectMutationAuthority {
+    #[default]
+    UnescapedInitializer,
+    VmMutator,
+    CellLockThenStructureLock,
+    GcTracingReadOnly,
 }
 
 /// Object state flags whose concrete packing belongs to a later layout pass.

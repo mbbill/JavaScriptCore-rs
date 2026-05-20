@@ -1,8 +1,9 @@
 //! Syntax-front-end contracts for the Rust JavaScriptCore rewrite.
 //!
-//! This module is a design skeleton. It names the source, lexer, parser, AST,
-//! arena, and early semantic boundaries without implementing JavaScript
-//! parsing or semantic behavior.
+//! This module owns source, lexing, parser, AST arena, and early semantic
+//! boundaries. Parsing starts with a conservative recursive-descent subset and
+//! keeps unsupported grammar as typed syntax errors instead of manufacturing a
+//! fake tree.
 
 pub(crate) mod arena;
 pub(crate) mod ast;
@@ -13,37 +14,51 @@ pub(crate) mod source;
 pub(crate) mod token;
 
 pub use arena::{
-    ArenaGeneration, AstRef, IdentifierArena, IdentifierSource, NodeArenaKind, NodeId, ParserArena,
-    ParserIdentifier, WellKnownIdentifier,
+    ArenaGeneration, AstRef, AstRefValidationFinding, AstRefValidationReport, IdentifierArena,
+    IdentifierSource, NodeArenaKind, NodeId, ParserArena, ParserIdentifier, WellKnownIdentifier,
 };
 pub use ast::{
     AssignmentContext, AstPropertyKey, AstRoot, BinaryOperator as AstBinaryOperator,
-    ClassElementKind, Expr, FunctionMetadata, FunctionSyntaxMode, LiteralKind, ModuleItem,
-    NodeHeader, Pattern, PrivateBrandRequirement, ScopeNode, ScopeNodeKind, Stmt, SuperBinding,
-    SyntaxKind,
+    ClassElementKind, Expr, FunctionDecl, FunctionMetadata, FunctionSyntaxMode, LiteralKind,
+    ModuleItem, NodeHeader, ObjectLiteralExpr, ObjectLiteralProperty, Pattern,
+    PrivateBrandRequirement, ScopeNode, ScopeNodeKind, Stmt, SuperBinding, SyntaxKind,
 };
 pub use lexer::{
     KeywordPolicy, LexDeferred, LexGoal, LexRequest, LexResult, LexStrictness, Lexer, LexerError,
     LexerFlags, LexerSnapshot, LexerState, RawStringMode, RegExpLexContext, TemplateLexContext,
 };
 pub use parser::{
-    AstBuilderConfig, BuiltinMode, CollectingDiagnostics, ErrorRecovery, ModuleGoal, ParseMode,
-    ParsePhase, Parser, ParserConfig, ParserDiagnosticSink, ParserError, ParserErrorKind,
-    ParserFeatureSet, ParserSession, ScriptMode, SourceParseMode, StrictModePolicy,
-    SyntaxCheckerConfig, TreeBuilder,
+    AstBuilder, AstBuilderConfig, BuiltinMode, CollectingDiagnostics, DeclarationDefaultContext,
+    DeclarationResultFlags, DerivedContextKind, DestructuringKind, ErrorRecovery, EvalContextKind,
+    FunctionBodyKind, FunctionNameRequirement, FunctionParsePhase, ModuleGoal, ParseMode,
+    ParsePhase, ParsedAst, ParsedSyntax, Parser, ParserConfig, ParserDiagnosticSink, ParserError,
+    ParserErrorKind, ParserFeatureDescriptor, ParserFeatureSet, ParserGrammarContext,
+    ParserImplementationVisibility, ParserModeDescriptor, ParserModeTable,
+    ParserModeTableMutationAuthority, ParserModeTableOwner, ParserSavePoint, ParserSession,
+    ScriptMode, SourceParseMode, SourceParseModeDescriptor, SourceParseModeSet, StrictModePolicy,
+    SyntaxCheckResult, SyntaxChecker, SyntaxCheckerConfig, TreeBuilder,
 };
 pub use semantic::{
-    CodeFeatures, Declaration, DeclarationKind, EarlyError, EarlyErrorKind, EarlySemanticInfo,
-    ModuleAnalysis, ModuleImport, ModuleRequest, PrivateNameDeclaration, PrivateNameKind, Scope,
-    ScopeId, ScopeKind, SemanticModel, VariableEnvironment,
+    analyze_root, analyze_scope_node, ClassElementError, ClassElementSemanticKind,
+    ClassElementSemanticName, ClassElementSemanticRecord, CodeFeatures, Declaration,
+    DeclarationKind, EarlyError, EarlyErrorKind, EarlySemanticInfo, EnvironmentSemanticFlags,
+    EnvironmentSemanticKind, EnvironmentSemanticRecord, EvalParseSemanticMetadata,
+    EvalSemanticContext, FunctionParseSemanticMetadata, ModuleAnalysis, ModuleExportBinding,
+    ModuleImport, ModuleParseSemanticMetadata, ModuleRequest, ModuleScopeData, ParseSemanticGoal,
+    ParseSemanticMetadata, PrivateNameDeclaration, PrivateNameError, PrivateNameKind,
+    PrivateNameReference, PrivateNameReferenceKind, Scope, ScopeBoundaryFlag, ScopeKind,
+    SemanticModel, SemanticScopeId, SemanticStrictness, SemanticValidationFinding,
+    SemanticValidationReport, VariableEnvironment,
 };
 pub use source::{
-    Diagnostic, DiagnosticKind, DiagnosticSeverity, DiagnosticSink, LineColumn, SourceBoundary,
-    SourceCode, SourceEncoding, SourceOrigin, SourcePosition, SourceProvider,
-    SourceProviderSourceType, SourceSpan, SourceTaint, SourceText,
+    summarize_source_for_tooling, Diagnostic, DiagnosticKind, DiagnosticSeverity, DiagnosticSink,
+    LineColumn, SourceBoundary, SourceCode, SourceEncoding, SourceOrigin, SourcePosition,
+    SourceProvider, SourceProviderSourceType, SourceSpan, SourceTaint, SourceText,
+    SourceToolingMapEntry, SourceToolingSummary, SourceValidationFinding, SourceValidationReport,
 };
 pub use token::{
-    ContextualKeyword, IdentifierTokenKind, Keyword, LexicalErrorKind, NumericLiteralKind,
-    NumericRadix, Punctuator, TemplateTokenKind, Token, TokenData, TokenFlags, TokenKind,
-    TokenLocation,
+    ContextualKeyword, IdentifierTokenKind, Keyword, KeywordDescriptor, KeywordStrictness,
+    LexicalErrorKind, NumericLiteralKind, NumericRadix, Punctuator, PunctuatorDescriptor,
+    StaticTokenTable, TemplateTokenKind, Token, TokenData, TokenFlags, TokenKind, TokenLocation,
+    TokenTableMutationAuthority, TokenTableOwner,
 };

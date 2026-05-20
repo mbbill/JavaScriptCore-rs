@@ -36,6 +36,16 @@ pub struct WasmMemoryObject {
     pub address_type: WasmAddressType,
     pub minimum_pages: u32,
     pub maximum_pages: Option<u32>,
+    pub owner_instance_count: u32,
+    pub grow_callback: Option<WasmMemoryGrowCallback>,
+}
+
+/// Symbolic grow callback registered by a Memory owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WasmMemoryGrowCallback {
+    pub previous_pages: u64,
+    pub current_pages: u64,
+    pub notifies_pressure: bool,
 }
 
 /// Static memory declaration from a module.
@@ -46,6 +56,7 @@ pub struct WasmMemoryDescriptor {
     pub maximum_pages: Option<u64>,
     pub sharing: WasmMemorySharing,
     pub address_type: WasmAddressType,
+    pub imported: bool,
 }
 
 /// Memory sharing mode.
@@ -69,7 +80,20 @@ pub enum WasmMemoryGrowthState {
     GrowRequested,
     GrowSucceeded,
     GrowFailed,
+    GrowSharedRequested,
+    GrowSharedSucceeded,
     Detached,
+}
+
+/// Buffer handle metadata retained by a Wasm memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WasmMemoryHandleDescriptor {
+    pub memory: WasmMemoryId,
+    pub mapped_capacity_bytes: u64,
+    pub fast_mapped_redzone_bytes: u64,
+    pub address_type: WasmAddressType,
+    pub sharing: WasmMemorySharing,
+    pub style: WasmMemoryStyle,
 }
 
 /// Instance-local cached memory base/size slot.

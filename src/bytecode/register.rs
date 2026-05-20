@@ -12,6 +12,32 @@ pub const INVALID_VIRTUAL_REGISTER: i32 = 0x3fff_ffff;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ThisArgumentOffset(pub i32);
 
+/// Rust interpreter view of the JSC call-frame header/value split.
+///
+/// Non-negative virtual registers below `this_argument_offset` are call-frame
+/// header slots, not JS value slots. The `this` argument starts immediately
+/// after the header and argument registers continue from there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct CallFrameSlotLayout {
+    pub header_slot_count: u32,
+    pub this_argument_offset: ThisArgumentOffset,
+}
+
+impl CallFrameSlotLayout {
+    pub const JSC_RUST: Self = Self {
+        header_slot_count: 5,
+        this_argument_offset: ThisArgumentOffset(5),
+    };
+
+    pub const fn is_header_register(self, register: VirtualRegister) -> bool {
+        register.is_argument_or_header() && register.raw() < self.this_argument_offset.0
+    }
+
+    pub const fn is_argument_register(self, register: VirtualRegister) -> bool {
+        register.is_argument_or_header() && register.raw() >= self.this_argument_offset.0
+    }
+}
+
 /// JSC virtual-register encoding contract.
 ///
 /// Locals, call-frame header slots, arguments, and constants share one signed
@@ -86,17 +112,43 @@ impl VirtualRegister {
     }
 
     pub fn classify(self, this_offset: ThisArgumentOffset) -> RegisterClass {
+        let layout = CallFrameSlotLayout {
+            header_slot_count: this_offset.0 as u32,
+            this_argument_offset: this_offset,
+        };
         if !self.is_valid() {
             RegisterClass::Invalid
         } else if let Some(index) = self.to_local_index() {
             RegisterClass::Local(index)
         } else if let Some(index) = self.to_constant_index() {
             RegisterClass::Constant(index)
-        } else if self.0 < this_offset.0 {
+        } else if layout.is_header_register(self) {
             RegisterClass::CallFrameHeader(self.0 as u32)
-        } else {
+        } else if layout.is_argument_register(self) {
             RegisterClass::ArgumentIncludingThis((self.0 - this_offset.0) as u32)
+        } else {
+            RegisterClass::Invalid
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_frame_slot_layout_classifies_header_and_arguments() {
+        let layout = CallFrameSlotLayout::JSC_RUST;
+
+        assert_eq!(layout.header_slot_count, 5);
+        assert!(layout.is_header_register(VirtualRegister::argument_or_header(0)));
+        assert!(layout.is_header_register(VirtualRegister::argument_or_header(4)));
+        assert!(!layout.is_header_register(VirtualRegister::argument_or_header(5)));
+        assert!(layout.is_argument_register(VirtualRegister::argument_or_header(5)));
+        assert_eq!(
+            VirtualRegister::argument_including_this(0, layout.this_argument_offset),
+            VirtualRegister::argument_or_header(5)
+        );
     }
 }
 

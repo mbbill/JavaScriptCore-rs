@@ -16,6 +16,19 @@ pub enum DfgWatchpointCollectionPhase {
     Finalize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DesiredWatchpointCounts {
+    pub watchpoint_count: u32,
+    pub adaptive_structure_watchpoint_count: u32,
+    pub adaptive_inferred_property_value_watchpoint_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchpointRegistrationConcurrency {
+    ConcurrentThread,
+    MainThread,
+}
+
 /// Mode used by a future collector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WatchpointCollectionMode {
@@ -33,6 +46,10 @@ pub struct DfgDesiredWatchpoints {
     pub dependencies: Vec<WatchpointDependency>,
     pub watchpoint_sets: Vec<WatchpointSetId>,
     pub adaptive_dependencies: Vec<WatchpointDependencyId>,
+    pub counts: DesiredWatchpointCounts,
+    /// Collection may happen concurrently, but materialization mutates runtime
+    /// watchpoint sets and is therefore main-thread authority.
+    pub registration_concurrency: WatchpointRegistrationConcurrency,
 }
 
 /// Stable identity for an explicit invalidation point in generated metadata.

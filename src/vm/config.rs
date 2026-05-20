@@ -1,12 +1,46 @@
 //! VM creation configuration.
 
+use crate::jit::TieringPolicy;
+
 #[derive(Clone, Debug, Default)]
 pub struct VmConfig {
+    pub execution_mode: VmExecutionMode,
     pub enable_conservative_roots: bool,
     pub enable_jit_compatibility_fields: bool,
     pub max_stack_bytes: Option<usize>,
     pub heap_policy: HeapPolicy,
     pub host_capabilities: HostCapabilities,
+}
+
+impl VmConfig {
+    pub fn interpreter_only() -> Self {
+        Self {
+            execution_mode: VmExecutionMode::InterpreterOnly,
+            ..Self::default()
+        }
+    }
+
+    pub fn baseline_allowed() -> Self {
+        Self {
+            execution_mode: VmExecutionMode::BaselineAllowed,
+            enable_jit_compatibility_fields: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn tiering_policy(&self) -> TieringPolicy {
+        match self.execution_mode {
+            VmExecutionMode::InterpreterOnly => TieringPolicy::InterpreterOnly,
+            VmExecutionMode::BaselineAllowed => TieringPolicy::BaselineAllowed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VmExecutionMode {
+    #[default]
+    InterpreterOnly,
+    BaselineAllowed,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

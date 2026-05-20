@@ -1,7 +1,7 @@
 use crate::runtime::scope::ScopeId;
 use crate::runtime::state::{
-    CodeBlockId, ExecutableId, NativeCodeId, ObjectId, SourceProviderId, StringId, StructureId,
-    WatchpointGeneration,
+    CodeBlockId, ExecutableId, NativeCodeId, ObjectId, RuntimeValue, SourceProviderId, StringId,
+    StructureId, WatchpointGeneration,
 };
 
 /// Function object contract.
@@ -17,6 +17,96 @@ pub struct JsFunction {
     pub allocation: FunctionAllocationMetadata,
     pub lazy_properties: FunctionLazyProperties,
     pub rare_data: Option<FunctionRareData>,
+}
+
+impl JsFunction {
+    pub fn call_data(&self) -> CallData {
+        match &self.executable {
+            FunctionExecutableLink::Native(executable) => CallData::Native(NativeCallTarget {
+                native_id: NativeCallId(executable.0 .0 .0),
+                executable: Some(*executable),
+                is_bound_function: self.identity.kind == FunctionObjectKind::Bound,
+                is_wasm_entry: false,
+            }),
+            FunctionExecutableLink::Script(executable) => {
+                let Some(scope) = self.scope.captured_scope.or(self.scope.realm_scope) else {
+                    return CallData::None;
+                };
+                CallData::JavaScript(JavaScriptCallTarget {
+                    executable: *executable,
+                    scope,
+                    code_block: None,
+                })
+            }
+            FunctionExecutableLink::RareData(_) => self
+                .rare_data
+                .as_ref()
+                .and_then(|rare| rare.executable)
+                .and_then(|executable| {
+                    self.scope
+                        .captured_scope
+                        .or(self.scope.realm_scope)
+                        .map(|scope| (executable, scope))
+                })
+                .map(|(executable, scope)| {
+                    CallData::JavaScript(JavaScriptCallTarget {
+                        executable,
+                        scope,
+                        code_block: None,
+                    })
+                })
+                .unwrap_or(CallData::None),
+            FunctionExecutableLink::Empty => CallData::None,
+        }
+    }
+
+    pub fn construct_data(&self, metadata: FunctionExecutableMetadata) -> ConstructData {
+        if metadata.construct_ability == ConstructAbility::NotConstructable
+            || metadata.constructor_kind == ConstructorKind::None
+        {
+            return ConstructData::None;
+        }
+
+        match &self.executable {
+            FunctionExecutableLink::Native(executable) => ConstructData::Native(NativeCallTarget {
+                native_id: NativeCallId(executable.0 .0 .0),
+                executable: Some(*executable),
+                is_bound_function: self.identity.kind == FunctionObjectKind::Bound,
+                is_wasm_entry: false,
+            }),
+            FunctionExecutableLink::Script(executable) => {
+                let Some(scope) = self.scope.captured_scope.or(self.scope.realm_scope) else {
+                    return ConstructData::None;
+                };
+                ConstructData::JavaScript(JavaScriptConstructTarget {
+                    executable: *executable,
+                    scope,
+                    constructor_kind: metadata.constructor_kind,
+                    code_block: None,
+                })
+            }
+            FunctionExecutableLink::RareData(_) => self
+                .rare_data
+                .as_ref()
+                .and_then(|rare| rare.executable)
+                .and_then(|executable| {
+                    self.scope
+                        .captured_scope
+                        .or(self.scope.realm_scope)
+                        .map(|scope| (executable, scope))
+                })
+                .map(|(executable, scope)| {
+                    ConstructData::JavaScript(JavaScriptConstructTarget {
+                        executable,
+                        scope,
+                        constructor_kind: metadata.constructor_kind,
+                        code_block: None,
+                    })
+                })
+                .unwrap_or(ConstructData::None),
+            FunctionExecutableLink::Empty => ConstructData::None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -160,6 +250,126 @@ pub struct MarkedArgList {
     pub value_count: usize,
     pub capacity: usize,
     pub owner_frame: Option<crate::runtime::interpreter::CallFrameId>,
+}
+
+/// Execution-time argument values prepared for a call boundary.
+///
+/// The values are copied transport bits. If a value names a cell, the caller or
+/// VM frame must already make it visible to rooting and exception machinery.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExecutionArgumentList {
+    pub values: Vec<RuntimeValue>,
+    pub source: ArgumentListSource,
+    pub has_this_value: bool,
+}
+
+impl ExecutionArgumentList {
+    pub fn new(values: Vec<RuntimeValue>, source: ArgumentListSource) -> Self {
+        Self {
+            values,
+            source,
+            has_this_value: false,
+        }
+    }
+
+    pub fn with_this(mut self) -> Self {
+        self.has_this_value = true;
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn at_or_undefined(&self, index: usize) -> RuntimeValue {
+        self.values
+            .get(index)
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum ArgumentListSource {
+    #[default]
+    Api,
+    CallFrame,
+    BoundFunction,
+    Spread,
+    Microtask,
+    ModuleEvaluation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArgumentBindingRecord {
+    pub arguments: ExecutionArgumentList,
+    pub expected_parameter_count: u32,
+    pub missing_argument_count: u32,
+    pub arity_check: ArityCheckMode,
+}
+
+pub fn bind_arguments_for_entry(
+    arguments: ExecutionArgumentList,
+    expected_parameter_count: u32,
+    arity_check: ArityCheckMode,
+) -> ArgumentBindingRecord {
+    let actual = arguments.len().min(u32::MAX as usize) as u32;
+    ArgumentBindingRecord {
+        arguments,
+        expected_parameter_count,
+        missing_argument_count: expected_parameter_count.saturating_sub(actual),
+        arity_check,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThisBindingRecord {
+    pub mode: ThisMode,
+    pub raw_this: RuntimeValue,
+    pub bound_this: Option<RuntimeValue>,
+    pub source: ThisBindingSource,
+    pub requires_global_substitution: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum ThisBindingSource {
+    #[default]
+    CallerProvided,
+    BoundFunction,
+    ConstructorAllocation,
+    LexicalEnvironment,
+    Module,
+}
+
+pub fn bind_this_for_entry(
+    mode: ThisMode,
+    raw_this: RuntimeValue,
+    global_this: Option<RuntimeValue>,
+    source: ThisBindingSource,
+) -> ThisBindingRecord {
+    let needs_global = matches!(mode, ThisMode::Global)
+        && matches!(
+            raw_this.kind(),
+            crate::value::ValueKind::Undefined | crate::value::ValueKind::Null
+        );
+    let bound_this = match mode {
+        ThisMode::Lexical => None,
+        ThisMode::Strict => Some(raw_this),
+        ThisMode::Global if needs_global => global_this,
+        ThisMode::Global => Some(raw_this),
+    };
+
+    ThisBindingRecord {
+        mode,
+        raw_this,
+        bound_this,
+        source,
+        requires_global_substitution: needs_global && global_this.is_none(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -424,4 +634,253 @@ pub struct HostFunction {
     pub call_entry: NativeCodeId,
     pub construct_entry: Option<NativeCodeId>,
     pub can_reenter_vm: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallableEntryRecord {
+    pub function_object: ObjectId,
+    pub mode: CallMode,
+    pub target: CallableEntryTarget,
+    pub this_binding: ThisBindingRecord,
+    pub arguments: ArgumentBindingRecord,
+    pub specialization: CodeSpecializationKind,
+    pub new_target: Option<RuntimeValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CallableEntryTarget {
+    NativeCall(NativeCallTarget),
+    ScriptCall(JavaScriptCallTarget),
+    NativeConstruct(NativeCallTarget),
+    ScriptConstruct(JavaScriptConstructTarget),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum FunctionEntryError {
+    NotCallable,
+    NotConstructor,
+}
+
+#[derive(Clone, Debug)]
+pub struct CallableEntryRequest<'function> {
+    function_object: ObjectId,
+    function: &'function JsFunction,
+    mode: CallMode,
+    metadata: FunctionExecutableMetadata,
+    raw_this: RuntimeValue,
+    global_this: Option<RuntimeValue>,
+    arguments: ExecutionArgumentList,
+    new_target: Option<RuntimeValue>,
+}
+
+impl<'function> CallableEntryRequest<'function> {
+    pub fn new(
+        function_object: ObjectId,
+        function: &'function JsFunction,
+        mode: CallMode,
+        metadata: FunctionExecutableMetadata,
+        arguments: ExecutionArgumentList,
+    ) -> Self {
+        Self {
+            function_object,
+            function,
+            mode,
+            metadata,
+            raw_this: RuntimeValue::undefined(),
+            global_this: None,
+            arguments,
+            new_target: None,
+        }
+    }
+
+    pub fn raw_this(mut self, raw_this: RuntimeValue) -> Self {
+        self.raw_this = raw_this;
+        self
+    }
+
+    pub fn global_this(mut self, global_this: Option<RuntimeValue>) -> Self {
+        self.global_this = global_this;
+        self
+    }
+
+    pub fn new_target(mut self, new_target: Option<RuntimeValue>) -> Self {
+        self.new_target = new_target;
+        self
+    }
+}
+
+pub fn prepare_callable_entry_record(
+    request: CallableEntryRequest<'_>,
+) -> Result<CallableEntryRecord, FunctionEntryError> {
+    let this_mode = request.metadata.this_mode;
+    let expected_parameter_count = request.metadata.parameter_count;
+    let plan = plan_function_call(request.function, request.mode, request.metadata);
+    let arity_check = if plan.performs_arity_check {
+        ArityCheckMode::MustCheckArity
+    } else {
+        ArityCheckMode::AlreadyChecked
+    };
+    let this_binding = bind_this_for_entry(
+        this_mode,
+        request.raw_this,
+        request.global_this,
+        ThisBindingSource::CallerProvided,
+    );
+    let arguments =
+        bind_arguments_for_entry(request.arguments, expected_parameter_count, arity_check);
+
+    let target = match request.mode {
+        CallMode::Construct => match plan.construct {
+            ConstructData::Native(target) => CallableEntryTarget::NativeConstruct(target),
+            ConstructData::JavaScript(target) => CallableEntryTarget::ScriptConstruct(target),
+            ConstructData::None => return Err(FunctionEntryError::NotConstructor),
+        },
+        CallMode::Regular | CallMode::Tail | CallMode::Varargs => match plan.call {
+            CallData::Native(target) => CallableEntryTarget::NativeCall(target),
+            CallData::JavaScript(target) => CallableEntryTarget::ScriptCall(target),
+            CallData::None => return Err(FunctionEntryError::NotCallable),
+        },
+    };
+
+    let specialization = if matches!(request.mode, CallMode::Construct) {
+        CodeSpecializationKind::Construct
+    } else {
+        CodeSpecializationKind::Call
+    };
+
+    Ok(CallableEntryRecord {
+        function_object: request.function_object,
+        mode: request.mode,
+        target,
+        this_binding,
+        arguments,
+        specialization,
+        new_target: request.new_target,
+    })
+}
+
+pub fn plan_function_call(
+    function: &JsFunction,
+    mode: CallMode,
+    metadata: FunctionExecutableMetadata,
+) -> FunctionCallPlan {
+    let requires_this_binding = metadata.this_mode != ThisMode::Lexical;
+    let performs_arity_check = metadata.parameter_count > 0;
+    let call = function.call_data();
+    let construct = if matches!(mode, CallMode::Construct) {
+        function.construct_data(metadata)
+    } else {
+        ConstructData::None
+    };
+    FunctionCallPlan {
+        mode,
+        call,
+        construct,
+        requires_this_binding,
+        performs_arity_check,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionCallPlan {
+    pub mode: CallMode,
+    pub call: CallData,
+    pub construct: ConstructData,
+    pub requires_this_binding: bool,
+    pub performs_arity_check: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gc::CellId;
+
+    #[test]
+    fn script_function_call_plan_uses_captured_scope_without_execution() {
+        let function = JsFunction {
+            executable: FunctionExecutableLink::Script(FunctionExecutableId(ExecutableId(CellId(
+                7,
+            )))),
+            scope: FunctionScopeLink {
+                captured_scope: Some(ScopeId(3)),
+                realm_scope: None,
+            },
+            ..JsFunction::default()
+        };
+
+        let plan = plan_function_call(
+            &function,
+            CallMode::Regular,
+            FunctionExecutableMetadata {
+                parameter_count: 2,
+                ..FunctionExecutableMetadata::default()
+            },
+        );
+
+        assert!(matches!(plan.call, CallData::JavaScript(_)));
+        assert!(plan.performs_arity_check);
+        assert_eq!(plan.construct, ConstructData::None);
+    }
+
+    #[test]
+    fn not_constructable_function_has_no_construct_data() {
+        let function = JsFunction::default();
+
+        let construct = function.construct_data(FunctionExecutableMetadata {
+            construct_ability: ConstructAbility::NotConstructable,
+            ..FunctionExecutableMetadata::default()
+        });
+
+        assert_eq!(construct, ConstructData::None);
+    }
+
+    #[test]
+    fn callable_entry_record_uses_function_call_plan_and_argument_binding() {
+        let function = JsFunction {
+            executable: FunctionExecutableLink::Script(FunctionExecutableId(ExecutableId(CellId(
+                7,
+            )))),
+            scope: FunctionScopeLink {
+                captured_scope: Some(ScopeId(3)),
+                realm_scope: None,
+            },
+            ..JsFunction::default()
+        };
+
+        let entry = prepare_callable_entry_record(
+            CallableEntryRequest::new(
+                ObjectId(CellId(11)),
+                &function,
+                CallMode::Regular,
+                FunctionExecutableMetadata {
+                    parameter_count: 2,
+                    this_mode: ThisMode::Strict,
+                    ..FunctionExecutableMetadata::default()
+                },
+                ExecutionArgumentList::new(
+                    vec![RuntimeValue::from_i32(1)],
+                    ArgumentListSource::Api,
+                ),
+            )
+            .raw_this(RuntimeValue::null()),
+        )
+        .unwrap();
+
+        assert!(matches!(entry.target, CallableEntryTarget::ScriptCall(_)));
+        assert_eq!(entry.arguments.missing_argument_count, 1);
+        assert_eq!(entry.this_binding.bound_this, Some(RuntimeValue::null()));
+    }
+
+    #[test]
+    fn global_this_binding_records_required_substitution_without_global_object() {
+        let binding = bind_this_for_entry(
+            ThisMode::Global,
+            RuntimeValue::undefined(),
+            None,
+            ThisBindingSource::CallerProvided,
+        );
+
+        assert_eq!(binding.bound_this, None);
+        assert!(binding.requires_global_substitution);
+    }
 }

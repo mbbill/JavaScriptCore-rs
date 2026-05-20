@@ -26,6 +26,8 @@ pub struct WasmTableObject {
     pub element_type: WasmTableElementType,
     pub minimum_elements: u32,
     pub maximum_elements: Option<u32>,
+    pub owner_object: Option<ObjectId>,
+    pub fixed_sized: bool,
 }
 
 /// Static table declaration.
@@ -35,6 +37,8 @@ pub struct WasmTableDescriptor {
     pub element_type: WasmTableElementType,
     pub minimum_elements: u32,
     pub maximum_elements: Option<u32>,
+    pub imported: bool,
+    pub fixed_sized: bool,
 }
 
 /// Table element family.
@@ -45,6 +49,22 @@ pub enum WasmTableElementType {
     AnyRef,
     EqRef,
     ConcreteHeapType(u32),
+}
+
+/// Table storage family selected by the element type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WasmTableStorageKind {
+    ExternOrAnyRef,
+    FuncRef,
+}
+
+/// Function-table entry holding both importable target and JS value identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WasmFuncRefTableEntry {
+    pub table: WasmTableId,
+    pub function: Option<WasmFunctionIndex>,
+    pub target_instance: Option<WasmInstanceId>,
+    pub value_object: Option<ObjectId>,
 }
 
 /// Instance-local cached table slot.
@@ -71,6 +91,8 @@ pub struct WasmCalleeGroup {
     pub callees: Vec<WasmCalleeDescriptor>,
     pub js_to_wasm: Vec<JsToWasmBridge>,
     pub wasm_to_js: Vec<WasmToJsBridge>,
+    pub optimized_callees: Vec<WasmOptimizedCalleeSlot>,
+    pub callers: Vec<WasmDirectCallerSet>,
 }
 
 /// Callee-group lifecycle.
@@ -79,8 +101,26 @@ pub enum WasmCalleeGroupState {
     CreatedFromInterpreter,
     Compiling,
     Runnable,
+    InstallingOptimizedCallee,
     Failed,
     Invalidated,
+}
+
+/// Optimized callee slot guarded by the callee-group lock in JSC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WasmOptimizedCalleeSlot {
+    pub function: WasmFunctionIndex,
+    pub bbq: Option<JitCodeId>,
+    pub omg: Option<JitCodeId>,
+    pub osr_entry: Option<JitCodeId>,
+    pub installing: bool,
+}
+
+/// Direct JIT caller set representation for replacement updates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WasmDirectCallerSet {
+    Sparse(Vec<WasmFunctionIndex>),
+    Dense { function_count: u32 },
 }
 
 /// Reserved callee descriptor for interpreter, BBQ, OMG, or bridge code.

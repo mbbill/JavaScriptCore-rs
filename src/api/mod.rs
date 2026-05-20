@@ -11,27 +11,40 @@ mod lock;
 mod protect;
 
 pub use callbacks::{
-    ApiCallbackObject, ApiCallbackPrivatePropertyMap, ApiClass, ApiClassAttributes,
-    ApiClassCallbacks, ApiClassContextData, ApiClassPrototypePolicy, ApiClassStaticTable,
-    ApiConvertToTypeCallback, ApiDeletePropertyCallback, ApiFinalizeCallback,
-    ApiGetPropertyCallback, ApiGetPropertyNamesCallback, ApiHasInstanceCallback,
-    ApiHasPropertyCallback, ApiHostConstructor, ApiHostFunction, ApiInitializeCallback,
-    ApiPropertyAttributes, ApiSetPropertyCallback, ApiStaticFunction, ApiStaticValue, ApiValueType,
+    ApiCallbackDescriptor, ApiCallbackKind, ApiCallbackObject, ApiCallbackPrivatePropertyMap,
+    ApiCallbackResultKind, ApiCallbackSemanticError, ApiCallbackSemanticOutcome, ApiClass,
+    ApiClassAttributes, ApiClassBuilder, ApiClassCallbacks, ApiClassContextData,
+    ApiClassDescriptor, ApiClassDescriptorBuilder, ApiClassLifecycle, ApiClassPrototypePolicy,
+    ApiClassPrototypeSchema, ApiClassSchemaRegistry, ApiClassSelection, ApiClassStaticTable,
+    ApiClassValidationError, ApiConvertToTypeCallback, ApiDeletePropertyCallback,
+    ApiDescriptorSelectionError, ApiFinalizeCallback, ApiGetPropertyCallback,
+    ApiGetPropertyNamesCallback, ApiHasInstanceCallback, ApiHasPropertyCallback,
+    ApiHostConstructor, ApiHostFunction, ApiInitializeCallback, ApiObjectCreationKind,
+    ApiPrivateDataAuthority, ApiPropertyAttributes, ApiPropertyFallback,
+    ApiRegistryMutationAuthority, ApiSchemaOwner, ApiSchemaProvenance, ApiSetPropertyCallback,
+    ApiStaticFunction, ApiStaticMemberDescriptor, ApiStaticMemberKind, ApiStaticMemberSelection,
+    ApiStaticValue, ApiValueType, API_CLASS_CALLBACK_DESCRIPTORS, API_CLASS_SCHEMA_REGISTRY,
 };
 pub use exception::{
-    ApiExceptionResult, ApiExceptionSlot, ApiExceptionSlotPolicy, ApiOperationResult,
-    ApiThrowDisposition,
+    ApiExceptionResult, ApiExceptionSemanticError, ApiExceptionSlot, ApiExceptionSlotPolicy,
+    ApiExceptionSlotUpdate, ApiExecutionDiagnosticSummary, ApiExecutionResultKind,
+    ApiExecutionResultRecord, ApiGcDiagnosticSummary, ApiGcEventResultKind, ApiGcEventResultRecord,
+    ApiOperationResult, ApiThrowDisposition, ApiTierDiagnosticSummary,
 };
 pub use handles::{
     ApiCastContract, ApiCastDirection, ApiClassRef, ApiContextGroup, ApiContextRef,
     ApiGlobalContext, ApiHandleKind, ApiInternalHandle, ApiObjectRef, ApiOpaqueHandle,
     ApiPropertyNameAccumulatorRef, ApiPropertyNameArrayRef, ApiReferenceOwnership, ApiScriptRef,
-    ApiStringRef, ApiValueRef, ApiValueRefKind, ApiWeakValueRef,
+    ApiScriptSourceLifetime, ApiStringRef, ApiStringStorageKind, ApiValueRef, ApiValueRefKind,
+    ApiWeakRefState, ApiWeakValueRef,
 };
 pub use lock::{
-    ApiEntryKind, ApiEntryScope, ApiLock, ApiLockDropState, ApiLockPolicy, ApiLockState,
-    ApiReentrancy,
+    ApiEntryKind, ApiEntryObservationRecord, ApiEntryScope, ApiExitObservationRecord, ApiLock,
+    ApiLockDropState, ApiLockPolicy, ApiLockState, ApiReentrancy,
 };
 pub use protect::{
-    ApiProtectionAction, ApiProtectionCount, ApiProtectionOwner, ApiProtectionSlot, ProtectedValue,
+    ApiHeapFinalizerRegistration, ApiProtectionAction, ApiProtectionCount, ApiProtectionOutcome,
+    ApiProtectionOwner, ApiProtectionRegistry, ApiProtectionRegistryEntry,
+    ApiProtectionRegistryError, ApiProtectionRootMutationOutcome, ApiProtectionSlot,
+    ApiProtectionTarget, ProtectedValue,
 };

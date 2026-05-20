@@ -1,54 +1,56 @@
 use std::marker::PhantomData;
 
 pub use crate::bytecode::SourceProviderId;
-pub use crate::gc::StructureId;
+pub use crate::gc::{CellId, StructureId};
 pub use crate::modules::ModuleRecordId;
-
-/// Placeholder for the runtime value transport type until `value` exposes
-/// its concrete `JsValue` contract.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RuntimeValue {
-    raw_placeholder: usize,
-}
-
-impl RuntimeValue {
-    pub const fn opaque(raw_placeholder: usize) -> Self {
-        Self { raw_placeholder }
-    }
-}
-
-/// Stable index for GC cells while the heap handle layer is still being designed.
+pub use crate::strings::StringId;
+/// Runtime-facing value representation.
 ///
-/// Runtime contracts use typed identifiers instead of raw pointers so that later
-/// GC integration can choose between handles, barriers, compressed pointers, or
-/// table indexes without changing the high-level execution APIs.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub struct CellId(pub u32);
+/// `value::JsValue` owns the bit-level representation. Runtime code imports
+/// this alias to describe API boundaries without creating a second value type.
+pub use crate::value::JsValue as RuntimeValue;
 
+/// Runtime object identity. The raw cell identity is owned by `gc`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct ObjectId(pub CellId);
 
+/// Runtime executable identity. The raw heap-cell identity is owned by `gc`;
+/// executable/runtime code only carries the typed handle.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct ExecutableId(pub CellId);
 
+/// Runtime code-block identity. The raw heap-cell identity is owned by `gc`;
+/// bytecode/compiler layers may borrow this typed handle but must not mint a
+/// parallel cell identity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct CodeBlockId(pub CellId);
 
+/// Native code thunk identity owned by the runtime/host integration layer.
+///
+/// This is not a GC cell identity and must not be widened to `CellId`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct NativeCodeId(pub u32);
 
+/// Host hook identity owned by VM services.
+///
+/// Runtime records borrow this handle to name callbacks; host/VM integration
+/// owns callback lifetime, reentrancy, and mutation authority.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct HostHookId(pub u32);
 
+/// Runtime JS Symbol cell identity.
+///
+/// This names a GC/runtime symbol cell. It is intentionally separate from
+/// `strings::SymbolUid`, which owns symbol property-name identity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub struct StringId(pub u32);
+pub struct SymbolCellId(pub CellId);
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub struct SymbolId(pub u32);
-
+/// VM stack-frame identity owned by interpreter/entry state.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct StackFrameId(pub u32);
 
+/// Monotonic watchpoint generation owned by the invalidation authority that
+/// guards the corresponding structure, scope, or cache.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct WatchpointGeneration(pub u64);
 

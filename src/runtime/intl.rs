@@ -97,3 +97,25 @@ pub trait IntlOperations {
         options: RuntimeValue,
     ) -> JsResult<ObjectId>;
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum IntlInitializationPlan {
+    Initialize,
+    AlreadyInitialized,
+    RequiresHostLocale,
+}
+
+impl IntlServiceObject {
+    pub fn initialization_plan(&self, intl: &IntlObject) -> IntlInitializationPlan {
+        if self.initialized {
+            IntlInitializationPlan::AlreadyInitialized
+        } else if self.locale.is_none()
+            && intl.default_locale.is_none()
+            && intl.hooks.default_locale.is_none()
+        {
+            IntlInitializationPlan::RequiresHostLocale
+        } else {
+            IntlInitializationPlan::Initialize
+        }
+    }
+}

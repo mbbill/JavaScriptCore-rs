@@ -1,3 +1,4 @@
+use crate::api::exception::{ApiExceptionSemanticError, ApiExecutionResultRecord};
 use crate::api::handles::ApiContextGroup;
 
 /// API reentrancy state observed by entry scopes.
@@ -168,5 +169,78 @@ impl<'lock> ApiEntryScope<'lock> {
 
     pub const fn entry_kind(&self) -> ApiEntryKind {
         self.entry_kind
+    }
+
+    pub const fn observe_entry(&self) -> ApiEntryObservationRecord {
+        ApiEntryObservationRecord {
+            context_group: self.lock.context_group(),
+            entry_kind: self.entry_kind,
+            lock_policy: self.lock.policy(),
+            lock_state: self.lock_state,
+            reentrancy: self.reentrancy,
+        }
+    }
+
+    pub fn observe_exit(
+        &self,
+        result: ApiExecutionResultRecord,
+    ) -> Result<ApiExitObservationRecord, ApiExceptionSemanticError> {
+        result.validate()?;
+        Ok(ApiExitObservationRecord {
+            entry: self.observe_entry(),
+            result,
+            lock_state_after_exit: self.lock_state,
+        })
+    }
+}
+
+/// API entry boundary observed after lock and reentrancy state are known.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiEntryObservationRecord {
+    pub context_group: ApiContextGroup,
+    pub entry_kind: ApiEntryKind,
+    pub lock_policy: ApiLockPolicy,
+    pub lock_state: ApiLockState,
+    pub reentrancy: ApiReentrancy,
+}
+
+/// API exit boundary observed after VM-facing work returned to API code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiExitObservationRecord {
+    pub entry: ApiEntryObservationRecord,
+    pub result: ApiExecutionResultRecord,
+    pub lock_state_after_exit: ApiLockState,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::handles::ApiOpaqueHandle;
+    use core::ffi::c_void;
+    use core::ptr::NonNull;
+
+    fn context_group() -> ApiContextGroup {
+        let raw = NonNull::<c_void>::dangling();
+        let handle = unsafe { ApiOpaqueHandle::from_raw(raw) };
+        unsafe { ApiContextGroup::from_opaque(handle) }
+    }
+
+    #[test]
+    fn records_api_entry_and_exit_boundary() {
+        let lock = ApiLock::with_policy(context_group(), ApiLockPolicy::MustAcquire);
+        let scope = ApiEntryScope::for_entry_kind(
+            &lock,
+            ApiReentrancy::Entering,
+            ApiLockState::Held { depth: 1 },
+            ApiEntryKind::EvaluateScript,
+        );
+
+        let exit = scope
+            .observe_exit(ApiExecutionResultRecord::returned_void())
+            .expect("exit observation");
+
+        assert_eq!(exit.entry.entry_kind, ApiEntryKind::EvaluateScript);
+        assert_eq!(exit.entry.lock_policy, ApiLockPolicy::MustAcquire);
+        assert_eq!(exit.result, ApiExecutionResultRecord::returned_void());
     }
 }

@@ -104,3 +104,130 @@ impl BuiltinIntrinsicDescriptor {
         self.phase
     }
 }
+
+/// Component that owns immutable intrinsic descriptor metadata.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IntrinsicRegistryOwner {
+    #[default]
+    BuiltinGenerator,
+    RuntimeSubsystems,
+    TestFixture,
+}
+
+/// Authority allowed to bind host hooks for intrinsic descriptors.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IntrinsicRegistryMutationAuthority {
+    #[default]
+    RuntimeOwnerBinding,
+    GeneratedDataRefresh,
+}
+
+/// Immutable registry of generated intrinsic descriptors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticIntrinsicRegistry {
+    pub owner: IntrinsicRegistryOwner,
+    pub mutation_authority: IntrinsicRegistryMutationAuthority,
+    pub descriptors: &'static [BuiltinIntrinsicDescriptor],
+}
+
+impl StaticIntrinsicRegistry {
+    pub const fn descriptors(self) -> &'static [BuiltinIntrinsicDescriptor] {
+        self.descriptors
+    }
+
+    pub fn descriptor_for_intrinsic(
+        self,
+        intrinsic: BuiltinIntrinsic,
+    ) -> Option<&'static BuiltinIntrinsicDescriptor> {
+        self.descriptors
+            .iter()
+            .find(|descriptor| descriptor.intrinsic() == intrinsic)
+    }
+
+    pub fn validate(self) -> IntrinsicValidationReport {
+        let mut findings = Vec::new();
+        for (index, descriptor) in self.descriptors.iter().enumerate() {
+            if self.descriptors[..index]
+                .iter()
+                .any(|candidate| candidate.intrinsic() == descriptor.intrinsic())
+            {
+                findings.push(IntrinsicValidationFinding::DuplicateIntrinsic {
+                    intrinsic: descriptor.intrinsic(),
+                });
+            }
+            if descriptor.phase() == IntrinsicBindingPhase::Bound
+                && descriptor.safety() == IntrinsicSafety::PureMetadata
+                && descriptor.owner() != IntrinsicHostOwner::Vm
+            {
+                findings.push(IntrinsicValidationFinding::PureMetadataBoundOutsideVm {
+                    intrinsic: descriptor.intrinsic(),
+                    owner: descriptor.owner(),
+                });
+            }
+        }
+        IntrinsicValidationReport { findings }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IntrinsicValidationReport {
+    pub findings: Vec<IntrinsicValidationFinding>,
+}
+
+impl IntrinsicValidationReport {
+    pub fn is_valid(&self) -> bool {
+        self.findings.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntrinsicValidationFinding {
+    DuplicateIntrinsic {
+        intrinsic: BuiltinIntrinsic,
+    },
+    PureMetadataBoundOutsideVm {
+        intrinsic: BuiltinIntrinsic,
+        owner: IntrinsicHostOwner,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INTRINSIC: BuiltinIntrinsic = BuiltinIntrinsic::from_generated_index(1);
+    const DESCRIPTOR: BuiltinIntrinsicDescriptor = BuiltinIntrinsicDescriptor::new(
+        INTRINSIC,
+        IntrinsicArity::Fixed(0),
+        IntrinsicSafety::PureMetadata,
+        IntrinsicHostOwner::Vm,
+        IntrinsicBindingPhase::Declared,
+    );
+
+    #[test]
+    fn intrinsic_registry_validation_accepts_unique_descriptors() {
+        let registry = StaticIntrinsicRegistry {
+            owner: IntrinsicRegistryOwner::TestFixture,
+            mutation_authority: IntrinsicRegistryMutationAuthority::GeneratedDataRefresh,
+            descriptors: &[DESCRIPTOR],
+        };
+
+        assert!(registry.validate().is_valid());
+    }
+
+    #[test]
+    fn intrinsic_registry_validation_reports_duplicates() {
+        let registry = StaticIntrinsicRegistry {
+            owner: IntrinsicRegistryOwner::TestFixture,
+            mutation_authority: IntrinsicRegistryMutationAuthority::GeneratedDataRefresh,
+            descriptors: &[DESCRIPTOR, DESCRIPTOR],
+        };
+
+        assert_eq!(
+            registry.validate().findings,
+            vec![IntrinsicValidationFinding::DuplicateIntrinsic {
+                intrinsic: INTRINSIC,
+            }]
+        );
+    }
+}

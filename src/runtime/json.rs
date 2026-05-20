@@ -1,5 +1,5 @@
 use crate::runtime::exception::JsResult;
-use crate::runtime::property::RuntimePropertyKey;
+use crate::runtime::property::RuntimePropertyAccessKey;
 use crate::runtime::state::{ObjectId, RuntimeValue, StringId};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -34,7 +34,7 @@ pub struct JsonStringifyStack {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct JsonPropertyVisit {
     pub holder: ObjectId,
-    pub key: RuntimePropertyKey,
+    pub key: RuntimePropertyAccessKey,
     pub value: RuntimeValue,
 }
 

@@ -1,6 +1,11 @@
 use crate::strings::atom::AtomId;
+use std::collections::HashSet;
 
-/// Stable identity for a symbol or private name.
+/// Stable property-name identity for a symbol or private name.
+///
+/// The strings subsystem owns this uid. Runtime symbol cells are named by
+/// `runtime::SymbolCellId`; object and runtime code must convert through VM
+/// authority instead of treating the two ids as interchangeable.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SymbolUid(u32);
 
@@ -158,6 +163,205 @@ impl SymbolIdentity {
     pub const fn description(self) -> SymbolDescription {
         self.description
     }
+}
+
+/// Owner of immutable symbol registry metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SymbolRegistryOwner {
+    VmPublicRegistry,
+    VmPrivateRegistry,
+    WellKnownSymbols,
+    BuiltinPrivateNames,
+    GeneratedStaticData,
+}
+
+/// Provenance for symbol registry descriptors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SymbolRegistryProvenance {
+    Ecma262WellKnownSymbols,
+    EngineBuiltinPrivateNames,
+    HostEmbedding,
+    GeneratedFromEngineMetadata,
+}
+
+/// Immutable descriptor for one symbol registry entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SymbolRegistryEntryDescriptor {
+    pub identity: SymbolIdentity,
+    pub registry_key: Option<AtomId>,
+}
+
+/// Immutable descriptor for a VM-owned symbol registry.
+///
+/// Registered-symbol mutation authority belongs to VM/string code. The entries
+/// here are static metadata for builtins or generated tables only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SymbolRegistryDescriptor {
+    pub name: &'static str,
+    pub registry: SymbolRegistryId,
+    pub kind: SymbolRegistryKind,
+    pub owner: SymbolRegistryOwner,
+    pub provenance: SymbolRegistryProvenance,
+    entries: &'static [SymbolRegistryEntryDescriptor],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SymbolRegistryValidationError {
+    EmptyRegistryName,
+    DuplicateSymbolUid(SymbolUid),
+    DuplicateRegistryKey(AtomId),
+    RegisteredEntryWithoutKey(SymbolUid),
+    RegistryKeyOnUnregisteredEntry(SymbolUid),
+    KindUniquenessMismatch(SymbolUid),
+    PublicRegistryContainsPrivateName(SymbolUid),
+    PrivateRegistryContainsPublicSymbol(SymbolUid),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SymbolRegistryDescriptorBuilder {
+    name: &'static str,
+    registry: SymbolRegistryId,
+    kind: SymbolRegistryKind,
+    owner: SymbolRegistryOwner,
+    provenance: SymbolRegistryProvenance,
+    entries: &'static [SymbolRegistryEntryDescriptor],
+}
+
+impl SymbolRegistryDescriptorBuilder {
+    pub const fn new(
+        name: &'static str,
+        registry: SymbolRegistryId,
+        kind: SymbolRegistryKind,
+        owner: SymbolRegistryOwner,
+        provenance: SymbolRegistryProvenance,
+    ) -> Self {
+        Self {
+            name,
+            registry,
+            kind,
+            owner,
+            provenance,
+            entries: &[],
+        }
+    }
+
+    pub const fn entries(mut self, entries: &'static [SymbolRegistryEntryDescriptor]) -> Self {
+        self.entries = entries;
+        self
+    }
+
+    pub fn build(self) -> Result<SymbolRegistryDescriptor, SymbolRegistryValidationError> {
+        let descriptor = SymbolRegistryDescriptor::new(
+            self.name,
+            self.registry,
+            self.kind,
+            self.owner,
+            self.provenance,
+            self.entries,
+        );
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+}
+
+impl SymbolRegistryDescriptor {
+    pub const fn new(
+        name: &'static str,
+        registry: SymbolRegistryId,
+        kind: SymbolRegistryKind,
+        owner: SymbolRegistryOwner,
+        provenance: SymbolRegistryProvenance,
+        entries: &'static [SymbolRegistryEntryDescriptor],
+    ) -> Self {
+        Self {
+            name,
+            registry,
+            kind,
+            owner,
+            provenance,
+            entries,
+        }
+    }
+
+    /// Returns immutable symbol registry entries.
+    pub const fn entries(&self) -> &'static [SymbolRegistryEntryDescriptor] {
+        self.entries
+    }
+
+    /// Returns one existing symbol registry entry by table index.
+    pub const fn entry_at(&self, index: usize) -> Option<&'static SymbolRegistryEntryDescriptor> {
+        if index < self.entries.len() {
+            Some(&self.entries[index])
+        } else {
+            None
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), SymbolRegistryValidationError> {
+        validate_symbol_registry_descriptor(self)
+    }
+}
+
+pub fn validate_symbol_registry_descriptor(
+    descriptor: &SymbolRegistryDescriptor,
+) -> Result<(), SymbolRegistryValidationError> {
+    if descriptor.name.is_empty() {
+        return Err(SymbolRegistryValidationError::EmptyRegistryName);
+    }
+
+    let mut seen_uids = HashSet::new();
+    let mut seen_keys = HashSet::new();
+    for entry in descriptor.entries {
+        validate_symbol_registry_entry(entry)?;
+        let uid = entry.identity.uid();
+        if !seen_uids.insert(uid) {
+            return Err(SymbolRegistryValidationError::DuplicateSymbolUid(uid));
+        }
+        if let Some(key) = entry.registry_key {
+            if !seen_keys.insert(key) {
+                return Err(SymbolRegistryValidationError::DuplicateRegistryKey(key));
+            }
+        }
+        match descriptor.kind {
+            SymbolRegistryKind::Public if entry.identity.kind().is_private() => {
+                return Err(SymbolRegistryValidationError::PublicRegistryContainsPrivateName(uid));
+            }
+            SymbolRegistryKind::Private if !entry.identity.kind().is_private() => {
+                return Err(
+                    SymbolRegistryValidationError::PrivateRegistryContainsPublicSymbol(uid),
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_symbol_registry_entry(
+    entry: &SymbolRegistryEntryDescriptor,
+) -> Result<(), SymbolRegistryValidationError> {
+    let uid = entry.identity.uid();
+    let registered_kind = entry.identity.kind().is_registered();
+    let registered_domain = matches!(
+        entry.identity.uniqueness(),
+        SymbolUniquenessDomain::Registered(_)
+    );
+
+    if registered_kind != registered_domain {
+        return Err(SymbolRegistryValidationError::KindUniquenessMismatch(uid));
+    }
+
+    if registered_kind && entry.registry_key.is_none() {
+        return Err(SymbolRegistryValidationError::RegisteredEntryWithoutKey(
+            uid,
+        ));
+    }
+
+    if !registered_kind && entry.registry_key.is_some() {
+        return Err(SymbolRegistryValidationError::RegistryKeyOnUnregisteredEntry(uid));
+    }
+
+    Ok(())
 }
 
 /// GC-managed symbol cell.

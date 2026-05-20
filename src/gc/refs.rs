@@ -9,6 +9,10 @@ use core::{marker::PhantomData, ptr::NonNull};
 use crate::gc::{HeapId, RootId, WeakId};
 
 /// Typed reference to a heap-owned cell.
+///
+/// `GcRef` is a non-owning borrow of heap storage. It carries neither rooting
+/// authority nor destruction authority; callers must pair it with an active
+/// root, handle, barrier, allocation-init token, or collector traversal proof.
 #[repr(transparent)]
 pub struct GcRef<T: ?Sized> {
     ptr: NonNull<T>,
@@ -50,11 +54,45 @@ impl<T: ?Sized> fmt::Debug for GcRef<T> {
 }
 
 /// Opaque handle scope identity.
+///
+/// This identifies a VM handle-scope record, not a heap cell.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[repr(transparent)]
 pub struct HandleScopeId(pub u64);
 
+/// Opaque handle slot identity owned by the VM handle set.
+///
+/// Slots borrow references to cells; they do not own cell identity or storage.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct HandleSlotId(pub u64);
+
+/// Handle slot membership in the strong-handle list.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HandleSlotState {
+    #[default]
+    Free,
+    Temporary,
+    Strong,
+}
+
+/// Descriptor for JSC's VM-owned handle set.
+///
+/// The handle set owns slots. `Handle`, `Root`, and strong references borrow
+/// slot identity and must not deallocate slots directly.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HandleSetDescriptor {
+    pub heap: HeapId,
+    pub strong_slots: Vec<HandleSlotId>,
+    pub free_slots: Vec<HandleSlotId>,
+    pub protected_global_object_count: usize,
+}
+
 /// Lexical scope for temporary handles.
+///
+/// The lifetime records scoped borrowing authority for handle slots associated
+/// with one heap. Dropping the scope ends temporary-root authority; it does not
+/// mutate cell storage directly.
 #[derive(Debug)]
 pub struct HandleScope<'heap> {
     heap: HeapId,
@@ -81,6 +119,9 @@ impl<'heap> HandleScope<'heap> {
 }
 
 /// Scoped rooted reference usable by Rust runtime code.
+///
+/// A handle borrows a VM-owned slot for `'heap`. The referenced cell remains
+/// owned by `Heap`; mutation of fields must still pass through barrier APIs.
 #[derive(Clone, Copy, Debug)]
 pub struct Handle<'heap, T: ?Sized> {
     reference: GcRef<T>,
@@ -107,6 +148,9 @@ impl<'heap, T: ?Sized> Handle<'heap, T> {
 }
 
 /// Long-lived explicit root registered with the heap or VM.
+///
+/// The root owns registration metadata only. It keeps the borrowed cell
+/// discoverable by GC but cannot allocate, move, destroy, or reinterpret it.
 #[derive(Debug)]
 pub struct Root<T: ?Sized> {
     reference: GcRef<T>,
@@ -136,7 +180,22 @@ impl<T: ?Sized> Root<T> {
     }
 }
 
+/// Long-lived strong handle that keeps a handle-set slot on the strong list.
+///
+/// Strong handles own slot membership in the VM handle set, not the target
+/// cell. Clearing or retargeting the slot is handle-set mutation authority.
+#[derive(Debug)]
+pub struct StrongHandle<T: ?Sized> {
+    pub reference: Option<GcRef<T>>,
+    pub slot: HandleSlotId,
+    pub heap: HeapId,
+}
+
 /// Weak reference cleared by GC weak processing.
+///
+/// Weak references borrow optional reachability information. Only weak
+/// processing or an owning weak registry should clear the target in response to
+/// liveness; callers must not infer that `WeakId` is a cell identity.
 #[derive(Debug)]
 pub struct Weak<T: ?Sized> {
     reference: Option<GcRef<T>>,

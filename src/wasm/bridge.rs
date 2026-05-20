@@ -13,8 +13,10 @@ use crate::wasm::{WasmFunctionIndex, WasmGlobalKind, WasmInstanceId, WasmModuleI
 pub enum BridgeAbi {
     Deferred,
     JsToWasm,
+    JsToWasmInlineCache,
     WasmToJs,
     WasmToWasm,
+    WasmBuiltin,
     WasmToHost,
 }
 
@@ -52,6 +54,17 @@ pub struct BridgeEntrypoint {
     pub abi: EntryAbi,
 }
 
+/// Ownership of a bridge entrypoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BridgeEntrypointOwner {
+    Module,
+    Instance,
+    CalleeGroup,
+    ImportWrapper,
+    ExportWrapper,
+    Host,
+}
+
 /// Wasm value type at a bridge boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WasmValueType {
@@ -74,6 +87,7 @@ pub struct WasmFunctionSignature {
     pub params: Vec<WasmValueType>,
     pub results: Vec<WasmValueType>,
     pub module_type_index: Option<u32>,
+    pub canonical_type_index: Option<crate::wasm::WasmTypeSignatureIndex>,
 }
 
 /// Conversion policy for JS values entering or leaving Wasm.

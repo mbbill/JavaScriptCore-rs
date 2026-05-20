@@ -246,3 +246,174 @@ pub enum TerminationReason {
     StackOverflow,
     HostRequested,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExceptionCreationRequest {
+    pub thrown_value: RuntimeValue,
+    pub capture: StackCaptureAction,
+    pub event_location: Option<ExceptionEventLocation>,
+    pub error_type: ErrorType,
+    pub message: Option<StringId>,
+    pub cause: RuntimeValue,
+    pub flags: ErrorFlags,
+}
+
+impl Default for ExceptionCreationRequest {
+    fn default() -> Self {
+        Self {
+            thrown_value: RuntimeValue::undefined(),
+            capture: StackCaptureAction::CaptureStack,
+            event_location: None,
+            error_type: ErrorType::Error,
+            message: None,
+            cause: RuntimeValue::undefined(),
+            flags: ErrorFlags::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExceptionCreationRecord {
+    pub exception: Exception,
+    pub error_instance: Option<ErrorInstance>,
+    pub pending: PendingException,
+}
+
+pub fn plan_exception_creation(request: ExceptionCreationRequest) -> ExceptionCreationRecord {
+    let stack = if matches!(request.capture, StackCaptureAction::CaptureStack) {
+        ExceptionStack {
+            frames: request
+                .event_location
+                .map(|location| vec![StackFrameId(location.stack_position as u32)])
+                .unwrap_or_default(),
+            capture_owner: None,
+            truncated: false,
+        }
+    } else {
+        ExceptionStack::default()
+    };
+
+    let exception = Exception {
+        id: None,
+        thrown_value: request.thrown_value,
+        stack: stack.clone(),
+        capture: request.capture,
+        inspector_notified: false,
+        wasm_tag_wrapping: WasmTagWrappingState::NotApplicable,
+    };
+    let error_instance = (request.error_type != ErrorType::Error
+        || request.message.is_some()
+        || request.flags != ErrorFlags::default())
+    .then(|| ErrorInstance {
+        error_type: request.error_type,
+        message: request.message,
+        cause: request.cause,
+        stack_trace: stack.frames,
+        flags: request.flags,
+        ..ErrorInstance::default()
+    });
+    let pending = PendingException {
+        exception_id: exception.id,
+        is_termination: false,
+        state: PendingExceptionState::PendingThrow,
+        event_location: request.event_location,
+    };
+
+    ExceptionCreationRecord {
+        exception,
+        error_instance,
+        pending,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExceptionPropagationRecord {
+    pub pending: PendingException,
+    pub action: ExceptionPropagationAction,
+    pub catch_info: Option<CatchInfo>,
+    pub frame: Option<CallFrameId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ExceptionPropagationAction {
+    NoException,
+    EnterHandler,
+    PropagateToCaller,
+    ReportUncaught,
+    Terminate,
+}
+
+pub fn plan_exception_propagation(
+    pending: PendingException,
+    unwinder: &Unwinder,
+) -> ExceptionPropagationRecord {
+    let action = if pending.state == PendingExceptionState::Clear {
+        ExceptionPropagationAction::NoException
+    } else if pending.is_termination || pending.state == PendingExceptionState::PendingTermination {
+        ExceptionPropagationAction::Terminate
+    } else if unwinder.catch_info.is_some() {
+        ExceptionPropagationAction::EnterHandler
+    } else if unwinder.current_frame.is_some() {
+        ExceptionPropagationAction::PropagateToCaller
+    } else {
+        ExceptionPropagationAction::ReportUncaught
+    };
+
+    ExceptionPropagationRecord {
+        pending,
+        action,
+        catch_info: unwinder.catch_info,
+        frame: unwinder.current_frame,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exception_creation_records_pending_throw_without_allocating_id() {
+        let record = plan_exception_creation(ExceptionCreationRequest {
+            thrown_value: RuntimeValue::from_i32(9),
+            event_location: Some(ExceptionEventLocation {
+                stack_position: 2,
+                ..ExceptionEventLocation::default()
+            }),
+            ..ExceptionCreationRequest::default()
+        });
+
+        assert_eq!(record.exception.thrown_value, RuntimeValue::from_i32(9));
+        assert_eq!(record.exception.stack.frames, vec![StackFrameId(2)]);
+        assert_eq!(record.pending.state, PendingExceptionState::PendingThrow);
+    }
+
+    #[test]
+    fn exception_propagation_enters_available_handler() {
+        let pending = PendingException {
+            state: PendingExceptionState::PendingThrow,
+            ..PendingException::default()
+        };
+        let handler = CatchInfo {
+            handler: HandlerInfo {
+                start: 0,
+                end: 10,
+                target: 12,
+                stack_depth: 1,
+                scope_depth: 0,
+            },
+            frame: Some(CallFrameId(4)),
+            catch_pc: CatchPc::Interpreter(BytecodeIndex(12)),
+            try_depth_for_throw: 1,
+        };
+        let unwinder = Unwinder {
+            current_frame: Some(CallFrameId(4)),
+            catch_info: Some(handler),
+            ..Unwinder::default()
+        };
+
+        let propagation = plan_exception_propagation(pending, &unwinder);
+
+        assert_eq!(propagation.action, ExceptionPropagationAction::EnterHandler);
+        assert_eq!(propagation.catch_info, Some(handler));
+    }
+}

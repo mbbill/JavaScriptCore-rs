@@ -12,21 +12,27 @@ pub(crate) mod speculation;
 pub(crate) mod watchpoint;
 
 pub use graph::{
-    BasicBlockId, BranchTarget, DfgBasicBlock, DfgEdge, DfgEdgeId, DfgGraph, DfgGraphId, DfgNode,
-    DfgNodeId, DfgNodeKind, DfgPhase, DfgValueRep, EdgeKillStatus, EdgeProofStatus, EdgeUseKind,
-    GraphForm, NodeEffects, NodeOrigin, NodeOriginKind,
+    BranchTarget, DfgBasicBlock, DfgBasicBlockId, DfgCommonDataDescriptor, DfgDominanceSet,
+    DfgEdge, DfgEdgeId, DfgGraph, DfgGraphBuilder, DfgGraphId, DfgGraphMutationAuthority,
+    DfgInlineCallFrameId, DfgNode, DfgNodeId, DfgNodeKind, DfgPhase, DfgPlanDescriptorRegistry,
+    DfgPlanRegistryMutationAuthority, DfgPlanSchemaOwner, DfgValidationError, DfgValueRep,
+    DfgVariableAccessDataId, EdgeKillStatus, EdgeProofStatus, EdgeUseKind, GraphForm,
+    InlineVariableData, NodeEffects, NodeOrigin, NodeOriginKind, StaticDfgPlanDescriptor,
+    DFG_PLAN_DESCRIPTOR_REGISTRY, STATIC_DFG_PLAN_DESCRIPTORS,
 };
 pub use osr::{
     DfgOsrEntryDescriptor, DfgOsrExitDescriptor, DfgOsrExitId, ExitProfileUpdate, FlushFormat,
-    MaterializationKind, OsrEntryAvailability, OsrEntryKind, OsrExitKind, OsrExitRecovery,
-    RecoverySource,
+    MaterializationKind, OsrEntryAvailability, OsrEntryKind, OsrExitKind, OsrExitOutcomeKind,
+    OsrExitOutcomeRecord, OsrExitRecovery, RecoverySource,
 };
 pub use speculation::{
     AbstractValueSource, PredictionSource, SpeculatedType, SpeculationCheck, SpeculationCheckId,
-    SpeculationCheckKind, SpeculationDirection, SpeculationRecovery, SpeculationRecoveryKind,
-    SpeculationSite,
+    SpeculationCheckKind, SpeculationDirection, SpeculationFailureSemantics,
+    SpeculationPreconditionKind, SpeculationRecovery, SpeculationRecoveryKind,
+    SpeculationSemanticValidationError, SpeculationSite,
 };
 pub use watchpoint::{
-    DfgDesiredWatchpoints, DfgInvalidationPoint, DfgInvalidationPointId,
+    DesiredWatchpointCounts, DfgDesiredWatchpoints, DfgInvalidationPoint, DfgInvalidationPointId,
     DfgWatchpointCollectionPhase, InvalidationPointKind, WatchpointCollectionMode,
+    WatchpointRegistrationConcurrency,
 };

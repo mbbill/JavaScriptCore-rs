@@ -1,5 +1,5 @@
 use crate::runtime::state::{
-    ModuleRecordId, ObjectId, RuntimeValue, StringId, SymbolId, WatchpointGeneration,
+    ModuleRecordId, ObjectId, RuntimeValue, StringId, SymbolCellId, WatchpointGeneration,
 };
 
 /// GC-managed scope cell contract.
@@ -155,7 +155,7 @@ impl SymbolTable {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SymbolTableEntry {
-    pub symbol: SymbolId,
+    pub symbol: SymbolCellId,
     pub name: Option<StringId>,
     pub offset: ScopeOffset,
     pub attributes: BindingAttributes,
@@ -200,6 +200,65 @@ impl BindingSlot {
     pub fn initialize_placeholder(&mut self, value: RuntimeValue) {
         self.value = value;
     }
+
+    pub fn read(&self, attributes: BindingAttributes) -> Result<RuntimeValue, BindingError> {
+        if self.state == BindingState::Deleted {
+            return Err(BindingError::Deleted);
+        }
+        if attributes.tdz_protected && self.state == BindingState::Uninitialized {
+            return Err(BindingError::TemporalDeadZone);
+        }
+        Ok(self.value)
+    }
+
+    pub fn initialize(&mut self, value: RuntimeValue, immutable: bool) -> Result<(), BindingError> {
+        if self.state != BindingState::Uninitialized {
+            return Err(BindingError::AlreadyInitialized);
+        }
+        self.value = value;
+        self.state = if immutable {
+            BindingState::Immutable
+        } else {
+            BindingState::Mutable
+        };
+        Ok(())
+    }
+
+    pub fn set_mutable(
+        &mut self,
+        value: RuntimeValue,
+        attributes: BindingAttributes,
+        strict: bool,
+    ) -> Result<BindingWriteOutcome, BindingError> {
+        if self.state == BindingState::Deleted {
+            return Err(BindingError::Deleted);
+        }
+        if attributes.tdz_protected && self.state == BindingState::Uninitialized {
+            return Err(BindingError::TemporalDeadZone);
+        }
+        if attributes.read_only || matches!(self.state, BindingState::Immutable) {
+            return if strict {
+                Err(BindingError::ReadOnly)
+            } else {
+                Ok(BindingWriteOutcome::IgnoredSloppyReadOnly)
+            };
+        }
+
+        self.value = value;
+        self.state = BindingState::Mutable;
+        Ok(BindingWriteOutcome::Updated)
+    }
+
+    pub fn delete(&mut self, attributes: BindingAttributes) -> BindingDeleteOutcome {
+        if self.state == BindingState::Deleted {
+            return BindingDeleteOutcome::Missing;
+        }
+        if !attributes.can_delete {
+            return BindingDeleteOutcome::Rejected;
+        }
+        self.state = BindingState::Deleted;
+        BindingDeleteOutcome::Deleted
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -210,6 +269,27 @@ pub enum BindingState {
     Mutable,
     Immutable,
     Deleted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum BindingError {
+    TemporalDeadZone,
+    ReadOnly,
+    AlreadyInitialized,
+    Deleted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum BindingWriteOutcome {
+    Updated,
+    IgnoredSloppyReadOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum BindingDeleteOutcome {
+    Deleted,
+    Missing,
+    Rejected,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -231,3 +311,40 @@ pub struct ScopeOffset(pub u32);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct VarOffset(pub u32);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_slot_enforces_tdz_and_initialization() {
+        let mut slot = BindingSlot::default();
+        let attributes = BindingAttributes {
+            tdz_protected: true,
+            ..BindingAttributes::default()
+        };
+
+        assert_eq!(slot.read(attributes), Err(BindingError::TemporalDeadZone));
+        assert_eq!(slot.initialize(RuntimeValue::from_i32(4), false), Ok(()));
+        assert_eq!(slot.read(attributes), Ok(RuntimeValue::from_i32(4)));
+    }
+
+    #[test]
+    fn immutable_binding_write_is_strict_error_or_sloppy_ignore() {
+        let mut slot = BindingSlot::default();
+        slot.initialize(RuntimeValue::from_i32(1), true).unwrap();
+        let attributes = BindingAttributes {
+            read_only: true,
+            ..BindingAttributes::default()
+        };
+
+        assert_eq!(
+            slot.set_mutable(RuntimeValue::from_i32(2), attributes, false),
+            Ok(BindingWriteOutcome::IgnoredSloppyReadOnly)
+        );
+        assert_eq!(
+            slot.set_mutable(RuntimeValue::from_i32(2), attributes, true),
+            Err(BindingError::ReadOnly)
+        );
+    }
+}

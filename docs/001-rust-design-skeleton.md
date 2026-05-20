@@ -10,6 +10,15 @@ below are design names. They may later map to modules, files, traits, or
 generated code inside the single Rust crate, but they already define the shape
 future implementation work must respect.
 
+This document now coexists with executable Rust code. When this design skeleton
+and the code diverge, the main agent should inspect the implementation, decide
+whether the implementation is architecturally correct, and then update the
+design or the code. Do not treat a passing test as proof that the design
+boundary is settled.
+
+Progress is tracked sparsely in `progress.md`. Work scheduling lives in
+`002-bfs-rewrite-plan.md`.
+
 ## How To Use This Skeleton
 
 Each subsystem section defines:
@@ -26,6 +35,10 @@ Future agents may implement behind these contracts. They must not redesign
 neighboring ownership, mutation, unsafe, or compatibility boundaries while
 working on one component.
 
+The main agent should delegate large component work and act as reviewer. Direct
+main-agent implementation should be reserved for small glue, corrections, or
+well-bounded fixes that do not alter subsystem priority.
+
 ## Cross-Cutting Design Rules
 
 This skeleton is breadth-first. It is complete only when all major engine
@@ -38,9 +51,82 @@ representation, heap identity, rooting, strings, global object initialization,
 bytecode shape, frames, exceptions, object storage, and builtin behavior. Those
 choices belong in explicit contracts.
 
-Deferred does not mean absent. JIT, Wasm, public API layout, optimized code
+Now that an executable interpreter path exists, the same rule applies in a
+different form: do not let local failing VM tests choose missing architecture.
+If a feature needs handles, GC, module jobs, host hooks, or tiering contracts,
+pause the local fix and schedule the shared dependency first.
+
+Deferred does not mean absent. Wasm, public API layout, optimized code
 metadata, and host integration may remain unimplemented, but their architectural
-attachment points must be named and preserved.
+attachment points must be named and preserved. Baseline JIT is no longer only a
+deferred hook: the rewrite needs one honest baseline tier, even if it supports
+only a narrow opcode slice, so execution, frame, root, fallback, exception, and
+GC contracts are tested against more than the interpreter.
+
+## Execution Architecture Policy
+
+The rewrite needs one reference interpreter and one baseline JIT tier before the
+execution architecture can be considered proven. It does not need all
+interpreter features or all JIT tiers first.
+
+The interpreter is the semantic oracle. It owns the canonical bytecode
+semantics, observable exception behavior, runtime-call behavior, root snapshots,
+and fallback state. Baseline-enabled execution must remain comparable against
+interpreter-only execution.
+
+The first baseline JIT is an integration proof, not an optimization project. It
+may support only constants, moves, returns, and a small arithmetic/control-flow
+slice, but it must enter through VM-owned code-block/tiering state, expose the
+same frame/root/exception/runtime-call/GC contracts as the interpreter, and fall
+back through the real interpreter for unsupported bytecode.
+
+The current serial dependency is the baseline execution contract. Memory
+ownership integration, the first baseline frame/root ABI, VM-owned baseline
+installation, CodeBlock-derived bytecode eligibility, the non-native typed
+baseline generated-code artifact contract, and interpreter frame/register helper
+boundary are already shaped. The VM now has a first generated-entry proof for a
+narrow typed baseline body covering constants, moves, return, and int32
+arithmetic with interpreter fallback for overflow/non-fast cases. It now also
+covers selected no-call/no-heap int32 bitwise fast paths: bit-not, bitwise
+or/xor/and, signed and unsigned shifts, int32 relational comparisons,
+unconditional jumps, nullish conditional jumps, and primitive-local
+`JumpIfFalse` truthiness. Unsigned shift now writes either Int32 or Double
+primitive results without treating the widening as overflow, and primitive
+`LogicalNot`, `StrictEqual`, and `StrictNotEqual` now use generated boolean
+helpers while cell/string/symbol or otherwise runtime-dependent cases fall back
+to the interpreter. Primitive number generation now covers `LoadDouble`,
+numeric-only `DivNumber`/`ModNumber`, primitive-only `ToNumber`, effect-neutral
+`Void`, primitive-coercing `NegateNumber`/`BitNotInt32`, pure-number
+Int32/Double `AddInt32`/`SubInt32`/`MulInt32`, numeric relational comparisons,
+and binary bitwise `ToInt32`; cell/unknown numeric coercion falls back with
+typed diagnostics, and `PowNumber` remains outside the generated subset.
+VM-boundary differential coverage and CodeBlock snapshot fingerprints reject
+stale same-owner bytecode before generated execution. Typed fallback diagnostics
+now travel through executor results into VM-owned fallback records, and
+generated fallback throws synchronize exception roots after no-GC exit. The
+current P6 opcode slice carries a generated-effect contract proving no heap
+allocation, no runtime/JS call, and no heap/root mutation, with an explicit
+register barrier-handoff caveat from the shared register write helper. The
+generated runtime/heap boundary now includes planner-side classification for
+no-JS-call heap/runtime helpers, executor helper-handoff metadata, VM-side
+heap/root/no-GC boundary evidence, and an explicit VM-owned helper execution
+path proven with planner-approved destination-only allocation handoffs. The VM
+suspends the active no-GC region, dispatches exactly one interpreter instruction
+through the runtime boundary, resumes no-GC, and rejects stale helper plans
+before helper execution. Helper plans are now artifact-owned metadata,
+validated against the artifact bytecode snapshot, rejected if malformed,
+recorded through VM-owned generated install, and consumed by the normal tiering
+entry path for an installed `NewObject`, `NewArray`, or `TypeOf` helper
+artifact. Planner/install now derives operand-role helper metadata from
+registered CodeBlock root maps and rejects explicit helper plans that do not
+match the derived CodeBlock/root-map proof. `TypeOf` remains a runtime-helper
+handoff, not direct generated execution. Before adding strings, objects,
+properties, calls, BigInt, or `PowNumber` broadly to generated code, each
+opcode's allocation, barrier, root, and exception contract must be proven
+through that derived helper path. A JIT slice that bypasses
+code-block ownership, cell identity, root visibility, barriers, exceptions,
+fallback, or runtime calls is not acceptable, even if it makes a small
+generated-code test pass.
 
 ## Compatibility Boundary Policy
 
@@ -810,6 +896,11 @@ This subsystem defines VM entry, dispatch, register access, frame layout, stack
 walking, and unwinding contracts so interpreter execution and later native
 entrypoints can attach without changing ownership boundaries.
 
+The interpreter is the reference execution engine. It is the semantic oracle for
+bytecode, values, calls, scopes, exceptions, runtime calls, builtins, and control
+flow. JIT-enabled execution must be compared against interpreter-only execution
+until the relevant opcode family and runtime boundary are proven equivalent.
+
 ### Proposed Types
 
 - `Interpreter`: dispatch and VM execution services.
@@ -1134,12 +1225,19 @@ callbacks, and modules for import APIs.
 - Is `JSValueRef` bit-compatible on 64-bit?
 - How are locking and reentrancy enforced for embedders using multiple threads?
 
-## JIT Integration Points - Deferred
+## Baseline JIT And Optimizing Tier Integration
 
 ### Proposed Responsibility
 
-JIT implementation is deferred. The skeleton still reserves the execution
-abstraction:
+The first JIT requirement is a real baseline tier. It may be narrow, but it must
+install through VM/code-block/tiering ownership, prove bytecode eligibility from
+the owning `CodeBlock`, enter generated code for eligible bytecode, fall back to
+the interpreter for unsupported bytecode, and share the interpreter's value
+representation, frame model, root visibility, runtime-call path, exception path,
+and GC/barrier contracts.
+
+DFG, FTL, B3, and other optimizing tiers remain deferred. The skeleton reserves
+the full execution abstraction:
 
 ```text
 Executable -> CodeBlock -> entrypoint/profile/metadata/tiering state
@@ -1154,7 +1252,13 @@ depend on those fields being populated.
 
 - `JitType`: interpreter thunk, baseline, DFG, FTL, or none.
 - `Entrypoint`: abstract execution entry.
-- `JitCodeRef`: future compiled-code reference.
+- `BaselineCodeRef`: installed baseline generated-code reference.
+- `BaselineGeneratedCodeArtifact`: non-native typed generated-code body and
+  proofs used before real executable memory exists.
+- `JitCodeRef`: optimizing-tier compiled-code reference.
+- `BaselineEligibility`: bytecode subset and safety decision for baseline entry.
+- `BaselineFallbackSnapshot`: frame/register/bytecode-index state needed to
+  resume in the interpreter.
 - `InlineCacheSlot`: property/call cache attachment point.
 - `TieringState`: counters, OSR metadata, and tiering policy.
 - `WatchpointDependency`: optimized-code invalidation dependency.
@@ -1163,22 +1267,28 @@ depend on those fields being populated.
 
 ### Ownership
 
-`CodeBlock` owns or references JIT side data. Compilation plans may hold weak or
-externally traced references to code blocks and runtime objects. Watchpoint
-dependencies must be traced or invalidated according to GC and structure rules.
+`CodeBlock` owns or references baseline and later JIT side data. Baseline code
+does not own semantic state; it owns executable code plus metadata that maps
+generated execution back to the shared frame, root, exception, and fallback
+contracts. Compilation plans may hold weak or externally traced references to
+code blocks and runtime objects. Watchpoint dependencies must be traced or
+invalidated according to GC and structure rules.
 
 ### Mutation
 
-JIT side data mutates through code-block APIs that state whether they are
-baseline Rust dispatch, generated-code, compiler-thread, or main-thread
-operations. No subsystem may remove JIT placeholders to simplify early
-execution.
+Baseline side data mutates through VM-owned code-block APIs that state whether
+the mutation installs, rejects, defers, invalidates, or falls back from generated
+code. Installation must carry both an ABI proof and a bytecode-eligibility proof
+for the same code-block owner before generated entry can be considered. Later
+JIT side data follows the same ownership rule and must state whether an
+operation is generated-code, compiler-thread, or main-thread visible. No
+subsystem may bypass these APIs to simplify early execution.
 
 ### Unsafe Boundary
 
-Unsafe is limited to generated code pointers, patching, register/stack ABI,
-barrier emission, code memory allocation, OSR entry/exit, and compiler-thread
-interaction with GC-visible state.
+Unsafe is limited to generated code pointers, executable memory, patching,
+register/stack ABI, barrier emission, code memory allocation, OSR entry/exit,
+and compiler-thread interaction with GC-visible state.
 
 ### Dependencies
 
@@ -1188,10 +1298,12 @@ exception metadata.
 
 ### Unresolved Questions
 
-- Is `JITType::InterpreterThunk` modeled before JIT exists?
+- Which backend produces the first baseline generated code?
 - What is the shape of profiling and inline-cache side data?
 - What concurrency model is used for compilation plans/worklists?
 - Which layout offsets are reserved abstractly versus exactly?
+- Which opcode family is the first baseline eligibility slice after frame/root
+  ABI and install policy are stable?
 
 ## Wasm Integration Points - Deferred
 

@@ -10,21 +10,33 @@ mod names;
 mod registry;
 
 pub use ids::{
-    BuiltinGeneratedArtifact, BuiltinGenerationPhase, BuiltinId, BuiltinInitializationEdge,
-    BuiltinInitializationStage, BuiltinInitializationStep, BuiltinTableRevision, BuiltinVisibility,
+    BuiltinCodeIndex, BuiltinGeneratedArtifact, BuiltinGenerationPhase, BuiltinId,
+    BuiltinInitializationEdge, BuiltinInitializationStage, BuiltinInitializationStep,
+    BuiltinTableRevision, BuiltinVisibility,
 };
 pub use intrinsics::{
     BuiltinIntrinsic, BuiltinIntrinsicDescriptor, IntrinsicArity, IntrinsicBindingPhase,
-    IntrinsicHostOwner, IntrinsicSafety,
+    IntrinsicHostOwner, IntrinsicRegistryMutationAuthority, IntrinsicRegistryOwner,
+    IntrinsicSafety, IntrinsicValidationFinding, IntrinsicValidationReport,
+    StaticIntrinsicRegistry,
 };
 pub use names::{
-    BuiltinNameLookupKind, BuiltinNameMapEntry, BuiltinNameSlot, BuiltinNameTableState,
-    BuiltinNames, BuiltinPrivateName, BuiltinPrivateNameTable, ExternalBuiltinName,
-    WellKnownBuiltinName,
+    BuiltinNameLookupKind, BuiltinNameMapEntry, BuiltinNameMutationAuthority,
+    BuiltinNameRegistryOwner, BuiltinNameSlot, BuiltinNameTableState, BuiltinNameValidationFinding,
+    BuiltinNameValidationReport, BuiltinNames, BuiltinPrivateName, BuiltinPrivateNameTable,
+    ExternalBuiltinName, StaticBuiltinNameRegistry, WellKnownBuiltinName,
 };
 pub use registry::{
-    BuiltinConstructAbility, BuiltinConstructorKind, BuiltinDescriptor, BuiltinExecutableCache,
-    BuiltinExecutableCacheEntry, BuiltinExecutableCacheState, BuiltinExecutableHandle,
-    BuiltinExecutableMetadata, BuiltinGeneratedPipelineStep, BuiltinInlinePolicy, BuiltinRegistry,
-    BuiltinRegistryState, BuiltinSource, BuiltinSourceKind, BuiltinSourceRange, HostIntrinsicHook,
+    describe_builtin_tier_execution_metadata, summarize_builtin_registry_integration,
+    BuiltinConstructAbility, BuiltinConstructorKind, BuiltinDescriptor, BuiltinExceptionContract,
+    BuiltinExecutableCache, BuiltinExecutableCacheEntry, BuiltinExecutableCacheState,
+    BuiltinExecutableCreationAuthority, BuiltinExecutableHandle, BuiltinExecutableMetadata,
+    BuiltinExecutionMetadataDescriptor, BuiltinExecutionTierKind, BuiltinGeneratedPipelineStep,
+    BuiltinInlinePolicy, BuiltinIntegrationDiagnostic, BuiltinIntegrationDiagnosticKind,
+    BuiltinParserMode, BuiltinRegistry, BuiltinRegistryIntegrationSummary,
+    BuiltinRegistryMutationAuthority, BuiltinRegistryOwner, BuiltinRegistryProvenance,
+    BuiltinRegistryState, BuiltinRegistryValidationFinding, BuiltinRegistryValidationReport,
+    BuiltinSemanticEffects, BuiltinSemanticMetadata, BuiltinSemanticParseSource, BuiltinSource,
+    BuiltinSourceDescriptor, BuiltinSourceKind, BuiltinSourceRange, BuiltinTierExecutionMetadata,
+    HostIntrinsicHook, StaticBuiltinRegistry,
 };
