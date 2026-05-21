@@ -7,10 +7,11 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
+use std::fs;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::ptr::NonNull;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bytecode::code_block::{
     CodeBlock, ConstantValue, HandlerRange, HandlerTarget, LinkedConstantPool,
@@ -1774,6 +1775,8 @@ pub enum ExecutionError {
     MissingFunctionCode(u32),
     InvalidCallCompletion,
     InvalidCallContinuation,
+    UnknownHostGlobal,
+    HostReadFile,
     BarrierDecision(BarrierDecisionError),
     MissingStaticCellMetadata(CellType),
     HeapIntegration(HeapIntegrationError),
@@ -2186,7 +2189,25 @@ struct CoreInitializedInstanceFields {
     receiver: RuntimeValue,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreHostOutputSink {
+    Print,
+    Alert,
+    ConsoleLog,
+    ConsoleInfo,
+    ConsoleWarn,
+    ConsoleError,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreHostOutputRecord {
+    pub sink: CoreHostOutputSink,
+    pub text: String,
+}
+
+const CORE_HOST_OUTPUT_RECORD_LIMIT: usize = 1024;
+
+#[derive(Clone, Debug)]
 pub struct CoreOpcodeDispatchHost {
     function_blocks: Vec<InterpreterFunctionCodeBlock>,
     objects: CoreObjectStore,
@@ -2194,6 +2215,9 @@ pub struct CoreOpcodeDispatchHost {
     bigints: CoreBigIntStore,
     symbols: CoreSymbolStore,
     math_random: CoreMathRandomState,
+    host_created_at: Instant,
+    last_performance_now_ms: f64,
+    host_output_records: Vec<CoreHostOutputRecord>,
     string_literals: HashMap<u32, String>,
     identifier_texts: HashMap<u32, String>,
     prototype_property_key: Option<CorePropertyKey>,
@@ -2205,6 +2229,33 @@ pub struct CoreOpcodeDispatchHost {
     initialized_instance_fields: Vec<CoreInitializedInstanceFields>,
     #[cfg(test)]
     call_frame_snapshots_for_test: Vec<CoreCallFrameSnapshotForTest>,
+}
+
+impl Default for CoreOpcodeDispatchHost {
+    fn default() -> Self {
+        Self {
+            function_blocks: Vec::new(),
+            objects: CoreObjectStore::default(),
+            strings: CoreStringStore::default(),
+            bigints: CoreBigIntStore::default(),
+            symbols: CoreSymbolStore::default(),
+            math_random: CoreMathRandomState::default(),
+            host_created_at: Instant::now(),
+            last_performance_now_ms: 0.0,
+            host_output_records: Vec::new(),
+            string_literals: HashMap::new(),
+            identifier_texts: HashMap::new(),
+            prototype_property_key: Some(CorePropertyKey::String("prototype".into())),
+            last_property_lookup: None,
+            pending_property_lookup_site: None,
+            last_property_store: None,
+            pending_property_store_site: None,
+            last_call_observation: None,
+            initialized_instance_fields: Vec::new(),
+            #[cfg(test)]
+            call_frame_snapshots_for_test: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2308,6 +2359,24 @@ impl CoreOpcodeDispatchHost {
         )
     }
 
+    pub fn install_host_global_properties<I, S>(
+        &mut self,
+        heap: &mut Heap,
+        global_object: RuntimeValue,
+        names: I,
+    ) -> Result<(), ExecutionError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.objects
+            .install_host_global_properties(heap, global_object, names)
+    }
+
+    pub fn host_output_records(&self) -> &[CoreHostOutputRecord] {
+        &self.host_output_records
+    }
+
     pub fn with_function_blocks(function_blocks: Vec<CodeBlock>) -> Self {
         Self::with_function_code_blocks(indexed_function_code_blocks(function_blocks))
     }
@@ -2315,22 +2384,7 @@ impl CoreOpcodeDispatchHost {
     pub fn with_function_code_blocks(function_blocks: Vec<InterpreterFunctionCodeBlock>) -> Self {
         Self {
             function_blocks,
-            objects: CoreObjectStore::default(),
-            strings: CoreStringStore::default(),
-            bigints: CoreBigIntStore::default(),
-            symbols: CoreSymbolStore::default(),
-            math_random: CoreMathRandomState::default(),
-            string_literals: HashMap::new(),
-            identifier_texts: HashMap::new(),
-            prototype_property_key: Some(CorePropertyKey::String("prototype".into())),
-            last_property_lookup: None,
-            pending_property_lookup_site: None,
-            last_property_store: None,
-            pending_property_store_site: None,
-            last_call_observation: None,
-            initialized_instance_fields: Vec::new(),
-            #[cfg(test)]
-            call_frame_snapshots_for_test: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -2350,22 +2404,8 @@ impl CoreOpcodeDispatchHost {
     ) -> Self {
         Self {
             function_blocks,
-            objects: CoreObjectStore::default(),
-            strings: CoreStringStore::default(),
-            bigints: CoreBigIntStore::default(),
-            symbols: CoreSymbolStore::default(),
-            math_random: CoreMathRandomState::default(),
             string_literals,
-            identifier_texts: HashMap::new(),
-            prototype_property_key: Some(CorePropertyKey::String("prototype".into())),
-            last_property_lookup: None,
-            pending_property_lookup_site: None,
-            last_property_store: None,
-            pending_property_store_site: None,
-            last_call_observation: None,
-            initialized_instance_fields: Vec::new(),
-            #[cfg(test)]
-            call_frame_snapshots_for_test: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -2400,22 +2440,10 @@ impl CoreOpcodeDispatchHost {
             .or_else(|| Some(CorePropertyKey::String("prototype".into())));
         Self {
             function_blocks,
-            objects: CoreObjectStore::default(),
-            strings: CoreStringStore::default(),
-            bigints: CoreBigIntStore::default(),
-            symbols: CoreSymbolStore::default(),
-            math_random: CoreMathRandomState::default(),
             string_literals,
             identifier_texts,
             prototype_property_key,
-            last_property_lookup: None,
-            pending_property_lookup_site: None,
-            last_property_store: None,
-            pending_property_store_site: None,
-            last_call_observation: None,
-            initialized_instance_fields: Vec::new(),
-            #[cfg(test)]
-            call_frame_snapshots_for_test: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -3879,6 +3907,14 @@ enum CoreNativeFunction {
     MathSqrt,
     MathTrunc,
     ParseInt,
+    HostPerformanceNow,
+    HostPrint,
+    HostAlert,
+    HostConsoleLog,
+    HostConsoleInfo,
+    HostConsoleWarn,
+    HostConsoleError,
+    HostReadFile,
     JsonParse,
     JsonStringify,
     ReflectApply,
@@ -4950,6 +4986,61 @@ impl CoreObjectStore {
             standard_attributes,
         )?;
         Ok(())
+    }
+
+    fn install_host_global_properties<I, S>(
+        &mut self,
+        heap: &mut Heap,
+        global_object: RuntimeValue,
+        names: I,
+    ) -> Result<(), ExecutionError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let host_attributes = CorePropertyAttributes {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        };
+        for name in names {
+            let name = name.as_ref();
+            let value = match name {
+                "performance" => self.allocate_host_performance_object(),
+                "print" => self.allocate_native_function(CoreNativeFunction::HostPrint),
+                "alert" => self.allocate_native_function(CoreNativeFunction::HostAlert),
+                "console" => self.allocate_host_console_object(),
+                "readFile" => self.allocate_native_function(CoreNativeFunction::HostReadFile),
+                _ => return Err(ExecutionError::UnknownHostGlobal),
+            };
+            self.install_standard_global_data_property(
+                heap,
+                global_object,
+                name,
+                value,
+                host_attributes,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn allocate_host_performance_object(&mut self) -> RuntimeValue {
+        let object = self.allocate();
+        self.install_native_method(object, "now", CoreNativeFunction::HostPerformanceNow);
+        object
+    }
+
+    fn allocate_host_console_object(&mut self) -> RuntimeValue {
+        let object = self.allocate();
+        for (name, native_function) in [
+            ("log", CoreNativeFunction::HostConsoleLog),
+            ("info", CoreNativeFunction::HostConsoleInfo),
+            ("warn", CoreNativeFunction::HostConsoleWarn),
+            ("error", CoreNativeFunction::HostConsoleError),
+        ] {
+            self.install_native_method(object, name, native_function);
+        }
+        object
     }
 
     fn install_standard_global_data_property(
@@ -13679,6 +13770,26 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::MathSqrt => self.native_math_sqrt(arguments),
             CoreNativeFunction::MathTrunc => self.native_math_trunc(arguments),
             CoreNativeFunction::ParseInt => self.native_parse_int(arguments),
+            CoreNativeFunction::HostPerformanceNow => Ok(self.native_host_performance_now()),
+            CoreNativeFunction::HostPrint => {
+                Ok(self.native_host_output(CoreHostOutputSink::Print, arguments))
+            }
+            CoreNativeFunction::HostAlert => {
+                Ok(self.native_host_output(CoreHostOutputSink::Alert, arguments))
+            }
+            CoreNativeFunction::HostConsoleLog => {
+                Ok(self.native_host_output(CoreHostOutputSink::ConsoleLog, arguments))
+            }
+            CoreNativeFunction::HostConsoleInfo => {
+                Ok(self.native_host_output(CoreHostOutputSink::ConsoleInfo, arguments))
+            }
+            CoreNativeFunction::HostConsoleWarn => {
+                Ok(self.native_host_output(CoreHostOutputSink::ConsoleWarn, arguments))
+            }
+            CoreNativeFunction::HostConsoleError => {
+                Ok(self.native_host_output(CoreHostOutputSink::ConsoleError, arguments))
+            }
+            CoreNativeFunction::HostReadFile => self.native_host_read_file(state.heap, arguments),
             CoreNativeFunction::JsonParse => self.native_json_parse(state.heap, arguments),
             CoreNativeFunction::JsonStringify => self.native_json_stringify(state, arguments),
             CoreNativeFunction::ReflectApply => {
@@ -13986,6 +14097,83 @@ impl CoreOpcodeDispatchHost {
             }
             CoreNativeFunction::Values => self.native_object_values(state, arguments),
         }
+    }
+
+    fn native_host_performance_now(&mut self) -> RuntimeValue {
+        let elapsed_ms = self.host_created_at.elapsed().as_secs_f64() * 1000.0;
+        let now_ms = elapsed_ms.max(self.last_performance_now_ms);
+        self.last_performance_now_ms = now_ms;
+        runtime_number_from_f64(now_ms)
+    }
+
+    fn native_host_output(
+        &mut self,
+        sink: CoreHostOutputSink,
+        arguments: &[RuntimeValue],
+    ) -> RuntimeValue {
+        let text = arguments
+            .iter()
+            .copied()
+            .map(|argument| self.host_output_argument_to_string(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if self.host_output_records.len() < CORE_HOST_OUTPUT_RECORD_LIMIT {
+            self.host_output_records
+                .push(CoreHostOutputRecord { sink, text });
+        }
+        RuntimeValue::undefined()
+    }
+
+    fn native_host_read_file(
+        &mut self,
+        heap: &mut Heap,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let Some(path_value) = arguments.first().copied() else {
+            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject));
+        };
+        let Some(path) = self.primitive_to_string(path_value) else {
+            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject));
+        };
+        let contents = fs::read_to_string(path)
+            .map_err(|_| DispatchOutcome::Fail(ExecutionError::HostReadFile))?;
+        self.strings
+            .allocate_with_heap(heap, &contents)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    fn host_output_argument_to_string(&self, value: RuntimeValue) -> String {
+        if let Some(text) = self.primitive_to_string(value) {
+            return text;
+        }
+        if self.objects.is_array(value) {
+            "[object Array]"
+        } else if self.objects.is_map(value) {
+            "[object Map]"
+        } else if self.objects.is_set(value) {
+            "[object Set]"
+        } else if self.objects.is_weak_map(value) {
+            "[object WeakMap]"
+        } else if self.objects.is_weak_set(value) {
+            "[object WeakSet]"
+        } else if self.objects.is_regexp(value) {
+            "[object RegExp]"
+        } else if self.objects.is_promise(value) {
+            "[object Promise]"
+        } else if self.objects.is_date(value) {
+            "[object Date]"
+        } else if self.objects.is_array_buffer(value) {
+            "[object ArrayBuffer]"
+        } else if self.objects.is_uint8_array(value) {
+            "[object Uint8Array]"
+        } else if self.objects.is_data_view(value) {
+            "[object DataView]"
+        } else if self.objects.is_function(value) {
+            "[object Function]"
+        } else {
+            "[object Object]"
+        }
+        .to_owned()
     }
 
     fn native_object_constructor(

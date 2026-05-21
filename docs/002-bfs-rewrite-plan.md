@@ -169,18 +169,18 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- M3c Octane String/global runtime slice: source sessions install
-  benchmark-visible standard globals, bytecompiler resolves `Math` and
-  `parseInt` through global bindings, Octane-required Math, String, and
-  `parseInt` APIs are installed, and global overrides persist across loaded
-  sources where required.
+- M3d1 safe shell-host global slice: source sessions can opt into
+  benchmark-visible host globals for `performance.now`, `readFile`, `print`,
+  `console`, and `alert`; these names are both bytecompiler-visible and
+  runtime-installed on the same source-session global/host; `readFile` reads
+  text only and does not append or execute source.
 - Full accepted gate at that checkpoint: `cargo test --lib -- --quiet` with
-  1824 passed.
+  1828 passed.
 
 Current git/code note:
 
 - The current working tree may contain documentation or active-batch edits.
-  Treat the 1824-test M3c String/global runtime slice as the last accepted green code
+  Treat the 1828-test M3d1 safe shell-host global slice as the last accepted green code
   checkpoint unless a later progress entry records passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
   repairing that baseline.
@@ -201,10 +201,9 @@ Major accepted capabilities:
 
 Known Octane run blockers:
 
-- Shell and benchmark host names can now be declared for bytecompiler
-  visibility, but their runtime behavior is not installed yet:
-  `performance.now`, `load`, `readFile`, `print`, `console`, and
-  error-reporting compatibility such as `alert`.
+- Full `load(path)` execution is not implemented. It must be VM-owned because
+  it needs to read, append, compile, execute, and resume in the same source
+  session/global/host instead of running from inside `CoreOpcodeDispatchHost`.
 - Standard object/global ownership is only partially tightened: `Math` is now a
   canonical session-global object, but the rest of the standard object family
   still needs a follow-up boundary before benchmark-visible mutation can be
@@ -385,10 +384,14 @@ M3: Current - add Octane-core runtime intrinsics and shell globals.
   `String.fromCharCode`, and global `parseInt`, with `parseInt` installed as a
   benchmark-visible session global and override persistence tested across
   loaded sources.
-- Next sub-slice: M3d installs shell/benchmark host globals:
-  `performance.now`, `load`, `readFile`, `print`, `console`, and `alert`.
-  It must reuse the existing file-source/session append boundary and must not
-  implement the Octane runner loop or JIT lowering in the same patch.
+- Accepted sub-slice: M3d1 installed opt-in safe shell/benchmark host globals:
+  `performance.now`, `readFile`, `print`, `console.log/info/warn/error`, and
+  `alert`. Host output is captured for later runner telemetry, `performance.now`
+  is nondecreasing within one host, and `readFile` is deliberately read-only.
+- Next sub-slice: M3d2 implements full `load(path)` through a VM-owned
+  deferral/resume boundary. It must reuse the existing file-source/session
+  append boundary and must not implement the Octane runner loop or JIT lowering
+  in the same patch.
 - Scheduling note: most executable native builtin code still lives in
   `src/interpreter/mod.rs`, so Math and String implementation batches should be
   serialized unless the main agent first splits builtin bodies into disjoint

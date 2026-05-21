@@ -55,10 +55,11 @@ use crate::interpreter::{
     sync_targeted_frame_roots, sync_targeted_register_roots, validate_call_return_continuation,
     validate_construct_return_continuation, BaselineFallbackRequest, CallObservationDrainRequest,
     CallObservationOutcome, CallReturnContinuation, ConstructReturnContinuation,
-    CoreOpcodeDispatchHost, DispatchConfig, DispatchHost, DispatchInstruction, DispatchOutcome,
-    DispatchState, ExecutionCompletion, ExecutionContextStack, ExecutionEntryRecord,
-    ExecutionError, ExecutionRootSnapshot, FramePushRequest, FunctionValueCallCompletion,
-    FunctionValueCallHandling, FunctionValueCallRequest, FunctionValueCallTailCompletion,
+    CoreHostOutputRecord, CoreOpcodeDispatchHost, DispatchConfig, DispatchHost,
+    DispatchInstruction, DispatchOutcome, DispatchState, ExecutionCompletion,
+    ExecutionContextStack, ExecutionEntryRecord, ExecutionError, ExecutionRootSnapshot,
+    FramePushRequest, FunctionValueCallCompletion, FunctionValueCallHandling,
+    FunctionValueCallRequest, FunctionValueCallTailCompletion,
     FunctionValuePropertyOperationCompletion, FunctionValuePropertyOperationOutcome,
     FunctionValuePropertyOperationResume, FunctionValueReturnTransform, InterpreterExecutionState,
     InterpreterFunctionCodeBlock, InterpreterWriteBarrierRecord, OrdinaryBytecodeCallHandling,
@@ -680,6 +681,7 @@ pub enum SourceExecutionError {
 pub struct SourceSessionExecution {
     global_object: GlobalObjectId,
     completions: Vec<ExecutionCompletion>,
+    host_output_records: Vec<CoreHostOutputRecord>,
 }
 
 impl SourceSessionExecution {
@@ -691,9 +693,69 @@ impl SourceSessionExecution {
         &self.completions
     }
 
+    pub fn host_output_records(&self) -> &[CoreHostOutputRecord] {
+        &self.host_output_records
+    }
+
     pub fn into_completions(self) -> Vec<ExecutionCompletion> {
         self.completions
     }
+}
+
+pub const SOURCE_SESSION_SAFE_BENCHMARK_HOST_GLOBAL_NAMES: &[&str] =
+    &["performance", "print", "alert", "console", "readFile"];
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SourceSessionHostGlobalConfig {
+    names: Vec<String>,
+}
+
+impl SourceSessionHostGlobalConfig {
+    pub fn safe_benchmark_host_globals() -> Self {
+        Self::from_host_names(
+            SOURCE_SESSION_SAFE_BENCHMARK_HOST_GLOBAL_NAMES
+                .iter()
+                .copied(),
+        )
+    }
+
+    pub fn from_host_names<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            names: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    fn declared_global_bindings(&self) -> BytecompilerGlobalBindingSet {
+        BytecompilerGlobalBindingSet::from_host_names(self.names.iter().map(String::as_str))
+    }
+
+    fn install_runtime_properties(
+        &self,
+        host: &mut CoreOpcodeDispatchHost,
+        heap: &mut Heap,
+        global_object: RuntimeValue,
+    ) -> Result<(), SourceExecutionError> {
+        host.install_host_global_properties(
+            heap,
+            global_object,
+            self.names.iter().map(String::as_str),
+        )
+        .map_err(SourceExecutionError::GlobalObjectValue)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SourceSessionConfiguration {
+    global_bindings: BytecompilerGlobalBindingSet,
+    host_globals: SourceSessionHostGlobalConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -763,10 +825,16 @@ impl SourceSessionHandle {
         &self.completions
     }
 
+    pub fn host_output_records(&self) -> &[CoreHostOutputRecord] {
+        self.host.host_output_records()
+    }
+
     pub fn finish(self) -> SourceSessionExecution {
+        let host_output_records = self.host.host_output_records().to_vec();
         SourceSessionExecution {
             global_object: self.global_object,
             completions: self.completions,
+            host_output_records,
         }
     }
 }
@@ -8390,9 +8458,9 @@ impl Vm {
         I: IntoIterator<Item = S>,
         S: Into<SourceSessionSource>,
     {
-        self.execute_source_session_with_global_bindings(
+        self.execute_source_session_with_configuration(
             sources,
-            BytecompilerGlobalBindingSet::default(),
+            SourceSessionConfiguration::default(),
         )
     }
 
@@ -8405,8 +8473,47 @@ impl Vm {
         I: IntoIterator<Item = S>,
         S: Into<SourceSessionSource>,
     {
+        self.execute_source_session_with_configuration(
+            sources,
+            SourceSessionConfiguration {
+                global_bindings,
+                host_globals: SourceSessionHostGlobalConfig::default(),
+            },
+        )
+    }
+
+    pub fn execute_source_session_with_host_globals<I, S>(
+        &mut self,
+        sources: I,
+        host_globals: SourceSessionHostGlobalConfig,
+    ) -> Result<SourceSessionExecution, SourceExecutionError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<SourceSessionSource>,
+    {
+        self.execute_source_session_with_configuration(
+            sources,
+            SourceSessionConfiguration {
+                global_bindings: BytecompilerGlobalBindingSet::default(),
+                host_globals,
+            },
+        )
+    }
+
+    fn execute_source_session_with_configuration<I, S>(
+        &mut self,
+        sources: I,
+        configuration: SourceSessionConfiguration,
+    ) -> Result<SourceSessionExecution, SourceExecutionError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<SourceSessionSource>,
+    {
         let mut stable_ids = SourceSessionStableIds::default();
-        let mut visible_global_bindings = Self::source_session_global_bindings(global_bindings);
+        let mut visible_global_bindings = Self::source_session_global_bindings(
+            configuration.global_bindings.clone(),
+            &configuration.host_globals,
+        );
         let mut bytecompiler_session_id = self.next_source_bytecompiler_session_id;
         let mut function_count = 0usize;
         let mut compiled_sources = Vec::new();
@@ -8454,6 +8561,11 @@ impl Vm {
             .map_err(SourceExecutionError::GlobalObjectValue)?;
         host.install_standard_global_properties(&mut self.heap, global_object_value)
             .map_err(SourceExecutionError::GlobalObjectValue)?;
+        configuration.host_globals.install_runtime_properties(
+            &mut host,
+            &mut self.heap,
+            global_object_value,
+        )?;
         self.record_source_global_object_value(global_object, global_object_value)?;
         let mut completions = Vec::with_capacity(entries.len());
         for entry in &entries {
@@ -8468,16 +8580,37 @@ impl Vm {
         Ok(SourceSessionExecution {
             global_object,
             completions,
+            host_output_records: host.host_output_records().to_vec(),
         })
     }
 
     pub fn open_source_session(&mut self) -> Result<SourceSessionHandle, SourceExecutionError> {
-        self.open_source_session_with_global_bindings(BytecompilerGlobalBindingSet::default())
+        self.open_source_session_with_configuration(SourceSessionConfiguration::default())
     }
 
     pub fn open_source_session_with_global_bindings(
         &mut self,
         global_bindings: BytecompilerGlobalBindingSet,
+    ) -> Result<SourceSessionHandle, SourceExecutionError> {
+        self.open_source_session_with_configuration(SourceSessionConfiguration {
+            global_bindings,
+            host_globals: SourceSessionHostGlobalConfig::default(),
+        })
+    }
+
+    pub fn open_source_session_with_host_globals(
+        &mut self,
+        host_globals: SourceSessionHostGlobalConfig,
+    ) -> Result<SourceSessionHandle, SourceExecutionError> {
+        self.open_source_session_with_configuration(SourceSessionConfiguration {
+            global_bindings: BytecompilerGlobalBindingSet::default(),
+            host_globals,
+        })
+    }
+
+    fn open_source_session_with_configuration(
+        &mut self,
+        configuration: SourceSessionConfiguration,
     ) -> Result<SourceSessionHandle, SourceExecutionError> {
         let global_object = self.allocate_global_object_cell()?;
         let mut host = CoreOpcodeDispatchHost::new();
@@ -8486,11 +8619,19 @@ impl Vm {
             .map_err(SourceExecutionError::GlobalObjectValue)?;
         host.install_standard_global_properties(&mut self.heap, global_object_value)
             .map_err(SourceExecutionError::GlobalObjectValue)?;
+        configuration.host_globals.install_runtime_properties(
+            &mut host,
+            &mut self.heap,
+            global_object_value,
+        )?;
         self.record_source_global_object_value(global_object, global_object_value)?;
         Ok(SourceSessionHandle {
             global_object,
             global_object_value,
-            visible_global_bindings: Self::source_session_global_bindings(global_bindings),
+            visible_global_bindings: Self::source_session_global_bindings(
+                configuration.global_bindings,
+                &configuration.host_globals,
+            ),
             stable_ids: SourceSessionStableIds::default(),
             function_count: 0,
             host,
@@ -8622,9 +8763,11 @@ impl Vm {
 
     fn source_session_global_bindings(
         global_bindings: BytecompilerGlobalBindingSet,
+        host_globals: &SourceSessionHostGlobalConfig,
     ) -> BytecompilerGlobalBindingSet {
         let mut visible_global_bindings = BytecompilerGlobalBindingSet::standard_globals();
         visible_global_bindings.extend(global_bindings);
+        visible_global_bindings.extend(host_globals.declared_global_bindings());
         visible_global_bindings
     }
 
@@ -11240,6 +11383,22 @@ mod tests {
             provider,
             SourceSpan::new(SourcePosition(0), SourcePosition(text.len() as u32)),
         )
+    }
+
+    fn js_string_literal(text: &str) -> String {
+        let mut literal = String::from("'");
+        for character in text.chars() {
+            match character {
+                '\\' => literal.push_str("\\\\"),
+                '\'' => literal.push_str("\\'"),
+                '\n' => literal.push_str("\\n"),
+                '\r' => literal.push_str("\\r"),
+                '\t' => literal.push_str("\\t"),
+                _ => literal.push(character),
+            }
+        }
+        literal.push('\'');
+        literal
     }
 
     fn compiler_produced_program_code_block(text: &str, session: u64) -> CodeBlock {
@@ -40983,7 +41142,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_source_session_host_binding_name_compiles_without_runtime_installation() {
+    fn vm_source_session_host_global_binding_name_compiles_without_runtime_installation() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
         let globals = BytecompilerGlobalBindingSet::from_host_names(["print"]);
 
@@ -40996,6 +41155,184 @@ mod tests {
             &[ExecutionCompletion::Failed(
                 ExecutionError::ExpectedFunction
             )]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_safe_benchmark_host_globals_are_visible_callable_and_record_output() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session_with_host_globals(
+                vec![source(
+                    "let before = performance.now(); \
+                     let printed = print('print', 1); \
+                     let alerted = alert('alert'); \
+                     let logged = console.log('log'); \
+                     let infoed = console.info('info'); \
+                     let warned = console.warn('warn'); \
+                     let errored = console.error('error'); \
+                     return typeof before === 'number' && \
+                         printed === undefined && \
+                         alerted === undefined && \
+                         logged === undefined && \
+                         infoed === undefined && \
+                         warned === undefined && \
+                         errored === undefined && \
+                         typeof readFile === 'function';",
+                )],
+                SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[ExecutionCompletion::Returned(RuntimeValue::from_bool(true))]
+        );
+        assert_eq!(
+            execution.host_output_records(),
+            &[
+                crate::interpreter::CoreHostOutputRecord {
+                    sink: crate::interpreter::CoreHostOutputSink::Print,
+                    text: "print 1".into(),
+                },
+                crate::interpreter::CoreHostOutputRecord {
+                    sink: crate::interpreter::CoreHostOutputSink::Alert,
+                    text: "alert".into(),
+                },
+                crate::interpreter::CoreHostOutputRecord {
+                    sink: crate::interpreter::CoreHostOutputSink::ConsoleLog,
+                    text: "log".into(),
+                },
+                crate::interpreter::CoreHostOutputRecord {
+                    sink: crate::interpreter::CoreHostOutputSink::ConsoleInfo,
+                    text: "info".into(),
+                },
+                crate::interpreter::CoreHostOutputRecord {
+                    sink: crate::interpreter::CoreHostOutputSink::ConsoleWarn,
+                    text: "warn".into(),
+                },
+                crate::interpreter::CoreHostOutputRecord {
+                    sink: crate::interpreter::CoreHostOutputSink::ConsoleError,
+                    text: "error".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_host_global_performance_now_is_numeric_and_nondecreasing() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session_with_host_globals(
+                vec![source(
+                    "let first = performance.now(); \
+                     let second = performance.now(); \
+                     return typeof first === 'number' && \
+                         typeof second === 'number' && \
+                         second >= first;",
+                )],
+                SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[ExecutionCompletion::Returned(RuntimeValue::from_bool(true))]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_host_global_read_file_reads_without_execution_or_append() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("webkit-rust-host-read-file-{unique}.js"));
+        let file_text = "print('from file');";
+        std::fs::write(&path, file_text).unwrap();
+        let path_text = path.to_string_lossy().into_owned();
+        let script = format!(
+            "let text = readFile({}); \
+             return text === {};",
+            js_string_literal(&path_text),
+            js_string_literal(file_text)
+        );
+
+        let execution = vm
+            .execute_source_session_with_host_globals(
+                vec![source(&script)],
+                SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+            )
+            .unwrap();
+
+        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            execution.completions(),
+            &[ExecutionCompletion::Returned(RuntimeValue::from_bool(true))]
+        );
+        assert!(
+            execution.host_output_records().is_empty(),
+            "readFile must not execute source text"
+        );
+    }
+
+    #[test]
+    fn vm_source_session_host_globals_persist_across_incremental_appends() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut session = vm
+            .open_source_session_with_host_globals(
+                SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            vm.append_source_session_source(&mut session, source("print('first');"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+        assert_eq!(
+            vm.append_source_session_source(
+                &mut session,
+                source(
+                    "console.log('second'); \
+                     return typeof print === 'function' && \
+                         typeof console.log === 'function' && \
+                         typeof performance.now === 'function';"
+                )
+            )
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(
+            session.host_output_records(),
+            &[
+                crate::interpreter::CoreHostOutputRecord {
+                    sink: crate::interpreter::CoreHostOutputSink::Print,
+                    text: "first".into(),
+                },
+                crate::interpreter::CoreHostOutputRecord {
+                    sink: crate::interpreter::CoreHostOutputSink::ConsoleLog,
+                    text: "second".into(),
+                },
+            ]
+        );
+
+        let execution = session.finish();
+        assert_eq!(
+            execution.host_output_records(),
+            &[
+                crate::interpreter::CoreHostOutputRecord {
+                    sink: crate::interpreter::CoreHostOutputSink::Print,
+                    text: "first".into(),
+                },
+                crate::interpreter::CoreHostOutputRecord {
+                    sink: crate::interpreter::CoreHostOutputSink::ConsoleLog,
+                    text: "second".into(),
+                },
+            ]
         );
     }
 
