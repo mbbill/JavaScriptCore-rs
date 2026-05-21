@@ -169,18 +169,17 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- M3a canonical standard-global proof slice: source sessions install a
-  canonical benchmark-visible `Math` object on the shared global, bytecompiler
-  resolves standard globals through the session global instead of fresh local
-  intrinsic loads, and `Math` property mutation persists across batch and
-  incremental loads.
+- M3b canonical Math runtime slice: source sessions install a benchmark-visible
+  `Math` object on the shared global, bytecompiler resolves standard `Math`
+  through global bindings, Octane-required Math APIs are installed on that
+  object, and `Math.random` overrides persist across loaded sources.
 - Full accepted gate at that checkpoint: `cargo test --lib -- --quiet` with
-  1818 passed.
+  1819 passed.
 
 Current git/code note:
 
 - The current working tree may contain documentation or active-batch edits.
-  Treat the 1818-test M3a canonical-Math slice as the last accepted green code
+  Treat the 1819-test M3b canonical-Math runtime slice as the last accepted green code
   checkpoint unless a later progress entry records passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
   repairing that baseline.
@@ -202,8 +201,7 @@ Major accepted capabilities:
 Known Octane run blockers:
 
 - Runtime intrinsics used by Octane-core still need an explicit benchmark
-  compatibility pass: `Math.floor`, `Math.sqrt`, `Math.random`, `Math.log`,
-  `Math.LN2`, `String.prototype.charCodeAt`,
+  compatibility pass for `String.prototype.charCodeAt`,
   `String.prototype.substring`, `String.fromCharCode`, and global `parseInt`.
 - Shell and benchmark host names can now be declared for bytecompiler
   visibility, but their runtime behavior is not installed yet:
@@ -378,9 +376,15 @@ M3: Current - add Octane-core runtime intrinsics and shell globals.
   intrinsic object loads, preserved lexical shadowing, and proved `Math`
   property mutation across batch and incremental loads; full gates passed with
   1818 lib tests.
-- Next sub-slice: M3b installs the Octane-required Math APIs on that canonical
-  object. It must not widen String, shell globals, runner control, or JIT math
-  lowering in the same patch.
+- Accepted sub-slice: M3b installed `Math.floor`, `Math.sqrt`, `Math.log`,
+  `Math.random`, and `Math.LN2` on the canonical `Math` object. The random
+  source is host-owned and deterministic enough for local execution; benchmark
+  determinism still belongs to the JetStream driver-compatible
+  `Math.random` override.
+- Next sub-slice: M3c installs Octane-required String/global runtime intrinsics:
+  `String.prototype.charCodeAt`, `String.prototype.substring`,
+  `String.fromCharCode`, and global `parseInt`. It must not widen shell
+  globals, runner control, or JIT lowering in the same patch.
 - Scheduling note: most executable native builtin code still lives in
   `src/interpreter/mod.rs`, so Math and String implementation batches should be
   serialized unless the main agent first splits builtin bodies into disjoint

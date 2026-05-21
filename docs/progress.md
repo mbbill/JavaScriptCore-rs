@@ -188,6 +188,7 @@ one-off test adjustments.
 - 2026-05-20: M2 global-binding slice accepted: source sessions expose top-level `function`/`var` and declared host names through a real shared global object, with full gates passed including `cargo test --lib -- --quiet` 1809 passed.
 - 2026-05-20: M2 file-source slice accepted: shell loaded-source records assign `SourceProviderId`/`SourceOriginId`, bytecompiler provenance reaches `SourceProvenance`, incremental source sessions preserve one global/host across appends, and full gates passed including `cargo test --lib -- --quiet` 1813 passed.
 - 2026-05-20: M3a canonical-Math global slice accepted: source sessions install benchmark-visible `Math` on the shared global, bytecompiler resolves standard `Math` through global bindings, Math property mutations persist across batch/incremental loads, and full gates passed including `cargo test --lib -- --quiet` 1818 passed.
+- 2026-05-20: M3b canonical-Math runtime slice accepted: `Math.floor`, `Math.sqrt`, `Math.log`, `Math.random`, and `Math.LN2` are installed on session-global `Math`, override persistence is tested across loaded sources, and full gates passed including `cargo test --lib -- --quiet` 1819 passed.
 
 ## Open High-Risk Gaps
 

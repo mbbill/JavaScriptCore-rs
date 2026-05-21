@@ -2193,6 +2193,7 @@ pub struct CoreOpcodeDispatchHost {
     strings: CoreStringStore,
     bigints: CoreBigIntStore,
     symbols: CoreSymbolStore,
+    math_random: CoreMathRandomState,
     string_literals: HashMap<u32, String>,
     identifier_texts: HashMap<u32, String>,
     prototype_property_key: Option<CorePropertyKey>,
@@ -2204,6 +2205,30 @@ pub struct CoreOpcodeDispatchHost {
     initialized_instance_fields: Vec<CoreInitializedInstanceFields>,
     #[cfg(test)]
     call_frame_snapshots_for_test: Vec<CoreCallFrameSnapshotForTest>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CoreMathRandomState {
+    state: u64,
+}
+
+impl Default for CoreMathRandomState {
+    fn default() -> Self {
+        Self {
+            state: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+}
+
+impl CoreMathRandomState {
+    fn next(&mut self) -> f64 {
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let fraction_bits = self.state >> 11;
+        (fraction_bits as f64) * (1.0 / ((1_u64 << 53) as f64))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2294,6 +2319,7 @@ impl CoreOpcodeDispatchHost {
             strings: CoreStringStore::default(),
             bigints: CoreBigIntStore::default(),
             symbols: CoreSymbolStore::default(),
+            math_random: CoreMathRandomState::default(),
             string_literals: HashMap::new(),
             identifier_texts: HashMap::new(),
             prototype_property_key: Some(CorePropertyKey::String("prototype".into())),
@@ -2328,6 +2354,7 @@ impl CoreOpcodeDispatchHost {
             strings: CoreStringStore::default(),
             bigints: CoreBigIntStore::default(),
             symbols: CoreSymbolStore::default(),
+            math_random: CoreMathRandomState::default(),
             string_literals,
             identifier_texts: HashMap::new(),
             prototype_property_key: Some(CorePropertyKey::String("prototype".into())),
@@ -2377,6 +2404,7 @@ impl CoreOpcodeDispatchHost {
             strings: CoreStringStore::default(),
             bigints: CoreBigIntStore::default(),
             symbols: CoreSymbolStore::default(),
+            math_random: CoreMathRandomState::default(),
             string_literals,
             identifier_texts,
             prototype_property_key,
@@ -3842,9 +3870,13 @@ enum CoreNativeFunction {
     ArrayFrom,
     ArrayOf,
     MathAbs,
+    MathFloor,
+    MathLog,
     MathMax,
     MathMin,
     MathPow,
+    MathRandom,
+    MathSqrt,
     MathTrunc,
     JsonParse,
     JsonStringify,
@@ -4560,9 +4592,13 @@ impl CoreObjectStore {
         let object = self.allocate();
         for (name, native_function) in [
             ("abs", CoreNativeFunction::MathAbs),
+            ("floor", CoreNativeFunction::MathFloor),
+            ("log", CoreNativeFunction::MathLog),
             ("max", CoreNativeFunction::MathMax),
             ("min", CoreNativeFunction::MathMin),
             ("pow", CoreNativeFunction::MathPow),
+            ("random", CoreNativeFunction::MathRandom),
+            ("sqrt", CoreNativeFunction::MathSqrt),
             ("trunc", CoreNativeFunction::MathTrunc),
         ] {
             let function = self.allocate_native_function(native_function);
@@ -4580,6 +4616,7 @@ impl CoreObjectStore {
         }
         for (name, value) in [
             ("E", RuntimeValue::from_double(std::f64::consts::E)),
+            ("LN2", RuntimeValue::from_double(std::f64::consts::LN_2)),
             ("PI", RuntimeValue::from_double(std::f64::consts::PI)),
         ] {
             let key = CorePropertyKey::String(name.into());
@@ -13614,9 +13651,13 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::ArrayFrom => self.native_array_from(state.heap, arguments),
             CoreNativeFunction::ArrayOf => self.native_array_of(state.heap, arguments),
             CoreNativeFunction::MathAbs => self.native_math_abs(arguments),
+            CoreNativeFunction::MathFloor => self.native_math_floor(arguments),
+            CoreNativeFunction::MathLog => self.native_math_log(arguments),
             CoreNativeFunction::MathMax => self.native_math_max(arguments),
             CoreNativeFunction::MathMin => self.native_math_min(arguments),
             CoreNativeFunction::MathPow => self.native_math_pow(arguments),
+            CoreNativeFunction::MathRandom => self.native_math_random(),
+            CoreNativeFunction::MathSqrt => self.native_math_sqrt(arguments),
             CoreNativeFunction::MathTrunc => self.native_math_trunc(arguments),
             CoreNativeFunction::JsonParse => self.native_json_parse(state.heap, arguments),
             CoreNativeFunction::JsonStringify => self.native_json_stringify(state, arguments),
@@ -17278,6 +17319,19 @@ impl CoreOpcodeDispatchHost {
         Ok(runtime_number_from_f64(value.abs()))
     }
 
+    fn native_math_floor(
+        &self,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let value = self.math_number_argument(arguments, 0)?;
+        Ok(runtime_number_from_f64(value.floor()))
+    }
+
+    fn native_math_log(&self, arguments: &[RuntimeValue]) -> Result<RuntimeValue, DispatchOutcome> {
+        let value = self.math_number_argument(arguments, 0)?;
+        Ok(runtime_number_from_f64(value.ln()))
+    }
+
     fn native_math_max(&self, arguments: &[RuntimeValue]) -> Result<RuntimeValue, DispatchOutcome> {
         if arguments.is_empty() {
             return Ok(RuntimeValue::from_double(f64::NEG_INFINITY));
@@ -17326,6 +17380,18 @@ impl CoreOpcodeDispatchHost {
         let base = self.math_number_argument(arguments, 0)?;
         let exponent = self.math_number_argument(arguments, 1)?;
         Ok(runtime_number_from_f64(base.powf(exponent)))
+    }
+
+    fn native_math_random(&mut self) -> Result<RuntimeValue, DispatchOutcome> {
+        Ok(runtime_number_from_f64(self.math_random.next()))
+    }
+
+    fn native_math_sqrt(
+        &self,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let value = self.math_number_argument(arguments, 0)?;
+        Ok(runtime_number_from_f64(value.sqrt()))
     }
 
     fn native_math_trunc(

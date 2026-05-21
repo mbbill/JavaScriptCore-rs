@@ -42294,6 +42294,10 @@ mod tests {
                      && Math.max(1, 7, 3) === 7 \
                      && Math.min(1, -7, 3) === -7 \
                      && Math.pow(2, 5) === 32 \
+                     && Math.floor(42.9) === 42 \
+                     && Math.floor(-42.1) === -43 \
+                     && Math.sqrt(81) === 9 \
+                     && Math.log(1) === 0 \
                      && Math.trunc(42.9) === 42 \
                      && Math.trunc(-42.9) === -42;",
             ))
@@ -42315,12 +42319,20 @@ mod tests {
                  let negativeInfinity = -(1 / 0); \
                  let maxNaN = Math.max(void 0); \
                  let minNaN = Math.min(1, void 0); \
+                 let floorNaN = Math.floor(); \
+                 let sqrtNaN = Math.sqrt(-1); \
+                 let logNaN = Math.log(-1); \
                  return Math.max() === negativeInfinity \
                      && Math.min() === positiveInfinity \
                      && maxNaN !== maxNaN \
                      && minNaN !== minNaN \
+                     && floorNaN !== floorNaN \
+                     && sqrtNaN !== sqrtNaN \
+                     && logNaN !== logNaN \
                      && Math.PI > 3 \
                      && Math.PI < 4 \
+                     && Math.LN2 > 0.69 \
+                     && Math.LN2 < 0.70 \
                      && Math.E > 2 \
                      && Math.E < 3;",
             ))
@@ -42333,6 +42345,41 @@ mod tests {
     }
 
     #[test]
+    fn vm_math_intrinsic_random_returns_fraction_and_can_be_overridden_in_source_session() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "let first = Math.random(); \
+                 let second = Math.random(); \
+                 return first >= 0 && first < 1 \
+                     && second >= 0 && second < 1;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let execution = vm
+            .execute_source_session(vec![
+                source("Math.random = function() { return 0.25; }; return Math.random();"),
+                source("return Math.random();"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::from_double(0.25)),
+                ExecutionCompletion::Returned(RuntimeValue::from_double(0.25)),
+            ]
+        );
+    }
+
+    #[test]
     fn vm_math_intrinsic_is_visible_inside_functions_and_closures() {
         let mut vm = Vm::new(VmConfig::default());
 
@@ -42340,7 +42387,7 @@ mod tests {
             .execute_source(source(
                 "function make(limit) { \
                      function inner(value) { \
-                         return Math.max(Math.abs(value), limit); \
+                         return Math.max(Math.floor(Math.sqrt(value * value)), limit); \
                      } \
                      return inner; \
                  } \
@@ -42360,8 +42407,8 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let Math = { abs: function(value) { return value + 1; } }; \
-                 return Math.abs(41) === 42;",
+                "let Math = { floor: function(value) { return value + 1; } }; \
+                 return Math.floor(41) === 42;",
             ))
             .unwrap();
 
