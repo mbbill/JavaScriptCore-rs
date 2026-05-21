@@ -7658,7 +7658,7 @@ mod tests {
     #[test]
     fn bytecompiler_propagates_source_provider_and_origin_ids() {
         let source = source_with_origin(
-            "return 42;",
+            "42;",
             SourceOrigin {
                 url: Some("file:///tmp/input.js".to_string()),
                 source_url: Some("file:///tmp/input.js".to_string()),
@@ -7706,7 +7706,7 @@ mod tests {
 
     #[test]
     fn parsed_ast_emits_core_bytecode_that_interpreter_executes() {
-        let source = source("let answer = 40 + 2; return answer;");
+        let source = source("let answer = 40 + 2; answer;");
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
             &mut arena,
@@ -7728,7 +7728,7 @@ mod tests {
         let summary = summarize_bytecompiler_integration(&plan);
         assert!(summary.is_ready_for_bytecode_handoff());
         let unlinked = plan.unlinked_code.unwrap();
-        assert_eq!(unlinked.instructions().instruction_count(), 6);
+        assert_eq!(unlinked.instructions().instruction_count(), 7);
 
         let code_block_id = CodeBlockId(CellId(99));
         let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
@@ -7780,8 +7780,7 @@ mod tests {
 
     #[test]
     fn bytecompiler_lowers_template_substitutions_as_string_concatenation() {
-        let completion =
-            execute_program_source("return `${1}${2}` === \"12\" && `${1}${2}` !== 3;", 36);
+        let completion = execute_program_source("`${1}${2}` === \"12\" && `${1}${2}` !== 3;", 36);
 
         assert_eq!(
             completion,
@@ -7791,7 +7790,7 @@ mod tests {
 
     #[test]
     fn parsed_ast_lowers_delete_member_without_property_get() {
-        let source = source("let object = { value: 1 }; return delete object.value;");
+        let source = source("let object = { value: 1 }; delete object.value;");
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
             &mut arena,
@@ -7824,7 +7823,7 @@ mod tests {
 
     #[test]
     fn parsed_ast_generates_root_map_for_object_literal() {
-        let unlinked = emit_program_source("return {};", 15);
+        let unlinked = emit_program_source("({});", 15);
         let root_map = exact_root_map_for_opcode(&unlinked, CoreOpcode::NewObject);
 
         assert_eq!(root_map.owner, None);
@@ -7846,7 +7845,7 @@ mod tests {
 
     #[test]
     fn parsed_ast_generates_root_map_for_array_literal() {
-        let unlinked = emit_program_source("return [];", 16);
+        let unlinked = emit_program_source("[];", 16);
         let root_map = exact_root_map_for_opcode(&unlinked, CoreOpcode::NewArray);
 
         assert_eq!(root_map.owner, None);
@@ -7864,7 +7863,7 @@ mod tests {
 
     #[test]
     fn parsed_ast_generates_typeof_root_map_with_argument_source_kind() {
-        let unlinked = emit_program_source("return typeof this;", 17);
+        let unlinked = emit_program_source("typeof this;", 17);
         let root_map = exact_root_map_for_opcode(&unlinked, CoreOpcode::TypeOf);
 
         assert_eq!(root_map.owner, None);
@@ -7883,7 +7882,7 @@ mod tests {
 
     #[test]
     fn parsed_ast_generates_root_map_for_string_literal_load() {
-        let unlinked = emit_program_source("return \"owned\";", 18);
+        let unlinked = emit_program_source("\"owned\";", 18);
         let root_map = exact_root_map_for_opcode(&unlinked, CoreOpcode::LoadString);
         let keys = load_string_identifier_keys(&unlinked);
 
@@ -7900,7 +7899,7 @@ mod tests {
 
     #[test]
     fn parsed_ast_generates_root_map_for_bigint_literal_load() {
-        let unlinked = emit_program_source("return 12345678901234567890n;", 19);
+        let unlinked = emit_program_source("12345678901234567890n;", 19);
         let root_map = exact_root_map_for_opcode(&unlinked, CoreOpcode::LoadBigInt);
         let keys = load_bigint_identifier_keys(&unlinked);
 
@@ -7920,7 +7919,7 @@ mod tests {
 
     #[test]
     fn parsed_ast_installs_code_block_string_literals_for_load_string() {
-        let source = source("return \"owned\";");
+        let source = source("\"owned\";");
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
             &mut arena,
@@ -7948,7 +7947,7 @@ mod tests {
 
     #[test]
     fn parsed_ast_installs_code_block_literal_text_for_load_bigint() {
-        let source = source("return 12345678901234567890n;");
+        let source = source("12345678901234567890n;");
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
             &mut arena,
@@ -7979,7 +7978,7 @@ mod tests {
 
     #[test]
     fn parsed_ast_installs_nested_function_string_literals_on_function_body() {
-        let source = source("function read() { return \"nested\"; } return read;");
+        let source = source("function read() { return \"nested\"; } read;");
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
             &mut arena,
@@ -8023,7 +8022,7 @@ mod tests {
 
     #[test]
     fn parsed_ast_installs_nested_function_bigint_literals_on_function_body() {
-        let source = source("function read() { return 9007199254740993n; } return read;");
+        let source = source("function read() { return 9007199254740993n; } read;");
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
             &mut arena,
@@ -8068,7 +8067,7 @@ mod tests {
     #[test]
     fn parsed_ast_resolves_standard_globals_without_intrinsic_object_loads() {
         let plan = emit_program_plan_with_global_bindings(
-            "function read() { return Math.custom; } return Math;",
+            "function read() { return Math.custom; } Math;",
             15,
             BytecompilerGlobalBindingSet::standard_globals(),
         );
@@ -8097,7 +8096,7 @@ mod tests {
     #[test]
     fn parsed_ast_function_declaration_resolves_host_global_alert_live() {
         let plan = emit_program_plan_with_global_bindings(
-            "function f() { alert('x'); } return f;",
+            "function f() { alert('x'); } f;",
             20,
             BytecompilerGlobalBindingSet::from_host_names(["alert"]),
         );
@@ -8119,7 +8118,7 @@ mod tests {
     #[test]
     fn parsed_ast_function_declaration_resolves_host_global_performance_live() {
         let plan = emit_program_plan_with_global_bindings(
-            "function f() { return performance.now(); } return f;",
+            "function f() { return performance.now(); } f;",
             21,
             BytecompilerGlobalBindingSet::from_host_names(["performance"]),
         );
@@ -8143,7 +8142,7 @@ mod tests {
         let mut globals = BytecompilerGlobalBindingSet::from_host_names(["performance"]);
         globals.declare(BytecompilerGlobalBinding::source_class("Benchmark"));
         let plan = emit_program_plan_with_global_bindings(
-            "class Benchmark { runIteration() { return performance.now(); } } return Benchmark;",
+            "class Benchmark { runIteration() { return performance.now(); } } Benchmark;",
             26,
             globals,
         );
@@ -8174,7 +8173,7 @@ mod tests {
     #[test]
     fn parsed_ast_function_expression_resolves_host_global_live() {
         let plan = emit_program_plan_with_global_bindings(
-            "var f = function() { alert('x'); }; return f;",
+            "var f = function() { alert('x'); }; f;",
             23,
             BytecompilerGlobalBindingSet::from_host_names(["alert"]),
         );
@@ -8196,7 +8195,7 @@ mod tests {
     #[test]
     fn parsed_ast_function_declaration_rejects_unknown_global_read() {
         let result = try_emit_program_plan_with_global_bindings(
-            "function f(x) { if (x) return DV; return 1; } return f;",
+            "function f(x) { if (x) return DV; return 1; } f;",
             22,
             BytecompilerGlobalBindingSet::default(),
         );
@@ -8210,7 +8209,7 @@ mod tests {
     #[test]
     fn parsed_ast_reads_sloppy_top_level_global_assignment_after_write() {
         let plan = emit_program_plan_with_global_bindings(
-            "setupEngine = function() { return 42; }; return setupEngine();",
+            "setupEngine = function() { return 42; }; setupEngine();",
             24,
             BytecompilerGlobalBindingSet::default(),
         );
@@ -8227,7 +8226,7 @@ mod tests {
     #[test]
     fn parsed_ast_rejects_sloppy_global_read_before_top_level_assignment() {
         let result = try_emit_program_plan_with_global_bindings(
-            "return setupEngine; setupEngine = function() { return 42; };",
+            "setupEngine; setupEngine = function() { return 42; };",
             25,
             BytecompilerGlobalBindingSet::default(),
         );
@@ -8244,7 +8243,7 @@ mod tests {
 
         let execution = vm
             .execute_source_session(vec![source(
-                "setupEngine = function() { return 42; }; return setupEngine();",
+                "setupEngine = function() { return 42; }; setupEngine();",
             )])
             .unwrap();
 
@@ -8258,7 +8257,7 @@ mod tests {
     fn vm_source_session_rejects_unknown_global_without_prior_sloppy_assignment() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
-        let result = vm.execute_source_session(vec![source("return misspelledGlobal;")]);
+        let result = vm.execute_source_session(vec![source("misspelledGlobal;")]);
 
         assert!(matches!(
             result,
@@ -8274,7 +8273,7 @@ mod tests {
 
         let execution = vm
             .execute_source_session_with_host_globals(
-                vec![source("function f() { return alert('x'); } return f();")],
+                vec![source("function f() { return alert('x'); } f();")],
                 SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
             )
             .unwrap();
@@ -8297,7 +8296,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
         let completion = vm
-            .execute_source(source("function f() { 42; } return f();"))
+            .execute_source(source("function f() { 42; } f();"))
             .unwrap();
 
         assert_eq!(
@@ -8314,7 +8313,7 @@ mod tests {
             .execute_source(source(
                 "function Field() { this.width = function() { return 64; }; } \
                  let f = new Field(); \
-                 return typeof f.width === \"function\" && f.width() === 64;",
+                 typeof f.width === \"function\" && f.width() === 64;",
             ))
             .unwrap();
 
@@ -8332,7 +8331,7 @@ mod tests {
             .execute_source(source(
                 "function Field() { this.marker = 1; this.payload = { value: 42 }; } \
                  let f = new Field(); \
-                 return f.marker === 1 && f.payload.value === 42 && f !== f.payload;",
+                 f.marker === 1 && f.payload.value === 42 && f !== f.payload;",
             ))
             .unwrap();
 
@@ -8356,7 +8355,7 @@ mod tests {
                          && typeof target.callable === \"function\" \
                          && target.callable() === 17; \
                  } \
-                 return outer();",
+                 outer();",
             ))
             .unwrap();
 
@@ -8375,7 +8374,7 @@ mod tests {
                 vec![source(
                     "class Benchmark { runIteration() { return performance.now(); } } \
                      let b = new Benchmark(); \
-                     return typeof Benchmark === \"function\" \
+                     typeof Benchmark === \"function\" \
                          && typeof b.runIteration() === \"number\";",
                 )],
                 SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
@@ -8398,7 +8397,7 @@ mod tests {
                     source("class Benchmark { runIteration() { return performance.now(); } }"),
                     source(
                         "let b = new Benchmark(); \
-                         return typeof Benchmark === \"function\" \
+                         typeof Benchmark === \"function\" \
                              && typeof b.runIteration() === \"number\";",
                     ),
                 ],
@@ -8420,7 +8419,7 @@ mod tests {
         let mut globals = BytecompilerGlobalBindingSet::standard_globals();
         globals.declare(BytecompilerGlobalBinding::source_let("Math"));
         let plan = emit_program_plan_with_global_bindings(
-            "let Math = { custom: 41 }; function read() { return Math.custom + 1; } return read();",
+            "let Math = { custom: 41 }; function read() { return Math.custom + 1; } read();",
             16,
             globals,
         );
@@ -8447,8 +8446,7 @@ mod tests {
         let mut globals = BytecompilerGlobalBindingSet::new();
         globals.declare(BytecompilerGlobalBinding::source_let("answer"));
 
-        let plan =
-            emit_program_plan_with_global_bindings("answer = 42; return answer;", 17, globals);
+        let plan = emit_program_plan_with_global_bindings("answer = 42; answer;", 17, globals);
         let program = plan.unlinked_code.as_ref().unwrap();
 
         assert!(unlinked_contains_opcode(
@@ -8469,7 +8467,7 @@ mod tests {
         globals.declare(BytecompilerGlobalBinding::source_class("Benchmark"));
 
         let plan = emit_program_plan_with_global_bindings(
-            "class Benchmark { static score() { return 42; } } return Benchmark;",
+            "class Benchmark { static score() { return 42; } } Benchmark;",
             18,
             globals,
         );
@@ -8492,7 +8490,7 @@ mod tests {
         globals.declare(BytecompilerGlobalBinding::source_let("answer"));
 
         let plan = emit_program_plan_with_global_bindings(
-            "function read() { return answer; } return read();",
+            "function read() { return answer; } read();",
             19,
             globals,
         );
@@ -8509,7 +8507,7 @@ mod tests {
     #[test]
     fn parsed_ast_collects_string_literals_for_program_and_function_bodies() {
         let source = source(
-            "function read() { return \"inner\"; } let object = { name: \"outer\" }; let value = 19n; return object.name === read();",
+            "function read() { return \"inner\"; } let object = { name: \"outer\" }; let value = 19n; object.name === read();",
         );
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
@@ -8611,7 +8609,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_local_update_prefix_and_postfix_values() {
         let completion = execute_program_source(
-            "let x = 1; let a = ++x; let b = x++; let c = --x; let d = x--; return a * 1000 + b * 100 + c * 10 + d + x;",
+            "let x = 1; let a = ++x; let b = x++; let c = --x; let d = x--; a * 1000 + b * 100 + c * 10 + d + x;",
             20,
         );
 
@@ -8624,7 +8622,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_property_and_index_updates_with_single_base_and_key() {
         let completion = execute_program_source(
-            "let count = 0; let object = { value: 1 }; let property = ((count = count + 1) ? object : object).value++; let array = [10]; let indexed = array[(count = count + 1) ? 0 : 0]++; return property + object.value * 10 + indexed * 100 + array[0] * 1000 + count * 10000;",
+            "let count = 0; let object = { value: 1 }; let property = ((count = count + 1) ? object : object).value++; let array = [10]; let indexed = array[(count = count + 1) ? 0 : 0]++; property + object.value * 10 + indexed * 100 + array[0] * 1000 + count * 10000;",
             21,
         );
 
@@ -8637,7 +8635,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_compound_assignments_for_locals_properties_and_indexes() {
         let completion = execute_program_source(
-            "let x = 8; x += 4; x -= 2; x *= 3; x /= 5; x %= 4; x |= 8; x &= 10; x ^= 3; x <<= 1; x >>= 1; x >>>= 1; let object = { value: 5 }; let array = [3]; object.value += 2; array[0] *= 4; return x * 100 + object.value * 10 + array[0];",
+            "let x = 8; x += 4; x -= 2; x *= 3; x /= 5; x %= 4; x |= 8; x &= 10; x ^= 3; x <<= 1; x >>= 1; x >>>= 1; let object = { value: 5 }; let array = [3]; object.value += 2; array[0] *= 4; x * 100 + object.value * 10 + array[0];",
             22,
         );
 
@@ -8650,7 +8648,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_conditional_expression_branch_results() {
         let completion = execute_program_source(
-            "let x = 0; let y = true ? (x = 1) : (x = 2); let z = false ? (x = 3) : (x = 4); return y * 100 + z * 10 + x;",
+            "let x = 0; let y = true ? (x = 1) : (x = 2); let z = false ? (x = 3) : (x = 4); y * 100 + z * 10 + x;",
             23,
         );
 
@@ -8663,7 +8661,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_octane_core_loose_equality_primitives() {
         let completion = execute_program_source(
-            "let a = null == undefined; let b = 1 == \"1\"; let c = true == 1; let d = 0 != false; return a && b && c && !d ? 42 : 0;",
+            "let a = null == undefined; let b = 1 == \"1\"; let c = true == 1; let d = 0 != false; a && b && c && !d ? 42 : 0;",
             24,
         );
 
@@ -8676,7 +8674,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_do_while_first_iteration() {
         let completion = execute_program_source(
-            "let count = 0; do { count = count + 1; } while (false); return count;",
+            "let count = 0; do { count = count + 1; } while (false); count;",
             25,
         );
 
@@ -8689,7 +8687,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_do_while_normal_loop() {
         let completion = execute_program_source(
-            "let i = 0; let total = 0; do { i = i + 1; total = total + i; } while (i < 3); return total * 10 + i;",
+            "let i = 0; let total = 0; do { i = i + 1; total = total + i; } while (i < 3); total * 10 + i;",
             26,
         );
 
@@ -8702,7 +8700,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_do_while_break() {
         let completion = execute_program_source(
-            "let i = 0; do { i = i + 1; if (i === 2) break; } while (i < 5); return i;",
+            "let i = 0; do { i = i + 1; if (i === 2) break; } while (i < 5); i;",
             27,
         );
 
@@ -8715,7 +8713,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_do_while_continue_to_condition() {
         let completion = execute_program_source(
-            "let i = 0; let after = 0; do { i = i + 1; if (i === 1) continue; after = 100; } while (false); return i * 100 + after;",
+            "let i = 0; let after = 0; do { i = i + 1; if (i === 1) continue; after = 100; } while (false); i * 100 + after;",
             28,
         );
 
@@ -8728,7 +8726,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_do_while_continue_through_finally() {
         let completion = execute_program_source(
-            "let i = 0; let cleanup = 0; do { i = i + 1; try { if (i === 1) continue; } finally { cleanup = cleanup + 10; } cleanup = cleanup + 1; } while (i < 2); return cleanup * 10 + i;",
+            "let i = 0; let cleanup = 0; do { i = i + 1; try { if (i === 1) continue; } finally { cleanup = cleanup + 10; } cleanup = cleanup + 1; } while (i < 2); cleanup * 10 + i;",
             29,
         );
 
@@ -8741,7 +8739,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_do_while_break_through_finally() {
         let completion = execute_program_source(
-            "let cleanup = 0; do { try { break; } finally { cleanup = 42; } cleanup = 99; } while (true); return cleanup;",
+            "let cleanup = 0; do { try { break; } finally { cleanup = 42; } cleanup = 99; } while (true); cleanup;",
             30,
         );
 
@@ -8754,7 +8752,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_switch_with_strict_matching() {
         let completion = execute_program_source(
-            "let out = 0; switch (\"1\") { case 1: out = 10; break; case \"1\": out = 42; break; default: out = 99; } return out;",
+            "let out = 0; switch (\"1\") { case 1: out = 10; break; case \"1\": out = 42; break; default: out = 99; } out;",
             31,
         );
 
@@ -8767,7 +8765,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_switch_default_in_middle_with_fallthrough() {
         let completion = execute_program_source(
-            "let out = 0; switch (9) { case 1: out = 1; break; default: out = 10; case 2: out = out + 2; } return out;",
+            "let out = 0; switch (9) { case 1: out = 1; break; default: out = 10; case 2: out = out + 2; } out;",
             32,
         );
 
@@ -8780,7 +8778,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_switch_case_tests_in_order_with_single_discriminant() {
         let completion = execute_program_source(
-            "let probe = 0; let selected = 0; switch (probe = probe + 1) { case (probe = probe + 1): selected = 10; break; case 1: selected = probe * 100 + 2; break; } return selected;",
+            "let probe = 0; let selected = 0; switch (probe = probe + 1) { case (probe = probe + 1): selected = 10; break; case 1: selected = probe * 100 + 2; break; } selected;",
             33,
         );
 
@@ -8793,7 +8791,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_switch_break_through_finally() {
         let completion = execute_program_source(
-            "let cleanup = 0; switch (1) { case 1: try { break; } finally { cleanup = 42; } cleanup = 99; } return cleanup;",
+            "let cleanup = 0; switch (1) { case 1: try { break; } finally { cleanup = 42; } cleanup = 99; } cleanup;",
             34,
         );
 
@@ -8806,7 +8804,7 @@ mod tests {
     #[test]
     fn parsed_ast_executes_continue_inside_switch_to_outer_loop() {
         let completion = execute_program_source(
-            "let i = 0; let total = 0; while (i < 3) { i = i + 1; switch (i) { case 2: continue; default: total = total + i; } total = total + 10; } return total * 10 + i;",
+            "let i = 0; let total = 0; while (i < 3) { i = i + 1; switch (i) { case 2: continue; default: total = total + i; } total = total + 10; } total * 10 + i;",
             35,
         );
 

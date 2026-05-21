@@ -16,7 +16,10 @@ use crate::syntax::lexer::{
     KeywordPolicy, LexDeferred, LexGoal, LexRequest, LexResult, Lexer, LexerError, RawStringMode,
     TemplateLexContext,
 };
-use crate::syntax::semantic::{EarlyError, EarlySemanticInfo, ModuleAnalysis, SemanticScopeId};
+use crate::syntax::semantic::{
+    ControlFlowError, EarlyError, EarlyErrorKind, EarlySemanticInfo, ModuleAnalysis,
+    SemanticScopeId,
+};
 use crate::syntax::source::{Diagnostic, DiagnosticSink, SourceCode, SourceSpan};
 use crate::syntax::token::{
     ContextualKeyword, Keyword, NumericLiteralKind, Punctuator, TemplateTokenKind, Token,
@@ -760,7 +763,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
         }
         cursor.expect_punctuator(Punctuator::CloseParen)?;
         let open = cursor.expect_punctuator(Punctuator::OpenBrace)?;
-        let statements = self.parse_statement_list(cursor, Some(Punctuator::CloseBrace))?;
+        let statements = self.parse_function_statement_list(cursor)?;
         let close = cursor.expect_punctuator(Punctuator::CloseBrace)?;
         let body_span = join_spans(open.span(), close.span());
         let strict = self.state.strict
@@ -1335,6 +1338,17 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
         cursor: &mut TokenCursor<'_>,
     ) -> Result<AstRef<Stmt>, ParserError> {
         let start = cursor.expect_keyword(Keyword::Return)?.span();
+        if self.state.function_depth == 0 {
+            return Err(ParserError {
+                span: Some(start),
+                kind: ParserErrorKind::Early(EarlyError {
+                    span: start,
+                    kind: EarlyErrorKind::InvalidControlFlow(
+                        ControlFlowError::ReturnOutsideFunction,
+                    ),
+                }),
+            });
+        }
         let value = if cursor.statement_is_terminated() {
             None
         } else {
@@ -1345,6 +1359,16 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             span: join_spans(start, end),
             kind: ControlKind::Return(value),
         })))
+    }
+
+    fn parse_function_statement_list(
+        &mut self,
+        cursor: &mut TokenCursor<'_>,
+    ) -> Result<Vec<AstRef<Stmt>>, ParserError> {
+        self.state.function_depth = self.state.function_depth.saturating_add(1);
+        let statements = self.parse_statement_list(cursor, Some(Punctuator::CloseBrace));
+        self.state.function_depth = self.state.function_depth.saturating_sub(1);
+        statements
     }
 
     fn parse_throw_statement(
@@ -3131,7 +3155,11 @@ impl ParserState {
             labels: Vec::new(),
             grammar: ParserGrammarContext::default(),
             scope_depth: 0,
-            function_depth: 0,
+            function_depth: if matches!(config.mode, ParseMode::FunctionBody) {
+                1
+            } else {
+                0
+            },
             loop_depth: 0,
             switch_depth: 0,
             class_depth: 0,
@@ -3403,7 +3431,7 @@ mod tests {
 
     #[test]
     fn parser_preserves_delete_member_reference_shape() {
-        let source = source("let object = {}; return delete object.value;");
+        let source = source("let object = {}; delete object.value;");
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
             &mut arena,
@@ -3421,14 +3449,10 @@ mod tests {
             }
         };
         let scope = arena.scope_node(root).unwrap();
-        let Some(Stmt::Control(ControlStmt {
-            kind: ControlKind::Return(Some(value)),
-            ..
-        })) = arena.statement(scope.statements[1])
-        else {
+        let Some(Stmt::Expression(value)) = arena.statement(scope.statements[1]) else {
             assert!(matches!(
                 arena.statement(scope.statements[1]),
-                Some(Stmt::Control(_))
+                Some(Stmt::Expression(_))
             ));
             return;
         };
@@ -3446,6 +3470,59 @@ mod tests {
             arena.expression(*argument),
             Some(Expr::Member(MemberExpr {
                 member: MemberKind::Dot(_),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn parser_rejects_top_level_return_outside_functions() {
+        for mode in [ParseMode::Program, ParseMode::Eval] {
+            for text in ["return 42;", "{ return 42; }", "if (true) { return 42; }"] {
+                let source = source(text);
+                let mut arena = ParserArena::new();
+                let error = Parser::with_mode(&mut arena, AstBuilder::default(), &source, mode)
+                    .parse()
+                    .unwrap_err();
+
+                assert!(matches!(
+                    error.kind,
+                    ParserErrorKind::Early(EarlyError {
+                        kind: EarlyErrorKind::InvalidControlFlow(
+                            ControlFlowError::ReturnOutsideFunction
+                        ),
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn parser_allows_return_inside_function_body() {
+        let source = source("return 42;");
+        let mut arena = ParserArena::new();
+        let parsed = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            ParseMode::FunctionBody,
+        )
+        .parse()
+        .unwrap();
+        let root = match parsed.root {
+            AstRoot::Function(root) => root,
+            other => {
+                assert!(matches!(other, AstRoot::Function(_)));
+                return;
+            }
+        };
+        let scope = arena.scope_node(root).unwrap();
+
+        assert!(matches!(
+            arena.statement(scope.statements[0]),
+            Some(Stmt::Control(ControlStmt {
+                kind: ControlKind::Return(Some(_)),
                 ..
             }))
         ));
@@ -3759,7 +3836,7 @@ mod tests {
 
     #[test]
     fn parser_builds_function_declaration_metadata() {
-        let source = source("function add(a, b) { return a + b; } return add(1, 2);");
+        let source = source("function add(a, b) { return a + b; } add(1, 2);");
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
             &mut arena,
@@ -4249,7 +4326,7 @@ mod tests {
     #[test]
     fn parser_builds_update_compound_conditional_and_loose_equality_expressions() {
         let source = source(
-            "let x = 0; ++x; x--; object.value += 1; object[key] >>>= 1; return x == 1 ? x != 2 : x === 3;",
+            "let x = 0; ++x; x--; object.value += 1; object[key] >>>= 1; x == 1 ? x != 2 : x === 3;",
         );
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
@@ -4337,14 +4414,10 @@ mod tests {
                         )
                 )
         ));
-        let Some(Stmt::Control(ControlStmt {
-            kind: ControlKind::Return(Some(value)),
-            ..
-        })) = arena.statement(scope.statements[5])
-        else {
+        let Some(Stmt::Expression(value)) = arena.statement(scope.statements[5]) else {
             assert!(matches!(
                 arena.statement(scope.statements[5]),
-                Some(Stmt::Control(_))
+                Some(Stmt::Expression(_))
             ));
             return;
         };

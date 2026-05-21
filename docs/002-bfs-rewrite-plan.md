@@ -176,14 +176,18 @@ Accepted green checkpoint:
   JSC-shaped parse/constructor/strict metadata; class constructors reject direct
   calls; methods and nonconstructable native functions reject `new`; sloppy
   nullish `this` normalizes to the session global object; Program/Eval
-  completion uses a JSC-shaped shared completion destination.
+  completion uses a JSC-shaped shared completion destination; top-level
+  `return` is rejected outside function bodies; generated Octane runner sources
+  use legal Program completion; batch source sessions compile/link/execute
+  sources in shell order on one global.
 - Full accepted gate at that checkpoint: `cargo fmt --check`,
   `cargo clippy --lib --all-targets -- -D warnings`,
-  `cargo build --lib`, and `cargo test --lib -- --quiet` with 1928 passed.
+  `cargo build --lib`, and `cargo test --lib -- --quiet` with 1932 passed.
 
 Current git/code note:
 
-- Treat the 1928-test A1 Program/Eval completion fidelity slice as
+- Treat the 1932-test A1/A2 top-level-return and source-session-ordering
+  fidelity slice as
   the last accepted green code checkpoint unless a later progress entry records
   passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
@@ -210,8 +214,9 @@ Major accepted capabilities:
 Known Octane run blockers:
 
 - The last recorded Octane-core matrix predates the A0 and A1/A2 fidelity
-  fixes. Rerun the six-test matrix after the current top-level-return and
-  source-session ordering audits; do not treat the old
+  fixes, including accepted top-level-return and source-session ordering
+  repairs. Rerun the six-test matrix before scheduling the next feature family;
+  do not treat the old
   `ExpectedFunction`/`ExpectedObject` labels as current evidence without
   rerunning.
 - Full shell-style `load(path)` execution is not implemented. It is not on the
@@ -232,9 +237,10 @@ Known Octane run blockers:
   top-level global assignment reads. JSC-shaped function metadata,
   call-vs-construct separation, class-constructor call rejection, method/native
   nonconstructability, sloppy nullish `this`, and Program/Eval completion are
-  accepted. The next shared work is finishing top-level `return` and
-  source-session ordering audits, rerunning the complete Octane-core pass/fail
-  matrix, and scheduling the next shared feature family from that evidence.
+  accepted. Top-level `return` rejection and shell-ordered source-session
+  execution are accepted. The next shared work is rerunning the complete
+  Octane-core pass/fail matrix and scheduling the next shared feature family
+  from that evidence.
 
 Known full-Octane blockers beyond the core subset:
 
@@ -519,9 +525,9 @@ rewrite phase.
   fixes, and reject unproven Rust-local behavior.
 - Sub-agents: inspect assigned Rust and C++ JSC components, classify fidelity,
   and implement fixes only when the write scope is explicit and disjoint.
-- Active batch: continue A1/A2 shared bytecompiler-runtime fidelity. The next
-  audits should cover top-level `return` gating and batch source execution
-  ordering before more benchmark-specific debugging.
+- Active batch: rerun the complete Octane-core pass/fail matrix after the
+  accepted A1/A2 fidelity repairs, then schedule the next shared feature family
+  from current evidence rather than stale failure labels.
 - Completion evidence for F0: all existing Rust subsystems have passed the
   breadth-first fidelity audit above, accidental deviations have fixes or
   tracked blockers, and full gates plus relevant benchmark probes pass from a

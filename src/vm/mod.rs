@@ -8524,83 +8524,11 @@ impl Vm {
         I: IntoIterator<Item = S>,
         S: Into<SourceSessionSource>,
     {
-        let mut stable_ids = SourceSessionStableIds::default();
-        let mut visible_global_bindings = Self::source_session_global_bindings(
-            configuration.global_bindings.clone(),
-            &configuration.host_globals,
-        );
-        let mut bytecompiler_session_id = self.next_source_bytecompiler_session_id;
-        let mut function_count = 0usize;
-        let mut compiled_sources = Vec::new();
-
+        let mut session = self.open_source_session_with_configuration(configuration)?;
         for source in sources {
-            let function_index_base = u32::try_from(function_count).map_err(|_| {
-                SourceExecutionError::SourceSessionFunctionTableOverflow { function_count }
-            })?;
-            let compiled = Self::compile_source_session_entry(
-                source.into(),
-                BytecompilerSessionId(bytecompiler_session_id),
-                function_index_base,
-                &mut stable_ids,
-                &visible_global_bindings,
-            )?;
-            Self::validate_source_session_global_binding_merge(
-                &visible_global_bindings,
-                &compiled.declared_global_bindings,
-            )?;
-            visible_global_bindings.extend(compiled.declared_global_bindings.clone());
-            function_count = function_count
-                .checked_add(compiled.function_bodies.len())
-                .ok_or(SourceExecutionError::SourceSessionFunctionTableOverflow {
-                    function_count: usize::MAX,
-                })?;
-            bytecompiler_session_id = bytecompiler_session_id.saturating_add(1);
-            compiled_sources.push(compiled);
+            self.append_source_session_source(&mut session, source)?;
         }
-
-        self.next_source_bytecompiler_session_id = bytecompiler_session_id;
-        let global_object = self.allocate_global_object_cell()?;
-
-        let mut entries = Vec::with_capacity(compiled_sources.len());
-        let mut function_blocks = Vec::with_capacity(function_count);
-        for compiled in compiled_sources {
-            let linked = self.link_source_session_compiled_entry(compiled)?;
-            function_blocks.extend(linked.function_blocks);
-            entries.push(linked.executable_entry);
-        }
-
-        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks_strings_and_prototype_key(
-            function_blocks,
-            stable_ids.string_literals,
-            stable_ids.identifier_texts,
-            stable_ids.prototype_property_key,
-        );
-        let global_object_value = host
-            .allocate_global_object_value(&mut self.heap, global_object)
-            .map_err(SourceExecutionError::GlobalObjectValue)?;
-        host.install_standard_global_properties(&mut self.heap, global_object_value)
-            .map_err(SourceExecutionError::GlobalObjectValue)?;
-        configuration.host_globals.install_runtime_properties(
-            &mut host,
-            &mut self.heap,
-            global_object_value,
-        )?;
-        self.record_source_global_object_value(global_object, global_object_value)?;
-        let mut completions = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            completions.push(self.execute_source_session_entry(
-                global_object,
-                global_object_value,
-                entry,
-                &mut host,
-            )?);
-        }
-
-        Ok(SourceSessionExecution {
-            global_object,
-            completions,
-            host_output_records: host.host_output_records().to_vec(),
-        })
+        Ok(session.finish())
     }
 
     pub fn open_source_session(&mut self) -> Result<SourceSessionHandle, SourceExecutionError> {
@@ -20423,7 +20351,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("let value = 6 * 7; return value;"))
+            .execute_source(source("let value = 6 * 7; value;"))
             .unwrap();
 
         assert_eq!(
@@ -20443,7 +20371,7 @@ mod tests {
     fn vm_execute_source_publishes_top_level_code_block_and_global_object_cells() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
-        let completion = vm.execute_source(source("return 42;")).unwrap();
+        let completion = vm.execute_source(source("42;")).unwrap();
 
         assert_eq!(
             completion,
@@ -20550,9 +20478,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
         let completion = vm
-            .execute_source(source(
-                "function add(a, b) { return a + b; } return add(20, 22);",
-            ))
+            .execute_source(source("function add(a, b) { return a + b; } add(20, 22);"))
             .unwrap();
 
         assert_eq!(
@@ -20713,7 +20639,7 @@ mod tests {
     fn vm_code_block_owner_liveness_rejects_dead_registered_owner() {
         let mut vm = Vm::new(VmConfig::default());
 
-        vm.execute_source(source("return 42;")).unwrap();
+        vm.execute_source(source("42;")).unwrap();
         let owner = vm.tiering_integration().diagnostics()[0].owner;
         assert!(vm.code_block_owner_is_live(owner));
 
@@ -20755,11 +20681,8 @@ mod tests {
     #[test]
     fn vm_baseline_install_updates_live_source_code_block() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
-        let (owner, _) = register_compiler_produced_program_code_block_with_executable(
-            &mut vm,
-            "return 42;",
-            31,
-        );
+        let (owner, _) =
+            register_compiler_produced_program_code_block_with_executable(&mut vm, "42;", 31);
         let slot = JitCodeSlot(31);
         let artifact = baseline_artifact(owner, 31);
         let link_finalization = baseline_link_finalization(&artifact);
@@ -20813,11 +20736,8 @@ mod tests {
     #[test]
     fn vm_platform_backed_baseline_materialization_stores_evidence_when_accepted() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
-        let (owner, _) = register_compiler_produced_program_code_block_with_executable(
-            &mut vm,
-            "return 42;",
-            431,
-        );
+        let (owner, _) =
+            register_compiler_produced_program_code_block_with_executable(&mut vm, "42;", 431);
         let artifact = baseline_artifact(owner, 431);
         let (link_finalization, linked_bytes) =
             baseline_link_finalization_with_byte_evidence_and_linked_bytes(&artifact);
@@ -20869,11 +20789,8 @@ mod tests {
     #[test]
     fn vm_platform_backed_baseline_materialization_rejects_wrong_linked_bytes_without_storage() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
-        let (owner, _) = register_compiler_produced_program_code_block_with_executable(
-            &mut vm,
-            "return 42;",
-            432,
-        );
+        let (owner, _) =
+            register_compiler_produced_program_code_block_with_executable(&mut vm, "42;", 432);
         let artifact = baseline_artifact(owner, 432);
         let (link_finalization, mut linked_bytes) =
             baseline_link_finalization_with_byte_evidence_and_linked_bytes(&artifact);
@@ -20913,11 +20830,8 @@ mod tests {
     #[test]
     fn vm_platform_backed_baseline_materialization_drops_evidence_when_tiering_rejects() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
-        let (owner, _) = register_compiler_produced_program_code_block_with_executable(
-            &mut vm,
-            "return 42;",
-            434,
-        );
+        let (owner, _) =
+            register_compiler_produced_program_code_block_with_executable(&mut vm, "42;", 434);
         let mismatched_owner = CodeBlockId(CellId(404_404));
         let artifact = baseline_artifact(owner, 434);
         let (link_finalization, linked_bytes) =
@@ -20953,11 +20867,8 @@ mod tests {
     #[test]
     fn vm_baseline_install_requires_prior_materialization_without_mutation() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
-        let (owner, _) = register_compiler_produced_program_code_block_with_executable(
-            &mut vm,
-            "return 42;",
-            30,
-        );
+        let (owner, _) =
+            register_compiler_produced_program_code_block_with_executable(&mut vm, "42;", 30);
         let slot = JitCodeSlot(30);
 
         let record = vm.install_baseline_artifact(
@@ -20993,11 +20904,8 @@ mod tests {
     #[test]
     fn vm_tiering_materialization_rejects_missing_link_finalization_without_mutation() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
-        let (owner, _) = register_compiler_produced_program_code_block_with_executable(
-            &mut vm,
-            "return 42;",
-            36,
-        );
+        let (owner, _) =
+            register_compiler_produced_program_code_block_with_executable(&mut vm, "42;", 36);
         let slot = JitCodeSlot(36);
         let artifact = baseline_artifact(owner, 36);
 
@@ -21050,11 +20958,8 @@ mod tests {
     #[test]
     fn vm_installs_typed_baseline_generated_artifact_without_native_code() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
-        let (owner, _) = register_compiler_produced_program_code_block_with_executable(
-            &mut vm,
-            "return 42;",
-            41,
-        );
+        let (owner, _) =
+            register_compiler_produced_program_code_block_with_executable(&mut vm, "42;", 41);
 
         let artifact = vm
             .install_baseline_generated_code_artifact(
@@ -21421,31 +21326,31 @@ mod tests {
         let cases = [
             (
                 "undefined return",
-                "return undefined;",
+                "undefined;",
                 ExecutionCompletion::Returned(RuntimeValue::undefined()),
                 &[CoreOpcode::LoadUndefined, CoreOpcode::Return][..],
             ),
             (
                 "null return",
-                "return null;",
+                "null;",
                 ExecutionCompletion::Returned(RuntimeValue::null()),
                 &[CoreOpcode::LoadNull, CoreOpcode::Return][..],
             ),
             (
                 "true return",
-                "return true;",
+                "true;",
                 ExecutionCompletion::Returned(RuntimeValue::from_bool(true)),
                 &[CoreOpcode::LoadBool, CoreOpcode::Return][..],
             ),
             (
                 "false return",
-                "return false;",
+                "false;",
                 ExecutionCompletion::Returned(RuntimeValue::from_bool(false)),
                 &[CoreOpcode::LoadBool, CoreOpcode::Return][..],
             ),
             (
                 "int32 return",
-                "return 7;",
+                "7;",
                 ExecutionCompletion::Returned(RuntimeValue::from_i32(7)),
                 &[CoreOpcode::LoadInt32, CoreOpcode::Return][..],
             ),
@@ -21927,7 +21832,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_bitwise_ops() {
-        let text = "return (~41 + 84) + ((5 & 3) << 5) - (8 | 2) - (7 ^ 3) - (84 >> 1) + 24;";
+        let text = "(~41 + 84) + ((5 & 3) << 5) - (8 | 2) - (7 ^ 3) - (84 >> 1) + 24;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -21973,7 +21878,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_widens_unsigned_right_shift_result() {
-        let text = "return ~0 >>> 32;";
+        let text = "~0 >>> 32;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22015,8 +21920,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_int32_relational_ops() {
-        let text =
-            "if (1 < 2) if (2 <= 2) if (3 > 2) return 4 >= 4; else return false; else return false; else return false;";
+        let text = "if (1 < 2) if (2 <= 2) if (3 > 2) 4 >= 4; else false; else false; else false;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22120,7 +22024,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_nullish_jump_source() {
-        let text = "return 7 ?? 42;";
+        let text = "7 ?? 42;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22158,7 +22062,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_jump_if_false_source() {
-        let text = "if (false && 42) return 1; if (true && 40) return 40 + (7 && 2); return 0;";
+        let text = "(false && 42) ? 1 : (true && 40) ? 40 + (7 && 2) : 0;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22200,7 +22104,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_if_false_source() {
-        let text = "if (false) return 1; else return 42;";
+        let text = "if (false) 1; else 42;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22238,7 +22142,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_primitive_boolean_source() {
-        let text = "return (!false === true) !== false;";
+        let text = "(!false === true) !== false;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22281,7 +22185,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_double_division_source() {
-        let text = "return -40.5 / 2;";
+        let text = "-40.5 / 2;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22324,7 +22228,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_int32_modulo_source() {
-        let text = "return 7 % 4;";
+        let text = "7 % 4;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22362,7 +22266,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_unary_plus_source() {
-        let text = "return +true + +null;";
+        let text = "+true + +null;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22404,7 +22308,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_void_source() {
-        let text = "return void (6 * 7);";
+        let text = "void (6 * 7);";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22444,19 +22348,9 @@ mod tests {
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_unary_minus_primitive_coercion_source(
     ) {
         let cases = [
-            (
-                "return -true;",
-                Some(RuntimeValue::from_i32(-1)),
-                191,
-                false,
-            ),
-            (
-                "return -null;",
-                Some(RuntimeValue::from_double(-0.0)),
-                192,
-                false,
-            ),
-            ("return -void 0;", None, 193, true),
+            ("-true;", Some(RuntimeValue::from_i32(-1)), 191, false),
+            ("-null;", Some(RuntimeValue::from_double(-0.0)), 192, false),
+            ("-void 0;", None, 193, true),
         ];
 
         for (text, expected, id, expects_void) in cases {
@@ -22528,7 +22422,7 @@ mod tests {
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_bit_not_primitive_coercion_source(
     ) {
-        let text = "return ~true + ~null + ~void 0 + ~1.5;";
+        let text = "~true + ~null + ~void 0 + ~1.5;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22747,26 +22641,14 @@ mod tests {
 
     #[test]
     fn vm_generated_runtime_helper_install_derives_from_compiler_produced_root_maps() {
-        assert_compiler_produced_helper_install("return {};", 31, 921, CoreOpcode::NewObject, 1);
-        assert_compiler_produced_helper_install("return [];", 32, 922, CoreOpcode::NewArray, 1);
-        assert_compiler_produced_helper_install(
-            "return typeof this;",
-            33,
-            923,
-            CoreOpcode::TypeOf,
-            2,
-        );
+        assert_compiler_produced_helper_install("({});", 31, 921, CoreOpcode::NewObject, 1);
+        assert_compiler_produced_helper_install("[];", 32, 922, CoreOpcode::NewArray, 1);
+        assert_compiler_produced_helper_install("typeof this;", 33, 923, CoreOpcode::TypeOf, 2);
         assert!(!P6_GENERATED_OPCODE_SUBSET.supports(CoreOpcode::LoadString));
-        assert_compiler_produced_helper_install(
-            "return \"owned\";",
-            34,
-            924,
-            CoreOpcode::LoadString,
-            1,
-        );
+        assert_compiler_produced_helper_install("\"owned\";", 34, 924, CoreOpcode::LoadString, 1);
         assert!(!P6_GENERATED_OPCODE_SUBSET.supports(CoreOpcode::LoadBigInt));
         assert_compiler_produced_helper_install(
-            "return 12345678901234567890n;",
+            "12345678901234567890n;",
             35,
             925,
             CoreOpcode::LoadBigInt,
@@ -35817,7 +35699,7 @@ mod tests {
     fn vm_enters_typed_baseline_generated_code_for_p6_subset() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
         assert_eq!(
-            vm.execute_source(source("return 6 * 7;")).unwrap(),
+            vm.execute_source(source("6 * 7;")).unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
         let owner = vm.tiering_integration().diagnostics()[0].owner;
@@ -35882,7 +35764,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_overflow_arithmetic_runs_generated_without_fallback() {
-        let text = "return 2147483647 + 1;";
+        let text = "2147483647 + 1;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
 
@@ -37792,7 +37674,7 @@ mod tests {
                  function PrimitiveReturn() { this.value = 2; return 7; } \
                  let object = new ObjectReturn(); \
                  let primitive = new PrimitiveReturn(); \
-                 return object.value + primitive.value;",
+                 object.value + primitive.value;",
             ))
             .unwrap();
 
@@ -38032,7 +37914,7 @@ mod tests {
             .execute_source(source(
                 "class Base { constructor(value) { this.value = value; } } \
                  class Derived extends Base { constructor(value) { super(value); } } \
-                 return new Derived(42).value;",
+                 new Derived(42).value;",
             ))
             .unwrap();
         assert_eq!(
@@ -38054,7 +37936,7 @@ mod tests {
             .execute_source(source(
                 "class Base { constructor(value) { this.value = value; } } \
                  class Derived extends Base { } \
-                 return new Derived(42).value;",
+                 new Derived(42).value;",
             ))
             .unwrap();
         assert_eq!(
@@ -38081,7 +37963,7 @@ mod tests {
                 "class Base { constructor(value) { this.value = value; } } \
                  class Mid extends Base { } \
                  class Derived extends Mid { } \
-                 return new Derived(42).value;",
+                 new Derived(42).value;",
             ))
             .unwrap();
 
@@ -38113,7 +37995,7 @@ mod tests {
                 "class Base { constructor() { return { base: 40 }; } } \
                  class Derived extends Base { derived = 2; constructor() { super(); } } \
                  let result = new Derived(); \
-                 return result.base + result.derived;",
+                 result.base + result.derived;",
             ))
             .unwrap();
 
@@ -38141,8 +38023,9 @@ mod tests {
             .execute_source(source(
                 "class Base { } \
                  class Derived extends Base { constructor() { this.value = 1; super(); } } \
-                 try { new Derived(); } catch (error) { return error instanceof TypeError; } \
-                 return false;",
+                 let threw = false; \
+                 try { new Derived(); } catch (error) { threw = error instanceof TypeError; } \
+                 threw;",
             ))
             .unwrap();
 
@@ -38160,8 +38043,9 @@ mod tests {
             .execute_source(source(
                 "class Base { } \
                  class Derived extends Base { constructor() { } } \
-                 try { new Derived(); } catch (error) { return error instanceof TypeError; } \
-                 return false;",
+                 let threw = false; \
+                 try { new Derived(); } catch (error) { threw = error instanceof TypeError; } \
+                 threw;",
             ))
             .unwrap();
 
@@ -38179,8 +38063,9 @@ mod tests {
             .execute_source(source(
                 "class Base { } \
                  class Derived extends Base { constructor() { return; } } \
-                 try { new Derived(); } catch (error) { return error instanceof TypeError; } \
-                 return false;",
+                 let threw = false; \
+                 try { new Derived(); } catch (error) { threw = error instanceof TypeError; } \
+                 threw;",
             ))
             .unwrap();
 
@@ -38198,8 +38083,9 @@ mod tests {
             .execute_source(source(
                 "class Base { } \
                  class Derived extends Base { constructor() { super(); return 1; } } \
-                 try { new Derived(); } catch (error) { return error instanceof TypeError; } \
-                 return false;",
+                 let threw = false; \
+                 try { new Derived(); } catch (error) { threw = error instanceof TypeError; } \
+                 threw;",
             ))
             .unwrap();
 
@@ -38217,8 +38103,9 @@ mod tests {
             .execute_source(source(
                 "class Base { } \
                  class Derived extends Base { constructor() { super(); super(); } } \
-                 try { new Derived(); } catch (error) { return error instanceof TypeError; } \
-                 return false;",
+                 let threw = false; \
+                 try { new Derived(); } catch (error) { threw = error instanceof TypeError; } \
+                 threw;",
             ))
             .unwrap();
 
@@ -38236,7 +38123,7 @@ mod tests {
             .execute_source(source(
                 "class Base { constructor() { return { value: 40 }; } get answer() { return this.value + 2; } } \
                  class Derived extends Base { constructor() { super(); this.answerValue = super.answer; } } \
-                 return new Derived().answerValue;",
+                 new Derived().answerValue;",
             ))
             .unwrap();
 
@@ -39100,7 +38987,7 @@ mod tests {
     #[cfg(all(unix, target_arch = "x86_64"))]
     #[test]
     fn vm_p6_semantic_callable_int32_arithmetic_enters_emitted_native_path() {
-        let text = "let a = 2147483646; let b = 1; return a + b;";
+        let text = "let a = 2147483646; let b = 1; a + b;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
 
@@ -39650,11 +39537,8 @@ mod tests {
     #[test]
     fn vm_p6_semantic_callable_stale_snapshot_falls_back_without_launch_metadata() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
-        let (owner, _) = register_compiler_produced_program_code_block_with_executable(
-            &mut vm,
-            "return 42;",
-            772,
-        );
+        let (owner, _) =
+            register_compiler_produced_program_code_block_with_executable(&mut vm, "42;", 772);
         let record = vm
             .install_p6_x86_64_callable_semantic_baseline_native_entry(p6_semantic_install_request(
                 owner, 772,
@@ -39688,7 +39572,7 @@ mod tests {
                 .map(|record| record.publications().len())
         });
 
-        let stale_code_block = compiler_produced_program_code_block("return 7;", 772);
+        let stale_code_block = compiler_produced_program_code_block("7;", 772);
         let mut host = CoreOpcodeDispatchHost::new();
         let completion =
             execute_registered_code_block_with_host(&mut vm, owner, &stale_code_block, &mut host);
@@ -39843,11 +39727,8 @@ mod tests {
     #[test]
     fn vm_baseline_install_keeps_baseline_allowed_execution_on_interpreter_path() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
-        let (owner, code_block) = register_compiler_produced_program_code_block_with_executable(
-            &mut vm,
-            "return 42;",
-            33,
-        );
+        let (owner, code_block) =
+            register_compiler_produced_program_code_block_with_executable(&mut vm, "42;", 33);
         let artifact = baseline_artifact(owner, 33);
         let link_finalization = baseline_link_finalization(&artifact);
         let executable_residency = baseline_executable_residency(&link_finalization);
@@ -40093,7 +39974,7 @@ mod tests {
 
     #[test]
     fn vm_native_entry_enabled_p6_int32_arithmetic_enters_native_path() {
-        let text = "let a = 2147483646; let b = 1; return a + b;";
+        let text = "let a = 2147483646; let b = 1; a + b;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
 
@@ -40170,7 +40051,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn vm_native_entry_enabled_uses_platform_backed_materialization_with_sealed_shim_authority() {
-        let text = "let a = 40; let b = 2; return a + b;";
+        let text = "let a = 40; let b = 2; a + b;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
 
@@ -40240,11 +40121,8 @@ mod tests {
     #[test]
     fn vm_native_entry_enabled_stale_bytecode_snapshot_falls_back_to_interpreter() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
-        let (owner, _) = register_compiler_produced_program_code_block_with_executable(
-            &mut vm,
-            "return 42;",
-            134,
-        );
+        let (owner, _) =
+            register_compiler_produced_program_code_block_with_executable(&mut vm, "42;", 134);
         let readiness = install_enabled_native_entry(&mut vm, owner, 134);
         assert_eq!(
             readiness.outcome,
@@ -40270,7 +40148,7 @@ mod tests {
                 .map(|record| record.publications().len())
         });
 
-        let stale_code_block = compiler_produced_program_code_block("return 7;", 134);
+        let stale_code_block = compiler_produced_program_code_block("7;", 134);
         let mut host = CoreOpcodeDispatchHost::new();
         let completion =
             execute_registered_code_block_with_host(&mut vm, owner, &stale_code_block, &mut host);
@@ -40323,11 +40201,8 @@ mod tests {
     #[test]
     fn vm_native_entry_disabled_stale_bytecode_snapshot_does_not_publish_launch_metadata() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
-        let (owner, _) = register_compiler_produced_program_code_block_with_executable(
-            &mut vm,
-            "return 42;",
-            234,
-        );
+        let (owner, _) =
+            register_compiler_produced_program_code_block_with_executable(&mut vm, "42;", 234);
         let artifact = baseline_artifact(owner, 234);
         let link_finalization = baseline_link_finalization(&artifact);
         let executable_residency = baseline_executable_residency(&link_finalization);
@@ -40382,7 +40257,7 @@ mod tests {
                 .map(|record| record.publications().len())
         });
 
-        let stale_code_block = compiler_produced_program_code_block("return 7;", 234);
+        let stale_code_block = compiler_produced_program_code_block("7;", 234);
         let mut host = CoreOpcodeDispatchHost::new();
         let completion =
             execute_registered_code_block_with_host(&mut vm, owner, &stale_code_block, &mut host);
@@ -40517,7 +40392,7 @@ mod tests {
     fn vm_native_entry_unsupported_opcode_rejects_install_without_sidecars() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
         assert!(matches!(
-            vm.execute_source(source("return 'native-entry-unsupported';"))
+            vm.execute_source(source("'native-entry-unsupported';"))
                 .unwrap(),
             ExecutionCompletion::Returned(_)
         ));
@@ -40621,7 +40496,7 @@ mod tests {
     fn vm_execute_source_keeps_global_targeted_root_live() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
-        let completion = vm.execute_source(source("return 42;")).unwrap();
+        let completion = vm.execute_source(source("42;")).unwrap();
 
         assert_eq!(
             completion,
@@ -40955,8 +40830,8 @@ mod tests {
     fn vm_execute_source_uses_cell_stable_global_root_ids_for_multiple_globals() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
-        vm.execute_source(source("return 1;")).unwrap();
-        vm.execute_source(source("return 2;")).unwrap();
+        vm.execute_source(source("1;")).unwrap();
+        vm.execute_source(source("2;")).unwrap();
 
         let plan = vm
             .global_runtime_state()
@@ -40982,7 +40857,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
         let execution = vm
-            .execute_source_session(vec![source("return 1;"), source("return 2;")])
+            .execute_source_session(vec![source("1;"), source("2;")])
             .unwrap();
 
         assert_eq!(
@@ -41026,11 +40901,11 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
         assert_eq!(
-            vm.execute_source(source("return 1;")).unwrap(),
+            vm.execute_source(source("1;")).unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::from_i32(1))
         );
         assert_eq!(
-            vm.execute_source(source("return 2;")).unwrap(),
+            vm.execute_source(source("2;")).unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::from_i32(2))
         );
 
@@ -41051,8 +40926,8 @@ mod tests {
 
         let execution = vm
             .execute_source_session(vec![
-                source("function first() { return 1; } return first();"),
-                source("function answer() { return 42; } return answer();"),
+                source("function first() { return 1; } first();"),
+                source("function answer() { return 42; } answer();"),
             ])
             .unwrap();
 
@@ -41076,9 +40951,9 @@ mod tests {
 
         let execution = vm
             .execute_source_session(vec![
-                source("let firstValue = 20; return firstValue + 1;"),
-                source("let secondValue = 21; return secondValue + 1;"),
-                source("function add(a, b) { return a + b; } return add(40, 2);"),
+                source("let firstValue = 20; firstValue + 1;"),
+                source("let secondValue = 21; secondValue + 1;"),
+                source("function add(a, b) { return a + b; } add(40, 2);"),
             ])
             .unwrap();
 
@@ -41107,7 +40982,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
         let execution = vm
-            .execute_source_session(vec![source("throw \"boom\";"), source("return 42;")])
+            .execute_source_session(vec![source("throw \"boom\";"), source("42;")])
             .unwrap();
 
         let pending = match execution.completions()[0] {
@@ -41136,13 +41011,39 @@ mod tests {
     }
 
     #[test]
+    fn vm_source_session_batch_executes_prior_source_before_later_parse_error() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let result = vm.execute_source_session_with_host_globals(
+            vec![
+                source("print('first'); this.answer = 41; throw 99;"),
+                source("let = ;"),
+            ],
+            SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+        );
+
+        assert!(matches!(result, Err(SourceExecutionError::Parse(_))));
+        assert_eq!(
+            vm.exception_state().pending().map(|pending| pending.value),
+            Some(RuntimeValue::from_i32(99))
+        );
+        let descriptors = vm
+            .global_runtime_state()
+            .global_root_plan(vm.heap().id())
+            .unwrap()
+            .descriptors()
+            .to_vec();
+        assert_eq!(descriptors.len(), 1);
+    }
+
+    #[test]
     fn vm_source_session_calls_function_declared_by_earlier_source() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
         let execution = vm
             .execute_source_session(vec![
                 source("function answer() { return 42; }"),
-                source("return answer();"),
+                source("answer();"),
             ])
             .unwrap();
 
@@ -41162,8 +41063,8 @@ mod tests {
         let execution = vm
             .execute_source_session(vec![
                 source("var answer = 41;"),
-                source("return answer + 1;"),
-                source("return this.answer + 1;"),
+                source("answer + 1;"),
+                source("this.answer + 1;"),
             ])
             .unwrap();
 
@@ -41183,8 +41084,8 @@ mod tests {
 
         let batch_execution = batch
             .execute_source_session(vec![
-                source("Math.custom = 41; return Math.custom;"),
-                source("function readCustom() { return Math.custom + 1; } return readCustom();"),
+                source("Math.custom = 41; Math.custom;"),
+                source("function readCustom() { return Math.custom + 1; } readCustom();"),
             ])
             .unwrap();
 
@@ -41203,7 +41104,7 @@ mod tests {
             incremental
                 .append_source_session_source(
                     &mut session,
-                    source("Math.custom = 41; return Math.custom;")
+                    source("Math.custom = 41; Math.custom;")
                 )
                 .unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
@@ -41212,9 +41113,7 @@ mod tests {
             incremental
                 .append_source_session_source(
                     &mut session,
-                    source(
-                        "function readCustom() { return Math.custom + 1; } return readCustom();"
-                    )
+                    source("function readCustom() { return Math.custom + 1; } readCustom();")
                 )
                 .unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
@@ -41228,11 +41127,11 @@ mod tests {
         let execution = vm
             .execute_source_session(vec![
                 source("function readMath() { return Math.custom; }"),
-                source("Math = { custom: 41 }; return readMath() + 1;"),
+                source("Math = { custom: 41 }; readMath() + 1;"),
                 source(
                     "function readObject() { return Object.answer; } \
                      Object = { answer: 40 }; \
-                     return readObject() + 2;",
+                     readObject() + 2;",
                 ),
             ])
             .unwrap();
@@ -41256,7 +41155,7 @@ mod tests {
                 "var answer = 1; \
                  function readAnswer() { return answer; } \
                  this.answer = 41; \
-                 return readAnswer() + 1;",
+                 readAnswer() + 1;",
             )])
             .unwrap();
 
@@ -41272,7 +41171,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "return this.Object === Object \
+                "this.Object === Object \
                      && this.Array === Array \
                      && this.String === String \
                      && this.JSON === JSON \
@@ -41292,12 +41191,12 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
         assert_eq!(
-            vm.execute_source(source("Math.custom = 41; return Math.custom;"))
+            vm.execute_source(source("Math.custom = 41; Math.custom;"))
                 .unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
         );
         assert_eq!(
-            vm.execute_source(source("return Math.custom;")).unwrap(),
+            vm.execute_source(source("Math.custom;")).unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::undefined())
         );
     }
@@ -41310,7 +41209,7 @@ mod tests {
             .execute_source_session(vec![source(
                 "let Math = { custom: 41 }; \
                  function readCustom() { return Math.custom + 1; } \
-                 return readCustom();",
+                 readCustom();",
             )])
             .unwrap();
 
@@ -41333,7 +41232,7 @@ mod tests {
         );
         assert_eq!(
             incremental
-                .append_source_session_source(&mut session, source("return answer + 1;"))
+                .append_source_session_source(&mut session, source("answer + 1;"))
                 .unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
@@ -41341,10 +41240,7 @@ mod tests {
         let incremental_execution = session.finish();
         let mut batch = Vm::new(VmConfig::baseline_allowed());
         let batch_execution = batch
-            .execute_source_session(vec![
-                source("var answer = 41;"),
-                source("return answer + 1;"),
-            ])
+            .execute_source_session(vec![source("var answer = 41;"), source("answer + 1;")])
             .unwrap();
 
         assert_eq!(
@@ -41364,7 +41260,7 @@ mod tests {
     fn vm_source_session_rejects_unknown_global_identifier() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
-        let result = vm.execute_source_session(vec![source("return misspelledGlobal;")]);
+        let result = vm.execute_source_session(vec![source("misspelledGlobal;")]);
 
         assert!(matches!(
             result,
@@ -41372,12 +41268,14 @@ mod tests {
                 BytecompilerEmissionError::UnboundIdentifier(_)
             ))
         ));
-        assert!(vm
-            .global_runtime_state()
-            .global_root_plan(vm.heap().id())
-            .unwrap()
-            .descriptors()
-            .is_empty());
+        assert_eq!(
+            vm.global_runtime_state()
+                .global_root_plan(vm.heap().id())
+                .unwrap()
+                .descriptors()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -41385,11 +41283,11 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
         assert_eq!(
-            vm.execute_source(source("var answer = 42; return answer;"))
+            vm.execute_source(source("var answer = 42; answer;"))
                 .unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
-        let result = vm.execute_source(source("return answer;"));
+        let result = vm.execute_source(source("answer;"));
 
         assert!(matches!(
             result,
@@ -41403,7 +41301,7 @@ mod tests {
             .unwrap()
             .descriptors()
             .to_vec();
-        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors.len(), 2);
     }
 
     #[test]
@@ -41437,7 +41335,7 @@ mod tests {
                      let infoed = console.info('info'); \
                      let warned = console.warn('warn'); \
                      let errored = console.error('error'); \
-                     return typeof before === 'number' && \
+                     typeof before === 'number' && \
                          printed === undefined && \
                          alerted === undefined && \
                          logged === undefined && \
@@ -41494,7 +41392,7 @@ mod tests {
                 vec![source(
                     "let first = performance.now(); \
                      let second = performance.now(); \
-                     return typeof first === 'number' && \
+                     typeof first === 'number' && \
                          typeof second === 'number' && \
                          second >= first;",
                 )],
@@ -41521,7 +41419,7 @@ mod tests {
         let path_text = path.to_string_lossy().into_owned();
         let script = format!(
             "let text = readFile({}); \
-             return text === {};",
+             text === {};",
             js_string_literal(&path_text),
             js_string_literal(file_text)
         );
@@ -41563,7 +41461,7 @@ mod tests {
                 &mut session,
                 source(
                     "console.log('second'); \
-                     return typeof print === 'function' && \
+                     typeof print === 'function' && \
                          typeof console.log === 'function' && \
                          typeof performance.now === 'function';"
                 )
@@ -41602,6 +41500,54 @@ mod tests {
     }
 
     #[test]
+    fn vm_incremental_source_session_preserves_output_after_duplicate_lexical_error() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut session = vm
+            .open_source_session_with_host_globals(
+                SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            vm.append_source_session_source(
+                &mut session,
+                source("print('first'); let answer = 41;")
+            )
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+        let result = vm.append_source_session_source(&mut session, source("let answer = 42;"));
+
+        assert!(matches!(
+            result,
+            Err(SourceExecutionError::SourceSessionGlobalBindingConflict {
+                name,
+                existing: BytecompilerGlobalBindingKind::SourceLet,
+                incoming: BytecompilerGlobalBindingKind::SourceLet,
+            }) if name == "answer"
+        ));
+        assert_eq!(
+            session.host_output_records(),
+            &[crate::interpreter::CoreHostOutputRecord {
+                sink: crate::interpreter::CoreHostOutputSink::Print,
+                text: "first".into(),
+            }]
+        );
+        assert_eq!(
+            vm.append_source_session_source(&mut session, source("answer + 1;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        assert_eq!(
+            session.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::undefined()),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            ]
+        );
+    }
+
+    #[test]
     fn vm_source_session_let_const_and_class_declarations_cross_source_without_global_object() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
@@ -41612,8 +41558,8 @@ mod tests {
                      const offset = 1; \
                      class Benchmark { static score() { return answer + offset + 1; } }",
                 ),
-                source("return Benchmark.score();"),
-                source("return this.Benchmark === undefined && this.answer === undefined;"),
+                source("Benchmark.score();"),
+                source("this.Benchmark === undefined && this.answer === undefined;"),
             ])
             .unwrap();
 
@@ -41641,12 +41587,12 @@ mod tests {
             ExecutionCompletion::Returned(RuntimeValue::undefined())
         );
         assert_eq!(
-            vm.append_source_session_source(&mut session, source("return Benchmark.score();"))
+            vm.append_source_session_source(&mut session, source("Benchmark.score();"))
                 .unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
         assert_eq!(
-            vm.append_source_session_source(&mut session, source("return this.Benchmark;"))
+            vm.append_source_session_source(&mut session, source("this.Benchmark;"))
                 .unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::undefined())
         );
@@ -41660,7 +41606,7 @@ mod tests {
             .execute_source_session(vec![
                 source("let n = 40; function read() { return n; }"),
                 source("n = 42;"),
-                source("return read();"),
+                source("read();"),
             ])
             .unwrap();
 
@@ -41679,7 +41625,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
         let execution = vm
-            .execute_source_session(vec![source("return answer; let answer = 42;")])
+            .execute_source_session(vec![source("answer; let answer = 42;")])
             .unwrap();
 
         assert!(matches!(
@@ -41697,9 +41643,9 @@ mod tests {
         let execution = vm
             .execute_source_session(vec![
                 source("const answer = 42;"),
-                source("answer = 7; return answer;"),
+                source("answer = 7; answer;"),
                 source("class Benchmark { static score() { return 42; } }"),
-                source("Benchmark = 7; return Benchmark.score();"),
+                source("Benchmark = 7; Benchmark.score();"),
             ])
             .unwrap();
 
@@ -41755,11 +41701,11 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
         assert_eq!(
-            vm.execute_source(source("let answer = 42; return answer;"))
+            vm.execute_source(source("let answer = 42; answer;"))
                 .unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
-        let result = vm.execute_source(source("return answer;"));
+        let result = vm.execute_source(source("answer;"));
 
         assert!(matches!(
             result,
@@ -41937,7 +41883,7 @@ mod tests {
     fn vm_source_completion_matches_interpreter_only_and_baseline_allowed_modes() {
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let mut baseline_vm = Vm::new(VmConfig::baseline_allowed());
-        let text = "return 6 * 7;";
+        let text = "6 * 7;";
 
         let interpreter_completion = interpreter_vm.execute_source(source(text)).unwrap();
         let baseline_completion = baseline_vm.execute_source(source(text)).unwrap();
@@ -41990,7 +41936,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let value = 0; if (1 < 2) value = 7; else value = 9; return value;",
+                "let value = 0; if (1 < 2) value = 7; else value = 9; value;",
             ))
             .unwrap();
 
@@ -42009,7 +41955,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let i = 0; let total = 0; while (i < 10) { i = i + 1; if (i < 3) continue; if (i > 5) break; total = total + i; } return total;",
+                "let i = 0; let total = 0; while (i < 10) { i = i + 1; if (i < 3) continue; if (i > 5) break; total = total + i; } total;",
             ))
             .unwrap();
 
@@ -42046,7 +41992,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("function fail() { throw 42; } fail(); return 1;"))
+            .execute_source(source("function fail() { throw 42; } fail(); 1;"))
             .unwrap();
 
         assert_eq!(
@@ -42065,7 +42011,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("try { throw 40; } catch (e) { return e + 2; }"))
+            .execute_source(source("try { throw 40; } catch (e) { e + 2; }"))
             .unwrap();
 
         assert_eq!(
@@ -42083,7 +42029,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function fail() { throw 42; } try { fail(); } catch (e) { return e; }",
+                "function fail() { throw 42; } try { fail(); } catch (e) { e; }",
             ))
             .unwrap();
 
@@ -42102,7 +42048,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let value = 0; try { value = 42; } catch (e) { value = 1; } return value;",
+                "let value = 0; try { value = 42; } catch (e) { value = 1; } value;",
             ))
             .unwrap();
 
@@ -42120,7 +42066,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("try { throw 1; } catch { return 42; }"))
+            .execute_source(source("try { throw 1; } catch { 42; }"))
             .unwrap();
 
         assert_eq!(
@@ -42138,7 +42084,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let value = 0; try { value = 1; } finally { value = value + 41; } return value;",
+                "let value = 0; try { value = 1; } finally { value = value + 41; } value;",
             ))
             .unwrap();
 
@@ -42157,7 +42103,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let marker = 0; try { try { throw 40; } finally { marker = 2; } } catch (e) { return e + marker; }",
+                "let marker = 0; try { try { throw 40; } finally { marker = 2; } } catch (e) { e + marker; }",
             ))
             .unwrap();
 
@@ -42176,7 +42122,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let marker = 0; function f() { try { return 40; } finally { marker = 2; } } return f() + marker;",
+                "let marker = 0; function f() { try { return 40; } finally { marker = 2; } } f() + marker;",
             ))
             .unwrap();
 
@@ -42195,7 +42141,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function f() { try { return 1; } finally { return 42; } } return f();",
+                "function f() { try { return 1; } finally { return 42; } } f();",
             ))
             .unwrap();
 
@@ -42214,7 +42160,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let i = 0; let total = 0; while (i < 5) { i = i + 1; try { if (i < 3) continue; if (i > 4) break; total = total + i; } finally { total = total + 10; } } return total;",
+                "let i = 0; let total = 0; while (i < 5) { i = i + 1; try { if (i < 3) continue; if (i > 4) break; total = total + i; } finally { total = total + 10; } } total;",
             ))
             .unwrap();
 
@@ -42233,7 +42179,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let marker = 0; try { throw 40; } catch (e) { marker = e; } finally { marker = marker + 2; } return marker;",
+                "let marker = 0; try { throw 40; } catch (e) { marker = e; } finally { marker = marker + 2; } marker;",
             ))
             .unwrap();
 
@@ -42252,7 +42198,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let marker = 0; try { try { throw 1; } catch (e) { throw 40; } finally { marker = 2; } } catch (e) { return e + marker; }",
+                "let marker = 0; try { try { throw 1; } catch (e) { throw 40; } finally { marker = 2; } } catch (e) { e + marker; }",
             ))
             .unwrap();
 
@@ -42271,7 +42217,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "try { try { throw 1; } catch (e) { } finally { throw 42; } } catch (e) { return e; }",
+                "try { try { throw 1; } catch (e) { } finally { throw 42; } } catch (e) { e; }",
             ))
             .unwrap();
 
@@ -42290,7 +42236,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "try { try { throw 40; } finally { try { throw 1; } catch (e) { } } } catch (e) { return e + 2; }",
+                "try { try { throw 40; } finally { try { throw 1; } catch (e) { } } } catch (e) { e + 2; }",
             ))
             .unwrap();
 
@@ -42308,9 +42254,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source(
-                "function add(a, b) { return a + b; } return add(40, 2);",
-            ))
+            .execute_source(source("function add(a, b) { return a + b; } add(40, 2);"))
             .unwrap();
 
         assert_eq!(
@@ -42328,7 +42272,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function sum(n) { let total = 0; let i = 0; while (i < n) { i = i + 1; total = total + i; } return total; } return sum(4);",
+                "function sum(n) { let total = 0; let i = 0; while (i < n) { i = i + 1; total = total + i; } return total; } sum(4);",
             ))
             .unwrap();
 
@@ -42356,7 +42300,7 @@ mod tests {
                         && alias === 7 \
                         && rest.z === 9; \
                  } \
-                 return pick([1, 2, 3], { x: 4, z: 9 });",
+                 pick([1, 2, 3], { x: 4, z: 9 });",
             ))
             .unwrap();
 
@@ -42373,7 +42317,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "function read([x] = [10], { a } = { a: 32 }) { return x + a; } \
-                 return read(undefined, undefined);",
+                 read(undefined, undefined);",
             ))
             .unwrap();
 
@@ -42396,7 +42340,7 @@ mod tests {
                         && items[1] === 3 \
                         && items[2] === 4; \
                  } \
-                 return collect(1, 2, 3, 4);",
+                 collect(1, 2, 3, 4);",
             ))
             .unwrap();
 
@@ -42419,7 +42363,7 @@ mod tests {
                         && arguments[2] === 12 \
                         && a === 10; \
                  } \
-                 return inspect(10, 20, 12);",
+                 inspect(10, 20, 12);",
             ))
             .unwrap();
 
@@ -42439,7 +42383,7 @@ mod tests {
                     function inner() { return arguments[0] + arguments.length; } \
                     return inner(40, 1); \
                  } \
-                 return outer(1, 2, 3);",
+                 outer(1, 2, 3);",
             ))
             .unwrap();
 
@@ -42456,7 +42400,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "function read(a = arguments[2], b = arguments.length) { return a + b; } \
-                 return read(undefined, undefined, 39);",
+                 read(undefined, undefined, 39);",
             ))
             .unwrap();
 
@@ -42474,7 +42418,7 @@ mod tests {
             .execute_source(source(
                 "function parameterShadow(arguments) { return arguments; } \
                  function localShadow() { let arguments = { value: 40 }; return arguments.value + 2; } \
-                 return parameterShadow(20, 1) + localShadow();",
+                 parameterShadow(20, 1) + localShadow();",
             ))
             .unwrap();
 
@@ -42494,7 +42438,7 @@ mod tests {
                     return function (...items) { return base + items[0] + items[1]; }; \
                  } \
                  let add = make(10); \
-                 return add(20, 12);",
+                 add(20, 12);",
             ))
             .unwrap();
 
@@ -42510,7 +42454,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function fact(n) { if (n < 2) return 1; return n * fact(n - 1); } return fact(5);",
+                "function fact(n) { if (n < 2) return 1; return n * fact(n - 1); } fact(5);",
             ))
             .unwrap();
 
@@ -42528,9 +42472,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source(
-                "let object = { x: 40, y: 2 }; return object.x + object.y;",
-            ))
+            .execute_source(source("let object = { x: 40, y: 2 }; object.x + object.y;"))
             .unwrap();
 
         assert_eq!(
@@ -42548,7 +42490,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let key = \"z\"; let object = { \"x\": 20, 10: 20, [key]: 2 }; return object.x + object[10] + object.z;",
+                "let key = \"z\"; let object = { \"x\": 20, 10: 20, [key]: 2 }; object.x + object[10] + object.z;",
             ))
             .unwrap();
 
@@ -42570,7 +42512,7 @@ mod tests {
                 "let [first, , third = 30] = [10, 20]; \
                  let [head, [nested]] = [1, [2]]; \
                  let [character] = \"xy\"; \
-                 return first === 10 \
+                 first === 10 \
                      && third === 30 \
                      && head === 1 \
                      && nested === 2 \
@@ -42594,7 +42536,7 @@ mod tests {
                  let { x, y: alias, missing = 4, nested: { z } } = source; \
                  let key = \"dynamic\"; \
                  let { [key]: value } = { dynamic: 5 }; \
-                 return x === 1 \
+                 x === 1 \
                      && alias === 2 \
                      && missing === 4 \
                      && z === 3 \
@@ -42618,7 +42560,7 @@ mod tests {
                  let [head, ...characters] = \"abc\"; \
                  let key = \"b\"; \
                  let { [key]: b, ...rest } = { a: 10, b: 20, c: 30 }; \
-                 return first === 1 \
+                 first === 1 \
                      && tail.length === 2 \
                      && tail[0] === 2 \
                      && tail[1] === 3 \
@@ -42649,7 +42591,7 @@ mod tests {
                  [first, , third = 30] = [10, 20]; \
                  [head, [nested]] = [1, [2]]; \
                  [character] = \"xy\"; \
-                 return first === 10 \
+                 first === 10 \
                      && third === 30 \
                      && head === 1 \
                      && nested === 2 \
@@ -42674,7 +42616,7 @@ mod tests {
                  ({ x, y: alias, missing: missing = 4, nested: { z }, [key]: value } = { \
                      x: 1, y: 2, nested: { z: 3 }, dynamic: 5 \
                  }); \
-                 return x === 1 \
+                 x === 1 \
                      && alias === 2 \
                      && missing === 4 \
                      && z === 3 \
@@ -42698,7 +42640,7 @@ mod tests {
                  [first, ...tail] = [5, 6, 7]; \
                  let a = 0; let rest = {}; \
                  ({ a, ...rest } = { a: 1, b: 2, c: 3 }); \
-                 return first === 5 \
+                 first === 5 \
                      && tail.length === 2 \
                      && tail[0] === 6 \
                      && tail[1] === 7 \
@@ -42723,7 +42665,7 @@ mod tests {
             .execute_source(source(
                 "let source = { a: 1, b: 2 }; \
                  let copy = { a: 0, ...source, b: 3 }; \
-                 return copy.a === 1 && copy.b === 3;",
+                 copy.a === 1 && copy.b === 3;",
             ))
             .unwrap();
 
@@ -42739,7 +42681,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let object = { value: 0, get answer() { return this.value + 2; }, set answer(value) { this.value = value; } }; object.answer = 40; return object.answer;",
+                "let object = { value: 0, get answer() { return this.value + 2; }, set answer(value) { this.value = value; } }; object.answer = 40; object.answer;",
             ))
             .unwrap();
 
@@ -42758,7 +42700,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let key = \"answer\"; let object = { value: 0, get [key]() { return this.value + 2; }, set [key](value) { this.value = value; } }; object.answer = 40; return object[\"answer\"];",
+                "let key = \"answer\"; let object = { value: 0, get [key]() { return this.value + 2; }, set [key](value) { this.value = value; } }; object.answer = 40; object[\"answer\"];",
             ))
             .unwrap();
 
@@ -42777,7 +42719,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let object = {}; object.value = 40; object.value = object.value + 2; return object.value;",
+                "let object = {}; object.value = 40; object.value = object.value + 2; object.value;",
             ))
             .unwrap();
 
@@ -42799,7 +42741,7 @@ mod tests {
                 "function Base() {} Base.prototype.value = 7; \
                  let object = new Base(); object.value = 42; \
                  let removed = delete object.value; \
-                 return removed && object.value === 7;",
+                 removed && object.value === 7;",
             ))
             .unwrap();
 
@@ -42817,7 +42759,7 @@ mod tests {
             .execute_source(source(
                 "let key = \"value\"; let object = { value: 41 }; \
                  let array = [1, 2, 3]; \
-                 return delete object[key] && object.value === void 0 \
+                 delete object[key] && object.value === void 0 \
                      && delete array[1] && array.length === 3 && array[1] === void 0;",
             ))
             .unwrap();
@@ -42840,7 +42782,7 @@ mod tests {
                  let lengthRemoved = delete array.length; \
                  let valueRemoved = delete object.value; \
                  delete array[1]; array[1] = 40; \
-                 return !lengthRemoved && valueRemoved && object.value === void 0 \
+                 !lengthRemoved && valueRemoved && object.value === void 0 \
                      && touched === 0 && array.length === 2 && array[1] === 40;",
             ))
             .unwrap();
@@ -42861,7 +42803,7 @@ mod tests {
                  Object.defineProperty(object, \"value\", { value: 41, writable: false, configurable: false }); \
                  object.value = 42; \
                  let removed = delete object.value; \
-                 return object.value === 41 && !removed;",
+                 object.value === 41 && !removed;",
             ))
             .unwrap();
 
@@ -42881,7 +42823,7 @@ mod tests {
                  Object.defineProperty(object, \"value\", { value: 41, writable: false, configurable: true }); \
                  object.value = 42; \
                  let removed = delete object.value; \
-                 return removed && object.value === void 0;",
+                 removed && object.value === void 0;",
             ))
             .unwrap();
 
@@ -42900,7 +42842,7 @@ mod tests {
                 "let object = {}; \
                  Object.defineProperty(object, \"value\", { value: 40, writable: true, configurable: false }); \
                  object.value = object.value + 2; \
-                 return object.value === 42 && !(delete object.value);",
+                 object.value === 42 && !(delete object.value);",
             ))
             .unwrap();
 
@@ -42919,7 +42861,7 @@ mod tests {
                 "function seal(object) { \
                      Object.defineProperty(object, \"value\", { value: 41, writable: false, configurable: false }); \
                  } \
-                 let object = {}; seal(object); object.value = 42; return object.value === 41;",
+                 let object = {}; seal(object); object.value = 42; object.value === 41;",
             ))
             .unwrap();
 
@@ -42935,7 +42877,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "return Array.isArray([1]) \
+                "Array.isArray([1]) \
                      && !Array.isArray({}) \
                      && !Array.isArray(function() { return 1; }) \
                      && !Array.isArray(1) \
@@ -42957,7 +42899,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "let array = Array.of(4, 5, 6); \
-                 return array.length === 3 \
+                 array.length === 3 \
                      && array[0] === 4 \
                      && array[1] === 5 \
                      && array[2] === 6 \
@@ -42985,7 +42927,7 @@ mod tests {
                      threw = error instanceof TypeError \
                          && error.message === \"Array.from requires an iterable value\"; \
                  } \
-                 return fromString.join(\"-\") === \"a-b\" \
+                 fromString.join(\"-\") === \"a-b\" \
                      && fromSet.join(\"-\") === \"1-2\" \
                      && fromMap.length === 2 \
                      && fromMap[0][0] === \"a\" \
@@ -43012,18 +42954,18 @@ mod tests {
                  let values = Array(1, 2); \
                  let holes = new Array(3); \
                  let constructed = new Array(4, 5); \
-                 if (typeof Array !== \"function\") return 1; \
-                 if (!Array.isArray(empty)) return 2; \
-                 if (!Array.isArray(values)) return 3; \
-                 if (!Array.isArray(constructed)) return 4; \
-                 if (empty.length !== 0) return 5; \
-                 if (values.join(\"-\") !== \"1-2\") return 6; \
-                 if (holes.length !== 3) return 7; \
-                 if (holes[0] !== void 0) return 8; \
-                 if (Object.getPrototypeOf(constructed) !== Array.prototype) return 11; \
-                 if (!(constructed instanceof Array)) return 9; \
-                 if (constructed.join(\"-\") !== \"4-5\") return 10; \
-                 return 42;",
+                 if (typeof Array !== \"function\") 1; \
+                 if (!Array.isArray(empty)) 2; \
+                 if (!Array.isArray(values)) 3; \
+                 if (!Array.isArray(constructed)) 4; \
+                 if (empty.length !== 0) 5; \
+                 if (values.join(\"-\") !== \"1-2\") 6; \
+                 if (holes.length !== 3) 7; \
+                 if (holes[0] !== void 0) 8; \
+                 if (Object.getPrototypeOf(constructed) !== Array.prototype) 11; \
+                 if (!(constructed instanceof Array)) 9; \
+                 if (constructed.join(\"-\") !== \"4-5\") 10; \
+                 42;",
             ))
             .unwrap();
 
@@ -43042,7 +42984,7 @@ mod tests {
                 "function Box() {} \
                  let box = new Box(); \
                  let array = new Array(1, 2); \
-                 return box instanceof Box && array instanceof Array;",
+                 box instanceof Box && array instanceof Array;",
             ))
             .unwrap();
 
@@ -43065,7 +43007,7 @@ mod tests {
                      } \
                      return inner; \
                  } \
-                 return make(4)(5);",
+                 make(4)(5);",
             ))
             .unwrap();
 
@@ -43081,7 +43023,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "return Math.abs(-42) === 42 \
+                "Math.abs(-42) === 42 \
                      && Math.abs(null) === 0 \
                      && Math.max(1, 7, 3) === 7 \
                      && Math.min(1, -7, 3) === -7 \
@@ -43114,7 +43056,7 @@ mod tests {
                  let floorNaN = Math.floor(); \
                  let sqrtNaN = Math.sqrt(-1); \
                  let logNaN = Math.log(-1); \
-                 return Math.max() === negativeInfinity \
+                 Math.max() === negativeInfinity \
                      && Math.min() === positiveInfinity \
                      && maxNaN !== maxNaN \
                      && minNaN !== minNaN \
@@ -43144,7 +43086,7 @@ mod tests {
             .execute_source(source(
                 "let first = Math.random(); \
                  let second = Math.random(); \
-                 return first >= 0 && first < 1 \
+                 first >= 0 && first < 1 \
                      && second >= 0 && second < 1;",
             ))
             .unwrap();
@@ -43157,8 +43099,8 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
         let execution = vm
             .execute_source_session(vec![
-                source("Math.random = function() { return 0.25; }; return Math.random();"),
-                source("return Math.random();"),
+                source("Math.random = function() { return 0.25; }; Math.random();"),
+                source("Math.random();"),
             ])
             .unwrap();
 
@@ -43183,7 +43125,7 @@ mod tests {
                      } \
                      return inner; \
                  } \
-                 return make(10)(-7) === 10 && make(10)(-12) === 12;",
+                 make(10)(-7) === 10 && make(10)(-12) === 12;",
             ))
             .unwrap();
 
@@ -43200,7 +43142,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "let Math = { floor: function(value) { return value + 1; } }; \
-                 return Math.floor(41) === 42;",
+                 Math.floor(41) === 42;",
             ))
             .unwrap();
 
@@ -43217,7 +43159,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "let array = [1, true, null, \"hi\", void 0]; \
-                 return typeof JSON === \"object\" \
+                 typeof JSON === \"object\" \
                      && JSON.stringify(null) === \"null\" \
                      && JSON.stringify(false) === \"false\" \
                      && JSON.stringify(42) === \"42\" \
@@ -43247,7 +43189,7 @@ mod tests {
                  object.skipped = void 0; \
                  object.fn = function() { return 1; }; \
                  Object.defineProperty(object, \"hidden\", { value: 9, enumerable: false }); \
-                 return JSON.stringify(object) === \"{\\\"1\\\":\\\"one\\\",\\\"2\\\":\\\"two\\\",\\\"b\\\":true,\\\"a\\\":null}\";",
+                 JSON.stringify(object) === \"{\\\"1\\\":\\\"one\\\",\\\"2\\\":\\\"two\\\",\\\"b\\\":true,\\\"a\\\":null}\";",
             ))
             .unwrap();
 
@@ -43264,7 +43206,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "let value = JSON.parse(\"{\\\"a\\\":1,\\\"b\\\":[true,null,\\\"x\\\"],\\\"c\\\":{\\\"n\\\":-2.5}}\"); \
-                 return value.a === 1 \
+                 value.a === 1 \
                      && value.b.length === 3 \
                      && value.b[0] === true \
                      && value.b[1] === null \
@@ -43288,7 +43230,7 @@ mod tests {
                 "let input = { b: [1, { c: \"see\" }], a: false }; \
                  let text = JSON.stringify(input); \
                  let output = JSON.parse(text); \
-                 return text === \"{\\\"b\\\":[1,{\\\"c\\\":\\\"see\\\"}],\\\"a\\\":false}\" \
+                 text === \"{\\\"b\\\":[1,{\\\"c\\\":\\\"see\\\"}],\\\"a\\\":false}\" \
                      && output.b.length === 2 \
                      && output.b[0] === 1 \
                      && output.b[1].c === \"see\" \
@@ -43310,7 +43252,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "let JSON = { stringify: function(value) { return value + 1; } }; \
-                 return JSON.stringify(41) === 42;",
+                 JSON.stringify(41) === 42;",
             ))
             .unwrap();
 
@@ -43327,7 +43269,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "let nan = Number(\"not a number\"); \
-                 return typeof String === \"function\" \
+                 typeof String === \"function\" \
                      && typeof Number === \"function\" \
                      && typeof Boolean === \"function\" \
                      && String() === \"\" \
@@ -43367,7 +43309,7 @@ mod tests {
                      } \
                      return inner; \
                  } \
-                 return make(\"v\")(\"41\") === \"v42true\";",
+                 make(\"v\")(\"41\") === \"v42true\";",
             ))
             .unwrap();
 
@@ -43386,7 +43328,7 @@ mod tests {
                 "let String = function(value) { return value + 1; }; \
                  let Number = function(value) { return value + 2; }; \
                  let Boolean = function(value) { return value + 3; }; \
-                 return String(1) === 2 && Number(1) === 3 && Boolean(1) === 4;",
+                 String(1) === 2 && Number(1) === 3 && Boolean(1) === 4;",
             ))
             .unwrap();
 
@@ -43404,7 +43346,7 @@ mod tests {
             .execute_source(source(
                 "let error = new Error(\"boom\"); \
                  let called = Error(42); \
-                 return error instanceof Error \
+                 error instanceof Error \
                      && Object.getPrototypeOf(error) === Error.prototype \
                      && Error.prototype.constructor === Error \
                      && error.name === \"Error\" \
@@ -43432,7 +43374,7 @@ mod tests {
                 "try { \
                      throw new TypeError(\"bad\"); \
                  } catch (error) { \
-                     return error instanceof TypeError \
+                     error instanceof TypeError \
                          && error instanceof Error \
                          && Object.getPrototypeOf(TypeError.prototype) === Error.prototype \
                          && TypeError.prototype.constructor === TypeError \
@@ -43462,7 +43404,7 @@ mod tests {
                  noName.name = \"\"; \
                  let noMessage = new Error(\"ignored\"); \
                  noMessage.message = \"\"; \
-                 return empty.toString() === \"Error\" \
+                 empty.toString() === \"Error\" \
                      && custom.toString() === \"Custom: text\" \
                      && noName.toString() === \"only message\" \
                      && noMessage.toString() === \"Error\";",
@@ -43487,7 +43429,7 @@ mod tests {
                      let Error = function(value) { return { message: value + 1 }; }; \
                      return Error(41).message; \
                  } \
-                 return make() === \"inside\" \
+                 make() === \"inside\" \
                      && makeType() === \"TypeError: type\" \
                      && shadow() === 42;",
             ))
@@ -43515,7 +43457,7 @@ mod tests {
                      return value + 1; \
                  }); \
                  chained.then(function(value) { seen = seen + value; }); \
-                 return seen;",
+                 seen;",
             ))
             .unwrap();
 
@@ -43536,7 +43478,7 @@ mod tests {
                      .catch(function(reason) { text = reason + \"y\"; return 40; }) \
                      .finally(function() { text = text + \"z\"; }) \
                      .then(function(value) { text = text + value; }); \
-                 return text === \"xyz40\";",
+                 text === \"xyz40\";",
             ))
             .unwrap();
 
@@ -43555,7 +43497,7 @@ mod tests {
                 "let message = \"\"; \
                  new Promise(function(resolve, reject) { throw TypeError(\"bad\"); }) \
                      .catch(function(error) { message = error.message; }); \
-                 return message === \"bad\";",
+                 message === \"bad\";",
             ))
             .unwrap();
 
@@ -43576,7 +43518,7 @@ mod tests {
                  let tag = Object.prototype.toString.call(promise); \
                  let value = 0; \
                  promise.then().then(function(resolved) { value = resolved; }); \
-                 return same && tag === \"[object Promise]\" && value === 42;",
+                 same && tag === \"[object Promise]\" && value === 42;",
             ))
             .unwrap();
 
@@ -43602,7 +43544,7 @@ mod tests {
                      executorThrew = error instanceof TypeError \
                          && error.message === \"Promise resolver must be a function\"; \
                  } \
-                 return callThrew && executorThrew;",
+                 callThrew && executorThrew;",
             ))
             .unwrap();
 
@@ -43620,7 +43562,7 @@ mod tests {
             .execute_source(source(
                 "let epoch = new Date(0); \
                  let next = new Date(\"1970-01-02T00:00:00.000Z\"); \
-                 return epoch instanceof Date \
+                 epoch instanceof Date \
                      && Object.getPrototypeOf(epoch) === Date.prototype \
                      && Date.prototype.constructor === Date \
                      && epoch.getTime() === 0 \
@@ -43647,7 +43589,7 @@ mod tests {
                  let utc = Date.UTC(1970, 0, 2, 3, 4, 5, 6); \
                  let overflow = new Date(Date.UTC(1969, 12, 1)); \
                  let shortYear = new Date(Date.UTC(99, 0, 1)); \
-                 return parsed === utc \
+                 parsed === utc \
                      && overflow.toISOString() === \"1970-01-01T00:00:00.000Z\" \
                      && shortYear.toISOString() === \"1999-01-01T00:00:00.000Z\";",
             ))
@@ -43674,7 +43616,7 @@ mod tests {
                      isoThrew = error instanceof TypeError \
                          && error.message === \"Invalid time value\"; \
                  } \
-                 return invalid.toString() === \"Invalid Date\" \
+                 invalid.toString() === \"Invalid Date\" \
                      && !(parsed === parsed) \
                      && typeof now === \"number\" \
                      && now >= 0 \
@@ -43701,7 +43643,7 @@ mod tests {
                      let Date = function(value) { return { value: value + 1 }; }; \
                      return Date(41).value; \
                  } \
-                 return make() === 0 && shadow() === 42;",
+                 make() === 0 && shadow() === 42;",
             ))
             .unwrap();
 
@@ -43719,7 +43661,7 @@ mod tests {
             .execute_source(source(
                 "let value = 0x10n + 0b10n + 0o7n; \
                  let negative = -5n; \
-                 return typeof value === \"bigint\" \
+                 typeof value === \"bigint\" \
                      && value === 25n \
                      && negative + 8n === 3n \
                      && 7n - 2n === 5n \
@@ -43760,7 +43702,7 @@ mod tests {
                  let constructed = BigInt(\"340282366920938463463374607431768211456\"); \
                  let shifted = 1n << 200n; \
                  let packed = shifted | 123n; \
-                 return huge.toString() === \"1361129467683753853853498429727072845824\" \
+                 huge.toString() === \"1361129467683753853853498429727072845824\" \
                      && (huge + 3n).toString() === \"1361129467683753853853498429727072845827\" \
                      && product.toString() === \"4083388403051261561560495289181218537472\" \
                      && product / 3n === huge \
@@ -43792,7 +43734,7 @@ mod tests {
                  let fromBoolean = BigInt(true); \
                  let text = fromString.toString(); \
                  let value = fromNumber.valueOf(); \
-                 return fromString === 16n \
+                 fromString === 16n \
                      && fromNumber === 26n \
                      && fromBoolean === 1n \
                      && text === \"16\" \
@@ -43824,7 +43766,7 @@ mod tests {
                  try { new BigInt(1); } catch (error) { \
                      constructThrew = error instanceof TypeError; \
                  } \
-                 return make() === \"bigint\" \
+                 make() === \"bigint\" \
                      && shadow() === 42 \
                      && constructThrew;",
             ))
@@ -43848,7 +43790,7 @@ mod tests {
                  view[1] = 255; \
                  view[2] = -1; \
                  let element = Object.getOwnPropertyDescriptor(view, \"0\"); \
-                 return buffer.byteLength === 4 \
+                 buffer.byteLength === 4 \
                      && view.length === 4 \
                      && view.byteLength === 4 \
                      && view.byteOffset === 0 \
@@ -43881,7 +43823,7 @@ mod tests {
                  let data = new DataView(buffer, 1, 2); \
                  data.setUint8(0, 258); \
                  data.setInt8(1, -1); \
-                 return view[1] === 2 \
+                 view[1] === 2 \
                      && view[2] === 255 \
                      && data.getUint8(1) === 255 \
                      && data.getInt8(1) === -1 \
@@ -43913,7 +43855,7 @@ mod tests {
                  let sliced = new Uint8Array(original.buffer.slice(1, 3)); \
                  let descriptor = Object.getOwnPropertyDescriptor(Uint8Array.prototype, \"fill\"); \
                  let keys = Object.keys(original); \
-                 return original[0] === 1 \
+                 original[0] === 1 \
                      && original[1] === 9 \
                      && original[2] === 9 \
                      && original[3] === 4 \
@@ -43958,7 +43900,7 @@ mod tests {
                  try { DataView(new ArrayBuffer(1)); } catch (error) { \
                      dataViewCallThrew = error instanceof TypeError; \
                  } \
-                 return make() === 2 \
+                 make() === 2 \
                      && shadow() === 42 \
                      && arrayBufferCallThrew \
                      && dataViewCallThrew;",
@@ -43979,7 +43921,7 @@ mod tests {
             .execute_source(source(
                 "let first = Symbol(\"id\"); \
                  let second = Symbol(\"id\"); \
-                 return typeof first === \"symbol\" \
+                 typeof first === \"symbol\" \
                      && first !== second \
                      && first.description === \"id\" \
                      && first.toString() === \"Symbol(id)\" \
@@ -44003,7 +43945,7 @@ mod tests {
                 "let shared = Symbol.for(\"shared\"); \
                  let again = Symbol.for(\"shared\"); \
                  let local = Symbol(\"shared\"); \
-                 return shared === again \
+                 shared === again \
                      && shared !== local \
                      && Symbol.keyFor(shared) === \"shared\" \
                      && Symbol.keyFor(local) === void 0 \
@@ -44031,7 +43973,7 @@ mod tests {
                  object[other] = 1; \
                  object[\"Symbol(key)\"] = 100; \
                  let descriptor = Object.getOwnPropertyDescriptor(object, key); \
-                 return object[key] === 41 \
+                 object[key] === 41 \
                      && object[other] === 1 \
                      && object[\"Symbol(key)\"] === 100 \
                      && descriptor.value === 41 \
@@ -44061,7 +44003,7 @@ mod tests {
                      keyForThrew = error instanceof TypeError \
                          && error.message === \"Symbol.keyFor requires a symbol\"; \
                  } \
-                 return constructThrew && keyForThrew;",
+                 constructThrew && keyForThrew;",
             ))
             .unwrap();
 
@@ -44082,7 +44024,7 @@ mod tests {
                      let Symbol = function(value) { return { value: value + 1 }; }; \
                      return Symbol(41).value; \
                  } \
-                 return make() === \"symbol\" && shadow() === 42;",
+                 make() === \"symbol\" && shadow() === 42;",
             ))
             .unwrap();
 
@@ -44104,7 +44046,7 @@ mod tests {
                  Reflect.set(object, key, 1); \
                  let beforeDelete = Reflect.has(object, key); \
                  let deleted = Reflect.deleteProperty(object, key); \
-                 return Reflect.get(object, \"value\") === 41 \
+                 Reflect.get(object, \"value\") === 41 \
                      && beforeDelete \
                      && deleted \
                      && !Reflect.has(object, key);",
@@ -44129,7 +44071,7 @@ mod tests {
                  object.visible = 2; \
                  object[key] = 3; \
                  let keys = Reflect.ownKeys(object); \
-                 return keys.length === 3 \
+                 keys.length === 3 \
                      && keys[0] === \"hidden\" \
                      && keys[1] === \"visible\" \
                      && keys[2] === key;",
@@ -44152,7 +44094,7 @@ mod tests {
                  let object = {}; \
                  let set = Reflect.setPrototypeOf(object, parent); \
                  let descriptor = Reflect.getOwnPropertyDescriptor(parent, \"inherited\"); \
-                 return set \
+                 set \
                      && Reflect.getPrototypeOf(object) === parent \
                      && Reflect.get(object, \"inherited\") === 1 \
                      && descriptor.value === 1 \
@@ -44174,7 +44116,7 @@ mod tests {
             .execute_source(source(
                 "let receiver = { base: 40 }; \
                  function add(left, right) { return this.base + left + right; } \
-                 return Reflect.apply(add, receiver, [1, 1]) === 42;",
+                 Reflect.apply(add, receiver, [1, 1]) === 42;",
             ))
             .unwrap();
 
@@ -44195,7 +44137,7 @@ mod tests {
                      let Reflect = { get: function(object, key) { return object[key] + 1; } }; \
                      return Reflect.get({ value: 41 }, \"value\"); \
                  } \
-                 return read({ value: 42 }) === 42 && shadow() === 42;",
+                 read({ value: 42 }) === 42 && shadow() === 42;",
             ))
             .unwrap();
 
@@ -44250,7 +44192,7 @@ mod tests {
                  let keys = Reflect.ownKeys(proxy); \
                  let read = proxy.value; \
                  let deleted = delete proxy.value; \
-                 return read === 23 \
+                 read === 23 \
                      && Reflect.has(proxy, \"value\") \
                      && deleted \
                      && keys[0] === \"extra\" \
@@ -44290,7 +44232,7 @@ mod tests {
                  pair.revoke(); \
                  let revoked = false; \
                  try { pair.proxy.value; } catch (error) { revoked = error instanceof TypeError; } \
-                 return applied === 43 \
+                 applied === 43 \
                      && direct === 24 \
                      && called === 2 \
                      && before === 6 \
@@ -44317,7 +44259,7 @@ mod tests {
                  } \
                  let callThrew = false; \
                  try { Proxy({}, {}); } catch (error) { callThrew = error instanceof TypeError; } \
-                 return typeof Proxy === \"function\" \
+                 typeof Proxy === \"function\" \
                      && read() === 42 \
                      && shadow() === 42 \
                      && callThrew;",
@@ -44345,7 +44287,7 @@ mod tests {
                  let deleted = map.delete(\"a\"); \
                  let missingDelete = map.delete(\"missing\"); \
                  let cleared = map.clear(); \
-                 return returned === map \
+                 returned === map \
                      && beforeDelete === 3 \
                      && map.get(\"a\") === void 0 \
                      && deleted === true \
@@ -44370,7 +44312,7 @@ mod tests {
                 "let key = {}; \
                  let nan = Number(\"not a number\"); \
                  let map = new Map([[\"a\", 1], [key, 2], [nan, 3]]); \
-                 return map instanceof Map \
+                 map instanceof Map \
                      && Object.getPrototypeOf(map) === Map.prototype \
                      && Map.prototype.constructor === Map \
                      && map.size === 3 \
@@ -44402,7 +44344,7 @@ mod tests {
                      threw = error instanceof TypeError \
                          && error.message === \"Map initializer must be iterable\"; \
                  } \
-                 return copy.size === 2 \
+                 copy.size === 2 \
                      && copy.get(\"a\") === 1 \
                      && copy.get(\"b\") === 2 \
                      && fromSet.size === 2 \
@@ -44435,7 +44377,7 @@ mod tests {
                  let deleted = set.delete(2); \
                  let missingDelete = set.delete(99); \
                  let cleared = set.clear(); \
-                 return set instanceof Set \
+                 set instanceof Set \
                      && Object.getPrototypeOf(set) === Set.prototype \
                      && Set.prototype.constructor === Set \
                      && returned === set \
@@ -44472,7 +44414,7 @@ mod tests {
                      threw = error instanceof TypeError \
                          && error.message === \"Set initializer must be iterable\"; \
                  } \
-                 return fromString.size === 2 \
+                 fromString.size === 2 \
                      && fromString.has(\"a\") \
                      && fromString.has(\"b\") \
                      && fromSet.size === 2 \
@@ -44510,7 +44452,7 @@ mod tests {
                      setError = error instanceof TypeError \
                          && error.message === \"Set method called on incompatible receiver\"; \
                  } \
-                 return map.set === Map.prototype.set \
+                 map.set === Map.prototype.set \
                      && set.add === Set.prototype.add \
                      && Object.hasOwn(map, \"set\") === false \
                      && Object.hasOwn(set, \"add\") === false \
@@ -44549,7 +44491,7 @@ mod tests {
                      setError = error instanceof TypeError \
                          && error.message === \"Constructor Set requires 'new'\"; \
                  } \
-                 return mapError && setError;",
+                 mapError && setError;",
             ))
             .unwrap();
 
@@ -44574,7 +44516,7 @@ mod tests {
                  let got = map.get(key); \
                  let deleted = map.delete(key); \
                  let missingDelete = map.delete(key); \
-                 return map instanceof WeakMap \
+                 map instanceof WeakMap \
                      && Object.getPrototypeOf(map) === WeakMap.prototype \
                      && WeakMap.prototype.constructor === WeakMap \
                      && Object.prototype.toString.call(map) === \"[object WeakMap]\" \
@@ -44611,7 +44553,7 @@ mod tests {
                  let beforeDelete = set.has(first); \
                  let deleted = set.delete(second); \
                  let missingDelete = set.delete(second); \
-                 return set instanceof WeakSet \
+                 set instanceof WeakSet \
                      && Object.getPrototypeOf(set) === WeakSet.prototype \
                      && WeakSet.prototype.constructor === WeakSet \
                      && Object.prototype.toString.call(set) === \"[object WeakSet]\" \
@@ -44665,7 +44607,7 @@ mod tests {
                      if (error instanceof TypeError \
                          && error.message === \"WeakSet method called on incompatible receiver\") errors = errors + 1; \
                  } \
-                 return errors === 6 \
+                 errors === 6 \
                      && weakMapDescriptor.writable === true \
                      && weakMapDescriptor.enumerable === false \
                      && weakMapDescriptor.configurable === true \
@@ -44694,7 +44636,7 @@ mod tests {
                 "let object = { base: 40 }; \
                  Object.defineProperty(object, \"answer\", { get: function() { return this.base + 2; }, configurable: false }); \
                  object.answer = 9; \
-                 return object.answer === 42 && !(delete object.answer);",
+                 object.answer === 42 && !(delete object.answer);",
             ))
             .unwrap();
 
@@ -44713,7 +44655,7 @@ mod tests {
                 "let object = { value: 0 }; \
                  Object.defineProperty(object, \"answer\", { set: function(value) { this.value = value + 2; }, configurable: true }); \
                  object.answer = 40; \
-                 return object.value === 42 && delete object.answer && object.answer === void 0;",
+                 object.value === 42 && delete object.answer && object.answer === void 0;",
             ))
             .unwrap();
 
@@ -44731,7 +44673,7 @@ mod tests {
             .execute_source(source(
                 "let re = /cat/; \
                  let match = re.exec(\"bobcat\"); \
-                 return re.test(\"concatenate\") \
+                 re.test(\"concatenate\") \
                      && !re.test(\"dog\") \
                      && match[0] === \"cat\" \
                      && match.index === 3 \
@@ -44760,7 +44702,7 @@ mod tests {
                         && re.test(text) \
                         && !re.test(\"scat\"); \
                  } \
-                 return check(\"CAT\");",
+                 check(\"CAT\");",
             ))
             .unwrap();
 
@@ -44782,7 +44724,7 @@ mod tests {
                  let second = re.test(\"baab\"); \
                  let afterSecond = re.lastIndex; \
                  let third = re.test(\"baab\"); \
-                 return first \
+                 first \
                      && afterFirst === 2 \
                      && second \
                      && afterSecond === 3 \
@@ -44803,11 +44745,12 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "try { RegExp(\"x\", \"gg\"); } catch (error) { \
-                    return error instanceof TypeError \
+                "let threw = false; \
+                 try { RegExp(\"x\", \"gg\"); } catch (error) { \
+                    threw = error instanceof TypeError \
                         && error.message === \"Invalid regular expression flags\"; \
                  } \
-                 return false;",
+                 threw;",
             ))
             .unwrap();
 
@@ -44829,7 +44772,7 @@ mod tests {
                      set: function(value) { this.value = value; }, \
                      configurable: true \
                  }); \
-                 object.answer = 40; return object.answer === 42;",
+                 object.answer = 40; object.answer === 42;",
             ))
             .unwrap();
 
@@ -44853,7 +44796,7 @@ mod tests {
                  object[1] = 3; \
                  object.second = 4; \
                  let keys = Object.keys(object); \
-                 return keys.length === 4 \
+                 keys.length === 4 \
                      && keys[0] === \"1\" && keys[1] === \"2\" \
                      && keys[2] === \"first\" && keys[3] === \"second\";",
             ))
@@ -44878,7 +44821,7 @@ mod tests {
                  let descriptor = Object.getOwnPropertyDescriptor(array, \"1\"); \
                  let lengthDescriptor = Object.getOwnPropertyDescriptor(array, \"length\"); \
                  let missing = Object.getOwnPropertyDescriptor(array, \"0\"); \
-                 return keys.length === 2 \
+                 keys.length === 2 \
                      && keys[0] === \"1\" && keys[1] === \"extra\" \
                      && descriptor.value === 42 \
                      && descriptor.writable === true \
@@ -44911,7 +44854,7 @@ mod tests {
                  Object.defineProperty(array, \"hidden\", { value: 9, enumerable: false }); \
                  let values = Object.values(array); \
                  let entries = Object.entries(array); \
-                 return values.length === 3 \
+                 values.length === 3 \
                      && values[0] === 42 && values[1] === 43 && values[2] === 7 \
                      && entries.length === 3 \
                      && entries[0][0] === \"1\" && entries[0][1] === 42 \
@@ -44943,7 +44886,7 @@ mod tests {
                  }); \
                  let values = Object.values(object); \
                  let entries = Object.entries(object); \
-                 return seen === 2 \
+                 seen === 2 \
                      && values.length === 2 \
                      && values[0] === 40 && values[1] === 41 \
                      && entries.length === 2 \
@@ -44978,7 +44921,7 @@ mod tests {
                  }); \
                  let target = { existing: 0 }; \
                  let returned = Object.assign(target, null, void 0, source); \
-                 return returned === target \
+                 returned === target \
                      && target.existing === 0 \
                      && target.visible === 1 \
                      && target.computed === 3 \
@@ -45006,7 +44949,7 @@ mod tests {
                  delete array[0]; \
                  array.extra = 9; \
                  let returned = Object.assign(target, source, array); \
-                 return returned === target \
+                 returned === target \
                      && target.captured === 42 \
                      && target.answer === void 0 \
                      && target[0] === void 0 \
@@ -45026,7 +44969,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("return Object.assign(1, { value: 42 });"))
+            .execute_source(source("Object.assign(1, { value: 42 });"))
             .unwrap();
 
         assert_eq!(
@@ -45045,7 +44988,7 @@ mod tests {
                  let called = Object(); \
                  let constructed = new Object(); \
                  let existing = { value: 42 }; \
-                 return typeof Object === \"function\" \
+                 typeof Object === \"function\" \
                      && Object.prototype.constructor === Object \
                      && Object.getPrototypeOf(Object.prototype) === null \
                      && Object.getPrototypeOf(literal) === Object.prototype \
@@ -45071,7 +45014,7 @@ mod tests {
             .execute_source(source(
                 "Object.prototype.shared = 42; \
                  function Fn() {} \
-                 return Array.prototype.shared === 42 \
+                 Array.prototype.shared === 42 \
                      && String.prototype.shared === 42 \
                      && Number.prototype.shared === 42 \
                      && Boolean.prototype.shared === 42 \
@@ -45096,7 +45039,7 @@ mod tests {
             .execute_source(source(
                 "let object = { value: 42 }; \
                  let array = [1]; \
-                 return object.hasOwnProperty(\"value\") \
+                 object.hasOwnProperty(\"value\") \
                      && !object.hasOwnProperty(\"missing\") \
                      && array.hasOwnProperty(\"0\") \
                      && !array.hasOwnProperty(\"push\") \
@@ -45131,7 +45074,7 @@ mod tests {
                  let inheritedBefore = object.value; \
                  let replacement = { value: 42 }; \
                  let returned = Object.setPrototypeOf(object, replacement); \
-                 return inheritedBefore === 41 \
+                 inheritedBefore === 41 \
                      && object.value === 42 \
                      && returned === object \
                      && Object.getPrototypeOf(object) === replacement \
@@ -45155,7 +45098,7 @@ mod tests {
                  let object = Object.create(base); \
                  Object.setPrototypeOf(object, null); \
                  let nullObject = Object.create(null); \
-                 return Object.getPrototypeOf(object) === null \
+                 Object.getPrototypeOf(object) === null \
                      && object.value === void 0 \
                      && Object.getPrototypeOf(nullObject) === null \
                      && nullObject.value === void 0;",
@@ -45181,7 +45124,7 @@ mod tests {
                  let array = [41, 42]; \
                  delete array[0]; \
                  Object.setPrototypeOf(array, arrayPrototype); \
-                 return Object.hasOwn(object, \"own\") \
+                 Object.hasOwn(object, \"own\") \
                      && !Object.hasOwn(object, \"inherited\") \
                      && array[0] === 99 \
                      && !Object.hasOwn(array, 0) \
@@ -45201,7 +45144,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("return Object.create(null, {});"))
+            .execute_source(source("Object.create(null, {});"))
             .unwrap();
 
         assert_eq!(
@@ -45222,7 +45165,7 @@ mod tests {
                  }); \
                  let descriptor = Object.getOwnPropertyDescriptor(object, \"value\"); \
                  let missing = Object.getOwnPropertyDescriptor(object, \"missing\"); \
-                 return descriptor.value === 42 \
+                 descriptor.value === 42 \
                      && descriptor.writable === false \
                      && descriptor.enumerable === true \
                      && descriptor.configurable === false \
@@ -45251,7 +45194,7 @@ mod tests {
                  Object.defineProperty(object, \"writeOnly\", { set: setter, enumerable: true }); \
                  let descriptor = Object.getOwnPropertyDescriptor(object, \"answer\"); \
                  let writeOnly = Object.getOwnPropertyDescriptor(object, \"writeOnly\"); \
-                 return descriptor.get === getter \
+                 descriptor.get === getter \
                      && descriptor.set === setter \
                      && descriptor.enumerable === false \
                      && descriptor.configurable === true \
@@ -45276,7 +45219,7 @@ mod tests {
             .execute_source(source(
                 "let value = 1; let sideEffect = 0; \
                  function mark() { sideEffect = 1; return 3; } \
-                 return delete missing && !(delete value) && delete mark() && sideEffect === 1;",
+                 delete missing && !(delete value) && delete mark() && sideEffect === 1;",
             ))
             .unwrap();
 
@@ -45292,7 +45235,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function read(object) { return object.x + 2; } let object = { x: 40 }; return read(object);",
+                "function read(object) { return object.x + 2; } let object = { x: 40 }; read(object);",
             ))
             .unwrap();
 
@@ -45310,7 +45253,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("return \"line\\ntext\" === \"line\\ntext\";"))
+            .execute_source(source("\"line\\ntext\" === \"line\\ntext\";"))
             .unwrap();
 
         assert_eq!(
@@ -45328,7 +45271,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function isCore(value) { return value === \"core\"; } let object = { name: \"core\" }; return isCore(object.name);",
+                "function isCore(value) { return value === \"core\"; } let object = { name: \"core\" }; isCore(object.name);",
             ))
             .unwrap();
 
@@ -45346,7 +45289,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("return \"hello \" + \"core\" === \"hello core\";"))
+            .execute_source(source("\"hello \" + \"core\" === \"hello core\";"))
             .unwrap();
 
         assert_eq!(
@@ -45364,7 +45307,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "if (\"answer \" + 42 === \"answer 42\") return 40 + \"2\" === \"402\"; else return false;",
+                "if (\"answer \" + 42 === \"answer 42\") 40 + \"2\" === \"402\"; else false;",
             ))
             .unwrap();
 
@@ -45383,7 +45326,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function read(value) { return value + \" value\"; } if (\"\" + true === \"true\") if (null + \"ish\" === \"nullish\") return read() === \"undefined value\"; else return false; else return false;",
+                "function read(value) { return value + \" value\"; } if (\"\" + true === \"true\") if (null + \"ish\" === \"nullish\") read() === \"undefined value\"; else false; else false;",
             ))
             .unwrap();
 
@@ -45400,9 +45343,7 @@ mod tests {
     fn vm_executes_template_literal_without_substitution() {
         let mut vm = Vm::new(VmConfig::default());
 
-        let completion = vm
-            .execute_source(source("return `plain` === \"plain\";"))
-            .unwrap();
+        let completion = vm.execute_source(source("`plain` === \"plain\";")).unwrap();
 
         assert_eq!(
             completion,
@@ -45418,7 +45359,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("return `${1}${2}` === \"12\" && `${1}${2}` !== 3;"))
+            .execute_source(source("`${1}${2}` === \"12\" && `${1}${2}` !== 3;"))
             .unwrap();
 
         assert_eq!(
@@ -45435,7 +45376,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("return `${`a${1}b`}${2}` === \"a1b2\";"))
+            .execute_source(source("`${`a${1}b`}${2}` === \"a1b2\";"))
             .unwrap();
 
         assert_eq!(
@@ -45453,7 +45394,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "return `${true},${false},${null},${void 0},${1.5}` === \"true,false,null,undefined,1.5\";",
+                "`${true},${false},${null},${void 0},${1.5}` === \"true,false,null,undefined,1.5\";",
             ))
             .unwrap();
 
@@ -45472,7 +45413,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let log = \"\"; function mark(value) { log = log + value; return value; } let text = `${mark(1)}${mark(2)}${mark(3)}`; return log === \"123\" && text === \"123\";",
+                "let log = \"\"; function mark(value) { log = log + value; return value; } let text = `${mark(1)}${mark(2)}${mark(3)}`; log === \"123\" && text === \"123\";",
             ))
             .unwrap();
 
@@ -45491,7 +45432,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let object = { toString: function() { return \"object\"; } }; return `${object}` === \"object\";",
+                "let object = { toString: function() { return \"object\"; } }; `${object}` === \"object\";",
             ))
             .unwrap();
 
@@ -45510,7 +45451,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Vector { constructor(x, y, z) { this.x = x; this.y = y; this.z = z; } toString() { return `Vector [${this.x},${this.y},${this.z}]`; } } return new Vector(1, 2, 3).toString() === \"Vector [1,2,3]\";",
+                "class Vector { constructor(x, y, z) { this.x = x; this.y = y; this.z = z; } toString() { return `Vector [${this.x},${this.y},${this.z}]`; } } new Vector(1, 2, 3).toString() === \"Vector [1,2,3]\";",
             ))
             .unwrap();
 
@@ -45528,7 +45469,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("let value = 40.5; return value + 2;"))
+            .execute_source(source("let value = 40.5; value + 2;"))
             .unwrap();
 
         assert_eq!(
@@ -45545,9 +45486,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source(
-                "if (1.5 < 2) return 42.0 === 42; else return false;",
-            ))
+            .execute_source(source("if (1.5 < 2) 42.0 === 42; else false;"))
             .unwrap();
 
         assert_eq!(
@@ -45563,7 +45502,7 @@ mod tests {
     fn vm_promotes_int32_overflow_arithmetic_to_double() {
         let mut vm = Vm::new(VmConfig::default());
 
-        let completion = vm.execute_source(source("return 2147483647 + 1;")).unwrap();
+        let completion = vm.execute_source(source("2147483647 + 1;")).unwrap();
 
         assert_eq!(
             completion,
@@ -45580,7 +45519,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "return (81 / 2 + 1.5) === 42 && 85 % 43 === 42 && 2 ** 5 + 10 === 42;",
+                "(81 / 2 + 1.5) === 42 && 85 % 43 === 42 && 2 ** 5 + 10 === 42;",
             ))
             .unwrap();
 
@@ -45598,9 +45537,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source(
-                "return ~-43 + ((5 & 3) << 5) - (8 | 2) - (7 ^ 3) - 18;",
-            ))
+            .execute_source(source("~-43 + ((5 & 3) << 5) - (8 | 2) - (7 ^ 3) - 18;"))
             .unwrap();
 
         assert_eq!(
@@ -45617,9 +45554,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source(
-                "return (-8 >> 1) === -4 && (-1 >>> 0) === 4294967295;",
-            ))
+            .execute_source(source("(-8 >> 1) === -4 && (-1 >>> 0) === 4294967295;"))
             .unwrap();
 
         assert_eq!(
@@ -45636,7 +45571,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("let value = 40.5; return -value + 83;"))
+            .execute_source(source("let value = 40.5; -value + 83;"))
             .unwrap();
 
         assert_eq!(
@@ -45652,7 +45587,7 @@ mod tests {
     fn vm_executes_unary_plus_for_boolean_and_null() {
         let mut vm = Vm::new(VmConfig::default());
 
-        let completion = vm.execute_source(source("return +true + +null;")).unwrap();
+        let completion = vm.execute_source(source("+true + +null;")).unwrap();
 
         assert_eq!(
             completion,
@@ -45669,7 +45604,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "if (typeof 1 === \"number\") if (typeof \"x\" === \"string\") if (typeof true === \"boolean\") return typeof void 0 === \"undefined\"; else return false; else return false; else return false;",
+                "if (typeof 1 === \"number\") if (typeof \"x\" === \"string\") if (typeof true === \"boolean\") typeof void 0 === \"undefined\"; else false; else false; else false;",
             ))
             .unwrap();
 
@@ -45688,7 +45623,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function fn() { return 1; } let object = {}; if (typeof null === \"object\") if (typeof object === \"object\") return typeof fn === \"function\"; else return false; else return false;",
+                "function fn() { return 1; } let object = {}; if (typeof null === \"object\") if (typeof object === \"object\") typeof fn === \"function\"; else false; else false;",
             ))
             .unwrap();
 
@@ -45707,7 +45642,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function read(value) { return typeof value; } return read(void (1 + 2)) === \"undefined\";",
+                "function read(value) { return typeof value; } read(void (1 + 2)) === \"undefined\";",
             ))
             .unwrap();
 
@@ -45727,7 +45662,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "function read() { return undefined; } \
-                 return undefined === void 0 \
+                 undefined === void 0 \
                      && read() === void 0 \
                      && typeof undefined === \"undefined\";",
             ))
@@ -45747,7 +45682,7 @@ mod tests {
             .execute_source(source(
                 "let undefined = 41; \
                  function read() { return undefined + 1; } \
-                 return read();",
+                 read();",
             ))
             .unwrap();
 
@@ -45762,7 +45697,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("if (!false) return !0; else return false;"))
+            .execute_source(source("if (!false) !0; else false;"))
             .unwrap();
 
         assert_eq!(
@@ -45779,7 +45714,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("if (\"\") return false; else return !\"\";"))
+            .execute_source(source("if (\"\") false; else !\"\";"))
             .unwrap();
 
         assert_eq!(
@@ -45797,7 +45732,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "if ((true && 42) === 42) if ((false || \"fallback\") === \"fallback\") return (\"left\" || \"right\") === \"left\"; else return false; else return false;",
+                "if ((true && 42) === 42) if ((false || \"fallback\") === \"fallback\") (\"left\" || \"right\") === \"left\"; else false; else false;",
             ))
             .unwrap();
 
@@ -45816,7 +45751,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let value = 0; false && (value = 1); true || (value = value + 2); return value;",
+                "let value = 0; false && (value = 1); true || (value = value + 2); value;",
             ))
             .unwrap();
 
@@ -45835,7 +45770,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function read(value) { return value ?? 42; } if ((null ?? 40) === 40) return read(); else return 0;",
+                "function read(value) { return value ?? 42; } if ((null ?? 40) === 40) read(); else 0;",
             ))
             .unwrap();
 
@@ -45854,7 +45789,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "if ((0 ?? 42) === 0) if ((false ?? true) === false) return (\"\" ?? \"fallback\") === \"\"; else return false; else return false;",
+                "if ((0 ?? 42) === 0) if ((false ?? true) === false) (\"\" ?? \"fallback\") === \"\"; else false; else false;",
             ))
             .unwrap();
 
@@ -45873,7 +45808,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let value = 0; 1 ?? (value = 1); null ?? (value = value + 42); return value;",
+                "let value = 0; 1 ?? (value = 1); null ?? (value = value + 42); value;",
             ))
             .unwrap();
 
@@ -45891,7 +45826,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
-            .execute_source(source("let array = [40, 2]; return array[0] + array[1];"))
+            .execute_source(source("let array = [40, 2]; array[0] + array[1];"))
             .unwrap();
 
         assert_eq!(
@@ -45909,7 +45844,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let array = [1]; array[2] = 41; return array.length + array[2] - array[0];",
+                "let array = [1]; array[2] = 41; array.length + array[2] - array[0];",
             ))
             .unwrap();
 
@@ -45930,7 +45865,7 @@ mod tests {
             .execute_source(source(
                 "let array = [1, 2]; \
                  let spread = [0, ...array, 3, ...\"ab\"]; \
-                 return spread.length === 6 \
+                 spread.length === 6 \
                      && spread[0] === 0 \
                      && spread[1] === 1 \
                      && spread[2] === 2 \
@@ -45956,7 +45891,7 @@ mod tests {
                  let array = Array(3); \
                  let spread = [...array]; \
                  delete Array.prototype[1]; \
-                 return spread.length === 3 \
+                 spread.length === 3 \
                      && spread[0] === void 0 \
                      && spread[1] === 41 \
                      && spread[2] === void 0;",
@@ -45978,7 +45913,7 @@ mod tests {
                 "let map = new Map([[\"a\", 1], [\"b\", 2]]); \
                  let set = new Set([3, 4, 3]); \
                  let spread = [...map, ...set]; \
-                 return spread.length === 4 \
+                 spread.length === 4 \
                      && spread[0][0] === \"a\" \
                      && spread[0][1] === 1 \
                      && spread[1][0] === \"b\" \
@@ -46005,7 +45940,7 @@ mod tests {
                      threw = error instanceof TypeError \
                          && error.message === \"Spread value is not iterable\"; \
                  } \
-                 return threw;",
+                 threw;",
             ))
             .unwrap();
 
@@ -46025,7 +45960,7 @@ mod tests {
                  let pushed = array.push(2, 3); \
                  let joined = array.join(\"-\"); \
                  let popped = array.pop(); \
-                 return pushed === 3 \
+                 pushed === 3 \
                      && joined === \"1-2-3\" \
                      && popped === 3 \
                      && array.length === 2 \
@@ -46048,7 +45983,7 @@ mod tests {
             .execute_source(source(
                 "let array = []; \
                  array.push = function(value) { return value + 1; }; \
-                 return array.push(41) === 42 && array.length === 0;",
+                 array.push(41) === 42 && array.length === 0;",
             ))
             .unwrap();
 
@@ -46067,7 +46002,7 @@ mod tests {
                 "let array = []; \
                  let descriptor = Object.getOwnPropertyDescriptor(Array.prototype, \"push\"); \
                  let mapDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, \"map\"); \
-                 return array.push === Array.prototype.push \
+                 array.push === Array.prototype.push \
                      && array.map === Array.prototype.map \
                      && array.reduce === Array.prototype.reduce \
                      && array.concat === Array.prototype.concat \
@@ -46113,7 +46048,7 @@ mod tests {
                  delete Array.prototype.push; \
                  let missing = array.push; \
                  Array.prototype.push = original; \
-                 return changed === 1 && array[0] === 42 && missing === void 0;",
+                 changed === 1 && array[0] === 42 && missing === void 0;",
             ))
             .unwrap();
 
@@ -46133,7 +46068,7 @@ mod tests {
                  let array = [1, \"two\", nan, 4]; \
                  let sliced = array.slice(1, -1); \
                  let tail = array.slice(-2); \
-                 return Array.prototype.slice === array.slice \
+                 Array.prototype.slice === array.slice \
                      && sliced.length === 2 \
                      && sliced[0] === \"two\" \
                      && sliced[1] !== sliced[1] \
@@ -46170,7 +46105,7 @@ mod tests {
                  let holey = [1, 2, 3]; \
                  delete holey[0]; \
                  let holeShifted = holey.shift(); \
-                 return shifted === 1 \
+                 shifted === 1 \
                      && unshifted === 4 \
                      && array.join(\"-\") === \"9-8-2-3\" \
                      && sparseUnshifted === 4 \
@@ -46201,7 +46136,7 @@ mod tests {
                  delete sparse[1]; \
                  let result = [0].concat(sparse, 4, [5, 6]); \
                  let empty = [].concat(); \
-                 return result.length === 7 \
+                 result.length === 7 \
                      && result[0] === 0 \
                      && result[1] === 1 \
                      && Object.hasOwn(result, \"2\") === false \
@@ -46229,7 +46164,7 @@ mod tests {
                  let returned = array.fill(9, 1, -1); \
                  let holes = Array(3); \
                  let holesReturned = holes.fill(\"x\"); \
-                 return returned === array \
+                 returned === array \
                      && array.join(\"-\") === \"1-9-9-4\" \
                      && holesReturned === holes \
                      && holes.length === 3 \
@@ -46256,7 +46191,7 @@ mod tests {
                  let sparse = [1, 2, 3]; \
                  delete sparse[1]; \
                  let sparseReturned = sparse.reverse(); \
-                 return returned === array \
+                 returned === array \
                      && array.join(\"-\") === \"4-3-2-1\" \
                      && sparseReturned === sparse \
                      && sparse.length === 3 \
@@ -46292,7 +46227,7 @@ mod tests {
                      threw = error instanceof TypeError \
                          && error.message === \"comparefn must be a function\"; \
                  } \
-                 return returned === array \
+                 returned === array \
                      && array.join(\"-\") === \"1-10-2\" \
                      && numericReturned === numeric \
                      && numeric.join(\"-\") === \"1-2-10\" \
@@ -46323,7 +46258,7 @@ mod tests {
                  let sparseRemoved = sparse.splice(1, 2, 9); \
                  let none = [1, 2]; \
                  let noneRemoved = none.splice(); \
-                 return removed.length === 2 \
+                 removed.length === 2 \
                      && removed[0] === 2 \
                      && removed[1] === 3 \
                      && array.length === 5 \
@@ -46365,7 +46300,7 @@ mod tests {
                  array.forEach(function(value, index, owner) { \
                      total = total + value + index + owner.length; \
                  }); \
-                 return context.count === 3 \
+                 context.count === 3 \
                      && seen.join(\"-\") === \"0-1-2\" \
                      && mapped.join(\"-\") === \"14-16-18\" \
                      && filtered.join(\"-\") === \"2-3\" \
@@ -46399,7 +46334,7 @@ mod tests {
                      return value + 1; \
                  }); \
                  delete Array.prototype[1]; \
-                 return count === 2 \
+                 count === 2 \
                      && mappedSparse.length === 3 \
                      && Object.hasOwn(mappedSparse, \"1\") === false \
                      && seen.join(\"-\") === \"0-1-2\" \
@@ -46430,7 +46365,7 @@ mod tests {
                      everyCalls = everyCalls + 1; \
                      return value < 5; \
                  }); \
-                 return matched \
+                 matched \
                      && someCalls === 2 \
                      && allSmall === false \
                      && everyCalls === 3 \
@@ -46472,7 +46407,7 @@ mod tests {
                          owner[3] = 40; \
                      } \
                  }); \
-                 return seen.join(\"-\") === \"0-2\" \
+                 seen.join(\"-\") === \"0-2\" \
                      && mapped.length === 3 \
                      && Object.hasOwn(mapped, \"1\") === false \
                      && mapped[2] === 30 \
@@ -46498,9 +46433,9 @@ mod tests {
                      [1, 2, 3].forEach(function(value) { \
                          if (value === 2) throw 42; \
                      }); \
-                     return false; \
+                     false; \
                  } catch (error) { \
-                     return error === 42; \
+                     error === 42; \
                  }",
             ))
             .unwrap();
@@ -46519,9 +46454,9 @@ mod tests {
             .execute_source(source(
                 "try { \
                      [].map(1); \
-                     return false; \
+                     false; \
                  } catch (error) { \
-                     return error instanceof TypeError \
+                     error instanceof TypeError \
                          && error.message === \"callback must be a function\" \
                          && error.toString() === \"TypeError: callback must be a function\"; \
                  }",
@@ -46557,7 +46492,7 @@ mod tests {
                      return value === 41; \
                  }); \
                  delete Array.prototype[1]; \
-                 return foundHole === void 0 \
+                 foundHole === void 0 \
                      && seen.join(\"-\") === \"0-1\" \
                      && inheritedIndex === 1 \
                      && sparse.findIndex(function(value) { return value === 99; }) === -1;",
@@ -46586,7 +46521,7 @@ mod tests {
                      } \
                      return index === 1 && value === void 0; \
                  }); \
-                 return found === void 0 \
+                 found === void 0 \
                      && seen.join(\"-\") === \"0-1\" \
                      && array.length === 4;",
             ))
@@ -46623,7 +46558,7 @@ mod tests {
                      rightOrder.push(index); \
                      return accumulator + value; \
                  }, 0); \
-                 return sum === 34 \
+                 sum === 34 \
                      && order.join(\"-\") === \"0-1-2-3\" \
                      && noInitial === 6 \
                      && right === 6 \
@@ -46659,7 +46594,7 @@ mod tests {
                  let explicitUndefined = [1].reduce(function(accumulator, value) { \
                      return accumulator === void 0 && value === 1; \
                  }, void 0); \
-                 return result === 10 \
+                 result === 10 \
                      && right === 20 \
                      && calls === 0 \
                      && rightCalls === 0 \
@@ -46681,9 +46616,9 @@ mod tests {
             .execute_source(source(
                 "try { \
                      [].reduce(1, 0); \
-                     return false; \
+                     false; \
                  } catch (error) { \
-                     return error instanceof TypeError \
+                     error instanceof TypeError \
                          && error.message === \"callback must be a function\"; \
                  }",
             ))
@@ -46698,9 +46633,9 @@ mod tests {
             .execute_source(source(
                 "try { \
                      [].reduce(function(acc, value) { return acc + value; }); \
-                     return false; \
+                     false; \
                  } catch (error) { \
-                     return error instanceof TypeError \
+                     error instanceof TypeError \
                          && error.message === \"Reduce of empty array with no initial value\" \
                          && error.toString() === \"TypeError: Reduce of empty array with no initial value\"; \
                  }",
@@ -46718,7 +46653,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let object = {}; object[\"value\"] = 40; return object[\"value\"] + 2;",
+                "let object = {}; object[\"value\"] = 40; object[\"value\"] + 2;",
             ))
             .unwrap();
 
@@ -46737,7 +46672,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let object = { value: 40, add: function(value) { return this.value + value; } }; return object[\"add\"](2);",
+                "let object = { value: 40, add: function(value) { return this.value + value; } }; object[\"add\"](2);",
             ))
             .unwrap();
 
@@ -46757,7 +46692,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "let text = \"core\"; \
-                 return text.charAt(1) === \"o\" \
+                 text.charAt(1) === \"o\" \
                      && text.charAt(99) === \"\" \
                      && text.indexOf(\"r\") === 2 \
                      && text.indexOf(\"x\") === -1 \
@@ -46779,7 +46714,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "let text = \"core\"; \
-                 return text.charCodeAt(1) === 111 \
+                 text.charCodeAt(1) === 111 \
                      && text.substring(1, 3) === \"or\" \
                      && String.fromCharCode(72, 105) === \"Hi\" \
                      && String.fromCharCode(65536 + 65) === \"A\";",
@@ -46799,7 +46734,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "let missing = \"core\".charCodeAt(99); \
-                 return missing !== missing;",
+                 missing !== missing;",
             ))
             .unwrap();
 
@@ -46816,7 +46751,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "let text = \"core\"; \
-                 return text.substring(3, 1) === \"or\" \
+                 text.substring(3, 1) === \"or\" \
                      && text.substring(-2, 2) === \"co\" \
                      && text.substring(Number(\"not a number\"), 2) === \"co\" \
                      && text.substring(2) === \"re\" \
@@ -46838,7 +46773,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "function read(value) { return value.charAt(0) + value.slice(1, 3); } \
-                 return read(\"core\") === \"cor\";",
+                 read(\"core\") === \"cor\";",
             ))
             .unwrap();
 
@@ -46855,7 +46790,7 @@ mod tests {
         let completion = vm
             .execute_source(source(
                 "let descriptor = Object.getOwnPropertyDescriptor(String.prototype, \"charAt\"); \
-                 return \"core\".charAt === String.prototype.charAt \
+                 \"core\".charAt === String.prototype.charAt \
                     && String.prototype.charAt === String.prototype.charAt \
                     && String.prototype.constructor === String \
                     && Object.hasOwn(String.prototype, \"charAt\") === true \
@@ -46884,7 +46819,7 @@ mod tests {
                  delete String.prototype.charAt; \
                  let missing = \"core\".charAt; \
                  String.prototype.charAt = original; \
-                 return changed === \"o!\" && missing === void 0;",
+                 changed === \"o!\" && missing === void 0;",
             ))
             .unwrap();
 
@@ -46903,7 +46838,7 @@ mod tests {
                 "let invalidInput = parseInt(\"not a number\", 10); \
                  let invalidLowRadix = parseInt(\"10\", 1); \
                  let invalidHighRadix = parseInt(\"10\", 37); \
-                 return parseInt(\"42\") === 42 \
+                 parseInt(\"42\") === 42 \
                      && parseInt(\"   42\") === 42 \
                      && parseInt(\"10\", 0) === 10 \
                      && parseInt(\"101\", 2) === 5 \
@@ -46932,12 +46867,12 @@ mod tests {
         let execution = vm
             .execute_source_session(vec![
                 source(
-                    "return typeof parseInt === \"function\" \
+                    "typeof parseInt === \"function\" \
                          && this.parseInt === parseInt \
                          && parseInt(\"10\") === 10;",
                 ),
-                source("parseInt = function(value) { return 41; }; return parseInt(\"10\");"),
-                source("return parseInt(\"20\") + 1;"),
+                source("parseInt = function(value) { return 41; }; parseInt(\"10\");"),
+                source("parseInt(\"20\") + 1;"),
             ])
             .unwrap();
 
@@ -46957,7 +46892,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "return \"core\"[1] === \"o\" \
+                "\"core\"[1] === \"o\" \
                     && \"core\"[99] === void 0 \
                     && \"core\"[\"length\"] === 4;",
             ))
@@ -46973,9 +46908,7 @@ mod tests {
     fn vm_executes_string_length() {
         let mut vm = Vm::new(VmConfig::default());
 
-        let completion = vm
-            .execute_source(source("return \"core\".length;"))
-            .unwrap();
+        let completion = vm.execute_source(source("\"core\".length;")).unwrap();
 
         assert_eq!(
             completion,
@@ -46992,7 +46925,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let array = [1, 2, 3, 4]; let total = 0; for (let i = 0; i < array.length; i = i + 1) { total = total + array[i]; } return total;",
+                "let array = [1, 2, 3, 4]; let total = 0; for (let i = 0; i < array.length; i = i + 1) { total = total + array[i]; } total;",
             ))
             .unwrap();
 
@@ -47011,7 +46944,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let total = 0; for (let i = 0; i < 6; i = i + 1) { if (i < 2) continue; if (i > 4) break; total = total + i; } return total;",
+                "let total = 0; for (let i = 0; i < 6; i = i + 1) { if (i < 2) continue; if (i > 4) break; total = total + i; } total;",
             ))
             .unwrap();
 
@@ -47030,7 +46963,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function add(a, b) { return a + b; } let callable = add; return callable(40, 2);",
+                "function add(a, b) { return a + b; } let callable = add; callable(40, 2);",
             ))
             .unwrap();
 
@@ -47049,7 +46982,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function apply(fn, value) { return fn(value); } function inc(value) { return value + 1; } return apply(inc, 41);",
+                "function apply(fn, value) { return fn(value); } function inc(value) { return value + 1; } apply(inc, 41);",
             ))
             .unwrap();
 
@@ -47068,7 +47001,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function inc(value) { return value + 1; } let object = {}; object.fn = inc; return object.fn(41);",
+                "function inc(value) { return value + 1; } let object = {}; object.fn = inc; object.fn(41);",
             ))
             .unwrap();
 
@@ -47091,7 +47024,7 @@ mod tests {
                  for (let value of [1, 2, 3]) { total = total + value; } \
                  let text = \"\"; \
                  for (let character of \"ab\") { text = text + character; } \
-                 return total === 6 && text === \"ab\";",
+                 total === 6 && text === \"ab\";",
             ))
             .unwrap();
 
@@ -47114,7 +47047,7 @@ mod tests {
                  } \
                  let total = 0; \
                  for (let value of new Set([3, 4, 3])) { total = total + value; } \
-                 return text === \"a1b2\" && total === 7;",
+                 text === \"a1b2\" && total === 7;",
             ))
             .unwrap();
 
@@ -47141,7 +47074,7 @@ mod tests {
                      threw = error instanceof TypeError \
                          && error.message === \"Spread value is not iterable\"; \
                  } \
-                 return total === 5 && threw;",
+                 total === 5 && threw;",
             ))
             .unwrap();
 
@@ -47157,7 +47090,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let object = { value: 40, add: function(value) { return this.value + value; } }; return object.add(2);",
+                "let object = { value: 40, add: function(value) { return this.value + value; } }; object.add(2);",
             ))
             .unwrap();
 
@@ -47176,7 +47109,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let array = [function() { return this.length; }, 1, 2]; return array[0]();",
+                "let array = [function() { return this.length; }, 1, 2]; array[0]();",
             ))
             .unwrap();
 
@@ -47195,7 +47128,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let object = { check: function() { return this.Math === Math; } }; let check = object.check; return check();",
+                "let object = { check: function() { return this.Math === Math; } }; let check = object.check; check();",
             ))
             .unwrap();
 
@@ -47214,7 +47147,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function check() { return this.Math === Math; } return check.call(null);",
+                "function check() { return this.Math === Math; } check.call(null);",
             ))
             .unwrap();
 
@@ -47236,7 +47169,7 @@ mod tests {
                 "class Box { constructor() { this.value = 1; } } \
                  let threw = false; \
                  try { Box(); } catch (error) { threw = error instanceof TypeError; } \
-                 return threw;",
+                 threw;",
             ))
             .unwrap();
 
@@ -47262,7 +47195,7 @@ mod tests {
                  let staticThrew = false; \
                  try { new method(); } catch (error) { methodThrew = error instanceof TypeError; } \
                  try { new staticMethod(); } catch (error) { staticThrew = error instanceof TypeError; } \
-                 return methodThrew && staticThrew;",
+                 methodThrew && staticThrew;",
             ))
             .unwrap();
 
@@ -47283,7 +47216,7 @@ mod tests {
             .execute_source(source(
                 "let threw = false; \
                  try { new Math.max(); } catch (error) { threw = error instanceof TypeError; } \
-                 return threw;",
+                 threw;",
             ))
             .unwrap();
 
@@ -47304,7 +47237,7 @@ mod tests {
             .execute_source(source(
                 "function Factory() { this.value = 42; } \
                  let object = new Factory(); \
-                 return object.value === 42 && object.constructor === Factory;",
+                 object.value === 42 && object.constructor === Factory;",
             ))
             .unwrap();
 
@@ -47325,7 +47258,7 @@ mod tests {
             .execute_source(source(
                 "function add(value) { return this.base + value; } \
                  let object = { base: 40 }; \
-                 return add.call(object, 2);",
+                 add.call(object, 2);",
             ))
             .unwrap();
 
@@ -47344,7 +47277,7 @@ mod tests {
                 "let array = []; \
                  let pushed = Array.prototype.push.call(array, 1, 2); \
                  let character = String.prototype.charAt.call(\"core\", 1); \
-                 return pushed === 2 \
+                 pushed === 2 \
                      && array.join(\"-\") === \"1-2\" \
                      && character === \"o\";",
             ))
@@ -47362,7 +47295,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function Point(x, y) { this.x = x; this.y = y; } let point = new Point(40, 2); return point.x + point.y;",
+                "function Point(x, y) { this.x = x; this.y = y; } let point = new Point(40, 2); point.x + point.y;",
             ))
             .unwrap();
 
@@ -47381,7 +47314,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function Box() { this.value = 1; return { value: 42 }; } let box = new Box(); return box.value;",
+                "function Box() { this.value = 1; return { value: 42 }; } let box = new Box(); box.value;",
             ))
             .unwrap();
 
@@ -47400,7 +47333,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function Box() { this.value = 42; return 7; } let box = new Box(); return box.value;",
+                "function Box() { this.value = 42; return 7; } let box = new Box(); box.value;",
             ))
             .unwrap();
 
@@ -47419,7 +47352,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function Box() {} Box.prototype.value = 42; let box = new Box(); return box.value;",
+                "function Box() {} Box.prototype.value = 42; let box = new Box(); box.value;",
             ))
             .unwrap();
 
@@ -47438,7 +47371,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function Box(value) { this.value = value; } Box.prototype.add = function(value) { return this.value + value; }; let box = new Box(40); return box.add(2);",
+                "function Box(value) { this.value = value; } Box.prototype.add = function(value) { return this.value + value; }; let box = new Box(40); box.add(2);",
             ))
             .unwrap();
 
@@ -47457,7 +47390,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function Box() {} Box.prototype = { value: 42 }; let box = new Box(); return box.value;",
+                "function Box() {} Box.prototype = { value: 42 }; let box = new Box(); box.value;",
             ))
             .unwrap();
 
@@ -47476,7 +47409,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function Box() { this.value = 42; } Box.prototype.value = 1; let box = new Box(); return box.value;",
+                "function Box() { this.value = 42; } Box.prototype.value = 1; let box = new Box(); box.value;",
             ))
             .unwrap();
 
@@ -47495,7 +47428,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let add = function(a, b) { return a + b; }; return add(40, 2);",
+                "let add = function(a, b) { return a + b; }; add(40, 2);",
             ))
             .unwrap();
 
@@ -47514,7 +47447,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let fact = function self(n) { if (n < 2) return 1; return n * self(n - 1); }; return fact(5);",
+                "let fact = function self(n) { if (n < 2) return 1; return n * self(n - 1); }; fact(5);",
             ))
             .unwrap();
 
@@ -47533,7 +47466,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let base = 40; let add = function(value) { return base + value; }; return add(2);",
+                "let base = 40; let add = function(value) { return base + value; }; add(2);",
             ))
             .unwrap();
 
@@ -47552,7 +47485,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function apply(fn) { return fn(); } let base = 40; let add = function() { return base + 2; }; return apply(add);",
+                "function apply(fn) { return fn(); } let base = 40; let add = function() { return base + 2; }; apply(add);",
             ))
             .unwrap();
 
@@ -47571,7 +47504,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let base = 20; let array = [function() { return base + 1; }]; let object = { fn: function() { return base + 1; } }; return array[0]() + object.fn();",
+                "let base = 20; let array = [function() { return base + 1; }]; let object = { fn: function() { return base + 1; } }; array[0]() + object.fn();",
             ))
             .unwrap();
 
@@ -47590,7 +47523,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let base = 1; let fact = function self(n) { if (n < 2) return base; return n * self(n - 1); }; return fact(5);",
+                "let base = 1; let fact = function self(n) { if (n < 2) return base; return n * self(n - 1); }; fact(5);",
             ))
             .unwrap();
 
@@ -47609,7 +47542,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let value = 0; let inc = function() { value = value + 1; return value; }; inc(); return inc();",
+                "let value = 0; let inc = function() { value = value + 1; return value; }; inc(); inc();",
             ))
             .unwrap();
 
@@ -47628,7 +47561,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let value = 40; let inc = function() { value = value + 1; }; let read = function() { return value; }; inc(); inc(); return read();",
+                "let value = 40; let inc = function() { value = value + 1; }; let read = function() { return value; }; inc(); inc(); read();",
             ))
             .unwrap();
 
@@ -47647,7 +47580,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function read() { return value; } let value = 42; return read();",
+                "function read() { return value; } let value = 42; read();",
             ))
             .unwrap();
 
@@ -47666,7 +47599,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let value = 40; let make = function() { return function() { return value + 2; }; }; let read = make(); return read();",
+                "let value = 40; let make = function() { return function() { return value + 2; }; }; let read = make(); read();",
             ))
             .unwrap();
 
@@ -47685,7 +47618,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let array = [function(value) { return value + 1; }]; let object = { fn: function(value) { return value + 1; } }; return array[0](20) + object.fn(20);",
+                "let array = [function(value) { return value + 1; }]; let object = { fn: function(value) { return value + 1; } }; array[0](20) + object.fn(20);",
             ))
             .unwrap();
 
@@ -47704,7 +47637,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { constructor(value) { this.value = value; } add(value) { return this.value + value; } } let box = new Box(40); return box.add(2);",
+                "class Box { constructor(value) { this.value = value; } add(value) { return this.value + value; } } let box = new Box(40); box.add(2);",
             ))
             .unwrap();
 
@@ -47723,7 +47656,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { constructor() { } static answer() { return 42; } } return Box.answer();",
+                "class Box { constructor() { } static answer() { return 42; } } Box.answer();",
             ))
             .unwrap();
 
@@ -47742,7 +47675,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { static answer = 42; static missing; } return Box.answer === 42 && Box.missing === void 0;",
+                "class Box { static answer = 42; static missing; } Box.answer === 42 && Box.missing === void 0;",
             ))
             .unwrap();
 
@@ -47761,7 +47694,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let seed = 40; let Box = class { static answer = seed + 2; }; return Box.answer;",
+                "let seed = 40; let Box = class { static answer = seed + 2; }; Box.answer;",
             ))
             .unwrap();
 
@@ -47780,7 +47713,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { value = 40; total = this.value + 2; missing; read() { return this.total === 42 && this.missing === void 0; } } return new Box().read();",
+                "class Box { value = 40; total = this.value + 2; missing; read() { return this.total === 42 && this.missing === void 0; } } new Box().read();",
             ))
             .unwrap();
 
@@ -47799,7 +47732,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let seed = 40; class Box { value = seed + 2; read() { return this.value; } } return new Box().read();",
+                "let seed = 40; class Box { value = seed + 2; read() { return this.value; } } new Box().read();",
             ))
             .unwrap();
 
@@ -47818,7 +47751,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Base { base = 40; } class Derived extends Base { value = this.base + 2; read() { return this.value; } } return new Derived().read();",
+                "class Base { base = 40; } class Derived extends Base { value = this.base + 2; read() { return this.value; } } new Derived().read();",
             ))
             .unwrap();
 
@@ -47837,7 +47770,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let key = \"value\"; class Box { [key] = 40; read() { return this.value + 2; } } return new Box().read();",
+                "let key = \"value\"; class Box { [key] = 40; read() { return this.value + 2; } } new Box().read();",
             ))
             .unwrap();
 
@@ -47856,7 +47789,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let key = \"answer\"; class Box { [key]() { return 42; } } return new Box().answer();",
+                "let key = \"answer\"; class Box { [key]() { return 42; } } new Box().answer();",
             ))
             .unwrap();
 
@@ -47875,7 +47808,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let method = \"read\"; let field = \"value\"; class Box { static [field] = 40; static [method]() { return this.value + 2; } } return Box.read();",
+                "let method = \"read\"; let field = \"value\"; class Box { static [field] = 40; static [method]() { return this.value + 2; } } Box.read();",
             ))
             .unwrap();
 
@@ -47894,7 +47827,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { constructor(value) { this.value = value; } get answer() { return this.value + 2; } } return new Box(40).answer;",
+                "class Box { constructor(value) { this.value = value; } get answer() { return this.value + 2; } } new Box(40).answer;",
             ))
             .unwrap();
 
@@ -47913,7 +47846,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { constructor() { this.value = 0; } set answer(value) { this.value = value + 2; } read() { return this.value; } } let box = new Box(); box.answer = 40; return box.read();",
+                "class Box { constructor() { this.value = 0; } set answer(value) { this.value = value + 2; } read() { return this.value; } } let box = new Box(); box.answer = 40; box.read();",
             ))
             .unwrap();
 
@@ -47932,7 +47865,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { constructor() { this.value = 0; } get answer() { return this.value + 2; } set answer(value) { this.value = value; } } let box = new Box(); box.answer = 40; return box.answer;",
+                "class Box { constructor() { this.value = 0; } get answer() { return this.value + 2; } set answer(value) { this.value = value; } } let box = new Box(); box.answer = 40; box.answer;",
             ))
             .unwrap();
 
@@ -47951,7 +47884,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { static get answer() { return 40; } static set answer(value) { this.extra = value + 1; } static read() { return this.answer + this.extra; } } Box.answer = 1; return Box.read();",
+                "class Box { static get answer() { return 40; } static set answer(value) { this.extra = value + 1; } static read() { return this.answer + this.extra; } } Box.answer = 1; Box.read();",
             ))
             .unwrap();
 
@@ -47970,7 +47903,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { constructor() { this.value = 0; } get [\"answer\"]() { return this.value + 2; } set [\"answer\"](value) { this.value = value; } } let box = new Box(); box.answer = 40; return box.answer;",
+                "class Box { constructor() { this.value = 0; } get [\"answer\"]() { return this.value + 2; } set [\"answer\"](value) { this.value = value; } } let box = new Box(); box.answer = 40; box.answer;",
             ))
             .unwrap();
 
@@ -47989,7 +47922,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Base { get answer() { return this.value + 2; } set answer(value) { this.value = value; } } class Derived extends Base { constructor() { super(); } } let box = new Derived(); box.answer = 40; return box.answer;",
+                "class Base { get answer() { return this.value + 2; } set answer(value) { this.value = value; } } class Derived extends Base { constructor() { super(); } } let box = new Derived(); box.answer = 40; box.answer;",
             ))
             .unwrap();
 
@@ -48008,7 +47941,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Base { get answer() { return this.value + 2; } } class Derived extends Base { constructor(value) { super(); this.value = value; } read() { return super.answer; } } return new Derived(40).read();",
+                "class Base { get answer() { return this.value + 2; } } class Derived extends Base { constructor(value) { super(); this.value = value; } read() { return super.answer; } } new Derived(40).read();",
             ))
             .unwrap();
 
@@ -48027,7 +47960,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { constructor(value) { this.value = value; } get length() { return this.value + 2; } } return new Box(40).length;",
+                "class Box { constructor(value) { this.value = value; } get length() { return this.value + 2; } } new Box(40).length;",
             ))
             .unwrap();
 
@@ -48046,7 +47979,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class MethodBox { static() { return 20; } } class FieldBox { static = 22; read() { return this.static; } } return new MethodBox().static() + new FieldBox().read();",
+                "class MethodBox { static() { return 20; } } class FieldBox { static = 22; read() { return this.static; } } new MethodBox().static() + new FieldBox().read();",
             ))
             .unwrap();
 
@@ -48065,7 +47998,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { static get() { return 42; } } return Box.get();",
+                "class Box { static get() { return 42; } } Box.get();",
             ))
             .unwrap();
 
@@ -48084,7 +48017,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Answer { value() { return 42; } } return new Answer().value();",
+                "class Answer { value() { return 42; } } new Answer().value();",
             ))
             .unwrap();
 
@@ -48103,7 +48036,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Base { constructor(value) { this.value = value; } } class Derived extends Base { read() { return this.value; } } return new Derived(42).read();",
+                "class Base { constructor(value) { this.value = value; } } class Derived extends Base { read() { return this.value; } } new Derived(42).read();",
             ))
             .unwrap();
 
@@ -48122,7 +48055,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "function Box() { } let box = new Box(); return box instanceof Box;",
+                "function Box() { } let box = new Box(); box instanceof Box;",
             ))
             .unwrap();
 
@@ -48141,7 +48074,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Box { } class Other { } let box = new Box(); return (box instanceof Box) && !(box instanceof Other);",
+                "class Box { } class Other { } let box = new Box(); (box instanceof Box) && !(box instanceof Other);",
             ))
             .unwrap();
 
@@ -48160,7 +48093,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Base { answer() { return 42; } } class Derived extends Base { } return new Derived().answer();",
+                "class Base { answer() { return 42; } } class Derived extends Base { } new Derived().answer();",
             ))
             .unwrap();
 
@@ -48179,7 +48112,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Base { static answer() { return 42; } } class Derived extends Base { } return Derived.answer();",
+                "class Base { static answer() { return 42; } } class Derived extends Base { } Derived.answer();",
             ))
             .unwrap();
 
@@ -48198,7 +48131,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Base { } class Derived extends Base { } let value = new Derived(); return value instanceof Derived && value instanceof Base;",
+                "class Base { } class Derived extends Base { } let value = new Derived(); value instanceof Derived && value instanceof Base;",
             ))
             .unwrap();
 
@@ -48217,7 +48150,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let Base = class { answer() { return 42; } }; let Derived = class extends Base { }; return new Derived().answer();",
+                "let Base = class { answer() { return 42; } }; let Derived = class extends Base { }; new Derived().answer();",
             ))
             .unwrap();
 
@@ -48236,7 +48169,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Base { constructor(value) { this.value = value; } read() { return this.value; } } class Derived extends Base { constructor(value) { super(value); } read() { return super.read() + 2; } } return new Derived(40).read();",
+                "class Base { constructor(value) { this.value = value; } read() { return this.value; } } class Derived extends Base { constructor(value) { super(value); } read() { return super.read() + 2; } } new Derived(40).read();",
             ))
             .unwrap();
 
@@ -48255,7 +48188,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Base { static answer() { return 40; } } class Derived extends Base { static answer() { return super.answer() + 2; } } return Derived.answer();",
+                "class Base { static answer() { return 40; } } class Derived extends Base { static answer() { return super.answer() + 2; } } Derived.answer();",
             ))
             .unwrap();
 
@@ -48274,7 +48207,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "class Base { constructor(value) { this.value = value; } } class Derived extends Base { constructor(value) { super(value); } read() { return this.value; } } return new Derived(42).read();",
+                "class Base { constructor(value) { this.value = value; } } class Derived extends Base { constructor(value) { super(value); } read() { return this.value; } } new Derived(42).read();",
             ))
             .unwrap();
 
@@ -48293,7 +48226,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let Box = class { constructor(value) { this.value = value; } read() { return this.value; } }; return new Box(42).read();",
+                "let Box = class { constructor(value) { this.value = value; } read() { return this.value; } }; new Box(42).read();",
             ))
             .unwrap();
 
@@ -48312,7 +48245,7 @@ mod tests {
 
         let completion = vm
             .execute_source(source(
-                "let offset = 2; class Box { constructor(value) { this.value = value; } read() { return this.value + offset; } } return new Box(40).read();",
+                "let offset = 2; class Box { constructor(value) { this.value = value; } read() { return this.value + offset; } } new Box(40).read();",
             ))
             .unwrap();
 

@@ -1502,7 +1502,7 @@ if (typeof __octaneBenchmark.validate === \"function\") {{
     __octaneValidationState = \"passed\";
 }}
 print(\"{telemetry_prefix}\" + {benchmark_name} + \"|{iterations}|\" + __octaneValidationState + \"|\" + __octaneResultsText);
-return __octaneResults;
+__octaneResults;
 ",
                 iterations = run_config.iterations,
                 random_reset = random_reset,
@@ -2301,7 +2301,9 @@ Benchmark.prototype.validate = function() {
         assert!(reset_index < run_index);
         assert!(crypto_runner.contains("let __octaneBenchmark = new Benchmark(120);"));
         assert!(crypto_runner.contains(OCTANE_DEFAULT_BENCHMARK_TELEMETRY_PREFIX));
-        assert!(crypto_runner.contains("return __octaneResults;"));
+        assert!(!crypto_runner.contains("return __octaneResults;"));
+        assert!(crypto_runner.contains("print("));
+        assert!(crypto_runner.ends_with("__octaneResults;\n"));
 
         let prepared_raytrace =
             prepare_octane_benchmark(root.path(), raytrace, OctaneBenchmarkRunOverrides::none())
