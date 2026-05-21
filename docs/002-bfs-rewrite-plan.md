@@ -203,8 +203,9 @@ Known Octane run blockers:
 - Benchmark telemetry and runner control: the Rust-side Octane manifest,
   `DefaultBenchmark` scoring contract, file/provenance preparation, and
   generated prelude/random/runner source preparation now exist under
-  `shell::octane`; VM source-session execution, result extraction,
-  failure classification, and tier-mode selection are still missing.
+  `shell::octane`; VM source-session execution and failure classification now
+  exist for prepared inputs. Result extraction, score reporting, and full
+  tier-mode comparison are still missing.
 - Full shell-style `load(path)` execution is not implemented. It is not on the
   shortest path to the first accepted-equivalent Octane-core runner because the
   active JetStream 3 driver uses `readFile`/runner-side file loading for CLI
@@ -439,14 +440,16 @@ M4: Current - run Octane-core correctly in the Rust engine.
   prelude/deterministic-random/iteration source, keep suite-wide source
   provider/origin IDs unique, and classify preparation failures before
   executing any benchmark.
-- Next sub-slice: execute prepared benchmarks through source sessions only far
-  enough to classify parse, bytecode-emission, link/session, runtime, thrown,
-  and score-telemetry outcomes. Do not tune individual benchmark failures in
-  that patch.
-- Next shared engine blockers after runner execution starts: source-session
-  global lexical/class declarations for top-level `class Benchmark`, then
-  parser/lowering coverage for `do while`, `switch`, and non-tagged template
-  literals.
+- Accepted sub-slice: M4c executes prepared benchmarks through a fresh
+  source-session VM in interpreter-only or baseline-allowed mode and classifies
+  parse, bytecode-emission, session-link, runtime, thrown/oracle,
+  score-telemetry, and baseline-only outcomes. Runner completion currently
+  returns typed `ResultExtractionMissing` instead of pretending scored success.
+- Next shared engine blocker: source-session global lexical/class declarations
+  for top-level `class Benchmark`. Do not mirror class/let/const declarations
+  onto `globalThis`; add a real global lexical environment boundary.
+- Next syntax/lowering blockers after that: `do while`, `switch`, and
+  non-tagged template literals.
 
 M5: Make the accepted baseline JIT cover Octane-core hot paths.
 

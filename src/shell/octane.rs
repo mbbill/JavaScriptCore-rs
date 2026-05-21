@@ -12,8 +12,11 @@ use super::{
     ShellMode, ShellSourceAppendRequest, ShellSourceKind, ShellSourceLoadError, ShellSourceLoader,
 };
 use crate::bytecode::{SourceOriginId, SourceProviderId};
+use crate::interpreter::{CoreHostOutputRecord, ExecutionCompletion, ExecutionError};
 use crate::syntax::source::SourceText;
-use crate::vm::SourceSessionSource;
+use crate::vm::{
+    SourceExecutionError, SourceSessionHostGlobalConfig, SourceSessionSource, Vm, VmConfig,
+};
 
 pub const OCTANE_DEFAULT_ITERATION_COUNT: usize = 120;
 pub const OCTANE_DEFAULT_WORST_CASE_COUNT: usize = 4;
@@ -274,6 +277,119 @@ impl OctanePreparationConfig {
             run,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OctaneExecutionMode {
+    #[default]
+    InterpreterOnly,
+    BaselineAllowed,
+}
+
+impl OctaneExecutionMode {
+    pub fn vm_config(self) -> VmConfig {
+        match self {
+            Self::InterpreterOnly => VmConfig::interpreter_only(),
+            Self::BaselineAllowed => VmConfig::baseline_allowed(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OctaneSuiteFailurePolicy {
+    #[default]
+    FailFast,
+    CollectAll,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OctaneExecutionConfig {
+    pub mode: OctaneExecutionMode,
+    pub failure_policy: OctaneSuiteFailurePolicy,
+}
+
+impl OctaneExecutionConfig {
+    pub const fn new(mode: OctaneExecutionMode, failure_policy: OctaneSuiteFailurePolicy) -> Self {
+        Self {
+            mode,
+            failure_policy,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OctanePreparedSuiteExecutionReport {
+    pub suite: OctaneSuite,
+    pub mode: OctaneExecutionMode,
+    pub failure_policy: OctaneSuiteFailurePolicy,
+    pub benchmarks: Vec<OctaneBenchmarkExecutionReport>,
+    pub stopped_early: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OctaneBenchmarkExecutionReport {
+    pub benchmark: &'static str,
+    pub mode: OctaneExecutionMode,
+    pub run_config: OctaneDefaultBenchmarkRunConfig,
+    pub source_records: Vec<OctaneSourceExecutionRecord>,
+    pub host_output_records: Vec<CoreHostOutputRecord>,
+    pub outcome: OctaneExecutionOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OctaneSourceExecutionRecord {
+    pub order_index: usize,
+    pub order_entry: OctanePreparedSourceOrderEntry,
+    pub label: String,
+    pub completion: Option<ExecutionCompletion>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OctaneExecutionPhase {
+    Parse,
+    BytecodeEmit,
+    SessionLink,
+    ExecuteRuntime,
+    ThrownOrOracle,
+    ScoreTelemetry,
+    BaselineOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OctaneExecutionOutcome {
+    ResultExtractionMissing,
+    Failed(OctaneExecutionFailure),
+}
+
+impl OctaneExecutionOutcome {
+    pub const fn phase(&self) -> OctaneExecutionPhase {
+        match self {
+            Self::ResultExtractionMissing => OctaneExecutionPhase::ScoreTelemetry,
+            Self::Failed(failure) => failure.phase,
+        }
+    }
+
+    pub const fn is_success(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OctaneExecutionFailure {
+    pub phase: OctaneExecutionPhase,
+    pub order_index: Option<usize>,
+    pub order_entry: Option<OctanePreparedSourceOrderEntry>,
+    pub label: Option<String>,
+    pub detail: OctaneExecutionFailureDetail,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OctaneExecutionFailureDetail {
+    SourceExecutionError(SourceExecutionError),
+    Completion(ExecutionCompletion),
+    MissingPreparedSource {
+        entry: OctanePreparedSourceOrderEntry,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -558,6 +674,268 @@ fn prepare_octane_benchmark_with_loader(
     })
 }
 
+pub fn execute_prepared_octane_benchmark(
+    prepared: &OctanePreparedBenchmark,
+    config: OctaneExecutionConfig,
+) -> OctaneBenchmarkExecutionReport {
+    let mut vm = Vm::new(config.mode.vm_config());
+    let mut source_records = Vec::with_capacity(prepared.source_order.len());
+    let mut session = match vm.open_source_session_with_host_globals(
+        SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            return OctaneBenchmarkExecutionReport {
+                benchmark: prepared.plan.name,
+                mode: config.mode,
+                run_config: prepared.run_config,
+                source_records,
+                host_output_records: Vec::new(),
+                outcome: OctaneExecutionOutcome::Failed(classify_source_execution_error(
+                    config.mode,
+                    None,
+                    None,
+                    None,
+                    error,
+                )),
+            };
+        }
+    };
+
+    for (order_index, order_entry) in prepared.source_order.iter().copied().enumerate() {
+        let Some(source) = prepared_source_for_order_entry(prepared, order_entry) else {
+            return OctaneBenchmarkExecutionReport {
+                benchmark: prepared.plan.name,
+                mode: config.mode,
+                run_config: prepared.run_config,
+                source_records,
+                host_output_records: session.host_output_records().to_vec(),
+                outcome: OctaneExecutionOutcome::Failed(OctaneExecutionFailure {
+                    phase: OctaneExecutionPhase::SessionLink,
+                    order_index: Some(order_index),
+                    order_entry: Some(order_entry),
+                    label: None,
+                    detail: OctaneExecutionFailureDetail::MissingPreparedSource {
+                        entry: order_entry,
+                    },
+                }),
+            };
+        };
+
+        let label = source.label.to_string();
+        let mut source_record = OctaneSourceExecutionRecord {
+            order_index,
+            order_entry,
+            label: label.clone(),
+            completion: None,
+        };
+
+        match vm.append_source_session_source(&mut session, source.source.clone()) {
+            Ok(completion) => {
+                source_record.completion = Some(completion.clone());
+                source_records.push(source_record);
+                if let Some(failure) =
+                    classify_completion(config.mode, order_index, order_entry, label, completion)
+                {
+                    return OctaneBenchmarkExecutionReport {
+                        benchmark: prepared.plan.name,
+                        mode: config.mode,
+                        run_config: prepared.run_config,
+                        source_records,
+                        host_output_records: session.host_output_records().to_vec(),
+                        outcome: OctaneExecutionOutcome::Failed(failure),
+                    };
+                }
+            }
+            Err(error) => {
+                source_records.push(source_record);
+                return OctaneBenchmarkExecutionReport {
+                    benchmark: prepared.plan.name,
+                    mode: config.mode,
+                    run_config: prepared.run_config,
+                    source_records,
+                    host_output_records: session.host_output_records().to_vec(),
+                    outcome: OctaneExecutionOutcome::Failed(classify_source_execution_error(
+                        config.mode,
+                        Some(order_index),
+                        Some(order_entry),
+                        Some(label),
+                        error,
+                    )),
+                };
+            }
+        }
+    }
+
+    OctaneBenchmarkExecutionReport {
+        benchmark: prepared.plan.name,
+        mode: config.mode,
+        run_config: prepared.run_config,
+        source_records,
+        host_output_records: session.host_output_records().to_vec(),
+        outcome: OctaneExecutionOutcome::ResultExtractionMissing,
+    }
+}
+
+pub fn execute_prepared_octane_suite(
+    prepared: &OctanePreparedSuite,
+    config: OctaneExecutionConfig,
+) -> OctanePreparedSuiteExecutionReport {
+    let mut benchmarks = Vec::with_capacity(prepared.benchmarks.len());
+    let mut stopped_early = false;
+
+    for benchmark in &prepared.benchmarks {
+        let report = execute_prepared_octane_benchmark(benchmark, config);
+        let should_stop = config.failure_policy == OctaneSuiteFailurePolicy::FailFast
+            && !report.outcome.is_success();
+        benchmarks.push(report);
+        if should_stop {
+            stopped_early = true;
+            break;
+        }
+    }
+
+    OctanePreparedSuiteExecutionReport {
+        suite: prepared.config.run.suite,
+        mode: config.mode,
+        failure_policy: config.failure_policy,
+        benchmarks,
+        stopped_early,
+    }
+}
+
+struct OctaneOrderedPreparedSource<'a> {
+    label: &'a str,
+    source: &'a SourceSessionSource,
+}
+
+fn prepared_source_for_order_entry(
+    prepared: &OctanePreparedBenchmark,
+    order_entry: OctanePreparedSourceOrderEntry,
+) -> Option<OctaneOrderedPreparedSource<'_>> {
+    match order_entry {
+        OctanePreparedSourceOrderEntry::Generated(kind) => {
+            prepared
+                .generated_source(kind)
+                .map(|source| OctaneOrderedPreparedSource {
+                    label: &source.label,
+                    source: &source.source,
+                })
+        }
+        OctanePreparedSourceOrderEntry::BenchmarkFile(index) => prepared
+            .benchmark_sources
+            .get(index)
+            .map(|source| OctaneOrderedPreparedSource {
+                label: &source.label,
+                source: &source.source,
+            }),
+    }
+}
+
+fn classify_source_execution_error(
+    mode: OctaneExecutionMode,
+    order_index: Option<usize>,
+    order_entry: Option<OctanePreparedSourceOrderEntry>,
+    label: Option<String>,
+    error: SourceExecutionError,
+) -> OctaneExecutionFailure {
+    let phase = match &error {
+        SourceExecutionError::Parse(_) => OctaneExecutionPhase::Parse,
+        SourceExecutionError::BytecompilerHandoff(_)
+        | SourceExecutionError::BytecodeEmission(_)
+        | SourceExecutionError::MissingUnlinkedCode
+        | SourceExecutionError::SourceSessionInstructionDecode(_)
+        | SourceExecutionError::SourceSessionMissingIdentifierText(_)
+        | SourceExecutionError::SourceSessionInvalidLoadFunctionOperand { .. }
+        | SourceExecutionError::SourceSessionFunctionIndexOverflow { .. }
+        | SourceExecutionError::SourceSessionFunctionTableOverflow { .. } => {
+            OctaneExecutionPhase::BytecodeEmit
+        }
+        SourceExecutionError::MissingStaticCellMetadata(_)
+        | SourceExecutionError::ExecutableAllocation(_)
+        | SourceExecutionError::ExecutablePublication(_)
+        | SourceExecutionError::ExecutableRegistration(_)
+        | SourceExecutionError::ExecutableInstall(_)
+        | SourceExecutionError::CodeBlockAllocation(_)
+        | SourceExecutionError::CodeBlockPublication(_)
+        | SourceExecutionError::GlobalObjectAllocation(_)
+        | SourceExecutionError::GlobalObjectPublication(_)
+        | SourceExecutionError::GlobalObjectValue(_)
+        | SourceExecutionError::GlobalRootRegistration(_) => OctaneExecutionPhase::SessionLink,
+        SourceExecutionError::ExceptionRootSynchronization(_)
+        | SourceExecutionError::FramePush(_)
+        | SourceExecutionError::FramePop(_)
+        | SourceExecutionError::EntryLeave(_) => OctaneExecutionPhase::ExecuteRuntime,
+    };
+    let phase = if source_execution_error_is_baseline_only(mode, &error) {
+        OctaneExecutionPhase::BaselineOnly
+    } else {
+        phase
+    };
+
+    OctaneExecutionFailure {
+        phase,
+        order_index,
+        order_entry,
+        label,
+        detail: OctaneExecutionFailureDetail::SourceExecutionError(error),
+    }
+}
+
+fn classify_completion(
+    mode: OctaneExecutionMode,
+    order_index: usize,
+    order_entry: OctanePreparedSourceOrderEntry,
+    label: String,
+    completion: ExecutionCompletion,
+) -> Option<OctaneExecutionFailure> {
+    let phase = match &completion {
+        ExecutionCompletion::Returned(_) => return None,
+        ExecutionCompletion::Threw(_) => OctaneExecutionPhase::ThrownOrOracle,
+        ExecutionCompletion::Failed(error) if execution_error_is_baseline_only(mode, error) => {
+            OctaneExecutionPhase::BaselineOnly
+        }
+        ExecutionCompletion::Failed(_) => OctaneExecutionPhase::ExecuteRuntime,
+        ExecutionCompletion::OrdinaryBytecodeCall(_)
+        | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
+        | ExecutionCompletion::FunctionValueCall(_)
+        | ExecutionCompletion::Terminated(_)
+        | ExecutionCompletion::Suspended(_) => OctaneExecutionPhase::ExecuteRuntime,
+    };
+
+    Some(OctaneExecutionFailure {
+        phase,
+        order_index: Some(order_index),
+        order_entry: Some(order_entry),
+        label: Some(label),
+        detail: OctaneExecutionFailureDetail::Completion(completion),
+    })
+}
+
+fn source_execution_error_is_baseline_only(
+    mode: OctaneExecutionMode,
+    error: &SourceExecutionError,
+) -> bool {
+    mode == OctaneExecutionMode::BaselineAllowed
+        && matches!(
+            error,
+            SourceExecutionError::FramePush(error)
+                | SourceExecutionError::FramePop(error)
+                | SourceExecutionError::EntryLeave(error)
+                | SourceExecutionError::GlobalObjectValue(error)
+                if execution_error_is_baseline_only(mode, error)
+        )
+}
+
+fn execution_error_is_baseline_only(mode: OctaneExecutionMode, error: &ExecutionError) -> bool {
+    mode == OctaneExecutionMode::BaselineAllowed
+        && matches!(
+            error,
+            ExecutionError::BaselineGeneratedCodeUnavailable
+                | ExecutionError::BaselineGeneratedExecutionRejected
+        )
+}
+
 fn append_generated_source(
     loader: &mut ShellSourceLoader,
     plan: &'static OctaneBenchmarkPlan,
@@ -647,21 +1025,19 @@ fn generate_octane_runner_source(
             };
             Ok(format!(
                 "\
-(function() {{
-    var __benchmark = new Benchmark({iterations});
-    var results = [];
-    for (var i = 0; i < {iterations}; i++) {{
-        if (__benchmark.prepareForNextIteration)
-            __benchmark.prepareForNextIteration();
-{random_reset}        var start = performance.now();
-        __benchmark.runIteration();
-        var end = performance.now();
-        results.push(Math.max(1, end - start));
-    }}
-    if (__benchmark.validate)
-        __benchmark.validate();
-    return results;
-}})();
+let __benchmark = new Benchmark({iterations});
+let results = [];
+for (let i = 0; i < {iterations}; i++) {{
+    if (__benchmark.prepareForNextIteration)
+        __benchmark.prepareForNextIteration();
+{random_reset}    let start = performance.now();
+    __benchmark.runIteration();
+    let end = performance.now();
+    results.push(Math.max(1, end - start));
+}}
+if (__benchmark.validate)
+    __benchmark.validate();
+return results;
 ",
                 iterations = run_config.iterations,
                 random_reset = random_reset
@@ -833,9 +1209,46 @@ fn geometric_mean(values: &[f64]) -> f64 {
 mod tests {
     use super::super::ShellFilesystemOperation;
     use super::*;
+    use crate::bytecompiler::BytecompilerEmissionError;
     use std::collections::HashSet;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static OCTANE_TEST_FUNCTION_PLAN: OctaneBenchmarkPlan = OctaneBenchmarkPlan {
+        name: "test-function",
+        files: &["./Octane/test-function.js"],
+        deterministic_random: false,
+        iterations: Some(1),
+        worst_case_count: Some(0),
+        benchmark_class: OctaneBenchmarkClass::DefaultBenchmark,
+    };
+
+    static OCTANE_TEST_CLASS_PLAN: OctaneBenchmarkPlan = OctaneBenchmarkPlan {
+        name: "test-class",
+        files: &["./Octane/test-class.js"],
+        deterministic_random: false,
+        iterations: Some(1),
+        worst_case_count: Some(0),
+        benchmark_class: OctaneBenchmarkClass::DefaultBenchmark,
+    };
+
+    static OCTANE_TEST_UNSUPPORTED_PLAN: OctaneBenchmarkPlan = OctaneBenchmarkPlan {
+        name: "test-unsupported",
+        files: &["./Octane/test-unsupported.js"],
+        deterministic_random: false,
+        iterations: Some(1),
+        worst_case_count: Some(0),
+        benchmark_class: OctaneBenchmarkClass::DefaultBenchmark,
+    };
+
+    static OCTANE_TEST_SECOND_PLAN: OctaneBenchmarkPlan = OctaneBenchmarkPlan {
+        name: "test-second",
+        files: &["./Octane/test-second.js"],
+        deterministic_random: false,
+        iterations: Some(1),
+        worst_case_count: Some(0),
+        benchmark_class: OctaneBenchmarkClass::DefaultBenchmark,
+    };
 
     struct TempJetStreamRoot {
         path: PathBuf,
@@ -879,6 +1292,27 @@ mod tests {
             (actual - expected).abs() < 1e-9,
             "expected {actual} to be within 1e-9 of {expected}"
         );
+    }
+
+    fn minimal_function_benchmark_source() -> &'static str {
+        "\
+function Benchmark(iterations) {
+}
+Benchmark.prototype.runIteration = function() {
+    return 1;
+};
+Benchmark.prototype.validate = function() {
+    return 1;
+};
+"
+    }
+
+    fn prepare_test_benchmark(
+        root: &TempJetStreamRoot,
+        plan: &'static OctaneBenchmarkPlan,
+    ) -> OctanePreparedBenchmark {
+        prepare_octane_benchmark(root.path(), plan, OctaneBenchmarkRunOverrides::none())
+            .expect("test benchmark should prepare")
     }
 
     #[test]
@@ -1270,7 +1704,7 @@ mod tests {
             .find("__benchmark.runIteration();")
             .expect("runner should run benchmark");
         assert!(reset_index < run_index);
-        assert!(crypto_runner.contains("var __benchmark = new Benchmark(120);"));
+        assert!(crypto_runner.contains("let __benchmark = new Benchmark(120);"));
         assert!(crypto_runner.contains("return results;"));
 
         let prepared_raytrace =
@@ -1339,5 +1773,212 @@ mod tests {
             assert!(!source.label.contains("Octane/run.js"));
             assert!(!source.text.contains("Octane/run.js"));
         }
+    }
+
+    #[test]
+    fn octane_executes_function_style_benchmark_until_result_extraction_is_missing() {
+        let root = TempJetStreamRoot::new();
+        root.write_manifest_file(
+            "./Octane/test-function.js",
+            minimal_function_benchmark_source(),
+        );
+        let prepared = prepare_test_benchmark(&root, &OCTANE_TEST_FUNCTION_PLAN);
+
+        let report = execute_prepared_octane_benchmark(
+            &prepared,
+            OctaneExecutionConfig::new(
+                OctaneExecutionMode::InterpreterOnly,
+                OctaneSuiteFailurePolicy::FailFast,
+            ),
+        );
+
+        assert_eq!(report.benchmark, "test-function");
+        assert_eq!(report.mode, OctaneExecutionMode::InterpreterOnly);
+        assert_eq!(
+            report.run_config,
+            OctaneDefaultBenchmarkRunConfig {
+                iterations: 1,
+                worst_case_count: 0,
+            }
+        );
+        assert_eq!(
+            report.outcome.phase(),
+            OctaneExecutionPhase::ScoreTelemetry,
+            "{report:#?}"
+        );
+        assert!(matches!(
+            report.outcome,
+            OctaneExecutionOutcome::ResultExtractionMissing
+        ));
+        assert_eq!(report.source_records.len(), prepared.source_order.len());
+        assert!(report
+            .source_records
+            .iter()
+            .all(|record| matches!(record.completion, Some(ExecutionCompletion::Returned(_)))));
+        assert!(report.host_output_records.is_empty());
+    }
+
+    #[test]
+    fn octane_class_style_benchmark_documents_top_level_class_visibility_blocker() {
+        let root = TempJetStreamRoot::new();
+        root.write_manifest_file(
+            "./Octane/test-class.js",
+            "\
+class Benchmark {
+    constructor() {}
+    runIteration() {}
+    validate() {}
+}
+",
+        );
+        let prepared = prepare_test_benchmark(&root, &OCTANE_TEST_CLASS_PLAN);
+
+        let report = execute_prepared_octane_benchmark(
+            &prepared,
+            OctaneExecutionConfig::new(
+                OctaneExecutionMode::InterpreterOnly,
+                OctaneSuiteFailurePolicy::FailFast,
+            ),
+        );
+
+        assert_eq!(report.outcome.phase(), OctaneExecutionPhase::BytecodeEmit);
+        let OctaneExecutionOutcome::Failed(failure) = report.outcome else {
+            panic!("class benchmark should fail with bytecode emission: {report:?}");
+        };
+        assert_eq!(failure.phase, OctaneExecutionPhase::BytecodeEmit);
+        assert_eq!(
+            failure.order_entry,
+            Some(OctanePreparedSourceOrderEntry::Generated(
+                OctanePreparedGeneratedSourceKind::Runner
+            ))
+        );
+        assert!(matches!(
+            failure.detail,
+            OctaneExecutionFailureDetail::SourceExecutionError(
+                SourceExecutionError::BytecodeEmission(
+                    BytecompilerEmissionError::UnboundIdentifier(_)
+                )
+            )
+        ));
+    }
+
+    #[test]
+    fn octane_unsupported_do_while_is_classified_as_parse_failure() {
+        let root = TempJetStreamRoot::new();
+        root.write_manifest_file(
+            "./Octane/test-unsupported.js",
+            "\
+do {
+} while (false);
+function Benchmark() {}
+",
+        );
+        let prepared = prepare_test_benchmark(&root, &OCTANE_TEST_UNSUPPORTED_PLAN);
+
+        let report = execute_prepared_octane_benchmark(
+            &prepared,
+            OctaneExecutionConfig::new(
+                OctaneExecutionMode::InterpreterOnly,
+                OctaneSuiteFailurePolicy::FailFast,
+            ),
+        );
+
+        assert_eq!(report.outcome.phase(), OctaneExecutionPhase::Parse);
+        let OctaneExecutionOutcome::Failed(failure) = report.outcome else {
+            panic!("unsupported do-while should fail before execution: {report:?}");
+        };
+        assert_eq!(failure.phase, OctaneExecutionPhase::Parse);
+        assert_eq!(
+            failure.order_entry,
+            Some(OctanePreparedSourceOrderEntry::BenchmarkFile(0))
+        );
+        assert!(matches!(
+            failure.detail,
+            OctaneExecutionFailureDetail::SourceExecutionError(SourceExecutionError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn octane_baseline_allowed_mode_is_accepted_and_recorded() {
+        let root = TempJetStreamRoot::new();
+        root.write_manifest_file(
+            "./Octane/test-function.js",
+            minimal_function_benchmark_source(),
+        );
+        let prepared = prepare_test_benchmark(&root, &OCTANE_TEST_FUNCTION_PLAN);
+
+        let report = execute_prepared_octane_benchmark(
+            &prepared,
+            OctaneExecutionConfig::new(
+                OctaneExecutionMode::BaselineAllowed,
+                OctaneSuiteFailurePolicy::FailFast,
+            ),
+        );
+
+        assert_eq!(report.mode, OctaneExecutionMode::BaselineAllowed);
+        assert_eq!(report.benchmark, "test-function");
+        assert_eq!(report.outcome.phase(), OctaneExecutionPhase::ScoreTelemetry);
+    }
+
+    #[test]
+    fn octane_suite_execution_respects_fail_fast_and_collect_all_policy() {
+        let root = TempJetStreamRoot::new();
+        root.write_manifest_file(
+            "./Octane/test-unsupported.js",
+            "\
+do {
+} while (false);
+function Benchmark() {}
+",
+        );
+        root.write_manifest_file(
+            "./Octane/test-second.js",
+            minimal_function_benchmark_source(),
+        );
+        let failing = prepare_test_benchmark(&root, &OCTANE_TEST_UNSUPPORTED_PLAN);
+        let second = prepare_test_benchmark(&root, &OCTANE_TEST_SECOND_PLAN);
+        let prepared_suite = OctanePreparedSuite {
+            config: OctanePreparationConfig::new(
+                root.path(),
+                OctaneRunConfig::new(OctaneSuite::Core),
+            ),
+            benchmarks: vec![failing, second],
+        };
+
+        let fail_fast = execute_prepared_octane_suite(
+            &prepared_suite,
+            OctaneExecutionConfig::new(
+                OctaneExecutionMode::InterpreterOnly,
+                OctaneSuiteFailurePolicy::FailFast,
+            ),
+        );
+        assert!(fail_fast.stopped_early);
+        assert_eq!(fail_fast.failure_policy, OctaneSuiteFailurePolicy::FailFast);
+        assert_eq!(fail_fast.benchmarks.len(), 1);
+        assert_eq!(fail_fast.benchmarks[0].benchmark, "test-unsupported");
+        assert_eq!(
+            fail_fast.benchmarks[0].outcome.phase(),
+            OctaneExecutionPhase::Parse
+        );
+
+        let collect_all = execute_prepared_octane_suite(
+            &prepared_suite,
+            OctaneExecutionConfig::new(
+                OctaneExecutionMode::InterpreterOnly,
+                OctaneSuiteFailurePolicy::CollectAll,
+            ),
+        );
+        assert!(!collect_all.stopped_early);
+        assert_eq!(
+            collect_all.failure_policy,
+            OctaneSuiteFailurePolicy::CollectAll
+        );
+        assert_eq!(collect_all.benchmarks.len(), 2);
+        assert_eq!(collect_all.benchmarks[0].benchmark, "test-unsupported");
+        assert_eq!(collect_all.benchmarks[1].benchmark, "test-second");
+        assert_eq!(
+            collect_all.benchmarks[1].outcome.phase(),
+            OctaneExecutionPhase::ScoreTelemetry
+        );
     }
 }
