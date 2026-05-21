@@ -2270,6 +2270,19 @@ impl CoreOpcodeDispatchHost {
         Ok(value)
     }
 
+    pub fn install_standard_global_properties(
+        &mut self,
+        heap: &mut Heap,
+        global_object: RuntimeValue,
+    ) -> Result<(), ExecutionError> {
+        self.objects.install_standard_global_properties(
+            heap,
+            &mut self.strings,
+            &mut self.symbols,
+            global_object,
+        )
+    }
+
     pub fn with_function_blocks(function_blocks: Vec<CodeBlock>) -> Self {
         Self::with_function_code_blocks(indexed_function_code_blocks(function_blocks))
     }
@@ -4860,6 +4873,42 @@ impl CoreObjectStore {
             },
         );
         Ok(constructor)
+    }
+
+    fn install_standard_global_properties(
+        &mut self,
+        heap: &mut Heap,
+        _strings: &mut CoreStringStore,
+        _symbols: &mut CoreSymbolStore,
+        global_object: RuntimeValue,
+    ) -> Result<(), ExecutionError> {
+        let standard_attributes = CorePropertyAttributes {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        };
+        let math = self.allocate_math_object();
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Math",
+            math,
+            standard_attributes,
+        )?;
+        Ok(())
+    }
+
+    fn install_standard_global_data_property(
+        &mut self,
+        heap: &mut Heap,
+        global_object: RuntimeValue,
+        name: &str,
+        value: RuntimeValue,
+        attributes: CorePropertyAttributes,
+    ) -> Result<(), ExecutionError> {
+        let key = CorePropertyKey::String(name.into());
+        self.define_data_property_with_write_barrier(heap, global_object, &key, value, attributes)?;
+        Ok(())
     }
 
     fn allocate_map(&mut self) -> RuntimeValue {

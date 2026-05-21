@@ -8406,7 +8406,7 @@ impl Vm {
         S: Into<SourceSessionSource>,
     {
         let mut stable_ids = SourceSessionStableIds::default();
-        let mut visible_global_bindings = global_bindings;
+        let mut visible_global_bindings = Self::source_session_global_bindings(global_bindings);
         let mut bytecompiler_session_id = self.next_source_bytecompiler_session_id;
         let mut function_count = 0usize;
         let mut compiled_sources = Vec::new();
@@ -8452,6 +8452,8 @@ impl Vm {
         let global_object_value = host
             .allocate_global_object_value(&mut self.heap, global_object)
             .map_err(SourceExecutionError::GlobalObjectValue)?;
+        host.install_standard_global_properties(&mut self.heap, global_object_value)
+            .map_err(SourceExecutionError::GlobalObjectValue)?;
         self.record_source_global_object_value(global_object, global_object_value)?;
         let mut completions = Vec::with_capacity(entries.len());
         for entry in &entries {
@@ -8482,11 +8484,13 @@ impl Vm {
         let global_object_value = host
             .allocate_global_object_value(&mut self.heap, global_object)
             .map_err(SourceExecutionError::GlobalObjectValue)?;
+        host.install_standard_global_properties(&mut self.heap, global_object_value)
+            .map_err(SourceExecutionError::GlobalObjectValue)?;
         self.record_source_global_object_value(global_object, global_object_value)?;
         Ok(SourceSessionHandle {
             global_object,
             global_object_value,
-            visible_global_bindings: global_bindings,
+            visible_global_bindings: Self::source_session_global_bindings(global_bindings),
             stable_ids: SourceSessionStableIds::default(),
             function_count: 0,
             host,
@@ -8614,6 +8618,14 @@ impl Vm {
             function_bodies: remapped_function_bodies,
             declared_global_bindings,
         })
+    }
+
+    fn source_session_global_bindings(
+        global_bindings: BytecompilerGlobalBindingSet,
+    ) -> BytecompilerGlobalBindingSet {
+        let mut visible_global_bindings = BytecompilerGlobalBindingSet::standard_globals();
+        visible_global_bindings.extend(global_bindings);
+        visible_global_bindings
     }
 
     fn link_source_session_compiled_entry(
@@ -40804,6 +40816,83 @@ mod tests {
                 ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
                 ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
             ]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_shares_standard_global_object_mutations() {
+        let mut batch = Vm::new(VmConfig::baseline_allowed());
+
+        let batch_execution = batch
+            .execute_source_session(vec![
+                source("Math.custom = 41; return Math.custom;"),
+                source("function readCustom() { return Math.custom + 1; } return readCustom();"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            batch_execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(41)),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            ]
+        );
+
+        let mut incremental = Vm::new(VmConfig::baseline_allowed());
+        let mut session = incremental.open_source_session().unwrap();
+
+        assert_eq!(
+            incremental
+                .append_source_session_source(
+                    &mut session,
+                    source("Math.custom = 41; return Math.custom;")
+                )
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
+        );
+        assert_eq!(
+            incremental
+                .append_source_session_source(
+                    &mut session,
+                    source(
+                        "function readCustom() { return Math.custom + 1; } return readCustom();"
+                    )
+                )
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn vm_execute_source_standard_global_mutations_do_not_leak_between_one_shots() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        assert_eq!(
+            vm.execute_source(source("Math.custom = 41; return Math.custom;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
+        );
+        assert_eq!(
+            vm.execute_source(source("return Math.custom;")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+    }
+
+    #[test]
+    fn vm_source_session_lexical_binding_shadows_standard_global() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![source(
+                "let Math = { custom: 41 }; \
+                 function readCustom() { return Math.custom + 1; } \
+                 return readCustom();",
+            )])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[ExecutionCompletion::Returned(RuntimeValue::from_i32(42))]
         );
     }
 

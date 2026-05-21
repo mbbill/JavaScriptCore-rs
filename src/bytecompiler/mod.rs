@@ -101,13 +101,15 @@ impl BytecompilerInput {
 /// Bytecompiler-visible object-backed global or host binding kind.
 ///
 /// This is intentionally a name-level model. Runtime installation of host
-/// functions and a real global lexical environment are separate slices; this
-/// M2 path only exposes source-session top-level `var`/function declarations
-/// and caller-provided host names to identifier resolution.
+/// functions, standard objects, and a real global lexical environment are
+/// separate slices; this path exposes source-session top-level `var`/function
+/// declarations, VM-provided standard names, and caller-provided host names to
+/// identifier resolution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BytecompilerGlobalBindingKind {
     SourceVar,
     SourceFunction,
+    Standard,
     HostDeclared,
 }
 
@@ -138,6 +140,13 @@ impl BytecompilerGlobalBinding {
             kind: BytecompilerGlobalBindingKind::HostDeclared,
         }
     }
+
+    pub fn standard(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: BytecompilerGlobalBindingKind::Standard,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -145,9 +154,19 @@ pub struct BytecompilerGlobalBindingSet {
     bindings: HashMap<String, BytecompilerGlobalBindingKind>,
 }
 
+pub const STANDARD_GLOBAL_BINDING_NAMES: &[&str] = &["Math"];
+
 impl BytecompilerGlobalBindingSet {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn standard_globals() -> Self {
+        let mut bindings = Self::new();
+        for name in STANDARD_GLOBAL_BINDING_NAMES {
+            bindings.declare_standard(*name);
+        }
+        bindings
     }
 
     pub fn from_host_names<I, S>(names: I) -> Self
@@ -168,6 +187,10 @@ impl BytecompilerGlobalBindingSet {
 
     pub fn declare_host(&mut self, name: impl Into<String>) {
         self.declare(BytecompilerGlobalBinding::host_declared(name));
+    }
+
+    pub fn declare_standard(&mut self, name: impl Into<String>) {
+        self.declare(BytecompilerGlobalBinding::standard(name));
     }
 
     pub fn extend(&mut self, other: Self) {
@@ -725,6 +748,7 @@ pub fn emit_unlinked_code_from_parsed_ast(
         arena,
         generator: &mut generator,
         locals: HashMap::new(),
+        global_capture_bindings: HashMap::new(),
         global_bindings: input.global_bindings.clone(),
         mirrored_global_bindings,
         captured_bindings: function_plan
@@ -2275,6 +2299,7 @@ struct AstBytecodeEmitter<'a, 'g> {
     arena: &'a ParserArena,
     generator: &'g mut BytecodeGenerator,
     locals: HashMap<ParserIdentifier, LocalBinding>,
+    global_capture_bindings: HashMap<ParserIdentifier, LocalBinding>,
     global_bindings: BytecompilerGlobalBindingSet,
     mirrored_global_bindings: HashSet<ParserIdentifier>,
     captured_bindings: HashSet<ParserIdentifier>,
@@ -2462,7 +2487,8 @@ impl AstBytecodeEmitter<'_, '_> {
             arena: self.arena,
             generator: &mut generator,
             locals: HashMap::new(),
-            global_bindings: BytecompilerGlobalBindingSet::default(),
+            global_capture_bindings: HashMap::new(),
+            global_bindings: self.global_bindings.clone(),
             mirrored_global_bindings: HashSet::new(),
             captured_bindings: self.captured_bindings.clone(),
             initialized_cells: HashSet::new(),
@@ -2760,6 +2786,10 @@ impl AstBytecodeEmitter<'_, '_> {
         if self.locals.contains_key(&name) {
             return Ok(());
         }
+        if self.global_bindings.contains_identifier(self.arena, name) {
+            self.emit_global_capture_binding_if_needed(name)?;
+            return Ok(());
+        }
         let register = self.generator.registers_mut().reserve_local();
         let kind = self.local_binding_kind(name);
         let binding = LocalBinding { register, kind };
@@ -2773,6 +2803,25 @@ impl AstBytecodeEmitter<'_, '_> {
                 self.initialized_cells.insert(name);
             }
         }
+        Ok(())
+    }
+
+    fn emit_global_capture_binding_if_needed(
+        &mut self,
+        name: ParserIdentifier,
+    ) -> Result<(), BytecompilerEmissionError> {
+        if !self.is_captured_binding(name) || self.global_capture_bindings.contains_key(&name) {
+            return Ok(());
+        }
+        let register = self.generator.registers_mut().reserve_local();
+        let binding = LocalBinding {
+            register,
+            kind: LocalBindingKind::ClosureCell,
+        };
+        let value = self.emit_get_by_name(Self::global_object_register(), name)?;
+        let cell = self.emit_new_closure_cell(value)?;
+        self.emit_move(register, cell);
+        self.global_capture_bindings.insert(name, binding);
         Ok(())
     }
 
@@ -5205,6 +5254,7 @@ impl AstBytecodeEmitter<'_, '_> {
             let binding = *self
                 .locals
                 .get(capture)
+                .or_else(|| self.global_capture_bindings.get(capture))
                 .ok_or(BytecompilerEmissionError::UnboundIdentifier(*capture))?;
             if binding.kind != LocalBindingKind::ClosureCell {
                 return Err(BytecompilerEmissionError::UnsupportedExpression(
@@ -6276,6 +6326,20 @@ mod tests {
     }
 
     fn emit_program_source(text: &str, session: u64) -> UnlinkedCodeBlock {
+        emit_program_plan_with_global_bindings(
+            text,
+            session,
+            BytecompilerGlobalBindingSet::default(),
+        )
+        .unlinked_code
+        .unwrap()
+    }
+
+    fn emit_program_plan_with_global_bindings(
+        text: &str,
+        session: u64,
+        global_bindings: BytecompilerGlobalBindingSet,
+    ) -> BytecompilerOutputPlan {
         let source = source(text);
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
@@ -6293,11 +6357,10 @@ mod tests {
             &arena,
         )
         .unwrap();
+        let mut input = input;
+        input.global_bindings = global_bindings;
 
-        emit_unlinked_code_from_parsed_ast(&input, &arena)
-            .unwrap()
-            .unlinked_code
-            .unwrap()
+        emit_unlinked_code_from_parsed_ast(&input, &arena).unwrap()
     }
 
     fn execute_program_source(text: &str, session: u64) -> ExecutionCompletion {
@@ -6372,6 +6435,29 @@ mod tests {
                     && root_map.bytecode_range_end == bytecode_index
             })
             .expect("exact helper root map")
+    }
+
+    fn unlinked_contains_opcode(code_block: &UnlinkedCodeBlock, opcode: CoreOpcode) -> bool {
+        code_block
+            .instructions()
+            .declarations()
+            .iter()
+            .any(|instruction| CoreOpcode::from_opcode(instruction.opcode) == Some(opcode))
+    }
+
+    fn load_function_capture_counts(code_block: &UnlinkedCodeBlock) -> Vec<u32> {
+        code_block
+            .instructions()
+            .declarations()
+            .iter()
+            .filter(|instruction| {
+                CoreOpcode::from_opcode(instruction.opcode) == Some(CoreOpcode::LoadFunction)
+            })
+            .filter_map(|instruction| match instruction.operands.get(2) {
+                Some(Operand::UnsignedImmediate(count)) => Some(*count),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -6873,6 +6959,50 @@ mod tests {
         assert!(nested_keys
             .iter()
             .any(|key| nested.string_literal(*key) == Some("9007199254740993n")));
+    }
+
+    #[test]
+    fn parsed_ast_resolves_standard_globals_without_intrinsic_object_loads() {
+        let plan = emit_program_plan_with_global_bindings(
+            "function read() { return Math.custom; } return Math;",
+            15,
+            BytecompilerGlobalBindingSet::standard_globals(),
+        );
+        let program = plan.unlinked_code.as_ref().unwrap();
+        let nested = plan.function_bodies.first().unwrap();
+
+        assert!(!unlinked_contains_opcode(
+            program,
+            CoreOpcode::LoadMathObject
+        ));
+        assert!(!unlinked_contains_opcode(
+            nested,
+            CoreOpcode::LoadMathObject
+        ));
+        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
+        assert!(unlinked_contains_opcode(nested, CoreOpcode::GetByName));
+        assert_eq!(load_function_capture_counts(program), vec![1]);
+    }
+
+    #[test]
+    fn parsed_ast_lexical_standard_name_shadow_remains_capturable() {
+        let plan = emit_program_plan_with_global_bindings(
+            "let Math = { custom: 41 }; function read() { return Math.custom + 1; } return read();",
+            16,
+            BytecompilerGlobalBindingSet::standard_globals(),
+        );
+        let program = plan.unlinked_code.as_ref().unwrap();
+        let nested = plan.function_bodies.first().unwrap();
+
+        assert!(!unlinked_contains_opcode(
+            program,
+            CoreOpcode::LoadMathObject
+        ));
+        assert!(!unlinked_contains_opcode(
+            nested,
+            CoreOpcode::LoadMathObject
+        ));
+        assert_eq!(load_function_capture_counts(program), vec![1]);
     }
 
     #[test]

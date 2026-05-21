@@ -169,16 +169,18 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- M2 source execution prerequisite slice: persistent source sessions,
-  expression lowering, cross-source global bindings, file-backed source
-  loading/provenance, and incremental session append support.
+- M3a canonical standard-global proof slice: source sessions install a
+  canonical benchmark-visible `Math` object on the shared global, bytecompiler
+  resolves standard globals through the session global instead of fresh local
+  intrinsic loads, and `Math` property mutation persists across batch and
+  incremental loads.
 - Full accepted gate at that checkpoint: `cargo test --lib -- --quiet` with
-  1813 passed.
+  1818 passed.
 
 Current git/code note:
 
 - The current working tree may contain documentation or active-batch edits.
-  Treat the 1813-test M2 prerequisite slice as the last accepted green code
+  Treat the 1818-test M3a canonical-Math slice as the last accepted green code
   checkpoint unless a later progress entry records passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
   repairing that baseline.
@@ -207,10 +209,10 @@ Known Octane run blockers:
   visibility, but their runtime behavior is not installed yet:
   `performance.now`, `load`, `readFile`, `print`, `console`, and
   error-reporting compatibility such as `alert`.
-- Standard object/global ownership must be tightened before M3 implementation:
-  several intrinsics are currently bytecompiler-local loads that allocate fresh
-  objects instead of canonical global-object properties, which is wrong for
-  benchmark-visible overrides such as deterministic `Math.random`.
+- Standard object/global ownership is only partially tightened: `Math` is now a
+  canonical session-global object, but the rest of the standard object family
+  still needs a follow-up boundary before benchmark-visible mutation can be
+  assumed broadly.
 - Benchmark telemetry and runner control: no Rust-side Octane manifest,
   load-order execution, iteration loop, validation policy, scoring, or
   tier-mode selection yet.
@@ -358,18 +360,27 @@ M2: Accepted - build Octane-core execution prerequisites in parallel.
 
 M3: Current - add Octane-core runtime intrinsics and shell globals.
 
-- Main agent: first settle the canonical standard-object/global-object boundary
-  so benchmark-visible mutation works. Existing bytecompiler-local intrinsic
-  loads are acceptable for isolated tests but cannot be the final model for
-  `Math.random` override/reset, `performance`, `console`, or host globals.
-- Sub-agents: implement in ordered batches after the boundary is clear:
-  Math runtime intrinsics (`floor`, `sqrt`, `log`, `LN2`, `random`); String and
-  global runtime intrinsics (`charCodeAt`, `substring`, `fromCharCode`,
-  `parseInt`); then shell host globals (`performance.now`, `load`, `readFile`,
-  `print`, `console`, `alert`).
+- Main agent: protect the accepted canonical `Math` global-object boundary and
+  keep the remaining M3 work serial where it defines shared runtime ownership.
+  Review every runtime intrinsic for benchmark-visible mutation, roots,
+  barriers, and deterministic runner behavior before accepting it.
+- Sub-agents: implement the remaining M3 work in ordered batches: Math runtime
+  intrinsics (`floor`, `sqrt`, `log`, `LN2`, `random`); String and global
+  runtime intrinsics (`charCodeAt`, `substring`, `fromCharCode`, `parseInt`);
+  then shell host globals (`performance.now`, `load`, `readFile`, `print`,
+  `console`, `alert`).
 - Completion evidence: each API has focused tests, deterministic behavior where
   benchmark repeatability requires it, benchmark-visible overrides persist
   across loaded sources, and no duplicate host/global ownership model exists.
+- Accepted sub-slice: M3a canonical standard-global proof installed a single
+  benchmark-visible `Math` object on each source-session global, resolved
+  standard `Math` references through global binding lookup instead of fresh
+  intrinsic object loads, preserved lexical shadowing, and proved `Math`
+  property mutation across batch and incremental loads; full gates passed with
+  1818 lib tests.
+- Next sub-slice: M3b installs the Octane-required Math APIs on that canonical
+  object. It must not widen String, shell globals, runner control, or JIT math
+  lowering in the same patch.
 - Scheduling note: most executable native builtin code still lives in
   `src/interpreter/mod.rs`, so Math and String implementation batches should be
   serialized unless the main agent first splits builtin bodies into disjoint
