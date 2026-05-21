@@ -12,8 +12,8 @@ use crate::bytecode::{
     BytecodeGenerator, BytecodeIndex, BytecodeRange, CodeFeatures as BytecodeCodeFeatures,
     CodeKind, CoreOpcode, GenerationPlan, GenerationRoot, GenerationValidationFinding, HandlerKind,
     Label, LabelRef, Operand, OperandWidth, ParseMode as BytecodeParseMode, RegisterAllocator,
-    RegisterFrameShape, SourceProvenance, SpecialRegisters, TemporaryLifetime, UnlinkedCodeBlock,
-    UnlinkedHandlerInfo, VirtualRegister,
+    RegisterFrameShape, SourceOriginId, SourceProvenance, SourceProviderId, SpecialRegisters,
+    TemporaryLifetime, UnlinkedCodeBlock, UnlinkedHandlerInfo, VirtualRegister,
 };
 use crate::syntax::ast::{
     ArrayLiteralElement, AssignmentExpr, AssignmentOperator, AstPropertyKey, BinaryExpr,
@@ -67,12 +67,35 @@ pub struct BytecompilerInput {
     /// Borrowed parse-time source view; persistent provider identity is carried
     /// later by `bytecode::SourceProviderId`.
     pub source: SourceCode,
+    pub source_provider_id: Option<SourceProviderId>,
+    pub source_origin_id: Option<SourceOriginId>,
     pub root: AstRoot,
     pub mode: BytecompilerMode,
     pub code_features: CodeFeatures,
     pub module_analysis: Option<ModuleAnalysis>,
     pub semantic_model: Option<SemanticModel>,
     pub global_bindings: BytecompilerGlobalBindingSet,
+}
+
+impl BytecompilerInput {
+    pub fn with_source_provenance(
+        mut self,
+        provider_id: SourceProviderId,
+        origin_id: SourceOriginId,
+    ) -> Self {
+        self.source_provider_id = Some(provider_id);
+        self.source_origin_id = Some(origin_id);
+        self
+    }
+
+    pub fn set_source_provenance(
+        &mut self,
+        provider_id: Option<SourceProviderId>,
+        origin_id: Option<SourceOriginId>,
+    ) {
+        self.source_provider_id = provider_id;
+        self.source_origin_id = origin_id;
+    }
 }
 
 /// Bytecompiler-visible object-backed global or host binding kind.
@@ -247,6 +270,8 @@ pub fn bytecompiler_input_from_parsed_ast(
     Ok(BytecompilerInput {
         session,
         source,
+        source_provider_id: None,
+        source_origin_id: None,
         root: parsed.root,
         mode,
         code_features: scope.semantics.features,
@@ -634,13 +659,14 @@ pub fn plan_bytecompiler_input(
     let mut generation = GenerationPlan::new(kind, parse_mode);
     generation.registers = registers;
     generation.source = SourceProvenance {
+        provider_id: input.source_provider_id,
+        origin: input.source_origin_id,
         start_offset: input.source.range().start.0,
         source_length: input.source.range().unit_len(),
         first_line: input.source.first_line(),
         start_column: input.source.start_column(),
         source_url: input.source.provider().origin().source_url.clone(),
         pre_redirect_url: input.source.provider().origin().pre_redirect_url.clone(),
-        ..SourceProvenance::default()
     };
     generation.features = map_code_features(input.code_features);
     generation.root = root;
@@ -6176,7 +6202,8 @@ mod tests {
     use super::*;
     use crate::bytecode::{
         BytecodeRootMap, BytecodeRootSlotKind, BytecodeRootSlotStorage, CodeBlock, CodeKind,
-        LinkContext, ParseMode, RegisterFrameShape, SpecialRegisters, VirtualRegister,
+        LinkContext, ParseMode, RegisterFrameShape, SourceOriginId, SourceProviderId,
+        SpecialRegisters, VirtualRegister,
     };
     use crate::gc::{CellId, Heap};
     use crate::interpreter::{
@@ -6208,6 +6235,17 @@ mod tests {
     fn source(text: &str) -> SourceCode {
         let provider = Arc::new(SourceProvider::new(
             SourceOrigin::default(),
+            SourceText::Latin1(text.as_bytes().to_vec()),
+        ));
+        SourceCode::new(
+            provider,
+            SourceSpan::new(SourcePosition(0), SourcePosition(text.len() as u32)),
+        )
+    }
+
+    fn source_with_origin(text: &str, origin: SourceOrigin) -> SourceCode {
+        let provider = Arc::new(SourceProvider::new(
+            origin,
             SourceText::Latin1(text.as_bytes().to_vec()),
         ));
         SourceCode::new(
@@ -6386,6 +6424,8 @@ mod tests {
         let input = BytecompilerInput {
             session: BytecompilerSessionId(7),
             source: source("import x from 'm';"),
+            source_provider_id: None,
+            source_origin_id: None,
             root: AstRoot::Module(AstRef::from_raw_index(0)),
             mode: BytecompilerMode::Module,
             code_features: CodeFeatures {
@@ -6434,6 +6474,55 @@ mod tests {
         assert_eq!(plan.generation.kind, CodeKind::Program);
         assert_eq!(plan.generation.source.source_length, 24);
         assert_eq!(plan.semantic.parse.goal, ParseSemanticGoal::Script);
+    }
+
+    #[test]
+    fn bytecompiler_propagates_source_provider_and_origin_ids() {
+        let source = source_with_origin(
+            "return 42;",
+            SourceOrigin {
+                url: Some("file:///tmp/input.js".to_string()),
+                source_url: Some("file:///tmp/input.js".to_string()),
+                pre_redirect_url: Some("file:///tmp/pre.js".to_string()),
+                ..SourceOrigin::default()
+            },
+        );
+        let mut arena = ParserArena::new();
+        let parsed = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            crate::syntax::ParseMode::Program,
+        )
+        .parse()
+        .unwrap();
+        let input = bytecompiler_input_from_parsed_ast(
+            BytecompilerSessionId(11),
+            source.clone(),
+            &parsed,
+            &arena,
+        )
+        .unwrap()
+        .with_source_provenance(SourceProviderId(31), SourceOriginId(41));
+
+        let plan = emit_unlinked_code_from_parsed_ast(&input, &arena).unwrap();
+        let unlinked = plan.unlinked_code.as_ref().expect("unlinked code");
+
+        assert_eq!(
+            plan.generation.source.provider_id,
+            Some(SourceProviderId(31))
+        );
+        assert_eq!(plan.generation.source.origin, Some(SourceOriginId(41)));
+        assert_eq!(
+            plan.generation.source.source_url.as_deref(),
+            Some("file:///tmp/input.js")
+        );
+        assert_eq!(
+            plan.generation.source.pre_redirect_url.as_deref(),
+            Some("file:///tmp/pre.js")
+        );
+        assert_eq!(unlinked.source().provider_id, Some(SourceProviderId(31)));
+        assert_eq!(unlinked.source().origin, Some(SourceOriginId(41)));
     }
 
     #[test]

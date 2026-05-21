@@ -169,15 +169,16 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- M2 prerequisite slice for source sessions, expression lowering, and
-  cross-source global bindings.
+- M2 source execution prerequisite slice: persistent source sessions,
+  expression lowering, cross-source global bindings, file-backed source
+  loading/provenance, and incremental session append support.
 - Full accepted gate at that checkpoint: `cargo test --lib -- --quiet` with
-  1809 passed.
+  1813 passed.
 
 Current git/code note:
 
 - The current working tree may contain documentation or active-batch edits.
-  Treat the 1809-test M2 prerequisite slice as the last accepted green code
+  Treat the 1813-test M2 prerequisite slice as the last accepted green code
   checkpoint unless a later progress entry records passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
   repairing that baseline.
@@ -198,12 +199,6 @@ Major accepted capabilities:
 
 Known Octane run blockers:
 
-- Source loading/session is only partly modeled: accepted batch sessions share
-  one VM global/root and dispatch host, and source-order top-level
-  `function`/`var` plus declared host names are visible through a real session
-  global object, but there is no filesystem-backed source loading,
-  source-origin record flow, or incremental host append/merge path for
-  `load()`/`readFile()` yet.
 - Runtime intrinsics used by Octane-core still need an explicit benchmark
   compatibility pass: `Math.floor`, `Math.sqrt`, `Math.random`, `Math.log`,
   `Math.LN2`, `String.prototype.charCodeAt`,
@@ -212,6 +207,10 @@ Known Octane run blockers:
   visibility, but their runtime behavior is not installed yet:
   `performance.now`, `load`, `readFile`, `print`, `console`, and
   error-reporting compatibility such as `alert`.
+- Standard object/global ownership must be tightened before M3 implementation:
+  several intrinsics are currently bytecompiler-local loads that allocate fresh
+  objects instead of canonical global-object properties, which is wrong for
+  benchmark-visible overrides such as deterministic `Math.random`.
 - Benchmark telemetry and runner control: no Rust-side Octane manifest,
   load-order execution, iteration loop, validation policy, scoring, or
   tier-mode selection yet.
@@ -323,7 +322,7 @@ M1: Accepted - freeze the Octane target and runner architecture.
   `Octane/run.js` path is rejected; the synchronous `DefaultBenchmark` runner
   design is accepted without requiring the official browser/async harness.
 
-M2: Current - build Octane-core execution prerequisites in parallel.
+M2: Accepted - build Octane-core execution prerequisites in parallel.
 
 - Main agent: protect the accepted source-session, global-binding, and
   expression-lowering contracts while closing the remaining file-loading
@@ -347,21 +346,34 @@ M2: Current - build Octane-core execution prerequisites in parallel.
   are parsed/lowered/executed; bytecompiler-visible global/host binding
   declarations and cross-load top-level `function`/`var` visibility are modeled
   through a real session global object; full gates passed with 1809 lib tests.
-- Remaining sub-slice: filesystem-backed source loading/source-origin records
-  and incremental host append/merge support for future `load`/`readFile`.
-  Top-level `let`/`const` cross-load visibility remains intentionally deferred
-  until a real global lexical environment exists. Do not start an Octane runner
-  before file loading is explicitly modeled.
+- Accepted final sub-slice: shell file reads now build loaded-source records
+  with canonical path provenance plus bytecode-owned `SourceProviderId` and
+  `SourceOriginId`; bytecompiler provenance flows into `SourceProvenance`; VM
+  incremental source sessions can append and execute one source at a time while
+  preserving the same global object, dispatch host, function table, identifier
+  table, string table, and visible global bindings; full gates passed with 1813
+  lib tests.
+- Deferred by design: runtime behavior for `load`/`readFile` and a real global
+  lexical environment for cross-source top-level `let`/`const`.
 
-M3: Add Octane-core runtime intrinsics and shell globals.
+M3: Current - add Octane-core runtime intrinsics and shell globals.
 
-- Main agent: decide which APIs belong in runtime intrinsics versus shell host
-  bindings so benchmark shims do not pollute VM semantics.
-- Sub-agents: implement Math, String, `parseInt`, `performance.now`, and shell
-  globals in disjoint runtime/shell slices.
+- Main agent: first settle the canonical standard-object/global-object boundary
+  so benchmark-visible mutation works. Existing bytecompiler-local intrinsic
+  loads are acceptable for isolated tests but cannot be the final model for
+  `Math.random` override/reset, `performance`, `console`, or host globals.
+- Sub-agents: implement in ordered batches after the boundary is clear:
+  Math runtime intrinsics (`floor`, `sqrt`, `log`, `LN2`, `random`); String and
+  global runtime intrinsics (`charCodeAt`, `substring`, `fromCharCode`,
+  `parseInt`); then shell host globals (`performance.now`, `load`, `readFile`,
+  `print`, `console`, `alert`).
 - Completion evidence: each API has focused tests, deterministic behavior where
-  benchmark repeatability requires it, and no duplicate host/global ownership
-  model.
+  benchmark repeatability requires it, benchmark-visible overrides persist
+  across loaded sources, and no duplicate host/global ownership model exists.
+- Scheduling note: most executable native builtin code still lives in
+  `src/interpreter/mod.rs`, so Math and String implementation batches should be
+  serialized unless the main agent first splits builtin bodies into disjoint
+  modules.
 
 M4: Run Octane-core correctly in the Rust engine.
 

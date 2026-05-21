@@ -3,14 +3,22 @@
 //! The shell is not the engine. This module only names command-line host
 //! services, testing hooks, module resolution hooks, and harness integration.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use crate::api::{
     ApiExecutionDiagnosticSummary, ApiExecutionResultKind, ApiGcDiagnosticSummary,
     ApiTierDiagnosticSummary,
 };
-use crate::bytecode::SourceProviderId;
+use crate::bytecode::{SourceOriginId, SourceProviderId};
 use crate::gc::{CollectionKind, GcPhase, HeapId, HeapSnapshotId};
 use crate::modules::{HostModulePayload, ImportMapId, ModuleKey, ModuleLoaderPolicy};
 use crate::runtime::{GlobalObjectId, HostHookId};
+use crate::syntax::source::{
+    SourceCode, SourceOrigin, SourcePosition, SourceProvider, SourceProviderSourceType, SourceSpan,
+    SourceText,
+};
 use crate::wasm::WasmDebugTransport;
 
 /// Shell execution mode.
@@ -518,6 +526,407 @@ impl ShellSource {
     }
 }
 
+/// Immutable file read result before a source is appended to a VM session.
+///
+/// This is the boundary future `readFile` support can reuse without implying
+/// that the file should be compiled or executed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellSourceFileRead {
+    pub requested_path: PathBuf,
+    pub canonical_path: PathBuf,
+    pub origin: SourceOrigin,
+    pub text: String,
+}
+
+/// Request to append source text to a shell-managed source registry.
+///
+/// The append step assigns bytecode-owned provider/origin identities and builds
+/// immutable syntax storage. It does not install runtime host functions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellSourceAppendRequest {
+    pub kind: ShellSourceKind,
+    pub mode: ShellMode,
+    pub is_module: bool,
+    pub is_strict_mode: bool,
+    pub text: String,
+    pub origin: SourceOrigin,
+    pub canonical_path: Option<PathBuf>,
+}
+
+impl ShellSourceAppendRequest {
+    pub fn eval(text: impl Into<String>, mode: ShellMode, source_url: Option<String>) -> Self {
+        let origin = SourceOrigin {
+            url: source_url.clone(),
+            source_url,
+            ..SourceOrigin::default()
+        };
+        Self {
+            kind: ShellSourceKind::EvalString,
+            mode,
+            is_module: false,
+            is_strict_mode: false,
+            text: text.into(),
+            origin,
+            canonical_path: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellSourceProviderRecord {
+    pub id: SourceProviderId,
+    pub origin: SourceOriginId,
+    pub kind: ShellSourceKind,
+    pub source_units: u32,
+    pub source_type: SourceProviderSourceType,
+    pub canonical_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellSourceOriginRecord {
+    pub id: SourceOriginId,
+    pub provider: SourceProviderId,
+    pub kind: ShellSourceKind,
+    pub url: Option<String>,
+    pub source_url: Option<String>,
+    pub pre_redirect_url: Option<String>,
+    pub canonical_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShellLoadedSource {
+    source: SourceCode,
+    source_record: ShellSource,
+    provider_record: ShellSourceProviderRecord,
+    origin_record: ShellSourceOriginRecord,
+}
+
+impl ShellLoadedSource {
+    pub fn source(&self) -> &SourceCode {
+        &self.source
+    }
+
+    pub fn source_code(&self) -> SourceCode {
+        self.source.clone()
+    }
+
+    pub fn source_record(&self) -> ShellSource {
+        self.source_record
+    }
+
+    pub fn provider_id(&self) -> SourceProviderId {
+        self.provider_record.id
+    }
+
+    pub fn origin_id(&self) -> SourceOriginId {
+        self.origin_record.id
+    }
+
+    pub fn provider_record(&self) -> &ShellSourceProviderRecord {
+        &self.provider_record
+    }
+
+    pub fn origin_record(&self) -> &ShellSourceOriginRecord {
+        &self.origin_record
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellSourceIdentityKind {
+    Provider,
+    Origin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellFilesystemOperation {
+    Canonicalize,
+    ReadToString,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShellSourceLoadError {
+    SourceValidation(ShellValidationError),
+    Filesystem {
+        operation: ShellFilesystemOperation,
+        path: PathBuf,
+        message: String,
+    },
+    SourceKindDoesNotUseFilesystem(ShellSourceKind),
+    SourceKindRequiresFilesystem(ShellSourceKind),
+    InvalidPathEncoding(PathBuf),
+    SourceTooLarge {
+        units: usize,
+    },
+    IdentityOverflow {
+        kind: ShellSourceIdentityKind,
+        next_id: u64,
+    },
+}
+
+impl From<ShellValidationError> for ShellSourceLoadError {
+    fn from(error: ShellValidationError) -> Self {
+        Self::SourceValidation(error)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellSourceLoader {
+    registry: ShellSchemaRegistry,
+    next_provider_id: u64,
+    next_origin_id: u64,
+    provider_records: Vec<ShellSourceProviderRecord>,
+    origin_records: Vec<ShellSourceOriginRecord>,
+}
+
+impl Default for ShellSourceLoader {
+    fn default() -> Self {
+        Self::new(SHELL_SCHEMA_REGISTRY)
+    }
+}
+
+impl ShellSourceLoader {
+    pub fn new(registry: ShellSchemaRegistry) -> Self {
+        Self {
+            registry,
+            next_provider_id: 1,
+            next_origin_id: 1,
+            provider_records: Vec::new(),
+            origin_records: Vec::new(),
+        }
+    }
+
+    pub fn with_next_ids(
+        registry: ShellSchemaRegistry,
+        next_provider_id: SourceProviderId,
+        next_origin_id: SourceOriginId,
+    ) -> Self {
+        Self {
+            registry,
+            next_provider_id: next_provider_id.0,
+            next_origin_id: next_origin_id.0,
+            provider_records: Vec::new(),
+            origin_records: Vec::new(),
+        }
+    }
+
+    pub fn provider_records(&self) -> &[ShellSourceProviderRecord] {
+        &self.provider_records
+    }
+
+    pub fn origin_records(&self) -> &[ShellSourceOriginRecord] {
+        &self.origin_records
+    }
+
+    pub fn read_file_source(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<ShellSourceFileRead, ShellSourceLoadError> {
+        let requested_path = path.as_ref().to_path_buf();
+        let canonical_path =
+            requested_path
+                .canonicalize()
+                .map_err(|error| ShellSourceLoadError::Filesystem {
+                    operation: ShellFilesystemOperation::Canonicalize,
+                    path: requested_path.clone(),
+                    message: error.to_string(),
+                })?;
+        let text = fs::read_to_string(&canonical_path).map_err(|error| {
+            ShellSourceLoadError::Filesystem {
+                operation: ShellFilesystemOperation::ReadToString,
+                path: canonical_path.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        let url = file_origin_url(&canonical_path)?;
+        Ok(ShellSourceFileRead {
+            requested_path,
+            canonical_path,
+            origin: SourceOrigin {
+                url: Some(url.clone()),
+                source_url: Some(url),
+                ..SourceOrigin::default()
+            },
+            text,
+        })
+    }
+
+    pub fn load_file_source(
+        &mut self,
+        path: impl AsRef<Path>,
+        kind: ShellSourceKind,
+        mode: ShellMode,
+        is_module: bool,
+    ) -> Result<ShellLoadedSource, ShellSourceLoadError> {
+        let classification = self.registry.classify_source(ShellSourceInput {
+            kind,
+            mode,
+            is_module,
+            has_source_url: true,
+        })?;
+        if !classification.requires_filesystem {
+            return Err(ShellSourceLoadError::SourceKindDoesNotUseFilesystem(kind));
+        }
+        let read = self.read_file_source(path)?;
+        self.append_file_read(read, kind, mode, is_module)
+    }
+
+    pub fn append_file_read(
+        &mut self,
+        read: ShellSourceFileRead,
+        kind: ShellSourceKind,
+        mode: ShellMode,
+        is_module: bool,
+    ) -> Result<ShellLoadedSource, ShellSourceLoadError> {
+        self.append_source_text(ShellSourceAppendRequest {
+            kind,
+            mode,
+            is_module,
+            is_strict_mode: is_module,
+            text: read.text,
+            origin: read.origin,
+            canonical_path: Some(read.canonical_path),
+        })
+    }
+
+    pub fn append_source_text(
+        &mut self,
+        request: ShellSourceAppendRequest,
+    ) -> Result<ShellLoadedSource, ShellSourceLoadError> {
+        let has_source_url =
+            request.origin.source_url.is_some() || request.origin.source_url_directive.is_some();
+        let classification = self.registry.classify_source(ShellSourceInput {
+            kind: request.kind,
+            mode: request.mode,
+            is_module: request.is_module,
+            has_source_url,
+        })?;
+        if classification.requires_filesystem && request.canonical_path.is_none() {
+            return Err(ShellSourceLoadError::SourceKindRequiresFilesystem(
+                request.kind,
+            ));
+        }
+        if !classification.requires_filesystem && request.canonical_path.is_some() {
+            return Err(ShellSourceLoadError::SourceKindDoesNotUseFilesystem(
+                request.kind,
+            ));
+        }
+
+        let source_text = source_text_from_utf8(&request.text)?;
+        let source_units = source_text_unit_len(&source_text)?;
+        let source_type = if request.is_module {
+            SourceProviderSourceType::Module
+        } else {
+            SourceProviderSourceType::Program
+        };
+        let provider = Arc::new(SourceProvider::with_source_type(
+            request.origin.clone(),
+            source_text,
+            source_type,
+        ));
+        let source = SourceCode::new(
+            provider,
+            SourceSpan::new(SourcePosition(0), SourcePosition(source_units)),
+        );
+        let provider_id = self.allocate_provider_id()?;
+        let origin_id = self.allocate_origin_id()?;
+        let source_record = ShellSource {
+            provider: provider_id,
+            kind: request.kind,
+            is_module: request.is_module,
+            is_strict_mode: request.is_strict_mode,
+            has_source_url,
+        };
+        source_record.validate(self.registry)?;
+        let provider_record = ShellSourceProviderRecord {
+            id: provider_id,
+            origin: origin_id,
+            kind: request.kind,
+            source_units,
+            source_type,
+            canonical_path: request.canonical_path.clone(),
+        };
+        let origin_record = ShellSourceOriginRecord {
+            id: origin_id,
+            provider: provider_id,
+            kind: request.kind,
+            url: request.origin.url.clone(),
+            source_url: request.origin.source_url.clone(),
+            pre_redirect_url: request.origin.pre_redirect_url.clone(),
+            canonical_path: request.canonical_path,
+        };
+        self.provider_records.push(provider_record.clone());
+        self.origin_records.push(origin_record.clone());
+
+        Ok(ShellLoadedSource {
+            source,
+            source_record,
+            provider_record,
+            origin_record,
+        })
+    }
+
+    fn allocate_provider_id(&mut self) -> Result<SourceProviderId, ShellSourceLoadError> {
+        let id = SourceProviderId(self.next_provider_id);
+        self.next_provider_id =
+            self.next_provider_id
+                .checked_add(1)
+                .ok_or(ShellSourceLoadError::IdentityOverflow {
+                    kind: ShellSourceIdentityKind::Provider,
+                    next_id: id.0,
+                })?;
+        Ok(id)
+    }
+
+    fn allocate_origin_id(&mut self) -> Result<SourceOriginId, ShellSourceLoadError> {
+        let id = SourceOriginId(self.next_origin_id);
+        self.next_origin_id =
+            self.next_origin_id
+                .checked_add(1)
+                .ok_or(ShellSourceLoadError::IdentityOverflow {
+                    kind: ShellSourceIdentityKind::Origin,
+                    next_id: id.0,
+                })?;
+        Ok(id)
+    }
+}
+
+fn source_text_from_utf8(text: &str) -> Result<SourceText, ShellSourceLoadError> {
+    if text.is_ascii() {
+        Ok(SourceText::Latin1(text.as_bytes().to_vec()))
+    } else {
+        let utf16 = text.encode_utf16().collect::<Vec<_>>();
+        if utf16.len() > u32::MAX as usize {
+            return Err(ShellSourceLoadError::SourceTooLarge { units: utf16.len() });
+        }
+        Ok(SourceText::Utf16(utf16))
+    }
+}
+
+fn source_text_unit_len(text: &SourceText) -> Result<u32, ShellSourceLoadError> {
+    let units = match text {
+        SourceText::Latin1(text) => text.len(),
+        SourceText::Utf16(text) => text.len(),
+    };
+    if units > u32::MAX as usize {
+        return Err(ShellSourceLoadError::SourceTooLarge { units });
+    }
+    Ok(units as u32)
+}
+
+fn file_origin_url(path: &Path) -> Result<String, ShellSourceLoadError> {
+    let path_text = path
+        .to_str()
+        .ok_or_else(|| ShellSourceLoadError::InvalidPathEncoding(path.to_path_buf()))?;
+    #[cfg(windows)]
+    {
+        Ok(format!("file:///{}", path_text.replace('\\', "/")))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(format!("file://{path_text}"))
+    }
+}
+
 /// Host hook installed by the shell global object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShellHostHookKind {
@@ -920,6 +1329,20 @@ fn validate_unique_sources(sources: &[ShellSourceDescriptor]) -> Result<(), Shel
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytecode::SourceOriginId;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEMP_SOURCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_source_path(name: &str) -> PathBuf {
+        let counter = TEMP_SOURCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "jsc-rust-shell-{name}-{}-{counter}.js",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn validates_builtin_shell_registry() {
@@ -1009,6 +1432,67 @@ mod tests {
                 ShellSourceKind::EvalString
             ))
         );
+    }
+
+    #[test]
+    fn file_source_loader_reads_canonical_path_and_records_provenance() {
+        let path = temp_source_path("records-provenance");
+        let text = "var answer = 42;\n";
+        fs::write(&path, text).expect("write source");
+        let canonical = path.canonicalize().expect("canonical path");
+        let expected_url = format!("file://{}", canonical.to_str().expect("utf8 path"));
+        let mut loader = ShellSourceLoader::default();
+
+        let loaded = loader
+            .load_file_source(&path, ShellSourceKind::File, ShellMode::ScriptFile, false)
+            .expect("loaded source");
+
+        assert_eq!(loaded.provider_id(), SourceProviderId(1));
+        assert_eq!(loaded.origin_id(), SourceOriginId(1));
+        assert_eq!(
+            loaded.source().provider().origin().url.as_deref(),
+            Some(expected_url.as_str())
+        );
+        assert_eq!(
+            loaded.source().provider().origin().source_url.as_deref(),
+            Some(expected_url.as_str())
+        );
+        assert_eq!(loaded.source().range().unit_len(), text.len() as u32);
+        assert_eq!(loaded.provider_record().source_units, text.len() as u32);
+        assert_eq!(
+            loaded.provider_record().canonical_path.as_ref(),
+            Some(&canonical)
+        );
+        assert_eq!(
+            loader.provider_records(),
+            &[loaded.provider_record().clone()]
+        );
+        assert_eq!(loader.origin_records(), &[loaded.origin_record().clone()]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_read_plan_does_not_allocate_until_append() {
+        let path = temp_source_path("read-append-boundary");
+        fs::write(&path, "return 42;\n").expect("write source");
+        let mut loader = ShellSourceLoader::default();
+
+        let read = loader.read_file_source(&path).expect("read source");
+
+        assert!(loader.provider_records().is_empty());
+        assert!(loader.origin_records().is_empty());
+
+        let loaded = loader
+            .append_file_read(read, ShellSourceKind::File, ShellMode::ScriptFile, false)
+            .expect("append source");
+
+        assert_eq!(loaded.provider_id(), SourceProviderId(1));
+        assert_eq!(loaded.origin_id(), SourceOriginId(1));
+        assert_eq!(loader.provider_records().len(), 1);
+        assert_eq!(loader.origin_records().len(), 1);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

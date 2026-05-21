@@ -2378,6 +2378,27 @@ impl CoreOpcodeDispatchHost {
         }
     }
 
+    pub fn append_function_code_blocks_strings_and_prototype_key(
+        &mut self,
+        function_blocks: Vec<InterpreterFunctionCodeBlock>,
+        string_literals: HashMap<u32, String>,
+        identifier_texts: HashMap<u32, String>,
+        prototype_property_key: Option<u32>,
+    ) {
+        self.function_blocks.extend(function_blocks);
+        self.string_literals.extend(string_literals);
+        if let Some(key) = prototype_property_key {
+            self.prototype_property_key = Some(
+                identifier_texts
+                    .get(&key)
+                    .cloned()
+                    .map(CorePropertyKey::String)
+                    .unwrap_or(CorePropertyKey::Identifier(key)),
+            );
+        }
+        self.identifier_texts.extend(identifier_texts);
+    }
+
     fn prototype_key(&self) -> CorePropertyKey {
         self.prototype_property_key
             .clone()

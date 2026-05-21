@@ -32,7 +32,8 @@ use crate::bytecode::{
     CodeBlockEntrypoints, CodeBlockLifecycleState, CodeBlockMutationAuthority, CodeSpecialization,
     CoreOpcode, DecodedInstruction, ExecutableEntryPublicationRequest, InstructionDecodeError,
     InterpreterEntrySlot, JitCodeSlot, LinkContext, Operand, PackedInstructionStream,
-    ScriptExecutableKind, TypedInstruction, UnlinkedCodeBlock, VirtualRegister,
+    ScriptExecutableKind, SourceOriginId, SourceProviderId, TypedInstruction, UnlinkedCodeBlock,
+    VirtualRegister,
 };
 use crate::bytecompiler::{
     bytecompiler_input_from_parsed_ast, emit_unlinked_code_from_parsed_ast,
@@ -696,10 +697,91 @@ impl SourceSessionExecution {
 }
 
 #[derive(Clone, Debug)]
+pub struct SourceSessionSource {
+    source: SourceCode,
+    provider_id: Option<SourceProviderId>,
+    origin_id: Option<SourceOriginId>,
+}
+
+impl SourceSessionSource {
+    pub fn new(source: SourceCode) -> Self {
+        Self {
+            source,
+            provider_id: None,
+            origin_id: None,
+        }
+    }
+
+    pub fn with_provenance(
+        source: SourceCode,
+        provider_id: SourceProviderId,
+        origin_id: SourceOriginId,
+    ) -> Self {
+        Self {
+            source,
+            provider_id: Some(provider_id),
+            origin_id: Some(origin_id),
+        }
+    }
+
+    pub fn source(&self) -> &SourceCode {
+        &self.source
+    }
+
+    pub fn provider_id(&self) -> Option<SourceProviderId> {
+        self.provider_id
+    }
+
+    pub fn origin_id(&self) -> Option<SourceOriginId> {
+        self.origin_id
+    }
+}
+
+impl From<SourceCode> for SourceSessionSource {
+    fn from(source: SourceCode) -> Self {
+        Self::new(source)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceSessionHandle {
+    global_object: GlobalObjectId,
+    global_object_value: RuntimeValue,
+    visible_global_bindings: BytecompilerGlobalBindingSet,
+    stable_ids: SourceSessionStableIds,
+    function_count: usize,
+    host: CoreOpcodeDispatchHost,
+    completions: Vec<ExecutionCompletion>,
+}
+
+impl SourceSessionHandle {
+    pub fn global_object(&self) -> GlobalObjectId {
+        self.global_object
+    }
+
+    pub fn completions(&self) -> &[ExecutionCompletion] {
+        &self.completions
+    }
+
+    pub fn finish(self) -> SourceSessionExecution {
+        SourceSessionExecution {
+            global_object: self.global_object,
+            completions: self.completions,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct SourceSessionCompiledEntry {
     shared_unlinked: Arc<UnlinkedCodeBlock>,
     function_bodies: Vec<UnlinkedCodeBlock>,
     declared_global_bindings: BytecompilerGlobalBindingSet,
+}
+
+#[derive(Clone, Debug)]
+struct SourceSessionLinkedEntry {
+    executable_entry: SourceSessionExecutableEntry,
+    function_blocks: Vec<InterpreterFunctionCodeBlock>,
 }
 
 #[derive(Clone, Debug)]
@@ -8300,12 +8382,13 @@ impl Vm {
             .unwrap_or_else(|| ExecutionCompletion::Returned(RuntimeValue::undefined())))
     }
 
-    pub fn execute_source_session<I>(
+    pub fn execute_source_session<I, S>(
         &mut self,
         sources: I,
     ) -> Result<SourceSessionExecution, SourceExecutionError>
     where
-        I: IntoIterator<Item = SourceCode>,
+        I: IntoIterator<Item = S>,
+        S: Into<SourceSessionSource>,
     {
         self.execute_source_session_with_global_bindings(
             sources,
@@ -8313,13 +8396,14 @@ impl Vm {
         )
     }
 
-    pub fn execute_source_session_with_global_bindings<I>(
+    pub fn execute_source_session_with_global_bindings<I, S>(
         &mut self,
         sources: I,
         global_bindings: BytecompilerGlobalBindingSet,
     ) -> Result<SourceSessionExecution, SourceExecutionError>
     where
-        I: IntoIterator<Item = SourceCode>,
+        I: IntoIterator<Item = S>,
+        S: Into<SourceSessionSource>,
     {
         let mut stable_ids = SourceSessionStableIds::default();
         let mut visible_global_bindings = global_bindings;
@@ -8332,7 +8416,7 @@ impl Vm {
                 SourceExecutionError::SourceSessionFunctionTableOverflow { function_count }
             })?;
             let compiled = Self::compile_source_session_entry(
-                source,
+                source.into(),
                 BytecompilerSessionId(bytecompiler_session_id),
                 function_index_base,
                 &mut stable_ids,
@@ -8354,43 +8438,9 @@ impl Vm {
         let mut entries = Vec::with_capacity(compiled_sources.len());
         let mut function_blocks = Vec::with_capacity(function_count);
         for compiled in compiled_sources {
-            let executable_id = self.allocate_executable_cell()?;
-            let code_block_id = self.allocate_code_block_cell()?;
-            let code_block = CodeBlock::from_shared_unlinked(
-                compiled.shared_unlinked.clone(),
-                LinkContext {
-                    owner_executable: Some(executable_id),
-                    specialization: CodeSpecialization::None,
-                    ..LinkContext::default()
-                },
-            )
-            .with_entrypoints(CodeBlockEntrypoints {
-                interpreter: Some(InterpreterEntrySlot(0)),
-                ..CodeBlockEntrypoints::default()
-            })
-            .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter);
-            self.executables
-                .register_script(
-                    executable_id,
-                    ScriptExecutableKind::Program,
-                    compiled.shared_unlinked,
-                )
-                .map_err(SourceExecutionError::ExecutableRegistration)?;
-            self.code_blocks.register(code_block_id, code_block.clone());
-            let install_record = self.executables.install_script_code(
-                executable_id,
-                code_block_id,
-                CodeSpecialization::None,
-                &code_block,
-            );
-            if let ExecutableInstallOutcome::Rejected(reason) = install_record.outcome {
-                return Err(SourceExecutionError::ExecutableInstall(reason));
-            }
-            function_blocks.extend(self.install_source_function_blocks(compiled.function_bodies)?);
-            entries.push(SourceSessionExecutableEntry {
-                code_block_id,
-                code_block,
-            });
+            let linked = self.link_source_session_compiled_entry(compiled)?;
+            function_blocks.extend(linked.function_blocks);
+            entries.push(linked.executable_entry);
         }
 
         let mut host = CoreOpcodeDispatchHost::with_function_code_blocks_strings_and_prototype_key(
@@ -8419,8 +8469,83 @@ impl Vm {
         })
     }
 
+    pub fn open_source_session(&mut self) -> Result<SourceSessionHandle, SourceExecutionError> {
+        self.open_source_session_with_global_bindings(BytecompilerGlobalBindingSet::default())
+    }
+
+    pub fn open_source_session_with_global_bindings(
+        &mut self,
+        global_bindings: BytecompilerGlobalBindingSet,
+    ) -> Result<SourceSessionHandle, SourceExecutionError> {
+        let global_object = self.allocate_global_object_cell()?;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let global_object_value = host
+            .allocate_global_object_value(&mut self.heap, global_object)
+            .map_err(SourceExecutionError::GlobalObjectValue)?;
+        self.record_source_global_object_value(global_object, global_object_value)?;
+        Ok(SourceSessionHandle {
+            global_object,
+            global_object_value,
+            visible_global_bindings: global_bindings,
+            stable_ids: SourceSessionStableIds::default(),
+            function_count: 0,
+            host,
+            completions: Vec::new(),
+        })
+    }
+
+    pub fn append_source_session_source<S>(
+        &mut self,
+        session: &mut SourceSessionHandle,
+        source: S,
+    ) -> Result<ExecutionCompletion, SourceExecutionError>
+    where
+        S: Into<SourceSessionSource>,
+    {
+        let function_index_base = u32::try_from(session.function_count).map_err(|_| {
+            SourceExecutionError::SourceSessionFunctionTableOverflow {
+                function_count: session.function_count,
+            }
+        })?;
+        let bytecompiler_session_id = self.next_source_bytecompiler_session_id;
+        let compiled = Self::compile_source_session_entry(
+            source.into(),
+            BytecompilerSessionId(bytecompiler_session_id),
+            function_index_base,
+            &mut session.stable_ids,
+            &session.visible_global_bindings,
+        )?;
+        session
+            .visible_global_bindings
+            .extend(compiled.declared_global_bindings.clone());
+        session.function_count = session
+            .function_count
+            .checked_add(compiled.function_bodies.len())
+            .ok_or(SourceExecutionError::SourceSessionFunctionTableOverflow {
+                function_count: usize::MAX,
+            })?;
+        self.next_source_bytecompiler_session_id = bytecompiler_session_id.saturating_add(1);
+        let linked = self.link_source_session_compiled_entry(compiled)?;
+        session
+            .host
+            .append_function_code_blocks_strings_and_prototype_key(
+                linked.function_blocks,
+                session.stable_ids.string_literals.clone(),
+                session.stable_ids.identifier_texts.clone(),
+                session.stable_ids.prototype_property_key,
+            );
+        let completion = self.execute_source_session_entry(
+            session.global_object,
+            session.global_object_value,
+            &linked.executable_entry,
+            &mut session.host,
+        )?;
+        session.completions.push(completion.clone());
+        Ok(completion)
+    }
+
     fn compile_source_session_entry(
-        source: SourceCode,
+        source: SourceSessionSource,
         session: BytecompilerSessionId,
         function_index_base: u32,
         stable_ids: &mut SourceSessionStableIds,
@@ -8430,7 +8555,7 @@ impl Vm {
         let parsed = Parser::with_mode(
             &mut arena,
             AstBuilder::default(),
-            &source,
+            source.source(),
             ParseMode::Program,
         )
         .parse()
@@ -8438,8 +8563,9 @@ impl Vm {
         let declared_global_bindings = source_global_bindings_from_parsed_ast(&parsed, &arena)
             .map_err(SourceExecutionError::BytecodeEmission)?;
         let mut input =
-            bytecompiler_input_from_parsed_ast(session, source.clone(), &parsed, &arena)
+            bytecompiler_input_from_parsed_ast(session, source.source().clone(), &parsed, &arena)
                 .map_err(SourceExecutionError::BytecompilerHandoff)?;
+        input.set_source_provenance(source.provider_id(), source.origin_id());
         input.global_bindings = visible_global_bindings.clone();
         input
             .global_bindings
@@ -8487,6 +8613,52 @@ impl Vm {
             shared_unlinked: Arc::new(unlinked),
             function_bodies: remapped_function_bodies,
             declared_global_bindings,
+        })
+    }
+
+    fn link_source_session_compiled_entry(
+        &mut self,
+        compiled: SourceSessionCompiledEntry,
+    ) -> Result<SourceSessionLinkedEntry, SourceExecutionError> {
+        let executable_id = self.allocate_executable_cell()?;
+        let code_block_id = self.allocate_code_block_cell()?;
+        let code_block = CodeBlock::from_shared_unlinked(
+            compiled.shared_unlinked.clone(),
+            LinkContext {
+                owner_executable: Some(executable_id),
+                specialization: CodeSpecialization::None,
+                ..LinkContext::default()
+            },
+        )
+        .with_entrypoints(CodeBlockEntrypoints {
+            interpreter: Some(InterpreterEntrySlot(0)),
+            ..CodeBlockEntrypoints::default()
+        })
+        .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter);
+        self.executables
+            .register_script(
+                executable_id,
+                ScriptExecutableKind::Program,
+                compiled.shared_unlinked,
+            )
+            .map_err(SourceExecutionError::ExecutableRegistration)?;
+        self.code_blocks.register(code_block_id, code_block.clone());
+        let install_record = self.executables.install_script_code(
+            executable_id,
+            code_block_id,
+            CodeSpecialization::None,
+            &code_block,
+        );
+        if let ExecutableInstallOutcome::Rejected(reason) = install_record.outcome {
+            return Err(SourceExecutionError::ExecutableInstall(reason));
+        }
+        let function_blocks = self.install_source_function_blocks(compiled.function_bodies)?;
+        Ok(SourceSessionLinkedEntry {
+            executable_entry: SourceSessionExecutableEntry {
+                code_block_id,
+                code_block,
+            },
+            function_blocks,
         })
     }
 
@@ -40633,6 +40805,46 @@ mod tests {
                 ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
             ]
         );
+    }
+
+    #[test]
+    fn vm_incremental_source_session_matches_batch_global_visibility() {
+        let mut incremental = Vm::new(VmConfig::baseline_allowed());
+        let mut session = incremental.open_source_session().unwrap();
+
+        assert_eq!(
+            incremental
+                .append_source_session_source(&mut session, source("var answer = 41;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+        assert_eq!(
+            incremental
+                .append_source_session_source(&mut session, source("return answer + 1;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+
+        let incremental_execution = session.finish();
+        let mut batch = Vm::new(VmConfig::baseline_allowed());
+        let batch_execution = batch
+            .execute_source_session(vec![
+                source("var answer = 41;"),
+                source("return answer + 1;"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            incremental_execution.completions(),
+            batch_execution.completions()
+        );
+        let plan = incremental
+            .global_runtime_state()
+            .global_root_plan(incremental.heap().id())
+            .unwrap();
+        let descriptors = plan.descriptors();
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].global, incremental_execution.global_object());
     }
 
     #[test]
