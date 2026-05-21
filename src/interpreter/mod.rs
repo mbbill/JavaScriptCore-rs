@@ -2259,6 +2259,17 @@ impl CoreOpcodeDispatchHost {
         Self::default()
     }
 
+    pub fn allocate_global_object_value(
+        &mut self,
+        heap: &mut Heap,
+        global_object: GlobalObjectId,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        let value = self.objects.allocate();
+        let GlobalObjectId(ObjectId(cell)) = global_object;
+        self.objects.bind_object_to_heap_cell(heap, value, cell)?;
+        Ok(value)
+    }
+
     pub fn with_function_blocks(function_blocks: Vec<CodeBlock>) -> Self {
         Self::with_function_code_blocks(indexed_function_code_blocks(function_blocks))
     }
@@ -5759,6 +5770,28 @@ impl CoreObjectStore {
         heap.publish_cell(cell_id)?;
         cell.cell_id = cell_id;
         Ok(cell_id)
+    }
+
+    fn bind_object_to_heap_cell(
+        &mut self,
+        heap: &mut Heap,
+        value: RuntimeValue,
+        cell_id: CellId,
+    ) -> Result<(), ExecutionError> {
+        let payload = value
+            .as_cell()
+            .map(|cell| cell.pointer_payload_bits())
+            .ok_or(ExecutionError::ExpectedObject)?;
+        let Some(cell) = self.find_mut(value) else {
+            return Err(ExecutionError::ExpectedObject);
+        };
+        if cell.cell_id != CellId::default() && cell.cell_id != cell_id {
+            return Err(ExecutionError::UnknownObject);
+        }
+        heap.bind_cell_payload(cell_id, payload)?;
+        heap.publish_cell(cell_id)?;
+        cell.cell_id = cell_id;
+        Ok(())
     }
 
     fn resolve_value_store_target(

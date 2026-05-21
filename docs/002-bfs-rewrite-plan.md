@@ -169,14 +169,15 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- M2 prerequisite slice for persistent source sessions and expression lowering.
+- M2 prerequisite slice for source sessions, expression lowering, and
+  cross-source global bindings.
 - Full accepted gate at that checkpoint: `cargo test --lib -- --quiet` with
-  1804 passed.
+  1809 passed.
 
 Current git/code note:
 
 - The current working tree may contain documentation or active-batch edits.
-  Treat the 1804-test M2 prerequisite slice as the last accepted green code
+  Treat the 1809-test M2 prerequisite slice as the last accepted green code
   checkpoint unless a later progress entry records passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
   repairing that baseline.
@@ -342,11 +343,14 @@ M2: Current - build Octane-core execution prerequisites in parallel.
   VM-owned global/root and one dispatch host across loaded sources while
   preserving one-shot `execute_source`; update expressions, compound
   assignments, conditional expressions, and an explicit loose-equality subset
-  are parsed/lowered/executed; full gates passed with 1804 lib tests.
-- Remaining sub-slice: bytecompiler-visible shell/global binding declarations,
-  persistent cross-load top-level global names, and filesystem-backed source
-  loading/source-origin records. Do not start an Octane runner before these are
-  at least explicitly modeled.
+  are parsed/lowered/executed; bytecompiler-visible global/host binding
+  declarations and cross-load top-level `function`/`var` visibility are modeled
+  through a real session global object; full gates passed with 1809 lib tests.
+- Remaining sub-slice: filesystem-backed source loading/source-origin records
+  and incremental host append/merge support for future `load`/`readFile`.
+  Top-level `let`/`const` cross-load visibility remains intentionally deferred
+  until a real global lexical environment exists. Do not start an Octane runner
+  before file loading is explicitly modeled.
 
 M3: Add Octane-core runtime intrinsics and shell globals.
 

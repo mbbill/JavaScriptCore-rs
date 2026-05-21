@@ -36,7 +36,8 @@ use crate::bytecode::{
 };
 use crate::bytecompiler::{
     bytecompiler_input_from_parsed_ast, emit_unlinked_code_from_parsed_ast,
-    BytecompilerEmissionError, BytecompilerParseHandoffError, BytecompilerSessionId,
+    source_global_bindings_from_parsed_ast, BytecompilerEmissionError,
+    BytecompilerGlobalBindingSet, BytecompilerParseHandoffError, BytecompilerSessionId,
 };
 use crate::gc::{
     evaluate_heap_semantics, static_cell_metadata_registry, AllocationMode, CellDestructionState,
@@ -666,6 +667,7 @@ pub enum SourceExecutionError {
     CodeBlockPublication(HeapIntegrationError),
     GlobalObjectAllocation(HeapIntegrationError),
     GlobalObjectPublication(HeapIntegrationError),
+    GlobalObjectValue(ExecutionError),
     GlobalRootRegistration(HeapIntegrationError),
     ExceptionRootSynchronization(HeapIntegrationError),
     FramePush(ExecutionError),
@@ -697,6 +699,7 @@ impl SourceSessionExecution {
 struct SourceSessionCompiledEntry {
     shared_unlinked: Arc<UnlinkedCodeBlock>,
     function_bodies: Vec<UnlinkedCodeBlock>,
+    declared_global_bindings: BytecompilerGlobalBindingSet,
 }
 
 #[derive(Clone, Debug)]
@@ -8304,7 +8307,22 @@ impl Vm {
     where
         I: IntoIterator<Item = SourceCode>,
     {
+        self.execute_source_session_with_global_bindings(
+            sources,
+            BytecompilerGlobalBindingSet::default(),
+        )
+    }
+
+    pub fn execute_source_session_with_global_bindings<I>(
+        &mut self,
+        sources: I,
+        global_bindings: BytecompilerGlobalBindingSet,
+    ) -> Result<SourceSessionExecution, SourceExecutionError>
+    where
+        I: IntoIterator<Item = SourceCode>,
+    {
         let mut stable_ids = SourceSessionStableIds::default();
+        let mut visible_global_bindings = global_bindings;
         let mut bytecompiler_session_id = self.next_source_bytecompiler_session_id;
         let mut function_count = 0usize;
         let mut compiled_sources = Vec::new();
@@ -8318,7 +8336,9 @@ impl Vm {
                 BytecompilerSessionId(bytecompiler_session_id),
                 function_index_base,
                 &mut stable_ids,
+                &visible_global_bindings,
             )?;
+            visible_global_bindings.extend(compiled.declared_global_bindings.clone());
             function_count = function_count
                 .checked_add(compiled.function_bodies.len())
                 .ok_or(SourceExecutionError::SourceSessionFunctionTableOverflow {
@@ -8330,7 +8350,6 @@ impl Vm {
 
         self.next_source_bytecompiler_session_id = bytecompiler_session_id;
         let global_object = self.allocate_global_object_cell()?;
-        self.record_source_global_object(global_object)?;
 
         let mut entries = Vec::with_capacity(compiled_sources.len());
         let mut function_blocks = Vec::with_capacity(function_count);
@@ -8380,9 +8399,18 @@ impl Vm {
             stable_ids.identifier_texts,
             stable_ids.prototype_property_key,
         );
+        let global_object_value = host
+            .allocate_global_object_value(&mut self.heap, global_object)
+            .map_err(SourceExecutionError::GlobalObjectValue)?;
+        self.record_source_global_object_value(global_object, global_object_value)?;
         let mut completions = Vec::with_capacity(entries.len());
         for entry in &entries {
-            completions.push(self.execute_source_session_entry(global_object, entry, &mut host)?);
+            completions.push(self.execute_source_session_entry(
+                global_object,
+                global_object_value,
+                entry,
+                &mut host,
+            )?);
         }
 
         Ok(SourceSessionExecution {
@@ -8396,6 +8424,7 @@ impl Vm {
         session: BytecompilerSessionId,
         function_index_base: u32,
         stable_ids: &mut SourceSessionStableIds,
+        visible_global_bindings: &BytecompilerGlobalBindingSet,
     ) -> Result<SourceSessionCompiledEntry, SourceExecutionError> {
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
@@ -8406,8 +8435,15 @@ impl Vm {
         )
         .parse()
         .map_err(SourceExecutionError::Parse)?;
-        let input = bytecompiler_input_from_parsed_ast(session, source.clone(), &parsed, &arena)
-            .map_err(SourceExecutionError::BytecompilerHandoff)?;
+        let declared_global_bindings = source_global_bindings_from_parsed_ast(&parsed, &arena)
+            .map_err(SourceExecutionError::BytecodeEmission)?;
+        let mut input =
+            bytecompiler_input_from_parsed_ast(session, source.clone(), &parsed, &arena)
+                .map_err(SourceExecutionError::BytecompilerHandoff)?;
+        input.global_bindings = visible_global_bindings.clone();
+        input
+            .global_bindings
+            .extend(declared_global_bindings.clone());
         let mut plan = emit_unlinked_code_from_parsed_ast(&input, &arena)
             .map_err(SourceExecutionError::BytecodeEmission)?;
         let unlinked = plan
@@ -8450,12 +8486,14 @@ impl Vm {
         Ok(SourceSessionCompiledEntry {
             shared_unlinked: Arc::new(unlinked),
             function_bodies: remapped_function_bodies,
+            declared_global_bindings,
         })
     }
 
     fn execute_source_session_entry(
         &mut self,
         global_object: GlobalObjectId,
+        global_object_value: RuntimeValue,
         executable_entry: &SourceSessionExecutableEntry,
         host: &mut CoreOpcodeDispatchHost,
     ) -> Result<ExecutionCompletion, SourceExecutionError> {
@@ -8464,7 +8502,7 @@ impl Vm {
             .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
                 code_block: executable_entry.code_block_id,
                 global_object,
-                this_value: RuntimeValue::undefined(),
+                this_value: global_object_value,
             }));
         let frame = self
             .execution
@@ -8477,7 +8515,7 @@ impl Vm {
                     lexical_scope: None,
                     shape: executable_entry.code_block.unlinked().frame(),
                     argument_count_including_this: 1,
-                    argument_values: Vec::new(),
+                    argument_values: vec![global_object_value],
                     start_bytecode_index: Some(crate::bytecode::BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
@@ -8774,17 +8812,27 @@ impl Vm {
         Ok(GlobalObjectId(ObjectId(allocation.cell)))
     }
 
+    #[cfg(test)]
     fn record_source_global_object(
         &mut self,
         global_object_id: GlobalObjectId,
     ) -> Result<(), SourceExecutionError> {
-        // Source execution currently publishes only the VM-owned global cell and
-        // its explicit root. Realm intrinsics, exception roots, entry/host
-        // targets, and public API handles remain owned by their subsystems.
+        self.record_source_global_object_value(global_object_id, RuntimeValue::undefined())
+    }
+
+    fn record_source_global_object_value(
+        &mut self,
+        global_object_id: GlobalObjectId,
+        object_value: RuntimeValue,
+    ) -> Result<(), SourceExecutionError> {
+        // Source execution publishes the VM-owned global cell, its explicit
+        // root, and the interpreter object value bound to that cell. Realm
+        // intrinsics, exception roots, entry/host targets, and public API
+        // handles remain owned by their subsystems.
         self.globals
             .describe_global(GlobalObjectRecord {
                 id: global_object_id,
-                object_value: RuntimeValue::undefined(),
+                object_value,
                 default_structure_epoch: self.structures.structure_epoch(),
                 script_execution_status: ScriptExecutionStatus::Running,
             })
@@ -40546,12 +40594,118 @@ mod tests {
     }
 
     #[test]
-    fn vm_source_session_reports_missing_cross_load_global_bindings() {
+    fn vm_source_session_calls_function_declared_by_earlier_source() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![
+                source("function answer() { return 42; }"),
+                source("return answer();"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::undefined()),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_reads_var_declared_by_earlier_source_from_global_object() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![
+                source("var answer = 41;"),
+                source("return answer + 1;"),
+                source("return this.answer + 1;"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::undefined()),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_rejects_unknown_global_identifier() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let result = vm.execute_source_session(vec![source("return misspelledGlobal;")]);
+
+        assert!(matches!(
+            result,
+            Err(SourceExecutionError::BytecodeEmission(
+                BytecompilerEmissionError::UnboundIdentifier(_)
+            ))
+        ));
+        assert!(vm
+            .global_runtime_state()
+            .global_root_plan(vm.heap().id())
+            .unwrap()
+            .descriptors()
+            .is_empty());
+    }
+
+    #[test]
+    fn vm_execute_source_global_declarations_do_not_leak_between_one_shot_loads() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        assert_eq!(
+            vm.execute_source(source("var answer = 42; return answer;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        let result = vm.execute_source(source("return answer;"));
+
+        assert!(matches!(
+            result,
+            Err(SourceExecutionError::BytecodeEmission(
+                BytecompilerEmissionError::UnboundIdentifier(_)
+            ))
+        ));
+        let descriptors = vm
+            .global_runtime_state()
+            .global_root_plan(vm.heap().id())
+            .unwrap()
+            .descriptors()
+            .to_vec();
+        assert_eq!(descriptors.len(), 1);
+    }
+
+    #[test]
+    fn vm_source_session_host_binding_name_compiles_without_runtime_installation() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let globals = BytecompilerGlobalBindingSet::from_host_names(["print"]);
+
+        let execution = vm
+            .execute_source_session_with_global_bindings(vec![source("print();")], globals)
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[ExecutionCompletion::Failed(
+                ExecutionError::ExpectedFunction
+            )]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_let_declarations_remain_source_local_for_now() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
         let result = vm.execute_source_session(vec![
             source("function answer() { return 42; }"),
-            source("return answer();"),
+            source("let localOnly = 42;"),
+            source("return localOnly;"),
         ]);
 
         assert!(matches!(

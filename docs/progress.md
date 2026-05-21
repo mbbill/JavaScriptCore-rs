@@ -185,6 +185,7 @@ one-off test adjustments.
 - 2026-05-20: P18b derived and super constructor nested entry accepted; explicit `super()` and default-derived forwarding now route registered bytecode super constructors through VM-owned `Construct` entry, with nested default-derived chain, object-returning `super()` plus derived field initialization, and throwing `super()` cleanup coverage; full gates passed including `cargo test --lib -- --quiet` 1791 passed.
 - 2026-05-20: M1 Octane target and runner contract accepted: local `JetStreamDriver.js` Octane group is the benchmark source, the stale `Octane/run.js` path is rejected, and the first Rust runner is a synchronous `DefaultBenchmark`-equivalent path before official browser/async harness work.
 - 2026-05-20: M2 prerequisite slice accepted: source sessions share one VM global/root and dispatch host, update and compound expressions plus conditionals and loose-equality subset execute, and full gates passed including `cargo test --lib -- --quiet` 1804 passed.
+- 2026-05-20: M2 global-binding slice accepted: source sessions expose top-level `function`/`var` and declared host names through a real shared global object, with full gates passed including `cargo test --lib -- --quiet` 1809 passed.
 
 ## Open High-Risk Gaps
 

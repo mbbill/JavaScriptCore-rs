@@ -18,9 +18,10 @@ use crate::bytecode::{
 use crate::syntax::ast::{
     ArrayLiteralElement, AssignmentExpr, AssignmentOperator, AstPropertyKey, BinaryExpr,
     BinaryOperator as AstBinaryOperator, CallExpr, ClassElementKind, ClassElementName, ClassExpr,
-    ConditionalExpr, ControlKind, DeclarationStmt, Expr, ForInit, ForOfBinding, FunctionMetadata,
-    LiteralKind, MemberExpr, MemberKind, NameKind, NewExpr, NumberLiteralValue,
-    ObjectLiteralPropertyKind, Pattern, Stmt, UnaryExpr, UnaryOperator as AstUnaryOperator,
+    ConditionalExpr, ControlKind, DeclarationStmt, DeclarationSyntaxKind, Expr, ForInit,
+    ForOfBinding, FunctionMetadata, LiteralKind, MemberExpr, MemberKind, NameKind, NewExpr,
+    NumberLiteralValue, ObjectLiteralPropertyKind, Pattern, Stmt, UnaryExpr,
+    UnaryOperator as AstUnaryOperator,
 };
 use crate::syntax::{
     AstRef, AstRoot, CodeFeatures, EnvironmentSemanticRecord, ModuleAnalysis,
@@ -71,6 +72,118 @@ pub struct BytecompilerInput {
     pub code_features: CodeFeatures,
     pub module_analysis: Option<ModuleAnalysis>,
     pub semantic_model: Option<SemanticModel>,
+    pub global_bindings: BytecompilerGlobalBindingSet,
+}
+
+/// Bytecompiler-visible object-backed global or host binding kind.
+///
+/// This is intentionally a name-level model. Runtime installation of host
+/// functions and a real global lexical environment are separate slices; this
+/// M2 path only exposes source-session top-level `var`/function declarations
+/// and caller-provided host names to identifier resolution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BytecompilerGlobalBindingKind {
+    SourceVar,
+    SourceFunction,
+    HostDeclared,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BytecompilerGlobalBinding {
+    pub name: String,
+    pub kind: BytecompilerGlobalBindingKind,
+}
+
+impl BytecompilerGlobalBinding {
+    pub fn source_var(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: BytecompilerGlobalBindingKind::SourceVar,
+        }
+    }
+
+    pub fn source_function(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: BytecompilerGlobalBindingKind::SourceFunction,
+        }
+    }
+
+    pub fn host_declared(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: BytecompilerGlobalBindingKind::HostDeclared,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BytecompilerGlobalBindingSet {
+    bindings: HashMap<String, BytecompilerGlobalBindingKind>,
+}
+
+impl BytecompilerGlobalBindingSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_host_names<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut bindings = Self::new();
+        for name in names {
+            bindings.declare_host(name);
+        }
+        bindings
+    }
+
+    pub fn declare(&mut self, binding: BytecompilerGlobalBinding) {
+        self.bindings.insert(binding.name, binding.kind);
+    }
+
+    pub fn declare_host(&mut self, name: impl Into<String>) {
+        self.declare(BytecompilerGlobalBinding::host_declared(name));
+    }
+
+    pub fn extend(&mut self, other: Self) {
+        for (name, kind) in other.bindings {
+            self.bindings.insert(name, kind);
+        }
+    }
+
+    pub fn contains_name(&self, name: &str) -> bool {
+        self.bindings.contains_key(name)
+    }
+
+    pub fn kind_for_name(&self, name: &str) -> Option<BytecompilerGlobalBindingKind> {
+        self.bindings.get(name).copied()
+    }
+
+    pub fn kind_for_identifier(
+        &self,
+        arena: &ParserArena,
+        identifier: ParserIdentifier,
+    ) -> Option<BytecompilerGlobalBindingKind> {
+        arena
+            .identifiers()
+            .identifier_text(identifier)
+            .and_then(|text| self.kind_for_name(text))
+    }
+
+    pub fn contains_identifier(&self, arena: &ParserArena, identifier: ParserIdentifier) -> bool {
+        self.kind_for_identifier(arena, identifier).is_some()
+    }
+
+    pub fn bindings(&self) -> impl Iterator<Item = BytecompilerGlobalBinding> + '_ {
+        self.bindings
+            .iter()
+            .map(|(name, kind)| BytecompilerGlobalBinding {
+                name: name.clone(),
+                kind: *kind,
+            })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,7 +252,19 @@ pub fn bytecompiler_input_from_parsed_ast(
         code_features: scope.semantics.features,
         module_analysis: scope.module.clone(),
         semantic_model: None,
+        global_bindings: BytecompilerGlobalBindingSet::default(),
     })
+}
+
+pub fn source_global_bindings_from_parsed_ast(
+    parsed: &ParsedAst,
+    arena: &ParserArena,
+) -> Result<BytecompilerGlobalBindingSet, BytecompilerEmissionError> {
+    let root = root_scope_ref(parsed.root);
+    let scope = arena
+        .scope_node(root)
+        .ok_or(BytecompilerEmissionError::MissingRootScope)?;
+    collect_source_global_bindings(arena, scope)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -567,11 +692,15 @@ pub fn emit_unlinked_code_from_parsed_ast(
         .ok_or(BytecompilerEmissionError::MissingRootScope)?;
     collect_scope_string_literals(arena, &scope, &mut plan.literal_strings)?;
     let function_plan = collect_function_compilation_plan(arena, &scope)?;
+    let mirrored_global_bindings =
+        collect_source_global_binding_identifiers(arena, &scope, &input.global_bindings)?;
     let mut generator = BytecodeGenerator::new(plan.generation.clone());
     let mut emitter = AstBytecodeEmitter {
         arena,
         generator: &mut generator,
         locals: HashMap::new(),
+        global_bindings: input.global_bindings.clone(),
+        mirrored_global_bindings,
         captured_bindings: function_plan
             .captures
             .values()
@@ -639,6 +768,77 @@ fn root_scope_ref(root: AstRoot) -> AstRef<crate::syntax::ScopeNode> {
     match root {
         AstRoot::Script(root) | AstRoot::Module(root) | AstRoot::Function(root) => root,
     }
+}
+
+fn collect_source_global_bindings(
+    arena: &ParserArena,
+    scope: &crate::syntax::ScopeNode,
+) -> Result<BytecompilerGlobalBindingSet, BytecompilerEmissionError> {
+    let mut globals = BytecompilerGlobalBindingSet::new();
+    for statement in &scope.statements {
+        let statement = arena
+            .statement(*statement)
+            .ok_or(BytecompilerEmissionError::MissingStatement)?;
+        match statement {
+            Stmt::FunctionDeclaration(declaration) => {
+                let Some(name) = arena.identifiers().identifier_text(declaration.name) else {
+                    return Err(BytecompilerEmissionError::UnsupportedStatement(
+                        "function global binding has no identifier text",
+                    ));
+                };
+                globals.declare(BytecompilerGlobalBinding::source_function(name));
+            }
+            Stmt::Declaration(declaration) if declaration.kind == DeclarationSyntaxKind::Var => {
+                let mut names = HashSet::new();
+                for binding in &declaration.bindings {
+                    collect_pattern_binding_names(arena, *binding, &mut names)?;
+                }
+                for name in names {
+                    let Some(text) = arena.identifiers().identifier_text(name) else {
+                        return Err(BytecompilerEmissionError::UnsupportedStatement(
+                            "var global binding has no identifier text",
+                        ));
+                    };
+                    globals.declare(BytecompilerGlobalBinding::source_var(text));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(globals)
+}
+
+fn collect_source_global_binding_identifiers(
+    arena: &ParserArena,
+    scope: &crate::syntax::ScopeNode,
+    visible_globals: &BytecompilerGlobalBindingSet,
+) -> Result<HashSet<ParserIdentifier>, BytecompilerEmissionError> {
+    let mut globals = HashSet::new();
+    for statement in &scope.statements {
+        let statement = arena
+            .statement(*statement)
+            .ok_or(BytecompilerEmissionError::MissingStatement)?;
+        match statement {
+            Stmt::FunctionDeclaration(declaration)
+                if visible_globals.contains_identifier(arena, declaration.name) =>
+            {
+                globals.insert(declaration.name);
+            }
+            Stmt::Declaration(declaration) if declaration.kind == DeclarationSyntaxKind::Var => {
+                let mut names = HashSet::new();
+                for binding in &declaration.bindings {
+                    collect_pattern_binding_names(arena, *binding, &mut names)?;
+                }
+                for name in names {
+                    if visible_globals.contains_identifier(arena, name) {
+                        globals.insert(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(globals)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2049,6 +2249,8 @@ struct AstBytecodeEmitter<'a, 'g> {
     arena: &'a ParserArena,
     generator: &'g mut BytecodeGenerator,
     locals: HashMap<ParserIdentifier, LocalBinding>,
+    global_bindings: BytecompilerGlobalBindingSet,
+    mirrored_global_bindings: HashSet<ParserIdentifier>,
     captured_bindings: HashSet<ParserIdentifier>,
     initialized_cells: HashSet<ParserIdentifier>,
     function_metadata_indices: HashMap<u32, u32>,
@@ -2132,7 +2334,10 @@ struct EmittedAssignmentReference {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EmittedAssignmentTarget {
-    Local(LocalBinding),
+    Binding {
+        name: ParserIdentifier,
+        target: ResolvedBinding,
+    },
     Dot {
         object: VirtualRegister,
         name: ParserIdentifier,
@@ -2143,9 +2348,35 @@ enum EmittedAssignmentTarget {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedBinding {
+    Local(LocalBinding),
+    Global(ParserIdentifier),
+}
+
 impl AstBytecodeEmitter<'_, '_> {
+    fn global_object_register() -> VirtualRegister {
+        VirtualRegister::argument_or_header(5)
+    }
+
     fn is_captured_binding(&self, name: ParserIdentifier) -> bool {
         self.captured_bindings.contains(&name)
+    }
+
+    fn resolve_binding(&self, name: ParserIdentifier) -> Option<ResolvedBinding> {
+        self.locals
+            .get(&name)
+            .copied()
+            .map(ResolvedBinding::Local)
+            .or_else(|| {
+                self.global_bindings
+                    .contains_identifier(self.arena, name)
+                    .then_some(ResolvedBinding::Global(name))
+            })
+    }
+
+    fn should_mirror_global_binding(&self, name: ParserIdentifier) -> bool {
+        self.mirrored_global_bindings.contains(&name)
     }
 
     fn local_binding_kind(&self, name: ParserIdentifier) -> LocalBindingKind {
@@ -2205,6 +2436,8 @@ impl AstBytecodeEmitter<'_, '_> {
             arena: self.arena,
             generator: &mut generator,
             locals: HashMap::new(),
+            global_bindings: BytecompilerGlobalBindingSet::default(),
+            mirrored_global_bindings: HashSet::new(),
             captured_bindings: self.captured_bindings.clone(),
             initialized_cells: HashSet::new(),
             function_metadata_indices: self.function_metadata_indices.clone(),
@@ -2568,7 +2801,7 @@ impl AstBytecodeEmitter<'_, '_> {
             .cloned()
             .unwrap_or_default();
         let value = self.emit_load_function(index, &captures)?;
-        self.emit_write_binding(target, value);
+        self.emit_write_named_binding(name, target, value);
         Ok(())
     }
 
@@ -2621,11 +2854,10 @@ impl AstBytecodeEmitter<'_, '_> {
     ) -> Result<(), BytecompilerEmissionError> {
         match pattern {
             Pattern::Binding(name) => {
-                let target = *self
-                    .locals
-                    .get(name)
+                let target = self
+                    .resolve_binding(*name)
                     .ok_or(BytecompilerEmissionError::UnboundIdentifier(*name))?;
-                self.emit_write_binding(target, value);
+                self.emit_write_resolved_binding(*name, target, value);
                 Ok(())
             }
             Pattern::Array(elements) => {
@@ -2907,11 +3139,10 @@ impl AstBytecodeEmitter<'_, '_> {
         let name = match binding {
             ForOfBinding::Declaration { name, .. } | ForOfBinding::Assignment(name) => name,
         };
-        let target = *self
-            .locals
-            .get(&name)
+        let target = self
+            .resolve_binding(name)
             .ok_or(BytecompilerEmissionError::UnboundIdentifier(name))?;
-        self.emit_write_binding(target, value);
+        self.emit_write_resolved_binding(name, target, value);
         Ok(())
     }
 
@@ -3112,13 +3343,12 @@ impl AstBytecodeEmitter<'_, '_> {
             },
             Expr::Name(name) => match name.kind {
                 NameKind::Resolve => {
-                    let binding = *self
-                        .locals
-                        .get(&name.name)
+                    let binding = self
+                        .resolve_binding(name.name)
                         .ok_or(BytecompilerEmissionError::UnboundIdentifier(name.name))?;
-                    self.emit_read_binding(binding)
+                    self.emit_read_resolved_binding(binding)
                 }
-                NameKind::This => Ok(VirtualRegister::argument_or_header(5)),
+                NameKind::This => Ok(Self::global_object_register()),
                 _ => Err(BytecompilerEmissionError::UnsupportedExpression(
                     "special name expression is not lowered yet",
                 )),
@@ -3275,7 +3505,7 @@ impl AstBytecodeEmitter<'_, '_> {
                 }
             }
             Expr::Name(name) if name.kind == NameKind::Resolve => {
-                self.emit_load_bool(!self.locals.contains_key(&name.name))
+                self.emit_load_bool(self.resolve_binding(name.name).is_none())
             }
             _ => {
                 self.emit_expression(argument)?;
@@ -3301,12 +3531,11 @@ impl AstBytecodeEmitter<'_, '_> {
         }
         match self.arena.expression(expr).cloned() {
             Some(Expr::Name(name)) if name.kind == NameKind::Resolve => {
-                let target = *self
-                    .locals
-                    .get(&name.name)
+                let target = self
+                    .resolve_binding(name.name)
                     .ok_or(BytecompilerEmissionError::UnboundIdentifier(name.name))?;
                 let value = self.emit_expression(assignment.value)?;
-                self.emit_write_binding(target, value);
+                self.emit_write_resolved_binding(name.name, target, value);
                 Ok(value)
             }
             Some(Expr::Member(member)) => {
@@ -3366,13 +3595,15 @@ impl AstBytecodeEmitter<'_, '_> {
     ) -> Result<EmittedAssignmentReference, BytecompilerEmissionError> {
         match self.arena.expression(target).cloned() {
             Some(Expr::Name(name)) if name.kind == NameKind::Resolve => {
-                let binding = *self
-                    .locals
-                    .get(&name.name)
+                let binding = self
+                    .resolve_binding(name.name)
                     .ok_or(BytecompilerEmissionError::UnboundIdentifier(name.name))?;
-                let value = self.emit_read_binding(binding)?;
+                let value = self.emit_read_resolved_binding(binding)?;
                 Ok(EmittedAssignmentReference {
-                    target: EmittedAssignmentTarget::Local(binding),
+                    target: EmittedAssignmentTarget::Binding {
+                        name: name.name,
+                        target: binding,
+                    },
                     value,
                 })
             }
@@ -3409,7 +3640,9 @@ impl AstBytecodeEmitter<'_, '_> {
         value: VirtualRegister,
     ) {
         match target {
-            EmittedAssignmentTarget::Local(binding) => self.emit_write_binding(binding, value),
+            EmittedAssignmentTarget::Binding { name, target } => {
+                self.emit_write_resolved_binding(name, target, value)
+            }
             EmittedAssignmentTarget::Dot { object, name } => {
                 self.emit_put_by_name(object, name, value)
             }
@@ -3426,11 +3659,10 @@ impl AstBytecodeEmitter<'_, '_> {
     ) -> Result<(), BytecompilerEmissionError> {
         match self.arena.expression(target).cloned() {
             Some(Expr::Name(name)) if name.kind == NameKind::Resolve => {
-                let target = *self
-                    .locals
-                    .get(&name.name)
+                let target = self
+                    .resolve_binding(name.name)
                     .ok_or(BytecompilerEmissionError::UnboundIdentifier(name.name))?;
-                self.emit_write_binding(target, value);
+                self.emit_write_resolved_binding(name.name, target, value);
                 Ok(())
             }
             Some(Expr::Member(member)) => {
@@ -4701,10 +4933,48 @@ impl AstBytecodeEmitter<'_, '_> {
         }
     }
 
+    fn emit_read_resolved_binding(
+        &mut self,
+        binding: ResolvedBinding,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        match binding {
+            ResolvedBinding::Local(binding) => self.emit_read_binding(binding),
+            ResolvedBinding::Global(name) => {
+                self.emit_get_by_name(Self::global_object_register(), name)
+            }
+        }
+    }
+
     fn emit_write_binding(&mut self, binding: LocalBinding, value: VirtualRegister) {
         match binding.kind {
             LocalBindingKind::Value => self.emit_move(binding.register, value),
             LocalBindingKind::ClosureCell => self.emit_put_closure_cell(binding.register, value),
+        }
+    }
+
+    fn emit_write_named_binding(
+        &mut self,
+        name: ParserIdentifier,
+        binding: LocalBinding,
+        value: VirtualRegister,
+    ) {
+        self.emit_write_binding(binding, value);
+        if self.should_mirror_global_binding(name) {
+            self.emit_put_by_name(Self::global_object_register(), name, value);
+        }
+    }
+
+    fn emit_write_resolved_binding(
+        &mut self,
+        name: ParserIdentifier,
+        binding: ResolvedBinding,
+        value: VirtualRegister,
+    ) {
+        match binding {
+            ResolvedBinding::Local(binding) => self.emit_write_named_binding(name, binding, value),
+            ResolvedBinding::Global(global_name) => {
+                self.emit_put_by_name(Self::global_object_register(), global_name, value)
+            }
         }
     }
 
@@ -6124,6 +6394,7 @@ mod tests {
             },
             module_analysis: Some(ModuleAnalysis::default()),
             semantic_model: None,
+            global_bindings: BytecompilerGlobalBindingSet::default(),
         };
 
         let plan = plan_bytecompiler_input(&input, valid_generation_plan().registers);
