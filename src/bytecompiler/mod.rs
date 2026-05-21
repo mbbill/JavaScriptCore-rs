@@ -98,19 +98,35 @@ impl BytecompilerInput {
     }
 }
 
-/// Bytecompiler-visible object-backed global or host binding kind.
+/// Bytecompiler-visible global or host binding kind.
 ///
 /// This is intentionally a name-level model. Runtime installation of host
-/// functions, standard objects, and a real global lexical environment are
-/// separate slices; this path exposes source-session top-level `var`/function
-/// declarations, VM-provided standard names, and caller-provided host names to
-/// identifier resolution.
+/// functions, standard objects, and global lexical environment records are
+/// separate slices; this path exposes source-session top-level declarations,
+/// VM-provided standard names, and caller-provided host names to identifier
+/// resolution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BytecompilerGlobalBindingKind {
     SourceVar,
     SourceFunction,
+    SourceLet,
+    SourceConst,
+    SourceClass,
     Standard,
     HostDeclared,
+}
+
+impl BytecompilerGlobalBindingKind {
+    pub const fn is_source_object_backed(self) -> bool {
+        matches!(self, Self::SourceVar | Self::SourceFunction)
+    }
+
+    pub const fn is_source_lexical(self) -> bool {
+        matches!(
+            self,
+            Self::SourceLet | Self::SourceConst | Self::SourceClass
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +147,27 @@ impl BytecompilerGlobalBinding {
         Self {
             name: name.into(),
             kind: BytecompilerGlobalBindingKind::SourceFunction,
+        }
+    }
+
+    pub fn source_let(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: BytecompilerGlobalBindingKind::SourceLet,
+        }
+    }
+
+    pub fn source_const(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: BytecompilerGlobalBindingKind::SourceConst,
+        }
+    }
+
+    pub fn source_class(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: BytecompilerGlobalBindingKind::SourceClass,
         }
     }
 
@@ -185,6 +222,23 @@ impl BytecompilerGlobalBindingSet {
         self.bindings.insert(binding.name, binding.kind);
     }
 
+    pub fn try_declare_source(
+        &mut self,
+        binding: BytecompilerGlobalBinding,
+    ) -> Result<(), BytecompilerGlobalBindingConflict> {
+        if let Some(existing) = self.kind_for_name(&binding.name) {
+            if existing.is_source_lexical() || binding.kind.is_source_lexical() {
+                return Err(BytecompilerGlobalBindingConflict {
+                    name: binding.name,
+                    existing,
+                    incoming: binding.kind,
+                });
+            }
+        }
+        self.declare(binding);
+        Ok(())
+    }
+
     pub fn declare_host(&mut self, name: impl Into<String>) {
         self.declare(BytecompilerGlobalBinding::host_declared(name));
     }
@@ -222,6 +276,15 @@ impl BytecompilerGlobalBindingSet {
         self.kind_for_identifier(arena, identifier).is_some()
     }
 
+    pub fn source_lexical_identifier(
+        &self,
+        arena: &ParserArena,
+        identifier: ParserIdentifier,
+    ) -> bool {
+        self.kind_for_identifier(arena, identifier)
+            .is_some_and(BytecompilerGlobalBindingKind::is_source_lexical)
+    }
+
     pub fn bindings(&self) -> impl Iterator<Item = BytecompilerGlobalBinding> + '_ {
         self.bindings
             .iter()
@@ -230,6 +293,13 @@ impl BytecompilerGlobalBindingSet {
                 kind: *kind,
             })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BytecompilerGlobalBindingConflict {
+    pub name: String,
+    pub existing: BytecompilerGlobalBindingKind,
+    pub incoming: BytecompilerGlobalBindingKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -252,6 +322,7 @@ pub enum BytecompilerEmissionError {
     UnsupportedLiteral(&'static str),
     UnsupportedAssignmentTarget,
     UnboundIdentifier(ParserIdentifier),
+    DuplicateGlobalBinding(ParserIdentifier),
     MissingInt32Literal,
 }
 
@@ -740,7 +811,7 @@ pub fn emit_unlinked_code_from_parsed_ast(
         .cloned()
         .ok_or(BytecompilerEmissionError::MissingRootScope)?;
     collect_scope_string_literals(arena, &scope, &mut plan.literal_strings)?;
-    let function_plan = collect_function_compilation_plan(arena, &scope)?;
+    let function_plan = collect_function_compilation_plan(arena, &scope, &input.global_bindings)?;
     let mirrored_global_bindings =
         collect_source_global_binding_identifiers(arena, &scope, &input.global_bindings)?;
     let mut generator = BytecodeGenerator::new(plan.generation.clone());
@@ -766,7 +837,7 @@ pub fn emit_unlinked_code_from_parsed_ast(
     for metadata in &function_plan.metadata_order {
         function_bodies.push(emitter.emit_function_body(*metadata)?);
     }
-    emitter.predeclare_scope_locals(&scope)?;
+    emitter.predeclare_root_scope_locals(&scope)?;
     emitter.emit_intrinsic_bindings()?;
     emitter.initialize_captured_local_cells()?;
     emitter.emit_scope_function_bindings(&scope)?;
@@ -836,9 +907,21 @@ fn collect_source_global_bindings(
                         "function global binding has no identifier text",
                     ));
                 };
-                globals.declare(BytecompilerGlobalBinding::source_function(name));
+                globals
+                    .try_declare_source(BytecompilerGlobalBinding::source_function(name))
+                    .map_err(|_| {
+                        BytecompilerEmissionError::DuplicateGlobalBinding(declaration.name)
+                    })?;
             }
-            Stmt::Declaration(declaration) if declaration.kind == DeclarationSyntaxKind::Var => {
+            Stmt::Declaration(declaration)
+                if matches!(
+                    declaration.kind,
+                    DeclarationSyntaxKind::Var
+                        | DeclarationSyntaxKind::Let
+                        | DeclarationSyntaxKind::Const
+                        | DeclarationSyntaxKind::Class
+                ) =>
+            {
                 let mut names = HashSet::new();
                 for binding in &declaration.bindings {
                     collect_pattern_binding_names(arena, *binding, &mut names)?;
@@ -846,10 +929,23 @@ fn collect_source_global_bindings(
                 for name in names {
                     let Some(text) = arena.identifiers().identifier_text(name) else {
                         return Err(BytecompilerEmissionError::UnsupportedStatement(
-                            "var global binding has no identifier text",
+                            "source global binding has no identifier text",
                         ));
                     };
-                    globals.declare(BytecompilerGlobalBinding::source_var(text));
+                    let binding = match declaration.kind {
+                        DeclarationSyntaxKind::Var => BytecompilerGlobalBinding::source_var(text),
+                        DeclarationSyntaxKind::Let => BytecompilerGlobalBinding::source_let(text),
+                        DeclarationSyntaxKind::Const => {
+                            BytecompilerGlobalBinding::source_const(text)
+                        }
+                        DeclarationSyntaxKind::Class => {
+                            BytecompilerGlobalBinding::source_class(text)
+                        }
+                        _ => continue,
+                    };
+                    globals
+                        .try_declare_source(binding)
+                        .map_err(|_| BytecompilerEmissionError::DuplicateGlobalBinding(name))?;
                 }
             }
             _ => {}
@@ -870,7 +966,9 @@ fn collect_source_global_binding_identifiers(
             .ok_or(BytecompilerEmissionError::MissingStatement)?;
         match statement {
             Stmt::FunctionDeclaration(declaration)
-                if visible_globals.contains_identifier(arena, declaration.name) =>
+                if visible_globals
+                    .kind_for_identifier(arena, declaration.name)
+                    .is_some_and(BytecompilerGlobalBindingKind::is_source_object_backed) =>
             {
                 globals.insert(declaration.name);
             }
@@ -880,7 +978,10 @@ fn collect_source_global_binding_identifiers(
                     collect_pattern_binding_names(arena, *binding, &mut names)?;
                 }
                 for name in names {
-                    if visible_globals.contains_identifier(arena, name) {
+                    if visible_globals
+                        .kind_for_identifier(arena, name)
+                        .is_some_and(BytecompilerGlobalBindingKind::is_source_object_backed)
+                    {
                         globals.insert(name);
                     }
                 }
@@ -901,12 +1002,22 @@ struct FunctionCompilationPlan {
 fn collect_function_compilation_plan(
     arena: &ParserArena,
     scope: &crate::syntax::ScopeNode,
+    global_bindings: &BytecompilerGlobalBindingSet,
 ) -> Result<FunctionCompilationPlan, BytecompilerEmissionError> {
     let mut plan = FunctionCompilationPlan::default();
     collect_scope_function_metadata(arena, scope, &mut plan)?;
     let mut capture_memo = HashMap::new();
+    let mut root_locals = HashSet::new();
+    collect_scope_local_names(arena, scope, &mut root_locals)?;
+    root_locals.retain(|name| !global_bindings.source_lexical_identifier(arena, *name));
     for metadata in plan.metadata_order.clone() {
-        let captures = collect_function_captures(arena, metadata, &mut capture_memo)?;
+        let captures = collect_function_captures(
+            arena,
+            metadata,
+            &mut capture_memo,
+            global_bindings,
+            &root_locals,
+        )?;
         plan.captures.insert(metadata.raw_index(), captures);
     }
     Ok(plan)
@@ -1470,6 +1581,8 @@ fn collect_function_captures(
     arena: &ParserArena,
     metadata: AstRef<FunctionMetadata>,
     memo: &mut HashMap<u32, Vec<ParserIdentifier>>,
+    global_bindings: &BytecompilerGlobalBindingSet,
+    outer_locals: &HashSet<ParserIdentifier>,
 ) -> Result<Vec<ParserIdentifier>, BytecompilerEmissionError> {
     let metadata_index = metadata.raw_index();
     if let Some(captures) = memo.get(&metadata_index) {
@@ -1502,13 +1615,24 @@ fn collect_function_captures(
     collect_scope_referenced_names(arena, scope, &mut references)?;
     let mut nested_functions = Vec::new();
     collect_scope_immediate_function_metadata(arena, scope, &mut nested_functions)?;
+    let mut nested_outer_locals = outer_locals.clone();
+    nested_outer_locals.extend(locals.iter().copied());
     for nested in nested_functions {
-        references.extend(collect_function_captures(arena, nested, memo)?);
+        references.extend(collect_function_captures(
+            arena,
+            nested,
+            memo,
+            global_bindings,
+            &nested_outer_locals,
+        )?);
     }
     let mut seen = HashSet::new();
     let captures = references
         .into_iter()
         .filter(|name| !locals.contains(name))
+        .filter(|name| {
+            outer_locals.contains(name) || !global_bindings.source_lexical_identifier(arena, *name)
+        })
         .filter(|name| seen.insert(*name))
         .collect::<Vec<_>>();
     memo.insert(metadata_index, captures.clone());
@@ -2402,7 +2526,8 @@ enum EmittedAssignmentTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResolvedBinding {
     Local(LocalBinding),
-    Global(ParserIdentifier),
+    GlobalObject(ParserIdentifier),
+    GlobalLexical(ParserIdentifier),
 }
 
 impl AstBytecodeEmitter<'_, '_> {
@@ -2421,8 +2546,14 @@ impl AstBytecodeEmitter<'_, '_> {
             .map(ResolvedBinding::Local)
             .or_else(|| {
                 self.global_bindings
-                    .contains_identifier(self.arena, name)
-                    .then_some(ResolvedBinding::Global(name))
+                    .kind_for_identifier(self.arena, name)
+                    .map(|kind| {
+                        if kind.is_source_lexical() {
+                            ResolvedBinding::GlobalLexical(name)
+                        } else {
+                            ResolvedBinding::GlobalObject(name)
+                        }
+                    })
             })
     }
 
@@ -2593,6 +2724,66 @@ impl AstBytecodeEmitter<'_, '_> {
             }
         }
         Ok(())
+    }
+
+    fn predeclare_root_scope_locals(
+        &mut self,
+        scope: &crate::syntax::ScopeNode,
+    ) -> Result<(), BytecompilerEmissionError> {
+        for statement in &scope.statements {
+            let Some(statement) = self.arena.statement(*statement).cloned() else {
+                return Err(BytecompilerEmissionError::MissingStatement);
+            };
+            match statement {
+                Stmt::Declaration(declaration)
+                    if self.declaration_is_source_session_global_lexical(&declaration)? => {}
+                Stmt::Declaration(declaration) => self.predeclare_declaration(&declaration)?,
+                Stmt::Block(block) => {
+                    let Some(scope) = self.arena.scope_node(block.scope).cloned() else {
+                        return Err(BytecompilerEmissionError::MissingRootScope);
+                    };
+                    self.predeclare_scope_locals(&scope)?;
+                }
+                Stmt::If(statement) => {
+                    self.predeclare_statement_locals(statement.consequent)?;
+                    if let Some(alternate) = statement.alternate {
+                        self.predeclare_statement_locals(alternate)?;
+                    }
+                }
+                Stmt::While(statement) => self.predeclare_statement_locals(statement.body)?,
+                Stmt::For(statement) => self.predeclare_for_locals(&statement)?,
+                Stmt::ForOf(statement) => self.predeclare_for_of_locals(&statement)?,
+                Stmt::Try(statement) => self.predeclare_try_locals(&statement)?,
+                Stmt::FunctionDeclaration(declaration) => {
+                    self.predeclare_function_binding(declaration.name)?
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn declaration_is_source_session_global_lexical(
+        &self,
+        declaration: &DeclarationStmt,
+    ) -> Result<bool, BytecompilerEmissionError> {
+        if !matches!(
+            declaration.kind,
+            DeclarationSyntaxKind::Let
+                | DeclarationSyntaxKind::Const
+                | DeclarationSyntaxKind::Class
+        ) {
+            return Ok(false);
+        }
+        let mut names = HashSet::new();
+        for binding in &declaration.bindings {
+            collect_pattern_binding_names(self.arena, *binding, &mut names)?;
+        }
+        Ok(!names.is_empty()
+            && names.iter().all(|name| {
+                self.global_bindings
+                    .source_lexical_identifier(self.arena, *name)
+            }))
     }
 
     fn predeclare_statement_locals(
@@ -2813,6 +3004,13 @@ impl AstBytecodeEmitter<'_, '_> {
         if !self.is_captured_binding(name) || self.global_capture_bindings.contains_key(&name) {
             return Ok(());
         }
+        if self
+            .global_bindings
+            .kind_for_identifier(self.arena, name)
+            .is_some_and(BytecompilerGlobalBindingKind::is_source_lexical)
+        {
+            return Ok(());
+        }
         let register = self.generator.registers_mut().reserve_local();
         let binding = LocalBinding {
             register,
@@ -2889,7 +3087,7 @@ impl AstBytecodeEmitter<'_, '_> {
                 Some(initializer) => self.emit_expression(initializer)?,
                 None => self.emit_load_undefined()?,
             };
-            self.emit_pattern_binding(*binding, value)?;
+            self.emit_pattern_declaration_binding(*binding, value)?;
         }
         Ok(())
     }
@@ -2905,6 +3103,19 @@ impl AstBytecodeEmitter<'_, '_> {
             .cloned()
             .ok_or(BytecompilerEmissionError::MissingPattern)?;
         self.emit_owned_pattern_binding(&pattern, value)
+    }
+
+    fn emit_pattern_declaration_binding(
+        &mut self,
+        pattern: AstRef<Pattern>,
+        value: VirtualRegister,
+    ) -> Result<(), BytecompilerEmissionError> {
+        let pattern = self
+            .arena
+            .pattern(pattern)
+            .cloned()
+            .ok_or(BytecompilerEmissionError::MissingPattern)?;
+        self.emit_owned_pattern_declaration_binding(&pattern, value)
     }
 
     fn parameter_rest_pattern(
@@ -2969,6 +3180,65 @@ impl AstBytecodeEmitter<'_, '_> {
                 Ok(())
             }
             Pattern::Rest(pattern) => self.emit_owned_pattern_binding(pattern, value),
+            Pattern::AssignmentTarget(_) => {
+                Err(BytecompilerEmissionError::UnsupportedAssignmentTarget)
+            }
+        }
+    }
+
+    fn emit_owned_pattern_declaration_binding(
+        &mut self,
+        pattern: &Pattern,
+        value: VirtualRegister,
+    ) -> Result<(), BytecompilerEmissionError> {
+        match pattern {
+            Pattern::Binding(name) => {
+                let target = self
+                    .resolve_binding(*name)
+                    .ok_or(BytecompilerEmissionError::UnboundIdentifier(*name))?;
+                self.emit_initialize_resolved_binding(*name, target, value);
+                Ok(())
+            }
+            Pattern::Array(elements) => {
+                for element in elements {
+                    if let Pattern::Rest(pattern) = &element.pattern {
+                        let rest = self.emit_array_rest(value, element.index)?;
+                        self.emit_owned_pattern_declaration_binding(pattern, rest)?;
+                    } else {
+                        let index =
+                            self.emit_load_int32(element.index.try_into().unwrap_or(i32::MAX))?;
+                        let element_value = self.emit_get_by_value(value, index)?;
+                        let element_value =
+                            self.emit_default_if_undefined(element_value, element.default_value)?;
+                        self.emit_owned_pattern_declaration_binding(
+                            &element.pattern,
+                            element_value,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+            Pattern::Object(properties) => {
+                let excluded_keys = self.emit_new_array();
+                for property in properties {
+                    if let Pattern::Rest(pattern) = &property.pattern {
+                        let rest = self.emit_object_rest(value, excluded_keys);
+                        self.emit_owned_pattern_declaration_binding(pattern, rest)?;
+                    } else {
+                        let key = self.emit_object_literal_property_key(property.key)?;
+                        self.emit_array_append_property_key(excluded_keys, key)?;
+                        let property_value = self.emit_get_by_property_key(value, key)?;
+                        let property_value =
+                            self.emit_default_if_undefined(property_value, property.default_value)?;
+                        self.emit_owned_pattern_declaration_binding(
+                            &property.pattern,
+                            property_value,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+            Pattern::Rest(pattern) => self.emit_owned_pattern_declaration_binding(pattern, value),
             Pattern::AssignmentTarget(_) => {
                 Err(BytecompilerEmissionError::UnsupportedAssignmentTarget)
             }
@@ -5014,9 +5284,10 @@ impl AstBytecodeEmitter<'_, '_> {
     ) -> Result<VirtualRegister, BytecompilerEmissionError> {
         match binding {
             ResolvedBinding::Local(binding) => self.emit_read_binding(binding),
-            ResolvedBinding::Global(name) => {
+            ResolvedBinding::GlobalObject(name) => {
                 self.emit_get_by_name(Self::global_object_register(), name)
             }
+            ResolvedBinding::GlobalLexical(name) => self.emit_get_global_lexical(name),
         }
     }
 
@@ -5047,8 +5318,28 @@ impl AstBytecodeEmitter<'_, '_> {
     ) {
         match binding {
             ResolvedBinding::Local(binding) => self.emit_write_named_binding(name, binding, value),
-            ResolvedBinding::Global(global_name) => {
+            ResolvedBinding::GlobalObject(global_name) => {
                 self.emit_put_by_name(Self::global_object_register(), global_name, value)
+            }
+            ResolvedBinding::GlobalLexical(global_name) => {
+                self.emit_put_global_lexical(global_name, value)
+            }
+        }
+    }
+
+    fn emit_initialize_resolved_binding(
+        &mut self,
+        name: ParserIdentifier,
+        binding: ResolvedBinding,
+        value: VirtualRegister,
+    ) {
+        match binding {
+            ResolvedBinding::Local(binding) => self.emit_write_named_binding(name, binding, value),
+            ResolvedBinding::GlobalObject(global_name) => {
+                self.emit_put_by_name(Self::global_object_register(), global_name, value)
+            }
+            ResolvedBinding::GlobalLexical(global_name) => {
+                self.emit_initialize_global_lexical(global_name, value)
             }
         }
     }
@@ -5080,6 +5371,41 @@ impl AstBytecodeEmitter<'_, '_> {
             vec![Operand::Register(destination), Operand::Register(value)],
         );
         Ok(destination)
+    }
+
+    fn emit_get_global_lexical(
+        &mut self,
+        name: ParserIdentifier,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::GetGlobalLexical.opcode(),
+            OperandWidth::Narrow,
+            vec![
+                Operand::Register(destination),
+                Operand::IdentifierIndex(name.0),
+            ],
+        );
+        Ok(destination)
+    }
+
+    fn emit_initialize_global_lexical(&mut self, name: ParserIdentifier, value: VirtualRegister) {
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::InitializeGlobalLexical.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::IdentifierIndex(name.0), Operand::Register(value)],
+        );
+    }
+
+    fn emit_put_global_lexical(&mut self, name: ParserIdentifier, value: VirtualRegister) {
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::PutGlobalLexical.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::IdentifierIndex(name.0), Operand::Register(value)],
+        );
     }
 
     fn emit_get_closure_cell(
@@ -6445,6 +6771,21 @@ mod tests {
             .any(|instruction| CoreOpcode::from_opcode(instruction.opcode) == Some(opcode))
     }
 
+    fn unlinked_contains_put_by_name_to_source_global(code_block: &UnlinkedCodeBlock) -> bool {
+        code_block
+            .instructions()
+            .declarations()
+            .iter()
+            .any(|instruction| {
+                CoreOpcode::from_opcode(instruction.opcode) == Some(CoreOpcode::PutByName)
+                    && matches!(
+                        instruction.operands.first(),
+                        Some(Operand::Register(register))
+                            if *register == AstBytecodeEmitter::global_object_register()
+                    )
+            })
+    }
+
     fn load_function_capture_counts(code_block: &UnlinkedCodeBlock) -> Vec<u32> {
         code_block
             .instructions()
@@ -7003,6 +7344,70 @@ mod tests {
             CoreOpcode::LoadMathObject
         ));
         assert_eq!(load_function_capture_counts(program), vec![1]);
+    }
+
+    #[test]
+    fn parsed_ast_resolves_source_session_global_lexicals_without_global_object_access() {
+        let mut globals = BytecompilerGlobalBindingSet::new();
+        globals.declare(BytecompilerGlobalBinding::source_let("answer"));
+
+        let plan =
+            emit_program_plan_with_global_bindings("answer = 42; return answer;", 17, globals);
+        let program = plan.unlinked_code.as_ref().unwrap();
+
+        assert!(unlinked_contains_opcode(
+            program,
+            CoreOpcode::PutGlobalLexical
+        ));
+        assert!(unlinked_contains_opcode(
+            program,
+            CoreOpcode::GetGlobalLexical
+        ));
+        assert!(!unlinked_contains_opcode(program, CoreOpcode::PutByName));
+        assert!(!unlinked_contains_opcode(program, CoreOpcode::GetByName));
+    }
+
+    #[test]
+    fn parsed_ast_initializes_source_session_class_as_global_lexical() {
+        let mut globals = BytecompilerGlobalBindingSet::new();
+        globals.declare(BytecompilerGlobalBinding::source_class("Benchmark"));
+
+        let plan = emit_program_plan_with_global_bindings(
+            "class Benchmark { static score() { return 42; } } return Benchmark;",
+            18,
+            globals,
+        );
+        let program = plan.unlinked_code.as_ref().unwrap();
+
+        assert!(unlinked_contains_opcode(
+            program,
+            CoreOpcode::InitializeGlobalLexical
+        ));
+        assert!(unlinked_contains_opcode(
+            program,
+            CoreOpcode::GetGlobalLexical
+        ));
+        assert!(!unlinked_contains_put_by_name_to_source_global(program));
+    }
+
+    #[test]
+    fn parsed_ast_nested_function_reads_global_lexical_as_live_binding() {
+        let mut globals = BytecompilerGlobalBindingSet::new();
+        globals.declare(BytecompilerGlobalBinding::source_let("answer"));
+
+        let plan = emit_program_plan_with_global_bindings(
+            "function read() { return answer; } return read();",
+            19,
+            globals,
+        );
+        let program = plan.unlinked_code.as_ref().unwrap();
+        let nested = plan.function_bodies.first().unwrap();
+
+        assert_eq!(load_function_capture_counts(program), vec![0]);
+        assert!(unlinked_contains_opcode(
+            nested,
+            CoreOpcode::GetGlobalLexical
+        ));
     }
 
     #[test]

@@ -848,7 +848,8 @@ fn classify_source_execution_error(
         | SourceExecutionError::SourceSessionMissingIdentifierText(_)
         | SourceExecutionError::SourceSessionInvalidLoadFunctionOperand { .. }
         | SourceExecutionError::SourceSessionFunctionIndexOverflow { .. }
-        | SourceExecutionError::SourceSessionFunctionTableOverflow { .. } => {
+        | SourceExecutionError::SourceSessionFunctionTableOverflow { .. }
+        | SourceExecutionError::SourceSessionGlobalBindingConflict { .. } => {
             OctaneExecutionPhase::BytecodeEmit
         }
         SourceExecutionError::MissingStaticCellMetadata(_)
@@ -861,6 +862,7 @@ fn classify_source_execution_error(
         | SourceExecutionError::GlobalObjectAllocation(_)
         | SourceExecutionError::GlobalObjectPublication(_)
         | SourceExecutionError::GlobalObjectValue(_)
+        | SourceExecutionError::SourceSessionGlobalLexicalInstall(_)
         | SourceExecutionError::GlobalRootRegistration(_) => OctaneExecutionPhase::SessionLink,
         SourceExecutionError::ExceptionRootSynchronization(_)
         | SourceExecutionError::FramePush(_)
@@ -1209,7 +1211,6 @@ fn geometric_mean(values: &[f64]) -> f64 {
 mod tests {
     use super::super::ShellFilesystemOperation;
     use super::*;
-    use crate::bytecompiler::BytecompilerEmissionError;
     use std::collections::HashSet;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1819,7 +1820,7 @@ Benchmark.prototype.validate = function() {
     }
 
     #[test]
-    fn octane_class_style_benchmark_documents_top_level_class_visibility_blocker() {
+    fn octane_executes_class_style_benchmark_until_result_extraction_is_missing() {
         let root = TempJetStreamRoot::new();
         root.write_manifest_file(
             "./Octane/test-class.js",
@@ -1841,25 +1842,20 @@ class Benchmark {
             ),
         );
 
-        assert_eq!(report.outcome.phase(), OctaneExecutionPhase::BytecodeEmit);
-        let OctaneExecutionOutcome::Failed(failure) = report.outcome else {
-            panic!("class benchmark should fail with bytecode emission: {report:?}");
-        };
-        assert_eq!(failure.phase, OctaneExecutionPhase::BytecodeEmit);
         assert_eq!(
-            failure.order_entry,
-            Some(OctanePreparedSourceOrderEntry::Generated(
-                OctanePreparedGeneratedSourceKind::Runner
-            ))
+            report.outcome.phase(),
+            OctaneExecutionPhase::ScoreTelemetry,
+            "{report:#?}"
         );
         assert!(matches!(
-            failure.detail,
-            OctaneExecutionFailureDetail::SourceExecutionError(
-                SourceExecutionError::BytecodeEmission(
-                    BytecompilerEmissionError::UnboundIdentifier(_)
-                )
-            )
+            report.outcome,
+            OctaneExecutionOutcome::ResultExtractionMissing
         ));
+        assert_eq!(report.source_records.len(), prepared.source_order.len());
+        assert!(report
+            .source_records
+            .iter()
+            .all(|record| matches!(record.completion, Some(ExecutionCompletion::Returned(_)))));
     }
 
     #[test]

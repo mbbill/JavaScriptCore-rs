@@ -37,8 +37,9 @@ use crate::bytecode::{
 };
 use crate::bytecompiler::{
     bytecompiler_input_from_parsed_ast, emit_unlinked_code_from_parsed_ast,
-    source_global_bindings_from_parsed_ast, BytecompilerEmissionError,
-    BytecompilerGlobalBindingSet, BytecompilerParseHandoffError, BytecompilerSessionId,
+    source_global_bindings_from_parsed_ast, BytecompilerEmissionError, BytecompilerGlobalBinding,
+    BytecompilerGlobalBindingKind, BytecompilerGlobalBindingSet, BytecompilerParseHandoffError,
+    BytecompilerSessionId,
 };
 use crate::gc::{
     evaluate_heap_semantics, static_cell_metadata_registry, AllocationMode, CellDestructionState,
@@ -55,11 +56,11 @@ use crate::interpreter::{
     sync_targeted_frame_roots, sync_targeted_register_roots, validate_call_return_continuation,
     validate_construct_return_continuation, BaselineFallbackRequest, CallObservationDrainRequest,
     CallObservationOutcome, CallReturnContinuation, ConstructReturnContinuation,
-    CoreHostOutputRecord, CoreOpcodeDispatchHost, DispatchConfig, DispatchHost,
-    DispatchInstruction, DispatchOutcome, DispatchState, ExecutionCompletion,
-    ExecutionContextStack, ExecutionEntryRecord, ExecutionError, ExecutionRootSnapshot,
-    FramePushRequest, FunctionValueCallCompletion, FunctionValueCallHandling,
-    FunctionValueCallRequest, FunctionValueCallTailCompletion,
+    CoreGlobalLexicalDeclaration, CoreGlobalLexicalDeclarationKind, CoreHostOutputRecord,
+    CoreOpcodeDispatchHost, DispatchConfig, DispatchHost, DispatchInstruction, DispatchOutcome,
+    DispatchState, ExecutionCompletion, ExecutionContextStack, ExecutionEntryRecord,
+    ExecutionError, ExecutionRootSnapshot, FramePushRequest, FunctionValueCallCompletion,
+    FunctionValueCallHandling, FunctionValueCallRequest, FunctionValueCallTailCompletion,
     FunctionValuePropertyOperationCompletion, FunctionValuePropertyOperationOutcome,
     FunctionValuePropertyOperationResume, FunctionValueReturnTransform, InterpreterExecutionState,
     InterpreterFunctionCodeBlock, InterpreterWriteBarrierRecord, OrdinaryBytecodeCallHandling,
@@ -657,9 +658,22 @@ pub enum SourceExecutionError {
     MissingUnlinkedCode,
     SourceSessionInstructionDecode(InstructionDecodeError),
     SourceSessionMissingIdentifierText(u32),
-    SourceSessionInvalidLoadFunctionOperand { bytecode_index: BytecodeIndex },
-    SourceSessionFunctionIndexOverflow { base: u32, index: u32 },
-    SourceSessionFunctionTableOverflow { function_count: usize },
+    SourceSessionInvalidLoadFunctionOperand {
+        bytecode_index: BytecodeIndex,
+    },
+    SourceSessionFunctionIndexOverflow {
+        base: u32,
+        index: u32,
+    },
+    SourceSessionFunctionTableOverflow {
+        function_count: usize,
+    },
+    SourceSessionGlobalBindingConflict {
+        name: String,
+        existing: BytecompilerGlobalBindingKind,
+        incoming: BytecompilerGlobalBindingKind,
+    },
+    SourceSessionGlobalLexicalInstall(ExecutionError),
     MissingStaticCellMetadata(CellType),
     ExecutableAllocation(HeapIntegrationError),
     ExecutablePublication(HeapIntegrationError),
@@ -856,6 +870,7 @@ struct SourceSessionLinkedEntry {
 struct SourceSessionExecutableEntry {
     code_block_id: CodeBlockId,
     code_block: CodeBlock,
+    declared_global_bindings: BytecompilerGlobalBindingSet,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -8529,6 +8544,10 @@ impl Vm {
                 &mut stable_ids,
                 &visible_global_bindings,
             )?;
+            Self::validate_source_session_global_binding_merge(
+                &visible_global_bindings,
+                &compiled.declared_global_bindings,
+            )?;
             visible_global_bindings.extend(compiled.declared_global_bindings.clone());
             function_count = function_count
                 .checked_add(compiled.function_bodies.len())
@@ -8660,6 +8679,10 @@ impl Vm {
             &mut session.stable_ids,
             &session.visible_global_bindings,
         )?;
+        Self::validate_source_session_global_binding_merge(
+            &session.visible_global_bindings,
+            &compiled.declared_global_bindings,
+        )?;
         session
             .visible_global_bindings
             .extend(compiled.declared_global_bindings.clone());
@@ -8771,6 +8794,44 @@ impl Vm {
         visible_global_bindings
     }
 
+    fn validate_source_session_global_binding_merge(
+        visible_global_bindings: &BytecompilerGlobalBindingSet,
+        declared_global_bindings: &BytecompilerGlobalBindingSet,
+    ) -> Result<(), SourceExecutionError> {
+        for binding in declared_global_bindings.bindings() {
+            let Some(existing) = visible_global_bindings.kind_for_name(&binding.name) else {
+                continue;
+            };
+            if Self::source_session_global_binding_conflicts(existing, binding.kind) {
+                return Err(SourceExecutionError::SourceSessionGlobalBindingConflict {
+                    name: binding.name,
+                    existing,
+                    incoming: binding.kind,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn source_session_global_binding_conflicts(
+        existing: BytecompilerGlobalBindingKind,
+        incoming: BytecompilerGlobalBindingKind,
+    ) -> bool {
+        if !(existing.is_source_lexical() || incoming.is_source_lexical()) {
+            return false;
+        }
+        if matches!(
+            existing,
+            BytecompilerGlobalBindingKind::Standard | BytecompilerGlobalBindingKind::HostDeclared
+        ) || matches!(
+            incoming,
+            BytecompilerGlobalBindingKind::Standard | BytecompilerGlobalBindingKind::HostDeclared
+        ) {
+            return false;
+        }
+        true
+    }
+
     fn link_source_session_compiled_entry(
         &mut self,
         compiled: SourceSessionCompiledEntry,
@@ -8812,6 +8873,7 @@ impl Vm {
             executable_entry: SourceSessionExecutableEntry {
                 code_block_id,
                 code_block,
+                declared_global_bindings: compiled.declared_global_bindings,
             },
             function_blocks,
         })
@@ -8824,6 +8886,10 @@ impl Vm {
         executable_entry: &SourceSessionExecutableEntry,
         host: &mut CoreOpcodeDispatchHost,
     ) -> Result<ExecutionCompletion, SourceExecutionError> {
+        host.install_global_lexical_declarations(Self::source_session_global_lexical_declarations(
+            &executable_entry.declared_global_bindings,
+        ))
+        .map_err(SourceExecutionError::SourceSessionGlobalLexicalInstall)?;
         let vm_entry = self
             .execution
             .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
@@ -8870,6 +8936,30 @@ impl Vm {
             return Err(error);
         }
         Ok(completion)
+    }
+
+    fn source_session_global_lexical_declarations(
+        bindings: &BytecompilerGlobalBindingSet,
+    ) -> Vec<CoreGlobalLexicalDeclaration> {
+        bindings
+            .bindings()
+            .filter_map(Self::source_session_global_lexical_declaration)
+            .collect()
+    }
+
+    fn source_session_global_lexical_declaration(
+        binding: BytecompilerGlobalBinding,
+    ) -> Option<CoreGlobalLexicalDeclaration> {
+        let kind = match binding.kind {
+            BytecompilerGlobalBindingKind::SourceLet => CoreGlobalLexicalDeclarationKind::Let,
+            BytecompilerGlobalBindingKind::SourceConst => CoreGlobalLexicalDeclarationKind::Const,
+            BytecompilerGlobalBindingKind::SourceClass => CoreGlobalLexicalDeclarationKind::Class,
+            _ => return None,
+        };
+        Some(CoreGlobalLexicalDeclaration {
+            name: binding.name,
+            kind,
+        })
     }
 
     fn remap_source_session_unlinked_code_block(
@@ -21327,41 +21417,37 @@ mod tests {
     }
 
     #[test]
-    fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_constant_move_return_sources() {
+    fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_constant_return_sources() {
         let cases = [
             (
-                "undefined move return",
-                "let value = undefined; return value;",
+                "undefined return",
+                "return undefined;",
                 ExecutionCompletion::Returned(RuntimeValue::undefined()),
-                &[
-                    CoreOpcode::LoadUndefined,
-                    CoreOpcode::Move,
-                    CoreOpcode::Return,
-                ][..],
+                &[CoreOpcode::LoadUndefined, CoreOpcode::Return][..],
             ),
             (
-                "null move return",
-                "let value = null; return value;",
+                "null return",
+                "return null;",
                 ExecutionCompletion::Returned(RuntimeValue::null()),
-                &[CoreOpcode::LoadNull, CoreOpcode::Move, CoreOpcode::Return][..],
+                &[CoreOpcode::LoadNull, CoreOpcode::Return][..],
             ),
             (
-                "true move return",
-                "let value = true; return value;",
+                "true return",
+                "return true;",
                 ExecutionCompletion::Returned(RuntimeValue::from_bool(true)),
-                &[CoreOpcode::LoadBool, CoreOpcode::Move, CoreOpcode::Return][..],
+                &[CoreOpcode::LoadBool, CoreOpcode::Return][..],
             ),
             (
-                "false move return",
-                "let value = false; return value;",
+                "false return",
+                "return false;",
                 ExecutionCompletion::Returned(RuntimeValue::from_bool(false)),
-                &[CoreOpcode::LoadBool, CoreOpcode::Move, CoreOpcode::Return][..],
+                &[CoreOpcode::LoadBool, CoreOpcode::Return][..],
             ),
             (
-                "int32 move return",
-                "let value = 7; return value;",
+                "int32 return",
+                "return 7;",
                 ExecutionCompletion::Returned(RuntimeValue::from_i32(7)),
-                &[CoreOpcode::LoadInt32, CoreOpcode::Move, CoreOpcode::Return][..],
+                &[CoreOpcode::LoadInt32, CoreOpcode::Return][..],
             ),
         ];
 
@@ -21929,7 +22015,8 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_int32_relational_ops() {
-        let text = "let lt = 1 < 2; let le = 2 <= 2; let gt = 3 > 2; let ge = 4 >= 4; return ge;";
+        let text =
+            "if (1 < 2) if (2 <= 2) if (3 > 2) return 4 >= 4; else return false; else return false; else return false;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22033,7 +22120,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_nullish_jump_source() {
-        let text = "let value = 7 ?? 42; return value;";
+        let text = "return 7 ?? 42;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22071,7 +22158,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_jump_if_false_source() {
-        let text = "let a = false && 42; let b = true && 40; let c = 0 && 42; let d = 7 && 2; return b + d;";
+        let text = "if (false && 42) return 1; if (true && 40) return 40 + (7 && 2); return 0;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22194,7 +22281,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_double_division_source() {
-        let text = "let value = -40.5; return value / 2;";
+        let text = "return -40.5 / 2;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -22237,7 +22324,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_generated_entry_matches_interpreter_for_p6_int32_modulo_source() {
-        let text = "let value = 7 % 4; return value;";
+        let text = "return 7 % 4;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
         assert_eq!(
@@ -35730,8 +35817,7 @@ mod tests {
     fn vm_enters_typed_baseline_generated_code_for_p6_subset() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
         assert_eq!(
-            vm.execute_source(source("let value = 6 * 7; return value;"))
-                .unwrap(),
+            vm.execute_source(source("return 6 * 7;")).unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
         let owner = vm.tiering_integration().diagnostics()[0].owner;
@@ -35796,7 +35882,7 @@ mod tests {
 
     #[test]
     fn vm_typed_baseline_overflow_arithmetic_runs_generated_without_fallback() {
-        let text = "let value = 2147483647 + 1; return value;";
+        let text = "return 2147483647 + 1;";
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let expected = interpreter_vm.execute_source(source(text)).unwrap();
 
@@ -40877,8 +40963,8 @@ mod tests {
 
         let execution = vm
             .execute_source_session(vec![
-                source("let value = 20; return value + 1;"),
-                source("let value = 21; return value + 1;"),
+                source("let firstValue = 20; return firstValue + 1;"),
+                source("let secondValue = 21; return secondValue + 1;"),
                 source("function add(a, b) { return a + b; } return add(40, 2);"),
             ])
             .unwrap();
@@ -41337,14 +41423,164 @@ mod tests {
     }
 
     #[test]
-    fn vm_source_session_let_declarations_remain_source_local_for_now() {
+    fn vm_source_session_let_const_and_class_declarations_cross_source_without_global_object() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
-        let result = vm.execute_source_session(vec![
-            source("function answer() { return 42; }"),
-            source("let localOnly = 42;"),
-            source("return localOnly;"),
-        ]);
+        let execution = vm
+            .execute_source_session(vec![
+                source(
+                    "let answer = 40; \
+                     const offset = 1; \
+                     class Benchmark { static score() { return answer + offset + 1; } }",
+                ),
+                source("return Benchmark.score();"),
+                source("return this.Benchmark === undefined && this.answer === undefined;"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::undefined()),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+                ExecutionCompletion::Returned(RuntimeValue::from_bool(true)),
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_incremental_source_session_shares_global_lexicals_without_global_object() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut session = vm.open_source_session().unwrap();
+
+        assert_eq!(
+            vm.append_source_session_source(
+                &mut session,
+                source("class Benchmark { static score() { return 42; } }")
+            )
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+        assert_eq!(
+            vm.append_source_session_source(&mut session, source("return Benchmark.score();"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        assert_eq!(
+            vm.append_source_session_source(&mut session, source("return this.Benchmark;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+    }
+
+    #[test]
+    fn vm_source_session_global_lexical_reads_are_live_across_sources() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![
+                source("let n = 40; function read() { return n; }"),
+                source("n = 42;"),
+                source("return read();"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::undefined()),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_global_lexical_read_before_initialization_fails() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![source("return answer; let answer = 42;")])
+            .unwrap();
+
+        assert!(matches!(
+            execution.completions(),
+            [ExecutionCompletion::Failed(ExecutionError::GlobalLexicalTemporalDeadZone(
+                name
+            ))] if name == "answer"
+        ));
+    }
+
+    #[test]
+    fn vm_source_session_const_and_class_reassignment_fails() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![
+                source("const answer = 42;"),
+                source("answer = 7; return answer;"),
+                source("class Benchmark { static score() { return 42; } }"),
+                source("Benchmark = 7; return Benchmark.score();"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::undefined()),
+                ExecutionCompletion::Failed(ExecutionError::GlobalLexicalReadOnly("answer".into())),
+                ExecutionCompletion::Returned(RuntimeValue::undefined()),
+                ExecutionCompletion::Failed(ExecutionError::GlobalLexicalReadOnly(
+                    "Benchmark".into()
+                )),
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_global_lexical_initializer_observes_tdz() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![source("let answer = answer;")])
+            .unwrap();
+
+        assert!(matches!(
+            execution.completions(),
+            [ExecutionCompletion::Failed(ExecutionError::GlobalLexicalTemporalDeadZone(
+                name
+            ))] if name == "answer"
+        ));
+    }
+
+    #[test]
+    fn vm_source_session_global_lexical_typeof_observes_tdz() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![source(
+                "let observed = typeof answer; let answer = 42;",
+            )])
+            .unwrap();
+
+        assert!(matches!(
+            execution.completions(),
+            [ExecutionCompletion::Failed(ExecutionError::GlobalLexicalTemporalDeadZone(
+                name
+            ))] if name == "answer"
+        ));
+    }
+
+    #[test]
+    fn vm_execute_source_global_lexical_declarations_do_not_leak_between_one_shots() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        assert_eq!(
+            vm.execute_source(source("let answer = 42; return answer;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        let result = vm.execute_source(source("return answer;"));
 
         assert!(matches!(
             result,
@@ -41352,12 +41588,52 @@ mod tests {
                 BytecompilerEmissionError::UnboundIdentifier(_)
             ))
         ));
-        assert!(vm
-            .global_runtime_state()
-            .global_root_plan(vm.heap().id())
-            .unwrap()
-            .descriptors()
-            .is_empty());
+    }
+
+    #[test]
+    fn vm_source_session_rejects_global_lexical_duplicate_declarations() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let result =
+            vm.execute_source_session(vec![source("let answer = 1;"), source("let answer = 2;")]);
+
+        assert!(matches!(
+            result,
+            Err(SourceExecutionError::SourceSessionGlobalBindingConflict {
+                name,
+                existing: BytecompilerGlobalBindingKind::SourceLet,
+                incoming: BytecompilerGlobalBindingKind::SourceLet,
+            }) if name == "answer"
+        ));
+    }
+
+    #[test]
+    fn vm_source_session_rejects_lexical_object_backed_global_conflicts() {
+        let mut lexical_after_var = Vm::new(VmConfig::baseline_allowed());
+        let result = lexical_after_var
+            .execute_source_session(vec![source("var answer = 1;"), source("let answer = 2;")]);
+
+        assert!(matches!(
+            result,
+            Err(SourceExecutionError::SourceSessionGlobalBindingConflict {
+                name,
+                existing: BytecompilerGlobalBindingKind::SourceVar,
+                incoming: BytecompilerGlobalBindingKind::SourceLet,
+            }) if name == "answer"
+        ));
+
+        let mut var_after_lexical = Vm::new(VmConfig::baseline_allowed());
+        let result = var_after_lexical
+            .execute_source_session(vec![source("const answer = 1;"), source("var answer = 2;")]);
+
+        assert!(matches!(
+            result,
+            Err(SourceExecutionError::SourceSessionGlobalBindingConflict {
+                name,
+                existing: BytecompilerGlobalBindingKind::SourceConst,
+                incoming: BytecompilerGlobalBindingKind::SourceVar,
+            }) if name == "answer"
+        ));
     }
 
     #[test]
@@ -41482,7 +41758,7 @@ mod tests {
     fn vm_source_completion_matches_interpreter_only_and_baseline_allowed_modes() {
         let mut interpreter_vm = Vm::new(VmConfig::interpreter_only());
         let mut baseline_vm = Vm::new(VmConfig::baseline_allowed());
-        let text = "let value = 6 * 7; return value;";
+        let text = "return 6 * 7;";
 
         let interpreter_completion = interpreter_vm.execute_source(source(text)).unwrap();
         let baseline_completion = baseline_vm.execute_source(source(text)).unwrap();

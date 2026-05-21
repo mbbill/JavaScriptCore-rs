@@ -54,6 +54,7 @@ use crate::object::{
     PropertyCacheability, PropertyLookupMode, PropertyOffset, WatchpointKind, WatchpointSet,
     WatchpointState,
 };
+use crate::runtime::scope::{BindingAttributes, BindingError, BindingSlot, BindingWriteOutcome};
 use crate::runtime::{
     CallFrameId, CodeBlockId, CodeSpecializationKind, EntryFrameId, ExecutableId, GlobalObjectId,
     ObjectId, PromiseState, RuntimeValue, ScopeId, StackFrameId, VmEntryReason,
@@ -1769,8 +1770,15 @@ pub enum ExecutionError {
     UnsupportedLooseEquality,
     MissingSuperBinding,
     MissingStringLiteral(u32),
+    MissingIdentifierText(u32),
     MissingPendingException,
     MissingCapture(u32),
+    GlobalLexicalBindingNotFound(String),
+    GlobalLexicalTemporalDeadZone(String),
+    GlobalLexicalReadOnly(String),
+    GlobalLexicalAlreadyInitialized(String),
+    GlobalLexicalDeleted(String),
+    GlobalLexicalDuplicateBinding(String),
     UnknownObject,
     MissingFunctionCode(u32),
     InvalidCallCompletion,
@@ -2207,6 +2215,25 @@ pub struct CoreHostOutputRecord {
 
 const CORE_HOST_OUTPUT_RECORD_LIMIT: usize = 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreGlobalLexicalDeclarationKind {
+    Let,
+    Const,
+    Class,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreGlobalLexicalDeclaration {
+    pub name: String,
+    pub kind: CoreGlobalLexicalDeclarationKind,
+}
+
+#[derive(Clone, Debug)]
+struct CoreGlobalLexicalBinding {
+    slot: BindingSlot,
+    attributes: BindingAttributes,
+}
+
 #[derive(Clone, Debug)]
 pub struct CoreOpcodeDispatchHost {
     function_blocks: Vec<InterpreterFunctionCodeBlock>,
@@ -2227,6 +2254,7 @@ pub struct CoreOpcodeDispatchHost {
     pending_property_store_site: Option<CorePropertyStoreSite>,
     last_call_observation: Option<CoreCallObservationRecord>,
     initialized_instance_fields: Vec<CoreInitializedInstanceFields>,
+    global_lexical_bindings: HashMap<String, CoreGlobalLexicalBinding>,
     #[cfg(test)]
     call_frame_snapshots_for_test: Vec<CoreCallFrameSnapshotForTest>,
 }
@@ -2252,6 +2280,7 @@ impl Default for CoreOpcodeDispatchHost {
             pending_property_store_site: None,
             last_call_observation: None,
             initialized_instance_fields: Vec::new(),
+            global_lexical_bindings: HashMap::new(),
             #[cfg(test)]
             call_frame_snapshots_for_test: Vec::new(),
         }
@@ -2279,6 +2308,19 @@ impl CoreMathRandomState {
             .wrapping_add(1_442_695_040_888_963_407);
         let fraction_bits = self.state >> 11;
         (fraction_bits as f64) * (1.0 / ((1_u64 << 53) as f64))
+    }
+}
+
+impl CoreGlobalLexicalDeclarationKind {
+    const fn attributes(self) -> BindingAttributes {
+        let read_only = matches!(self, Self::Const | Self::Class);
+        BindingAttributes {
+            read_only,
+            tdz_protected: true,
+            can_delete: false,
+            is_const: read_only,
+            is_private_name: false,
+        }
     }
 }
 
@@ -2375,6 +2417,30 @@ impl CoreOpcodeDispatchHost {
 
     pub fn host_output_records(&self) -> &[CoreHostOutputRecord] {
         &self.host_output_records
+    }
+
+    pub fn install_global_lexical_declarations<I>(
+        &mut self,
+        declarations: I,
+    ) -> Result<(), ExecutionError>
+    where
+        I: IntoIterator<Item = CoreGlobalLexicalDeclaration>,
+    {
+        for declaration in declarations {
+            if self.global_lexical_bindings.contains_key(&declaration.name) {
+                return Err(ExecutionError::GlobalLexicalDuplicateBinding(
+                    declaration.name,
+                ));
+            }
+            self.global_lexical_bindings.insert(
+                declaration.name,
+                CoreGlobalLexicalBinding {
+                    slot: BindingSlot::default(),
+                    attributes: declaration.kind.attributes(),
+                },
+            );
+        }
+        Ok(())
     }
 
     pub fn with_function_blocks(function_blocks: Vec<CodeBlock>) -> Self {
@@ -10504,6 +10570,69 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Err(error) => DispatchOutcome::Fail(error),
                 }
             }
+            CoreOpcode::GetGlobalLexical => {
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let key = match identifier_index_operand(instruction, 1) {
+                    Ok(key) => key,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let name = match self.global_lexical_name(key) {
+                    Ok(name) => name,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let value = match self.read_global_lexical(&name) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                write_register(state, window, destination, value)
+            }
+            CoreOpcode::InitializeGlobalLexical => {
+                let key = match identifier_index_operand(instruction, 0) {
+                    Ok(key) => key,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let value = match register_operand(instruction, 1).and_then(|register| {
+                    state
+                        .registers
+                        .read(window, register, Some(state.code_block.constants()))
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let name = match self.global_lexical_name(key) {
+                    Ok(name) => name,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                match self.initialize_global_lexical(&name, value) {
+                    Ok(()) => DispatchOutcome::Continue,
+                    Err(error) => DispatchOutcome::Fail(error),
+                }
+            }
+            CoreOpcode::PutGlobalLexical => {
+                let key = match identifier_index_operand(instruction, 0) {
+                    Ok(key) => key,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let value = match register_operand(instruction, 1).and_then(|register| {
+                    state
+                        .registers
+                        .read(window, register, Some(state.code_block.constants()))
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let name = match self.global_lexical_name(key) {
+                    Ok(name) => name,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                match self.put_global_lexical(&name, value) {
+                    Ok(_) => DispatchOutcome::Continue,
+                    Err(error) => DispatchOutcome::Fail(error),
+                }
+            }
             CoreOpcode::GetSuperByName => {
                 let destination = match register_operand(instruction, 0) {
                     Ok(register) => register,
@@ -11045,6 +11174,54 @@ impl DispatchHost for CoreOpcodeDispatchHost {
 }
 
 impl CoreOpcodeDispatchHost {
+    fn global_lexical_name(&self, key: u32) -> Result<String, ExecutionError> {
+        self.identifier_texts
+            .get(&key)
+            .cloned()
+            .ok_or(ExecutionError::MissingIdentifierText(key))
+    }
+
+    fn read_global_lexical(&self, name: &str) -> Result<RuntimeValue, ExecutionError> {
+        let binding = self
+            .global_lexical_bindings
+            .get(name)
+            .ok_or_else(|| ExecutionError::GlobalLexicalBindingNotFound(name.into()))?;
+        binding
+            .slot
+            .read(binding.attributes)
+            .map_err(|error| global_lexical_binding_error(name, error))
+    }
+
+    fn initialize_global_lexical(
+        &mut self,
+        name: &str,
+        value: RuntimeValue,
+    ) -> Result<(), ExecutionError> {
+        let binding = self
+            .global_lexical_bindings
+            .get_mut(name)
+            .ok_or_else(|| ExecutionError::GlobalLexicalBindingNotFound(name.into()))?;
+        binding
+            .slot
+            .initialize(value, binding.attributes.read_only)
+            .map_err(|error| global_lexical_binding_error(name, error))
+    }
+
+    fn put_global_lexical(
+        &mut self,
+        name: &str,
+        value: RuntimeValue,
+    ) -> Result<BindingWriteOutcome, ExecutionError> {
+        let binding = self
+            .global_lexical_bindings
+            .get_mut(name)
+            .ok_or_else(|| ExecutionError::GlobalLexicalBindingNotFound(name.into()))?;
+        binding
+            .slot
+            .set_mutable(value, binding.attributes, true)
+            .map_err(|error| global_lexical_binding_error(name, error))
+    }
+
     fn truthy(&self, value: RuntimeValue) -> bool {
         if self.symbols.is_symbol(value) {
             return true;
@@ -19230,6 +19407,19 @@ fn json_quote_string(text: &str) -> String {
 
 fn json_parse_error() -> DispatchOutcome {
     DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion)
+}
+
+fn global_lexical_binding_error(name: &str, error: BindingError) -> ExecutionError {
+    match error {
+        BindingError::TemporalDeadZone => {
+            ExecutionError::GlobalLexicalTemporalDeadZone(name.into())
+        }
+        BindingError::ReadOnly => ExecutionError::GlobalLexicalReadOnly(name.into()),
+        BindingError::AlreadyInitialized => {
+            ExecutionError::GlobalLexicalAlreadyInitialized(name.into())
+        }
+        BindingError::Deleted => ExecutionError::GlobalLexicalDeleted(name.into()),
+    }
 }
 
 fn write_register(
