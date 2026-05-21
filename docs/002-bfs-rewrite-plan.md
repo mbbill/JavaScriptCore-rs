@@ -169,18 +169,19 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- M3d1 safe shell-host global slice: source sessions can opt into
-  benchmark-visible host globals for `performance.now`, `readFile`, `print`,
-  `console`, and `alert`; these names are both bytecompiler-visible and
-  runtime-installed on the same source-session global/host; `readFile` reads
-  text only and does not append or execute source.
-- Full accepted gate at that checkpoint: `cargo test --lib -- --quiet` with
-  1828 passed.
+- M4c prepared Octane execution/classification: source-session runner
+  execution now reports parse, bytecode-emission, session-link, runtime,
+  thrown/oracle, score-telemetry, and baseline-only outcomes for prepared
+  Octane inputs.
+- Full accepted gate at that checkpoint: `cargo fmt --check`,
+  `cargo clippy --lib --all-targets -- -D warnings`, and
+  `cargo test --lib -- --quiet` with 1845 passed.
 
 Current git/code note:
 
-- Treat the 1828-test M3d1 safe shell-host global slice as the last accepted
-  green code checkpoint unless a later progress entry records passing gates.
+- Treat the 1845-test M4c prepared Octane execution/classification slice as
+  the last accepted green code checkpoint unless a later progress entry records
+  passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
   repairing that baseline.
 
@@ -197,15 +198,18 @@ Major accepted capabilities:
 - VM-owned ordinary, derived, and super bytecode constructor entry for the
   accepted construction spine.
 - Interpreter fallback and differential testing for the accepted native subset.
+- Octane manifest, scoring math, source preparation, deterministic-random
+  runner source generation, and prepared benchmark execution/failure
+  classification under `shell::octane`.
 
 Known Octane run blockers:
 
 - Benchmark telemetry and runner control: the Rust-side Octane manifest,
-  `DefaultBenchmark` scoring contract, file/provenance preparation, and
-  generated prelude/random/runner source preparation now exist under
-  `shell::octane`; VM source-session execution and failure classification now
-  exist for prepared inputs. Result extraction, score reporting, and full
-  tier-mode comparison are still missing.
+  `DefaultBenchmark` scoring contract, file/provenance preparation, generated
+  prelude/random/runner source preparation, VM source-session execution, and
+  failure classification now exist under `shell::octane`. Result extraction,
+  score reporting, oracle handling, and full interpreter-vs-baseline comparison
+  are still missing.
 - Full shell-style `load(path)` execution is not implemented. It is not on the
   shortest path to the first accepted-equivalent Octane-core runner because the
   active JetStream 3 driver uses `readFile`/runner-side file loading for CLI
@@ -299,6 +303,78 @@ repair or review of that broken layer.
 Correctness comes before optimization, but performance pressure must shape the
 design from the beginning. The goal is not "passes Octane slowly"; the goal is a
 rewrite that can explain and close its performance gap against C++ JSC.
+
+## Octane BFS Dependency Map
+
+Work moves by shared dependency layer, not by chasing one benchmark until it
+passes. A benchmark-specific failure is useful when it identifies the next
+engine boundary to widen.
+
+Layer A: benchmark contract and runner boundary.
+
+- Main agent: keep the Rust runner aligned with JetStream 3
+  `DefaultBenchmark`, reject legacy Octane harness assumptions, and require
+  typed failure classification before fixes.
+- Sub-agents: maintain manifest/load order, file provenance, generated prelude,
+  deterministic random reset, runner execution, result extraction, scoring, and
+  telemetry as separate owned slices.
+- Current status: manifest, preparation, scoring math, generated runner source,
+  and execution classification are accepted. Result extraction and score output
+  remain open.
+
+Layer B: shared language/runtime blockers for Octane-core.
+
+- Main agent: prioritize source-session and bytecode/runtime boundaries that
+  unblock multiple Octane-core files before touching isolated benchmark logic.
+- Sub-agents: implement source-session global lexical/class declarations,
+  `do while`, `switch`, non-tagged template literals, benchmark oracle
+  compatibility, and any missing standard-library pieces as independent
+  engine features with focused tests.
+- Current status: top-level `function`/`var` cross-source visibility works;
+  top-level `class`/`let`/`const` still need a real global lexical environment.
+
+Layer C: Octane-core correctness.
+
+- Main agent: run the six-test core subset in interpreter-only and
+  baseline-allowed modes, classify every failure, and accept only honest
+  source-compatible behavior.
+- Sub-agents: own failing feature families, not individual one-off benchmark
+  edits. No benchmark source hacks are allowed.
+- Completion evidence: `richards`, `delta-blue`, `crypto`, `splay`,
+  `navier-stokes`, and `raytrace` complete under the accepted runner with
+  validated results and comparable score records.
+
+Layer D: Octane-core baseline performance.
+
+- Main agent: use Rust telemetry and C++ JSC inspection to choose JIT widening
+  in dependency order.
+- Sub-agents: implement measured opcode/runtime families such as numeric loops,
+  Math intrinsics, array indexed access, property/call ICs, constructors,
+  allocation paths, and loop/tiering behavior.
+- Completion evidence: core subset performance movement is measured against
+  local C++ JSC, and native coverage explains the remaining gap.
+
+Layer E: full Octane correctness breadth.
+
+- Main agent: widen by shared full-Octane feature family instead of easiest
+  remaining test.
+- Sub-agents: implement typed-array breadth, RegExp depth, eval and
+  `Function` constructor behavior, code-load behavior, older shell/browser
+  shims, Date/time compatibility, and large-program parser/bytecompiler
+  pressure.
+- Completion evidence: all fifteen JetStream 3 Octane tests complete with
+  expected results and no source patches.
+
+Layer F: full Octane performance parity.
+
+- Main agent: treat optimization as a rewrite of known JSC ideas, not
+  rediscovery. Compare bytecode, ICs, generated code, tiering, runtime calls,
+  and allocation behavior against C++ JavaScriptCore before choosing work.
+- Sub-agents: own large optimization families with before/after evidence and
+  clear fallback/telemetry explanations.
+- Completion evidence: the full Octane score is at local C++ JSC level on the
+  same machine and command inputs, or the remaining gap is quantified and
+  attributed to specific missing tiers/features.
 
 ## Current Priority Queue
 
@@ -418,11 +494,13 @@ M4: Current - run Octane-core correctly in the Rust engine.
   implementation should be a Rust-side synchronous `DefaultBenchmark`-equivalent
   runner for the Octane-core subset, using `ShellSourceLoader`,
   `SourceSessionSource::with_provenance`, and opt-in safe host globals. Do not
-  use the stale `Octane/run.js` path.
+  use the stale `Octane/run.js` path. Select each next batch by the blocker
+  that removes the most shared Octane-core risk.
 - Sub-agents: implement and audit independent M4 pieces with disjoint write
   sets: Octane manifest/load-order extraction, synchronous runner/scoring
-  scaffolding, per-test execution adapters, and failure classification for
-  syntax/runtime/VM/JIT gaps.
+  scaffolding, per-test execution adapters, failure classification for
+  syntax/runtime/VM/JIT gaps, source-session global lexical/class support,
+  parser/lowering blockers, and result extraction.
 - Completion evidence: `richards`, `delta-blue`, `crypto`, `splay`,
   `navier-stokes`, and `raytrace` load in `JetStreamDriver.js` order, execute
   with one fresh source-session global per benchmark, run the accepted
@@ -445,17 +523,25 @@ M4: Current - run Octane-core correctly in the Rust engine.
   parse, bytecode-emission, session-link, runtime, thrown/oracle,
   score-telemetry, and baseline-only outcomes. Runner completion currently
   returns typed `ResultExtractionMissing` instead of pretending scored success.
-- Next shared engine blocker: source-session global lexical/class declarations
-  for top-level `class Benchmark`. Do not mirror class/let/const declarations
-  onto `globalThis`; add a real global lexical environment boundary.
-- Next syntax/lowering blockers after that: `do while`, `switch`, and
-  non-tagged template literals.
+- Planned sub-slice: M4d adds source-session global lexical/class declarations
+  for top-level `class Benchmark`, `let`, and `const`. Do not mirror these
+  declarations onto `globalThis`; add a real global lexical environment
+  boundary with duplicate-declaration, TDZ, and read-only semantics.
+- Planned sub-slice: M4e adds shared syntax/lowering support for `do while`,
+  `switch`, and non-tagged template literals. Lower these as normal language
+  features, not as Octane-specific rewrites.
+- Planned sub-slice: M4f completes runner result extraction, benchmark oracle
+  handling, score reporting, and interpreter-only vs baseline-allowed
+  comparison records.
+- Planned sub-slice: M4g runs and records the complete Octane-core pass/fail
+  matrix, then uses the classified matrix to schedule M5 instead of guessing.
 
 M5: Make the accepted baseline JIT cover Octane-core hot paths.
 
 - Main agent: use profiler/telemetry output to choose opcode-family widening,
-  not isolated convenience tests. Compare Rust bytecode/JIT decisions with C++
-  JSC before choosing the next widening.
+  not isolated convenience tests. Compare Rust bytecode/JIT decisions, IC
+  behavior, generated code, runtime calls, and fallback reasons with C++ JSC
+  before choosing the next widening.
 - Sub-agents: implement disjoint JIT/runtime slices such as numeric operations,
   Math intrinsics, array indexed access, property ICs, call ICs, constructor
   paths, and allocation fast paths.
@@ -489,7 +575,8 @@ M8: Close the performance gap against C++ JSC.
 
 - Main agent: run the optimization loop as a rewrite, not rediscovery. For each
   gap, inspect C++ JSC bytecode, IC, tiering, runtime, and generated code, then
-  decide which design should be ported/adapted to Rust.
+  decide which design should be ported/adapted to Rust. Do not spend a long
+  loop on local tuning before checking whether JSC already has the design.
 - Sub-agents: own large optimization families with measured hypotheses and
   before/after evidence: IC specialization, native inline stubs, loop/tiering,
   allocation/GC pressure, constructor/class paths, and optimizing-tier

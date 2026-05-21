@@ -196,6 +196,7 @@ one-off test adjustments.
 - 2026-05-20: M4a Octane manifest/scoring scaffold accepted under `shell::octane`; full gates passed including `cargo test --lib -- --quiet` 1833 passed.
 - 2026-05-20: M4b non-executing Octane preparation accepted: runner inputs now load through shell provenance, generated prelude/random/runner sources are prepared, and full gates passed including `cargo test --lib -- --quiet` 1840 passed.
 - 2026-05-20: M4c prepared Octane execution/classification accepted: source-session runner execution now reports parse/bytecode/runtime/thrown/telemetry phases, with full gates passing including `cargo test --lib -- --quiet` 1845 passed.
+- 2026-05-21: Scheduler refined for the full Octane parity goal: finish Octane-core correctness breadth first, then Octane-core JIT performance, full-Octane correctness breadth, official/comparable scoring, and C++ JSC-level performance closure.
 
 ## Open High-Risk Gaps
 
