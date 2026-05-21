@@ -20,8 +20,8 @@ use crate::syntax::ast::{
     BinaryOperator as AstBinaryOperator, CallExpr, ClassElementKind, ClassElementName, ClassExpr,
     ConditionalExpr, ControlKind, DeclarationStmt, DeclarationSyntaxKind, DoWhileStmt, Expr,
     ForInit, ForOfBinding, FunctionMetadata, LiteralKind, MemberExpr, MemberKind, NameKind,
-    NewExpr, NumberLiteralValue, ObjectLiteralPropertyKind, Pattern, Stmt, SwitchStmt, UnaryExpr,
-    UnaryOperator as AstUnaryOperator,
+    NewExpr, NumberLiteralValue, ObjectLiteralPropertyKind, Pattern, Stmt, SwitchStmt,
+    TemplateExpr, UnaryExpr, UnaryOperator as AstUnaryOperator,
 };
 use crate::syntax::{
     AstRef, AstRoot, CodeFeatures, EnvironmentSemanticRecord, ModuleAnalysis,
@@ -2316,6 +2316,14 @@ fn collect_expression_string_literals(
             if let Some(tag) = template.tag {
                 collect_expression_string_literals(arena, tag, table)?;
             }
+            for quasi in &template.quasis {
+                let Some(cooked) = quasi.cooked else {
+                    return Err(BytecompilerEmissionError::UnsupportedLiteral(
+                        "untagged template literal requires cooked quasi text",
+                    ));
+                };
+                record_string_literal(arena, cooked, table)?;
+            }
             for expression in &template.expressions {
                 collect_expression_string_literals(arena, *expression, table)?;
             }
@@ -3947,12 +3955,64 @@ impl AstBytecodeEmitter<'_, '_> {
             Expr::Function(metadata) => self.emit_function_expression(metadata),
             Expr::Class(class) => self.emit_class_expression(&class),
             Expr::Unary(unary) => self.emit_unary(&unary),
-            Expr::Template(_) | Expr::ImportMeta(_) => {
-                Err(BytecompilerEmissionError::UnsupportedExpression(
-                    "expression kind is not lowered yet",
-                ))
-            }
+            Expr::Template(template) => self.emit_template(&template),
+            Expr::ImportMeta(_) => Err(BytecompilerEmissionError::UnsupportedExpression(
+                "expression kind is not lowered yet",
+            )),
         }
+    }
+
+    fn emit_template(
+        &mut self,
+        template: &TemplateExpr,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        if template.tag.is_some() {
+            return Err(BytecompilerEmissionError::UnsupportedExpression(
+                "tagged template literals are not lowered",
+            ));
+        }
+        if template.quasis.len() != template.expressions.len().saturating_add(1) {
+            return Err(BytecompilerEmissionError::UnsupportedExpression(
+                "template literal quasi/expression shape is invalid",
+            ));
+        }
+        let first = template
+            .quasis
+            .first()
+            .and_then(|quasi| quasi.cooked)
+            .ok_or(BytecompilerEmissionError::UnsupportedLiteral(
+                "untagged template literal requires cooked quasi text",
+            ))?;
+        let mut result = self.emit_load_string(first)?;
+        for (index, expression) in template.expressions.iter().enumerate() {
+            let value = self.emit_expression(*expression)?;
+            let string_value = self.emit_to_string(value)?;
+            result = self.emit_binary_opcode(CoreOpcode::AddInt32, result, string_value)?;
+            let quasi = template.quasis[index.saturating_add(1)].cooked.ok_or(
+                BytecompilerEmissionError::UnsupportedLiteral(
+                    "untagged template literal requires cooked quasi text",
+                ),
+            )?;
+            let quasi = self.emit_load_string(quasi)?;
+            result = self.emit_binary_opcode(CoreOpcode::AddInt32, result, quasi)?;
+        }
+        Ok(result)
+    }
+
+    fn emit_to_string(
+        &mut self,
+        value: VirtualRegister,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::ToString.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::Register(destination), Operand::Register(value)],
+        );
+        Ok(destination)
     }
 
     fn emit_unary(
@@ -7261,6 +7321,17 @@ mod tests {
         assert_eq!(
             completion,
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn bytecompiler_lowers_template_substitutions_as_string_concatenation() {
+        let completion =
+            execute_program_source("return `${1}${2}` === \"12\" && `${1}${2}` !== 3;", 36);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
         );
     }
 

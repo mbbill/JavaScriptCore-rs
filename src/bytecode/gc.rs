@@ -182,7 +182,7 @@ pub fn build_p6_no_js_call_helper_root_map(
             })?;
             vec![root_slot_for_register(bytecode_index, destination)]
         }
-        CoreOpcode::TypeOf => {
+        CoreOpcode::TypeOf | CoreOpcode::ToString => {
             let destination = instruction.register_operand(0).map_err(|source| {
                 BytecodeRootMapBuildError::MissingDestinationRegister {
                     bytecode_index,
@@ -522,46 +522,50 @@ mod tests {
     }
 
     #[test]
-    fn builds_typeof_destination_and_source_root_map_with_argument_kind() {
-        let destination = VirtualRegister::local(2);
-        let source = VirtualRegister::argument_or_header(5);
-        let maps = single_instruction_root_maps(
-            CoreOpcode::TypeOf,
-            vec![Operand::Register(destination), Operand::Register(source)],
-        );
+    fn builds_destination_and_source_root_map_with_argument_kind() {
+        for opcode in [CoreOpcode::TypeOf, CoreOpcode::ToString] {
+            let destination = VirtualRegister::local(2);
+            let source = VirtualRegister::argument_or_header(5);
+            let maps = single_instruction_root_maps(
+                opcode,
+                vec![Operand::Register(destination), Operand::Register(source)],
+            );
 
-        assert_eq!(maps.len(), 1);
-        assert_eq!(
-            maps[0].slots,
-            vec![
-                BytecodeRootSlotDescriptor::virtual_register(
-                    BytecodeIndex::from_offset(0),
-                    destination,
-                    BytecodeRootSlotKind::VirtualRegister,
-                ),
-                BytecodeRootSlotDescriptor::virtual_register(
-                    BytecodeIndex::from_offset(0),
-                    source,
-                    BytecodeRootSlotKind::Argument,
-                ),
-            ]
-        );
+            assert_eq!(maps.len(), 1);
+            assert_eq!(
+                maps[0].slots,
+                vec![
+                    BytecodeRootSlotDescriptor::virtual_register(
+                        BytecodeIndex::from_offset(0),
+                        destination,
+                        BytecodeRootSlotKind::VirtualRegister,
+                    ),
+                    BytecodeRootSlotDescriptor::virtual_register(
+                        BytecodeIndex::from_offset(0),
+                        source,
+                        BytecodeRootSlotKind::Argument,
+                    ),
+                ]
+            );
+        }
     }
 
     #[test]
-    fn dedupes_typeof_root_map_when_source_matches_destination() {
-        let register = VirtualRegister::local(3);
-        let maps = single_instruction_root_maps(
-            CoreOpcode::TypeOf,
-            vec![Operand::Register(register), Operand::Register(register)],
-        );
+    fn dedupes_destination_source_root_map_when_source_matches_destination() {
+        for opcode in [CoreOpcode::TypeOf, CoreOpcode::ToString] {
+            let register = VirtualRegister::local(3);
+            let maps = single_instruction_root_maps(
+                opcode,
+                vec![Operand::Register(register), Operand::Register(register)],
+            );
 
-        assert_eq!(maps.len(), 1);
-        assert_eq!(maps[0].slots.len(), 1);
-        assert_eq!(
-            maps[0].slots[0].storage,
-            BytecodeRootSlotStorage::Register(register)
-        );
+            assert_eq!(maps.len(), 1);
+            assert_eq!(maps[0].slots.len(), 1);
+            assert_eq!(
+                maps[0].slots[0].storage,
+                BytecodeRootSlotStorage::Register(register)
+            );
+        }
     }
 
     #[test]

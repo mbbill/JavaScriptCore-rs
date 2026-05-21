@@ -9762,6 +9762,24 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     };
                 write_register(state, window, destination, value)
             }
+            CoreOpcode::ToString => {
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let source = match register_operand(instruction, 1).and_then(|register| {
+                    state
+                        .registers
+                        .read(window, register, Some(state.code_block.constants()))
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                match self.coerce_to_string_value(state, source) {
+                    Ok(value) => write_register(state, window, destination, value),
+                    Err(outcome) => outcome,
+                }
+            }
             CoreOpcode::ToNumber
             | CoreOpcode::NegateNumber
             | CoreOpcode::BitNotInt32
@@ -11378,6 +11396,70 @@ impl CoreOpcodeDispatchHost {
             .ok_or(ExecutionError::ExpectedObject)?;
         text.push_str(&right);
         self.strings.allocate_with_heap(heap, &text)
+    }
+
+    fn coerce_to_string_value(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        value: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        if self.strings.text(value).is_some() {
+            return Ok(value);
+        }
+        if self.symbols.is_symbol(value) {
+            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject));
+        }
+        if let Some(text) = self.primitive_to_string(value) {
+            return self
+                .strings
+                .allocate_with_heap(state.heap, &text)
+                .map_err(DispatchOutcome::Fail);
+        }
+
+        let primitive = self.object_to_string_hint_primitive(state, value)?;
+        if self.symbols.is_symbol(primitive) {
+            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject));
+        }
+        let text = self
+            .primitive_to_string(primitive)
+            .ok_or(DispatchOutcome::Fail(ExecutionError::ExpectedObject))?;
+        self.strings
+            .allocate_with_heap(state.heap, &text)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    fn object_to_string_hint_primitive(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        object: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        for name in ["toString", "valueOf"] {
+            let method = self.get_property_value(
+                state,
+                object,
+                &CorePropertyKey::String(name.into()),
+                object,
+            )?;
+            if !self.is_callable_value(method) {
+                continue;
+            }
+            let result = self.execute_function_value(state, method, object, &[])?;
+            if self.is_primitive_value(result) {
+                return Ok(result);
+            }
+        }
+        Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject))
+    }
+
+    fn is_callable_value(&self, value: RuntimeValue) -> bool {
+        self.objects.is_proxy(value) || self.objects.function_call_target(value).is_ok()
+    }
+
+    fn is_primitive_value(&self, value: RuntimeValue) -> bool {
+        value.kind() != ValueKind::Cell
+            || self.strings.text(value).is_some()
+            || self.bigints.is_bigint(value)
+            || self.symbols.is_symbol(value)
     }
 
     fn primitive_to_string(&self, value: RuntimeValue) -> Option<String> {
@@ -13995,7 +14077,7 @@ impl CoreOpcodeDispatchHost {
                 self.native_reflect_set_prototype_of(state, arguments)
             }
             CoreNativeFunction::StringConstructor => {
-                self.native_string_constructor(state.heap, arguments)
+                self.native_string_constructor(state, arguments)
             }
             CoreNativeFunction::StringFromCharCode => {
                 self.native_string_from_char_code(state.heap, arguments)
@@ -17963,21 +18045,26 @@ impl CoreOpcodeDispatchHost {
 
     fn native_string_constructor(
         &mut self,
-        heap: &mut Heap,
+        state: &mut DispatchState<'_>,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, DispatchOutcome> {
         let Some(value) = arguments.first().copied() else {
             return self
                 .strings
-                .allocate_with_heap(heap, "")
+                .allocate_with_heap(state.heap, "")
                 .map_err(DispatchOutcome::Fail);
         };
-        let Some(text) = self.strings.primitive_to_string(value) else {
-            return Err(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion));
-        };
-        self.strings
-            .allocate_with_heap(heap, &text)
-            .map_err(DispatchOutcome::Fail)
+        if self.symbols.is_symbol(value) {
+            let text = self
+                .symbols
+                .symbol_to_string(value)
+                .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
+            return self
+                .strings
+                .allocate_with_heap(state.heap, &text)
+                .map_err(DispatchOutcome::Fail);
+        }
+        self.coerce_to_string_value(state, value)
     }
 
     fn native_string_from_char_code(

@@ -10,15 +10,17 @@ use crate::syntax::ast::{
     IfStmt, LiteralExpr, LiteralKind, MemberExpr, MemberKind, ModuleItem, NameExpr, NameKind,
     NewExpr, NumberLiteralValue, ObjectLiteralExpr, ObjectLiteralProperty,
     ObjectLiteralPropertyKind, Pattern, ScopeBlock, ScopeNode, ScopeNodeKind, Stmt, SwitchCase,
-    SwitchStmt, TryStmt, UnaryExpr, UnaryOperator, WhileStmt,
+    SwitchStmt, TemplateExpr, TemplatePart, TryStmt, UnaryExpr, UnaryOperator, WhileStmt,
 };
 use crate::syntax::lexer::{
-    KeywordPolicy, LexDeferred, LexGoal, LexRequest, LexResult, Lexer, LexerError,
+    KeywordPolicy, LexDeferred, LexGoal, LexRequest, LexResult, Lexer, LexerError, RawStringMode,
+    TemplateLexContext,
 };
 use crate::syntax::semantic::{EarlyError, EarlySemanticInfo, ModuleAnalysis, SemanticScopeId};
 use crate::syntax::source::{Diagnostic, DiagnosticSink, SourceCode, SourceSpan};
 use crate::syntax::token::{
-    ContextualKeyword, Keyword, NumericLiteralKind, Punctuator, Token, TokenData, TokenKind,
+    ContextualKeyword, Keyword, NumericLiteralKind, Punctuator, TemplateTokenKind, Token,
+    TokenData, TokenKind,
 };
 
 /// Parser grammar and code-kind mode.
@@ -319,6 +321,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
         };
         let mut tokens = Vec::new();
         let mut previous = None;
+        let mut template_stack = Vec::<TemplateLexingContext>::new();
         loop {
             let request = LexRequest {
                 goal: if regexp_literal_allowed_after(previous) {
@@ -331,12 +334,39 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             match lexer.next_token(request) {
                 LexResult::Ready(token) => {
                     let is_eof = token.kind == TokenKind::EndOfFile;
+                    let resume_template =
+                        update_template_lexing_context(&mut template_stack, token.kind);
                     if !is_eof {
-                        previous = Some(token.kind);
+                        previous = previous_kind_after_lexed_token(token.kind);
                     }
                     tokens.push(token);
                     if is_eof {
                         return Ok(tokens);
+                    }
+                    if resume_template {
+                        let token = match lexer.template_literal(TemplateLexContext {
+                            raw_strings: RawStringMode::Build,
+                            expression_depth: 1,
+                        }) {
+                            LexResult::Ready(token) => token,
+                            LexResult::Error(error) => {
+                                return Err(ParserError {
+                                    span: Some(error.span),
+                                    kind: ParserErrorKind::Lexer(error),
+                                });
+                            }
+                            LexResult::Deferred(deferred) => {
+                                return Err(ParserError {
+                                    span: Some(crate::syntax::source::SourceSpan::at(
+                                        deferred.cursor,
+                                    )),
+                                    kind: ParserErrorKind::LexDeferred(deferred),
+                                });
+                            }
+                        };
+                        update_template_lexing_context(&mut template_stack, token.kind);
+                        previous = previous_kind_after_lexed_token(token.kind);
+                        tokens.push(token);
                     }
                 }
                 LexResult::Error(error) => {
@@ -1581,6 +1611,11 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
                     member: MemberKind::Bracket(index),
                     optional: false,
                 }));
+            } else if matches!(cursor.current().kind, TokenKind::TemplateLiteral(_)) {
+                return syntax_error(
+                    cursor.current(),
+                    "tagged template literals are not supported",
+                );
             } else {
                 return Ok(expr);
             }
@@ -1725,10 +1760,93 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
                 cursor.expect_punctuator(Punctuator::CloseParen)?;
                 Ok(expr)
             }
+            TokenKind::TemplateLiteral(_) => self.parse_template_expression(cursor),
             TokenKind::Punctuator(Punctuator::OpenBrace) => self.parse_object_literal(cursor),
             TokenKind::Punctuator(Punctuator::OpenBracket) => self.parse_array_literal(cursor),
             _ => syntax_error(&token, "expected expression"),
         }
+    }
+
+    fn parse_template_expression(
+        &mut self,
+        cursor: &mut TokenCursor<'_>,
+    ) -> Result<AstRef<Expr>, ParserError> {
+        let first = cursor.current().clone();
+        let TokenKind::TemplateLiteral(kind) = first.kind else {
+            return syntax_error(&first, "expected template literal");
+        };
+        match kind {
+            TemplateTokenKind::NoSubstitution => {
+                cursor.bump();
+                let quasi = self.parse_template_part(&first, kind)?;
+                Ok(self.arena.alloc_expression(Expr::Template(TemplateExpr {
+                    span: first.span(),
+                    tag: None,
+                    quasis: vec![quasi],
+                    expressions: Vec::new(),
+                })))
+            }
+            TemplateTokenKind::Head => {
+                cursor.bump();
+                let mut quasis = vec![self.parse_template_part(&first, kind)?];
+                let mut expressions = Vec::new();
+                loop {
+                    expressions.push(self.parse_expression(cursor)?);
+                    cursor.expect_punctuator(Punctuator::CloseBrace)?;
+                    let quasi_token = cursor.current().clone();
+                    let TokenKind::TemplateLiteral(quasi_kind) = quasi_token.kind else {
+                        return syntax_error(&quasi_token, "expected template continuation");
+                    };
+                    match quasi_kind {
+                        TemplateTokenKind::Middle => {
+                            cursor.bump();
+                            quasis.push(self.parse_template_part(&quasi_token, quasi_kind)?);
+                        }
+                        TemplateTokenKind::Tail => {
+                            cursor.bump();
+                            quasis.push(self.parse_template_part(&quasi_token, quasi_kind)?);
+                            let span = join_spans(first.span(), quasi_token.span());
+                            return Ok(self.arena.alloc_expression(Expr::Template(TemplateExpr {
+                                span,
+                                tag: None,
+                                quasis,
+                                expressions,
+                            })));
+                        }
+                        TemplateTokenKind::Head | TemplateTokenKind::NoSubstitution => {
+                            return syntax_error(&quasi_token, "expected template middle or tail");
+                        }
+                    }
+                }
+            }
+            TemplateTokenKind::Middle | TemplateTokenKind::Tail => {
+                syntax_error(&first, "unexpected template continuation")
+            }
+        }
+    }
+
+    fn parse_template_part(
+        &mut self,
+        token: &Token,
+        kind: TemplateTokenKind,
+    ) -> Result<TemplatePart, ParserError> {
+        let content_span = template_content_span(token, kind)?;
+        let raw_text = self.source_ascii(content_span).ok_or_else(|| ParserError {
+            span: Some(token.span()),
+            kind: ParserErrorKind::Syntax(
+                "core parser template literals currently require ascii source text".into(),
+            ),
+        })?;
+        let cooked_text = cook_template_text(token, &raw_text)?;
+        let identifiers = self.arena.identifiers_mut();
+        let raw = identifiers.reserve_identifier_text(IdentifierSource::RawString, raw_text);
+        let cooked =
+            identifiers.reserve_identifier_text(IdentifierSource::CookedString, cooked_text);
+        Ok(TemplatePart {
+            cooked: Some(cooked),
+            raw,
+            span: token.span(),
+        })
     }
 
     fn parse_object_literal(
@@ -2284,6 +2402,48 @@ fn regexp_literal_allowed_after(previous: Option<TokenKind>) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TemplateLexingContext {
+    brace_depth: u32,
+}
+
+fn update_template_lexing_context(stack: &mut Vec<TemplateLexingContext>, kind: TokenKind) -> bool {
+    match kind {
+        TokenKind::TemplateLiteral(TemplateTokenKind::Head | TemplateTokenKind::Middle) => {
+            stack.push(TemplateLexingContext::default());
+            false
+        }
+        TokenKind::Punctuator(Punctuator::OpenBrace) => {
+            if let Some(context) = stack.last_mut() {
+                context.brace_depth = context.brace_depth.saturating_add(1);
+            }
+            false
+        }
+        TokenKind::Punctuator(Punctuator::CloseBrace) => {
+            let Some(context) = stack.last_mut() else {
+                return false;
+            };
+            if context.brace_depth == 0 {
+                stack.pop();
+                true
+            } else {
+                context.brace_depth = context.brace_depth.saturating_sub(1);
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn previous_kind_after_lexed_token(kind: TokenKind) -> Option<TokenKind> {
+    match kind {
+        TokenKind::TemplateLiteral(TemplateTokenKind::Head | TemplateTokenKind::Middle) => {
+            Some(TokenKind::Punctuator(Punctuator::OpenBrace))
+        }
+        _ => Some(kind),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JumpStatementKind {
     Break,
@@ -2482,6 +2642,147 @@ impl<'a> TokenCursor<'a> {
             }
             _ => None,
         }
+    }
+}
+
+fn template_content_span(
+    token: &Token,
+    kind: TemplateTokenKind,
+) -> Result<SourceSpan, ParserError> {
+    let (leading, trailing) = match kind {
+        TemplateTokenKind::NoSubstitution => (1, 1),
+        TemplateTokenKind::Head => (1, 2),
+        TemplateTokenKind::Middle => (0, 2),
+        TemplateTokenKind::Tail => (0, 1),
+    };
+    if token.span().unit_len() < leading + trailing {
+        return Err(ParserError {
+            span: Some(token.span()),
+            kind: ParserErrorKind::Syntax("invalid template literal token".into()),
+        });
+    }
+    Ok(SourceSpan::new(
+        crate::syntax::source::SourcePosition(token.span().start.0 + leading),
+        crate::syntax::source::SourcePosition(token.span().end.0 - trailing),
+    ))
+}
+
+fn cook_template_text(token: &Token, raw: &str) -> Result<String, ParserError> {
+    let mut cooked = String::new();
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        index += 1;
+        if byte != b'\\' {
+            cooked.push(char::from(byte));
+            continue;
+        }
+        if index >= bytes.len() {
+            return Err(ParserError {
+                span: Some(token.span()),
+                kind: ParserErrorKind::Syntax("invalid template escape".into()),
+            });
+        }
+        let escaped = bytes[index];
+        index += 1;
+        match escaped {
+            b'\n' => {}
+            b'\r' => {
+                if bytes.get(index) == Some(&b'\n') {
+                    index += 1;
+                }
+            }
+            b'`' => cooked.push('`'),
+            b'$' => cooked.push('$'),
+            b'\'' => cooked.push('\''),
+            b'"' => cooked.push('"'),
+            b'\\' => cooked.push('\\'),
+            b'b' => cooked.push('\u{0008}'),
+            b'f' => cooked.push('\u{000c}'),
+            b'n' => cooked.push('\n'),
+            b'r' => cooked.push('\r'),
+            b't' => cooked.push('\t'),
+            b'v' => cooked.push('\u{000b}'),
+            b'0' => cooked.push('\0'),
+            b'x' => {
+                let (unit, next) =
+                    parse_fixed_hex_escape(bytes, index, 2).ok_or_else(|| ParserError {
+                        span: Some(token.span()),
+                        kind: ParserErrorKind::Syntax("invalid template hex escape".into()),
+                    })?;
+                index = next;
+                cooked.push(char::from_u32(unit).ok_or_else(|| ParserError {
+                    span: Some(token.span()),
+                    kind: ParserErrorKind::Syntax("invalid template hex escape".into()),
+                })?);
+            }
+            b'u' if bytes.get(index) == Some(&b'{') => {
+                index += 1;
+                let start = index;
+                let mut unit = 0_u32;
+                while bytes.get(index).is_some_and(|byte| *byte != b'}') {
+                    let digit = hex_value(bytes[index]).ok_or_else(|| ParserError {
+                        span: Some(token.span()),
+                        kind: ParserErrorKind::Syntax("invalid template unicode escape".into()),
+                    })?;
+                    unit = unit.saturating_mul(16).saturating_add(u32::from(digit));
+                    index += 1;
+                }
+                if index == start || bytes.get(index) != Some(&b'}') {
+                    return Err(ParserError {
+                        span: Some(token.span()),
+                        kind: ParserErrorKind::Syntax("invalid template unicode escape".into()),
+                    });
+                }
+                index += 1;
+                cooked.push(char::from_u32(unit).ok_or_else(|| ParserError {
+                    span: Some(token.span()),
+                    kind: ParserErrorKind::Syntax("invalid template unicode escape".into()),
+                })?);
+            }
+            b'u' => {
+                let (unit, next) =
+                    parse_fixed_hex_escape(bytes, index, 4).ok_or_else(|| ParserError {
+                        span: Some(token.span()),
+                        kind: ParserErrorKind::Syntax("invalid template unicode escape".into()),
+                    })?;
+                index = next;
+                cooked.push(char::from_u32(unit).ok_or_else(|| ParserError {
+                    span: Some(token.span()),
+                    kind: ParserErrorKind::Syntax("invalid template unicode escape".into()),
+                })?);
+            }
+            _ => {
+                return Err(ParserError {
+                    span: Some(token.span()),
+                    kind: ParserErrorKind::Syntax(
+                        "unsupported template escape in core parser".into(),
+                    ),
+                });
+            }
+        }
+    }
+    Ok(cooked)
+}
+
+fn parse_fixed_hex_escape(bytes: &[u8], start: usize, count: usize) -> Option<(u32, usize)> {
+    let mut unit = 0_u32;
+    let mut index = start;
+    for _ in 0..count {
+        let digit = hex_value(*bytes.get(index)?)?;
+        unit = unit.saturating_mul(16).saturating_add(u32::from(digit));
+        index += 1;
+    }
+    Some((unit, index))
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -3505,6 +3806,129 @@ mod tests {
         assert_eq!(
             arena.identifiers().identifier_text(*text),
             Some("line\ntext")
+        );
+    }
+
+    #[test]
+    fn parser_builds_template_literal_with_substitution() {
+        let mut arena = ParserArena::new();
+        let expression = parse_first_class_expression(&mut arena, "let value = `a${answer}b`;");
+        let Some(Expr::Template(template)) = arena.expression(expression) else {
+            assert!(matches!(
+                arena.expression(expression),
+                Some(Expr::Template(_))
+            ));
+            return;
+        };
+
+        assert_eq!(template.tag, None);
+        assert_eq!(template.quasis.len(), 2);
+        assert_eq!(template.expressions.len(), 1);
+        assert_eq!(
+            arena
+                .identifiers()
+                .identifier_text(template.quasis[0].cooked.unwrap()),
+            Some("a")
+        );
+        assert_eq!(
+            arena
+                .identifiers()
+                .identifier_text(template.quasis[1].cooked.unwrap()),
+            Some("b")
+        );
+        assert!(matches!(
+            arena.expression(template.expressions[0]),
+            Some(Expr::Name(NameExpr {
+                kind: NameKind::Resolve,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn parser_preserves_cooked_template_escape_text() {
+        let mut arena = ParserArena::new();
+        let expression = parse_first_class_expression(&mut arena, "let value = `line\\ntext`;");
+        let Some(Expr::Template(template)) = arena.expression(expression) else {
+            assert!(matches!(
+                arena.expression(expression),
+                Some(Expr::Template(_))
+            ));
+            return;
+        };
+
+        assert_eq!(template.expressions.len(), 0);
+        assert_eq!(
+            arena
+                .identifiers()
+                .identifier_text(template.quasis[0].cooked.unwrap()),
+            Some("line\ntext")
+        );
+        assert_eq!(
+            arena.identifiers().identifier_text(template.quasis[0].raw),
+            Some("line\\ntext")
+        );
+    }
+
+    #[test]
+    fn parser_keeps_escaped_template_substitution_marker_as_text() {
+        let mut arena = ParserArena::new();
+        let expression =
+            parse_first_class_expression(&mut arena, "let value = `\\${notExpression}`;");
+        let Some(Expr::Template(template)) = arena.expression(expression) else {
+            assert!(matches!(
+                arena.expression(expression),
+                Some(Expr::Template(_))
+            ));
+            return;
+        };
+
+        assert_eq!(template.expressions.len(), 0);
+        assert_eq!(
+            arena
+                .identifiers()
+                .identifier_text(template.quasis[0].cooked.unwrap()),
+            Some("${notExpression}")
+        );
+        assert_eq!(
+            arena.identifiers().identifier_text(template.quasis[0].raw),
+            Some("\\${notExpression}")
+        );
+    }
+
+    #[test]
+    fn parser_rejects_tagged_template_literals() {
+        let source = source("tag`value`;");
+        let mut arena = ParserArena::new();
+        let error = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            ParseMode::Program,
+        )
+        .parse()
+        .unwrap_err();
+
+        assert!(
+            matches!(error.kind, ParserErrorKind::Syntax(message) if message == "tagged template literals are not supported")
+        );
+    }
+
+    #[test]
+    fn parser_rejects_invalid_untagged_template_escape() {
+        let source = source("let value = `bad\\8`;");
+        let mut arena = ParserArena::new();
+        let error = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            ParseMode::Program,
+        )
+        .parse()
+        .unwrap_err();
+
+        assert!(
+            matches!(error.kind, ParserErrorKind::Syntax(message) if message == "unsupported template escape in core parser")
         );
     }
 

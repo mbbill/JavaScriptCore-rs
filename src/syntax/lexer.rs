@@ -162,7 +162,6 @@ impl<'src, 'arena, E> Lexer<'src, 'arena, E> {
 
     pub fn template_literal(&mut self, context: TemplateLexContext) -> LexResult<Token> {
         self.state.goal = LexGoal::TemplateTail;
-        self.skip_trivia(false);
         let start = self.cursor;
         self.scan_template_literal(
             context,
@@ -621,10 +620,18 @@ impl<'src, 'arena, E> Lexer<'src, 'arena, E> {
         start_column: u32,
         begins_at_line_start: bool,
     ) -> LexResult<Token> {
-        if self.peek_unit() == Some(b'`') {
+        let initial_segment = context.expression_depth == 0;
+        if initial_segment && self.peek_unit() == Some(b'`') {
             self.advance_unit();
         }
         while let Some(unit) = self.peek_unit() {
+            if unit == b'\\' {
+                self.advance_unit();
+                if !self.is_eof() {
+                    self.advance_unit();
+                }
+                continue;
+            }
             if unit == b'`' {
                 self.advance_unit();
                 let raw = self
@@ -635,7 +642,11 @@ impl<'src, 'arena, E> Lexer<'src, 'arena, E> {
                         .reserve_identifier(IdentifierSource::CookedString)
                 });
                 return LexResult::Ready(self.make_token(
-                    TokenKind::TemplateLiteral(TemplateTokenKind::NoSubstitution),
+                    TokenKind::TemplateLiteral(if initial_segment {
+                        TemplateTokenKind::NoSubstitution
+                    } else {
+                        TemplateTokenKind::Tail
+                    }),
                     TokenData::Template {
                         cooked,
                         raw,
@@ -660,7 +671,7 @@ impl<'src, 'arena, E> Lexer<'src, 'arena, E> {
                         .reserve_identifier(IdentifierSource::CookedString)
                 });
                 return LexResult::Ready(self.make_token(
-                    TokenKind::TemplateLiteral(if context.expression_depth == 0 {
+                    TokenKind::TemplateLiteral(if initial_segment {
                         TemplateTokenKind::Head
                     } else {
                         TemplateTokenKind::Middle

@@ -45218,6 +45218,133 @@ mod tests {
     }
 
     #[test]
+    fn vm_executes_template_literal_without_substitution() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source("return `plain` === \"plain\";"))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
+    fn vm_executes_template_substitutions_as_strings() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source("return `${1}${2}` === \"12\" && `${1}${2}` !== 3;"))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
+    fn vm_executes_nested_template_substitutions() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source("return `${`a${1}b`}${2}` === \"a1b2\";"))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
+    fn vm_interpolates_template_primitive_values() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "return `${true},${false},${null},${void 0},${1.5}` === \"true,false,null,undefined,1.5\";",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
+    fn vm_evaluates_template_substitutions_left_to_right() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "let log = \"\"; function mark(value) { log = log + value; return value; } let text = `${mark(1)}${mark(2)}${mark(3)}`; return log === \"123\" && text === \"123\";",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
+    fn vm_interpolates_template_object_to_string_result() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "let object = { toString: function() { return \"object\"; } }; return `${object}` === \"object\";",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
+    fn vm_executes_raytrace_style_template_to_string_method() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "class Vector { constructor(x, y, z) { this.x = x; this.y = y; this.z = z; } toString() { return `Vector [${this.x},${this.y},${this.z}]`; } } return new Vector(1, 2, 3).toString() === \"Vector [1,2,3]\";",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
     fn vm_executes_double_literal_and_mixed_number_addition() {
         let mut vm = Vm::new(VmConfig::default());
 

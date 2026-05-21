@@ -169,16 +169,17 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- M4d source-session global lexical/class declarations: top-level
-  `let`/`const`/`class` now persist across runner sources through a distinct
-  global lexical boundary without leaking to `globalThis`.
+- M4e3 non-tagged template literals: parser/lexer support `${...}` template
+  substitutions, bytecompiler lowering preserves left-to-right substitution
+  evaluation, and runtime `ToString` covers primitives plus object
+  `toString`/`valueOf` coercion for template interpolation.
 - Full accepted gate at that checkpoint: `cargo fmt --check`,
   `cargo clippy --lib --all-targets -- -D warnings`, and
-  `cargo test --lib -- --quiet` with 1857 passed.
+  `cargo test --lib -- --quiet` with 1883 passed.
 
 Current git/code note:
 
-- Treat the 1857-test M4d source-session global lexical/class slice as
+- Treat the 1883-test M4e3 template literal slice as
   the last accepted green code checkpoint unless a later progress entry records
   passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
@@ -222,10 +223,11 @@ Known Octane run blockers:
 - Source-session global lexical/class visibility is accepted for the first
   runner contract slice; later realm/global-environment tightening may still be
   needed when full conformance expands beyond Octane-core.
-- Octane-core still has syntax/lowering blockers before all six files can parse
-  and run honestly: `do while` and `switch` are accepted, while template
-  literals still need shared parser/bytecompiler support rather than
-  benchmark-local workarounds.
+- Octane-core syntax/lowering blockers discovered so far are now accepted for
+  `do while`, `switch`, and non-tagged template literals. The next shared M4
+  blocker is runner result extraction, benchmark oracle handling, and score
+  reporting so the engine can distinguish real correctness failures from
+  missing telemetry.
 
 Known full-Octane blockers beyond the core subset:
 
@@ -331,8 +333,9 @@ Layer B: shared language/runtime blockers for Octane-core.
   engine features with focused tests.
 - Current status: top-level `function`/`var` cross-source visibility works and
   top-level `class`/`let`/`const` now use a distinct source-session global
-  lexical boundary. `do while` and `switch` are accepted; the next shared
-  blocker is non-tagged template literal lowering.
+  lexical boundary. `do while`, `switch`, and non-tagged template literals are
+  accepted. The next shared blocker is M4f runner result extraction and oracle
+  handling.
 
 Layer C: Octane-core correctness.
 
@@ -537,10 +540,13 @@ M4: Current - run Octane-core correctly in the Rust engine.
   case-test evaluation order, duplicate-default rejection, `break` through
   `finally`, and `continue` targeting the enclosing loop rather than the
   switch.
-- Active sub-slice: M4e3 adds non-tagged template literal parsing/lowering.
-  Preserve cooked string parts, left-to-right expression evaluation, and JS
-  string coercion rather than relying on benchmark-specific string assembly.
-- Planned sub-slice: M4f completes runner result extraction, benchmark oracle
+- Accepted sub-slice: M4e3 added non-tagged template literal parsing/lowering.
+  The lexer resumes template tails after substitution braces, the parser
+  preserves raw and cooked quasis for supported escapes, the bytecompiler
+  lowers substitutions through a real `ToString` opcode, and runtime coercion
+  covers primitives plus object `toString`/`valueOf`. Tagged templates and
+  non-ASCII template source remain outside this slice.
+- Active sub-slice: M4f completes runner result extraction, benchmark oracle
   handling, score reporting, and interpreter-only vs baseline-allowed
   comparison records.
 - Planned sub-slice: M4g runs and records the complete Octane-core pass/fail
