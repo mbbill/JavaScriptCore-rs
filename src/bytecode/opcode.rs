@@ -39,6 +39,7 @@ pub enum Opcode {
 /// bytecode tables are available.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum CoreOpcode {
+    LoadEmpty,
     LoadUndefined,
     LoadNull,
     LoadBool,
@@ -145,6 +146,8 @@ pub enum CoreOpcode {
     CallDirect,
     Throw,
     TakeException,
+    EnsureThis,
+    ReturnDerived,
     Return,
 }
 
@@ -158,6 +161,7 @@ impl CoreOpcode {
             return None;
         };
         match id.generated_index() {
+            108 => Some(Self::LoadEmpty),
             1 => Some(Self::LoadUndefined),
             2 => Some(Self::LoadNull),
             3 => Some(Self::LoadBool),
@@ -264,6 +268,8 @@ impl CoreOpcode {
             20 => Some(Self::CallDirect),
             41 => Some(Self::Throw),
             42 => Some(Self::TakeException),
+            109 => Some(Self::EnsureThis),
+            110 => Some(Self::ReturnDerived),
             21 => Some(Self::Return),
             _ => None,
         }
@@ -271,6 +277,7 @@ impl CoreOpcode {
 
     const fn id(self) -> u16 {
         match self {
+            Self::LoadEmpty => 108,
             Self::LoadUndefined => 1,
             Self::LoadNull => 2,
             Self::LoadBool => 3,
@@ -377,6 +384,8 @@ impl CoreOpcode {
             Self::CallDirect => 20,
             Self::Throw => 41,
             Self::TakeException => 42,
+            Self::EnsureThis => 109,
+            Self::ReturnDerived => 110,
             Self::Return => 21,
         }
     }

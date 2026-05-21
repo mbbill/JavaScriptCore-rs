@@ -1699,9 +1699,16 @@ pub struct InterpreterWriteBarrierRecord {
 
 fn frame_local_capacity(shape: RegisterFrameShape) -> u32 {
     shape
-        .num_vars
-        .saturating_add(shape.num_callee_locals)
-        .saturating_add(shape.num_temporaries)
+        .num_callee_locals
+        .max(shape.num_vars.saturating_add(shape.num_temporaries))
+}
+
+fn empty_value() -> RuntimeValue {
+    RuntimeValue::from_encoded(EncodedJsValue(0))
+}
+
+fn is_empty_value(value: RuntimeValue) -> bool {
+    value.is_empty_or_deleted_sentinel()
 }
 
 fn read_constant(
@@ -9250,6 +9257,13 @@ impl DispatchHost for CoreOpcodeDispatchHost {
             return DispatchOutcome::Fail(ExecutionError::NoActiveFrame);
         };
         match opcode {
+            CoreOpcode::LoadEmpty => {
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                write_register(state, window, destination, empty_value())
+            }
             CoreOpcode::LoadUndefined => {
                 let destination = match register_operand(instruction, 0) {
                     Ok(register) => register,
@@ -10668,12 +10682,11 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let receiver_register = VirtualRegister::argument_or_header(5);
-                let receiver = match state.registers.read(
-                    window,
-                    receiver_register,
-                    Some(state.code_block.constants()),
-                ) {
+                let receiver = match register_operand(instruction, 2).and_then(|register| {
+                    state
+                        .registers
+                        .read(window, register, Some(state.code_block.constants()))
+                }) {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
@@ -11173,6 +11186,69 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     return DispatchOutcome::Fail(ExecutionError::MissingPendingException);
                 };
                 write_register(state, window, destination, pending.value)
+            }
+            CoreOpcode::EnsureThis => {
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let value = match register_operand(instruction, 1).and_then(|register| {
+                    state
+                        .registers
+                        .read(window, register, Some(state.code_block.constants()))
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                if is_empty_value(value) {
+                    return self.type_error_outcome_with_heap(
+                        state.heap,
+                        "Cannot access 'this' before calling super()",
+                    );
+                }
+                write_register(state, window, destination, value)
+            }
+            CoreOpcode::ReturnDerived => {
+                let source = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let this_register = match register_operand(instruction, 1) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let returned =
+                    match state
+                        .registers
+                        .read(window, source, Some(state.code_block.constants()))
+                    {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
+                if self.objects.is_constructor_return_value(returned) {
+                    return DispatchOutcome::Return(returned);
+                }
+                if returned.kind() == ValueKind::Undefined {
+                    let this_value = match state.registers.read(
+                        window,
+                        this_register,
+                        Some(state.code_block.constants()),
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
+                    if is_empty_value(this_value) {
+                        return self.type_error_outcome_with_heap(
+                            state.heap,
+                            "Cannot access 'this' before calling super()",
+                        );
+                    }
+                    return DispatchOutcome::Return(this_value);
+                }
+                self.type_error_outcome_with_heap(
+                    state.heap,
+                    "Cannot return a non-object type in the constructor of a derived class",
+                )
             }
             CoreOpcode::Return => {
                 let source = match register_operand(instruction, 0) {
@@ -13229,11 +13305,25 @@ impl CoreOpcodeDispatchHost {
             Ok(register) => register,
             Err(error) => return DispatchOutcome::Fail(error),
         };
-        let this_value = match register_operand(instruction, 1).and_then(|register| {
+        let current_this = match register_operand(instruction, 1).and_then(|register| {
             state
                 .registers
                 .read(caller_window, register, Some(state.code_block.constants()))
         }) {
+            Ok(value) => value,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        if !is_empty_value(current_this) {
+            return self.type_error_outcome_with_heap(
+                state.heap,
+                "'super()' can't be called more than once in a constructor",
+            );
+        }
+        let this_value = match state.registers.read(
+            caller_window,
+            VirtualRegister::argument_or_header(5),
+            Some(state.code_block.constants()),
+        ) {
             Ok(value) => value,
             Err(error) => return DispatchOutcome::Fail(error),
         };
@@ -13956,15 +14046,6 @@ impl CoreOpcodeDispatchHost {
                             &request.post_construct_field_initialization_constructors,
                             value,
                         ) {
-                            return outcome;
-                        }
-                    } else if let Some(callee) = request
-                        .callee_value
-                        .filter(|callee| self.objects.has_super_constructor(*callee))
-                    {
-                        if let Err(outcome) =
-                            self.initialize_instance_fields_once(state, callee, value)
-                        {
                             return outcome;
                         }
                     }
@@ -25727,7 +25808,7 @@ mod tests {
                     shape: RegisterFrameShape {
                         num_parameters_including_this: 1,
                         num_vars: 2,
-                        num_callee_locals: 1,
+                        num_callee_locals: 2,
                         num_temporaries: 0,
                         special: Default::default(),
                     },
@@ -25740,7 +25821,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(stack.frame_depth(), 1);
-        assert_eq!(registers.register_count(), 4);
+        assert_eq!(registers.register_count(), 3);
         let installed = stack.top_frame().unwrap().clone();
         assert_eq!(
             registers

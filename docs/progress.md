@@ -204,6 +204,7 @@ one-off test adjustments.
 - 2026-05-21: M4f Octane runner scoring accepted: reserved result telemetry now yields typed benchmark success records, per-benchmark and suite scores, oracle-alert failures, and interpreter-vs-baseline comparison records; full gates passed including `cargo test --lib -- --quiet` 1888 passed.
 - 2026-05-21: M4g precursor accepted: non-decimal number literals, trailing call/new argument commas, global/host function capture cells, and sloppy top-level global assignment reads clear the known Octane-core parse/bytecode blockers; full gates passed including `cargo test --lib -- --quiet` 1899 passed.
 - 2026-05-21: Octane scheduler refreshed: the active proof target is full JetStream 3 Octane at local C++ JSC-level performance, with M4g now focused on shared runtime blockers before benchmark-specific debugging.
+- 2026-05-21: A0 JSC fidelity audit/fix accepted for register windows, capture ordering, ordinary fallthrough, and derived-constructor `this`/`super`/return semantics; full gates passed including `cargo test --lib -- --quiet` 1914 passed.
 
 ## Open High-Risk Gaps
 

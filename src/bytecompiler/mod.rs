@@ -843,9 +843,12 @@ pub fn emit_unlinked_code_from_parsed_ast(
             BytecompilerMode::Program | BytecompilerMode::Eval
         ) && !scope.semantics.strict,
         sloppy_top_level_assignment_expression: None,
+        is_derived_constructor: false,
+        this_binding: AstBytecodeEmitter::global_object_register(),
         initialized_cells: HashSet::new(),
         function_metadata_indices: function_plan.metadata_indices.clone(),
         function_captures: function_plan.captures.clone(),
+        derived_constructor_metadata: function_plan.derived_constructors.clone(),
         loop_stack: Vec::new(),
         break_stack: Vec::new(),
         finally_stack: Vec::new(),
@@ -855,6 +858,7 @@ pub fn emit_unlinked_code_from_parsed_ast(
         function_bodies.push(emitter.emit_function_body(*metadata)?);
     }
     emitter.predeclare_root_scope_locals(&scope)?;
+    emitter.predeclare_immediate_function_capture_bindings(&scope)?;
     emitter.emit_intrinsic_bindings()?;
     emitter.initialize_captured_local_cells()?;
     emitter.emit_scope_function_bindings(&scope)?;
@@ -1014,6 +1018,7 @@ struct FunctionCompilationPlan {
     metadata_order: Vec<AstRef<FunctionMetadata>>,
     metadata_indices: HashMap<u32, u32>,
     captures: HashMap<u32, Vec<ParserIdentifier>>,
+    derived_constructors: HashSet<u32>,
 }
 
 fn collect_function_compilation_plan(
@@ -1225,6 +1230,9 @@ fn collect_expression_function_metadata(
         Expr::Class(class) => {
             if let Some(heritage) = class.heritage {
                 collect_expression_function_metadata(arena, heritage, plan)?;
+                if let Some(constructor) = explicit_constructor_metadata_for_class(arena, class) {
+                    plan.derived_constructors.insert(constructor.raw_index());
+                }
             }
             for element in &class.elements {
                 if let crate::syntax::ast::ClassElementName::Computed(expression) = element.name {
@@ -1251,6 +1259,25 @@ fn collect_expression_function_metadata(
             Ok(())
         }
     }
+}
+
+fn explicit_constructor_metadata_for_class(
+    arena: &ParserArena,
+    class: &ClassExpr,
+) -> Option<AstRef<FunctionMetadata>> {
+    class
+        .elements
+        .iter()
+        .find(|element| {
+            !element.is_synthesized_default_constructor
+                && !element.is_static
+                && element.kind == ClassElementKind::Method
+                && matches!(
+                    element.name,
+                    ClassElementName::Public(name) if arena.identifiers().identifier_text(name) == Some("constructor")
+                )
+        })
+        .and_then(|element| element.metadata)
 }
 
 fn collect_pattern_function_metadata(
@@ -2531,13 +2558,19 @@ struct AstBytecodeEmitter<'a, 'g> {
     captured_bindings: HashSet<ParserIdentifier>,
     allows_sloppy_top_level_global_assignment: bool,
     sloppy_top_level_assignment_expression: Option<AstRef<Expr>>,
+    is_derived_constructor: bool,
+    this_binding: VirtualRegister,
     initialized_cells: HashSet<ParserIdentifier>,
     function_metadata_indices: HashMap<u32, u32>,
     function_captures: HashMap<u32, Vec<ParserIdentifier>>,
+    derived_constructor_metadata: HashSet<u32>,
     loop_stack: Vec<LoopControlLabels>,
     break_stack: Vec<BreakControlLabels>,
     finally_stack: Vec<ActiveFinallyContext>,
 }
+
+type IntrinsicLoadEmitter<'a, 'g> =
+    fn(&mut AstBytecodeEmitter<'a, 'g>) -> Result<VirtualRegister, BytecompilerEmissionError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LocalBinding {
@@ -2646,6 +2679,10 @@ impl AstBytecodeEmitter<'_, '_> {
         VirtualRegister::argument_or_header(5)
     }
 
+    fn this_register(&self) -> VirtualRegister {
+        self.this_binding
+    }
+
     fn is_captured_binding(&self, name: ParserIdentifier) -> bool {
         self.captured_bindings.contains(&name)
     }
@@ -2739,6 +2776,12 @@ impl AstBytecodeEmitter<'_, '_> {
         generation.source = self.generator.plan().source.clone();
         generation.root = GenerationRoot::FunctionNode;
         let mut generator = BytecodeGenerator::new(generation);
+        let is_derived_constructor = self.function_metadata_is_derived_constructor(metadata_ref);
+        let this_binding = if is_derived_constructor {
+            generator.registers_mut().reserve_local()
+        } else {
+            Self::global_object_register()
+        };
         let mut child = AstBytecodeEmitter {
             arena: self.arena,
             generator: &mut generator,
@@ -2749,13 +2792,20 @@ impl AstBytecodeEmitter<'_, '_> {
             captured_bindings: self.captured_bindings.clone(),
             allows_sloppy_top_level_global_assignment: false,
             sloppy_top_level_assignment_expression: None,
+            is_derived_constructor,
+            this_binding,
             initialized_cells: HashSet::new(),
             function_metadata_indices: self.function_metadata_indices.clone(),
             function_captures: self.function_captures.clone(),
+            derived_constructor_metadata: self.derived_constructor_metadata.clone(),
             loop_stack: Vec::new(),
             break_stack: Vec::new(),
             finally_stack: Vec::new(),
         };
+        if is_derived_constructor {
+            let empty_this = child.emit_load_empty()?;
+            child.emit_move(this_binding, empty_this);
+        }
         for parameter in &metadata.parameters {
             child.predeclare_pattern_binding(parameter.pattern)?;
         }
@@ -2764,7 +2814,7 @@ impl AstBytecodeEmitter<'_, '_> {
             .get(&metadata_ref.raw_index())
             .cloned()
             .unwrap_or_default();
-        for (index, capture) in captures.iter().copied().enumerate() {
+        for capture in captures.iter().copied() {
             let register = child.generator.registers_mut().reserve_local();
             child.locals.insert(
                 capture,
@@ -2773,16 +2823,26 @@ impl AstBytecodeEmitter<'_, '_> {
                     kind: LocalBindingKind::ClosureCell,
                 },
             );
-            let value = child.emit_load_capture(index.try_into().unwrap_or(u32::MAX))?;
-            child.emit_move(register, value);
-            child.initialized_cells.insert(capture);
         }
         child.predeclare_scope_locals(&scope)?;
         if let Some(name) = metadata.name {
             child.predeclare_function_binding(name)?;
         }
+        let arguments_object = child.predeclare_arguments_object_binding(&metadata, &scope)?;
+        child.predeclare_immediate_function_capture_bindings(&scope)?;
+        for (index, capture) in captures.iter().copied().enumerate() {
+            let binding = *child
+                .locals
+                .get(&capture)
+                .ok_or(BytecompilerEmissionError::UnboundIdentifier(capture))?;
+            let value = child.emit_load_capture(index.try_into().unwrap_or(u32::MAX))?;
+            child.emit_move(binding.register, value);
+            child.initialized_cells.insert(capture);
+        }
         child.emit_intrinsic_bindings()?;
-        child.emit_arguments_object_binding(&metadata, &scope)?;
+        if let Some(arguments) = arguments_object {
+            child.emit_arguments_object_binding(arguments)?;
+        }
         child.initialize_captured_local_cells()?;
         for (index, parameter) in metadata.parameters.iter().enumerate() {
             if let Some(rest_pattern) = child.parameter_rest_pattern(parameter.pattern)? {
@@ -2799,24 +2859,28 @@ impl AstBytecodeEmitter<'_, '_> {
             child.emit_function_binding(name, metadata_ref)?;
         }
         child.emit_scope_function_bindings(&scope)?;
-        let mut last_value = None;
         let mut terminated = false;
         for statement in &scope.statements {
             if terminated {
                 break;
             }
             let emission = child.emit_statement(*statement)?;
-            last_value = emission.value;
             terminated = emission.terminated;
         }
         if !terminated {
-            let value = match last_value {
-                Some(value) => value,
-                None => child.emit_load_undefined()?,
+            let value = if child.is_derived_constructor {
+                child.emit_ensure_this(child.this_binding)?
+            } else {
+                child.emit_load_undefined()?
             };
             child.emit_return(value);
         }
         install_code_block_literal_text_table(self.arena, generator.finish().code_block)
+    }
+
+    fn function_metadata_is_derived_constructor(&self, metadata: AstRef<FunctionMetadata>) -> bool {
+        self.derived_constructor_metadata
+            .contains(&metadata.raw_index())
     }
 
     fn predeclare_scope_locals(
@@ -3066,6 +3130,66 @@ impl AstBytecodeEmitter<'_, '_> {
         Ok(())
     }
 
+    fn predeclare_arguments_object_binding(
+        &mut self,
+        metadata: &FunctionMetadata,
+        scope: &crate::syntax::ScopeNode,
+    ) -> Result<Option<ParserIdentifier>, BytecompilerEmissionError> {
+        let Some(arguments) = self.arena.identifiers().identifier_for_text("arguments") else {
+            return Ok(None);
+        };
+        if self.locals.contains_key(&arguments)
+            || !function_uses_arguments_identifier(self.arena, metadata, scope, arguments)?
+        {
+            return Ok(None);
+        }
+        self.predeclare_function_binding(arguments)?;
+        Ok(Some(arguments))
+    }
+
+    fn predeclare_immediate_function_capture_bindings(
+        &mut self,
+        scope: &crate::syntax::ScopeNode,
+    ) -> Result<(), BytecompilerEmissionError> {
+        let mut functions = Vec::new();
+        collect_scope_immediate_function_metadata(self.arena, scope, &mut functions)?;
+        for metadata in functions {
+            let captures = self
+                .function_captures
+                .get(&metadata.raw_index())
+                .cloned()
+                .unwrap_or_default();
+            for capture in captures {
+                self.predeclare_global_capture_binding_if_needed(capture);
+            }
+        }
+        Ok(())
+    }
+
+    fn predeclare_global_capture_binding_if_needed(&mut self, name: ParserIdentifier) {
+        if !self.is_captured_binding(name)
+            || self.locals.contains_key(&name)
+            || self.global_capture_bindings.contains_key(&name)
+        {
+            return;
+        }
+        if self
+            .global_bindings
+            .kind_for_identifier(self.arena, name)
+            .is_some_and(BytecompilerGlobalBindingKind::is_source_lexical)
+        {
+            return;
+        }
+        let register = self.generator.registers_mut().reserve_local();
+        self.global_capture_bindings.insert(
+            name,
+            LocalBinding {
+                register,
+                kind: LocalBindingKind::ClosureCell,
+            },
+        );
+    }
+
     fn emit_scope_function_bindings(
         &mut self,
         scope: &crate::syntax::ScopeNode,
@@ -3086,58 +3210,63 @@ impl AstBytecodeEmitter<'_, '_> {
     }
 
     fn emit_intrinsic_bindings(&mut self) -> Result<(), BytecompilerEmissionError> {
-        self.emit_intrinsic_binding("undefined", Self::emit_load_undefined)?;
-        self.emit_intrinsic_binding("Object", Self::emit_load_object_constructor)?;
-        self.emit_intrinsic_binding("Array", Self::emit_load_array_constructor)?;
-        self.emit_intrinsic_binding("Math", Self::emit_load_math_object)?;
-        self.emit_intrinsic_binding("JSON", Self::emit_load_json_object)?;
-        self.emit_intrinsic_binding("Reflect", Self::emit_load_reflect_object)?;
-        self.emit_intrinsic_binding("String", Self::emit_load_string_constructor)?;
-        self.emit_intrinsic_binding("Number", Self::emit_load_number_constructor)?;
-        self.emit_intrinsic_binding("Boolean", Self::emit_load_boolean_constructor)?;
-        self.emit_intrinsic_binding("Error", Self::emit_load_error_constructor)?;
-        self.emit_intrinsic_binding("TypeError", Self::emit_load_type_error_constructor)?;
-        self.emit_intrinsic_binding("Map", Self::emit_load_map_constructor)?;
-        self.emit_intrinsic_binding("Set", Self::emit_load_set_constructor)?;
-        self.emit_intrinsic_binding("WeakMap", Self::emit_load_weak_map_constructor)?;
-        self.emit_intrinsic_binding("WeakSet", Self::emit_load_weak_set_constructor)?;
-        self.emit_intrinsic_binding("RegExp", Self::emit_load_regexp_constructor)?;
-        self.emit_intrinsic_binding("Promise", Self::emit_load_promise_constructor)?;
-        self.emit_intrinsic_binding("Date", Self::emit_load_date_constructor)?;
-        self.emit_intrinsic_binding("BigInt", Self::emit_load_bigint_constructor)?;
-        self.emit_intrinsic_binding("ArrayBuffer", Self::emit_load_array_buffer_constructor)?;
-        self.emit_intrinsic_binding("Uint8Array", Self::emit_load_uint8_array_constructor)?;
-        self.emit_intrinsic_binding("DataView", Self::emit_load_data_view_constructor)?;
-        self.emit_intrinsic_binding("Proxy", Self::emit_load_proxy_constructor)?;
-        self.emit_intrinsic_binding("Symbol", Self::emit_load_symbol_constructor)
-    }
-
-    fn emit_intrinsic_binding(
-        &mut self,
-        text: &str,
-        emit_load: fn(&mut Self) -> Result<VirtualRegister, BytecompilerEmissionError>,
-    ) -> Result<(), BytecompilerEmissionError> {
-        let Some(name) = self.arena.identifiers().identifier_for_text(text) else {
-            return Ok(());
-        };
-        if self.locals.contains_key(&name) {
-            return Ok(());
+        let intrinsics: &[(&str, IntrinsicLoadEmitter<'_, '_>)] = &[
+            ("undefined", Self::emit_load_undefined),
+            ("Object", Self::emit_load_object_constructor),
+            ("Array", Self::emit_load_array_constructor),
+            ("Math", Self::emit_load_math_object),
+            ("JSON", Self::emit_load_json_object),
+            ("Reflect", Self::emit_load_reflect_object),
+            ("String", Self::emit_load_string_constructor),
+            ("Number", Self::emit_load_number_constructor),
+            ("Boolean", Self::emit_load_boolean_constructor),
+            ("Error", Self::emit_load_error_constructor),
+            ("TypeError", Self::emit_load_type_error_constructor),
+            ("Map", Self::emit_load_map_constructor),
+            ("Set", Self::emit_load_set_constructor),
+            ("WeakMap", Self::emit_load_weak_map_constructor),
+            ("WeakSet", Self::emit_load_weak_set_constructor),
+            ("RegExp", Self::emit_load_regexp_constructor),
+            ("Promise", Self::emit_load_promise_constructor),
+            ("Date", Self::emit_load_date_constructor),
+            ("BigInt", Self::emit_load_bigint_constructor),
+            ("ArrayBuffer", Self::emit_load_array_buffer_constructor),
+            ("Uint8Array", Self::emit_load_uint8_array_constructor),
+            ("DataView", Self::emit_load_data_view_constructor),
+            ("Proxy", Self::emit_load_proxy_constructor),
+            ("Symbol", Self::emit_load_symbol_constructor),
+        ];
+        let mut local_intrinsics = Vec::new();
+        let mut global_intrinsics = Vec::new();
+        for (text, emit_load) in intrinsics {
+            let Some(name) = self.arena.identifiers().identifier_for_text(text) else {
+                continue;
+            };
+            if self.locals.contains_key(&name) {
+                continue;
+            }
+            if self.global_bindings.contains_identifier(self.arena, name) {
+                global_intrinsics.push(name);
+                continue;
+            }
+            let register = self.generator.registers_mut().reserve_local();
+            let kind = self.local_binding_kind(name);
+            let binding = LocalBinding { register, kind };
+            self.locals.insert(name, binding);
+            local_intrinsics.push((name, binding, *emit_load));
         }
-        if self.global_bindings.contains_identifier(self.arena, name) {
+        for name in global_intrinsics {
             self.emit_global_capture_binding_if_needed(name)?;
-            return Ok(());
         }
-        let register = self.generator.registers_mut().reserve_local();
-        let kind = self.local_binding_kind(name);
-        let binding = LocalBinding { register, kind };
-        self.locals.insert(name, binding);
-        let value = emit_load(self)?;
-        match kind {
-            LocalBindingKind::Value => self.emit_write_binding(binding, value),
-            LocalBindingKind::ClosureCell => {
-                let cell = self.emit_new_closure_cell(value)?;
-                self.emit_move(register, cell);
-                self.initialized_cells.insert(name);
+        for (name, binding, emit_load) in local_intrinsics {
+            let value = emit_load(self)?;
+            match binding.kind {
+                LocalBindingKind::Value => self.emit_write_binding(binding, value),
+                LocalBindingKind::ClosureCell => {
+                    let cell = self.emit_new_closure_cell(value)?;
+                    self.emit_move(binding.register, cell);
+                    self.initialized_cells.insert(name);
+                }
             }
         }
         Ok(())
@@ -3147,7 +3276,7 @@ impl AstBytecodeEmitter<'_, '_> {
         &mut self,
         name: ParserIdentifier,
     ) -> Result<(), BytecompilerEmissionError> {
-        if !self.is_captured_binding(name) || self.global_capture_bindings.contains_key(&name) {
+        if !self.is_captured_binding(name) {
             return Ok(());
         }
         if self
@@ -3157,15 +3286,24 @@ impl AstBytecodeEmitter<'_, '_> {
         {
             return Ok(());
         }
-        let register = self.generator.registers_mut().reserve_local();
-        let binding = LocalBinding {
-            register,
-            kind: LocalBindingKind::ClosureCell,
+        let binding = if let Some(binding) = self.global_capture_bindings.get(&name).copied() {
+            binding
+        } else {
+            let register = self.generator.registers_mut().reserve_local();
+            let binding = LocalBinding {
+                register,
+                kind: LocalBindingKind::ClosureCell,
+            };
+            self.global_capture_bindings.insert(name, binding);
+            binding
         };
+        if self.initialized_cells.contains(&name) {
+            return Ok(());
+        }
         let value = self.emit_get_by_name(Self::global_object_register(), name)?;
         let cell = self.emit_new_closure_cell(value)?;
-        self.emit_move(register, cell);
-        self.global_capture_bindings.insert(name, binding);
+        self.emit_move(binding.register, cell);
+        self.initialized_cells.insert(name);
         Ok(())
     }
 
@@ -3174,9 +3312,6 @@ impl AstBytecodeEmitter<'_, '_> {
         name: ParserIdentifier,
     ) -> Result<LocalBinding, BytecompilerEmissionError> {
         if let Some(binding) = self.locals.get(&name) {
-            return Ok(*binding);
-        }
-        if let Some(binding) = self.global_capture_bindings.get(&name) {
             return Ok(*binding);
         }
         self.emit_global_capture_binding_if_needed(name)?;
@@ -3188,18 +3323,11 @@ impl AstBytecodeEmitter<'_, '_> {
 
     fn emit_arguments_object_binding(
         &mut self,
-        metadata: &FunctionMetadata,
-        scope: &crate::syntax::ScopeNode,
+        arguments: ParserIdentifier,
     ) -> Result<(), BytecompilerEmissionError> {
-        let Some(arguments) = self.arena.identifiers().identifier_for_text("arguments") else {
-            return Ok(());
-        };
-        if self.locals.contains_key(&arguments)
-            || !function_uses_arguments_identifier(self.arena, metadata, scope, arguments)?
-        {
+        if self.initialized_cells.contains(&arguments) {
             return Ok(());
         }
-        self.predeclare_function_binding(arguments)?;
         let binding = *self
             .locals
             .get(&arguments)
@@ -3210,9 +3338,9 @@ impl AstBytecodeEmitter<'_, '_> {
             LocalBindingKind::ClosureCell => {
                 let cell = self.emit_new_closure_cell(value)?;
                 self.emit_move(binding.register, cell);
-                self.initialized_cells.insert(arguments);
             }
         }
+        self.initialized_cells.insert(arguments);
         Ok(())
     }
 
@@ -4031,7 +4159,7 @@ impl AstBytecodeEmitter<'_, '_> {
                         .ok_or(BytecompilerEmissionError::UnboundIdentifier(name.name))?;
                     self.emit_read_resolved_binding(binding)
                 }
-                NameKind::This => Ok(Self::global_object_register()),
+                NameKind::This => self.emit_this_value(),
                 _ => Err(BytecompilerEmissionError::UnsupportedExpression(
                     "special name expression is not lowered yet",
                 )),
@@ -4570,7 +4698,7 @@ impl AstBytecodeEmitter<'_, '_> {
                     ));
                 }
             };
-            let this_value = VirtualRegister::argument_or_header(5);
+            let this_value = self.this_register();
             let mut argument_registers = Vec::new();
             for argument in arguments {
                 argument_registers.push(self.emit_expression(*argument)?);
@@ -4663,7 +4791,7 @@ impl AstBytecodeEmitter<'_, '_> {
         &mut self,
         arguments: &[AstRef<Expr>],
     ) -> Result<VirtualRegister, BytecompilerEmissionError> {
-        let this_value = VirtualRegister::argument_or_header(5);
+        let this_value = self.this_register();
         let mut argument_registers = Vec::new();
         for argument in arguments {
             argument_registers.push(self.emit_expression(*argument)?);
@@ -4683,7 +4811,8 @@ impl AstBytecodeEmitter<'_, '_> {
             OperandWidth::Narrow,
             operands,
         );
-        Ok(destination)
+        self.emit_move(this_value, destination);
+        Ok(this_value)
     }
 
     fn emit_function_expression(
@@ -4981,6 +5110,7 @@ impl AstBytecodeEmitter<'_, '_> {
         &mut self,
         name: ParserIdentifier,
     ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let receiver = self.emit_this_value()?;
         let destination = self
             .generator
             .registers_mut()
@@ -4991,6 +5121,7 @@ impl AstBytecodeEmitter<'_, '_> {
             vec![
                 Operand::Register(destination),
                 Operand::IdentifierIndex(name.0),
+                Operand::Register(receiver),
             ],
         );
         Ok(destination)
@@ -5760,6 +5891,44 @@ impl AstBytecodeEmitter<'_, '_> {
         Ok(destination)
     }
 
+    fn emit_load_empty(&mut self) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::LoadEmpty.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::Register(destination)],
+        );
+        Ok(destination)
+    }
+
+    fn emit_this_value(&mut self) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let this = self.this_register();
+        if self.is_derived_constructor {
+            self.emit_ensure_this(this)
+        } else {
+            Ok(this)
+        }
+    }
+
+    fn emit_ensure_this(
+        &mut self,
+        source: VirtualRegister,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::EnsureThis.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::Register(destination), Operand::Register(source)],
+        );
+        Ok(destination)
+    }
+
     fn emit_new_closure_cell(
         &mut self,
         value: VirtualRegister,
@@ -5970,6 +6139,16 @@ impl AstBytecodeEmitter<'_, '_> {
         function_index: u32,
         captures: &[ParserIdentifier],
     ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let mut capture_registers = Vec::with_capacity(captures.len());
+        for capture in captures {
+            let binding = self.emit_function_capture_binding(*capture)?;
+            if binding.kind != LocalBindingKind::ClosureCell {
+                return Err(BytecompilerEmissionError::UnsupportedExpression(
+                    "captured binding was not lowered to a closure cell",
+                ));
+            }
+            capture_registers.push(binding.register);
+        }
         let destination = self
             .generator
             .registers_mut()
@@ -5979,15 +6158,7 @@ impl AstBytecodeEmitter<'_, '_> {
             Operand::UnsignedImmediate(function_index),
             Operand::UnsignedImmediate(captures.len().try_into().unwrap_or(u32::MAX)),
         ];
-        for capture in captures {
-            let binding = self.emit_function_capture_binding(*capture)?;
-            if binding.kind != LocalBindingKind::ClosureCell {
-                return Err(BytecompilerEmissionError::UnsupportedExpression(
-                    "captured binding was not lowered to a closure cell",
-                ));
-            }
-            operands.push(Operand::Register(binding.register));
-        }
+        operands.extend(capture_registers.into_iter().map(Operand::Register));
         self.generator.instructions_mut().declare_instruction(
             CoreOpcode::LoadFunction.opcode(),
             OperandWidth::Narrow,
@@ -6583,10 +6754,23 @@ impl AstBytecodeEmitter<'_, '_> {
     }
 
     fn emit_return(&mut self, source: VirtualRegister) {
+        let opcode = if self.is_derived_constructor {
+            CoreOpcode::ReturnDerived
+        } else {
+            CoreOpcode::Return
+        };
+        let operands = if self.is_derived_constructor {
+            vec![
+                Operand::Register(source),
+                Operand::Register(self.this_binding),
+            ]
+        } else {
+            vec![Operand::Register(source)]
+        };
         self.generator.instructions_mut().declare_instruction(
-            CoreOpcode::Return.opcode(),
+            opcode.opcode(),
             OperandWidth::Narrow,
-            vec![Operand::Register(source)],
+            operands,
         );
     }
 
@@ -7209,6 +7393,40 @@ mod tests {
             .collect()
     }
 
+    fn load_function_registers(
+        code_block: &UnlinkedCodeBlock,
+    ) -> Vec<(VirtualRegister, Vec<VirtualRegister>)> {
+        code_block
+            .instructions()
+            .declarations()
+            .iter()
+            .filter(|instruction| {
+                CoreOpcode::from_opcode(instruction.opcode) == Some(CoreOpcode::LoadFunction)
+            })
+            .filter_map(|instruction| {
+                let destination = match instruction.operands.first() {
+                    Some(Operand::Register(register)) => *register,
+                    _ => return None,
+                };
+                let capture_count = match instruction.operands.get(2) {
+                    Some(Operand::UnsignedImmediate(count)) => *count as usize,
+                    _ => return None,
+                };
+                let captures = instruction
+                    .operands
+                    .iter()
+                    .skip(3)
+                    .take(capture_count)
+                    .filter_map(|operand| match operand {
+                        Operand::Register(register) => Some(*register),
+                        _ => None,
+                    })
+                    .collect();
+                Some((destination, captures))
+            })
+            .collect()
+    }
+
     #[test]
     fn bytecompiler_plan_validation_accepts_empty_early_phase() {
         let plan = BytecompilerOutputPlan::new(
@@ -7775,6 +7993,48 @@ mod tests {
     }
 
     #[test]
+    fn parsed_ast_class_method_host_capture_keeps_temporaries_out_of_var_prefix() {
+        let mut globals = BytecompilerGlobalBindingSet::from_host_names(["performance"]);
+        globals.declare(BytecompilerGlobalBinding::source_class("Benchmark"));
+        let plan = emit_program_plan_with_global_bindings(
+            "class Benchmark { runIteration() { return performance.now(); } } return Benchmark;",
+            26,
+            globals,
+        );
+        let program = plan.unlinked_code.as_ref().unwrap();
+        let frame = program.frame();
+        let load_functions = load_function_registers(program);
+        let method_load = load_functions
+            .iter()
+            .find(|(_, captures)| captures.len() == 1)
+            .expect("method LoadFunction captures performance");
+
+        for (destination, captures) in &load_functions {
+            let destination_index = destination
+                .to_local_index()
+                .expect("LoadFunction destination is a local temporary");
+            assert!(
+                destination_index >= frame.num_vars,
+                "LoadFunction destination {:?} was counted inside num_vars {}",
+                destination,
+                frame.num_vars
+            );
+            assert!(!captures.contains(destination));
+        }
+        let capture_index = method_load.1[0]
+            .to_local_index()
+            .expect("captured performance cell is a local");
+        assert!(
+            capture_index < frame.num_vars,
+            "captured performance cell should be in the var prefix"
+        );
+        assert_eq!(
+            frame.num_callee_locals,
+            frame.num_vars.saturating_add(frame.num_temporaries)
+        );
+    }
+
+    #[test]
     fn parsed_ast_function_expression_captures_host_global_before_body_use() {
         let plan = emit_program_plan_with_global_bindings(
             "var f = function() { alert('x'); }; return f;",
@@ -7883,6 +8143,129 @@ mod tests {
                 sink: crate::interpreter::CoreHostOutputSink::Alert,
                 text: "x".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn m4g_function_fallthrough_returns_undefined() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let completion = vm
+            .execute_source(source("function f() { 42; } return f();"))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+    }
+
+    #[test]
+    fn m4g_constructor_assignment_installs_callable_property() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let completion = vm
+            .execute_source(source(
+                "function Field() { this.width = function() { return 64; }; } \
+                 let f = new Field(); \
+                 return typeof f.width === \"function\" && f.width() === 64;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn m4g_constructor_object_assignment_returns_constructed_instance() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let completion = vm
+            .execute_source(source(
+                "function Field() { this.marker = 1; this.payload = { value: 42 }; } \
+                 let f = new Field(); \
+                 return f.marker === 1 && f.payload.value === 42 && f !== f.payload;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn m4g_nested_installer_fallthrough_installs_callable_and_returns_undefined() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let completion = vm
+            .execute_source(source(
+                "function outer() { \
+                     let target = {}; \
+                     function install() { target.callable = function() { return 17; }; } \
+                     let result = install(); \
+                     return result === void 0 \
+                         && typeof target.callable === \"function\" \
+                         && target.callable() === 17; \
+                 } \
+                 return outer();",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn m4g_source_session_class_method_host_capture_same_source() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session_with_host_globals(
+                vec![source(
+                    "class Benchmark { runIteration() { return performance.now(); } } \
+                     let b = new Benchmark(); \
+                     return typeof Benchmark === \"function\" \
+                         && typeof b.runIteration() === \"number\";",
+                )],
+                SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[ExecutionCompletion::Returned(RuntimeValue::from_bool(true))]
+        );
+    }
+
+    #[test]
+    fn m4g_source_session_class_method_host_capture_split_sources() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session_with_host_globals(
+                vec![
+                    source("class Benchmark { runIteration() { return performance.now(); } }"),
+                    source(
+                        "let b = new Benchmark(); \
+                         return typeof Benchmark === \"function\" \
+                             && typeof b.runIteration() === \"number\";",
+                    ),
+                ],
+                SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::undefined()),
+                ExecutionCompletion::Returned(RuntimeValue::from_bool(true)),
+            ]
         );
     }
 

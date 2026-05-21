@@ -38134,6 +38134,119 @@ mod tests {
     }
 
     #[test]
+    fn vm_p18b_derived_constructor_rejects_this_before_super() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+
+        let completion = vm
+            .execute_source(source(
+                "class Base { } \
+                 class Derived extends Base { constructor() { this.value = 1; super(); } } \
+                 try { new Derived(); } catch (error) { return error instanceof TypeError; } \
+                 return false;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_p18b_derived_constructor_rejects_missing_super_on_fallthrough() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+
+        let completion = vm
+            .execute_source(source(
+                "class Base { } \
+                 class Derived extends Base { constructor() { } } \
+                 try { new Derived(); } catch (error) { return error instanceof TypeError; } \
+                 return false;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_p18b_derived_constructor_rejects_return_undefined_before_super() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+
+        let completion = vm
+            .execute_source(source(
+                "class Base { } \
+                 class Derived extends Base { constructor() { return; } } \
+                 try { new Derived(); } catch (error) { return error instanceof TypeError; } \
+                 return false;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_p18b_derived_constructor_rejects_primitive_return() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+
+        let completion = vm
+            .execute_source(source(
+                "class Base { } \
+                 class Derived extends Base { constructor() { super(); return 1; } } \
+                 try { new Derived(); } catch (error) { return error instanceof TypeError; } \
+                 return false;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_p18b_derived_constructor_rejects_duplicate_super() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+
+        let completion = vm
+            .execute_source(source(
+                "class Base { } \
+                 class Derived extends Base { constructor() { super(); super(); } } \
+                 try { new Derived(); } catch (error) { return error instanceof TypeError; } \
+                 return false;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_p18b_super_getter_after_object_returning_super_uses_derived_this() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+
+        let completion = vm
+            .execute_source(source(
+                "class Base { constructor() { return { value: 40 }; } get answer() { return this.value + 2; } } \
+                 class Derived extends Base { constructor() { super(); this.answerValue = super.answer; } } \
+                 return new Derived().answerValue;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
     fn vm_p18b_throwing_super_cleans_frames_roots_and_no_gc_depth() {
         let mut vm = Vm::new(VmConfig::interpreter_only());
 

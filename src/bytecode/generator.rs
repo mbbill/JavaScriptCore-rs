@@ -429,7 +429,7 @@ impl RegisterAllocator {
     pub fn new(frame: RegisterFrameShape) -> Self {
         Self {
             next_local: frame.num_vars,
-            next_temporary: 0,
+            next_temporary: frame.num_temporaries,
             frame,
         }
     }
@@ -438,19 +438,16 @@ impl RegisterAllocator {
         let register = VirtualRegister::local(self.next_local);
         self.next_local = self.next_local.saturating_add(1);
         self.frame.num_vars = self.frame.num_vars.max(self.next_local);
+        self.update_frame_capacity();
         register
     }
 
     pub fn reserve_temporary(&mut self, _lifetime: TemporaryLifetime) -> VirtualRegister {
-        let index = self.frame.num_vars.saturating_add(self.next_temporary);
-        let register = VirtualRegister::local(index);
+        let register =
+            VirtualRegister::local(self.frame.num_vars.saturating_add(self.next_temporary));
         self.next_temporary = self.next_temporary.saturating_add(1);
         self.frame.num_temporaries = self.frame.num_temporaries.max(self.next_temporary);
-        self.frame.num_callee_locals = self.frame.num_callee_locals.max(
-            self.frame
-                .num_vars
-                .saturating_add(self.frame.num_temporaries),
-        );
+        self.update_frame_capacity();
         register
     }
 
@@ -460,6 +457,14 @@ impl RegisterAllocator {
 
     pub fn frame_shape(&self) -> RegisterFrameShape {
         self.frame
+    }
+
+    fn update_frame_capacity(&mut self) {
+        self.frame.num_callee_locals = self.frame.num_callee_locals.max(
+            self.frame
+                .num_vars
+                .saturating_add(self.frame.num_temporaries),
+        );
     }
 }
 
@@ -633,6 +638,55 @@ mod tests {
         let findings = plan.validate().findings;
         assert!(findings.contains(&GenerationValidationFinding::GeneratorificationMissingRegisters));
         assert!(findings.contains(&GenerationValidationFinding::DuplicateYieldState { state: 1 }));
+    }
+
+    #[test]
+    fn register_allocator_temporary_does_not_extend_var_prefix() {
+        let mut allocator = RegisterAllocator::new(RegisterFrameShape {
+            num_vars: 1,
+            num_callee_locals: 1,
+            special: SpecialRegisters {
+                this_register: VirtualRegister::argument_or_header(0),
+                scope_register: VirtualRegister::local(0),
+                ..SpecialRegisters::default()
+            },
+            ..RegisterFrameShape::default()
+        });
+
+        let temporary = allocator.reserve_temporary(TemporaryLifetime::Expression);
+        let frame = allocator.frame_shape();
+
+        assert_eq!(temporary.to_local_index(), Some(1));
+        assert_eq!(frame.num_vars, 1);
+        assert_eq!(frame.num_temporaries, 1);
+        assert_eq!(frame.num_callee_locals, 2);
+        let mut plan = GenerationPlan::new(CodeKind::Function, ParseMode::NormalFunction);
+        plan.registers = frame;
+        assert!(plan.validate().is_valid());
+    }
+
+    #[test]
+    fn register_allocator_local_prefix_precedes_temporary_window() {
+        let mut allocator = RegisterAllocator::new(RegisterFrameShape {
+            num_vars: 1,
+            num_callee_locals: 1,
+            special: SpecialRegisters {
+                this_register: VirtualRegister::argument_or_header(0),
+                scope_register: VirtualRegister::local(0),
+                ..SpecialRegisters::default()
+            },
+            ..RegisterFrameShape::default()
+        });
+
+        let local = allocator.reserve_local();
+        let temporary = allocator.reserve_temporary(TemporaryLifetime::Expression);
+        let frame = allocator.frame_shape();
+
+        assert_eq!(local.to_local_index(), Some(1));
+        assert_eq!(temporary.to_local_index(), Some(2));
+        assert_eq!(frame.num_vars, 2);
+        assert_eq!(frame.num_temporaries, 1);
+        assert_eq!(frame.num_callee_locals, 3);
     }
 
     #[test]

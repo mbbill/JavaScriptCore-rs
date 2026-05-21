@@ -313,6 +313,26 @@ Correctness comes before optimization, but performance pressure must shape the
 design from the beginning. The goal is not "passes Octane slowly"; the goal is a
 rewrite that can explain and close its performance gap against C++ JSC.
 
+This is a faithful safe-Rust rewrite of JavaScriptCore, not a new JavaScript
+engine from scratch. For every non-trivial feature, runtime behavior, bytecode
+lowering, interpreter path, JIT path, GC/rooting rule, or benchmark issue, use
+C++ JavaScriptCore as the source of truth before inventing Rust-local logic.
+Borrow JSC's tested behavior and algorithms wherever possible, then reshape the
+types, ownership, borrowing, rooting, and mutation boundaries so the design is
+safe Rust.
+
+Deviations from JSC require a clear reason:
+
+- Rust ownership, borrowing, rooting, or safety requires a different structure.
+- The Rust design is demonstrably cleaner, faster, or safer while preserving the
+  same observable semantics.
+
+When the Rust implementation hits a bug or benchmark failure, first ask whether
+C++ JSC has the same issue. If not, compare against the original implementation
+and identify which JSC behavior or invariant the Rust rewrite failed to carry
+over. Do not spend long loops debugging an invented design before checking the
+tested original.
+
 ## Octane BFS Dependency Map
 
 Work moves by shared dependency layer, not by chasing one benchmark until it
@@ -394,7 +414,79 @@ Layer F: full Octane performance parity.
   same machine and command inputs, or the remaining gap is quantified and
   attributed to specific missing tiers/features.
 
+## JSC Fidelity Audit Plan
+
+The rewrite is now in audit-and-fix mode before further feature expansion. The
+audit is breadth-first and evidence driven: inspect the corresponding C++ JSC
+components, classify the Rust subsystem, fix accidental deviations, then move
+to the next shared dependency. Do not treat a green Rust test suite as proof of
+fidelity unless it covers the JSC behavior being claimed.
+
+Audit classifications:
+
+- Faithful: Rust behavior and invariants match JSC; Rust types may differ only
+  to express ownership, rooting, or borrowing safely.
+- Intentional Rust deviation: the observable semantics match JSC, but the
+  internal structure differs for safe Rust ownership/borrowing/rooting or a
+  clearly better design.
+- Accidental deviation: Rust invented or drifted from JSC behavior without a
+  justified reason; this must be fixed before building more work on top.
+
+Audit order:
+
+- A0 accepted 2026-05-21: function fallthrough, derived constructors,
+  `super()`, `this` binding, capture lowering, and register allocation were
+  audited against C++ JSC and fixed where Rust had drifted. JSC evidence:
+  `BytecodeGenerator.cpp`, `BytecodeGenerator.h`,
+  `BytecodeGeneratorBaseInlines.h`, `NodesCodegen.cpp`, `CodeBlock.h`,
+  `UnlinkedCodeBlock.h`, `CommonSlowPaths.cpp`, and LLInt return/super
+  construct paths. Rust files: `src/bytecode/generator.rs`,
+  `src/bytecode/opcode.rs`, `src/bytecompiler/mod.rs`,
+  `src/interpreter/mod.rs`, and `src/vm/mod.rs`. Classification: ordinary
+  function fallthrough was faithful; register-window growth, late capture
+  allocation, and derived-constructor `this`/`super`/return handling were
+  accidental deviations and are fixed. Remaining intentional Rust deviation:
+  derived-constructor checks are represented as explicit Rust bytecode helper
+  opcodes while preserving JSC observable semantics.
+- A1 bytecompiler fidelity: source/program completion, function returns,
+  declaration binding, lexical/global environment lowering, captures, class
+  lowering, and source-session behavior against JSC `BytecodeGenerator`.
+- A2 interpreter/runtime fidelity: call, construct, property lookup/store,
+  prototype behavior, object allocation, constructor return normalization,
+  exceptions, and host/global behavior against JSC LLInt slow paths,
+  `JITOperations`, `JSObject`, `JSFunction`, and `JSGlobalObject`.
+- A3 VM/linking/execution fidelity: `CodeBlock`, executable/function tables,
+  source sessions, frame/entry ownership, and tiering boundaries against JSC
+  `CodeBlock`, `Executable`, `VM`, LLInt, and baseline JIT entry contracts.
+- A4 memory fidelity: `JSCell`, heap ownership, write barriers, roots,
+  weak/ephemeron behavior, finalization, and visitor marking against JSC heap
+  and `WriteBarrier` contracts.
+- A5 JIT fidelity: LLInt/baseline/IC/tiering/runtime-helper structure against
+  JSC before widening Octane performance work.
+
+Every accepted audit/fix checkpoint must record the JSC files inspected, Rust
+files inspected, classification, fixes made, tests/gates run, and remaining
+known deviations.
+
 ## Current Priority Queue
+
+F0: Current - audit and fix existing Rust code against C++ JSC before the next
+rewrite phase.
+
+- Main agent: own the audit priority queue, delegate subsystem comparisons to
+  agents, require JSC source evidence for every non-trivial patch, integrate
+  fixes, and reject unproven Rust-local behavior.
+- Sub-agents: inspect assigned Rust and C++ JSC components, classify fidelity,
+  and implement fixes only when the write scope is explicit and disjoint.
+- Active batch: A1/A2 shared bytecompiler-runtime fidelity. The next audits
+  should cover standard globals as real global properties, live global
+  resolution after mutation, default/class constructor metadata, class-call
+  rejection, sloppy `this`, and source-session completion behavior before more
+  benchmark-specific debugging.
+- Completion evidence for F0: all existing Rust subsystems have passed the
+  breadth-first fidelity audit above, accidental deviations have fixes or
+  tracked blockers, and full gates plus relevant benchmark probes pass from a
+  clean committed checkpoint.
 
 M0: Accepted - restore a clean accepted baseline.
 
@@ -661,6 +753,8 @@ Implementation batch:
 - Has bounded file ownership.
 - Adds tests at the correct layer.
 - Must report whether the implementation exposes a missing upstream contract.
+- Must report which C++ JSC files/components were inspected, what behavior or
+  algorithm was borrowed, and any intentional deviation from JSC.
 
 Audit batch:
 
@@ -685,11 +779,18 @@ Each delegated batch should be assigned with:
 - Dependencies still blocked.
 - File/module ownership.
 - Explicit non-goals.
+- C++ JSC source files/components to inspect before editing.
+- Expected JSC behavior or algorithm to preserve.
+- Allowed Rust-specific deviations, limited to ownership, safety, or clearly
+  better design.
 - Required tests and gates.
 - Expected final report format.
 
 The main agent reviews each batch for:
 
+- Whether the implementation is faithful to the inspected JSC behavior.
+- Whether any deviation from JSC is justified by Rust ownership/safety or a
+  clearly better design.
 - Ownership consistency.
 - Dependency direction.
 - Barrier/root/handle discipline.
