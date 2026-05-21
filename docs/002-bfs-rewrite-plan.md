@@ -110,7 +110,7 @@ Full Octane is the target. The core subset is the first correctness gate because
 it requires fewer unrelated features than `gbemu`, `mandreel`, `zlib`,
 `regexp`, `typescript`, and code-load style tests.
 
-Accepted M1 runner contract:
+Accepted Octane runner contract:
 
 - The first Rust runner is a synchronous, non-browser,
   `DefaultBenchmark`-equivalent runner for the local `Octane` group.
@@ -141,7 +141,7 @@ Accepted M1 runner contract:
 - Do not use legacy Octane `BenchmarkSuite`, reference-score throughput loops,
   or benchmark-source hacks.
 
-Accepted M1 feature map:
+Accepted Octane-core feature map:
 
 - `richards`: prototype-style functions, linked lists, allocation churn,
   polymorphic calls, integer counters, and throwing queue/hold-count oracle.
@@ -179,9 +179,8 @@ Accepted green checkpoint:
 
 Current git/code note:
 
-- The current working tree may contain documentation or active-batch edits.
-  Treat the 1828-test M3d1 safe shell-host global slice as the last accepted green code
-  checkpoint unless a later progress entry records passing gates.
+- Treat the 1828-test M3d1 safe shell-host global slice as the last accepted
+  green code checkpoint unless a later progress entry records passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
   repairing that baseline.
 
@@ -356,16 +355,16 @@ M2: Accepted - build Octane-core execution prerequisites in parallel.
 - Deferred by design: runtime behavior for `load`/`readFile` and a real global
   lexical environment for cross-source top-level `let`/`const`.
 
-M3: Current - add Octane-core runtime intrinsics and shell globals.
+M3: Accepted - add Octane-core runtime intrinsics and shell globals.
 
-- Main agent: protect the accepted canonical `Math` global-object boundary and
-  keep the remaining M3 work serial where it defines shared runtime ownership.
-  Review every runtime intrinsic for benchmark-visible mutation, roots,
-  barriers, and deterministic runner behavior before accepting it.
-- Sub-agents: implement the remaining M3 work in ordered batches: Math runtime
-  intrinsics (`floor`, `sqrt`, `log`, `LN2`, `random`); String and global
-  runtime intrinsics (`charCodeAt`, `substring`, `fromCharCode`, `parseInt`);
-  then shell host globals (`performance.now`, `load`, `readFile`, `print`,
+- Main agent: protected the accepted canonical `Math` global-object boundary,
+  serialized the runtime batches where they defined shared ownership, and
+  reviewed benchmark-visible mutation, roots, barriers, and deterministic
+  runner behavior before accepting each slice.
+- Sub-agents: implemented the ordered M3 batches: Math runtime intrinsics
+  (`floor`, `sqrt`, `log`, `LN2`, `random`); String and global runtime
+  intrinsics (`charCodeAt`, `substring`, `fromCharCode`, `parseInt`); then safe
+  shell host globals (`performance.now`, read-only `readFile`, `print`,
   `console`, `alert`).
 - Completion evidence: each API has focused tests, deterministic behavior where
   benchmark repeatability requires it, benchmark-visible overrides persist
