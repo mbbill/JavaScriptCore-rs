@@ -31,11 +31,12 @@ rewrite. Preserve JavaScriptCore's real engine responsibilities while adapting
 them to Rust ownership, rooting, frame, exception, runtime, GC, and execution
 tier contracts.
 
-The current public proof target is the full JetStream 3 Octane group at local
-C++ JavaScriptCore-level performance. Treat Octane as a correctness and
-performance forcing function: first make the benchmark run honestly, then widen
-to the full Octane set, then optimize by comparing behavior, bytecode, ICs,
-generated code, tiering, and runtime decisions against C++ JavaScriptCore.
+The current proof target is full JetStream 3 Octane at local C++
+JavaScriptCore-level performance. Treat Octane as a correctness and performance
+forcing function: first make Octane-core run honestly, then widen to full
+Octane correctness, then close performance by comparing behavior, bytecode,
+ICs, generated code, tiering, runtime calls, and allocation behavior against
+C++ JavaScriptCore.
 
 Own priority, dependency order, and parallelism across the whole rewrite. Keep
 the rewrite breadth-first before depth-first: expand and validate major engine
@@ -169,17 +170,17 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- M4e3 non-tagged template literals: parser/lexer support `${...}` template
-  substitutions, bytecompiler lowering preserves left-to-right substitution
-  evaluation, and runtime `ToString` covers primitives plus object
-  `toString`/`valueOf` coercion for template interpolation.
+- M4g runtime-only Octane-core matrix precursor: parser/lowering blockers found
+  so far are accepted for `do while`, `switch`, non-tagged template literals,
+  non-decimal number literals, trailing call/new argument commas, function
+  capture cells, and sloppy top-level global assignment reads.
 - Full accepted gate at that checkpoint: `cargo fmt --check`,
   `cargo clippy --lib --all-targets -- -D warnings`, and
-  `cargo test --lib -- --quiet` with 1883 passed.
+  `cargo test --lib -- --quiet` with 1899 passed.
 
 Current git/code note:
 
-- Treat the 1883-test M4e3 template literal slice as
+- Treat the 1899-test M4g precursor slice as
   the last accepted green code checkpoint unless a later progress entry records
   passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
@@ -199,17 +200,22 @@ Major accepted capabilities:
   accepted construction spine.
 - Interpreter fallback and differential testing for the accepted native subset.
 - Octane manifest, scoring math, source preparation, deterministic-random
-  runner source generation, and prepared benchmark execution/failure
-  classification under `shell::octane`.
+  runner source generation, prepared benchmark execution/failure
+  classification, success records, score records, oracle-alert classification,
+  and interpreter-vs-baseline comparison under `shell::octane`.
 
 Known Octane run blockers:
 
-- Benchmark telemetry and runner control: the Rust-side Octane manifest,
-  `DefaultBenchmark` scoring contract, file/provenance preparation, generated
-  prelude/random/runner source preparation, VM source-session execution, and
-  failure classification now exist under `shell::octane`. Result extraction,
-  score reporting, oracle handling, and full interpreter-vs-baseline comparison
-  are still missing.
+- Octane-core now reaches runtime-only failures in both interpreter-only and
+  baseline-allowed modes. The current matrix is: `richards` runner
+  `ExpectedFunction`; `delta-blue` runner `ExpectedObject`; `crypto`, `splay`,
+  and `navier-stokes` benchmark-file `ExpectedObject`; `raytrace` runner
+  `ExpectedObject`.
+- Two shared runtime/lowering blockers have been diagnosed and should be fixed
+  before chasing individual benchmarks: ordinary function fallthrough currently
+  returns the last expression instead of `undefined`, which corrupts constructor
+  return behavior; and late global/host capture local allocation can collide
+  with live temporaries during class method lowering.
 - Full shell-style `load(path)` execution is not implemented. It is not on the
   shortest path to the first accepted-equivalent Octane-core runner because the
   active JetStream 3 driver uses `readFile`/runner-side file loading for CLI
@@ -224,10 +230,12 @@ Known Octane run blockers:
   runner contract slice; later realm/global-environment tightening may still be
   needed when full conformance expands beyond Octane-core.
 - Octane-core syntax/lowering blockers discovered so far are now accepted for
-  `do while`, `switch`, and non-tagged template literals. Runner result
-  telemetry and scoring are accepted. The next shared M4 blocker is a complete
-  Octane-core pass/fail matrix so the engine can schedule missing features from
-  classified evidence.
+  `do while`, `switch`, non-tagged template literals, non-decimal number
+  literals, trailing argument commas, function capture cells, and sloppy
+  top-level global assignment reads. The next shared M4 work is fixing the
+  diagnosed runtime/lowering blockers, rerunning the complete Octane-core
+  pass/fail matrix, and scheduling the next shared feature family from that
+  evidence.
 
 Known full-Octane blockers beyond the core subset:
 
@@ -329,14 +337,16 @@ Layer B: shared language/runtime blockers for Octane-core.
 - Main agent: prioritize source-session and bytecode/runtime boundaries that
   unblock multiple Octane-core files before touching isolated benchmark logic.
 - Sub-agents: implement source-session global lexical/class declarations,
-  `do while`, `switch`, non-tagged template literals, benchmark oracle
-  compatibility, and any missing standard-library pieces as independent
-  engine features with focused tests.
+  `do while`, `switch`, non-tagged template literals, parser numeric forms,
+  function/global capture fixes, benchmark oracle compatibility, and any
+  missing standard-library pieces as independent engine features with focused
+  tests.
 - Current status: top-level `function`/`var` cross-source visibility works and
   top-level `class`/`let`/`const` now use a distinct source-session global
-  lexical boundary. `do while`, `switch`, and non-tagged template literals are
-  accepted. The next shared blocker is the M4g Octane-core pass/fail matrix,
-  which should classify missing engine features by shared dependency.
+  lexical boundary. `do while`, `switch`, non-tagged template literals,
+  non-decimal number literals, trailing argument commas, function capture cells,
+  and sloppy top-level global assignment reads are accepted. The current matrix
+  has moved from parse/bytecode blockers to runtime blockers.
 
 Layer C: Octane-core correctness.
 
@@ -345,6 +355,9 @@ Layer C: Octane-core correctness.
   source-compatible behavior.
 - Sub-agents: own failing feature families, not individual one-off benchmark
   edits. No benchmark source hacks are allowed.
+- Current priority: fix shared runtime/lowering blockers before individual
+  benchmark debugging. First fix ordinary function fallthrough return semantics
+  and late local/register allocation collision, then rerun the six-test matrix.
 - Completion evidence: `richards`, `delta-blue`, `crypto`, `splay`,
   `navier-stokes`, and `raytrace` complete under the accepted runner with
   validated results and comparable score records.
@@ -550,8 +563,14 @@ M4: Current - run Octane-core correctly in the Rust engine.
   benchmark success records, per-benchmark and suite score reporting,
   oracle-alert classification, and interpreter-only vs baseline-allowed
   comparison records.
-- Active sub-slice: M4g runs and records the complete Octane-core pass/fail
-  matrix, then uses the classified matrix to schedule M5 instead of guessing.
+- Accepted sub-slice: M4g precursor cleared the remaining parse/bytecode
+  blockers discovered by the first matrix: non-decimal number literals,
+  trailing call/new argument commas, global/host function capture cells, and
+  sloppy top-level global assignment reads.
+- Active sub-slice: M4g completes the Octane-core runtime matrix by fixing
+  shared engine blockers first, then rerunning and recording the six-benchmark
+  matrix. Current shared fixes are ordinary function fallthrough returning
+  `undefined` and late local allocation avoiding live temporary collisions.
 
 M5: Make the accepted baseline JIT cover Octane-core hot paths.
 
