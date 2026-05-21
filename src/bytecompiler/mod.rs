@@ -3135,6 +3135,23 @@ impl AstBytecodeEmitter<'_, '_> {
         Ok(())
     }
 
+    fn emit_function_capture_binding(
+        &mut self,
+        name: ParserIdentifier,
+    ) -> Result<LocalBinding, BytecompilerEmissionError> {
+        if let Some(binding) = self.locals.get(&name) {
+            return Ok(*binding);
+        }
+        if let Some(binding) = self.global_capture_bindings.get(&name) {
+            return Ok(*binding);
+        }
+        self.emit_global_capture_binding_if_needed(name)?;
+        self.global_capture_bindings
+            .get(&name)
+            .copied()
+            .ok_or(BytecompilerEmissionError::UnboundIdentifier(name))
+    }
+
     fn emit_arguments_object_binding(
         &mut self,
         metadata: &FunctionMetadata,
@@ -5875,11 +5892,7 @@ impl AstBytecodeEmitter<'_, '_> {
             Operand::UnsignedImmediate(captures.len().try_into().unwrap_or(u32::MAX)),
         ];
         for capture in captures {
-            let binding = *self
-                .locals
-                .get(capture)
-                .or_else(|| self.global_capture_bindings.get(capture))
-                .ok_or(BytecompilerEmissionError::UnboundIdentifier(*capture))?;
+            let binding = self.emit_function_capture_binding(*capture)?;
             if binding.kind != LocalBindingKind::ClosureCell {
                 return Err(BytecompilerEmissionError::UnsupportedExpression(
                     "captured binding was not lowered to a closure cell",
@@ -6891,6 +6904,7 @@ mod tests {
         SourceOrigin, SourcePosition, SourceProvider, SourceSpan, SourceText,
     };
     use crate::syntax::{AstBuilder, Parser, ParserArena};
+    use crate::vm::{SourceSessionHostGlobalConfig, Vm, VmConfig};
     use std::sync::Arc;
 
     fn valid_generation_plan() -> GenerationPlan {
@@ -7632,6 +7646,90 @@ mod tests {
         assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
         assert!(unlinked_contains_opcode(nested, CoreOpcode::GetByName));
         assert_eq!(load_function_capture_counts(program), vec![1]);
+    }
+
+    #[test]
+    fn parsed_ast_function_declaration_captures_host_global_alert_before_body_use() {
+        let plan = emit_program_plan_with_global_bindings(
+            "function f() { alert('x'); } return f;",
+            20,
+            BytecompilerGlobalBindingSet::from_host_names(["alert"]),
+        );
+        let program = plan.unlinked_code.as_ref().unwrap();
+        let nested = plan.function_bodies.first().unwrap();
+
+        assert_eq!(load_function_capture_counts(program), vec![1]);
+        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
+        assert!(unlinked_contains_opcode(nested, CoreOpcode::GetClosureCell));
+    }
+
+    #[test]
+    fn parsed_ast_function_declaration_captures_host_global_performance_before_body_use() {
+        let plan = emit_program_plan_with_global_bindings(
+            "function f() { return performance.now(); } return f;",
+            21,
+            BytecompilerGlobalBindingSet::from_host_names(["performance"]),
+        );
+        let program = plan.unlinked_code.as_ref().unwrap();
+        let nested = plan.function_bodies.first().unwrap();
+
+        assert_eq!(load_function_capture_counts(program), vec![1]);
+        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
+        assert!(unlinked_contains_opcode(nested, CoreOpcode::GetClosureCell));
+    }
+
+    #[test]
+    fn parsed_ast_function_expression_captures_host_global_before_body_use() {
+        let plan = emit_program_plan_with_global_bindings(
+            "var f = function() { alert('x'); }; return f;",
+            23,
+            BytecompilerGlobalBindingSet::from_host_names(["alert"]),
+        );
+        let program = plan.unlinked_code.as_ref().unwrap();
+        let nested = plan.function_bodies.first().unwrap();
+
+        assert_eq!(load_function_capture_counts(program), vec![1]);
+        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
+        assert!(unlinked_contains_opcode(nested, CoreOpcode::GetClosureCell));
+    }
+
+    #[test]
+    fn parsed_ast_function_declaration_captures_unknown_global_read_as_global_object_capture() {
+        let plan = emit_program_plan_with_global_bindings(
+            "function f(x) { if (x) return DV; return 1; } return f;",
+            22,
+            BytecompilerGlobalBindingSet::default(),
+        );
+        let program = plan.unlinked_code.as_ref().unwrap();
+        let nested = plan.function_bodies.first().unwrap();
+
+        assert_eq!(load_function_capture_counts(program), vec![1]);
+        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
+        assert!(unlinked_contains_opcode(nested, CoreOpcode::GetClosureCell));
+    }
+
+    #[test]
+    fn vm_source_session_nested_function_reads_host_global_alert() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session_with_host_globals(
+                vec![source("function f() { return alert('x'); } return f();")],
+                SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[ExecutionCompletion::Returned(RuntimeValue::undefined())]
+        );
+        assert_eq!(
+            execution.host_output_records(),
+            &[crate::interpreter::CoreHostOutputRecord {
+                sink: crate::interpreter::CoreHostOutputSink::Alert,
+                text: "x".into(),
+            }]
+        );
     }
 
     #[test]
