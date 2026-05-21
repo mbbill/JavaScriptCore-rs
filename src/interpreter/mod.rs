@@ -3878,6 +3878,7 @@ enum CoreNativeFunction {
     MathRandom,
     MathSqrt,
     MathTrunc,
+    ParseInt,
     JsonParse,
     JsonStringify,
     ReflectApply,
@@ -3893,6 +3894,7 @@ enum CoreNativeFunction {
     ProxyRevocable,
     ProxyRevoke,
     StringConstructor,
+    StringFromCharCode,
     NumberConstructor,
     BooleanConstructor,
     ErrorConstructor,
@@ -3990,8 +3992,10 @@ enum CoreNativeFunction {
     ArrayReduce,
     ArrayReduceRight,
     StringCharAt,
+    StringCharCodeAt,
     StringIndexOf,
     StringSlice,
+    StringSubstring,
     Assign,
     Create,
     DefineProperty,
@@ -4694,6 +4698,11 @@ impl CoreObjectStore {
         let prototype = self.ensure_string_prototype();
         self.install_constructor_prototype(constructor, prototype);
         self.install_prototype_constructor_with_write_barrier(heap, prototype, constructor)?;
+        self.install_native_method(
+            constructor,
+            "fromCharCode",
+            CoreNativeFunction::StringFromCharCode,
+        );
         Ok(constructor)
     }
 
@@ -4924,6 +4933,14 @@ impl CoreObjectStore {
             enumerable: false,
             configurable: true,
         };
+        let parse_int = self.allocate_native_function(CoreNativeFunction::ParseInt);
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "parseInt",
+            parse_int,
+            standard_attributes,
+        )?;
         let math = self.allocate_math_object();
         self.install_standard_global_data_property(
             heap,
@@ -5262,8 +5279,10 @@ impl CoreObjectStore {
         self.string_prototype = Some(prototype);
         for (name, native_function) in [
             ("charAt", CoreNativeFunction::StringCharAt),
+            ("charCodeAt", CoreNativeFunction::StringCharCodeAt),
             ("indexOf", CoreNativeFunction::StringIndexOf),
             ("slice", CoreNativeFunction::StringSlice),
+            ("substring", CoreNativeFunction::StringSubstring),
         ] {
             self.install_native_method(prototype, name, native_function);
         }
@@ -13659,6 +13678,7 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::MathRandom => self.native_math_random(),
             CoreNativeFunction::MathSqrt => self.native_math_sqrt(arguments),
             CoreNativeFunction::MathTrunc => self.native_math_trunc(arguments),
+            CoreNativeFunction::ParseInt => self.native_parse_int(arguments),
             CoreNativeFunction::JsonParse => self.native_json_parse(state.heap, arguments),
             CoreNativeFunction::JsonStringify => self.native_json_stringify(state, arguments),
             CoreNativeFunction::ReflectApply => {
@@ -13688,6 +13708,9 @@ impl CoreOpcodeDispatchHost {
             }
             CoreNativeFunction::StringConstructor => {
                 self.native_string_constructor(state.heap, arguments)
+            }
+            CoreNativeFunction::StringFromCharCode => {
+                self.native_string_from_char_code(state.heap, arguments)
             }
             CoreNativeFunction::NumberConstructor => self.native_number_constructor(arguments),
             CoreNativeFunction::BooleanConstructor => {
@@ -13934,9 +13957,15 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::StringCharAt => {
                 self.native_string_char_at(state.heap, this_value, arguments)
             }
+            CoreNativeFunction::StringCharCodeAt => {
+                self.native_string_char_code_at(this_value, arguments)
+            }
             CoreNativeFunction::StringIndexOf => self.native_string_index_of(this_value, arguments),
             CoreNativeFunction::StringSlice => {
                 self.native_string_slice(state.heap, this_value, arguments)
+            }
+            CoreNativeFunction::StringSubstring => {
+                self.native_string_substring(state.heap, this_value, arguments)
             }
             CoreNativeFunction::Assign => self.native_object_assign(state, arguments),
             CoreNativeFunction::Create => self.native_object_create(state.heap, arguments),
@@ -17418,6 +17447,38 @@ impl CoreOpcodeDispatchHost {
         Ok(number_to_f64(number))
     }
 
+    fn native_parse_int(
+        &self,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let value = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        let text = self
+            .primitive_to_string(value)
+            .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
+        let radix = self.parse_int_radix_argument(arguments)?;
+        Ok(parse_int_text(&text, radix))
+    }
+
+    fn parse_int_radix_argument(&self, arguments: &[RuntimeValue]) -> Result<i32, DispatchOutcome> {
+        let Some(value) = arguments.get(1).copied() else {
+            return Ok(0);
+        };
+        let number = self.number_constructor_value(value)?;
+        let Some(number) = number.as_number() else {
+            return Ok(0);
+        };
+        let number = number_to_f64(number);
+        if !number.is_finite() {
+            return Ok(0);
+        }
+        Ok(number
+            .trunc()
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32)
+    }
+
     fn native_json_stringify(
         &mut self,
         state: &mut DispatchState<'_>,
@@ -17552,6 +17613,29 @@ impl CoreOpcodeDispatchHost {
         self.strings
             .allocate_with_heap(heap, &text)
             .map_err(DispatchOutcome::Fail)
+    }
+
+    fn native_string_from_char_code(
+        &mut self,
+        heap: &mut Heap,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let mut result = String::new();
+        for value in arguments.iter().copied() {
+            let code = self.string_from_char_code_unit(value)?;
+            result.push(char::from_u32(u32::from(code)).unwrap_or('\u{FFFD}'));
+        }
+        self.strings
+            .allocate_with_heap(heap, &result)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    fn string_from_char_code_unit(&self, value: RuntimeValue) -> Result<u16, DispatchOutcome> {
+        let number = self.number_constructor_value(value)?;
+        let Some(number) = number.as_number() else {
+            return Ok(0);
+        };
+        Ok(f64_to_int32(number_to_f64(number)) as u16)
     }
 
     fn native_number_constructor(
@@ -17746,6 +17830,23 @@ impl CoreOpcodeDispatchHost {
             .map_err(DispatchOutcome::Fail)
     }
 
+    fn native_string_char_code_at(
+        &mut self,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let text = self.string_this(this_value)?;
+        let chars: Vec<char> = text.chars().collect();
+        let index = self.integer_argument_or(arguments, 0, 0)?;
+        let Some(character) = usize::try_from(index)
+            .ok()
+            .and_then(|index| chars.get(index).copied())
+        else {
+            return Ok(RuntimeValue::from_double(f64::NAN));
+        };
+        Ok(RuntimeValue::from_i32(character as u32 as i32))
+    }
+
     fn native_string_index_of(
         &mut self,
         this_value: RuntimeValue,
@@ -17791,6 +17892,36 @@ impl CoreOpcodeDispatchHost {
         } else {
             (start, end)
         };
+        let result: String = chars
+            .into_iter()
+            .skip(usize::try_from(start).unwrap_or(usize::MAX))
+            .take(usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX))
+            .collect();
+        self.strings
+            .allocate_with_heap(heap, &result)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    fn native_string_substring(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let text = self.string_this(this_value)?;
+        let chars: Vec<char> = text.chars().collect();
+        let length = chars.len().try_into().unwrap_or(i32::MAX);
+        let mut start = self.integer_argument_or(arguments, 0, 0)?.clamp(0, length);
+        let mut end = match arguments.get(1).copied() {
+            Some(value) if value.kind() != ValueKind::Undefined => {
+                self.integer_argument_or(arguments, 1, length)?
+            }
+            _ => length,
+        }
+        .clamp(0, length);
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
         let result: String = chars
             .into_iter()
             .skip(usize::try_from(start).unwrap_or(usize::MAX))
@@ -19080,6 +19211,64 @@ fn number_from_string(text: &str) -> RuntimeValue {
             .parse::<f64>()
             .map(runtime_number_from_f64)
             .unwrap_or_else(|_| RuntimeValue::from_double(f64::NAN)),
+    }
+}
+
+fn parse_int_text(text: &str, radix_argument: i32) -> RuntimeValue {
+    let mut text = text.trim_start();
+    let negative = text.starts_with('-');
+    if matches!(text.as_bytes().first(), Some(b'+' | b'-')) {
+        text = &text[1..];
+    }
+
+    let mut radix = radix_argument;
+    if radix != 0 && !(2..=36).contains(&radix) {
+        return RuntimeValue::from_double(f64::NAN);
+    }
+    if radix == 0 {
+        if let Some(rest) = strip_hex_prefix(text) {
+            radix = 16;
+            text = rest;
+        } else {
+            radix = 10;
+        }
+    } else if radix == 16 {
+        if let Some(rest) = strip_hex_prefix(text) {
+            text = rest;
+        }
+    }
+
+    let mut result = 0.0;
+    let mut saw_digit = false;
+    for character in text.chars() {
+        let Some(digit) = parse_int_digit(character) else {
+            break;
+        };
+        if digit >= radix as u32 {
+            break;
+        }
+        saw_digit = true;
+        result = result * f64::from(radix) + f64::from(digit);
+    }
+    if !saw_digit {
+        return RuntimeValue::from_double(f64::NAN);
+    }
+    if negative {
+        result = -result;
+    }
+    runtime_number_from_f64(result)
+}
+
+fn strip_hex_prefix(text: &str) -> Option<&str> {
+    text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"))
+}
+
+fn parse_int_digit(character: char) -> Option<u32> {
+    match character {
+        '0'..='9' => Some(character as u32 - '0' as u32),
+        'a'..='z' => Some(character as u32 - 'a' as u32 + 10),
+        'A'..='Z' => Some(character as u32 - 'A' as u32 + 10),
+        _ => None,
     }
 }
 

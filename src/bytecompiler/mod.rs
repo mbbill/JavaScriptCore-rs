@@ -154,7 +154,7 @@ pub struct BytecompilerGlobalBindingSet {
     bindings: HashMap<String, BytecompilerGlobalBindingKind>,
 }
 
-pub const STANDARD_GLOBAL_BINDING_NAMES: &[&str] = &["Math"];
+pub const STANDARD_GLOBAL_BINDING_NAMES: &[&str] = &["Math", "parseInt"];
 
 impl BytecompilerGlobalBindingSet {
     pub fn new() -> Self {

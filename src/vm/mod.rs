@@ -45854,6 +45854,65 @@ mod tests {
     }
 
     #[test]
+    fn vm_string_octane_intrinsics_basic_behavior() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "let text = \"core\"; \
+                 return text.charCodeAt(1) === 111 \
+                     && text.substring(1, 3) === \"or\" \
+                     && String.fromCharCode(72, 105) === \"Hi\" \
+                     && String.fromCharCode(65536 + 65) === \"A\";",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_string_char_code_at_out_of_range_returns_nan() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "let missing = \"core\".charCodeAt(99); \
+                 return missing !== missing;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_string_substring_swaps_clamps_and_defaults() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "let text = \"core\"; \
+                 return text.substring(3, 1) === \"or\" \
+                     && text.substring(-2, 2) === \"co\" \
+                     && text.substring(Number(\"not a number\"), 2) === \"co\" \
+                     && text.substring(2) === \"re\" \
+                     && text.substring(1, void 0) === \"ore\" \
+                     && text.substring(0, 99) === \"core\";",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
     fn vm_string_builtin_methods_are_visible_inside_functions() {
         let mut vm = Vm::new(VmConfig::default());
 
@@ -45913,6 +45972,63 @@ mod tests {
         assert_eq!(
             completion,
             ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_parse_int_octane_core_behavior() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "let invalidInput = parseInt(\"not a number\", 10); \
+                 let invalidLowRadix = parseInt(\"10\", 1); \
+                 let invalidHighRadix = parseInt(\"10\", 37); \
+                 return parseInt(\"42\") === 42 \
+                     && parseInt(\"   42\") === 42 \
+                     && parseInt(\"10\", 0) === 10 \
+                     && parseInt(\"101\", 2) === 5 \
+                     && parseInt(\"ff\", 16) === 255 \
+                     && parseInt(\"0x10\") === 16 \
+                     && parseInt(\"0x10\", 16) === 16 \
+                     && parseInt(\"-0xF\") === -15 \
+                     && parseInt(\"+15\") === 15 \
+                     && parseInt(\"12px\", 10) === 12 \
+                     && invalidInput !== invalidInput \
+                     && invalidLowRadix !== invalidLowRadix \
+                     && invalidHighRadix !== invalidHighRadix;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_parse_int_source_session_global_property_is_shared_and_overridable() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![
+                source(
+                    "return typeof parseInt === \"function\" \
+                         && this.parseInt === parseInt \
+                         && parseInt(\"10\") === 10;",
+                ),
+                source("parseInt = function(value) { return 41; }; return parseInt(\"10\");"),
+                source("return parseInt(\"20\") + 1;"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::from_bool(true)),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(41)),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            ]
         );
     }
 

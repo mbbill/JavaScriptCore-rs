@@ -169,17 +169,18 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- M3b canonical Math runtime slice: source sessions install a benchmark-visible
-  `Math` object on the shared global, bytecompiler resolves standard `Math`
-  through global bindings, Octane-required Math APIs are installed on that
-  object, and `Math.random` overrides persist across loaded sources.
+- M3c Octane String/global runtime slice: source sessions install
+  benchmark-visible standard globals, bytecompiler resolves `Math` and
+  `parseInt` through global bindings, Octane-required Math, String, and
+  `parseInt` APIs are installed, and global overrides persist across loaded
+  sources where required.
 - Full accepted gate at that checkpoint: `cargo test --lib -- --quiet` with
-  1819 passed.
+  1824 passed.
 
 Current git/code note:
 
 - The current working tree may contain documentation or active-batch edits.
-  Treat the 1819-test M3b canonical-Math runtime slice as the last accepted green code
+  Treat the 1824-test M3c String/global runtime slice as the last accepted green code
   checkpoint unless a later progress entry records passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
   repairing that baseline.
@@ -200,9 +201,6 @@ Major accepted capabilities:
 
 Known Octane run blockers:
 
-- Runtime intrinsics used by Octane-core still need an explicit benchmark
-  compatibility pass for `String.prototype.charCodeAt`,
-  `String.prototype.substring`, `String.fromCharCode`, and global `parseInt`.
 - Shell and benchmark host names can now be declared for bytecompiler
   visibility, but their runtime behavior is not installed yet:
   `performance.now`, `load`, `readFile`, `print`, `console`, and
@@ -381,10 +379,16 @@ M3: Current - add Octane-core runtime intrinsics and shell globals.
   source is host-owned and deterministic enough for local execution; benchmark
   determinism still belongs to the JetStream driver-compatible
   `Math.random` override.
-- Next sub-slice: M3c installs Octane-required String/global runtime intrinsics:
+- Accepted sub-slice: M3c installed Octane-required String/global runtime
+  intrinsics:
   `String.prototype.charCodeAt`, `String.prototype.substring`,
-  `String.fromCharCode`, and global `parseInt`. It must not widen shell
-  globals, runner control, or JIT lowering in the same patch.
+  `String.fromCharCode`, and global `parseInt`, with `parseInt` installed as a
+  benchmark-visible session global and override persistence tested across
+  loaded sources.
+- Next sub-slice: M3d installs shell/benchmark host globals:
+  `performance.now`, `load`, `readFile`, `print`, `console`, and `alert`.
+  It must reuse the existing file-source/session append boundary and must not
+  implement the Octane runner loop or JIT lowering in the same patch.
 - Scheduling note: most executable native builtin code still lives in
   `src/interpreter/mod.rs`, so Math and String implementation batches should be
   serialized unless the main agent first splits builtin bodies into disjoint

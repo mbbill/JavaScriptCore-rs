@@ -189,6 +189,7 @@ one-off test adjustments.
 - 2026-05-20: M2 file-source slice accepted: shell loaded-source records assign `SourceProviderId`/`SourceOriginId`, bytecompiler provenance reaches `SourceProvenance`, incremental source sessions preserve one global/host across appends, and full gates passed including `cargo test --lib -- --quiet` 1813 passed.
 - 2026-05-20: M3a canonical-Math global slice accepted: source sessions install benchmark-visible `Math` on the shared global, bytecompiler resolves standard `Math` through global bindings, Math property mutations persist across batch/incremental loads, and full gates passed including `cargo test --lib -- --quiet` 1818 passed.
 - 2026-05-20: M3b canonical-Math runtime slice accepted: `Math.floor`, `Math.sqrt`, `Math.log`, `Math.random`, and `Math.LN2` are installed on session-global `Math`, override persistence is tested across loaded sources, and full gates passed including `cargo test --lib -- --quiet` 1819 passed.
+- 2026-05-20: M3c String/global runtime slice accepted: `String.prototype.charCodeAt`, `String.prototype.substring`, `String.fromCharCode`, and global `parseInt` are implemented, `parseInt` is a session-global property with cross-load override coverage, and full gates passed including `cargo test --lib -- --quiet` 1824 passed.
 
 ## Open High-Risk Gaps
 
