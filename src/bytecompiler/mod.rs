@@ -10,18 +10,19 @@ use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::{
     BytecodeGenerator, BytecodeIndex, BytecodeRange, CodeFeatures as BytecodeCodeFeatures,
-    CodeKind, CoreOpcode, GenerationPlan, GenerationRoot, GenerationValidationFinding, HandlerKind,
-    Label, LabelRef, Operand, OperandWidth, ParseMode as BytecodeParseMode, RegisterAllocator,
-    RegisterFrameShape, SourceOriginId, SourceProvenance, SourceProviderId, SpecialRegisters,
-    TemporaryLifetime, UnlinkedCodeBlock, UnlinkedHandlerInfo, VirtualRegister,
+    CodeKind, ConstructorKind as BytecodeConstructorKind, CoreOpcode, GenerationPlan,
+    GenerationRoot, GenerationValidationFinding, HandlerKind, Label, LabelRef, Operand,
+    OperandWidth, ParseMode as BytecodeParseMode, RegisterAllocator, RegisterFrameShape,
+    ScriptMode as BytecodeScriptMode, SourceOriginId, SourceProvenance, SourceProviderId,
+    SpecialRegisters, TemporaryLifetime, UnlinkedCodeBlock, UnlinkedHandlerInfo, VirtualRegister,
 };
 use crate::syntax::ast::{
     ArrayLiteralElement, AssignmentExpr, AssignmentOperator, AstPropertyKey, BinaryExpr,
     BinaryOperator as AstBinaryOperator, CallExpr, ClassElementKind, ClassElementName, ClassExpr,
     ConditionalExpr, ControlKind, DeclarationStmt, DeclarationSyntaxKind, DoWhileStmt, Expr,
-    ForInit, ForOfBinding, FunctionMetadata, LiteralKind, MemberExpr, MemberKind, NameKind,
-    NewExpr, NumberLiteralValue, ObjectLiteralPropertyKind, Pattern, Stmt, SwitchStmt,
-    TemplateExpr, UnaryExpr, UnaryOperator as AstUnaryOperator,
+    ForInit, ForOfBinding, FunctionMetadata, FunctionSyntaxMode, LiteralKind, MemberExpr,
+    MemberKind, NameKind, NewExpr, NumberLiteralValue, ObjectLiteralPropertyKind, Pattern, Stmt,
+    SwitchStmt, TemplateExpr, UnaryExpr, UnaryOperator as AstUnaryOperator,
 };
 use crate::syntax::{
     AstRef, AstRoot, CodeFeatures, EnvironmentSemanticRecord, ModuleAnalysis,
@@ -873,6 +874,7 @@ pub fn emit_unlinked_code_from_parsed_ast(
         initialized_cells: HashSet::new(),
         function_metadata_indices: function_plan.metadata_indices.clone(),
         function_captures: function_plan.captures.clone(),
+        class_constructor_metadata: function_plan.class_constructors.clone(),
         derived_constructor_metadata: function_plan.derived_constructors.clone(),
         loop_stack: Vec::new(),
         break_stack: Vec::new(),
@@ -1043,6 +1045,7 @@ struct FunctionCompilationPlan {
     metadata_order: Vec<AstRef<FunctionMetadata>>,
     metadata_indices: HashMap<u32, u32>,
     captures: HashMap<u32, Vec<ParserIdentifier>>,
+    class_constructors: HashMap<u32, BytecodeConstructorKind>,
     derived_constructors: HashSet<u32>,
 }
 
@@ -1253,6 +1256,15 @@ fn collect_expression_function_metadata(
                     plan.derived_constructors.insert(constructor.raw_index());
                 }
             }
+            if let Some(constructor) = constructor_metadata_for_class(arena, class) {
+                let constructor_kind = if class.heritage.is_some() {
+                    BytecodeConstructorKind::Derived
+                } else {
+                    BytecodeConstructorKind::Base
+                };
+                plan.class_constructors
+                    .insert(constructor.raw_index(), constructor_kind);
+            }
             for element in &class.elements {
                 if let crate::syntax::ast::ClassElementName::Computed(expression) = element.name {
                     collect_expression_function_metadata(arena, expression, plan)?;
@@ -1278,6 +1290,24 @@ fn collect_expression_function_metadata(
             Ok(())
         }
     }
+}
+
+fn constructor_metadata_for_class(
+    arena: &ParserArena,
+    class: &ClassExpr,
+) -> Option<AstRef<FunctionMetadata>> {
+    class
+        .elements
+        .iter()
+        .find(|element| {
+            !element.is_static
+                && element.kind == ClassElementKind::Method
+                && matches!(
+                    element.name,
+                    ClassElementName::Public(name) if arena.identifiers().identifier_text(name) == Some("constructor")
+                )
+        })
+        .and_then(|element| element.metadata)
 }
 
 fn explicit_constructor_metadata_for_class(
@@ -2542,6 +2572,30 @@ fn function_uses_arguments_identifier(
     Ok(references.into_iter().any(|name| name == arguments))
 }
 
+fn bytecode_parse_mode_for_function_syntax(mode: FunctionSyntaxMode) -> BytecodeParseMode {
+    match mode {
+        FunctionSyntaxMode::Normal => BytecodeParseMode::NormalFunction,
+        FunctionSyntaxMode::Generator => BytecodeParseMode::GeneratorBody,
+        FunctionSyntaxMode::Async => BytecodeParseMode::AsyncFunctionBody,
+        FunctionSyntaxMode::AsyncGenerator => BytecodeParseMode::AsyncGeneratorBody,
+        FunctionSyntaxMode::Arrow => BytecodeParseMode::ArrowFunction,
+        FunctionSyntaxMode::Method => BytecodeParseMode::Method,
+        FunctionSyntaxMode::Getter => BytecodeParseMode::Getter,
+        FunctionSyntaxMode::Setter => BytecodeParseMode::Setter,
+        FunctionSyntaxMode::ClassFieldInitializer => BytecodeParseMode::ClassFieldInitializer,
+        FunctionSyntaxMode::ClassStaticBlock => BytecodeParseMode::ClassStaticBlock,
+    }
+}
+
+fn function_metadata_can_construct(
+    metadata: &FunctionMetadata,
+    constructor_kind: BytecodeConstructorKind,
+) -> bool {
+    matches!(metadata.mode, FunctionSyntaxMode::Normal)
+        || (matches!(metadata.mode, FunctionSyntaxMode::Method)
+            && constructor_kind != BytecodeConstructorKind::None)
+}
+
 fn compound_assignment_opcode(op: AssignmentOperator) -> Option<CoreOpcode> {
     match op {
         AssignmentOperator::Assign => None,
@@ -2578,6 +2632,7 @@ struct AstBytecodeEmitter<'a, 'g> {
     initialized_cells: HashSet<ParserIdentifier>,
     function_metadata_indices: HashMap<u32, u32>,
     function_captures: HashMap<u32, Vec<ParserIdentifier>>,
+    class_constructor_metadata: HashMap<u32, BytecodeConstructorKind>,
     derived_constructor_metadata: HashSet<u32>,
     loop_stack: Vec<LoopControlLabels>,
     break_stack: Vec<BreakControlLabels>,
@@ -2785,11 +2840,19 @@ impl AstBytecodeEmitter<'_, '_> {
             .scope_node(metadata.body)
             .cloned()
             .ok_or(BytecompilerEmissionError::MissingRootScope)?;
-        let mut generation =
-            GenerationPlan::new(CodeKind::Function, BytecodeParseMode::NormalFunction);
+        let constructor_kind = self.function_metadata_constructor_kind(metadata_ref);
+        let parse_mode = bytecode_parse_mode_for_function_syntax(metadata.mode);
+        let mut generation = GenerationPlan::new(CodeKind::Function, parse_mode);
         generation.registers = function_execution_frame_shape(metadata.parameter_count);
         generation.source = self.generator.plan().source.clone();
         generation.root = GenerationRoot::FunctionNode;
+        generation.executable_info.script_mode = Some(BytecodeScriptMode::Classic);
+        generation.executable_info.constructor_kind = constructor_kind;
+        generation.executable_info.is_constructor =
+            function_metadata_can_construct(&metadata, constructor_kind);
+        generation.executable_info.is_class_context =
+            constructor_kind != BytecodeConstructorKind::None;
+        generation.executable_info.is_strict_mode = metadata.strict;
         let mut generator = BytecodeGenerator::new(generation);
         let is_derived_constructor = self.function_metadata_is_derived_constructor(metadata_ref);
         let this_binding = if is_derived_constructor {
@@ -2812,6 +2875,7 @@ impl AstBytecodeEmitter<'_, '_> {
             initialized_cells: HashSet::new(),
             function_metadata_indices: self.function_metadata_indices.clone(),
             function_captures: self.function_captures.clone(),
+            class_constructor_metadata: self.class_constructor_metadata.clone(),
             derived_constructor_metadata: self.derived_constructor_metadata.clone(),
             loop_stack: Vec::new(),
             break_stack: Vec::new(),
@@ -2896,6 +2960,16 @@ impl AstBytecodeEmitter<'_, '_> {
     fn function_metadata_is_derived_constructor(&self, metadata: AstRef<FunctionMetadata>) -> bool {
         self.derived_constructor_metadata
             .contains(&metadata.raw_index())
+    }
+
+    fn function_metadata_constructor_kind(
+        &self,
+        metadata: AstRef<FunctionMetadata>,
+    ) -> BytecodeConstructorKind {
+        self.class_constructor_metadata
+            .get(&metadata.raw_index())
+            .copied()
+            .unwrap_or(BytecodeConstructorKind::None)
     }
 
     fn predeclare_scope_locals(

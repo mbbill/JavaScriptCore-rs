@@ -170,17 +170,19 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- A1/A2 partial JSC fidelity checkpoint: object-backed standard, host, and
-  source-declared globals resolve through the live source-session global object
-  instead of closure-captured snapshots, and the standard object family is
-  installed as benchmark-visible global properties.
+- A1/A2 function boundary JSC fidelity checkpoint: object-backed standard,
+  host, and source-declared globals resolve through the live source-session
+  global object instead of closure-captured snapshots; source functions carry
+  JSC-shaped parse/constructor/strict metadata; class constructors reject direct
+  calls; methods and nonconstructable native functions reject `new`; sloppy
+  nullish `this` normalizes to the session global object.
 - Full accepted gate at that checkpoint: `cargo fmt --check`,
   `cargo clippy --lib --all-targets -- -D warnings`,
-  `cargo build --lib`, and `cargo test --lib -- --quiet` with 1917 passed.
+  `cargo build --lib`, and `cargo test --lib -- --quiet` with 1922 passed.
 
 Current git/code note:
 
-- Treat the 1917-test A1/A2 partial fidelity slice as
+- Treat the 1922-test A1/A2 function-boundary fidelity slice as
   the last accepted green code checkpoint unless a later progress entry records
   passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
@@ -207,9 +209,9 @@ Major accepted capabilities:
 Known Octane run blockers:
 
 - The last recorded Octane-core matrix predates the A0 and A1/A2 fidelity
-  fixes. Rerun the six-test matrix after the current class/constructor and
-  completion audits; do not treat the old `ExpectedFunction`/`ExpectedObject`
-  labels as current evidence without rerunning.
+  fixes. Rerun the six-test matrix after the current completion/top-level-return
+  audits; do not treat the old `ExpectedFunction`/`ExpectedObject` labels as
+  current evidence without rerunning.
 - Full shell-style `load(path)` execution is not implemented. It is not on the
   shortest path to the first accepted-equivalent Octane-core runner because the
   active JetStream 3 driver uses `readFile`/runner-side file loading for CLI
@@ -225,15 +227,20 @@ Known Octane run blockers:
 - Octane-core syntax/lowering blockers discovered so far are now accepted for
   `do while`, `switch`, non-tagged template literals, non-decimal number
   literals, trailing argument commas, function capture cells, and sloppy
-  top-level global assignment reads. The next shared work is finishing the
-  remaining A1/A2 class/constructor and completion audits, rerunning the
-  complete Octane-core pass/fail matrix, and scheduling the next shared feature
-  family from that evidence.
+  top-level global assignment reads. JSC-shaped function metadata,
+  call-vs-construct separation, class-constructor call rejection, method/native
+  nonconstructability, and sloppy nullish `this` are accepted. The next shared
+  work is finishing source/program completion, top-level `return`, and
+  source-session ordering audits, rerunning the complete Octane-core pass/fail
+  matrix, and scheduling the next shared feature family from that evidence.
 
 Known full-Octane blockers beyond the core subset:
 
 - Typed-array breadth beyond the current basic `ArrayBuffer`, `Uint8Array`, and
   `DataView` slices.
+- Primitive wrapper object construction remains incomplete: C++ JSC constructs
+  `new String`, `new Number`, and `new Boolean` wrapper objects, but the Rust
+  object model still lacks boxed primitive object cells.
 - `Function` constructor and eval/code-load behavior.
 - Deeper RegExp/Yarr behavior.
 - More standard-library breadth, Date/time compatibility, and browser/shell
@@ -454,6 +461,21 @@ Audit order:
   globals are now real global-object properties, identifier reads/writes use
   live global-object opcodes, and transient bootstrap strings/symbols are
   rebound through the Rust root bridge when they become live roots.
+- A1/A2 function boundary accepted 2026-05-21: function parse metadata,
+  constructability, class-constructor call rejection, and sloppy `this` were
+  audited against C++ JSC and fixed where Rust had drifted into treating all
+  `LoadFunction` results as constructable ordinary functions. JSC evidence:
+  `ParserModes.h`, `BytecodeGenerator.h`, `BytecodeGenerator.cpp`,
+  `JSFunctionInlines.h`, `JSCJSValueInlines.h`, and `CommonSlowPaths.cpp`.
+  Rust files: `src/bytecode/code_block.rs`, `src/bytecompiler/mod.rs`,
+  `src/interpreter/mod.rs`, and `src/vm/mod.rs`. Classification: ordinary
+  member-vs-bare call lowering and constructor return normalization were
+  faithful; missing function metadata, class-constructor direct-call acceptance,
+  method constructability, nonconstructable native construction failure mode,
+  and sloppy nullish `this` handling were accidental deviations and are fixed.
+  Remaining tracked deviations: sloppy primitive `this` boxing and
+  `String`/`Number`/`Boolean` wrapper construction need boxed primitive object
+  cells before they can be made JSC-faithful.
 - A1 bytecompiler fidelity: source/program completion, function returns,
   declaration binding, lexical/global environment lowering, captures, class
   lowering, and source-session behavior against JSC `BytecodeGenerator`.
@@ -485,8 +507,7 @@ rewrite phase.
 - Sub-agents: inspect assigned Rust and C++ JSC components, classify fidelity,
   and implement fixes only when the write scope is explicit and disjoint.
 - Active batch: continue A1/A2 shared bytecompiler-runtime fidelity. The next
-  audits should cover default/class constructor metadata, class-call rejection,
-  sloppy `this`, branch/try/source-session completion behavior, top-level
+  audits should cover branch/try/source-session completion behavior, top-level
   `return` gating, and batch source execution ordering before more
   benchmark-specific debugging.
 - Completion evidence for F0: all existing Rust subsystems have passed the

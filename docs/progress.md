@@ -206,6 +206,7 @@ one-off test adjustments.
 - 2026-05-21: Octane scheduler refreshed: the active proof target is full JetStream 3 Octane at local C++ JSC-level performance, with M4g now focused on shared runtime blockers before benchmark-specific debugging.
 - 2026-05-21: A0 JSC fidelity audit/fix accepted for register windows, capture ordering, ordinary fallthrough, and derived-constructor `this`/`super`/return semantics; full gates passed including `cargo test --lib -- --quiet` 1914 passed.
 - 2026-05-21: A1/A2 live global-resolution audit/fix accepted: object-backed standard, host, and source globals now resolve through real session-global properties instead of closure snapshots; full gates passed including `cargo test --lib -- --quiet` 1917 passed.
+- 2026-05-21: A1/A2 function metadata and call-vs-construct fidelity accepted: source functions now carry JSC parse/constructor/strict metadata, class constructors reject direct calls, methods and nonconstructable natives reject `new`, and sloppy nullish `this` normalizes to the session global object; full gates passed including `cargo test --lib -- --quiet` 1922 passed.
 
 ## Open High-Risk Gaps
 

@@ -134,6 +134,7 @@ pub enum ParseMode {
     Getter,
     Setter,
     ClassFieldInitializer,
+    ClassStaticBlock,
     GeneratorBody,
     AsyncFunctionBody,
     AsyncGeneratorBody,
@@ -288,6 +289,7 @@ pub struct ExecutableInfo {
     pub is_class_context: bool,
     pub is_arrow_function_context: bool,
     pub is_constructor: bool,
+    pub is_strict_mode: bool,
 }
 
 /// Lifecycle of a source-derived unlinked code block.

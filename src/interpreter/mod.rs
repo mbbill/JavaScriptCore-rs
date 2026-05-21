@@ -23,7 +23,10 @@ use crate::bytecode::opcode::Opcode;
 use crate::bytecode::register::{
     CallFrameSlotLayout, RegisterFrameShape, ThisArgumentOffset, VirtualRegister,
 };
-use crate::bytecode::{BytecodeIndex, CoreOpcode, OperandKind, PackedInstructionStream};
+use crate::bytecode::{
+    BytecodeIndex, CodeKind, ConstructAbility, ConstructorKind, CoreOpcode, OperandKind,
+    PackedInstructionStream, ParseMode,
+};
 use crate::gc::{
     static_barrier_schema_registry, static_cell_metadata_registry, AllocationMode,
     BarrierDecisionError, BarrierFieldKind, BarrierMutationAuthority, BarrierRequirementOutcome,
@@ -3920,6 +3923,7 @@ struct CoreObjectCell {
     prototype: Option<RuntimeValue>,
     function_index: Option<u32>,
     native_function: Option<CoreNativeFunction>,
+    construct_ability: ConstructAbility,
     super_base: Option<RuntimeValue>,
     super_constructor: Option<RuntimeValue>,
     is_default_derived_constructor: bool,
@@ -4129,6 +4133,38 @@ enum CoreNativeFunction {
     Keys,
     SetPrototypeOf,
     Values,
+}
+
+impl CoreNativeFunction {
+    fn construct_ability(self) -> ConstructAbility {
+        match self {
+            Self::ObjectConstructor
+            | Self::ArrayConstructor
+            | Self::ProxyConstructor
+            | Self::ErrorConstructor
+            | Self::TypeErrorConstructor
+            | Self::MapConstructor
+            | Self::SetConstructor
+            | Self::WeakMapConstructor
+            | Self::WeakSetConstructor
+            | Self::RegExpConstructor
+            | Self::PromiseConstructor
+            | Self::DateConstructor
+            | Self::ArrayBufferConstructor
+            | Self::Uint8ArrayConstructor
+            | Self::DataViewConstructor => ConstructAbility::CanConstruct,
+            _ => ConstructAbility::CannotConstruct,
+        }
+    }
+
+    fn not_a_constructor_message(self) -> &'static str {
+        match self {
+            Self::BigIntConstructor => "BigInt is not a constructor",
+            Self::SymbolConstructor => "Symbol is not a constructor",
+            Self::MathMax => "Math.max is not a constructor",
+            _ => "Function is not a constructor",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4571,11 +4607,27 @@ impl CoreObjectStore {
         })
     }
 
+    #[cfg(test)]
     fn allocate_function(
         &mut self,
         function_index: u32,
         captures: Vec<RuntimeValue>,
         prototype_property_key: Option<CorePropertyKey>,
+    ) -> RuntimeValue {
+        self.allocate_function_with_construct_ability(
+            function_index,
+            captures,
+            prototype_property_key,
+            ConstructAbility::CanConstruct,
+        )
+    }
+
+    fn allocate_function_with_construct_ability(
+        &mut self,
+        function_index: u32,
+        captures: Vec<RuntimeValue>,
+        prototype_property_key: Option<CorePropertyKey>,
+        construct_ability: ConstructAbility,
     ) -> RuntimeValue {
         let function_prototype = self.ensure_function_prototype();
         let mut properties = HashMap::new();
@@ -4604,6 +4656,7 @@ impl CoreObjectStore {
             captures,
             properties,
             property_order,
+            construct_ability,
             ..CoreObjectCell::default()
         });
         if let Some(prototype) = instance_prototype {
@@ -4612,17 +4665,19 @@ impl CoreObjectStore {
         function
     }
 
-    fn allocate_function_with_write_barrier(
+    fn allocate_function_with_construct_ability_and_write_barrier(
         &mut self,
         heap: &mut Heap,
         function_index: u32,
         captures: Vec<RuntimeValue>,
         prototype_property_key: Option<CorePropertyKey>,
+        construct_ability: ConstructAbility,
     ) -> Result<RuntimeValue, ExecutionError> {
-        let function = self.allocate_function(
+        let function = self.allocate_function_with_construct_ability(
             function_index,
             captures.clone(),
             prototype_property_key.clone(),
+            construct_ability,
         );
         for capture in captures {
             self.apply_value_store_write_barrier(heap, function, capture)?;
@@ -4650,6 +4705,7 @@ impl CoreObjectStore {
             kind: CoreObjectKind::NativeFunction,
             prototype,
             native_function: Some(native_function),
+            construct_ability: native_function.construct_ability(),
             ..CoreObjectCell::default()
         })
     }
@@ -7797,6 +7853,57 @@ impl CoreObjectStore {
         })
     }
 
+    fn function_construct_ability(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<ConstructAbility, ExecutionError> {
+        let Some(object) = self.find(value) else {
+            return Err(ExecutionError::ExpectedFunction);
+        };
+        match object.kind {
+            CoreObjectKind::Function | CoreObjectKind::NativeFunction => {
+                Ok(object.construct_ability)
+            }
+            CoreObjectKind::Proxy => {
+                let target = object
+                    .proxy_target
+                    .ok_or(ExecutionError::ExpectedFunction)?;
+                self.function_construct_ability(target)
+            }
+            CoreObjectKind::Ordinary
+            | CoreObjectKind::Array
+            | CoreObjectKind::ClosureCell
+            | CoreObjectKind::Map
+            | CoreObjectKind::Set
+            | CoreObjectKind::WeakMap
+            | CoreObjectKind::WeakSet
+            | CoreObjectKind::RegExp
+            | CoreObjectKind::Promise
+            | CoreObjectKind::Date
+            | CoreObjectKind::ArrayBuffer
+            | CoreObjectKind::Uint8Array
+            | CoreObjectKind::DataView => Err(ExecutionError::ExpectedFunction),
+        }
+    }
+
+    fn function_not_constructor_message(&self, value: RuntimeValue) -> &'static str {
+        let Some(object) = self.find(value) else {
+            return "Value is not a constructor";
+        };
+        match object.kind {
+            CoreObjectKind::NativeFunction => object
+                .native_function
+                .map(CoreNativeFunction::not_a_constructor_message)
+                .unwrap_or("Function is not a constructor"),
+            CoreObjectKind::Function => "Function is not a constructor",
+            CoreObjectKind::Proxy => object
+                .proxy_target
+                .map(|target| self.function_not_constructor_message(target))
+                .unwrap_or("Function is not a constructor"),
+            _ => "Value is not a constructor",
+        }
+    }
+
     fn is_array(&self, value: RuntimeValue) -> bool {
         self.find(value)
             .is_some_and(|object| object.kind == CoreObjectKind::Array)
@@ -9661,12 +9768,18 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                         };
                     captures.push(capture);
                 }
-                let function = match self.objects.allocate_function_with_write_barrier(
-                    state.heap,
-                    function_index,
-                    captures,
-                    Some(self.prototype_key()),
-                ) {
+                let construct_ability = self.construct_ability_for_function_index(function_index);
+                let prototype_key = (construct_ability == ConstructAbility::CanConstruct)
+                    .then(|| self.prototype_key());
+                let function = match self
+                    .objects
+                    .allocate_function_with_construct_ability_and_write_barrier(
+                        state.heap,
+                        function_index,
+                        captures,
+                        prototype_key,
+                        construct_ability,
+                    ) {
                     Ok(function) => function,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
@@ -11624,6 +11737,74 @@ impl CoreOpcodeDispatchHost {
         Err(ExecutionError::ExpectedObject)
     }
 
+    fn construct_ability_for_function_index(&self, function_index: u32) -> ConstructAbility {
+        let Some(entry) = self
+            .function_blocks
+            .get(usize::try_from(function_index).unwrap_or(usize::MAX))
+        else {
+            return ConstructAbility::CannotConstruct;
+        };
+        let unlinked = entry.code_block.unlinked();
+        let info = unlinked.executable_info();
+        if info.is_constructor {
+            return ConstructAbility::CanConstruct;
+        }
+        match (info.parse_mode, info.constructor_kind) {
+            (Some(ParseMode::NormalFunction), _) => ConstructAbility::CanConstruct,
+            (Some(ParseMode::Method), ConstructorKind::Base | ConstructorKind::Derived) => {
+                ConstructAbility::CanConstruct
+            }
+            // Hand-authored legacy test blocks often predate parser metadata.
+            // Source-derived function blocks are `CodeKind::Function` with an
+            // explicit parse mode, so this does not loosen parser output.
+            (None, _) if unlinked.kind() != CodeKind::Function => ConstructAbility::CanConstruct,
+            _ => ConstructAbility::CannotConstruct,
+        }
+    }
+
+    fn function_index_is_class_constructor(&self, function_index: u32) -> bool {
+        self.function_blocks
+            .get(usize::try_from(function_index).unwrap_or(usize::MAX))
+            .is_some_and(|entry| {
+                let info = entry.code_block.unlinked().executable_info();
+                info.is_class_context
+                    || matches!(
+                        info.constructor_kind,
+                        ConstructorKind::Base | ConstructorKind::Derived
+                    )
+            })
+    }
+
+    fn normalize_this_for_function_index(
+        &self,
+        stack: &ExecutionContextStack,
+        function_index: u32,
+        this_value: RuntimeValue,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        let should_normalize = self
+            .function_blocks
+            .get(usize::try_from(function_index).unwrap_or(usize::MAX))
+            .is_some_and(|entry| {
+                let info = entry.code_block.unlinked().executable_info();
+                matches!(info.parse_mode, Some(ParseMode::NormalFunction))
+                    && !info.is_strict_mode
+                    && !matches!(
+                        info.constructor_kind,
+                        ConstructorKind::Base | ConstructorKind::Derived
+                    )
+            });
+        if !should_normalize {
+            return Ok(this_value);
+        }
+        match this_value.kind() {
+            ValueKind::Undefined | ValueKind::Null => self.active_global_object_value(stack),
+            // JSC's sloppy `to_this` boxes primitives here. Primitive object
+            // wrappers are broader runtime work, so this slice only implements
+            // the nullish-to-global path required by Octane-era sloppy calls.
+            _ => Ok(this_value),
+        }
+    }
+
     fn global_lexical_name(&self, key: u32) -> Result<String, ExecutionError> {
         self.identifier_texts
             .get(&key)
@@ -12999,6 +13180,12 @@ impl CoreOpcodeDispatchHost {
                 );
             }
         };
+        if self.function_index_is_class_constructor(function_index) {
+            return Err(self.type_error_outcome_with_heap(
+                state.heap,
+                "Class constructor cannot be invoked without 'new'",
+            ));
+        }
         let Some(function_entry) = self
             .function_blocks
             .get(usize::try_from(function_index).unwrap_or(usize::MAX))
@@ -13014,6 +13201,9 @@ impl CoreOpcodeDispatchHost {
             .frame()
             .num_parameters_including_this
             .saturating_sub(1);
+        let this_value = self
+            .normalize_this_for_function_index(state.stack, function_index, this_value)
+            .map_err(DispatchOutcome::Fail)?;
         let mut argument_values = Vec::with_capacity(provided_arguments.len().saturating_add(1));
         argument_values.push(this_value);
         argument_values.extend(provided_arguments.iter().copied());
@@ -13435,6 +13625,16 @@ impl CoreOpcodeDispatchHost {
             Err(error) => return DispatchOutcome::Fail(error),
         };
         let is_proxy_callee = self.objects.is_proxy(callee);
+        match self.objects.function_construct_ability(callee) {
+            Ok(ConstructAbility::CanConstruct) => {}
+            Ok(ConstructAbility::CannotConstruct) => {
+                let message = self.objects.function_not_constructor_message(callee);
+                return self.type_error_outcome_with_heap(state.heap, message);
+            }
+            Err(_) => {
+                return self.type_error_outcome_with_heap(state.heap, "Value is not a constructor");
+            }
+        }
         let target = match self.objects.function_call_target(callee) {
             Ok(target) => target,
             Err(error) => return DispatchOutcome::Fail(error),
@@ -14182,6 +14382,15 @@ impl CoreOpcodeDispatchHost {
         instruction: DispatchInstruction<'_>,
         request: CoreCallDispatchRequest,
     ) -> DispatchOutcome {
+        if request.constructor_this.is_none()
+            && self.function_index_is_class_constructor(request.function_index)
+        {
+            return self.type_error_outcome_with_heap(
+                state.heap,
+                "Class constructor cannot be invoked without 'new'",
+            );
+        }
+
         if let Some(callee) = request.callee_value.filter(|callee| {
             request.constructor_this.is_some()
                 && self.objects.is_default_derived_constructor(*callee)
@@ -14291,12 +14500,24 @@ impl CoreOpcodeDispatchHost {
             .frame()
             .num_parameters_including_this
             .saturating_sub(1);
+        let this_value = if request.constructor_this.is_none() {
+            match self.normalize_this_for_function_index(
+                state.stack,
+                request.function_index,
+                request.this_value,
+            ) {
+                Ok(value) => value,
+                Err(error) => return DispatchOutcome::Fail(error),
+            }
+        } else {
+            request.this_value
+        };
         let mut argument_values = Vec::with_capacity(
             usize::try_from(request.argument_count)
                 .unwrap_or(usize::MAX)
                 .saturating_add(1),
         );
-        argument_values.push(request.this_value);
+        argument_values.push(this_value);
         for argument_index in 0..request.argument_count {
             let operand_index = usize::try_from(argument_index)
                 .unwrap_or(usize::MAX)

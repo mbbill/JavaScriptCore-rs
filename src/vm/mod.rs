@@ -47190,12 +47190,121 @@ mod tests {
     }
 
     #[test]
-    fn vm_calls_extracted_method_with_undefined_this() {
+    fn vm_calls_extracted_sloppy_function_with_global_this() {
         let mut vm = Vm::new(VmConfig::default());
 
         let completion = vm
             .execute_source(source(
-                "let object = { check: function() { return typeof this; } }; let check = object.check; return check() === \"undefined\";",
+                "let object = { check: function() { return this.Math === Math; } }; let check = object.check; return check();",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
+    fn vm_sloppy_function_call_normalizes_null_this_to_global_object() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "function check() { return this.Math === Math; } return check.call(null);",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
+    fn vm_class_constructor_direct_call_throws_type_error() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "class Box { constructor() { this.value = 1; } } \
+                 let threw = false; \
+                 try { Box(); } catch (error) { threw = error instanceof TypeError; } \
+                 return threw;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
+    fn vm_class_method_construction_throws_type_error() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "class Box { method() { return 1; } static staticMethod() { return 2; } } \
+                 let method = Box.prototype.method; \
+                 let staticMethod = Box.staticMethod; \
+                 let methodThrew = false; \
+                 let staticThrew = false; \
+                 try { new method(); } catch (error) { methodThrew = error instanceof TypeError; } \
+                 try { new staticMethod(); } catch (error) { staticThrew = error instanceof TypeError; } \
+                 return methodThrew && staticThrew;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
+    fn vm_non_constructor_native_new_throws_type_error() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "let threw = false; \
+                 try { new Math.max(); } catch (error) { threw = error instanceof TypeError; } \
+                 return threw;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.register_file().register_count(), 0);
+    }
+
+    #[test]
+    fn vm_ordinary_function_construction_still_works() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "function Factory() { this.value = 42; } \
+                 let object = new Factory(); \
+                 return object.value === 42 && object.constructor === Factory;",
             ))
             .unwrap();
 
