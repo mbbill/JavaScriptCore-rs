@@ -194,6 +194,7 @@ one-off test adjustments.
 - 2026-05-20: Scheduler moved from M3d1 to M4 runner integration: VM-owned `load(path)` remains designed but deferred because the accepted JetStream 3 Octane-core path can use runner-side file loading and read-only `readFile`.
 - 2026-05-20: Octane goal plan refreshed: M3 is now marked accepted, M4 runner integration is the active BFS batch, and the durable `/goal` text points at full JetStream 3 Octane correctness and local C++ JSC-level performance.
 - 2026-05-20: M4a Octane manifest/scoring scaffold accepted under `shell::octane`; full gates passed including `cargo test --lib -- --quiet` 1833 passed.
+- 2026-05-20: M4b non-executing Octane preparation accepted: runner inputs now load through shell provenance, generated prelude/random/runner sources are prepared, and full gates passed including `cargo test --lib -- --quiet` 1840 passed.
 
 ## Open High-Risk Gaps
 

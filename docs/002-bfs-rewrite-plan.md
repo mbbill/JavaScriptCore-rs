@@ -200,9 +200,10 @@ Major accepted capabilities:
 
 Known Octane run blockers:
 
-- Benchmark telemetry and runner control: the Rust-side Octane manifest and
-  `DefaultBenchmark` scoring contract now exist under `shell::octane`; load
-  order execution, generated runner source, iteration/validation collection,
+- Benchmark telemetry and runner control: the Rust-side Octane manifest,
+  `DefaultBenchmark` scoring contract, file/provenance preparation, and
+  generated prelude/random/runner source preparation now exist under
+  `shell::octane`; VM source-session execution, result extraction,
   failure classification, and tier-mode selection are still missing.
 - Full shell-style `load(path)` execution is not implemented. It is not on the
   shortest path to the first accepted-equivalent Octane-core runner because the
@@ -432,11 +433,20 @@ M4: Current - run Octane-core correctly in the Rust engine.
   `DefaultBenchmark` run-config resolution and scoring, and typed scoring or
   manifest errors. It deliberately does not read files, execute JavaScript,
   install host globals, or choose tier mode.
-- Next sub-slice: implement the non-executing runner preparation boundary:
+- Accepted sub-slice: M4b added the non-executing runner preparation boundary:
   resolve selected plans, load benchmark files through `ShellSourceLoader`,
   convert them to `SourceSessionSource::with_provenance`, generate the JS
-  prelude/deterministic-random/iteration source, and classify preparation
-  failures before executing any benchmark.
+  prelude/deterministic-random/iteration source, keep suite-wide source
+  provider/origin IDs unique, and classify preparation failures before
+  executing any benchmark.
+- Next sub-slice: execute prepared benchmarks through source sessions only far
+  enough to classify parse, bytecode-emission, link/session, runtime, thrown,
+  and score-telemetry outcomes. Do not tune individual benchmark failures in
+  that patch.
+- Next shared engine blockers after runner execution starts: source-session
+  global lexical/class declarations for top-level `class Benchmark`, then
+  parser/lowering coverage for `do while`, `switch`, and non-tagged template
+  literals.
 
 M5: Make the accepted baseline JIT cover Octane-core hot paths.
 
