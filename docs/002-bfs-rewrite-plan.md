@@ -224,10 +224,10 @@ Known Octane run blockers:
   runner contract slice; later realm/global-environment tightening may still be
   needed when full conformance expands beyond Octane-core.
 - Octane-core syntax/lowering blockers discovered so far are now accepted for
-  `do while`, `switch`, and non-tagged template literals. The next shared M4
-  blocker is runner result extraction, benchmark oracle handling, and score
-  reporting so the engine can distinguish real correctness failures from
-  missing telemetry.
+  `do while`, `switch`, and non-tagged template literals. Runner result
+  telemetry and scoring are accepted. The next shared M4 blocker is a complete
+  Octane-core pass/fail matrix so the engine can schedule missing features from
+  classified evidence.
 
 Known full-Octane blockers beyond the core subset:
 
@@ -320,8 +320,9 @@ Layer A: benchmark contract and runner boundary.
   deterministic random reset, runner execution, result extraction, scoring, and
   telemetry as separate owned slices.
 - Current status: manifest, preparation, scoring math, generated runner source,
-  and execution classification are accepted. Result extraction and score output
-  remain open.
+  execution classification, reserved result telemetry, per-benchmark scores,
+  suite scores, oracle-alert handling, and interpreter-vs-baseline comparison
+  records are accepted.
 
 Layer B: shared language/runtime blockers for Octane-core.
 
@@ -334,8 +335,8 @@ Layer B: shared language/runtime blockers for Octane-core.
 - Current status: top-level `function`/`var` cross-source visibility works and
   top-level `class`/`let`/`const` now use a distinct source-session global
   lexical boundary. `do while`, `switch`, and non-tagged template literals are
-  accepted. The next shared blocker is M4f runner result extraction and oracle
-  handling.
+  accepted. The next shared blocker is the M4g Octane-core pass/fail matrix,
+  which should classify missing engine features by shared dependency.
 
 Layer C: Octane-core correctness.
 
@@ -525,8 +526,7 @@ M4: Current - run Octane-core correctly in the Rust engine.
 - Accepted sub-slice: M4c executes prepared benchmarks through a fresh
   source-session VM in interpreter-only or baseline-allowed mode and classifies
   parse, bytecode-emission, session-link, runtime, thrown/oracle,
-  score-telemetry, and baseline-only outcomes. Runner completion currently
-  returns typed `ResultExtractionMissing` instead of pretending scored success.
+  score-telemetry, and baseline-only outcomes.
 - Accepted sub-slice: M4d added source-session global lexical/class
   declarations for top-level `class Benchmark`, `let`, and `const` through a
   distinct host-owned lexical boundary with duplicate-declaration, TDZ, and
@@ -546,10 +546,11 @@ M4: Current - run Octane-core correctly in the Rust engine.
   lowers substitutions through a real `ToString` opcode, and runtime coercion
   covers primitives plus object `toString`/`valueOf`. Tagged templates and
   non-ASCII template source remain outside this slice.
-- Active sub-slice: M4f completes runner result extraction, benchmark oracle
-  handling, score reporting, and interpreter-only vs baseline-allowed
+- Accepted sub-slice: M4f added reserved runner result telemetry, typed
+  benchmark success records, per-benchmark and suite score reporting,
+  oracle-alert classification, and interpreter-only vs baseline-allowed
   comparison records.
-- Planned sub-slice: M4g runs and records the complete Octane-core pass/fail
+- Active sub-slice: M4g runs and records the complete Octane-core pass/fail
   matrix, then uses the classified matrix to schedule M5 instead of guessing.
 
 M5: Make the accepted baseline JIT cover Octane-core hot paths.

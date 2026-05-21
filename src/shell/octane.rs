@@ -6,13 +6,16 @@
 //! `DefaultBenchmark` scoring math used by JetStream 3.
 
 use std::cmp::Ordering;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use super::{
     ShellMode, ShellSourceAppendRequest, ShellSourceKind, ShellSourceLoadError, ShellSourceLoader,
 };
 use crate::bytecode::{SourceOriginId, SourceProviderId};
-use crate::interpreter::{CoreHostOutputRecord, ExecutionCompletion, ExecutionError};
+use crate::interpreter::{
+    CoreHostOutputRecord, CoreHostOutputSink, ExecutionCompletion, ExecutionError,
+};
 use crate::syntax::source::SourceText;
 use crate::vm::{
     SourceExecutionError, SourceSessionHostGlobalConfig, SourceSessionSource, Vm, VmConfig,
@@ -20,6 +23,7 @@ use crate::vm::{
 
 pub const OCTANE_DEFAULT_ITERATION_COUNT: usize = 120;
 pub const OCTANE_DEFAULT_WORST_CASE_COUNT: usize = 4;
+const OCTANE_DEFAULT_BENCHMARK_TELEMETRY_PREFIX: &str = "__JSC_RUST_OCTANE_RESULTS__:";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OctaneBenchmarkClass {
@@ -317,16 +321,17 @@ impl OctaneExecutionConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OctanePreparedSuiteExecutionReport {
     pub suite: OctaneSuite,
     pub mode: OctaneExecutionMode,
     pub failure_policy: OctaneSuiteFailurePolicy,
     pub benchmarks: Vec<OctaneBenchmarkExecutionReport>,
+    pub suite_score: Option<OctaneSuiteScoreRecord>,
     pub stopped_early: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OctaneBenchmarkExecutionReport {
     pub benchmark: &'static str,
     pub mode: OctaneExecutionMode,
@@ -344,6 +349,35 @@ pub struct OctaneSourceExecutionRecord {
     pub completion: Option<ExecutionCompletion>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct OctaneSuiteScoreRecord {
+    pub suite: OctaneSuite,
+    pub mode: OctaneExecutionMode,
+    pub benchmark_scores: Vec<OctaneSuiteBenchmarkScoreRecord>,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OctaneSuiteBenchmarkScoreRecord {
+    pub benchmark: &'static str,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OctanePreparedSuiteModeComparisonReport {
+    pub suite: OctaneSuite,
+    pub failure_policy: OctaneSuiteFailurePolicy,
+    pub benchmarks: Vec<OctaneBenchmarkModeComparisonRecord>,
+    pub stopped_early: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OctaneBenchmarkModeComparisonRecord {
+    pub benchmark: &'static str,
+    pub interpreter_only: OctaneBenchmarkExecutionReport,
+    pub baseline_allowed: OctaneBenchmarkExecutionReport,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OctaneExecutionPhase {
     Parse,
@@ -355,26 +389,44 @@ pub enum OctaneExecutionPhase {
     BaselineOnly,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum OctaneExecutionOutcome {
-    ResultExtractionMissing,
+    Succeeded(OctaneBenchmarkExecutionSuccess),
     Failed(OctaneExecutionFailure),
 }
 
 impl OctaneExecutionOutcome {
     pub const fn phase(&self) -> OctaneExecutionPhase {
         match self {
-            Self::ResultExtractionMissing => OctaneExecutionPhase::ScoreTelemetry,
+            Self::Succeeded(_) => OctaneExecutionPhase::ScoreTelemetry,
             Self::Failed(failure) => failure.phase,
         }
     }
 
     pub const fn is_success(&self) -> bool {
-        false
+        matches!(self, Self::Succeeded(_))
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OctaneBenchmarkExecutionSuccess {
+    pub telemetry: OctaneDefaultBenchmarkTelemetry,
+    pub scores: OctaneDefaultBenchmarkScores,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OctaneDefaultBenchmarkTelemetry {
+    pub elapsed_times_ms: Vec<f64>,
+    pub validation_state: OctaneBenchmarkValidationState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OctaneBenchmarkValidationState {
+    NotRun,
+    Passed,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct OctaneExecutionFailure {
     pub phase: OctaneExecutionPhase,
     pub order_index: Option<usize>,
@@ -383,13 +435,65 @@ pub struct OctaneExecutionFailure {
     pub detail: OctaneExecutionFailureDetail,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum OctaneExecutionFailureDetail {
     SourceExecutionError(SourceExecutionError),
     Completion(ExecutionCompletion),
     MissingPreparedSource {
         entry: OctanePreparedSourceOrderEntry,
     },
+    OracleAlert(CoreHostOutputRecord),
+    ScoreTelemetry(OctaneScoreTelemetryError),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum OctaneScoreTelemetryError {
+    Missing,
+    Duplicate {
+        count: usize,
+    },
+    Malformed {
+        text: String,
+    },
+    UnexpectedBenchmark {
+        expected: &'static str,
+        actual: String,
+    },
+    InvalidIterationCount {
+        value: String,
+    },
+    UnexpectedIterationCount {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidValidationState {
+        value: String,
+    },
+    InvalidElapsedTime {
+        index: usize,
+        value: String,
+    },
+    NonFiniteElapsedTime {
+        index: usize,
+        value: String,
+    },
+    ElapsedTimeOutOfRange {
+        index: usize,
+        value: String,
+    },
+    Scoring(OctaneScoringError),
+    NonFiniteScore {
+        component: OctaneScoreComponent,
+        value: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OctaneScoreComponent {
+    FirstIteration,
+    WorstCase,
+    Average,
+    Score,
 }
 
 #[derive(Clone, Debug)]
@@ -773,7 +877,10 @@ pub fn execute_prepared_octane_benchmark(
         run_config: prepared.run_config,
         source_records,
         host_output_records: session.host_output_records().to_vec(),
-        outcome: OctaneExecutionOutcome::ResultExtractionMissing,
+        outcome: match extract_octane_benchmark_success(prepared, session.host_output_records()) {
+            Ok(success) => OctaneExecutionOutcome::Succeeded(success),
+            Err(failure) => OctaneExecutionOutcome::Failed(failure),
+        },
     }
 }
 
@@ -799,9 +906,353 @@ pub fn execute_prepared_octane_suite(
         suite: prepared.config.run.suite,
         mode: config.mode,
         failure_policy: config.failure_policy,
+        suite_score: octane_suite_score_record(prepared.config.run.suite, config.mode, &benchmarks),
         benchmarks,
         stopped_early,
     }
+}
+
+pub fn execute_prepared_octane_benchmark_mode_comparison(
+    prepared: &OctanePreparedBenchmark,
+    failure_policy: OctaneSuiteFailurePolicy,
+) -> OctaneBenchmarkModeComparisonRecord {
+    let interpreter_only = execute_prepared_octane_benchmark(
+        prepared,
+        OctaneExecutionConfig::new(OctaneExecutionMode::InterpreterOnly, failure_policy),
+    );
+    let baseline_allowed = execute_prepared_octane_benchmark(
+        prepared,
+        OctaneExecutionConfig::new(OctaneExecutionMode::BaselineAllowed, failure_policy),
+    );
+
+    OctaneBenchmarkModeComparisonRecord {
+        benchmark: prepared.plan.name,
+        interpreter_only,
+        baseline_allowed,
+    }
+}
+
+pub fn execute_prepared_octane_suite_mode_comparison(
+    prepared: &OctanePreparedSuite,
+    failure_policy: OctaneSuiteFailurePolicy,
+) -> OctanePreparedSuiteModeComparisonReport {
+    let mut benchmarks = Vec::with_capacity(prepared.benchmarks.len());
+    let mut stopped_early = false;
+
+    for benchmark in &prepared.benchmarks {
+        let record = execute_prepared_octane_benchmark_mode_comparison(benchmark, failure_policy);
+        let should_stop = failure_policy == OctaneSuiteFailurePolicy::FailFast
+            && (!record.interpreter_only.outcome.is_success()
+                || !record.baseline_allowed.outcome.is_success());
+        benchmarks.push(record);
+        if should_stop {
+            stopped_early = true;
+            break;
+        }
+    }
+
+    OctanePreparedSuiteModeComparisonReport {
+        suite: prepared.config.run.suite,
+        failure_policy,
+        benchmarks,
+        stopped_early,
+    }
+}
+
+fn octane_suite_score_record(
+    suite: OctaneSuite,
+    mode: OctaneExecutionMode,
+    reports: &[OctaneBenchmarkExecutionReport],
+) -> Option<OctaneSuiteScoreRecord> {
+    if reports.is_empty() {
+        return None;
+    }
+
+    let mut benchmark_scores = Vec::with_capacity(reports.len());
+    for report in reports {
+        let OctaneExecutionOutcome::Succeeded(success) = &report.outcome else {
+            return None;
+        };
+        benchmark_scores.push(OctaneSuiteBenchmarkScoreRecord {
+            benchmark: report.benchmark,
+            score: success.scores.score,
+        });
+    }
+
+    let scores = benchmark_scores
+        .iter()
+        .map(|record| record.score)
+        .collect::<Vec<_>>();
+    Some(OctaneSuiteScoreRecord {
+        suite,
+        mode,
+        benchmark_scores,
+        score: geometric_mean(&scores),
+    })
+}
+
+fn extract_octane_benchmark_success(
+    prepared: &OctanePreparedBenchmark,
+    host_output_records: &[CoreHostOutputRecord],
+) -> Result<OctaneBenchmarkExecutionSuccess, OctaneExecutionFailure> {
+    if let Some(failure) = classify_octane_oracle_alert(prepared, host_output_records) {
+        return Err(failure);
+    }
+
+    match extract_octane_default_benchmark_telemetry(
+        prepared.plan,
+        prepared.run_config,
+        host_output_records,
+    )
+    .and_then(|telemetry| score_octane_default_benchmark_telemetry(prepared.run_config, telemetry))
+    {
+        Ok(success) => Ok(success),
+        Err(error) => Err(octane_score_telemetry_failure(prepared, error)),
+    }
+}
+
+fn classify_octane_oracle_alert(
+    prepared: &OctanePreparedBenchmark,
+    host_output_records: &[CoreHostOutputRecord],
+) -> Option<OctaneExecutionFailure> {
+    host_output_records
+        .iter()
+        .find(|record| record.sink == CoreHostOutputSink::Alert)
+        .cloned()
+        .map(|record| {
+            let (order_index, order_entry, label) = octane_runner_execution_context(prepared);
+            OctaneExecutionFailure {
+                phase: OctaneExecutionPhase::ThrownOrOracle,
+                order_index,
+                order_entry,
+                label,
+                detail: OctaneExecutionFailureDetail::OracleAlert(record),
+            }
+        })
+}
+
+fn extract_octane_default_benchmark_telemetry(
+    plan: &'static OctaneBenchmarkPlan,
+    run_config: OctaneDefaultBenchmarkRunConfig,
+    host_output_records: &[CoreHostOutputRecord],
+) -> Result<OctaneDefaultBenchmarkTelemetry, OctaneScoreTelemetryError> {
+    let telemetry_records = host_output_records
+        .iter()
+        .filter(|record| {
+            record.sink == CoreHostOutputSink::Print
+                && octane_telemetry_text_matches_prefix(&record.text)
+        })
+        .collect::<Vec<_>>();
+
+    let [record] = telemetry_records.as_slice() else {
+        return if telemetry_records.is_empty() {
+            Err(OctaneScoreTelemetryError::Missing)
+        } else {
+            Err(OctaneScoreTelemetryError::Duplicate {
+                count: telemetry_records.len(),
+            })
+        };
+    };
+
+    parse_octane_default_benchmark_telemetry_text(plan, run_config, &record.text)
+}
+
+fn parse_octane_default_benchmark_telemetry_text(
+    plan: &'static OctaneBenchmarkPlan,
+    run_config: OctaneDefaultBenchmarkRunConfig,
+    text: &str,
+) -> Result<OctaneDefaultBenchmarkTelemetry, OctaneScoreTelemetryError> {
+    let Some(telemetry) = text.strip_prefix(OCTANE_DEFAULT_BENCHMARK_TELEMETRY_PREFIX) else {
+        return Err(OctaneScoreTelemetryError::Malformed {
+            text: text.to_string(),
+        });
+    };
+
+    let mut fields = telemetry.split('|');
+    let Some(benchmark) = fields.next() else {
+        return Err(OctaneScoreTelemetryError::Malformed {
+            text: text.to_string(),
+        });
+    };
+    let Some(iterations) = fields.next() else {
+        return Err(OctaneScoreTelemetryError::Malformed {
+            text: text.to_string(),
+        });
+    };
+    let Some(validation_state) = fields.next() else {
+        return Err(OctaneScoreTelemetryError::Malformed {
+            text: text.to_string(),
+        });
+    };
+    let Some(elapsed_times) = fields.next() else {
+        return Err(OctaneScoreTelemetryError::Malformed {
+            text: text.to_string(),
+        });
+    };
+    if fields.next().is_some() {
+        return Err(OctaneScoreTelemetryError::Malformed {
+            text: text.to_string(),
+        });
+    }
+
+    if benchmark != plan.name {
+        return Err(OctaneScoreTelemetryError::UnexpectedBenchmark {
+            expected: plan.name,
+            actual: benchmark.to_string(),
+        });
+    }
+
+    let iterations = iterations.parse::<usize>().map_err(|_| {
+        OctaneScoreTelemetryError::InvalidIterationCount {
+            value: iterations.to_string(),
+        }
+    })?;
+    if iterations != run_config.iterations {
+        return Err(OctaneScoreTelemetryError::UnexpectedIterationCount {
+            expected: run_config.iterations,
+            actual: iterations,
+        });
+    }
+
+    let validation_state = parse_octane_validation_state(validation_state)?;
+    let elapsed_times_ms = if elapsed_times.is_empty() {
+        Vec::new()
+    } else {
+        elapsed_times
+            .split(',')
+            .enumerate()
+            .map(|(index, value)| parse_octane_elapsed_time(index, value))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    Ok(OctaneDefaultBenchmarkTelemetry {
+        elapsed_times_ms,
+        validation_state,
+    })
+}
+
+fn parse_octane_validation_state(
+    value: &str,
+) -> Result<OctaneBenchmarkValidationState, OctaneScoreTelemetryError> {
+    match value {
+        "not-run" => Ok(OctaneBenchmarkValidationState::NotRun),
+        "passed" => Ok(OctaneBenchmarkValidationState::Passed),
+        _ => Err(OctaneScoreTelemetryError::InvalidValidationState {
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn parse_octane_elapsed_time(index: usize, value: &str) -> Result<f64, OctaneScoreTelemetryError> {
+    let elapsed_time =
+        value
+            .parse::<f64>()
+            .map_err(|_| OctaneScoreTelemetryError::InvalidElapsedTime {
+                index,
+                value: value.to_string(),
+            })?;
+    if !elapsed_time.is_finite() {
+        return Err(OctaneScoreTelemetryError::NonFiniteElapsedTime {
+            index,
+            value: value.to_string(),
+        });
+    }
+    if elapsed_time < 1.0 {
+        return Err(OctaneScoreTelemetryError::ElapsedTimeOutOfRange {
+            index,
+            value: value.to_string(),
+        });
+    }
+    Ok(elapsed_time)
+}
+
+fn score_octane_default_benchmark_telemetry(
+    run_config: OctaneDefaultBenchmarkRunConfig,
+    telemetry: OctaneDefaultBenchmarkTelemetry,
+) -> Result<OctaneBenchmarkExecutionSuccess, OctaneScoreTelemetryError> {
+    let scores = run_config
+        .score_results(&telemetry.elapsed_times_ms)
+        .map_err(OctaneScoreTelemetryError::Scoring)?;
+    validate_octane_scores(scores)?;
+    Ok(OctaneBenchmarkExecutionSuccess { telemetry, scores })
+}
+
+fn validate_octane_scores(
+    scores: OctaneDefaultBenchmarkScores,
+) -> Result<(), OctaneScoreTelemetryError> {
+    for (component, value) in [
+        (OctaneScoreComponent::FirstIteration, scores.first_iteration),
+        (OctaneScoreComponent::WorstCase, scores.worst_case),
+        (OctaneScoreComponent::Average, scores.average),
+        (OctaneScoreComponent::Score, scores.score),
+    ] {
+        if !value.is_finite() {
+            return Err(OctaneScoreTelemetryError::NonFiniteScore {
+                component,
+                value: value.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn octane_score_telemetry_failure(
+    prepared: &OctanePreparedBenchmark,
+    error: OctaneScoreTelemetryError,
+) -> OctaneExecutionFailure {
+    let (order_index, order_entry, label) = octane_runner_execution_context(prepared);
+
+    OctaneExecutionFailure {
+        phase: OctaneExecutionPhase::ScoreTelemetry,
+        order_index,
+        order_entry,
+        label,
+        detail: OctaneExecutionFailureDetail::ScoreTelemetry(error),
+    }
+}
+
+fn octane_runner_execution_context(
+    prepared: &OctanePreparedBenchmark,
+) -> (
+    Option<usize>,
+    Option<OctanePreparedSourceOrderEntry>,
+    Option<String>,
+) {
+    let order_entry =
+        OctanePreparedSourceOrderEntry::Generated(OctanePreparedGeneratedSourceKind::Runner);
+    let order_index = prepared
+        .source_order
+        .iter()
+        .position(|entry| *entry == order_entry);
+    let label = prepared
+        .generated_source(OctanePreparedGeneratedSourceKind::Runner)
+        .map(|source| source.label.clone());
+
+    (order_index, Some(order_entry), label)
+}
+
+fn octane_telemetry_text_matches_prefix(text: &str) -> bool {
+    text.starts_with(OCTANE_DEFAULT_BENCHMARK_TELEMETRY_PREFIX)
+}
+
+fn octane_js_double_quoted_string(value: &str) -> String {
+    let mut literal = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            character if character.is_control() => {
+                write!(&mut literal, "\\u{:04x}", character as u32)
+                    .expect("writing to a String should not fail");
+            }
+            character => literal.push(character),
+        }
+    }
+    literal.push('"');
+    literal
 }
 
 struct OctaneOrderedPreparedSource<'a> {
@@ -1025,24 +1476,38 @@ fn generate_octane_runner_source(
             } else {
                 ""
             };
+            let benchmark_name = octane_js_double_quoted_string(plan.name);
             Ok(format!(
                 "\
-let __benchmark = new Benchmark({iterations});
-let results = [];
+let __octaneBenchmark = new Benchmark({iterations});
+let __octaneResults = [];
+let __octaneResultsText = \"\";
+let __octaneValidationState = \"not-run\";
 for (let i = 0; i < {iterations}; i++) {{
-    if (__benchmark.prepareForNextIteration)
-        __benchmark.prepareForNextIteration();
+    if (typeof __octaneBenchmark.prepareForNextIteration === \"function\")
+        __octaneBenchmark.prepareForNextIteration();
 {random_reset}    let start = performance.now();
-    __benchmark.runIteration();
+    __octaneBenchmark.runIteration();
     let end = performance.now();
-    results.push(Math.max(1, end - start));
+    let __octaneElapsed = Math.max(1, end - start);
+    __octaneResults.push(__octaneElapsed);
+    if (i > 0)
+        __octaneResultsText = __octaneResultsText + \",\";
+    __octaneResultsText = __octaneResultsText + __octaneElapsed;
 }}
-if (__benchmark.validate)
-    __benchmark.validate();
-return results;
+if (typeof __octaneBenchmark.validate === \"function\") {{
+    let __octaneValidationResult = __octaneBenchmark.validate();
+    if (__octaneValidationResult === false)
+        alert(\"Octane validation failed\");
+    __octaneValidationState = \"passed\";
+}}
+print(\"{telemetry_prefix}\" + {benchmark_name} + \"|{iterations}|\" + __octaneValidationState + \"|\" + __octaneResultsText);
+return __octaneResults;
 ",
                 iterations = run_config.iterations,
-                random_reset = random_reset
+                random_reset = random_reset,
+                benchmark_name = benchmark_name,
+                telemetry_prefix = OCTANE_DEFAULT_BENCHMARK_TELEMETRY_PREFIX
             ))
         }
     }
@@ -1219,8 +1684,8 @@ mod tests {
         name: "test-function",
         files: &["./Octane/test-function.js"],
         deterministic_random: false,
-        iterations: Some(1),
-        worst_case_count: Some(0),
+        iterations: Some(3),
+        worst_case_count: Some(1),
         benchmark_class: OctaneBenchmarkClass::DefaultBenchmark,
     };
 
@@ -1228,8 +1693,8 @@ mod tests {
         name: "test-class",
         files: &["./Octane/test-class.js"],
         deterministic_random: false,
-        iterations: Some(1),
-        worst_case_count: Some(0),
+        iterations: Some(3),
+        worst_case_count: Some(1),
         benchmark_class: OctaneBenchmarkClass::DefaultBenchmark,
     };
 
@@ -1237,8 +1702,8 @@ mod tests {
         name: "test-unsupported",
         files: &["./Octane/test-unsupported.js"],
         deterministic_random: false,
-        iterations: Some(1),
-        worst_case_count: Some(0),
+        iterations: Some(3),
+        worst_case_count: Some(1),
         benchmark_class: OctaneBenchmarkClass::DefaultBenchmark,
     };
 
@@ -1246,8 +1711,8 @@ mod tests {
         name: "test-second",
         files: &["./Octane/test-second.js"],
         deterministic_random: false,
-        iterations: Some(1),
-        worst_case_count: Some(0),
+        iterations: Some(3),
+        worst_case_count: Some(1),
         benchmark_class: OctaneBenchmarkClass::DefaultBenchmark,
     };
 
@@ -1295,6 +1760,31 @@ mod tests {
         );
     }
 
+    fn octane_telemetry_text(
+        benchmark: &str,
+        iterations: usize,
+        validation_state: &str,
+        elapsed_times: &str,
+    ) -> String {
+        format!(
+            "{OCTANE_DEFAULT_BENCHMARK_TELEMETRY_PREFIX}{benchmark}|{iterations}|{validation_state}|{elapsed_times}"
+        )
+    }
+
+    fn octane_print_record(text: String) -> CoreHostOutputRecord {
+        CoreHostOutputRecord {
+            sink: CoreHostOutputSink::Print,
+            text,
+        }
+    }
+
+    fn octane_alert_record(text: &str) -> CoreHostOutputRecord {
+        CoreHostOutputRecord {
+            sink: CoreHostOutputSink::Alert,
+            text: text.to_string(),
+        }
+    }
+
     fn minimal_function_benchmark_source() -> &'static str {
         "\
 function Benchmark(iterations) {
@@ -1304,6 +1794,25 @@ Benchmark.prototype.runIteration = function() {
 };
 Benchmark.prototype.validate = function() {
     return 1;
+};
+"
+    }
+
+    fn deterministic_timing_benchmark_source() -> &'static str {
+        "\
+var __testNowValues = [100, 105, 200, 210, 300, 320];
+var __testNowIndex = 0;
+performance.now = function() {
+    return __testNowValues[__testNowIndex++];
+};
+function Benchmark(iterations) {
+    this.iterations = iterations;
+}
+Benchmark.prototype.runIteration = function() {
+    return this.iterations;
+};
+Benchmark.prototype.validate = function() {
+    return true;
 };
 "
     }
@@ -1524,6 +2033,91 @@ Benchmark.prototype.validate = function() {
     }
 
     #[test]
+    fn octane_score_telemetry_parses_reserved_runner_record() {
+        let run_config = OctaneDefaultBenchmarkRunConfig::new(3, 1).expect("valid config");
+        let telemetry = parse_octane_default_benchmark_telemetry_text(
+            &OCTANE_TEST_FUNCTION_PLAN,
+            run_config,
+            &octane_telemetry_text("test-function", 3, "not-run", "1,2,3"),
+        )
+        .expect("telemetry should parse");
+
+        assert_eq!(
+            telemetry,
+            OctaneDefaultBenchmarkTelemetry {
+                elapsed_times_ms: vec![1.0, 2.0, 3.0],
+                validation_state: OctaneBenchmarkValidationState::NotRun,
+            }
+        );
+    }
+
+    #[test]
+    fn octane_score_telemetry_classifies_missing_duplicate_and_invalid_records() {
+        let run_config = OctaneDefaultBenchmarkRunConfig::new(3, 1).expect("valid config");
+        assert_eq!(
+            extract_octane_default_benchmark_telemetry(&OCTANE_TEST_FUNCTION_PLAN, run_config, &[],),
+            Err(OctaneScoreTelemetryError::Missing)
+        );
+
+        let telemetry = octane_telemetry_text("test-function", 3, "passed", "1,2,3");
+        assert_eq!(
+            extract_octane_default_benchmark_telemetry(
+                &OCTANE_TEST_FUNCTION_PLAN,
+                run_config,
+                &[
+                    octane_print_record(telemetry.clone()),
+                    octane_print_record(telemetry)
+                ],
+            ),
+            Err(OctaneScoreTelemetryError::Duplicate { count: 2 })
+        );
+
+        assert_eq!(
+            parse_octane_default_benchmark_telemetry_text(
+                &OCTANE_TEST_FUNCTION_PLAN,
+                run_config,
+                &octane_telemetry_text("wrong-benchmark", 3, "passed", "1,2,3"),
+            ),
+            Err(OctaneScoreTelemetryError::UnexpectedBenchmark {
+                expected: "test-function",
+                actual: "wrong-benchmark".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_octane_default_benchmark_telemetry_text(
+                &OCTANE_TEST_FUNCTION_PLAN,
+                run_config,
+                &octane_telemetry_text("test-function", 4, "passed", "1,2,3"),
+            ),
+            Err(OctaneScoreTelemetryError::UnexpectedIterationCount {
+                expected: 3,
+                actual: 4,
+            })
+        );
+        assert_eq!(
+            parse_octane_default_benchmark_telemetry_text(
+                &OCTANE_TEST_FUNCTION_PLAN,
+                run_config,
+                &octane_telemetry_text("test-function", 3, "unknown", "1,2,3"),
+            ),
+            Err(OctaneScoreTelemetryError::InvalidValidationState {
+                value: "unknown".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_octane_default_benchmark_telemetry_text(
+                &OCTANE_TEST_FUNCTION_PLAN,
+                run_config,
+                &octane_telemetry_text("test-function", 3, "passed", "1,nope,3"),
+            ),
+            Err(OctaneScoreTelemetryError::InvalidElapsedTime {
+                index: 1,
+                value: "nope".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn octane_preparation_loads_manifest_files_in_order_with_provenance() {
         let root = TempJetStreamRoot::new();
         let plan = octane_plan_by_name("gbemu").expect("gbemu plan");
@@ -1702,11 +2296,12 @@ Benchmark.prototype.validate = function() {
             .find("Math.random.__resetSeed();")
             .expect("runner should reset random");
         let run_index = crypto_runner
-            .find("__benchmark.runIteration();")
+            .find("__octaneBenchmark.runIteration();")
             .expect("runner should run benchmark");
         assert!(reset_index < run_index);
-        assert!(crypto_runner.contains("let __benchmark = new Benchmark(120);"));
-        assert!(crypto_runner.contains("return results;"));
+        assert!(crypto_runner.contains("let __octaneBenchmark = new Benchmark(120);"));
+        assert!(crypto_runner.contains(OCTANE_DEFAULT_BENCHMARK_TELEMETRY_PREFIX));
+        assert!(crypto_runner.contains("return __octaneResults;"));
 
         let prepared_raytrace =
             prepare_octane_benchmark(root.path(), raytrace, OctaneBenchmarkRunOverrides::none())
@@ -1716,7 +2311,7 @@ Benchmark.prototype.validate = function() {
             .expect("raytrace runner source")
             .text;
         assert!(!raytrace_runner.contains("Math.random.__resetSeed();"));
-        assert!(raytrace_runner.contains("__benchmark.runIteration();"));
+        assert!(raytrace_runner.contains("__octaneBenchmark.runIteration();"));
     }
 
     #[test]
@@ -1777,11 +2372,11 @@ Benchmark.prototype.validate = function() {
     }
 
     #[test]
-    fn octane_executes_function_style_benchmark_until_result_extraction_is_missing() {
+    fn octane_executes_function_style_benchmark_and_scores_extracted_results() {
         let root = TempJetStreamRoot::new();
         root.write_manifest_file(
             "./Octane/test-function.js",
-            minimal_function_benchmark_source(),
+            deterministic_timing_benchmark_source(),
         );
         let prepared = prepare_test_benchmark(&root, &OCTANE_TEST_FUNCTION_PLAN);
 
@@ -1798,29 +2393,37 @@ Benchmark.prototype.validate = function() {
         assert_eq!(
             report.run_config,
             OctaneDefaultBenchmarkRunConfig {
-                iterations: 1,
-                worst_case_count: 0,
+                iterations: 3,
+                worst_case_count: 1,
             }
         );
+        let OctaneExecutionOutcome::Succeeded(success) = &report.outcome else {
+            panic!("expected success: {report:#?}");
+        };
         assert_eq!(
-            report.outcome.phase(),
-            OctaneExecutionPhase::ScoreTelemetry,
-            "{report:#?}"
+            success.telemetry,
+            OctaneDefaultBenchmarkTelemetry {
+                elapsed_times_ms: vec![5.0, 10.0, 20.0],
+                validation_state: OctaneBenchmarkValidationState::Passed,
+            }
         );
-        assert!(matches!(
-            report.outcome,
-            OctaneExecutionOutcome::ResultExtractionMissing
-        ));
+        assert_close(success.scores.first_iteration, 1000.0);
+        assert_close(success.scores.worst_case, 250.0);
+        assert_close(success.scores.average, 5000.0 / 15.0);
+        assert_close(
+            success.scores.score,
+            (1000.0_f64 * 250.0 * (5000.0 / 15.0)).powf(1.0 / 3.0),
+        );
         assert_eq!(report.source_records.len(), prepared.source_order.len());
         assert!(report
             .source_records
             .iter()
             .all(|record| matches!(record.completion, Some(ExecutionCompletion::Returned(_)))));
-        assert!(report.host_output_records.is_empty());
+        assert_eq!(report.host_output_records.len(), 1);
     }
 
     #[test]
-    fn octane_executes_class_style_benchmark_until_result_extraction_is_missing() {
+    fn octane_executes_class_style_benchmark_and_extracts_score_telemetry() {
         let root = TempJetStreamRoot::new();
         root.write_manifest_file(
             "./Octane/test-class.js",
@@ -1842,20 +2445,91 @@ class Benchmark {
             ),
         );
 
+        let OctaneExecutionOutcome::Succeeded(success) = &report.outcome else {
+            panic!("expected success: {report:#?}");
+        };
         assert_eq!(
-            report.outcome.phase(),
-            OctaneExecutionPhase::ScoreTelemetry,
-            "{report:#?}"
+            success.telemetry.validation_state,
+            OctaneBenchmarkValidationState::Passed
         );
-        assert!(matches!(
-            report.outcome,
-            OctaneExecutionOutcome::ResultExtractionMissing
-        ));
+        assert_eq!(success.telemetry.elapsed_times_ms.len(), 3);
+        assert!(success
+            .telemetry
+            .elapsed_times_ms
+            .iter()
+            .all(|time| *time >= 1.0));
         assert_eq!(report.source_records.len(), prepared.source_order.len());
         assert!(report
             .source_records
             .iter()
             .all(|record| matches!(record.completion, Some(ExecutionCompletion::Returned(_)))));
+    }
+
+    #[test]
+    fn octane_oracle_alert_is_reported_as_runner_execution_failure() {
+        let root = TempJetStreamRoot::new();
+        root.write_manifest_file(
+            "./Octane/test-function.js",
+            minimal_function_benchmark_source(),
+        );
+        let prepared = prepare_test_benchmark(&root, &OCTANE_TEST_FUNCTION_PLAN);
+
+        let failure = classify_octane_oracle_alert(
+            &prepared,
+            &[octane_alert_record("Octane validation failed")],
+        )
+        .expect("alert should classify as oracle failure");
+
+        assert_eq!(failure.phase, OctaneExecutionPhase::ThrownOrOracle);
+        assert_eq!(
+            failure.order_entry,
+            Some(OctanePreparedSourceOrderEntry::Generated(
+                OctanePreparedGeneratedSourceKind::Runner
+            ))
+        );
+        assert!(failure
+            .label
+            .as_deref()
+            .is_some_and(|label| label.contains("runner")));
+        assert!(matches!(
+            failure.detail,
+            OctaneExecutionFailureDetail::OracleAlert(CoreHostOutputRecord {
+                sink: CoreHostOutputSink::Alert,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn octane_mode_comparison_records_interpreter_and_baseline_outcomes() {
+        let root = TempJetStreamRoot::new();
+        root.write_manifest_file(
+            "./Octane/test-function.js",
+            minimal_function_benchmark_source(),
+        );
+        let prepared = prepare_test_benchmark(&root, &OCTANE_TEST_FUNCTION_PLAN);
+
+        let comparison = execute_prepared_octane_benchmark_mode_comparison(
+            &prepared,
+            OctaneSuiteFailurePolicy::FailFast,
+        );
+
+        assert_eq!(comparison.benchmark, "test-function");
+        assert_eq!(
+            comparison.interpreter_only.mode,
+            OctaneExecutionMode::InterpreterOnly
+        );
+        assert_eq!(
+            comparison.baseline_allowed.mode,
+            OctaneExecutionMode::BaselineAllowed
+        );
+        assert!(comparison.interpreter_only.outcome.is_success());
+        assert!(
+            comparison.baseline_allowed.outcome.is_success()
+                || comparison.baseline_allowed.outcome.phase()
+                    == OctaneExecutionPhase::BaselineOnly,
+            "{comparison:#?}"
+        );
     }
 
     #[test]
@@ -1892,7 +2566,7 @@ Benchmark.prototype.validate = function() {
         assert_ne!(report.outcome.phase(), OctaneExecutionPhase::BytecodeEmit);
         assert!(matches!(
             report.outcome,
-            OctaneExecutionOutcome::ResultExtractionMissing
+            OctaneExecutionOutcome::Succeeded(_)
                 | OctaneExecutionOutcome::Failed(OctaneExecutionFailure {
                     phase: OctaneExecutionPhase::ExecuteRuntime,
                     ..
@@ -1919,7 +2593,11 @@ Benchmark.prototype.validate = function() {
 
         assert_eq!(report.mode, OctaneExecutionMode::BaselineAllowed);
         assert_eq!(report.benchmark, "test-function");
-        assert_eq!(report.outcome.phase(), OctaneExecutionPhase::ScoreTelemetry);
+        assert!(
+            matches!(report.outcome, OctaneExecutionOutcome::Succeeded(_))
+                || report.outcome.phase() == OctaneExecutionPhase::BaselineOnly,
+            "{report:#?}"
+        );
     }
 
     #[test]
@@ -1976,9 +2654,7 @@ function Benchmark() {
         assert_eq!(collect_all.benchmarks.len(), 2);
         assert_eq!(collect_all.benchmarks[0].benchmark, "test-unsupported");
         assert_eq!(collect_all.benchmarks[1].benchmark, "test-second");
-        assert_eq!(
-            collect_all.benchmarks[1].outcome.phase(),
-            OctaneExecutionPhase::ScoreTelemetry
-        );
+        assert!(collect_all.benchmarks[1].outcome.is_success());
+        assert!(collect_all.suite_score.is_none());
     }
 }

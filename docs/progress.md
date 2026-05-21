@@ -201,6 +201,7 @@ one-off test adjustments.
 - 2026-05-21: M4e1 do-while support accepted: AST/parser/bytecompiler lowering now handles `do while` first-iteration semantics plus `break`/`continue`/`finally`, the Octane do-while blocker gets past parse/lowering, and full gates passed including `cargo test --lib -- --quiet` 1864 passed.
 - 2026-05-21: M4e2 switch support accepted: AST/parser/bytecompiler lowering now handles strict case matching, default/fallthrough, case-test order, duplicate-default rejection, switch-local break targets, and loop continue from inside switch; full gates passed including `cargo test --lib -- --quiet` 1871 passed.
 - 2026-05-21: M4e3 non-tagged template literals accepted: parser/lexer resume template tails, bytecompiler lowers substitutions through `ToString`, object `toString` interpolation is covered, and full gates passed including `cargo test --lib -- --quiet` 1883 passed.
+- 2026-05-21: M4f Octane runner scoring accepted: reserved result telemetry now yields typed benchmark success records, per-benchmark and suite scores, oracle-alert failures, and interpreter-vs-baseline comparison records; full gates passed including `cargo test --lib -- --quiet` 1888 passed.
 
 ## Open High-Risk Gaps
 
