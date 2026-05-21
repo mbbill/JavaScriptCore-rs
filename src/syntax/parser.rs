@@ -1633,6 +1633,9 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
                 if cursor.consume_punctuator(Punctuator::Comma).is_none() {
                     break;
                 }
+                if cursor.at_punctuator(Punctuator::CloseParen) {
+                    break;
+                }
             }
         }
         let close = cursor.expect_punctuator(Punctuator::CloseParen)?.clone();
@@ -2141,6 +2144,14 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             ),
         })?;
         if kind == NumericLiteralKind::Integer {
+            if let Some((digits, radix)) = non_decimal_literal_digits_and_radix(&raw) {
+                return parse_non_decimal_number_literal(digits, radix).ok_or_else(|| {
+                    ParserError {
+                        span: Some(token.span()),
+                        kind: ParserErrorKind::Syntax("invalid numeric literal token".into()),
+                    }
+                });
+            }
             if let Ok(value) = raw.parse::<i32>() {
                 return Ok(NumberLiteralValue::Int32(value));
             }
@@ -2766,6 +2777,44 @@ fn cook_template_text(token: &Token, raw: &str) -> Result<String, ParserError> {
     Ok(cooked)
 }
 
+fn non_decimal_literal_digits_and_radix(raw: &str) -> Option<(&str, u32)> {
+    let bytes = raw.as_bytes();
+    if bytes.first() != Some(&b'0') {
+        return None;
+    }
+    let radix = match bytes.get(1) {
+        Some(b'x' | b'X') => 16,
+        Some(b'b' | b'B') => 2,
+        Some(b'o' | b'O') => 8,
+        _ => return None,
+    };
+    Some((&raw[2..], radix))
+}
+
+fn parse_non_decimal_number_literal(digits: &str, radix: u32) -> Option<NumberLiteralValue> {
+    if digits.is_empty() {
+        return None;
+    }
+    if let Ok(value) = i32::from_str_radix(digits, radix) {
+        return Some(NumberLiteralValue::Int32(value));
+    }
+    if let Ok(value) = u128::from_str_radix(digits, radix) {
+        return Some(NumberLiteralValue::DoubleBits((value as f64).to_bits()));
+    }
+
+    let mut value = 0.0;
+    let radix_value = f64::from(radix);
+    for unit in digits.bytes() {
+        let digit = u32::from(hex_value(unit)?);
+        if digit >= radix {
+            return None;
+        }
+        value = value * radix_value + f64::from(digit);
+    }
+
+    Some(NumberLiteralValue::DoubleBits(value.to_bits()))
+}
+
 fn parse_fixed_hex_escape(bytes: &[u8], start: usize, count: usize) -> Option<(u32, usize)> {
     let mut unit = 0_u32;
     let mut index = start;
@@ -3243,6 +3292,45 @@ mod tests {
             _ => None,
         }
         .expect("class declaration must have initializer")
+    }
+
+    fn parse_script_scope(arena: &mut ParserArena, text: &str) -> AstRef<ScopeNode> {
+        let source = source(text);
+        let parsed = Parser::with_mode(arena, AstBuilder::default(), &source, ParseMode::Program)
+            .parse()
+            .unwrap();
+        match parsed.root {
+            AstRoot::Script(root) => root,
+            other => {
+                assert!(matches!(other, AstRoot::Script(_)));
+                unreachable!();
+            }
+        }
+    }
+
+    fn declaration_initializer(
+        arena: &ParserArena,
+        scope: &ScopeNode,
+        statement_index: usize,
+        initializer_index: usize,
+    ) -> AstRef<Expr> {
+        let Some(Stmt::Declaration(DeclarationStmt { initializers, .. })) =
+            arena.statement(scope.statements[statement_index])
+        else {
+            panic!("expected declaration statement");
+        };
+        initializers[initializer_index].expect("expected declaration initializer")
+    }
+
+    fn number_literal_value(arena: &ParserArena, expression: AstRef<Expr>) -> NumberLiteralValue {
+        let Some(Expr::Literal(LiteralExpr {
+            kind: LiteralKind::Number { value },
+            ..
+        })) = arena.expression(expression)
+        else {
+            panic!("expected number literal expression");
+        };
+        *value
     }
 
     fn class_element_name(arena: &ParserArena, element: &ClassElement) -> String {
@@ -3979,6 +4067,60 @@ mod tests {
         };
 
         assert_eq!(f64::from_bits(*bits), 40.5);
+    }
+
+    #[test]
+    fn parser_parses_non_decimal_numeric_literals() {
+        let mut arena = ParserArena::new();
+        let root = parse_script_scope(
+            &mut arena,
+            "let hex = 0xD008; \
+             let wide = 0xffffffff; \
+             let binary = 0b1010; \
+             let octal = 0o755; \
+             let upper_hex = 0XD008; \
+             let upper_binary = 0B1010; \
+             let upper_octal = 0O755;",
+        );
+        let scope = arena.scope_node(root).unwrap();
+        let expected = [
+            NumberLiteralValue::Int32(0xD008),
+            NumberLiteralValue::DoubleBits(f64::from(u32::MAX).to_bits()),
+            NumberLiteralValue::Int32(0b1010),
+            NumberLiteralValue::Int32(0o755),
+            NumberLiteralValue::Int32(0xD008),
+            NumberLiteralValue::Int32(0b1010),
+            NumberLiteralValue::Int32(0o755),
+        ];
+
+        assert_eq!(scope.statements.len(), expected.len());
+        for (index, expected_value) in expected.into_iter().enumerate() {
+            let initializer = declaration_initializer(&arena, scope, index, 0);
+            assert_eq!(number_literal_value(&arena, initializer), expected_value);
+        }
+    }
+
+    #[test]
+    fn parser_allows_trailing_commas_in_call_and_new_argument_lists() {
+        let mut arena = ParserArena::new();
+        let root = parse_script_scope(
+            &mut arena,
+            "let call = Color.add(a, b, ); let constructed = new Color(a, b, );",
+        );
+        let scope = arena.scope_node(root).unwrap();
+
+        let call_initializer = declaration_initializer(&arena, scope, 0, 0);
+        let Some(Expr::Call(CallExpr { arguments, .. })) = arena.expression(call_initializer)
+        else {
+            panic!("expected call expression");
+        };
+        assert_eq!(arguments.len(), 2);
+
+        let new_initializer = declaration_initializer(&arena, scope, 1, 0);
+        let Some(Expr::New(NewExpr { arguments, .. })) = arena.expression(new_initializer) else {
+            panic!("expected new expression");
+        };
+        assert_eq!(arguments.len(), 2);
     }
 
     #[test]
