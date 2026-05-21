@@ -109,6 +109,7 @@ impl BytecompilerInput {
 pub enum BytecompilerGlobalBindingKind {
     SourceVar,
     SourceFunction,
+    SourceSloppyGlobalProperty,
     SourceLet,
     SourceConst,
     SourceClass,
@@ -118,7 +119,10 @@ pub enum BytecompilerGlobalBindingKind {
 
 impl BytecompilerGlobalBindingKind {
     pub const fn is_source_object_backed(self) -> bool {
-        matches!(self, Self::SourceVar | Self::SourceFunction)
+        matches!(
+            self,
+            Self::SourceVar | Self::SourceFunction | Self::SourceSloppyGlobalProperty
+        )
     }
 
     pub const fn is_source_lexical(self) -> bool {
@@ -147,6 +151,13 @@ impl BytecompilerGlobalBinding {
         Self {
             name: name.into(),
             kind: BytecompilerGlobalBindingKind::SourceFunction,
+        }
+    }
+
+    pub fn source_sloppy_global_property(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: BytecompilerGlobalBindingKind::SourceSloppyGlobalProperty,
         }
     }
 
@@ -827,6 +838,11 @@ pub fn emit_unlinked_code_from_parsed_ast(
             .values()
             .flat_map(|captures| captures.iter().copied())
             .collect(),
+        allows_sloppy_top_level_global_assignment: matches!(
+            input.mode,
+            BytecompilerMode::Program | BytecompilerMode::Eval
+        ) && !scope.semantics.strict,
+        sloppy_top_level_assignment_expression: None,
         initialized_cells: HashSet::new(),
         function_metadata_indices: function_plan.metadata_indices.clone(),
         function_captures: function_plan.captures.clone(),
@@ -848,7 +864,7 @@ pub fn emit_unlinked_code_from_parsed_ast(
         if terminated {
             break;
         }
-        let emission = emitter.emit_statement(*statement)?;
+        let emission = emitter.emit_root_statement(*statement)?;
         last_value = emission.value;
         terminated = emission.terminated;
     }
@@ -2513,6 +2529,8 @@ struct AstBytecodeEmitter<'a, 'g> {
     global_bindings: BytecompilerGlobalBindingSet,
     mirrored_global_bindings: HashSet<ParserIdentifier>,
     captured_bindings: HashSet<ParserIdentifier>,
+    allows_sloppy_top_level_global_assignment: bool,
+    sloppy_top_level_assignment_expression: Option<AstRef<Expr>>,
     initialized_cells: HashSet<ParserIdentifier>,
     function_metadata_indices: HashMap<u32, u32>,
     function_captures: HashMap<u32, Vec<ParserIdentifier>>,
@@ -2654,6 +2672,20 @@ impl AstBytecodeEmitter<'_, '_> {
         self.mirrored_global_bindings.contains(&name)
     }
 
+    fn declare_source_sloppy_global_property(
+        &mut self,
+        name: ParserIdentifier,
+    ) -> Result<(), BytecompilerEmissionError> {
+        let Some(text) = self.arena.identifiers().identifier_text(name) else {
+            return Err(BytecompilerEmissionError::UnsupportedAssignmentTarget);
+        };
+        self.global_bindings
+            .declare(BytecompilerGlobalBinding::source_sloppy_global_property(
+                text,
+            ));
+        Ok(())
+    }
+
     fn local_binding_kind(&self, name: ParserIdentifier) -> LocalBindingKind {
         if self.is_captured_binding(name) {
             LocalBindingKind::ClosureCell
@@ -2715,6 +2747,8 @@ impl AstBytecodeEmitter<'_, '_> {
             global_bindings: self.global_bindings.clone(),
             mirrored_global_bindings: HashSet::new(),
             captured_bindings: self.captured_bindings.clone(),
+            allows_sloppy_top_level_global_assignment: false,
+            sloppy_top_level_assignment_expression: None,
             initialized_cells: HashSet::new(),
             function_metadata_indices: self.function_metadata_indices.clone(),
             function_captures: self.function_captures.clone(),
@@ -3392,6 +3426,46 @@ impl AstBytecodeEmitter<'_, '_> {
         Ok(value)
     }
 
+    fn emit_root_statement(
+        &mut self,
+        statement: AstRef<Stmt>,
+    ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        let previous = self.sloppy_top_level_assignment_expression;
+        self.sloppy_top_level_assignment_expression =
+            self.top_level_sloppy_assignment_expression(statement);
+        let result = self.emit_statement(statement);
+        self.sloppy_top_level_assignment_expression = previous;
+        result
+    }
+
+    fn top_level_sloppy_assignment_expression(
+        &self,
+        statement: AstRef<Stmt>,
+    ) -> Option<AstRef<Expr>> {
+        if !self.allows_sloppy_top_level_global_assignment {
+            return None;
+        }
+        let Some(Stmt::Expression(expression)) = self.arena.statement(statement) else {
+            return None;
+        };
+        match self.arena.expression(*expression) {
+            Some(Expr::Assignment(assignment)) if assignment.op == AssignmentOperator::Assign => {
+                Some(*expression)
+            }
+            _ => None,
+        }
+    }
+
+    fn emit_expression_without_sloppy_top_level_assignment(
+        &mut self,
+        expression: AstRef<Expr>,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let previous = self.sloppy_top_level_assignment_expression.take();
+        let result = self.emit_expression(expression);
+        self.sloppy_top_level_assignment_expression = previous;
+        result
+    }
+
     fn emit_statement(
         &mut self,
         statement: AstRef<Stmt>,
@@ -3930,6 +4004,7 @@ impl AstBytecodeEmitter<'_, '_> {
         &mut self,
         expression: AstRef<Expr>,
     ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let expression_ref = expression;
         let expression = self
             .arena
             .expression(expression)
@@ -3961,7 +4036,7 @@ impl AstBytecodeEmitter<'_, '_> {
                     "special name expression is not lowered yet",
                 )),
             },
-            Expr::Assignment(assignment) => self.emit_assignment(&assignment),
+            Expr::Assignment(assignment) => self.emit_assignment(expression_ref, &assignment),
             Expr::Conditional(conditional) => self.emit_conditional(&conditional),
             Expr::Binary(binary) => self.emit_binary(&binary),
             Expr::Call(call) => self.emit_call(&call),
@@ -4176,6 +4251,7 @@ impl AstBytecodeEmitter<'_, '_> {
 
     fn emit_assignment(
         &mut self,
+        expression: AstRef<Expr>,
         assignment: &AssignmentExpr,
     ) -> Result<VirtualRegister, BytecompilerEmissionError> {
         let target = self
@@ -4191,24 +4267,34 @@ impl AstBytecodeEmitter<'_, '_> {
         }
         match self.arena.expression(expr).cloned() {
             Some(Expr::Name(name)) if name.kind == NameKind::Resolve => {
-                let target = self
-                    .resolve_binding(name.name)
-                    .ok_or(BytecompilerEmissionError::UnboundIdentifier(name.name))?;
-                let value = self.emit_expression(assignment.value)?;
-                self.emit_write_resolved_binding(name.name, target, value);
+                let target = self.resolve_binding(name.name);
+                let value =
+                    self.emit_expression_without_sloppy_top_level_assignment(assignment.value)?;
+                match target {
+                    Some(target) => self.emit_write_resolved_binding(name.name, target, value),
+                    None if self.sloppy_top_level_assignment_expression == Some(expression) => {
+                        self.emit_put_by_name(Self::global_object_register(), name.name, value);
+                        self.declare_source_sloppy_global_property(name.name)?;
+                    }
+                    None => return Err(BytecompilerEmissionError::UnboundIdentifier(name.name)),
+                }
                 Ok(value)
             }
             Some(Expr::Member(member)) => {
                 let object = self.emit_expression(member.base)?;
                 match member.member {
                     MemberKind::Dot(name) => {
-                        let value = self.emit_expression(assignment.value)?;
+                        let value = self.emit_expression_without_sloppy_top_level_assignment(
+                            assignment.value,
+                        )?;
                         self.emit_put_by_name(object, name, value);
                         Ok(value)
                     }
                     MemberKind::Bracket(index) => {
                         let key = self.emit_expression(index)?;
-                        let value = self.emit_expression(assignment.value)?;
+                        let value = self.emit_expression_without_sloppy_top_level_assignment(
+                            assignment.value,
+                        )?;
                         self.emit_put_by_value(object, key, value);
                         Ok(value)
                     }
@@ -4218,12 +4304,14 @@ impl AstBytecodeEmitter<'_, '_> {
                 }
             }
             Some(Expr::Array(array)) => {
-                let value = self.emit_expression(assignment.value)?;
+                let value =
+                    self.emit_expression_without_sloppy_top_level_assignment(assignment.value)?;
                 self.emit_array_destructuring_assignment(&array, value)?;
                 Ok(value)
             }
             Some(Expr::Object(object)) => {
-                let value = self.emit_expression(assignment.value)?;
+                let value =
+                    self.emit_expression_without_sloppy_top_level_assignment(assignment.value)?;
                 self.emit_object_destructuring_assignment(&object, value)?;
                 Ok(value)
             }
@@ -6904,7 +6992,7 @@ mod tests {
         SourceOrigin, SourcePosition, SourceProvider, SourceSpan, SourceText,
     };
     use crate::syntax::{AstBuilder, Parser, ParserArena};
-    use crate::vm::{SourceSessionHostGlobalConfig, Vm, VmConfig};
+    use crate::vm::{SourceExecutionError, SourceSessionHostGlobalConfig, Vm, VmConfig};
     use std::sync::Arc;
 
     fn valid_generation_plan() -> GenerationPlan {
@@ -6978,6 +7066,14 @@ mod tests {
         session: u64,
         global_bindings: BytecompilerGlobalBindingSet,
     ) -> BytecompilerOutputPlan {
+        try_emit_program_plan_with_global_bindings(text, session, global_bindings).unwrap()
+    }
+
+    fn try_emit_program_plan_with_global_bindings(
+        text: &str,
+        session: u64,
+        global_bindings: BytecompilerGlobalBindingSet,
+    ) -> Result<BytecompilerOutputPlan, BytecompilerEmissionError> {
         let source = source(text);
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
@@ -6998,7 +7094,7 @@ mod tests {
         let mut input = input;
         input.global_bindings = global_bindings;
 
-        emit_unlinked_code_from_parsed_ast(&input, &arena).unwrap()
+        emit_unlinked_code_from_parsed_ast(&input, &arena)
     }
 
     fn execute_program_source(text: &str, session: u64) -> ExecutionCompletion {
@@ -7706,6 +7802,64 @@ mod tests {
         assert_eq!(load_function_capture_counts(program), vec![1]);
         assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
         assert!(unlinked_contains_opcode(nested, CoreOpcode::GetClosureCell));
+    }
+
+    #[test]
+    fn parsed_ast_reads_sloppy_top_level_global_assignment_after_write() {
+        let plan = emit_program_plan_with_global_bindings(
+            "setupEngine = function() { return 42; }; return setupEngine();",
+            24,
+            BytecompilerGlobalBindingSet::default(),
+        );
+        let program = plan.unlinked_code.as_ref().unwrap();
+
+        assert!(unlinked_contains_put_by_name_to_source_global(program));
+        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
+        assert!(unlinked_contains_opcode(program, CoreOpcode::Call));
+    }
+
+    #[test]
+    fn parsed_ast_rejects_sloppy_global_read_before_top_level_assignment() {
+        let result = try_emit_program_plan_with_global_bindings(
+            "return setupEngine; setupEngine = function() { return 42; };",
+            25,
+            BytecompilerGlobalBindingSet::default(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(BytecompilerEmissionError::UnboundIdentifier(_))
+        ));
+    }
+
+    #[test]
+    fn vm_source_session_executes_sloppy_top_level_global_assignment_call() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![source(
+                "setupEngine = function() { return 42; }; return setupEngine();",
+            )])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[ExecutionCompletion::Returned(RuntimeValue::from_i32(42))]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_rejects_unknown_global_without_prior_sloppy_assignment() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let result = vm.execute_source_session(vec![source("return misspelledGlobal;")]);
+
+        assert!(matches!(
+            result,
+            Err(SourceExecutionError::BytecodeEmission(
+                BytecompilerEmissionError::UnboundIdentifier(_)
+            ))
+        ));
     }
 
     #[test]
