@@ -18,9 +18,9 @@ use crate::bytecode::{
 use crate::syntax::ast::{
     ArrayLiteralElement, AssignmentExpr, AssignmentOperator, AstPropertyKey, BinaryExpr,
     BinaryOperator as AstBinaryOperator, CallExpr, ClassElementKind, ClassElementName, ClassExpr,
-    ConditionalExpr, ControlKind, DeclarationStmt, DeclarationSyntaxKind, Expr, ForInit,
-    ForOfBinding, FunctionMetadata, LiteralKind, MemberExpr, MemberKind, NameKind, NewExpr,
-    NumberLiteralValue, ObjectLiteralPropertyKind, Pattern, Stmt, UnaryExpr,
+    ConditionalExpr, ControlKind, DeclarationStmt, DeclarationSyntaxKind, DoWhileStmt, Expr,
+    ForInit, ForOfBinding, FunctionMetadata, LiteralKind, MemberExpr, MemberKind, NameKind,
+    NewExpr, NumberLiteralValue, ObjectLiteralPropertyKind, Pattern, Stmt, UnaryExpr,
     UnaryOperator as AstUnaryOperator,
 };
 use crate::syntax::{
@@ -1074,6 +1074,10 @@ fn collect_statement_function_metadata(
             collect_expression_function_metadata(arena, statement.condition, plan)?;
             collect_statement_function_metadata(arena, statement.body, plan)
         }
+        Stmt::DoWhile(statement) => {
+            collect_statement_function_metadata(arena, statement.body, plan)?;
+            collect_expression_function_metadata(arena, statement.condition, plan)
+        }
         Stmt::For(statement) => {
             if let Some(init) = &statement.init {
                 match init {
@@ -1343,6 +1347,10 @@ fn collect_statement_immediate_function_metadata(
         Stmt::While(statement) => {
             collect_expression_immediate_function_metadata(arena, statement.condition, functions)?;
             collect_statement_immediate_function_metadata(arena, statement.body, functions)
+        }
+        Stmt::DoWhile(statement) => {
+            collect_statement_immediate_function_metadata(arena, statement.body, functions)?;
+            collect_expression_immediate_function_metadata(arena, statement.condition, functions)
         }
         Stmt::For(statement) => {
             if let Some(init) = &statement.init {
@@ -1680,6 +1688,7 @@ fn collect_statement_local_names(
             Ok(())
         }
         Stmt::While(statement) => collect_statement_local_names(arena, statement.body, locals),
+        Stmt::DoWhile(statement) => collect_statement_local_names(arena, statement.body, locals),
         Stmt::For(statement) => {
             if let Some(ForInit::Declaration(declaration)) = &statement.init {
                 collect_declaration_local_names(arena, declaration, locals)?;
@@ -1800,6 +1809,10 @@ fn collect_statement_referenced_names(
         Stmt::While(statement) => {
             collect_expression_referenced_names(arena, statement.condition, references)?;
             collect_statement_referenced_names(arena, statement.body, references)
+        }
+        Stmt::DoWhile(statement) => {
+            collect_statement_referenced_names(arena, statement.body, references)?;
+            collect_expression_referenced_names(arena, statement.condition, references)
         }
         Stmt::For(statement) => {
             if let Some(init) = &statement.init {
@@ -2055,6 +2068,10 @@ fn collect_statement_string_literals(
         Stmt::While(statement) => {
             collect_expression_string_literals(arena, statement.condition, table)?;
             collect_statement_string_literals(arena, statement.body, table)
+        }
+        Stmt::DoWhile(statement) => {
+            collect_statement_string_literals(arena, statement.body, table)?;
+            collect_expression_string_literals(arena, statement.condition, table)
         }
         Stmt::For(statement) => {
             if let Some(init) = &statement.init {
@@ -2714,6 +2731,7 @@ impl AstBytecodeEmitter<'_, '_> {
                     }
                 }
                 Stmt::While(statement) => self.predeclare_statement_locals(statement.body)?,
+                Stmt::DoWhile(statement) => self.predeclare_statement_locals(statement.body)?,
                 Stmt::For(statement) => self.predeclare_for_locals(&statement)?,
                 Stmt::ForOf(statement) => self.predeclare_for_of_locals(&statement)?,
                 Stmt::Try(statement) => self.predeclare_try_locals(&statement)?,
@@ -2751,6 +2769,7 @@ impl AstBytecodeEmitter<'_, '_> {
                     }
                 }
                 Stmt::While(statement) => self.predeclare_statement_locals(statement.body)?,
+                Stmt::DoWhile(statement) => self.predeclare_statement_locals(statement.body)?,
                 Stmt::For(statement) => self.predeclare_for_locals(&statement)?,
                 Stmt::ForOf(statement) => self.predeclare_for_of_locals(&statement)?,
                 Stmt::Try(statement) => self.predeclare_try_locals(&statement)?,
@@ -2809,6 +2828,7 @@ impl AstBytecodeEmitter<'_, '_> {
                 Ok(())
             }
             Stmt::While(statement) => self.predeclare_statement_locals(statement.body),
+            Stmt::DoWhile(statement) => self.predeclare_statement_locals(statement.body),
             Stmt::For(statement) => self.predeclare_for_locals(&statement),
             Stmt::ForOf(statement) => self.predeclare_for_of_locals(&statement),
             Stmt::Try(statement) => self.predeclare_try_locals(&statement),
@@ -3345,6 +3365,7 @@ impl AstBytecodeEmitter<'_, '_> {
             }
             Stmt::For(statement) => self.emit_for_statement(&statement),
             Stmt::ForOf(statement) => self.emit_for_of_statement(&statement),
+            Stmt::DoWhile(statement) => self.emit_do_while_statement(&statement),
             Stmt::Try(statement) => self.emit_try_statement(&statement),
             Stmt::Control(control) => match control.kind {
                 ControlKind::Return(value) => {
@@ -3432,6 +3453,38 @@ impl AstBytecodeEmitter<'_, '_> {
         }
         if !body.terminated {
             self.emit_jump(loop_start);
+        }
+        self.bind_label(labels.break_target)?;
+        Ok(StatementEmission::default())
+    }
+
+    fn emit_do_while_statement(
+        &mut self,
+        statement: &DoWhileStmt,
+    ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        let loop_start = self.declare_label(Some("do_while_start"));
+        let continue_target = self.declare_label(Some("do_while_continue"));
+        let break_target = self.declare_label(Some("do_while_break"));
+        self.bind_label(loop_start)?;
+        self.loop_stack.push(LoopControlLabels {
+            break_target,
+            continue_target,
+            finally_stack_depth: self.finally_stack.len(),
+        });
+        let body = self.emit_statement(statement.body)?;
+        let Some(labels) = self.loop_stack.pop() else {
+            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                "loop control stack underflow",
+            ));
+        };
+        self.bind_label(labels.continue_target)?;
+        let condition = self.emit_expression(statement.condition)?;
+        let condition_false = self.declare_label(Some("do_while_condition_false"));
+        self.emit_jump_if_false(condition, condition_false);
+        self.emit_jump(loop_start);
+        self.bind_label(condition_false)?;
+        if body.terminated {
+            self.emit_jump(labels.break_target);
         }
         self.bind_label(labels.break_target)?;
         Ok(StatementEmission::default())
@@ -7505,6 +7558,84 @@ mod tests {
         let completion = execute_program_source(
             "let a = null == undefined; let b = 1 == \"1\"; let c = true == 1; let d = 0 != false; return a && b && c && !d ? 42 : 0;",
             24,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_do_while_first_iteration() {
+        let completion = execute_program_source(
+            "let count = 0; do { count = count + 1; } while (false); return count;",
+            25,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(1))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_do_while_normal_loop() {
+        let completion = execute_program_source(
+            "let i = 0; let total = 0; do { i = i + 1; total = total + i; } while (i < 3); return total * 10 + i;",
+            26,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(63))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_do_while_break() {
+        let completion = execute_program_source(
+            "let i = 0; do { i = i + 1; if (i === 2) break; } while (i < 5); return i;",
+            27,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(2))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_do_while_continue_to_condition() {
+        let completion = execute_program_source(
+            "let i = 0; let after = 0; do { i = i + 1; if (i === 1) continue; after = 100; } while (false); return i * 100 + after;",
+            28,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(100))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_do_while_continue_through_finally() {
+        let completion = execute_program_source(
+            "let i = 0; let cleanup = 0; do { i = i + 1; try { if (i === 1) continue; } finally { cleanup = cleanup + 10; } cleanup = cleanup + 1; } while (i < 2); return cleanup * 10 + i;",
+            29,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(212))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_do_while_break_through_finally() {
+        let completion = execute_program_source(
+            "let cleanup = 0; do { try { break; } finally { cleanup = 42; } cleanup = 99; } while (true); return cleanup;",
+            30,
         );
 
         assert_eq!(

@@ -5,12 +5,12 @@ use crate::syntax::ast::{
     ArrayLiteralElement, ArrayLiteralExpr, AssignmentContext, AssignmentExpr, AssignmentOperator,
     AstPropertyKey, AstRoot, BinaryExpr, BinaryOperator as AstBinaryOperator, CallExpr,
     ClassElement, ClassElementKind, ClassElementName, ClassExpr, ConditionalExpr, ControlKind,
-    ControlStmt, DeclarationStmt, DeclarationSyntaxKind, Expr, ForInit, ForOfBinding, ForOfStmt,
-    ForStmt, FunctionDecl, FunctionMetadata, FunctionParameter, FunctionSyntaxMode, IfStmt,
-    LiteralExpr, LiteralKind, MemberExpr, MemberKind, ModuleItem, NameExpr, NameKind, NewExpr,
-    NumberLiteralValue, ObjectLiteralExpr, ObjectLiteralProperty, ObjectLiteralPropertyKind,
-    Pattern, ScopeBlock, ScopeNode, ScopeNodeKind, Stmt, TryStmt, UnaryExpr, UnaryOperator,
-    WhileStmt,
+    ControlStmt, DeclarationStmt, DeclarationSyntaxKind, DoWhileStmt, Expr, ForInit, ForOfBinding,
+    ForOfStmt, ForStmt, FunctionDecl, FunctionMetadata, FunctionParameter, FunctionSyntaxMode,
+    IfStmt, LiteralExpr, LiteralKind, MemberExpr, MemberKind, ModuleItem, NameExpr, NameKind,
+    NewExpr, NumberLiteralValue, ObjectLiteralExpr, ObjectLiteralProperty,
+    ObjectLiteralPropertyKind, Pattern, ScopeBlock, ScopeNode, ScopeNodeKind, Stmt, TryStmt,
+    UnaryExpr, UnaryOperator, WhileStmt,
 };
 use crate::syntax::lexer::{
     KeywordPolicy, LexDeferred, LexGoal, LexRequest, LexResult, Lexer, LexerError,
@@ -396,6 +396,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             TokenKind::Keyword(Keyword::Class) => self.parse_class_declaration(cursor),
             TokenKind::Keyword(Keyword::Return) => self.parse_return_statement(cursor),
             TokenKind::Keyword(Keyword::If) => self.parse_if_statement(cursor),
+            TokenKind::Keyword(Keyword::Do) => self.parse_do_while_statement(cursor),
             TokenKind::Keyword(Keyword::While) => self.parse_while_statement(cursor),
             TokenKind::Keyword(Keyword::For) => self.parse_for_statement(cursor),
             TokenKind::Keyword(Keyword::Try) => self.parse_try_statement(cursor),
@@ -1120,6 +1121,24 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             condition,
             consequent,
             alternate,
+        })))
+    }
+
+    fn parse_do_while_statement(
+        &mut self,
+        cursor: &mut TokenCursor<'_>,
+    ) -> Result<AstRef<Stmt>, ParserError> {
+        let start = cursor.expect_keyword(Keyword::Do)?.span();
+        let body = self.parse_statement(cursor)?;
+        cursor.expect_keyword(Keyword::While)?;
+        cursor.expect_punctuator(Punctuator::OpenParen)?;
+        let condition = self.parse_expression(cursor)?;
+        let close = cursor.expect_punctuator(Punctuator::CloseParen)?.span();
+        let end = self.consume_statement_terminator(cursor)?.unwrap_or(close);
+        Ok(self.arena.alloc_statement(Stmt::DoWhile(DoWhileStmt {
+            span: join_spans(start, end),
+            body,
+            condition,
         })))
     }
 
@@ -1897,6 +1916,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             Some(Stmt::Declaration(declaration)) => declaration.span,
             Some(Stmt::FunctionDeclaration(declaration)) => declaration.span,
             Some(Stmt::If(statement)) => statement.span,
+            Some(Stmt::DoWhile(statement)) => statement.span,
             Some(Stmt::While(statement)) => statement.span,
             Some(Stmt::For(statement)) => statement.span,
             Some(Stmt::ForOf(statement)) => statement.span,
@@ -3163,6 +3183,39 @@ mod tests {
                 alternate: Some(_),
                 ..
             }))
+        ));
+    }
+
+    #[test]
+    fn parser_builds_do_while_statement() {
+        let source = source("do { value = value + 1; } while (value < 3);");
+        let mut arena = ParserArena::new();
+        let parsed = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            ParseMode::Program,
+        )
+        .parse()
+        .unwrap();
+        let AstRoot::Script(root) = parsed.root else {
+            panic!("expected script root");
+        };
+        let scope = arena.scope_node(root).unwrap();
+        let Some(Stmt::DoWhile(statement)) = arena.statement(scope.statements[0]) else {
+            panic!("expected do-while statement");
+        };
+
+        assert!(matches!(
+            arena.expression(statement.condition),
+            Some(Expr::Binary(BinaryExpr {
+                op: AstBinaryOperator::LessThan,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            arena.statement(statement.body),
+            Some(Stmt::Block(_))
         ));
     }
 

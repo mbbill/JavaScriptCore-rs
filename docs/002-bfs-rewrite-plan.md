@@ -169,17 +169,16 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- M4c prepared Octane execution/classification: source-session runner
-  execution now reports parse, bytecode-emission, session-link, runtime,
-  thrown/oracle, score-telemetry, and baseline-only outcomes for prepared
-  Octane inputs.
+- M4d source-session global lexical/class declarations: top-level
+  `let`/`const`/`class` now persist across runner sources through a distinct
+  global lexical boundary without leaking to `globalThis`.
 - Full accepted gate at that checkpoint: `cargo fmt --check`,
   `cargo clippy --lib --all-targets -- -D warnings`, and
-  `cargo test --lib -- --quiet` with 1845 passed.
+  `cargo test --lib -- --quiet` with 1857 passed.
 
 Current git/code note:
 
-- Treat the 1845-test M4c prepared Octane execution/classification slice as
+- Treat the 1857-test M4d source-session global lexical/class slice as
   the last accepted green code checkpoint unless a later progress entry records
   passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
@@ -220,13 +219,13 @@ Known Octane run blockers:
   canonical session-global object, but the rest of the standard object family
   still needs a follow-up boundary before benchmark-visible mutation can be
   assumed broadly.
-- Source-session global lexical/class visibility is still incomplete for the
-  runner contract: Octane-core files expose top-level `class Benchmark`, while
-  current cross-source visibility is deliberately stronger for `function`/`var`
-  than for lexical/class declarations.
+- Source-session global lexical/class visibility is accepted for the first
+  runner contract slice; later realm/global-environment tightening may still be
+  needed when full conformance expands beyond Octane-core.
 - Octane-core still has syntax/lowering blockers before all six files can parse
-  and run honestly: at least `do while`, `switch`, and template literals need
-  shared parser/bytecompiler support rather than benchmark-local workarounds.
+  and run honestly: `do while` is accepted, while `switch` and template
+  literals still need shared parser/bytecompiler support rather than
+  benchmark-local workarounds.
 
 Known full-Octane blockers beyond the core subset:
 
@@ -330,8 +329,10 @@ Layer B: shared language/runtime blockers for Octane-core.
   `do while`, `switch`, non-tagged template literals, benchmark oracle
   compatibility, and any missing standard-library pieces as independent
   engine features with focused tests.
-- Current status: top-level `function`/`var` cross-source visibility works;
-  top-level `class`/`let`/`const` still need a real global lexical environment.
+- Current status: top-level `function`/`var` cross-source visibility works and
+  top-level `class`/`let`/`const` now use a distinct source-session global
+  lexical boundary. `do while` is accepted; the next shared blockers are
+  `switch` and non-tagged template literal lowering.
 
 Layer C: Octane-core correctness.
 
@@ -523,13 +524,19 @@ M4: Current - run Octane-core correctly in the Rust engine.
   parse, bytecode-emission, session-link, runtime, thrown/oracle,
   score-telemetry, and baseline-only outcomes. Runner completion currently
   returns typed `ResultExtractionMissing` instead of pretending scored success.
-- Planned sub-slice: M4d adds source-session global lexical/class declarations
-  for top-level `class Benchmark`, `let`, and `const`. Do not mirror these
-  declarations onto `globalThis`; add a real global lexical environment
-  boundary with duplicate-declaration, TDZ, and read-only semantics.
-- Planned sub-slice: M4e adds shared syntax/lowering support for `do while`,
-  `switch`, and non-tagged template literals. Lower these as normal language
-  features, not as Octane-specific rewrites.
+- Accepted sub-slice: M4d added source-session global lexical/class
+  declarations for top-level `class Benchmark`, `let`, and `const` through a
+  distinct host-owned lexical boundary with duplicate-declaration, TDZ, and
+  read-only semantics. These declarations are not mirrored onto `globalThis`.
+- Accepted sub-slice: M4e1 added shared AST/parser/bytecompiler support for
+  `do while`, including first-iteration semantics, `break`, `continue`, and
+  `finally` interactions. The Octane do-while blocker now gets past
+  parse/lowering.
+- Active sub-slice: M4e2 adds shared syntax/lowering support for `switch`.
+  Lower it as a normal language feature, not as an Octane-specific rewrite.
+- Planned sub-slice: M4e3 adds non-tagged template literal parsing/lowering.
+  Preserve cooked string parts, left-to-right expression evaluation, and JS
+  string coercion rather than relying on benchmark-specific string assembly.
 - Planned sub-slice: M4f completes runner result extraction, benchmark oracle
   handling, score reporting, and interpreter-only vs baseline-allowed
   comparison records.

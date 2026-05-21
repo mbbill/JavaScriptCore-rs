@@ -79,6 +79,7 @@ pub enum Stmt {
     Declaration(DeclarationStmt),
     FunctionDeclaration(FunctionDecl),
     If(IfStmt),
+    DoWhile(DoWhileStmt),
     While(WhileStmt),
     For(ForStmt),
     ForOf(ForOfStmt),
@@ -500,6 +501,13 @@ pub struct IfStmt {
     pub condition: AstRef<Expr>,
     pub consequent: AstRef<Stmt>,
     pub alternate: Option<AstRef<Stmt>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DoWhileStmt {
+    pub span: SourceSpan,
+    pub body: AstRef<Stmt>,
+    pub condition: AstRef<Expr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

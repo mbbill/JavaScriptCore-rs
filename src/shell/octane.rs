@@ -1859,14 +1859,23 @@ class Benchmark {
     }
 
     #[test]
-    fn octane_unsupported_do_while_is_classified_as_parse_failure() {
+    fn octane_do_while_gets_past_parse_and_lowering() {
         let root = TempJetStreamRoot::new();
         root.write_manifest_file(
             "./Octane/test-unsupported.js",
             "\
-do {
-} while (false);
-function Benchmark() {}
+function Benchmark(iterations) {
+}
+Benchmark.prototype.runIteration = function() {
+    let value = 0;
+    do {
+        value = value + 1;
+    } while (false);
+    return value;
+};
+Benchmark.prototype.validate = function() {
+    return 1;
+};
 ",
         );
         let prepared = prepare_test_benchmark(&root, &OCTANE_TEST_UNSUPPORTED_PLAN);
@@ -1879,18 +1888,15 @@ function Benchmark() {}
             ),
         );
 
-        assert_eq!(report.outcome.phase(), OctaneExecutionPhase::Parse);
-        let OctaneExecutionOutcome::Failed(failure) = report.outcome else {
-            panic!("unsupported do-while should fail before execution: {report:?}");
-        };
-        assert_eq!(failure.phase, OctaneExecutionPhase::Parse);
-        assert_eq!(
-            failure.order_entry,
-            Some(OctanePreparedSourceOrderEntry::BenchmarkFile(0))
-        );
+        assert_ne!(report.outcome.phase(), OctaneExecutionPhase::Parse);
+        assert_ne!(report.outcome.phase(), OctaneExecutionPhase::BytecodeEmit);
         assert!(matches!(
-            failure.detail,
-            OctaneExecutionFailureDetail::SourceExecutionError(SourceExecutionError::Parse(_))
+            report.outcome,
+            OctaneExecutionOutcome::ResultExtractionMissing
+                | OctaneExecutionOutcome::Failed(OctaneExecutionFailure {
+                    phase: OctaneExecutionPhase::ExecuteRuntime,
+                    ..
+                })
         ));
     }
 
@@ -1922,9 +1928,7 @@ function Benchmark() {}
         root.write_manifest_file(
             "./Octane/test-unsupported.js",
             "\
-do {
-} while (false);
-function Benchmark() {}
+function Benchmark() {
 ",
         );
         root.write_manifest_file(
