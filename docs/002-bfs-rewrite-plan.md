@@ -201,16 +201,19 @@ Major accepted capabilities:
 
 Known Octane run blockers:
 
-- Full `load(path)` execution is not implemented. It must be VM-owned because
-  it needs to read, append, compile, execute, and resume in the same source
-  session/global/host instead of running from inside `CoreOpcodeDispatchHost`.
+- Benchmark telemetry and runner control: no Rust-side Octane manifest,
+  load-order execution, iteration loop, validation policy, scoring, or
+  tier-mode selection yet.
+- Full shell-style `load(path)` execution is not implemented. It is not on the
+  shortest path to the first accepted-equivalent Octane-core runner because the
+  active JetStream 3 driver uses `readFile`/runner-side file loading for CLI
+  benchmark sources, while the stale legacy `Octane/run.js` path is rejected.
+  Keep `load(path)` as a designed VM-owned follow-up boundary for shell/full
+  harness compatibility.
 - Standard object/global ownership is only partially tightened: `Math` is now a
   canonical session-global object, but the rest of the standard object family
   still needs a follow-up boundary before benchmark-visible mutation can be
   assumed broadly.
-- Benchmark telemetry and runner control: no Rust-side Octane manifest,
-  load-order execution, iteration loop, validation policy, scoring, or
-  tier-mode selection yet.
 
 Known full-Octane blockers beyond the core subset:
 
@@ -388,25 +391,35 @@ M3: Current - add Octane-core runtime intrinsics and shell globals.
   `performance.now`, `readFile`, `print`, `console.log/info/warn/error`, and
   `alert`. Host output is captured for later runner telemetry, `performance.now`
   is nondecreasing within one host, and `readFile` is deliberately read-only.
-- Next sub-slice: M3d2 implements full `load(path)` through a VM-owned
-  deferral/resume boundary. It must reuse the existing file-source/session
-  append boundary and must not implement the Octane runner loop or JIT lowering
-  in the same patch.
+- Deferred sub-slice: M3d2 implements full `load(path)` through a VM-owned
+  deferral/resume boundary. The design is known, but implementation is deferred
+  until the first runner proves it is needed for accepted-equivalent Octane
+  execution or for the official/full shell harness. It must reuse the existing
+  file-source/session append boundary and must not implement the Octane runner
+  loop or JIT lowering in the same patch.
 - Scheduling note: most executable native builtin code still lives in
   `src/interpreter/mod.rs`, so Math and String implementation batches should be
   serialized unless the main agent first splits builtin bodies into disjoint
   modules.
 
-M4: Run Octane-core correctly in the Rust engine.
+M4: Current - run Octane-core correctly in the Rust engine.
 
-- Main agent: own the runner integration and failure triage. Failures should be
-  classified as syntax, runtime semantic, shell API, VM boundary, GC/rooting, or
-  JIT/tiering gaps before any local fix begins.
-- Sub-agents: debug independent Octane-core failures by test or feature area,
-  with strict file ownership and no local shortcuts in benchmark sources.
+- Main agent: own runner integration, keep the benchmark source of truth aligned
+  with `JetStreamDriver.js`, and triage failures before fixing. The first
+  implementation should be a Rust-side synchronous `DefaultBenchmark`-equivalent
+  runner for the Octane-core subset, using `ShellSourceLoader`,
+  `SourceSessionSource::with_provenance`, and opt-in safe host globals. Do not
+  use the stale `Octane/run.js` path.
+- Sub-agents: implement and audit independent M4 pieces with disjoint write
+  sets: Octane manifest/load-order extraction, synchronous runner/scoring
+  scaffolding, per-test execution adapters, and failure classification for
+  syntax/runtime/VM/JIT gaps.
 - Completion evidence: `richards`, `delta-blue`, `crypto`, `splay`,
-  `navier-stokes`, and `raytrace` run to correct completion under the Rust
-  shell/runner in interpreter-only mode and baseline-enabled mode.
+  `navier-stokes`, and `raytrace` load in `JetStreamDriver.js` order, execute
+  with one fresh source-session global per benchmark, run the accepted
+  iteration/validation policy without benchmark source hacks, and report
+  classified failures or correctness success under interpreter-only and
+  baseline-enabled modes.
 
 M5: Make the accepted baseline JIT cover Octane-core hot paths.
 
