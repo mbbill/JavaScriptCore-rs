@@ -871,6 +871,7 @@ pub fn emit_unlinked_code_from_parsed_ast(
         sloppy_top_level_assignment_expression: None,
         is_derived_constructor: false,
         this_binding: AstBytecodeEmitter::global_object_register(),
+        completion_target: None,
         initialized_cells: HashSet::new(),
         function_metadata_indices: function_plan.metadata_indices.clone(),
         function_captures: function_plan.captures.clone(),
@@ -889,18 +890,25 @@ pub fn emit_unlinked_code_from_parsed_ast(
     emitter.emit_intrinsic_bindings()?;
     emitter.initialize_captured_local_cells()?;
     emitter.emit_scope_function_bindings(&scope)?;
-    let mut last_value = None;
+    let completion_target = if matches!(
+        input.mode,
+        BytecompilerMode::Program | BytecompilerMode::Eval
+    ) {
+        Some(emitter.emit_load_undefined()?)
+    } else {
+        None
+    };
+    emitter.completion_target = completion_target;
     let mut terminated = false;
     for statement in &scope.statements {
         if terminated {
             break;
         }
         let emission = emitter.emit_root_statement(*statement)?;
-        last_value = emission.value;
         terminated = emission.terminated;
     }
     if !terminated {
-        let value = match last_value {
+        let value = match completion_target {
             Some(value) => value,
             None => emitter.emit_load_undefined()?,
         };
@@ -2629,6 +2637,7 @@ struct AstBytecodeEmitter<'a, 'g> {
     sloppy_top_level_assignment_expression: Option<AstRef<Expr>>,
     is_derived_constructor: bool,
     this_binding: VirtualRegister,
+    completion_target: Option<VirtualRegister>,
     initialized_cells: HashSet<ParserIdentifier>,
     function_metadata_indices: HashMap<u32, u32>,
     function_captures: HashMap<u32, Vec<ParserIdentifier>>,
@@ -2872,6 +2881,7 @@ impl AstBytecodeEmitter<'_, '_> {
             sloppy_top_level_assignment_expression: None,
             is_derived_constructor,
             this_binding,
+            completion_target: None,
             initialized_cells: HashSet::new(),
             function_metadata_indices: self.function_metadata_indices.clone(),
             function_captures: self.function_captures.clone(),
@@ -3694,10 +3704,16 @@ impl AstBytecodeEmitter<'_, '_> {
             .ok_or(BytecompilerEmissionError::MissingStatement)?;
         match statement {
             Stmt::Empty(_) => Ok(StatementEmission::default()),
-            Stmt::Expression(expr) => self.emit_expression(expr).map(|value| StatementEmission {
-                value: Some(value),
-                terminated: false,
-            }),
+            Stmt::Expression(expr) => {
+                let value = self.emit_expression(expr)?;
+                if let Some(completion_target) = self.completion_target {
+                    self.emit_move(completion_target, value);
+                }
+                Ok(StatementEmission {
+                    value: Some(value),
+                    terminated: false,
+                })
+            }
             Stmt::Declaration(declaration) => {
                 self.emit_declaration(&declaration)?;
                 Ok(StatementEmission::default())
@@ -7712,7 +7728,7 @@ mod tests {
         let summary = summarize_bytecompiler_integration(&plan);
         assert!(summary.is_ready_for_bytecode_handoff());
         let unlinked = plan.unlinked_code.unwrap();
-        assert_eq!(unlinked.instructions().instruction_count(), 5);
+        assert_eq!(unlinked.instructions().instruction_count(), 6);
 
         let code_block_id = CodeBlockId(CellId(99));
         let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
@@ -8526,6 +8542,70 @@ mod tests {
             .literal_strings
             .values()
             .any(|value| value.as_str() == "19n"));
+    }
+
+    #[test]
+    fn parsed_ast_preserves_program_completion_across_declarations() {
+        let completion = execute_program_source("1; var x;", 80);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(1))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_tracks_if_else_program_completion() {
+        let completion = execute_program_source("let flag = false; if (flag) 1; else 2;", 81);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(2))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_tracks_loop_program_completion() {
+        let completion = execute_program_source("let i = 0; while (i < 3) { i = i + 1; i; }", 82);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(3))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_tracks_switch_program_completion() {
+        let completion = execute_program_source(
+            "let x = 2; switch (x) { case 1: 10; break; case 2: 20; break; default: 30; }",
+            83,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(20))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_tracks_try_catch_program_completion() {
+        let completion =
+            execute_program_source("try { throw 1; } catch (error) { error + 41; }", 84);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_tracks_try_finally_program_completion() {
+        let completion = execute_program_source("try { 1; } finally { 2; }", 85);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(2))
+        );
     }
 
     #[test]

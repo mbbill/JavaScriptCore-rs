@@ -175,14 +175,15 @@ Accepted green checkpoint:
   global object instead of closure-captured snapshots; source functions carry
   JSC-shaped parse/constructor/strict metadata; class constructors reject direct
   calls; methods and nonconstructable native functions reject `new`; sloppy
-  nullish `this` normalizes to the session global object.
+  nullish `this` normalizes to the session global object; Program/Eval
+  completion uses a JSC-shaped shared completion destination.
 - Full accepted gate at that checkpoint: `cargo fmt --check`,
   `cargo clippy --lib --all-targets -- -D warnings`,
-  `cargo build --lib`, and `cargo test --lib -- --quiet` with 1922 passed.
+  `cargo build --lib`, and `cargo test --lib -- --quiet` with 1928 passed.
 
 Current git/code note:
 
-- Treat the 1922-test A1/A2 function-boundary fidelity slice as
+- Treat the 1928-test A1 Program/Eval completion fidelity slice as
   the last accepted green code checkpoint unless a later progress entry records
   passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
@@ -209,9 +210,10 @@ Major accepted capabilities:
 Known Octane run blockers:
 
 - The last recorded Octane-core matrix predates the A0 and A1/A2 fidelity
-  fixes. Rerun the six-test matrix after the current completion/top-level-return
-  audits; do not treat the old `ExpectedFunction`/`ExpectedObject` labels as
-  current evidence without rerunning.
+  fixes. Rerun the six-test matrix after the current top-level-return and
+  source-session ordering audits; do not treat the old
+  `ExpectedFunction`/`ExpectedObject` labels as current evidence without
+  rerunning.
 - Full shell-style `load(path)` execution is not implemented. It is not on the
   shortest path to the first accepted-equivalent Octane-core runner because the
   active JetStream 3 driver uses `readFile`/runner-side file loading for CLI
@@ -229,8 +231,8 @@ Known Octane run blockers:
   literals, trailing argument commas, function capture cells, and sloppy
   top-level global assignment reads. JSC-shaped function metadata,
   call-vs-construct separation, class-constructor call rejection, method/native
-  nonconstructability, and sloppy nullish `this` are accepted. The next shared
-  work is finishing source/program completion, top-level `return`, and
+  nonconstructability, sloppy nullish `this`, and Program/Eval completion are
+  accepted. The next shared work is finishing top-level `return` and
   source-session ordering audits, rerunning the complete Octane-core pass/fail
   matrix, and scheduling the next shared feature family from that evidence.
 
@@ -476,9 +478,20 @@ Audit order:
   Remaining tracked deviations: sloppy primitive `this` boxing and
   `String`/`Number`/`Boolean` wrapper construction need boxed primitive object
   cells before they can be made JSC-faithful.
-- A1 bytecompiler fidelity: source/program completion, function returns,
-  declaration binding, lexical/global environment lowering, captures, class
-  lowering, and source-session behavior against JSC `BytecodeGenerator`.
+- A1 Program/Eval completion accepted 2026-05-21: source/program completion was
+  audited against C++ JSC and fixed where Rust had drifted into syntactic
+  last-statement selection. JSC evidence: `NodesCodegen.cpp`
+  `SourceElements::emitBytecode`, `ProgramNode::emitBytecode`, and
+  `EvalNode::emitBytecode`. Rust files: `src/bytecompiler/mod.rs`.
+  Classification: expression statement evaluation was faithful, but completion
+  selection across declarations/control flow was an accidental deviation and is
+  fixed by a root-only shared completion register seeded with `undefined` and
+  updated by executed expression statements. Function body return semantics are
+  intentionally unchanged.
+- A1 bytecompiler fidelity: function returns, declaration binding,
+  lexical/global environment lowering, captures, class lowering,
+  source-session behavior, and remaining completion-adjacent syntax gates
+  against JSC `BytecodeGenerator`.
 - A2 interpreter/runtime fidelity: call, construct, property lookup/store,
   prototype behavior, object allocation, constructor return normalization,
   exceptions, and host/global behavior against JSC LLInt slow paths,
@@ -507,9 +520,8 @@ rewrite phase.
 - Sub-agents: inspect assigned Rust and C++ JSC components, classify fidelity,
   and implement fixes only when the write scope is explicit and disjoint.
 - Active batch: continue A1/A2 shared bytecompiler-runtime fidelity. The next
-  audits should cover branch/try/source-session completion behavior, top-level
-  `return` gating, and batch source execution ordering before more
-  benchmark-specific debugging.
+  audits should cover top-level `return` gating and batch source execution
+  ordering before more benchmark-specific debugging.
 - Completion evidence for F0: all existing Rust subsystems have passed the
   breadth-first fidelity audit above, accidental deviations have fixes or
   tracked blockers, and full gates plus relevant benchmark probes pass from a
