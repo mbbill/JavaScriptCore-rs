@@ -41222,6 +41222,72 @@ mod tests {
     }
 
     #[test]
+    fn vm_source_session_nested_functions_read_reassigned_standard_globals_live() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![
+                source("function readMath() { return Math.custom; }"),
+                source("Math = { custom: 41 }; return readMath() + 1;"),
+                source(
+                    "function readObject() { return Object.answer; } \
+                     Object = { answer: 40 }; \
+                     return readObject() + 2;",
+                ),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::undefined()),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_nested_functions_read_reassigned_var_globals_live() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![source(
+                "var answer = 1; \
+                 function readAnswer() { return answer; } \
+                 this.answer = 41; \
+                 return readAnswer() + 1;",
+            )])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[ExecutionCompletion::Returned(RuntimeValue::from_i32(42))]
+        );
+    }
+
+    #[test]
+    fn vm_source_session_standard_constructors_are_global_properties() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let completion = vm
+            .execute_source(source(
+                "return this.Object === Object \
+                     && this.Array === Array \
+                     && this.String === String \
+                     && this.JSON === JSON \
+                     && this.Reflect === Reflect \
+                     && this.Symbol === Symbol;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
     fn vm_execute_source_standard_global_mutations_do_not_leak_between_one_shots() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 

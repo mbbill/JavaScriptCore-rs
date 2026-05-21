@@ -2391,7 +2391,7 @@ impl CoreOpcodeDispatchHost {
     ) -> Result<RuntimeValue, ExecutionError> {
         let value = self.objects.allocate();
         let GlobalObjectId(ObjectId(cell)) = global_object;
-        self.objects.bind_object_to_heap_cell(heap, value, cell)?;
+        self.objects.assign_object_heap_cell(heap, value, cell)?;
         Ok(value)
     }
 
@@ -2642,6 +2642,20 @@ impl CoreOpcodeDispatchHost {
 
         if let Some(index) = self.strings.index_for_value(descriptor.value) {
             let rebound = self.strings.bind_index_to_heap(heap, index)?;
+            if rebound != descriptor.value {
+                return Err(ExecutionError::UnresolvedRegisterRoot {
+                    slot: descriptor.slot,
+                });
+            }
+            return heap
+                .cell_for_payload(payload)
+                .ok_or(ExecutionError::UnresolvedRegisterRoot {
+                    slot: descriptor.slot,
+                });
+        }
+
+        if let Some(index) = self.symbols.index_for_value(descriptor.value) {
+            let rebound = self.symbols.bind_index_to_heap(heap, index)?;
             if rebound != descriptor.value {
                 return Err(ExecutionError::UnresolvedRegisterRoot {
                     slot: descriptor.slot,
@@ -5033,8 +5047,8 @@ impl CoreObjectStore {
     fn install_standard_global_properties(
         &mut self,
         heap: &mut Heap,
-        _strings: &mut CoreStringStore,
-        _symbols: &mut CoreSymbolStore,
+        strings: &mut CoreStringStore,
+        symbols: &mut CoreSymbolStore,
         global_object: RuntimeValue,
     ) -> Result<(), ExecutionError> {
         let standard_attributes = CorePropertyAttributes {
@@ -5042,12 +5056,20 @@ impl CoreObjectStore {
             enumerable: false,
             configurable: true,
         };
-        let parse_int = self.allocate_native_function(CoreNativeFunction::ParseInt);
+        let object = self.allocate_object_constructor_with_write_barrier(heap)?;
         self.install_standard_global_data_property(
             heap,
             global_object,
-            "parseInt",
-            parse_int,
+            "Object",
+            object,
+            standard_attributes,
+        )?;
+        let array = self.allocate_array_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Array",
+            array,
             standard_attributes,
         )?;
         let math = self.allocate_math_object();
@@ -5056,6 +5078,184 @@ impl CoreObjectStore {
             global_object,
             "Math",
             math,
+            standard_attributes,
+        )?;
+        let json = self.allocate_json_object();
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "JSON",
+            json,
+            standard_attributes,
+        )?;
+        let reflect = self.allocate_reflect_object();
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Reflect",
+            reflect,
+            standard_attributes,
+        )?;
+        let string = self.allocate_string_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "String",
+            string,
+            standard_attributes,
+        )?;
+        let number = self.allocate_number_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Number",
+            number,
+            standard_attributes,
+        )?;
+        let boolean = self.allocate_boolean_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Boolean",
+            boolean,
+            standard_attributes,
+        )?;
+        let error_name = strings.allocate_untracked("Error");
+        let type_error_name = strings.allocate_untracked("TypeError");
+        let empty_message = strings.allocate_untracked("");
+        let error =
+            self.allocate_error_constructor_with_write_barrier(heap, error_name, empty_message)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Error",
+            error,
+            standard_attributes,
+        )?;
+        let type_error = self.allocate_type_error_constructor_with_write_barrier(
+            heap,
+            error_name,
+            type_error_name,
+            empty_message,
+        )?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "TypeError",
+            type_error,
+            standard_attributes,
+        )?;
+        let map = self.allocate_map_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Map",
+            map,
+            standard_attributes,
+        )?;
+        let set = self.allocate_set_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Set",
+            set,
+            standard_attributes,
+        )?;
+        let weak_map = self.allocate_weak_map_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "WeakMap",
+            weak_map,
+            standard_attributes,
+        )?;
+        let weak_set = self.allocate_weak_set_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "WeakSet",
+            weak_set,
+            standard_attributes,
+        )?;
+        let regexp = self.allocate_regexp_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "RegExp",
+            regexp,
+            standard_attributes,
+        )?;
+        let promise = self.allocate_promise_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Promise",
+            promise,
+            standard_attributes,
+        )?;
+        let date = self.allocate_date_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Date",
+            date,
+            standard_attributes,
+        )?;
+        let bigint = self.allocate_bigint_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "BigInt",
+            bigint,
+            standard_attributes,
+        )?;
+        let array_buffer = self.allocate_array_buffer_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "ArrayBuffer",
+            array_buffer,
+            standard_attributes,
+        )?;
+        let uint8_array = self.allocate_uint8_array_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Uint8Array",
+            uint8_array,
+            standard_attributes,
+        )?;
+        let data_view = self.allocate_data_view_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "DataView",
+            data_view,
+            standard_attributes,
+        )?;
+        let proxy = self.allocate_proxy_constructor();
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Proxy",
+            proxy,
+            standard_attributes,
+        )?;
+        let iterator = symbols.well_known_untracked("Symbol.iterator");
+        let symbol = self.allocate_symbol_constructor_with_write_barrier(heap, iterator)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Symbol",
+            symbol,
+            standard_attributes,
+        )?;
+        let parse_int = self.allocate_native_function(CoreNativeFunction::ParseInt);
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "parseInt",
+            parse_int,
             standard_attributes,
         )?;
         Ok(())
@@ -5118,14 +5318,14 @@ impl CoreObjectStore {
 
     fn install_standard_global_data_property(
         &mut self,
-        heap: &mut Heap,
+        _heap: &mut Heap,
         global_object: RuntimeValue,
         name: &str,
         value: RuntimeValue,
         attributes: CorePropertyAttributes,
     ) -> Result<(), ExecutionError> {
         let key = CorePropertyKey::String(name.into());
-        self.define_data_property_with_write_barrier(heap, global_object, &key, value, attributes)?;
+        let _ = self.define_data_property(global_object, &key, value, attributes)?;
         Ok(())
     }
 
@@ -6049,6 +6249,11 @@ impl CoreObjectStore {
         let Some(cell) = self.find_mut(value) else {
             return Err(ExecutionError::ExpectedObject);
         };
+        if let Some(existing) = heap.cell_for_payload(payload) {
+            heap.publish_cell(existing)?;
+            cell.cell_id = existing;
+            return Ok(existing);
+        }
         if cell.cell_id != CellId::default() {
             heap.bind_cell_payload(cell.cell_id, payload)?;
             heap.publish_cell(cell.cell_id)?;
@@ -6062,23 +6267,18 @@ impl CoreObjectStore {
         Ok(cell_id)
     }
 
-    fn bind_object_to_heap_cell(
+    fn assign_object_heap_cell(
         &mut self,
         heap: &mut Heap,
         value: RuntimeValue,
         cell_id: CellId,
     ) -> Result<(), ExecutionError> {
-        let payload = value
-            .as_cell()
-            .map(|cell| cell.pointer_payload_bits())
-            .ok_or(ExecutionError::ExpectedObject)?;
         let Some(cell) = self.find_mut(value) else {
             return Err(ExecutionError::ExpectedObject);
         };
         if cell.cell_id != CellId::default() && cell.cell_id != cell_id {
             return Err(ExecutionError::UnknownObject);
         }
-        heap.bind_cell_payload(cell_id, payload)?;
         heap.publish_cell(cell_id)?;
         cell.cell_id = cell_id;
         Ok(())
@@ -8235,7 +8435,6 @@ fn allocate_primitive_interpreter_cell_id(
 }
 
 impl CoreStringStore {
-    #[cfg(test)]
     fn allocate_untracked(&mut self, text: &str) -> RuntimeValue {
         if let Some(index) = self.by_text.get(text).copied() {
             return self.value_for_index(index);
@@ -8942,6 +9141,28 @@ struct CoreSymbolCell {
 }
 
 impl CoreSymbolStore {
+    fn allocate_untracked(&mut self, description: Option<String>) -> RuntimeValue {
+        let mut symbol = Box::pin(CoreSymbolCell {
+            cell_id: CellId::default(),
+            description,
+            registry_key: None,
+        });
+        let ptr = NonNull::from(symbol.as_mut().get_mut());
+        self.symbols.push(symbol);
+        // SAFETY: The host owns the boxed cell for the lifetime of the dispatch
+        // run and never moves the allocation after the value is published.
+        RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
+    }
+
+    fn well_known_untracked(&mut self, name: &str) -> RuntimeValue {
+        if let Some(symbol) = self.well_known.get(name).copied() {
+            return symbol;
+        }
+        let symbol = self.allocate_untracked(Some(name.to_owned()));
+        self.well_known.insert(name.to_owned(), symbol);
+        symbol
+    }
+
     fn allocate(
         &mut self,
         heap: &mut Heap,
@@ -8980,6 +9201,30 @@ impl CoreSymbolStore {
         Ok(symbol)
     }
 
+    fn bind_index_to_heap(
+        &mut self,
+        heap: &mut Heap,
+        index: usize,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        let symbol = self.symbols[index].as_ref().get_ref();
+        let payload = core::ptr::from_ref(symbol) as usize;
+        let cell_id = if let Some(cell_id) = heap.cell_for_payload(payload) {
+            heap.publish_cell(cell_id)?;
+            cell_id
+        } else {
+            let cell_id = allocate_primitive_interpreter_cell_id(
+                heap,
+                CellType::Symbol,
+                std::mem::size_of::<CoreSymbolCell>().max(1),
+            )?;
+            heap.bind_cell_payload(cell_id, payload)?;
+            heap.publish_cell(cell_id)?;
+            cell_id
+        };
+        self.symbols[index].as_mut().get_mut().cell_id = cell_id;
+        Ok(self.value_for_index(index))
+    }
+
     fn is_symbol(&self, value: RuntimeValue) -> bool {
         self.find(value).is_some()
     }
@@ -8999,6 +9244,22 @@ impl CoreSymbolStore {
             Some(description) => format!("Symbol({description})"),
             None => "Symbol()".to_owned(),
         })
+    }
+
+    fn index_for_value(&self, value: RuntimeValue) -> Option<usize> {
+        let payload = value.as_cell()?.pointer_payload_bits();
+        self.symbols
+            .iter()
+            .position(|symbol| core::ptr::from_ref(symbol.as_ref().get_ref()) as usize == payload)
+    }
+
+    fn value_for_index(&self, index: usize) -> RuntimeValue {
+        let symbol = self.symbols[index].as_ref().get_ref();
+        let _ = symbol.cell_id;
+        let ptr = NonNull::from(symbol);
+        // SAFETY: The indexed symbol cell is owned by this store and remains
+        // pinned while the dispatch host is alive.
+        RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
     }
 
     fn allocate_cell(
@@ -10665,6 +10926,84 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Err(error) => DispatchOutcome::Fail(error),
                 }
             }
+            CoreOpcode::GetGlobalObjectProperty => {
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let key = match identifier_index_operand(instruction, 1) {
+                    Ok(key) => key,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let global_object = match self.active_global_object_value(state.stack) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let key = self.identifier_property_key(key);
+                let site = CorePropertyLookupSite {
+                    bytecode_index: Some(instruction.bytecode_index),
+                    opcode: Some(CoreOpcode::GetGlobalObjectProperty),
+                };
+                let completion_context = match self
+                    .function_value_property_operation_context_for_current_instruction(
+                        state,
+                        window,
+                        instruction,
+                        FunctionValueReturnTransform::WriteValue { destination },
+                    ) {
+                    Ok(context) => context,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                self.begin_property_lookup_recording(site);
+                let value = match self.get_property_value_with_completion(
+                    state,
+                    global_object,
+                    &key,
+                    global_object,
+                    completion_context,
+                ) {
+                    Ok(value) => value,
+                    Err(outcome) => return outcome,
+                };
+                write_register(state, window, destination, value)
+            }
+            CoreOpcode::PutGlobalObjectProperty => {
+                let key = match identifier_index_operand(instruction, 0) {
+                    Ok(key) => key,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let value = match register_operand(instruction, 1).and_then(|register| {
+                    state
+                        .registers
+                        .read(window, register, Some(state.code_block.constants()))
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let global_object = match self.active_global_object_value(state.stack) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let key = self.identifier_property_key(key);
+                let completion_context = match self
+                    .function_value_property_operation_context_for_current_instruction(
+                        state,
+                        window,
+                        instruction,
+                        FunctionValueReturnTransform::ContinueIgnoringValue,
+                    ) {
+                    Ok(context) => context,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                self.put_by_name_property_value_with_observation(
+                    state,
+                    instruction.bytecode_index,
+                    global_object,
+                    &key,
+                    value,
+                    completion_context,
+                )
+            }
             CoreOpcode::GetSuperByName => {
                 let destination = match register_operand(instruction, 0) {
                     Ok(register) => register,
@@ -11268,6 +11607,23 @@ impl DispatchHost for CoreOpcodeDispatchHost {
 }
 
 impl CoreOpcodeDispatchHost {
+    fn active_global_object_value(
+        &self,
+        stack: &ExecutionContextStack,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        if stack.active_entry().is_none() {
+            return Err(ExecutionError::NoActiveEntry);
+        }
+        for entry in stack.entries.iter().rev() {
+            match &entry.record {
+                ExecutionEntryRecord::Program(program) => return Ok(program.this_value),
+                ExecutionEntryRecord::Eval(eval) => return Ok(eval.this_value),
+                ExecutionEntryRecord::Function(_) | ExecutionEntryRecord::Module(_) => {}
+            }
+        }
+        Err(ExecutionError::ExpectedObject)
+    }
+
     fn global_lexical_name(&self, key: u32) -> Result<String, ExecutionError> {
         self.identifier_texts
             .get(&key)

@@ -170,17 +170,17 @@ The Rust tree is a single crate with module-level subsystem boundaries.
 
 Accepted green checkpoint:
 
-- M4g runtime-only Octane-core matrix precursor: parser/lowering blockers found
-  so far are accepted for `do while`, `switch`, non-tagged template literals,
-  non-decimal number literals, trailing call/new argument commas, function
-  capture cells, and sloppy top-level global assignment reads.
+- A1/A2 partial JSC fidelity checkpoint: object-backed standard, host, and
+  source-declared globals resolve through the live source-session global object
+  instead of closure-captured snapshots, and the standard object family is
+  installed as benchmark-visible global properties.
 - Full accepted gate at that checkpoint: `cargo fmt --check`,
-  `cargo clippy --lib --all-targets -- -D warnings`, and
-  `cargo test --lib -- --quiet` with 1899 passed.
+  `cargo clippy --lib --all-targets -- -D warnings`,
+  `cargo build --lib`, and `cargo test --lib -- --quiet` with 1917 passed.
 
 Current git/code note:
 
-- Treat the 1899-test M4g precursor slice as
+- Treat the 1917-test A1/A2 partial fidelity slice as
   the last accepted green code checkpoint unless a later progress entry records
   passing gates.
 - Do not build benchmark work on a red baseline unless the batch is explicitly
@@ -206,36 +206,29 @@ Major accepted capabilities:
 
 Known Octane run blockers:
 
-- Octane-core now reaches runtime-only failures in both interpreter-only and
-  baseline-allowed modes. The current matrix is: `richards` runner
-  `ExpectedFunction`; `delta-blue` runner `ExpectedObject`; `crypto`, `splay`,
-  and `navier-stokes` benchmark-file `ExpectedObject`; `raytrace` runner
-  `ExpectedObject`.
-- Two shared runtime/lowering blockers have been diagnosed and should be fixed
-  before chasing individual benchmarks: ordinary function fallthrough currently
-  returns the last expression instead of `undefined`, which corrupts constructor
-  return behavior; and late global/host capture local allocation can collide
-  with live temporaries during class method lowering.
+- The last recorded Octane-core matrix predates the A0 and A1/A2 fidelity
+  fixes. Rerun the six-test matrix after the current class/constructor and
+  completion audits; do not treat the old `ExpectedFunction`/`ExpectedObject`
+  labels as current evidence without rerunning.
 - Full shell-style `load(path)` execution is not implemented. It is not on the
   shortest path to the first accepted-equivalent Octane-core runner because the
   active JetStream 3 driver uses `readFile`/runner-side file loading for CLI
   benchmark sources, while the stale legacy `Octane/run.js` path is rejected.
   Keep `load(path)` as a designed VM-owned follow-up boundary for shell/full
   harness compatibility.
-- Standard object/global ownership is only partially tightened: `Math` is now a
-  canonical session-global object, but the rest of the standard object family
-  still needs a follow-up boundary before benchmark-visible mutation can be
-  assumed broadly.
+- Standard object/global ownership is accepted for the current source-session
+  boundary: the standard object family is installed as real global-object
+  properties, and nested functions observe live reassignment.
 - Source-session global lexical/class visibility is accepted for the first
   runner contract slice; later realm/global-environment tightening may still be
   needed when full conformance expands beyond Octane-core.
 - Octane-core syntax/lowering blockers discovered so far are now accepted for
   `do while`, `switch`, non-tagged template literals, non-decimal number
   literals, trailing argument commas, function capture cells, and sloppy
-  top-level global assignment reads. The next shared M4 work is fixing the
-  diagnosed runtime/lowering blockers, rerunning the complete Octane-core
-  pass/fail matrix, and scheduling the next shared feature family from that
-  evidence.
+  top-level global assignment reads. The next shared work is finishing the
+  remaining A1/A2 class/constructor and completion audits, rerunning the
+  complete Octane-core pass/fail matrix, and scheduling the next shared feature
+  family from that evidence.
 
 Known full-Octane blockers beyond the core subset:
 
@@ -365,8 +358,9 @@ Layer B: shared language/runtime blockers for Octane-core.
   top-level `class`/`let`/`const` now use a distinct source-session global
   lexical boundary. `do while`, `switch`, non-tagged template literals,
   non-decimal number literals, trailing argument commas, function capture cells,
-  and sloppy top-level global assignment reads are accepted. The current matrix
-  has moved from parse/bytecode blockers to runtime blockers.
+  sloppy top-level global assignment reads, and live object-backed global
+  resolution are accepted. The current matrix must be rerun after the remaining
+  A1/A2 class/constructor and completion audits.
 
 Layer C: Octane-core correctness.
 
@@ -376,8 +370,8 @@ Layer C: Octane-core correctness.
 - Sub-agents: own failing feature families, not individual one-off benchmark
   edits. No benchmark source hacks are allowed.
 - Current priority: fix shared runtime/lowering blockers before individual
-  benchmark debugging. First fix ordinary function fallthrough return semantics
-  and late local/register allocation collision, then rerun the six-test matrix.
+  benchmark debugging. First finish class constructor/call/sloppy-`this` and
+  source completion audits, then rerun the six-test matrix.
 - Completion evidence: `richards`, `delta-blue`, `crypto`, `splay`,
   `navier-stokes`, and `raytrace` complete under the accepted runner with
   validated results and comparable score records.
@@ -448,6 +442,18 @@ Audit order:
   accidental deviations and are fixed. Remaining intentional Rust deviation:
   derived-constructor checks are represented as explicit Rust bytecode helper
   opcodes while preserving JSC observable semantics.
+- A1/A2 partial accepted 2026-05-21: standard, host, and source-declared
+  object-backed globals were audited against JSC global-object behavior and
+  fixed where Rust had drifted into closure-captured snapshots. JSC evidence:
+  `JSGlobalObject.cpp`, `JSGlobalObject.h`, `JSScope.cpp`, `JSScope.h`,
+  `JSObject.cpp`, `JSObject.h`, `BytecodeGenerator.cpp`,
+  `BytecodeGenerator.h`, `NodesCodegen.cpp`, and `jsc.cpp`. Rust files:
+  `src/bytecode/opcode.rs`, `src/bytecompiler/mod.rs`,
+  `src/interpreter/mod.rs`, and `src/vm/mod.rs`. Classification: captured
+  object-backed globals were accidental deviations and are fixed; standard
+  globals are now real global-object properties, identifier reads/writes use
+  live global-object opcodes, and transient bootstrap strings/symbols are
+  rebound through the Rust root bridge when they become live roots.
 - A1 bytecompiler fidelity: source/program completion, function returns,
   declaration binding, lexical/global environment lowering, captures, class
   lowering, and source-session behavior against JSC `BytecodeGenerator`.
@@ -478,10 +484,10 @@ rewrite phase.
   fixes, and reject unproven Rust-local behavior.
 - Sub-agents: inspect assigned Rust and C++ JSC components, classify fidelity,
   and implement fixes only when the write scope is explicit and disjoint.
-- Active batch: A1/A2 shared bytecompiler-runtime fidelity. The next audits
-  should cover standard globals as real global properties, live global
-  resolution after mutation, default/class constructor metadata, class-call
-  rejection, sloppy `this`, and source-session completion behavior before more
+- Active batch: continue A1/A2 shared bytecompiler-runtime fidelity. The next
+  audits should cover default/class constructor metadata, class-call rejection,
+  sloppy `this`, branch/try/source-session completion behavior, top-level
+  `return` gating, and batch source execution ordering before more
   benchmark-specific debugging.
 - Completion evidence for F0: all existing Rust subsystems have passed the
   breadth-first fidelity audit above, accidental deviations have fixes or

@@ -202,7 +202,32 @@ pub struct BytecompilerGlobalBindingSet {
     bindings: HashMap<String, BytecompilerGlobalBindingKind>,
 }
 
-pub const STANDARD_GLOBAL_BINDING_NAMES: &[&str] = &["Math", "parseInt"];
+pub const STANDARD_GLOBAL_BINDING_NAMES: &[&str] = &[
+    "Object",
+    "Array",
+    "Math",
+    "JSON",
+    "Reflect",
+    "String",
+    "Number",
+    "Boolean",
+    "Error",
+    "TypeError",
+    "Map",
+    "Set",
+    "WeakMap",
+    "WeakSet",
+    "RegExp",
+    "Promise",
+    "Date",
+    "BigInt",
+    "ArrayBuffer",
+    "Uint8Array",
+    "DataView",
+    "Proxy",
+    "Symbol",
+    "parseInt",
+];
 
 impl BytecompilerGlobalBindingSet {
     pub fn new() -> Self {
@@ -1031,15 +1056,9 @@ fn collect_function_compilation_plan(
     let mut capture_memo = HashMap::new();
     let mut root_locals = HashSet::new();
     collect_scope_local_names(arena, scope, &mut root_locals)?;
-    root_locals.retain(|name| !global_bindings.source_lexical_identifier(arena, *name));
+    root_locals.retain(|name| !global_bindings.contains_identifier(arena, *name));
     for metadata in plan.metadata_order.clone() {
-        let captures = collect_function_captures(
-            arena,
-            metadata,
-            &mut capture_memo,
-            global_bindings,
-            &root_locals,
-        )?;
+        let captures = collect_function_captures(arena, metadata, &mut capture_memo, &root_locals)?;
         plan.captures.insert(metadata.raw_index(), captures);
     }
     Ok(plan)
@@ -1661,7 +1680,6 @@ fn collect_function_captures(
     arena: &ParserArena,
     metadata: AstRef<FunctionMetadata>,
     memo: &mut HashMap<u32, Vec<ParserIdentifier>>,
-    global_bindings: &BytecompilerGlobalBindingSet,
     outer_locals: &HashSet<ParserIdentifier>,
 ) -> Result<Vec<ParserIdentifier>, BytecompilerEmissionError> {
     let metadata_index = metadata.raw_index();
@@ -1702,7 +1720,6 @@ fn collect_function_captures(
             arena,
             nested,
             memo,
-            global_bindings,
             &nested_outer_locals,
         )?);
     }
@@ -1710,9 +1727,7 @@ fn collect_function_captures(
     let captures = references
         .into_iter()
         .filter(|name| !locals.contains(name))
-        .filter(|name| {
-            outer_locals.contains(name) || !global_bindings.source_lexical_identifier(arena, *name)
-        })
+        .filter(|name| outer_locals.contains(name))
         .filter(|name| seen.insert(*name))
         .collect::<Vec<_>>();
     memo.insert(metadata_index, captures.clone());
@@ -4401,7 +4416,7 @@ impl AstBytecodeEmitter<'_, '_> {
                 match target {
                     Some(target) => self.emit_write_resolved_binding(name.name, target, value),
                     None if self.sloppy_top_level_assignment_expression == Some(expression) => {
-                        self.emit_put_by_name(Self::global_object_register(), name.name, value);
+                        self.emit_put_global_object_property(name.name, value);
                         self.declare_source_sloppy_global_property(name.name)?;
                     }
                     None => return Err(BytecompilerEmissionError::UnboundIdentifier(name.name)),
@@ -5818,9 +5833,7 @@ impl AstBytecodeEmitter<'_, '_> {
     ) -> Result<VirtualRegister, BytecompilerEmissionError> {
         match binding {
             ResolvedBinding::Local(binding) => self.emit_read_binding(binding),
-            ResolvedBinding::GlobalObject(name) => {
-                self.emit_get_by_name(Self::global_object_register(), name)
-            }
+            ResolvedBinding::GlobalObject(name) => self.emit_get_global_object_property(name),
             ResolvedBinding::GlobalLexical(name) => self.emit_get_global_lexical(name),
         }
     }
@@ -5840,7 +5853,7 @@ impl AstBytecodeEmitter<'_, '_> {
     ) {
         self.emit_write_binding(binding, value);
         if self.should_mirror_global_binding(name) {
-            self.emit_put_by_name(Self::global_object_register(), name, value);
+            self.emit_put_global_object_property(name, value);
         }
     }
 
@@ -5853,7 +5866,7 @@ impl AstBytecodeEmitter<'_, '_> {
         match binding {
             ResolvedBinding::Local(binding) => self.emit_write_named_binding(name, binding, value),
             ResolvedBinding::GlobalObject(global_name) => {
-                self.emit_put_by_name(Self::global_object_register(), global_name, value)
+                self.emit_put_global_object_property(global_name, value)
             }
             ResolvedBinding::GlobalLexical(global_name) => {
                 self.emit_put_global_lexical(global_name, value)
@@ -5870,7 +5883,7 @@ impl AstBytecodeEmitter<'_, '_> {
         match binding {
             ResolvedBinding::Local(binding) => self.emit_write_named_binding(name, binding, value),
             ResolvedBinding::GlobalObject(global_name) => {
-                self.emit_put_by_name(Self::global_object_register(), global_name, value)
+                self.emit_put_global_object_property(global_name, value)
             }
             ResolvedBinding::GlobalLexical(global_name) => {
                 self.emit_initialize_global_lexical(global_name, value)
@@ -5975,6 +5988,33 @@ impl AstBytecodeEmitter<'_, '_> {
     fn emit_put_global_lexical(&mut self, name: ParserIdentifier, value: VirtualRegister) {
         self.generator.instructions_mut().declare_instruction(
             CoreOpcode::PutGlobalLexical.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::IdentifierIndex(name.0), Operand::Register(value)],
+        );
+    }
+
+    fn emit_get_global_object_property(
+        &mut self,
+        name: ParserIdentifier,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::GetGlobalObjectProperty.opcode(),
+            OperandWidth::Narrow,
+            vec![
+                Operand::Register(destination),
+                Operand::IdentifierIndex(name.0),
+            ],
+        );
+        Ok(destination)
+    }
+
+    fn emit_put_global_object_property(&mut self, name: ParserIdentifier, value: VirtualRegister) {
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::PutGlobalObjectProperty.opcode(),
             OperandWidth::Narrow,
             vec![Operand::IdentifierIndex(name.0), Operand::Register(value)],
         );
@@ -7363,18 +7403,14 @@ mod tests {
             .any(|instruction| CoreOpcode::from_opcode(instruction.opcode) == Some(opcode))
     }
 
-    fn unlinked_contains_put_by_name_to_source_global(code_block: &UnlinkedCodeBlock) -> bool {
+    fn unlinked_contains_put_to_source_global(code_block: &UnlinkedCodeBlock) -> bool {
         code_block
             .instructions()
             .declarations()
             .iter()
             .any(|instruction| {
-                CoreOpcode::from_opcode(instruction.opcode) == Some(CoreOpcode::PutByName)
-                    && matches!(
-                        instruction.operands.first(),
-                        Some(Operand::Register(register))
-                            if *register == AstBytecodeEmitter::global_object_register()
-                    )
+                CoreOpcode::from_opcode(instruction.opcode)
+                    == Some(CoreOpcode::PutGlobalObjectProperty)
             })
     }
 
@@ -7957,13 +7993,19 @@ mod tests {
             nested,
             CoreOpcode::LoadMathObject
         ));
-        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
-        assert!(unlinked_contains_opcode(nested, CoreOpcode::GetByName));
-        assert_eq!(load_function_capture_counts(program), vec![1]);
+        assert!(unlinked_contains_opcode(
+            program,
+            CoreOpcode::GetGlobalObjectProperty
+        ));
+        assert!(unlinked_contains_opcode(
+            nested,
+            CoreOpcode::GetGlobalObjectProperty
+        ));
+        assert_eq!(load_function_capture_counts(program), vec![0]);
     }
 
     #[test]
-    fn parsed_ast_function_declaration_captures_host_global_alert_before_body_use() {
+    fn parsed_ast_function_declaration_resolves_host_global_alert_live() {
         let plan = emit_program_plan_with_global_bindings(
             "function f() { alert('x'); } return f;",
             20,
@@ -7972,13 +8014,20 @@ mod tests {
         let program = plan.unlinked_code.as_ref().unwrap();
         let nested = plan.function_bodies.first().unwrap();
 
-        assert_eq!(load_function_capture_counts(program), vec![1]);
-        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
-        assert!(unlinked_contains_opcode(nested, CoreOpcode::GetClosureCell));
+        assert_eq!(load_function_capture_counts(program), vec![0]);
+        assert!(!unlinked_contains_opcode(program, CoreOpcode::GetByName));
+        assert!(unlinked_contains_opcode(
+            nested,
+            CoreOpcode::GetGlobalObjectProperty
+        ));
+        assert!(!unlinked_contains_opcode(
+            nested,
+            CoreOpcode::GetClosureCell
+        ));
     }
 
     #[test]
-    fn parsed_ast_function_declaration_captures_host_global_performance_before_body_use() {
+    fn parsed_ast_function_declaration_resolves_host_global_performance_live() {
         let plan = emit_program_plan_with_global_bindings(
             "function f() { return performance.now(); } return f;",
             21,
@@ -7987,13 +8036,20 @@ mod tests {
         let program = plan.unlinked_code.as_ref().unwrap();
         let nested = plan.function_bodies.first().unwrap();
 
-        assert_eq!(load_function_capture_counts(program), vec![1]);
-        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
-        assert!(unlinked_contains_opcode(nested, CoreOpcode::GetClosureCell));
+        assert_eq!(load_function_capture_counts(program), vec![0]);
+        assert!(!unlinked_contains_opcode(program, CoreOpcode::GetByName));
+        assert!(unlinked_contains_opcode(
+            nested,
+            CoreOpcode::GetGlobalObjectProperty
+        ));
+        assert!(!unlinked_contains_opcode(
+            nested,
+            CoreOpcode::GetClosureCell
+        ));
     }
 
     #[test]
-    fn parsed_ast_class_method_host_capture_keeps_temporaries_out_of_var_prefix() {
+    fn parsed_ast_class_method_live_host_global_keeps_temporaries_out_of_var_prefix() {
         let mut globals = BytecompilerGlobalBindingSet::from_host_names(["performance"]);
         globals.declare(BytecompilerGlobalBinding::source_class("Benchmark"));
         let plan = emit_program_plan_with_global_bindings(
@@ -8004,11 +8060,6 @@ mod tests {
         let program = plan.unlinked_code.as_ref().unwrap();
         let frame = program.frame();
         let load_functions = load_function_registers(program);
-        let method_load = load_functions
-            .iter()
-            .find(|(_, captures)| captures.len() == 1)
-            .expect("method LoadFunction captures performance");
-
         for (destination, captures) in &load_functions {
             let destination_index = destination
                 .to_local_index()
@@ -8021,13 +8072,9 @@ mod tests {
             );
             assert!(!captures.contains(destination));
         }
-        let capture_index = method_load.1[0]
-            .to_local_index()
-            .expect("captured performance cell is a local");
-        assert!(
-            capture_index < frame.num_vars,
-            "captured performance cell should be in the var prefix"
-        );
+        assert!(load_functions
+            .iter()
+            .all(|(_, captures)| captures.is_empty()));
         assert_eq!(
             frame.num_callee_locals,
             frame.num_vars.saturating_add(frame.num_temporaries)
@@ -8035,7 +8082,7 @@ mod tests {
     }
 
     #[test]
-    fn parsed_ast_function_expression_captures_host_global_before_body_use() {
+    fn parsed_ast_function_expression_resolves_host_global_live() {
         let plan = emit_program_plan_with_global_bindings(
             "var f = function() { alert('x'); }; return f;",
             23,
@@ -8044,24 +8091,30 @@ mod tests {
         let program = plan.unlinked_code.as_ref().unwrap();
         let nested = plan.function_bodies.first().unwrap();
 
-        assert_eq!(load_function_capture_counts(program), vec![1]);
-        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
-        assert!(unlinked_contains_opcode(nested, CoreOpcode::GetClosureCell));
+        assert_eq!(load_function_capture_counts(program), vec![0]);
+        assert!(!unlinked_contains_opcode(program, CoreOpcode::GetByName));
+        assert!(unlinked_contains_opcode(
+            nested,
+            CoreOpcode::GetGlobalObjectProperty
+        ));
+        assert!(!unlinked_contains_opcode(
+            nested,
+            CoreOpcode::GetClosureCell
+        ));
     }
 
     #[test]
-    fn parsed_ast_function_declaration_captures_unknown_global_read_as_global_object_capture() {
-        let plan = emit_program_plan_with_global_bindings(
+    fn parsed_ast_function_declaration_rejects_unknown_global_read() {
+        let result = try_emit_program_plan_with_global_bindings(
             "function f(x) { if (x) return DV; return 1; } return f;",
             22,
             BytecompilerGlobalBindingSet::default(),
         );
-        let program = plan.unlinked_code.as_ref().unwrap();
-        let nested = plan.function_bodies.first().unwrap();
 
-        assert_eq!(load_function_capture_counts(program), vec![1]);
-        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
-        assert!(unlinked_contains_opcode(nested, CoreOpcode::GetClosureCell));
+        assert!(matches!(
+            result,
+            Err(BytecompilerEmissionError::UnboundIdentifier(_))
+        ));
     }
 
     #[test]
@@ -8073,8 +8126,11 @@ mod tests {
         );
         let program = plan.unlinked_code.as_ref().unwrap();
 
-        assert!(unlinked_contains_put_by_name_to_source_global(program));
-        assert!(unlinked_contains_opcode(program, CoreOpcode::GetByName));
+        assert!(unlinked_contains_put_to_source_global(program));
+        assert!(unlinked_contains_opcode(
+            program,
+            CoreOpcode::GetGlobalObjectProperty
+        ));
         assert!(unlinked_contains_opcode(program, CoreOpcode::Call));
     }
 
@@ -8270,11 +8326,13 @@ mod tests {
     }
 
     #[test]
-    fn parsed_ast_lexical_standard_name_shadow_remains_capturable() {
+    fn parsed_ast_lexical_standard_name_shadow_resolves_as_global_lexical() {
+        let mut globals = BytecompilerGlobalBindingSet::standard_globals();
+        globals.declare(BytecompilerGlobalBinding::source_let("Math"));
         let plan = emit_program_plan_with_global_bindings(
             "let Math = { custom: 41 }; function read() { return Math.custom + 1; } return read();",
             16,
-            BytecompilerGlobalBindingSet::standard_globals(),
+            globals,
         );
         let program = plan.unlinked_code.as_ref().unwrap();
         let nested = plan.function_bodies.first().unwrap();
@@ -8287,7 +8345,11 @@ mod tests {
             nested,
             CoreOpcode::LoadMathObject
         ));
-        assert_eq!(load_function_capture_counts(program), vec![1]);
+        assert_eq!(load_function_capture_counts(program), vec![0]);
+        assert!(unlinked_contains_opcode(
+            nested,
+            CoreOpcode::GetGlobalLexical
+        ));
     }
 
     #[test]
@@ -8331,7 +8393,7 @@ mod tests {
             program,
             CoreOpcode::GetGlobalLexical
         ));
-        assert!(!unlinked_contains_put_by_name_to_source_global(program));
+        assert!(!unlinked_contains_put_to_source_global(program));
     }
 
     #[test]
