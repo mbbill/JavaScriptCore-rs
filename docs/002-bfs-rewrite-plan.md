@@ -200,9 +200,10 @@ Major accepted capabilities:
 
 Known Octane run blockers:
 
-- Benchmark telemetry and runner control: no Rust-side Octane manifest,
-  load-order execution, iteration loop, validation policy, scoring, or
-  tier-mode selection yet.
+- Benchmark telemetry and runner control: the Rust-side Octane manifest and
+  `DefaultBenchmark` scoring contract now exist under `shell::octane`; load
+  order execution, generated runner source, iteration/validation collection,
+  failure classification, and tier-mode selection are still missing.
 - Full shell-style `load(path)` execution is not implemented. It is not on the
   shortest path to the first accepted-equivalent Octane-core runner because the
   active JetStream 3 driver uses `readFile`/runner-side file loading for CLI
@@ -213,6 +214,13 @@ Known Octane run blockers:
   canonical session-global object, but the rest of the standard object family
   still needs a follow-up boundary before benchmark-visible mutation can be
   assumed broadly.
+- Source-session global lexical/class visibility is still incomplete for the
+  runner contract: Octane-core files expose top-level `class Benchmark`, while
+  current cross-source visibility is deliberately stronger for `function`/`var`
+  than for lexical/class declarations.
+- Octane-core still has syntax/lowering blockers before all six files can parse
+  and run honestly: at least `do while`, `switch`, and template literals need
+  shared parser/bytecompiler support rather than benchmark-local workarounds.
 
 Known full-Octane blockers beyond the core subset:
 
@@ -419,6 +427,16 @@ M4: Current - run Octane-core correctly in the Rust engine.
   iteration/validation policy without benchmark source hacks, and report
   classified failures or correctness success under interpreter-only and
   baseline-enabled modes.
+- Accepted sub-slice: M4a added `shell::octane` with the full JetStream 3
+  Octane manifest in driver order, the accepted Octane-core selection, pure
+  `DefaultBenchmark` run-config resolution and scoring, and typed scoring or
+  manifest errors. It deliberately does not read files, execute JavaScript,
+  install host globals, or choose tier mode.
+- Next sub-slice: implement the non-executing runner preparation boundary:
+  resolve selected plans, load benchmark files through `ShellSourceLoader`,
+  convert them to `SourceSessionSource::with_provenance`, generate the JS
+  prelude/deterministic-random/iteration source, and classify preparation
+  failures before executing any benchmark.
 
 M5: Make the accepted baseline JIT cover Octane-core hot paths.
 

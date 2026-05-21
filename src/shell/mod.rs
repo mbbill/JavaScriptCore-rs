@@ -3,6 +3,8 @@
 //! The shell is not the engine. This module only names command-line host
 //! services, testing hooks, module resolution hooks, and harness integration.
 
+pub mod octane;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
