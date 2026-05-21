@@ -31,11 +31,11 @@ rewrite. Preserve JavaScriptCore's real engine responsibilities while adapting
 them to Rust ownership, rooting, frame, exception, runtime, GC, and execution
 tier contracts.
 
-The current public proof target is full JetStream 3 Octane execution at
-JavaScriptCore-level performance. Treat Octane as a correctness and performance
-forcing function: first make the benchmark run honestly, then widen to the full
-Octane set, then optimize by comparing behavior, bytecode, ICs, generated code,
-tiering, and runtime decisions against C++ JavaScriptCore.
+The current public proof target is the full JetStream 3 Octane group at local
+C++ JavaScriptCore-level performance. Treat Octane as a correctness and
+performance forcing function: first make the benchmark run honestly, then widen
+to the full Octane set, then optimize by comparing behavior, bytecode, ICs,
+generated code, tiering, and runtime decisions against C++ JavaScriptCore.
 
 Own priority, dependency order, and parallelism across the whole rewrite. Keep
 the rewrite breadth-first before depth-first: expand and validate major engine
@@ -198,19 +198,20 @@ Major accepted capabilities:
 
 Known Octane run blockers:
 
-- Persistent shell/source session: the current public source execution path is
-  in-memory and fresh per source, which is wrong for `load()`-based benchmark
-  plans that must share one global/host state per benchmark.
-- Update expressions: `++` and `--`.
-- Compound assignment: `+=`, `-=`, `*=`, `/=`, `%=`, bitwise compound forms,
-  and related read-modify-write lowering.
-- Conditional expression: `?:`.
-- Loose equality: `==` and `!=`.
-- Runtime intrinsics used by Octane-core: `Math.floor`, `Math.sqrt`,
-  `Math.random`, `Math.log`, `Math.LN2`, `String.prototype.charCodeAt`,
+- Source loading/session is only partly modeled: accepted batch sessions share
+  one VM global/root and dispatch host, and source-order top-level
+  `function`/`var` plus declared host names are visible through a real session
+  global object, but there is no filesystem-backed source loading,
+  source-origin record flow, or incremental host append/merge path for
+  `load()`/`readFile()` yet.
+- Runtime intrinsics used by Octane-core still need an explicit benchmark
+  compatibility pass: `Math.floor`, `Math.sqrt`, `Math.random`, `Math.log`,
+  `Math.LN2`, `String.prototype.charCodeAt`,
   `String.prototype.substring`, `String.fromCharCode`, and global `parseInt`.
-- Shell and benchmark globals: `performance.now`, `load`, `readFile`, `print`,
-  `console`, and error-reporting compatibility such as `alert`.
+- Shell and benchmark host names can now be declared for bytecompiler
+  visibility, but their runtime behavior is not installed yet:
+  `performance.now`, `load`, `readFile`, `print`, `console`, and
+  error-reporting compatibility such as `alert`.
 - Benchmark telemetry and runner control: no Rust-side Octane manifest,
   load-order execution, iteration loop, validation policy, scoring, or
   tier-mode selection yet.
@@ -324,21 +325,21 @@ M1: Accepted - freeze the Octane target and runner architecture.
 
 M2: Current - build Octane-core execution prerequisites in parallel.
 
-- Main agent: keep the shared execution boundary serial and delegate
-  independent syntax/runtime prerequisites in parallel. First approve the
-  persistent source-session contract and the expression-lowering contract so
-  workers do not invent separate global, host, or read-modify-write models.
-- Sub-agents: implement disjoint prerequisite slices:
-  persistent VM/source session with one shared global/host across benchmark
-  loads; filesystem-backed source loading and source-origin records; explicit
-  shell host binding declarations for bytecompiler-visible globals; update
-  expressions; compound assignment; conditional expression; and loose equality.
+- Main agent: protect the accepted source-session, global-binding, and
+  expression-lowering contracts while closing the remaining file-loading
+  boundary. Keep the host `load`/`readFile` model serial enough that workers do
+  not invent a second global, origin, or source append identity.
+- Sub-agents: finish the remaining disjoint prerequisite slice:
+  filesystem-backed source loading, source-origin records flowing into
+  compiled sources, and incremental host append/merge support for future
+  `load`/`readFile` execution.
 - Completion evidence: multiple loaded sources share one benchmark global/host
   state without reinitializing VM-owned roots or dispatch state; shell globals
-  can be declared without ad hoc intrinsic hardcoding; focused VM/source tests
-  cover locals, properties, indexed elements, prefix/postfix value semantics,
-  side-effect order, conditional branch behavior, and loose equality cases used
-  by Octane-core.
+  can be declared without ad hoc intrinsic hardcoding; loaded files carry
+  source-origin records into compiled sources; focused VM/source tests cover
+  locals, properties, indexed elements, prefix/postfix value semantics,
+  side-effect order, conditional branch behavior, loose equality cases used by
+  Octane-core, and batch-vs-incremental source visibility.
 - Accepted sub-slice: persistent batch source sessions now reuse one
   VM-owned global/root and one dispatch host across loaded sources while
   preserving one-shot `execute_source`; update expressions, compound
