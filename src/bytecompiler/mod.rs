@@ -20,7 +20,7 @@ use crate::syntax::ast::{
     BinaryOperator as AstBinaryOperator, CallExpr, ClassElementKind, ClassElementName, ClassExpr,
     ConditionalExpr, ControlKind, DeclarationStmt, DeclarationSyntaxKind, DoWhileStmt, Expr,
     ForInit, ForOfBinding, FunctionMetadata, LiteralKind, MemberExpr, MemberKind, NameKind,
-    NewExpr, NumberLiteralValue, ObjectLiteralPropertyKind, Pattern, Stmt, UnaryExpr,
+    NewExpr, NumberLiteralValue, ObjectLiteralPropertyKind, Pattern, Stmt, SwitchStmt, UnaryExpr,
     UnaryOperator as AstUnaryOperator,
 };
 use crate::syntax::{
@@ -831,6 +831,7 @@ pub fn emit_unlinked_code_from_parsed_ast(
         function_metadata_indices: function_plan.metadata_indices.clone(),
         function_captures: function_plan.captures.clone(),
         loop_stack: Vec::new(),
+        break_stack: Vec::new(),
         finally_stack: Vec::new(),
     };
     let mut function_bodies = Vec::with_capacity(function_plan.metadata_order.len());
@@ -1077,6 +1078,18 @@ fn collect_statement_function_metadata(
         Stmt::DoWhile(statement) => {
             collect_statement_function_metadata(arena, statement.body, plan)?;
             collect_expression_function_metadata(arena, statement.condition, plan)
+        }
+        Stmt::Switch(statement) => {
+            collect_expression_function_metadata(arena, statement.discriminant, plan)?;
+            for case in &statement.cases {
+                if let Some(test) = case.test {
+                    collect_expression_function_metadata(arena, test, plan)?;
+                }
+                for statement in &case.statements {
+                    collect_statement_function_metadata(arena, *statement, plan)?;
+                }
+            }
+            Ok(())
         }
         Stmt::For(statement) => {
             if let Some(init) = &statement.init {
@@ -1351,6 +1364,22 @@ fn collect_statement_immediate_function_metadata(
         Stmt::DoWhile(statement) => {
             collect_statement_immediate_function_metadata(arena, statement.body, functions)?;
             collect_expression_immediate_function_metadata(arena, statement.condition, functions)
+        }
+        Stmt::Switch(statement) => {
+            collect_expression_immediate_function_metadata(
+                arena,
+                statement.discriminant,
+                functions,
+            )?;
+            for case in &statement.cases {
+                if let Some(test) = case.test {
+                    collect_expression_immediate_function_metadata(arena, test, functions)?;
+                }
+                for statement in &case.statements {
+                    collect_statement_immediate_function_metadata(arena, *statement, functions)?;
+                }
+            }
+            Ok(())
         }
         Stmt::For(statement) => {
             if let Some(init) = &statement.init {
@@ -1689,6 +1718,14 @@ fn collect_statement_local_names(
         }
         Stmt::While(statement) => collect_statement_local_names(arena, statement.body, locals),
         Stmt::DoWhile(statement) => collect_statement_local_names(arena, statement.body, locals),
+        Stmt::Switch(statement) => {
+            for case in &statement.cases {
+                for statement in &case.statements {
+                    collect_statement_local_names(arena, *statement, locals)?;
+                }
+            }
+            Ok(())
+        }
         Stmt::For(statement) => {
             if let Some(ForInit::Declaration(declaration)) = &statement.init {
                 collect_declaration_local_names(arena, declaration, locals)?;
@@ -1813,6 +1850,18 @@ fn collect_statement_referenced_names(
         Stmt::DoWhile(statement) => {
             collect_statement_referenced_names(arena, statement.body, references)?;
             collect_expression_referenced_names(arena, statement.condition, references)
+        }
+        Stmt::Switch(statement) => {
+            collect_expression_referenced_names(arena, statement.discriminant, references)?;
+            for case in &statement.cases {
+                if let Some(test) = case.test {
+                    collect_expression_referenced_names(arena, test, references)?;
+                }
+                for statement in &case.statements {
+                    collect_statement_referenced_names(arena, *statement, references)?;
+                }
+            }
+            Ok(())
         }
         Stmt::For(statement) => {
             if let Some(init) = &statement.init {
@@ -2072,6 +2121,18 @@ fn collect_statement_string_literals(
         Stmt::DoWhile(statement) => {
             collect_statement_string_literals(arena, statement.body, table)?;
             collect_expression_string_literals(arena, statement.condition, table)
+        }
+        Stmt::Switch(statement) => {
+            collect_expression_string_literals(arena, statement.discriminant, table)?;
+            for case in &statement.cases {
+                if let Some(test) = case.test {
+                    collect_expression_string_literals(arena, test, table)?;
+                }
+                for statement in &case.statements {
+                    collect_statement_string_literals(arena, *statement, table)?;
+                }
+            }
+            Ok(())
         }
         Stmt::For(statement) => {
             if let Some(init) = &statement.init {
@@ -2448,6 +2509,7 @@ struct AstBytecodeEmitter<'a, 'g> {
     function_metadata_indices: HashMap<u32, u32>,
     function_captures: HashMap<u32, Vec<ParserIdentifier>>,
     loop_stack: Vec<LoopControlLabels>,
+    break_stack: Vec<BreakControlLabels>,
     finally_stack: Vec<ActiveFinallyContext>,
 }
 
@@ -2482,6 +2544,12 @@ impl StatementEmission {
 struct LoopControlLabels {
     break_target: LabelRef,
     continue_target: LabelRef,
+    finally_stack_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BreakControlLabels {
+    break_target: LabelRef,
     finally_stack_depth: usize,
 }
 
@@ -2643,6 +2711,7 @@ impl AstBytecodeEmitter<'_, '_> {
             function_metadata_indices: self.function_metadata_indices.clone(),
             function_captures: self.function_captures.clone(),
             loop_stack: Vec::new(),
+            break_stack: Vec::new(),
             finally_stack: Vec::new(),
         };
         for parameter in &metadata.parameters {
@@ -2732,6 +2801,7 @@ impl AstBytecodeEmitter<'_, '_> {
                 }
                 Stmt::While(statement) => self.predeclare_statement_locals(statement.body)?,
                 Stmt::DoWhile(statement) => self.predeclare_statement_locals(statement.body)?,
+                Stmt::Switch(statement) => self.predeclare_switch_locals(&statement)?,
                 Stmt::For(statement) => self.predeclare_for_locals(&statement)?,
                 Stmt::ForOf(statement) => self.predeclare_for_of_locals(&statement)?,
                 Stmt::Try(statement) => self.predeclare_try_locals(&statement)?,
@@ -2770,6 +2840,7 @@ impl AstBytecodeEmitter<'_, '_> {
                 }
                 Stmt::While(statement) => self.predeclare_statement_locals(statement.body)?,
                 Stmt::DoWhile(statement) => self.predeclare_statement_locals(statement.body)?,
+                Stmt::Switch(statement) => self.predeclare_switch_locals(&statement)?,
                 Stmt::For(statement) => self.predeclare_for_locals(&statement)?,
                 Stmt::ForOf(statement) => self.predeclare_for_of_locals(&statement)?,
                 Stmt::Try(statement) => self.predeclare_try_locals(&statement)?,
@@ -2829,6 +2900,7 @@ impl AstBytecodeEmitter<'_, '_> {
             }
             Stmt::While(statement) => self.predeclare_statement_locals(statement.body),
             Stmt::DoWhile(statement) => self.predeclare_statement_locals(statement.body),
+            Stmt::Switch(statement) => self.predeclare_switch_locals(&statement),
             Stmt::For(statement) => self.predeclare_for_locals(&statement),
             Stmt::ForOf(statement) => self.predeclare_for_of_locals(&statement),
             Stmt::Try(statement) => self.predeclare_try_locals(&statement),
@@ -2837,6 +2909,18 @@ impl AstBytecodeEmitter<'_, '_> {
             }
             _ => Ok(()),
         }
+    }
+
+    fn predeclare_switch_locals(
+        &mut self,
+        statement: &SwitchStmt,
+    ) -> Result<(), BytecompilerEmissionError> {
+        for case in &statement.cases {
+            for statement in &case.statements {
+                self.predeclare_statement_locals(*statement)?;
+            }
+        }
+        Ok(())
     }
 
     fn predeclare_for_locals(
@@ -3346,15 +3430,25 @@ impl AstBytecodeEmitter<'_, '_> {
                 self.bind_label(continue_target)?;
                 let condition = self.emit_expression(statement.condition)?;
                 self.emit_jump_if_false(condition, break_target);
+                let break_labels = BreakControlLabels {
+                    break_target,
+                    finally_stack_depth: self.finally_stack.len(),
+                };
                 self.loop_stack.push(LoopControlLabels {
                     break_target,
                     continue_target,
-                    finally_stack_depth: self.finally_stack.len(),
+                    finally_stack_depth: break_labels.finally_stack_depth,
                 });
+                self.break_stack.push(break_labels);
                 let body = self.emit_statement(statement.body)?;
                 let Some(labels) = self.loop_stack.pop() else {
                     return Err(BytecompilerEmissionError::UnsupportedStatement(
                         "loop control stack underflow",
+                    ));
+                };
+                let Some(_) = self.break_stack.pop() else {
+                    return Err(BytecompilerEmissionError::UnsupportedStatement(
+                        "break control stack underflow",
                     ));
                 };
                 if !body.terminated {
@@ -3363,6 +3457,7 @@ impl AstBytecodeEmitter<'_, '_> {
                 self.bind_label(labels.break_target)?;
                 Ok(StatementEmission::default())
             }
+            Stmt::Switch(statement) => self.emit_switch_statement(&statement),
             Stmt::For(statement) => self.emit_for_statement(&statement),
             Stmt::ForOf(statement) => self.emit_for_of_statement(&statement),
             Stmt::DoWhile(statement) => self.emit_do_while_statement(&statement),
@@ -3387,9 +3482,9 @@ impl AstBytecodeEmitter<'_, '_> {
                             "named break statements need label-scope resolution",
                         ));
                     }
-                    let Some(labels) = self.loop_stack.last().copied() else {
+                    let Some(labels) = self.break_stack.last().copied() else {
                         return Err(BytecompilerEmissionError::UnsupportedStatement(
-                            "break statement outside loop",
+                            "break statement outside breakable statement",
                         ));
                     };
                     self.emit_break_completion(labels)?;
@@ -3436,15 +3531,25 @@ impl AstBytecodeEmitter<'_, '_> {
             let condition = self.emit_expression(condition)?;
             self.emit_jump_if_false(condition, break_target);
         }
+        let break_labels = BreakControlLabels {
+            break_target,
+            finally_stack_depth: self.finally_stack.len(),
+        };
         self.loop_stack.push(LoopControlLabels {
             break_target,
             continue_target,
-            finally_stack_depth: self.finally_stack.len(),
+            finally_stack_depth: break_labels.finally_stack_depth,
         });
+        self.break_stack.push(break_labels);
         let body = self.emit_statement(statement.body)?;
         let Some(labels) = self.loop_stack.pop() else {
             return Err(BytecompilerEmissionError::UnsupportedStatement(
                 "loop control stack underflow",
+            ));
+        };
+        let Some(_) = self.break_stack.pop() else {
+            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                "break control stack underflow",
             ));
         };
         self.bind_label(labels.continue_target)?;
@@ -3458,6 +3563,66 @@ impl AstBytecodeEmitter<'_, '_> {
         Ok(StatementEmission::default())
     }
 
+    fn emit_switch_statement(
+        &mut self,
+        statement: &SwitchStmt,
+    ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        let discriminant = self.emit_expression(statement.discriminant)?;
+        let break_target = self.declare_label(Some("switch_break"));
+        let case_labels = statement
+            .cases
+            .iter()
+            .map(|case| {
+                self.declare_label(if case.test.is_some() {
+                    Some("switch_case")
+                } else {
+                    Some("switch_default")
+                })
+            })
+            .collect::<Vec<_>>();
+        let default_target = statement
+            .cases
+            .iter()
+            .position(|case| case.test.is_none())
+            .map(|index| case_labels[index]);
+
+        for (case, case_label) in statement.cases.iter().zip(case_labels.iter().copied()) {
+            let Some(test) = case.test else {
+                continue;
+            };
+            let value = self.emit_expression(test)?;
+            let matched = self.emit_binary_opcode(CoreOpcode::StrictEqual, discriminant, value)?;
+            let next_case = self.declare_label(Some("switch_next_case"));
+            self.emit_jump_if_false(matched, next_case);
+            self.emit_jump(case_label);
+            self.bind_label(next_case)?;
+        }
+        self.emit_jump(default_target.unwrap_or(break_target));
+
+        let break_labels = BreakControlLabels {
+            break_target,
+            finally_stack_depth: self.finally_stack.len(),
+        };
+        self.break_stack.push(break_labels);
+        for (case, case_label) in statement.cases.iter().zip(case_labels.iter().copied()) {
+            self.bind_label(case_label)?;
+            let mut emission = StatementEmission::default();
+            for statement in &case.statements {
+                if emission.terminated {
+                    break;
+                }
+                emission = self.emit_statement(*statement)?;
+            }
+        }
+        let Some(_) = self.break_stack.pop() else {
+            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                "break control stack underflow",
+            ));
+        };
+        self.bind_label(break_target)?;
+        Ok(StatementEmission::default())
+    }
+
     fn emit_do_while_statement(
         &mut self,
         statement: &DoWhileStmt,
@@ -3466,15 +3631,25 @@ impl AstBytecodeEmitter<'_, '_> {
         let continue_target = self.declare_label(Some("do_while_continue"));
         let break_target = self.declare_label(Some("do_while_break"));
         self.bind_label(loop_start)?;
+        let break_labels = BreakControlLabels {
+            break_target,
+            finally_stack_depth: self.finally_stack.len(),
+        };
         self.loop_stack.push(LoopControlLabels {
             break_target,
             continue_target,
-            finally_stack_depth: self.finally_stack.len(),
+            finally_stack_depth: break_labels.finally_stack_depth,
         });
+        self.break_stack.push(break_labels);
         let body = self.emit_statement(statement.body)?;
         let Some(labels) = self.loop_stack.pop() else {
             return Err(BytecompilerEmissionError::UnsupportedStatement(
                 "loop control stack underflow",
+            ));
+        };
+        let Some(_) = self.break_stack.pop() else {
+            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                "break control stack underflow",
             ));
         };
         self.bind_label(labels.continue_target)?;
@@ -3508,15 +3683,25 @@ impl AstBytecodeEmitter<'_, '_> {
         self.emit_jump_if_false(condition, break_target);
         let value = self.emit_get_by_index(values, index)?;
         self.emit_write_for_of_binding(statement.binding, value)?;
+        let break_labels = BreakControlLabels {
+            break_target,
+            finally_stack_depth: self.finally_stack.len(),
+        };
         self.loop_stack.push(LoopControlLabels {
             break_target,
             continue_target,
-            finally_stack_depth: self.finally_stack.len(),
+            finally_stack_depth: break_labels.finally_stack_depth,
         });
+        self.break_stack.push(break_labels);
         let body = self.emit_statement(statement.body)?;
         let Some(labels) = self.loop_stack.pop() else {
             return Err(BytecompilerEmissionError::UnsupportedStatement(
                 "loop control stack underflow",
+            ));
+        };
+        let Some(_) = self.break_stack.pop() else {
+            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                "break control stack underflow",
             ));
         };
         self.bind_label(labels.continue_target)?;
@@ -6135,7 +6320,7 @@ impl AstBytecodeEmitter<'_, '_> {
 
     fn emit_break_completion(
         &mut self,
-        labels: LoopControlLabels,
+        labels: BreakControlLabels,
     ) -> Result<(), BytecompilerEmissionError> {
         self.emit_break_to(labels.break_target, labels.finally_stack_depth)
     }
@@ -7641,6 +7826,71 @@ mod tests {
         assert_eq!(
             completion,
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_switch_with_strict_matching() {
+        let completion = execute_program_source(
+            "let out = 0; switch (\"1\") { case 1: out = 10; break; case \"1\": out = 42; break; default: out = 99; } return out;",
+            31,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_switch_default_in_middle_with_fallthrough() {
+        let completion = execute_program_source(
+            "let out = 0; switch (9) { case 1: out = 1; break; default: out = 10; case 2: out = out + 2; } return out;",
+            32,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(12))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_switch_case_tests_in_order_with_single_discriminant() {
+        let completion = execute_program_source(
+            "let probe = 0; let selected = 0; switch (probe = probe + 1) { case (probe = probe + 1): selected = 10; break; case 1: selected = probe * 100 + 2; break; } return selected;",
+            33,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(202))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_switch_break_through_finally() {
+        let completion = execute_program_source(
+            "let cleanup = 0; switch (1) { case 1: try { break; } finally { cleanup = 42; } cleanup = 99; } return cleanup;",
+            34,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_continue_inside_switch_to_outer_loop() {
+        let completion = execute_program_source(
+            "let i = 0; let total = 0; while (i < 3) { i = i + 1; switch (i) { case 2: continue; default: total = total + i; } total = total + 10; } return total * 10 + i;",
+            35,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(243))
         );
     }
 

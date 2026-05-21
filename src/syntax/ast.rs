@@ -81,6 +81,7 @@ pub enum Stmt {
     If(IfStmt),
     DoWhile(DoWhileStmt),
     While(WhileStmt),
+    Switch(SwitchStmt),
     For(ForStmt),
     ForOf(ForOfStmt),
     Try(TryStmt),
@@ -515,6 +516,20 @@ pub struct WhileStmt {
     pub span: SourceSpan,
     pub condition: AstRef<Expr>,
     pub body: AstRef<Stmt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwitchStmt {
+    pub span: SourceSpan,
+    pub discriminant: AstRef<Expr>,
+    pub cases: Vec<SwitchCase>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwitchCase {
+    pub span: SourceSpan,
+    pub test: Option<AstRef<Expr>>,
+    pub statements: Vec<AstRef<Stmt>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

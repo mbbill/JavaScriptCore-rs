@@ -223,7 +223,7 @@ Known Octane run blockers:
   runner contract slice; later realm/global-environment tightening may still be
   needed when full conformance expands beyond Octane-core.
 - Octane-core still has syntax/lowering blockers before all six files can parse
-  and run honestly: `do while` is accepted, while `switch` and template
+  and run honestly: `do while` and `switch` are accepted, while template
   literals still need shared parser/bytecompiler support rather than
   benchmark-local workarounds.
 
@@ -331,8 +331,8 @@ Layer B: shared language/runtime blockers for Octane-core.
   engine features with focused tests.
 - Current status: top-level `function`/`var` cross-source visibility works and
   top-level `class`/`let`/`const` now use a distinct source-session global
-  lexical boundary. `do while` is accepted; the next shared blockers are
-  `switch` and non-tagged template literal lowering.
+  lexical boundary. `do while` and `switch` are accepted; the next shared
+  blocker is non-tagged template literal lowering.
 
 Layer C: Octane-core correctness.
 
@@ -532,9 +532,12 @@ M4: Current - run Octane-core correctly in the Rust engine.
   `do while`, including first-iteration semantics, `break`, `continue`, and
   `finally` interactions. The Octane do-while blocker now gets past
   parse/lowering.
-- Active sub-slice: M4e2 adds shared syntax/lowering support for `switch`.
-  Lower it as a normal language feature, not as an Octane-specific rewrite.
-- Planned sub-slice: M4e3 adds non-tagged template literal parsing/lowering.
+- Accepted sub-slice: M4e2 added shared AST/parser/bytecompiler support for
+  `switch`, including strict case matching, default/fallthrough behavior,
+  case-test evaluation order, duplicate-default rejection, `break` through
+  `finally`, and `continue` targeting the enclosing loop rather than the
+  switch.
+- Active sub-slice: M4e3 adds non-tagged template literal parsing/lowering.
   Preserve cooked string parts, left-to-right expression evaluation, and JS
   string coercion rather than relying on benchmark-specific string assembly.
 - Planned sub-slice: M4f completes runner result extraction, benchmark oracle

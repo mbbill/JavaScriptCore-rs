@@ -9,8 +9,8 @@ use crate::syntax::ast::{
     ForOfStmt, ForStmt, FunctionDecl, FunctionMetadata, FunctionParameter, FunctionSyntaxMode,
     IfStmt, LiteralExpr, LiteralKind, MemberExpr, MemberKind, ModuleItem, NameExpr, NameKind,
     NewExpr, NumberLiteralValue, ObjectLiteralExpr, ObjectLiteralProperty,
-    ObjectLiteralPropertyKind, Pattern, ScopeBlock, ScopeNode, ScopeNodeKind, Stmt, TryStmt,
-    UnaryExpr, UnaryOperator, WhileStmt,
+    ObjectLiteralPropertyKind, Pattern, ScopeBlock, ScopeNode, ScopeNodeKind, Stmt, SwitchCase,
+    SwitchStmt, TryStmt, UnaryExpr, UnaryOperator, WhileStmt,
 };
 use crate::syntax::lexer::{
     KeywordPolicy, LexDeferred, LexGoal, LexRequest, LexResult, Lexer, LexerError,
@@ -398,6 +398,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             TokenKind::Keyword(Keyword::If) => self.parse_if_statement(cursor),
             TokenKind::Keyword(Keyword::Do) => self.parse_do_while_statement(cursor),
             TokenKind::Keyword(Keyword::While) => self.parse_while_statement(cursor),
+            TokenKind::Keyword(Keyword::Switch) => self.parse_switch_statement(cursor),
             TokenKind::Keyword(Keyword::For) => self.parse_for_statement(cursor),
             TokenKind::Keyword(Keyword::Try) => self.parse_try_statement(cursor),
             TokenKind::Keyword(Keyword::Throw) => self.parse_throw_statement(cursor),
@@ -1156,6 +1157,69 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             span,
             condition,
             body,
+        })))
+    }
+
+    fn parse_switch_statement(
+        &mut self,
+        cursor: &mut TokenCursor<'_>,
+    ) -> Result<AstRef<Stmt>, ParserError> {
+        let start = cursor.expect_keyword(Keyword::Switch)?.span();
+        cursor.expect_punctuator(Punctuator::OpenParen)?;
+        let discriminant = self.parse_expression(cursor)?;
+        cursor.expect_punctuator(Punctuator::CloseParen)?;
+        cursor.expect_punctuator(Punctuator::OpenBrace)?;
+
+        self.state.switch_depth = self.state.switch_depth.saturating_add(1);
+        let mut cases = Vec::new();
+        let mut saw_default = false;
+        while !cursor.at_punctuator(Punctuator::CloseBrace) {
+            if cursor.is_eof() {
+                return syntax_error(cursor.current(), "unterminated switch statement");
+            }
+
+            let clause_token = cursor.current().clone();
+            let clause_start = clause_token.span();
+            let test = if cursor.consume_keyword(Keyword::Case).is_some() {
+                Some(self.parse_expression(cursor)?)
+            } else if cursor.consume_keyword(Keyword::Default).is_some() {
+                if saw_default {
+                    return syntax_error(&clause_token, "duplicate default clause in switch");
+                }
+                saw_default = true;
+                None
+            } else {
+                return syntax_error(cursor.current(), "expected switch case or default");
+            };
+            let colon = cursor.expect_punctuator(Punctuator::Colon)?.span();
+
+            let mut statements = Vec::new();
+            while !cursor.is_eof()
+                && !cursor.at_punctuator(Punctuator::CloseBrace)
+                && !matches!(
+                    cursor.current().kind,
+                    TokenKind::Keyword(Keyword::Case | Keyword::Default)
+                )
+            {
+                statements.push(self.parse_statement(cursor)?);
+            }
+            let end = statements
+                .last()
+                .map(|statement| self.stmt_span(*statement))
+                .unwrap_or(colon);
+            cases.push(SwitchCase {
+                span: join_spans(clause_start, end),
+                test,
+                statements,
+            });
+        }
+        let close = cursor.expect_punctuator(Punctuator::CloseBrace)?.span();
+        self.state.switch_depth = self.state.switch_depth.saturating_sub(1);
+
+        Ok(self.arena.alloc_statement(Stmt::Switch(SwitchStmt {
+            span: join_spans(start, close),
+            discriminant,
+            cases,
         })))
     }
 
@@ -1918,6 +1982,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             Some(Stmt::If(statement)) => statement.span,
             Some(Stmt::DoWhile(statement)) => statement.span,
             Some(Stmt::While(statement)) => statement.span,
+            Some(Stmt::Switch(statement)) => statement.span,
             Some(Stmt::For(statement)) => statement.span,
             Some(Stmt::ForOf(statement)) => statement.span,
             Some(Stmt::Try(statement)) => statement.span,
@@ -3217,6 +3282,50 @@ mod tests {
             arena.statement(statement.body),
             Some(Stmt::Block(_))
         ));
+    }
+
+    #[test]
+    fn parser_builds_switch_statement() {
+        let source = source("switch (value) { case 1: value = 2; break; default: value = 3; }");
+        let mut arena = ParserArena::new();
+        let parsed = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            ParseMode::Program,
+        )
+        .parse()
+        .unwrap();
+        let AstRoot::Script(root) = parsed.root else {
+            panic!("expected script root");
+        };
+        let scope = arena.scope_node(root).unwrap();
+        let Some(Stmt::Switch(statement)) = arena.statement(scope.statements[0]) else {
+            panic!("expected switch statement");
+        };
+
+        assert_eq!(statement.cases.len(), 2);
+        assert!(statement.cases[0].test.is_some());
+        assert!(statement.cases[1].test.is_none());
+        assert_eq!(statement.cases[0].statements.len(), 2);
+    }
+
+    #[test]
+    fn parser_rejects_duplicate_switch_default() {
+        let source = source("switch (value) { default: break; default: break; }");
+        let mut arena = ParserArena::new();
+        let error = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            ParseMode::Program,
+        )
+        .parse()
+        .unwrap_err();
+
+        assert!(
+            matches!(error.kind, ParserErrorKind::Syntax(message) if message == "duplicate default clause in switch")
+        );
     }
 
     #[test]
