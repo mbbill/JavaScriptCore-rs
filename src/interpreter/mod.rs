@@ -1765,6 +1765,7 @@ pub enum ExecutionError {
     ExpectedArrayIndex,
     ExpectedFunction,
     ExpectedPropertyKey,
+    UnsupportedLooseEquality,
     MissingSuperBinding,
     MissingStringLiteral(u32),
     MissingPendingException,
@@ -8726,6 +8727,22 @@ struct CoreCallDispatchRequest {
     post_construct_field_initialization_constructors: Vec<RuntimeValue>,
 }
 
+struct CoreConstructFunctionIndexRequest<'a> {
+    continuation: ConstructReturnContinuationRequest,
+    function_index: u32,
+    argument_count: u32,
+    first_argument_operand: usize,
+    this_value: RuntimeValue,
+    accepted_opcodes: &'a [CoreOpcode],
+}
+
+struct CoreConstructArgumentValuesRequest<'a> {
+    argument_count: u32,
+    first_argument_operand: usize,
+    this_value: RuntimeValue,
+    construct_code_block: &'a CodeBlock,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CoreNativeCallDispatchRequest {
     destination: VirtualRegister,
@@ -9561,7 +9578,10 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 };
                 write_register(state, window, destination, RuntimeValue::from_bool(result))
             }
-            CoreOpcode::StrictEqual | CoreOpcode::StrictNotEqual => {
+            CoreOpcode::Equal
+            | CoreOpcode::NotEqual
+            | CoreOpcode::StrictEqual
+            | CoreOpcode::StrictNotEqual => {
                 let destination = match register_operand(instruction, 0) {
                     Ok(register) => register,
                     Err(error) => return DispatchOutcome::Fail(error),
@@ -9582,8 +9602,19 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let equals = self.strict_same_value(left, right);
-                let result = matches!(opcode, CoreOpcode::StrictEqual) == equals;
+                let equals = match opcode {
+                    CoreOpcode::Equal | CoreOpcode::NotEqual => match self.loose_equal(left, right)
+                    {
+                        Ok(equals) => equals,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    },
+                    CoreOpcode::StrictEqual | CoreOpcode::StrictNotEqual => {
+                        self.strict_same_value(left, right)
+                    }
+                    _ => unreachable!("equality opcode match arm only handles equality opcodes"),
+                };
+                let result =
+                    matches!(opcode, CoreOpcode::Equal | CoreOpcode::StrictEqual) == equals;
                 write_register(state, window, destination, RuntimeValue::from_bool(result))
             }
             CoreOpcode::InstanceOf => {
@@ -10845,6 +10876,67 @@ impl CoreOpcodeDispatchHost {
             .unwrap_or_else(|| left.strict_equals(right))
     }
 
+    fn loose_equal(&self, left: RuntimeValue, right: RuntimeValue) -> Result<bool, ExecutionError> {
+        if self.same_loose_equality_type(left, right) {
+            return Ok(self.strict_same_value(left, right));
+        }
+        if is_nullish(left) && is_nullish(right) {
+            return Ok(true);
+        }
+        if is_nullish(left) || is_nullish(right) {
+            return Ok(false);
+        }
+        if let Some(left) = left.as_bool() {
+            return self.loose_equal(RuntimeValue::from_i32(i32::from(left)), right);
+        }
+        if let Some(right) = right.as_bool() {
+            return self.loose_equal(left, RuntimeValue::from_i32(i32::from(right)));
+        }
+        if self.strings.text(left).is_some() && right.as_number().is_some() {
+            return Ok(self.strict_same_value(
+                number_from_string(self.strings.text(left).unwrap_or_default()),
+                right,
+            ));
+        }
+        if left.as_number().is_some() && self.strings.text(right).is_some() {
+            return Ok(self.strict_same_value(
+                left,
+                number_from_string(self.strings.text(right).unwrap_or_default()),
+            ));
+        }
+        if self.is_object_loose_equality_operand(left)
+            || self.is_object_loose_equality_operand(right)
+            || self.bigints.is_bigint(left)
+            || self.bigints.is_bigint(right)
+        {
+            return Err(ExecutionError::UnsupportedLooseEquality);
+        }
+        Ok(false)
+    }
+
+    fn same_loose_equality_type(&self, left: RuntimeValue, right: RuntimeValue) -> bool {
+        if self.strings.text(left).is_some() || self.strings.text(right).is_some() {
+            return self.strings.text(left).is_some() && self.strings.text(right).is_some();
+        }
+        if self.bigints.is_bigint(left) || self.bigints.is_bigint(right) {
+            return self.bigints.is_bigint(left) && self.bigints.is_bigint(right);
+        }
+        if self.symbols.is_symbol(left) || self.symbols.is_symbol(right) {
+            return self.symbols.is_symbol(left) && self.symbols.is_symbol(right);
+        }
+        match (left.kind(), right.kind()) {
+            (ValueKind::Int32 | ValueKind::Double, ValueKind::Int32 | ValueKind::Double) => true,
+            (left, right) => left == right,
+        }
+    }
+
+    fn is_object_loose_equality_operand(&self, value: RuntimeValue) -> bool {
+        value.kind() == ValueKind::Cell
+            && self.strings.text(value).is_none()
+            && !self.bigints.is_bigint(value)
+            && !self.symbols.is_symbol(value)
+    }
+
     fn concat_primitives(
         &mut self,
         heap: &mut Heap,
@@ -11879,9 +11971,11 @@ impl CoreOpcodeDispatchHost {
         constructor: RuntimeValue,
         receiver: RuntimeValue,
     ) -> Result<(), DispatchOutcome> {
-        if self.initialized_instance_fields.iter().any(|record| {
-            record.constructor == constructor && record.receiver == receiver
-        }) {
+        if self
+            .initialized_instance_fields
+            .iter()
+            .any(|record| record.constructor == constructor && record.receiver == receiver)
+        {
             return Ok(());
         }
         self.initialize_instance_fields(state, constructor, receiver)?;
@@ -12663,28 +12757,33 @@ impl CoreOpcodeDispatchHost {
         else {
             return DispatchOutcome::Fail(ExecutionError::ExpectedFunction);
         };
-        if !self.objects.is_default_derived_constructor(super_constructor) {
+        if !self
+            .objects
+            .is_default_derived_constructor(super_constructor)
+        {
             let request = match self.ordinary_bytecode_construct_request_for_function_index(
                 state,
                 caller_window,
                 instruction,
-                ConstructReturnContinuationRequest {
-                    caller_frame: instruction.frame,
-                    caller_window,
-                    owner: instruction.code_block,
-                    construct_bytecode_index: instruction.bytecode_index,
-                    resume_bytecode_index: instruction.next_bytecode_index,
-                    destination,
-                    argument_count_including_this: argument_count.saturating_add(1),
-                    callee_value: super_constructor,
-                    constructor_this: this_value,
-                    post_return_field_initialization_constructors: vec![function],
+                CoreConstructFunctionIndexRequest {
+                    continuation: ConstructReturnContinuationRequest {
+                        caller_frame: instruction.frame,
+                        caller_window,
+                        owner: instruction.code_block,
+                        construct_bytecode_index: instruction.bytecode_index,
+                        resume_bytecode_index: instruction.next_bytecode_index,
+                        destination,
+                        argument_count_including_this: argument_count.saturating_add(1),
+                        callee_value: super_constructor,
+                        constructor_this: this_value,
+                        post_return_field_initialization_constructors: vec![function],
+                    },
+                    function_index,
+                    argument_count,
+                    first_argument_operand: 3,
+                    this_value,
+                    accepted_opcodes: &[CoreOpcode::ConstructSuper],
                 },
-                function_index,
-                argument_count,
-                3,
-                this_value,
-                &[CoreOpcode::ConstructSuper],
             ) {
                 Ok(request) => request,
                 Err(error) => return DispatchOutcome::Fail(error),
@@ -12871,28 +12970,23 @@ impl CoreOpcodeDispatchHost {
         state: &mut DispatchState<'_>,
         caller_window: RegisterWindow,
         instruction: DispatchInstruction<'_>,
-        continuation_request: ConstructReturnContinuationRequest,
-        function_index: u32,
-        argument_count: u32,
-        first_argument_operand: usize,
-        this_value: RuntimeValue,
-        accepted_opcodes: &[CoreOpcode],
+        request: CoreConstructFunctionIndexRequest<'_>,
     ) -> Result<Option<OrdinaryBytecodeConstructRequest>, ExecutionError> {
         let Some(continuation) = self.construct_return_continuation_for_opcodes(
             state,
             instruction,
-            continuation_request,
-            accepted_opcodes,
+            request.continuation,
+            request.accepted_opcodes,
         )?
         else {
             return Ok(None);
         };
         let Some(function_entry) = self
             .function_blocks
-            .get(usize::try_from(function_index).unwrap_or(usize::MAX))
+            .get(usize::try_from(request.function_index).unwrap_or(usize::MAX))
             .cloned()
         else {
-            return Err(ExecutionError::MissingFunctionCode(function_index));
+            return Err(ExecutionError::MissingFunctionCode(request.function_index));
         };
         let (Some(construct_code_block_id), Some(construct_code_block)) = (
             function_entry.construct_id,
@@ -12904,10 +12998,12 @@ impl CoreOpcodeDispatchHost {
             state,
             caller_window,
             instruction,
-            argument_count,
-            first_argument_operand,
-            this_value,
-            &construct_code_block,
+            CoreConstructArgumentValuesRequest {
+                argument_count: request.argument_count,
+                first_argument_operand: request.first_argument_operand,
+                this_value: request.this_value,
+                construct_code_block: &construct_code_block,
+            },
         )?;
         Ok(Some(OrdinaryBytecodeConstructRequest {
             continuation,
@@ -12922,26 +13018,24 @@ impl CoreOpcodeDispatchHost {
         state: &mut DispatchState<'_>,
         caller_window: RegisterWindow,
         instruction: DispatchInstruction<'_>,
-        argument_count: u32,
-        first_argument_operand: usize,
-        this_value: RuntimeValue,
-        construct_code_block: &CodeBlock,
+        request: CoreConstructArgumentValuesRequest<'_>,
     ) -> Result<Vec<RuntimeValue>, ExecutionError> {
-        let formal_parameter_count = construct_code_block
+        let formal_parameter_count = request
+            .construct_code_block
             .unlinked()
             .frame()
             .num_parameters_including_this
             .saturating_sub(1);
         let mut argument_values = Vec::with_capacity(
-            usize::try_from(argument_count)
+            usize::try_from(request.argument_count)
                 .unwrap_or(usize::MAX)
                 .saturating_add(1),
         );
-        argument_values.push(this_value);
-        for argument_index in 0..argument_count {
+        argument_values.push(request.this_value);
+        for argument_index in 0..request.argument_count {
             let operand_index = usize::try_from(argument_index)
                 .unwrap_or(usize::MAX)
-                .saturating_add(first_argument_operand);
+                .saturating_add(request.first_argument_operand);
             let register = register_operand(instruction, operand_index)?;
             let value = state.registers.read(
                 caller_window,
@@ -13163,29 +13257,34 @@ impl CoreOpcodeDispatchHost {
                     return outcome;
                 }
             }
-            if !self.objects.is_default_derived_constructor(super_constructor) {
+            if !self
+                .objects
+                .is_default_derived_constructor(super_constructor)
+            {
                 let deferred = match self.ordinary_bytecode_construct_request_for_function_index(
                     state,
                     caller_window,
                     instruction,
-                    ConstructReturnContinuationRequest {
-                        caller_frame: instruction.frame,
-                        caller_window,
-                        owner: instruction.code_block,
-                        construct_bytecode_index: instruction.bytecode_index,
-                        resume_bytecode_index: instruction.next_bytecode_index,
-                        destination: request.destination,
-                        argument_count_including_this: request.argument_count.saturating_add(1),
-                        callee_value: super_constructor,
-                        constructor_this: request.this_value,
-                        post_return_field_initialization_constructors:
-                            post_construct_field_initialization_constructors.clone(),
+                    CoreConstructFunctionIndexRequest {
+                        continuation: ConstructReturnContinuationRequest {
+                            caller_frame: instruction.frame,
+                            caller_window,
+                            owner: instruction.code_block,
+                            construct_bytecode_index: instruction.bytecode_index,
+                            resume_bytecode_index: instruction.next_bytecode_index,
+                            destination: request.destination,
+                            argument_count_including_this: request.argument_count.saturating_add(1),
+                            callee_value: super_constructor,
+                            constructor_this: request.this_value,
+                            post_return_field_initialization_constructors:
+                                post_construct_field_initialization_constructors.clone(),
+                        },
+                        function_index,
+                        argument_count: request.argument_count,
+                        first_argument_operand: request.first_argument_operand,
+                        this_value: request.this_value,
+                        accepted_opcodes: &[CoreOpcode::Construct, CoreOpcode::ConstructSuper],
                     },
-                    function_index,
-                    request.argument_count,
-                    request.first_argument_operand,
-                    request.this_value,
-                    &[CoreOpcode::Construct, CoreOpcode::ConstructSuper],
                 ) {
                     Ok(request) => request,
                     Err(error) => return DispatchOutcome::Fail(error),
@@ -13207,8 +13306,7 @@ impl CoreOpcodeDispatchHost {
                     captures,
                     this_value: request.this_value,
                     constructor_this: request.constructor_this,
-                    post_construct_field_initialization_constructors:
-                        post_construct_field_initialization_constructors,
+                    post_construct_field_initialization_constructors,
                 },
             );
         }

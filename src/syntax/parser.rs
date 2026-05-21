@@ -2,14 +2,15 @@ use crate::syntax::arena::{
     AstRef, IdentifierSource, ParserArena, ParserIdentifier, WellKnownIdentifier,
 };
 use crate::syntax::ast::{
-    ArrayLiteralElement, ArrayLiteralExpr, AssignmentContext, AssignmentExpr, AstPropertyKey,
-    AstRoot, BinaryExpr, BinaryOperator as AstBinaryOperator, CallExpr, ClassElement,
-    ClassElementKind, ClassElementName, ClassExpr, ControlKind, ControlStmt, DeclarationStmt,
-    DeclarationSyntaxKind, Expr, ForInit, ForOfBinding, ForOfStmt, ForStmt, FunctionDecl,
-    FunctionMetadata, FunctionParameter, FunctionSyntaxMode, IfStmt, LiteralExpr, LiteralKind,
-    MemberExpr, MemberKind, ModuleItem, NameExpr, NameKind, NewExpr, NumberLiteralValue,
-    ObjectLiteralExpr, ObjectLiteralProperty, ObjectLiteralPropertyKind, Pattern, ScopeBlock,
-    ScopeNode, ScopeNodeKind, Stmt, TryStmt, UnaryExpr, UnaryOperator, WhileStmt,
+    ArrayLiteralElement, ArrayLiteralExpr, AssignmentContext, AssignmentExpr, AssignmentOperator,
+    AstPropertyKey, AstRoot, BinaryExpr, BinaryOperator as AstBinaryOperator, CallExpr,
+    ClassElement, ClassElementKind, ClassElementName, ClassExpr, ConditionalExpr, ControlKind,
+    ControlStmt, DeclarationStmt, DeclarationSyntaxKind, Expr, ForInit, ForOfBinding, ForOfStmt,
+    ForStmt, FunctionDecl, FunctionMetadata, FunctionParameter, FunctionSyntaxMode, IfStmt,
+    LiteralExpr, LiteralKind, MemberExpr, MemberKind, ModuleItem, NameExpr, NameKind, NewExpr,
+    NumberLiteralValue, ObjectLiteralExpr, ObjectLiteralProperty, ObjectLiteralPropertyKind,
+    Pattern, ScopeBlock, ScopeNode, ScopeNodeKind, Stmt, TryStmt, UnaryExpr, UnaryOperator,
+    WhileStmt,
 };
 use crate::syntax::lexer::{
     KeywordPolicy, LexDeferred, LexGoal, LexRequest, LexResult, Lexer, LexerError,
@@ -1337,10 +1338,11 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
         &mut self,
         cursor: &mut TokenCursor<'_>,
     ) -> Result<AstRef<Expr>, ParserError> {
-        let left = self.parse_binary_expression(cursor, 0)?;
-        if cursor.consume_punctuator(Punctuator::Equal).is_none() {
+        let left = self.parse_conditional_expression(cursor)?;
+        let Some(op) = cursor.current_assignment_operator() else {
             return Ok(left);
-        }
+        };
+        cursor.bump();
         let value = self.parse_assignment_expression(cursor)?;
         let target = self.arena.alloc_pattern(Pattern::AssignmentTarget(left));
         let span = join_spans(self.expr_span(left), self.expr_span(value));
@@ -1348,9 +1350,32 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             .arena
             .alloc_expression(Expr::Assignment(AssignmentExpr {
                 span,
+                op,
                 target,
                 value,
                 context: AssignmentContext::Expression,
+            })))
+    }
+
+    fn parse_conditional_expression(
+        &mut self,
+        cursor: &mut TokenCursor<'_>,
+    ) -> Result<AstRef<Expr>, ParserError> {
+        let test = self.parse_binary_expression(cursor, 0)?;
+        if cursor.consume_punctuator(Punctuator::Question).is_none() {
+            return Ok(test);
+        }
+        let consequent = self.parse_assignment_expression(cursor)?;
+        cursor.expect_punctuator(Punctuator::Colon)?;
+        let alternate = self.parse_assignment_expression(cursor)?;
+        let span = join_spans(self.expr_span(test), self.expr_span(alternate));
+        Ok(self
+            .arena
+            .alloc_expression(Expr::Conditional(ConditionalExpr {
+                span,
+                test,
+                consequent,
+                alternate,
             })))
     }
 
@@ -1388,6 +1413,8 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
     ) -> Result<AstRef<Expr>, ParserError> {
         let token = cursor.current().clone();
         let op = match token.kind {
+            TokenKind::Punctuator(Punctuator::PlusPlus) => Some(UnaryOperator::PreIncrement),
+            TokenKind::Punctuator(Punctuator::MinusMinus) => Some(UnaryOperator::PreDecrement),
             TokenKind::Punctuator(Punctuator::Plus) => Some(UnaryOperator::Plus),
             TokenKind::Punctuator(Punctuator::Minus) => Some(UnaryOperator::Minus),
             TokenKind::Punctuator(Punctuator::Exclamation) => Some(UnaryOperator::LogicalNot),
@@ -1413,7 +1440,26 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
         cursor: &mut TokenCursor<'_>,
     ) -> Result<AstRef<Expr>, ParserError> {
         let expr = self.parse_primary_expression(cursor)?;
-        self.parse_postfix_suffixes(cursor, expr, true)
+        let expr = self.parse_postfix_suffixes(cursor, expr, true)?;
+        if cursor.current().flags.has_line_terminator_before {
+            return Ok(expr);
+        }
+        let token = cursor.current().clone();
+        let op = match token.kind {
+            TokenKind::Punctuator(Punctuator::PlusPlus) => Some(UnaryOperator::PostIncrement),
+            TokenKind::Punctuator(Punctuator::MinusMinus) => Some(UnaryOperator::PostDecrement),
+            _ => None,
+        };
+        let Some(op) = op else {
+            return Ok(expr);
+        };
+        cursor.bump();
+        let span = join_spans(self.expr_span(expr), token.span());
+        Ok(self.arena.alloc_expression(Expr::Unary(UnaryExpr {
+            span,
+            op,
+            argument: expr,
+        })))
     }
 
     fn parse_postfix_suffixes(
@@ -2317,6 +2363,31 @@ impl<'a> TokenCursor<'a> {
         Some(op)
     }
 
+    fn current_assignment_operator(&self) -> Option<AssignmentOperator> {
+        let TokenKind::Punctuator(punctuator) = self.current().kind else {
+            return None;
+        };
+        match punctuator {
+            Punctuator::Equal => Some(AssignmentOperator::Assign),
+            Punctuator::PlusEqual => Some(AssignmentOperator::Add),
+            Punctuator::MinusEqual => Some(AssignmentOperator::Subtract),
+            Punctuator::MultiplyEqual => Some(AssignmentOperator::Multiply),
+            Punctuator::DivideEqual => Some(AssignmentOperator::Divide),
+            Punctuator::ModEqual => Some(AssignmentOperator::Modulo),
+            Punctuator::BitOrEqual => Some(AssignmentOperator::BitOr),
+            Punctuator::BitAndEqual => Some(AssignmentOperator::BitAnd),
+            Punctuator::BitXorEqual => Some(AssignmentOperator::BitXor),
+            Punctuator::LeftShiftEqual => Some(AssignmentOperator::LeftShift),
+            Punctuator::RightShiftEqual => Some(AssignmentOperator::RightShift),
+            Punctuator::UnsignedRightShiftEqual => Some(AssignmentOperator::UnsignedRightShift),
+            Punctuator::PowEqual => Some(AssignmentOperator::Pow),
+            Punctuator::CoalesceEqual => Some(AssignmentOperator::Coalesce),
+            Punctuator::OrEqual => Some(AssignmentOperator::LogicalOr),
+            Punctuator::AndEqual => Some(AssignmentOperator::LogicalAnd),
+            _ => None,
+        }
+    }
+
     fn current_declaration_keyword(&self) -> Option<DeclarationSyntaxKind> {
         match self.current().kind {
             TokenKind::Keyword(Keyword::Var) => Some(DeclarationSyntaxKind::Var),
@@ -2354,6 +2425,7 @@ fn expr_span(expr: &Expr) -> SourceSpan {
         Expr::Unary(expr) => expr.span,
         Expr::Binary(expr) => expr.span,
         Expr::Assignment(expr) => expr.span,
+        Expr::Conditional(expr) => expr.span,
         Expr::Call(expr) => expr.span,
         Expr::New(expr) => expr.span,
         Expr::Member(expr) => expr.span,
@@ -3444,5 +3516,183 @@ mod tests {
                         )
                 )
         ));
+    }
+
+    #[test]
+    fn parser_builds_update_compound_conditional_and_loose_equality_expressions() {
+        let source = source(
+            "let x = 0; ++x; x--; object.value += 1; object[key] >>>= 1; return x == 1 ? x != 2 : x === 3;",
+        );
+        let mut arena = ParserArena::new();
+        let parsed = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            ParseMode::Program,
+        )
+        .parse()
+        .unwrap();
+        let root = match parsed.root {
+            AstRoot::Script(root) => root,
+            other => {
+                assert!(matches!(other, AstRoot::Script(_)));
+                return;
+            }
+        };
+        let scope = arena.scope_node(root).unwrap();
+
+        assert!(matches!(
+            arena.statement(scope.statements[1]),
+            Some(Stmt::Expression(expr))
+                if matches!(
+                    arena.expression(*expr),
+                    Some(Expr::Unary(UnaryExpr {
+                        op: UnaryOperator::PreIncrement,
+                        ..
+                    }))
+                )
+        ));
+        assert!(matches!(
+            arena.statement(scope.statements[2]),
+            Some(Stmt::Expression(expr))
+                if matches!(
+                    arena.expression(*expr),
+                    Some(Expr::Unary(UnaryExpr {
+                        op: UnaryOperator::PostDecrement,
+                        ..
+                    }))
+                )
+        ));
+        assert!(matches!(
+            arena.statement(scope.statements[3]),
+            Some(Stmt::Expression(expr))
+                if matches!(
+                    arena.expression(*expr),
+                    Some(Expr::Assignment(AssignmentExpr {
+                        op: AssignmentOperator::Add,
+                        target,
+                        ..
+                    }))
+                        if matches!(
+                            arena.pattern(*target),
+                            Some(Pattern::AssignmentTarget(target_expr))
+                                if matches!(
+                                    arena.expression(*target_expr),
+                                    Some(Expr::Member(MemberExpr {
+                                        member: MemberKind::Dot(_),
+                                        ..
+                                    }))
+                                )
+                        )
+                )
+        ));
+        assert!(matches!(
+            arena.statement(scope.statements[4]),
+            Some(Stmt::Expression(expr))
+                if matches!(
+                    arena.expression(*expr),
+                    Some(Expr::Assignment(AssignmentExpr {
+                        op: AssignmentOperator::UnsignedRightShift,
+                        target,
+                        ..
+                    }))
+                        if matches!(
+                            arena.pattern(*target),
+                            Some(Pattern::AssignmentTarget(target_expr))
+                                if matches!(
+                                    arena.expression(*target_expr),
+                                    Some(Expr::Member(MemberExpr {
+                                        member: MemberKind::Bracket(_),
+                                        ..
+                                    }))
+                                )
+                        )
+                )
+        ));
+        let Some(Stmt::Control(ControlStmt {
+            kind: ControlKind::Return(Some(value)),
+            ..
+        })) = arena.statement(scope.statements[5])
+        else {
+            assert!(matches!(
+                arena.statement(scope.statements[5]),
+                Some(Stmt::Control(_))
+            ));
+            return;
+        };
+        let Some(Expr::Conditional(ConditionalExpr {
+            test,
+            consequent,
+            alternate,
+            ..
+        })) = arena.expression(*value)
+        else {
+            assert!(matches!(
+                arena.expression(*value),
+                Some(Expr::Conditional(_))
+            ));
+            return;
+        };
+
+        assert!(matches!(
+            arena.expression(*test),
+            Some(Expr::Binary(BinaryExpr {
+                op: AstBinaryOperator::Equal,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            arena.expression(*consequent),
+            Some(Expr::Binary(BinaryExpr {
+                op: AstBinaryOperator::NotEqual,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            arena.expression(*alternate),
+            Some(Expr::Binary(BinaryExpr {
+                op: AstBinaryOperator::StrictEqual,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn parser_builds_all_update_operator_forms() {
+        let source = source("let x = 0; ++x; --x; x++; x--;");
+        let mut arena = ParserArena::new();
+        let parsed = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            ParseMode::Program,
+        )
+        .parse()
+        .unwrap();
+        let root = match parsed.root {
+            AstRoot::Script(root) => root,
+            other => {
+                assert!(matches!(other, AstRoot::Script(_)));
+                return;
+            }
+        };
+        let scope = arena.scope_node(root).unwrap();
+        let expected = [
+            UnaryOperator::PreIncrement,
+            UnaryOperator::PreDecrement,
+            UnaryOperator::PostIncrement,
+            UnaryOperator::PostDecrement,
+        ];
+
+        for (index, expected_op) in expected.iter().enumerate() {
+            assert!(matches!(
+                arena.statement(scope.statements[index + 1]),
+                Some(Stmt::Expression(expr))
+                    if matches!(
+                        arena.expression(*expr),
+                        Some(Expr::Unary(UnaryExpr { op, .. })) if op == expected_op
+                    )
+            ));
+        }
     }
 }

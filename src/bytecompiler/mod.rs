@@ -16,11 +16,11 @@ use crate::bytecode::{
     UnlinkedHandlerInfo, VirtualRegister,
 };
 use crate::syntax::ast::{
-    ArrayLiteralElement, AssignmentExpr, AstPropertyKey, BinaryExpr,
+    ArrayLiteralElement, AssignmentExpr, AssignmentOperator, AstPropertyKey, BinaryExpr,
     BinaryOperator as AstBinaryOperator, CallExpr, ClassElementKind, ClassElementName, ClassExpr,
-    ControlKind, DeclarationStmt, Expr, ForInit, ForOfBinding, FunctionMetadata, LiteralKind,
-    MemberExpr, MemberKind, NameKind, NewExpr, NumberLiteralValue, ObjectLiteralPropertyKind,
-    Pattern, Stmt, UnaryExpr, UnaryOperator as AstUnaryOperator,
+    ConditionalExpr, ControlKind, DeclarationStmt, Expr, ForInit, ForOfBinding, FunctionMetadata,
+    LiteralKind, MemberExpr, MemberKind, NameKind, NewExpr, NumberLiteralValue,
+    ObjectLiteralPropertyKind, Pattern, Stmt, UnaryExpr, UnaryOperator as AstUnaryOperator,
 };
 use crate::syntax::{
     AstRef, AstRoot, CodeFeatures, EnvironmentSemanticRecord, ModuleAnalysis,
@@ -778,6 +778,11 @@ fn collect_expression_function_metadata(
             collect_pattern_function_metadata(arena, assignment.target, plan)?;
             collect_expression_function_metadata(arena, assignment.value, plan)
         }
+        Expr::Conditional(conditional) => {
+            collect_expression_function_metadata(arena, conditional.test, plan)?;
+            collect_expression_function_metadata(arena, conditional.consequent, plan)?;
+            collect_expression_function_metadata(arena, conditional.alternate, plan)
+        }
         Expr::Call(call) => {
             collect_expression_function_metadata(arena, call.callee, plan)?;
             for argument in &call.arguments {
@@ -1050,6 +1055,15 @@ fn collect_expression_immediate_function_metadata(
         Expr::Assignment(assignment) => {
             collect_pattern_immediate_function_metadata(arena, assignment.target, functions)?;
             collect_expression_immediate_function_metadata(arena, assignment.value, functions)
+        }
+        Expr::Conditional(conditional) => {
+            collect_expression_immediate_function_metadata(arena, conditional.test, functions)?;
+            collect_expression_immediate_function_metadata(
+                arena,
+                conditional.consequent,
+                functions,
+            )?;
+            collect_expression_immediate_function_metadata(arena, conditional.alternate, functions)
         }
         Expr::Call(call) => {
             collect_expression_immediate_function_metadata(arena, call.callee, functions)?;
@@ -1489,6 +1503,11 @@ fn collect_expression_referenced_names(
             collect_pattern_referenced_names(arena, assignment.target, references)?;
             collect_expression_referenced_names(arena, assignment.value, references)
         }
+        Expr::Conditional(conditional) => {
+            collect_expression_referenced_names(arena, conditional.test, references)?;
+            collect_expression_referenced_names(arena, conditional.consequent, references)?;
+            collect_expression_referenced_names(arena, conditional.alternate, references)
+        }
         Expr::Call(call) => {
             collect_expression_referenced_names(arena, call.callee, references)?;
             for argument in &call.arguments {
@@ -1760,6 +1779,11 @@ fn collect_expression_string_literals(
             collect_pattern_string_literals(arena, assignment.target, table)?;
             collect_expression_string_literals(arena, assignment.value, table)
         }
+        Expr::Conditional(conditional) => {
+            collect_expression_string_literals(arena, conditional.test, table)?;
+            collect_expression_string_literals(arena, conditional.consequent, table)?;
+            collect_expression_string_literals(arena, conditional.alternate, table)
+        }
         Expr::Call(call) => {
             collect_expression_string_literals(arena, call.callee, table)?;
             for argument in &call.arguments {
@@ -2000,6 +2024,27 @@ fn function_uses_arguments_identifier(
     Ok(references.into_iter().any(|name| name == arguments))
 }
 
+fn compound_assignment_opcode(op: AssignmentOperator) -> Option<CoreOpcode> {
+    match op {
+        AssignmentOperator::Assign => None,
+        AssignmentOperator::Add => Some(CoreOpcode::AddInt32),
+        AssignmentOperator::Subtract => Some(CoreOpcode::SubInt32),
+        AssignmentOperator::Multiply => Some(CoreOpcode::MulInt32),
+        AssignmentOperator::Divide => Some(CoreOpcode::DivNumber),
+        AssignmentOperator::Modulo => Some(CoreOpcode::ModNumber),
+        AssignmentOperator::BitOr => Some(CoreOpcode::BitOrInt32),
+        AssignmentOperator::BitAnd => Some(CoreOpcode::BitAndInt32),
+        AssignmentOperator::BitXor => Some(CoreOpcode::BitXorInt32),
+        AssignmentOperator::LeftShift => Some(CoreOpcode::LeftShiftInt32),
+        AssignmentOperator::RightShift => Some(CoreOpcode::RightShiftInt32),
+        AssignmentOperator::UnsignedRightShift => Some(CoreOpcode::UnsignedRightShiftInt32),
+        AssignmentOperator::Pow => Some(CoreOpcode::PowNumber),
+        AssignmentOperator::Coalesce
+        | AssignmentOperator::LogicalOr
+        | AssignmentOperator::LogicalAnd => None,
+    }
+}
+
 struct AstBytecodeEmitter<'a, 'g> {
     arena: &'a ParserArena,
     generator: &'g mut BytecodeGenerator,
@@ -2077,6 +2122,25 @@ enum FinallyExitKind {
 enum EmittedPropertyKey {
     Name(ParserIdentifier),
     Value(VirtualRegister),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EmittedAssignmentReference {
+    target: EmittedAssignmentTarget,
+    value: VirtualRegister,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmittedAssignmentTarget {
+    Local(LocalBinding),
+    Dot {
+        object: VirtualRegister,
+        name: ParserIdentifier,
+    },
+    Bracket {
+        object: VirtualRegister,
+        key: VirtualRegister,
+    },
 }
 
 impl AstBytecodeEmitter<'_, '_> {
@@ -3060,6 +3124,7 @@ impl AstBytecodeEmitter<'_, '_> {
                 )),
             },
             Expr::Assignment(assignment) => self.emit_assignment(&assignment),
+            Expr::Conditional(conditional) => self.emit_conditional(&conditional),
             Expr::Binary(binary) => self.emit_binary(&binary),
             Expr::Call(call) => self.emit_call(&call),
             Expr::New(new) => self.emit_construct(&new),
@@ -3084,6 +3149,15 @@ impl AstBytecodeEmitter<'_, '_> {
         if unary.op == AstUnaryOperator::Delete {
             return self.emit_delete(unary.argument);
         }
+        if matches!(
+            unary.op,
+            AstUnaryOperator::PreIncrement
+                | AstUnaryOperator::PreDecrement
+                | AstUnaryOperator::PostIncrement
+                | AstUnaryOperator::PostDecrement
+        ) {
+            return self.emit_update(unary);
+        }
         let argument = self.emit_expression(unary.argument)?;
         let opcode = match unary.op {
             AstUnaryOperator::Plus => CoreOpcode::ToNumber,
@@ -3097,9 +3171,7 @@ impl AstBytecodeEmitter<'_, '_> {
             | AstUnaryOperator::PreDecrement
             | AstUnaryOperator::PostIncrement
             | AstUnaryOperator::PostDecrement => {
-                return Err(BytecompilerEmissionError::UnsupportedExpression(
-                    "update expression needs read-modify-write lowering",
-                ));
+                unreachable!("update expressions are lowered before unary argument emission");
             }
             AstUnaryOperator::Await | AstUnaryOperator::Yield => {
                 return Err(BytecompilerEmissionError::UnsupportedExpression(
@@ -3115,6 +3187,59 @@ impl AstBytecodeEmitter<'_, '_> {
             opcode.opcode(),
             OperandWidth::Narrow,
             vec![Operand::Register(destination), Operand::Register(argument)],
+        );
+        Ok(destination)
+    }
+
+    fn emit_update(
+        &mut self,
+        unary: &UnaryExpr,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let reference = self.emit_assignment_reference(unary.argument)?;
+        let numeric_old = self.emit_unary_opcode(CoreOpcode::ToNumber, reference.value)?;
+        let result = if matches!(
+            unary.op,
+            AstUnaryOperator::PostIncrement | AstUnaryOperator::PostDecrement
+        ) {
+            self.emit_move_temporary(numeric_old)
+        } else {
+            numeric_old
+        };
+        let one = self.emit_load_int32(1)?;
+        let opcode = match unary.op {
+            AstUnaryOperator::PreIncrement | AstUnaryOperator::PostIncrement => {
+                CoreOpcode::AddInt32
+            }
+            AstUnaryOperator::PreDecrement | AstUnaryOperator::PostDecrement => {
+                CoreOpcode::SubInt32
+            }
+            _ => unreachable!("emit_update only receives update operators"),
+        };
+        let updated = self.emit_binary_opcode(opcode, numeric_old, one)?;
+        self.emit_write_assignment_target(reference.target, updated);
+        if matches!(
+            unary.op,
+            AstUnaryOperator::PostIncrement | AstUnaryOperator::PostDecrement
+        ) {
+            Ok(result)
+        } else {
+            Ok(updated)
+        }
+    }
+
+    fn emit_unary_opcode(
+        &mut self,
+        opcode: CoreOpcode,
+        source: VirtualRegister,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            opcode.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::Register(destination), Operand::Register(source)],
         );
         Ok(destination)
     }
@@ -3171,6 +3296,9 @@ impl AstBytecodeEmitter<'_, '_> {
         let Pattern::AssignmentTarget(expr) = target else {
             return Err(BytecompilerEmissionError::UnsupportedAssignmentTarget);
         };
+        if assignment.op != AssignmentOperator::Assign {
+            return self.emit_compound_assignment(expr, assignment.op, assignment.value);
+        }
         match self.arena.expression(expr).cloned() {
             Some(Expr::Name(name)) if name.kind == NameKind::Resolve => {
                 let target = *self
@@ -3211,6 +3339,83 @@ impl AstBytecodeEmitter<'_, '_> {
                 Ok(value)
             }
             _ => Err(BytecompilerEmissionError::UnsupportedAssignmentTarget),
+        }
+    }
+
+    fn emit_compound_assignment(
+        &mut self,
+        target: AstRef<Expr>,
+        op: AssignmentOperator,
+        value: AstRef<Expr>,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let opcode = compound_assignment_opcode(op).ok_or(
+            BytecompilerEmissionError::UnsupportedExpression(
+                "logical compound assignment is not lowered yet",
+            ),
+        )?;
+        let reference = self.emit_assignment_reference(target)?;
+        let right = self.emit_expression(value)?;
+        let result = self.emit_binary_opcode(opcode, reference.value, right)?;
+        self.emit_write_assignment_target(reference.target, result);
+        Ok(result)
+    }
+
+    fn emit_assignment_reference(
+        &mut self,
+        target: AstRef<Expr>,
+    ) -> Result<EmittedAssignmentReference, BytecompilerEmissionError> {
+        match self.arena.expression(target).cloned() {
+            Some(Expr::Name(name)) if name.kind == NameKind::Resolve => {
+                let binding = *self
+                    .locals
+                    .get(&name.name)
+                    .ok_or(BytecompilerEmissionError::UnboundIdentifier(name.name))?;
+                let value = self.emit_read_binding(binding)?;
+                Ok(EmittedAssignmentReference {
+                    target: EmittedAssignmentTarget::Local(binding),
+                    value,
+                })
+            }
+            Some(Expr::Member(member)) => {
+                let object = self.emit_expression(member.base)?;
+                match member.member {
+                    MemberKind::Dot(name) => {
+                        let value = self.emit_get_by_name(object, name)?;
+                        Ok(EmittedAssignmentReference {
+                            target: EmittedAssignmentTarget::Dot { object, name },
+                            value,
+                        })
+                    }
+                    MemberKind::Bracket(index) => {
+                        let key = self.emit_expression(index)?;
+                        let value = self.emit_get_by_value(object, key)?;
+                        Ok(EmittedAssignmentReference {
+                            target: EmittedAssignmentTarget::Bracket { object, key },
+                            value,
+                        })
+                    }
+                    MemberKind::PrivateDot(_) => {
+                        Err(BytecompilerEmissionError::UnsupportedAssignmentTarget)
+                    }
+                }
+            }
+            _ => Err(BytecompilerEmissionError::UnsupportedAssignmentTarget),
+        }
+    }
+
+    fn emit_write_assignment_target(
+        &mut self,
+        target: EmittedAssignmentTarget,
+        value: VirtualRegister,
+    ) {
+        match target {
+            EmittedAssignmentTarget::Local(binding) => self.emit_write_binding(binding, value),
+            EmittedAssignmentTarget::Dot { object, name } => {
+                self.emit_put_by_name(object, name, value)
+            }
+            EmittedAssignmentTarget::Bracket { object, key } => {
+                self.emit_put_by_value(object, key, value)
+            }
         }
     }
 
@@ -4358,6 +4563,8 @@ impl AstBytecodeEmitter<'_, '_> {
             AstBinaryOperator::LessEqual => CoreOpcode::LessEqualInt32,
             AstBinaryOperator::GreaterThan => CoreOpcode::GreaterThanInt32,
             AstBinaryOperator::GreaterEqual => CoreOpcode::GreaterEqualInt32,
+            AstBinaryOperator::Equal => CoreOpcode::Equal,
+            AstBinaryOperator::NotEqual => CoreOpcode::NotEqual,
             AstBinaryOperator::StrictEqual => CoreOpcode::StrictEqual,
             AstBinaryOperator::StrictNotEqual => CoreOpcode::StrictNotEqual,
             AstBinaryOperator::Instanceof => CoreOpcode::InstanceOf,
@@ -4402,6 +4609,28 @@ impl AstBytecodeEmitter<'_, '_> {
                 Operand::Register(right),
             ],
         );
+        Ok(destination)
+    }
+
+    fn emit_conditional(
+        &mut self,
+        conditional: &ConditionalExpr,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let test = self.emit_expression(conditional.test)?;
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        let alternate_label = self.declare_label(Some("conditional_alternate"));
+        let end_label = self.declare_label(Some("conditional_end"));
+        self.emit_jump_if_false(test, alternate_label);
+        let consequent = self.emit_expression(conditional.consequent)?;
+        self.emit_move(destination, consequent);
+        self.emit_jump(end_label);
+        self.bind_label(alternate_label)?;
+        let alternate = self.emit_expression(conditional.alternate)?;
+        self.emit_move(destination, alternate);
+        self.bind_label(end_label)?;
         Ok(destination)
     }
 
@@ -5054,6 +5283,15 @@ impl AstBytecodeEmitter<'_, '_> {
             OperandWidth::Narrow,
             vec![Operand::Register(destination), Operand::Register(source)],
         );
+    }
+
+    fn emit_move_temporary(&mut self, source: VirtualRegister) -> VirtualRegister {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.emit_move(destination, source);
+        destination
     }
 
     fn declare_label(&mut self, name: Option<&'static str>) -> LabelRef {
@@ -5754,6 +5992,51 @@ mod tests {
             .unwrap()
     }
 
+    fn execute_program_source(text: &str, session: u64) -> ExecutionCompletion {
+        let unlinked = emit_program_source(text, session);
+        let code_block_id = CodeBlockId(CellId(session.try_into().unwrap_or(u32::MAX)));
+        let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = crate::vm::ExceptionState::default();
+        let mut heap = Heap::new();
+        stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+            code_block: code_block_id,
+            global_object: GlobalObjectId(ObjectId(CellId(1))),
+            this_value: RuntimeValue::undefined(),
+        }));
+        stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(code_block_id),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: code_block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: Vec::new(),
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+
+        let mut host = CoreOpcodeDispatchHost::new();
+        execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            code_block_id,
+            &code_block,
+            &mut host,
+            DispatchConfig::default(),
+        )
+    }
+
     fn first_instruction_index(
         code_block: &UnlinkedCodeBlock,
         opcode: CoreOpcode,
@@ -6268,6 +6551,71 @@ mod tests {
             .literal_strings
             .values()
             .any(|value| value.as_str() == "19n"));
+    }
+
+    #[test]
+    fn parsed_ast_executes_local_update_prefix_and_postfix_values() {
+        let completion = execute_program_source(
+            "let x = 1; let a = ++x; let b = x++; let c = --x; let d = x--; return a * 1000 + b * 100 + c * 10 + d + x;",
+            20,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(2223))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_property_and_index_updates_with_single_base_and_key() {
+        let completion = execute_program_source(
+            "let count = 0; let object = { value: 1 }; let property = ((count = count + 1) ? object : object).value++; let array = [10]; let indexed = array[(count = count + 1) ? 0 : 0]++; return property + object.value * 10 + indexed * 100 + array[0] * 1000 + count * 10000;",
+            21,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(32021))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_compound_assignments_for_locals_properties_and_indexes() {
+        let completion = execute_program_source(
+            "let x = 8; x += 4; x -= 2; x *= 3; x /= 5; x %= 4; x |= 8; x &= 10; x ^= 3; x <<= 1; x >>= 1; x >>>= 1; let object = { value: 5 }; let array = [3]; object.value += 2; array[0] *= 4; return x * 100 + object.value * 10 + array[0];",
+            22,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(482))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_conditional_expression_branch_results() {
+        let completion = execute_program_source(
+            "let x = 0; let y = true ? (x = 1) : (x = 2); let z = false ? (x = 3) : (x = 4); return y * 100 + z * 10 + x;",
+            23,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(144))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_executes_octane_core_loose_equality_primitives() {
+        let completion = execute_program_source(
+            "let a = null == undefined; let b = 1 == \"1\"; let c = true == 1; let d = 0 != false; return a && b && c && !d ? 42 : 0;",
+            24,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
     }
 
     #[test]

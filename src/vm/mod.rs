@@ -7,6 +7,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use core::ffi::c_void;
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -29,8 +30,9 @@ use crate::bytecode::ic::{
 use crate::bytecode::{
     BytecodeIndex, BytecodeRootMap, BytecodeRootMapId, BytecodeRootSlotStorage, CodeBlock,
     CodeBlockEntrypoints, CodeBlockLifecycleState, CodeBlockMutationAuthority, CodeSpecialization,
-    CoreOpcode, DecodedInstruction, ExecutableEntryPublicationRequest, InterpreterEntrySlot,
-    JitCodeSlot, LinkContext, ScriptExecutableKind, UnlinkedCodeBlock, VirtualRegister,
+    CoreOpcode, DecodedInstruction, ExecutableEntryPublicationRequest, InstructionDecodeError,
+    InterpreterEntrySlot, JitCodeSlot, LinkContext, Operand, PackedInstructionStream,
+    ScriptExecutableKind, TypedInstruction, UnlinkedCodeBlock, VirtualRegister,
 };
 use crate::bytecompiler::{
     bytecompiler_input_from_parsed_ast, emit_unlinked_code_from_parsed_ast,
@@ -650,6 +652,11 @@ pub enum SourceExecutionError {
     BytecompilerHandoff(BytecompilerParseHandoffError),
     BytecodeEmission(BytecompilerEmissionError),
     MissingUnlinkedCode,
+    SourceSessionInstructionDecode(InstructionDecodeError),
+    SourceSessionMissingIdentifierText(u32),
+    SourceSessionInvalidLoadFunctionOperand { bytecode_index: BytecodeIndex },
+    SourceSessionFunctionIndexOverflow { base: u32, index: u32 },
+    SourceSessionFunctionTableOverflow { function_count: usize },
     MissingStaticCellMetadata(CellType),
     ExecutableAllocation(HeapIntegrationError),
     ExecutablePublication(HeapIntegrationError),
@@ -664,6 +671,104 @@ pub enum SourceExecutionError {
     FramePush(ExecutionError),
     FramePop(ExecutionError),
     EntryLeave(ExecutionError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceSessionExecution {
+    global_object: GlobalObjectId,
+    completions: Vec<ExecutionCompletion>,
+}
+
+impl SourceSessionExecution {
+    pub fn global_object(&self) -> GlobalObjectId {
+        self.global_object
+    }
+
+    pub fn completions(&self) -> &[ExecutionCompletion] {
+        &self.completions
+    }
+
+    pub fn into_completions(self) -> Vec<ExecutionCompletion> {
+        self.completions
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SourceSessionCompiledEntry {
+    shared_unlinked: Arc<UnlinkedCodeBlock>,
+    function_bodies: Vec<UnlinkedCodeBlock>,
+}
+
+#[derive(Clone, Debug)]
+struct SourceSessionExecutableEntry {
+    code_block_id: CodeBlockId,
+    code_block: CodeBlock,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourceSessionStableIds {
+    next_identifier_index: u32,
+    text_to_identifier: HashMap<String, u32>,
+    identifier_texts: HashMap<u32, String>,
+    string_literals: HashMap<u32, String>,
+    prototype_property_key: Option<u32>,
+}
+
+impl SourceSessionStableIds {
+    fn map_source_identifiers(&mut self, mut identifiers: Vec<(u32, String)>) -> HashMap<u32, u32> {
+        identifiers.sort_by_key(|(identifier, _)| *identifier);
+        identifiers
+            .into_iter()
+            .map(|(source_identifier, text)| {
+                let session_identifier = self.identifier_for_text(&text, Some(source_identifier));
+                if text == "prototype" {
+                    self.prototype_property_key = Some(session_identifier);
+                }
+                (source_identifier, session_identifier)
+            })
+            .collect()
+    }
+
+    fn merge_source_string_literals(
+        &mut self,
+        string_literals: HashMap<u32, String>,
+        identifier_map: &HashMap<u32, u32>,
+    ) -> Result<(), SourceExecutionError> {
+        for (source_identifier, text) in string_literals {
+            let session_identifier = identifier_map
+                .get(&source_identifier)
+                .copied()
+                .unwrap_or_else(|| self.identifier_for_text(&text, None));
+            self.string_literals
+                .entry(session_identifier)
+                .or_insert(text);
+        }
+        Ok(())
+    }
+
+    fn identifier_for_text(&mut self, text: &str, preferred: Option<u32>) -> u32 {
+        if let Some(identifier) = self.text_to_identifier.get(text) {
+            return *identifier;
+        }
+
+        let identifier = preferred
+            .filter(|identifier| !self.identifier_texts.contains_key(identifier))
+            .unwrap_or_else(|| self.next_unused_identifier());
+        self.next_identifier_index = self.next_identifier_index.max(identifier.saturating_add(1));
+        self.text_to_identifier.insert(text.to_owned(), identifier);
+        self.identifier_texts.insert(identifier, text.to_owned());
+        identifier
+    }
+
+    fn next_unused_identifier(&mut self) -> u32 {
+        loop {
+            let identifier = self.next_identifier_index;
+            self.next_identifier_index = self.next_identifier_index.saturating_add(1);
+            if !self.identifier_texts.contains_key(&identifier) {
+                return identifier;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6901,8 +7006,12 @@ impl Vm {
             ExecutionCompletion::Threw(pending) => Some(*pending),
             _ => None,
         };
-        let dispatch_outcome =
-            self.finish_ordinary_js_construct_return(continuation, completion, host, caller_code_block);
+        let dispatch_outcome = self.finish_ordinary_js_construct_return(
+            continuation,
+            completion,
+            host,
+            caller_code_block,
+        );
 
         self.ordinary_bytecode_call_single_dispatch_outcome(
             caller_frame,
@@ -8182,6 +8291,112 @@ impl Vm {
         &mut self,
         source: SourceCode,
     ) -> Result<ExecutionCompletion, SourceExecutionError> {
+        let mut completions = self.execute_source_session([source])?.into_completions();
+        Ok(completions
+            .pop()
+            .unwrap_or_else(|| ExecutionCompletion::Returned(RuntimeValue::undefined())))
+    }
+
+    pub fn execute_source_session<I>(
+        &mut self,
+        sources: I,
+    ) -> Result<SourceSessionExecution, SourceExecutionError>
+    where
+        I: IntoIterator<Item = SourceCode>,
+    {
+        let mut stable_ids = SourceSessionStableIds::default();
+        let mut bytecompiler_session_id = self.next_source_bytecompiler_session_id;
+        let mut function_count = 0usize;
+        let mut compiled_sources = Vec::new();
+
+        for source in sources {
+            let function_index_base = u32::try_from(function_count).map_err(|_| {
+                SourceExecutionError::SourceSessionFunctionTableOverflow { function_count }
+            })?;
+            let compiled = Self::compile_source_session_entry(
+                source,
+                BytecompilerSessionId(bytecompiler_session_id),
+                function_index_base,
+                &mut stable_ids,
+            )?;
+            function_count = function_count
+                .checked_add(compiled.function_bodies.len())
+                .ok_or(SourceExecutionError::SourceSessionFunctionTableOverflow {
+                    function_count: usize::MAX,
+                })?;
+            bytecompiler_session_id = bytecompiler_session_id.saturating_add(1);
+            compiled_sources.push(compiled);
+        }
+
+        self.next_source_bytecompiler_session_id = bytecompiler_session_id;
+        let global_object = self.allocate_global_object_cell()?;
+        self.record_source_global_object(global_object)?;
+
+        let mut entries = Vec::with_capacity(compiled_sources.len());
+        let mut function_blocks = Vec::with_capacity(function_count);
+        for compiled in compiled_sources {
+            let executable_id = self.allocate_executable_cell()?;
+            let code_block_id = self.allocate_code_block_cell()?;
+            let code_block = CodeBlock::from_shared_unlinked(
+                compiled.shared_unlinked.clone(),
+                LinkContext {
+                    owner_executable: Some(executable_id),
+                    specialization: CodeSpecialization::None,
+                    ..LinkContext::default()
+                },
+            )
+            .with_entrypoints(CodeBlockEntrypoints {
+                interpreter: Some(InterpreterEntrySlot(0)),
+                ..CodeBlockEntrypoints::default()
+            })
+            .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter);
+            self.executables
+                .register_script(
+                    executable_id,
+                    ScriptExecutableKind::Program,
+                    compiled.shared_unlinked,
+                )
+                .map_err(SourceExecutionError::ExecutableRegistration)?;
+            self.code_blocks.register(code_block_id, code_block.clone());
+            let install_record = self.executables.install_script_code(
+                executable_id,
+                code_block_id,
+                CodeSpecialization::None,
+                &code_block,
+            );
+            if let ExecutableInstallOutcome::Rejected(reason) = install_record.outcome {
+                return Err(SourceExecutionError::ExecutableInstall(reason));
+            }
+            function_blocks.extend(self.install_source_function_blocks(compiled.function_bodies)?);
+            entries.push(SourceSessionExecutableEntry {
+                code_block_id,
+                code_block,
+            });
+        }
+
+        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks_strings_and_prototype_key(
+            function_blocks,
+            stable_ids.string_literals,
+            stable_ids.identifier_texts,
+            stable_ids.prototype_property_key,
+        );
+        let mut completions = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            completions.push(self.execute_source_session_entry(global_object, entry, &mut host)?);
+        }
+
+        Ok(SourceSessionExecution {
+            global_object,
+            completions,
+        })
+    }
+
+    fn compile_source_session_entry(
+        source: SourceCode,
+        session: BytecompilerSessionId,
+        function_index_base: u32,
+        stable_ids: &mut SourceSessionStableIds,
+    ) -> Result<SourceSessionCompiledEntry, SourceExecutionError> {
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
             &mut arena,
@@ -8191,7 +8406,6 @@ impl Vm {
         )
         .parse()
         .map_err(SourceExecutionError::Parse)?;
-        let session = BytecompilerSessionId(self.next_source_bytecompiler_session_id);
         let input = bytecompiler_input_from_parsed_ast(session, source.clone(), &parsed, &arena)
             .map_err(SourceExecutionError::BytecompilerHandoff)?;
         let mut plan = emit_unlinked_code_from_parsed_ast(&input, &arena)
@@ -8200,61 +8414,56 @@ impl Vm {
             .unlinked_code
             .take()
             .ok_or(SourceExecutionError::MissingUnlinkedCode)?;
-        let shared_unlinked = Arc::new(unlinked);
         let function_bodies = plan.function_bodies.drain(..).collect::<Vec<_>>();
-        let string_literals = plan.literal_strings;
         let identifier_texts = arena
             .identifiers()
             .identifier_texts()
             .into_iter()
             .map(|(identifier, text)| (identifier.0, text))
-            .collect();
+            .collect::<Vec<_>>();
+        let identifier_map = stable_ids.map_source_identifiers(identifier_texts);
+        stable_ids.merge_source_string_literals(plan.literal_strings, &identifier_map)?;
         let prototype_property_key = arena
             .identifiers()
             .identifier_for_text("prototype")
             .map(|identifier| identifier.0);
-        let executable_id = self.allocate_executable_cell()?;
-        let code_block_id = self.allocate_code_block_cell()?;
-        let global_object_id = self.allocate_global_object_cell()?;
-        self.record_source_global_object(global_object_id)?;
-        self.next_source_bytecompiler_session_id =
-            self.next_source_bytecompiler_session_id.saturating_add(1);
-        let code_block = CodeBlock::from_shared_unlinked(
-            shared_unlinked.clone(),
-            LinkContext {
-                owner_executable: Some(executable_id),
-                specialization: CodeSpecialization::None,
-                ..LinkContext::default()
-            },
-        )
-        .with_entrypoints(CodeBlockEntrypoints {
-            interpreter: Some(InterpreterEntrySlot(0)),
-            ..CodeBlockEntrypoints::default()
-        })
-        .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter);
-        self.executables
-            .register_script(
-                executable_id,
-                ScriptExecutableKind::Program,
-                shared_unlinked,
-            )
-            .map_err(SourceExecutionError::ExecutableRegistration)?;
-        self.code_blocks.register(code_block_id, code_block.clone());
-        let install_record = self.executables.install_script_code(
-            executable_id,
-            code_block_id,
-            CodeSpecialization::None,
-            &code_block,
-        );
-        if let ExecutableInstallOutcome::Rejected(reason) = install_record.outcome {
-            return Err(SourceExecutionError::ExecutableInstall(reason));
+        if let Some(prototype_property_key) = prototype_property_key {
+            stable_ids.prototype_property_key = Some(Self::remap_source_session_identifier_index(
+                &identifier_map,
+                prototype_property_key,
+            )?);
         }
-        let function_blocks = self.install_source_function_blocks(function_bodies)?;
-        let entry = self
+        let unlinked = Self::remap_source_session_unlinked_code_block(
+            unlinked,
+            &identifier_map,
+            function_index_base,
+        )?;
+        let mut remapped_function_bodies = Vec::with_capacity(function_bodies.len());
+        for function_body in function_bodies {
+            remapped_function_bodies.push(Self::remap_source_session_unlinked_code_block(
+                function_body,
+                &identifier_map,
+                function_index_base,
+            )?);
+        }
+
+        Ok(SourceSessionCompiledEntry {
+            shared_unlinked: Arc::new(unlinked),
+            function_bodies: remapped_function_bodies,
+        })
+    }
+
+    fn execute_source_session_entry(
+        &mut self,
+        global_object: GlobalObjectId,
+        executable_entry: &SourceSessionExecutableEntry,
+        host: &mut CoreOpcodeDispatchHost,
+    ) -> Result<ExecutionCompletion, SourceExecutionError> {
+        let vm_entry = self
             .execution
             .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
-                code_block: code_block_id,
-                global_object: global_object_id,
+                code_block: executable_entry.code_block_id,
+                global_object,
                 this_value: RuntimeValue::undefined(),
             }));
         let frame = self
@@ -8262,11 +8471,11 @@ impl Vm {
             .push_frame(
                 &mut self.registers,
                 FramePushRequest {
-                    code_block: Some(code_block_id),
+                    code_block: Some(executable_entry.code_block_id),
                     callee: None,
                     callee_value: None,
                     lexical_scope: None,
-                    shape: code_block.unlinked().frame(),
+                    shape: executable_entry.code_block.unlinked().frame(),
                     argument_count_including_this: 1,
                     argument_values: Vec::new(),
                     start_bytecode_index: Some(crate::bytecode::BytecodeIndex::from_offset(0)),
@@ -8274,29 +8483,149 @@ impl Vm {
                 },
             )
             .map_err(SourceExecutionError::FramePush)?;
-        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks_strings_and_prototype_key(
-            function_blocks,
-            string_literals,
-            identifier_texts,
-            prototype_property_key,
-        );
         let completion = self.execute_code_block(
-            code_block_id,
-            &code_block,
-            &mut host,
+            executable_entry.code_block_id,
+            &executable_entry.code_block,
+            host,
             DispatchConfig::default(),
         );
+        let mut cleanup_error = None;
         if self.execution.frame(frame).is_some() {
-            self.execution
-                .pop_frame(&mut self.registers, frame)
-                .map_err(SourceExecutionError::FramePop)?;
+            if let Err(error) = self.execution.pop_frame(&mut self.registers, frame) {
+                cleanup_error.get_or_insert(SourceExecutionError::FramePop(error));
+            }
         }
-        self.execution
-            .leave(entry)
-            .map_err(SourceExecutionError::EntryLeave)?;
-        self.sync_exception_targeted_roots()
-            .map_err(SourceExecutionError::ExceptionRootSynchronization)?;
+        if let Err(error) = self.execution.leave(vm_entry) {
+            cleanup_error.get_or_insert(SourceExecutionError::EntryLeave(error));
+        }
+        if let Err(error) = self.sync_exception_targeted_roots() {
+            cleanup_error.get_or_insert(SourceExecutionError::ExceptionRootSynchronization(error));
+        }
+        if let Some(error) = cleanup_error {
+            return Err(error);
+        }
         Ok(completion)
+    }
+
+    fn remap_source_session_unlinked_code_block(
+        unlinked: UnlinkedCodeBlock,
+        identifier_map: &HashMap<u32, u32>,
+        function_index_base: u32,
+    ) -> Result<UnlinkedCodeBlock, SourceExecutionError> {
+        let kind = unlinked.kind();
+        let executable_info = unlinked.executable_info().clone();
+        let source = unlinked.source().clone();
+        let frame = unlinked.frame();
+        let metadata = unlinked.metadata().clone();
+        let constants = unlinked.constants().clone();
+        let side_tables = unlinked.side_tables().clone();
+        let features = unlinked.features();
+        let generation_modes = unlinked.generation_modes();
+        let phase = unlinked.phase();
+        let instructions = Self::remap_source_session_instruction_stream(
+            unlinked.instructions(),
+            identifier_map,
+            function_index_base,
+        )?;
+        let string_literals = unlinked
+            .string_literals()
+            .entries()
+            .iter()
+            .map(|entry| {
+                Ok((
+                    Self::remap_source_session_identifier_index(
+                        identifier_map,
+                        entry.identifier_index,
+                    )?,
+                    entry.text.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>, SourceExecutionError>>()?;
+
+        Ok(UnlinkedCodeBlock::new(kind, instructions)
+            .with_source(source)
+            .with_executable_info(executable_info)
+            .with_features(features)
+            .with_generation_modes(generation_modes)
+            .with_frame(frame)
+            .with_metadata(metadata)
+            .with_constants(constants)
+            .with_string_literals(string_literals)
+            .with_side_tables(side_tables)
+            .with_phase(phase))
+    }
+
+    fn remap_source_session_instruction_stream(
+        instructions: &PackedInstructionStream,
+        identifier_map: &HashMap<u32, u32>,
+        function_index_base: u32,
+    ) -> Result<PackedInstructionStream, SourceExecutionError> {
+        let mut remapped = Vec::with_capacity(instructions.instruction_count());
+        for instruction in instructions.decoded_instructions() {
+            let instruction =
+                instruction.map_err(SourceExecutionError::SourceSessionInstructionDecode)?;
+            remapped.push(TypedInstruction {
+                opcode: instruction.opcode,
+                width: instruction.width,
+                operands: Self::remap_source_session_instruction_operands(
+                    instruction.opcode,
+                    instruction.bytecode_index,
+                    instruction.operands,
+                    identifier_map,
+                    function_index_base,
+                )?,
+                schema: instruction.schema,
+                bytecode_index: Some(instruction.bytecode_index),
+            });
+        }
+        Ok(PackedInstructionStream::from_typed_placeholder(remapped))
+    }
+
+    fn remap_source_session_instruction_operands(
+        opcode: crate::bytecode::Opcode,
+        bytecode_index: BytecodeIndex,
+        operands: &[Operand],
+        identifier_map: &HashMap<u32, u32>,
+        function_index_base: u32,
+    ) -> Result<Vec<Operand>, SourceExecutionError> {
+        let mut remapped = operands
+            .iter()
+            .copied()
+            .map(|operand| match operand {
+                Operand::IdentifierIndex(index) => {
+                    Self::remap_source_session_identifier_index(identifier_map, index)
+                        .map(Operand::IdentifierIndex)
+                }
+                _ => Ok(operand),
+            })
+            .collect::<Result<Vec<_>, SourceExecutionError>>()?;
+
+        if CoreOpcode::from_opcode(opcode) == Some(CoreOpcode::LoadFunction) {
+            let Some(Operand::UnsignedImmediate(index)) = remapped.get_mut(1) else {
+                return Err(
+                    SourceExecutionError::SourceSessionInvalidLoadFunctionOperand {
+                        bytecode_index,
+                    },
+                );
+            };
+            *index = function_index_base.checked_add(*index).ok_or(
+                SourceExecutionError::SourceSessionFunctionIndexOverflow {
+                    base: function_index_base,
+                    index: *index,
+                },
+            )?;
+        }
+
+        Ok(remapped)
+    }
+
+    fn remap_source_session_identifier_index(
+        identifier_map: &HashMap<u32, u32>,
+        index: u32,
+    ) -> Result<u32, SourceExecutionError> {
+        identifier_map.get(&index).copied().ok_or(
+            SourceExecutionError::SourceSessionMissingIdentifierText(index),
+        )
     }
 
     fn install_source_function_blocks(
@@ -10679,116 +11008,6 @@ mod tests {
             provider,
             SourceSpan::new(SourcePosition(0), SourcePosition(text.len() as u32)),
         )
-    }
-
-    fn execute_source_retaining_function_blocks(
-        vm: &mut Vm,
-        text: &str,
-    ) -> (ExecutionCompletion, Vec<InterpreterFunctionCodeBlock>) {
-        let source = source(text);
-        let mut arena = ParserArena::new();
-        let parsed = Parser::with_mode(
-            &mut arena,
-            AstBuilder::default(),
-            &source,
-            crate::syntax::ParseMode::Program,
-        )
-        .parse()
-        .unwrap();
-        let session = BytecompilerSessionId(vm.next_source_bytecompiler_session_id);
-        let input = bytecompiler_input_from_parsed_ast(session, source.clone(), &parsed, &arena)
-            .unwrap();
-        let mut plan = emit_unlinked_code_from_parsed_ast(&input, &arena).unwrap();
-        let unlinked = plan.unlinked_code.take().unwrap();
-        let shared_unlinked = Arc::new(unlinked);
-        let function_bodies = plan.function_bodies.drain(..).collect::<Vec<_>>();
-        let string_literals = plan.literal_strings;
-        let identifier_texts = arena
-            .identifiers()
-            .identifier_texts()
-            .into_iter()
-            .map(|(identifier, text)| (identifier.0, text))
-            .collect();
-        let prototype_property_key = arena
-            .identifiers()
-            .identifier_for_text("prototype")
-            .map(|identifier| identifier.0);
-        let executable_id = vm.allocate_executable_cell().unwrap();
-        let code_block_id = vm.allocate_code_block_cell().unwrap();
-        let global_object_id = vm.allocate_global_object_cell().unwrap();
-        vm.record_source_global_object(global_object_id).unwrap();
-        vm.next_source_bytecompiler_session_id =
-            vm.next_source_bytecompiler_session_id.saturating_add(1);
-        let code_block = CodeBlock::from_shared_unlinked(
-            shared_unlinked.clone(),
-            LinkContext {
-                owner_executable: Some(executable_id),
-                specialization: CodeSpecialization::None,
-                ..LinkContext::default()
-            },
-        )
-        .with_entrypoints(CodeBlockEntrypoints {
-            interpreter: Some(InterpreterEntrySlot(0)),
-            ..CodeBlockEntrypoints::default()
-        })
-        .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter);
-        vm.executables
-            .register_script(executable_id, ScriptExecutableKind::Program, shared_unlinked)
-            .unwrap();
-        vm.code_blocks.register(code_block_id, code_block.clone());
-        let install_record = vm.executables.install_script_code(
-            executable_id,
-            code_block_id,
-            CodeSpecialization::None,
-            &code_block,
-        );
-        assert!(
-            !matches!(install_record.outcome, ExecutableInstallOutcome::Rejected(_)),
-            "program executable install failed: {install_record:?}"
-        );
-        let function_blocks = vm.install_source_function_blocks(function_bodies).unwrap();
-        let entry = vm
-            .execution
-            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
-                code_block: code_block_id,
-                global_object: global_object_id,
-                this_value: RuntimeValue::undefined(),
-            }));
-        let frame = vm
-            .execution
-            .push_frame(
-                &mut vm.registers,
-                FramePushRequest {
-                    code_block: Some(code_block_id),
-                    callee: None,
-                    callee_value: None,
-                    lexical_scope: None,
-                    shape: code_block.unlinked().frame(),
-                    argument_count_including_this: 1,
-                    argument_values: Vec::new(),
-                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
-                    return_bytecode_index: None,
-                },
-            )
-            .unwrap();
-        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks_strings_and_prototype_key(
-            function_blocks.clone(),
-            string_literals,
-            identifier_texts,
-            prototype_property_key,
-        );
-        let completion = vm.execute_code_block(
-            code_block_id,
-            &code_block,
-            &mut host,
-            DispatchConfig::default(),
-        );
-        if vm.execution.frame(frame).is_some() {
-            vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
-        }
-        vm.execution.leave(entry).unwrap();
-        vm.sync_exception_targeted_roots().unwrap();
-        (completion, function_blocks)
     }
 
     fn compiler_produced_program_code_block(text: &str, session: u64) -> CodeBlock {
@@ -37330,7 +37549,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_p18a_construct_super_and_default_derived_constructors_do_not_use_construct_request() {
+    fn vm_p18b_construct_super_and_default_derived_constructors_enter_construct_request() {
         let mut explicit = Vm::new(VmConfig::interpreter_only());
         let explicit_completion = explicit
             .execute_source(source(
@@ -37347,7 +37566,11 @@ mod tests {
             .tiering_integration()
             .entry_decisions()
             .iter()
-            .all(|record| record.entry_kind != ExecutionEntryKind::Construct));
+            .any(|record| record.entry_kind == ExecutionEntryKind::Construct));
+        assert_eq!(explicit.execution_context_stack().frame_depth(), 0);
+        assert_eq!(explicit.execution_context_stack().entry_depth(), 0);
+        assert_eq!(explicit.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(explicit.heap().no_gc_scope_depth(), 0);
 
         let mut default_derived = Vm::new(VmConfig::interpreter_only());
         let default_completion = default_derived
@@ -37365,7 +37588,101 @@ mod tests {
             .tiering_integration()
             .entry_decisions()
             .iter()
-            .all(|record| record.entry_kind != ExecutionEntryKind::Construct));
+            .any(|record| record.entry_kind == ExecutionEntryKind::Construct));
+        assert_eq!(default_derived.execution_context_stack().frame_depth(), 0);
+        assert_eq!(default_derived.execution_context_stack().entry_depth(), 0);
+        assert_eq!(default_derived.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(default_derived.heap().no_gc_scope_depth(), 0);
+    }
+
+    #[test]
+    fn vm_p18b_nested_default_derived_chain_enters_construct_requests() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+
+        let completion = vm
+            .execute_source(source(
+                "class Base { constructor(value) { this.value = value; } } \
+                 class Mid extends Base { } \
+                 class Derived extends Mid { } \
+                 return new Derived(42).value;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        assert!(
+            vm.tiering_integration()
+                .entry_decisions()
+                .iter()
+                .filter(|record| record.entry_kind == ExecutionEntryKind::Construct)
+                .count()
+                >= 1
+        );
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+        assert!(exception_targeted_roots(&vm).is_empty());
+    }
+
+    #[test]
+    fn vm_p18b_object_returning_super_initializes_derived_fields() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+
+        let completion = vm
+            .execute_source(source(
+                "class Base { constructor() { return { base: 40 }; } } \
+                 class Derived extends Base { derived = 2; constructor() { super(); } } \
+                 let result = new Derived(); \
+                 return result.base + result.derived;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        assert!(vm
+            .tiering_integration()
+            .entry_decisions()
+            .iter()
+            .any(|record| record.entry_kind == ExecutionEntryKind::Construct));
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+        assert!(exception_targeted_roots(&vm).is_empty());
+    }
+
+    #[test]
+    fn vm_p18b_throwing_super_cleans_frames_roots_and_no_gc_depth() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+
+        let completion = vm
+            .execute_source(source(
+                "class Base { constructor() { throw 7; } } \
+                 class Derived extends Base { constructor() { super(); } } \
+                 new Derived();",
+            ))
+            .unwrap();
+        let pending = PendingException {
+            value: RuntimeValue::from_i32(7),
+        };
+
+        assert_eq!(completion, ExecutionCompletion::Threw(pending));
+        assert_eq!(vm.exception_state().pending(), Some(pending));
+        assert!(vm
+            .tiering_integration()
+            .entry_decisions()
+            .iter()
+            .any(|record| record.entry_kind == ExecutionEntryKind::Construct));
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+        assert!(exception_targeted_roots(&vm).is_empty());
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]
@@ -40068,6 +40385,187 @@ mod tests {
             assert_eq!(descriptor.record.target, global_cell);
         }
         assert_ne!(descriptors[0].record.root.id, descriptors[1].record.root.id);
+    }
+
+    #[test]
+    fn vm_source_session_reuses_one_global_root_for_multiple_sources() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![source("return 1;"), source("return 2;")])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(1)),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(2)),
+            ]
+        );
+        let plan = vm
+            .global_runtime_state()
+            .global_root_plan(vm.heap().id())
+            .unwrap();
+        let descriptors = plan.descriptors();
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].global, execution.global_object());
+        assert_eq!(
+            descriptors[0].record.root.id,
+            global_root_id(execution.global_object())
+        );
+        let GlobalObjectId(ObjectId(global_cell)) = execution.global_object();
+        assert_eq!(descriptors[0].record.target, global_cell);
+        assert_eq!(
+            vm.heap().targeted_roots().records(),
+            plan.targeted_records()
+        );
+        assert_eq!(
+            vm.heap()
+                .allocation_records()
+                .iter()
+                .filter(|record| {
+                    record.request.metadata.type_info.cell_type == CellType::CodeBlock
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn vm_execute_source_wrapper_keeps_independent_globals() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        assert_eq!(
+            vm.execute_source(source("return 1;")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(1))
+        );
+        assert_eq!(
+            vm.execute_source(source("return 2;")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(2))
+        );
+
+        let descriptors = vm
+            .global_runtime_state()
+            .global_root_plan(vm.heap().id())
+            .unwrap()
+            .descriptors()
+            .to_vec();
+        assert_eq!(descriptors.len(), 2);
+        assert_ne!(descriptors[0].global, descriptors[1].global);
+        assert_ne!(descriptors[0].record.root, descriptors[1].record.root);
+    }
+
+    #[test]
+    fn vm_source_session_installs_later_source_function_blocks() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![
+                source("function first() { return 1; } return first();"),
+                source("function answer() { return 42; } return answer();"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(1)),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            ]
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+        assert!(exception_targeted_roots(&vm).is_empty());
+    }
+
+    #[test]
+    fn vm_source_session_cleans_entries_frames_and_no_gc_after_multiple_loads() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![
+                source("let value = 20; return value + 1;"),
+                source("let value = 21; return value + 1;"),
+                source("function add(a, b) { return a + b; } return add(40, 2);"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            execution.completions(),
+            &[
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(21)),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(22)),
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            ]
+        );
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+        let hook = vm.heap_snapshot_hook();
+        assert_eq!(hook.active_entry_depth, 0);
+        assert_eq!(hook.active_frame_depth, 0);
+        assert!(hook.entry_roots.is_empty());
+        assert!(hook.execution_roots.is_empty());
+        assert!(exception_targeted_roots(&vm).is_empty());
+    }
+
+    #[test]
+    fn vm_source_session_throwing_load_cleans_entry_state_and_continues() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let execution = vm
+            .execute_source_session(vec![source("throw \"boom\";"), source("return 42;")])
+            .unwrap();
+
+        let pending = match execution.completions()[0] {
+            ExecutionCompletion::Threw(pending) => pending,
+            ref completion => unreachable!("expected thrown completion, got {completion:?}"),
+        };
+        assert_eq!(
+            execution.completions()[1],
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        assert_eq!(vm.exception_state().pending(), Some(pending));
+        assert_eq!(vm.execution_context_stack().entry_depth(), 0);
+        assert_eq!(vm.execution_context_stack().frame_depth(), 0);
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+        let hook = vm.heap_snapshot_hook();
+        assert_eq!(hook.active_entry_depth, 0);
+        assert_eq!(hook.active_frame_depth, 0);
+        assert!(hook.entry_roots.is_empty());
+        assert!(hook.execution_roots.is_empty());
+        let exception_plan = vm
+            .exception_state()
+            .targeted_root_plan(vm.heap())
+            .expect("exception targeted root plan");
+        assert_eq!(exception_targeted_roots(&vm), exception_plan.records());
+    }
+
+    #[test]
+    fn vm_source_session_reports_missing_cross_load_global_bindings() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+
+        let result = vm.execute_source_session(vec![
+            source("function answer() { return 42; }"),
+            source("return answer();"),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(SourceExecutionError::BytecodeEmission(
+                BytecompilerEmissionError::UnboundIdentifier(_)
+            ))
+        ));
+        assert!(vm
+            .global_runtime_state()
+            .global_root_plan(vm.heap().id())
+            .unwrap()
+            .descriptors()
+            .is_empty());
     }
 
     #[test]

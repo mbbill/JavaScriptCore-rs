@@ -57,6 +57,7 @@ pub enum Expr {
     Unary(UnaryExpr),
     Binary(BinaryExpr),
     Assignment(AssignmentExpr),
+    Conditional(ConditionalExpr),
     Call(CallExpr),
     New(NewExpr),
     Member(MemberExpr),
@@ -266,9 +267,30 @@ pub enum BinaryOperator {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssignmentExpr {
     pub span: SourceSpan,
+    pub op: AssignmentOperator,
     pub target: AstRef<Pattern>,
     pub value: AstRef<Expr>,
     pub context: AssignmentContext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssignmentOperator {
+    Assign,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    BitOr,
+    BitAnd,
+    BitXor,
+    LeftShift,
+    RightShift,
+    UnsignedRightShift,
+    Pow,
+    Coalesce,
+    LogicalOr,
+    LogicalAnd,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,6 +300,14 @@ pub enum AssignmentContext {
     ConstDeclaration,
     UsingDeclaration,
     AwaitUsingDeclaration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionalExpr {
+    pub span: SourceSpan,
+    pub test: AstRef<Expr>,
+    pub consequent: AstRef<Expr>,
+    pub alternate: AstRef<Expr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
