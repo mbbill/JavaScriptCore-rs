@@ -27,9 +27,12 @@ Suggested durable `/goal` text:
 
 ```text
 Act as architect and lead reviewer for the single-crate Rust JavaScriptCore
-rewrite. Preserve JavaScriptCore's real engine responsibilities while adapting
-them to Rust ownership, rooting, frame, exception, runtime, GC, and execution
-tier contracts.
+rewrite. This is a faithful rewrite of C++ JavaScriptCore, not a new
+JavaScript engine. Use C++ JavaScriptCore as the source of truth for behavior,
+algorithms, bytecode lowering, runtime invariants, interpreter/JIT structure,
+GC/rooting, and benchmark semantics, while adapting those responsibilities to
+safe Rust ownership, borrowing, rooting, frame, exception, runtime, GC, and
+execution-tier contracts.
 
 The current proof target is full JetStream 3 Octane at local C++
 JavaScriptCore-level performance. Treat Octane as a correctness and performance
@@ -44,10 +47,12 @@ boundaries before deep local tuning, and choose work by the most important
 unblocked engine dependency rather than local test convenience.
 
 Main agent role: maintain architecture, manage the dependency graph, delegate
-large implementation and audit work to agents, review and integrate their
-patches, run gates, and keep progress honest. Use sub-agents for large or
-parallelizable batches; implement locally only for trivial glue or tightly
-bounded fixes.
+large implementation, audit, and benchmark-investigation work to agents, review
+their JSC evidence and patches, integrate accepted fixes, run gates, commit
+clean checkpoints, and keep progress honest. Use sub-agents for large or
+parallelizable batches. Implement locally only for trivial glue, review
+corrections, temporary probes, or tightly bounded repairs; do not hand-edit
+large feature/test migrations when that work can be delegated and reviewed.
 
 Use `Source/JavaScriptCore/rust/docs/002-bfs-rewrite-plan.md` and
 `Source/JavaScriptCore/rust/docs/progress.md` as the mutable scheduler and
@@ -310,6 +315,13 @@ roots, handles, or fallback paths while waiting for GC/VM contracts.
 Parallelism is expected. Independent audits or implementation batches should be
 delegated together when their write sets do not overlap.
 
+The main agent is the architect and integration reviewer, not the default bulk
+coder. For large code changes, broad test migrations, subsystem audits, or
+benchmark investigations, assign bounded work to agents with explicit write
+sets and required JSC evidence. The main agent may create small probes or
+review corrections locally, but should avoid becoming the primary implementer
+for large chunks.
+
 Do not widen runtime, standard-library, module, or tooling breadth unless it
 unblocks Octane execution, fallback, roots, exceptions, calls, object/property
 behavior, JIT behavior, or benchmark harness compatibility.
@@ -525,9 +537,11 @@ rewrite phase.
   fixes, and reject unproven Rust-local behavior.
 - Sub-agents: inspect assigned Rust and C++ JSC components, classify fidelity,
   and implement fixes only when the write scope is explicit and disjoint.
-- Active batch: rerun the complete Octane-core pass/fail matrix after the
-  accepted A1/A2 fidelity repairs, then schedule the next shared feature family
-  from current evidence rather than stale failure labels.
+- Active batch: move the clean `9638776` baseline forward by delegating the
+  Octane-core pass/fail matrix and current-failure classification. The main
+  agent should define the matrix contract, assign per-benchmark/probe work to
+  agents, review the evidence, and schedule the next shared engine feature
+  family from current results rather than stale failure labels.
 - Completion evidence for F0: all existing Rust subsystems have passed the
   breadth-first fidelity audit above, accidental deviations have fixes or
   tracked blockers, and full gates plus relevant benchmark probes pass from a
@@ -704,10 +718,19 @@ M4: Current - run Octane-core correctly in the Rust engine.
   blockers discovered by the first matrix: non-decimal number literals,
   trailing call/new argument commas, global/host function capture cells, and
   sloppy top-level global assignment reads.
-- Active sub-slice: M4g completes the Octane-core runtime matrix by fixing
-  shared engine blockers first, then rerunning and recording the six-benchmark
-  matrix. Current shared fixes are ordinary function fallthrough returning
-  `undefined` and late local allocation avoiding live temporary collisions.
+- Accepted audit sub-slice after M4g: A0/A1/A2 fidelity repairs fixed register
+  windows, capture ordering, ordinary fallthrough, derived-constructor
+  semantics, live global resolution, function metadata/constructability,
+  Program/Eval completion, top-level `return` rejection, and shell-ordered
+  source-session execution. The clean accepted baseline is `9638776`.
+- Active sub-slice: M4h reruns and records the real Octane-core matrix from the
+  clean baseline, then chooses the next shared feature family from current
+  evidence. The main agent defines the runner/probe contract and reviews
+  outputs; sub-agents run bounded per-benchmark investigations, identify
+  parse/bytecode/runtime/timeout/baseline-only phases, inspect the corresponding
+  C++ JSC implementation before proposing fixes, and avoid benchmark-local
+  hacks. If a benchmark times out, classify the source-order point and likely
+  shared engine dependency before assigning implementation work.
 
 M5: Make the accepted baseline JIT cover Octane-core hot paths.
 
