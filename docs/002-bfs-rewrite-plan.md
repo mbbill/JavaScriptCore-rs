@@ -1,11 +1,10 @@
 # Priority-Managed BFS Rewrite Plan
 
-This file is the active architect contract and scheduler for the Rust
-JavaScriptCore rewrite. It should stay compact enough to be useful after
-context compression.
+This file is the durable architect contract for the Rust JavaScriptCore
+rewrite. It should stay compact enough to be useful after context compression.
 
-Use `progress.md` only for sparse completed checkpoints. Historical detail is
-not carried here.
+Use `progress.md` for sparse completed checkpoints and current status.
+Historical detail and immediate next steps are not carried here.
 
 ## Durable Goal
 
@@ -17,47 +16,36 @@ Suggested durable `/goal` text:
 
 ```text
 Act as architect and lead reviewer for the single-crate Rust JavaScriptCore
-rewrite. This is a faithful rewrite of C++ JavaScriptCore, not a new
-JavaScript engine. Use C++ JavaScriptCore as the source of truth for behavior,
-algorithms, bytecode lowering, runtime invariants, interpreter/JIT structure,
-GC/rooting, and benchmark semantics, while adapting those responsibilities to
-safe Rust ownership, borrowing, rooting, frame, exception, runtime, GC, and
-execution-tier contracts.
+rewrite. This is a faithful rewrite of C++ JavaScriptCore, not a new JavaScript
+engine. Treat C++ JSC as the source of truth for behavior, algorithms, bytecode
+lowering, runtime invariants, interpreter/JIT structure, GC/rooting, and
+benchmark semantics. Deviate only when safe Rust ownership/borrowing/rooting
+requires it, or when a clearly better design preserves observable semantics.
 
-The current proof target is full JetStream 3 Octane at local C++
-JavaScriptCore-level performance. Treat Octane as a correctness and performance
-forcing function: first make Octane-core run honestly, then widen to full
-Octane correctness, then close performance by comparing behavior, bytecode,
+Drive the rewrite by priority, dependency order, and parallelism. Keep it
+breadth-first before depth-first: establish and validate major engine
+boundaries before deep local tuning, and always choose the most important
+unblocked shared dependency over local test convenience.
+
+Act as architect and integration reviewer. Delegate large implementation,
+audit, and benchmark-investigation batches to agents; review their C++ JSC
+evidence, patches, tests, risks, and ownership fit before merging. Sub-agents
+must inspect relevant C++ JSC first and report what behavior was borrowed or
+why any Rust deviation is justified. Use isolated worktrees/workspaces for
+parallel code work when practical.
+
+The durable proof target is JetStream 3 Octane at local C++ JavaScriptCore
+correctness and performance. Advance from honest subset execution to full
+Octane correctness to performance parity by comparing Rust behavior, bytecode,
 ICs, generated code, tiering, runtime calls, and allocation behavior against
-C++ JavaScriptCore.
-
-Own priority, dependency order, and parallelism across the whole rewrite. Keep
-the rewrite breadth-first before depth-first: expand and validate major engine
-boundaries before deep local tuning, and choose work by the most important
-unblocked engine dependency rather than local test convenience.
-
-Main agent role: maintain architecture, manage the dependency graph, delegate
-large implementation, audit, and benchmark-investigation work to agents, review
-their JSC evidence and patches, integrate accepted fixes, run gates, commit
-clean checkpoints, and keep progress honest. Use sub-agents for large or
-parallelizable batches. Implement locally only for trivial glue, review
-corrections, temporary probes, or tightly bounded repairs; do not hand-edit
-large feature/test migrations when that work can be delegated and reviewed.
-
-Sub-agents must not blindly write features. Every non-trivial task must inspect
-the corresponding C++ JavaScriptCore files first and explain what behavior was
-borrowed or why a safe-Rust deviation is justified. For parallel work, prefer
-separate git worktrees or isolated agent workspaces, then merge/rebase only
-after main-agent review and verification.
-
-Use `Source/JavaScriptCore/rust/docs/002-bfs-rewrite-plan.md` and
-`Source/JavaScriptCore/rust/docs/progress.md` as the mutable scheduler and
-checkpoint record between context compressions.
+C++ JSC. Avoid benchmark source hacks, tiny-path shortcuts, invented engine
+behavior, and unreviewed ownership models. Keep docs compact: this plan holds
+durable process only, while current status belongs in sparse progress records.
 ```
 
-## Current Target
+## Proof Target
 
-The active proof target is local JetStream 3 Octane:
+The durable proof target is local JetStream 3 Octane:
 
 ```text
 Octane-core correctness
@@ -137,65 +125,6 @@ Required runner behavior:
 - Do not use legacy Octane `BenchmarkSuite`, reference-score throughput loops,
   or benchmark-source hacks.
 
-## Current Baseline
-
-The Rust tree is a single crate with module-level subsystem boundaries.
-
-Last accepted clean checkpoint:
-
-```text
-9638776 Fix A1 program completion fidelity
-```
-
-Accepted gate at that checkpoint:
-
-```text
-cargo fmt --check
-cargo clippy --lib --all-targets -- -D warnings
-cargo build --lib
-cargo test --lib -- --quiet
-1932 tests passed
-```
-
-Accepted high-level capabilities:
-
-- Parser -> bytecompiler -> interpreter execution for a broad JavaScript
-  subset.
-- VM-owned `CodeBlock`, frame, root, exception, call, construct, and tiering
-  boundaries for the accepted execution spine.
-- Heap/cell/root/barrier ownership scaffolding with targeted roots.
-- One x86_64 baseline native tier for a narrow opcode subset, entered through
-  VM-owned readiness with interpreter fallback.
-- VM-owned native exits for runtime helpers, calls, property loads/stores, and
-  loop backedges.
-- VM-owned ordinary, derived, and super constructor entry for the accepted
-  construction spine.
-- Octane manifest, scoring math, source preparation, deterministic-random
-  runner source generation, execution/failure classification, success records,
-  score records, oracle-alert classification, and interpreter-vs-baseline
-  comparison records under `shell::octane`.
-
-Current evidence note:
-
-- The Octane-core pass/fail matrix must be rerun from the clean baseline.
-- A temporary post-checkpoint probe reached `richards` runner execution in
-  interpreter-only mode and timed out after appending the generated runner
-  source. Treat this only as a current investigation lead, not as accepted
-  matrix evidence.
-
-Known broad blockers:
-
-- `load(path)` execution is not fully implemented.
-- Primitive wrapper object construction for `new String`, `new Number`, and
-  `new Boolean` remains incomplete.
-- Full-Octane breadth still needs typed-array depth, `Function` constructor,
-  eval/code-load behavior, deeper RegExp/Yarr behavior, Date/time
-  compatibility, and older shell/browser shims.
-- Performance parity still needs native fast paths, Math intrinsics in native
-  paths, array indexed load/store and length fast paths, property/call IC
-  quality, constructor/class/super fast paths, allocation/GC pressure work, and
-  an optimizing-tier strategy or justified alternative.
-
 ## Roles
 
 Project owner:
@@ -207,7 +136,8 @@ Project owner:
 Main agent:
 
 - Acts as architect and lead reviewer.
-- Maintains the dependency graph and current priority queue.
+- Maintains the dependency graph and live priority queue outside this durable
+  plan.
 - Decomposes broad work into parallel agent-owned batches.
 - Requires C++ JSC evidence for every non-trivial change.
 - Reviews code, tests, reports, and patches for architecture fit.
@@ -275,16 +205,12 @@ Layer A: benchmark contract and runner boundary.
 - Main agent keeps the runner aligned with JetStream 3 `DefaultBenchmark`.
 - Sub-agents own manifest/load order, file provenance, prelude generation,
   deterministic random reset, result extraction, scoring, and telemetry.
-- Current status: accepted runner scaffolding exists; current matrix must be
-  rerun from the clean baseline.
 
 Layer B: shared language/runtime blockers for Octane-core.
 
 - Main agent prioritizes source-session and bytecode/runtime boundaries that
   unblock multiple Octane-core files.
 - Sub-agents own failing feature families, not benchmark-local hacks.
-- Current status: several parser/lowering/runtime blockers are accepted; rerun
-  the current matrix before scheduling the next feature family.
 
 Layer C: Octane-core correctness.
 
@@ -323,62 +249,6 @@ Layer F: full Octane performance parity.
 - Completion evidence: full Octane score reaches local C++ JSC level on the
   same machine and command inputs, or the remaining gap is quantified and
   attributed to specific missing tiers/features.
-
-## Current Priority Queue
-
-P0: Rerun and classify the Octane-core matrix from `9638776`.
-
-- Main agent: define the probe contract, run or delegate the matrix, require
-  phase classification, review JSC evidence, and select the next shared engine
-  dependency from current results.
-- Sub-agents: investigate assigned benchmarks or failure families in isolated
-  workspaces where useful; inspect corresponding C++ JSC code before proposing
-  fixes; report load order, phase reached, failure mode, suspected shared
-  dependency, JSC evidence, and minimal fix recommendation.
-- Completion evidence: `richards`, `delta-blue`, `crypto`, `splay`,
-  `navier-stokes`, and `raytrace` each have current interpreter-only and
-  baseline-allowed status: success, classified failure, or classified timeout.
-
-P1: Fix the highest-shared Octane-core blocker revealed by P0.
-
-- Main agent: choose the blocker that removes the most shared engine risk, not
-  the easiest isolated test.
-- Sub-agents: implement the selected feature family with JSC evidence, focused
-  tests, and no benchmark source hacks.
-- Completion evidence: focused tests pass, full gates pass, and the relevant
-  Octane-core matrix entries move forward.
-
-P2: Make the accepted baseline JIT cover Octane-core hot paths.
-
-- Main agent: choose opcode-family widening from telemetry and JSC comparison.
-- Sub-agents: implement disjoint JIT/runtime slices with before/after evidence.
-- Completion evidence: baseline-enabled Octane-core is correct, native coverage
-  is meaningful, and the remaining fallback/performance gap is understood.
-
-P3: Widen from Octane-core to full Octane correctness.
-
-- Main agent: schedule by shared feature dependency.
-- Sub-agents: implement full-Octane feature families in parallel where write
-  sets are disjoint.
-- Completion evidence: all full Octane tests run correctly with no benchmark
-  source patches.
-
-P4: Support the official JetStream Octane harness path.
-
-- Main agent: decide whether official driver compatibility requires async/job
-  semantics, a host-side adapter, or both.
-- Sub-agents: implement only the chosen harness compatibility pieces.
-- Completion evidence: the Rust engine can run the JetStream 3 Octane selection
-  through the official or accepted-equivalent harness and produce comparable
-  score output.
-
-P5: Close the performance gap against C++ JSC.
-
-- Main agent: compare bytecode, ICs, generated code, tiering, runtime calls,
-  and allocation behavior against C++ JSC before choosing optimization work.
-- Sub-agents: own measured optimization families with source/JIT comparison.
-- Completion evidence: full Octane score approaches local C++ JSC on the same
-  machine, with remaining gaps explained.
 
 ## Delegated Batch Contract
 
