@@ -1413,6 +1413,27 @@ impl TargetedRootSet {
         Ok(set)
     }
 
+    /// In-place reload of this set from `records`, reusing the existing `records`
+    /// Vec and `index` HashMap allocations instead of allocating a fresh set.
+    ///
+    /// Semantically identical to constructing a new set via `from_records`
+    /// (validate, then rebuild the id->position index), but used by the
+    /// per-instruction interpreter root sync where a fresh allocation every
+    /// bytecode dominated the hot loop. This is a Rust-internal allocation reuse
+    /// path with no C++ JSC counterpart (C++ JSC roots VM registers through
+    /// conservative stack scanning, not an eager precise targeted-root set).
+    pub fn refill_from_records(
+        &mut self,
+        heap: HeapId,
+        records: impl IntoIterator<Item = TargetedRootRecord>,
+    ) -> Result<(), RootSetSemanticError> {
+        self.records.clear();
+        self.records.extend(records);
+        self.validate(heap)?;
+        self.rebuild_index();
+        Ok(())
+    }
+
     pub fn validate(&self, heap: HeapId) -> Result<(), RootSetSemanticError> {
         RootSet::from_records(self.records.iter().map(|record| record.root).collect())?;
 

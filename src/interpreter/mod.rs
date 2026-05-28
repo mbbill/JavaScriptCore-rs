@@ -822,6 +822,31 @@ impl ExecutionContextStack {
         })
     }
 
+    /// Fill `register_roots` (cleared first) with the per-frame register-root
+    /// descriptors for `owner_frame`, reusing the caller-owned buffer instead of
+    /// allocating a fresh Vec. Behaves exactly like the `register_roots` field of
+    /// `register_root_snapshot_for_frame` (same descriptors, same order, same
+    /// validation); only the allocation is reused. Used by the per-instruction
+    /// dispatch-loop root sync.
+    fn register_root_snapshot_for_frame_into(
+        &self,
+        heap: &Heap,
+        registers: &RegisterFile,
+        owner_frame: CallFrameId,
+        register_roots: &mut Vec<RegisterRootDescriptor>,
+    ) -> Result<(), RootSetSemanticError> {
+        register_roots.clear();
+        for frame in self.frames.iter().filter(|frame| frame.id == owner_frame) {
+            registers.root_descriptors_for_window_into(
+                heap.id(),
+                frame.register_window,
+                register_roots,
+            );
+        }
+        validate_root_records(register_roots.iter().map(|descriptor| descriptor.root))?;
+        Ok(())
+    }
+
     fn nonlocal_frame_root_snapshot_for_heap(
         &self,
         heap: &Heap,
@@ -1226,6 +1251,38 @@ impl RegisterFile {
             )
         });
         locals.chain(arguments).collect()
+    }
+
+    /// Append the register-root descriptors for `window` onto `out` (locals then
+    /// arguments, same order as `root_descriptors_for_window`), reusing the
+    /// caller-owned buffer instead of allocating. Used by the per-instruction
+    /// dispatch-loop root sync to avoid a fresh Vec every bytecode.
+    fn root_descriptors_for_window_into(
+        &self,
+        heap: HeapId,
+        window: RegisterWindow,
+        out: &mut Vec<RegisterRootDescriptor>,
+    ) {
+        for offset in 0..window.local_count {
+            if let Some(descriptor) = self.register_root_descriptor(
+                heap,
+                window,
+                window.base.saturating_add(offset),
+                RegisterSlotKind::Local,
+            ) {
+                out.push(descriptor);
+            }
+        }
+        for offset in 0..window.argument_count {
+            if let Some(descriptor) = self.register_root_descriptor(
+                heap,
+                window,
+                window.argument_base.saturating_add(offset),
+                RegisterSlotKind::Argument,
+            ) {
+                out.push(descriptor);
+            }
+        }
     }
 
     pub fn allocate_frame(
@@ -2286,6 +2343,25 @@ pub trait DispatchHost {
         Ok(Vec::new())
     }
 
+    /// Fill `out` (cleared first) with the same targeted register-root records
+    /// `targeted_register_roots` would return, reusing the caller-owned buffer
+    /// instead of allocating a fresh Vec per call. The default delegates to
+    /// `targeted_register_roots` (still one allocation) so test/non-production
+    /// hosts need no change; the production `CoreOpcodeDispatchHost` overrides it
+    /// to fill `out` directly. Used by the per-instruction dispatch-loop root
+    /// sync where the allocation dominated the hot loop.
+    fn targeted_register_roots_into(
+        &mut self,
+        heap: &mut Heap,
+        snapshot: &ExecutionRootSnapshot,
+        out: &mut Vec<TargetedRootRecord>,
+    ) -> Result<(), ExecutionError> {
+        let records = self.targeted_register_roots(heap, snapshot)?;
+        out.clear();
+        out.extend(records);
+        Ok(())
+    }
+
     fn drain_property_load_observation(
         &mut self,
         _heap: &mut Heap,
@@ -2926,6 +3002,57 @@ impl CoreOpcodeDispatchHost {
         TargetedRootSet::from_records(heap.id(), records)
             .map(|set| set.records().to_vec())
             .map_err(ExecutionError::from)
+    }
+
+    /// Buffered form of `targeted_register_roots`: resolve the snapshot's
+    /// register roots directly into `out` (cleared first), reusing the
+    /// caller-owned buffer instead of allocating a `records` Vec plus a
+    /// `TargetedRootSet` plus a `.to_vec()` copy per call.
+    ///
+    /// Divergence from `targeted_register_roots`: this variant does not run the
+    /// `TargetedRootSet::from_records` validation here. That validation
+    /// (no-duplicate-root-id and per-record targeted-root validity over the full
+    /// resolved set) is instead performed once, downstream, by the buffered VM
+    /// root sync (`refill_from_records` on the desired set). This is equivalent
+    /// for this host: every register root produced here is `RootKind::VMRegister`
+    /// (see `register_root_descriptor`), so the downstream VMRegister filter is a
+    /// pass-through and validates exactly the same record set with the same
+    /// errors; the snapshot's root records are also already validated upstream by
+    /// `register_root_snapshot_for_frame_into`.
+    pub fn targeted_register_roots_into(
+        &mut self,
+        heap: &mut Heap,
+        snapshot: &ExecutionRootSnapshot,
+        out: &mut Vec<TargetedRootRecord>,
+    ) -> Result<(), ExecutionError> {
+        validate_root_records(
+            snapshot
+                .register_roots
+                .iter()
+                .map(|descriptor| descriptor.root),
+        )?;
+
+        out.clear();
+        for descriptor in &snapshot.register_roots {
+            if descriptor.root.heap != heap.id() {
+                return Err(RootSetSemanticError::HeapMismatch {
+                    expected: heap.id(),
+                    actual: descriptor.root.heap,
+                }
+                .into());
+            }
+
+            let Some(payload) = descriptor.cell_payload else {
+                continue;
+            };
+            let target = self.resolve_register_root_target(heap, descriptor, payload)?;
+            out.push(TargetedRootRecord {
+                root: descriptor.root,
+                target,
+            });
+        }
+
+        Ok(())
     }
 
     fn resolve_register_root_target(
@@ -11372,6 +11499,15 @@ impl DispatchHost for CoreOpcodeDispatchHost {
         snapshot: &ExecutionRootSnapshot,
     ) -> Result<Vec<TargetedRootRecord>, ExecutionError> {
         CoreOpcodeDispatchHost::targeted_register_roots(self, heap, snapshot)
+    }
+
+    fn targeted_register_roots_into(
+        &mut self,
+        heap: &mut Heap,
+        snapshot: &ExecutionRootSnapshot,
+        out: &mut Vec<TargetedRootRecord>,
+    ) -> Result<(), ExecutionError> {
+        CoreOpcodeDispatchHost::targeted_register_roots_into(self, heap, snapshot, out)
     }
 
     fn drain_property_load_observation(
@@ -25716,6 +25852,7 @@ fn execute_single_dispatch_with_ordinary_call_handling<H: DispatchHost>(
     };
     let mut active_targeted_register_roots = Vec::new();
     let mut active_targeted_frame_roots = Vec::new();
+    let mut register_root_scratch = RegisterRootSyncScratch::new();
 
     if let Err(error) = sync_targeted_frame_roots(
         frame.id,
@@ -25732,13 +25869,14 @@ fn execute_single_dispatch_with_ordinary_call_handling<H: DispatchHost>(
         );
     }
 
-    if let Err(error) = sync_targeted_register_roots(
+    if let Err(error) = sync_targeted_register_roots_buffered(
         frame.id,
         execution.stack,
         execution.registers,
         execution.heap,
         host,
         &mut active_targeted_register_roots,
+        &mut register_root_scratch,
     ) {
         return finish_single_dispatch_with_targeted_root_cleanup(
             execution.heap,
@@ -25788,13 +25926,14 @@ fn execute_single_dispatch_with_ordinary_call_handling<H: DispatchHost>(
         host.dispatch_instruction(&mut state, instruction)
     };
 
-    if let Err(error) = sync_targeted_register_roots(
+    if let Err(error) = sync_targeted_register_roots_buffered(
         frame.id,
         execution.stack,
         execution.registers,
         execution.heap,
         host,
         &mut active_targeted_register_roots,
+        &mut register_root_scratch,
     ) {
         return finish_single_dispatch_with_targeted_root_cleanup(
             execution.heap,
@@ -25879,6 +26018,10 @@ fn execute_code_block_with_resume<H: DispatchHost>(
     let mut steps = 0usize;
     let mut active_targeted_register_roots = Vec::new();
     let mut active_targeted_frame_roots = Vec::new();
+    // One scratch buffer set owned across all loop iterations so the
+    // per-instruction register-root sync reuses its working collections instead
+    // of allocating them every bytecode (see RegisterRootSyncScratch).
+    let mut register_root_scratch = RegisterRootSyncScratch::new();
 
     if let Err(error) = sync_targeted_frame_roots(
         frame.id,
@@ -25895,13 +26038,14 @@ fn execute_code_block_with_resume<H: DispatchHost>(
         );
     }
 
-    if let Err(error) = sync_targeted_register_roots(
+    if let Err(error) = sync_targeted_register_roots_buffered(
         frame.id,
         execution.stack,
         execution.registers,
         execution.heap,
         host,
         &mut active_targeted_register_roots,
+        &mut register_root_scratch,
     ) {
         return finish_with_targeted_root_cleanup(
             execution.heap,
@@ -25964,13 +26108,14 @@ fn execute_code_block_with_resume<H: DispatchHost>(
             };
             host.dispatch_instruction(&mut state, instruction)
         };
-        if let Err(error) = sync_targeted_register_roots(
+        if let Err(error) = sync_targeted_register_roots_buffered(
             frame.id,
             execution.stack,
             execution.registers,
             execution.heap,
             host,
             &mut active_targeted_register_roots,
+            &mut register_root_scratch,
         ) {
             return finish_with_targeted_root_cleanup(
                 execution.heap,
@@ -26309,6 +26454,46 @@ pub(crate) fn sync_targeted_register_roots<H: DispatchHost>(
     sync_targeted_vm_roots(heap, active_roots, targeted)
 }
 
+/// Allocation-free-per-instruction form of `sync_targeted_register_roots`.
+///
+/// Identical roots, identical register/retarget/unregister order; the only
+/// difference is that every working collection is reused from `scratch` instead
+/// of being freshly allocated each bytecode. The dispatch loops own one
+/// `RegisterRootSyncScratch` across iterations and pass it in here per
+/// instruction. See `RegisterRootSyncScratch` for why this exists (interpreter
+/// hot-loop allocation churn) and that it has no C++ JSC counterpart.
+pub(crate) fn sync_targeted_register_roots_buffered<H: DispatchHost>(
+    owner_frame: CallFrameId,
+    stack: &ExecutionContextStack,
+    registers: &RegisterFile,
+    heap: &mut Heap,
+    host: &mut H,
+    active_roots: &mut Vec<RootRecord>,
+    scratch: &mut RegisterRootSyncScratch,
+) -> Result<(), ExecutionError> {
+    // 1. Fill the register-root snapshot into the reused buffer, then build a
+    //    transient snapshot view that borrows it (no Vec allocation).
+    stack.register_root_snapshot_for_frame_into(
+        heap,
+        registers,
+        owner_frame,
+        &mut scratch.snapshot_registers,
+    )?;
+    let snapshot = ExecutionRootSnapshot {
+        frame_roots: Vec::new(),
+        register_roots: std::mem::take(&mut scratch.snapshot_registers),
+    };
+    // 2. Resolve targeted records into the reused buffer.
+    let targeted_result =
+        host.targeted_register_roots_into(heap, &snapshot, &mut scratch.targeted_records);
+    // Return the snapshot's register buffer to the scratch so its capacity is
+    // reused next instruction, regardless of whether resolution succeeded.
+    scratch.snapshot_registers = snapshot.register_roots;
+    targeted_result?;
+
+    sync_targeted_vm_roots_buffered(heap, active_roots, scratch)
+}
+
 pub(crate) fn sync_targeted_nonlocal_frame_roots(
     owner_frame: CallFrameId,
     stack: &ExecutionContextStack,
@@ -26355,7 +26540,92 @@ fn sync_targeted_vm_roots(
         .filter(|root| !desired_root_ids.contains(&root.id))
         .collect::<Vec<_>>();
 
+    apply_desired_vm_roots(heap, active_roots, &desired, &stale_roots)
+}
+
+/// Reusable scratch buffers for the per-instruction register-root sync.
+///
+/// The interpreter dispatch loop runs `sync_targeted_register_roots` after every
+/// bytecode instruction. The straightforward version (`sync_targeted_vm_roots`)
+/// allocates several fresh collections per instruction (the register snapshot
+/// Vec, the host's targeted-record Vec, the filtered desired-record Vec, the
+/// desired `TargetedRootSet`, the desired-id `HashSet`, and the stale-root Vec).
+/// That allocation churn dominated the interpreter hot loop, so the dispatch
+/// loops own one `RegisterRootSyncScratch` across iterations and clear-and-reuse
+/// these buffers each instruction. This is a Rust-internal allocation-reuse
+/// optimization with no C++ JSC counterpart; the produced roots and the order in
+/// which they are registered/retargeted/unregistered are identical to the
+/// allocating path.
+#[derive(Default)]
+pub(crate) struct RegisterRootSyncScratch {
+    snapshot_registers: Vec<RegisterRootDescriptor>,
+    targeted_records: Vec<TargetedRootRecord>,
+    desired_set: TargetedRootSet,
+    desired_root_ids: HashSet<RootId>,
+    stale_roots: Vec<RootRecord>,
+}
+
+impl RegisterRootSyncScratch {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Buffered form of `sync_targeted_vm_roots`: filter `scratch.targeted_records`
+/// to VMRegister roots and load them into the reused `scratch.desired_set`
+/// (validating in place via `refill_from_records`), compute the stale set in the
+/// reused `scratch.stale_roots`/`scratch.desired_root_ids` buffers, then apply
+/// the same mutations as `sync_targeted_vm_roots`. No per-instruction
+/// allocation.
+fn sync_targeted_vm_roots_buffered(
+    heap: &mut Heap,
+    active_roots: &mut Vec<RootRecord>,
+    scratch: &mut RegisterRootSyncScratch,
+) -> Result<(), ExecutionError> {
+    let heap_id = heap.id();
+    scratch.desired_set.refill_from_records(
+        heap_id,
+        scratch
+            .targeted_records
+            .iter()
+            .copied()
+            .filter(|record| record.root.kind == RootKind::VMRegister),
+    )?;
+
+    scratch.desired_root_ids.clear();
+    scratch
+        .desired_root_ids
+        .extend(scratch.desired_set.records().iter().map(|r| r.root.id));
+
+    scratch.stale_roots.clear();
+    scratch.stale_roots.extend(
+        active_roots
+            .iter()
+            .copied()
+            .filter(|root| !scratch.desired_root_ids.contains(&root.id)),
+    );
+
+    apply_desired_vm_roots(
+        heap,
+        active_roots,
+        &scratch.desired_set,
+        &scratch.stale_roots,
+    )
+}
+
+/// Shared core of the VM-register-root sync, used by both the allocating
+/// (`sync_targeted_vm_roots`) and the buffered per-instruction
+/// (`sync_targeted_register_roots_buffered`) entry points. `desired` is the
+/// validated desired targeted-root set; `stale_roots` is the precomputed set of
+/// currently-active roots that are absent from `desired`.
+fn apply_desired_vm_roots(
+    heap: &mut Heap,
+    active_roots: &mut Vec<RootRecord>,
+    desired: &TargetedRootSet,
+    stale_roots: &[RootRecord],
+) -> Result<(), ExecutionError> {
     for root in stale_roots {
+        let root = *root;
         // O(1) membership test by root identity instead of scanning the whole
         // live targeted-root set on every stale root (see TargetedRootSet index).
         if heap.targeted_roots().contains_root(root) {
