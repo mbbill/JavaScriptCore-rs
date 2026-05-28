@@ -5288,6 +5288,29 @@ enum CoreNativeFunction {
     MathRandom,
     MathSqrt,
     MathTrunc,
+    MathCeil,
+    MathRound,
+    MathSign,
+    MathExp,
+    MathCbrt,
+    MathLog2,
+    MathLog10,
+    MathSin,
+    MathCos,
+    MathTan,
+    MathAsin,
+    MathAcos,
+    MathAtan,
+    MathAtan2,
+    MathSinh,
+    MathCosh,
+    MathTanh,
+    MathAsinh,
+    MathAcosh,
+    MathAtanh,
+    MathExpm1,
+    MathLog1p,
+    MathHypot,
     ParseInt,
     ParseFloat,
     HostPerformanceNow,
@@ -6239,6 +6262,29 @@ impl CoreObjectStore {
             ("random", CoreNativeFunction::MathRandom),
             ("sqrt", CoreNativeFunction::MathSqrt),
             ("trunc", CoreNativeFunction::MathTrunc),
+            ("ceil", CoreNativeFunction::MathCeil),
+            ("round", CoreNativeFunction::MathRound),
+            ("sign", CoreNativeFunction::MathSign),
+            ("exp", CoreNativeFunction::MathExp),
+            ("cbrt", CoreNativeFunction::MathCbrt),
+            ("log2", CoreNativeFunction::MathLog2),
+            ("log10", CoreNativeFunction::MathLog10),
+            ("sin", CoreNativeFunction::MathSin),
+            ("cos", CoreNativeFunction::MathCos),
+            ("tan", CoreNativeFunction::MathTan),
+            ("asin", CoreNativeFunction::MathAsin),
+            ("acos", CoreNativeFunction::MathAcos),
+            ("atan", CoreNativeFunction::MathAtan),
+            ("atan2", CoreNativeFunction::MathAtan2),
+            ("sinh", CoreNativeFunction::MathSinh),
+            ("cosh", CoreNativeFunction::MathCosh),
+            ("tanh", CoreNativeFunction::MathTanh),
+            ("asinh", CoreNativeFunction::MathAsinh),
+            ("acosh", CoreNativeFunction::MathAcosh),
+            ("atanh", CoreNativeFunction::MathAtanh),
+            ("expm1", CoreNativeFunction::MathExpm1),
+            ("log1p", CoreNativeFunction::MathLog1p),
+            ("hypot", CoreNativeFunction::MathHypot),
         ] {
             let function = self.allocate_native_function(native_function);
             let key = CorePropertyKey::String(name.into());
@@ -17797,6 +17843,29 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::MathRandom => self.native_math_random(),
             CoreNativeFunction::MathSqrt => self.native_math_sqrt(arguments),
             CoreNativeFunction::MathTrunc => self.native_math_trunc(arguments),
+            CoreNativeFunction::MathCeil => self.native_math_unary(arguments, f64::ceil),
+            CoreNativeFunction::MathRound => self.native_math_unary(arguments, js_math_round),
+            CoreNativeFunction::MathSign => self.native_math_unary(arguments, js_math_sign),
+            CoreNativeFunction::MathExp => self.native_math_unary(arguments, f64::exp),
+            CoreNativeFunction::MathCbrt => self.native_math_unary(arguments, f64::cbrt),
+            CoreNativeFunction::MathLog2 => self.native_math_unary(arguments, f64::log2),
+            CoreNativeFunction::MathLog10 => self.native_math_unary(arguments, f64::log10),
+            CoreNativeFunction::MathSin => self.native_math_unary(arguments, f64::sin),
+            CoreNativeFunction::MathCos => self.native_math_unary(arguments, f64::cos),
+            CoreNativeFunction::MathTan => self.native_math_unary(arguments, f64::tan),
+            CoreNativeFunction::MathAsin => self.native_math_unary(arguments, f64::asin),
+            CoreNativeFunction::MathAcos => self.native_math_unary(arguments, f64::acos),
+            CoreNativeFunction::MathAtan => self.native_math_unary(arguments, f64::atan),
+            CoreNativeFunction::MathAtan2 => self.native_math_binary(arguments, f64::atan2),
+            CoreNativeFunction::MathSinh => self.native_math_unary(arguments, f64::sinh),
+            CoreNativeFunction::MathCosh => self.native_math_unary(arguments, f64::cosh),
+            CoreNativeFunction::MathTanh => self.native_math_unary(arguments, f64::tanh),
+            CoreNativeFunction::MathAsinh => self.native_math_unary(arguments, f64::asinh),
+            CoreNativeFunction::MathAcosh => self.native_math_unary(arguments, f64::acosh),
+            CoreNativeFunction::MathAtanh => self.native_math_unary(arguments, f64::atanh),
+            CoreNativeFunction::MathExpm1 => self.native_math_unary(arguments, f64::exp_m1),
+            CoreNativeFunction::MathLog1p => self.native_math_unary(arguments, f64::ln_1p),
+            CoreNativeFunction::MathHypot => self.native_math_hypot(arguments),
             CoreNativeFunction::ParseInt => self.native_parse_int(arguments),
             CoreNativeFunction::ParseFloat => self.native_parse_float(arguments),
             CoreNativeFunction::HostPerformanceNow => Ok(self.native_host_performance_now()),
@@ -21728,6 +21797,58 @@ impl CoreOpcodeDispatchHost {
         Ok(runtime_number_from_f64(value.trunc()))
     }
 
+    // Single-argument Math functions: ToNumber(arg0) then apply `op`. Mirrors
+    // the C++ JSC pattern where each mathProtoFunc* coerces argument(0) and
+    // applies the corresponding libm operation.
+    fn native_math_unary(
+        &self,
+        arguments: &[RuntimeValue],
+        op: fn(f64) -> f64,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let value = self.math_number_argument(arguments, 0)?;
+        Ok(runtime_number_from_f64(op(value)))
+    }
+
+    fn native_math_binary(
+        &self,
+        arguments: &[RuntimeValue],
+        op: fn(f64, f64) -> f64,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let a = self.math_number_argument(arguments, 0)?;
+        let b = self.math_number_argument(arguments, 1)?;
+        Ok(runtime_number_from_f64(op(a, b)))
+    }
+
+    // C++ JSC mathProtoFuncHypot: ToNumber each argument, return sqrt of the
+    // sum of squares. Rust's f64::hypot is only two-argument, so accumulate.
+    fn native_math_hypot(
+        &self,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let mut sum = 0.0f64;
+        let mut saw_nan = false;
+        let mut saw_inf = false;
+        for index in 0..arguments.len() {
+            let value = self.math_number_argument(arguments, index)?;
+            if value.is_infinite() {
+                saw_inf = true;
+            } else if value.is_nan() {
+                saw_nan = true;
+            }
+            sum += value * value;
+        }
+        // Per spec: if any argument is +/-Infinity the result is +Infinity even
+        // if another argument is NaN.
+        let result = if saw_inf {
+            f64::INFINITY
+        } else if saw_nan {
+            f64::NAN
+        } else {
+            sum.sqrt()
+        };
+        Ok(runtime_number_from_f64(result))
+    }
+
     fn math_number_argument(
         &self,
         arguments: &[RuntimeValue],
@@ -24584,6 +24705,33 @@ fn runtime_number_from_f64(value: f64) -> RuntimeValue {
         RuntimeValue::from_i32(value as i32)
     } else {
         RuntimeValue::from_double(value)
+    }
+}
+
+// ECMAScript Math.round: round half toward +Infinity (not away from zero like
+// Rust's f64::round). Math.round(-0.5) === -0, Math.round(0.5) === 1. Implement
+// as floor(x + 0.5) with NaN/Infinity/zero passthrough.
+fn js_math_round(value: f64) -> f64 {
+    if value.is_nan() || value.is_infinite() || value == 0.0 {
+        return value;
+    }
+    // Values in (-0.5, 0) round to -0; floor(x + 0.5) would give 0 (positive),
+    // so preserve the sign of zero for that range.
+    if value > -0.5 && value < 0.0 {
+        return -0.0;
+    }
+    (value + 0.5).floor()
+}
+
+// ECMAScript Math.sign: -1, -0, +0, 1, or NaN. Rust's signum returns +/-1 for
+// zero, so handle zero/NaN explicitly to preserve the signed zero.
+fn js_math_sign(value: f64) -> f64 {
+    if value.is_nan() || value == 0.0 {
+        value
+    } else if value > 0.0 {
+        1.0
+    } else {
+        -1.0
     }
 }
 
