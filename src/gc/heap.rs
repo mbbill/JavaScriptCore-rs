@@ -1354,9 +1354,19 @@ impl RootSet {
 }
 
 /// Precise roots paired with the cell IDs they keep reachable.
+///
+/// `records` is the authoritative live set. `index` mirrors it as a
+/// `RootId -> Vec position` map so callers (notably the per-instruction
+/// interpreter root sync) can resolve a record by root identity in O(1)
+/// instead of scanning the whole set on every bytecode. The index is a
+/// Rust-internal acceleration structure with no C++ JSC counterpart (C++ JSC
+/// roots VM registers via conservative stack scanning rather than an eager
+/// per-instruction precise targeted-root registry), so it is maintained in
+/// lock-step with `records` on every register/retarget/unregister.
 #[derive(Clone, Debug, Default)]
 pub struct TargetedRootSet {
     records: Vec<TargetedRootRecord>,
+    index: HashMap<RootId, usize>,
 }
 
 impl TargetedRootSet {
@@ -1364,12 +1374,38 @@ impl TargetedRootSet {
         &self.records
     }
 
+    /// O(1) lookup of the live record for `root` (full `RootRecord` equality,
+    /// matching the previous linear `find(|existing| existing.root == ...)`).
+    pub fn record_for_root(&self, root: RootRecord) -> Option<&TargetedRootRecord> {
+        self.index
+            .get(&root.id)
+            .map(|&position| &self.records[position])
+            .filter(|record| record.root == root)
+    }
+
+    /// O(1) membership test for `root` (full `RootRecord` equality, matching the
+    /// previous linear `any(|record| record.root == root)`).
+    pub fn contains_root(&self, root: RootRecord) -> bool {
+        self.record_for_root(root).is_some()
+    }
+
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        for (position, record) in self.records.iter().enumerate() {
+            self.index.insert(record.root.id, position);
+        }
+    }
+
     pub fn from_records(
         heap: HeapId,
         records: Vec<TargetedRootRecord>,
     ) -> Result<Self, RootSetSemanticError> {
-        let set = Self { records };
+        let mut set = Self {
+            records,
+            index: HashMap::new(),
+        };
         set.validate(heap)?;
+        set.rebuild_index();
         Ok(set)
     }
 
@@ -1394,7 +1430,10 @@ impl TargetedRootSet {
             RootSetMutation::register(record.root, authority),
             Some(record),
         )?;
+        // The new record lands at the tail; record its position in the index.
+        let position = self.records.len();
         self.records.push(record);
+        self.index.insert(record.root.id, position);
         Ok(record)
     }
 
@@ -1409,12 +1448,10 @@ impl TargetedRootSet {
             RootSetMutation::retarget(record.root, authority),
             Some(record),
         )?;
-        if let Some(existing) = self
-            .records
-            .iter_mut()
-            .find(|existing| existing.root.id == record.root.id)
-        {
-            *existing = record;
+        // Retarget replaces the record at its existing slot in place; the root id
+        // (and therefore the index entry and Vec position) is unchanged.
+        if let Some(&position) = self.index.get(&record.root.id) {
+            self.records[position] = record;
         }
         Ok(record)
     }
@@ -1435,6 +1472,9 @@ impl TargetedRootSet {
             _ => unreachable!("unregister mutation cannot produce another root outcome"),
         };
         self.records.retain(|record| record.root.id != root);
+        // `retain` shifts the positions of every record after the removed slot,
+        // so the position index must be rebuilt to stay consistent.
+        self.rebuild_index();
         Ok(root)
     }
 

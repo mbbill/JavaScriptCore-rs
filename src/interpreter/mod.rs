@@ -26356,24 +26356,18 @@ fn sync_targeted_vm_roots(
         .collect::<Vec<_>>();
 
     for root in stale_roots {
-        if heap
-            .targeted_roots()
-            .records()
-            .iter()
-            .any(|record| record.root == root)
-        {
+        // O(1) membership test by root identity instead of scanning the whole
+        // live targeted-root set on every stale root (see TargetedRootSet index).
+        if heap.targeted_roots().contains_root(root) {
             heap.unregister_targeted_root(root, RootSetMutationAuthority::VmRegisterFile)?;
         }
         active_roots.retain(|active| active.id != root.id);
     }
 
     for record in desired.records() {
-        let existing = heap
-            .targeted_roots()
-            .records()
-            .iter()
-            .find(|existing| existing.root == record.root)
-            .copied();
+        // O(1) lookup of the existing record by root identity instead of a linear
+        // scan of the live targeted-root set per desired record.
+        let existing = heap.targeted_roots().record_for_root(record.root).copied();
         match existing {
             Some(existing) if existing == *record => {
                 if !active_roots
