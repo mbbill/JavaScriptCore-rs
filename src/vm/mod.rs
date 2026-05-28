@@ -65206,6 +65206,78 @@ mod tests {
     }
 
     #[test]
+    fn vm_object_prototype_define_getter_installs_accessor() {
+        // C++ JSC ObjectPrototype.cpp objectProtoFuncDefineGetter installs an
+        // enumerable+configurable accessor on ToObject(this).
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var o = {}; o.__defineGetter__('x', function () { return 42; }); o.x === 42 && typeof ({}).__defineGetter__ === 'function';",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_object_prototype_define_setter_installs_accessor() {
+        // C++ JSC ObjectPrototype.cpp objectProtoFuncDefineSetter installs an
+        // enumerable+configurable accessor on ToObject(this).
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var o = { _v: 0 }; o.__defineSetter__('x', function (v) { this._v = v; }); o.x = 5; o._v === 5 && typeof ({}).__defineSetter__ === 'function';",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_object_prototype_define_getter_then_setter_merges_accessor() {
+        // C++ defineOwnProperty merges a getter-only and a setter-only
+        // descriptor into a single accessor; __defineGetter__ then
+        // __defineSetter__ on the same name must keep both halves.
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var o = { _v: 0 }; o.__defineGetter__('x', function () { return this._v + 1; }); o.__defineSetter__('x', function (v) { this._v = v; }); o.x = 10; o.x === 11;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_object_prototype_define_getter_rejects_non_callable() {
+        // C++ throws a TypeError when the accessor argument is not callable.
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source("({}).__defineGetter__('x', 123);"))
+            .unwrap();
+
+        // A thrown TypeError surfaces as a Failed completion with the
+        // engine's ExpectedFunction error (the callable-argument check).
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Failed(ExecutionError::ExpectedFunction)
+        );
+    }
+
+    #[test]
     fn vm_executes_double_literal_and_mixed_number_addition() {
         let mut vm = Vm::new(VmConfig::default());
 

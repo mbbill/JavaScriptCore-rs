@@ -5265,6 +5265,8 @@ enum CoreNativeFunction {
     ObjectPrototypeHasOwnProperty,
     ObjectPrototypeToString,
     ObjectPrototypeValueOf,
+    ObjectDefineGetter,
+    ObjectDefineSetter,
     FunctionCall,
     ArrayConstructor,
     ArrayIsArray,
@@ -7106,6 +7108,10 @@ impl CoreObjectStore {
             ),
             ("toString", CoreNativeFunction::ObjectPrototypeToString),
             ("valueOf", CoreNativeFunction::ObjectPrototypeValueOf),
+            // Legacy accessor helpers (C++ JSC ObjectPrototype.cpp
+            // objectProtoFuncDefineGetter / objectProtoFuncDefineSetter).
+            ("__defineGetter__", CoreNativeFunction::ObjectDefineGetter),
+            ("__defineSetter__", CoreNativeFunction::ObjectDefineSetter),
         ] {
             self.install_native_method(prototype, name, native_function);
         }
@@ -17697,6 +17703,12 @@ impl CoreOpcodeDispatchHost {
                 self.native_object_prototype_to_string(state.heap, this_value)
             }
             CoreNativeFunction::ObjectPrototypeValueOf => Ok(this_value),
+            CoreNativeFunction::ObjectDefineGetter => {
+                self.native_object_define_getter(state, this_value, arguments)
+            }
+            CoreNativeFunction::ObjectDefineSetter => {
+                self.native_object_define_setter(state, this_value, arguments)
+            }
             CoreNativeFunction::FunctionCall => {
                 self.native_function_call(state, this_value, arguments, function_value_completion)
             }
@@ -23469,6 +23481,106 @@ impl CoreOpcodeDispatchHost {
             true => Ok(object),
             false => Err(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion)),
         }
+    }
+
+    /// Object.prototype.__defineGetter__ (C++ JSC ObjectPrototype.cpp
+    /// objectProtoFuncDefineGetter). Installs an accessor with the given getter
+    /// on ToObject(this), enumerable + configurable.
+    fn native_object_define_getter(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        self.object_define_accessor(state, this_value, arguments, true)
+    }
+
+    /// Object.prototype.__defineSetter__ (C++ JSC ObjectPrototype.cpp
+    /// objectProtoFuncDefineSetter). Installs an accessor with the given setter
+    /// on ToObject(this), enumerable + configurable.
+    fn native_object_define_setter(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        self.object_define_accessor(state, this_value, arguments, false)
+    }
+
+    /// Shared body for __defineGetter__/__defineSetter__. Mirrors the C++ JSC
+    /// path: validate the function argument is callable (else TypeError), then
+    /// build a PropertyDescriptor that sets only the getter or only the setter
+    /// (enumerable + configurable) and run defineOwnProperty.
+    ///
+    /// C++ PropertyDescriptor::setGetter/setSetter only fills one accessor half,
+    /// and JSObject::defineOwnProperty merges that with any existing accessor.
+    /// The Rust `define_accessor_property` path replaces the whole property, so
+    /// we explicitly carry over the complementary half from the current own
+    /// accessor to reproduce the C++ merge behavior.
+    fn object_define_accessor(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+        is_getter: bool,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        // thisObject = ToObject(this). The engine has no primitive-boxing
+        // ToObject helper; legacy __define{Getter,Setter}__ callers (e.g. the
+        // box2d Octane benchmark) always invoke on objects, so require an
+        // object here and surface ExpectedObject (TypeError) otherwise.
+        let object = this_value;
+        if self.objects.find(object).is_none() {
+            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject));
+        }
+
+        // C++ checks callability of argument(1) before coercing argument(0).
+        let accessor = arguments
+            .get(1)
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        if !self.is_callable_value(accessor) {
+            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedFunction));
+        }
+
+        let key_value = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        let key = self
+            .value_property_key(key_value)
+            .map_err(DispatchOutcome::Fail)?;
+
+        // Preserve the complementary accessor half when an accessor already
+        // exists, matching C++ defineOwnProperty's accessor merge.
+        let (existing_getter, existing_setter) = match self
+            .objects
+            .get_own_property(object, &key)
+            .map_err(DispatchOutcome::Fail)?
+        {
+            Some(CoreProperty {
+                kind: CorePropertyKind::Accessor { getter, setter },
+                ..
+            }) => (getter, setter),
+            _ => (None, None),
+        };
+
+        let (getter, setter) = if is_getter {
+            (Some(accessor), existing_setter)
+        } else {
+            (existing_getter, Some(accessor))
+        };
+
+        let attributes = CorePropertyAttributes {
+            writable: false,
+            enumerable: true,
+            configurable: true,
+        };
+        self.objects
+            .define_accessor_property_with_write_barrier(
+                state.heap, object, &key, getter, setter, attributes,
+            )
+            .map_err(DispatchOutcome::Fail)?;
+        Ok(RuntimeValue::undefined())
     }
 
     fn native_object_get_own_property_descriptor(
