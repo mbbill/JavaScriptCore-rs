@@ -206,6 +206,7 @@ pub struct BytecompilerGlobalBindingSet {
 pub const STANDARD_GLOBAL_BINDING_NAMES: &[&str] = &[
     "Object",
     "Array",
+    "Function",
     "Math",
     "JSON",
     "Reflect",
@@ -3397,6 +3398,7 @@ impl AstBytecodeEmitter<'_, '_> {
             ("undefined", Self::emit_load_undefined),
             ("Object", Self::emit_load_object_constructor),
             ("Array", Self::emit_load_array_constructor),
+            ("Function", Self::emit_load_function_constructor),
             ("Math", Self::emit_load_math_object),
             ("JSON", Self::emit_load_json_object),
             ("Reflect", Self::emit_load_reflect_object),
@@ -6794,6 +6796,21 @@ impl AstBytecodeEmitter<'_, '_> {
             .reserve_temporary(TemporaryLifetime::Expression);
         self.generator.instructions_mut().declare_instruction(
             CoreOpcode::LoadArrayConstructor.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::Register(destination)],
+        );
+        Ok(destination)
+    }
+
+    fn emit_load_function_constructor(
+        &mut self,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::LoadFunctionConstructor.opcode(),
             OperandWidth::Narrow,
             vec![Operand::Register(destination)],
         );

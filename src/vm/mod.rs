@@ -64717,6 +64717,32 @@ mod tests {
     }
 
     #[test]
+    fn vm_function_constructor_is_exposed_as_global() {
+        // C++ JSC binds the global `Function` to the Function constructor whose
+        // prototype is the shared function prototype (JSGlobalObject.cpp). Here
+        // we verify `typeof Function`, `f instanceof Function`, and that the
+        // shared function prototype's constructor is the same Function object.
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "function f() {} \
+                 typeof Function === \"function\" \
+                     && f instanceof Function \
+                     && (function g() {}) instanceof Function \
+                     && Function.prototype === f.constructor.prototype \
+                     && Function.prototype.constructor === Function \
+                     && Function === ({}).constructor.constructor;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
     fn vm_builtin_prototypes_inherit_from_object_prototype() {
         let mut vm = Vm::new(VmConfig::default());
 

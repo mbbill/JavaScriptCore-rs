@@ -6498,6 +6498,7 @@ const fn baseline_opcode_is_function_or_constructor(opcode: CoreOpcode) -> bool 
         CoreOpcode::LoadFunction
             | CoreOpcode::LoadObjectConstructor
             | CoreOpcode::LoadArrayConstructor
+            | CoreOpcode::LoadFunctionConstructor
             | CoreOpcode::LoadArrayBufferConstructor
             | CoreOpcode::LoadUint8ArrayConstructor
             | CoreOpcode::LoadDataViewConstructor
@@ -6531,6 +6532,7 @@ const fn baseline_opcode_is_allocation_or_object(opcode: CoreOpcode) -> bool {
             | CoreOpcode::TypeOf
             | CoreOpcode::LoadObjectConstructor
             | CoreOpcode::LoadArrayConstructor
+            | CoreOpcode::LoadFunctionConstructor
             | CoreOpcode::LoadMathObject
             | CoreOpcode::LoadJsonObject
             | CoreOpcode::LoadReflectObject

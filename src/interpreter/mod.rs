@@ -5268,6 +5268,13 @@ enum CoreNativeFunction {
     ObjectDefineGetter,
     ObjectDefineSetter,
     FunctionCall,
+    // C++ JSC FunctionConstructor (runtime/FunctionConstructor.cpp): the global
+    // `Function`. Rust does not implement dynamic source compilation
+    // (`new Function(string)`), so this native function only exists to give the
+    // shared function prototype a `constructor` and to expose `Function` as a
+    // global for `typeof`/`instanceof`; calling it throws (see
+    // native_function_constructor).
+    FunctionConstructor,
     ArrayConstructor,
     ArrayIsArray,
     ArrayFrom,
@@ -6195,6 +6202,27 @@ impl CoreObjectStore {
         Ok(constructor)
     }
 
+    // C++ JSC JSGlobalObject::init wires the Function constructor at
+    // runtime/JSGlobalObject.cpp: FunctionConstructor::create uses
+    // m_functionPrototype as its prototype, `Function.prototype` is the shared
+    // function prototype, and `m_functionPrototype->constructor` is the
+    // constructor (DontEnum). The global name `Function` is bound to it.
+    // We reuse the existing `ensure_function_prototype()` object rather than
+    // creating a new prototype, matching that the same Function.prototype is
+    // shared by every function. Unlike Object/Array, we do not implement
+    // `new Function(string)` (dynamic compilation), so this constructor is not
+    // constructible (see construct_ability) and calling it throws.
+    fn allocate_function_constructor_with_write_barrier(
+        &mut self,
+        heap: &mut Heap,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        let prototype = self.ensure_function_prototype();
+        let constructor = self.allocate_native_function(CoreNativeFunction::FunctionConstructor);
+        self.install_constructor_prototype(constructor, prototype);
+        self.install_prototype_constructor_with_write_barrier(heap, prototype, constructor)?;
+        Ok(constructor)
+    }
+
     fn allocate_math_object(&mut self) -> RuntimeValue {
         // Math is intentionally an ordinary intrinsic object, not a
         // constructor. Static functions and constants are installed as own data
@@ -6573,6 +6601,19 @@ impl CoreObjectStore {
             global_object,
             "Array",
             array,
+            standard_attributes,
+        )?;
+        // C++ JSC JSGlobalObject::init binds the global `Function` to the
+        // Function constructor (runtime/JSGlobalObject.cpp:
+        // putDirectWithoutTransition(vm.propertyNames->Function, ...,
+        // DontEnum)). standard_attributes matches DontEnum (writable,
+        // configurable, not enumerable).
+        let function = self.allocate_function_constructor_with_write_barrier(heap)?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Function",
+            function,
             standard_attributes,
         )?;
         let math = self.allocate_math_object();
@@ -11942,6 +11983,20 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 let constructor = match self
                     .objects
                     .allocate_array_constructor_with_write_barrier(state.heap)
+                {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                write_register(state, window, destination, constructor)
+            }
+            CoreOpcode::LoadFunctionConstructor => {
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let constructor = match self
+                    .objects
+                    .allocate_function_constructor_with_write_barrier(state.heap)
                 {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
@@ -17711,6 +17766,17 @@ impl CoreOpcodeDispatchHost {
             }
             CoreNativeFunction::FunctionCall => {
                 self.native_function_call(state, this_value, arguments, function_value_completion)
+            }
+            CoreNativeFunction::FunctionConstructor => {
+                // C++ JSC callFunctionConstructor compiles a function from a
+                // source string (runtime/FunctionConstructor.cpp). Rust does not
+                // implement dynamic source compilation; calling `Function(...)`
+                // is unsupported. `Function` itself is only exposed so that
+                // `typeof Function`/`x instanceof Function` work.
+                Err(self.type_error_outcome_with_heap(
+                    state.heap,
+                    "Function constructor (dynamic compilation) is not supported",
+                ))
             }
             CoreNativeFunction::ArrayConstructor => {
                 self.native_array_constructor(state.heap, arguments)
