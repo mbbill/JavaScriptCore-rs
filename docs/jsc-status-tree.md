@@ -37,7 +37,7 @@ Legend:
       [blocked] box2d <= ExpectedInt32 load/runner blockers cleared for
                  arithmetic ToNumeric primitives and relational object ToPrimitive;
                  LoopHint opcode/placement, generated-baseline LoopHint counters,
-                 and direct generated-baseline LLInt LoopHint handoff are in;
+                 and generated-artifact LLInt LoopHint handoff are in;
                  generated property IC dependency invalidation now retires the
                  latest owner artifact when IC snapshots drift; duplicate guarded
                  property-load sidecar candidates now collapse like C++ AccessCase
@@ -167,7 +167,7 @@ Legend:
   [missing] optimized JIT parity path
   [wip] loop tiering and OSR
     [done] LoopHint opcode, JSC loop-header placement, interpreter telemetry,
-           LLInt LoopHint direct generated-baseline handoff skeleton,
+           LLInt LoopHint generated-artifact handoff skeleton,
            generated-baseline LoopHint counters, and native no-op lowering for
            current baseline subset
     [missing] native inline LoopHint counter/operationOptimize flow matching

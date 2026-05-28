@@ -4719,16 +4719,6 @@ impl Vm {
         )
     }
 
-    fn baseline_loop_handoff_generated_artifact_is_direct(
-        artifact: &BaselineGeneratedCodeArtifact,
-    ) -> bool {
-        artifact.runtime_helper_plan().is_none()
-            && artifact.property_handoff_plan().is_none()
-            && artifact
-                .owner_continuation_map()
-                .is_none_or(|map| map.call_site_count() == 0)
-    }
-
     fn execute_baseline_loop_handoff_completion_in_current_region<H: DispatchHost>(
         &mut self,
         _region: &mut VmNoGcRegion,
@@ -4756,16 +4746,17 @@ impl Vm {
         let has_generated_loop_entry = pre_install_gate
             .as_ref()
             .filter(|gate| gate.outcome == BaselineEntryGateOutcome::Eligible)
-            .and_then(|gate| gate.generated_artifact.as_ref())
-            .is_some_and(Self::baseline_loop_handoff_generated_artifact_is_direct);
+            .is_some_and(|gate| gate.generated_artifact.is_some());
         if !has_generated_loop_entry {
             // C++ _llint_loop_osr jumps to JITCodeMap::find(current LoopHint).
-            // Rust generated baseline can honor the active frame bytecode
-            // index for direct artifacts. Artifacts that rely on runtime
-            // helper/property/JS-call continuation side metadata still need a
-            // mid-loop continuation skeleton, and emitted native baseline entry
-            // still starts at the artifact entrypoint. Decline those cases
-            // until Rust has the matching C++ code-location/continuation maps.
+            // JITCodeMap is keyed only by bytecode index; BaselineJITCode's
+            // call/property side tables are finalized separately from the map,
+            // and runtime-helper bytecodes are not filtered out as OSR targets.
+            // Rust generated baseline mirrors that by reading the active frame
+            // bytecode index on entry and using artifact metadata during
+            // execution. Emitted native baseline still lacks a per-bytecode
+            // LoopHint entry map, so it remains on the interpreter-decline path
+            // here.
             return Ok((
                 self.continue_interpreter_after_declined_loop_handoff(
                     handoff, code_block, host, config,
@@ -19897,6 +19888,30 @@ mod tests {
                 vec![Operand::Register(local(0))],
             ),
         ])
+    }
+
+    fn loop_hint_runtime_helper_new_object_code_block(owner: CodeBlockId) -> CodeBlock {
+        linked_p6_test_code_block(vec![
+            typed_core_instruction(0, CoreOpcode::LoopHint),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::NewObject,
+                vec![Operand::Register(local(0))],
+            ),
+            typed_core_instruction_with_operands(
+                2,
+                CoreOpcode::Return,
+                vec![Operand::Register(local(0))],
+            ),
+        ])
+        .with_side_tables(LinkedSideTables {
+            root_maps: vec![runtime_helper_root_map(
+                owner,
+                BytecodeIndex::from_offset(1),
+                BytecodeRootMapId(42),
+            )],
+            ..LinkedSideTables::default()
+        })
     }
 
     fn loop_hint_zero_iteration_code_block() -> CodeBlock {
@@ -54943,6 +54958,112 @@ mod tests {
                 .selected_plan
                 .is_some_and(|plan| plan.kind == TierPlanKind::BaselineFromBytecode)
         }));
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+    }
+
+    #[test]
+    fn vm_interpreter_loop_hint_handoffs_to_generated_baseline_with_runtime_helper_plan() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = vm.allocate_code_block_cell().unwrap();
+        let code_block = loop_hint_runtime_helper_new_object_code_block(owner);
+        vm.code_blocks.register(owner, code_block.clone());
+        let artifact = install_typed_baseline_for_test(&mut vm, owner, 2_210);
+        assert_eq!(
+            artifact
+                .runtime_helper_plan()
+                .map(|plan| plan.proof_count()),
+            Some(1)
+        );
+        let (entry, frame) = enter_runtime_helper_program_frame(&mut vm, owner, &code_block);
+        vm.execution
+            .mark_top_bytecode_index(BytecodeIndex::from_offset(0));
+        let _ = vm.tiering.select_interpreter_entry_plan(TierEntryRequest {
+            owner,
+            entry_kind: crate::interpreter::ExecutionEntryKind::Program,
+            bytecode_index: Some(BytecodeIndex::from_offset(0)),
+            frame: Some(frame),
+            stack_frame: None,
+            bytecode_size: Some(
+                code_block
+                    .unlinked()
+                    .instructions()
+                    .instruction_count()
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            ),
+            inline_cache_count: inline_cache_count(&code_block),
+            policy: vm.config.tiering_policy(),
+        });
+        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        let handoff = match vm.execute_interpreter_code_block_in_current_region(
+            owner,
+            &code_block,
+            &mut host,
+            DispatchConfig::default(),
+        ) {
+            ExecutionCompletion::BaselineLoopHandoff(handoff) => handoff,
+            completion => panic!("expected runtime-helper LoopHint handoff, got {completion:?}"),
+        };
+        let mut region = vm.enter_no_gc_execution_region();
+        let (completion, path) = vm
+            .execute_baseline_loop_handoff_completion_in_current_region(
+                &mut region,
+                owner,
+                &code_block,
+                handoff,
+                crate::interpreter::ExecutionEntryKind::Program,
+                &mut host,
+                DispatchConfig::default(),
+            )
+            .expect("runtime-helper generated loop handoff should not fail no-GC suspension");
+        let completion = vm.leave_no_gc_region_with_completion(region, completion);
+
+        let returned = match completion {
+            ExecutionCompletion::Returned(value) => value,
+            completion => panic!("expected runtime-helper object return, got {completion:?}"),
+        };
+        assert_eq!(
+            heap_cell_type_for_returned_value(&vm, returned),
+            CellType::Object
+        );
+        if vm.execution.frame(frame).is_some() {
+            vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
+        }
+        vm.execution.leave(entry).unwrap();
+        assert_eq!(
+            path,
+            TierEntryExecutionPath::GeneratedCode(JitType::Baseline)
+        );
+        assert_eq!(
+            vm.tiering_integration().entry_decisions().len(),
+            entry_decision_count_before + 1
+        );
+        let handoff_decision = vm
+            .tiering_integration()
+            .entry_decisions()
+            .last()
+            .expect("runtime-helper LoopHint handoff entry decision");
+        assert_eq!(
+            handoff_decision.bytecode_index,
+            Some(BytecodeIndex::from_offset(0))
+        );
+        assert_eq!(
+            handoff_decision.decision,
+            TierEntryDecision::EnterOptimized {
+                tier: JitType::Baseline
+            }
+        );
+        assert_eq!(
+            handoff_decision
+                .baseline_entry_gate
+                .as_ref()
+                .and_then(|gate| gate.generated_artifact.clone()),
+            Some(artifact)
+        );
+        assert_no_gc_execution_depth_observed(&vm, VmNoGcExecutionPathForTest::GeneratedEntry, 1);
         assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
         assert_eq!(vm.heap().no_gc_scope_depth(), 0);
     }
