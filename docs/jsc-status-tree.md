@@ -21,10 +21,14 @@ Legend:
   [wip] Current proof path — core 4/6 pass, full 4/15
     [wip] Octane core (6 benchmarks)
       [done] richards, navier-stokes, crypto, delta-blue (interpreter, scored)
-      [wip] raytrace (same execution path, expected pass)
+      [risk] raytrace render path CORRECT (validated: checkNumber guard reached,
+             monotonic w/ canvas size), but throughput-gated like the suite (30x30
+             render ~57s; official = 15x 100x100/iter) -> NOT a cheap win; same
+             generated-code throughput bottleneck as box2d
       [risk] splay functionally expected pass but pathologically slow (48min+,
              killed): it is the GC-stress benchmark and the engine runs no GC, so
              it allocates unboundedly -> reinforces GC is needed for splay perf
+             (note: box2d RSS is flat, so box2d is NOT a GC problem -- different root)
     [wip] Octane non-core (9 benchmarks)
       [done] non-ASCII strings, replace-with-fn, .5 literals, String.match,
              __defineGetter__/__defineSetter__, global Function, standard Math
@@ -34,16 +38,20 @@ Legend:
                  (typeof eval === undefined). Real eval = runtime parse+compile in
                  caller scope + dynamic scope-chain resolution. Large subsystem, not
                  a quick capture fix. Verified empirically 2026-05-27.
-      [blocked] box2d <= ExpectedInt32 load/runner blockers cleared for
-                 arithmetic ToNumeric primitives and relational object ToPrimitive;
-                 LoopHint opcode/placement, generated-baseline LoopHint counters,
-                 and generated-artifact LLInt LoopHint handoff are in;
-                 generated property IC dependency invalidation now retires the
-                 latest owner artifact when IC snapshots drift; duplicate guarded
-                 property-load sidecar candidates now collapse like C++ AccessCase
-                 replacement. Baseline proof `MakeNewWorld(); true` passes;
-                 `world.Step(1 / 60, 10, 3)` still times out at 120s in the
-                 b2World.Solve throughput path.
+      [blocked] box2d <= interpreter-COMPUTE-bound, NOT GC-bound (RSS flat ~1816kB
+                 across a 64s Step; one Step ~53-60s interpreter CPU). Baseline tier
+                 is currently a ~8.5x NET REGRESSION (MakeNewWorld 39s baseline vs
+                 4.6s interpreter): generated code runs only ~2 bytecodes/entry then
+                 exits+re-enters. Gate is generated-code RESIDENCY, capped by (1)
+                 property-IC attachment in hot b2ContactSolver blocks (sidecar returns
+                 None -> `Property` exit when no plan attached) and (2) user-JS `call`
+                 exits (R.Clamp/SynchronizeTransform always terminate residency; only
+                 native intrinsics stay resident). Non-cell property IC-hit resident
+                 path ALREADY exists; LoopHint-handoff widening was the WRONG lever
+                 (trigger already fires: 729 backedges/47 installs on MakeNewWorld;
+                 residency is the gate, not the trigger). `MakeNewWorld(); true`
+                 passes; `world.Step(1/60,10,3)` times out 120s. Next: measure
+                 exit-reason breakdown, then fix IC attachment and/or resident call.
                  Object/BigInt bitwise and shift coercion remains a separate risk.
       [blocked] regexp <= complex Yarr patterns throw (match works, exec/replace
                  subset works; needs fuller Yarr execute)
@@ -134,7 +142,13 @@ Legend:
   [deferred] Wasm
 
 [wip] Execution tiers and JIT
-  [done] generated baseline execution for accepted subset
+  [done] generated baseline execution for accepted (number/move/jump) subset
+  [risk] baseline is a NET REGRESSION on real code (box2d ~8.5x slower): no native
+         get_by_id/put_by_id/get_by_val/call lowering -> whole-block emitter rejects
+         on first unsupported opcode; executor exits on property (when IC unattached)
+         and on ALL user-JS calls -> ~2 bytecodes/entry on box2d. C++ JIT.cpp compiles
+         EVERY opcode w/ fast path + out-of-line slow-case-callout-that-RETURNS to
+         native. Faithful fix: stay-resident property-IC hits + resident direct-call.
   [wip] emitted native entry
     [done] number-number arithmetic fast path subset
     [wip] native-entry retained side-exit handling
@@ -170,6 +184,8 @@ Legend:
            LLInt LoopHint generated-artifact handoff skeleton,
            generated-baseline LoopHint counters, and native no-op lowering for
            current baseline subset
+    [risk] LoopHint handoff TRIGGER already fires aggressively; residency (not the
+           trigger) is the box2d gate -> further widening admission is counterproductive
     [missing] native inline LoopHint counter/operationOptimize flow matching
               JSC emit_op_loop_hint
     [missing] real loop OSR entry and optimized tier transition
