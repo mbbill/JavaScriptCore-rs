@@ -1478,13 +1478,46 @@ impl TargetedRootSet {
         Ok(root)
     }
 
+    /// Evaluate a single register/retarget/unregister against the live set in
+    /// O(1) amortized time.
+    ///
+    /// The previous implementation re-validated the *entire* set on every
+    /// mutation (`self.validate(heap)` plus a second
+    /// `RootSet::from_records(...).evaluate_mutation(...)`), making each
+    /// mutation O(records^2) and call-heavy interpreter code O(instructions x
+    /// records^2). That full-set re-validation is redundant defensive work:
+    /// `from_records`/`register`/`retarget`/`unregister` maintain the set
+    /// invariant (no duplicate ids, every record valid for `heap`)
+    /// incrementally, so if the set was valid before this mutation and the
+    /// single mutation is valid, the set stays valid. We therefore drop the
+    /// full-set re-validation and resolve existence through the O(1) `index`,
+    /// while raising exactly the same errors in the same order as the old
+    /// path:
+    ///   1. `mutation.record.heap != heap` -> `HeapMismatch` (unchanged).
+    ///   2. validate the single mutated record (targeted-record validation for
+    ///      register/retarget, plain root validation for unregister) -
+    ///      unchanged, only the *one* record is checked instead of every
+    ///      record.
+    ///   3. the body of `RootSet::evaluate_mutation`
+    ///      (`validate_root_record` + `validate_root_authority` + existing-root
+    ///      heap match + Register/Unregister/Retarget -> Duplicate/Unknown/OK),
+    ///      with the linear `records.iter().find(id)` existence scan replaced by
+    ///      an O(1) `self.index.get(&id)` lookup. Existence semantics are
+    ///      identical because both match on `RootId` alone and `index` mirrors
+    ///      `records` one-to-one.
+    ///
+    /// Safety: the dropped full-set `validate(heap)` could in principle have
+    /// caught a pre-existing duplicate or invalid record already living in the
+    /// set. That state is unreachable here: every prior mutation went through
+    /// this same validated path (or `from_records`, which validates eagerly),
+    /// so the set is always valid on entry. There is no public API that can
+    /// inject an unvalidated record into `records`/`index`.
     fn evaluate_targeted_mutation(
         &self,
         heap: HeapId,
         mutation: RootSetMutation,
         record: Option<TargetedRootRecord>,
     ) -> Result<RootSetMutationOutcome, RootSetSemanticError> {
-        self.validate(heap)?;
         if mutation.record.heap != heap {
             return Err(RootSetSemanticError::HeapMismatch {
                 expected: heap,
@@ -1496,8 +1529,46 @@ impl TargetedRootSet {
         } else {
             validate_root_record(mutation.record)?;
         }
-        RootSet::from_records(self.records.iter().map(|record| record.root).collect())?
-            .evaluate_mutation(mutation)
+
+        // Inlined `RootSet::evaluate_mutation`, with the linear existence scan
+        // replaced by the O(1) index lookup. Matches its checks and error
+        // order exactly.
+        validate_root_record(mutation.record)?;
+        validate_root_authority(mutation.record.kind, mutation.authority)?;
+
+        let existing = self
+            .index
+            .get(&mutation.record.id)
+            .map(|&position| &self.records[position]);
+        if let Some(existing) = existing {
+            if existing.root.heap != mutation.record.heap {
+                return Err(RootSetSemanticError::HeapMismatch {
+                    expected: existing.root.heap,
+                    actual: mutation.record.heap,
+                });
+            }
+        }
+
+        match mutation.kind {
+            RootSetMutationKind::Register if existing.is_some() => {
+                Err(RootSetSemanticError::DuplicateRoot(mutation.record.id))
+            }
+            RootSetMutationKind::Register => {
+                Ok(RootSetMutationOutcome::Registered(mutation.record))
+            }
+            RootSetMutationKind::Unregister if existing.is_none() => {
+                Err(RootSetSemanticError::UnknownRoot(mutation.record.id))
+            }
+            RootSetMutationKind::Unregister => {
+                Ok(RootSetMutationOutcome::Unregistered(mutation.record.id))
+            }
+            RootSetMutationKind::Retarget if existing.is_none() => {
+                Err(RootSetSemanticError::UnknownRoot(mutation.record.id))
+            }
+            RootSetMutationKind::Retarget => {
+                Ok(RootSetMutationOutcome::Retargeted(mutation.record))
+            }
+        }
     }
 }
 
