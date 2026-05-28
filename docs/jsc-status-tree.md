@@ -37,9 +37,10 @@ Legend:
       [blocked] box2d <= ExpectedInt32 load/runner blockers cleared for
                  arithmetic ToNumeric primitives and relational object ToPrimitive;
                  MakeNewWorld returns, but one world.Step still rejects under
-                 --baseline. LoopHint opcode/placement groundwork is in; native
-                 generated paths still report profile_loop_backedges=0, so next
-                 blocker is baseline/native loop-hint counter flow for Step/Solve.
+                 --baseline. LoopHint opcode/placement and generated-baseline
+                 LoopHint counters are in (Step probe now reports
+                 profile_loop_backedges=92); next blocker is the remaining
+                 BaselineGeneratedExecutionRejected path in Step/Solve.
                  Object/BigInt bitwise and shift coercion remains a separate risk.
       [blocked] regexp <= complex Yarr patterns throw (match works, exec/replace
                  subset works; needs fuller Yarr execute)
@@ -163,8 +164,10 @@ Legend:
   [missing] optimized JIT parity path
   [wip] loop tiering and OSR
     [done] LoopHint opcode, JSC loop-header placement, interpreter telemetry,
-           and native no-op lowering for current baseline subset
-    [missing] baseline/native LoopHint counter flow matching JSC emit_op_loop_hint
+           generated-baseline LoopHint counters, and native no-op lowering for
+           current baseline subset
+    [missing] native inline LoopHint counter/operationOptimize flow matching
+              JSC emit_op_loop_hint
     [missing] real loop OSR entry and optimized tier transition
   [missing] DFG/FTL-equivalent strategy or justified parity route
 

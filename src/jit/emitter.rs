@@ -10093,11 +10093,12 @@ fn lower_p6_x86_64_decoded_instruction_for_subset(
         CoreOpcode::LoopHint => {
             validate_p6_operand_count(instruction, opcode, 0)?;
             // C++ baseline JIT's emit_op_loop_hint increments optimization
-            // counters and may enter the slow optimizer path. Rust lowers the
-            // hint as a generated no-op for now: VM interpreter dispatch records
-            // LoopBackedge telemetry at this bytecode index, while native
-            // generated execution keeps the existing P14 backward-branch
-            // safepoints as the native loop telemetry point.
+            // counters and may enter the slow optimizer path at this bytecode
+            // index. Rust lowers the hint as a native no-op for now: the
+            // generated-body executor reports LoopHint telemetry through
+            // BaselineGeneratedExecutionMetrics, while P14 backward-branch
+            // safepoints remain a separate native reentry mechanism rather
+            // than the JSC baseline LoopHint counter.
             P6X86_64BaselineLoweredOperation::LoopHint
         }
         CoreOpcode::LoadUndefined => {

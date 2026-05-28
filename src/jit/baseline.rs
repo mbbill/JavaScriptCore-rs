@@ -82,9 +82,39 @@ pub(crate) enum BaselineGeneratedExecutionWithRuntimeHelpersResult {
     RuntimeHelper(BaselineGeneratedRuntimeHelperHandoff),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BaselineGeneratedLoopHintObservation {
+    pub(crate) bytecode_index: BytecodeIndex,
+    pub(crate) count: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BaselineGeneratedExecutionMetrics {
     pub(crate) executed_bytecode_count: u64,
+    loop_hint_observations: Vec<BaselineGeneratedLoopHintObservation>,
+}
+
+impl BaselineGeneratedExecutionMetrics {
+    fn record_loop_hint(&mut self, bytecode_index: BytecodeIndex) {
+        if let Some(observation) = self
+            .loop_hint_observations
+            .iter_mut()
+            .find(|observation| observation.bytecode_index == bytecode_index)
+        {
+            observation.count = observation.count.saturating_add(1);
+            return;
+        }
+
+        self.loop_hint_observations
+            .push(BaselineGeneratedLoopHintObservation {
+                bytecode_index,
+                count: 1,
+            });
+    }
+
+    pub(crate) fn loop_hint_observations(&self) -> &[BaselineGeneratedLoopHintObservation] {
+        &self.loop_hint_observations
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2077,6 +2107,9 @@ fn execute_baseline_generated_code_internal(
         execution.stack.mark_top_bytecode_index(bytecode_index);
         if let Some(metrics) = metrics.as_deref_mut() {
             metrics.executed_bytecode_count = metrics.executed_bytecode_count.saturating_add(1);
+            if CoreOpcode::from_opcode(instruction.opcode) == Some(CoreOpcode::LoopHint) {
+                metrics.record_loop_hint(bytecode_index);
+            }
         }
 
         let outcome = match execute_instruction(
@@ -2906,6 +2939,13 @@ fn execute_instruction(
         }
         CoreOpcode::JumpIfNotNullish => {
             execute_jump_if_not_nullish(code_block, window, execution, instruction, fallback)
+        }
+        CoreOpcode::LoopHint => {
+            // C++ emit_op_loop_hint increments the baseline execute counter at
+            // this bytecode index. The Rust generated-body executor records
+            // that in BaselineGeneratedExecutionMetrics before dispatching the
+            // instruction, so the bytecode operation itself is a no-op here.
+            Ok(BaselineInstructionOutcome::Continue)
         }
         CoreOpcode::LogicalNot => {
             execute_logical_not(code_block, window, execution, instruction, fallback)

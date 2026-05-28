@@ -8231,6 +8231,22 @@ impl Vm {
         metrics: BaselineGeneratedExecutionMetrics,
         outcome: VmBaselineGeneratedExecutionOutcome,
     ) {
+        // C++ Baseline JIT increments BaselineJITData::m_executeCounter in
+        // JIT::emit_op_loop_hint and slow-paths operationOptimize at the
+        // LoopHint bytecode index. The Rust generated executor cannot borrow
+        // Vm tiering while it also owns the interpreter stack/register/heap
+        // execution borrows, so baseline.rs aggregates executed LoopHint
+        // indices and Vm replays them into tiering after the generated body
+        // returns. Real loop OSR entry remains a separate tiering batch.
+        for observation in metrics.loop_hint_observations() {
+            for _ in 0..observation.count {
+                self.tiering.observe_loop_backedge(
+                    owner,
+                    self.config.tiering_policy(),
+                    observation.bytecode_index,
+                );
+            }
+        }
         self.tiering
             .record_baseline_generated_execution(VmBaselineGeneratedExecutionRequest {
                 owner,
@@ -54531,6 +54547,73 @@ mod tests {
             vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
         }
         vm.execution.leave(entry).unwrap();
+        assert_eq!(
+            vm.tiering_integration().profile_loop_backedge_count(),
+            loop_count_before
+        );
+        assert!(vm
+            .tiering_integration()
+            .profile_records()
+            .iter()
+            .skip(profile_count_before)
+            .all(|record| record.event != TierProfileEvent::LoopBackedge));
+    }
+
+    #[test]
+    fn vm_generated_baseline_records_loop_hint_backedges_at_loop_hint_index() {
+        let code_block = loop_hint_counter_code_block();
+        let expected = ExecutionCompletion::Returned(RuntimeValue::from_i32(3));
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        install_typed_baseline_for_test(&mut vm, owner, 2_206);
+        let profile_count_before = vm.tiering_integration().profile_records().len();
+        let loop_count_before = vm.tiering_integration().profile_loop_backedge_count();
+        let mut host = InterpreterDispatchMustNotRun;
+
+        let completion =
+            execute_registered_code_block_with_host(&mut vm, owner, &code_block, &mut host);
+
+        assert_eq!(completion, expected);
+        assert_no_gc_execution_depth_observed(&vm, VmNoGcExecutionPathForTest::GeneratedEntry, 1);
+        assert_eq!(
+            vm.tiering_integration().profile_loop_backedge_count(),
+            loop_count_before + 3
+        );
+        let backedge_records = vm
+            .tiering_integration()
+            .profile_records()
+            .iter()
+            .skip(profile_count_before)
+            .filter(|record| {
+                record.owner == owner && record.event == TierProfileEvent::LoopBackedge
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backedge_records.len(), 3);
+        assert!(backedge_records
+            .iter()
+            .all(|record| { record.bytecode_index == Some(BytecodeIndex::from_offset(5)) }));
+        assert!(backedge_records
+            .iter()
+            .all(|record| { record.bytecode_index != Some(BytecodeIndex::from_offset(9)) }));
+        assert_eq!(backedge_records.last().unwrap().counters.loop_count, 3);
+    }
+
+    #[test]
+    fn vm_generated_baseline_skips_loop_hint_for_zero_iteration_loop() {
+        let code_block = loop_hint_zero_iteration_code_block();
+        let expected = ExecutionCompletion::Returned(RuntimeValue::from_i32(0));
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        install_typed_baseline_for_test(&mut vm, owner, 2_207);
+        let profile_count_before = vm.tiering_integration().profile_records().len();
+        let loop_count_before = vm.tiering_integration().profile_loop_backedge_count();
+        let mut host = InterpreterDispatchMustNotRun;
+
+        let completion =
+            execute_registered_code_block_with_host(&mut vm, owner, &code_block, &mut host);
+
+        assert_eq!(completion, expected);
+        assert_no_gc_execution_depth_observed(&vm, VmNoGcExecutionPathForTest::GeneratedEntry, 1);
         assert_eq!(
             vm.tiering_integration().profile_loop_backedge_count(),
             loop_count_before
