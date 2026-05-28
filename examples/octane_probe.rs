@@ -1723,6 +1723,7 @@ fn completion_kind(completion: &ExecutionCompletion) -> &'static str {
         ExecutionCompletion::Threw(_) => "threw",
         ExecutionCompletion::OrdinaryBytecodeCall(_) => "ordinary-bytecode-call",
         ExecutionCompletion::OrdinaryBytecodeConstruct(_) => "ordinary-bytecode-construct",
+        ExecutionCompletion::BaselineLoopHandoff(_) => "baseline-loop-handoff",
         ExecutionCompletion::FunctionValueCall(_) => "function-value-call",
         ExecutionCompletion::Terminated(_) => "terminated",
         ExecutionCompletion::Suspended(_) => "suspended",

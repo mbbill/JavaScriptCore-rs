@@ -52,7 +52,8 @@ use crate::jit::{
     PropertyLoadBaseNormalization, PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome,
     PropertyLoadGuardPlan, PropertyLoadGuardRequirement, PropertyLoadObservationChainEntry,
     PropertyLoadObservationDescriptor, PropertyLoadObservationReadiness,
-    PropertyStoreAccessCasePlanKind, WatchpointFireEvent, WatchpointSetId, WatchpointTarget,
+    PropertyStoreAccessCasePlanKind, TierPlanDescriptor, WatchpointFireEvent, WatchpointSetId,
+    WatchpointTarget,
 };
 use crate::object::{
     PropertyCacheability, PropertyLookupMode, PropertyOffset, WatchpointKind, WatchpointSet,
@@ -1846,6 +1847,7 @@ pub(crate) fn finish_ordinary_js_call_return(
         }
         ExecutionCompletion::OrdinaryBytecodeCall(_)
         | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
+        | ExecutionCompletion::BaselineLoopHandoff(_)
         | ExecutionCompletion::FunctionValueCall(_)
         | ExecutionCompletion::Terminated(_)
         | ExecutionCompletion::Suspended(_) => {
@@ -16473,6 +16475,7 @@ impl CoreOpcodeDispatchHost {
             ExecutionCompletion::Failed(error) => Err(DispatchOutcome::Fail(error)),
             ExecutionCompletion::OrdinaryBytecodeCall(_)
             | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
+            | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => {
@@ -16515,6 +16518,7 @@ impl CoreOpcodeDispatchHost {
             DispatchOutcome::Throw(_) => CallObservationOutcome::Threw,
             DispatchOutcome::Jump(_)
             | DispatchOutcome::Return(_)
+            | DispatchOutcome::BaselineLoopHandoff(_)
             | DispatchOutcome::OrdinaryBytecodeCall(_)
             | DispatchOutcome::OrdinaryBytecodeConstruct(_)
             | DispatchOutcome::FunctionValueCall(_)
@@ -18068,6 +18072,7 @@ impl CoreOpcodeDispatchHost {
             ExecutionCompletion::Failed(error) => DispatchOutcome::Fail(error),
             ExecutionCompletion::OrdinaryBytecodeCall(_)
             | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
+            | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => {
@@ -25685,6 +25690,7 @@ fn property_store_outcome_from_dispatch_error(
         | DispatchOutcome::ContinueTo(_)
         | DispatchOutcome::Jump(_)
         | DispatchOutcome::Return(_)
+        | DispatchOutcome::BaselineLoopHandoff(_)
         | DispatchOutcome::OrdinaryBytecodeCall(_)
         | DispatchOutcome::OrdinaryBytecodeConstruct(_)
         | DispatchOutcome::FunctionValueCall(_)
@@ -26179,6 +26185,33 @@ impl BaselineFallbackRequest {
     }
 }
 
+/// Interpreter-to-VM LLInt loop handoff for a selected baseline plan.
+///
+/// The resume shape is the same validated active-frame boundary used by
+/// baseline fallback. The VM owns baseline entry gating/materialization because
+/// the interpreter dispatch loop cannot borrow the VM while it is also cleaning
+/// frame/register roots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BaselineLoopHandoffRequest {
+    pub(crate) resume: BaselineFallbackRequest,
+    pub(crate) next_bytecode_index: Option<BytecodeIndex>,
+    pub(crate) selected_plan: TierPlanDescriptor,
+}
+
+impl BaselineLoopHandoffRequest {
+    pub(crate) const fn new(
+        resume: BaselineFallbackRequest,
+        next_bytecode_index: Option<BytecodeIndex>,
+        selected_plan: TierPlanDescriptor,
+    ) -> Self {
+        Self {
+            resume,
+            next_bytecode_index,
+            selected_plan,
+        }
+    }
+}
+
 /// VM-owned generated helpers use this boundary to execute one decoded
 /// interpreter instruction without entering the bytecode loop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26317,6 +26350,7 @@ pub enum DispatchOutcome {
     Jump(BytecodeIndex),
     Return(RuntimeValue),
     Throw(RuntimeValue),
+    BaselineLoopHandoff(BaselineLoopHandoffRequest),
     OrdinaryBytecodeCall(Box<OrdinaryBytecodeCallRequest>),
     OrdinaryBytecodeConstruct(Box<OrdinaryBytecodeConstructRequest>),
     FunctionValueCall(Box<FunctionValueCallRequest>),
@@ -26328,6 +26362,7 @@ pub enum DispatchOutcome {
 pub enum ExecutionCompletion {
     Returned(RuntimeValue),
     Threw(PendingException),
+    BaselineLoopHandoff(BaselineLoopHandoffRequest),
     OrdinaryBytecodeCall(Box<OrdinaryBytecodeCallRequest>),
     OrdinaryBytecodeConstruct(Box<OrdinaryBytecodeConstructRequest>),
     FunctionValueCall(Box<FunctionValueCallRequest>),
@@ -26895,6 +26930,14 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                     ExecutionCompletion::Returned(value),
                 );
             }
+            DispatchOutcome::BaselineLoopHandoff(request) => {
+                return finish_with_targeted_root_cleanup(
+                    execution.heap,
+                    &mut active_targeted_register_roots,
+                    &mut active_targeted_frame_roots,
+                    ExecutionCompletion::BaselineLoopHandoff(request),
+                );
+            }
             DispatchOutcome::OrdinaryBytecodeCall(request) => {
                 return finish_with_targeted_root_cleanup(
                     execution.heap,
@@ -27047,6 +27090,9 @@ fn map_single_dispatch_outcome(
             }
         }
         DispatchOutcome::Return(value) => SingleDispatchOutcome::Return(value),
+        DispatchOutcome::BaselineLoopHandoff(_) => {
+            SingleDispatchOutcome::Failed(ExecutionError::BaselineGeneratedExecutionRejected)
+        }
         DispatchOutcome::OrdinaryBytecodeCall(request) => {
             if call_handling.ordinary_bytecode_call == OrdinaryBytecodeCallHandling::DeferToVm {
                 SingleDispatchOutcome::OrdinaryBytecodeCall(request)

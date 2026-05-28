@@ -36,13 +36,14 @@ Legend:
                  a quick capture fix. Verified empirically 2026-05-27.
       [blocked] box2d <= ExpectedInt32 load/runner blockers cleared for
                  arithmetic ToNumeric primitives and relational object ToPrimitive;
-                 LoopHint opcode/placement and generated-baseline LoopHint counters
-                 are in; generated property IC dependency invalidation now retires
-                 the latest owner artifact when IC snapshots drift; duplicate
-                 guarded property-load sidecar candidates now collapse like C++
-                 AccessCase replacement. Baseline proof `MakeNewWorld(); true`
-                 passes; `world.Step(1 / 60, 10, 3)` still times out at 120s in
-                 the b2World.Solve throughput path.
+                 LoopHint opcode/placement, generated-baseline LoopHint counters,
+                 and direct generated-baseline LLInt LoopHint handoff are in;
+                 generated property IC dependency invalidation now retires the
+                 latest owner artifact when IC snapshots drift; duplicate guarded
+                 property-load sidecar candidates now collapse like C++ AccessCase
+                 replacement. Baseline proof `MakeNewWorld(); true` passes;
+                 `world.Step(1 / 60, 10, 3)` still times out at 120s in the
+                 b2World.Solve throughput path.
                  Object/BigInt bitwise and shift coercion remains a separate risk.
       [blocked] regexp <= complex Yarr patterns throw (match works, exec/replace
                  subset works; needs fuller Yarr execute)
@@ -166,6 +167,7 @@ Legend:
   [missing] optimized JIT parity path
   [wip] loop tiering and OSR
     [done] LoopHint opcode, JSC loop-header placement, interpreter telemetry,
+           LLInt LoopHint direct generated-baseline handoff skeleton,
            generated-baseline LoopHint counters, and native no-op lowering for
            current baseline subset
     [missing] native inline LoopHint counter/operationOptimize flow matching

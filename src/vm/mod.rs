@@ -57,11 +57,11 @@ use crate::interpreter::{
     pop_call_return_callee, sync_targeted_frame_roots, sync_targeted_nonlocal_frame_roots,
     sync_targeted_nonlocal_register_roots, sync_targeted_register_roots,
     validate_call_return_continuation, validate_construct_return_continuation,
-    BaselineFallbackRequest, CallObservationDescriptor, CallObservationDrainRequest,
-    CallObservationOutcome, CallReturnContinuation, ConstructReturnContinuation,
-    CoreGlobalLexicalDeclaration, CoreGlobalLexicalDeclarationKind, CoreHostOutputRecord,
-    CoreHostResultRecord, CoreOpcodeDispatchHost, DispatchConfig, DispatchHost,
-    DispatchInstruction, DispatchOutcome, DispatchState, ExecutionCompletion,
+    BaselineFallbackRequest, BaselineLoopHandoffRequest, CallObservationDescriptor,
+    CallObservationDrainRequest, CallObservationOutcome, CallReturnContinuation,
+    ConstructReturnContinuation, CoreGlobalLexicalDeclaration, CoreGlobalLexicalDeclarationKind,
+    CoreHostOutputRecord, CoreHostResultRecord, CoreOpcodeDispatchHost, DispatchConfig,
+    DispatchHost, DispatchInstruction, DispatchOutcome, DispatchState, ExecutionCompletion,
     ExecutionContextStack, ExecutionEntryRecord, ExecutionError, ExecutionRootSnapshot,
     FramePushRequest, FunctionValueCallCompletion, FunctionValueCallHandling,
     FunctionValueCallRequest, FunctionValueCallTailCompletion, FunctionValuePropertyObservation,
@@ -1229,6 +1229,12 @@ impl GeneratedExecutionControl {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoGcAutoInstallFailure {
+    ActiveRegion,
+    AbandonedRegion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GeneratedSingleDispatchExitTransaction {
     resume: GeneratedSingleDispatchResume,
     requires_no_gc_exit_reentry: bool,
@@ -1438,11 +1444,11 @@ impl<H: DispatchHost> DispatchHost for RuntimeHelperRootMapDispatchHost<'_, H> {
     }
 }
 
-// C++ JSC's LLInt handles op_loop_hint inside the interpreter/tiering slow path.
-// Rust needs a host wrapper so interpreter dispatch can borrow VM tiering state
-// while still forwarding the existing DispatchHost hooks for roots, ICs, calls,
-// watchpoints, and generated handoffs. This records the loop hint as telemetry;
-// real loop OSR entry remains a separate tiering batch.
+// C++ JSC's LLInt handles op_loop_hint by running checkSwitchToJITForLoop and
+// calling _llint_loop_osr, which returns a baseline entry target for the current
+// LoopHint bytecode index. Rust keeps that boundary in a host wrapper so the
+// interpreter can finish targeted-root cleanup before the VM borrows itself to
+// gate/materialize and enter baseline code.
 struct VmLoopHintDispatchHost<'host, H> {
     inner: &'host mut H,
     tiering: &'host mut tiering::VmTieringIntegration,
@@ -1674,8 +1680,31 @@ impl<H: DispatchHost> DispatchHost for VmLoopHintDispatchHost<'_, H> {
         if self.observes_loop_hints()
             && CoreOpcode::from_opcode(instruction.opcode) == Some(CoreOpcode::LoopHint)
         {
-            self.tiering
-                .observe_loop_backedge(self.owner, self.policy, instruction.bytecode_index);
+            let selected_plan = self.tiering.observe_loop_backedge(
+                self.owner,
+                self.policy,
+                instruction.bytecode_index,
+            );
+            if let Some(plan) = selected_plan {
+                if plan.kind == TierPlanKind::BaselineFromBytecode
+                    && plan.to_tier == JitType::Baseline
+                {
+                    return DispatchOutcome::BaselineLoopHandoff(BaselineLoopHandoffRequest::new(
+                        BaselineFallbackRequest::new(
+                            self.owner,
+                            instruction.frame,
+                            instruction.bytecode_index,
+                        ),
+                        instruction.next_bytecode_index,
+                        plan,
+                    ));
+                }
+                // C++ Baseline JIT handles optimized loop OSR from
+                // JIT::emitSlow_op_loop_hint via operationOptimize. This LLInt
+                // skeleton only performs the baseline _llint_loop_osr handoff,
+                // so non-baseline plans stay recorded telemetry and continue in
+                // the interpreter until the optimized OSR skeleton exists.
+            }
         }
         self.inner.dispatch_instruction(state, instruction)
     }
@@ -2623,6 +2652,43 @@ impl Vm {
                         generated,
                     },
                 );
+            }
+        }
+    }
+
+    fn try_p15_auto_install_selected_baseline_entry_with_no_gc_suspension(
+        &mut self,
+        region: &mut VmNoGcRegion,
+        owner: CodeBlockId,
+        code_block: &CodeBlock,
+        selection: &TierEntryPlanSelection,
+        gate: Option<BaselineEntryGateRecord>,
+    ) -> Result<(), NoGcAutoInstallFailure> {
+        if self
+            .selected_entry_plan_p15_auto_baseline_install_mode(
+                owner,
+                code_block,
+                selection,
+                gate.as_ref(),
+            )
+            .is_none()
+        {
+            return Ok(());
+        }
+
+        let suspended = match self.suspend_no_gc_execution_region() {
+            Ok(suspended) => suspended,
+            Err(_) => return Err(NoGcAutoInstallFailure::ActiveRegion),
+        };
+        self.try_p15_auto_install_selected_baseline_entry(owner, code_block, selection, gate);
+        match self.resume_no_gc_execution_region(suspended) {
+            Ok(resumed) => {
+                *region = resumed;
+                Ok(())
+            }
+            Err(_) => {
+                let _ = self.abandon_suspended_no_gc_execution_region(suspended);
+                Err(NoGcAutoInstallFailure::AbandonedRegion)
             }
         }
     }
@@ -4100,43 +4166,27 @@ impl Vm {
         let pre_install_gate = self
             .tiering
             .baseline_entry_gate_for_plan(code_block_id, entry_selection.selected_plan);
-        if self
-            .selected_entry_plan_p15_auto_baseline_install_mode(
-                code_block_id,
-                code_block,
-                &entry_selection,
-                pre_install_gate.as_ref(),
-            )
-            .is_some()
-        {
-            let suspended = match self.suspend_no_gc_execution_region() {
-                Ok(suspended) => suspended,
-                Err(_) => {
-                    return self.finish_execute_code_block_gc_boundary_failure(
-                        Some(region),
-                        code_block_id,
-                        entry_kind,
-                    )
-                }
-            };
-            self.try_p15_auto_install_selected_baseline_entry(
-                code_block_id,
-                code_block,
-                &entry_selection,
-                pre_install_gate,
-            );
-            match self.resume_no_gc_execution_region(suspended) {
-                Ok(resumed) => {
-                    region = resumed;
-                }
-                Err(_) => {
-                    let _ = self.abandon_suspended_no_gc_execution_region(suspended);
-                    return self.finish_execute_code_block_gc_boundary_failure(
-                        None,
-                        code_block_id,
-                        entry_kind,
-                    );
-                }
+        match self.try_p15_auto_install_selected_baseline_entry_with_no_gc_suspension(
+            &mut region,
+            code_block_id,
+            code_block,
+            &entry_selection,
+            pre_install_gate,
+        ) {
+            Ok(()) => {}
+            Err(NoGcAutoInstallFailure::ActiveRegion) => {
+                return self.finish_execute_code_block_gc_boundary_failure(
+                    Some(region),
+                    code_block_id,
+                    entry_kind,
+                )
+            }
+            Err(NoGcAutoInstallFailure::AbandonedRegion) => {
+                return self.finish_execute_code_block_gc_boundary_failure(
+                    None,
+                    code_block_id,
+                    entry_kind,
+                );
             }
         }
         let boundary = self.fallback_boundary_snapshot();
@@ -4242,6 +4292,36 @@ impl Vm {
                         host,
                         config,
                     ),
+                ExecutionCompletion::BaselineLoopHandoff(handoff) => {
+                    match self.execute_baseline_loop_handoff_completion_in_current_region(
+                        &mut region,
+                        code_block_id,
+                        code_block,
+                        handoff,
+                        entry_kind,
+                        host,
+                        config,
+                    ) {
+                        Ok((completion, path)) => {
+                            completion_path = path;
+                            completion
+                        }
+                        Err(NoGcAutoInstallFailure::ActiveRegion) => {
+                            return self.finish_execute_code_block_gc_boundary_failure(
+                                Some(region),
+                                code_block_id,
+                                entry_kind,
+                            )
+                        }
+                        Err(NoGcAutoInstallFailure::AbandonedRegion) => {
+                            return self.finish_execute_code_block_gc_boundary_failure(
+                                None,
+                                code_block_id,
+                                entry_kind,
+                            );
+                        }
+                    }
+                }
                 done => {
                     completion = done;
                     break;
@@ -4566,6 +4646,187 @@ impl Vm {
             &mut host,
             config,
         )
+    }
+
+    fn baseline_loop_handoff_entry_selection(
+        &self,
+        owner: CodeBlockId,
+        code_block: &CodeBlock,
+        handoff: BaselineLoopHandoffRequest,
+        entry_kind: crate::interpreter::ExecutionEntryKind,
+    ) -> Result<TierEntryPlanSelection, ExecutionError> {
+        let resume = handoff.resume;
+        let plan = handoff.selected_plan;
+        if resume.code_block != owner {
+            return Err(ExecutionError::CodeBlockMismatch {
+                expected: owner,
+                actual: Some(resume.code_block),
+            });
+        }
+        if plan.owner != owner
+            || plan.kind != TierPlanKind::BaselineFromBytecode
+            || plan.to_tier != JitType::Baseline
+        {
+            return Err(ExecutionError::BaselineGeneratedExecutionRejected);
+        }
+        let instruction = code_block
+            .decoded_instruction_at(resume.bytecode_index)
+            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+        if CoreOpcode::from_opcode(instruction.opcode) != Some(CoreOpcode::LoopHint) {
+            return Err(ExecutionError::BaselineGeneratedExecutionRejected);
+        }
+
+        Ok(TierEntryPlanSelection {
+            request: TierEntryRequest {
+                owner,
+                entry_kind,
+                bytecode_index: Some(resume.bytecode_index),
+                frame: Some(resume.frame),
+                stack_frame: None,
+                bytecode_size: Some(
+                    code_block
+                        .unlinked()
+                        .instructions()
+                        .instruction_count()
+                        .try_into()
+                        .unwrap_or(u32::MAX),
+                ),
+                inline_cache_count: inline_cache_count(code_block),
+                policy: self.config.tiering_policy(),
+            },
+            selected_plan: Some(plan),
+            current_tier: plan.from_tier,
+            counters: plan.profile.counters,
+            thresholds: plan.profile.thresholds,
+        })
+    }
+
+    fn continue_interpreter_after_declined_loop_handoff<H: DispatchHost>(
+        &mut self,
+        handoff: BaselineLoopHandoffRequest,
+        code_block: &CodeBlock,
+        host: &mut H,
+        config: DispatchConfig,
+    ) -> ExecutionCompletion {
+        let Some(next) = handoff.next_bytecode_index else {
+            return ExecutionCompletion::Returned(RuntimeValue::undefined());
+        };
+        self.execute_baseline_fallback_in_current_region(
+            BaselineFallbackRequest::new(handoff.resume.code_block, handoff.resume.frame, next),
+            code_block,
+            host,
+            config,
+        )
+    }
+
+    fn baseline_loop_handoff_generated_artifact_is_direct(
+        artifact: &BaselineGeneratedCodeArtifact,
+    ) -> bool {
+        artifact.runtime_helper_plan().is_none()
+            && artifact.property_handoff_plan().is_none()
+            && artifact
+                .owner_continuation_map()
+                .is_none_or(|map| map.call_site_count() == 0)
+    }
+
+    fn execute_baseline_loop_handoff_completion_in_current_region<H: DispatchHost>(
+        &mut self,
+        _region: &mut VmNoGcRegion,
+        owner: CodeBlockId,
+        code_block: &CodeBlock,
+        handoff: BaselineLoopHandoffRequest,
+        entry_kind: crate::interpreter::ExecutionEntryKind,
+        host: &mut H,
+        config: DispatchConfig,
+    ) -> Result<(ExecutionCompletion, TierEntryExecutionPath), NoGcAutoInstallFailure> {
+        let selection = match self
+            .baseline_loop_handoff_entry_selection(owner, code_block, handoff, entry_kind)
+        {
+            Ok(selection) => selection,
+            Err(error) => {
+                return Ok((
+                    ExecutionCompletion::Failed(error),
+                    TierEntryExecutionPath::Interpreter,
+                ))
+            }
+        };
+        let pre_install_gate = self
+            .tiering
+            .baseline_entry_gate_for_plan(owner, selection.selected_plan);
+        let has_generated_loop_entry = pre_install_gate
+            .as_ref()
+            .filter(|gate| gate.outcome == BaselineEntryGateOutcome::Eligible)
+            .and_then(|gate| gate.generated_artifact.as_ref())
+            .is_some_and(Self::baseline_loop_handoff_generated_artifact_is_direct);
+        if !has_generated_loop_entry {
+            // C++ _llint_loop_osr jumps to JITCodeMap::find(current LoopHint).
+            // Rust generated baseline can honor the active frame bytecode
+            // index for direct artifacts. Artifacts that rely on runtime
+            // helper/property/JS-call continuation side metadata still need a
+            // mid-loop continuation skeleton, and emitted native baseline entry
+            // still starts at the artifact entrypoint. Decline those cases
+            // until Rust has the matching C++ code-location/continuation maps.
+            return Ok((
+                self.continue_interpreter_after_declined_loop_handoff(
+                    handoff, code_block, host, config,
+                ),
+                TierEntryExecutionPath::Interpreter,
+            ));
+        }
+
+        let boundary = self.fallback_boundary_snapshot();
+        let entry_decision = self
+            .tiering
+            .commit_interpreter_entry_decision(selection, boundary);
+        self.record_baseline_native_entry_launch_descriptor_if_ready(
+            owner,
+            code_block,
+            &entry_decision,
+        );
+
+        // C++ _llint_loop_osr jumps to JITCodeMap::find(current LoopHint).
+        // Rust baseline bodies do not yet expose a per-bytecode code-location
+        // map; generated baseline reads the active frame's bytecode index, so
+        // the VM marks the frame at LoopHint before entering baseline.
+        self.execution
+            .mark_top_bytecode_index(handoff.resume.bytecode_index);
+
+        match entry_decision.decision {
+            TierEntryDecision::EnterOptimized {
+                tier: JitType::Baseline,
+            } => {
+                #[cfg(test)]
+                self.record_no_gc_execution_depth_observation_for_test(
+                    VmNoGcExecutionPathForTest::GeneratedEntry,
+                );
+                Ok((
+                    self.execute_baseline_generated_code_in_current_region(
+                        owner,
+                        code_block,
+                        Some(handoff.resume.frame),
+                        entry_decision.entry_kind,
+                        entry_decision.current_tier,
+                        host,
+                        config,
+                    ),
+                    TierEntryExecutionPath::GeneratedCode(JitType::Baseline),
+                ))
+            }
+            TierEntryDecision::EnterNative {
+                tier: JitType::Baseline,
+            } => Ok((
+                self.continue_interpreter_after_declined_loop_handoff(
+                    handoff, code_block, host, config,
+                ),
+                TierEntryExecutionPath::Interpreter,
+            )),
+            _ => Ok((
+                self.continue_interpreter_after_declined_loop_handoff(
+                    handoff, code_block, host, config,
+                ),
+                TierEntryExecutionPath::Interpreter,
+            )),
+        }
     }
 
     fn execute_baseline_native_entry_shim_in_current_region<H: DispatchHost>(
@@ -8324,6 +8585,9 @@ impl Vm {
             }
             ExecutionCompletion::FunctionValueCall(_) => {
                 VmBaselineGeneratedExecutionOutcome::FunctionValueCall
+            }
+            ExecutionCompletion::BaselineLoopHandoff(_) => {
+                VmBaselineGeneratedExecutionOutcome::Fallback
             }
             ExecutionCompletion::Terminated(_) => VmBaselineGeneratedExecutionOutcome::Terminated,
             ExecutionCompletion::Suspended(_) => VmBaselineGeneratedExecutionOutcome::Suspended,
@@ -12713,6 +12977,7 @@ impl Vm {
             }
             ExecutionCompletion::OrdinaryBytecodeCall(_)
             | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
+            | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => self.finish_function_value_call_fail(
@@ -13740,6 +14005,7 @@ impl Vm {
             ExecutionCompletion::Failed(error) => DispatchOutcome::Fail(error),
             ExecutionCompletion::OrdinaryBytecodeCall(_)
             | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
+            | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => {
@@ -13812,6 +14078,9 @@ impl Vm {
             DispatchOutcome::FunctionValueCall(_) => {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
             }
+            DispatchOutcome::BaselineLoopHandoff(_) => {
+                SingleDispatchOutcome::Failed(ExecutionError::BaselineGeneratedExecutionRejected)
+            }
             DispatchOutcome::Continue => {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
             }
@@ -13859,6 +14128,9 @@ impl Vm {
             }
             DispatchOutcome::FunctionValueCall(_) => {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
+            }
+            DispatchOutcome::BaselineLoopHandoff(_) => {
+                SingleDispatchOutcome::Failed(ExecutionError::BaselineGeneratedExecutionRejected)
             }
             DispatchOutcome::Continue | DispatchOutcome::Jump(_) => {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
@@ -15624,7 +15896,12 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> ExecutionCompletion {
-        let region = self.enter_no_gc_execution_region();
+        let mut region = self.enter_no_gc_execution_region();
+        let entry_kind = self
+            .execution
+            .active_entry()
+            .map(|entry| entry.record.kind())
+            .unwrap_or(crate::interpreter::ExecutionEntryKind::Program);
         let mut completion =
             self.execute_baseline_fallback_in_current_region(request, code_block, host, config);
         loop {
@@ -15650,6 +15927,28 @@ impl Vm {
                         host,
                         config,
                     )
+                }
+                ExecutionCompletion::BaselineLoopHandoff(handoff) => {
+                    match self.execute_baseline_loop_handoff_completion_in_current_region(
+                        &mut region,
+                        handoff.resume.code_block,
+                        code_block,
+                        handoff,
+                        entry_kind,
+                        host,
+                        config,
+                    ) {
+                        Ok((completion, _)) => completion,
+                        Err(NoGcAutoInstallFailure::ActiveRegion) => {
+                            return self.leave_no_gc_region_with_completion(
+                                region,
+                                ExecutionCompletion::Failed(ExecutionError::GcBoundaryViolation),
+                            )
+                        }
+                        Err(NoGcAutoInstallFailure::AbandonedRegion) => {
+                            return ExecutionCompletion::Failed(ExecutionError::GcBoundaryViolation)
+                        }
+                    }
                 }
                 done => {
                     completion = done;
@@ -19578,6 +19877,22 @@ mod tests {
             ),
             typed_core_instruction_with_operands(
                 10,
+                CoreOpcode::Return,
+                vec![Operand::Register(local(0))],
+            ),
+        ])
+    }
+
+    fn loop_hint_resume_guard_code_block() -> CodeBlock {
+        linked_p6_test_code_block(vec![
+            typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(0)), Operand::SignedImmediate(0)],
+            ),
+            typed_core_instruction(1, CoreOpcode::LoopHint),
+            typed_core_instruction_with_operands(
+                2,
                 CoreOpcode::Return,
                 vec![Operand::Register(local(0))],
             ),
@@ -54495,6 +54810,280 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(backedge_records.len(), 3);
         assert_eq!(backedge_records.last().unwrap().counters.loop_count, 3);
+    }
+
+    #[test]
+    fn vm_interpreter_loop_hint_handoffs_to_generated_baseline_at_current_index() {
+        let code_block = loop_hint_resume_guard_code_block();
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        install_typed_baseline_for_test(&mut vm, owner, 2_208);
+        let global_object = vm.allocate_global_object_cell().unwrap();
+        vm.record_source_global_object(global_object).unwrap();
+        let entry = vm
+            .execution
+            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+                code_block: owner,
+                global_object,
+                this_value: RuntimeValue::undefined(),
+            }));
+        let frame = vm
+            .execution
+            .push_frame(
+                &mut vm.registers,
+                FramePushRequest {
+                    code_block: Some(owner),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: code_block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: Vec::new(),
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(1)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let window = vm.execution.top_frame().unwrap().register_window;
+        vm.registers
+            .write(window, local(0), RuntimeValue::from_i32(41))
+            .unwrap();
+        vm.execution
+            .mark_top_bytecode_index(BytecodeIndex::from_offset(1));
+        let _ = vm.tiering.select_interpreter_entry_plan(TierEntryRequest {
+            owner,
+            entry_kind: crate::interpreter::ExecutionEntryKind::Program,
+            bytecode_index: Some(BytecodeIndex::from_offset(1)),
+            frame: Some(frame),
+            stack_frame: None,
+            bytecode_size: Some(
+                code_block
+                    .unlinked()
+                    .instructions()
+                    .instruction_count()
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            ),
+            inline_cache_count: inline_cache_count(&code_block),
+            policy: vm.config.tiering_policy(),
+        });
+        let profile_count_before = vm.tiering_integration().profile_records().len();
+        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
+        let mut host = InterpreterDispatchMustNotRun;
+
+        let handoff = match vm.execute_interpreter_code_block_in_current_region(
+            owner,
+            &code_block,
+            &mut host,
+            DispatchConfig::default(),
+        ) {
+            ExecutionCompletion::BaselineLoopHandoff(handoff) => handoff,
+            completion => panic!("expected LoopHint handoff, got {completion:?}"),
+        };
+        let mut region = vm.enter_no_gc_execution_region();
+        let (completion, path) = vm
+            .execute_baseline_loop_handoff_completion_in_current_region(
+                &mut region,
+                owner,
+                &code_block,
+                handoff,
+                crate::interpreter::ExecutionEntryKind::Program,
+                &mut host,
+                DispatchConfig::default(),
+            )
+            .expect("generated loop handoff should not fail no-GC suspension");
+        let completion = vm.leave_no_gc_region_with_completion(region, completion);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
+        );
+        if vm.execution.frame(frame).is_some() {
+            vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
+        }
+        vm.execution.leave(entry).unwrap();
+        assert_no_gc_execution_depth_observed(&vm, VmNoGcExecutionPathForTest::GeneratedEntry, 1);
+        assert_eq!(
+            path,
+            TierEntryExecutionPath::GeneratedCode(JitType::Baseline)
+        );
+        let handoff_decision = vm
+            .tiering_integration()
+            .entry_decisions()
+            .last()
+            .expect("LoopHint handoff entry decision");
+        assert_eq!(
+            vm.tiering_integration().entry_decisions().len(),
+            entry_decision_count_before + 1
+        );
+        assert_eq!(
+            handoff_decision.bytecode_index,
+            Some(BytecodeIndex::from_offset(1))
+        );
+        assert_eq!(
+            handoff_decision.decision,
+            TierEntryDecision::EnterOptimized {
+                tier: JitType::Baseline
+            }
+        );
+        let loop_records = vm
+            .tiering_integration()
+            .profile_records()
+            .iter()
+            .skip(profile_count_before)
+            .filter(|record| {
+                record.owner == owner
+                    && record.event == TierProfileEvent::LoopBackedge
+                    && record.bytecode_index == Some(BytecodeIndex::from_offset(1))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(loop_records.len(), 2);
+        assert!(loop_records.iter().all(|record| {
+            record
+                .selected_plan
+                .is_some_and(|plan| plan.kind == TierPlanKind::BaselineFromBytecode)
+        }));
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn vm_interpreter_loop_hint_declines_native_baseline_without_loop_entry_map() {
+        let code_block = loop_hint_counter_code_block();
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let record = vm
+            .install_p6_x86_64_callable_semantic_baseline_native_entry(p6_semantic_install_request(
+                owner, 2_209,
+            ))
+            .expect("native baseline install");
+        assert_p6_callable_emitted_readiness(&record);
+        assert!(vm
+            .tiering
+            .baseline_generated_code_artifact_for(owner)
+            .is_none());
+        let global_object = vm.allocate_global_object_cell().unwrap();
+        vm.record_source_global_object(global_object).unwrap();
+        let entry = vm
+            .execution
+            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+                code_block: owner,
+                global_object,
+                this_value: RuntimeValue::undefined(),
+            }));
+        let frame = vm
+            .execution
+            .push_frame(
+                &mut vm.registers,
+                FramePushRequest {
+                    code_block: Some(owner),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: code_block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: Vec::new(),
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(5)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let window = vm.execution.top_frame().unwrap().register_window;
+        vm.registers
+            .write(window, local(0), RuntimeValue::from_i32(41))
+            .unwrap();
+        vm.registers
+            .write(window, local(1), RuntimeValue::from_i32(42))
+            .unwrap();
+        vm.registers
+            .write(window, local(2), RuntimeValue::from_i32(1))
+            .unwrap();
+        vm.execution
+            .mark_top_bytecode_index(BytecodeIndex::from_offset(5));
+        let _ = vm.tiering.select_interpreter_entry_plan(TierEntryRequest {
+            owner,
+            entry_kind: crate::interpreter::ExecutionEntryKind::Program,
+            bytecode_index: Some(BytecodeIndex::from_offset(5)),
+            frame: Some(frame),
+            stack_frame: None,
+            bytecode_size: Some(
+                code_block
+                    .unlinked()
+                    .instructions()
+                    .instruction_count()
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            ),
+            inline_cache_count: inline_cache_count(&code_block),
+            policy: vm.config.tiering_policy(),
+        });
+        let profile_count_before = vm.tiering_integration().profile_records().len();
+        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
+        let fallback_count_before = vm.tiering_integration().fallback_records().len();
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        let handoff = match vm.execute_interpreter_code_block_in_current_region(
+            owner,
+            &code_block,
+            &mut host,
+            DispatchConfig::default(),
+        ) {
+            ExecutionCompletion::BaselineLoopHandoff(handoff) => handoff,
+            completion => panic!("expected native-declined LoopHint handoff, got {completion:?}"),
+        };
+        let mut region = vm.enter_no_gc_execution_region();
+        let (completion, path) = vm
+            .execute_baseline_loop_handoff_completion_in_current_region(
+                &mut region,
+                owner,
+                &code_block,
+                handoff,
+                crate::interpreter::ExecutionEntryKind::Program,
+                &mut host,
+                DispatchConfig::default(),
+            )
+            .expect("native-declined loop handoff should not fail no-GC suspension");
+        let completion = vm.leave_no_gc_region_with_completion(region, completion);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        if vm.execution.frame(frame).is_some() {
+            vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
+        }
+        vm.execution.leave(entry).unwrap();
+        assert_eq!(
+            vm.tiering_integration().entry_decisions().len(),
+            entry_decision_count_before
+        );
+        assert_eq!(
+            vm.tiering_integration().fallback_records().len(),
+            fallback_count_before
+        );
+        assert_eq!(path, TierEntryExecutionPath::Interpreter);
+        let loop_records = vm
+            .tiering_integration()
+            .profile_records()
+            .iter()
+            .skip(profile_count_before)
+            .filter(|record| {
+                record.owner == owner
+                    && record.event == TierProfileEvent::LoopBackedge
+                    && record.bytecode_index == Some(BytecodeIndex::from_offset(5))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(loop_records.len(), 1);
+        assert!(loop_records[0]
+            .selected_plan
+            .is_some_and(|plan| plan.kind == TierPlanKind::BaselineFromBytecode));
+        assert!(vm
+            .no_gc_execution_depth_observations_for_test
+            .iter()
+            .all(|observation| observation.path != VmNoGcExecutionPathForTest::NativeEntry));
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
     }
 
     #[test]

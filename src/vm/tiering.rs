@@ -2661,6 +2661,9 @@ impl VmTieringIntegration {
             )
             .ok()
             .flatten();
+            if let Some(plan) = selected_plan {
+                state.tiering.requested_tier = Some(plan.to_tier);
+            }
             (selected_plan, state.tiering.counters)
         };
         let ordinal = self.next_record_ordinal();
@@ -13589,6 +13592,7 @@ impl CompletionDiagnostic {
             ExecutionCompletion::Threw(_) => Self::Threw,
             ExecutionCompletion::OrdinaryBytecodeCall(_)
             | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
+            | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_) => Self::Failed,
             ExecutionCompletion::Terminated(_) => Self::Terminated,
             ExecutionCompletion::Suspended(_) => Self::Suspended,

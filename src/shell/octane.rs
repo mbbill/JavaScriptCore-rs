@@ -2393,6 +2393,7 @@ fn classify_completion(
         ExecutionCompletion::Failed(_) => OctaneExecutionPhase::ExecuteRuntime,
         ExecutionCompletion::OrdinaryBytecodeCall(_)
         | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
+        | ExecutionCompletion::BaselineLoopHandoff(_)
         | ExecutionCompletion::FunctionValueCall(_)
         | ExecutionCompletion::Terminated(_)
         | ExecutionCompletion::Suspended(_) => OctaneExecutionPhase::ExecuteRuntime,
