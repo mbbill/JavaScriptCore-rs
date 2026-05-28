@@ -133,9 +133,7 @@ impl<'src, 'arena, E> Lexer<'src, 'arena, E> {
         }
         // C++ JSC: `.5` is a valid numeric literal (DecimalLiteral starting
         // with DecimalDigits omitted before the dot).
-        if unit == b'.'
-            && matches!(self.peek_next_unit(), Some(next) if is_decimal_digit(next))
-        {
+        if unit == b'.' && matches!(self.peek_next_unit(), Some(next) if is_decimal_digit(next)) {
             return self.scan_numeric_literal(
                 start,
                 start_line,
