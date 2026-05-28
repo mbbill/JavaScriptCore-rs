@@ -66865,6 +66865,53 @@ mod tests {
     }
 
     #[test]
+    fn vm_string_replace_with_function_callback() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        // C++ JSC: replaceUsingRegExpSearch with function replacer.
+        // Non-global regexp, global regexp, and string-search paths.
+        let completion = vm
+            .execute_source(source(
+                "'abc'.replace(/b/, function(m) { return m.toUpperCase(); }) === 'aBc' \
+                    && 'aaa'.replace(/a/g, function(m, offset, str) { return '' + offset; }) === '012' \
+                    && 'hello world'.replace('world', function(m) { return m.toUpperCase(); }) === 'hello WORLD';",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_string_match_handles_regexp_and_string_arguments() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        // C++ JSC: builtins/StringPrototype.js match + builtins/RegExpPrototype.js
+        // match/matchSlow. Non-global returns exec-style array with index/input;
+        // global returns full-match strings only; string arg coerces via
+        // RegExpCreate; no match returns null.
+        let completion = vm
+            .execute_source(source(
+                "var r1 = 'hello world'.match(/world/); \
+                 var r2 = 'aabbaabb'.match(/a+/g); \
+                 var r3 = 'test'.match(/x/); \
+                 var r4 = 'abc'.match('b'); \
+                 r1[0] === 'world' && r1.index === 6 && r1.input === 'hello world' \
+                    && r2.length === 2 && r2[0] === 'aa' && r2[1] === 'aa' \
+                    && r3 === null \
+                    && r4[0] === 'b' && r4.index === 1;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
     fn vm_executes_string_length() {
         let mut vm = Vm::new(VmConfig::default());
 

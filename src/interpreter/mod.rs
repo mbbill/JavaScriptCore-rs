@@ -5289,6 +5289,7 @@ enum CoreNativeFunction {
     StringSubstr,
     StringSplit,
     StringReplace,
+    StringMatch,
     StringToLowerCase,
     StringToUpperCase,
     StringToLocaleLowerCase,
@@ -7063,6 +7064,7 @@ impl CoreObjectStore {
             ("substr", CoreNativeFunction::StringSubstr),
             ("split", CoreNativeFunction::StringSplit),
             ("replace", CoreNativeFunction::StringReplace),
+            ("match", CoreNativeFunction::StringMatch),
             ("toLowerCase", CoreNativeFunction::StringToLowerCase),
             ("toUpperCase", CoreNativeFunction::StringToUpperCase),
             (
@@ -17920,6 +17922,9 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::StringReplace => {
                 self.native_string_replace(state, this_value, arguments)
             }
+            CoreNativeFunction::StringMatch => {
+                self.native_string_match(state.heap, this_value, arguments)
+            }
             CoreNativeFunction::StringToLowerCase => {
                 self.native_string_to_lower_case(state.heap, this_value)
             }
@@ -22476,6 +22481,176 @@ impl CoreOpcodeDispatchHost {
                 .push_array_element_with_write_barrier(heap, array, value)
                 .map_err(DispatchOutcome::Fail)?;
         }
+        Ok(array)
+    }
+
+    /// C++ JSC: builtins/StringPrototype.js `match` + builtins/RegExpPrototype.js
+    /// `match`/`matchSlow` + runtime/RegExpPrototype.cpp `regExpProtoFuncMatchFast`.
+    ///
+    /// `String.prototype.match(regexp)` coerces a non-RegExp argument by calling
+    /// `RegExpCreate(regexp, undefined)`, then defers to
+    /// `RegExp.prototype[@@match]`. The fast path branches on the `global` flag:
+    /// without it we return `RegExp.exec`'s result (array with `index`/`input`
+    /// or `null`); with it we collect every match's full-string substring into
+    /// a fresh array, resetting `lastIndex` to 0 and returning `null` when no
+    /// matches were found.
+    fn native_string_match(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let text = self.string_this(this_value)?;
+        let argument = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        // C++ JSC: if argument is not a RegExp object, coerce via
+        // `regExpCreate(regexp, undefined)`. Mirror that by allocating a fresh
+        // RegExp from the string form of the argument with no flags.
+        let (source, flags, _flags_text) = if self.objects.is_regexp(argument) {
+            self.regexp_source_and_flags_or_throw(heap, argument)?
+        } else {
+            let pattern = if argument.kind() == ValueKind::Undefined {
+                String::new()
+            } else {
+                self.strings.primitive_to_string(argument).ok_or_else(|| {
+                    self.type_error_outcome_with_heap(heap, "RegExp pattern must be a string")
+                })?
+            };
+            let flags = self.parse_regexp_flags_or_throw(heap, "")?;
+            self.validate_regexp_pattern_or_throw(heap, &pattern, flags)?;
+            (pattern, flags, String::new())
+        };
+
+        if !flags.global {
+            // C++ JSC: regExpProtoFuncMatchFast non-global branch calls
+            // `thisObject->exec(globalObject, string)`, which returns either an
+            // exec-style array or null.
+            // For a non-RegExp coerced argument lastIndex is 0; for a RegExp
+            // argument with neither global nor sticky, execute_simple_yarr
+            // always searches from 0 (mirroring native_regexp_exec).
+            let matched = execute_simple_yarr(&source, flags, &text, 0).map_err(|_| {
+                self.type_error_outcome_with_heap(heap, "Unsupported regular expression execution")
+            })?;
+            let Some(matched) = matched else {
+                return Ok(RuntimeValue::null());
+            };
+            return self.build_regexp_match_array(
+                heap,
+                &text,
+                matched.start,
+                matched.end,
+                &matched.captures,
+            );
+        }
+
+        // C++ JSC: matchGlobal resets lastIndex to 0 then collects every
+        // match's full substring into an array (no index/input properties);
+        // returns null if no matches were found.
+        if self.objects.is_regexp(argument) {
+            self.set_regexp_last_index(heap, argument, 0)?;
+        }
+        let mut matches: Vec<String> = Vec::new();
+        let mut search_index = 0usize;
+        loop {
+            let matched =
+                execute_simple_yarr(&source, flags, &text, search_index).map_err(|_| {
+                    self.type_error_outcome_with_heap(
+                        heap,
+                        "Unsupported regular expression execution",
+                    )
+                })?;
+            let Some(matched) = matched else {
+                break;
+            };
+            let matched_str = text
+                .get(matched.start..matched.end)
+                .unwrap_or_default()
+                .to_owned();
+            // C++ JSC matchSlow: advance lastIndex past an empty match so we
+            // don't loop forever.
+            if matched.end == search_index {
+                search_index = advance_string_byte_index(&text, search_index);
+            } else {
+                search_index = matched.end;
+            }
+            matches.push(matched_str);
+            if search_index > text.len() {
+                break;
+            }
+        }
+        if self.objects.is_regexp(argument) {
+            self.set_regexp_last_index(heap, argument, 0)?;
+        }
+        if matches.is_empty() {
+            return Ok(RuntimeValue::null());
+        }
+        let array = self.objects.allocate_array();
+        for matched_str in &matches {
+            let value = self
+                .strings
+                .allocate_with_heap(heap, matched_str)
+                .map_err(DispatchOutcome::Fail)?;
+            self.objects
+                .push_array_element_with_write_barrier(heap, array, value)
+                .map_err(DispatchOutcome::Fail)?;
+        }
+        Ok(array)
+    }
+
+    /// C++ JSC: createRegExpMatchesArray. Build the array returned by
+    /// non-global `String.prototype.match` / `RegExp.prototype.exec`: index 0
+    /// is the full match, subsequent indices are capture group substrings (or
+    /// undefined for unmatched groups), with `index` and `input` properties.
+    fn build_regexp_match_array(
+        &mut self,
+        heap: &mut Heap,
+        input: &str,
+        start: usize,
+        end: usize,
+        captures: &[Option<YarrSimpleMatchRange>],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let array = self.objects.allocate_array();
+        let matched = self
+            .strings
+            .allocate_with_heap(heap, input.get(start..end).unwrap_or_default())
+            .map_err(DispatchOutcome::Fail)?;
+        self.objects
+            .push_array_element_with_write_barrier(heap, array, matched)
+            .map_err(DispatchOutcome::Fail)?;
+        for capture in captures {
+            let value = if let Some(range) = capture {
+                self.strings
+                    .allocate_with_heap(heap, input.get(range.start..range.end).unwrap_or_default())
+                    .map_err(DispatchOutcome::Fail)?
+            } else {
+                RuntimeValue::undefined()
+            };
+            self.objects
+                .push_array_element_with_write_barrier(heap, array, value)
+                .map_err(DispatchOutcome::Fail)?;
+        }
+        self.objects
+            .put_data_own_with_write_barrier(
+                heap,
+                array,
+                &CorePropertyKey::String("index".into()),
+                RuntimeValue::from_i32(start.try_into().unwrap_or(i32::MAX)),
+            )
+            .map_err(DispatchOutcome::Fail)?;
+        let input_value = self
+            .strings
+            .allocate_with_heap(heap, input)
+            .map_err(DispatchOutcome::Fail)?;
+        self.objects
+            .put_data_own_with_write_barrier(
+                heap,
+                array,
+                &CorePropertyKey::String("input".into()),
+                input_value,
+            )
+            .map_err(DispatchOutcome::Fail)?;
         Ok(array)
     }
 
