@@ -12624,11 +12624,13 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 } else if self.bigints.is_bigint(left) || self.bigints.is_bigint(right) {
                     self.bigint_binary_result(state.heap, left, right, opcode)
                 } else {
-                    let Some(left) = left.as_number() else {
-                        return DispatchOutcome::Fail(ExecutionError::ExpectedInt32);
+                    let left = match self.non_bigint_number_operand(left) {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
                     };
-                    let Some(right) = right.as_number() else {
-                        return DispatchOutcome::Fail(ExecutionError::ExpectedInt32);
+                    let right = match self.non_bigint_number_operand(right) {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
                     };
                     match opcode {
                         CoreOpcode::AddInt32
@@ -12677,9 +12679,9 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let result = match self.numeric_compare(left, right, opcode) {
+                let result = match self.numeric_compare(state, left, right, opcode) {
                     Ok(result) => result,
-                    Err(error) => return DispatchOutcome::Fail(error),
+                    Err(outcome) => return outcome,
                 };
                 write_register(state, window, destination, RuntimeValue::from_bool(result))
             }
@@ -14667,11 +14669,28 @@ impl CoreOpcodeDispatchHost {
         state: &mut DispatchState<'_>,
         object: RuntimeValue,
     ) -> Result<RuntimeValue, DispatchOutcome> {
-        for name in ["toString", "valueOf"] {
+        self.object_to_preferred_primitive(state, object, &["toString", "valueOf"])
+    }
+
+    fn object_to_number_hint_primitive(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        object: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        self.object_to_preferred_primitive(state, object, &["valueOf", "toString"])
+    }
+
+    fn object_to_preferred_primitive(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        object: RuntimeValue,
+        method_order: &[&str],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        for name in method_order {
             let method = self.get_property_value(
                 state,
                 object,
-                &CorePropertyKey::String(name.into()),
+                &CorePropertyKey::String((*name).into()),
                 object,
             )?;
             if !self.is_callable_value(method) {
@@ -14759,6 +14778,25 @@ impl CoreOpcodeDispatchHost {
     }
 
     fn numeric_compare(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        left: RuntimeValue,
+        right: RuntimeValue,
+        opcode: CoreOpcode,
+    ) -> Result<bool, DispatchOutcome> {
+        let (left, right) = if self.is_primitive_value(left) && self.is_primitive_value(right) {
+            (left, right)
+        } else {
+            (
+                self.relational_to_primitive(state, left)?,
+                self.relational_to_primitive(state, right)?,
+            )
+        };
+        self.compare_primitive_relational(left, right, opcode)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    fn compare_primitive_relational(
         &self,
         left: RuntimeValue,
         right: RuntimeValue,
@@ -14792,6 +14830,21 @@ impl CoreOpcodeDispatchHost {
         Ok(result)
     }
 
+    fn relational_to_primitive(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        value: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        // C++ JSC jsLess/jsLessEq use toPrimitiveNumeric, which applies
+        // ToPrimitive with PreferNumber before choosing string or numeric
+        // comparison. Ordinary objects therefore try valueOf before toString.
+        if self.is_primitive_value(value) {
+            Ok(value)
+        } else {
+            self.object_to_number_hint_primitive(state, value)
+        }
+    }
+
     fn relational_numeric_value(&self, value: RuntimeValue) -> Result<NumberValue, ExecutionError> {
         if let Some(number) = value.as_number() {
             return Ok(number);
@@ -14816,6 +14869,20 @@ impl CoreOpcodeDispatchHost {
             }
         }
         to_number_value(value)
+    }
+
+    fn non_bigint_number_operand(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<NumberValue, ExecutionError> {
+        // C++ JSC's arithmeticBinaryOp applies JSValue::toNumeric before its
+        // Number branch, while bitwise helpers apply toBigIntOrInt32 before
+        // ToInt32. For the current non-BigInt primitive slice both routes go
+        // through ToNumber; object ToPrimitive remains handled only where the
+        // existing Rust skeleton can express it safely.
+        self.to_number_with_string(value)?
+            .as_number()
+            .ok_or(ExecutionError::ExpectedInt32)
     }
 
     fn same_value_zero(&self, left: RuntimeValue, right: RuntimeValue) -> bool {

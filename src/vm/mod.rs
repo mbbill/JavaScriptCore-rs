@@ -52355,7 +52355,7 @@ mod tests {
                     register: local(0),
                     value_kind: ValueKind::Boolean,
                 },
-                expected: ExecutionCompletion::Failed(ExecutionError::ExpectedInt32),
+                expected: ExecutionCompletion::Returned(RuntimeValue::from_i32(2)),
             },
             FallbackCase {
                 name: "sub null left",
@@ -52392,7 +52392,7 @@ mod tests {
                     register: local(0),
                     value_kind: ValueKind::Null,
                 },
-                expected: ExecutionCompletion::Failed(ExecutionError::ExpectedInt32),
+                expected: ExecutionCompletion::Returned(RuntimeValue::from_i32(-1)),
             },
             FallbackCase {
                 name: "bit and undefined right",
@@ -52429,7 +52429,7 @@ mod tests {
                     register: local(1),
                     value_kind: ValueKind::Undefined,
                 },
-                expected: ExecutionCompletion::Failed(ExecutionError::ExpectedInt32),
+                expected: ExecutionCompletion::Returned(RuntimeValue::from_i32(0)),
             },
             FallbackCase {
                 name: "less than boolean right",
@@ -58689,7 +58689,7 @@ mod tests {
                 opcode: CoreOpcode::AddInt32,
                 side_exit_reason: P6X86_64BaselineSelectedSideExitReason::NonInt32Operand,
                 generated_cause: None,
-                expected_execution_path: TierEntryExecutionPath::Interpreter,
+                expected_execution_path: TierEntryExecutionPath::NativeCode(JitType::Baseline),
             },
             SideExitCase {
                 name: "bitand non-int32 operand",
@@ -59981,7 +59981,7 @@ mod tests {
 
         assert_eq!(
             completion,
-            ExecutionCompletion::Failed(ExecutionError::ExpectedInt32)
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(3))
         );
         assert_latest_generated_fallback(
             &vm,
@@ -66945,6 +66945,61 @@ mod tests {
                 ExecutionCompletion::Returned(RuntimeValue::from_i32(41)),
                 ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
             ]
+        );
+    }
+
+    #[test]
+    fn vm_arithmetic_binary_ops_coerce_non_number_primitives() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var box2dSettings = {}; \
+                 box2dSettings.b2_polygonRadius = 2 * box2dSettings.b2_linearSlop; \
+                 let missingPropertyProduct = box2dSettings.b2_polygonRadius; \
+                 missingPropertyProduct !== missingPropertyProduct \
+                     && 2 * \"3\" === 6 \
+                     && 8 - true === 7 \
+                     && null * 5 === 0 \
+                     && 6 / false === Infinity \
+                     && 5 % undefined !== 5 % undefined;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_relational_ops_use_ordinary_to_primitive_for_objects() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "let first = {}; \
+                 let second = {}; \
+                 let pair = {}; \
+                 pair.proxyA = first < second ? first : second; \
+                 pair.proxyB = first >= second ? first : second; \
+                 let order = \"\"; \
+                 let numericLeft = { valueOf: function() { order = order + \"l\"; return 2; } }; \
+                 let numericRight = { valueOf: function() { order = order + \"r\"; return 3; } }; \
+                 first < second === false \
+                     && first <= second === true \
+                     && first > second === false \
+                     && first >= second === true \
+                     && pair.proxyA === second \
+                     && pair.proxyB === first \
+                     && numericLeft < numericRight === true \
+                     && order === \"lr\";",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
         );
     }
 

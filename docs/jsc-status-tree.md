@@ -34,9 +34,11 @@ Legend:
                  (typeof eval === undefined). Real eval = runtime parse+compile in
                  caller scope + dynamic scope-chain resolution. Large subsystem, not
                  a quick capture fix. Verified empirically 2026-05-27.
-      [blocked] box2d <= next blocker ExpectedInt32 (numeric/opcode int32-operand
-                 coercion; basic bitwise ToInt32 verified working, so it's a subtler
-                 path — needs bisecting the 228KB file). Cleared 5 prior box2d blockers.
+      [blocked] box2d <= ExpectedInt32 load/runner blockers cleared for
+                 arithmetic ToNumeric primitives and relational object ToPrimitive;
+                 MakeNewWorld returns, but one world.Step timed out at 60s in
+                 interpreter. Next blocker is Step hot-path/throughput audit.
+                 Object/BigInt bitwise and shift coercion remains a separate risk.
       [blocked] regexp <= complex Yarr patterns throw (match works, exec/replace
                  subset works; needs fuller Yarr execute)
       [blocked] pdfjs <= non-ASCII fixed; likely needs eval too
@@ -68,6 +70,7 @@ Legend:
   [wip] objects, structures, properties, and prototypes
     [wip] basic object allocation and property storage
     [wip] prototype lookup and cacheability predicates
+    [done] ordinary object ToPrimitive ordering for current relational path
     [wip] property mutation planning and readiness
     [missing] full C++ structure/watchpoint invalidation fidelity
     [missing] dictionary, override, and static-class-table predicates
@@ -145,6 +148,8 @@ Legend:
     [done] non-cell no-barrier store readiness proof
     [missing] C++ ToNumeric/Inc update lowering
   [wip] ToNumber/Add slow paths
+    [done] interpreter arithmetic/bitwise primitive numeric coercion for
+           current non-BigInt Number branch
     [wip] ToNumber slow-path continuation
     [wip] AddInt32 slow-path continuation/profiling
     [deferred] static generic rootless ToNumber admission
