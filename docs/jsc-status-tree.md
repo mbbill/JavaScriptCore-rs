@@ -139,9 +139,12 @@ Legend:
 
 [wip] GC, rooting, barriers, and handles
   [done] bytecode root maps for current generated paths
-  [done] targeted-root sync O(1) lookup + O(1) mutation (was O(instr x records^2))
+  [done] targeted-root sync O(1) lookup + O(1) mutation + O(n) validate + buffer reuse
+         (was O(instr x records^2) + per-instruction alloc; richards 12:13 -> 8:15,
+         arith micro-bench 12.6s -> 8.0s)
   [risk] per-instruction eager targeted-root registry diverges from C++ JSC
-         conservative-scan-at-safepoint; required by VM handoff UnresolvedRegisterRoot
+         conservative-scan-at-safepoint; required by VM handoff UnresolvedRegisterRoot;
+         interpreter still ~1.6us/op (architecture floor) -> parity must come from JIT
   [wip] targeted roots around helper exits
   [wip] write-barrier evidence for current property stores
   [missing] no GC collection runs during execution (unbounded heap growth)
