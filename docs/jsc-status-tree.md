@@ -18,14 +18,19 @@ Legend:
     [done] JetStreamDriver load order and shell globals
     [done] iteration, validation, scoring, and telemetry
     [done] benchmark/probe command surface for current investigations
-  [wip] Current proof path
-    [wip] honest subset execution toward full Octane
-      [done] richards correctness (interpreter, scored)
-      [done] navier-stokes correctness (interpreter, scored)
-      [done] crypto correctness (interpreter, scored)
-      [wip] delta-blue, splay, raytrace (running, slow interpreter)
-    [wip] TypeScript parser-prefix execution and throughput
-    [missing] full TypeScript benchmark correctness
+  [wip] Current proof path — core 4/6 pass, full 4/15
+    [wip] Octane core (6 benchmarks)
+      [done] richards, navier-stokes, crypto, delta-blue (interpreter, scored)
+      [wip] splay, raytrace (running, slow interpreter, expected pass)
+    [wip] Octane non-core (9 benchmarks)
+      [done] non-ASCII string parsing fixed (unblocks code-load, pdfjs)
+      [done] String.replace with function callback fixed
+      [done] .5 numeric literal parsing fixed (unblocks box2d parsing)
+      [wip] String.prototype.match implementation (unblocks regexp)
+      [blocked] code-load, earley-boyer, gbemu, mandreel <= eval scope propagation
+      [blocked] pdfjs <= non-ASCII strings fixed but may hit eval issue too
+      [blocked] box2d <= __defineGetter__/__defineSetter__
+      [blocked] regexp <= String.prototype.match missing
     [missing] full Octane correctness
     [missing] Octane score parity with local C++ JSC
 
