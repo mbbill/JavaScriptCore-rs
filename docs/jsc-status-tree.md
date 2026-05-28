@@ -36,11 +36,12 @@ Legend:
                  a quick capture fix. Verified empirically 2026-05-27.
       [blocked] box2d <= ExpectedInt32 load/runner blockers cleared for
                  arithmetic ToNumeric primitives and relational object ToPrimitive;
-                 MakeNewWorld returns, but one world.Step still rejects under
-                 --baseline. LoopHint opcode/placement and generated-baseline
-                 LoopHint counters are in (Step probe now reports
-                 profile_loop_backedges=92); next blocker is the remaining
-                 BaselineGeneratedExecutionRejected path in Step/Solve.
+                 LoopHint opcode/placement and generated-baseline LoopHint counters
+                 are in; generated property IC dependency invalidation now retires
+                 the latest owner artifact when IC snapshots drift. Current
+                 baseline proof `MakeNewWorld(); true` still rejects after bytecode
+                 640 (`x.Add(deltaX)`) during generated/fallback resume, so
+                 world.Step remains blocked.
                  Object/BigInt bitwise and shift coercion remains a separate risk.
       [blocked] regexp <= complex Yarr patterns throw (match works, exec/replace
                  subset works; needs fuller Yarr execute)

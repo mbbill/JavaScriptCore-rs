@@ -4706,12 +4706,12 @@ impl VmTieringIntegration {
                 .iter()
                 .find(|record| record.ordinal == request.materialization_ordinal)
                 .and_then(|record| record.guard_plan_ordinal);
-            let generated_artifact_invalidation_target =
+            let generated_artifact_invalidation_owner =
                 guard_plan_ordinal.and_then(|guard_plan_ordinal| {
                     self.property_load_guard_plans
                         .iter()
                         .find(|record| record.ordinal == guard_plan_ordinal)
-                        .map(|record| (record.owner, record.bytecode_snapshot))
+                        .map(|record| record.owner)
                 });
             if let Some(materialization) = self
                 .property_load_guard_watchpoint_materializations
@@ -4740,12 +4740,16 @@ impl VmTieringIntegration {
                     };
                 }
             }
-            if let Some((owner, bytecode_snapshot)) = generated_artifact_invalidation_target {
+            if let Some(owner) = generated_artifact_invalidation_owner {
                 self.record_baseline_generated_code_invalidation(
                     BaselineGeneratedCodeInvalidationRequest {
                         owner,
                         artifact_id: None,
-                        bytecode_snapshot: Some(bytecode_snapshot),
+                        // C++ JSC resets PropertyInlineCache through the owning CodeBlock,
+                        // while on-stack stub code stays valid by handler/code lifetime.
+                        // Rust snapshots are generated-code metadata and change with IC
+                        // side-table mutation, so dependency retirement invalidates by owner/artifact.
+                        bytecode_snapshot: None,
                         reason: CodeInvalidationReason::WatchpointFired,
                         source:
                             BaselineGeneratedCodeInvalidationSource::PropertyLoadGuardWatchpointInvalidation,
@@ -4867,7 +4871,10 @@ impl VmTieringIntegration {
                     BaselineGeneratedCodeInvalidationRequest {
                         owner: request.owner,
                         artifact_id: None,
-                        bytecode_snapshot: Some(request.bytecode_snapshot),
+                        // C++ JSC retires the property IC by owner/cache reset and keeps
+                        // on-stack stub code alive separately; Rust IC snapshots are mutable
+                        // metadata, so dependency misses invalidate the latest owner artifact.
+                        bytecode_snapshot: None,
                         reason: CodeInvalidationReason::GeneratedInlineCacheDependencyInvalidated,
                         source: BaselineGeneratedCodeInvalidationSource::PropertyLoadProbeMiss,
                     },
@@ -5716,7 +5723,10 @@ impl VmTieringIntegration {
                 BaselineGeneratedCodeInvalidationRequest {
                     owner: request.owner,
                     artifact_id: None,
-                    bytecode_snapshot: Some(request.bytecode_snapshot),
+                    // C++ JSC retires the property IC by owner/cache reset and keeps
+                    // on-stack stub code alive separately; Rust IC snapshots are mutable
+                    // metadata, so dependency misses invalidate the latest owner artifact.
+                    bytecode_snapshot: None,
                     reason: CodeInvalidationReason::GeneratedInlineCacheDependencyInvalidated,
                     source: BaselineGeneratedCodeInvalidationSource::GuardedPropertyLoadProbeMiss,
                 },
@@ -19670,6 +19680,17 @@ mod tests {
         .expect("test baseline generated code artifact")
     }
 
+    fn alternate_snapshot_baseline_generated_code_artifact(
+        owner: CodeBlockId,
+        id: u64,
+    ) -> BaselineGeneratedCodeArtifact {
+        baseline_generated_code_artifact_with_proof(
+            owner,
+            id,
+            baseline_eligibility_proof_with_arithmetic_opcode(owner, CoreOpcode::SubInt32),
+        )
+    }
+
     fn observe_baseline_entry(
         tiering: &mut VmTieringIntegration,
         owner: CodeBlockId,
@@ -27635,6 +27656,80 @@ mod tests {
     }
 
     #[test]
+    fn generated_guarded_property_load_probe_miss_targets_generated_artifact_when_ic_snapshot_differs(
+    ) {
+        let (mut tiering, guard_plan, ic_snapshot) = record_prototype_data_guard_fixture();
+        let owner = guard_plan.owner;
+        let generated_artifact = tiering
+            .record_baseline_generated_code_artifact(
+                owner,
+                alternate_snapshot_baseline_generated_code_artifact(owner, 243),
+            )
+            .unwrap();
+        let artifact_snapshot = generated_artifact
+            .eligibility_proof
+            .bytecode_snapshot_fingerprint();
+        assert_eq!(guard_plan.bytecode_snapshot, ic_snapshot);
+        assert_eq!(
+            tiering.property_load_guard_dependencies()[0].bytecode_snapshot,
+            ic_snapshot
+        );
+        assert_ne!(ic_snapshot, artifact_snapshot);
+        accepted_watchpoint_materialization(
+            &mut tiering,
+            &guard_plan,
+            WatchpointState::Clear,
+            None,
+            243,
+        );
+        let table = tiering
+            .property_load_guarded_candidate_table_for_owner(owner, ic_snapshot)
+            .expect("guarded candidate table");
+        let candidate = table.candidates()[0].clone();
+
+        let terminal_request = generated_guarded_property_load_probe_miss_request(
+            &guard_plan,
+            &candidate,
+            GeneratedGuardedPropertyLoadProbeMissReason::GuardStructureMismatch,
+            Some(0),
+        );
+        assert_eq!(terminal_request.bytecode_snapshot, ic_snapshot);
+        let terminal = tiering.record_generated_guarded_property_load_probe_miss(terminal_request);
+        let generated_invalidation = tiering
+            .baseline_generated_code_invalidations()
+            .last()
+            .copied()
+            .expect(
+                "terminal guarded property-load generated invalidation with mismatched IC snapshot",
+            );
+
+        assert!(terminal.terminal);
+        assert_eq!(
+            terminal.retired_guard_plan_ordinal,
+            Some(guard_plan.ordinal)
+        );
+        assert_eq!(
+            generated_invalidation.outcome,
+            BaselineGeneratedCodeInvalidationOutcome::Accepted
+        );
+        assert_eq!(
+            generated_invalidation.source,
+            BaselineGeneratedCodeInvalidationSource::GuardedPropertyLoadProbeMiss
+        );
+        assert_eq!(
+            generated_invalidation.artifact_id,
+            Some(generated_artifact.id)
+        );
+        assert_eq!(
+            generated_invalidation.bytecode_snapshot,
+            Some(artifact_snapshot)
+        );
+        assert!(tiering
+            .baseline_generated_code_artifact_for(owner)
+            .is_none());
+    }
+
+    #[test]
     fn vm_property_guarded_candidate_table_builder_filters_owner_and_snapshot() {
         let (mut tiering, guard_plan, bytecode_snapshot) = record_prototype_data_guard_fixture();
         accepted_watchpoint_materialization(
@@ -27948,6 +28043,76 @@ mod tests {
             Some(BaselineEntryGateOutcome::InvalidatedGeneratedArtifact)
         );
         assert_eq!(entry.execution_path, TierEntryExecutionPath::Interpreter);
+    }
+
+    #[test]
+    fn property_load_guard_watchpoint_invalidation_targets_generated_artifact_when_ic_snapshot_differs(
+    ) {
+        let (mut tiering, guard_plan, ic_snapshot) = record_prototype_data_guard_fixture();
+        let owner = guard_plan.owner;
+        let generated_artifact = tiering
+            .record_baseline_generated_code_artifact(
+                owner,
+                alternate_snapshot_baseline_generated_code_artifact(owner, 227),
+            )
+            .unwrap();
+        let artifact_snapshot = generated_artifact
+            .eligibility_proof
+            .bytecode_snapshot_fingerprint();
+        assert_eq!(guard_plan.bytecode_snapshot, ic_snapshot);
+        assert_eq!(
+            tiering.property_load_guard_dependencies()[0].bytecode_snapshot,
+            ic_snapshot
+        );
+        assert_ne!(ic_snapshot, artifact_snapshot);
+        let materialization = accepted_watchpoint_materialization(
+            &mut tiering,
+            &guard_plan,
+            WatchpointState::Clear,
+            None,
+            227,
+        );
+        let binding = materialization.bindings[0].clone();
+        let event = watchpoint_fire_event_for_binding(
+            &binding,
+            WatchpointGeneration(binding.sampled_generation.0 + 1),
+        );
+
+        let invalidation = tiering.record_property_load_guard_watchpoint_invalidation(
+            VmPropertyLoadGuardWatchpointInvalidationRequest {
+                materialization_ordinal: materialization.ordinal,
+                event,
+            },
+        );
+        let generated_invalidation = tiering
+            .baseline_generated_code_invalidations()
+            .last()
+            .copied()
+            .expect("generated artifact invalidation with mismatched IC snapshot");
+
+        assert!(matches!(
+            invalidation.outcome,
+            VmPropertyLoadGuardWatchpointInvalidationOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            generated_invalidation.outcome,
+            BaselineGeneratedCodeInvalidationOutcome::Accepted
+        );
+        assert_eq!(
+            generated_invalidation.source,
+            BaselineGeneratedCodeInvalidationSource::PropertyLoadGuardWatchpointInvalidation
+        );
+        assert_eq!(
+            generated_invalidation.artifact_id,
+            Some(generated_artifact.id)
+        );
+        assert_eq!(
+            generated_invalidation.bytecode_snapshot,
+            Some(artifact_snapshot)
+        );
+        assert!(tiering
+            .baseline_generated_code_artifact_for(owner)
+            .is_none());
     }
 
     #[test]
@@ -31667,6 +31832,68 @@ mod tests {
             entry.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::InvalidatedGeneratedArtifact)
         );
+    }
+
+    #[test]
+    fn generated_property_load_probe_miss_targets_generated_artifact_when_ic_snapshot_differs() {
+        let owner = CodeBlockId(CellId(143));
+        let mut tiering = VmTieringIntegration::default();
+        let ic_snapshot = baseline_bytecode_snapshot(owner);
+        let bytecode_index = BytecodeIndex::from_offset(6);
+        let generated_artifact = tiering
+            .record_baseline_generated_code_artifact(
+                owner,
+                alternate_snapshot_baseline_generated_code_artifact(owner, 143),
+            )
+            .unwrap();
+        let artifact_snapshot = generated_artifact
+            .eligibility_proof
+            .bytecode_snapshot_fingerprint();
+        assert_ne!(ic_snapshot, artifact_snapshot);
+        let descriptor = property_handoff_observation(owner, InlineCacheSlotId(0), bytecode_index);
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            ic_snapshot,
+            descriptor,
+        );
+
+        let terminal_request = generated_property_load_probe_miss_request(
+            &tiering.property_load_access_case_plans()[0],
+            GeneratedPropertyLoadProbeMissReason::MissingProperty,
+        );
+        assert_eq!(
+            tiering.property_load_access_case_plans()[0].bytecode_snapshot,
+            ic_snapshot
+        );
+        assert_eq!(terminal_request.bytecode_snapshot, ic_snapshot);
+        let terminal = tiering.record_generated_property_load_probe_miss(terminal_request);
+        let generated_invalidation = tiering
+            .baseline_generated_code_invalidations()
+            .last()
+            .copied()
+            .expect("terminal property-load generated invalidation with mismatched IC snapshot");
+
+        assert!(terminal.terminal);
+        assert_eq!(
+            generated_invalidation.outcome,
+            BaselineGeneratedCodeInvalidationOutcome::Accepted
+        );
+        assert_eq!(
+            generated_invalidation.source,
+            BaselineGeneratedCodeInvalidationSource::PropertyLoadProbeMiss
+        );
+        assert_eq!(
+            generated_invalidation.artifact_id,
+            Some(generated_artifact.id)
+        );
+        assert_eq!(
+            generated_invalidation.bytecode_snapshot,
+            Some(artifact_snapshot)
+        );
+        assert!(tiering
+            .baseline_generated_code_artifact_for(owner)
+            .is_none());
     }
 
     #[test]
