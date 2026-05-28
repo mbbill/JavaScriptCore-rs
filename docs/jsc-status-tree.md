@@ -23,16 +23,17 @@ Legend:
       [done] richards, navier-stokes, crypto, delta-blue (interpreter, scored)
       [wip] splay, raytrace (running, slow interpreter, expected pass)
     [wip] Octane non-core (9 benchmarks)
-      [done] non-ASCII string parsing fixed (unblocks code-load, pdfjs)
-      [done] String.replace with function callback fixed
-      [done] .5 numeric literal parsing fixed (unblocks box2d parsing)
-      [done] String.prototype.match (regexp now past match; complex patterns still throw)
+      [done] non-ASCII strings, replace-with-fn, .5 literals, String.match,
+             __defineGetter__/__defineSetter__, global Function, standard Math
+             (trig/round/sign/exp/hypot/...), apply/bind, isFinite/isNaN,
+             NaN/Infinity/parseFloat globals
       [deferred] code-load, earley-boyer, gbemu, mandreel <= NO eval() support at all
                  (typeof eval === undefined). Real eval = runtime parse+compile in
                  caller scope + dynamic scope-chain resolution. Large subsystem, not
                  a quick capture fix. Verified empirically 2026-05-27.
-      [blocked] box2d <= __defineGetter__/__defineSetter__ (DefineGetter/Setter
-                 opcodes exist; needs Object.prototype.__define*__ methods)
+      [blocked] box2d <= next blocker ExpectedInt32 (numeric/opcode int32-operand
+                 coercion; basic bitwise ToInt32 verified working, so it's a subtler
+                 path — needs bisecting the 228KB file). Cleared 5 prior box2d blockers.
       [blocked] regexp <= complex Yarr patterns throw (match works, exec/replace
                  subset works; needs fuller Yarr execute)
       [blocked] pdfjs <= non-ASCII fixed; likely needs eval too
@@ -105,7 +106,17 @@ Legend:
     [done] Array.prototype.slice.call on arguments/array-likes
     [done] Array.prototype.toString calls join
     [risk] other Array methods may not support non-Array this
-  [missing] Date, Math, and standard-library completeness
+  [wip] functions and globals
+    [done] Function.prototype.call/apply/bind (bind = CoreObjectKind::BoundFunction
+           mirroring C++ JSBoundFunction); global Function constructor (non-constructible,
+           no dynamic compile); isFinite/isNaN; NaN/Infinity/parseFloat globals
+    [missing] new Function(string) dynamic compilation; bound-function construct args
+  [wip] Math standard library
+    [done] abs/floor/log/max/min/pow/random/sqrt/trunc + trig (sin/cos/tan/asin/
+           acos/atan/atan2/sinh/cosh/tanh/asinh/acosh/atanh) + ceil/round/sign/exp/
+           expm1/cbrt/log2/log10/log1p/hypot (JS round/sign semantics)
+    [missing] clz32/fround/imul/log... edge fidelity audit
+  [missing] Date and remaining standard-library completeness
   [missing] modules, jobs, microtasks, async ordering
   [deferred] Wasm
 
