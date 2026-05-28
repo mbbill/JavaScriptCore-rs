@@ -5236,6 +5236,11 @@ struct CoreObjectCell {
     view_length: usize,
     proxy_target: Option<RuntimeValue>,
     proxy_handler: Option<RuntimeValue>,
+    /// C++ JSC JSBoundFunction: [[BoundTargetFunction]], [[BoundThis]], and
+    /// [[BoundArguments]]. Only populated for CoreObjectKind::BoundFunction.
+    bound_target: Option<RuntimeValue>,
+    bound_this: RuntimeValue,
+    bound_args: Vec<RuntimeValue>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -5245,6 +5250,10 @@ enum CoreObjectKind {
     Array,
     Function,
     NativeFunction,
+    // C++ JSC JSBoundFunction (runtime/JSBoundFunction.h): the object created by
+    // Function.prototype.bind. Stores the target function, bound `this`, and
+    // bound leading arguments in bound_target/bound_this/bound_args.
+    BoundFunction,
     ClosureCell,
     Map,
     Set,
@@ -5268,6 +5277,14 @@ enum CoreNativeFunction {
     ObjectDefineGetter,
     ObjectDefineSetter,
     FunctionCall,
+    // C++ JSC FunctionPrototype.cpp: Function.prototype.apply
+    // (functionPrototypeApplyCodeGenerator) and Function.prototype.bind
+    // (functionProtoFuncBind). `apply` reuses the same call path as `call`
+    // (execute_function_value_with_completion), sourcing arguments from the
+    // array-like argument instead of varargs. `bind` allocates a
+    // CoreObjectKind::BoundFunction (Rust mirror of JSBoundFunction).
+    FunctionApply,
+    FunctionBind,
     // C++ JSC FunctionConstructor (runtime/FunctionConstructor.cpp): the global
     // `Function`. Rust does not implement dynamic source compilation
     // (`new Function(string)`), so this native function only exists to give the
@@ -5313,6 +5330,11 @@ enum CoreNativeFunction {
     MathHypot,
     ParseInt,
     ParseFloat,
+    // C++ JSC GlobalObjectMethodTable / globalFuncIsFinite & globalFuncIsNaN
+    // (runtime/JSGlobalObjectFunctions.cpp): the global `isFinite`/`isNaN`
+    // functions. Both ToNumber the argument then test finiteness/NaN.
+    GlobalIsFinite,
+    GlobalIsNaN,
     HostPerformanceNow,
     HostPrint,
     HostAlert,
@@ -6168,6 +6190,26 @@ impl CoreObjectStore {
         })
     }
 
+    /// C++ JSC JSBoundFunction::create (runtime/JSBoundFunction.cpp): allocate a
+    /// bound function whose prototype is Function.prototype, capturing the
+    /// target callable, bound `this`, and bound leading arguments.
+    fn allocate_bound_function(
+        &mut self,
+        target: RuntimeValue,
+        bound_this: RuntimeValue,
+        bound_args: Vec<RuntimeValue>,
+    ) -> RuntimeValue {
+        let function_prototype = self.ensure_function_prototype();
+        self.allocate_cell(CoreObjectCell {
+            kind: CoreObjectKind::BoundFunction,
+            prototype: Some(function_prototype),
+            bound_target: Some(target),
+            bound_this,
+            bound_args,
+            ..CoreObjectCell::default()
+        })
+    }
+
     fn allocate_object_constructor_with_write_barrier(
         &mut self,
         heap: &mut Heap,
@@ -6870,6 +6912,47 @@ impl CoreObjectStore {
             parse_float,
             standard_attributes,
         )?;
+        // C++ JSC JSGlobalObject::init binds the global `isFinite`/`isNaN`
+        // (runtime/JSGlobalObjectFunctions.cpp). standard_attributes matches
+        // their DontEnum installation.
+        let is_finite = self.allocate_native_function(CoreNativeFunction::GlobalIsFinite);
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "isFinite",
+            is_finite,
+            standard_attributes,
+        )?;
+        let is_nan = self.allocate_native_function(CoreNativeFunction::GlobalIsNaN);
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "isNaN",
+            is_nan,
+            standard_attributes,
+        )?;
+        // C++ JSC JSGlobalObject::init installs `NaN` and `Infinity` as value
+        // properties with DontEnum | DontDelete | ReadOnly attributes
+        // (not writable, not enumerable, not configurable).
+        let value_constant_attributes = CorePropertyAttributes {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "NaN",
+            RuntimeValue::from_double(f64::NAN),
+            value_constant_attributes,
+        )?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "Infinity",
+            RuntimeValue::from_double(f64::INFINITY),
+            value_constant_attributes,
+        )?;
         Ok(())
     }
 
@@ -7212,21 +7295,28 @@ impl CoreObjectStore {
         let object_prototype = self.ensure_object_prototype();
         let prototype = self.allocate_with_prototype(Some(object_prototype));
         self.function_prototype = Some(prototype);
-        let call = self.allocate_native_function_with_prototype(
-            CoreNativeFunction::FunctionCall,
-            Some(prototype),
-        );
-        let key = CorePropertyKey::String("call".into());
-        let _ = self.define_data_property(
-            prototype,
-            &key,
-            call,
-            CorePropertyAttributes {
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            },
-        );
+        // C++ JSC FunctionPrototype::addFunctionProperties installs call/apply/
+        // bind on Function.prototype as DontEnum. We mirror that here. apply/bind
+        // and call share the function prototype as their own prototype.
+        for (name, native_function) in [
+            ("call", CoreNativeFunction::FunctionCall),
+            ("apply", CoreNativeFunction::FunctionApply),
+            ("bind", CoreNativeFunction::FunctionBind),
+        ] {
+            let function =
+                self.allocate_native_function_with_prototype(native_function, Some(prototype));
+            let key = CorePropertyKey::String(name.into());
+            let _ = self.define_data_property(
+                prototype,
+                &key,
+                function,
+                CorePropertyAttributes {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
         prototype
     }
 
@@ -9634,6 +9724,16 @@ impl CoreObjectStore {
                     callee: value,
                 })
                 .ok_or(ExecutionError::ExpectedFunction),
+            // C++ JSC JSBoundFunction is callable; resolve through to the bound
+            // target so callability checks succeed. Argument prepending and
+            // boundThis substitution happen in
+            // execute_function_value_with_completion.
+            CoreObjectKind::BoundFunction => {
+                let target = object
+                    .bound_target
+                    .ok_or(ExecutionError::ExpectedFunction)?;
+                self.function_call_target(target)
+            }
             CoreObjectKind::Ordinary
             | CoreObjectKind::Array
             | CoreObjectKind::ClosureCell
@@ -9672,6 +9772,13 @@ impl CoreObjectStore {
         };
         match object.kind {
             CoreObjectKind::Function | CoreObjectKind::NativeFunction => Ok(value),
+            // C++ JSC JSBoundFunction is itself a callable value.
+            CoreObjectKind::BoundFunction => {
+                let _ = object
+                    .bound_target
+                    .ok_or(ExecutionError::ExpectedFunction)?;
+                Ok(value)
+            }
             CoreObjectKind::Proxy => {
                 let target = object
                     .proxy_target
@@ -9724,7 +9831,11 @@ impl CoreObjectStore {
         self.find(value).is_some_and(|object| {
             matches!(
                 object.kind,
-                CoreObjectKind::Function | CoreObjectKind::NativeFunction
+                // C++ JSC: a JSBoundFunction is callable, so `typeof` reports
+                // "function" and callability checks succeed.
+                CoreObjectKind::Function
+                    | CoreObjectKind::NativeFunction
+                    | CoreObjectKind::BoundFunction
             )
         })
     }
@@ -9743,6 +9854,14 @@ impl CoreObjectStore {
             CoreObjectKind::Proxy => {
                 let target = object
                     .proxy_target
+                    .ok_or(ExecutionError::ExpectedFunction)?;
+                self.function_construct_ability(target)
+            }
+            // C++ JSC: JSBoundFunction inherits its construct ability from the
+            // bound target ([[Construct]] forwards to [[BoundTargetFunction]]).
+            CoreObjectKind::BoundFunction => {
+                let target = object
+                    .bound_target
                     .ok_or(ExecutionError::ExpectedFunction)?;
                 self.function_construct_ability(target)
             }
@@ -9865,6 +9984,20 @@ impl CoreObjectStore {
     fn is_proxy(&self, value: RuntimeValue) -> bool {
         self.find(value)
             .is_some_and(|object| object.kind == CoreObjectKind::Proxy)
+    }
+
+    /// C++ JSC JSBoundFunction accessors: returns ([[BoundTargetFunction]],
+    /// [[BoundThis]], [[BoundArguments]]) when `value` is a bound function.
+    fn bound_function_data(
+        &self,
+        value: RuntimeValue,
+    ) -> Option<(RuntimeValue, RuntimeValue, Vec<RuntimeValue>)> {
+        let object = self.find(value)?;
+        if object.kind != CoreObjectKind::BoundFunction {
+            return None;
+        }
+        let target = object.bound_target?;
+        Some((target, object.bound_this, object.bound_args.clone()))
     }
 
     fn proxy_target_handler(
@@ -16142,6 +16275,23 @@ impl CoreOpcodeDispatchHost {
                 completion,
             );
         }
+        // C++ JSC JSBoundFunction::call (runtime/JSBoundFunction.cpp /
+        // boundThisNoArgsFunctionCall): a bound function ignores the incoming
+        // `this`, substitutes [[BoundThis]], and prepends [[BoundArguments]] to
+        // the caller-supplied arguments before invoking [[BoundTargetFunction]].
+        if let Some((target, bound_this, bound_args)) = self.objects.bound_function_data(function) {
+            let mut combined_arguments =
+                Vec::with_capacity(bound_args.len() + provided_arguments.len());
+            combined_arguments.extend(bound_args);
+            combined_arguments.extend_from_slice(provided_arguments);
+            return self.execute_function_value_with_completion(
+                state,
+                target,
+                bound_this,
+                &combined_arguments,
+                completion,
+            );
+        }
         let target = self
             .objects
             .function_call_target(function)
@@ -16398,6 +16548,21 @@ impl CoreOpcodeDispatchHost {
                     Err(outcome) => outcome,
                 }
             }
+            // C++ JSC JSBoundFunction::call: route through
+            // execute_function_value_with_completion, which substitutes
+            // [[BoundThis]] and prepends [[BoundArguments]] before invoking the
+            // bound target. Mirrors the proxy branch above.
+            Ok(_) if self.objects.bound_function_data(callee).is_some() => self
+                .dispatch_bound_function_call(
+                    state,
+                    caller_window,
+                    instruction,
+                    destination,
+                    callee,
+                    RuntimeValue::undefined(),
+                    argument_count,
+                    3,
+                ),
             Ok(CoreFunctionCallTarget::Bytecode {
                 function_index,
                 captures,
@@ -16446,6 +16611,51 @@ impl CoreOpcodeDispatchHost {
             &outcome,
         );
         outcome
+    }
+
+    /// C++ JSC JSBoundFunction::call / boundThisNoArgsFunctionCall. Collects the
+    /// caller-supplied arguments from the instruction and routes through
+    /// execute_function_value_with_completion, which substitutes [[BoundThis]]
+    /// and prepends [[BoundArguments]]. The incoming `this_value` is ignored for
+    /// bound functions (the bound function decides `this`), matching the proxy
+    /// branch's argument-collection pattern.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_bound_function_call(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        caller_window: RegisterWindow,
+        instruction: DispatchInstruction<'_>,
+        destination: VirtualRegister,
+        callee: RuntimeValue,
+        this_value: RuntimeValue,
+        argument_count: u32,
+        first_argument_operand: usize,
+    ) -> DispatchOutcome {
+        let arguments = match self.call_arguments_from_instruction(
+            state,
+            caller_window,
+            instruction,
+            argument_count,
+            first_argument_operand,
+        ) {
+            Ok(arguments) => arguments,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        let completion = match self.function_value_tail_completion_for_current_call(
+            state,
+            caller_window,
+            instruction,
+            destination,
+        ) {
+            Ok(completion) => completion,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        match self.execute_function_value_with_completion(
+            state, callee, this_value, &arguments, completion,
+        ) {
+            Ok(value) => write_register(state, caller_window, destination, value),
+            Err(outcome) => outcome,
+        }
     }
 
     fn call_arguments_from_instruction(
@@ -16539,6 +16749,20 @@ impl CoreOpcodeDispatchHost {
                     Err(outcome) => outcome,
                 }
             }
+            // C++ JSC JSBoundFunction::call: the bound function ignores the
+            // explicit `this` and substitutes [[BoundThis]] plus prepended
+            // [[BoundArguments]] inside execute_function_value_with_completion.
+            Ok(_) if self.objects.bound_function_data(callee).is_some() => self
+                .dispatch_bound_function_call(
+                    state,
+                    caller_window,
+                    instruction,
+                    destination,
+                    callee,
+                    this_value,
+                    argument_count,
+                    4,
+                ),
             Ok(CoreFunctionCallTarget::Bytecode {
                 function_index,
                 captures,
@@ -17813,6 +18037,12 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::FunctionCall => {
                 self.native_function_call(state, this_value, arguments, function_value_completion)
             }
+            CoreNativeFunction::FunctionApply => {
+                self.native_function_apply(state, this_value, arguments, function_value_completion)
+            }
+            CoreNativeFunction::FunctionBind => {
+                self.native_function_bind(state, this_value, arguments)
+            }
             CoreNativeFunction::FunctionConstructor => {
                 // C++ JSC callFunctionConstructor compiles a function from a
                 // source string (runtime/FunctionConstructor.cpp). Rust does not
@@ -17868,6 +18098,8 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::MathHypot => self.native_math_hypot(arguments),
             CoreNativeFunction::ParseInt => self.native_parse_int(arguments),
             CoreNativeFunction::ParseFloat => self.native_parse_float(arguments),
+            CoreNativeFunction::GlobalIsFinite => self.native_global_is_finite(arguments),
+            CoreNativeFunction::GlobalIsNaN => self.native_global_is_nan(arguments),
             CoreNativeFunction::HostPerformanceNow => Ok(self.native_host_performance_now()),
             CoreNativeFunction::HostPrint => {
                 Ok(self.native_host_output(CoreHostOutputSink::Print, arguments))
@@ -18452,6 +18684,99 @@ impl CoreOpcodeDispatchHost {
             provided_arguments,
             completion,
         )
+    }
+
+    /// C++ JSC FunctionPrototype.cpp Function.prototype.apply
+    /// (functionPrototypeApplyCodeGenerator / applyFunction). `this` is the
+    /// target callable, arguments[0] is thisArg, arguments[1] is the array-like
+    /// argument list. Reuses the same call path as Function.prototype.call
+    /// (execute_function_value_with_completion), sourcing arguments from the
+    /// array-like instead of varargs.
+    fn native_function_apply(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        function: RuntimeValue,
+        arguments: &[RuntimeValue],
+        completion: Option<FunctionValueCallCompletion>,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        if self.objects.function_call_target(function).is_err() {
+            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedFunction));
+        }
+        let this_arg = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        let array_argument = arguments
+            .get(1)
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        // C++ JSC: a null/undefined argument list means call with no arguments.
+        let call_arguments = match array_argument.kind() {
+            ValueKind::Undefined | ValueKind::Null => Vec::new(),
+            _ => self.reflect_argument_list(state.heap, array_argument)?,
+        };
+        self.execute_function_value_with_completion(
+            state,
+            function,
+            this_arg,
+            &call_arguments,
+            completion,
+        )
+    }
+
+    /// C++ JSC FunctionPrototype.cpp functionProtoFuncBind. `this` is the target
+    /// callable; arguments[0] is boundThis and arguments[1..] are boundArgs.
+    /// Returns a CoreObjectKind::BoundFunction (Rust mirror of JSBoundFunction).
+    fn native_function_bind(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        function: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        if self.objects.function_call_target(function).is_err() {
+            return Err(self.type_error_outcome_with_heap(
+                state.heap,
+                "|this| is not a function inside Function.prototype.bind",
+            ));
+        }
+        let bound_this = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        let bound_args: Vec<RuntimeValue> = arguments.get(1..).unwrap_or(&[]).to_vec();
+        Ok(self
+            .objects
+            .allocate_bound_function(function, bound_this, bound_args))
+    }
+
+    /// C++ JSC globalFuncIsFinite (runtime/JSGlobalObjectFunctions.cpp):
+    /// ToNumber the argument, return false for NaN/+-Infinity else true.
+    fn native_global_is_finite(
+        &self,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let value = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        let number = self.number_constructor_value(value)?;
+        let number = number.as_number().map(number_to_f64).unwrap_or(f64::NAN);
+        Ok(RuntimeValue::from_bool(number.is_finite()))
+    }
+
+    /// C++ JSC globalFuncIsNaN (runtime/JSGlobalObjectFunctions.cpp): ToNumber
+    /// the argument, return true if the result is NaN.
+    fn native_global_is_nan(
+        &self,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let value = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        let number = self.number_constructor_value(value)?;
+        let number = number.as_number().map(number_to_f64).unwrap_or(f64::NAN);
+        Ok(RuntimeValue::from_bool(number.is_nan()))
     }
 
     fn native_date_constructor(

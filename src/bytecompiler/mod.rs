@@ -230,6 +230,11 @@ pub const STANDARD_GLOBAL_BINDING_NAMES: &[&str] = &[
     "Proxy",
     "Symbol",
     "parseInt",
+    "parseFloat",
+    "isFinite",
+    "isNaN",
+    "NaN",
+    "Infinity",
 ];
 
 impl BytecompilerGlobalBindingSet {

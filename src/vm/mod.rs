@@ -29452,6 +29452,102 @@ mod tests {
     }
 
     #[test]
+    fn vm_function_prototype_apply_calls_with_array_arguments() {
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("function f(a,b){return a+b;} f.apply(null,[3,4]);"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(7))
+        );
+    }
+
+    #[test]
+    fn vm_function_prototype_apply_null_argument_list_calls_with_no_args() {
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source(
+                "function f(){return arguments.length;} f.apply(null);"
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(0))
+        );
+        assert_eq!(
+            vm.execute_source(source(
+                "function g(){return arguments.length;} g.apply(null, undefined);"
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(0))
+        );
+    }
+
+    #[test]
+    fn vm_function_prototype_apply_forwards_to_math_max() {
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("Math.max.apply(null,[1,5,2]);"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(5))
+        );
+    }
+
+    #[test]
+    fn vm_function_prototype_bind_prepends_bound_this_and_args() {
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("function f(a){return a+1;} f.bind(null)(5);"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(6))
+        );
+        assert_eq!(
+            vm.execute_source(source("function g(a,b){return a+b;} g.bind(null, 3)(4);"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(7))
+        );
+    }
+
+    #[test]
+    fn vm_function_prototype_bind_substitutes_bound_this() {
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source(
+                "var o={v:42}; function f(){return this.v;} f.bind(o)();"
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn vm_global_is_finite_matches_jsc_semantics() {
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("isFinite(5);")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(
+            vm.execute_source(source("isFinite(Infinity);")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(false))
+        );
+        assert_eq!(
+            vm.execute_source(source("isFinite(NaN);")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(false))
+        );
+    }
+
+    #[test]
+    fn vm_global_is_nan_matches_jsc_semantics() {
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("isNaN(NaN);")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(
+            vm.execute_source(source("isNaN(5);")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(false))
+        );
+    }
+
+    #[test]
     fn vm_execute_source_publishes_top_level_code_block_and_global_object_cells() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
