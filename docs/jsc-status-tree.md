@@ -26,11 +26,16 @@ Legend:
       [done] non-ASCII string parsing fixed (unblocks code-load, pdfjs)
       [done] String.replace with function callback fixed
       [done] .5 numeric literal parsing fixed (unblocks box2d parsing)
-      [wip] String.prototype.match implementation (unblocks regexp)
-      [blocked] code-load, earley-boyer, gbemu, mandreel <= eval scope propagation
-      [blocked] pdfjs <= non-ASCII strings fixed but may hit eval issue too
-      [blocked] box2d <= __defineGetter__/__defineSetter__
-      [blocked] regexp <= String.prototype.match missing
+      [done] String.prototype.match (regexp now past match; complex patterns still throw)
+      [deferred] code-load, earley-boyer, gbemu, mandreel <= NO eval() support at all
+                 (typeof eval === undefined). Real eval = runtime parse+compile in
+                 caller scope + dynamic scope-chain resolution. Large subsystem, not
+                 a quick capture fix. Verified empirically 2026-05-27.
+      [blocked] box2d <= __defineGetter__/__defineSetter__ (DefineGetter/Setter
+                 opcodes exist; needs Object.prototype.__define*__ methods)
+      [blocked] regexp <= complex Yarr patterns throw (match works, exec/replace
+                 subset works; needs fuller Yarr execute)
+      [blocked] pdfjs <= non-ASCII fixed; likely needs eval too
     [missing] full Octane correctness
     [missing] Octane score parity with local C++ JSC
 
