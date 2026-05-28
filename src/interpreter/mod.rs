@@ -24,8 +24,8 @@ use crate::bytecode::register::{
     CallFrameSlotLayout, RegisterFrameShape, ThisArgumentOffset, VirtualRegister,
 };
 use crate::bytecode::{
-    BytecodeIndex, CodeKind, ConstructAbility, ConstructorKind, CoreOpcode, OperandKind,
-    PackedInstructionStream, ParseMode,
+    ArrayProfile, BytecodeIndex, CodeKind, ConstructAbility, ConstructorKind, CoreOpcode,
+    OperandKind, PackedInstructionStream, ParseMode, PropertyCacheKey,
 };
 use crate::gc::{
     static_barrier_schema_registry, static_cell_metadata_registry, AllocationMode,
@@ -43,13 +43,14 @@ use crate::jit::{
     AccessCaseKind, CacheKey, GeneratedCallLinkProbeMissReason, GeneratedCallLinkProbeRequest,
     GeneratedCallLinkProbeResult, GeneratedGuardedPropertyLoadProbeMissReason,
     GeneratedGuardedPropertyLoadProbeRequest, GeneratedGuardedPropertyLoadProbeResult,
-    GeneratedPropertyLoadProbeMissReason, GeneratedPropertyLoadProbeRequest,
-    GeneratedPropertyLoadProbeResult, GeneratedPropertyStoreProbeMissReason,
-    GeneratedPropertyStoreProbeRequest, GeneratedPropertyStoreProbeResult,
-    InlineCacheFallbackSemantics, InlineCacheKind, InlineCacheMissHandoffDescriptor,
-    InlineCacheSlotId, InlineCacheStubKind, PropertyLoadAccessCasePlanKind,
-    PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome, PropertyLoadGuardPlan,
-    PropertyLoadGuardRequirement, PropertyLoadObservationChainEntry,
+    GeneratedPropertyLoadMegamorphicHolderProbeRequest, GeneratedPropertyLoadProbeMissReason,
+    GeneratedPropertyLoadProbeRequest, GeneratedPropertyLoadProbeResult,
+    GeneratedPropertyStoreProbeMissReason, GeneratedPropertyStoreProbeRequest,
+    GeneratedPropertyStoreProbeResult, InlineCacheFallbackSemantics, InlineCacheKind,
+    InlineCacheMissHandoffDescriptor, InlineCacheSlotId, InlineCacheStubKind,
+    PropertyHasObservationDescriptor, PropertyLoadAccessCasePlanKind,
+    PropertyLoadBaseNormalization, PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome,
+    PropertyLoadGuardPlan, PropertyLoadGuardRequirement, PropertyLoadObservationChainEntry,
     PropertyLoadObservationDescriptor, PropertyLoadObservationReadiness,
     PropertyStoreAccessCasePlanKind, WatchpointFireEvent, WatchpointSetId, WatchpointTarget,
 };
@@ -63,12 +64,17 @@ use crate::runtime::{
     ObjectId, PromiseState, RuntimeValue, ScopeId, StackFrameId, VmEntryReason,
     WatchpointGeneration,
 };
-use crate::strings::{AtomId, Identifier, PropertyKey};
+use crate::strings::{AtomId, Identifier, PropertyIndex, PropertyKey};
 use crate::value::{EncodedJsValue, NumberValue, ValueKind};
 use crate::vm::{
     ExceptionState, ExceptionUnwindState, PendingException, TerminationReason, UnwindHandler,
 };
-use crate::yarr::{parse_regex_flags, plan_yarr_parse, RegexFlags};
+use crate::yarr::{
+    execute_simple_yarr, parse_regex_flags, plan_yarr_parse, RegexFlags, YarrSimpleMatchRange,
+};
+
+const FRAME_ROOT_ID_BASE: u64 = 1_000_000_000_000;
+const REGISTER_ROOT_ID_BASE: u64 = 2_000_000_000_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct InterpreterStackId(pub u64);
@@ -238,6 +244,12 @@ impl FunctionValuePropertyObservation {
         }
     }
 
+    fn property_has(record: CorePropertyLookupRecord) -> Self {
+        Self {
+            kind: FunctionValuePropertyObservationKind::PropertyHas { record },
+        }
+    }
+
     fn property_store(
         site: CorePropertyStoreSite,
         object: RuntimeValue,
@@ -265,6 +277,9 @@ impl FunctionValuePropertyObservation {
 enum FunctionValuePropertyObservationKind {
     None,
     PropertyLoad {
+        record: CorePropertyLookupRecord,
+    },
+    PropertyHas {
         record: CorePropertyLookupRecord,
     },
     PropertyStore {
@@ -542,6 +557,20 @@ impl ExecutionContextStack {
         self.frames.last_mut()
     }
 
+    pub fn active_global_this_value(&self) -> Result<RuntimeValue, ExecutionError> {
+        if self.active_entry().is_none() {
+            return Err(ExecutionError::NoActiveEntry);
+        }
+        for entry in self.entries.iter().rev() {
+            match &entry.record {
+                ExecutionEntryRecord::Program(program) => return Ok(program.this_value),
+                ExecutionEntryRecord::Eval(eval) => return Ok(eval.this_value),
+                ExecutionEntryRecord::Function(_) | ExecutionEntryRecord::Module(_) => {}
+            }
+        }
+        Err(ExecutionError::ExpectedObject)
+    }
+
     pub fn frame(&self, id: CallFrameId) -> Option<&InstalledCallFrame> {
         self.frames.iter().find(|frame| frame.id == id)
     }
@@ -717,6 +746,7 @@ impl ExecutionContextStack {
         self.root_snapshot_with_frame_roots(heap, registers, frame_roots)
     }
 
+    #[cfg(test)]
     fn root_snapshot_for_heap(
         &self,
         heap: &Heap,
@@ -736,7 +766,11 @@ impl ExecutionContextStack {
         registers: &RegisterFile,
         frame_roots: Vec<FrameRootDescriptor>,
     ) -> Result<ExecutionRootSnapshot, RootSetSemanticError> {
-        let register_roots = registers.root_descriptors(heap);
+        let register_roots = self
+            .frames
+            .iter()
+            .flat_map(|frame| registers.root_descriptors_for_window(heap, frame.register_window))
+            .collect::<Vec<_>>();
         validate_root_records(
             frame_roots
                 .iter()
@@ -745,6 +779,107 @@ impl ExecutionContextStack {
         )?;
         Ok(ExecutionRootSnapshot {
             frame_roots,
+            register_roots,
+        })
+    }
+
+    fn frame_root_snapshot_for_heap(
+        &self,
+        heap: &Heap,
+        owner_frame: CallFrameId,
+    ) -> Result<ExecutionRootSnapshot, RootSetSemanticError> {
+        let frame_roots = self
+            .frames
+            .iter()
+            .filter(|frame| frame.id == owner_frame)
+            .flat_map(|frame| frame.root_descriptors_for_heap(heap))
+            .collect::<Vec<_>>();
+        validate_root_records(frame_roots.iter().map(|descriptor| descriptor.root))?;
+        Ok(ExecutionRootSnapshot {
+            frame_roots,
+            register_roots: Vec::new(),
+        })
+    }
+
+    fn register_root_snapshot_for_frame(
+        &self,
+        heap: &Heap,
+        registers: &RegisterFile,
+        owner_frame: CallFrameId,
+    ) -> Result<ExecutionRootSnapshot, RootSetSemanticError> {
+        let register_roots = self
+            .frames
+            .iter()
+            .filter(|frame| frame.id == owner_frame)
+            .flat_map(|frame| {
+                registers.root_descriptors_for_window(heap.id(), frame.register_window)
+            })
+            .collect::<Vec<_>>();
+        validate_root_records(register_roots.iter().map(|descriptor| descriptor.root))?;
+        Ok(ExecutionRootSnapshot {
+            frame_roots: Vec::new(),
+            register_roots,
+        })
+    }
+
+    fn nonlocal_frame_root_snapshot_for_heap(
+        &self,
+        heap: &Heap,
+        owner_frame: CallFrameId,
+    ) -> Result<ExecutionRootSnapshot, RootSetSemanticError> {
+        let frame_roots = self
+            .frames
+            .iter()
+            .filter(|frame| frame.id != owner_frame)
+            .flat_map(|frame| frame.root_descriptors_for_heap(heap))
+            .collect::<Vec<_>>();
+        validate_root_records(frame_roots.iter().map(|descriptor| descriptor.root))?;
+        Ok(ExecutionRootSnapshot {
+            frame_roots,
+            register_roots: Vec::new(),
+        })
+    }
+
+    fn nonlocal_register_root_snapshot_for_frame(
+        &self,
+        heap: &Heap,
+        registers: &RegisterFile,
+        owner_frame: CallFrameId,
+    ) -> Result<ExecutionRootSnapshot, RootSetSemanticError> {
+        let register_roots = self
+            .frames
+            .iter()
+            .filter(|frame| frame.id != owner_frame)
+            .flat_map(|frame| {
+                registers.root_descriptors_for_window(heap.id(), frame.register_window)
+            })
+            .collect::<Vec<_>>();
+        validate_root_records(register_roots.iter().map(|descriptor| descriptor.root))?;
+        Ok(ExecutionRootSnapshot {
+            frame_roots: Vec::new(),
+            register_roots,
+        })
+    }
+
+    pub(crate) fn register_root_snapshot_for_slots(
+        &self,
+        heap: HeapId,
+        registers: &RegisterFile,
+        slots: &[(CallFrameId, usize)],
+    ) -> Result<ExecutionRootSnapshot, RootSetSemanticError> {
+        let register_roots = self
+            .frames
+            .iter()
+            .flat_map(|frame| registers.root_descriptors_for_window(heap, frame.register_window))
+            .filter(|descriptor| {
+                slots
+                    .iter()
+                    .any(|(frame, slot)| descriptor.frame == *frame && descriptor.slot == *slot)
+            })
+            .collect::<Vec<_>>();
+        validate_root_records(register_roots.iter().map(|descriptor| descriptor.root))?;
+        Ok(ExecutionRootSnapshot {
+            frame_roots: Vec::new(),
             register_roots,
         })
     }
@@ -1065,26 +1200,32 @@ impl RegisterFile {
     pub fn root_descriptors(&self, heap: HeapId) -> Vec<RegisterRootDescriptor> {
         self.windows
             .iter()
-            .flat_map(|window| {
-                let locals = (0..window.local_count).filter_map(move |offset| {
-                    self.register_root_descriptor(
-                        heap,
-                        *window,
-                        window.base.saturating_add(offset),
-                        RegisterSlotKind::Local,
-                    )
-                });
-                let arguments = (0..window.argument_count).filter_map(move |offset| {
-                    self.register_root_descriptor(
-                        heap,
-                        *window,
-                        window.argument_base.saturating_add(offset),
-                        RegisterSlotKind::Argument,
-                    )
-                });
-                locals.chain(arguments)
-            })
+            .flat_map(|window| self.root_descriptors_for_window(heap, *window))
             .collect()
+    }
+
+    fn root_descriptors_for_window(
+        &self,
+        heap: HeapId,
+        window: RegisterWindow,
+    ) -> Vec<RegisterRootDescriptor> {
+        let locals = (0..window.local_count).filter_map(|offset| {
+            self.register_root_descriptor(
+                heap,
+                window,
+                window.base.saturating_add(offset),
+                RegisterSlotKind::Local,
+            )
+        });
+        let arguments = (0..window.argument_count).filter_map(|offset| {
+            self.register_root_descriptor(
+                heap,
+                window,
+                window.argument_base.saturating_add(offset),
+                RegisterSlotKind::Argument,
+            )
+        });
+        locals.chain(arguments).collect()
     }
 
     pub fn allocate_frame(
@@ -1834,7 +1975,7 @@ pub struct PropertyLoadObservationDrainRequest {
     pub slot: InlineCacheSlotId,
     pub cache_kind: InlineCacheKind,
     pub fallback: InlineCacheFallbackSemantics,
-    pub property_key: PropertyKey,
+    pub property_key: PropertyCacheKey,
     pub cold_miss_handoff: InlineCacheMissHandoffDescriptor,
 }
 
@@ -1847,7 +1988,20 @@ pub struct PropertyStoreObservationDrainRequest {
     pub slot: InlineCacheSlotId,
     pub cache_kind: InlineCacheKind,
     pub fallback: InlineCacheFallbackSemantics,
-    pub property_key: PropertyKey,
+    pub property_key: PropertyCacheKey,
+    pub cold_miss_handoff: InlineCacheMissHandoffDescriptor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PropertyHasObservationDrainRequest {
+    pub owner: CodeBlockId,
+    pub frame: CallFrameId,
+    pub bytecode_index: BytecodeIndex,
+    pub opcode: CoreOpcode,
+    pub slot: InlineCacheSlotId,
+    pub cache_kind: InlineCacheKind,
+    pub fallback: InlineCacheFallbackSemantics,
+    pub property_key: PropertyCacheKey,
     pub cold_miss_handoff: InlineCacheMissHandoffDescriptor,
 }
 
@@ -1863,15 +2017,68 @@ pub struct CallObservationDrainRequest {
 pub enum CallObservationThisSource {
     ImplicitUndefined,
     ExplicitRegister(VirtualRegister),
+    ConstructAllocatedReceiver,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CallObservationTargetKind {
-    BytecodeFunction { function_index: u32 },
-    NativeFunction { native: String },
+    BytecodeFunction {
+        function_index: u32,
+    },
+    NativeFunction {
+        native: String,
+        intrinsic: Option<NativeIntrinsic>,
+    },
     Proxy,
     NonCallableOrError,
     Opaque,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeIntrinsic {
+    StringCharCodeAt,
+    StringIndexOf,
+    StringLastIndexOf,
+    StringSubstring,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GeneratedNativeIntrinsicCallRequest {
+    pub owner: CodeBlockId,
+    pub bytecode_index: BytecodeIndex,
+    pub opcode: CoreOpcode,
+    pub callee_value: RuntimeValue,
+    pub this_value: RuntimeValue,
+    pub provided_argument_count: u32,
+    pub first_argument: Option<RuntimeValue>,
+    pub second_argument: Option<RuntimeValue>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GeneratedNativeIntrinsicCallHit {
+    pub intrinsic: NativeIntrinsic,
+    pub value: RuntimeValue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratedNativeIntrinsicCallMissReason {
+    HostUnavailable,
+    UnsupportedOpcode,
+    UnsupportedCallee,
+    UnsupportedThis,
+    UnsupportedArgument,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratedNativeIntrinsicCallResult {
+    Hit(GeneratedNativeIntrinsicCallHit),
+    Miss(GeneratedNativeIntrinsicCallMissReason),
+}
+
+impl GeneratedNativeIntrinsicCallResult {
+    pub const fn miss(reason: GeneratedNativeIntrinsicCallMissReason) -> Self {
+        Self::Miss(reason)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1919,13 +2126,17 @@ pub struct CallObservationDescriptor {
 
 impl CallObservationDescriptor {
     pub fn validate(&self) -> Result<(), ExecutionError> {
-        if !matches!(self.opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+        if !matches!(
+            self.opcode,
+            CoreOpcode::Call | CoreOpcode::CallWithThis | CoreOpcode::Construct
+        ) {
             return Err(ExecutionError::BaselineGeneratedExecutionRejected);
         }
         match (self.opcode, self.this_source) {
             (CoreOpcode::Call, CallObservationThisSource::ImplicitUndefined)
                 if self.this_object.is_none() => {}
             (CoreOpcode::CallWithThis, CallObservationThisSource::ExplicitRegister(_)) => {}
+            (CoreOpcode::Construct, CallObservationThisSource::ConstructAllocatedReceiver) => {}
             _ => return Err(ExecutionError::BaselineGeneratedExecutionRejected),
         }
         if self.argument_count_including_this
@@ -1947,6 +2158,13 @@ impl CallObservationDescriptor {
         }
         if self.root_safety == CallObservationRootSafety::RootSafe
             && self.opcode == CoreOpcode::CallWithThis
+            && self.this_value_kind == ValueKind::Cell
+            && self.this_object.is_none()
+        {
+            return Err(ExecutionError::BaselineGeneratedExecutionRejected);
+        }
+        if self.root_safety == CallObservationRootSafety::RootSafe
+            && self.opcode == CoreOpcode::Construct
             && self.this_value_kind == ValueKind::Cell
             && self.this_object.is_none()
         {
@@ -1977,6 +2195,7 @@ impl CallObservationDescriptor {
 pub enum PropertyStoreObservationOutcome {
     OwnDataStore,
     CreatedProperty,
+    IndexedStore,
     Setter,
     Proxy,
     Ignored,
@@ -2002,6 +2221,7 @@ pub struct PropertyStoreObservationDescriptor {
     pub outcome: PropertyStoreObservationOutcome,
     pub may_call_js: bool,
     pub cacheability: PropertyCacheability,
+    pub can_use_put_by_id_megamorphic: bool,
     pub write_barrier_count: u32,
     pub last_write_barrier: Option<BarrierRequirementOutcome>,
     pub cold_miss_handoff: InlineCacheMissHandoffDescriptor,
@@ -2009,7 +2229,10 @@ pub struct PropertyStoreObservationDescriptor {
 
 impl PropertyStoreObservationDescriptor {
     pub fn validate(&self) -> Result<(), ExecutionError> {
-        if self.cache_kind != InlineCacheKind::PropertyStore {
+        if !matches!(
+            self.cache_kind,
+            InlineCacheKind::PropertyStore | InlineCacheKind::ElementStore
+        ) {
             return Err(ExecutionError::BaselineGeneratedExecutionRejected);
         }
         if self.fallback != InlineCacheFallbackSemantics::SlowPathLookup {
@@ -2049,6 +2272,11 @@ pub struct StructureTransitionWatchpointSnapshot {
     pub kind: Option<WatchpointKind>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StructureChainInvalidationEvent {
+    pub old_structure: StructureId,
+}
+
 pub trait DispatchHost {
     fn targeted_register_roots(
         &mut self,
@@ -2071,6 +2299,16 @@ pub trait DispatchHost {
         _heap: &mut Heap,
         _request: PropertyStoreObservationDrainRequest,
     ) -> Result<Option<PropertyStoreObservationDescriptor>, ExecutionError> {
+        Ok(None)
+    }
+
+    fn discard_property_store_observations(&mut self) {}
+
+    fn drain_property_has_observation(
+        &mut self,
+        _heap: &mut Heap,
+        _request: PropertyHasObservationDrainRequest,
+    ) -> Result<Option<PropertyHasObservationDescriptor>, ExecutionError> {
         Ok(None)
     }
 
@@ -2138,9 +2376,49 @@ pub trait DispatchHost {
         Vec::new()
     }
 
+    fn has_pending_structure_chain_invalidation_events(&mut self) -> bool {
+        false
+    }
+
+    fn drain_structure_chain_invalidation_events(
+        &mut self,
+    ) -> Vec<StructureChainInvalidationEvent> {
+        Vec::new()
+    }
+
+    fn generated_property_sidecar_base_structure(
+        &mut self,
+        _base: RuntimeValue,
+    ) -> Option<StructureId> {
+        None
+    }
+
+    fn generated_property_has_sidecar_base_structure(
+        &mut self,
+        _base: RuntimeValue,
+    ) -> Option<StructureId> {
+        None
+    }
+
+    fn generated_property_has_sidecar_runtime_key(
+        &mut self,
+        _property: RuntimeValue,
+    ) -> Option<CacheKey> {
+        None
+    }
+
     fn probe_generated_property_load(
         &mut self,
         _request: GeneratedPropertyLoadProbeRequest<'_>,
+    ) -> GeneratedPropertyLoadProbeResult {
+        GeneratedPropertyLoadProbeResult::miss(
+            GeneratedPropertyLoadProbeMissReason::HostUnavailable,
+        )
+    }
+
+    fn probe_generated_property_load_megamorphic_holder(
+        &mut self,
+        _request: GeneratedPropertyLoadMegamorphicHolderProbeRequest,
     ) -> GeneratedPropertyLoadProbeResult {
         GeneratedPropertyLoadProbeResult::miss(
             GeneratedPropertyLoadProbeMissReason::HostUnavailable,
@@ -2185,6 +2463,16 @@ pub trait DispatchHost {
         GeneratedCallLinkProbeResult::miss(GeneratedCallLinkProbeMissReason::HostUnavailable)
     }
 
+    fn dispatch_generated_native_intrinsic_call(
+        &mut self,
+        _heap: &mut Heap,
+        _request: GeneratedNativeIntrinsicCallRequest,
+    ) -> GeneratedNativeIntrinsicCallResult {
+        GeneratedNativeIntrinsicCallResult::miss(
+            GeneratedNativeIntrinsicCallMissReason::HostUnavailable,
+        )
+    }
+
     fn dispatch_instruction(
         &mut self,
         state: &mut DispatchState<'_>,
@@ -2225,6 +2513,12 @@ pub struct CoreHostOutputRecord {
 
 const CORE_HOST_OUTPUT_RECORD_LIMIT: usize = 1024;
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum CoreHostResultRecord {
+    Resolved { elapsed_times_ms: Vec<f64> },
+    Rejected { reason: String },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoreGlobalLexicalDeclarationKind {
     Let,
@@ -2255,13 +2549,16 @@ pub struct CoreOpcodeDispatchHost {
     host_created_at: Instant,
     last_performance_now_ms: f64,
     host_output_records: Vec<CoreHostOutputRecord>,
+    host_result_records: Vec<CoreHostResultRecord>,
     string_literals: HashMap<u32, String>,
     identifier_texts: HashMap<u32, String>,
     prototype_property_key: Option<CorePropertyKey>,
     last_property_lookup: Option<CorePropertyLookupRecord>,
     pending_property_lookup_site: Option<CorePropertyLookupSite>,
     last_property_store: Option<CorePropertyStoreRecord>,
+    property_store_records: Vec<CorePropertyStoreRecord>,
     pending_property_store_site: Option<CorePropertyStoreSite>,
+    last_array_profile_observation: Option<CoreArrayProfileObservationRecord>,
     last_call_observation: Option<CoreCallObservationRecord>,
     initialized_instance_fields: Vec<CoreInitializedInstanceFields>,
     global_lexical_bindings: HashMap<String, CoreGlobalLexicalBinding>,
@@ -2281,13 +2578,16 @@ impl Default for CoreOpcodeDispatchHost {
             host_created_at: Instant::now(),
             last_performance_now_ms: 0.0,
             host_output_records: Vec::new(),
+            host_result_records: Vec::new(),
             string_literals: HashMap::new(),
             identifier_texts: HashMap::new(),
             prototype_property_key: Some(CorePropertyKey::String("prototype".into())),
             last_property_lookup: None,
             pending_property_lookup_site: None,
             last_property_store: None,
+            property_store_records: Vec::new(),
             pending_property_store_site: None,
+            last_array_profile_observation: None,
             last_call_observation: None,
             initialized_instance_fields: Vec::new(),
             global_lexical_bindings: HashMap::new(),
@@ -2427,6 +2727,10 @@ impl CoreOpcodeDispatchHost {
 
     pub fn host_output_records(&self) -> &[CoreHostOutputRecord] {
         &self.host_output_records
+    }
+
+    pub fn host_result_records(&self) -> &[CoreHostResultRecord] {
+        &self.host_result_records
     }
 
     pub fn install_global_lexical_declarations<I>(
@@ -2694,12 +2998,13 @@ impl CoreOpcodeDispatchHost {
 
     #[cfg(test)]
     pub(crate) fn has_property_store_record(&self) -> bool {
-        self.last_property_store.is_some()
+        self.last_property_store.is_some() || !self.property_store_records.is_empty()
     }
 
     #[cfg(test)]
     pub(crate) fn clear_property_store_record(&mut self) {
         self.last_property_store = None;
+        self.property_store_records.clear();
         self.pending_property_store_site = None;
     }
 
@@ -2729,6 +3034,25 @@ impl CoreOpcodeDispatchHost {
             .set_data_own(object, &CorePropertyKey::Identifier(identifier), value)
     }
 
+    #[cfg(test)]
+    pub(crate) fn put_array_element_for_test(
+        &mut self,
+        object: RuntimeValue,
+        index: usize,
+        value: RuntimeValue,
+    ) -> Result<(), ExecutionError> {
+        self.objects.put_array_element(object, index, value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_index_for_test(
+        &self,
+        object: RuntimeValue,
+        index: i32,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        self.objects.get_index(object, index)
+    }
+
     fn record_property_lookup(&mut self, record: CorePropertyLookupRecord) {
         self.last_property_lookup = Some(record);
     }
@@ -2739,7 +3063,11 @@ impl CoreOpcodeDispatchHost {
     }
 
     fn record_property_store(&mut self, record: CorePropertyStoreRecord) {
-        self.last_property_store = Some(record);
+        self.last_property_store = Some(record.clone());
+        if self.property_store_records.len() >= CORE_HOST_OUTPUT_RECORD_LIMIT {
+            self.property_store_records.remove(0);
+        }
+        self.property_store_records.push(record);
     }
 
     fn begin_property_store_recording(&mut self, site: CorePropertyStoreSite) {
@@ -2756,7 +3084,7 @@ impl CoreOpcodeDispatchHost {
         heap: &mut Heap,
         request: PropertyLoadObservationDrainRequest,
     ) -> Result<Option<PropertyLoadObservationDescriptor>, ExecutionError> {
-        let Some(record) = self.last_property_lookup.take() else {
+        let Some(mut record) = self.last_property_lookup.take() else {
             self.pending_property_lookup_site = None;
             return Ok(None);
         };
@@ -2765,14 +3093,21 @@ impl CoreOpcodeDispatchHost {
         if record.bytecode_index != Some(request.bytecode_index)
             || record.opcode != Some(request.opcode)
             || record.lookup_mode != PropertyLookupMode::Get
-            || request.opcode != CoreOpcode::GetByName
+            || !matches!(
+                request.opcode,
+                CoreOpcode::GetByName
+                    | CoreOpcode::GetGlobalObjectProperty
+                    | CoreOpcode::GetByValue
+            )
         {
             return Ok(None);
         }
 
-        if !self.core_property_key_matches_expected(&record.key, request.property_key) {
+        let Some(cache_key) =
+            self.property_observation_cache_key(&record.key, request.opcode, request.property_key)
+        else {
             return Ok(None);
-        }
+        };
 
         let mut cacheability = record.cacheability;
         let mut may_call_js = record.may_call_js;
@@ -2793,12 +3128,39 @@ impl CoreOpcodeDispatchHost {
             may_call_js = true;
             observed_access_case_kind = None;
             base_structure = None;
+            record.base_normalization = PropertyLoadBaseNormalization::None;
             offset = None;
         }
         if observed_access_case_kind == Some(AccessCaseKind::IndexedLoad) {
+            let cacheable_dense_indexed_load = request.opcode == CoreOpcode::GetByValue
+                && request.cache_kind == InlineCacheKind::ElementLoad
+                && record.prototype_depth == 0
+                && record.holder == record.base_object
+                && key_array_index(&record.key).is_some()
+                && record.returned_value.is_some()
+                && record
+                    .base_object
+                    .and_then(|base| self.objects.find(base))
+                    .is_some_and(|cell| cell.kind == CoreObjectKind::Array);
+            if cacheable_dense_indexed_load {
+                cacheability = PropertyCacheability::Allowed;
+                observed_access_case_kind = Some(AccessCaseKind::IndexedLoad);
+                offset = None;
+            } else {
+                cacheability = PropertyCacheability::Disallowed;
+                observed_access_case_kind = None;
+                base_structure = None;
+                record.base_normalization = PropertyLoadBaseNormalization::None;
+                offset = None;
+            }
+        }
+        if observed_access_case_kind == Some(AccessCaseKind::IndexedLoad)
+            && request.cache_kind != InlineCacheKind::ElementLoad
+        {
             cacheability = PropertyCacheability::Disallowed;
             observed_access_case_kind = None;
             base_structure = None;
+            record.base_normalization = PropertyLoadBaseNormalization::None;
             offset = None;
         }
         if record.classification == CorePropertyLookupClassification::Missing
@@ -2807,6 +3169,7 @@ impl CoreOpcodeDispatchHost {
             cacheability = PropertyCacheability::Disallowed;
             observed_access_case_kind = None;
             base_structure = None;
+            record.base_normalization = PropertyLoadBaseNormalization::None;
             offset = None;
         }
 
@@ -2817,15 +3180,22 @@ impl CoreOpcodeDispatchHost {
             bytecode_index: request.bytecode_index.offset(),
             cache_kind: request.cache_kind,
             fallback: request.fallback,
-            key: CacheKey::Property(request.property_key),
+            key: CacheKey::Property(cache_key),
             base_object,
             holder_object,
+            base_normalization: record.base_normalization,
             base_structure,
             offset,
             prototype_depth,
             observed_access_case_kind,
             may_call_js,
             cacheability,
+            can_use_get_by_id_megamorphic: self
+                .property_observation_supports_get_by_id_megamorphic(
+                    &record.key,
+                    request.opcode,
+                    request.cache_kind,
+                ),
             readiness: PropertyLoadObservationReadiness::ReadyForAttachment,
             cold_miss_handoff: request.cold_miss_handoff,
             chain: chain.unwrap_or_default(),
@@ -2837,27 +3207,156 @@ impl CoreOpcodeDispatchHost {
         Ok(Some(descriptor))
     }
 
+    fn drain_property_has_observation_descriptor(
+        &mut self,
+        heap: &mut Heap,
+        request: PropertyHasObservationDrainRequest,
+    ) -> Result<Option<PropertyHasObservationDescriptor>, ExecutionError> {
+        let Some(record) = self.last_property_lookup.take() else {
+            self.pending_property_lookup_site = None;
+            return Ok(None);
+        };
+        self.pending_property_lookup_site = None;
+
+        if record.bytecode_index != Some(request.bytecode_index)
+            || record.opcode != Some(request.opcode)
+            || record.lookup_mode != PropertyLookupMode::HasProperty
+            || !matches!(request.opcode, CoreOpcode::InById | CoreOpcode::InByVal)
+        {
+            return Ok(None);
+        }
+
+        let mut cache_key =
+            self.property_has_observation_cache_key(&record, request.opcode, request.property_key);
+        let result = record
+            .returned_value
+            .and_then(RuntimeValue::as_bool)
+            .unwrap_or(false);
+        let mut cacheability = record.cacheability;
+        let mut may_call_js = record.may_call_js;
+        let mut observed_access_case_kind =
+            self.property_has_observation_access_case_kind(&record, result);
+        let mut base_structure = record.base_structure;
+        let mut offset = record.offset;
+        let base_object =
+            self.root_safe_object_id_for_property_observation(heap, record.base_object)?;
+        let mut holder_object =
+            self.root_safe_object_id_for_property_observation(heap, record.holder)?;
+        let chain = self.root_safe_property_observation_chain(heap, &record.chain)?;
+
+        let mut root_safety_blocked = record.base_object.is_some() && base_object.is_none()
+            || record.holder.is_some() && holder_object.is_none()
+            || chain.is_none();
+        if record.returned_value.is_none() {
+            root_safety_blocked = true;
+        }
+        if matches!(cache_key, CacheKey::Dynamic) {
+            let dynamic_proxy_case = matches!(
+                observed_access_case_kind,
+                Some(AccessCaseKind::ProxyObjectIn | AccessCaseKind::IndexedProxyObjectIn)
+            );
+            cacheability = if dynamic_proxy_case {
+                record.cacheability
+            } else {
+                PropertyCacheability::Disallowed
+            };
+            if !dynamic_proxy_case {
+                observed_access_case_kind = None;
+            }
+            base_structure = None;
+            holder_object = None;
+            offset = None;
+        }
+        if root_safety_blocked {
+            cacheability = PropertyCacheability::TaintedByOpaqueObject;
+            may_call_js = true;
+            observed_access_case_kind = None;
+            base_structure = None;
+            holder_object = None;
+            offset = None;
+            cache_key = match cache_key {
+                CacheKey::Property(key) => CacheKey::Property(key),
+                CacheKey::Dynamic => CacheKey::Dynamic,
+            };
+        }
+
+        let prototype_depth = u16::try_from(record.prototype_depth).unwrap_or(u16::MAX);
+        let descriptor = PropertyHasObservationDescriptor {
+            owner: request.owner,
+            slot: request.slot,
+            bytecode_index: request.bytecode_index.offset(),
+            opcode: request.opcode,
+            cache_kind: request.cache_kind,
+            fallback: request.fallback,
+            key: cache_key,
+            base_object,
+            holder_object,
+            base_structure,
+            offset,
+            prototype_depth,
+            observed_access_case_kind,
+            result,
+            may_call_js,
+            cacheability,
+            can_use_in_by_id_megamorphic: !matches!(cache_key, CacheKey::Dynamic)
+                && !root_safety_blocked
+                && cacheability == PropertyCacheability::Allowed
+                && matches!(
+                    observed_access_case_kind,
+                    Some(AccessCaseKind::InHit | AccessCaseKind::InMiss)
+                )
+                && self.property_observation_supports_in_by_id_megamorphic(
+                    &record.key,
+                    request.opcode,
+                    request.cache_kind,
+                ),
+            cold_miss_handoff: request.cold_miss_handoff,
+            chain: if root_safety_blocked || matches!(cache_key, CacheKey::Dynamic) {
+                Vec::new()
+            } else {
+                chain.unwrap_or_default()
+            },
+        };
+        descriptor
+            .validate()
+            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+        Ok(Some(descriptor))
+    }
+
     fn drain_property_store_observation_descriptor(
         &mut self,
         heap: &mut Heap,
         request: PropertyStoreObservationDrainRequest,
     ) -> Result<Option<PropertyStoreObservationDescriptor>, ExecutionError> {
-        let Some(record) = self.last_property_store.take() else {
+        let Some(record_index) = self.property_store_records.iter().position(|record| {
+            record.bytecode_index == Some(request.bytecode_index)
+                && record.opcode == Some(request.opcode)
+                && matches!(
+                    request.opcode,
+                    CoreOpcode::PutByName
+                        | CoreOpcode::PutGlobalObjectProperty
+                        | CoreOpcode::PutByValue
+                )
+                && self
+                    .property_observation_cache_key(
+                        &record.key,
+                        request.opcode,
+                        request.property_key,
+                    )
+                    .is_some()
+        }) else {
             self.pending_property_store_site = None;
             return Ok(None);
         };
+        let record = self.property_store_records.remove(record_index);
+        self.last_property_store = self.property_store_records.last().cloned();
         self.pending_property_store_site = None;
 
-        if record.bytecode_index != Some(request.bytecode_index)
-            || record.opcode != Some(request.opcode)
-            || request.opcode != CoreOpcode::PutByName
-        {
+        let Some(cache_key) =
+            self.property_observation_cache_key(&record.key, request.opcode, request.property_key)
+        else {
             return Ok(None);
-        }
-
-        if !self.core_property_key_matches_expected(&record.key, request.property_key) {
-            return Ok(None);
-        }
+        };
 
         let base_object =
             self.root_safe_object_id_for_property_observation(heap, record.base_object)?;
@@ -2868,7 +3367,7 @@ impl CoreOpcodeDispatchHost {
             bytecode_index: request.bytecode_index.offset(),
             cache_kind: request.cache_kind,
             fallback: request.fallback,
-            key: CacheKey::Property(request.property_key),
+            key: CacheKey::Property(cache_key),
             base_object,
             base_structure_before: record.base_structure_before,
             base_structure_after: record.base_structure_after,
@@ -2877,6 +3376,12 @@ impl CoreOpcodeDispatchHost {
             outcome: record.outcome,
             may_call_js: record.may_call_js,
             cacheability: record.cacheability,
+            can_use_put_by_id_megamorphic: self
+                .property_observation_supports_put_by_id_megamorphic(
+                    &record.key,
+                    request.opcode,
+                    request.cache_kind,
+                ),
             write_barrier_count: record.write_barrier_count,
             last_write_barrier: record.last_write_barrier,
             cold_miss_handoff: request.cold_miss_handoff,
@@ -2885,6 +3390,14 @@ impl CoreOpcodeDispatchHost {
             descriptor.outcome = PropertyStoreObservationOutcome::Opaque;
             descriptor.may_call_js = true;
             descriptor.cacheability = PropertyCacheability::TaintedByOpaqueObject;
+            descriptor.base_structure_before = None;
+            descriptor.base_structure_after = None;
+            descriptor.offset_after = None;
+        }
+        if request.opcode == CoreOpcode::PutGlobalObjectProperty
+            && descriptor.outcome == PropertyStoreObservationOutcome::CreatedProperty
+        {
+            descriptor.outcome = PropertyStoreObservationOutcome::Opaque;
             descriptor.base_structure_before = None;
             descriptor.base_structure_after = None;
             descriptor.offset_after = None;
@@ -2906,7 +3419,10 @@ impl CoreOpcodeDispatchHost {
             || record.frame != request.frame
             || record.bytecode_index != request.bytecode_index
             || record.opcode != request.opcode
-            || !matches!(request.opcode, CoreOpcode::Call | CoreOpcode::CallWithThis)
+            || !matches!(
+                request.opcode,
+                CoreOpcode::Call | CoreOpcode::CallWithThis | CoreOpcode::Construct
+            )
         {
             return Ok(None);
         }
@@ -2920,6 +3436,7 @@ impl CoreOpcodeDispatchHost {
         let this_blocked = matches!(
             record.this_source,
             CallObservationThisSource::ExplicitRegister(_)
+                | CallObservationThisSource::ConstructAllocatedReceiver
         ) && record.this_value.kind() == ValueKind::Cell
             && this_object.is_none();
 
@@ -2931,7 +3448,7 @@ impl CoreOpcodeDispatchHost {
         let mut target_kind = record.target_kind;
         let mut may_call_js = record.may_call_js;
         let (mut target_executable, mut target_code_block) =
-            self.bytecode_call_target_identity(&target_kind);
+            self.bytecode_call_target_identity(&target_kind, request.opcode);
         if root_safety == CallObservationRootSafety::Blocked {
             target_kind = CallObservationTargetKind::Opaque;
             may_call_js = true;
@@ -2952,7 +3469,8 @@ impl CoreOpcodeDispatchHost {
             this_value_kind: record.this_value.kind(),
             this_object: match record.this_source {
                 CallObservationThisSource::ImplicitUndefined => None,
-                CallObservationThisSource::ExplicitRegister(_) => this_object,
+                CallObservationThisSource::ExplicitRegister(_)
+                | CallObservationThisSource::ConstructAllocatedReceiver => this_object,
             },
             provided_argument_count: record.provided_argument_count,
             argument_count_including_this: record.provided_argument_count.saturating_add(1),
@@ -2977,6 +3495,11 @@ impl CoreOpcodeDispatchHost {
         match observation.kind {
             FunctionValuePropertyObservationKind::None => Ok(()),
             FunctionValuePropertyObservationKind::PropertyLoad { record } => {
+                self.pending_property_lookup_site = None;
+                self.record_property_lookup(record);
+                Ok(())
+            }
+            FunctionValuePropertyObservationKind::PropertyHas { record } => {
                 self.pending_property_lookup_site = None;
                 self.record_property_lookup(record);
                 Ok(())
@@ -3034,6 +3557,7 @@ impl CoreOpcodeDispatchHost {
     fn bytecode_call_target_identity(
         &self,
         target_kind: &CallObservationTargetKind,
+        opcode: CoreOpcode,
     ) -> (Option<ExecutableId>, Option<CodeBlockId>) {
         let CallObservationTargetKind::BytecodeFunction { function_index } = target_kind else {
             return (None, None);
@@ -3044,10 +3568,21 @@ impl CoreOpcodeDispatchHost {
         else {
             return (None, None);
         };
-        let Some(executable) = function_entry.code_block.link_context().owner_executable else {
+        let code_block = match opcode {
+            CoreOpcode::Construct => function_entry.construct_code_block.as_ref(),
+            _ => Some(&function_entry.code_block),
+        };
+        let Some(code_block) = code_block else {
             return (None, None);
         };
-        (Some(executable), Some(function_entry.id))
+        let Some(executable) = code_block.link_context().owner_executable else {
+            return (None, None);
+        };
+        let code_block_id = match opcode {
+            CoreOpcode::Construct => function_entry.construct_id,
+            _ => Some(function_entry.id),
+        };
+        (Some(executable), code_block_id)
     }
 
     pub fn snapshot_structure_transition_watchpoints(
@@ -3072,6 +3607,17 @@ impl CoreOpcodeDispatchHost {
         self.objects.drain_watchpoint_fire_events()
     }
 
+    pub fn has_pending_structure_chain_invalidation_events(&self) -> bool {
+        self.objects
+            .has_pending_structure_chain_invalidation_events()
+    }
+
+    pub fn drain_structure_chain_invalidation_events(
+        &mut self,
+    ) -> Vec<StructureChainInvalidationEvent> {
+        self.objects.drain_structure_chain_invalidation_events()
+    }
+
     pub fn probe_generated_call_link(
         &mut self,
         heap: &mut Heap,
@@ -3090,6 +3636,127 @@ impl CoreOpcodeDispatchHost {
         GeneratedCallLinkProbeResult::for_request(&resolved_request)
     }
 
+    pub fn dispatch_generated_native_intrinsic_call(
+        &mut self,
+        heap: &mut Heap,
+        request: GeneratedNativeIntrinsicCallRequest,
+    ) -> GeneratedNativeIntrinsicCallResult {
+        use GeneratedNativeIntrinsicCallMissReason as Miss;
+
+        if request.opcode != CoreOpcode::CallWithThis {
+            return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedOpcode);
+        }
+        let Some(native) = self.objects.native_function_for_value(request.callee_value) else {
+            return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedCallee);
+        };
+
+        match native {
+            CoreNativeFunction::StringCharCodeAt => {
+                if request.provided_argument_count != 1 {
+                    return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedArgument);
+                }
+                let Some(text) = self.strings.text(request.this_value) else {
+                    return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedThis);
+                };
+                let Some(NumberValue::Int32(index)) =
+                    request.first_argument.and_then(RuntimeValue::as_number)
+                else {
+                    return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedArgument);
+                };
+                let Some(unit) = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| string_code_unit_at(text, index))
+                else {
+                    return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedArgument);
+                };
+                GeneratedNativeIntrinsicCallResult::Hit(GeneratedNativeIntrinsicCallHit {
+                    intrinsic: NativeIntrinsic::StringCharCodeAt,
+                    value: RuntimeValue::from_i32(i32::from(unit)),
+                })
+            }
+            CoreNativeFunction::StringIndexOf | CoreNativeFunction::StringLastIndexOf => {
+                if request.provided_argument_count == 0 || request.provided_argument_count > 2 {
+                    return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedArgument);
+                }
+                let Some(text) = self.strings.text(request.this_value) else {
+                    return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedThis);
+                };
+                let Some(search) = request
+                    .first_argument
+                    .and_then(|value| self.strings.text(value))
+                else {
+                    return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedArgument);
+                };
+                let default_position = if native == CoreNativeFunction::StringIndexOf {
+                    0
+                } else {
+                    i32::MAX
+                };
+                let Some(position) =
+                    generated_native_int32_argument_or(request.second_argument, default_position)
+                else {
+                    return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedArgument);
+                };
+                let (intrinsic, index) = if native == CoreNativeFunction::StringIndexOf {
+                    (
+                        NativeIntrinsic::StringIndexOf,
+                        string_index_of(text, search, position),
+                    )
+                } else {
+                    (
+                        NativeIntrinsic::StringLastIndexOf,
+                        string_last_index_of(text, search, position),
+                    )
+                };
+                GeneratedNativeIntrinsicCallResult::Hit(GeneratedNativeIntrinsicCallHit {
+                    intrinsic,
+                    value: RuntimeValue::from_i32(index),
+                })
+            }
+            CoreNativeFunction::StringSubstring => {
+                if request.provided_argument_count > 2 {
+                    return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedArgument);
+                }
+                let (start, end) = {
+                    let Some(text) = self.strings.text(request.this_value) else {
+                        return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedThis);
+                    };
+                    let length = string_code_unit_len_i32(text);
+                    let Some(mut start) =
+                        generated_native_int32_argument_or(request.first_argument, 0)
+                    else {
+                        return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedArgument);
+                    };
+                    let Some(mut end) =
+                        generated_native_int32_argument_or(request.second_argument, length)
+                    else {
+                        return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedArgument);
+                    };
+                    start = start.clamp(0, length);
+                    end = end.clamp(0, length);
+                    if start > end {
+                        std::mem::swap(&mut start, &mut end);
+                    }
+                    (
+                        usize::try_from(start).unwrap_or(usize::MAX),
+                        usize::try_from(end).unwrap_or(usize::MAX),
+                    )
+                };
+                let Ok(value) =
+                    self.strings
+                        .allocate_substring_with_heap(heap, request.this_value, start, end)
+                else {
+                    return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedArgument);
+                };
+                GeneratedNativeIntrinsicCallResult::Hit(GeneratedNativeIntrinsicCallHit {
+                    intrinsic: NativeIntrinsic::StringSubstring,
+                    value,
+                })
+            }
+            _ => GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedCallee),
+        }
+    }
+
     pub fn probe_generated_property_load(
         &self,
         request: GeneratedPropertyLoadProbeRequest<'_>,
@@ -3097,6 +3764,68 @@ impl CoreOpcodeDispatchHost {
         use GeneratedPropertyLoadProbeMissReason as Miss;
 
         let plan = request.plan;
+        if plan.plan_kind == PropertyLoadAccessCasePlanKind::DataOnlyIndexedLoad
+            || plan.access_case.kind == AccessCaseKind::IndexedLoad
+        {
+            if plan.plan_kind != PropertyLoadAccessCasePlanKind::DataOnlyIndexedLoad
+                || plan.planned_stub_kind != InlineCacheStubKind::DataOnlyHandler
+                || plan.access_case.kind != AccessCaseKind::IndexedLoad
+                || plan.access_case.key != plan.key
+                || plan.access_case.new_structure.is_some()
+                || plan.access_case.holder.is_some()
+                || plan.access_case.offset.is_some()
+                || plan.access_case.via_global_proxy
+                || plan.access_case.may_call_js
+                || !plan.access_case.dependencies.is_empty()
+            {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::UnsupportedPlan);
+            }
+
+            if !plan
+                .effect_contract
+                .supports_generated_data_only_indexed_load()
+            {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::UnsupportedPlanMetadata);
+            }
+
+            let Some(base_structure) = plan.access_case.base_structure else {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::MissingBaseStructure);
+            };
+            if base_structure == StructureId::INVALID {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::MissingBaseStructure);
+            }
+
+            let CacheKey::Property(property_key) = plan.key else {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::KeyNotRepresentable);
+            };
+            let Some(index) = property_key.as_index().map(|index| index.get() as usize) else {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::KeyNotRepresentable);
+            };
+
+            if request.base.as_cell().is_none() {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::NonCellBase);
+            }
+
+            let Some(cell) = self.objects.find(request.base) else {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::UnknownObject);
+            };
+            if cell.kind == CoreObjectKind::Proxy {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::OpaqueObject);
+            }
+            if cell.kind != CoreObjectKind::Array {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::OpaqueObject);
+            }
+            if cell.structure_id != base_structure {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::StructureMismatch);
+            }
+
+            let Some(Some(value)) = cell.elements.get(index).copied() else {
+                return GeneratedPropertyLoadProbeResult::miss(Miss::MissingProperty);
+            };
+
+            return GeneratedPropertyLoadProbeResult::hit(value);
+        }
+
         if plan.plan_kind != PropertyLoadAccessCasePlanKind::DataOnlyOwnLoad
             || plan.planned_stub_kind != InlineCacheStubKind::DataOnlyHandler
             || plan.access_case.kind != AccessCaseKind::Load
@@ -3172,6 +3901,53 @@ impl CoreOpcodeDispatchHost {
         GeneratedPropertyLoadProbeResult::hit(value)
     }
 
+    pub fn probe_generated_property_load_megamorphic_holder(
+        &self,
+        request: GeneratedPropertyLoadMegamorphicHolderProbeRequest,
+    ) -> GeneratedPropertyLoadProbeResult {
+        use GeneratedPropertyLoadProbeMissReason as Miss;
+
+        if request.base_structure == StructureId::INVALID {
+            return GeneratedPropertyLoadProbeResult::miss(Miss::MissingBaseStructure);
+        }
+        if request.offset == PropertyOffset::INVALID || request.offset.raw() < 0 {
+            return GeneratedPropertyLoadProbeResult::miss(Miss::MissingOrInvalidOffset);
+        }
+
+        let Some(key) = self.generated_property_load_core_key(request.key) else {
+            return GeneratedPropertyLoadProbeResult::miss(Miss::KeyNotRepresentable);
+        };
+        if !key.supports_named_property_offset() {
+            return GeneratedPropertyLoadProbeResult::miss(Miss::IndexedProperty);
+        }
+
+        let Some(holder) = self.objects.find_by_object_id(request.holder) else {
+            return GeneratedPropertyLoadProbeResult::miss(Miss::UnknownObject);
+        };
+        if holder.kind == CoreObjectKind::Proxy {
+            return GeneratedPropertyLoadProbeResult::miss(Miss::OpaqueObject);
+        }
+
+        let Some((stored_key, property)) = holder
+            .properties
+            .iter()
+            .find(|(stored_key, _)| key.matches(stored_key))
+        else {
+            return GeneratedPropertyLoadProbeResult::miss(Miss::MissingProperty);
+        };
+        let CorePropertyKind::Data(value) = property.kind else {
+            return GeneratedPropertyLoadProbeResult::miss(Miss::NonDataProperty);
+        };
+        let Some(actual_offset) = holder.property_offset(stored_key) else {
+            return GeneratedPropertyLoadProbeResult::miss(Miss::MissingOrInvalidOffset);
+        };
+        if actual_offset != request.offset {
+            return GeneratedPropertyLoadProbeResult::miss(Miss::KeyOffsetMismatch);
+        }
+
+        GeneratedPropertyLoadProbeResult::hit(value)
+    }
+
     pub fn probe_generated_property_store(
         &self,
         request: GeneratedPropertyStoreProbeRequest<'_>,
@@ -3184,6 +3960,44 @@ impl CoreOpcodeDispatchHost {
                 GeneratedPropertyStoreProbeResult::Hit(hit) => hit,
                 miss @ GeneratedPropertyStoreProbeResult::Miss(_) => return miss,
             };
+
+        if plan.plan_kind == PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore {
+            let CacheKey::Property(property_key) = plan_hit.key else {
+                return GeneratedPropertyStoreProbeResult::miss(Miss::KeyNotRepresentable);
+            };
+            let Some(index) = property_key.as_index().map(|index| index.get() as usize) else {
+                return GeneratedPropertyStoreProbeResult::miss(Miss::KeyNotRepresentable);
+            };
+            if plan_hit.planned_new_structure.is_some() {
+                return GeneratedPropertyStoreProbeResult::miss(Miss::TransitionStructureMismatch);
+            }
+            if plan_hit.planned_offset != PropertyOffset::INVALID {
+                return GeneratedPropertyStoreProbeResult::miss(Miss::MissingOrInvalidOffset);
+            }
+            if request.base.as_cell().is_none() {
+                return GeneratedPropertyStoreProbeResult::miss(Miss::NonCellBase);
+            }
+            let Some(cell) = self.objects.find(request.base) else {
+                return GeneratedPropertyStoreProbeResult::miss(Miss::UnknownObject);
+            };
+            if cell.kind == CoreObjectKind::Proxy {
+                return GeneratedPropertyStoreProbeResult::miss(Miss::OpaqueObject);
+            }
+            if cell.kind != CoreObjectKind::Array {
+                return GeneratedPropertyStoreProbeResult::miss(Miss::OpaqueObject);
+            }
+            if cell.structure_id != plan_hit.base_structure {
+                return GeneratedPropertyStoreProbeResult::miss(Miss::StructureMismatch);
+            }
+            if !cell
+                .elements
+                .get(index)
+                .is_some_and(|element| element.is_some())
+            {
+                return GeneratedPropertyStoreProbeResult::miss(Miss::ExistingPropertyMismatch);
+            }
+            return GeneratedPropertyStoreProbeResult::Hit(plan_hit);
+        }
 
         let Some(key) = self.generated_property_load_core_key(plan.key) else {
             return GeneratedPropertyStoreProbeResult::miss(Miss::KeyNotRepresentable);
@@ -3250,12 +4064,15 @@ impl CoreOpcodeDispatchHost {
                     return GeneratedPropertyStoreProbeResult::miss(Miss::ExistingPropertyMismatch);
                 }
             }
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
+                unreachable!("handled before named store probe")
+            }
             PropertyStoreAccessCasePlanKind::Unsupported => {
                 return GeneratedPropertyStoreProbeResult::miss(Miss::UnsupportedPlan);
             }
         }
 
-        GeneratedPropertyStoreProbeResult::hit_for_plan(plan, request.stored_value)
+        GeneratedPropertyStoreProbeResult::Hit(plan_hit)
     }
 
     pub fn commit_generated_property_store(
@@ -3266,6 +4083,77 @@ impl CoreOpcodeDispatchHost {
         use GeneratedPropertyStoreMutationMissReason as Miss;
 
         let hit = request.probe_hit;
+        if hit.continuation_plan_kind == PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore {
+            let CacheKey::Property(property_key) = hit.key else {
+                return GeneratedPropertyStoreMutationResult::rejected(Miss::KeyNotRepresentable);
+            };
+            let Some(index) = property_key.as_index().map(|index| index.get() as usize) else {
+                return GeneratedPropertyStoreMutationResult::rejected(Miss::KeyNotRepresentable);
+            };
+            if hit.planned_new_structure.is_some() {
+                return GeneratedPropertyStoreMutationResult::rejected(
+                    Miss::TransitionStructureMismatch,
+                );
+            }
+            if hit.planned_offset != PropertyOffset::INVALID {
+                return GeneratedPropertyStoreMutationResult::rejected(
+                    Miss::MissingOrInvalidOffset,
+                );
+            }
+            if request.base.as_cell().is_none() {
+                return GeneratedPropertyStoreMutationResult::rejected(Miss::NonCellBase);
+            }
+            let Some(cell) = self.objects.find(request.base) else {
+                return GeneratedPropertyStoreMutationResult::rejected(Miss::UnknownObject);
+            };
+            if cell.kind == CoreObjectKind::Proxy {
+                return GeneratedPropertyStoreMutationResult::rejected(Miss::OpaqueObject);
+            }
+            if cell.kind != CoreObjectKind::Array {
+                return GeneratedPropertyStoreMutationResult::rejected(Miss::OpaqueObject);
+            }
+            if cell.structure_id != hit.base_structure {
+                return GeneratedPropertyStoreMutationResult::rejected(Miss::StructureMismatch);
+            }
+            if !cell
+                .elements
+                .get(index)
+                .is_some_and(|element| element.is_some())
+            {
+                return GeneratedPropertyStoreMutationResult::rejected(
+                    Miss::ExistingPropertyMismatch,
+                );
+            }
+            if self
+                .objects
+                .apply_value_store_write_barrier(heap, request.base, hit.stored_value)
+                .is_err()
+            {
+                return GeneratedPropertyStoreMutationResult::rejected(Miss::BarrierRejected);
+            }
+            let Some(cell) = self.objects.find_mut(request.base) else {
+                return GeneratedPropertyStoreMutationResult::rejected(Miss::UnknownObject);
+            };
+            if cell.kind != CoreObjectKind::Array || cell.structure_id != hit.base_structure {
+                return GeneratedPropertyStoreMutationResult::rejected(Miss::StructureMismatch);
+            }
+            let Some(slot) = cell.elements.get_mut(index) else {
+                return GeneratedPropertyStoreMutationResult::rejected(
+                    Miss::ExistingPropertyMismatch,
+                );
+            };
+            if slot.is_none() {
+                return GeneratedPropertyStoreMutationResult::rejected(
+                    Miss::ExistingPropertyMismatch,
+                );
+            }
+            *slot = Some(hit.stored_value);
+
+            return GeneratedPropertyStoreMutationResult::committed(
+                GeneratedPropertyStoreMutationCommit::host_confirmed_for_request(&request),
+            );
+        }
+
         let mutation_key = {
             let Some(key) = self.generated_property_load_core_key(hit.key) else {
                 return match hit.key {
@@ -3355,6 +4243,9 @@ impl CoreOpcodeDispatchHost {
                     }
                     key.to_core_property_key()
                 }
+                PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
+                    unreachable!("handled before named store commit")
+                }
                 PropertyStoreAccessCasePlanKind::Unsupported => {
                     return GeneratedPropertyStoreMutationResult::probe_rejected(
                         GeneratedPropertyStoreProbeMissReason::UnsupportedPlan,
@@ -3412,14 +4303,16 @@ impl CoreOpcodeDispatchHost {
                     cell.structure_id = new_structure;
                     Some(old_structure)
                 }
+                PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
+                    unreachable!("handled before named store mutation")
+                }
                 PropertyStoreAccessCasePlanKind::Unsupported => {
                     unreachable!("checked before barrier")
                 }
             }
         };
         if let Some(old_structure) = old_structure {
-            self.objects
-                .fire_structure_transition_watchpoints(old_structure);
+            self.objects.finish_structure_transition(old_structure);
         }
 
         GeneratedPropertyStoreMutationResult::committed(
@@ -3853,16 +4746,235 @@ impl CoreOpcodeDispatchHost {
             CorePropertyKey::Symbol(_) => false,
         }
     }
+
+    fn property_observation_cache_key(
+        &self,
+        key: &CorePropertyKey,
+        opcode: CoreOpcode,
+        expected: PropertyCacheKey,
+    ) -> Option<PropertyKey> {
+        match (opcode, expected) {
+            (
+                CoreOpcode::GetByName
+                | CoreOpcode::GetGlobalObjectProperty
+                | CoreOpcode::PutByName
+                | CoreOpcode::PutGlobalObjectProperty,
+                PropertyCacheKey::Key(expected),
+            ) if self.core_property_key_matches_expected(key, expected) => Some(expected),
+            (
+                CoreOpcode::GetByValue | CoreOpcode::PutByValue,
+                PropertyCacheKey::RuntimeValue(_),
+            ) => {
+                let index = u32::try_from(key_array_index(key)?).ok()?;
+                Some(PropertyKey::from_index(
+                    PropertyIndex::from_canonical_index(index),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn property_has_observation_cache_key(
+        &self,
+        record: &CorePropertyLookupRecord,
+        opcode: CoreOpcode,
+        expected: PropertyCacheKey,
+    ) -> CacheKey {
+        if opcode == CoreOpcode::InByVal && matches!(expected, PropertyCacheKey::RuntimeValue(_)) {
+            if let Some(cache_key) = record.cache_key {
+                return cache_key;
+            }
+        }
+        let key = &record.key;
+        match (opcode, expected) {
+            (CoreOpcode::InById, PropertyCacheKey::Key(expected))
+                if self.core_property_key_matches_expected(key, expected) =>
+            {
+                CacheKey::Property(expected)
+            }
+            (CoreOpcode::InByVal, PropertyCacheKey::RuntimeValue(_)) => {
+                if let Some(index) =
+                    key_array_index(key).and_then(|index| u32::try_from(index).ok())
+                {
+                    return CacheKey::Property(PropertyKey::from_index(
+                        PropertyIndex::from_canonical_index(index),
+                    ));
+                }
+                CacheKey::Dynamic
+            }
+            _ => CacheKey::Dynamic,
+        }
+    }
+
+    fn cacheable_in_by_val_cache_key(
+        &self,
+        key_value: RuntimeValue,
+        property_key: &CorePropertyKey,
+    ) -> Option<CacheKey> {
+        let CorePropertyKey::String(text) = property_key else {
+            return None;
+        };
+        if parse_array_index_name(text).is_some() {
+            return None;
+        }
+        let identifier = self.strings.atom_identifier(key_value)?;
+        Some(CacheKey::Property(PropertyKey::from_identifier(identifier)))
+    }
+
+    fn property_has_observation_access_case_kind(
+        &self,
+        record: &CorePropertyLookupRecord,
+        result: bool,
+    ) -> Option<AccessCaseKind> {
+        match record.access_case_kind {
+            Some(AccessCaseKind::IndexedIn) => {
+                return self.property_has_observation_indexed_access_case_kind(record, result);
+            }
+            Some(AccessCaseKind::Miss) if key_array_index(&record.key).is_some() => {
+                return self.property_has_observation_indexed_access_case_kind(record, result);
+            }
+            Some(AccessCaseKind::Miss) => return Some(AccessCaseKind::InMiss),
+            Some(
+                AccessCaseKind::InHit
+                | AccessCaseKind::InMiss
+                | AccessCaseKind::ProxyObjectIn
+                | AccessCaseKind::IndexedProxyObjectIn
+                | AccessCaseKind::IndexedArrayStorageInHit
+                | AccessCaseKind::IndexedTypedArrayUint8In
+                | AccessCaseKind::IndexedNoIndexingInMiss,
+            ) => return record.access_case_kind,
+            _ => {}
+        }
+
+        match record.classification {
+            CorePropertyLookupClassification::OwnData
+            | CorePropertyLookupClassification::PrototypeData
+            | CorePropertyLookupClassification::OwnAccessorGetter
+            | CorePropertyLookupClassification::PrototypeAccessorGetter
+            | CorePropertyLookupClassification::AccessorWithoutGetter
+                if result =>
+            {
+                Some(AccessCaseKind::InHit)
+            }
+            CorePropertyLookupClassification::Missing if !result => Some(AccessCaseKind::InMiss),
+            CorePropertyLookupClassification::IndexedOrTypedArray if result => {
+                self.property_has_observation_indexed_access_case_kind(record, result)
+            }
+            CorePropertyLookupClassification::OpaqueOrUncacheable
+                if record.may_call_js
+                    && record.cacheability == PropertyCacheability::TaintedByOpaqueObject =>
+            {
+                Some(match record.opcode {
+                    Some(CoreOpcode::InByVal) => AccessCaseKind::IndexedProxyObjectIn,
+                    _ => AccessCaseKind::ProxyObjectIn,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn property_has_observation_indexed_access_case_kind(
+        &self,
+        record: &CorePropertyLookupRecord,
+        result: bool,
+    ) -> Option<AccessCaseKind> {
+        let indexed_key = key_array_index(&record.key).is_some();
+        if !indexed_key {
+            return None;
+        }
+        let base = record.base_object?;
+        let base_kind = self.objects.find(base).map(|cell| cell.kind)?;
+        match (base_kind, result) {
+            (CoreObjectKind::Array, true) => Some(AccessCaseKind::IndexedArrayStorageInHit),
+            (CoreObjectKind::Uint8Array, true) => Some(AccessCaseKind::IndexedTypedArrayUint8In),
+            (CoreObjectKind::Proxy, _) => Some(AccessCaseKind::IndexedProxyObjectIn),
+            (CoreObjectKind::Ordinary, false) => Some(AccessCaseKind::IndexedNoIndexingInMiss),
+            _ => None,
+        }
+    }
+
+    fn property_observation_supports_get_by_id_megamorphic(
+        &self,
+        key: &CorePropertyKey,
+        opcode: CoreOpcode,
+        cache_kind: InlineCacheKind,
+    ) -> bool {
+        if opcode != CoreOpcode::GetByName || cache_kind != InlineCacheKind::PropertyLoad {
+            return false;
+        }
+        let Some(text) = self.property_observation_key_text(key) else {
+            return false;
+        };
+        can_use_get_by_id_megamorphic_property_name(text)
+    }
+
+    fn property_observation_supports_put_by_id_megamorphic(
+        &self,
+        key: &CorePropertyKey,
+        opcode: CoreOpcode,
+        cache_kind: InlineCacheKind,
+    ) -> bool {
+        if opcode != CoreOpcode::PutByName || cache_kind != InlineCacheKind::PropertyStore {
+            return false;
+        }
+        let Some(text) = self.property_observation_key_text(key) else {
+            return false;
+        };
+        can_use_put_by_id_megamorphic_property_name(text)
+    }
+
+    fn property_observation_supports_in_by_id_megamorphic(
+        &self,
+        key: &CorePropertyKey,
+        opcode: CoreOpcode,
+        cache_kind: InlineCacheKind,
+    ) -> bool {
+        if !matches!(opcode, CoreOpcode::InById | CoreOpcode::InByVal)
+            || cache_kind != InlineCacheKind::HasProperty
+        {
+            return false;
+        }
+        let Some(text) = self.property_observation_key_text(key) else {
+            return false;
+        };
+        can_use_in_by_id_megamorphic_property_name(text)
+    }
+
+    fn property_observation_key_text<'a>(&'a self, key: &'a CorePropertyKey) -> Option<&'a str> {
+        match key {
+            CorePropertyKey::Identifier(identifier) => {
+                self.identifier_texts.get(identifier).map(String::as_str)
+            }
+            CorePropertyKey::String(text) => Some(text.as_str()),
+            CorePropertyKey::Symbol(_) => None,
+        }
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+fn can_use_get_by_id_megamorphic_property_name(text: &str) -> bool {
+    !matches!(text, "length" | "name" | "prototype" | "__proto__")
+        && parse_array_index_name(text).is_none()
+}
+
+#[allow(dead_code)]
+fn can_use_in_by_id_megamorphic_property_name(text: &str) -> bool {
+    can_use_get_by_id_megamorphic_property_name(text)
+}
+
+fn can_use_put_by_id_megamorphic_property_name(text: &str) -> bool {
+    text != "__proto__" && parse_array_index_name(text).is_none()
+}
+
+#[derive(Debug, Default)]
 struct CoreObjectStore {
     objects: Vec<Pin<Box<CoreObjectCell>>>,
+    object_indices_by_payload: HashMap<usize, usize>,
     structure_ids: CoreStructureIdAllocator,
     structure_transition_watchpoints:
         HashMap<WatchpointSetId, CoreStructureTransitionWatchpointRecord>,
     structure_transition_watchpoints_by_structure: HashMap<StructureId, Vec<WatchpointSetId>>,
     fired_watchpoint_events: Vec<WatchpointFireEvent>,
+    structure_chain_invalidation_events: Vec<StructureChainInvalidationEvent>,
     object_prototype: Option<RuntimeValue>,
     function_prototype: Option<RuntimeValue>,
     array_prototype: Option<RuntimeValue>,
@@ -3871,6 +4983,7 @@ struct CoreObjectStore {
     boolean_prototype: Option<RuntimeValue>,
     error_prototype: Option<RuntimeValue>,
     type_error_prototype: Option<RuntimeValue>,
+    reference_error_prototype: Option<RuntimeValue>,
     map_prototype: Option<RuntimeValue>,
     set_prototype: Option<RuntimeValue>,
     weak_map_prototype: Option<RuntimeValue>,
@@ -3883,6 +4996,45 @@ struct CoreObjectStore {
     array_buffer_prototype: Option<RuntimeValue>,
     uint8_array_prototype: Option<RuntimeValue>,
     data_view_prototype: Option<RuntimeValue>,
+}
+
+impl Clone for CoreObjectStore {
+    fn clone(&self) -> Self {
+        let mut cloned = Self {
+            objects: self.objects.clone(),
+            object_indices_by_payload: HashMap::new(),
+            structure_ids: self.structure_ids.clone(),
+            structure_transition_watchpoints: self.structure_transition_watchpoints.clone(),
+            structure_transition_watchpoints_by_structure: self
+                .structure_transition_watchpoints_by_structure
+                .clone(),
+            fired_watchpoint_events: self.fired_watchpoint_events.clone(),
+            structure_chain_invalidation_events: self.structure_chain_invalidation_events.clone(),
+            object_prototype: self.object_prototype,
+            function_prototype: self.function_prototype,
+            array_prototype: self.array_prototype,
+            string_prototype: self.string_prototype,
+            number_prototype: self.number_prototype,
+            boolean_prototype: self.boolean_prototype,
+            error_prototype: self.error_prototype,
+            type_error_prototype: self.type_error_prototype,
+            reference_error_prototype: self.reference_error_prototype,
+            map_prototype: self.map_prototype,
+            set_prototype: self.set_prototype,
+            weak_map_prototype: self.weak_map_prototype,
+            weak_set_prototype: self.weak_set_prototype,
+            regexp_prototype: self.regexp_prototype,
+            promise_prototype: self.promise_prototype,
+            date_prototype: self.date_prototype,
+            bigint_prototype: self.bigint_prototype,
+            symbol_prototype: self.symbol_prototype,
+            array_buffer_prototype: self.array_buffer_prototype,
+            uint8_array_prototype: self.uint8_array_prototype,
+            data_view_prototype: self.data_view_prototype,
+        };
+        cloned.rebuild_object_indices();
+        cloned
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3946,6 +5098,9 @@ struct CoreObjectCell {
     promise_resolving_kind: Option<CorePromiseResolvingKind>,
     native_bound_promise: Option<RuntimeValue>,
     native_bound_proxy: Option<RuntimeValue>,
+    /// C++ JSC: NumberObject/BooleanObject/StringObject internal value.
+    /// Mirrors JSC's NumberObject::internalValue() / BooleanObject::internalValue().
+    primitive_value: Option<RuntimeValue>,
     date_value: f64,
     array_buffer_data: Vec<u8>,
     view_buffer: Option<RuntimeValue>,
@@ -3998,6 +5153,7 @@ enum CoreNativeFunction {
     MathSqrt,
     MathTrunc,
     ParseInt,
+    ParseFloat,
     HostPerformanceNow,
     HostPrint,
     HostAlert,
@@ -4006,6 +5162,8 @@ enum CoreNativeFunction {
     HostConsoleWarn,
     HostConsoleError,
     HostReadFile,
+    HostCurrentResolve,
+    HostCurrentReject,
     JsonParse,
     JsonStringify,
     ReflectApply,
@@ -4023,9 +5181,12 @@ enum CoreNativeFunction {
     StringConstructor,
     StringFromCharCode,
     NumberConstructor,
+    NumberPrototypeToString,
+    NumberPrototypeValueOf,
     BooleanConstructor,
     ErrorConstructor,
     TypeErrorConstructor,
+    ReferenceErrorConstructor,
     ErrorPrototypeToString,
     MapConstructor,
     MapGet,
@@ -4101,6 +5262,7 @@ enum CoreNativeFunction {
     ArrayShift,
     ArrayUnshift,
     ArrayJoin,
+    ArrayPrototypeToString,
     ArraySlice,
     ArrayConcat,
     ArrayFill,
@@ -4121,8 +5283,16 @@ enum CoreNativeFunction {
     StringCharAt,
     StringCharCodeAt,
     StringIndexOf,
+    StringLastIndexOf,
     StringSlice,
     StringSubstring,
+    StringSubstr,
+    StringSplit,
+    StringReplace,
+    StringToLowerCase,
+    StringToUpperCase,
+    StringToLocaleLowerCase,
+    StringToLocaleUpperCase,
     Assign,
     Create,
     DefineProperty,
@@ -4136,13 +5306,27 @@ enum CoreNativeFunction {
 }
 
 impl CoreNativeFunction {
+    const fn intrinsic(self) -> Option<NativeIntrinsic> {
+        match self {
+            Self::StringCharCodeAt => Some(NativeIntrinsic::StringCharCodeAt),
+            Self::StringIndexOf => Some(NativeIntrinsic::StringIndexOf),
+            Self::StringLastIndexOf => Some(NativeIntrinsic::StringLastIndexOf),
+            Self::StringSubstring => Some(NativeIntrinsic::StringSubstring),
+            _ => None,
+        }
+    }
+
     fn construct_ability(self) -> ConstructAbility {
         match self {
             Self::ObjectConstructor
             | Self::ArrayConstructor
             | Self::ProxyConstructor
+            | Self::NumberConstructor
+            | Self::BooleanConstructor
+            | Self::StringConstructor
             | Self::ErrorConstructor
             | Self::TypeErrorConstructor
+            | Self::ReferenceErrorConstructor
             | Self::MapConstructor
             | Self::SetConstructor
             | Self::WeakMapConstructor
@@ -4297,6 +5481,7 @@ enum CorePropertyGet {
 pub(crate) struct CorePropertyLookupSite {
     pub bytecode_index: Option<BytecodeIndex>,
     pub opcode: Option<CoreOpcode>,
+    pub cache_key: Option<CacheKey>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -4331,7 +5516,9 @@ struct CorePropertyLookupRecord {
     pub base: RuntimeValue,
     pub base_object: Option<RuntimeValue>,
     pub base_structure: Option<StructureId>,
+    pub base_normalization: PropertyLoadBaseNormalization,
     pub key: CorePropertyKey,
+    pub cache_key: Option<CacheKey>,
     pub holder: Option<RuntimeValue>,
     pub offset: Option<PropertyOffset>,
     pub prototype_depth: usize,
@@ -4351,6 +5538,8 @@ struct CorePropertyStoreSnapshot {
     pub has_own_property: bool,
     pub has_own_data_property: bool,
     pub is_indexed_or_typed_array_store: bool,
+    pub is_dense_array_indexed_store: bool,
+    pub has_own_indexed_element: bool,
     pub offset: Option<PropertyOffset>,
 }
 
@@ -4369,6 +5558,16 @@ struct CorePropertyStoreRecord {
     pub cacheability: PropertyCacheability,
     pub write_barrier_count: u32,
     pub last_write_barrier: Option<BarrierRequirementOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CoreArrayProfileObservationRecord {
+    pub bytecode_index: BytecodeIndex,
+    pub opcode: CoreOpcode,
+    pub base_object: RuntimeValue,
+    pub base_structure: StructureId,
+    pub index: u32,
+    pub profile: ArrayProfile,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4455,7 +5654,9 @@ impl CorePropertyLookupRecord {
             base,
             base_object: Some(base),
             base_structure: None,
+            base_normalization: PropertyLoadBaseNormalization::None,
             key: key.clone(),
+            cache_key: site.cache_key,
             holder,
             offset: None,
             prototype_depth,
@@ -4467,6 +5668,45 @@ impl CorePropertyLookupRecord {
             access_case_kind,
             chain: Vec::new(),
         }
+    }
+
+    fn from_has_property_lookup(
+        site: CorePropertyLookupSite,
+        base: RuntimeValue,
+        key: &CorePropertyKey,
+        holder: Option<RuntimeValue>,
+        prototype_depth: usize,
+        classification: CorePropertyLookupClassification,
+        result: bool,
+    ) -> Self {
+        let mut record =
+            Self::from_object_lookup(site, base, key, holder, prototype_depth, classification);
+        record.lookup_mode = PropertyLookupMode::HasProperty;
+        record.returned_value = Some(RuntimeValue::from_bool(result));
+        match classification {
+            CorePropertyLookupClassification::OwnData
+            | CorePropertyLookupClassification::PrototypeData
+            | CorePropertyLookupClassification::OwnAccessorGetter
+            | CorePropertyLookupClassification::PrototypeAccessorGetter
+            | CorePropertyLookupClassification::AccessorWithoutGetter => {
+                record.may_call_js = false;
+                record.cacheability = PropertyCacheability::Allowed;
+                record.access_case_kind = None;
+            }
+            CorePropertyLookupClassification::Missing => {
+                record.may_call_js = false;
+                record.access_case_kind = Some(AccessCaseKind::Miss);
+            }
+            CorePropertyLookupClassification::IndexedOrTypedArray => {
+                record.may_call_js = false;
+                record.cacheability = PropertyCacheability::Disallowed;
+                record.access_case_kind = None;
+            }
+            CorePropertyLookupClassification::OpaqueOrUncacheable => {
+                record.access_case_kind = None;
+            }
+        }
+        record
     }
 
     fn opaque(
@@ -4484,7 +5724,9 @@ impl CorePropertyLookupRecord {
             base,
             base_object,
             base_structure: None,
+            base_normalization: PropertyLoadBaseNormalization::None,
             key: key.clone(),
+            cache_key: site.cache_key,
             holder: None,
             offset: None,
             prototype_depth: 0,
@@ -4496,6 +5738,62 @@ impl CorePropertyLookupRecord {
             access_case_kind: None,
             chain: Vec::new(),
         }
+    }
+
+    fn opaque_has_property(
+        site: CorePropertyLookupSite,
+        base: RuntimeValue,
+        base_object: Option<RuntimeValue>,
+        key: &CorePropertyKey,
+        may_call_js: bool,
+        cacheability: PropertyCacheability,
+        result: Option<bool>,
+    ) -> Self {
+        let mut record = Self::opaque(site, base, base_object, key, may_call_js, cacheability);
+        record.lookup_mode = PropertyLookupMode::HasProperty;
+        record.returned_value = result.map(RuntimeValue::from_bool);
+        record
+    }
+
+    fn from_string_prototype_own_data(
+        site: CorePropertyLookupSite,
+        base: RuntimeValue,
+        string_prototype: RuntimeValue,
+        string_prototype_structure: StructureId,
+        key: &CorePropertyKey,
+        offset: Option<PropertyOffset>,
+        returned_value: RuntimeValue,
+    ) -> Self {
+        Self {
+            bytecode_index: site.bytecode_index,
+            opcode: site.opcode,
+            lookup_mode: PropertyLookupMode::Get,
+            base,
+            base_object: Some(string_prototype),
+            base_structure: Some(string_prototype_structure),
+            base_normalization: PropertyLoadBaseNormalization::StringPrototype,
+            key: key.clone(),
+            cache_key: site.cache_key,
+            holder: Some(string_prototype),
+            offset,
+            prototype_depth: 0,
+            classification: CorePropertyLookupClassification::OwnData,
+            may_call_js: false,
+            cacheability: PropertyCacheability::Allowed,
+            returned_value: Some(returned_value),
+            getter: None,
+            access_case_kind: Some(AccessCaseKind::Load),
+            chain: vec![CorePropertyLookupChainEntry {
+                object: string_prototype,
+                structure: string_prototype_structure,
+            }],
+        }
+    }
+
+    fn normalized_string_prototype_lookup(base: RuntimeValue, mut record: Self) -> Self {
+        record.base = base;
+        record.base_normalization = PropertyLoadBaseNormalization::StringPrototype;
+        record
     }
 }
 
@@ -4938,6 +6236,25 @@ impl CoreObjectStore {
         Ok(constructor)
     }
 
+    fn allocate_reference_error_constructor_with_write_barrier(
+        &mut self,
+        heap: &mut Heap,
+        error_name_value: RuntimeValue,
+        reference_error_name_value: RuntimeValue,
+        message_value: RuntimeValue,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        let constructor =
+            self.allocate_native_function(CoreNativeFunction::ReferenceErrorConstructor);
+        let prototype = self.ensure_reference_error_prototype(
+            error_name_value,
+            reference_error_name_value,
+            message_value,
+        );
+        self.install_constructor_prototype(constructor, prototype);
+        self.install_prototype_constructor_with_write_barrier(heap, prototype, constructor)?;
+        Ok(constructor)
+    }
+
     fn allocate_map_constructor_with_write_barrier(
         &mut self,
         heap: &mut Heap,
@@ -5178,6 +6495,7 @@ impl CoreObjectStore {
         )?;
         let error_name = strings.allocate_untracked("Error");
         let type_error_name = strings.allocate_untracked("TypeError");
+        let reference_error_name = strings.allocate_untracked("ReferenceError");
         let empty_message = strings.allocate_untracked("");
         let error =
             self.allocate_error_constructor_with_write_barrier(heap, error_name, empty_message)?;
@@ -5199,6 +6517,19 @@ impl CoreObjectStore {
             global_object,
             "TypeError",
             type_error,
+            standard_attributes,
+        )?;
+        let reference_error = self.allocate_reference_error_constructor_with_write_barrier(
+            heap,
+            error_name,
+            reference_error_name,
+            empty_message,
+        )?;
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "ReferenceError",
+            reference_error,
             standard_attributes,
         )?;
         let map = self.allocate_map_constructor_with_write_barrier(heap)?;
@@ -5314,6 +6645,14 @@ impl CoreObjectStore {
             parse_int,
             standard_attributes,
         )?;
+        let parse_float = self.allocate_native_function(CoreNativeFunction::ParseFloat);
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "parseFloat",
+            parse_float,
+            standard_attributes,
+        )?;
         Ok(())
     }
 
@@ -5340,6 +6679,7 @@ impl CoreObjectStore {
                 "alert" => self.allocate_native_function(CoreNativeFunction::HostAlert),
                 "console" => self.allocate_host_console_object(),
                 "readFile" => self.allocate_native_function(CoreNativeFunction::HostReadFile),
+                "top" => self.allocate_host_top_object(),
                 _ => return Err(ExecutionError::UnknownHostGlobal),
             };
             self.install_standard_global_data_property(
@@ -5369,6 +6709,21 @@ impl CoreObjectStore {
         ] {
             self.install_native_method(object, name, native_function);
         }
+        object
+    }
+
+    fn allocate_host_top_object(&mut self) -> RuntimeValue {
+        let object = self.allocate();
+        self.install_native_method(
+            object,
+            "currentResolve",
+            CoreNativeFunction::HostCurrentResolve,
+        );
+        self.install_native_method(
+            object,
+            "currentReject",
+            CoreNativeFunction::HostCurrentReject,
+        );
         object
     }
 
@@ -5667,6 +7022,7 @@ impl CoreObjectStore {
             ("shift", CoreNativeFunction::ArrayShift),
             ("unshift", CoreNativeFunction::ArrayUnshift),
             ("join", CoreNativeFunction::ArrayJoin),
+            ("toString", CoreNativeFunction::ArrayPrototypeToString),
             ("slice", CoreNativeFunction::ArraySlice),
             ("concat", CoreNativeFunction::ArrayConcat),
             ("fill", CoreNativeFunction::ArrayFill),
@@ -5701,8 +7057,22 @@ impl CoreObjectStore {
             ("charAt", CoreNativeFunction::StringCharAt),
             ("charCodeAt", CoreNativeFunction::StringCharCodeAt),
             ("indexOf", CoreNativeFunction::StringIndexOf),
+            ("lastIndexOf", CoreNativeFunction::StringLastIndexOf),
             ("slice", CoreNativeFunction::StringSlice),
             ("substring", CoreNativeFunction::StringSubstring),
+            ("substr", CoreNativeFunction::StringSubstr),
+            ("split", CoreNativeFunction::StringSplit),
+            ("replace", CoreNativeFunction::StringReplace),
+            ("toLowerCase", CoreNativeFunction::StringToLowerCase),
+            ("toUpperCase", CoreNativeFunction::StringToUpperCase),
+            (
+                "toLocaleLowerCase",
+                CoreNativeFunction::StringToLocaleLowerCase,
+            ),
+            (
+                "toLocaleUpperCase",
+                CoreNativeFunction::StringToLocaleUpperCase,
+            ),
         ] {
             self.install_native_method(prototype, name, native_function);
         }
@@ -5716,6 +7086,19 @@ impl CoreObjectStore {
         let object_prototype = self.ensure_object_prototype();
         let prototype = self.allocate_with_prototype(Some(object_prototype));
         self.number_prototype = Some(prototype);
+        // C++ JSC: NumberPrototype::finishCreation installs toString and valueOf
+        // on Number.prototype. toString is numberProtoFuncToString and valueOf
+        // is numberProtoFuncValueOf.
+        self.install_native_method(
+            prototype,
+            "toString",
+            CoreNativeFunction::NumberPrototypeToString,
+        );
+        self.install_native_method(
+            prototype,
+            "valueOf",
+            CoreNativeFunction::NumberPrototypeValueOf,
+        );
         prototype
     }
 
@@ -5762,6 +7145,22 @@ impl CoreObjectStore {
         let prototype = self.allocate_with_prototype(Some(error_prototype));
         self.type_error_prototype = Some(prototype);
         self.install_error_prototype_fields(prototype, type_error_name_value, message_value);
+        prototype
+    }
+
+    fn ensure_reference_error_prototype(
+        &mut self,
+        error_name_value: RuntimeValue,
+        reference_error_name_value: RuntimeValue,
+        message_value: RuntimeValue,
+    ) -> RuntimeValue {
+        if let Some(prototype) = self.reference_error_prototype {
+            return prototype;
+        }
+        let error_prototype = self.ensure_error_prototype(error_name_value, message_value);
+        let prototype = self.allocate_with_prototype(Some(error_prototype));
+        self.reference_error_prototype = Some(prototype);
+        self.install_error_prototype_fields(prototype, reference_error_name_value, message_value);
         prototype
     }
 
@@ -6132,10 +7531,25 @@ impl CoreObjectStore {
         cell.install_initial_shape_metadata();
         let mut object = Box::pin(cell);
         let ptr = NonNull::from(object.as_mut().get_mut());
+        let payload = ptr.as_ptr() as usize;
+        let index = self.objects.len();
+        debug_assert!(
+            !self.object_indices_by_payload.contains_key(&payload),
+            "new interpreter object payload reused while still live"
+        );
         self.objects.push(object);
+        self.object_indices_by_payload.insert(payload, index);
         // SAFETY: The host owns the boxed cell for the lifetime of the dispatch
         // run and never moves the allocation after the value is published.
         RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
+    }
+
+    fn rebuild_object_indices(&mut self) {
+        self.object_indices_by_payload.clear();
+        for (index, object) in self.objects.iter().enumerate() {
+            let payload = core::ptr::from_ref(object.as_ref().get_ref()) as usize;
+            self.object_indices_by_payload.insert(payload, index);
+        }
     }
 
     fn allocate_structure_id(&mut self) -> StructureId {
@@ -6253,6 +7667,12 @@ impl CoreObjectStore {
         }
     }
 
+    fn finish_structure_transition(&mut self, old_structure: StructureId) {
+        self.structure_chain_invalidation_events
+            .push(StructureChainInvalidationEvent { old_structure });
+        self.fire_structure_transition_watchpoints(old_structure);
+    }
+
     fn fire_structure_transition_watchpoints(&mut self, old_structure: StructureId) {
         let Some(set_ids) = self
             .structure_transition_watchpoints_by_structure
@@ -6289,6 +7709,16 @@ impl CoreObjectStore {
 
     fn drain_watchpoint_fire_events(&mut self) -> Vec<WatchpointFireEvent> {
         std::mem::take(&mut self.fired_watchpoint_events)
+    }
+
+    fn has_pending_structure_chain_invalidation_events(&self) -> bool {
+        !self.structure_chain_invalidation_events.is_empty()
+    }
+
+    fn drain_structure_chain_invalidation_events(
+        &mut self,
+    ) -> Vec<StructureChainInvalidationEvent> {
+        std::mem::take(&mut self.structure_chain_invalidation_events)
     }
 
     // P3 bridge entry point that gives interpreter-owned object payloads a
@@ -6438,6 +7868,130 @@ impl CoreObjectStore {
         }
     }
 
+    fn has_property_with_lookup_record(
+        &self,
+        object: RuntimeValue,
+        key: &CorePropertyKey,
+        site: CorePropertyLookupSite,
+    ) -> Result<(bool, CorePropertyLookupRecord), ExecutionError> {
+        let Some(base_cell) = self.find(object) else {
+            return Err(ExecutionError::ExpectedObject);
+        };
+        let base_structure = Some(base_cell.structure_id);
+
+        let mut current = object;
+        let mut prototype_depth = 0;
+        let mut chain = Vec::new();
+        loop {
+            let Some(cell) = self.find(current) else {
+                return Err(ExecutionError::ExpectedObject);
+            };
+            chain.push(CorePropertyLookupChainEntry {
+                object: current,
+                structure: cell.structure_id,
+            });
+            if let Some(property) = cell.properties.get(key).copied() {
+                let classification = match property.kind {
+                    CorePropertyKind::Data(_) if prototype_depth == 0 => {
+                        CorePropertyLookupClassification::OwnData
+                    }
+                    CorePropertyKind::Data(_) => CorePropertyLookupClassification::PrototypeData,
+                    CorePropertyKind::Accessor {
+                        getter: Some(_), ..
+                    } if prototype_depth == 0 => {
+                        CorePropertyLookupClassification::OwnAccessorGetter
+                    }
+                    CorePropertyKind::Accessor {
+                        getter: Some(_), ..
+                    } => CorePropertyLookupClassification::PrototypeAccessorGetter,
+                    CorePropertyKind::Accessor { getter: None, .. } => {
+                        CorePropertyLookupClassification::AccessorWithoutGetter
+                    }
+                };
+                let mut record = CorePropertyLookupRecord::from_has_property_lookup(
+                    site,
+                    object,
+                    key,
+                    Some(current),
+                    prototype_depth,
+                    classification,
+                    true,
+                );
+                record.base_structure = base_structure;
+                record.offset = cell.property_offset(key);
+                record.chain = chain.clone();
+                return Ok((true, record));
+            }
+            if cell.kind == CoreObjectKind::Array {
+                let found = if key.is_string("length") {
+                    true
+                } else {
+                    key_array_index(key).is_some_and(|index| {
+                        cell.elements
+                            .get(index)
+                            .is_some_and(|element| element.is_some())
+                    })
+                };
+                if found {
+                    let mut record = CorePropertyLookupRecord::from_has_property_lookup(
+                        site,
+                        object,
+                        key,
+                        Some(current),
+                        prototype_depth,
+                        CorePropertyLookupClassification::IndexedOrTypedArray,
+                        true,
+                    );
+                    record.base_structure = base_structure;
+                    record.chain = chain.clone();
+                    if key_array_index(key).is_some() {
+                        record.access_case_kind = Some(AccessCaseKind::IndexedArrayStorageInHit);
+                    }
+                    return Ok((true, record));
+                }
+            }
+            if cell.kind == CoreObjectKind::Uint8Array {
+                if key_array_index(key).is_some_and(|index| index < cell.view_length) {
+                    let mut record = CorePropertyLookupRecord::from_has_property_lookup(
+                        site,
+                        object,
+                        key,
+                        Some(current),
+                        prototype_depth,
+                        CorePropertyLookupClassification::IndexedOrTypedArray,
+                        true,
+                    );
+                    record.base_structure = base_structure;
+                    record.chain = chain.clone();
+                    record.access_case_kind = Some(AccessCaseKind::IndexedTypedArrayUint8In);
+                    return Ok((true, record));
+                }
+            }
+            let Some(prototype) = cell.prototype else {
+                let mut record = CorePropertyLookupRecord::from_has_property_lookup(
+                    site,
+                    object,
+                    key,
+                    None,
+                    prototype_depth,
+                    CorePropertyLookupClassification::Missing,
+                    false,
+                );
+                record.base_structure = base_structure;
+                record.chain = chain.clone();
+                if site.opcode == Some(CoreOpcode::InByVal)
+                    && key_array_index(key).is_some()
+                    && base_cell.kind == CoreObjectKind::Ordinary
+                {
+                    record.access_case_kind = Some(AccessCaseKind::IndexedNoIndexingInMiss);
+                }
+                return Ok((false, record));
+            };
+            current = prototype;
+            prototype_depth = prototype_depth.saturating_add(1);
+        }
+    }
+
     fn property_store_snapshot(
         &self,
         object: RuntimeValue,
@@ -6450,21 +8004,34 @@ impl CoreObjectStore {
                 has_own_property: false,
                 has_own_data_property: false,
                 is_indexed_or_typed_array_store: false,
+                is_dense_array_indexed_store: false,
+                has_own_indexed_element: false,
                 offset: None,
             };
         };
         let own_property = cell.properties.get(key);
         let has_own_data_property =
             own_property.is_some_and(|property| matches!(property.kind, CorePropertyKind::Data(_)));
-        let is_indexed_or_typed_array_store = matches!(cell.kind, CoreObjectKind::Array)
-            && key_array_index(key).is_some()
-            || matches!(cell.kind, CoreObjectKind::Uint8Array);
+        let indexed_key = key_array_index(key);
+        let is_dense_array_indexed_store =
+            matches!(cell.kind, CoreObjectKind::Array) && indexed_key.is_some();
+        let has_own_indexed_element = indexed_key.is_some_and(|index| {
+            matches!(cell.kind, CoreObjectKind::Array)
+                && cell
+                    .elements
+                    .get(index)
+                    .is_some_and(|element| element.is_some())
+        });
+        let is_indexed_or_typed_array_store =
+            is_dense_array_indexed_store || matches!(cell.kind, CoreObjectKind::Uint8Array);
         CorePropertyStoreSnapshot {
             base_object: Some(object),
             base_structure: Some(cell.structure_id),
             has_own_property: own_property.is_some(),
             has_own_data_property,
             is_indexed_or_typed_array_store,
+            is_dense_array_indexed_store,
+            has_own_indexed_element,
             offset: cell.property_offset(key),
         }
     }
@@ -6627,6 +8194,39 @@ impl CoreObjectStore {
         &self,
         object: RuntimeValue,
     ) -> Result<Vec<String>, ExecutionError> {
+        Ok(self
+            .own_string_property_names_with_enumerability(object)?
+            .into_iter()
+            .filter_map(|(name, enumerable)| enumerable.then_some(name))
+            .collect())
+    }
+
+    fn enumerable_string_property_names_for_in(
+        &self,
+        mut object: RuntimeValue,
+    ) -> Result<Vec<String>, ExecutionError> {
+        let mut names = Vec::new();
+        let mut visited = HashSet::new();
+        loop {
+            for (name, enumerable) in self.own_string_property_names_with_enumerability(object)? {
+                if visited.insert(name.clone()) && enumerable {
+                    names.push(name);
+                }
+            }
+            let Some(cell) = self.find(object) else {
+                return Err(ExecutionError::ExpectedObject);
+            };
+            let Some(prototype) = cell.prototype else {
+                return Ok(names);
+            };
+            object = prototype;
+        }
+    }
+
+    fn own_string_property_names_with_enumerability(
+        &self,
+        object: RuntimeValue,
+    ) -> Result<Vec<(String, bool)>, ExecutionError> {
         let Some(object) = self.find(object) else {
             return Err(ExecutionError::ExpectedObject);
         };
@@ -6644,6 +8244,7 @@ impl CoreObjectStore {
         }
 
         let mut string_names = Vec::new();
+        let mut hidden_index_names = BTreeSet::new();
         for key in &object.property_order {
             let Some(name) = key_string_name(key) else {
                 continue;
@@ -6654,19 +8255,27 @@ impl CoreObjectStore {
             if let Some(index) = parse_array_index_name(name) {
                 if property.attributes.enumerable {
                     index_names.insert(index);
+                    hidden_index_names.remove(&index);
                 } else {
                     index_names.remove(&index);
+                    hidden_index_names.insert(index);
                 }
-            } else if property.attributes.enumerable {
-                string_names.push(name.to_owned());
+            } else {
+                string_names.push((name.to_owned(), property.attributes.enumerable));
             }
         }
 
-        Ok(index_names
+        let mut names = index_names
             .into_iter()
-            .map(|index| index.to_string())
-            .chain(string_names)
-            .collect())
+            .map(|index| (index.to_string(), true))
+            .collect::<Vec<_>>();
+        names.extend(
+            hidden_index_names
+                .into_iter()
+                .map(|index| (index.to_string(), false)),
+        );
+        names.extend(string_names);
+        Ok(names)
     }
 
     fn own_property_keys(
@@ -6744,7 +8353,7 @@ impl CoreObjectStore {
             }
         };
         if let Some(old_structure) = old_structure {
-            self.fire_structure_transition_watchpoints(old_structure);
+            self.finish_structure_transition(old_structure);
         }
         Ok(())
     }
@@ -6810,7 +8419,7 @@ impl CoreObjectStore {
             }
         };
         if let Some(old_structure) = old_structure {
-            self.fire_structure_transition_watchpoints(old_structure);
+            self.finish_structure_transition(old_structure);
         }
         Ok(())
     }
@@ -6874,7 +8483,7 @@ impl CoreObjectStore {
             }
         };
         if let Some(old_structure) = old_structure {
-            self.fire_structure_transition_watchpoints(old_structure);
+            self.finish_structure_transition(old_structure);
         }
         Ok(true)
     }
@@ -6935,7 +8544,7 @@ impl CoreObjectStore {
             }
         };
         if let Some(old_structure) = old_structure {
-            self.fire_structure_transition_watchpoints(old_structure);
+            self.finish_structure_transition(old_structure);
         }
         Ok(true)
     }
@@ -7025,7 +8634,7 @@ impl CoreObjectStore {
             }
         };
         if let Some(old_structure) = old_structure {
-            self.fire_structure_transition_watchpoints(old_structure);
+            self.finish_structure_transition(old_structure);
         }
         Ok(())
     }
@@ -7109,7 +8718,7 @@ impl CoreObjectStore {
             }
         };
         if let Some(old_structure) = old_structure {
-            self.fire_structure_transition_watchpoints(old_structure);
+            self.finish_structure_transition(old_structure);
         }
         Ok(true)
     }
@@ -7179,7 +8788,7 @@ impl CoreObjectStore {
             }
         };
         if let Some(old_structure) = old_structure {
-            self.fire_structure_transition_watchpoints(old_structure);
+            self.finish_structure_transition(old_structure);
         }
         Ok(())
     }
@@ -7564,6 +9173,16 @@ impl CoreObjectStore {
         self.get_index_from_prototype_chain(object, index)
     }
 
+    fn get_index_with_lookup_record(
+        &self,
+        object: RuntimeValue,
+        index: i32,
+        site: CorePropertyLookupSite,
+    ) -> Result<(RuntimeValue, CorePropertyLookupRecord), ExecutionError> {
+        let index = usize::try_from(index).map_err(|_| ExecutionError::ExpectedArrayIndex)?;
+        self.get_index_from_prototype_chain_with_lookup_record(object, index, site)
+    }
+
     fn put_index(
         &mut self,
         heap: &mut Heap,
@@ -7697,7 +9316,35 @@ impl CoreObjectStore {
                 object.view_length.try_into().unwrap_or(i32::MAX),
             )));
         }
-        Ok(None)
+        // C++ JSC: toLength(thisObj->get(exec, propertyNames.length))
+        // For non-Array objects (e.g. arguments objects), read the "length"
+        // property generically so that Array.prototype methods work on any
+        // array-like object.
+        let length_key = CorePropertyKey::String("length".into());
+        match self.get_property(object_value, &length_key)? {
+            CorePropertyGet::Data(value) => Ok(Some(value)),
+            _ => Ok(None),
+        }
+    }
+
+    fn array_number_values(&self, object_value: RuntimeValue) -> Result<Vec<f64>, ExecutionError> {
+        let Some(object) = self.find(object_value) else {
+            return Err(ExecutionError::ExpectedObject);
+        };
+        if object.kind != CoreObjectKind::Array {
+            return Err(ExecutionError::ExpectedObject);
+        }
+        object
+            .elements
+            .iter()
+            .map(|slot| {
+                let value = slot.unwrap_or_else(RuntimeValue::undefined);
+                let Some(number) = value.as_number() else {
+                    return Err(ExecutionError::ExpectedInt32);
+                };
+                Ok(number_to_f64(number))
+            })
+            .collect()
     }
 
     fn get_closure_cell(&self, value: RuntimeValue) -> Result<RuntimeValue, ExecutionError> {
@@ -7785,6 +9432,13 @@ impl CoreObjectStore {
                 self.function_call_target(target)
             }
         }
+    }
+
+    fn native_function_for_value(&self, value: RuntimeValue) -> Option<CoreNativeFunction> {
+        let object = self.find(value)?;
+        (object.kind == CoreObjectKind::NativeFunction)
+            .then_some(object.native_function)
+            .flatten()
     }
 
     fn function_call_target_value(
@@ -7907,6 +9561,10 @@ impl CoreObjectStore {
     fn is_array(&self, value: RuntimeValue) -> bool {
         self.find(value)
             .is_some_and(|object| object.kind == CoreObjectKind::Array)
+    }
+
+    fn is_object(&self, value: RuntimeValue) -> bool {
+        self.find(value).is_some()
     }
 
     fn is_constructor_return_value(&self, value: RuntimeValue) -> bool {
@@ -8197,14 +9855,6 @@ impl CoreObjectStore {
         }
     }
 
-    fn get_string_prototype_property(
-        &mut self,
-        key: &CorePropertyKey,
-    ) -> Result<CorePropertyGet, ExecutionError> {
-        let prototype = self.ensure_string_prototype();
-        self.get_property(prototype, key)
-    }
-
     fn get_symbol_prototype_property(
         &mut self,
         key: &CorePropertyKey,
@@ -8218,6 +9868,22 @@ impl CoreObjectStore {
         key: &CorePropertyKey,
     ) -> Result<CorePropertyGet, ExecutionError> {
         let prototype = self.ensure_bigint_prototype();
+        self.get_property(prototype, key)
+    }
+
+    fn get_number_prototype_property(
+        &mut self,
+        key: &CorePropertyKey,
+    ) -> Result<CorePropertyGet, ExecutionError> {
+        let prototype = self.ensure_number_prototype();
+        self.get_property(prototype, key)
+    }
+
+    fn get_boolean_prototype_property(
+        &mut self,
+        key: &CorePropertyKey,
+    ) -> Result<CorePropertyGet, ExecutionError> {
+        let prototype = self.ensure_boolean_prototype();
         self.get_property(prototype, key)
     }
 
@@ -8433,26 +10099,129 @@ impl CoreObjectStore {
         }
     }
 
+    fn get_index_from_prototype_chain_with_lookup_record(
+        &self,
+        object: RuntimeValue,
+        index: usize,
+        site: CorePropertyLookupSite,
+    ) -> Result<(RuntimeValue, CorePropertyLookupRecord), ExecutionError> {
+        let key = CorePropertyKey::String(index.to_string());
+        let Some(base_cell) = self.find(object) else {
+            return Err(ExecutionError::ExpectedObject);
+        };
+        let base_structure = Some(base_cell.structure_id);
+
+        let mut current = object;
+        let mut prototype_depth = 0;
+        let mut chain = Vec::new();
+        loop {
+            let Some(cell) = self.find(current) else {
+                return Err(ExecutionError::ExpectedObject);
+            };
+            chain.push(CorePropertyLookupChainEntry {
+                object: current,
+                structure: cell.structure_id,
+            });
+
+            if cell.kind == CoreObjectKind::Uint8Array {
+                let value = self
+                    .read_uint8_element(current, index)?
+                    .map_or_else(RuntimeValue::undefined, |value| {
+                        RuntimeValue::from_i32(i32::from(value))
+                    });
+                let mut record = CorePropertyLookupRecord::from_object_lookup(
+                    site,
+                    object,
+                    &key,
+                    Some(current),
+                    prototype_depth,
+                    CorePropertyLookupClassification::IndexedOrTypedArray,
+                );
+                record.base_structure = base_structure;
+                record.returned_value = Some(value);
+                record.chain = chain.clone();
+                return Ok((value, record));
+            }
+            if let Some(Some(value)) = cell.elements.get(index).copied() {
+                let mut record = CorePropertyLookupRecord::from_object_lookup(
+                    site,
+                    object,
+                    &key,
+                    Some(current),
+                    prototype_depth,
+                    CorePropertyLookupClassification::IndexedOrTypedArray,
+                );
+                record.base_structure = base_structure;
+                record.returned_value = Some(value);
+                record.chain = chain.clone();
+                return Ok((value, record));
+            }
+            if let Some(property) = cell.properties.get(&key) {
+                if let CorePropertyKind::Data(value) = property.kind {
+                    let mut record = CorePropertyLookupRecord::from_object_lookup(
+                        site,
+                        object,
+                        &key,
+                        Some(current),
+                        prototype_depth,
+                        if prototype_depth == 0 {
+                            CorePropertyLookupClassification::OwnData
+                        } else {
+                            CorePropertyLookupClassification::PrototypeData
+                        },
+                    );
+                    record.base_structure = base_structure;
+                    record.offset = cell.property_offset(&key);
+                    record.returned_value = Some(value);
+                    record.chain = chain.clone();
+                    return Ok((value, record));
+                }
+            }
+            let Some(prototype) = cell.prototype else {
+                let value = RuntimeValue::undefined();
+                let mut record = CorePropertyLookupRecord::from_object_lookup(
+                    site,
+                    object,
+                    &key,
+                    None,
+                    prototype_depth,
+                    CorePropertyLookupClassification::Missing,
+                );
+                record.base_structure = base_structure;
+                record.returned_value = Some(value);
+                record.chain = chain.clone();
+                return Ok((value, record));
+            };
+            current = prototype;
+            prototype_depth = prototype_depth.saturating_add(1);
+        }
+    }
+
     fn find(&self, value: RuntimeValue) -> Option<&CoreObjectCell> {
         let payload = value.as_cell()?.pointer_payload_bits();
+        let index = self.object_indices_by_payload.get(&payload).copied()?;
+        let object = self.objects.get(index)?.as_ref().get_ref();
+        debug_assert_eq!(core::ptr::from_ref(object) as usize, payload);
+        let _ = object.cell_id;
+        Some(object)
+    }
+
+    fn find_by_object_id(&self, object_id: ObjectId) -> Option<&CoreObjectCell> {
+        if object_id == ObjectId::default() {
+            return None;
+        }
         self.objects
             .iter()
-            .find(|object| core::ptr::from_ref(object.as_ref().get_ref()) as usize == payload)
-            .map(|object| {
-                let object = object.as_ref().get_ref();
-                let _ = object.cell_id;
-                object
-            })
+            .map(|object| object.as_ref().get_ref())
+            .find(|object| object.cell_id == object_id.0)
     }
 
     fn find_mut(&mut self, value: RuntimeValue) -> Option<&mut CoreObjectCell> {
         let payload = value.as_cell()?.pointer_payload_bits();
-        let index = self.objects.iter().position(|object| {
-            core::ptr::from_ref(object.as_ref().get_ref()) as usize == payload
-        })?;
-        self.objects
-            .get_mut(index)
-            .map(|object| object.as_mut().get_mut())
+        let index = self.object_indices_by_payload.get(&payload).copied()?;
+        let object = self.objects.get_mut(index)?.as_mut().get_mut();
+        debug_assert_eq!(core::ptr::from_ref(object) as usize, payload);
+        Some(object)
     }
 
     #[cfg(test)]
@@ -8479,13 +10248,29 @@ impl CoreObjectStore {
 struct CoreStringStore {
     strings: Vec<Pin<Box<CoreStringCell>>>,
     by_text: HashMap<String, usize>,
+    indices_by_payload: HashMap<usize, usize>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct CoreStringCell {
     cell_id: CellId,
-    text: String,
+    text: CoreStringCellText,
+    atom: Option<Identifier>,
 }
+
+#[derive(Clone, Debug, Default)]
+enum CoreStringCellText {
+    #[default]
+    Empty,
+    Flat(String),
+    Substring {
+        base: usize,
+        start_byte: usize,
+        end_byte: usize,
+    },
+}
+
+const SHARED_SUBSTRING_MIN_CODE_UNITS: usize = 32;
 
 fn allocate_object_interpreter_cell_id(heap: &mut Heap) -> Result<CellId, ExecutionError> {
     let metadata = static_cell_metadata_registry()
@@ -8548,12 +10333,15 @@ impl CoreStringStore {
         }
         let mut string = Box::pin(CoreStringCell {
             cell_id: CellId::default(),
-            text: text.to_owned(),
+            text: CoreStringCellText::Flat(text.to_owned()),
+            atom: None,
         });
         let ptr = NonNull::from(string.as_mut().get_mut());
+        let payload = ptr.as_ptr() as usize;
         let index = self.strings.len();
         self.strings.push(string);
         self.by_text.insert(text.to_owned(), index);
+        self.indices_by_payload.insert(payload, index);
         // SAFETY: The host owns the boxed cell for the lifetime of the dispatch
         // run and never moves the allocation after the value is published.
         RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
@@ -8571,12 +10359,100 @@ impl CoreStringStore {
             allocate_primitive_interpreter_cell(heap, CellType::String, |cell_id| {
                 CoreStringCell {
                     cell_id,
-                    text: text.to_owned(),
+                    text: CoreStringCellText::Flat(text.to_owned()),
+                    atom: None,
                 }
             })?;
         let index = self.strings.len();
+        let payload = core::ptr::from_ref(string.as_ref().get_ref()) as usize;
         self.strings.push(string);
         self.by_text.insert(text.to_owned(), index);
+        self.indices_by_payload.insert(payload, index);
+        Ok(value)
+    }
+
+    fn allocate_substring_with_heap(
+        &mut self,
+        heap: &mut Heap,
+        base_value: RuntimeValue,
+        start: usize,
+        end: usize,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        let Some(base) = self.index_for_value(base_value) else {
+            return self.allocate_with_heap(heap, "");
+        };
+        let substring = {
+            let Some(text) = self.text_for_index(base) else {
+                return self.allocate_with_heap(heap, "");
+            };
+            let length = string_code_unit_len(text);
+            let start = start.min(length);
+            let end = end.min(length);
+            if start >= end {
+                return self.allocate_with_heap(heap, "");
+            }
+            if start == 0 && end == length {
+                return self.bind_index_to_heap(heap, base);
+            }
+            let substring_len = end.saturating_sub(start);
+            if substring_len < SHARED_SUBSTRING_MIN_CODE_UNITS {
+                return self.allocate_with_heap(heap, &string_slice_code_units(text, start, end));
+            }
+            let Some(start_byte) = string_byte_index_for_code_unit(text, start) else {
+                return self.allocate_with_heap(heap, &string_slice_code_units(text, start, end));
+            };
+            let Some(end_byte) = string_byte_index_for_code_unit(text, end) else {
+                return self.allocate_with_heap(heap, &string_slice_code_units(text, start, end));
+            };
+            if !text.is_ascii() {
+                return self.allocate_with_heap(heap, &string_slice_code_units(text, start, end));
+            }
+            let (base, start_byte, end_byte) = match &self.strings[base].as_ref().get_ref().text {
+                CoreStringCellText::Substring {
+                    base,
+                    start_byte: base_start,
+                    ..
+                } => (
+                    *base,
+                    base_start.saturating_add(start_byte),
+                    base_start.saturating_add(end_byte),
+                ),
+                _ => (base, start_byte, end_byte),
+            };
+            CoreStringCellText::Substring {
+                base,
+                start_byte,
+                end_byte,
+            }
+        };
+        let (string, value) =
+            allocate_primitive_interpreter_cell(heap, CellType::String, |cell_id| {
+                CoreStringCell {
+                    cell_id,
+                    text: substring,
+                    atom: None,
+                }
+            })?;
+        let index = self.strings.len();
+        let payload = core::ptr::from_ref(string.as_ref().get_ref()) as usize;
+        self.strings.push(string);
+        self.indices_by_payload.insert(payload, index);
+        Ok(value)
+    }
+
+    fn allocate_atom_with_heap(
+        &mut self,
+        heap: &mut Heap,
+        identifier: Identifier,
+        text: &str,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        let value = self.allocate_with_heap(heap, text)?;
+        if let Some(index) = self.index_for_value(value) {
+            let string = self.strings[index].as_mut().get_mut();
+            if string.atom.is_none() {
+                string.atom = Some(identifier);
+            }
+        }
         Ok(value)
     }
 
@@ -8631,14 +10507,29 @@ impl CoreStringStore {
 
     fn text(&self, value: RuntimeValue) -> Option<&str> {
         let index = self.index_for_value(value)?;
-        Some(self.strings[index].as_ref().get_ref().text.as_str())
+        self.text_for_index(index)
+    }
+
+    fn text_for_index(&self, index: usize) -> Option<&str> {
+        match &self.strings.get(index)?.as_ref().get_ref().text {
+            CoreStringCellText::Empty => Some(""),
+            CoreStringCellText::Flat(text) => Some(text.as_str()),
+            CoreStringCellText::Substring {
+                base,
+                start_byte,
+                end_byte,
+            } => self.text_for_index(*base)?.get(*start_byte..*end_byte),
+        }
+    }
+
+    fn atom_identifier(&self, value: RuntimeValue) -> Option<Identifier> {
+        let index = self.index_for_value(value)?;
+        self.strings[index].as_ref().get_ref().atom
     }
 
     fn index_for_value(&self, value: RuntimeValue) -> Option<usize> {
         let payload = value.as_cell()?.pointer_payload_bits();
-        self.strings
-            .iter()
-            .position(|string| core::ptr::from_ref(string.as_ref().get_ref()) as usize == payload)
+        self.indices_by_payload.get(&payload).copied()
     }
 
     fn value_for_index(&self, index: usize) -> RuntimeValue {
@@ -9469,18 +11360,7 @@ struct CoreRegExpMatch {
     input: String,
     start: usize,
     end: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SimpleRegExpMatch {
-    start: usize,
-    end: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SimpleRegExpAtom {
-    Literal(char),
-    Any,
+    captures: Vec<Option<YarrSimpleMatchRange>>,
 }
 
 impl DispatchHost for CoreOpcodeDispatchHost {
@@ -9506,6 +11386,20 @@ impl DispatchHost for CoreOpcodeDispatchHost {
         request: PropertyStoreObservationDrainRequest,
     ) -> Result<Option<PropertyStoreObservationDescriptor>, ExecutionError> {
         self.drain_property_store_observation_descriptor(heap, request)
+    }
+
+    fn discard_property_store_observations(&mut self) {
+        self.last_property_store = None;
+        self.property_store_records.clear();
+        self.pending_property_store_site = None;
+    }
+
+    fn drain_property_has_observation(
+        &mut self,
+        heap: &mut Heap,
+        request: PropertyHasObservationDrainRequest,
+    ) -> Result<Option<PropertyHasObservationDescriptor>, ExecutionError> {
+        self.drain_property_has_observation_descriptor(heap, request)
     }
 
     fn drain_call_observation(
@@ -9573,11 +11467,70 @@ impl DispatchHost for CoreOpcodeDispatchHost {
         CoreOpcodeDispatchHost::drain_watchpoint_fire_events(self)
     }
 
+    fn has_pending_structure_chain_invalidation_events(&mut self) -> bool {
+        CoreOpcodeDispatchHost::has_pending_structure_chain_invalidation_events(self)
+    }
+
+    fn drain_structure_chain_invalidation_events(
+        &mut self,
+    ) -> Vec<StructureChainInvalidationEvent> {
+        CoreOpcodeDispatchHost::drain_structure_chain_invalidation_events(self)
+    }
+
+    fn generated_property_sidecar_base_structure(
+        &mut self,
+        base: RuntimeValue,
+    ) -> Option<StructureId> {
+        if self.strings.text(base).is_some() {
+            let string_prototype = self.objects.ensure_string_prototype();
+            return self
+                .objects
+                .find(string_prototype)
+                .map(|cell| cell.structure_id);
+        }
+        let cell = self.objects.find(base)?;
+        (cell.kind != CoreObjectKind::Proxy).then_some(cell.structure_id)
+    }
+
+    fn generated_property_has_sidecar_base_structure(
+        &mut self,
+        base: RuntimeValue,
+    ) -> Option<StructureId> {
+        let cell = self.objects.find(base)?;
+        (cell.kind != CoreObjectKind::Proxy).then_some(cell.structure_id)
+    }
+
+    fn generated_property_has_sidecar_runtime_key(
+        &mut self,
+        property: RuntimeValue,
+    ) -> Option<CacheKey> {
+        let text = self.strings.text(property)?;
+        if !can_use_in_by_id_megamorphic_property_name(text) {
+            return None;
+        }
+        let identifier = self.strings.atom_identifier(property)?;
+        if self
+            .identifier_texts
+            .get(&identifier.atom().table_slot())
+            .is_some_and(|identifier_text| identifier_text.as_str() != text)
+        {
+            return None;
+        }
+        Some(CacheKey::Property(PropertyKey::from_identifier(identifier)))
+    }
+
     fn probe_generated_property_load(
         &mut self,
         request: GeneratedPropertyLoadProbeRequest<'_>,
     ) -> GeneratedPropertyLoadProbeResult {
         CoreOpcodeDispatchHost::probe_generated_property_load(self, request)
+    }
+
+    fn probe_generated_property_load_megamorphic_holder(
+        &mut self,
+        request: GeneratedPropertyLoadMegamorphicHolderProbeRequest,
+    ) -> GeneratedPropertyLoadProbeResult {
+        CoreOpcodeDispatchHost::probe_generated_property_load_megamorphic_holder(self, request)
     }
 
     fn probe_generated_property_store(
@@ -9608,6 +11561,14 @@ impl DispatchHost for CoreOpcodeDispatchHost {
         request: GeneratedCallLinkProbeRequest<'_>,
     ) -> GeneratedCallLinkProbeResult {
         CoreOpcodeDispatchHost::probe_generated_call_link(self, heap, request)
+    }
+
+    fn dispatch_generated_native_intrinsic_call(
+        &mut self,
+        heap: &mut Heap,
+        request: GeneratedNativeIntrinsicCallRequest,
+    ) -> GeneratedNativeIntrinsicCallResult {
+        CoreOpcodeDispatchHost::dispatch_generated_native_intrinsic_call(self, heap, request)
     }
 
     fn dispatch_instruction(
@@ -9785,6 +11746,17 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 };
                 write_register(state, window, destination, function)
             }
+            CoreOpcode::LoadCallee => {
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let Some(callee) = state.stack.top_frame().and_then(|frame| frame.callee_value)
+                else {
+                    return DispatchOutcome::Fail(ExecutionError::ExpectedFunction);
+                };
+                write_register(state, window, destination, callee)
+            }
             CoreOpcode::LoadCapture => {
                 let destination = match register_operand(instruction, 0) {
                     Ok(register) => register,
@@ -9944,6 +11916,39 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                         state.heap,
                         error_name,
                         type_error_name,
+                        message,
+                    ) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                write_register(state, window, destination, function)
+            }
+            CoreOpcode::LoadReferenceErrorConstructor => {
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let error_name = match self.strings.allocate_with_heap(state.heap, "Error") {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let reference_error_name = match self
+                    .strings
+                    .allocate_with_heap(state.heap, "ReferenceError")
+                {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let message = match self.strings.allocate_with_heap(state.heap, "") {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let function = match self
+                    .objects
+                    .allocate_reference_error_constructor_with_write_barrier(
+                        state.heap,
+                        error_name,
+                        reference_error_name,
                         message,
                     ) {
                     Ok(value) => value,
@@ -10187,7 +12192,7 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
                 let value = match opcode {
-                    CoreOpcode::ToNumber => to_number_value(source),
+                    CoreOpcode::ToNumber => self.to_number_with_string(source),
                     CoreOpcode::NegateNumber => self.negate_numeric_value(state.heap, source),
                     CoreOpcode::BitNotInt32 => self.bit_not_numeric_value(state.heap, source),
                     CoreOpcode::LogicalNot => Ok(RuntimeValue::from_bool(!self.truthy(source))),
@@ -10369,6 +12374,119 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     }
                     Err(error) => DispatchOutcome::Fail(error),
                 }
+            }
+            CoreOpcode::InById => {
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let base = match register_operand(instruction, 1).and_then(|register| {
+                    state
+                        .registers
+                        .read(window, register, Some(state.code_block.constants()))
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                if !self.objects.is_object(base) {
+                    let message = self.invalid_in_parameter_message(base);
+                    return self.type_error_outcome_with_heap(state.heap, &message);
+                }
+                let identifier = match identifier_index_operand(instruction, 2) {
+                    Ok(key) => key,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let key = self.identifier_property_key(identifier);
+                let completion_context = match self
+                    .function_value_property_operation_context_for_current_instruction(
+                        state,
+                        window,
+                        instruction,
+                        FunctionValueReturnTransform::WriteTruthy { destination },
+                    ) {
+                    Ok(context) => context,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                self.begin_property_lookup_recording(CorePropertyLookupSite {
+                    bytecode_index: Some(instruction.bytecode_index),
+                    opcode: Some(CoreOpcode::InById),
+                    cache_key: Some(CacheKey::Property(PropertyKey::from_identifier(
+                        Identifier::from_atom(AtomId::from_table_slot(identifier)),
+                    ))),
+                });
+                let result = match self.has_property_value_with_completion(
+                    state,
+                    base,
+                    &key,
+                    completion_context,
+                ) {
+                    Ok(result) => result,
+                    Err(outcome) => return outcome,
+                };
+                write_register(state, window, destination, RuntimeValue::from_bool(result))
+            }
+            CoreOpcode::InByVal => {
+                self.last_array_profile_observation = None;
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let base = match register_operand(instruction, 1).and_then(|register| {
+                    state
+                        .registers
+                        .read(window, register, Some(state.code_block.constants()))
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                if !self.objects.is_object(base) {
+                    let message = self.invalid_in_parameter_message(base);
+                    return self.type_error_outcome_with_heap(state.heap, &message);
+                }
+                let key_value = match register_operand(instruction, 2).and_then(|register| {
+                    state
+                        .registers
+                        .read(window, register, Some(state.code_block.constants()))
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                if let Some(index) = self.value_uint32_index(key_value) {
+                    self.record_in_by_val_array_profile_indexed_read(
+                        instruction.bytecode_index,
+                        base,
+                        index,
+                    );
+                }
+                let key = match self.to_property_key(state, key_value) {
+                    Ok(key) => key,
+                    Err(outcome) => return outcome,
+                };
+                let completion_context = match self
+                    .function_value_property_operation_context_for_current_instruction(
+                        state,
+                        window,
+                        instruction,
+                        FunctionValueReturnTransform::WriteTruthy { destination },
+                    ) {
+                    Ok(context) => context,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                self.begin_property_lookup_recording(CorePropertyLookupSite {
+                    bytecode_index: Some(instruction.bytecode_index),
+                    opcode: Some(CoreOpcode::InByVal),
+                    cache_key: self.cacheable_in_by_val_cache_key(key_value, &key),
+                });
+                let result = match self.has_property_value_with_completion(
+                    state,
+                    base,
+                    &key,
+                    completion_context,
+                ) {
+                    Ok(result) => result,
+                    Err(outcome) => return outcome,
+                };
+                write_register(state, window, destination, RuntimeValue::from_bool(result))
             }
             CoreOpcode::Jump => match bytecode_index_operand(instruction, 0) {
                 Ok(target) => DispatchOutcome::Jump(target),
@@ -10553,6 +12671,25 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
                 write_register(state, window, destination, length)
+            }
+            CoreOpcode::ForInKeys => {
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let object = match register_operand(instruction, 1).and_then(|register| {
+                    state
+                        .registers
+                        .read(window, register, Some(state.code_block.constants()))
+                }) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let keys = match self.for_in_keys_array(state.heap, object) {
+                    Ok(keys) => keys,
+                    Err(outcome) => return outcome,
+                };
+                write_register(state, window, destination, keys)
             }
             CoreOpcode::CopyObjectRest => {
                 let target = match register_operand(instruction, 0).and_then(|register| {
@@ -11056,6 +13193,7 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 let site = CorePropertyLookupSite {
                     bytecode_index: Some(instruction.bytecode_index),
                     opcode: Some(CoreOpcode::GetGlobalObjectProperty),
+                    cache_key: None,
                 };
                 let completion_context = match self
                     .function_value_property_operation_context_for_current_instruction(
@@ -11079,6 +13217,85 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Err(outcome) => return outcome,
                 };
                 write_register(state, window, destination, value)
+            }
+            CoreOpcode::ResolveGlobalObjectProperty => {
+                let destination = match register_operand(instruction, 0) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let key = match identifier_index_operand(instruction, 1) {
+                    Ok(key) => key,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let global_object = match self.active_global_object_value(state.stack) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                let property_key = self.identifier_property_key(key);
+                let site = CorePropertyLookupSite {
+                    bytecode_index: Some(instruction.bytecode_index),
+                    opcode: Some(CoreOpcode::ResolveGlobalObjectProperty),
+                    cache_key: None,
+                };
+                let (property, record) = match self.objects.get_property_with_lookup_record(
+                    global_object,
+                    &property_key,
+                    site,
+                ) {
+                    Ok((property, record)) => (property, record),
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                match property {
+                    CorePropertyGet::Data(value) => {
+                        self.record_property_lookup(record);
+                        write_register(state, window, destination, value)
+                    }
+                    CorePropertyGet::Getter(getter) => {
+                        let completion_context = match self
+                            .function_value_property_operation_context_for_current_instruction(
+                                state,
+                                window,
+                                instruction,
+                                FunctionValueReturnTransform::WriteValue { destination },
+                            ) {
+                            Ok(context) => context,
+                            Err(error) => return DispatchOutcome::Fail(error),
+                        };
+                        let completion = completion_context.map(|context| {
+                            context.completion(FunctionValuePropertyObservation::property_load(
+                                record.clone(),
+                            ))
+                        });
+                        let result = self.execute_function_value_with_completion(
+                            state,
+                            getter,
+                            global_object,
+                            &[],
+                            completion,
+                        );
+                        if !matches!(result, Err(DispatchOutcome::FunctionValueCall(_))) {
+                            self.record_property_lookup(record);
+                        }
+                        match result {
+                            Ok(value) => write_register(state, window, destination, value),
+                            Err(outcome) => outcome,
+                        }
+                    }
+                    CorePropertyGet::AccessorWithoutGetter => {
+                        self.record_property_lookup(record);
+                        write_register(state, window, destination, RuntimeValue::undefined())
+                    }
+                    CorePropertyGet::Missing => {
+                        self.record_property_lookup(record);
+                        let name = self
+                            .identifier_texts
+                            .get(&key)
+                            .map(String::as_str)
+                            .unwrap_or("<unknown>");
+                        let message = format!("Can't find variable: {name}");
+                        self.reference_error_outcome_with_heap(state.heap, &message)
+                    }
+                }
             }
             CoreOpcode::PutGlobalObjectProperty => {
                 let key = match identifier_index_operand(instruction, 0) {
@@ -11108,9 +13325,10 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(context) => context,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                self.put_by_name_property_value_with_observation(
+                self.put_property_value_with_store_observation(
                     state,
                     instruction.bytecode_index,
+                    CoreOpcode::PutGlobalObjectProperty,
                     global_object,
                     &key,
                     value,
@@ -11178,14 +13396,15 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let key = match identifier_index_operand(instruction, 2) {
+                let key_index = match identifier_index_operand(instruction, 2) {
                     Ok(key) => key,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let key = self.identifier_property_key(key);
+                let key = self.identifier_property_key(key_index);
                 let site = CorePropertyLookupSite {
                     bytecode_index: Some(instruction.bytecode_index),
                     opcode: Some(CoreOpcode::GetByName),
+                    cache_key: None,
                 };
                 let completion_context = match self
                     .function_value_property_operation_context_for_current_instruction(
@@ -11315,12 +13534,23 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                self.last_property_lookup = None;
+                self.pending_property_lookup_site = None;
                 if self.objects.is_array(object) {
                     if let Some(index) = self.value_array_index(key_value) {
-                        let value = match self.objects.get_index(object, index) {
-                            Ok(value) => value,
+                        let site = CorePropertyLookupSite {
+                            bytecode_index: Some(instruction.bytecode_index),
+                            opcode: Some(CoreOpcode::GetByValue),
+                            cache_key: None,
+                        };
+                        let (value, record) = match self
+                            .objects
+                            .get_index_with_lookup_record(object, index, site)
+                        {
+                            Ok(result) => result,
                             Err(error) => return DispatchOutcome::Fail(error),
                         };
+                        self.record_property_lookup(record);
                         return write_register(state, window, destination, value);
                     }
                 }
@@ -11338,25 +13568,32 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(context) => context,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                let site = CorePropertyLookupSite {
+                    bytecode_index: Some(instruction.bytecode_index),
+                    opcode: Some(CoreOpcode::GetByValue),
+                    cache_key: None,
+                };
                 let value = if key.is_string("length") {
                     if let Some(text) = self.strings.text(object) {
-                        Ok(RuntimeValue::from_i32(
-                            text.chars().count().try_into().unwrap_or(i32::MAX),
-                        ))
+                        Ok(RuntimeValue::from_i32(string_code_unit_len_i32(text)))
                     } else {
                         match self.objects.array_length(object) {
                             Ok(Some(length)) => Ok(length),
-                            Ok(None) => self.get_property_value_with_completion(
-                                state,
-                                object,
-                                &key,
-                                object,
-                                completion_context,
-                            ),
-                            Err(error) => Err(DispatchOutcome::Fail(error)),
+                            Ok(None) => {
+                                self.begin_property_lookup_recording(site);
+                                self.get_property_value_with_completion(
+                                    state,
+                                    object,
+                                    &key,
+                                    object,
+                                    completion_context,
+                                )
+                            }
+                            Err(error) => return DispatchOutcome::Fail(error),
                         }
                     }
                 } else {
+                    self.begin_property_lookup_recording(site);
                     self.get_property_value_with_completion(
                         state,
                         object,
@@ -11397,10 +13634,14 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 };
                 if self.objects.is_array(object) {
                     if let Some(index) = self.value_array_index(key_value) {
-                        return match self.objects.put_index(state.heap, object, index, value) {
-                            Ok(()) => DispatchOutcome::Continue,
-                            Err(error) => DispatchOutcome::Fail(error),
-                        };
+                        return self.put_index_with_store_observation(
+                            state,
+                            instruction.bytecode_index,
+                            CoreOpcode::PutByValue,
+                            object,
+                            index,
+                            value,
+                        );
                     }
                 }
                 let key = match self.value_property_key(key_value) {
@@ -11417,16 +13658,15 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(context) => context,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                match self.put_property_value_with_completion(
+                self.put_property_value_with_store_observation(
                     state,
+                    instruction.bytecode_index,
+                    CoreOpcode::PutByValue,
                     object,
                     &key,
                     value,
                     completion_context,
-                ) {
-                    Ok(()) => DispatchOutcome::Continue,
-                    Err(outcome) => outcome,
-                }
+                )
             }
             CoreOpcode::DeleteByValue => {
                 let destination = match register_operand(instruction, 0) {
@@ -11529,10 +13769,21 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let value = match self.objects.get_index(object, index) {
-                    Ok(value) => value,
+                self.last_property_lookup = None;
+                self.pending_property_lookup_site = None;
+                let site = CorePropertyLookupSite {
+                    bytecode_index: Some(instruction.bytecode_index),
+                    opcode: Some(CoreOpcode::GetByIndex),
+                    cache_key: None,
+                };
+                let (value, record) = match self
+                    .objects
+                    .get_index_with_lookup_record(object, index, site)
+                {
+                    Ok(result) => result,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                self.record_property_lookup(record);
                 write_register(state, window, destination, value)
             }
             CoreOpcode::PutByIndex => {
@@ -11556,10 +13807,14 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                match self.objects.put_index(state.heap, object, index, value) {
-                    Ok(()) => DispatchOutcome::Continue,
-                    Err(error) => DispatchOutcome::Fail(error),
-                }
+                self.put_index_with_store_observation(
+                    state,
+                    instruction.bytecode_index,
+                    CoreOpcode::PutByIndex,
+                    object,
+                    index,
+                    value,
+                )
             }
             CoreOpcode::GetLength => {
                 let destination = match register_operand(instruction, 0) {
@@ -11590,9 +13845,7 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
                 let length = if let Some(text) = self.strings.text(value) {
-                    Ok(RuntimeValue::from_i32(
-                        text.chars().count().try_into().unwrap_or(i32::MAX),
-                    ))
+                    Ok(RuntimeValue::from_i32(string_code_unit_len_i32(text)))
                 } else {
                     match self.objects.array_length(value) {
                         Ok(Some(length)) => Ok(length),
@@ -11724,17 +13977,7 @@ impl CoreOpcodeDispatchHost {
         &self,
         stack: &ExecutionContextStack,
     ) -> Result<RuntimeValue, ExecutionError> {
-        if stack.active_entry().is_none() {
-            return Err(ExecutionError::NoActiveEntry);
-        }
-        for entry in stack.entries.iter().rev() {
-            match &entry.record {
-                ExecutionEntryRecord::Program(program) => return Ok(program.this_value),
-                ExecutionEntryRecord::Eval(eval) => return Ok(eval.this_value),
-                ExecutionEntryRecord::Function(_) | ExecutionEntryRecord::Module(_) => {}
-            }
-        }
-        Err(ExecutionError::ExpectedObject)
+        stack.active_global_this_value()
     }
 
     fn construct_ability_for_function_index(&self, function_index: u32) -> ConstructAbility {
@@ -12143,6 +14386,9 @@ impl CoreOpcodeDispatchHost {
         right: RuntimeValue,
         opcode: CoreOpcode,
     ) -> Result<bool, ExecutionError> {
+        if let (Some(left), Some(right)) = (self.strings.text(left), self.strings.text(right)) {
+            return relational_string_compare(left, right, opcode);
+        }
         let result = match (self.bigints.value(left), self.bigints.value(right)) {
             (Some(left), Some(right)) => match opcode {
                 CoreOpcode::LessThanInt32 => left.cmp(&right) == Ordering::Less,
@@ -12152,28 +14398,46 @@ impl CoreOpcodeDispatchHost {
                 _ => return Err(ExecutionError::ExpectedInt32),
             },
             (Some(left), None) => {
-                let Some(right) = right.as_number() else {
-                    return Err(ExecutionError::ExpectedInt32);
-                };
+                let right = self.relational_numeric_value(right)?;
                 compare_f64(left.to_f64(), number_to_f64(right), opcode)?
             }
             (None, Some(right)) => {
-                let Some(left) = left.as_number() else {
-                    return Err(ExecutionError::ExpectedInt32);
-                };
+                let left = self.relational_numeric_value(left)?;
                 compare_f64(number_to_f64(left), right.to_f64(), opcode)?
             }
             (None, None) => {
-                let Some(left) = left.as_number() else {
-                    return Err(ExecutionError::ExpectedInt32);
-                };
-                let Some(right) = right.as_number() else {
-                    return Err(ExecutionError::ExpectedInt32);
-                };
+                let left = self.relational_numeric_value(left)?;
+                let right = self.relational_numeric_value(right)?;
                 compare_f64(number_to_f64(left), number_to_f64(right), opcode)?
             }
         };
         Ok(result)
+    }
+
+    fn relational_numeric_value(&self, value: RuntimeValue) -> Result<NumberValue, ExecutionError> {
+        if let Some(number) = value.as_number() {
+            return Ok(number);
+        }
+        if let Some(text) = self.strings.text(value) {
+            return number_from_string(text)
+                .as_number()
+                .ok_or(ExecutionError::ExpectedInt32);
+        }
+        self.to_number_with_string(value)?
+            .as_number()
+            .ok_or(ExecutionError::ExpectedInt32)
+    }
+
+    fn to_number_with_string(&self, value: RuntimeValue) -> Result<RuntimeValue, ExecutionError> {
+        if let Some(text) = self.strings.text(value) {
+            return Ok(number_from_string(text));
+        }
+        if let Some(object) = self.objects.find(value) {
+            if object.kind == CoreObjectKind::Date {
+                return Ok(runtime_number_from_f64(object.date_value));
+            }
+        }
+        to_number_value(value)
     }
 
     fn same_value_zero(&self, left: RuntimeValue, right: RuntimeValue) -> bool {
@@ -12227,11 +14491,90 @@ impl CoreOpcodeDispatchHost {
         }
     }
 
+    fn to_property_key(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        value: RuntimeValue,
+    ) -> Result<CorePropertyKey, DispatchOutcome> {
+        if self.is_primitive_value(value) {
+            return self
+                .value_property_key(value)
+                .map_err(DispatchOutcome::Fail);
+        }
+        let primitive = match self.object_to_string_hint_primitive(state, value) {
+            Ok(primitive) => primitive,
+            Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject)) => {
+                return Err(self.type_error_outcome_with_heap(
+                    state.heap,
+                    "Cannot convert object to primitive value",
+                ));
+            }
+            Err(outcome) => return Err(outcome),
+        };
+        self.value_property_key(primitive)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    fn invalid_in_parameter_message(&self, value: RuntimeValue) -> String {
+        let description = if self.symbols.is_symbol(value) {
+            self.symbols
+                .symbol_to_string(value)
+                .unwrap_or_else(|| "Symbol()".to_owned())
+        } else {
+            self.primitive_to_string(value)
+                .unwrap_or_else(|| "Value".to_owned())
+        };
+        format!("{description} is not an Object.")
+    }
+
+    fn value_uint32_index(&self, value: RuntimeValue) -> Option<u32> {
+        match value.as_number()? {
+            NumberValue::Int32(index) if index >= 0 => Some(index as u32),
+            NumberValue::DoubleBits(bits) => {
+                let value = bits.to_f64();
+                if !value.is_finite() || value < 0.0 {
+                    return None;
+                }
+                let index = value as u32;
+                (f64::from(index) == value).then_some(index)
+            }
+            NumberValue::Int32(_) => None,
+        }
+    }
+
     fn value_array_index(&self, value: RuntimeValue) -> Option<i32> {
         match value.as_number()? {
             NumberValue::Int32(index) if index >= 0 => Some(index),
             _ => None,
         }
+    }
+
+    fn record_in_by_val_array_profile_indexed_read(
+        &mut self,
+        bytecode_index: BytecodeIndex,
+        base: RuntimeValue,
+        index: u32,
+    ) {
+        let Some(cell) = self.objects.find(base) else {
+            return;
+        };
+        let structure = cell.structure_id;
+        let index_usize = usize::try_from(index).ok();
+        let out_of_bounds = match (cell.kind, index_usize) {
+            (CoreObjectKind::Array, Some(index)) => index >= cell.elements.len(),
+            (CoreObjectKind::Uint8Array, Some(index)) => index >= cell.view_length,
+            _ => true,
+        };
+        let mut profile = ArrayProfile::for_bytecode_index(bytecode_index);
+        profile.observe_indexed_read(structure, out_of_bounds);
+        self.last_array_profile_observation = Some(CoreArrayProfileObservationRecord {
+            bytecode_index,
+            opcode: CoreOpcode::InByVal,
+            base_object: base,
+            base_structure: structure,
+            index,
+            profile,
+        });
     }
 
     fn get_property_value(
@@ -12332,6 +14675,18 @@ impl CoreOpcodeDispatchHost {
             return result;
         }
         if self.strings.text(object).is_some() {
+            return self.get_string_property_value_with_completion(
+                state,
+                object,
+                key,
+                receiver,
+                completion_context,
+                lookup_site,
+            );
+        }
+        // C++ JSC: toThisNumber / Number autoboxing — primitive numbers route
+        // through Number.prototype for property access (e.g. (42).toString()).
+        if object.as_number().is_some() {
             let record = lookup_site.map(|site| {
                 CorePropertyLookupRecord::opaque(
                     site,
@@ -12342,7 +14697,35 @@ impl CoreOpcodeDispatchHost {
                     PropertyCacheability::Disallowed,
                 )
             });
-            let result = self.get_string_property_value_with_completion(
+            let result = self.get_number_property_value_with_completion(
+                state,
+                object,
+                key,
+                receiver,
+                completion_context,
+                record.clone(),
+            );
+            if let Some(record) = record {
+                if !matches!(result, Err(DispatchOutcome::FunctionValueCall(_))) {
+                    self.record_property_lookup(record);
+                }
+            }
+            return result;
+        }
+        // C++ JSC: Boolean autoboxing — primitive booleans route through
+        // Boolean.prototype for property access.
+        if object.as_bool().is_some() {
+            let record = lookup_site.map(|site| {
+                CorePropertyLookupRecord::opaque(
+                    site,
+                    object,
+                    None,
+                    key,
+                    true,
+                    PropertyCacheability::Disallowed,
+                )
+            });
+            let result = self.get_boolean_property_value_with_completion(
                 state,
                 object,
                 key,
@@ -12543,41 +14926,23 @@ impl CoreOpcodeDispatchHost {
         }
     }
 
-    fn get_string_property_value_with_completion(
+    /// C++ JSC: Number autoboxing — routes property access on primitive numbers
+    /// through Number.prototype, mirroring the toThisNumber path.
+    fn get_number_property_value_with_completion(
         &mut self,
         state: &mut DispatchState<'_>,
-        value: RuntimeValue,
+        _value: RuntimeValue,
         key: &CorePropertyKey,
         receiver: RuntimeValue,
         completion_context: Option<FunctionValuePropertyOperationContext>,
         load_record: Option<CorePropertyLookupRecord>,
     ) -> Result<RuntimeValue, DispatchOutcome> {
-        let text = self
-            .strings
-            .text(value)
-            .ok_or(DispatchOutcome::Fail(ExecutionError::ExpectedObject))?
-            .to_owned();
-        if key.is_string("length") {
-            return Ok(RuntimeValue::from_i32(
-                text.chars().count().try_into().unwrap_or(i32::MAX),
-            ));
-        }
-        if let Some(index) = key_array_index(key) {
-            let character = text.chars().nth(index);
-            return match character {
-                Some(character) => self
-                    .strings
-                    .allocate_with_heap(state.heap, &character.to_string())
-                    .map_err(DispatchOutcome::Fail),
-                None => Ok(RuntimeValue::undefined()),
-            };
-        }
         match self
             .objects
-            .get_string_prototype_property(key)
+            .get_number_prototype_property(key)
             .map_err(DispatchOutcome::Fail)?
         {
-            CorePropertyGet::Data(value) => Ok(value),
+            CorePropertyGet::Data(data) => Ok(data),
             CorePropertyGet::Getter(getter) => {
                 let completion = completion_context.map(|context| {
                     context.completion(
@@ -12600,6 +14965,238 @@ impl CoreOpcodeDispatchHost {
         }
     }
 
+    /// C++ JSC: Boolean autoboxing — routes property access on primitive booleans
+    /// through Boolean.prototype.
+    fn get_boolean_property_value_with_completion(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        _value: RuntimeValue,
+        key: &CorePropertyKey,
+        receiver: RuntimeValue,
+        completion_context: Option<FunctionValuePropertyOperationContext>,
+        load_record: Option<CorePropertyLookupRecord>,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        match self
+            .objects
+            .get_boolean_prototype_property(key)
+            .map_err(DispatchOutcome::Fail)?
+        {
+            CorePropertyGet::Data(data) => Ok(data),
+            CorePropertyGet::Getter(getter) => {
+                let completion = completion_context.map(|context| {
+                    context.completion(
+                        load_record
+                            .map(FunctionValuePropertyObservation::property_load)
+                            .unwrap_or_else(FunctionValuePropertyObservation::none),
+                    )
+                });
+                self.execute_function_value_with_completion(
+                    state,
+                    getter,
+                    receiver,
+                    &[],
+                    completion,
+                )
+            }
+            CorePropertyGet::Missing | CorePropertyGet::AccessorWithoutGetter => {
+                Ok(RuntimeValue::undefined())
+            }
+        }
+    }
+
+    fn get_string_property_value_with_completion(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        value: RuntimeValue,
+        key: &CorePropertyKey,
+        receiver: RuntimeValue,
+        completion_context: Option<FunctionValuePropertyOperationContext>,
+        lookup_site: Option<CorePropertyLookupSite>,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        if self.strings.text(value).is_none() {
+            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject));
+        }
+        let opaque_record = |site| {
+            CorePropertyLookupRecord::opaque(
+                site,
+                value,
+                None,
+                key,
+                true,
+                PropertyCacheability::Disallowed,
+            )
+        };
+        let can_record_string_prototype_megamorphic_lookup = lookup_site
+            .is_some_and(|site| site.opcode == Some(CoreOpcode::GetByName))
+            && self
+                .property_observation_key_text(key)
+                .is_some_and(can_use_get_by_id_megamorphic_property_name);
+        if key.is_string("length") {
+            if let Some(site) = lookup_site {
+                self.record_property_lookup(opaque_record(site));
+            }
+            let length = self
+                .strings
+                .text(value)
+                .map(string_code_unit_len_i32)
+                .ok_or(DispatchOutcome::Fail(ExecutionError::ExpectedObject))?;
+            return Ok(RuntimeValue::from_i32(length));
+        }
+        if let Some(index) = key_array_index(key) {
+            let character = self
+                .strings
+                .text(value)
+                .ok_or(DispatchOutcome::Fail(ExecutionError::ExpectedObject))
+                .map(|text| string_slice_code_units(text, index, index.saturating_add(1)))?;
+            let result = if character.is_empty() {
+                Ok(RuntimeValue::undefined())
+            } else {
+                self.strings
+                    .allocate_with_heap(state.heap, &character)
+                    .map_err(DispatchOutcome::Fail)
+            };
+            if let Some(site) = lookup_site {
+                if !matches!(result, Err(DispatchOutcome::FunctionValueCall(_))) {
+                    self.record_property_lookup(opaque_record(site));
+                }
+            }
+            return result;
+        }
+
+        let string_prototype = self.objects.ensure_string_prototype();
+        let own_property = self.objects.find(string_prototype).and_then(|cell| {
+            let structure = cell.structure_id;
+            let property = cell.properties.get(key).copied()?;
+            let offset = cell.property_offset(key);
+            Some((structure, property, offset))
+        });
+        if let Some((structure, property, offset)) = own_property {
+            match property.kind {
+                CorePropertyKind::Data(property_value) => {
+                    if let Some(site) = lookup_site {
+                        if can_record_string_prototype_megamorphic_lookup {
+                            self.record_property_lookup(
+                                CorePropertyLookupRecord::from_string_prototype_own_data(
+                                    site,
+                                    value,
+                                    string_prototype,
+                                    structure,
+                                    key,
+                                    offset,
+                                    property_value,
+                                ),
+                            );
+                        } else {
+                            self.record_property_lookup(opaque_record(site));
+                        }
+                    }
+                    return Ok(property_value);
+                }
+                CorePropertyKind::Accessor {
+                    getter: Some(getter),
+                    ..
+                } => {
+                    let load_record = lookup_site.map(opaque_record);
+                    let completion = completion_context.map(|context| {
+                        context.completion(
+                            load_record
+                                .clone()
+                                .map(FunctionValuePropertyObservation::property_load)
+                                .unwrap_or_else(FunctionValuePropertyObservation::none),
+                        )
+                    });
+                    let result = self.execute_function_value_with_completion(
+                        state,
+                        getter,
+                        receiver,
+                        &[],
+                        completion,
+                    );
+                    if let Some(record) = load_record {
+                        if !matches!(result, Err(DispatchOutcome::FunctionValueCall(_))) {
+                            self.record_property_lookup(record);
+                        }
+                    }
+                    return result;
+                }
+                CorePropertyKind::Accessor { getter: None, .. } => {
+                    if let Some(site) = lookup_site {
+                        self.record_property_lookup(opaque_record(site));
+                    }
+                    return Ok(RuntimeValue::undefined());
+                }
+            }
+        }
+
+        if can_record_string_prototype_megamorphic_lookup {
+            let site = lookup_site.expect("checked string prototype lookup site");
+            let (property, normalized_record) = self
+                .objects
+                .get_property_with_lookup_record(string_prototype, key, site)
+                .map(|(property, record)| {
+                    (
+                        property,
+                        CorePropertyLookupRecord::normalized_string_prototype_lookup(value, record),
+                    )
+                })
+                .map_err(DispatchOutcome::Fail)?;
+            match property {
+                CorePropertyGet::Data(value) => {
+                    self.record_property_lookup(normalized_record);
+                    return Ok(value);
+                }
+                CorePropertyGet::Missing => {
+                    self.record_property_lookup(normalized_record);
+                    return Ok(RuntimeValue::undefined());
+                }
+                CorePropertyGet::Getter(_) | CorePropertyGet::AccessorWithoutGetter => {}
+            }
+        }
+
+        let load_record = lookup_site.map(opaque_record);
+        match self
+            .objects
+            .get_property(string_prototype, key)
+            .map_err(DispatchOutcome::Fail)?
+        {
+            CorePropertyGet::Data(value) => {
+                if let Some(record) = load_record {
+                    self.record_property_lookup(record);
+                }
+                Ok(value)
+            }
+            CorePropertyGet::Getter(getter) => {
+                let completion = completion_context.map(|context| {
+                    context.completion(
+                        load_record
+                            .clone()
+                            .map(FunctionValuePropertyObservation::property_load)
+                            .unwrap_or_else(FunctionValuePropertyObservation::none),
+                    )
+                });
+                let result = self.execute_function_value_with_completion(
+                    state,
+                    getter,
+                    receiver,
+                    &[],
+                    completion,
+                );
+                if let Some(record) = load_record {
+                    if !matches!(result, Err(DispatchOutcome::FunctionValueCall(_))) {
+                        self.record_property_lookup(record);
+                    }
+                }
+                result
+            }
+            CorePropertyGet::Missing | CorePropertyGet::AccessorWithoutGetter => {
+                if let Some(record) = load_record {
+                    self.record_property_lookup(record);
+                }
+                Ok(RuntimeValue::undefined())
+            }
+        }
+    }
+
     fn put_by_name_property_value_with_observation(
         &mut self,
         state: &mut DispatchState<'_>,
@@ -12609,9 +15206,30 @@ impl CoreOpcodeDispatchHost {
         value: RuntimeValue,
         completion_context: Option<FunctionValuePropertyOperationContext>,
     ) -> DispatchOutcome {
+        self.put_property_value_with_store_observation(
+            state,
+            bytecode_index,
+            CoreOpcode::PutByName,
+            object,
+            key,
+            value,
+            completion_context,
+        )
+    }
+
+    fn put_property_value_with_store_observation(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+        object: RuntimeValue,
+        key: &CorePropertyKey,
+        value: RuntimeValue,
+        completion_context: Option<FunctionValuePropertyOperationContext>,
+    ) -> DispatchOutcome {
         let site = CorePropertyStoreSite {
             bytecode_index: Some(bytecode_index),
-            opcode: Some(CoreOpcode::PutByName),
+            opcode: Some(opcode),
         };
         self.begin_property_store_recording(site);
         let before = self.objects.property_store_snapshot(object, key);
@@ -12681,6 +15299,70 @@ impl CoreOpcodeDispatchHost {
 
         match result {
             Ok(_) => DispatchOutcome::Continue,
+            Err(outcome) => outcome,
+        }
+    }
+
+    fn put_index_with_store_observation(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+        object: RuntimeValue,
+        index: i32,
+        value: RuntimeValue,
+    ) -> DispatchOutcome {
+        let key = array_index_property_key(index);
+        let site = CorePropertyStoreSite {
+            bytecode_index: Some(bytecode_index),
+            opcode: Some(opcode),
+        };
+        self.begin_property_store_recording(site);
+        let before = self.objects.property_store_snapshot(object, &key);
+        let barrier_start = state.heap.barrier_records().len();
+        let result = self
+            .objects
+            .put_index(state.heap, object, index, value)
+            .map_err(DispatchOutcome::Fail);
+        let after = self.objects.property_store_snapshot(object, &key);
+        let write_barrier_count = state
+            .heap
+            .barrier_records()
+            .len()
+            .saturating_sub(barrier_start)
+            .min(u32::MAX as usize) as u32;
+        let last_write_barrier = if write_barrier_count == 0 {
+            None
+        } else {
+            state
+                .heap
+                .barrier_records()
+                .last()
+                .map(|record| record.outcome)
+        };
+        let outcome = match &result {
+            Ok(()) => classify_stored_property_outcome(before, after),
+            Err(outcome) => property_store_outcome_from_dispatch_error(outcome),
+        };
+        let recorded_site = self.pending_property_store_site.take().unwrap_or(site);
+        self.record_property_store(CorePropertyStoreRecord {
+            bytecode_index: recorded_site.bytecode_index,
+            opcode: recorded_site.opcode,
+            base_object: before.base_object.or(after.base_object),
+            base_structure_before: before.base_structure,
+            base_structure_after: after.base_structure,
+            key,
+            offset_after: after.offset,
+            stored_value: value,
+            outcome,
+            may_call_js: property_store_observation_may_call_js(outcome),
+            cacheability: property_store_cacheability(outcome, before, after),
+            write_barrier_count,
+            last_write_barrier,
+        });
+
+        match result {
+            Ok(()) => DispatchOutcome::Continue,
             Err(outcome) => outcome,
         }
     }
@@ -12835,31 +15517,83 @@ impl CoreOpcodeDispatchHost {
         key: &CorePropertyKey,
         completion_context: Option<FunctionValuePropertyOperationContext>,
     ) -> Result<bool, DispatchOutcome> {
+        let lookup_site = self.pending_property_lookup_site.take();
         if self.objects.is_proxy(object) {
+            let opaque_record = lookup_site.map(|site| {
+                CorePropertyLookupRecord::opaque_has_property(
+                    site,
+                    object,
+                    self.objects.find(object).map(|_| object),
+                    key,
+                    true,
+                    PropertyCacheability::TaintedByOpaqueObject,
+                    None,
+                )
+            });
             let (target, handler) = self.proxy_target_handler_or_throw(state.heap, object)?;
             let Some(trap) = self.proxy_trap(state, handler, "has")? else {
-                return self
+                let result = self
                     .objects
                     .has_property(target, key)
                     .map_err(DispatchOutcome::Fail);
+                if let (Ok(result), Some(mut record)) = (&result, opaque_record.clone()) {
+                    record.returned_value = Some(RuntimeValue::from_bool(*result));
+                    self.record_property_lookup(record);
+                }
+                return result;
             };
             let key_value = self
                 .property_key_value(state.heap, key)
                 .map_err(DispatchOutcome::Fail)?;
-            let completion = completion_context
-                .map(|context| context.completion(FunctionValuePropertyObservation::none()));
+            let completion = completion_context.map(|context| {
+                context.completion(
+                    opaque_record
+                        .clone()
+                        .map(FunctionValuePropertyObservation::property_has)
+                        .unwrap_or_else(FunctionValuePropertyObservation::none),
+                )
+            });
             let result = self.execute_function_value_with_completion(
                 state,
                 trap,
                 handler,
                 &[target, key_value],
                 completion,
-            )?;
-            return Ok(self.truthy(result));
+            );
+            match result {
+                Ok(value) => {
+                    let truthy = self.truthy(value);
+                    if let Some(mut record) = opaque_record {
+                        record.returned_value = Some(RuntimeValue::from_bool(truthy));
+                        self.record_property_lookup(record);
+                    }
+                    return Ok(truthy);
+                }
+                Err(DispatchOutcome::FunctionValueCall(request)) => {
+                    return Err(DispatchOutcome::FunctionValueCall(request));
+                }
+                Err(outcome) => {
+                    if let Some(record) = opaque_record {
+                        self.record_property_lookup(record);
+                    }
+                    return Err(outcome);
+                }
+            }
         }
-        self.objects
-            .has_property(object, key)
-            .map_err(DispatchOutcome::Fail)
+        match lookup_site {
+            Some(site) => {
+                let (result, record) = self
+                    .objects
+                    .has_property_with_lookup_record(object, key, site)
+                    .map_err(DispatchOutcome::Fail)?;
+                self.record_property_lookup(record);
+                Ok(result)
+            }
+            None => self
+                .objects
+                .has_property(object, key)
+                .map_err(DispatchOutcome::Fail),
+        }
     }
 
     fn delete_property_value(
@@ -13302,6 +16036,7 @@ impl CoreOpcodeDispatchHost {
             Ok(CoreFunctionCallTarget::Native { native, .. }) => (
                 CallObservationTargetKind::NativeFunction {
                     native: format!("{native:?}"),
+                    intrinsic: native.intrinsic(),
                 },
                 true,
             ),
@@ -13334,7 +16069,10 @@ impl CoreOpcodeDispatchHost {
         let Some(opcode) = CoreOpcode::from_opcode(instruction.opcode) else {
             return;
         };
-        if !matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+        if !matches!(
+            opcode,
+            CoreOpcode::Call | CoreOpcode::CallWithThis | CoreOpcode::Construct
+        ) {
             return;
         }
         self.record_call_observation(CoreCallObservationRecord {
@@ -13616,11 +16354,15 @@ impl CoreOpcodeDispatchHost {
             Ok(register) => register,
             Err(error) => return DispatchOutcome::Fail(error),
         };
-        let callee = match register_operand(instruction, 1).and_then(|register| {
-            state
-                .registers
-                .read(caller_window, register, Some(state.code_block.constants()))
-        }) {
+        let callee_register = match register_operand(instruction, 1) {
+            Ok(register) => register,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        let callee = match state.registers.read(
+            caller_window,
+            callee_register,
+            Some(state.code_block.constants()),
+        ) {
             Ok(value) => value,
             Err(error) => return DispatchOutcome::Fail(error),
         };
@@ -13635,7 +16377,9 @@ impl CoreOpcodeDispatchHost {
                 return self.type_error_outcome_with_heap(state.heap, "Value is not a constructor");
             }
         }
-        let target = match self.objects.function_call_target(callee) {
+        let target = self.objects.function_call_target(callee);
+        let (target_kind, may_call_js) = self.call_observation_target_kind(callee, target.as_ref());
+        let target = match target {
             Ok(target) => target,
             Err(error) => return DispatchOutcome::Fail(error),
         };
@@ -13670,6 +16414,7 @@ impl CoreOpcodeDispatchHost {
                     | CoreNativeFunction::ArrayConstructor
                     | CoreNativeFunction::ErrorConstructor
                     | CoreNativeFunction::TypeErrorConstructor
+                    | CoreNativeFunction::ReferenceErrorConstructor
                     | CoreNativeFunction::RegExpConstructor => self.call_native_function(
                         state,
                         callee,
@@ -13678,6 +16423,15 @@ impl CoreOpcodeDispatchHost {
                         &arguments,
                         None,
                     ),
+                    CoreNativeFunction::NumberConstructor => {
+                        self.native_number_construct(state.heap, &arguments)
+                    }
+                    CoreNativeFunction::BooleanConstructor => {
+                        self.native_boolean_construct(state.heap, &arguments)
+                    }
+                    CoreNativeFunction::StringConstructor => {
+                        self.native_string_construct(state, &arguments)
+                    }
                     CoreNativeFunction::PromiseConstructor => {
                         self.native_promise_constructor(state, &arguments)
                     }
@@ -13822,7 +16576,7 @@ impl CoreOpcodeDispatchHost {
                     {
                         argument_values.push(RuntimeValue::undefined());
                     }
-                    return DispatchOutcome::OrdinaryBytecodeConstruct(Box::new(
+                    let outcome = DispatchOutcome::OrdinaryBytecodeConstruct(Box::new(
                         OrdinaryBytecodeConstructRequest {
                             continuation,
                             target_code_block_id: construct_code_block_id,
@@ -13830,6 +16584,21 @@ impl CoreOpcodeDispatchHost {
                             argument_values,
                         },
                     ));
+                    self.finish_call_observation(
+                        CoreCallObservationCapture {
+                            instruction,
+                            destination,
+                            callee_register,
+                            callee_value: constructor_callee,
+                            this_source: CallObservationThisSource::ConstructAllocatedReceiver,
+                            this_value,
+                            provided_argument_count: argument_count,
+                            target_kind,
+                            may_call_js,
+                        },
+                        &outcome,
+                    );
+                    return outcome;
                 }
             }
         }
@@ -14008,6 +16777,132 @@ impl CoreOpcodeDispatchHost {
         instruction: DispatchInstruction<'_>,
         request: CoreNativeCallDispatchRequest,
     ) -> DispatchOutcome {
+        if request.native == CoreNativeFunction::StringCharCodeAt {
+            let index_value = if request.argument_count == 0 {
+                RuntimeValue::undefined()
+            } else {
+                let register = match register_operand(instruction, request.first_argument_operand) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                match state.registers.read(
+                    caller_window,
+                    register,
+                    Some(state.code_block.constants()),
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                }
+            };
+            let value = match self.native_string_char_code_at_value(request.this_value, index_value)
+            {
+                Ok(value) => value,
+                Err(outcome) => return outcome,
+            };
+            return write_register(state, caller_window, request.destination, value);
+        }
+        if request.native == CoreNativeFunction::StringSubstring {
+            let start_value = if request.argument_count == 0 {
+                None
+            } else {
+                let register = match register_operand(instruction, request.first_argument_operand) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                match state.registers.read(
+                    caller_window,
+                    register,
+                    Some(state.code_block.constants()),
+                ) {
+                    Ok(value) => Some(value),
+                    Err(error) => return DispatchOutcome::Fail(error),
+                }
+            };
+            let end_value = if request.argument_count <= 1 {
+                None
+            } else {
+                let register =
+                    match register_operand(instruction, request.first_argument_operand + 1) {
+                        Ok(register) => register,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
+                match state.registers.read(
+                    caller_window,
+                    register,
+                    Some(state.code_block.constants()),
+                ) {
+                    Ok(value) => Some(value),
+                    Err(error) => return DispatchOutcome::Fail(error),
+                }
+            };
+            let value = match self.native_string_substring_value(
+                state.heap,
+                request.this_value,
+                start_value,
+                end_value,
+            ) {
+                Ok(value) => value,
+                Err(outcome) => return outcome,
+            };
+            return write_register(state, caller_window, request.destination, value);
+        }
+        if matches!(
+            request.native,
+            CoreNativeFunction::StringIndexOf | CoreNativeFunction::StringLastIndexOf
+        ) {
+            let search_value = if request.argument_count == 0 {
+                None
+            } else {
+                let register = match register_operand(instruction, request.first_argument_operand) {
+                    Ok(register) => register,
+                    Err(error) => return DispatchOutcome::Fail(error),
+                };
+                match state.registers.read(
+                    caller_window,
+                    register,
+                    Some(state.code_block.constants()),
+                ) {
+                    Ok(value) => Some(value),
+                    Err(error) => return DispatchOutcome::Fail(error),
+                }
+            };
+            let position_value = if request.argument_count <= 1 {
+                None
+            } else {
+                let register =
+                    match register_operand(instruction, request.first_argument_operand + 1) {
+                        Ok(register) => register,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
+                match state.registers.read(
+                    caller_window,
+                    register,
+                    Some(state.code_block.constants()),
+                ) {
+                    Ok(value) => Some(value),
+                    Err(error) => return DispatchOutcome::Fail(error),
+                }
+            };
+            let value = match request.native {
+                CoreNativeFunction::StringIndexOf => self.native_string_index_of_value(
+                    request.this_value,
+                    search_value,
+                    position_value,
+                ),
+                CoreNativeFunction::StringLastIndexOf => self.native_string_last_index_of_value(
+                    request.this_value,
+                    search_value,
+                    position_value,
+                ),
+                _ => unreachable!(),
+            };
+            let value = match value {
+                Ok(value) => value,
+                Err(outcome) => return outcome,
+            };
+            return write_register(state, caller_window, request.destination, value);
+        }
+
         let mut arguments =
             Vec::with_capacity(usize::try_from(request.argument_count).unwrap_or(usize::MAX));
         for argument_index in 0..request.argument_count {
@@ -14687,6 +17582,7 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::MathSqrt => self.native_math_sqrt(arguments),
             CoreNativeFunction::MathTrunc => self.native_math_trunc(arguments),
             CoreNativeFunction::ParseInt => self.native_parse_int(arguments),
+            CoreNativeFunction::ParseFloat => self.native_parse_float(arguments),
             CoreNativeFunction::HostPerformanceNow => Ok(self.native_host_performance_now()),
             CoreNativeFunction::HostPrint => {
                 Ok(self.native_host_output(CoreHostOutputSink::Print, arguments))
@@ -14707,6 +17603,8 @@ impl CoreOpcodeDispatchHost {
                 Ok(self.native_host_output(CoreHostOutputSink::ConsoleError, arguments))
             }
             CoreNativeFunction::HostReadFile => self.native_host_read_file(state.heap, arguments),
+            CoreNativeFunction::HostCurrentResolve => self.native_host_current_resolve(arguments),
+            CoreNativeFunction::HostCurrentReject => Ok(self.native_host_current_reject(arguments)),
             CoreNativeFunction::JsonParse => self.native_json_parse(state.heap, arguments),
             CoreNativeFunction::JsonStringify => self.native_json_stringify(state, arguments),
             CoreNativeFunction::ReflectApply => {
@@ -14741,6 +17639,12 @@ impl CoreOpcodeDispatchHost {
                 self.native_string_from_char_code(state.heap, arguments)
             }
             CoreNativeFunction::NumberConstructor => self.native_number_constructor(arguments),
+            CoreNativeFunction::NumberPrototypeToString => {
+                self.native_number_prototype_to_string(state.heap, this_value, arguments)
+            }
+            CoreNativeFunction::NumberPrototypeValueOf => {
+                self.native_number_prototype_value_of(this_value)
+            }
             CoreNativeFunction::BooleanConstructor => {
                 Ok(self.native_boolean_constructor(arguments))
             }
@@ -14749,6 +17653,9 @@ impl CoreOpcodeDispatchHost {
             }
             CoreNativeFunction::TypeErrorConstructor => {
                 self.native_type_error_constructor(state.heap, arguments)
+            }
+            CoreNativeFunction::ReferenceErrorConstructor => {
+                self.native_reference_error_constructor(state.heap, arguments)
             }
             CoreNativeFunction::ErrorPrototypeToString => {
                 self.native_error_prototype_to_string(state, this_value)
@@ -14949,6 +17856,12 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::ArrayJoin => {
                 self.native_array_join(state.heap, this_value, arguments)
             }
+            CoreNativeFunction::ArrayPrototypeToString => {
+                // C++ JSC: arrayProtoFuncToString calls this.join() if
+                // join is callable, otherwise falls back to
+                // Object.prototype.toString.
+                self.native_array_join(state.heap, this_value, &[])
+            }
             CoreNativeFunction::ArraySlice => {
                 self.native_array_slice(state.heap, this_value, arguments)
             }
@@ -14989,11 +17902,35 @@ impl CoreOpcodeDispatchHost {
                 self.native_string_char_code_at(this_value, arguments)
             }
             CoreNativeFunction::StringIndexOf => self.native_string_index_of(this_value, arguments),
+            CoreNativeFunction::StringLastIndexOf => {
+                self.native_string_last_index_of(this_value, arguments)
+            }
             CoreNativeFunction::StringSlice => {
                 self.native_string_slice(state.heap, this_value, arguments)
             }
             CoreNativeFunction::StringSubstring => {
                 self.native_string_substring(state.heap, this_value, arguments)
+            }
+            CoreNativeFunction::StringSubstr => {
+                self.native_string_substr(state.heap, this_value, arguments)
+            }
+            CoreNativeFunction::StringSplit => {
+                self.native_string_split(state.heap, this_value, arguments)
+            }
+            CoreNativeFunction::StringReplace => {
+                self.native_string_replace(state.heap, this_value, arguments)
+            }
+            CoreNativeFunction::StringToLowerCase => {
+                self.native_string_to_lower_case(state.heap, this_value)
+            }
+            CoreNativeFunction::StringToUpperCase => {
+                self.native_string_to_upper_case(state.heap, this_value)
+            }
+            CoreNativeFunction::StringToLocaleLowerCase => {
+                self.native_string_to_lower_case(state.heap, this_value)
+            }
+            CoreNativeFunction::StringToLocaleUpperCase => {
+                self.native_string_to_upper_case(state.heap, this_value)
             }
             CoreNativeFunction::Assign => self.native_object_assign(state, arguments),
             CoreNativeFunction::Create => self.native_object_create(state.heap, arguments),
@@ -15038,6 +17975,34 @@ impl CoreOpcodeDispatchHost {
             self.host_output_records
                 .push(CoreHostOutputRecord { sink, text });
         }
+        RuntimeValue::undefined()
+    }
+
+    fn native_host_current_resolve(
+        &mut self,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let Some(result_value) = arguments.first().copied() else {
+            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject));
+        };
+        let elapsed_times_ms = self
+            .objects
+            .array_number_values(result_value)
+            .map_err(DispatchOutcome::Fail)?;
+        self.host_result_records
+            .push(CoreHostResultRecord::Resolved { elapsed_times_ms });
+        Ok(RuntimeValue::undefined())
+    }
+
+    fn native_host_current_reject(&mut self, arguments: &[RuntimeValue]) -> RuntimeValue {
+        let reason = arguments
+            .iter()
+            .copied()
+            .map(|argument| self.host_output_argument_to_string(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.host_result_records
+            .push(CoreHostResultRecord::Rejected { reason });
         RuntimeValue::undefined()
     }
 
@@ -17009,6 +19974,18 @@ impl CoreOpcodeDispatchHost {
         self.objects
             .push_array_element_with_write_barrier(heap, array, matched)
             .map_err(DispatchOutcome::Fail)?;
+        for capture in &result.captures {
+            let value = if let Some(range) = capture {
+                self.strings
+                    .allocate_with_heap(heap, &result.input[range.start..range.end])
+                    .map_err(DispatchOutcome::Fail)?
+            } else {
+                RuntimeValue::undefined()
+            };
+            self.objects
+                .push_array_element_with_write_barrier(heap, array, value)
+                .map_err(DispatchOutcome::Fail)?;
+        }
         self.objects
             .put_data_own_with_write_barrier(
                 heap,
@@ -17065,7 +20042,9 @@ impl CoreOpcodeDispatchHost {
         } else {
             0
         };
-        let result = simple_regexp_match(&source, flags, &input, start);
+        let result = execute_simple_yarr(&source, flags, &input, start).map_err(|_| {
+            self.type_error_outcome_with_heap(heap, "Unsupported regular expression execution")
+        })?;
         if flags.global || flags.sticky {
             let next_index = result.as_ref().map_or(0, |matched| matched.end);
             self.set_regexp_last_index(heap, this_value, next_index)?;
@@ -17074,6 +20053,7 @@ impl CoreOpcodeDispatchHost {
             input,
             start: matched.start,
             end: matched.end,
+            captures: matched.captures,
         }))
     }
 
@@ -17704,14 +20684,7 @@ impl CoreOpcodeDispatchHost {
         this_value: RuntimeValue,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, DispatchOutcome> {
-        let length = self
-            .objects
-            .array_length(this_value)
-            .map_err(DispatchOutcome::Fail)?
-            .ok_or(DispatchOutcome::Fail(ExecutionError::ExpectedObject))?;
-        let Some(NumberValue::Int32(length)) = length.as_number() else {
-            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedArrayIndex));
-        };
+        let length = self.array_this_length(this_value)?;
         let separator = match arguments.first().copied() {
             Some(value) if value.kind() != ValueKind::Undefined => self
                 .strings
@@ -18567,6 +21540,27 @@ impl CoreOpcodeDispatchHost {
         Ok(parse_int_text(&text, radix))
     }
 
+    fn native_parse_float(
+        &self,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let value = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        if let Some(number) = value.as_number() {
+            let number = number_to_f64(number);
+            if number == 0.0 {
+                return Ok(RuntimeValue::from_i32(0));
+            }
+            return Ok(runtime_number_from_f64(number));
+        }
+        let text = self
+            .primitive_to_string(value)
+            .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
+        Ok(parse_float_text(&text))
+    }
+
     fn parse_int_radix_argument(&self, arguments: &[RuntimeValue]) -> Result<i32, DispatchOutcome> {
         let Some(value) = arguments.get(1).copied() else {
             return Ok(0);
@@ -18767,6 +21761,149 @@ impl CoreOpcodeDispatchHost {
         )
     }
 
+    /// C++ JSC: `new Number(value)` — creates a NumberObject wrapper with an
+    /// internal [[NumberData]] value, mirroring NumberObject::create +
+    /// setInternalValue in C++ JSC.
+    fn native_number_construct(
+        &mut self,
+        heap: &mut Heap,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let numeric_value = if let Some(value) = arguments.first().copied() {
+            self.number_constructor_value(value)?
+        } else {
+            RuntimeValue::from_i32(0)
+        };
+        let prototype = self.objects.ensure_number_prototype();
+        let wrapper = self
+            .objects
+            .allocate_with_prototype_with_write_barrier(heap, Some(prototype))
+            .map_err(DispatchOutcome::Fail)?;
+        if let Some(cell) = self.objects.find_mut(wrapper) {
+            cell.primitive_value = Some(numeric_value);
+        }
+        Ok(wrapper)
+    }
+
+    /// C++ JSC: `new Boolean(value)` — creates a BooleanObject wrapper with an
+    /// internal [[BooleanData]] value.
+    fn native_boolean_construct(
+        &mut self,
+        heap: &mut Heap,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let bool_value = self.native_boolean_constructor(arguments);
+        let prototype = self.objects.ensure_boolean_prototype();
+        let wrapper = self
+            .objects
+            .allocate_with_prototype_with_write_barrier(heap, Some(prototype))
+            .map_err(DispatchOutcome::Fail)?;
+        if let Some(cell) = self.objects.find_mut(wrapper) {
+            cell.primitive_value = Some(bool_value);
+        }
+        Ok(wrapper)
+    }
+
+    /// C++ JSC: `new String(value)` — creates a StringObject wrapper with an
+    /// internal [[StringData]] value.
+    fn native_string_construct(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let string_value = self.native_string_constructor(state, arguments)?;
+        let prototype = self.objects.ensure_string_prototype();
+        let wrapper = self
+            .objects
+            .allocate_with_prototype_with_write_barrier(state.heap, Some(prototype))
+            .map_err(DispatchOutcome::Fail)?;
+        if let Some(cell) = self.objects.find_mut(wrapper) {
+            cell.primitive_value = Some(string_value);
+        }
+        Ok(wrapper)
+    }
+
+    /// C++ JSC: numberProtoFuncToString — extracts the number from `this`
+    /// (primitive number or NumberObject), extracts radix from argument[0]
+    /// (default 10), and converts to string.  Mirrors toThisNumber +
+    /// extractToStringRadixArgument + numberToStringInternal.
+    fn native_number_prototype_to_string(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        // C++ JSC toThisNumber: extract the numeric value from this.
+        let number = self
+            .to_this_number(this_value)
+            .map_err(DispatchOutcome::Fail)?;
+        // C++ JSC extractToStringRadixArgument: default radix is 10.
+        let radix = self
+            .extract_to_string_radix_argument(arguments)
+            .map_err(DispatchOutcome::Fail)?;
+        let text = number_to_string_with_radix(number, radix);
+        self.strings
+            .allocate_with_heap(heap, &text)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    /// C++ JSC: numberProtoFuncValueOf — extracts the number from `this`.
+    fn native_number_prototype_value_of(
+        &self,
+        this_value: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        // C++ JSC toThisNumber path.
+        let number = self
+            .to_this_number(this_value)
+            .map_err(DispatchOutcome::Fail)?;
+        Ok(runtime_number_from_f64(number))
+    }
+
+    /// C++ JSC: toThisNumber — extract the double value from a primitive number
+    /// or a NumberObject.  Mirrors the C++ toThisNumber helper.
+    fn to_this_number(&self, value: RuntimeValue) -> Result<f64, ExecutionError> {
+        if let Some(number) = value.as_number() {
+            return Ok(number_to_f64(number));
+        }
+        // Check for NumberObject — an object with a primitive_value that is a number.
+        if let Some(cell) = self.objects.find(value) {
+            if let Some(prim) = cell.primitive_value {
+                if let Some(number) = prim.as_number() {
+                    return Ok(number_to_f64(number));
+                }
+            }
+        }
+        Err(ExecutionError::ExpectedObject)
+    }
+
+    /// C++ JSC: extractToStringRadixArgument — extract and validate the radix
+    /// argument for Number.prototype.toString.
+    fn extract_to_string_radix_argument(
+        &self,
+        arguments: &[RuntimeValue],
+    ) -> Result<u32, ExecutionError> {
+        let Some(radix_value) = arguments.first().copied() else {
+            return Ok(10);
+        };
+        if radix_value.kind() == ValueKind::Undefined {
+            return Ok(10);
+        }
+        if let Some(NumberValue::Int32(radix)) = radix_value.as_number() {
+            if radix >= 2 && radix <= 36 {
+                return Ok(radix as u32);
+            }
+        } else if let Some(num) = radix_value.as_number() {
+            let d = number_to_f64(num);
+            let truncated = d as i64;
+            if truncated >= 2 && truncated <= 36 {
+                return Ok(truncated as u32);
+            }
+        }
+        // C++ JSC throws RangeError here. Using ExpectedInt32 as the engine
+        // does not yet have a dedicated RangeError variant.
+        Err(ExecutionError::ExpectedInt32)
+    }
+
     fn native_error_constructor(
         &mut self,
         heap: &mut Heap,
@@ -18804,6 +21941,31 @@ impl CoreOpcodeDispatchHost {
         let prototype =
             self.objects
                 .ensure_type_error_prototype(error_name, type_error_name, message);
+        self.allocate_error_instance(heap, prototype, arguments)
+    }
+
+    fn native_reference_error_constructor(
+        &mut self,
+        heap: &mut Heap,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let error_name = self
+            .strings
+            .allocate_with_heap(heap, "Error")
+            .map_err(DispatchOutcome::Fail)?;
+        let reference_error_name = self
+            .strings
+            .allocate_with_heap(heap, "ReferenceError")
+            .map_err(DispatchOutcome::Fail)?;
+        let message = self
+            .strings
+            .allocate_with_heap(heap, "")
+            .map_err(DispatchOutcome::Fail)?;
+        let prototype = self.objects.ensure_reference_error_prototype(
+            error_name,
+            reference_error_name,
+            message,
+        );
         self.allocate_error_instance(heap, prototype, arguments)
     }
 
@@ -18921,20 +22083,62 @@ impl CoreOpcodeDispatchHost {
         }
     }
 
+    fn reference_error_outcome_with_heap(
+        &mut self,
+        heap: &mut Heap,
+        message: &str,
+    ) -> DispatchOutcome {
+        let error_name = match self.strings.allocate_with_heap(heap, "Error") {
+            Ok(value) => value,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        let reference_error_name = match self.strings.allocate_with_heap(heap, "ReferenceError") {
+            Ok(value) => value,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        let empty_message = match self.strings.allocate_with_heap(heap, "") {
+            Ok(value) => value,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        let message = match self.strings.allocate_with_heap(heap, message) {
+            Ok(value) => value,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        let prototype = self.objects.ensure_reference_error_prototype(
+            error_name,
+            reference_error_name,
+            empty_message,
+        );
+        let error = match self
+            .objects
+            .allocate_with_prototype_with_write_barrier(heap, Some(prototype))
+        {
+            Ok(error) => error,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        match self
+            .define_non_enumerable_data_field_with_write_barrier(heap, error, "message", message)
+        {
+            Ok(()) => DispatchOutcome::Throw(error),
+            Err(outcome) => outcome,
+        }
+    }
+
     fn native_string_char_at(
         &mut self,
         heap: &mut Heap,
         this_value: RuntimeValue,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, DispatchOutcome> {
-        let text = self.string_this(this_value)?;
-        let chars: Vec<char> = text.chars().collect();
         let index = self.integer_argument_or(arguments, 0, 0)?;
-        let result = usize::try_from(index)
-            .ok()
-            .and_then(|index| chars.get(index).copied())
-            .map(|character| character.to_string())
-            .unwrap_or_default();
+        let result = {
+            let text = self.string_this_text(this_value)?;
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| string_code_unit_at(text, index))
+                .map(|unit| String::from_utf16_lossy(&[unit]))
+                .unwrap_or_default()
+        };
         self.strings
             .allocate_with_heap(heap, &result)
             .map_err(DispatchOutcome::Fail)
@@ -18945,16 +22149,27 @@ impl CoreOpcodeDispatchHost {
         this_value: RuntimeValue,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, DispatchOutcome> {
-        let text = self.string_this(this_value)?;
-        let chars: Vec<char> = text.chars().collect();
-        let index = self.integer_argument_or(arguments, 0, 0)?;
-        let Some(character) = usize::try_from(index)
+        let index_value = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        self.native_string_char_code_at_value(this_value, index_value)
+    }
+
+    fn native_string_char_code_at_value(
+        &self,
+        this_value: RuntimeValue,
+        index_value: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let index = self.integer_value_or(index_value, 0)?;
+        let text = self.string_this_text(this_value)?;
+        let Some(unit) = usize::try_from(index)
             .ok()
-            .and_then(|index| chars.get(index).copied())
+            .and_then(|index| string_code_unit_at(text, index))
         else {
             return Ok(RuntimeValue::from_double(f64::NAN));
         };
-        Ok(RuntimeValue::from_i32(character as u32 as i32))
+        Ok(RuntimeValue::from_i32(i32::from(unit)))
     }
 
     fn native_string_index_of(
@@ -18962,28 +22177,75 @@ impl CoreOpcodeDispatchHost {
         this_value: RuntimeValue,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, DispatchOutcome> {
-        let text = self.string_this(this_value)?;
-        let search = match arguments.first().copied() {
+        self.native_string_index_of_value(
+            this_value,
+            arguments.first().copied(),
+            arguments.get(1).copied(),
+        )
+    }
+
+    fn native_string_index_of_value(
+        &self,
+        this_value: RuntimeValue,
+        search_value: Option<RuntimeValue>,
+        position_value: Option<RuntimeValue>,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let search = match search_value {
             Some(value) => self
                 .strings
                 .primitive_to_string(value)
                 .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?,
             None => "undefined".to_owned(),
         };
-        let start = self
-            .integer_argument_or(arguments, 1, 0)?
-            .clamp(0, text.chars().count().try_into().unwrap_or(i32::MAX));
-        let haystack: String = text
-            .chars()
-            .skip(usize::try_from(start).unwrap_or(usize::MAX))
-            .collect();
-        let Some(byte_index) = haystack.find(&search) else {
-            return Ok(RuntimeValue::from_i32(-1));
+        let start_argument = match position_value {
+            Some(value) => self.integer_value_or(value, 0)?,
+            None => 0,
         };
-        let char_index = haystack[..byte_index].chars().count();
-        Ok(RuntimeValue::from_i32(
-            start.saturating_add(char_index.try_into().unwrap_or(i32::MAX)),
-        ))
+        let text = self.string_this_text(this_value)?;
+        Ok(RuntimeValue::from_i32(string_index_of(
+            text,
+            &search,
+            start_argument,
+        )))
+    }
+
+    fn native_string_last_index_of(
+        &mut self,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        self.native_string_last_index_of_value(
+            this_value,
+            arguments.first().copied(),
+            arguments.get(1).copied(),
+        )
+    }
+
+    fn native_string_last_index_of_value(
+        &self,
+        this_value: RuntimeValue,
+        search_value: Option<RuntimeValue>,
+        position_value: Option<RuntimeValue>,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let search = match search_value {
+            Some(value) => self
+                .strings
+                .primitive_to_string(value)
+                .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?,
+            None => "undefined".to_owned(),
+        };
+        let position_argument = match position_value {
+            Some(value) if value.kind() != ValueKind::Undefined => {
+                self.integer_value_or(value, 0)?
+            }
+            _ => i32::MAX,
+        };
+        let text = self.string_this_text(this_value)?;
+        Ok(RuntimeValue::from_i32(string_last_index_of(
+            text,
+            &search,
+            position_argument,
+        )))
     }
 
     fn native_string_slice(
@@ -18992,21 +22254,23 @@ impl CoreOpcodeDispatchHost {
         this_value: RuntimeValue,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, DispatchOutcome> {
-        let text = self.string_this(this_value)?;
-        let chars: Vec<char> = text.chars().collect();
-        let length = chars.len().try_into().unwrap_or(i32::MAX);
-        let start = normalize_string_index(self.integer_argument_or(arguments, 0, 0)?, length);
-        let end = normalize_string_index(self.integer_argument_or(arguments, 1, length)?, length);
-        let (start, end) = if end < start {
-            (start, start)
-        } else {
-            (start, end)
+        let result = {
+            let text = self.string_this_text(this_value)?;
+            let length = string_code_unit_len_i32(text);
+            let start = normalize_string_index(self.integer_argument_or(arguments, 0, 0)?, length);
+            let end =
+                normalize_string_index(self.integer_argument_or(arguments, 1, length)?, length);
+            let (start, end) = if end < start {
+                (start, start)
+            } else {
+                (start, end)
+            };
+            string_slice_code_units(
+                text,
+                usize::try_from(start).unwrap_or(usize::MAX),
+                usize::try_from(end).unwrap_or(usize::MAX),
+            )
         };
-        let result: String = chars
-            .into_iter()
-            .skip(usize::try_from(start).unwrap_or(usize::MAX))
-            .take(usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX))
-            .collect();
         self.strings
             .allocate_with_heap(heap, &result)
             .map_err(DispatchOutcome::Fail)
@@ -19018,34 +22282,324 @@ impl CoreOpcodeDispatchHost {
         this_value: RuntimeValue,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, DispatchOutcome> {
-        let text = self.string_this(this_value)?;
-        let chars: Vec<char> = text.chars().collect();
-        let length = chars.len().try_into().unwrap_or(i32::MAX);
-        let mut start = self.integer_argument_or(arguments, 0, 0)?.clamp(0, length);
-        let mut end = match arguments.get(1).copied() {
-            Some(value) if value.kind() != ValueKind::Undefined => {
-                self.integer_argument_or(arguments, 1, length)?
+        self.native_string_substring_value(
+            heap,
+            this_value,
+            arguments.first().copied(),
+            arguments.get(1).copied(),
+        )
+    }
+
+    fn native_string_substring_value(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+        start_value: Option<RuntimeValue>,
+        end_value: Option<RuntimeValue>,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let (start, end) = {
+            let text = self.string_this_text(this_value)?;
+            let length = string_code_unit_len_i32(text);
+            let mut start = match start_value {
+                Some(value) => self.integer_value_or(value, 0)?,
+                None => 0,
             }
-            _ => length,
-        }
-        .clamp(0, length);
-        if start > end {
-            std::mem::swap(&mut start, &mut end);
-        }
-        let result: String = chars
-            .into_iter()
-            .skip(usize::try_from(start).unwrap_or(usize::MAX))
-            .take(usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX))
-            .collect();
+            .clamp(0, length);
+            let mut end = match end_value {
+                Some(value) if value.kind() != ValueKind::Undefined => {
+                    self.integer_value_or(value, length)?
+                }
+                _ => length,
+            }
+            .clamp(0, length);
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+            (
+                usize::try_from(start).unwrap_or(usize::MAX),
+                usize::try_from(end).unwrap_or(usize::MAX),
+            )
+        };
+        self.strings
+            .allocate_substring_with_heap(heap, this_value, start, end)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    fn native_string_substr(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let result = {
+            let text = self.string_this_text(this_value)?;
+            let length = string_code_unit_len_i32(text);
+            let mut start = self.integer_argument_or(arguments, 0, 0)?;
+            if start < 0 {
+                start = length.saturating_add(start).max(0);
+            } else {
+                start = start.min(length);
+            }
+            let count = match arguments.get(1).copied() {
+                Some(value) if value.kind() != ValueKind::Undefined => {
+                    self.integer_argument_or(arguments, 1, length)?
+                }
+                _ => length,
+            }
+            .max(0);
+            let end = start.saturating_add(count).min(length);
+            string_slice_code_units(
+                text,
+                usize::try_from(start).unwrap_or(usize::MAX),
+                usize::try_from(end).unwrap_or(usize::MAX),
+            )
+        };
         self.strings
             .allocate_with_heap(heap, &result)
             .map_err(DispatchOutcome::Fail)
     }
 
+    fn native_string_split(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let text = self.string_this(this_value)?;
+        let limit = arguments
+            .get(1)
+            .and_then(|value| array_length_argument(*value))
+            .unwrap_or(usize::MAX);
+        let array = self.objects.allocate_array();
+        if limit == 0 {
+            return Ok(array);
+        }
+        let Some(separator_value) = arguments
+            .first()
+            .copied()
+            .filter(|value| value.kind() != ValueKind::Undefined)
+        else {
+            let value = self
+                .strings
+                .allocate_with_heap(heap, &text)
+                .map_err(DispatchOutcome::Fail)?;
+            self.objects
+                .push_array_element_with_write_barrier(heap, array, value)
+                .map_err(DispatchOutcome::Fail)?;
+            return Ok(array);
+        };
+        if self.objects.is_regexp(separator_value) {
+            return self.native_string_split_regexp(heap, &text, separator_value, limit, array);
+        }
+        let separator = self
+            .strings
+            .primitive_to_string(separator_value)
+            .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
+        if separator.is_empty() {
+            for unit in text.encode_utf16().take(limit) {
+                let part = String::from_utf16_lossy(&[unit]);
+                let value = self
+                    .strings
+                    .allocate_with_heap(heap, &part)
+                    .map_err(DispatchOutcome::Fail)?;
+                self.objects
+                    .push_array_element_with_write_barrier(heap, array, value)
+                    .map_err(DispatchOutcome::Fail)?;
+            }
+            return Ok(array);
+        }
+        for part in text.split(&separator).take(limit) {
+            let value = self
+                .strings
+                .allocate_with_heap(heap, part)
+                .map_err(DispatchOutcome::Fail)?;
+            self.objects
+                .push_array_element_with_write_barrier(heap, array, value)
+                .map_err(DispatchOutcome::Fail)?;
+        }
+        Ok(array)
+    }
+
+    fn native_string_split_regexp(
+        &mut self,
+        heap: &mut Heap,
+        text: &str,
+        separator: RuntimeValue,
+        limit: usize,
+        array: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let (source, mut flags, _) = self.regexp_source_and_flags_or_throw(heap, separator)?;
+        flags.global = true;
+        let mut last_end = 0usize;
+        let mut search_index = 0usize;
+        let mut count = 0usize;
+        while count < limit {
+            let matched =
+                execute_simple_yarr(&source, flags, text, search_index).map_err(|_| {
+                    self.type_error_outcome_with_heap(
+                        heap,
+                        "Unsupported regular expression execution",
+                    )
+                })?;
+            let Some(matched) = matched else {
+                break;
+            };
+            if matched.end == last_end && matched.start == last_end {
+                search_index = advance_string_byte_index(text, search_index);
+                if search_index > text.len() {
+                    break;
+                }
+                continue;
+            }
+            let part = text.get(last_end..matched.start).unwrap_or_default();
+            let value = self
+                .strings
+                .allocate_with_heap(heap, part)
+                .map_err(DispatchOutcome::Fail)?;
+            self.objects
+                .push_array_element_with_write_barrier(heap, array, value)
+                .map_err(DispatchOutcome::Fail)?;
+            count = count.saturating_add(1);
+            if count >= limit {
+                return Ok(array);
+            }
+            last_end = matched.end;
+            search_index = matched.end;
+        }
+        if count < limit {
+            let part = text.get(last_end..).unwrap_or_default();
+            let value = self
+                .strings
+                .allocate_with_heap(heap, part)
+                .map_err(DispatchOutcome::Fail)?;
+            self.objects
+                .push_array_element_with_write_barrier(heap, array, value)
+                .map_err(DispatchOutcome::Fail)?;
+        }
+        Ok(array)
+    }
+
+    fn native_string_replace(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let text = self.string_this(this_value)?;
+        let search_value = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        let replacement_value = arguments
+            .get(1)
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        if self.objects.function_call_target(replacement_value).is_ok() {
+            return Err(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion));
+        }
+        let replacement = self
+            .strings
+            .primitive_to_string(replacement_value)
+            .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
+        let result = if self.objects.is_regexp(search_value) {
+            self.string_replace_regexp(heap, &text, search_value, &replacement)?
+        } else {
+            let search = self
+                .strings
+                .primitive_to_string(search_value)
+                .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
+            string_replace_once(&text, &search, &replacement)
+        };
+        self.strings
+            .allocate_with_heap(heap, &result)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    fn string_replace_regexp(
+        &mut self,
+        heap: &mut Heap,
+        text: &str,
+        regexp: RuntimeValue,
+        replacement: &str,
+    ) -> Result<String, DispatchOutcome> {
+        let (source, flags, _) = self.regexp_source_and_flags_or_throw(heap, regexp)?;
+        if flags.global {
+            self.set_regexp_last_index(heap, regexp, 0)?;
+        }
+        let mut result = String::new();
+        let mut last_end = 0usize;
+        let mut search_index = 0usize;
+        loop {
+            let matched =
+                execute_simple_yarr(&source, flags, text, search_index).map_err(|_| {
+                    self.type_error_outcome_with_heap(
+                        heap,
+                        "Unsupported regular expression execution",
+                    )
+                })?;
+            let Some(matched) = matched else {
+                break;
+            };
+            if matched.start < last_end {
+                break;
+            }
+            result.push_str(text.get(last_end..matched.start).unwrap_or_default());
+            result.push_str(&expand_replace_string(
+                replacement,
+                text,
+                matched.start,
+                matched.end,
+                &matched.captures,
+            ));
+            last_end = matched.end;
+            if !flags.global {
+                break;
+            }
+            if matched.end == search_index {
+                search_index = advance_string_byte_index(text, search_index);
+                if search_index > text.len() {
+                    break;
+                }
+            } else {
+                search_index = matched.end;
+            }
+        }
+        result.push_str(text.get(last_end..).unwrap_or_default());
+        if flags.global {
+            self.set_regexp_last_index(heap, regexp, 0)?;
+        }
+        Ok(result)
+    }
+
+    fn native_string_to_lower_case(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let text = self.string_this(this_value)?;
+        self.strings
+            .allocate_with_heap(heap, &text.to_lowercase())
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    fn native_string_to_upper_case(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let text = self.string_this(this_value)?;
+        self.strings
+            .allocate_with_heap(heap, &text.to_uppercase())
+            .map_err(DispatchOutcome::Fail)
+    }
+
     fn string_this(&self, this_value: RuntimeValue) -> Result<String, DispatchOutcome> {
+        self.string_this_text(this_value).map(str::to_owned)
+    }
+
+    fn string_this_text(&self, this_value: RuntimeValue) -> Result<&str, DispatchOutcome> {
         self.strings
             .text(this_value)
-            .map(str::to_owned)
             .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))
     }
 
@@ -19058,6 +22612,10 @@ impl CoreOpcodeDispatchHost {
         let Some(value) = arguments.get(index).copied() else {
             return Ok(default);
         };
+        self.integer_value_or(value, default)
+    }
+
+    fn integer_value_or(&self, value: RuntimeValue, _default: i32) -> Result<i32, DispatchOutcome> {
         let number = self.number_constructor_value(value)?;
         let Some(number) = number.as_number() else {
             return Ok(0);
@@ -19075,10 +22633,8 @@ impl CoreOpcodeDispatchHost {
         &self,
         value: RuntimeValue,
     ) -> Result<RuntimeValue, DispatchOutcome> {
-        if let Some(text) = self.strings.text(value) {
-            return Ok(number_from_string(text));
-        }
-        to_number_value(value).map_err(DispatchOutcome::Fail)
+        self.to_number_with_string(value)
+            .map_err(DispatchOutcome::Fail)
     }
 
     fn native_reflect_get(
@@ -19340,7 +22896,11 @@ impl CoreOpcodeDispatchHost {
                     .get(identifier)
                     .cloned()
                     .unwrap_or_else(|| identifier.to_string());
-                self.strings.allocate_with_heap(heap, &text)
+                self.strings.allocate_atom_with_heap(
+                    heap,
+                    Identifier::from_atom(AtomId::from_table_slot(*identifier)),
+                    &text,
+                )
             }
             CorePropertyKey::Symbol(encoded) => {
                 Ok(RuntimeValue::from_encoded(EncodedJsValue(*encoded)))
@@ -19612,6 +23172,38 @@ impl CoreOpcodeDispatchHost {
         }
 
         Ok(())
+    }
+
+    fn for_in_keys_array(
+        &mut self,
+        heap: &mut Heap,
+        value: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let keys = if is_nullish(value) {
+            Vec::new()
+        } else if let Some(text) = self.strings.text(value).map(str::to_owned) {
+            (0..text.chars().count())
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+        } else if self.objects.find(value).is_some() {
+            self.objects
+                .enumerable_string_property_names_for_in(value)
+                .map_err(DispatchOutcome::Fail)?
+        } else {
+            Vec::new()
+        };
+
+        let result = self.objects.allocate_array();
+        for (index, key) in keys.iter().enumerate() {
+            let value = self
+                .strings
+                .allocate_with_heap(heap, key)
+                .map_err(DispatchOutcome::Fail)?;
+            self.objects
+                .put_index(heap, result, index.try_into().unwrap_or(i32::MAX), value)
+                .map_err(DispatchOutcome::Fail)?;
+        }
+        Ok(result)
     }
 
     fn native_object_keys(
@@ -20237,6 +23829,20 @@ fn compare_f64(left: f64, right: f64, opcode: CoreOpcode) -> Result<bool, Execut
     })
 }
 
+fn relational_string_compare(
+    left: &str,
+    right: &str,
+    opcode: CoreOpcode,
+) -> Result<bool, ExecutionError> {
+    Ok(match opcode {
+        CoreOpcode::LessThanInt32 => left < right,
+        CoreOpcode::LessEqualInt32 => left <= right,
+        CoreOpcode::GreaterThanInt32 => left > right,
+        CoreOpcode::GreaterEqualInt32 => left >= right,
+        _ => return Err(ExecutionError::ExpectedInt32),
+    })
+}
+
 fn bitwise_binary_result(
     left: NumberValue,
     right: NumberValue,
@@ -20335,6 +23941,70 @@ fn number_from_string(text: &str) -> RuntimeValue {
             .map(runtime_number_from_f64)
             .unwrap_or_else(|_| RuntimeValue::from_double(f64::NAN)),
     }
+}
+
+fn parse_float_text(text: &str) -> RuntimeValue {
+    let text = text.trim_start();
+    if text.is_empty() {
+        return RuntimeValue::from_double(f64::NAN);
+    }
+
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        index = 1;
+    }
+
+    if text[index..].starts_with("Infinity") {
+        let value = if bytes.first() == Some(&b'-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+        return RuntimeValue::from_double(value);
+    }
+
+    let mut digits_before_decimal = 0usize;
+    while bytes.get(index).is_some_and(|byte| byte.is_ascii_digit()) {
+        index += 1;
+        digits_before_decimal += 1;
+    }
+
+    let mut digits_after_decimal = 0usize;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        while bytes.get(index).is_some_and(|byte| byte.is_ascii_digit()) {
+            index += 1;
+            digits_after_decimal += 1;
+        }
+    }
+
+    if digits_before_decimal == 0 && digits_after_decimal == 0 {
+        return RuntimeValue::from_double(f64::NAN);
+    }
+
+    let mut end = index;
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        let exponent_start = index;
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        let exponent_digits_start = index;
+        while bytes.get(index).is_some_and(|byte| byte.is_ascii_digit()) {
+            index += 1;
+        }
+        if index > exponent_digits_start {
+            end = index;
+        } else {
+            end = exponent_start;
+        }
+    }
+
+    text[..end]
+        .parse::<f64>()
+        .map(runtime_number_from_f64)
+        .unwrap_or_else(|_| RuntimeValue::from_double(f64::NAN))
 }
 
 fn parse_int_text(text: &str, radix_argument: i32) -> RuntimeValue {
@@ -20437,6 +24107,225 @@ fn normalize_string_index(index: i32, length: i32) -> i32 {
     } else {
         index.min(length)
     }
+}
+
+fn string_code_unit_len(text: &str) -> usize {
+    if text.is_ascii() {
+        text.len()
+    } else {
+        text.encode_utf16().count()
+    }
+}
+
+fn string_code_unit_len_i32(text: &str) -> i32 {
+    string_code_unit_len(text).try_into().unwrap_or(i32::MAX)
+}
+
+fn string_code_unit_at(text: &str, index: usize) -> Option<u16> {
+    if text.is_ascii() {
+        text.as_bytes().get(index).copied().map(u16::from)
+    } else {
+        text.encode_utf16().nth(index)
+    }
+}
+
+fn string_index_of(text: &str, search: &str, start_argument: i32) -> i32 {
+    let length = string_code_unit_len_i32(text);
+    let start = start_argument.clamp(0, length);
+    let start_index = usize::try_from(start).unwrap_or(usize::MAX);
+    if search.is_empty() {
+        return start;
+    }
+    if text.is_ascii() && search.is_ascii() {
+        let Some(haystack) = text.get(start_index..) else {
+            return -1;
+        };
+        let Some(byte_index) = haystack.find(search) else {
+            return -1;
+        };
+        return start.saturating_add(byte_index.try_into().unwrap_or(i32::MAX));
+    }
+    let Some(start_byte) = string_byte_index_for_code_unit(text, start_index) else {
+        return -1;
+    };
+    let Some(haystack) = text.get(start_byte..) else {
+        return -1;
+    };
+    let Some(byte_index) = haystack.find(search) else {
+        return -1;
+    };
+    let char_index = string_code_unit_len(&haystack[..byte_index]);
+    start.saturating_add(char_index.try_into().unwrap_or(i32::MAX))
+}
+
+fn string_last_index_of(text: &str, search: &str, position_argument: i32) -> i32 {
+    let length = string_code_unit_len_i32(text);
+    let position = position_argument.clamp(0, length);
+    if search.is_empty() {
+        return position;
+    }
+    if text.is_ascii() && search.is_ascii() {
+        let end = usize::try_from(position)
+            .unwrap_or(usize::MAX)
+            .saturating_add(search.len())
+            .min(text.len());
+        let Some(haystack) = text.get(..end) else {
+            return -1;
+        };
+        let Some(byte_index) = haystack.rfind(search) else {
+            return -1;
+        };
+        return byte_index.try_into().unwrap_or(i32::MAX);
+    }
+
+    let max_start = usize::try_from(position).unwrap_or(usize::MAX);
+    let mut result = -1;
+    let mut start = 0usize;
+    while start <= max_start {
+        let Some(start_byte) = string_byte_index_for_code_unit(text, start) else {
+            break;
+        };
+        let Some(candidate) = text.get(start_byte..) else {
+            break;
+        };
+        if candidate.starts_with(search) {
+            result = start.try_into().unwrap_or(i32::MAX);
+        }
+        start = start.saturating_add(1);
+    }
+    result
+}
+
+fn generated_native_int32_argument_or(value: Option<RuntimeValue>, default: i32) -> Option<i32> {
+    match value {
+        None => Some(default),
+        Some(value) if value.kind() == ValueKind::Undefined => Some(default),
+        Some(value) => match value.as_number() {
+            Some(NumberValue::Int32(index)) => Some(index),
+            _ => None,
+        },
+    }
+}
+
+fn string_byte_index_for_code_unit(text: &str, target: usize) -> Option<usize> {
+    if target == 0 {
+        return Some(0);
+    }
+    if text.is_ascii() {
+        return (target <= text.len()).then_some(target);
+    }
+    let mut units = 0usize;
+    for (byte_index, character) in text.char_indices() {
+        if units == target {
+            return Some(byte_index);
+        }
+        units = units.saturating_add(character.len_utf16());
+        if units > target {
+            return None;
+        }
+    }
+    (units == target).then_some(text.len())
+}
+
+fn string_slice_code_units(text: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return String::new();
+    }
+    if text.is_ascii() {
+        return text
+            .get(start..end.min(text.len()))
+            .unwrap_or_default()
+            .to_owned();
+    }
+    let units = text
+        .encode_utf16()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect::<Vec<_>>();
+    String::from_utf16_lossy(&units)
+}
+
+fn advance_string_byte_index(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len().saturating_add(1);
+    }
+    text.get(index..)
+        .and_then(|remaining| remaining.chars().next())
+        .map(|character| index.saturating_add(character.len_utf8()))
+        .unwrap_or_else(|| text.len().saturating_add(1))
+}
+
+fn string_replace_once(text: &str, search: &str, replacement: &str) -> String {
+    let Some(index) = text.find(search) else {
+        return text.to_owned();
+    };
+    let mut result = String::new();
+    result.push_str(&text[..index]);
+    result.push_str(&expand_replace_string(
+        replacement,
+        text,
+        index,
+        index.saturating_add(search.len()),
+        &[],
+    ));
+    result.push_str(&text[index.saturating_add(search.len())..]);
+    result
+}
+
+fn expand_replace_string(
+    replacement: &str,
+    input: &str,
+    matched_start: usize,
+    matched_end: usize,
+    captures: &[Option<YarrSimpleMatchRange>],
+) -> String {
+    let mut result = String::new();
+    let mut chars = replacement.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            result.push(ch);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('$') => {
+                chars.next();
+                result.push('$');
+            }
+            Some('&') => {
+                chars.next();
+                result.push_str(input.get(matched_start..matched_end).unwrap_or_default());
+            }
+            Some('1'..='9') => {
+                let first = chars.next().unwrap_or_default();
+                let mut index = first.to_digit(10).unwrap_or_default() as usize;
+                if let Some(second @ '0'..='9') = chars.peek().copied() {
+                    let two_digit = index
+                        .saturating_mul(10)
+                        .saturating_add(second.to_digit(10).unwrap_or_default() as usize);
+                    if two_digit <= captures.len() {
+                        chars.next();
+                        index = two_digit;
+                    }
+                }
+                if let Some(Some(range)) = captures.get(index.saturating_sub(1)) {
+                    result.push_str(input.get(range.start..range.end).unwrap_or_default());
+                } else if index > captures.len() {
+                    result.push('$');
+                    result.push(first);
+                }
+            }
+            Some('`') => {
+                chars.next();
+                result.push_str(input.get(..matched_start).unwrap_or_default());
+            }
+            Some('\'') => {
+                chars.next();
+                result.push_str(input.get(matched_end..).unwrap_or_default());
+            }
+            _ => result.push('$'),
+        }
+    }
+    result
 }
 
 fn normalize_search_start(index: i32, length: i32) -> i32 {
@@ -20562,6 +24451,18 @@ fn classify_stored_property_outcome(
     before: CorePropertyStoreSnapshot,
     after: CorePropertyStoreSnapshot,
 ) -> PropertyStoreObservationOutcome {
+    if before.is_dense_array_indexed_store || after.is_dense_array_indexed_store {
+        if before.is_dense_array_indexed_store
+            && after.is_dense_array_indexed_store
+            && before.base_object == after.base_object
+            && before.base_structure == after.base_structure
+            && before.has_own_indexed_element
+            && after.has_own_indexed_element
+        {
+            return PropertyStoreObservationOutcome::IndexedStore;
+        }
+        return PropertyStoreObservationOutcome::Opaque;
+    }
     if before.is_indexed_or_typed_array_store || after.is_indexed_or_typed_array_store {
         return PropertyStoreObservationOutcome::Opaque;
     }
@@ -20599,12 +24500,14 @@ fn property_store_cacheability(
     match outcome {
         PropertyStoreObservationOutcome::OwnDataStore
         | PropertyStoreObservationOutcome::CreatedProperty
+        | PropertyStoreObservationOutcome::IndexedStore
             if before.base_object.is_none() || after.base_object.is_none() =>
         {
             PropertyCacheability::TaintedByOpaqueObject
         }
         PropertyStoreObservationOutcome::OwnDataStore
-        | PropertyStoreObservationOutcome::CreatedProperty => PropertyCacheability::Disallowed,
+        | PropertyStoreObservationOutcome::CreatedProperty
+        | PropertyStoreObservationOutcome::IndexedStore => PropertyCacheability::Disallowed,
         PropertyStoreObservationOutcome::Proxy => PropertyCacheability::TaintedByOpaqueObject,
         PropertyStoreObservationOutcome::Setter
         | PropertyStoreObservationOutcome::Ignored
@@ -20634,120 +24537,6 @@ fn parse_array_index_name(name: &str) -> Option<usize> {
         return None;
     }
     Some(index as usize)
-}
-
-fn simple_regexp_match(
-    pattern: &str,
-    flags: RegexFlags,
-    input: &str,
-    start_index: usize,
-) -> Option<SimpleRegExpMatch> {
-    if start_index > input.len() || !input.is_char_boundary(start_index) {
-        return None;
-    }
-    let (anchored_start, anchored_end, body) = simple_regexp_body(pattern)?;
-    let atoms = simple_regexp_atoms(body)?;
-    if flags.sticky || anchored_start {
-        return simple_regexp_match_at(input, start_index, &atoms, flags, anchored_end);
-    }
-
-    for (index, _) in input
-        .char_indices()
-        .filter(|(index, _)| *index >= start_index)
-    {
-        if let Some(result) = simple_regexp_match_at(input, index, &atoms, flags, anchored_end) {
-            return Some(result);
-        }
-    }
-    if start_index <= input.len() {
-        simple_regexp_match_at(input, input.len(), &atoms, flags, anchored_end)
-    } else {
-        None
-    }
-}
-
-fn simple_regexp_body(pattern: &str) -> Option<(bool, bool, &str)> {
-    let anchored_start = pattern.starts_with('^');
-    let start = usize::from(anchored_start);
-    let anchored_end = pattern_ends_with_unescaped_dollar(pattern, start);
-    let end = if anchored_end {
-        pattern.len().saturating_sub(1)
-    } else {
-        pattern.len()
-    };
-    if start > end {
-        return None;
-    }
-    Some((anchored_start, anchored_end, &pattern[start..end]))
-}
-
-fn pattern_ends_with_unescaped_dollar(pattern: &str, start: usize) -> bool {
-    if !pattern.ends_with('$') || pattern.len() <= start {
-        return false;
-    }
-    let mut backslashes = 0;
-    for byte in pattern[..pattern.len().saturating_sub(1)].bytes().rev() {
-        if byte == b'\\' {
-            backslashes += 1;
-        } else {
-            break;
-        }
-    }
-    backslashes % 2 == 0
-}
-
-fn simple_regexp_atoms(body: &str) -> Option<Vec<SimpleRegExpAtom>> {
-    let mut atoms = Vec::new();
-    let mut chars = body.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => atoms.push(SimpleRegExpAtom::Literal(chars.next()?)),
-            '.' => atoms.push(SimpleRegExpAtom::Any),
-            '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => {
-                return None;
-            }
-            _ => atoms.push(SimpleRegExpAtom::Literal(ch)),
-        }
-    }
-    Some(atoms)
-}
-
-fn simple_regexp_match_at(
-    input: &str,
-    start: usize,
-    atoms: &[SimpleRegExpAtom],
-    flags: RegexFlags,
-    anchored_end: bool,
-) -> Option<SimpleRegExpMatch> {
-    let mut offset = start;
-    for atom in atoms {
-        let ch = input.get(offset..)?.chars().next()?;
-        match atom {
-            SimpleRegExpAtom::Literal(expected) => {
-                if !regexp_char_eq(*expected, ch, flags.ignore_case) {
-                    return None;
-                }
-            }
-            SimpleRegExpAtom::Any => {
-                if !flags.dot_all && matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
-                    return None;
-                }
-            }
-        }
-        offset += ch.len_utf8();
-    }
-    if anchored_end && offset != input.len() {
-        return None;
-    }
-    Some(SimpleRegExpMatch { start, end: offset })
-}
-
-fn regexp_char_eq(left: char, right: char, ignore_case: bool) -> bool {
-    if ignore_case {
-        left.eq_ignore_ascii_case(&right)
-    } else {
-        left == right
-    }
 }
 
 fn current_time_ms() -> f64 {
@@ -20927,6 +24716,130 @@ fn number_to_string(value: NumberValue) -> String {
             }
         }
     }
+}
+
+/// C++ JSC: toStringWithRadix — converts a double to a string in the given radix.
+/// Mirrors JSC::toStringWithRadix from NumberPrototype.cpp.
+fn number_to_string_with_radix(value: f64, radix: u32) -> String {
+    if value.is_nan() {
+        return "NaN".to_owned();
+    }
+    if value == f64::INFINITY {
+        return "Infinity".to_owned();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-Infinity".to_owned();
+    }
+    if radix == 10 {
+        // Use the standard number_to_string for base 10.
+        if value == 0.0 {
+            return "0".to_owned();
+        }
+        let int_val = value as i32;
+        if f64::from(int_val) == value {
+            return int_val.to_string();
+        }
+        if value.fract() == 0.0 {
+            return format!("{value:.0}");
+        }
+        return value.to_string();
+    }
+    // For integer values, do direct integer-to-radix conversion.
+    let int_val = value as i64;
+    if int_val as f64 == value {
+        return int_to_string_with_radix(int_val, radix);
+    }
+    // Non-integer with non-10 radix: use the full radix conversion algorithm.
+    // C++ JSC: toStringWithRadixInternal(buffer, doubleValue, radix).
+    double_to_string_with_radix(value, radix)
+}
+
+/// Integer to string with arbitrary radix (2..=36).
+fn int_to_string_with_radix(value: i64, radix: u32) -> String {
+    const RADIX_DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_owned();
+    }
+    let negative = value < 0;
+    let mut unsigned = if negative {
+        (value as i128).unsigned_abs() as u64
+    } else {
+        value as u64
+    };
+    let mut buf = Vec::with_capacity(66);
+    while unsigned > 0 {
+        let index = (unsigned % u64::from(radix)) as usize;
+        buf.push(RADIX_DIGITS[index]);
+        unsigned /= u64::from(radix);
+    }
+    if negative {
+        buf.push(b'-');
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap_or_else(|_| "0".to_owned())
+}
+
+/// C++ JSC: toStringWithRadixInternal for doubles with non-10 radix.
+/// Faithful port of the C++ algorithm from NumberPrototype.cpp.
+fn double_to_string_with_radix(original_number: f64, radix: u32) -> String {
+    const RADIX_DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let is_negative = original_number < 0.0;
+    let number = original_number.abs();
+    let integer_part_f = number.floor();
+    let fraction_part = number - integer_part_f;
+
+    // Build the integer portion (right to left).
+    let mut integer_digits = Vec::new();
+    if integer_part_f == 0.0 {
+        integer_digits.push(b'0');
+    } else {
+        let mut remaining = integer_part_f;
+        while remaining >= 1.0 {
+            let digit = (remaining % f64::from(radix)) as usize;
+            integer_digits.push(RADIX_DIGITS[digit.min(RADIX_DIGITS.len() - 1)]);
+            remaining = (remaining / f64::from(radix)).floor();
+        }
+        integer_digits.reverse();
+    }
+
+    // Build the fractional portion.
+    let mut fraction_digits = Vec::new();
+    if fraction_part > 0.0 {
+        // Use the delta-based approach from C++ JSC to determine precision.
+        let next_number = f64::from_bits(number.to_bits() + 1);
+        let delta = (next_number - number) * 0.5;
+        let mut frac = fraction_part;
+        let mut d = delta;
+        loop {
+            frac *= f64::from(radix);
+            d *= f64::from(radix);
+            let digit = frac as usize;
+            frac -= digit as f64;
+            fraction_digits.push(RADIX_DIGITS[digit.min(RADIX_DIGITS.len() - 1)]);
+            if frac < d || (1.0 - frac) < d {
+                break;
+            }
+            // Safety limit to prevent infinite loops.
+            if fraction_digits.len() > 1100 {
+                break;
+            }
+        }
+        // Trim trailing zeros.
+        while fraction_digits.last() == Some(&b'0') {
+            fraction_digits.pop();
+        }
+    }
+
+    let mut result = Vec::new();
+    if is_negative {
+        result.push(b'-');
+    }
+    result.extend_from_slice(&integer_digits);
+    if !fraction_digits.is_empty() {
+        result.push(b'.');
+        result.extend_from_slice(&fraction_digits);
+    }
+    String::from_utf8(result).unwrap_or_else(|_| "0".to_owned())
 }
 
 fn register_operand(
@@ -21252,9 +25165,21 @@ pub struct DispatchConfig {
     pub max_steps: usize,
 }
 
+impl DispatchConfig {
+    pub const fn new(max_steps: usize) -> Self {
+        Self { max_steps }
+    }
+
+    pub const fn unbounded() -> Self {
+        Self {
+            max_steps: usize::MAX,
+        }
+    }
+}
+
 impl Default for DispatchConfig {
     fn default() -> Self {
-        Self { max_steps: 100_000 }
+        Self::unbounded()
     }
 }
 
@@ -22017,15 +25942,11 @@ impl TargetedFrameRootPlan {
 pub(crate) fn sync_targeted_frame_roots(
     owner_frame: CallFrameId,
     stack: &ExecutionContextStack,
-    registers: &RegisterFile,
+    _registers: &RegisterFile,
     heap: &mut Heap,
     active_roots: &mut Vec<RootRecord>,
 ) -> Result<(), ExecutionError> {
-    let mut snapshot = stack.root_snapshot_for_heap(heap, registers)?;
-    snapshot.register_roots.clear();
-    snapshot
-        .frame_roots
-        .retain(|descriptor| descriptor.frame == owner_frame);
+    let snapshot = stack.frame_root_snapshot_for_heap(heap, owner_frame)?;
     let targeted = TargetedFrameRootPlan::resolve(heap, &snapshot)?;
     sync_targeted_vm_roots(heap, active_roots, targeted.into_records())
 }
@@ -22038,11 +25959,32 @@ pub(crate) fn sync_targeted_register_roots<H: DispatchHost>(
     host: &mut H,
     active_roots: &mut Vec<RootRecord>,
 ) -> Result<(), ExecutionError> {
-    let mut snapshot = stack.root_snapshot_for_heap(heap, registers)?;
-    snapshot.frame_roots.clear();
-    snapshot
-        .register_roots
-        .retain(|descriptor| descriptor.frame == owner_frame);
+    let snapshot = stack.register_root_snapshot_for_frame(heap, registers, owner_frame)?;
+    let targeted = host.targeted_register_roots(heap, &snapshot)?;
+    sync_targeted_vm_roots(heap, active_roots, targeted)
+}
+
+pub(crate) fn sync_targeted_nonlocal_frame_roots(
+    owner_frame: CallFrameId,
+    stack: &ExecutionContextStack,
+    _registers: &RegisterFile,
+    heap: &mut Heap,
+    active_roots: &mut Vec<RootRecord>,
+) -> Result<(), ExecutionError> {
+    let snapshot = stack.nonlocal_frame_root_snapshot_for_heap(heap, owner_frame)?;
+    let targeted = TargetedFrameRootPlan::resolve(heap, &snapshot)?;
+    sync_targeted_vm_roots(heap, active_roots, targeted.into_records())
+}
+
+pub(crate) fn sync_targeted_nonlocal_register_roots<H: DispatchHost>(
+    owner_frame: CallFrameId,
+    stack: &ExecutionContextStack,
+    registers: &RegisterFile,
+    heap: &mut Heap,
+    host: &mut H,
+    active_roots: &mut Vec<RootRecord>,
+) -> Result<(), ExecutionError> {
+    let snapshot = stack.nonlocal_register_root_snapshot_for_frame(heap, registers, owner_frame)?;
     let targeted = host.targeted_register_roots(heap, &snapshot)?;
     sync_targeted_vm_roots(heap, active_roots, targeted)
 }
@@ -22206,14 +26148,18 @@ pub(crate) fn find_handler(
 
 fn frame_root_id(frame: CallFrameId, source: FrameRootSource) -> RootId {
     RootId(
-        1_000_000_u64
+        FRAME_ROOT_ID_BASE
             .saturating_add(u64::from(frame.0).saturating_mul(16))
             .saturating_add(source.ordinal()),
     )
 }
 
 fn register_root_id(slot: usize) -> RootId {
-    RootId(2_000_000_u64.saturating_add(slot as u64).saturating_add(1))
+    RootId(
+        REGISTER_ROOT_ID_BASE
+            .saturating_add(slot as u64)
+            .saturating_add(1),
+    )
 }
 
 fn value_cell_payload(value: RuntimeValue) -> Option<usize> {
@@ -22271,6 +26217,523 @@ mod tests {
     };
     use crate::strings::PropertyIndex;
     use crate::value::EncodedJsValue;
+
+    #[test]
+    fn get_by_id_megamorphic_property_name_gate_matches_jsc_exclusions() {
+        for name in ["field", "toString", "constructor"] {
+            assert!(can_use_get_by_id_megamorphic_property_name(name));
+        }
+        for name in ["length", "name", "prototype", "__proto__", "0", "42"] {
+            assert!(!can_use_get_by_id_megamorphic_property_name(name));
+        }
+        assert!(can_use_get_by_id_megamorphic_property_name("01"));
+        assert!(can_use_get_by_id_megamorphic_property_name("4294967295"));
+    }
+
+    #[test]
+    fn in_by_id_megamorphic_property_name_gate_matches_get_by_id_exclusions() {
+        for name in ["field", "toString", "constructor"] {
+            assert!(can_use_in_by_id_megamorphic_property_name(name));
+        }
+        for name in ["length", "name", "prototype", "__proto__", "0", "42"] {
+            assert!(!can_use_in_by_id_megamorphic_property_name(name));
+        }
+        assert!(can_use_in_by_id_megamorphic_property_name("01"));
+        assert!(can_use_in_by_id_megamorphic_property_name("4294967295"));
+    }
+
+    #[test]
+    fn generated_property_has_sidecar_runtime_key_accepts_only_atom_named_string() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let identifier = Identifier::from_atom(AtomId::from_table_slot(11));
+        let atom_string = host
+            .strings
+            .allocate_atom_with_heap(&mut heap, identifier, "field")
+            .unwrap();
+        let plain_string = host.strings.allocate_with_heap(&mut heap, "plain").unwrap();
+        let index_identifier = Identifier::from_atom(AtomId::from_table_slot(12));
+        let index_string = host
+            .strings
+            .allocate_atom_with_heap(&mut heap, index_identifier, "0")
+            .unwrap();
+        let length_identifier = Identifier::from_atom(AtomId::from_table_slot(13));
+        let length_string = host
+            .strings
+            .allocate_atom_with_heap(&mut heap, length_identifier, "length")
+            .unwrap();
+
+        assert_eq!(
+            <CoreOpcodeDispatchHost as DispatchHost>::generated_property_has_sidecar_runtime_key(
+                &mut host,
+                atom_string,
+            ),
+            Some(CacheKey::Property(PropertyKey::from_identifier(identifier)))
+        );
+        assert_eq!(
+            <CoreOpcodeDispatchHost as DispatchHost>::generated_property_has_sidecar_runtime_key(
+                &mut host,
+                plain_string,
+            ),
+            None
+        );
+        assert_eq!(
+            <CoreOpcodeDispatchHost as DispatchHost>::generated_property_has_sidecar_runtime_key(
+                &mut host,
+                index_string,
+            ),
+            None
+        );
+        assert_eq!(
+            <CoreOpcodeDispatchHost as DispatchHost>::generated_property_has_sidecar_runtime_key(
+                &mut host,
+                length_string,
+            ),
+            None
+        );
+        host.identifier_texts
+            .insert(identifier.atom().table_slot(), "other".to_string());
+        assert_eq!(
+            <CoreOpcodeDispatchHost as DispatchHost>::generated_property_has_sidecar_runtime_key(
+                &mut host,
+                atom_string,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn native_char_code_at_observation_records_typed_intrinsic_identity() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let callee = host
+            .objects
+            .allocate_native_function(CoreNativeFunction::StringCharCodeAt);
+        let target = host.objects.function_call_target(callee);
+        let (target_kind, may_call_js) = host.call_observation_target_kind(callee, target.as_ref());
+
+        assert_eq!(
+            target_kind,
+            CallObservationTargetKind::NativeFunction {
+                native: "StringCharCodeAt".to_string(),
+                intrinsic: Some(NativeIntrinsic::StringCharCodeAt),
+            }
+        );
+        assert!(may_call_js);
+    }
+
+    #[test]
+    fn generated_native_char_code_at_fast_path_hits_only_narrow_intrinsic_case() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let callee = host
+            .objects
+            .allocate_native_function(CoreNativeFunction::StringCharCodeAt);
+        let other_callee = host
+            .objects
+            .allocate_native_function(CoreNativeFunction::ObjectConstructor);
+        let text = host.strings.allocate_with_heap(&mut heap, "core").unwrap();
+        let base_request = GeneratedNativeIntrinsicCallRequest {
+            owner: CodeBlockId(CellId(1)),
+            bytecode_index: BytecodeIndex::from_offset(7),
+            opcode: CoreOpcode::CallWithThis,
+            callee_value: callee,
+            this_value: text,
+            provided_argument_count: 1,
+            first_argument: Some(RuntimeValue::from_i32(1)),
+            second_argument: None,
+        };
+
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(&mut heap, base_request),
+            GeneratedNativeIntrinsicCallResult::Hit(GeneratedNativeIntrinsicCallHit {
+                intrinsic: NativeIntrinsic::StringCharCodeAt,
+                value: RuntimeValue::from_i32(111),
+            })
+        );
+
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    callee_value: other_callee,
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Miss(
+                GeneratedNativeIntrinsicCallMissReason::UnsupportedCallee,
+            )
+        );
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    this_value: RuntimeValue::from_i32(0),
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Miss(
+                GeneratedNativeIntrinsicCallMissReason::UnsupportedThis,
+            )
+        );
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    provided_argument_count: 2,
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Miss(
+                GeneratedNativeIntrinsicCallMissReason::UnsupportedArgument,
+            )
+        );
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    first_argument: Some(RuntimeValue::from_i32(99)),
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Miss(
+                GeneratedNativeIntrinsicCallMissReason::UnsupportedArgument,
+            )
+        );
+    }
+
+    #[test]
+    fn native_substring_observation_records_typed_intrinsic_identity() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let callee = host
+            .objects
+            .allocate_native_function(CoreNativeFunction::StringSubstring);
+        let target = host.objects.function_call_target(callee);
+        let (target_kind, may_call_js) = host.call_observation_target_kind(callee, target.as_ref());
+
+        assert_eq!(
+            target_kind,
+            CallObservationTargetKind::NativeFunction {
+                native: "StringSubstring".to_string(),
+                intrinsic: Some(NativeIntrinsic::StringSubstring),
+            }
+        );
+        assert!(may_call_js);
+    }
+
+    #[test]
+    fn generated_native_substring_fast_path_hits_jsc_int32_cases() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let callee = host
+            .objects
+            .allocate_native_function(CoreNativeFunction::StringSubstring);
+        let text = host.strings.allocate_with_heap(&mut heap, "core").unwrap();
+        let base_request = GeneratedNativeIntrinsicCallRequest {
+            owner: CodeBlockId(CellId(1)),
+            bytecode_index: BytecodeIndex::from_offset(7),
+            opcode: CoreOpcode::CallWithThis,
+            callee_value: callee,
+            this_value: text,
+            provided_argument_count: 2,
+            first_argument: Some(RuntimeValue::from_i32(3)),
+            second_argument: Some(RuntimeValue::from_i32(1)),
+        };
+
+        let hit = match host.dispatch_generated_native_intrinsic_call(&mut heap, base_request) {
+            GeneratedNativeIntrinsicCallResult::Hit(hit) => hit,
+            result => panic!("expected substring hit, got {result:?}"),
+        };
+        assert_eq!(hit.intrinsic, NativeIntrinsic::StringSubstring);
+        assert_eq!(host.strings.text(hit.value), Some("or"));
+
+        let hit = match host.dispatch_generated_native_intrinsic_call(
+            &mut heap,
+            GeneratedNativeIntrinsicCallRequest {
+                provided_argument_count: 1,
+                first_argument: Some(RuntimeValue::from_i32(2)),
+                second_argument: None,
+                ..base_request
+            },
+        ) {
+            GeneratedNativeIntrinsicCallResult::Hit(hit) => hit,
+            result => panic!("expected one-argument substring hit, got {result:?}"),
+        };
+        assert_eq!(host.strings.text(hit.value), Some("re"));
+
+        let hit = match host.dispatch_generated_native_intrinsic_call(
+            &mut heap,
+            GeneratedNativeIntrinsicCallRequest {
+                first_argument: Some(RuntimeValue::from_i32(1)),
+                second_argument: Some(RuntimeValue::undefined()),
+                ..base_request
+            },
+        ) {
+            GeneratedNativeIntrinsicCallResult::Hit(hit) => hit,
+            result => panic!("expected undefined-end substring hit, got {result:?}"),
+        };
+        assert_eq!(host.strings.text(hit.value), Some("ore"));
+    }
+
+    #[test]
+    fn generated_native_substring_fast_path_misses_non_intrinsic_cases() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let callee = host
+            .objects
+            .allocate_native_function(CoreNativeFunction::StringSubstring);
+        let other_callee = host
+            .objects
+            .allocate_native_function(CoreNativeFunction::ObjectConstructor);
+        let text = host.strings.allocate_with_heap(&mut heap, "core").unwrap();
+        let base_request = GeneratedNativeIntrinsicCallRequest {
+            owner: CodeBlockId(CellId(1)),
+            bytecode_index: BytecodeIndex::from_offset(7),
+            opcode: CoreOpcode::CallWithThis,
+            callee_value: callee,
+            this_value: text,
+            provided_argument_count: 2,
+            first_argument: Some(RuntimeValue::from_i32(1)),
+            second_argument: Some(RuntimeValue::from_i32(3)),
+        };
+
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    callee_value: other_callee,
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Miss(
+                GeneratedNativeIntrinsicCallMissReason::UnsupportedCallee,
+            )
+        );
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    this_value: RuntimeValue::from_i32(0),
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Miss(
+                GeneratedNativeIntrinsicCallMissReason::UnsupportedThis,
+            )
+        );
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    provided_argument_count: 3,
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Miss(
+                GeneratedNativeIntrinsicCallMissReason::UnsupportedArgument,
+            )
+        );
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    first_argument: Some(RuntimeValue::from_double(1.5)),
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Miss(
+                GeneratedNativeIntrinsicCallMissReason::UnsupportedArgument,
+            )
+        );
+    }
+
+    #[test]
+    fn native_string_search_observation_records_typed_intrinsic_identity() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        for (native, intrinsic, name) in [
+            (
+                CoreNativeFunction::StringIndexOf,
+                NativeIntrinsic::StringIndexOf,
+                "StringIndexOf",
+            ),
+            (
+                CoreNativeFunction::StringLastIndexOf,
+                NativeIntrinsic::StringLastIndexOf,
+                "StringLastIndexOf",
+            ),
+        ] {
+            let callee = host.objects.allocate_native_function(native);
+            let target = host.objects.function_call_target(callee);
+            let (target_kind, may_call_js) =
+                host.call_observation_target_kind(callee, target.as_ref());
+
+            assert_eq!(
+                target_kind,
+                CallObservationTargetKind::NativeFunction {
+                    native: name.to_string(),
+                    intrinsic: Some(intrinsic),
+                }
+            );
+            assert!(may_call_js);
+        }
+    }
+
+    #[test]
+    fn generated_native_string_search_fast_path_hits_jsc_string_int32_cases() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let index_of = host
+            .objects
+            .allocate_native_function(CoreNativeFunction::StringIndexOf);
+        let last_index_of = host
+            .objects
+            .allocate_native_function(CoreNativeFunction::StringLastIndexOf);
+        let text = host
+            .strings
+            .allocate_with_heap(&mut heap, "banana")
+            .unwrap();
+        let search = host.strings.allocate_with_heap(&mut heap, "ana").unwrap();
+        let base_request = GeneratedNativeIntrinsicCallRequest {
+            owner: CodeBlockId(CellId(1)),
+            bytecode_index: BytecodeIndex::from_offset(7),
+            opcode: CoreOpcode::CallWithThis,
+            callee_value: index_of,
+            this_value: text,
+            provided_argument_count: 1,
+            first_argument: Some(search),
+            second_argument: None,
+        };
+
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(&mut heap, base_request),
+            GeneratedNativeIntrinsicCallResult::Hit(GeneratedNativeIntrinsicCallHit {
+                intrinsic: NativeIntrinsic::StringIndexOf,
+                value: RuntimeValue::from_i32(1),
+            })
+        );
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    provided_argument_count: 2,
+                    second_argument: Some(RuntimeValue::from_i32(2)),
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Hit(GeneratedNativeIntrinsicCallHit {
+                intrinsic: NativeIntrinsic::StringIndexOf,
+                value: RuntimeValue::from_i32(3),
+            })
+        );
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    callee_value: last_index_of,
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Hit(GeneratedNativeIntrinsicCallHit {
+                intrinsic: NativeIntrinsic::StringLastIndexOf,
+                value: RuntimeValue::from_i32(3),
+            })
+        );
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    callee_value: last_index_of,
+                    provided_argument_count: 2,
+                    second_argument: Some(RuntimeValue::from_i32(2)),
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Hit(GeneratedNativeIntrinsicCallHit {
+                intrinsic: NativeIntrinsic::StringLastIndexOf,
+                value: RuntimeValue::from_i32(1),
+            })
+        );
+    }
+
+    #[test]
+    fn generated_native_string_search_fast_path_misses_coercive_cases() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let callee = host
+            .objects
+            .allocate_native_function(CoreNativeFunction::StringIndexOf);
+        let text = host
+            .strings
+            .allocate_with_heap(&mut heap, "banana")
+            .unwrap();
+        let search = host.strings.allocate_with_heap(&mut heap, "ana").unwrap();
+        let base_request = GeneratedNativeIntrinsicCallRequest {
+            owner: CodeBlockId(CellId(1)),
+            bytecode_index: BytecodeIndex::from_offset(7),
+            opcode: CoreOpcode::CallWithThis,
+            callee_value: callee,
+            this_value: text,
+            provided_argument_count: 1,
+            first_argument: Some(search),
+            second_argument: None,
+        };
+
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    first_argument: Some(RuntimeValue::from_i32(7)),
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Miss(
+                GeneratedNativeIntrinsicCallMissReason::UnsupportedArgument,
+            )
+        );
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    provided_argument_count: 2,
+                    second_argument: Some(RuntimeValue::from_double(1.5)),
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Miss(
+                GeneratedNativeIntrinsicCallMissReason::UnsupportedArgument,
+            )
+        );
+        assert_eq!(
+            host.dispatch_generated_native_intrinsic_call(
+                &mut heap,
+                GeneratedNativeIntrinsicCallRequest {
+                    provided_argument_count: 3,
+                    ..base_request
+                },
+            ),
+            GeneratedNativeIntrinsicCallResult::Miss(
+                GeneratedNativeIntrinsicCallMissReason::UnsupportedArgument,
+            )
+        );
+    }
+
+    #[test]
+    fn put_by_id_megamorphic_property_name_gate_matches_jsc_exclusions() {
+        for name in [
+            "field",
+            "toString",
+            "constructor",
+            "length",
+            "name",
+            "prototype",
+        ] {
+            assert!(can_use_put_by_id_megamorphic_property_name(name));
+        }
+        for name in ["__proto__", "0", "42"] {
+            assert!(!can_use_put_by_id_megamorphic_property_name(name));
+        }
+        assert!(can_use_put_by_id_megamorphic_property_name("01"));
+        assert!(can_use_put_by_id_megamorphic_property_name("4294967295"));
+    }
 
     struct CountingHost {
         count: usize,
@@ -22535,6 +26998,15 @@ mod tests {
         CorePropertyLookupSite {
             bytecode_index: Some(BytecodeIndex::from_offset(offset)),
             opcode: Some(CoreOpcode::GetByName),
+            cache_key: None,
+        }
+    }
+
+    fn in_property_lookup_site(offset: u32, opcode: CoreOpcode) -> CorePropertyLookupSite {
+        CorePropertyLookupSite {
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+            opcode: Some(opcode),
+            cache_key: None,
         }
     }
 
@@ -22559,6 +27031,7 @@ mod tests {
         property_offsets: HashMap<CorePropertyKey, PropertyOffset>,
         next_property_offset: i32,
         property_order: Vec<CorePropertyKey>,
+        elements: Vec<Option<RuntimeValue>>,
     }
 
     fn object_store_mutation_snapshot(
@@ -22574,6 +27047,7 @@ mod tests {
             property_offsets: cell.property_offsets.clone(),
             next_property_offset: cell.next_property_offset,
             property_order: cell.property_order.clone(),
+            elements: cell.elements.clone(),
         }
     }
 
@@ -22616,14 +27090,43 @@ mod tests {
             slot: InlineCacheSlotId(0),
             cache_kind: InlineCacheKind::PropertyLoad,
             fallback: InlineCacheFallbackSemantics::SlowPathLookup,
-            property_key: PropertyKey::from_identifier(Identifier::from_atom(
-                AtomId::from_table_slot(key),
+            property_key: PropertyCacheKey::Key(PropertyKey::from_identifier(
+                Identifier::from_atom(AtomId::from_table_slot(key)),
             )),
             cold_miss_handoff: InlineCacheMissHandoffDescriptor {
                 owner,
                 slot: InlineCacheSlotId(0),
                 bytecode_index: offset,
                 cache_kind: InlineCacheKind::PropertyLoad,
+                miss_kind: InlineCacheMissKind::Cold,
+                fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                boundary: None,
+                call_link: None,
+                preserves_operand_registers: true,
+            },
+        }
+    }
+
+    fn property_has_observation_request(
+        owner: CodeBlockId,
+        offset: u32,
+        opcode: CoreOpcode,
+        key: PropertyCacheKey,
+    ) -> PropertyHasObservationDrainRequest {
+        PropertyHasObservationDrainRequest {
+            owner,
+            frame: CallFrameId(3),
+            bytecode_index: BytecodeIndex::from_offset(offset),
+            opcode,
+            slot: InlineCacheSlotId(0),
+            cache_kind: InlineCacheKind::HasProperty,
+            fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+            property_key: key,
+            cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                owner,
+                slot: InlineCacheSlotId(0),
+                bytecode_index: offset,
+                cache_kind: InlineCacheKind::HasProperty,
                 miss_kind: InlineCacheMissKind::Cold,
                 fallback: InlineCacheFallbackSemantics::SlowPathLookup,
                 boundary: None,
@@ -22674,6 +27177,20 @@ mod tests {
         GeneratedPropertyLoadProbeRequest { plan, base }
     }
 
+    fn generated_property_load_megamorphic_holder_probe_request(
+        objects: &CoreObjectStore,
+        holder: RuntimeValue,
+        key: u32,
+    ) -> GeneratedPropertyLoadMegamorphicHolderProbeRequest {
+        let core_key = CorePropertyKey::Identifier(key);
+        GeneratedPropertyLoadMegamorphicHolderProbeRequest {
+            key: cache_key_for_identifier(key),
+            base_structure: StructureId::new(1),
+            holder: ObjectId(objects.find(holder).expect("holder object").cell_id),
+            offset: object_property_offset(objects, holder, &core_key).expect("holder offset"),
+        }
+    }
+
     fn generated_property_store_replace_plan(
         base_structure: StructureId,
         offset: PropertyOffset,
@@ -22715,6 +27232,35 @@ mod tests {
         plan.access_case.new_structure = Some(new_structure);
         plan.effect_contract = PropertyStoreAccessCasePlanContract::DATA_ONLY_TRANSITION;
         plan
+    }
+
+    fn generated_property_store_indexed_plan(
+        base_structure: StructureId,
+        index: u32,
+    ) -> PropertyStoreAccessCasePlan {
+        let cache_key = CacheKey::Property(PropertyKey::from_index(
+            PropertyIndex::from_canonical_index(index),
+        ));
+        PropertyStoreAccessCasePlan {
+            plan_kind: PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore,
+            owner: CodeBlockId(CellId(91)),
+            slot: InlineCacheSlotId(1),
+            bytecode_index: 8,
+            key: cache_key,
+            access_case: AccessCaseDescriptor {
+                kind: AccessCaseKind::IndexedStore,
+                key: cache_key,
+                base_structure: Some(base_structure),
+                new_structure: None,
+                holder: None,
+                offset: None,
+                via_global_proxy: false,
+                may_call_js: false,
+                dependencies: Vec::new(),
+            },
+            planned_stub_kind: InlineCacheStubKind::RepatchingStub,
+            effect_contract: PropertyStoreAccessCasePlanContract::DATA_ONLY_INDEXED_STORE,
+        }
     }
 
     fn generated_property_store_probe_request<'a>(
@@ -23061,6 +27607,41 @@ mod tests {
     }
 
     #[test]
+    fn object_store_indexes_object_payloads_and_rebuilds_clone_index() {
+        let mut objects = CoreObjectStore::default();
+        let first = objects.allocate_with_prototype(None);
+        let second = objects.allocate_with_prototype(None);
+        let first_payload = first.as_cell().unwrap().pointer_payload_bits();
+        let second_payload = second.as_cell().unwrap().pointer_payload_bits();
+
+        assert_eq!(
+            objects.object_indices_by_payload.get(&first_payload),
+            Some(&0)
+        );
+        assert_eq!(
+            objects.object_indices_by_payload.get(&second_payload),
+            Some(&1)
+        );
+        assert!(core::ptr::eq(
+            objects.find(first).unwrap(),
+            objects.objects[0].as_ref().get_ref()
+        ));
+        assert!(core::ptr::eq(
+            objects.find(second).unwrap(),
+            objects.objects[1].as_ref().get_ref()
+        ));
+
+        let cloned = objects.clone();
+        assert!(!cloned
+            .object_indices_by_payload
+            .contains_key(&first_payload));
+        for (index, object) in cloned.objects.iter().enumerate() {
+            let payload = core::ptr::from_ref(object.as_ref().get_ref()) as usize;
+            assert_eq!(cloned.object_indices_by_payload.get(&payload), Some(&index));
+        }
+    }
+
+    #[test]
     fn property_lookup_object_shape_metadata_tracks_named_data_offsets_and_shape_mutations() {
         let mut objects = CoreObjectStore::default();
         let object = objects.allocate_with_prototype(None);
@@ -23210,6 +27791,10 @@ mod tests {
             old_structure,
             WatchpointGeneration(1),
         );
+        assert_eq!(
+            host.drain_structure_chain_invalidation_events(),
+            vec![StructureChainInvalidationEvent { old_structure }]
+        );
         assert_ne!(object_structure_id(&host.objects, object), old_structure);
     }
 
@@ -23223,6 +27808,7 @@ mod tests {
             .set_data_own(object, &key, RuntimeValue::from_i32(1))
             .unwrap();
         let watched_structure = object_structure_id(&host.objects, object);
+        assert_eq!(host.drain_structure_chain_invalidation_events().len(), 1);
         let request = structure_watchpoint_request(12, watched_structure);
         host.start_structure_transition_watchpoints(&[request])
             .expect("structure watchpoint start");
@@ -23234,6 +27820,7 @@ mod tests {
         );
 
         assert!(host.drain_watchpoint_fire_events().is_empty());
+        assert!(host.drain_structure_chain_invalidation_events().is_empty());
         assert_eq!(
             object_structure_id(&host.objects, object),
             watched_structure
@@ -23279,7 +27866,99 @@ mod tests {
             old_structure,
             WatchpointGeneration(1),
         );
+        assert_eq!(
+            host.drain_structure_chain_invalidation_events(),
+            vec![StructureChainInvalidationEvent { old_structure }]
+        );
         assert_eq!(object_structure_id(&host.objects, object), new_structure);
+    }
+
+    #[test]
+    fn structure_chain_invalidation_events_track_shape_and_prototype_transitions() {
+        let mut objects = CoreObjectStore::default();
+        let object = objects.allocate_with_prototype(None);
+        let first = CorePropertyKey::String("first".into());
+        let second = CorePropertyKey::String("second".into());
+
+        let initial_structure = object_structure_id(&objects, object);
+        objects
+            .set_data_own(object, &first, RuntimeValue::from_i32(1))
+            .unwrap();
+        assert_eq!(
+            objects.drain_structure_chain_invalidation_events(),
+            vec![StructureChainInvalidationEvent {
+                old_structure: initial_structure
+            }]
+        );
+        let after_first = object_structure_id(&objects, object);
+
+        objects
+            .set_data_own(object, &first, RuntimeValue::from_i32(2))
+            .unwrap();
+        assert_eq!(object_structure_id(&objects, object), after_first);
+        assert!(objects
+            .drain_structure_chain_invalidation_events()
+            .is_empty());
+
+        objects
+            .define_data_property(
+                object,
+                &first,
+                RuntimeValue::from_i32(3),
+                CorePropertyAttributes {
+                    writable: false,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            objects.drain_structure_chain_invalidation_events(),
+            vec![StructureChainInvalidationEvent {
+                old_structure: after_first
+            }]
+        );
+        let after_attribute_change = object_structure_id(&objects, object);
+
+        objects
+            .put_data_own(object, &second, RuntimeValue::from_i32(4))
+            .unwrap();
+        assert_eq!(
+            objects.drain_structure_chain_invalidation_events(),
+            vec![StructureChainInvalidationEvent {
+                old_structure: after_attribute_change
+            }]
+        );
+        let after_second = object_structure_id(&objects, object);
+
+        assert_eq!(objects.delete_property(object, &second), Ok(true));
+        assert_eq!(
+            objects.drain_structure_chain_invalidation_events(),
+            vec![StructureChainInvalidationEvent {
+                old_structure: after_second
+            }]
+        );
+        let after_delete = object_structure_id(&objects, object);
+
+        let prototype = objects.allocate_with_prototype(None);
+        objects
+            .set_prototype_or_null(object, Some(prototype))
+            .unwrap();
+        assert_eq!(
+            objects.drain_structure_chain_invalidation_events(),
+            vec![StructureChainInvalidationEvent {
+                old_structure: after_delete
+            }]
+        );
+        let after_prototype = object_structure_id(&objects, object);
+
+        objects
+            .set_prototype_or_null(object, Some(prototype))
+            .unwrap();
+        assert_eq!(object_structure_id(&objects, object), after_prototype);
+        assert!(objects
+            .drain_structure_chain_invalidation_events()
+            .is_empty());
     }
 
     #[test]
@@ -23601,6 +28280,1326 @@ mod tests {
     }
 
     #[test]
+    fn has_property_lookup_records_boolean_presence_without_getter_calls() {
+        let mut objects = CoreObjectStore::default();
+        let prototype = objects.allocate_with_prototype(None);
+        let object = objects.allocate_with_prototype(Some(prototype));
+        let own_key = CorePropertyKey::Identifier(11);
+        let accessor_key = CorePropertyKey::Identifier(12);
+        let missing_key = CorePropertyKey::Identifier(13);
+        let getter = objects.allocate_function(0, Vec::new(), None);
+        objects
+            .set_data_own(object, &own_key, RuntimeValue::from_i32(42))
+            .unwrap();
+        objects
+            .define_accessor(prototype, &accessor_key, Some(getter), None)
+            .unwrap();
+
+        let (found, record) = objects
+            .has_property_with_lookup_record(
+                object,
+                &own_key,
+                in_property_lookup_site(41, CoreOpcode::InById),
+            )
+            .unwrap();
+        assert!(found);
+        assert_eq!(record.lookup_mode, PropertyLookupMode::HasProperty);
+        assert_eq!(record.opcode, Some(CoreOpcode::InById));
+        assert_eq!(record.key, own_key);
+        assert_eq!(record.holder, Some(object));
+        assert_eq!(record.offset, Some(PropertyOffset::new(0)));
+        assert_eq!(record.prototype_depth, 0);
+        assert_eq!(record.returned_value, Some(RuntimeValue::from_bool(true)));
+        assert_eq!(
+            record.classification,
+            CorePropertyLookupClassification::OwnData
+        );
+        assert!(!record.may_call_js);
+        assert_eq!(record.cacheability, PropertyCacheability::Allowed);
+        assert_eq!(record.access_case_kind, None);
+
+        let (found, record) = objects
+            .has_property_with_lookup_record(
+                object,
+                &accessor_key,
+                in_property_lookup_site(42, CoreOpcode::InById),
+            )
+            .unwrap();
+        assert!(found);
+        assert_eq!(record.lookup_mode, PropertyLookupMode::HasProperty);
+        assert_eq!(record.holder, Some(prototype));
+        assert_eq!(record.prototype_depth, 1);
+        assert_eq!(
+            record.classification,
+            CorePropertyLookupClassification::PrototypeAccessorGetter
+        );
+        assert_eq!(record.returned_value, Some(RuntimeValue::from_bool(true)));
+        assert!(!record.may_call_js);
+        assert_eq!(record.cacheability, PropertyCacheability::Allowed);
+        assert_eq!(record.access_case_kind, None);
+
+        let (found, record) = objects
+            .has_property_with_lookup_record(
+                object,
+                &missing_key,
+                in_property_lookup_site(43, CoreOpcode::InById),
+            )
+            .unwrap();
+        assert!(!found);
+        assert_eq!(record.lookup_mode, PropertyLookupMode::HasProperty);
+        assert_eq!(record.holder, None);
+        assert_eq!(record.returned_value, Some(RuntimeValue::from_bool(false)));
+        assert_eq!(
+            record.classification,
+            CorePropertyLookupClassification::Missing
+        );
+        assert_eq!(record.access_case_kind, Some(AccessCaseKind::Miss));
+        assert_eq!(
+            record.chain,
+            vec![
+                CorePropertyLookupChainEntry {
+                    object,
+                    structure: object_structure_id(&objects, object),
+                },
+                CorePropertyLookupChainEntry {
+                    object: prototype,
+                    structure: object_structure_id(&objects, prototype),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn has_property_lookup_records_indexed_in_as_uncacheable_boolean_presence() {
+        let mut objects = CoreObjectStore::default();
+        let array = objects.allocate_array();
+        objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(99))
+            .unwrap();
+        let key = array_index_property_key(0);
+
+        let (found, record) = objects
+            .has_property_with_lookup_record(
+                array,
+                &key,
+                in_property_lookup_site(44, CoreOpcode::InByVal),
+            )
+            .unwrap();
+
+        assert!(found);
+        assert_eq!(record.lookup_mode, PropertyLookupMode::HasProperty);
+        assert_eq!(record.opcode, Some(CoreOpcode::InByVal));
+        assert_eq!(record.holder, Some(array));
+        assert_eq!(
+            record.classification,
+            CorePropertyLookupClassification::IndexedOrTypedArray
+        );
+        assert_eq!(record.returned_value, Some(RuntimeValue::from_bool(true)));
+        assert!(!record.may_call_js);
+        assert_eq!(record.cacheability, PropertyCacheability::Disallowed);
+        assert_eq!(
+            record.access_case_kind,
+            Some(AccessCaseKind::IndexedArrayStorageInHit)
+        );
+    }
+
+    #[test]
+    fn get_by_value_array_index_fast_path_records_indexed_lookup() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let destination = local(2);
+        let value = RuntimeValue::from_i32(88);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByValue,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ]);
+        let owner = CodeBlockId(CellId(91));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects.put_array_element(array, 0, value).unwrap();
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(0))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(completion, ExecutionCompletion::Returned(value));
+        let record = host
+            .last_property_lookup_record()
+            .expect("GetByValue indexed lookup record");
+        assert_eq!(record.bytecode_index, Some(BytecodeIndex::from_offset(0)));
+        assert_eq!(record.opcode, Some(CoreOpcode::GetByValue));
+        assert_eq!(record.key, array_index_property_key(0));
+        assert_eq!(record.holder, Some(array));
+        assert_eq!(
+            record.classification,
+            CorePropertyLookupClassification::IndexedOrTypedArray
+        );
+        assert_eq!(record.returned_value, Some(value));
+        assert_eq!(record.cacheability, PropertyCacheability::Disallowed);
+        assert_eq!(record.access_case_kind, Some(AccessCaseKind::IndexedLoad));
+
+        let descriptor = host
+            .drain_property_load_observation(
+                &mut heap,
+                PropertyLoadObservationDrainRequest {
+                    owner,
+                    frame: CallFrameId(3),
+                    bytecode_index: BytecodeIndex::from_offset(0),
+                    opcode: CoreOpcode::GetByValue,
+                    slot: InlineCacheSlotId(0),
+                    cache_kind: InlineCacheKind::ElementLoad,
+                    fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                    property_key: PropertyCacheKey::RuntimeValue(key_register),
+                    cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                        owner,
+                        slot: InlineCacheSlotId(0),
+                        bytecode_index: 0,
+                        cache_kind: InlineCacheKind::ElementLoad,
+                        miss_kind: InlineCacheMissKind::Cold,
+                        fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                        boundary: None,
+                        call_link: None,
+                        preserves_operand_registers: true,
+                    },
+                },
+            )
+            .unwrap()
+            .expect("GetByValue element-load observation");
+        assert_eq!(descriptor.cache_kind, InlineCacheKind::ElementLoad);
+        assert_eq!(
+            descriptor.key,
+            CacheKey::Property(PropertyKey::from_index(
+                PropertyIndex::from_canonical_index(0)
+            ))
+        );
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Allowed);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::IndexedLoad)
+        );
+        assert_eq!(
+            descriptor.readiness,
+            PropertyLoadObservationReadiness::ReadyForAttachment
+        );
+        let plan = plan_property_load_access_case_from_observation(&descriptor)
+            .unwrap()
+            .expect("dense indexed ElementLoad plan");
+        assert_eq!(
+            plan.plan_kind,
+            PropertyLoadAccessCasePlanKind::DataOnlyIndexedLoad
+        );
+        assert_eq!(plan.access_case.kind, AccessCaseKind::IndexedLoad);
+        assert_eq!(plan.access_case.offset, None);
+    }
+
+    #[test]
+    fn in_by_id_records_has_property_lookup_and_load_drain_ignores_it() {
+        let object_register = local(0);
+        let destination = local(1);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InById,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ]);
+        let owner = CodeBlockId(CellId(94));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let object = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_data_own(
+                object,
+                &CorePropertyKey::Identifier(11),
+                RuntimeValue::from_i32(7),
+            )
+            .unwrap();
+        registers.write(window, object_register, object).unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        let record = host
+            .last_property_lookup_record()
+            .expect("InById has lookup record");
+        assert_eq!(record.bytecode_index, Some(BytecodeIndex::from_offset(0)));
+        assert_eq!(record.opcode, Some(CoreOpcode::InById));
+        assert_eq!(record.lookup_mode, PropertyLookupMode::HasProperty);
+        assert_eq!(record.key, CorePropertyKey::Identifier(11));
+        assert_eq!(record.base, object);
+        assert_eq!(record.base_object, Some(object));
+        assert_eq!(record.holder, Some(object));
+        assert_eq!(record.returned_value, Some(RuntimeValue::from_bool(true)));
+        assert_eq!(
+            record.classification,
+            CorePropertyLookupClassification::OwnData
+        );
+        assert!(!record.may_call_js);
+        assert_eq!(record.cacheability, PropertyCacheability::Allowed);
+
+        assert_eq!(
+            host.drain_property_load_observation(
+                &mut heap,
+                property_load_observation_request(owner, 0, 11),
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(host.last_property_lookup_record(), None);
+    }
+
+    #[test]
+    fn in_by_id_has_observation_drain_records_boolean_descriptor() {
+        let object_register = local(0);
+        let destination = local(1);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InById,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ]);
+        let owner = CodeBlockId(CellId(194));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        host.identifier_texts.insert(11, "field".into());
+        let object = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_data_own(
+                object,
+                &CorePropertyKey::String("field".into()),
+                RuntimeValue::from_i32(7),
+            )
+            .unwrap();
+        registers.write(window, object_register, object).unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        let record = host
+            .last_property_lookup_record()
+            .expect("named InByVal lookup record");
+        assert_eq!(record.cache_key, Some(cache_key_for_identifier(11)));
+        let descriptor = host
+            .drain_property_has_observation(
+                &mut heap,
+                property_has_observation_request(
+                    owner,
+                    0,
+                    CoreOpcode::InById,
+                    PropertyCacheKey::Key(PropertyKey::from_identifier(Identifier::from_atom(
+                        AtomId::from_table_slot(11),
+                    ))),
+                ),
+            )
+            .unwrap()
+            .expect("InById has observation");
+
+        assert_eq!(descriptor.cache_kind, InlineCacheKind::HasProperty);
+        assert_eq!(descriptor.opcode, CoreOpcode::InById);
+        assert_eq!(descriptor.key, cache_key_for_identifier(11));
+        assert_eq!(descriptor.result, true);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::InHit)
+        );
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Allowed);
+        assert!(!descriptor.may_call_js);
+        assert!(descriptor.can_use_in_by_id_megamorphic);
+        assert!(descriptor.base_object.is_some());
+        assert_eq!(descriptor.holder_object, descriptor.base_object);
+        assert_eq!(descriptor.prototype_depth, 0);
+        assert_eq!(descriptor.chain.len(), 1);
+        assert!(descriptor.validate().is_ok());
+        assert_eq!(host.last_property_lookup_record(), None);
+    }
+
+    #[test]
+    fn in_by_id_missing_has_observation_maps_to_in_miss() {
+        let owner = CodeBlockId(CellId(195));
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        host.identifier_texts.insert(12, "missing".into());
+        let object = host.objects.allocate_with_prototype(None);
+        let key = CorePropertyKey::String("missing".into());
+        let (found, record) = host
+            .objects
+            .has_property_with_lookup_record(
+                object,
+                &key,
+                in_property_lookup_site(9, CoreOpcode::InById),
+            )
+            .unwrap();
+        assert!(!found);
+        host.record_property_lookup(record);
+
+        let descriptor = host
+            .drain_property_has_observation(
+                &mut heap,
+                property_has_observation_request(
+                    owner,
+                    9,
+                    CoreOpcode::InById,
+                    PropertyCacheKey::Key(PropertyKey::from_identifier(Identifier::from_atom(
+                        AtomId::from_table_slot(12),
+                    ))),
+                ),
+            )
+            .unwrap()
+            .expect("InById missing has observation");
+
+        assert_eq!(descriptor.result, false);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::InMiss)
+        );
+        assert_eq!(descriptor.key, cache_key_for_identifier(12));
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Allowed);
+        assert!(descriptor.can_use_in_by_id_megamorphic);
+        assert_eq!(descriptor.holder_object, None);
+        assert_eq!(descriptor.chain.len(), 1);
+        assert!(descriptor.validate().is_ok());
+    }
+
+    #[test]
+    fn in_by_val_records_converted_key_has_property_lookup() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let destination = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ]);
+        let owner = CodeBlockId(CellId(95));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        host.identifier_texts.insert(11, "field".into());
+        let object = host.objects.allocate_with_prototype(None);
+        let key = CorePropertyKey::String("field".into());
+        host.objects
+            .set_data_own(object, &key, RuntimeValue::from_i32(9))
+            .unwrap();
+        let key_value = host.strings.allocate_with_heap(&mut heap, "field").unwrap();
+        registers.write(window, object_register, object).unwrap();
+        registers.write(window, key_register, key_value).unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        let record = host
+            .last_property_lookup_record()
+            .expect("InByVal has lookup record");
+        assert_eq!(record.bytecode_index, Some(BytecodeIndex::from_offset(0)));
+        assert_eq!(record.opcode, Some(CoreOpcode::InByVal));
+        assert_eq!(record.lookup_mode, PropertyLookupMode::HasProperty);
+        assert_eq!(record.key, key);
+        assert_eq!(record.cache_key, None);
+        assert_eq!(record.returned_value, Some(RuntimeValue::from_bool(true)));
+        assert_eq!(
+            record.classification,
+            CorePropertyLookupClassification::OwnData
+        );
+
+        let descriptor = host
+            .drain_property_has_observation(
+                &mut heap,
+                property_has_observation_request(
+                    owner,
+                    0,
+                    CoreOpcode::InByVal,
+                    PropertyCacheKey::RuntimeValue(key_register),
+                ),
+            )
+            .unwrap()
+            .expect("InByVal has observation");
+        assert_eq!(descriptor.key, CacheKey::Dynamic);
+        assert_eq!(descriptor.result, true);
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Disallowed);
+        assert_eq!(descriptor.observed_access_case_kind, None);
+        assert!(!descriptor.can_use_in_by_id_megamorphic);
+        assert!(descriptor.base_object.is_some());
+        assert_eq!(descriptor.holder_object, None);
+        assert!(descriptor.chain.is_empty());
+        assert!(descriptor.validate().is_ok());
+    }
+
+    #[test]
+    fn in_by_val_known_named_string_has_observation_records_cacheable_descriptor() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let destination = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ]);
+        let owner = CodeBlockId(CellId(201));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        host.identifier_texts.insert(11, "field".into());
+        let object = host.objects.allocate_with_prototype(None);
+        let key = CorePropertyKey::String("field".into());
+        host.objects
+            .set_data_own(object, &key, RuntimeValue::from_i32(9))
+            .unwrap();
+        let key_value = host
+            .property_key_value(&mut heap, &CorePropertyKey::Identifier(11))
+            .unwrap();
+        registers.write(window, object_register, object).unwrap();
+        registers.write(window, key_register, key_value).unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        let descriptor = host
+            .drain_property_has_observation(
+                &mut heap,
+                property_has_observation_request(
+                    owner,
+                    0,
+                    CoreOpcode::InByVal,
+                    PropertyCacheKey::RuntimeValue(key_register),
+                ),
+            )
+            .unwrap()
+            .expect("named InByVal has observation");
+
+        assert_eq!(descriptor.key, cache_key_for_identifier(11));
+        assert_eq!(descriptor.result, true);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::InHit)
+        );
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Allowed);
+        assert!(!descriptor.may_call_js);
+        assert!(descriptor.can_use_in_by_id_megamorphic);
+        assert_eq!(descriptor.holder_object, descriptor.base_object);
+        assert_eq!(descriptor.chain.len(), 1);
+        assert!(descriptor.validate().is_ok());
+    }
+
+    #[test]
+    fn in_by_val_converted_non_string_key_stays_dynamic_for_has_observation() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let destination = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ]);
+        let owner = CodeBlockId(CellId(202));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        host.identifier_texts.insert(11, "true".into());
+        let object = host.objects.allocate_with_prototype(None);
+        let key = CorePropertyKey::String("true".into());
+        host.objects
+            .set_data_own(object, &key, RuntimeValue::from_i32(1))
+            .unwrap();
+        registers.write(window, object_register, object).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_bool(true))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        let record = host
+            .last_property_lookup_record()
+            .expect("converted InByVal lookup record");
+        assert_eq!(record.key, key);
+        assert_eq!(record.cache_key, None);
+        let descriptor = host
+            .drain_property_has_observation(
+                &mut heap,
+                property_has_observation_request(
+                    owner,
+                    0,
+                    CoreOpcode::InByVal,
+                    PropertyCacheKey::RuntimeValue(key_register),
+                ),
+            )
+            .unwrap()
+            .expect("converted InByVal has observation");
+
+        assert_eq!(descriptor.key, CacheKey::Dynamic);
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Disallowed);
+        assert_eq!(descriptor.observed_access_case_kind, None);
+        assert!(!descriptor.can_use_in_by_id_megamorphic);
+        assert!(descriptor.chain.is_empty());
+        assert!(descriptor.validate().is_ok());
+    }
+
+    #[test]
+    fn in_by_val_indexed_has_observation_records_indexed_in_descriptor() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let destination = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ]);
+        let owner = CodeBlockId(CellId(196));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(9))
+            .unwrap();
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(0))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        let array_profile = host
+            .last_array_profile_observation
+            .expect("InByVal uint32 array profile observation");
+        assert_eq!(array_profile.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(array_profile.opcode, CoreOpcode::InByVal);
+        assert_eq!(array_profile.base_object, array);
+        assert_eq!(
+            array_profile.base_structure,
+            object_structure_id(&host.objects, array)
+        );
+        assert_eq!(array_profile.index, 0);
+        assert_eq!(
+            array_profile.profile.last_seen_structure,
+            Some(object_structure_id(&host.objects, array))
+        );
+        assert!(!array_profile.profile.flags.out_of_bounds);
+        assert!(!array_profile.profile.flags.may_be_large_typed_array);
+        let descriptor = host
+            .drain_property_has_observation(
+                &mut heap,
+                property_has_observation_request(
+                    owner,
+                    0,
+                    CoreOpcode::InByVal,
+                    PropertyCacheKey::RuntimeValue(key_register),
+                ),
+            )
+            .unwrap()
+            .expect("InByVal indexed has observation");
+
+        assert_eq!(
+            descriptor.key,
+            CacheKey::Property(PropertyKey::from_index(
+                PropertyIndex::from_canonical_index(0)
+            ))
+        );
+        assert_eq!(descriptor.result, true);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::IndexedArrayStorageInHit)
+        );
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Disallowed);
+        assert!(!descriptor.can_use_in_by_id_megamorphic);
+        assert_eq!(descriptor.holder_object, descriptor.base_object);
+        assert_eq!(descriptor.chain.len(), 1);
+        assert!(descriptor.validate().is_ok());
+    }
+
+    #[test]
+    fn in_by_val_typed_array_has_observation_records_uint8_in_descriptor() {
+        let owner = CodeBlockId(CellId(198));
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let buffer = host.objects.allocate_array_buffer(1);
+        let array = host
+            .objects
+            .allocate_uint8_array_with_write_barrier(&mut heap, buffer, 0, 1)
+            .unwrap();
+        let key = array_index_property_key(0);
+        let (found, record) = host
+            .objects
+            .has_property_with_lookup_record(
+                array,
+                &key,
+                in_property_lookup_site(12, CoreOpcode::InByVal),
+            )
+            .unwrap();
+        assert!(found);
+        host.record_property_lookup(record);
+
+        let descriptor = host
+            .drain_property_has_observation(
+                &mut heap,
+                property_has_observation_request(
+                    owner,
+                    12,
+                    CoreOpcode::InByVal,
+                    PropertyCacheKey::RuntimeValue(local(0)),
+                ),
+            )
+            .unwrap()
+            .expect("typed-array indexed has observation");
+        assert_eq!(descriptor.result, true);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::IndexedTypedArrayUint8In)
+        );
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Disallowed);
+        assert!(descriptor.validate().is_ok());
+    }
+
+    #[test]
+    fn in_by_val_uint32_out_of_bounds_records_array_profile_flag() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let destination = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ]);
+        let owner = CodeBlockId(CellId(199));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let buffer = host.objects.allocate_array_buffer(1);
+        let array = host
+            .objects
+            .allocate_uint8_array_with_write_barrier(&mut heap, buffer, 0, 1)
+            .unwrap();
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(4))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(false))
+        );
+        let array_profile = host
+            .last_array_profile_observation
+            .expect("InByVal uint32 array profile observation");
+        assert_eq!(array_profile.index, 4);
+        assert_eq!(
+            array_profile.profile.last_seen_structure,
+            Some(object_structure_id(&host.objects, array))
+        );
+        assert!(array_profile.profile.flags.out_of_bounds);
+        assert!(!array_profile.profile.flags.may_be_large_typed_array);
+    }
+
+    #[test]
+    fn in_by_val_numeric_miss_records_indexed_no_indexing_miss_descriptor() {
+        let owner = CodeBlockId(CellId(200));
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let object = host.objects.allocate_with_prototype(None);
+        let key = array_index_property_key(0);
+        let (found, record) = host
+            .objects
+            .has_property_with_lookup_record(
+                object,
+                &key,
+                in_property_lookup_site(13, CoreOpcode::InByVal),
+            )
+            .unwrap();
+        assert!(!found);
+        host.record_property_lookup(record);
+
+        let descriptor = host
+            .drain_property_has_observation(
+                &mut heap,
+                property_has_observation_request(
+                    owner,
+                    13,
+                    CoreOpcode::InByVal,
+                    PropertyCacheKey::RuntimeValue(local(0)),
+                ),
+            )
+            .unwrap()
+            .expect("numeric missing has observation");
+        assert_eq!(descriptor.result, false);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::IndexedNoIndexingInMiss)
+        );
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Disallowed);
+        assert!(descriptor.validate().is_ok());
+    }
+
+    #[test]
+    fn proxy_has_without_trap_records_opaque_has_property_lookup() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let key = CorePropertyKey::Identifier(11);
+        let target = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_data_own(target, &key, RuntimeValue::from_i32(1))
+            .unwrap();
+        let handler = host.objects.allocate_with_prototype(None);
+        let proxy = host
+            .objects
+            .allocate_proxy_with_write_barrier(&mut heap, target, handler)
+            .unwrap();
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let block = code_block(Vec::new());
+
+        {
+            let mut state = dispatch_state(
+                &mut stack,
+                &mut registers,
+                &mut exceptions,
+                &mut heap,
+                &block,
+            );
+            host.begin_property_lookup_recording(in_property_lookup_site(45, CoreOpcode::InById));
+            assert_eq!(
+                host.has_property_value_with_completion(&mut state, proxy, &key, None),
+                Ok(true)
+            );
+        }
+
+        let record = host
+            .last_property_lookup_record()
+            .expect("proxy has lookup record");
+        assert_eq!(record.bytecode_index, Some(BytecodeIndex::from_offset(45)));
+        assert_eq!(record.opcode, Some(CoreOpcode::InById));
+        assert_eq!(record.lookup_mode, PropertyLookupMode::HasProperty);
+        assert_eq!(record.base, proxy);
+        assert_eq!(record.base_object, Some(proxy));
+        assert_eq!(record.holder, None);
+        assert_eq!(
+            record.classification,
+            CorePropertyLookupClassification::OpaqueOrUncacheable
+        );
+        assert_eq!(record.returned_value, Some(RuntimeValue::from_bool(true)));
+        assert!(record.may_call_js);
+        assert_eq!(
+            record.cacheability,
+            PropertyCacheability::TaintedByOpaqueObject
+        );
+        assert_eq!(record.access_case_kind, None);
+
+        let owner = CodeBlockId(CellId(197));
+        let descriptor = host
+            .drain_property_has_observation(
+                &mut heap,
+                property_has_observation_request(
+                    owner,
+                    45,
+                    CoreOpcode::InById,
+                    PropertyCacheKey::Key(PropertyKey::from_identifier(Identifier::from_atom(
+                        AtomId::from_table_slot(11),
+                    ))),
+                ),
+            )
+            .unwrap()
+            .expect("proxy has observation");
+        assert_eq!(descriptor.result, true);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::ProxyObjectIn)
+        );
+        assert!(descriptor.may_call_js);
+        assert_eq!(
+            descriptor.cacheability,
+            PropertyCacheability::TaintedByOpaqueObject
+        );
+        assert!(!descriptor.can_use_in_by_id_megamorphic);
+        assert!(descriptor.base_object.is_some());
+        assert!(descriptor.chain.is_empty());
+        assert!(descriptor.validate().is_ok());
+    }
+
+    #[test]
+    fn in_by_val_proxy_has_observation_records_indexed_proxy_in_descriptor() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let key = array_index_property_key(0);
+        let target = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_data_own(target, &key, RuntimeValue::from_i32(1))
+            .unwrap();
+        let handler = host.objects.allocate_with_prototype(None);
+        let proxy = host
+            .objects
+            .allocate_proxy_with_write_barrier(&mut heap, target, handler)
+            .unwrap();
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let block = code_block(Vec::new());
+
+        {
+            let mut state = dispatch_state(
+                &mut stack,
+                &mut registers,
+                &mut exceptions,
+                &mut heap,
+                &block,
+            );
+            host.begin_property_lookup_recording(in_property_lookup_site(46, CoreOpcode::InByVal));
+            assert_eq!(
+                host.has_property_value_with_completion(&mut state, proxy, &key, None),
+                Ok(true)
+            );
+        }
+
+        let owner = CodeBlockId(CellId(200));
+        let descriptor = host
+            .drain_property_has_observation(
+                &mut heap,
+                property_has_observation_request(
+                    owner,
+                    46,
+                    CoreOpcode::InByVal,
+                    PropertyCacheKey::RuntimeValue(local(0)),
+                ),
+            )
+            .unwrap()
+            .expect("by-val proxy has observation");
+        assert_eq!(descriptor.result, true);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::IndexedProxyObjectIn)
+        );
+        assert!(descriptor.may_call_js);
+        assert_eq!(
+            descriptor.cacheability,
+            PropertyCacheability::TaintedByOpaqueObject
+        );
+        assert!(!descriptor.can_use_in_by_id_megamorphic);
+        assert!(descriptor.base_object.is_some());
+        assert!(descriptor.chain.is_empty());
+        assert!(descriptor.validate().is_ok());
+    }
+
+    #[test]
+    fn put_by_value_array_extension_stays_opaque_for_element_store() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let value_register = local(2);
+        let stored_value = RuntimeValue::from_i32(99);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::PutByValue,
+                vec![
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                    Operand::Register(value_register),
+                ],
+            ),
+            core_typed(
+                1,
+                CoreOpcode::Return,
+                vec![Operand::Register(value_register)],
+            ),
+        ]);
+        let owner = CodeBlockId(CellId(92));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(0))
+            .unwrap();
+        registers
+            .write(window, value_register, stored_value)
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(completion, ExecutionCompletion::Returned(stored_value));
+        assert_eq!(host.objects.get_index(array, 0), Ok(stored_value));
+        let record = host
+            .last_property_store
+            .as_ref()
+            .expect("PutByValue indexed store record");
+        assert_eq!(record.bytecode_index, Some(BytecodeIndex::from_offset(0)));
+        assert_eq!(record.opcode, Some(CoreOpcode::PutByValue));
+        assert_eq!(record.base_object, Some(array));
+        assert_eq!(record.key, array_index_property_key(0));
+        assert_eq!(record.offset_after, None);
+        assert_eq!(record.stored_value, stored_value);
+        assert_eq!(record.outcome, PropertyStoreObservationOutcome::Opaque);
+        assert!(!record.may_call_js);
+        assert_eq!(record.cacheability, PropertyCacheability::Disallowed);
+
+        let descriptor = host
+            .drain_property_store_observation(
+                &mut heap,
+                PropertyStoreObservationDrainRequest {
+                    owner,
+                    frame: CallFrameId(3),
+                    bytecode_index: BytecodeIndex::from_offset(0),
+                    opcode: CoreOpcode::PutByValue,
+                    slot: InlineCacheSlotId(0),
+                    cache_kind: InlineCacheKind::ElementStore,
+                    fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                    property_key: PropertyCacheKey::RuntimeValue(key_register),
+                    cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                        owner,
+                        slot: InlineCacheSlotId(0),
+                        bytecode_index: 0,
+                        cache_kind: InlineCacheKind::ElementStore,
+                        miss_kind: InlineCacheMissKind::Cold,
+                        fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                        boundary: None,
+                        call_link: None,
+                        preserves_operand_registers: true,
+                    },
+                },
+            )
+            .unwrap()
+            .expect("PutByValue element-store observation");
+        assert_eq!(descriptor.cache_kind, InlineCacheKind::ElementStore);
+        assert_eq!(
+            descriptor.key,
+            CacheKey::Property(PropertyKey::from_index(
+                PropertyIndex::from_canonical_index(0)
+            ))
+        );
+        assert_eq!(descriptor.outcome, PropertyStoreObservationOutcome::Opaque);
+    }
+
+    #[test]
+    fn put_by_value_existing_array_index_records_indexed_store() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let value_register = local(2);
+        let stored_value = RuntimeValue::from_i32(99);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::PutByValue,
+                vec![
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                    Operand::Register(value_register),
+                ],
+            ),
+            core_typed(
+                1,
+                CoreOpcode::Return,
+                vec![Operand::Register(value_register)],
+            ),
+        ]);
+        let owner = CodeBlockId(CellId(93));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(1))
+            .unwrap();
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(0))
+            .unwrap();
+        registers
+            .write(window, value_register, stored_value)
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(completion, ExecutionCompletion::Returned(stored_value));
+        assert_eq!(host.objects.get_index(array, 0), Ok(stored_value));
+        let record = host
+            .last_property_store
+            .as_ref()
+            .expect("PutByValue indexed store record");
+        assert_eq!(record.bytecode_index, Some(BytecodeIndex::from_offset(0)));
+        assert_eq!(record.opcode, Some(CoreOpcode::PutByValue));
+        assert_eq!(record.base_object, Some(array));
+        assert_eq!(record.key, array_index_property_key(0));
+        assert_eq!(record.offset_after, None);
+        assert_eq!(record.stored_value, stored_value);
+        assert_eq!(
+            record.outcome,
+            PropertyStoreObservationOutcome::IndexedStore
+        );
+        assert!(!record.may_call_js);
+        assert_eq!(record.cacheability, PropertyCacheability::Disallowed);
+
+        let descriptor = host
+            .drain_property_store_observation(
+                &mut heap,
+                PropertyStoreObservationDrainRequest {
+                    owner,
+                    frame: CallFrameId(3),
+                    bytecode_index: BytecodeIndex::from_offset(0),
+                    opcode: CoreOpcode::PutByValue,
+                    slot: InlineCacheSlotId(0),
+                    cache_kind: InlineCacheKind::ElementStore,
+                    fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                    property_key: PropertyCacheKey::RuntimeValue(key_register),
+                    cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                        owner,
+                        slot: InlineCacheSlotId(0),
+                        bytecode_index: 0,
+                        cache_kind: InlineCacheKind::ElementStore,
+                        miss_kind: InlineCacheMissKind::Cold,
+                        fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                        boundary: None,
+                        call_link: None,
+                        preserves_operand_registers: true,
+                    },
+                },
+            )
+            .unwrap()
+            .expect("PutByValue element-store observation");
+        assert_eq!(descriptor.cache_kind, InlineCacheKind::ElementStore);
+        assert_eq!(
+            descriptor.key,
+            CacheKey::Property(PropertyKey::from_index(
+                PropertyIndex::from_canonical_index(0)
+            ))
+        );
+        assert_eq!(
+            descriptor.outcome,
+            PropertyStoreObservationOutcome::IndexedStore
+        );
+        assert_eq!(descriptor.offset_after, None);
+    }
+
+    #[test]
     fn property_lookup_failed_recording_drops_stale_record_and_pending_site() {
         let mut host = CoreOpcodeDispatchHost::new();
         let object = host.objects.allocate_with_prototype(None);
@@ -23643,14 +29642,16 @@ mod tests {
                 &mut heap,
                 &block,
             );
+            // C++ JSC: accessing a property on a primitive number routes through
+            // Number.prototype (autoboxing). "field" is not on Number.prototype,
+            // so the result is undefined rather than an error.
             let result =
                 host.get_property_value(&mut state, RuntimeValue::from_i32(1), &key, object);
-            assert_eq!(
-                result,
-                Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject))
-            );
+            assert_eq!(result, Ok(RuntimeValue::undefined()));
         }
-        assert_eq!(host.last_property_lookup_record(), None);
+        // With number autoboxing, the lookup through Number.prototype records
+        // an opaque record, so the record is present (not None).
+        assert!(host.last_property_lookup_record().is_some());
         assert_eq!(host.pending_property_lookup_site, None);
     }
 
@@ -23722,6 +29723,331 @@ mod tests {
             .contains(PropertyLoadObservationBlocker::MissingOffset));
         assert_eq!(descriptor.validate(), Ok(()));
         assert_eq!(host.last_property_lookup_record(), None);
+    }
+
+    #[test]
+    fn string_primitive_own_string_prototype_data_property_records_normalized_lookup() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let owner = CodeBlockId(CellId(78));
+        host.identifier_texts.insert(11, "extra".into());
+        let prototype = host.objects.ensure_string_prototype();
+        let key = CorePropertyKey::String("extra".into());
+        let value = RuntimeValue::from_i32(42);
+        host.objects.set_data_own(prototype, &key, value).unwrap();
+        let expected_structure = object_structure_id(&host.objects, prototype);
+        let expected_offset =
+            object_property_offset(&host.objects, prototype, &key).expect("prototype offset");
+        let string = host.strings.allocate_with_heap(&mut heap, "seed").unwrap();
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let block = code_block(Vec::new());
+
+        {
+            let mut state = dispatch_state(
+                &mut stack,
+                &mut registers,
+                &mut exceptions,
+                &mut heap,
+                &block,
+            );
+            host.begin_property_lookup_recording(property_lookup_site(9));
+            let result = host.get_property_value(&mut state, string, &key, string);
+            assert_eq!(result, Ok(value));
+        }
+
+        let record = host
+            .last_property_lookup_record()
+            .expect("string primitive lookup record");
+        assert_eq!(record.base, string);
+        assert_eq!(record.base_object, Some(prototype));
+        assert_eq!(record.holder, Some(prototype));
+        assert_eq!(
+            record.base_normalization,
+            PropertyLoadBaseNormalization::StringPrototype
+        );
+        assert_eq!(record.base_structure, Some(expected_structure));
+        assert_eq!(record.offset, Some(expected_offset));
+        assert_eq!(
+            record.chain,
+            vec![CorePropertyLookupChainEntry {
+                object: prototype,
+                structure: expected_structure,
+            }]
+        );
+
+        let descriptor = host
+            .drain_property_load_observation(
+                &mut heap,
+                property_load_observation_request(owner, 9, 11),
+            )
+            .unwrap()
+            .expect("normalized string property load observation");
+        let prototype_cell = heap_cell_for_value(&heap, prototype);
+        assert_eq!(descriptor.base_object, Some(ObjectId(prototype_cell)));
+        assert_eq!(descriptor.holder_object, Some(ObjectId(prototype_cell)));
+        assert_eq!(
+            descriptor.base_normalization,
+            PropertyLoadBaseNormalization::StringPrototype
+        );
+        assert_eq!(descriptor.base_structure, Some(expected_structure));
+        assert_eq!(descriptor.offset, Some(expected_offset));
+        assert_eq!(descriptor.prototype_depth, 0);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::Load)
+        );
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Allowed);
+        assert!(descriptor.can_use_get_by_id_megamorphic);
+        assert_eq!(
+            descriptor.readiness,
+            PropertyLoadObservationReadiness::ReadyForAttachment
+        );
+        assert_eq!(
+            descriptor.chain,
+            vec![PropertyLoadObservationChainEntry {
+                object: ObjectId(prototype_cell),
+                structure: expected_structure,
+                next_prototype: None,
+            }]
+        );
+        assert_eq!(
+            <CoreOpcodeDispatchHost as DispatchHost>::generated_property_sidecar_base_structure(
+                &mut host, string,
+            ),
+            Some(expected_structure)
+        );
+    }
+
+    #[test]
+    fn string_primitive_prototype_chain_data_property_records_normalized_lookup() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let owner = CodeBlockId(CellId(781));
+        host.identifier_texts.insert(12, "above".into());
+        let string_prototype = host.objects.ensure_string_prototype();
+        let object_prototype = host.objects.ensure_object_prototype();
+        let key = CorePropertyKey::String("above".into());
+        let value = RuntimeValue::from_i32(84);
+        host.objects
+            .set_data_own(object_prototype, &key, value)
+            .unwrap();
+        let string_prototype_structure = object_structure_id(&host.objects, string_prototype);
+        let object_prototype_structure = object_structure_id(&host.objects, object_prototype);
+        let expected_offset =
+            object_property_offset(&host.objects, object_prototype, &key).expect("holder offset");
+        let string = host.strings.allocate_with_heap(&mut heap, "seed").unwrap();
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let block = code_block(Vec::new());
+
+        {
+            let mut state = dispatch_state(
+                &mut stack,
+                &mut registers,
+                &mut exceptions,
+                &mut heap,
+                &block,
+            );
+            host.begin_property_lookup_recording(property_lookup_site(12));
+            let result = host.get_property_value(&mut state, string, &key, string);
+            assert_eq!(result, Ok(value));
+        }
+
+        let record = host
+            .last_property_lookup_record()
+            .expect("string primitive prototype-chain lookup record");
+        assert_eq!(record.base, string);
+        assert_eq!(record.base_object, Some(string_prototype));
+        assert_eq!(record.holder, Some(object_prototype));
+        assert_eq!(
+            record.base_normalization,
+            PropertyLoadBaseNormalization::StringPrototype
+        );
+        assert_eq!(record.base_structure, Some(string_prototype_structure));
+        assert_eq!(record.offset, Some(expected_offset));
+        assert_eq!(record.prototype_depth, 1);
+        assert_eq!(
+            record.chain,
+            vec![
+                CorePropertyLookupChainEntry {
+                    object: string_prototype,
+                    structure: string_prototype_structure,
+                },
+                CorePropertyLookupChainEntry {
+                    object: object_prototype,
+                    structure: object_prototype_structure,
+                },
+            ]
+        );
+
+        let descriptor = host
+            .drain_property_load_observation(
+                &mut heap,
+                property_load_observation_request(owner, 12, 12),
+            )
+            .unwrap()
+            .expect("normalized string prototype-chain property load observation");
+        let string_prototype_cell = heap_cell_for_value(&heap, string_prototype);
+        let object_prototype_cell = heap_cell_for_value(&heap, object_prototype);
+        assert_eq!(
+            descriptor.base_object,
+            Some(ObjectId(string_prototype_cell))
+        );
+        assert_eq!(
+            descriptor.holder_object,
+            Some(ObjectId(object_prototype_cell))
+        );
+        assert_eq!(
+            descriptor.base_normalization,
+            PropertyLoadBaseNormalization::StringPrototype
+        );
+        assert_eq!(descriptor.base_structure, Some(string_prototype_structure));
+        assert_eq!(descriptor.offset, Some(expected_offset));
+        assert_eq!(descriptor.prototype_depth, 1);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::Load)
+        );
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Allowed);
+        assert!(descriptor.can_use_get_by_id_megamorphic);
+        assert_eq!(
+            descriptor.chain,
+            vec![
+                PropertyLoadObservationChainEntry {
+                    object: ObjectId(string_prototype_cell),
+                    structure: string_prototype_structure,
+                    next_prototype: Some(ObjectId(object_prototype_cell)),
+                },
+                PropertyLoadObservationChainEntry {
+                    object: ObjectId(object_prototype_cell),
+                    structure: object_prototype_structure,
+                    next_prototype: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn string_primitive_prototype_chain_missing_property_records_normalized_lookup() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let owner = CodeBlockId(CellId(782));
+        host.identifier_texts.insert(13, "absentExtra".into());
+        let string_prototype = host.objects.ensure_string_prototype();
+        let object_prototype = host.objects.ensure_object_prototype();
+        let key = CorePropertyKey::String("absentExtra".into());
+        let string_prototype_structure = object_structure_id(&host.objects, string_prototype);
+        let object_prototype_structure = object_structure_id(&host.objects, object_prototype);
+        let string = host.strings.allocate_with_heap(&mut heap, "seed").unwrap();
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let block = code_block(Vec::new());
+
+        {
+            let mut state = dispatch_state(
+                &mut stack,
+                &mut registers,
+                &mut exceptions,
+                &mut heap,
+                &block,
+            );
+            host.begin_property_lookup_recording(property_lookup_site(13));
+            let result = host.get_property_value(&mut state, string, &key, string);
+            assert_eq!(result, Ok(RuntimeValue::undefined()));
+        }
+
+        let descriptor = host
+            .drain_property_load_observation(
+                &mut heap,
+                property_load_observation_request(owner, 13, 13),
+            )
+            .unwrap()
+            .expect("normalized string prototype-chain missing observation");
+        let string_prototype_cell = heap_cell_for_value(&heap, string_prototype);
+        let object_prototype_cell = heap_cell_for_value(&heap, object_prototype);
+        assert_eq!(
+            descriptor.base_object,
+            Some(ObjectId(string_prototype_cell))
+        );
+        assert_eq!(descriptor.holder_object, None);
+        assert_eq!(
+            descriptor.base_normalization,
+            PropertyLoadBaseNormalization::StringPrototype
+        );
+        assert_eq!(descriptor.base_structure, Some(string_prototype_structure));
+        assert_eq!(descriptor.offset, None);
+        assert_eq!(descriptor.prototype_depth, 1);
+        assert_eq!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::Miss)
+        );
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Allowed);
+        assert!(descriptor.can_use_get_by_id_megamorphic);
+        assert_eq!(
+            descriptor.chain,
+            vec![
+                PropertyLoadObservationChainEntry {
+                    object: ObjectId(string_prototype_cell),
+                    structure: string_prototype_structure,
+                    next_prototype: Some(ObjectId(object_prototype_cell)),
+                },
+                PropertyLoadObservationChainEntry {
+                    object: ObjectId(object_prototype_cell),
+                    structure: object_prototype_structure,
+                    next_prototype: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn string_primitive_excluded_length_lookup_remains_uncacheable() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let owner = CodeBlockId(CellId(79));
+        host.identifier_texts.insert(11, "length".into());
+        let key = CorePropertyKey::String("length".into());
+        let string = host.strings.allocate_with_heap(&mut heap, "seed").unwrap();
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let block = code_block(Vec::new());
+
+        {
+            let mut state = dispatch_state(
+                &mut stack,
+                &mut registers,
+                &mut exceptions,
+                &mut heap,
+                &block,
+            );
+            host.begin_property_lookup_recording(property_lookup_site(10));
+            let result = host.get_property_value(&mut state, string, &key, string);
+            assert_eq!(result, Ok(RuntimeValue::from_i32(4)));
+        }
+
+        let descriptor = host
+            .drain_property_load_observation(
+                &mut heap,
+                property_load_observation_request(owner, 10, 11),
+            )
+            .unwrap()
+            .expect("length property load observation");
+        assert_eq!(
+            descriptor.base_normalization,
+            PropertyLoadBaseNormalization::None
+        );
+        assert_eq!(descriptor.base_object, None);
+        assert_eq!(descriptor.holder_object, None);
+        assert_eq!(descriptor.base_structure, None);
+        assert_eq!(descriptor.offset, None);
+        assert_eq!(descriptor.observed_access_case_kind, None);
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Disallowed);
+        assert!(!descriptor.can_use_get_by_id_megamorphic);
     }
 
     #[test]
@@ -23854,6 +30180,126 @@ mod tests {
             }
             GeneratedPropertyLoadProbeResult::Miss(_) => unreachable!(),
         }
+    }
+
+    #[test]
+    fn generated_property_load_megamorphic_holder_probe_hits_holder_data_property() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let holder = host.objects.allocate_with_prototype(None);
+        let child = host.objects.allocate_with_prototype(None);
+        let key = CorePropertyKey::Identifier(11);
+        host.objects.bind_object_to_heap(&mut heap, holder).unwrap();
+        host.objects.set_data_own(holder, &key, child).unwrap();
+        let cell_request =
+            generated_property_load_megamorphic_holder_probe_request(&host.objects, holder, 11);
+
+        let cell_result = host.probe_generated_property_load_megamorphic_holder(cell_request);
+        assert_eq!(
+            cell_result,
+            GeneratedPropertyLoadProbeResult::Hit(GeneratedPropertyLoadProbeHit {
+                value: child,
+                destination_root_sync:
+                    GeneratedPropertyLoadDestinationRootSync::TargetedRegisterRequiredForCell,
+            })
+        );
+
+        let immediate_key = CorePropertyKey::Identifier(12);
+        let immediate = RuntimeValue::from_i32(81);
+        host.objects
+            .set_data_own(holder, &immediate_key, immediate)
+            .unwrap();
+        let immediate_request =
+            generated_property_load_megamorphic_holder_probe_request(&host.objects, holder, 12);
+
+        assert_eq!(
+            host.probe_generated_property_load_megamorphic_holder(immediate_request),
+            GeneratedPropertyLoadProbeResult::Hit(GeneratedPropertyLoadProbeHit {
+                value: immediate,
+                destination_root_sync:
+                    GeneratedPropertyLoadDestinationRootSync::NotRequiredForImmediate,
+            })
+        );
+    }
+
+    #[test]
+    fn generated_property_load_megamorphic_holder_probe_misses_for_stale_holder_metadata() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let holder = host.objects.allocate_with_prototype(None);
+        let key = CorePropertyKey::Identifier(11);
+        host.objects.bind_object_to_heap(&mut heap, holder).unwrap();
+        host.objects
+            .set_data_own(holder, &key, RuntimeValue::from_i32(42))
+            .unwrap();
+        let request =
+            generated_property_load_megamorphic_holder_probe_request(&host.objects, holder, 11);
+
+        let mut default_holder = request;
+        default_holder.holder = ObjectId::default();
+        assert_eq!(
+            probe_miss_reason(
+                host.probe_generated_property_load_megamorphic_holder(default_holder)
+            ),
+            GeneratedPropertyLoadProbeMissReason::UnknownObject
+        );
+
+        let mut missing_key = request;
+        missing_key.key = cache_key_for_identifier(12);
+        assert_eq!(
+            probe_miss_reason(host.probe_generated_property_load_megamorphic_holder(missing_key)),
+            GeneratedPropertyLoadProbeMissReason::MissingProperty
+        );
+
+        let mut mismatched_offset = request;
+        mismatched_offset.offset = PropertyOffset::new(request.offset.raw() + 1);
+        assert_eq!(
+            probe_miss_reason(
+                host.probe_generated_property_load_megamorphic_holder(mismatched_offset)
+            ),
+            GeneratedPropertyLoadProbeMissReason::KeyOffsetMismatch
+        );
+
+        let accessor = host.objects.allocate_with_prototype(None);
+        let getter = host.objects.allocate_function(0, Vec::new(), None);
+        host.objects
+            .define_accessor(accessor, &key, Some(getter), None)
+            .unwrap();
+        host.objects
+            .bind_object_to_heap(&mut heap, accessor)
+            .unwrap();
+        let accessor_request = GeneratedPropertyLoadMegamorphicHolderProbeRequest {
+            key: cache_key_for_identifier(11),
+            base_structure: StructureId::new(1),
+            holder: ObjectId(
+                host.objects
+                    .find(accessor)
+                    .expect("accessor object")
+                    .cell_id,
+            ),
+            offset: PropertyOffset::new(0),
+        };
+        assert_eq!(
+            probe_miss_reason(
+                host.probe_generated_property_load_megamorphic_holder(accessor_request)
+            ),
+            GeneratedPropertyLoadProbeMissReason::NonDataProperty
+        );
+
+        let target = host.objects.allocate_with_prototype(None);
+        let handler = host.objects.allocate_with_prototype(None);
+        let proxy = host
+            .objects
+            .allocate_proxy_with_write_barrier(&mut heap, target, handler)
+            .unwrap();
+        host.objects.bind_object_to_heap(&mut heap, proxy).unwrap();
+        let proxy_id = ObjectId(host.objects.find(proxy).expect("proxy object").cell_id);
+        let mut proxy_request = request;
+        proxy_request.holder = proxy_id;
+        assert_eq!(
+            probe_miss_reason(host.probe_generated_property_load_megamorphic_holder(proxy_request)),
+            GeneratedPropertyLoadProbeMissReason::OpaqueObject
+        );
     }
 
     #[test]
@@ -24087,6 +30533,89 @@ mod tests {
             }
             GeneratedPropertyStoreProbeResult::Miss(_) => unreachable!(),
         }
+    }
+
+    #[test]
+    fn generated_property_store_probe_hits_indexed_existing_element_without_mutating_object() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        let original_value = RuntimeValue::from_i32(42);
+        let stored_value = RuntimeValue::from_i32(99);
+        host.objects
+            .put_array_element(array, 0, original_value)
+            .unwrap();
+        let plan =
+            generated_property_store_indexed_plan(object_structure_id(&host.objects, array), 0);
+        let snapshot = object_store_mutation_snapshot(&host.objects, array);
+
+        let result = host.probe_generated_property_store(generated_property_store_probe_request(
+            &plan,
+            array,
+            stored_value,
+        ));
+
+        assert_eq!(
+            result,
+            GeneratedPropertyStoreProbeResult::hit_for_plan(&plan, stored_value)
+        );
+        assert_eq!(
+            snapshot,
+            object_store_mutation_snapshot(&host.objects, array)
+        );
+        assert_eq!(host.objects.get_index(array, 0), Ok(original_value));
+        match result {
+            GeneratedPropertyStoreProbeResult::Hit(hit) => {
+                assert_eq!(
+                    hit.continuation_plan_kind,
+                    PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore
+                );
+                assert_eq!(hit.planned_offset, PropertyOffset::INVALID);
+                assert_eq!(hit.planned_new_structure, None);
+            }
+            GeneratedPropertyStoreProbeResult::Miss(_) => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn generated_property_store_probe_misses_indexed_store_without_mutation_for_holes_and_bounds() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        let original_value = RuntimeValue::from_i32(42);
+        let stored_value = RuntimeValue::from_i32(99);
+        host.objects
+            .put_array_element(array, 0, original_value)
+            .unwrap();
+        let plan =
+            generated_property_store_indexed_plan(object_structure_id(&host.objects, array), 1);
+        let snapshot = object_store_mutation_snapshot(&host.objects, array);
+
+        assert_eq!(
+            store_probe_miss_reason(host.probe_generated_property_store(
+                generated_property_store_probe_request(&plan, array, stored_value)
+            )),
+            GeneratedPropertyStoreProbeMissReason::ExistingPropertyMismatch
+        );
+        assert_eq!(
+            snapshot,
+            object_store_mutation_snapshot(&host.objects, array)
+        );
+
+        host.objects
+            .find_mut(array)
+            .expect("array")
+            .elements
+            .resize(2, None);
+        let hole_snapshot = object_store_mutation_snapshot(&host.objects, array);
+        assert_eq!(
+            store_probe_miss_reason(host.probe_generated_property_store(
+                generated_property_store_probe_request(&plan, array, stored_value)
+            )),
+            GeneratedPropertyStoreProbeMissReason::ExistingPropertyMismatch
+        );
+        assert_eq!(
+            hole_snapshot,
+            object_store_mutation_snapshot(&host.objects, array)
+        );
     }
 
     #[test]
@@ -24541,6 +31070,50 @@ mod tests {
         assert_single_value_store_barrier(
             &heap,
             host.objects.cell_id(object).expect("owner cell"),
+            Some(host.objects.cell_id(stored_value).expect("target cell")),
+            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+        );
+    }
+
+    #[test]
+    fn generated_property_store_mutation_indexed_store_commits_existing_element_with_one_barrier() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let array = host.objects.allocate_array();
+        let original_value = RuntimeValue::from_i32(42);
+        host.objects
+            .put_array_element(array, 0, original_value)
+            .unwrap();
+        let stored_value = host.objects.allocate_with_prototype(None);
+        let plan =
+            generated_property_store_indexed_plan(object_structure_id(&host.objects, array), 0);
+        let hit = store_probe_hit(host.probe_generated_property_store(
+            generated_property_store_probe_request(&plan, array, stored_value),
+        ));
+        let request = GeneratedPropertyStoreMutationRequest::new(array, hit);
+        let before = object_store_mutation_snapshot(&host.objects, array);
+
+        let commit =
+            store_mutation_commit(host.commit_generated_property_store(&mut heap, request));
+
+        assert_eq!(
+            commit,
+            GeneratedPropertyStoreMutationCommit::host_confirmed_for_request(&request)
+        );
+        let mut expected = before.clone();
+        expected.elements[0] = Some(stored_value);
+        assert_eq!(
+            expected,
+            object_store_mutation_snapshot(&host.objects, array)
+        );
+        assert_eq!(host.objects.get_index(array, 0), Ok(stored_value));
+        assert_eq!(
+            host.objects.find(array).expect("array").elements.len(),
+            before.elements.len()
+        );
+        assert_single_value_store_barrier(
+            &heap,
+            host.objects.cell_id(array).expect("owner cell"),
             Some(host.objects.cell_id(stored_value).expect("target cell")),
             BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
         );
@@ -25865,6 +32438,91 @@ mod tests {
     }
 
     #[test]
+    fn core_string_store_ascii_substring_shares_base_text_without_interning_copy() {
+        let mut strings = CoreStringStore::default();
+        let mut heap = Heap::new();
+        let base_text = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let base = strings.allocate_with_heap(&mut heap, base_text).unwrap();
+
+        let substring = strings
+            .allocate_substring_with_heap(&mut heap, base, 5, 45)
+            .unwrap();
+
+        assert_eq!(strings.text(substring), Some(&base_text[5..45]));
+        let substring_index = strings.index_for_value(substring).unwrap();
+        assert!(matches!(
+            strings.strings[substring_index].as_ref().get_ref().text,
+            CoreStringCellText::Substring {
+                base: 0,
+                start_byte: 5,
+                end_byte: 45,
+            }
+        ));
+        assert!(!strings.by_text.contains_key(&base_text[5..45]));
+
+        let flat = strings
+            .allocate_with_heap(&mut heap, &base_text[5..45])
+            .unwrap();
+        assert_eq!(strings.strict_equals(substring, flat), Some(true));
+
+        let nested = strings
+            .allocate_substring_with_heap(&mut heap, substring, 3, 37)
+            .unwrap();
+        assert_eq!(strings.text(nested), Some(&base_text[8..42]));
+        let nested_index = strings.index_for_value(nested).unwrap();
+        assert!(matches!(
+            strings.strings[nested_index].as_ref().get_ref().text,
+            CoreStringCellText::Substring {
+                base: 0,
+                start_byte: 8,
+                end_byte: 42,
+            }
+        ));
+    }
+
+    #[test]
+    fn core_string_store_tiny_ascii_substring_copies_like_jsc_small_strings() {
+        let mut strings = CoreStringStore::default();
+        let mut heap = Heap::new();
+        let base = strings
+            .allocate_with_heap(&mut heap, "compiler_input")
+            .unwrap();
+
+        let substring = strings
+            .allocate_substring_with_heap(&mut heap, base, 0, 8)
+            .unwrap();
+
+        assert_eq!(strings.text(substring), Some("compiler"));
+        let substring_index = strings.index_for_value(substring).unwrap();
+        assert!(matches!(
+            strings.strings[substring_index].as_ref().get_ref().text,
+            CoreStringCellText::Flat(_),
+        ));
+        assert!(strings.by_text.contains_key("compiler"));
+    }
+
+    #[test]
+    fn core_string_store_substring_falls_back_for_utf16_boundary_text() {
+        let mut strings = CoreStringStore::default();
+        let mut heap = Heap::new();
+        let base = strings
+            .allocate_with_heap(&mut heap, "a\u{1f600}b")
+            .unwrap();
+
+        let substring = strings
+            .allocate_substring_with_heap(&mut heap, base, 1, 3)
+            .unwrap();
+
+        assert_eq!(strings.text(substring), Some("\u{1f600}"));
+        let substring_index = strings.index_for_value(substring).unwrap();
+        assert!(matches!(
+            strings.strings[substring_index].as_ref().get_ref().text,
+            CoreStringCellText::Flat(_),
+        ));
+        assert!(strings.by_text.contains_key("\u{1f600}"));
+    }
+
+    #[test]
     fn core_object_store_binds_fresh_object_to_heap_on_demand() {
         let mut objects = CoreObjectStore::default();
         let mut heap = Heap::new();
@@ -26414,6 +33072,74 @@ mod tests {
         assert_eq!(registers.register_count(), 0);
         let exit = stack.leave(entry).unwrap();
         assert_eq!(exit.kind, ExecutionEntryKind::Eval);
+    }
+
+    #[test]
+    fn execution_root_snapshot_uses_stack_reachable_register_windows() {
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let heap = Heap::new();
+        let code_block_id = CodeBlockId(CellId(8));
+        stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+            code_block: code_block_id,
+            global_object: GlobalObjectId(ObjectId(CellId(1))),
+            this_value: RuntimeValue::undefined(),
+        }));
+        let frame = stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(code_block_id),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: RegisterFrameShape {
+                        num_parameters_including_this: 1,
+                        num_vars: 1,
+                        num_callee_locals: 0,
+                        num_temporaries: 0,
+                        special: Default::default(),
+                    },
+                    argument_count_including_this: 1,
+                    argument_values: vec![RuntimeValue::from_i32(42)],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let live_window = stack.frame(frame).unwrap().register_window;
+        registers.windows.push(live_window);
+
+        assert_eq!(
+            registers
+                .root_descriptors(heap.id())
+                .iter()
+                .filter(|descriptor| descriptor.root.id == register_root_id(live_window.base))
+                .count(),
+            2
+        );
+
+        let snapshot = stack.root_snapshot(heap.id(), &registers).unwrap();
+        assert_eq!(
+            snapshot
+                .register_roots
+                .iter()
+                .filter(|descriptor| descriptor.root.id == register_root_id(live_window.base))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn dynamic_frame_and_register_roots_use_reserved_high_namespaces() {
+        let frame_root = frame_root_id(CallFrameId(250_000), FrameRootSource::CodeBlock);
+        let global_root = crate::vm::global_root_id(GlobalObjectId(ObjectId(CellId(1))));
+        assert_ne!(frame_root, global_root);
+        assert!(frame_root.0 >= FRAME_ROOT_ID_BASE);
+
+        let register_root = register_root_id(3_000_000);
+        assert_ne!(register_root, global_root);
+        assert!(register_root.0 >= REGISTER_ROOT_ID_BASE);
     }
 
     #[test]
@@ -27735,6 +34461,132 @@ mod tests {
         );
         let mut active_roots = Vec::new();
         sync_targeted_frame_roots(frame, &stack, &registers, &mut heap, &mut active_roots).unwrap();
+        assert!(active_roots.is_empty());
+        assert!(heap.targeted_roots().records().is_empty());
+    }
+
+    #[test]
+    fn targeted_frame_root_sync_filters_before_register_root_validation() {
+        let block = code_block_with_frame(
+            vec![typed(0)],
+            RegisterFrameShape {
+                num_parameters_including_this: 1,
+                num_vars: 0,
+                num_callee_locals: 0,
+                num_temporaries: 0,
+                special: Default::default(),
+            },
+        );
+        let code_block_id = CodeBlockId(CellId(44));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut heap = Heap::new();
+        stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+            code_block: code_block_id,
+            global_object: GlobalObjectId(ObjectId(CellId(1_000))),
+            this_value: RuntimeValue::undefined(),
+        }));
+        let frame = stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(code_block_id),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: vec![RuntimeValue::from_i32(7)],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let mut duplicate = stack.frame(frame).unwrap().clone();
+        duplicate.id = CallFrameId(99);
+        duplicate.caller = Some(frame);
+        stack.frames.push(duplicate);
+
+        assert_eq!(
+            stack.root_snapshot_for_heap(&heap, &registers),
+            Err(RootSetSemanticError::DuplicateRoot(register_root_id(0)))
+        );
+
+        let mut active_roots = Vec::new();
+        sync_targeted_frame_roots(frame, &stack, &registers, &mut heap, &mut active_roots).unwrap();
+        assert!(active_roots.is_empty());
+        assert!(heap.targeted_roots().records().is_empty());
+    }
+
+    #[test]
+    fn targeted_register_root_sync_filters_owner_before_root_validation() {
+        let block = code_block_with_frame(
+            vec![typed(0)],
+            RegisterFrameShape {
+                num_parameters_including_this: 1,
+                num_vars: 0,
+                num_callee_locals: 0,
+                num_temporaries: 0,
+                special: Default::default(),
+            },
+        );
+        let code_block_id = CodeBlockId(CellId(45));
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut heap = Heap::new();
+        let object = host.objects.allocate();
+        stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+            code_block: code_block_id,
+            global_object: GlobalObjectId(ObjectId(CellId(1_000))),
+            this_value: RuntimeValue::undefined(),
+        }));
+        let frame = stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(code_block_id),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: vec![object],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let mut duplicate = stack.frame(frame).unwrap().clone();
+        duplicate.id = CallFrameId(99);
+        duplicate.caller = Some(frame);
+        stack.frames.push(duplicate);
+
+        assert_eq!(
+            stack.root_snapshot_for_heap(&heap, &registers),
+            Err(RootSetSemanticError::DuplicateRoot(register_root_id(0)))
+        );
+
+        let mut active_roots = Vec::new();
+        sync_targeted_register_roots(
+            frame,
+            &stack,
+            &registers,
+            &mut heap,
+            &mut host,
+            &mut active_roots,
+        )
+        .unwrap();
+        assert_eq!(
+            active_roots,
+            vec![RootRecord {
+                id: register_root_id(0),
+                kind: RootKind::VMRegister,
+                heap: heap.id(),
+            }]
+        );
+        assert_eq!(heap.targeted_roots().records().len(), 1);
+        cleanup_targeted_vm_roots(&mut heap, &mut active_roots).unwrap();
         assert!(active_roots.is_empty());
         assert!(heap.targeted_roots().records().is_empty());
     }

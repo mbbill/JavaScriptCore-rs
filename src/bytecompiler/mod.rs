@@ -20,9 +20,9 @@ use crate::syntax::ast::{
     ArrayLiteralElement, AssignmentExpr, AssignmentOperator, AstPropertyKey, BinaryExpr,
     BinaryOperator as AstBinaryOperator, CallExpr, ClassElementKind, ClassElementName, ClassExpr,
     ConditionalExpr, ControlKind, DeclarationStmt, DeclarationSyntaxKind, DoWhileStmt, Expr,
-    ForInit, ForOfBinding, FunctionMetadata, FunctionSyntaxMode, LiteralKind, MemberExpr,
-    MemberKind, NameKind, NewExpr, NumberLiteralValue, ObjectLiteralPropertyKind, Pattern, Stmt,
-    SwitchStmt, TemplateExpr, UnaryExpr, UnaryOperator as AstUnaryOperator,
+    ForInBinding, ForInit, ForOfBinding, FunctionMetadata, FunctionSyntaxMode, LiteralKind,
+    MemberExpr, MemberKind, NameKind, NewExpr, NumberLiteralValue, ObjectLiteralPropertyKind,
+    Pattern, Stmt, SwitchStmt, TemplateExpr, UnaryExpr, UnaryOperator as AstUnaryOperator,
 };
 use crate::syntax::{
     AstRef, AstRoot, CodeFeatures, EnvironmentSemanticRecord, ModuleAnalysis,
@@ -214,6 +214,7 @@ pub const STANDARD_GLOBAL_BINDING_NAMES: &[&str] = &[
     "Boolean",
     "Error",
     "TypeError",
+    "ReferenceError",
     "Map",
     "Set",
     "WeakMap",
@@ -879,6 +880,7 @@ pub fn emit_unlinked_code_from_parsed_ast(
         derived_constructor_metadata: function_plan.derived_constructors.clone(),
         loop_stack: Vec::new(),
         break_stack: Vec::new(),
+        named_label_stack: Vec::new(),
         finally_stack: Vec::new(),
     };
     let mut function_bodies = Vec::with_capacity(function_plan.metadata_order.len());
@@ -1163,6 +1165,10 @@ fn collect_statement_function_metadata(
             }
             collect_statement_function_metadata(arena, statement.body, plan)
         }
+        Stmt::ForIn(statement) => {
+            collect_expression_function_metadata(arena, statement.object, plan)?;
+            collect_statement_function_metadata(arena, statement.body, plan)
+        }
         Stmt::ForOf(statement) => {
             collect_expression_function_metadata(arena, statement.iterable, plan)?;
             collect_statement_function_metadata(arena, statement.body, plan)
@@ -1177,6 +1183,7 @@ fn collect_statement_function_metadata(
             }
             Ok(())
         }
+        Stmt::Label(label) => collect_statement_function_metadata(arena, label.body, plan),
         Stmt::Control(control) => match control.kind {
             ControlKind::Return(Some(value)) => {
                 collect_expression_function_metadata(arena, value, plan)
@@ -1206,6 +1213,12 @@ fn collect_expression_function_metadata(
         Expr::Assignment(assignment) => {
             collect_pattern_function_metadata(arena, assignment.target, plan)?;
             collect_expression_function_metadata(arena, assignment.value, plan)
+        }
+        Expr::Sequence(sequence) => {
+            for expression in &sequence.expressions {
+                collect_expression_function_metadata(arena, *expression, plan)?;
+            }
+            Ok(())
         }
         Expr::Conditional(conditional) => {
             collect_expression_function_metadata(arena, conditional.test, plan)?;
@@ -1510,6 +1523,10 @@ fn collect_statement_immediate_function_metadata(
             }
             collect_statement_immediate_function_metadata(arena, statement.body, functions)
         }
+        Stmt::ForIn(statement) => {
+            collect_expression_immediate_function_metadata(arena, statement.object, functions)?;
+            collect_statement_immediate_function_metadata(arena, statement.body, functions)
+        }
         Stmt::ForOf(statement) => {
             collect_expression_immediate_function_metadata(arena, statement.iterable, functions)?;
             collect_statement_immediate_function_metadata(arena, statement.body, functions)
@@ -1523,6 +1540,9 @@ fn collect_statement_immediate_function_metadata(
                 collect_statement_immediate_function_metadata(arena, finally, functions)?;
             }
             Ok(())
+        }
+        Stmt::Label(label) => {
+            collect_statement_immediate_function_metadata(arena, label.body, functions)
         }
         Stmt::Control(control) => match control.kind {
             ControlKind::Return(Some(value)) | ControlKind::Throw(value) => {
@@ -1553,6 +1573,12 @@ fn collect_expression_immediate_function_metadata(
         Expr::Assignment(assignment) => {
             collect_pattern_immediate_function_metadata(arena, assignment.target, functions)?;
             collect_expression_immediate_function_metadata(arena, assignment.value, functions)
+        }
+        Expr::Sequence(sequence) => {
+            for expression in &sequence.expressions {
+                collect_expression_immediate_function_metadata(arena, *expression, functions)?;
+            }
+            Ok(())
         }
         Expr::Conditional(conditional) => {
             collect_expression_immediate_function_metadata(arena, conditional.test, functions)?;
@@ -1828,6 +1854,12 @@ fn collect_statement_local_names(
             }
             collect_statement_local_names(arena, statement.body, locals)
         }
+        Stmt::ForIn(statement) => {
+            if let ForInBinding::Declaration { name, .. } = statement.binding {
+                locals.insert(name);
+            }
+            collect_statement_local_names(arena, statement.body, locals)
+        }
         Stmt::ForOf(statement) => {
             if let ForOfBinding::Declaration { name, .. } = statement.binding {
                 locals.insert(name);
@@ -1847,6 +1879,7 @@ fn collect_statement_local_names(
             }
             Ok(())
         }
+        Stmt::Label(label) => collect_statement_local_names(arena, label.body, locals),
         Stmt::Empty(_) | Stmt::Expression(_) | Stmt::Control(_) | Stmt::Module(_) => Ok(()),
     }
 }
@@ -1980,6 +2013,13 @@ fn collect_statement_referenced_names(
             }
             collect_statement_referenced_names(arena, statement.body, references)
         }
+        Stmt::ForIn(statement) => {
+            if let ForInBinding::Assignment(name) = statement.binding {
+                references.push(name);
+            }
+            collect_expression_referenced_names(arena, statement.object, references)?;
+            collect_statement_referenced_names(arena, statement.body, references)
+        }
         Stmt::ForOf(statement) => {
             if let ForOfBinding::Assignment(name) = statement.binding {
                 references.push(name);
@@ -1997,6 +2037,7 @@ fn collect_statement_referenced_names(
             }
             Ok(())
         }
+        Stmt::Label(label) => collect_statement_referenced_names(arena, label.body, references),
         Stmt::Control(control) => match control.kind {
             ControlKind::Return(Some(value)) => {
                 collect_expression_referenced_names(arena, value, references)
@@ -2034,6 +2075,12 @@ fn collect_expression_referenced_names(
         Expr::Assignment(assignment) => {
             collect_pattern_referenced_names(arena, assignment.target, references)?;
             collect_expression_referenced_names(arena, assignment.value, references)
+        }
+        Expr::Sequence(sequence) => {
+            for expression in &sequence.expressions {
+                collect_expression_referenced_names(arena, *expression, references)?;
+            }
+            Ok(())
         }
         Expr::Conditional(conditional) => {
             collect_expression_referenced_names(arena, conditional.test, references)?;
@@ -2251,6 +2298,10 @@ fn collect_statement_string_literals(
             }
             collect_statement_string_literals(arena, statement.body, table)
         }
+        Stmt::ForIn(statement) => {
+            collect_expression_string_literals(arena, statement.object, table)?;
+            collect_statement_string_literals(arena, statement.body, table)
+        }
         Stmt::ForOf(statement) => {
             collect_expression_string_literals(arena, statement.iterable, table)?;
             collect_statement_string_literals(arena, statement.body, table)
@@ -2265,6 +2316,7 @@ fn collect_statement_string_literals(
             }
             Ok(())
         }
+        Stmt::Label(label) => collect_statement_string_literals(arena, label.body, table),
         Stmt::Control(control) => match control.kind {
             ControlKind::Return(Some(value)) => {
                 collect_expression_string_literals(arena, value, table)
@@ -2326,6 +2378,12 @@ fn collect_expression_string_literals(
         Expr::Assignment(assignment) => {
             collect_pattern_string_literals(arena, assignment.target, table)?;
             collect_expression_string_literals(arena, assignment.value, table)
+        }
+        Expr::Sequence(sequence) => {
+            for expression in &sequence.expressions {
+                collect_expression_string_literals(arena, *expression, table)?;
+            }
+            Ok(())
         }
         Expr::Conditional(conditional) => {
             collect_expression_string_literals(arena, conditional.test, table)?;
@@ -2645,6 +2703,7 @@ struct AstBytecodeEmitter<'a, 'g> {
     derived_constructor_metadata: HashSet<u32>,
     loop_stack: Vec<LoopControlLabels>,
     break_stack: Vec<BreakControlLabels>,
+    named_label_stack: Vec<NamedControlLabels>,
     finally_stack: Vec<ActiveFinallyContext>,
 }
 
@@ -2688,6 +2747,14 @@ struct LoopControlLabels {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BreakControlLabels {
     break_target: LabelRef,
+    finally_stack_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NamedControlLabels {
+    name: ParserIdentifier,
+    break_target: LabelRef,
+    continue_target: Option<LabelRef>,
     finally_stack_depth: usize,
 }
 
@@ -2889,6 +2956,7 @@ impl AstBytecodeEmitter<'_, '_> {
             derived_constructor_metadata: self.derived_constructor_metadata.clone(),
             loop_stack: Vec::new(),
             break_stack: Vec::new(),
+            named_label_stack: Vec::new(),
             finally_stack: Vec::new(),
         };
         if is_derived_constructor {
@@ -2945,7 +3013,7 @@ impl AstBytecodeEmitter<'_, '_> {
             }
         }
         if let Some(name) = metadata.name {
-            child.emit_function_binding(name, metadata_ref)?;
+            child.emit_current_function_name_binding(name)?;
         }
         child.emit_scope_function_bindings(&scope)?;
         let mut terminated = false;
@@ -3008,8 +3076,10 @@ impl AstBytecodeEmitter<'_, '_> {
                 Stmt::DoWhile(statement) => self.predeclare_statement_locals(statement.body)?,
                 Stmt::Switch(statement) => self.predeclare_switch_locals(&statement)?,
                 Stmt::For(statement) => self.predeclare_for_locals(&statement)?,
+                Stmt::ForIn(statement) => self.predeclare_for_in_locals(&statement)?,
                 Stmt::ForOf(statement) => self.predeclare_for_of_locals(&statement)?,
                 Stmt::Try(statement) => self.predeclare_try_locals(&statement)?,
+                Stmt::Label(label) => self.predeclare_statement_locals(label.body)?,
                 Stmt::FunctionDeclaration(declaration) => {
                     self.predeclare_function_binding(declaration.name)?
                 }
@@ -3047,8 +3117,10 @@ impl AstBytecodeEmitter<'_, '_> {
                 Stmt::DoWhile(statement) => self.predeclare_statement_locals(statement.body)?,
                 Stmt::Switch(statement) => self.predeclare_switch_locals(&statement)?,
                 Stmt::For(statement) => self.predeclare_for_locals(&statement)?,
+                Stmt::ForIn(statement) => self.predeclare_for_in_locals(&statement)?,
                 Stmt::ForOf(statement) => self.predeclare_for_of_locals(&statement)?,
                 Stmt::Try(statement) => self.predeclare_try_locals(&statement)?,
+                Stmt::Label(label) => self.predeclare_statement_locals(label.body)?,
                 Stmt::FunctionDeclaration(declaration) => {
                     self.predeclare_function_binding(declaration.name)?
                 }
@@ -3107,8 +3179,10 @@ impl AstBytecodeEmitter<'_, '_> {
             Stmt::DoWhile(statement) => self.predeclare_statement_locals(statement.body),
             Stmt::Switch(statement) => self.predeclare_switch_locals(&statement),
             Stmt::For(statement) => self.predeclare_for_locals(&statement),
+            Stmt::ForIn(statement) => self.predeclare_for_in_locals(&statement),
             Stmt::ForOf(statement) => self.predeclare_for_of_locals(&statement),
             Stmt::Try(statement) => self.predeclare_try_locals(&statement),
+            Stmt::Label(label) => self.predeclare_statement_locals(label.body),
             Stmt::FunctionDeclaration(declaration) => {
                 self.predeclare_function_binding(declaration.name)
             }
@@ -3134,6 +3208,16 @@ impl AstBytecodeEmitter<'_, '_> {
     ) -> Result<(), BytecompilerEmissionError> {
         if let Some(ForInit::Declaration(declaration)) = &statement.init {
             self.predeclare_declaration(declaration)?;
+        }
+        self.predeclare_statement_locals(statement.body)
+    }
+
+    fn predeclare_for_in_locals(
+        &mut self,
+        statement: &crate::syntax::ast::ForInStmt,
+    ) -> Result<(), BytecompilerEmissionError> {
+        if let ForInBinding::Declaration { name, .. } = statement.binding {
+            self.predeclare_function_binding(name)?;
         }
         self.predeclare_statement_locals(statement.body)
     }
@@ -3321,6 +3405,10 @@ impl AstBytecodeEmitter<'_, '_> {
             ("Boolean", Self::emit_load_boolean_constructor),
             ("Error", Self::emit_load_error_constructor),
             ("TypeError", Self::emit_load_type_error_constructor),
+            (
+                "ReferenceError",
+                Self::emit_load_reference_error_constructor,
+            ),
             ("Map", Self::emit_load_map_constructor),
             ("Set", Self::emit_load_set_constructor),
             ("WeakMap", Self::emit_load_weak_map_constructor),
@@ -3468,15 +3556,32 @@ impl AstBytecodeEmitter<'_, '_> {
         Ok(())
     }
 
+    fn emit_current_function_name_binding(
+        &mut self,
+        name: ParserIdentifier,
+    ) -> Result<(), BytecompilerEmissionError> {
+        let target = *self
+            .locals
+            .get(&name)
+            .ok_or(BytecompilerEmissionError::UnboundIdentifier(name))?;
+        let value = self.emit_load_callee();
+        self.emit_write_named_binding(name, target, value);
+        Ok(())
+    }
+
     fn emit_declaration(
         &mut self,
         declaration: &DeclarationStmt,
     ) -> Result<(), BytecompilerEmissionError> {
         for (index, binding) in declaration.bindings.iter().enumerate() {
-            let value = match declaration.initializers.get(index).copied().flatten() {
-                Some(initializer) => self.emit_expression(initializer)?,
-                None => self.emit_load_undefined()?,
-            };
+            let value =
+                if let Some(initializer) = declaration.initializers.get(index).copied().flatten() {
+                    self.emit_expression(initializer)?
+                } else if declaration.kind == DeclarationSyntaxKind::Var {
+                    continue;
+                } else {
+                    self.emit_load_undefined()?
+                };
             self.emit_pattern_declaration_binding(*binding, value)?;
         }
         Ok(())
@@ -3756,44 +3861,14 @@ impl AstBytecodeEmitter<'_, '_> {
                         && alternate.terminated,
                 })
             }
-            Stmt::While(statement) => {
-                let continue_target = self.declare_label(Some("while_continue"));
-                let break_target = self.declare_label(Some("while_break"));
-                self.bind_label(continue_target)?;
-                let condition = self.emit_expression(statement.condition)?;
-                self.emit_jump_if_false(condition, break_target);
-                let break_labels = BreakControlLabels {
-                    break_target,
-                    finally_stack_depth: self.finally_stack.len(),
-                };
-                self.loop_stack.push(LoopControlLabels {
-                    break_target,
-                    continue_target,
-                    finally_stack_depth: break_labels.finally_stack_depth,
-                });
-                self.break_stack.push(break_labels);
-                let body = self.emit_statement(statement.body)?;
-                let Some(labels) = self.loop_stack.pop() else {
-                    return Err(BytecompilerEmissionError::UnsupportedStatement(
-                        "loop control stack underflow",
-                    ));
-                };
-                let Some(_) = self.break_stack.pop() else {
-                    return Err(BytecompilerEmissionError::UnsupportedStatement(
-                        "break control stack underflow",
-                    ));
-                };
-                if !body.terminated {
-                    self.emit_jump(labels.continue_target);
-                }
-                self.bind_label(labels.break_target)?;
-                Ok(StatementEmission::default())
-            }
+            Stmt::While(statement) => self.emit_while_statement(&statement),
             Stmt::Switch(statement) => self.emit_switch_statement(&statement),
             Stmt::For(statement) => self.emit_for_statement(&statement),
+            Stmt::ForIn(statement) => self.emit_for_in_statement(&statement),
             Stmt::ForOf(statement) => self.emit_for_of_statement(&statement),
             Stmt::DoWhile(statement) => self.emit_do_while_statement(&statement),
             Stmt::Try(statement) => self.emit_try_statement(&statement),
+            Stmt::Label(label) => self.emit_label_statement(&label),
             Stmt::Control(control) => match control.kind {
                 ControlKind::Return(value) => {
                     let value = match value {
@@ -3809,29 +3884,37 @@ impl AstBytecodeEmitter<'_, '_> {
                     Ok(StatementEmission::terminated(Some(value)))
                 }
                 ControlKind::Break(label) => {
-                    if label.is_some() {
-                        return Err(BytecompilerEmissionError::UnsupportedStatement(
-                            "named break statements need label-scope resolution",
-                        ));
-                    }
-                    let Some(labels) = self.break_stack.last().copied() else {
-                        return Err(BytecompilerEmissionError::UnsupportedStatement(
-                            "break statement outside breakable statement",
-                        ));
+                    let labels = if let Some(label) = label {
+                        self.named_break_labels(label).ok_or(
+                            BytecompilerEmissionError::UnsupportedStatement(
+                                "break statement references an unknown label",
+                            ),
+                        )?
+                    } else {
+                        let Some(labels) = self.break_stack.last().copied() else {
+                            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                                "break statement outside breakable statement",
+                            ));
+                        };
+                        labels
                     };
                     self.emit_break_completion(labels)?;
                     Ok(StatementEmission::terminated(None))
                 }
                 ControlKind::Continue(label) => {
-                    if label.is_some() {
-                        return Err(BytecompilerEmissionError::UnsupportedStatement(
-                            "named continue statements need label-scope resolution",
-                        ));
-                    }
-                    let Some(labels) = self.loop_stack.last().copied() else {
-                        return Err(BytecompilerEmissionError::UnsupportedStatement(
-                            "continue statement outside loop",
-                        ));
+                    let labels = if let Some(label) = label {
+                        self.named_continue_labels(label).ok_or(
+                            BytecompilerEmissionError::UnsupportedStatement(
+                                "continue statement references a non-loop label",
+                            ),
+                        )?
+                    } else {
+                        let Some(labels) = self.loop_stack.last().copied() else {
+                            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                                "continue statement outside loop",
+                            ));
+                        };
+                        labels
                     };
                     self.emit_continue_completion(labels)?;
                     Ok(StatementEmission::terminated(None))
@@ -3846,6 +3929,105 @@ impl AstBytecodeEmitter<'_, '_> {
     fn emit_for_statement(
         &mut self,
         statement: &crate::syntax::ast::ForStmt,
+    ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        self.emit_for_statement_with_label(statement, None)
+    }
+
+    fn emit_label_statement(
+        &mut self,
+        label: &crate::syntax::ast::LabelStmt,
+    ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        let Some(statement) = self.arena.statement(label.body).cloned() else {
+            return Err(BytecompilerEmissionError::MissingStatement);
+        };
+        match statement {
+            Stmt::While(statement) => {
+                self.emit_while_statement_with_label(&statement, Some(label.label))
+            }
+            Stmt::DoWhile(statement) => {
+                self.emit_do_while_statement_with_label(&statement, Some(label.label))
+            }
+            Stmt::For(statement) => {
+                self.emit_for_statement_with_label(&statement, Some(label.label))
+            }
+            Stmt::ForIn(statement) => {
+                self.emit_for_in_statement_with_label(&statement, Some(label.label))
+            }
+            Stmt::ForOf(statement) => {
+                self.emit_for_of_statement_with_label(&statement, Some(label.label))
+            }
+            _ => {
+                let break_target = self.declare_label(Some("label_break"));
+                self.named_label_stack.push(NamedControlLabels {
+                    name: label.label,
+                    break_target,
+                    continue_target: None,
+                    finally_stack_depth: self.finally_stack.len(),
+                });
+                let _body = self.emit_statement(label.body)?;
+                self.pop_named_label(label.label)?;
+                self.bind_label(break_target)?;
+                Ok(StatementEmission::default())
+            }
+        }
+    }
+
+    fn emit_while_statement(
+        &mut self,
+        statement: &crate::syntax::ast::WhileStmt,
+    ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        self.emit_while_statement_with_label(statement, None)
+    }
+
+    fn emit_while_statement_with_label(
+        &mut self,
+        statement: &crate::syntax::ast::WhileStmt,
+        named_label: Option<ParserIdentifier>,
+    ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        let continue_target = self.declare_label(Some("while_continue"));
+        let break_target = self.declare_label(Some("while_break"));
+        self.bind_label(continue_target)?;
+        let condition = self.emit_expression(statement.condition)?;
+        self.emit_jump_if_false(condition, break_target);
+        let break_labels = BreakControlLabels {
+            break_target,
+            finally_stack_depth: self.finally_stack.len(),
+        };
+        let loop_labels = LoopControlLabels {
+            break_target,
+            continue_target,
+            finally_stack_depth: break_labels.finally_stack_depth,
+        };
+        if let Some(name) = named_label {
+            self.push_named_loop_label(name, loop_labels);
+        }
+        self.loop_stack.push(loop_labels);
+        self.break_stack.push(break_labels);
+        let body = self.emit_statement(statement.body)?;
+        let Some(labels) = self.loop_stack.pop() else {
+            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                "loop control stack underflow",
+            ));
+        };
+        let Some(_) = self.break_stack.pop() else {
+            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                "break control stack underflow",
+            ));
+        };
+        if let Some(name) = named_label {
+            self.pop_named_label(name)?;
+        }
+        if !body.terminated {
+            self.emit_jump(labels.continue_target);
+        }
+        self.bind_label(labels.break_target)?;
+        Ok(StatementEmission::default())
+    }
+
+    fn emit_for_statement_with_label(
+        &mut self,
+        statement: &crate::syntax::ast::ForStmt,
+        named_label: Option<ParserIdentifier>,
     ) -> Result<StatementEmission, BytecompilerEmissionError> {
         if let Some(init) = &statement.init {
             match init {
@@ -3867,11 +4049,15 @@ impl AstBytecodeEmitter<'_, '_> {
             break_target,
             finally_stack_depth: self.finally_stack.len(),
         };
-        self.loop_stack.push(LoopControlLabels {
+        let loop_labels = LoopControlLabels {
             break_target,
             continue_target,
             finally_stack_depth: break_labels.finally_stack_depth,
-        });
+        };
+        if let Some(name) = named_label {
+            self.push_named_loop_label(name, loop_labels);
+        }
+        self.loop_stack.push(loop_labels);
         self.break_stack.push(break_labels);
         let body = self.emit_statement(statement.body)?;
         let Some(labels) = self.loop_stack.pop() else {
@@ -3884,6 +4070,9 @@ impl AstBytecodeEmitter<'_, '_> {
                 "break control stack underflow",
             ));
         };
+        if let Some(name) = named_label {
+            self.pop_named_label(name)?;
+        }
         self.bind_label(labels.continue_target)?;
         if let Some(update) = statement.update {
             self.emit_expression(update)?;
@@ -3959,6 +4148,14 @@ impl AstBytecodeEmitter<'_, '_> {
         &mut self,
         statement: &DoWhileStmt,
     ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        self.emit_do_while_statement_with_label(statement, None)
+    }
+
+    fn emit_do_while_statement_with_label(
+        &mut self,
+        statement: &DoWhileStmt,
+        named_label: Option<ParserIdentifier>,
+    ) -> Result<StatementEmission, BytecompilerEmissionError> {
         let loop_start = self.declare_label(Some("do_while_start"));
         let continue_target = self.declare_label(Some("do_while_continue"));
         let break_target = self.declare_label(Some("do_while_break"));
@@ -3967,11 +4164,15 @@ impl AstBytecodeEmitter<'_, '_> {
             break_target,
             finally_stack_depth: self.finally_stack.len(),
         };
-        self.loop_stack.push(LoopControlLabels {
+        let loop_labels = LoopControlLabels {
             break_target,
             continue_target,
             finally_stack_depth: break_labels.finally_stack_depth,
-        });
+        };
+        if let Some(name) = named_label {
+            self.push_named_loop_label(name, loop_labels);
+        }
+        self.loop_stack.push(loop_labels);
         self.break_stack.push(break_labels);
         let body = self.emit_statement(statement.body)?;
         let Some(labels) = self.loop_stack.pop() else {
@@ -3984,6 +4185,9 @@ impl AstBytecodeEmitter<'_, '_> {
                 "break control stack underflow",
             ));
         };
+        if let Some(name) = named_label {
+            self.pop_named_label(name)?;
+        }
         self.bind_label(labels.continue_target)?;
         let condition = self.emit_expression(statement.condition)?;
         let condition_false = self.declare_label(Some("do_while_condition_false"));
@@ -3997,9 +4201,80 @@ impl AstBytecodeEmitter<'_, '_> {
         Ok(StatementEmission::default())
     }
 
+    fn emit_for_in_statement(
+        &mut self,
+        statement: &crate::syntax::ast::ForInStmt,
+    ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        self.emit_for_in_statement_with_label(statement, None)
+    }
+
+    fn emit_for_in_statement_with_label(
+        &mut self,
+        statement: &crate::syntax::ast::ForInStmt,
+        named_label: Option<ParserIdentifier>,
+    ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        let object = self.emit_expression(statement.object)?;
+        let keys = self.emit_for_in_keys(object);
+        let index = self.emit_load_int32(0)?;
+        let one = self.emit_load_int32(1)?;
+        let loop_start = self.declare_label(Some("for_in_start"));
+        let continue_target = self.declare_label(Some("for_in_continue"));
+        let break_target = self.declare_label(Some("for_in_break"));
+        self.bind_label(loop_start)?;
+        let length = self.emit_array_length(keys)?;
+        let condition = self.emit_binary_opcode(CoreOpcode::LessThanInt32, index, length)?;
+        self.emit_jump_if_false(condition, break_target);
+        let value = self.emit_get_by_index(keys, index)?;
+        self.emit_write_for_in_binding(statement.binding, value)?;
+        let break_labels = BreakControlLabels {
+            break_target,
+            finally_stack_depth: self.finally_stack.len(),
+        };
+        let loop_labels = LoopControlLabels {
+            break_target,
+            continue_target,
+            finally_stack_depth: break_labels.finally_stack_depth,
+        };
+        if let Some(name) = named_label {
+            self.push_named_loop_label(name, loop_labels);
+        }
+        self.loop_stack.push(loop_labels);
+        self.break_stack.push(break_labels);
+        let body = self.emit_statement(statement.body)?;
+        let Some(labels) = self.loop_stack.pop() else {
+            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                "loop control stack underflow",
+            ));
+        };
+        let Some(_) = self.break_stack.pop() else {
+            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                "break control stack underflow",
+            ));
+        };
+        if let Some(name) = named_label {
+            self.pop_named_label(name)?;
+        }
+        self.bind_label(labels.continue_target)?;
+        let next_index = self.emit_binary_opcode(CoreOpcode::AddInt32, index, one)?;
+        self.emit_move(index, next_index);
+        if !body.terminated {
+            self.emit_jump(loop_start);
+        }
+        self.bind_label(labels.break_target)?;
+        Ok(StatementEmission::default())
+    }
+
     fn emit_for_of_statement(
         &mut self,
         statement: &crate::syntax::ast::ForOfStmt,
+    ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        self.emit_for_of_statement_with_label(statement, None)
+    }
+
+    fn emit_for_of_statement_with_label(
+        &mut self,
+        statement: &crate::syntax::ast::ForOfStmt,
+        named_label: Option<ParserIdentifier>,
     ) -> Result<StatementEmission, BytecompilerEmissionError> {
         let iterable = self.emit_expression(statement.iterable)?;
         let values = self.emit_new_array();
@@ -4019,11 +4294,15 @@ impl AstBytecodeEmitter<'_, '_> {
             break_target,
             finally_stack_depth: self.finally_stack.len(),
         };
-        self.loop_stack.push(LoopControlLabels {
+        let loop_labels = LoopControlLabels {
             break_target,
             continue_target,
             finally_stack_depth: break_labels.finally_stack_depth,
-        });
+        };
+        if let Some(name) = named_label {
+            self.push_named_loop_label(name, loop_labels);
+        }
+        self.loop_stack.push(loop_labels);
         self.break_stack.push(break_labels);
         let body = self.emit_statement(statement.body)?;
         let Some(labels) = self.loop_stack.pop() else {
@@ -4036,6 +4315,9 @@ impl AstBytecodeEmitter<'_, '_> {
                 "break control stack underflow",
             ));
         };
+        if let Some(name) = named_label {
+            self.pop_named_label(name)?;
+        }
         self.bind_label(labels.continue_target)?;
         let next_index = self.emit_binary_opcode(CoreOpcode::AddInt32, index, one)?;
         self.emit_move(index, next_index);
@@ -4044,6 +4326,21 @@ impl AstBytecodeEmitter<'_, '_> {
         }
         self.bind_label(labels.break_target)?;
         Ok(StatementEmission::default())
+    }
+
+    fn emit_write_for_in_binding(
+        &mut self,
+        binding: ForInBinding,
+        value: VirtualRegister,
+    ) -> Result<(), BytecompilerEmissionError> {
+        let name = match binding {
+            ForInBinding::Declaration { name, .. } | ForInBinding::Assignment(name) => name,
+        };
+        let target = self
+            .resolve_binding(name)
+            .ok_or(BytecompilerEmissionError::UnboundIdentifier(name))?;
+        self.emit_write_resolved_binding(name, target, value);
+        Ok(())
     }
 
     fn emit_write_for_of_binding(
@@ -4259,10 +4556,11 @@ impl AstBytecodeEmitter<'_, '_> {
             },
             Expr::Name(name) => match name.kind {
                 NameKind::Resolve => {
-                    let binding = self
-                        .resolve_binding(name.name)
-                        .ok_or(BytecompilerEmissionError::UnboundIdentifier(name.name))?;
-                    self.emit_read_resolved_binding(binding)
+                    if let Some(binding) = self.resolve_binding(name.name) {
+                        self.emit_read_resolved_binding(binding)
+                    } else {
+                        self.emit_resolve_global_object_property(name.name)
+                    }
                 }
                 NameKind::This => self.emit_this_value(),
                 _ => Err(BytecompilerEmissionError::UnsupportedExpression(
@@ -4270,6 +4568,7 @@ impl AstBytecodeEmitter<'_, '_> {
                 )),
             },
             Expr::Assignment(assignment) => self.emit_assignment(expression_ref, &assignment),
+            Expr::Sequence(sequence) => self.emit_sequence(&sequence),
             Expr::Conditional(conditional) => self.emit_conditional(&conditional),
             Expr::Binary(binary) => self.emit_binary(&binary),
             Expr::Call(call) => self.emit_call(&call),
@@ -4285,6 +4584,21 @@ impl AstBytecodeEmitter<'_, '_> {
                 "expression kind is not lowered yet",
             )),
         }
+    }
+
+    fn emit_sequence(
+        &mut self,
+        sequence: &crate::syntax::ast::SequenceExpr,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let mut expressions = sequence.expressions.iter().copied();
+        let Some(first) = expressions.next() else {
+            return self.emit_load_undefined();
+        };
+        let mut result = self.emit_expression(first)?;
+        for expression in expressions {
+            result = self.emit_expression(expression)?;
+        }
+        Ok(result)
     }
 
     fn emit_template(
@@ -4356,6 +4670,9 @@ impl AstBytecodeEmitter<'_, '_> {
         ) {
             return self.emit_update(unary);
         }
+        if unary.op == AstUnaryOperator::Typeof {
+            return self.emit_typeof(unary.argument);
+        }
         let argument = self.emit_expression(unary.argument)?;
         let opcode = match unary.op {
             AstUnaryOperator::Plus => CoreOpcode::ToNumber,
@@ -4387,6 +4704,28 @@ impl AstBytecodeEmitter<'_, '_> {
             vec![Operand::Register(destination), Operand::Register(argument)],
         );
         Ok(destination)
+    }
+
+    fn emit_typeof(
+        &mut self,
+        argument: AstRef<Expr>,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let expression = self
+            .arena
+            .expression(argument)
+            .cloned()
+            .ok_or(BytecompilerEmissionError::MissingExpression)?;
+        let source = match expression {
+            Expr::Name(name) if name.kind == NameKind::Resolve => {
+                if let Some(binding) = self.resolve_binding(name.name) {
+                    self.emit_read_resolved_binding(binding)?
+                } else {
+                    self.emit_get_global_object_property(name.name)?
+                }
+            }
+            _ => self.emit_expression(argument)?,
+        };
+        self.emit_unary_opcode(CoreOpcode::TypeOf, source)
     }
 
     fn emit_update(
@@ -5269,6 +5608,19 @@ impl AstBytecodeEmitter<'_, '_> {
         Ok(destination)
     }
 
+    fn emit_for_in_keys(&mut self, object: VirtualRegister) -> VirtualRegister {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::ForInKeys.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::Register(destination), Operand::Register(object)],
+        );
+        destination
+    }
+
     fn emit_array_rest(
         &mut self,
         iterable: VirtualRegister,
@@ -5750,6 +6102,19 @@ impl AstBytecodeEmitter<'_, '_> {
         self.arena.identifiers().identifier_text(name) == Some(text)
     }
 
+    fn non_index_string_literal(&self, expression: AstRef<Expr>) -> Option<ParserIdentifier> {
+        let Expr::Literal(literal) = self.arena.expression(expression)? else {
+            return None;
+        };
+        let LiteralKind::String { text } = literal.kind else {
+            return None;
+        };
+        let literal_text = self.arena.identifiers().identifier_text(text)?;
+        bytecompiler_array_index_name(literal_text)
+            .is_none()
+            .then_some(text)
+    }
+
     fn emit_binary(
         &mut self,
         binary: &BinaryExpr,
@@ -5758,6 +6123,7 @@ impl AstBytecodeEmitter<'_, '_> {
             AstBinaryOperator::LogicalAnd => return self.emit_logical_and(binary),
             AstBinaryOperator::LogicalOr => return self.emit_logical_or(binary),
             AstBinaryOperator::Coalesce => return self.emit_nullish_coalesce(binary),
+            AstBinaryOperator::In => return self.emit_in(binary),
             _ => {}
         }
         let left = self.emit_expression(binary.left)?;
@@ -5801,6 +6167,62 @@ impl AstBytecodeEmitter<'_, '_> {
                 Operand::Register(destination),
                 Operand::Register(left),
                 Operand::Register(right),
+            ],
+        );
+        Ok(destination)
+    }
+
+    fn emit_in(
+        &mut self,
+        binary: &BinaryExpr,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        if let Some(property) = self.non_index_string_literal(binary.left) {
+            let base = self.emit_expression(binary.right)?;
+            return self.emit_in_by_id(base, property);
+        }
+
+        let key = self.emit_expression(binary.left)?;
+        let base = self.emit_expression(binary.right)?;
+        self.emit_in_by_val(base, key)
+    }
+
+    fn emit_in_by_id(
+        &mut self,
+        base: VirtualRegister,
+        property: ParserIdentifier,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::InById.opcode(),
+            OperandWidth::Narrow,
+            vec![
+                Operand::Register(destination),
+                Operand::Register(base),
+                Operand::IdentifierIndex(property.0),
+            ],
+        );
+        Ok(destination)
+    }
+
+    fn emit_in_by_val(
+        &mut self,
+        base: VirtualRegister,
+        key: VirtualRegister,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::InByVal.opcode(),
+            OperandWidth::Narrow,
+            vec![
+                Operand::Register(destination),
+                Operand::Register(base),
+                Operand::Register(key),
             ],
         );
         Ok(destination)
@@ -6102,6 +6524,25 @@ impl AstBytecodeEmitter<'_, '_> {
         Ok(destination)
     }
 
+    fn emit_resolve_global_object_property(
+        &mut self,
+        name: ParserIdentifier,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::ResolveGlobalObjectProperty.opcode(),
+            OperandWidth::Narrow,
+            vec![
+                Operand::Register(destination),
+                Operand::IdentifierIndex(name.0),
+            ],
+        );
+        Ok(destination)
+    }
+
     fn emit_put_global_object_property(&mut self, name: ParserIdentifier, value: VirtualRegister) {
         self.generator.instructions_mut().declare_instruction(
             CoreOpcode::PutGlobalObjectProperty.opcode(),
@@ -6297,6 +6738,19 @@ impl AstBytecodeEmitter<'_, '_> {
         Ok(destination)
     }
 
+    fn emit_load_callee(&mut self) -> VirtualRegister {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::LoadCallee.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::Register(destination)],
+        );
+        destination
+    }
+
     fn emit_load_capture(
         &mut self,
         capture_index: u32,
@@ -6454,6 +6908,21 @@ impl AstBytecodeEmitter<'_, '_> {
             .reserve_temporary(TemporaryLifetime::Expression);
         self.generator.instructions_mut().declare_instruction(
             CoreOpcode::LoadTypeErrorConstructor.opcode(),
+            OperandWidth::Narrow,
+            vec![Operand::Register(destination)],
+        );
+        Ok(destination)
+    }
+
+    fn emit_load_reference_error_constructor(
+        &mut self,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        let destination = self
+            .generator
+            .registers_mut()
+            .reserve_temporary(TemporaryLifetime::Expression);
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::LoadReferenceErrorConstructor.opcode(),
             OperandWidth::Narrow,
             vec![Operand::Register(destination)],
         );
@@ -6787,6 +7256,56 @@ impl AstBytecodeEmitter<'_, '_> {
         self.emit_break_to(labels.break_target, labels.finally_stack_depth)
     }
 
+    fn push_named_loop_label(&mut self, name: ParserIdentifier, labels: LoopControlLabels) {
+        self.named_label_stack.push(NamedControlLabels {
+            name,
+            break_target: labels.break_target,
+            continue_target: Some(labels.continue_target),
+            finally_stack_depth: labels.finally_stack_depth,
+        });
+    }
+
+    fn pop_named_label(&mut self, name: ParserIdentifier) -> Result<(), BytecompilerEmissionError> {
+        let Some(label) = self.named_label_stack.pop() else {
+            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                "named label stack underflow",
+            ));
+        };
+        if label.name != name {
+            return Err(BytecompilerEmissionError::UnsupportedStatement(
+                "named label stack mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn named_break_labels(&self, name: ParserIdentifier) -> Option<BreakControlLabels> {
+        self.named_label_stack
+            .iter()
+            .rev()
+            .find(|label| label.name == name)
+            .map(|label| BreakControlLabels {
+                break_target: label.break_target,
+                finally_stack_depth: label.finally_stack_depth,
+            })
+    }
+
+    fn named_continue_labels(&self, name: ParserIdentifier) -> Option<LoopControlLabels> {
+        self.named_label_stack
+            .iter()
+            .rev()
+            .find(|label| label.name == name)
+            .and_then(|label| {
+                label
+                    .continue_target
+                    .map(|continue_target| LoopControlLabels {
+                        break_target: label.break_target,
+                        continue_target,
+                        finally_stack_depth: label.finally_stack_depth,
+                    })
+            })
+    }
+
     fn emit_continue_completion(
         &mut self,
         labels: LoopControlLabels,
@@ -6924,6 +7443,19 @@ impl AstBytecodeEmitter<'_, '_> {
         );
         Ok(destination)
     }
+}
+
+fn bytecompiler_array_index_name(name: &str) -> Option<u32> {
+    if name.is_empty() || (name.len() > 1 && name.starts_with('0')) {
+        return None;
+    }
+    let Ok(index) = name.parse::<u32>() else {
+        return None;
+    };
+    if index == u32::MAX || index.to_string() != name {
+        return None;
+    }
+    Some(index)
 }
 
 fn synthesize_parse_semantics(input: &BytecompilerInput) -> ParseSemanticMetadata {
@@ -7306,7 +7838,7 @@ mod tests {
         SourceOrigin, SourcePosition, SourceProvider, SourceSpan, SourceText,
     };
     use crate::syntax::{AstBuilder, Parser, ParserArena};
-    use crate::vm::{SourceExecutionError, SourceSessionHostGlobalConfig, Vm, VmConfig};
+    use crate::vm::{SourceSessionHostGlobalConfig, Vm, VmConfig};
     use std::sync::Arc;
 
     fn valid_generation_plan() -> GenerationPlan {
@@ -7822,6 +8354,89 @@ mod tests {
     }
 
     #[test]
+    fn parsed_ast_lowers_non_index_string_in_to_in_by_id() {
+        let unlinked = emit_program_source("let object = { x: 1 }; \"x\" in object;", 201);
+
+        assert!(unlinked_contains_opcode(&unlinked, CoreOpcode::InById));
+        assert!(!unlinked_contains_opcode(&unlinked, CoreOpcode::InByVal));
+        assert!(!unlinked_contains_opcode(&unlinked, CoreOpcode::LoadString));
+    }
+
+    #[test]
+    fn parsed_ast_lowers_index_string_and_dynamic_in_to_in_by_val() {
+        let index_string = emit_program_source("let object = {}; \"0\" in object;", 202);
+        let dynamic_key = emit_program_source(
+            "let key = \"x\"; let object = { x: 1 }; key in object;",
+            203,
+        );
+
+        assert!(unlinked_contains_opcode(&index_string, CoreOpcode::InByVal));
+        assert!(!unlinked_contains_opcode(&index_string, CoreOpcode::InById));
+        assert!(unlinked_contains_opcode(
+            &index_string,
+            CoreOpcode::LoadString
+        ));
+        assert!(unlinked_contains_opcode(&dynamic_key, CoreOpcode::InByVal));
+    }
+
+    #[test]
+    fn parsed_ast_executes_in_by_id_and_in_by_val() {
+        assert_eq!(
+            execute_program_source("let object = { x: 1 }; \"x\" in object;", 204),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(
+            execute_program_source("let object = { x: 1 }; \"missing\" in object;", 205),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(false))
+        );
+        assert_eq!(
+            execute_program_source("0 in [7];", 206),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        assert_eq!(
+            execute_program_source("1 in [7];", 207),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(false))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_in_checks_rhs_object_before_by_val_key_conversion() {
+        assert_eq!(
+            execute_program_source(
+                "let called = false; \
+                 let key = { toString: function() { called = true; return \"x\"; } }; \
+                 try { key in 1; } catch (error) { } \
+                 called;",
+                208,
+            ),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(false))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_in_by_val_coerces_object_keys_with_string_hint() {
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source(
+                "let key = {}; \
+                 key.toString = function() { return \"x\"; }; \
+                 let object = { x: 1 }; \
+                 key in object;",
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_in_non_object_rhs_is_catchable_throw() {
+        assert_eq!(
+            execute_program_source("try { \"x\" in null; false; } catch (error) { true; }", 210),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
     fn parsed_ast_generates_root_map_for_object_literal() {
         let unlinked = emit_program_source("({});", 15);
         let root_map = exact_root_map_for_opcode(&unlinked, CoreOpcode::NewObject);
@@ -7878,6 +8493,21 @@ mod tests {
             root_map.slots[1].storage,
             BytecodeRootSlotStorage::Register(register) if register.is_argument_or_header()
         ));
+    }
+
+    #[test]
+    fn parsed_ast_typeof_unresolved_name_uses_non_throwing_global_lookup() {
+        let unlinked = emit_program_source("typeof ActiveXObject;", 317);
+
+        assert!(unlinked_contains_opcode(
+            &unlinked,
+            CoreOpcode::GetGlobalObjectProperty
+        ));
+        assert!(!unlinked_contains_opcode(
+            &unlinked,
+            CoreOpcode::ResolveGlobalObjectProperty
+        ));
+        assert!(unlinked_contains_opcode(&unlinked, CoreOpcode::TypeOf));
     }
 
     #[test]
@@ -8193,17 +8823,26 @@ mod tests {
     }
 
     #[test]
-    fn parsed_ast_function_declaration_rejects_unknown_global_read() {
-        let result = try_emit_program_plan_with_global_bindings(
+    fn parsed_ast_function_declaration_lowers_unknown_global_read() {
+        let plan = emit_program_plan_with_global_bindings(
             "function f(x) { if (x) return DV; return 1; } f;",
             22,
             BytecompilerGlobalBindingSet::default(),
         );
+        let nested = plan.function_bodies.first().unwrap();
 
-        assert!(matches!(
-            result,
-            Err(BytecompilerEmissionError::UnboundIdentifier(_))
+        assert!(unlinked_contains_opcode(
+            nested,
+            CoreOpcode::ResolveGlobalObjectProperty
         ));
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        assert_eq!(
+            vm.execute_source(source(
+                "function f(x) { if (x) return DV; return 1; } f(false);",
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(1))
+        );
     }
 
     #[test]
@@ -8224,16 +8863,17 @@ mod tests {
     }
 
     #[test]
-    fn parsed_ast_rejects_sloppy_global_read_before_top_level_assignment() {
-        let result = try_emit_program_plan_with_global_bindings(
+    fn parsed_ast_lowers_sloppy_global_read_before_top_level_assignment_as_runtime_resolve() {
+        let plan = emit_program_plan_with_global_bindings(
             "setupEngine; setupEngine = function() { return 42; };",
             25,
             BytecompilerGlobalBindingSet::default(),
         );
+        let program = plan.unlinked_code.as_ref().unwrap();
 
-        assert!(matches!(
-            result,
-            Err(BytecompilerEmissionError::UnboundIdentifier(_))
+        assert!(unlinked_contains_opcode(
+            program,
+            CoreOpcode::ResolveGlobalObjectProperty
         ));
     }
 
@@ -8254,17 +8894,22 @@ mod tests {
     }
 
     #[test]
-    fn vm_source_session_rejects_unknown_global_without_prior_sloppy_assignment() {
+    fn vm_source_session_unknown_global_read_throws_reference_error() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
 
-        let result = vm.execute_source_session(vec![source("misspelledGlobal;")]);
+        let execution = vm
+            .execute_source_session(vec![source(
+                "try { misspelledGlobal; } catch (error) { \
+                     error instanceof ReferenceError \
+                         && error.message === \"Can't find variable: misspelledGlobal\"; \
+                 }",
+            )])
+            .unwrap();
 
-        assert!(matches!(
-            result,
-            Err(SourceExecutionError::BytecodeEmission(
-                BytecompilerEmissionError::UnboundIdentifier(_)
-            ))
-        ));
+        assert_eq!(
+            execution.completions(),
+            &[ExecutionCompletion::Returned(RuntimeValue::from_bool(true))]
+        );
     }
 
     #[test]
@@ -8549,6 +9194,48 @@ mod tests {
         assert_eq!(
             completion,
             ExecutionCompletion::Returned(RuntimeValue::from_i32(1))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_var_declaration_without_initializer_preserves_existing_binding() {
+        let completion = execute_program_source(
+            "var TypeScript; \
+             TypeScript = {}; \
+             var TypeScript; \
+             TypeScript.value = 42; \
+             TypeScript.value;",
+            211,
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_function_var_declaration_without_initializer_preserves_existing_binding() {
+        let mut vm = Vm::new(VmConfig::default());
+        let completion = vm
+            .execute_source(source(
+                "function read() { var value = 41; var value; return value + 1; } read();",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_var_declaration_without_initializer_reads_undefined() {
+        let completion = execute_program_source("var value; value === undefined;", 213);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
         );
     }
 

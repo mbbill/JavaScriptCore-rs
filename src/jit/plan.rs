@@ -6,11 +6,13 @@
 
 use crate::bytecode::{
     BytecodeIndex, BytecodeRootMap, BytecodeRootMapId, BytecodeRootMapValidationError,
-    BytecodeRootSlotDescriptor, BytecodeRootSlotKind, BytecodeRootSlotStorage, CodeBlock,
-    CoreOpcode, DecodedInstruction, DecodedInstructionSource, InlineCacheMutationAuthority,
-    InlineCacheState as BytecodeInlineCacheState, InstructionDecodeError, Opcode, Operand,
-    OperandAccessError, OperandWidth, PropertyAccessType, PropertyCacheKey, PropertyCacheKind,
-    PropertyInlineCache, PropertyInlineCacheDispatch, VirtualRegister,
+    BytecodeRootSlotDescriptor, BytecodeRootSlotKind, BytecodeRootSlotStorage, Checkpoint,
+    CodeBlock, CoreOpcode, DecodedInstruction, DecodedInstructionSource,
+    InlineCacheMutationAuthority, InlineCacheState as BytecodeInlineCacheState,
+    InstructionDecodeError, Opcode, Operand, OperandAccessError, OperandWidth, PropertyAccessType,
+    PropertyCacheKey, PropertyCacheKind, PropertyInlineCache, PropertyInlineCacheDispatch,
+    RuntimeSlot, ValueProfileBucketKind, ValueProfileEmissionPolicy,
+    ValueProfileJitStorageGeneration, VirtualRegister,
 };
 use crate::gc::{
     CellId, HeapId, RootId, RootKind, RootRecord, RootSetMutationAuthority, RootSetSemanticError,
@@ -149,6 +151,24 @@ pub enum BaselineSupportedOpcodeSubset {
     P6ConstantsMovesReturnInt32Arithmetic,
     P8aConstantsMovesReturnInt32ArithmeticBranchNullish,
     P8bConstantsMovesReturnInt32ArithmeticBranchNullishFalse,
+    P6ConstantsMovesReturnInt32ArithmeticBitAndOr,
+    P8aConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullish,
+    P8bConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullishFalse,
+    P6ConstantsMovesReturnInt32ArithmeticBitAndOrEquality,
+    P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullish,
+    P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullishFalse,
+    P6ConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelational,
+    P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullish,
+    P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullishFalse,
+    P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEquality,
+    P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityBranchNullish,
+    P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityBranchNullishFalse,
+    P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelational,
+    P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullish,
+    P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullishFalse,
+    P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumber,
+    P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullish,
+    P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullishFalse,
     P6ConstantsMovesReturnInt32ArithmeticBitwise,
     P6ConstantsMovesReturnInt32ArithmeticBitwiseRelational,
     P6ConstantsMovesReturnInt32ArithmeticBitwiseRelationalJumps,
@@ -206,6 +226,7 @@ impl BaselineGeneratedEffectContract {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BaselineGeneratedRuntimeBoundaryCategory {
     NoJsCallHeapRuntimeHelper,
+    ExceptionThrow,
 }
 
 #[allow(dead_code)]
@@ -447,24 +468,15 @@ impl BaselineGeneratedRuntimeHelperProof {
     }
 }
 
-pub(crate) const BASELINE_GENERATED_RUNTIME_HELPER_PLAN_PROOF_CAPACITY: usize = 16;
-pub(crate) const BASELINE_GENERATED_PROPERTY_HANDOFF_PLAN_SITE_CAPACITY: usize = 16;
-pub(crate) const BASELINE_GENERATED_JS_CALL_NATIVE_EXIT_PLAN_SITE_CAPACITY: usize = 16;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BaselineGeneratedRuntimeHelperProofTable<'proof> {
-    Slice(&'proof [BaselineGeneratedRuntimeHelperProof]),
-    Inline {
-        proof_count: usize,
-        proofs: &'proof [Option<BaselineGeneratedRuntimeHelperProof>;
-                    BASELINE_GENERATED_RUNTIME_HELPER_PLAN_PROOF_CAPACITY],
-    },
-}
+// P9 encodes the retained JS-call native-exit site index in a u32 payload.
+// This must not be tied to the separate inline argument-register array size.
+pub(crate) const BASELINE_GENERATED_JS_CALL_NATIVE_EXIT_PLAN_SITE_CAPACITY: usize =
+    u32::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BaselineGeneratedRuntimeHelperPlan<'proof> {
     pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
-    proof_table: BaselineGeneratedRuntimeHelperProofTable<'proof>,
+    proofs: &'proof [BaselineGeneratedRuntimeHelperProof],
 }
 
 impl<'proof> BaselineGeneratedRuntimeHelperPlan<'proof> {
@@ -475,48 +487,18 @@ impl<'proof> BaselineGeneratedRuntimeHelperPlan<'proof> {
     ) -> Self {
         Self {
             bytecode_snapshot,
-            proof_table: BaselineGeneratedRuntimeHelperProofTable::Slice(proofs),
-        }
-    }
-
-    const fn from_inline_table(
-        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
-        proof_count: usize,
-        proofs: &'proof [Option<BaselineGeneratedRuntimeHelperProof>;
-                    BASELINE_GENERATED_RUNTIME_HELPER_PLAN_PROOF_CAPACITY],
-    ) -> Self {
-        Self {
-            bytecode_snapshot,
-            proof_table: BaselineGeneratedRuntimeHelperProofTable::Inline {
-                proof_count,
-                proofs,
-            },
+            proofs,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn proof_count(&self) -> usize {
-        match self.proof_table {
-            BaselineGeneratedRuntimeHelperProofTable::Slice(proofs) => proofs.len(),
-            BaselineGeneratedRuntimeHelperProofTable::Inline { proof_count, .. } => proof_count,
-        }
+        self.proofs.len()
     }
 
     #[cfg(test)]
     pub(crate) fn proof_at(&self, index: usize) -> Option<&BaselineGeneratedRuntimeHelperProof> {
-        match self.proof_table {
-            BaselineGeneratedRuntimeHelperProofTable::Slice(proofs) => proofs.get(index),
-            BaselineGeneratedRuntimeHelperProofTable::Inline {
-                proof_count,
-                proofs,
-            } => {
-                if index >= proof_count {
-                    None
-                } else {
-                    proofs[index].as_ref()
-                }
-            }
-        }
+        self.proofs.get(index)
     }
 
     pub(crate) fn proof_for_bytecode_index(
@@ -525,28 +507,13 @@ impl<'proof> BaselineGeneratedRuntimeHelperPlan<'proof> {
     ) -> Result<Option<&'proof BaselineGeneratedRuntimeBoundaryProof>, ()> {
         let mut matching = None;
         let mut ambiguous = false;
-        match self.proof_table {
-            BaselineGeneratedRuntimeHelperProofTable::Slice(proofs) => {
-                for proof in proofs {
-                    if proof.bytecode_index == bytecode_index {
-                        if matching.is_some() {
-                            ambiguous = true;
-                            break;
-                        }
-                        matching = Some(&proof.proof);
-                    }
+        for proof in self.proofs {
+            if proof.bytecode_index == bytecode_index {
+                if matching.is_some() {
+                    ambiguous = true;
+                    break;
                 }
-            }
-            BaselineGeneratedRuntimeHelperProofTable::Inline {
-                proof_count,
-                proofs,
-            } => {
-                for proof in proofs.iter().take(proof_count).flatten() {
-                    if proof.bytecode_index == bytecode_index {
-                        matching = Some(&proof.proof);
-                        break;
-                    }
-                }
+                matching = Some(&proof.proof);
             }
         }
         if ambiguous {
@@ -563,12 +530,10 @@ impl<'proof> BaselineGeneratedRuntimeHelperPlan<'proof> {
 /// construction, so a generated artifact can own proof data while executor
 /// entrypoints borrow a plan view without cloning proofs.
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BaselineGeneratedRuntimeHelperPlanMetadata {
     bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
-    proof_count: usize,
-    proofs: [Option<BaselineGeneratedRuntimeHelperProof>;
-        BASELINE_GENERATED_RUNTIME_HELPER_PLAN_PROOF_CAPACITY],
+    proofs: Vec<BaselineGeneratedRuntimeHelperProof>,
 }
 
 #[allow(dead_code)]
@@ -578,15 +543,9 @@ impl BaselineGeneratedRuntimeHelperPlanMetadata {
         mut proofs: Vec<BaselineGeneratedRuntimeHelperProof>,
     ) -> Result<Self, JitPlanValidationError> {
         validate_baseline_generated_runtime_helper_proofs(&mut proofs)?;
-        let proof_count = proofs.len();
-        let mut proof_table = [None; BASELINE_GENERATED_RUNTIME_HELPER_PLAN_PROOF_CAPACITY];
-        for (index, proof) in proofs.into_iter().enumerate() {
-            proof_table[index] = Some(proof);
-        }
         Ok(Self {
             bytecode_snapshot,
-            proof_count,
-            proofs: proof_table,
+            proofs,
         })
     }
 
@@ -604,40 +563,26 @@ impl BaselineGeneratedRuntimeHelperPlanMetadata {
         self.bytecode_snapshot
     }
 
-    pub(crate) const fn proof_count(&self) -> usize {
-        self.proof_count
+    pub(crate) fn proof_count(&self) -> usize {
+        self.proofs.len()
     }
 
     pub(crate) fn proof_at(&self, index: usize) -> Option<&BaselineGeneratedRuntimeHelperProof> {
-        if index >= self.proof_count {
-            None
-        } else {
-            self.proofs[index].as_ref()
-        }
+        self.proofs.get(index)
     }
 
     pub(crate) fn borrowed_plan(&self) -> BaselineGeneratedRuntimeHelperPlan<'_> {
-        BaselineGeneratedRuntimeHelperPlan::from_inline_table(
-            self.bytecode_snapshot,
-            self.proof_count,
-            &self.proofs,
-        )
+        BaselineGeneratedRuntimeHelperPlan::new(self.bytecode_snapshot, &self.proofs)
     }
 
     pub(crate) fn proof_for_bytecode_index(
         &self,
         bytecode_index: BytecodeIndex,
     ) -> Option<&BaselineGeneratedRuntimeBoundaryProof> {
-        self.proofs[..self.proof_count]
-            .binary_search_by_key(&bytecode_index, |proof| {
-                proof
-                    .as_ref()
-                    .map(|proof| proof.bytecode_index)
-                    .unwrap_or(BytecodeIndex::INVALID)
-            })
+        self.proofs
+            .binary_search_by_key(&bytecode_index, |proof| proof.bytecode_index)
             .ok()
-            .and_then(|index| self.proofs[index].as_ref())
-            .map(|proof| &proof.proof)
+            .map(|index| &self.proofs[index].proof)
     }
 }
 
@@ -715,6 +660,142 @@ pub(crate) struct BaselineGeneratedJsCallNativeExitPlanDerivation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BaselineGeneratedOwnerBytecodeLabel {
+    pub(crate) owner: CodeBlockId,
+    pub(crate) bytecode_index: BytecodeIndex,
+    pub(crate) opcode: CoreOpcode,
+    pub(crate) next_bytecode_index: Option<BytecodeIndex>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BaselineGeneratedOwnerContinuationKind {
+    Call,
+    Construct,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BaselineGeneratedOwnerCallResultProfileSite {
+    pub(crate) profile_slot: RuntimeSlot,
+    pub(crate) bytecode_index: BytecodeIndex,
+    pub(crate) checkpoint: Checkpoint,
+    pub(crate) bucket_kind: ValueProfileBucketKind,
+    pub(crate) storage_generation: ValueProfileJitStorageGeneration,
+    pub(crate) value_profile_offset: u32,
+    pub(crate) metadata_table_displacement: i32,
+    pub(crate) metadata_table_base_address: usize,
+    pub(crate) raw_bucket_address: usize,
+    pub(crate) raw_bucket_bytes: u32,
+    pub(crate) emission_policy: ValueProfileEmissionPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BaselineGeneratedOwnerContinuationSite {
+    pub(crate) owner: CodeBlockId,
+    pub(crate) call_bytecode_index: BytecodeIndex,
+    pub(crate) opcode: CoreOpcode,
+    pub(crate) destination: VirtualRegister,
+    pub(crate) argument_count_including_this: u32,
+    pub(crate) resume_bytecode_index: Option<BytecodeIndex>,
+    pub(crate) kind: BaselineGeneratedOwnerContinuationKind,
+    pub(crate) result_profile: Option<BaselineGeneratedOwnerCallResultProfileSite>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct BaselineGeneratedOwnerContinuationMapMetadata {
+    bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    labels: Vec<BaselineGeneratedOwnerBytecodeLabel>,
+    call_sites: Vec<BaselineGeneratedOwnerContinuationSite>,
+}
+
+impl std::fmt::Debug for BaselineGeneratedOwnerContinuationMapMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BaselineGeneratedOwnerContinuationMapMetadata")
+            .field("bytecode_snapshot", &self.bytecode_snapshot)
+            .field("label_count", &self.labels.len())
+            .field("call_site_count", &self.call_sites.len())
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
+impl BaselineGeneratedOwnerContinuationMapMetadata {
+    pub(crate) fn new(
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        mut labels: Vec<BaselineGeneratedOwnerBytecodeLabel>,
+        mut call_sites: Vec<BaselineGeneratedOwnerContinuationSite>,
+    ) -> Result<Self, JitPlanValidationError> {
+        validate_baseline_generated_owner_continuation_labels(&mut labels)?;
+        validate_baseline_generated_owner_continuation_sites(&labels, &mut call_sites)?;
+        Ok(Self {
+            bytecode_snapshot,
+            labels,
+            call_sites,
+        })
+    }
+
+    pub(crate) fn from_code_block_snapshot(
+        code_block: &CodeBlock,
+        labels: Vec<BaselineGeneratedOwnerBytecodeLabel>,
+        call_sites: Vec<BaselineGeneratedOwnerContinuationSite>,
+    ) -> Result<Self, JitPlanValidationError> {
+        Self::new(
+            baseline_bytecode_snapshot_fingerprint_from_code_block(code_block)?,
+            labels,
+            call_sites,
+        )
+    }
+
+    pub(crate) const fn bytecode_snapshot(&self) -> BaselineBytecodeSnapshotFingerprint {
+        self.bytecode_snapshot
+    }
+
+    pub(crate) fn label_count(&self) -> usize {
+        self.labels.len()
+    }
+
+    pub(crate) fn call_site_count(&self) -> usize {
+        self.call_sites.len()
+    }
+
+    pub(crate) fn label_at(&self, index: usize) -> Option<&BaselineGeneratedOwnerBytecodeLabel> {
+        self.labels.get(index)
+    }
+
+    pub(crate) fn call_site_at(
+        &self,
+        index: usize,
+    ) -> Option<&BaselineGeneratedOwnerContinuationSite> {
+        self.call_sites.get(index)
+    }
+
+    pub(crate) fn label_for_bytecode_index(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<&BaselineGeneratedOwnerBytecodeLabel> {
+        self.labels
+            .binary_search_by_key(&bytecode_index, |label| label.bytecode_index)
+            .ok()
+            .and_then(|index| self.labels.get(index))
+    }
+
+    pub(crate) fn call_site_for_bytecode_index(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<&BaselineGeneratedOwnerContinuationSite> {
+        self.call_sites
+            .binary_search_by_key(&bytecode_index, |site| site.call_bytecode_index)
+            .ok()
+            .and_then(|index| self.call_sites.get(index))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BaselineGeneratedOwnerContinuationMapDerivation {
+    pub(crate) metadata: Option<BaselineGeneratedOwnerContinuationMapMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BaselineGeneratedPropertyHandoffSite {
     pub(crate) owner: CodeBlockId,
     pub(crate) slot: InlineCacheSlotId,
@@ -723,7 +804,7 @@ pub struct BaselineGeneratedPropertyHandoffSite {
     pub(crate) cache_kind: InlineCacheKind,
     pub(crate) access: PropertyAccessType,
     pub(crate) property_cache_kind: PropertyCacheKind,
-    pub(crate) property_key: PropertyKey,
+    pub(crate) property_key: PropertyCacheKey,
     pub(crate) fallback: InlineCacheFallbackSemantics,
     pub(crate) cold_miss_handoff: InlineCacheMissHandoffDescriptor,
     pub(crate) requires_no_gc_exit_reentry: bool,
@@ -745,7 +826,71 @@ impl BaselineGeneratedPropertyHandoffSite {
             cache_kind: InlineCacheKind::PropertyLoad,
             access: PropertyAccessType::GetById,
             property_cache_kind: PropertyCacheKind::GetById,
-            property_key,
+            property_key: PropertyCacheKey::Key(property_key),
+            fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+            cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                owner,
+                slot,
+                bytecode_index: bytecode_index.offset(),
+                cache_kind: InlineCacheKind::PropertyLoad,
+                miss_kind: InlineCacheMissKind::Cold,
+                fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                boundary: None,
+                call_link: None,
+                preserves_operand_registers: true,
+            },
+            requires_no_gc_exit_reentry: true,
+            may_throw: true,
+        }
+    }
+
+    pub(crate) const fn get_global_object_property_load(
+        owner: CodeBlockId,
+        slot: InlineCacheSlotId,
+        bytecode_index: BytecodeIndex,
+        property_key: PropertyKey,
+    ) -> Self {
+        Self {
+            owner,
+            slot,
+            bytecode_index,
+            opcode: CoreOpcode::GetGlobalObjectProperty,
+            cache_kind: InlineCacheKind::PropertyLoad,
+            access: PropertyAccessType::GetById,
+            property_cache_kind: PropertyCacheKind::GetById,
+            property_key: PropertyCacheKey::Key(property_key),
+            fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+            cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                owner,
+                slot,
+                bytecode_index: bytecode_index.offset(),
+                cache_kind: InlineCacheKind::PropertyLoad,
+                miss_kind: InlineCacheMissKind::Cold,
+                fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                boundary: None,
+                call_link: None,
+                preserves_operand_registers: true,
+            },
+            requires_no_gc_exit_reentry: true,
+            may_throw: true,
+        }
+    }
+
+    pub(crate) const fn get_length_property_load(
+        owner: CodeBlockId,
+        slot: InlineCacheSlotId,
+        bytecode_index: BytecodeIndex,
+        property_key: PropertyKey,
+    ) -> Self {
+        Self {
+            owner,
+            slot,
+            bytecode_index,
+            opcode: CoreOpcode::GetLength,
+            cache_kind: InlineCacheKind::PropertyLoad,
+            access: PropertyAccessType::GetById,
+            property_cache_kind: PropertyCacheKind::GetById,
+            property_key: PropertyCacheKey::Key(property_key),
             fallback: InlineCacheFallbackSemantics::SlowPathLookup,
             cold_miss_handoff: InlineCacheMissHandoffDescriptor {
                 owner,
@@ -777,13 +922,173 @@ impl BaselineGeneratedPropertyHandoffSite {
             cache_kind: InlineCacheKind::PropertyStore,
             access: PropertyAccessType::PutByIdSloppy,
             property_cache_kind: PropertyCacheKind::PutById,
-            property_key,
+            property_key: PropertyCacheKey::Key(property_key),
             fallback: InlineCacheFallbackSemantics::SlowPathLookup,
             cold_miss_handoff: InlineCacheMissHandoffDescriptor {
                 owner,
                 slot,
                 bytecode_index: bytecode_index.offset(),
                 cache_kind: InlineCacheKind::PropertyStore,
+                miss_kind: InlineCacheMissKind::Cold,
+                fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                boundary: None,
+                call_link: None,
+                preserves_operand_registers: true,
+            },
+            requires_no_gc_exit_reentry: true,
+            may_throw: true,
+        }
+    }
+
+    pub(crate) const fn put_global_object_property_store(
+        owner: CodeBlockId,
+        slot: InlineCacheSlotId,
+        bytecode_index: BytecodeIndex,
+        property_key: PropertyKey,
+    ) -> Self {
+        Self {
+            owner,
+            slot,
+            bytecode_index,
+            opcode: CoreOpcode::PutGlobalObjectProperty,
+            cache_kind: InlineCacheKind::PropertyStore,
+            access: PropertyAccessType::PutByIdSloppy,
+            property_cache_kind: PropertyCacheKind::PutById,
+            property_key: PropertyCacheKey::Key(property_key),
+            fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+            cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                owner,
+                slot,
+                bytecode_index: bytecode_index.offset(),
+                cache_kind: InlineCacheKind::PropertyStore,
+                miss_kind: InlineCacheMissKind::Cold,
+                fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                boundary: None,
+                call_link: None,
+                preserves_operand_registers: true,
+            },
+            requires_no_gc_exit_reentry: true,
+            may_throw: true,
+        }
+    }
+
+    pub(crate) const fn get_by_value_element_load(
+        owner: CodeBlockId,
+        slot: InlineCacheSlotId,
+        bytecode_index: BytecodeIndex,
+        property_register: VirtualRegister,
+    ) -> Self {
+        Self {
+            owner,
+            slot,
+            bytecode_index,
+            opcode: CoreOpcode::GetByValue,
+            cache_kind: InlineCacheKind::ElementLoad,
+            access: PropertyAccessType::GetByVal,
+            property_cache_kind: PropertyCacheKind::GetByVal,
+            property_key: PropertyCacheKey::RuntimeValue(property_register),
+            fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+            cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                owner,
+                slot,
+                bytecode_index: bytecode_index.offset(),
+                cache_kind: InlineCacheKind::ElementLoad,
+                miss_kind: InlineCacheMissKind::Cold,
+                fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                boundary: None,
+                call_link: None,
+                preserves_operand_registers: true,
+            },
+            requires_no_gc_exit_reentry: true,
+            may_throw: true,
+        }
+    }
+
+    pub(crate) const fn put_by_value_element_store(
+        owner: CodeBlockId,
+        slot: InlineCacheSlotId,
+        bytecode_index: BytecodeIndex,
+        property_register: VirtualRegister,
+    ) -> Self {
+        Self {
+            owner,
+            slot,
+            bytecode_index,
+            opcode: CoreOpcode::PutByValue,
+            cache_kind: InlineCacheKind::ElementStore,
+            access: PropertyAccessType::PutByValSloppy,
+            property_cache_kind: PropertyCacheKind::PutByVal,
+            property_key: PropertyCacheKey::RuntimeValue(property_register),
+            fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+            cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                owner,
+                slot,
+                bytecode_index: bytecode_index.offset(),
+                cache_kind: InlineCacheKind::ElementStore,
+                miss_kind: InlineCacheMissKind::Cold,
+                fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                boundary: None,
+                call_link: None,
+                preserves_operand_registers: true,
+            },
+            requires_no_gc_exit_reentry: true,
+            may_throw: true,
+        }
+    }
+
+    pub(crate) const fn in_by_id_has(
+        owner: CodeBlockId,
+        slot: InlineCacheSlotId,
+        bytecode_index: BytecodeIndex,
+        property_key: PropertyKey,
+    ) -> Self {
+        Self {
+            owner,
+            slot,
+            bytecode_index,
+            opcode: CoreOpcode::InById,
+            cache_kind: InlineCacheKind::HasProperty,
+            access: PropertyAccessType::InById,
+            property_cache_kind: PropertyCacheKind::InById,
+            property_key: PropertyCacheKey::Key(property_key),
+            fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+            cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                owner,
+                slot,
+                bytecode_index: bytecode_index.offset(),
+                cache_kind: InlineCacheKind::HasProperty,
+                miss_kind: InlineCacheMissKind::Cold,
+                fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                boundary: None,
+                call_link: None,
+                preserves_operand_registers: true,
+            },
+            requires_no_gc_exit_reentry: true,
+            may_throw: true,
+        }
+    }
+
+    pub(crate) const fn in_by_value_has(
+        owner: CodeBlockId,
+        slot: InlineCacheSlotId,
+        bytecode_index: BytecodeIndex,
+        property_register: VirtualRegister,
+    ) -> Self {
+        Self {
+            owner,
+            slot,
+            bytecode_index,
+            opcode: CoreOpcode::InByVal,
+            cache_kind: InlineCacheKind::HasProperty,
+            access: PropertyAccessType::InByVal,
+            property_cache_kind: PropertyCacheKind::InByVal,
+            property_key: PropertyCacheKey::RuntimeValue(property_register),
+            fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+            cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                owner,
+                slot,
+                bytecode_index: bytecode_index.offset(),
+                cache_kind: InlineCacheKind::HasProperty,
                 miss_kind: InlineCacheMissKind::Cold,
                 fallback: InlineCacheFallbackSemantics::SlowPathLookup,
                 boundary: None,
@@ -805,20 +1110,9 @@ impl BaselineGeneratedPropertyHandoffSite {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
-enum BaselineGeneratedPropertyHandoffSiteTable<'site> {
-    Slice(&'site [BaselineGeneratedPropertyHandoffSite]),
-    Inline {
-        site_count: usize,
-        sites: &'site [Option<BaselineGeneratedPropertyHandoffSite>;
-                   BASELINE_GENERATED_PROPERTY_HANDOFF_PLAN_SITE_CAPACITY],
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BaselineGeneratedPropertyHandoffPlan<'site> {
     pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
-    site_table: BaselineGeneratedPropertyHandoffSiteTable<'site>,
+    sites: &'site [BaselineGeneratedPropertyHandoffSite],
 }
 
 impl<'site> BaselineGeneratedPropertyHandoffPlan<'site> {
@@ -829,44 +1123,20 @@ impl<'site> BaselineGeneratedPropertyHandoffPlan<'site> {
     ) -> Self {
         Self {
             bytecode_snapshot,
-            site_table: BaselineGeneratedPropertyHandoffSiteTable::Slice(sites),
-        }
-    }
-
-    const fn from_inline_table(
-        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
-        site_count: usize,
-        sites: &'site [Option<BaselineGeneratedPropertyHandoffSite>;
-                   BASELINE_GENERATED_PROPERTY_HANDOFF_PLAN_SITE_CAPACITY],
-    ) -> Self {
-        Self {
-            bytecode_snapshot,
-            site_table: BaselineGeneratedPropertyHandoffSiteTable::Inline { site_count, sites },
+            sites,
         }
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn site_count(&self) -> usize {
-        match self.site_table {
-            BaselineGeneratedPropertyHandoffSiteTable::Slice(sites) => sites.len(),
-            BaselineGeneratedPropertyHandoffSiteTable::Inline { site_count, .. } => site_count,
-        }
+        self.sites.len()
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn site_at(&self, index: usize) -> Option<&BaselineGeneratedPropertyHandoffSite> {
-        match self.site_table {
-            BaselineGeneratedPropertyHandoffSiteTable::Slice(sites) => sites.get(index),
-            BaselineGeneratedPropertyHandoffSiteTable::Inline { site_count, sites } => {
-                if index >= site_count {
-                    None
-                } else {
-                    sites[index].as_ref()
-                }
-            }
-        }
+        self.sites.get(index)
     }
 
     pub(crate) fn site_for_bytecode_index(
@@ -875,25 +1145,13 @@ impl<'site> BaselineGeneratedPropertyHandoffPlan<'site> {
     ) -> Result<Option<&'site BaselineGeneratedPropertyHandoffSite>, ()> {
         let mut matching = None;
         let mut ambiguous = false;
-        match self.site_table {
-            BaselineGeneratedPropertyHandoffSiteTable::Slice(sites) => {
-                for site in sites {
-                    if site.bytecode_index == bytecode_index {
-                        if matching.is_some() {
-                            ambiguous = true;
-                            break;
-                        }
-                        matching = Some(site);
-                    }
+        for site in self.sites {
+            if site.bytecode_index == bytecode_index {
+                if matching.is_some() {
+                    ambiguous = true;
+                    break;
                 }
-            }
-            BaselineGeneratedPropertyHandoffSiteTable::Inline { site_count, sites } => {
-                for site in sites.iter().take(site_count).flatten() {
-                    if site.bytecode_index == bytecode_index {
-                        matching = Some(site);
-                        break;
-                    }
-                }
+                matching = Some(site);
             }
         }
         if ambiguous {
@@ -904,12 +1162,10 @@ impl<'site> BaselineGeneratedPropertyHandoffPlan<'site> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BaselineGeneratedPropertyHandoffPlanMetadata {
     bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
-    site_count: usize,
-    sites: [Option<BaselineGeneratedPropertyHandoffSite>;
-        BASELINE_GENERATED_PROPERTY_HANDOFF_PLAN_SITE_CAPACITY],
+    sites: Vec<BaselineGeneratedPropertyHandoffSite>,
 }
 
 impl BaselineGeneratedPropertyHandoffPlanMetadata {
@@ -918,15 +1174,9 @@ impl BaselineGeneratedPropertyHandoffPlanMetadata {
         mut sites: Vec<BaselineGeneratedPropertyHandoffSite>,
     ) -> Result<Self, JitPlanValidationError> {
         validate_baseline_generated_property_handoff_sites(&mut sites)?;
-        let site_count = sites.len();
-        let mut site_table = [None; BASELINE_GENERATED_PROPERTY_HANDOFF_PLAN_SITE_CAPACITY];
-        for (index, site) in sites.into_iter().enumerate() {
-            site_table[index] = Some(site);
-        }
         Ok(Self {
             bytecode_snapshot,
-            site_count,
-            sites: site_table,
+            sites,
         })
     }
 
@@ -944,38 +1194,26 @@ impl BaselineGeneratedPropertyHandoffPlanMetadata {
         self.bytecode_snapshot
     }
 
-    pub(crate) const fn site_count(&self) -> usize {
-        self.site_count
+    pub(crate) fn site_count(&self) -> usize {
+        self.sites.len()
     }
 
     pub(crate) fn site_at(&self, index: usize) -> Option<&BaselineGeneratedPropertyHandoffSite> {
-        if index >= self.site_count {
-            None
-        } else {
-            self.sites[index].as_ref()
-        }
+        self.sites.get(index)
     }
 
     pub(crate) fn borrowed_plan(&self) -> BaselineGeneratedPropertyHandoffPlan<'_> {
-        BaselineGeneratedPropertyHandoffPlan::from_inline_table(
-            self.bytecode_snapshot,
-            self.site_count,
-            &self.sites,
-        )
+        BaselineGeneratedPropertyHandoffPlan::new(self.bytecode_snapshot, &self.sites)
     }
 
     pub(crate) fn site_for_bytecode_index(
         &self,
         bytecode_index: BytecodeIndex,
     ) -> Option<&BaselineGeneratedPropertyHandoffSite> {
-        self.sites[..self.site_count]
-            .binary_search_by_key(&bytecode_index, |site| {
-                site.as_ref()
-                    .map(|site| site.bytecode_index)
-                    .unwrap_or(BytecodeIndex::INVALID)
-            })
+        self.sites
+            .binary_search_by_key(&bytecode_index, |site| site.bytecode_index)
             .ok()
-            .and_then(|index| self.sites[index].as_ref())
+            .and_then(|index| self.sites.get(index))
     }
 }
 
@@ -1081,13 +1319,42 @@ const fn baseline_runtime_helper_opcode_is_native_exit_eligible(opcode: CoreOpco
             | CoreOpcode::NewArray
             | CoreOpcode::LoadString
             | CoreOpcode::LoadBigInt
+            | CoreOpcode::LoadCapture
+            | CoreOpcode::NewClosureCell
+            | CoreOpcode::GetClosureCell
+            | CoreOpcode::PutClosureCell
+            | CoreOpcode::ArrayAppend
             | CoreOpcode::TypeOf
+            | CoreOpcode::Throw
     )
 }
 
 pub(crate) fn derive_baseline_generated_property_handoff_plan_from_code_block(
     code_block: &CodeBlock,
     owner: CodeBlockId,
+) -> Result<BaselineGeneratedPropertyHandoffPlanDerivation, JitPlanValidationError> {
+    derive_baseline_generated_property_handoff_plan_from_code_block_with_cache_validation(
+        code_block,
+        owner,
+        PropertyHandoffBytecodeCacheValidation::ColdInstall,
+    )
+}
+
+pub(crate) fn derive_baseline_generated_property_handoff_plan_from_current_code_block_metadata(
+    code_block: &CodeBlock,
+    owner: CodeBlockId,
+) -> Result<BaselineGeneratedPropertyHandoffPlanDerivation, JitPlanValidationError> {
+    derive_baseline_generated_property_handoff_plan_from_code_block_with_cache_validation(
+        code_block,
+        owner,
+        PropertyHandoffBytecodeCacheValidation::CurrentMetadata,
+    )
+}
+
+fn derive_baseline_generated_property_handoff_plan_from_code_block_with_cache_validation(
+    code_block: &CodeBlock,
+    owner: CodeBlockId,
+    cache_validation: PropertyHandoffBytecodeCacheValidation,
 ) -> Result<BaselineGeneratedPropertyHandoffPlanDerivation, JitPlanValidationError> {
     let mut sites = Vec::new();
 
@@ -1105,12 +1372,27 @@ pub(crate) fn derive_baseline_generated_property_handoff_plan_from_code_block(
         })?;
         if !matches!(
             CoreOpcode::from_opcode(decoded.opcode),
-            Some(CoreOpcode::GetByName | CoreOpcode::PutByName)
+            Some(
+                CoreOpcode::GetByName
+                    | CoreOpcode::GetGlobalObjectProperty
+                    | CoreOpcode::GetLength
+                    | CoreOpcode::PutByName
+                    | CoreOpcode::PutGlobalObjectProperty
+                    | CoreOpcode::GetByValue
+                    | CoreOpcode::PutByValue
+                    | CoreOpcode::InById
+                    | CoreOpcode::InByVal
+            )
         ) {
             continue;
         }
 
-        let site = derive_baseline_generated_property_handoff_site(code_block, owner, decoded)?;
+        let site = derive_baseline_generated_property_handoff_site_with_cache_validation(
+            code_block,
+            owner,
+            decoded,
+            cache_validation,
+        )?;
         sites.push(site);
     }
 
@@ -1147,7 +1429,7 @@ pub(crate) fn derive_baseline_generated_js_call_native_exit_plan_from_code_block
         })?;
         if !matches!(
             CoreOpcode::from_opcode(decoded.opcode),
-            Some(CoreOpcode::Call | CoreOpcode::CallWithThis)
+            Some(CoreOpcode::Call | CoreOpcode::CallWithThis | CoreOpcode::Construct)
         ) {
             continue;
         }
@@ -1168,6 +1450,87 @@ pub(crate) fn derive_baseline_generated_js_call_native_exit_plan_from_code_block
     };
 
     Ok(BaselineGeneratedJsCallNativeExitPlanDerivation { metadata })
+}
+
+pub(crate) fn derive_baseline_generated_owner_continuation_map_from_code_block(
+    code_block: &CodeBlock,
+    owner: CodeBlockId,
+) -> Result<BaselineGeneratedOwnerContinuationMapDerivation, JitPlanValidationError> {
+    let decoded = collect_decoded_instructions_for_owner_continuation_map(code_block)?;
+    let mut labels = Vec::with_capacity(decoded.len());
+    let mut call_sites = Vec::new();
+
+    for (index, instruction) in decoded.iter().copied().enumerate() {
+        let Some(opcode) = CoreOpcode::from_opcode(instruction.opcode) else {
+            continue;
+        };
+        let next_bytecode_index = decoded
+            .get(index.saturating_add(1))
+            .map(|next| next.bytecode_index);
+        labels.push(BaselineGeneratedOwnerBytecodeLabel {
+            owner,
+            bytecode_index: instruction.bytecode_index,
+            opcode,
+            next_bytecode_index,
+        });
+
+        if !baseline_opcode_is_generated_js_call_handoff(opcode) {
+            continue;
+        }
+        let native_exit_site =
+            derive_baseline_generated_js_call_native_exit_site(code_block, owner, instruction)?;
+        call_sites.push(BaselineGeneratedOwnerContinuationSite {
+            owner,
+            call_bytecode_index: native_exit_site.bytecode_index,
+            opcode,
+            destination: native_exit_site.destination,
+            argument_count_including_this: native_exit_site
+                .provided_argument_count
+                .saturating_add(1),
+            resume_bytecode_index: native_exit_site.resume_bytecode_index,
+            kind: owner_continuation_kind_for_opcode(opcode).ok_or(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapUnsupportedOpcode {
+                    bytecode_index: instruction.bytecode_index,
+                    opcode,
+                },
+            )?,
+            result_profile: baseline_generated_owner_call_result_profile_site(
+                code_block,
+                instruction.bytecode_index,
+                opcode,
+            )?,
+        });
+    }
+
+    let metadata = if labels.is_empty() {
+        None
+    } else {
+        Some(
+            BaselineGeneratedOwnerContinuationMapMetadata::from_code_block_snapshot(
+                code_block, labels, call_sites,
+            )?,
+        )
+    };
+
+    Ok(BaselineGeneratedOwnerContinuationMapDerivation { metadata })
+}
+
+#[allow(dead_code)]
+pub(crate) fn validate_baseline_generated_owner_continuation_map_against_code_block(
+    code_block: &CodeBlock,
+    owner: CodeBlockId,
+    owner_continuation_map: &BaselineGeneratedOwnerContinuationMapMetadata,
+) -> Result<BaselineGeneratedOwnerContinuationMapDerivation, JitPlanValidationError> {
+    let derivation =
+        derive_baseline_generated_owner_continuation_map_from_code_block(code_block, owner)?;
+    if derivation.metadata.as_ref() != Some(owner_continuation_map) {
+        return Err(baseline_generated_owner_continuation_map_mismatch_error(
+            code_block,
+            derivation.metadata.as_ref(),
+            owner_continuation_map,
+        ));
+    }
+    Ok(derivation)
 }
 
 pub(crate) fn validate_baseline_generated_js_call_native_exit_site_against_code_block(
@@ -1267,6 +1630,110 @@ fn baseline_generated_property_handoff_plan_mismatch_error(
     }
 }
 
+#[allow(dead_code)]
+fn baseline_generated_owner_continuation_map_mismatch_error(
+    code_block: &CodeBlock,
+    expected: Option<&BaselineGeneratedOwnerContinuationMapMetadata>,
+    actual: &BaselineGeneratedOwnerContinuationMapMetadata,
+) -> JitPlanValidationError {
+    let expected_label_count = expected.map_or(0, |metadata| metadata.label_count());
+    let actual_label_count = actual.label_count();
+    let first_label_mismatch = expected.and_then(|metadata| {
+        let shared_count = metadata.label_count().min(actual.label_count());
+        (0..shared_count).find(|index| metadata.label_at(*index) != actual.label_at(*index))
+    });
+    let expected_site_count = expected.map_or(0, |metadata| metadata.call_site_count());
+    let actual_site_count = actual.call_site_count();
+    let first_site_mismatch = expected.and_then(|metadata| {
+        let shared_count = metadata.call_site_count().min(actual.call_site_count());
+        (0..shared_count).find(|index| metadata.call_site_at(*index) != actual.call_site_at(*index))
+    });
+    let expected_snapshot = match expected {
+        Some(metadata) => Some(metadata.bytecode_snapshot()),
+        None => baseline_bytecode_snapshot_fingerprint_from_code_block(code_block).ok(),
+    };
+
+    JitPlanValidationError::BaselineGeneratedOwnerContinuationMapCodeBlockDerivationMismatch {
+        expected_label_count,
+        actual_label_count,
+        first_label_mismatch,
+        expected_site_count,
+        actual_site_count,
+        first_site_mismatch,
+        bytecode_snapshot_matches: expected_snapshot
+            .map(|expected_snapshot| expected_snapshot == actual.bytecode_snapshot()),
+    }
+}
+
+fn collect_decoded_instructions_for_owner_continuation_map(
+    code_block: &CodeBlock,
+) -> Result<Vec<DecodedInstruction<'_>>, JitPlanValidationError> {
+    let mut decoded = Vec::new();
+    for (ordinal, instruction) in code_block
+        .unlinked()
+        .instructions()
+        .decoded_instructions()
+        .enumerate()
+    {
+        decoded.push(instruction.map_err(|error| {
+            JitPlanValidationError::BaselineEligibilityInstructionDecodeFailed {
+                bytecode_index: BytecodeIndex::from_offset(ordinal as u32),
+                error,
+            }
+        })?);
+    }
+    Ok(decoded)
+}
+
+const fn owner_continuation_kind_for_opcode(
+    opcode: CoreOpcode,
+) -> Option<BaselineGeneratedOwnerContinuationKind> {
+    match opcode {
+        CoreOpcode::Call | CoreOpcode::CallWithThis => {
+            Some(BaselineGeneratedOwnerContinuationKind::Call)
+        }
+        CoreOpcode::Construct => Some(BaselineGeneratedOwnerContinuationKind::Construct),
+        _ => None,
+    }
+}
+
+fn baseline_generated_owner_call_result_profile_site(
+    code_block: &CodeBlock,
+    bytecode_index: BytecodeIndex,
+    opcode: CoreOpcode,
+) -> Result<Option<BaselineGeneratedOwnerCallResultProfileSite>, JitPlanValidationError> {
+    if !matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+        return Ok(None);
+    }
+
+    let target = code_block
+        .side_tables()
+        .value_profiles
+        .jit_store_target(
+            bytecode_index,
+            crate::bytecode::Checkpoint::NONE,
+            ValueProfileBucketKind::Sample,
+        )
+        .map_err(|_| {
+            JitPlanValidationError::BaselineGeneratedOwnerContinuationMapMalformedSite {
+                bytecode_index,
+            }
+        })?;
+    Ok(Some(BaselineGeneratedOwnerCallResultProfileSite {
+        profile_slot: target.binding.profile_slot,
+        bytecode_index: target.binding.bytecode_index,
+        checkpoint: target.binding.checkpoint,
+        bucket_kind: target.binding.kind,
+        storage_generation: target.binding.storage_generation,
+        value_profile_offset: target.binding.value_profile_offset,
+        metadata_table_displacement: target.binding.metadata_table_displacement,
+        metadata_table_base_address: target.metadata_table_base_address,
+        raw_bucket_address: target.raw_bucket_address,
+        raw_bucket_bytes: target.raw_bucket_bytes,
+        emission_policy: target.binding.emission_policy,
+    }))
+}
+
 fn derive_baseline_generated_js_call_native_exit_site(
     code_block: &CodeBlock,
     owner: CodeBlockId,
@@ -1287,7 +1754,7 @@ fn derive_baseline_generated_js_call_native_exit_site(
             reason: BaselineOpcodeRejectionReason::Call,
         },
     )?;
-    if !matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+    if !baseline_opcode_is_generated_js_call_handoff(opcode) {
         return Err(
             JitPlanValidationError::BaselineGeneratedJsCallNativeExitPlanUnsupportedOpcode {
                 bytecode_index,
@@ -1299,7 +1766,7 @@ fn derive_baseline_generated_js_call_native_exit_site(
     let destination = js_call_native_exit_register_operand(instruction, opcode, 0)?;
     let callee = js_call_native_exit_register_operand(instruction, opcode, 1)?;
     let (this_register, argument_count_operand, first_argument_operand) = match opcode {
-        CoreOpcode::Call => (None, 2usize, 3usize),
+        CoreOpcode::Call | CoreOpcode::Construct => (None, 2usize, 3usize),
         CoreOpcode::CallWithThis => (
             Some(js_call_native_exit_register_operand(
                 instruction,
@@ -1448,6 +1915,61 @@ fn derive_baseline_generated_property_handoff_site(
     owner: CodeBlockId,
     instruction: DecodedInstruction<'_>,
 ) -> Result<BaselineGeneratedPropertyHandoffSite, JitPlanValidationError> {
+    derive_baseline_generated_property_handoff_site_with_cache_validation(
+        code_block,
+        owner,
+        instruction,
+        PropertyHandoffBytecodeCacheValidation::ColdInstall,
+    )
+}
+
+pub(crate) fn validate_baseline_generated_property_handoff_site_against_current_code_block(
+    code_block: &CodeBlock,
+    owner: CodeBlockId,
+    site: &BaselineGeneratedPropertyHandoffSite,
+) -> Result<(), JitPlanValidationError> {
+    let instruction = code_block
+        .decoded_instruction_at(site.bytecode_index)
+        .map_err(|_| {
+            JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanInvalidBytecodeIndex {
+                bytecode_index: site.bytecode_index,
+            }
+        })?;
+    let derived = derive_baseline_generated_property_handoff_site_with_cache_validation(
+        code_block,
+        owner,
+        instruction,
+        PropertyHandoffBytecodeCacheValidation::CurrentMetadata,
+    )?;
+    if derived != *site {
+        return Err(
+            JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanCodeBlockDerivationMismatch {
+                expected_site_count: 1,
+                actual_site_count: 1,
+                first_mismatch: Some(0),
+                bytecode_snapshot_matches: baseline_bytecode_snapshot_fingerprint_from_code_block(
+                    code_block,
+                )
+                .ok()
+                .map(|_| true),
+            },
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PropertyHandoffBytecodeCacheValidation {
+    ColdInstall,
+    CurrentMetadata,
+}
+
+fn derive_baseline_generated_property_handoff_site_with_cache_validation(
+    code_block: &CodeBlock,
+    owner: CodeBlockId,
+    instruction: DecodedInstruction<'_>,
+    cache_validation: PropertyHandoffBytecodeCacheValidation,
+) -> Result<BaselineGeneratedPropertyHandoffSite, JitPlanValidationError> {
     let bytecode_index = instruction.bytecode_index;
     if !bytecode_index.is_valid() {
         return Err(
@@ -1463,7 +1985,18 @@ fn derive_baseline_generated_property_handoff_site(
             reason: BaselineOpcodeRejectionReason::PropertyAccess,
         },
     )?;
-    if !matches!(opcode, CoreOpcode::GetByName | CoreOpcode::PutByName) {
+    if !matches!(
+        opcode,
+        CoreOpcode::GetByName
+            | CoreOpcode::GetGlobalObjectProperty
+            | CoreOpcode::GetLength
+            | CoreOpcode::PutByName
+            | CoreOpcode::PutGlobalObjectProperty
+            | CoreOpcode::GetByValue
+            | CoreOpcode::PutByValue
+            | CoreOpcode::InById
+            | CoreOpcode::InByVal
+    ) {
         return Err(
             JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanUnsupportedOpcode {
                 bytecode_index,
@@ -1472,46 +2005,135 @@ fn derive_baseline_generated_property_handoff_site(
         );
     }
 
-    let base_operand_index = match opcode {
-        CoreOpcode::GetByName => 1,
-        CoreOpcode::PutByName => 0,
-        _ => unreachable!(),
-    };
-    let base = instruction
-        .register_operand(base_operand_index)
-        .map_err(|_| {
+    let base = match opcode {
+        CoreOpcode::GetByName
+        | CoreOpcode::GetLength
+        | CoreOpcode::GetByValue
+        | CoreOpcode::InById
+        | CoreOpcode::InByVal => Some(instruction.register_operand(1).map_err(|_| {
             JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanMissingBaseRegister {
                 bytecode_index,
                 opcode,
             }
-        })?;
-    let property_key = named_property_key_from_instruction(instruction, opcode)?;
+        })?),
+        CoreOpcode::GetGlobalObjectProperty | CoreOpcode::PutGlobalObjectProperty => None,
+        CoreOpcode::PutByName | CoreOpcode::PutByValue => {
+            Some(instruction.register_operand(0).map_err(|_| {
+                JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanMissingBaseRegister {
+                    bytecode_index,
+                    opcode,
+                }
+            })?)
+        }
+        _ => unreachable!(),
+    };
+    let property_key = property_cache_key_from_instruction(instruction, opcode)?;
     let (slot, cache) = unique_property_access_slot_for_bytecode_index(code_block, bytecode_index)?;
-    validate_named_property_inline_cache(cache, bytecode_index, opcode, base, property_key)?;
+    validate_property_inline_cache(
+        cache,
+        bytecode_index,
+        opcode,
+        base,
+        property_key,
+        cache_validation,
+    )?;
 
     let cache_kind = property_handoff_cache_kind_for_opcode(opcode);
     let cold_miss_handoff =
-        derive_named_property_miss_handoff_descriptor(owner, slot, bytecode_index, cache_kind)?;
+        derive_property_miss_handoff_descriptor(owner, slot, bytecode_index, cache_kind)?;
 
     let site = match opcode {
         CoreOpcode::GetByName => BaselineGeneratedPropertyHandoffSite::get_by_name_property_load(
             owner,
             slot,
             bytecode_index,
-            property_key,
+            match property_key {
+                PropertyCacheKey::Key(property_key) => property_key,
+                _ => unreachable!(),
+            },
+        ),
+        CoreOpcode::GetGlobalObjectProperty => {
+            BaselineGeneratedPropertyHandoffSite::get_global_object_property_load(
+                owner,
+                slot,
+                bytecode_index,
+                match property_key {
+                    PropertyCacheKey::Key(property_key) => property_key,
+                    _ => unreachable!(),
+                },
+            )
+        }
+        CoreOpcode::GetLength => BaselineGeneratedPropertyHandoffSite::get_length_property_load(
+            owner,
+            slot,
+            bytecode_index,
+            match property_key {
+                PropertyCacheKey::Key(property_key) => property_key,
+                _ => unreachable!(),
+            },
         ),
         CoreOpcode::PutByName => BaselineGeneratedPropertyHandoffSite::put_by_name_property_store(
             owner,
             slot,
             bytecode_index,
-            property_key,
+            match property_key {
+                PropertyCacheKey::Key(property_key) => property_key,
+                _ => unreachable!(),
+            },
+        ),
+        CoreOpcode::PutGlobalObjectProperty => {
+            BaselineGeneratedPropertyHandoffSite::put_global_object_property_store(
+                owner,
+                slot,
+                bytecode_index,
+                match property_key {
+                    PropertyCacheKey::Key(property_key) => property_key,
+                    _ => unreachable!(),
+                },
+            )
+        }
+        CoreOpcode::GetByValue => BaselineGeneratedPropertyHandoffSite::get_by_value_element_load(
+            owner,
+            slot,
+            bytecode_index,
+            match property_key {
+                PropertyCacheKey::RuntimeValue(property_register) => property_register,
+                _ => unreachable!(),
+            },
+        ),
+        CoreOpcode::PutByValue => BaselineGeneratedPropertyHandoffSite::put_by_value_element_store(
+            owner,
+            slot,
+            bytecode_index,
+            match property_key {
+                PropertyCacheKey::RuntimeValue(property_register) => property_register,
+                _ => unreachable!(),
+            },
+        ),
+        CoreOpcode::InById => BaselineGeneratedPropertyHandoffSite::in_by_id_has(
+            owner,
+            slot,
+            bytecode_index,
+            match property_key {
+                PropertyCacheKey::Key(property_key) => property_key,
+                _ => unreachable!(),
+            },
+        ),
+        CoreOpcode::InByVal => BaselineGeneratedPropertyHandoffSite::in_by_value_has(
+            owner,
+            slot,
+            bytecode_index,
+            match property_key {
+                PropertyCacheKey::RuntimeValue(property_register) => property_register,
+                _ => unreachable!(),
+            },
         ),
         _ => unreachable!(),
     };
     Ok(site.with_cold_miss_handoff(cold_miss_handoff))
 }
 
-fn derive_named_property_miss_handoff_descriptor(
+fn derive_property_miss_handoff_descriptor(
     owner: CodeBlockId,
     slot: InlineCacheSlotId,
     bytecode_index: BytecodeIndex,
@@ -1521,7 +2143,10 @@ fn derive_named_property_miss_handoff_descriptor(
         .owner(owner)
         .bytecode_index(bytecode_index.offset())
         .state(JitInlineCacheState::ColdSlowPath);
-    if cache_kind == InlineCacheKind::PropertyStore {
+    if matches!(
+        cache_kind,
+        InlineCacheKind::PropertyStore | InlineCacheKind::ElementStore
+    ) {
         builder = builder.barrier_metadata(InlineCacheBarrierMetadata::store_value(
             InlineCacheBarrierTarget::StoredValue,
         ));
@@ -1568,14 +2193,20 @@ fn unique_property_access_slot_for_bytecode_index(
     Ok((InlineCacheSlotId(slot as u32), cache))
 }
 
-fn named_property_key_from_instruction(
+fn property_cache_key_from_instruction(
     instruction: DecodedInstruction<'_>,
     opcode: CoreOpcode,
-) -> Result<PropertyKey, JitPlanValidationError> {
+) -> Result<PropertyCacheKey, JitPlanValidationError> {
     let bytecode_index = instruction.bytecode_index;
     let property_operand_index = match opcode {
         CoreOpcode::GetByName => 2,
+        CoreOpcode::GetGlobalObjectProperty => 1,
+        CoreOpcode::GetLength => 2,
         CoreOpcode::PutByName => 1,
+        CoreOpcode::PutGlobalObjectProperty => 0,
+        CoreOpcode::GetByValue => 2,
+        CoreOpcode::PutByValue => 1,
+        CoreOpcode::InById | CoreOpcode::InByVal => 2,
         _ => {
             return Err(
                 JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanUnsupportedOpcode {
@@ -1591,25 +2222,42 @@ fn named_property_key_from_instruction(
             opcode,
         }
     })?;
-    let Operand::IdentifierIndex(identifier_index) = property_operand else {
-        return Err(
+    match (opcode, property_operand) {
+        (
+            CoreOpcode::GetByName
+            | CoreOpcode::GetGlobalObjectProperty
+            | CoreOpcode::GetLength
+            | CoreOpcode::PutByName
+            | CoreOpcode::PutGlobalObjectProperty,
+            Operand::IdentifierIndex(identifier_index),
+        ) => Ok(PropertyCacheKey::Key(PropertyKey::from_identifier(
+            Identifier::from_atom(AtomId::from_table_slot(identifier_index)),
+        ))),
+        (CoreOpcode::InById, Operand::IdentifierIndex(identifier_index)) => {
+            Ok(PropertyCacheKey::Key(PropertyKey::from_identifier(
+                Identifier::from_atom(AtomId::from_table_slot(identifier_index)),
+            )))
+        }
+        (
+            CoreOpcode::GetByValue | CoreOpcode::PutByValue | CoreOpcode::InByVal,
+            Operand::Register(register),
+        ) => Ok(PropertyCacheKey::RuntimeValue(register)),
+        _ => Err(
             JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanMissingPropertyIdentifier {
                 bytecode_index,
                 opcode,
             },
-        );
-    };
-    Ok(PropertyKey::from_identifier(Identifier::from_atom(
-        AtomId::from_table_slot(identifier_index),
-    )))
+        ),
+    }
 }
 
-fn validate_named_property_inline_cache(
+fn validate_property_inline_cache(
     cache: &PropertyInlineCache,
     bytecode_index: BytecodeIndex,
     opcode: CoreOpcode,
-    base: VirtualRegister,
-    property_key: PropertyKey,
+    base: Option<VirtualRegister>,
+    property_key: PropertyCacheKey,
+    cache_validation: PropertyHandoffBytecodeCacheValidation,
 ) -> Result<(), JitPlanValidationError> {
     let expected = property_handoff_shape_for_opcode(opcode)?;
     if cache.bytecode_index != bytecode_index {
@@ -1638,34 +2286,36 @@ fn validate_named_property_inline_cache(
             },
         );
     }
-    if cache.dispatch != PropertyInlineCacheDispatch::Unlinked
-        || cache.mutation_authority != InlineCacheMutationAuthority::LinkedCodeBlock
-    {
-        return Err(
-            JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanMalformedBytecodeCache {
-                bytecode_index,
-            },
-        );
+    if cache_validation == PropertyHandoffBytecodeCacheValidation::ColdInstall {
+        if cache.dispatch != PropertyInlineCacheDispatch::Unlinked
+            || cache.mutation_authority != InlineCacheMutationAuthority::LinkedCodeBlock
+        {
+            return Err(
+                JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanMalformedBytecodeCache {
+                    bytecode_index,
+                },
+            );
+        }
+        if cache.state != BytecodeInlineCacheState::Unset {
+            return Err(
+                JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanBytecodeCacheStateMismatch {
+                    bytecode_index,
+                    expected: BytecodeInlineCacheState::Unset,
+                    actual: cache.state,
+                },
+            );
+        }
     }
-    if cache.state != BytecodeInlineCacheState::Unset {
-        return Err(
-            JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanBytecodeCacheStateMismatch {
-                bytecode_index,
-                expected: BytecodeInlineCacheState::Unset,
-                actual: cache.state,
-            },
-        );
-    }
-    if cache.base != Some(base) {
+    if cache.base != base {
         return Err(
             JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanBaseMismatch {
                 bytecode_index,
-                expected: base,
+                expected: base.unwrap_or(VirtualRegister::INVALID),
                 actual: cache.base,
             },
         );
     }
-    if cache.property != PropertyCacheKey::Key(property_key) {
+    if cache.property != property_key {
         return Err(
             JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanPropertyKeyMismatch {
                 bytecode_index,
@@ -1699,19 +2349,56 @@ fn property_handoff_shape_for_opcode(
     opcode: CoreOpcode,
 ) -> Result<BaselineGeneratedPropertyHandoffShape, JitPlanValidationError> {
     match opcode {
-        CoreOpcode::GetByName => Ok(BaselineGeneratedPropertyHandoffShape {
-            cache_kind: InlineCacheKind::PropertyLoad,
-            access: PropertyAccessType::GetById,
-            property_cache_kind: PropertyCacheKind::GetById,
-            has_get_by_id: true,
-            has_put_by_id: false,
-        }),
+        CoreOpcode::GetByName | CoreOpcode::GetGlobalObjectProperty | CoreOpcode::GetLength => {
+            Ok(BaselineGeneratedPropertyHandoffShape {
+                cache_kind: InlineCacheKind::PropertyLoad,
+                access: PropertyAccessType::GetById,
+                property_cache_kind: PropertyCacheKind::GetById,
+                has_get_by_id: true,
+                has_put_by_id: false,
+            })
+        }
         CoreOpcode::PutByName => Ok(BaselineGeneratedPropertyHandoffShape {
             cache_kind: InlineCacheKind::PropertyStore,
             access: PropertyAccessType::PutByIdSloppy,
             property_cache_kind: PropertyCacheKind::PutById,
             has_get_by_id: false,
             has_put_by_id: true,
+        }),
+        CoreOpcode::PutGlobalObjectProperty => Ok(BaselineGeneratedPropertyHandoffShape {
+            cache_kind: InlineCacheKind::PropertyStore,
+            access: PropertyAccessType::PutByIdSloppy,
+            property_cache_kind: PropertyCacheKind::PutById,
+            has_get_by_id: false,
+            has_put_by_id: true,
+        }),
+        CoreOpcode::GetByValue => Ok(BaselineGeneratedPropertyHandoffShape {
+            cache_kind: InlineCacheKind::ElementLoad,
+            access: PropertyAccessType::GetByVal,
+            property_cache_kind: PropertyCacheKind::GetByVal,
+            has_get_by_id: false,
+            has_put_by_id: false,
+        }),
+        CoreOpcode::PutByValue => Ok(BaselineGeneratedPropertyHandoffShape {
+            cache_kind: InlineCacheKind::ElementStore,
+            access: PropertyAccessType::PutByValSloppy,
+            property_cache_kind: PropertyCacheKind::PutByVal,
+            has_get_by_id: false,
+            has_put_by_id: false,
+        }),
+        CoreOpcode::InById => Ok(BaselineGeneratedPropertyHandoffShape {
+            cache_kind: InlineCacheKind::HasProperty,
+            access: PropertyAccessType::InById,
+            property_cache_kind: PropertyCacheKind::InById,
+            has_get_by_id: false,
+            has_put_by_id: false,
+        }),
+        CoreOpcode::InByVal => Ok(BaselineGeneratedPropertyHandoffShape {
+            cache_kind: InlineCacheKind::HasProperty,
+            access: PropertyAccessType::InByVal,
+            property_cache_kind: PropertyCacheKind::InByVal,
+            has_get_by_id: false,
+            has_put_by_id: false,
         }),
         _ => Err(
             JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanUnsupportedOpcode {
@@ -1724,8 +2411,15 @@ fn property_handoff_shape_for_opcode(
 
 fn property_handoff_cache_kind_for_opcode(opcode: CoreOpcode) -> InlineCacheKind {
     match opcode {
-        CoreOpcode::GetByName => InlineCacheKind::PropertyLoad,
-        CoreOpcode::PutByName => InlineCacheKind::PropertyStore,
+        CoreOpcode::GetByName | CoreOpcode::GetGlobalObjectProperty | CoreOpcode::GetLength => {
+            InlineCacheKind::PropertyLoad
+        }
+        CoreOpcode::PutByName | CoreOpcode::PutGlobalObjectProperty => {
+            InlineCacheKind::PropertyStore
+        }
+        CoreOpcode::GetByValue => InlineCacheKind::ElementLoad,
+        CoreOpcode::PutByValue => InlineCacheKind::ElementStore,
+        CoreOpcode::InById | CoreOpcode::InByVal => InlineCacheKind::HasProperty,
         _ => unreachable!(),
     }
 }
@@ -1786,21 +2480,19 @@ fn derive_baseline_generated_runtime_helper_site(
             .ok_or(JitPlanValidationError::SafepointMissingRootMap(
                 safepoint_id,
             ))?;
-    if !helper.root_map_contains_register_slot(
-        root_map,
-        bytecode_index,
-        required_operands.destination,
-    ) {
-        return Err(
-            JitPlanValidationError::BaselineGeneratedRuntimeHelperDerivationMissingDestinationSlot {
-                bytecode_index,
-                opcode,
-                root_map: root_map.id,
-                register: required_operands.destination,
-            },
-        );
+    if let Some(destination) = required_operands.destination {
+        if !helper.root_map_contains_register_slot(root_map, bytecode_index, destination) {
+            return Err(
+                JitPlanValidationError::BaselineGeneratedRuntimeHelperDerivationMissingDestinationSlot {
+                    bytecode_index,
+                    opcode,
+                    root_map: root_map.id,
+                    register: destination,
+                },
+            );
+        }
     }
-    if let Some(source) = required_operands.source {
+    for source in required_operands.sources {
         if !helper.root_map_contains_register_slot(root_map, bytecode_index, source) {
             return Err(
                 JitPlanValidationError::BaselineGeneratedRuntimeHelperDerivationMissingSourceSlot {
@@ -1829,10 +2521,10 @@ struct BaselineGeneratedRuntimeHelperOperandDescriptor {
     operand_index: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct BaselineGeneratedRuntimeHelperRequiredOperands {
-    destination: VirtualRegister,
-    source: Option<VirtualRegister>,
+    destination: Option<VirtualRegister>,
+    sources: Vec<VirtualRegister>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1851,6 +2543,11 @@ const SOURCE_OPERAND_1: BaselineGeneratedRuntimeHelperOperandDescriptor =
         role: BaselineGeneratedRuntimeHelperOperandRole::Source,
         operand_index: 1,
     };
+const SOURCE_OPERAND_0: BaselineGeneratedRuntimeHelperOperandDescriptor =
+    BaselineGeneratedRuntimeHelperOperandDescriptor {
+        role: BaselineGeneratedRuntimeHelperOperandRole::Source,
+        operand_index: 0,
+    };
 const STRING_LITERAL_OPERAND_1: BaselineGeneratedRuntimeHelperOperandDescriptor =
     BaselineGeneratedRuntimeHelperOperandDescriptor {
         role: BaselineGeneratedRuntimeHelperOperandRole::StringLiteral,
@@ -1864,6 +2561,12 @@ const DESTINATION_SOURCE_RUNTIME_HELPER_OPERANDS:
 const DESTINATION_STRING_LITERAL_RUNTIME_HELPER_OPERANDS:
     [BaselineGeneratedRuntimeHelperOperandDescriptor; 2] =
     [DESTINATION_OPERAND_0, STRING_LITERAL_OPERAND_1];
+const SOURCE_ONLY_RUNTIME_HELPER_OPERANDS: [BaselineGeneratedRuntimeHelperOperandDescriptor; 1] =
+    [SOURCE_OPERAND_1];
+const THROW_RUNTIME_HELPER_OPERANDS: [BaselineGeneratedRuntimeHelperOperandDescriptor; 1] =
+    [SOURCE_OPERAND_0];
+const SOURCE_SOURCE_RUNTIME_HELPER_OPERANDS: [BaselineGeneratedRuntimeHelperOperandDescriptor; 2] =
+    [SOURCE_OPERAND_0, SOURCE_OPERAND_1];
 
 impl BaselineGeneratedRuntimeHelperDescriptor {
     const fn for_opcode(opcode: CoreOpcode) -> Option<Self> {
@@ -1876,9 +2579,41 @@ impl BaselineGeneratedRuntimeHelperDescriptor {
                 opcode,
                 operands: &DESTINATION_ONLY_RUNTIME_HELPER_OPERANDS,
             }),
+            CoreOpcode::LoadCapture => Some(Self {
+                opcode,
+                operands: &DESTINATION_ONLY_RUNTIME_HELPER_OPERANDS,
+            }),
+            CoreOpcode::NewClosureCell | CoreOpcode::GetClosureCell => Some(Self {
+                opcode,
+                operands: &DESTINATION_SOURCE_RUNTIME_HELPER_OPERANDS,
+            }),
+            CoreOpcode::PutClosureCell => Some(Self {
+                opcode,
+                operands: &SOURCE_SOURCE_RUNTIME_HELPER_OPERANDS,
+            }),
+            CoreOpcode::ArrayAppend => Some(Self {
+                opcode,
+                operands: &SOURCE_SOURCE_RUNTIME_HELPER_OPERANDS,
+            }),
+            CoreOpcode::LoadFunction => Some(Self {
+                opcode,
+                operands: &DESTINATION_ONLY_RUNTIME_HELPER_OPERANDS,
+            }),
+            CoreOpcode::InitializeGlobalLexical => Some(Self {
+                opcode,
+                operands: &SOURCE_ONLY_RUNTIME_HELPER_OPERANDS,
+            }),
             CoreOpcode::TypeOf => Some(Self {
                 opcode,
                 operands: &DESTINATION_SOURCE_RUNTIME_HELPER_OPERANDS,
+            }),
+            CoreOpcode::ForInKeys => Some(Self {
+                opcode,
+                operands: &DESTINATION_SOURCE_RUNTIME_HELPER_OPERANDS,
+            }),
+            CoreOpcode::Throw => Some(Self {
+                opcode,
+                operands: &THROW_RUNTIME_HELPER_OPERANDS,
             }),
             _ => None,
         }
@@ -1894,7 +2629,7 @@ impl BaselineGeneratedRuntimeHelperDescriptor {
         instruction: DecodedInstruction<'_>,
     ) -> Result<BaselineGeneratedRuntimeHelperRequiredOperands, JitPlanValidationError> {
         let mut destination = None;
-        let mut source = None;
+        let mut sources = Vec::new();
         for operand in self.operands {
             match operand.role {
                 BaselineGeneratedRuntimeHelperOperandRole::Destination => {
@@ -1917,7 +2652,7 @@ impl BaselineGeneratedRuntimeHelperDescriptor {
                             }
                         },
                     )?;
-                    source = Some(register);
+                    push_unique_runtime_helper_source(&mut sources, register);
                 }
                 BaselineGeneratedRuntimeHelperOperandRole::StringLiteral => {
                     let key = match instruction.operand(operand.operand_index) {
@@ -1943,14 +2678,48 @@ impl BaselineGeneratedRuntimeHelperDescriptor {
                 }
             }
         }
+        if self.opcode == CoreOpcode::LoadFunction {
+            let capture_count = match instruction.operand(2) {
+                Ok(Operand::UnsignedImmediate(count)) => count,
+                Ok(_) | Err(_) => {
+                    return Err(
+                        JitPlanValidationError::BaselineGeneratedRuntimeHelperDerivationMissingSourceRegister {
+                            bytecode_index: instruction.bytecode_index,
+                            opcode: self.opcode,
+                        },
+                    );
+                }
+            };
+            for capture_index in 0..capture_count {
+                let operand_index = usize::try_from(capture_index)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(3);
+                let register = instruction.register_operand(operand_index).map_err(|_| {
+                    JitPlanValidationError::BaselineGeneratedRuntimeHelperDerivationMissingSourceRegister {
+                        bytecode_index: instruction.bytecode_index,
+                        opcode: self.opcode,
+                    }
+                })?;
+                push_unique_runtime_helper_source(&mut sources, register);
+            }
+        }
         Ok(BaselineGeneratedRuntimeHelperRequiredOperands {
-            destination: destination.ok_or(
-                JitPlanValidationError::BaselineGeneratedRuntimeHelperDerivationMissingDestinationRegister {
-                    bytecode_index: instruction.bytecode_index,
-                    opcode: self.opcode,
-                },
-            )?,
-            source,
+            destination: if self.operands.iter().any(|operand| {
+                matches!(
+                    operand.role,
+                    BaselineGeneratedRuntimeHelperOperandRole::Destination
+                )
+            }) {
+                Some(destination.ok_or(
+                    JitPlanValidationError::BaselineGeneratedRuntimeHelperDerivationMissingDestinationRegister {
+                        bytecode_index: instruction.bytecode_index,
+                        opcode: self.opcode,
+                    },
+                )?)
+            } else {
+                destination
+            },
+            sources,
         })
     }
 
@@ -1967,6 +2736,15 @@ impl BaselineGeneratedRuntimeHelperDescriptor {
                     BytecodeRootSlotStorage::Register(register) if register == required_register
                 )
         })
+    }
+}
+
+fn push_unique_runtime_helper_source(
+    sources: &mut Vec<VirtualRegister>,
+    register: VirtualRegister,
+) {
+    if !sources.contains(&register) {
+        sources.push(register);
     }
 }
 
@@ -2690,6 +3468,24 @@ impl BaselineSupportedOpcodeSubset {
             Self::P6ConstantsMovesReturnInt32Arithmetic
             | Self::P8aConstantsMovesReturnInt32ArithmeticBranchNullish
             | Self::P8bConstantsMovesReturnInt32ArithmeticBranchNullishFalse
+            | Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOr
+            | Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullish
+            | Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullishFalse
+            | Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEquality
+            | Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullish
+            | Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullishFalse
+            | Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelational
+            | Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullish
+            | Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullishFalse
+            | Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEquality
+            | Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityBranchNullish
+            | Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityBranchNullishFalse
+            | Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelational
+            | Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullish
+            | Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullishFalse
+            | Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumber
+            | Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullish
+            | Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullishFalse
             | Self::P6ConstantsMovesReturnInt32ArithmeticBitwise
             | Self::P6ConstantsMovesReturnInt32ArithmeticBitwiseRelational
             | Self::P6ConstantsMovesReturnInt32ArithmeticBitwiseRelationalJumps
@@ -2740,6 +3536,7 @@ impl BaselineSupportedOpcodeSubset {
                     | CoreOpcode::LoadNull
                     | CoreOpcode::LoadBool
                     | CoreOpcode::LoadInt32
+                    | CoreOpcode::LoadCallee
                     | CoreOpcode::Move
                     | CoreOpcode::Return
                     | CoreOpcode::AddInt32
@@ -2752,6 +3549,107 @@ impl BaselineSupportedOpcodeSubset {
             }
             Self::P8bConstantsMovesReturnInt32ArithmeticBranchNullishFalse => {
                 Self::P8aConstantsMovesReturnInt32ArithmeticBranchNullish.supports(opcode)
+                    || matches!(opcode, CoreOpcode::JumpIfFalse)
+            }
+            Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOr => {
+                Self::P6ConstantsMovesReturnInt32Arithmetic.supports(opcode)
+                    || matches!(
+                        opcode,
+                        CoreOpcode::BitOrInt32
+                            | CoreOpcode::BitAndInt32
+                            | CoreOpcode::BitXorInt32
+                            | CoreOpcode::RightShiftInt32
+                    )
+            }
+            Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullish => {
+                Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOr.supports(opcode)
+                    || matches!(opcode, CoreOpcode::Jump | CoreOpcode::JumpIfNotNullish)
+            }
+            Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullishFalse => {
+                Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullish.supports(opcode)
+                    || matches!(opcode, CoreOpcode::JumpIfFalse)
+            }
+            Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEquality => {
+                Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOr.supports(opcode)
+                    || matches!(opcode, CoreOpcode::Equal | CoreOpcode::NotEqual)
+            }
+            Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullish => {
+                Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEquality.supports(opcode)
+                    || matches!(opcode, CoreOpcode::Jump | CoreOpcode::JumpIfNotNullish)
+            }
+            Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullishFalse => {
+                Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullish
+                    .supports(opcode)
+                    || matches!(opcode, CoreOpcode::JumpIfFalse)
+            }
+            Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelational => {
+                Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEquality.supports(opcode)
+                    || matches!(
+                        opcode,
+                        CoreOpcode::LessThanInt32
+                            | CoreOpcode::LessEqualInt32
+                            | CoreOpcode::GreaterThanInt32
+                            | CoreOpcode::GreaterEqualInt32
+                    )
+            }
+            Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullish => {
+                Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelational
+                    .supports(opcode)
+                    || matches!(opcode, CoreOpcode::Jump | CoreOpcode::JumpIfNotNullish)
+            }
+            Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullishFalse => {
+                Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullish
+                    .supports(opcode)
+                    || matches!(opcode, CoreOpcode::JumpIfFalse)
+            }
+            Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEquality => {
+                Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOr.supports(opcode)
+                    || matches!(opcode, CoreOpcode::Equal | CoreOpcode::NotEqual)
+            }
+            Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityBranchNullish => {
+                Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEquality
+                    .supports(opcode)
+                    || matches!(opcode, CoreOpcode::Jump | CoreOpcode::JumpIfNotNullish)
+            }
+            Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityBranchNullishFalse => {
+                Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityBranchNullish
+                    .supports(opcode)
+                    || matches!(opcode, CoreOpcode::JumpIfFalse)
+            }
+            Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelational => {
+                Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEquality
+                    .supports(opcode)
+                    || matches!(
+                        opcode,
+                        CoreOpcode::LessThanInt32
+                            | CoreOpcode::LessEqualInt32
+                            | CoreOpcode::GreaterThanInt32
+                            | CoreOpcode::GreaterEqualInt32
+                    )
+            }
+            Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullish => {
+                Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelational
+                    .supports(opcode)
+                    || matches!(opcode, CoreOpcode::Jump | CoreOpcode::JumpIfNotNullish)
+            }
+            Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullishFalse => {
+                Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullish
+                    .supports(opcode)
+                    || matches!(opcode, CoreOpcode::JumpIfFalse)
+            }
+            Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumber => {
+                Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelational
+                    .supports(opcode)
+                    || matches!(opcode, CoreOpcode::ToNumber)
+            }
+            Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullish => {
+                Self::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumber
+                    .supports(opcode)
+                    || matches!(opcode, CoreOpcode::Jump | CoreOpcode::JumpIfNotNullish)
+            }
+            Self::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullishFalse => {
+                Self::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullish
+                    .supports(opcode)
                     || matches!(opcode, CoreOpcode::JumpIfFalse)
             }
             Self::P6ConstantsMovesReturnInt32ArithmeticBitwise => {
@@ -2810,6 +3708,10 @@ impl BaselineSupportedOpcodeSubset {
             }
             Self::P6ConstantsMovesReturnInt32ArithmeticBitwiseRelationalJumpsPrimitiveTruthinessPrimitiveBooleanPrimitiveNumberPrimitiveToNumberVoidPureNumberBinary => {
                 Self::P6ConstantsMovesReturnInt32ArithmeticBitwiseRelationalJumpsPrimitiveTruthinessPrimitiveBooleanPrimitiveNumberPrimitiveToNumberVoid.supports(opcode)
+                    || matches!(
+                        opcode,
+                        CoreOpcode::Equal | CoreOpcode::NotEqual | CoreOpcode::LoadCallee
+                    )
             }
         }
     }
@@ -3270,10 +4172,6 @@ pub enum JitPlanValidationError {
     BaselineGeneratedRuntimeHelperPlanDuplicateProof {
         bytecode_index: BytecodeIndex,
     },
-    BaselineGeneratedRuntimeHelperPlanTooManyProofs {
-        capacity: usize,
-        actual: usize,
-    },
     BaselineGeneratedRuntimeHelperPlanContractDoesNotCallRuntimeHelper {
         bytecode_index: BytecodeIndex,
         opcode: CoreOpcode,
@@ -3313,10 +4211,6 @@ pub enum JitPlanValidationError {
     },
     BaselineGeneratedPropertyHandoffPlanDuplicateSite {
         bytecode_index: BytecodeIndex,
-    },
-    BaselineGeneratedPropertyHandoffPlanTooManySites {
-        capacity: usize,
-        actual: usize,
     },
     BaselineGeneratedPropertyHandoffPlanDuplicateBytecodeCache {
         bytecode_index: BytecodeIndex,
@@ -3364,7 +4258,7 @@ pub enum JitPlanValidationError {
     },
     BaselineGeneratedPropertyHandoffPlanPropertyKeyMismatch {
         bytecode_index: BytecodeIndex,
-        expected: PropertyKey,
+        expected: PropertyCacheKey,
         actual: PropertyCacheKey,
     },
     BaselineGeneratedPropertyHandoffPlanMissingBytecodeCache {
@@ -3463,6 +4357,37 @@ pub enum JitPlanValidationError {
         expected_site_count: usize,
         actual_site_count: usize,
         first_mismatch: Option<usize>,
+        bytecode_snapshot_matches: Option<bool>,
+    },
+    BaselineGeneratedOwnerContinuationMapInvalidBytecodeIndex {
+        bytecode_index: BytecodeIndex,
+    },
+    BaselineGeneratedOwnerContinuationMapDuplicateLabel {
+        bytecode_index: BytecodeIndex,
+    },
+    BaselineGeneratedOwnerContinuationMapDuplicateSite {
+        bytecode_index: BytecodeIndex,
+    },
+    BaselineGeneratedOwnerContinuationMapMissingLabel {
+        bytecode_index: BytecodeIndex,
+    },
+    BaselineGeneratedOwnerContinuationMapUnsupportedOpcode {
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+    },
+    BaselineGeneratedOwnerContinuationMapMalformedLabel {
+        bytecode_index: BytecodeIndex,
+    },
+    BaselineGeneratedOwnerContinuationMapMalformedSite {
+        bytecode_index: BytecodeIndex,
+    },
+    BaselineGeneratedOwnerContinuationMapCodeBlockDerivationMismatch {
+        expected_label_count: usize,
+        actual_label_count: usize,
+        first_label_mismatch: Option<usize>,
+        expected_site_count: usize,
+        actual_site_count: usize,
+        first_site_mismatch: Option<usize>,
         bytecode_snapshot_matches: Option<bool>,
     },
     BaselineGeneratedRuntimeHelperDerivationRejectedOpcode {
@@ -4162,15 +5087,6 @@ fn baseline_bytecode_snapshot_fingerprint_from_record(
 fn validate_baseline_generated_runtime_helper_proofs(
     proofs: &mut [BaselineGeneratedRuntimeHelperProof],
 ) -> Result<(), JitPlanValidationError> {
-    if proofs.len() > BASELINE_GENERATED_RUNTIME_HELPER_PLAN_PROOF_CAPACITY {
-        return Err(
-            JitPlanValidationError::BaselineGeneratedRuntimeHelperPlanTooManyProofs {
-                capacity: BASELINE_GENERATED_RUNTIME_HELPER_PLAN_PROOF_CAPACITY,
-                actual: proofs.len(),
-            },
-        );
-    }
-
     for proof in proofs.iter() {
         if !proof.bytecode_index.is_valid() {
             return Err(
@@ -4199,15 +5115,6 @@ fn validate_baseline_generated_runtime_helper_proofs(
 fn validate_baseline_generated_property_handoff_sites(
     sites: &mut [BaselineGeneratedPropertyHandoffSite],
 ) -> Result<(), JitPlanValidationError> {
-    if sites.len() > BASELINE_GENERATED_PROPERTY_HANDOFF_PLAN_SITE_CAPACITY {
-        return Err(
-            JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanTooManySites {
-                capacity: BASELINE_GENERATED_PROPERTY_HANDOFF_PLAN_SITE_CAPACITY,
-                actual: sites.len(),
-            },
-        );
-    }
-
     for site in sites.iter() {
         if !site.bytecode_index.is_valid() {
             return Err(
@@ -4263,12 +5170,144 @@ fn validate_baseline_generated_js_call_native_exit_sites(
     Ok(())
 }
 
+fn validate_baseline_generated_owner_continuation_labels(
+    labels: &mut [BaselineGeneratedOwnerBytecodeLabel],
+) -> Result<(), JitPlanValidationError> {
+    for label in labels.iter() {
+        if label.owner == CodeBlockId::default() || !label.bytecode_index.is_valid() {
+            return Err(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapMalformedLabel {
+                    bytecode_index: label.bytecode_index,
+                },
+            );
+        }
+        if label
+            .next_bytecode_index
+            .is_some_and(|next| !next.is_valid())
+        {
+            return Err(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapInvalidBytecodeIndex {
+                    bytecode_index: label.next_bytecode_index.unwrap_or(BytecodeIndex::INVALID),
+                },
+            );
+        }
+    }
+
+    labels.sort_by_key(|label| label.bytecode_index);
+    for duplicate in labels.windows(2) {
+        if duplicate[0].bytecode_index == duplicate[1].bytecode_index {
+            return Err(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapDuplicateLabel {
+                    bytecode_index: duplicate[0].bytecode_index,
+                },
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_baseline_generated_owner_continuation_sites(
+    labels: &[BaselineGeneratedOwnerBytecodeLabel],
+    call_sites: &mut [BaselineGeneratedOwnerContinuationSite],
+) -> Result<(), JitPlanValidationError> {
+    for site in call_sites.iter() {
+        validate_baseline_generated_owner_continuation_site_metadata(site)?;
+        let label = labels
+            .binary_search_by_key(&site.call_bytecode_index, |label| label.bytecode_index)
+            .ok()
+            .and_then(|index| labels.get(index))
+            .ok_or(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapMissingLabel {
+                    bytecode_index: site.call_bytecode_index,
+                },
+            )?;
+        if label.owner != site.owner
+            || label.opcode != site.opcode
+            || label.next_bytecode_index != site.resume_bytecode_index
+        {
+            return Err(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapMalformedSite {
+                    bytecode_index: site.call_bytecode_index,
+                },
+            );
+        }
+    }
+
+    call_sites.sort_by_key(|site| site.call_bytecode_index);
+    for duplicate in call_sites.windows(2) {
+        if duplicate[0].call_bytecode_index == duplicate[1].call_bytecode_index {
+            return Err(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapDuplicateSite {
+                    bytecode_index: duplicate[0].call_bytecode_index,
+                },
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_baseline_generated_owner_continuation_site_metadata(
+    site: &BaselineGeneratedOwnerContinuationSite,
+) -> Result<(), JitPlanValidationError> {
+    if site.owner == CodeBlockId::default()
+        || !site.call_bytecode_index.is_valid()
+        || site.argument_count_including_this == 0
+        || site
+            .resume_bytecode_index
+            .is_some_and(|resume| !resume.is_valid())
+    {
+        return Err(
+            JitPlanValidationError::BaselineGeneratedOwnerContinuationMapMalformedSite {
+                bytecode_index: site.call_bytecode_index,
+            },
+        );
+    }
+    let Some(expected_kind) = owner_continuation_kind_for_opcode(site.opcode) else {
+        return Err(
+            JitPlanValidationError::BaselineGeneratedOwnerContinuationMapUnsupportedOpcode {
+                bytecode_index: site.call_bytecode_index,
+                opcode: site.opcode,
+            },
+        );
+    };
+    if site.kind != expected_kind {
+        return Err(
+            JitPlanValidationError::BaselineGeneratedOwnerContinuationMapMalformedSite {
+                bytecode_index: site.call_bytecode_index,
+            },
+        );
+    }
+    match (site.kind, site.result_profile) {
+        (BaselineGeneratedOwnerContinuationKind::Call, Some(profile))
+            if profile.profile_slot.0 != 0
+                && profile.bytecode_index == site.call_bytecode_index
+                && profile.checkpoint == Checkpoint::NONE
+                && profile.bucket_kind == ValueProfileBucketKind::Sample
+                && profile.storage_generation != ValueProfileJitStorageGeneration::default()
+                && profile.value_profile_offset != 0
+                && profile.metadata_table_base_address != 0
+                && profile.raw_bucket_address != 0
+                && profile.raw_bucket_bytes > 0 => {}
+        (BaselineGeneratedOwnerContinuationKind::Construct, None) => {}
+        _ => {
+            return Err(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapMalformedSite {
+                    bytecode_index: site.call_bytecode_index,
+                },
+            )
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_baseline_generated_js_call_native_exit_site_metadata(
     site: &BaselineGeneratedJsCallNativeExitSite,
 ) -> Result<(), JitPlanValidationError> {
     if site.owner == CodeBlockId::default()
         || !site.bytecode_index.is_valid()
-        || !matches!(site.opcode, CoreOpcode::Call | CoreOpcode::CallWithThis)
+        || !baseline_opcode_is_generated_js_call_handoff(site.opcode)
         || site.provided_argument_count as usize != site.argument_registers.len()
         || !site.requires_no_gc_exit_reentry
         || !site.may_throw
@@ -4279,7 +5318,8 @@ pub(crate) fn validate_baseline_generated_js_call_native_exit_site_metadata(
             },
         );
     }
-    if (site.opcode == CoreOpcode::Call && site.this_register.is_some())
+    if (matches!(site.opcode, CoreOpcode::Call | CoreOpcode::Construct)
+        && site.this_register.is_some())
         || (site.opcode == CoreOpcode::CallWithThis && site.this_register.is_none())
     {
         return Err(
@@ -4295,24 +5335,12 @@ pub(crate) fn validate_baseline_generated_property_handoff_site_metadata(
     site: &BaselineGeneratedPropertyHandoffSite,
 ) -> Result<(), JitPlanValidationError> {
     let bytecode_index = site.bytecode_index;
-    let expected = match site.opcode {
-        CoreOpcode::GetByName | CoreOpcode::PutByName => {
-            property_handoff_shape_for_opcode(site.opcode).map_err(|_| {
-                JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanUnsupportedOpcode {
-                    bytecode_index,
-                    opcode: site.opcode,
-                }
-            })?
+    let expected = property_handoff_shape_for_opcode(site.opcode).map_err(|_| {
+        JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanUnsupportedOpcode {
+            bytecode_index,
+            opcode: site.opcode,
         }
-        _ => {
-            return Err(
-                JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanUnsupportedOpcode {
-                    bytecode_index,
-                    opcode: site.opcode,
-                },
-            )
-        }
-    };
+    })?;
     if site.cache_kind != expected.cache_kind {
         return Err(
             JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanCacheKindMismatch {
@@ -4337,6 +5365,29 @@ pub(crate) fn validate_baseline_generated_property_handoff_site_metadata(
                 bytecode_index,
                 expected: expected.property_cache_kind,
                 actual: site.property_cache_kind,
+            },
+        );
+    }
+    if !matches!(
+        (site.opcode, site.property_key),
+        (
+            CoreOpcode::GetByName
+                | CoreOpcode::GetGlobalObjectProperty
+                | CoreOpcode::GetLength
+                | CoreOpcode::PutByName
+                | CoreOpcode::InById,
+            PropertyCacheKey::Key(_)
+        ) | (
+            CoreOpcode::PutGlobalObjectProperty,
+            PropertyCacheKey::Key(_)
+        ) | (
+            CoreOpcode::GetByValue | CoreOpcode::PutByValue | CoreOpcode::InByVal,
+            PropertyCacheKey::RuntimeValue(_)
+        )
+    ) {
+        return Err(
+            JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanMalformedSite {
+                bytecode_index,
             },
         );
     }
@@ -5031,6 +6082,15 @@ const fn baseline_opcode_effect(opcode: CoreOpcode) -> BaselineOpcodeEffect {
             records_write_barrier_handoff: true,
         };
     }
+    if matches!(opcode, CoreOpcode::LoadCallee) {
+        return BaselineOpcodeEffect {
+            opcode,
+            summary: local_effect_summary(true, true, true, false),
+            may_call_runtime: false,
+            touches_gc_roots: false,
+            records_write_barrier_handoff: true,
+        };
+    }
     if matches!(opcode, CoreOpcode::Return) {
         return BaselineOpcodeEffect {
             opcode,
@@ -5118,6 +6178,8 @@ const fn baseline_opcode_effect(opcode: CoreOpcode) -> BaselineOpcodeEffect {
         opcode,
         CoreOpcode::StrictEqual
             | CoreOpcode::StrictNotEqual
+            | CoreOpcode::Equal
+            | CoreOpcode::NotEqual
             | CoreOpcode::LogicalNot
             | CoreOpcode::ToNumber
             | CoreOpcode::NegateNumber
@@ -5290,13 +6352,35 @@ pub const fn baseline_generated_runtime_boundary_contract(
     opcode: CoreOpcode,
 ) -> Result<BaselineGeneratedRuntimeBoundaryContract, BaselineGeneratedRuntimeBoundaryRejectionReason>
 {
+    if matches!(opcode, CoreOpcode::Throw) {
+        let effect = baseline_opcode_effect(opcode);
+        return Ok(BaselineGeneratedRuntimeBoundaryContract {
+            opcode,
+            category: BaselineGeneratedRuntimeBoundaryCategory::ExceptionThrow,
+            summary: effect.summary,
+            effects: BaselineGeneratedRuntimeBoundaryEffects {
+                calls_runtime_helper: true,
+                allocates: false,
+                may_throw: true,
+                writes_heap: false,
+                touches_gc_roots: true,
+                records_write_barrier_handoff: false,
+            },
+            requirements: BaselineGeneratedRuntimeBoundaryRequirements {
+                complete_safepoint_root_map: true,
+                no_gc_exit_reentry: true,
+            },
+        });
+    }
     if baseline_opcode_is_property_access(opcode) {
         return Err(BaselineGeneratedRuntimeBoundaryRejectionReason::PropertyAccess);
     }
     if baseline_opcode_is_call(opcode) {
         return Err(BaselineGeneratedRuntimeBoundaryRejectionReason::JsCallOrConstructor);
     }
-    if baseline_opcode_is_function_or_constructor(opcode) {
+    if !matches!(opcode, CoreOpcode::LoadFunction)
+        && baseline_opcode_is_function_or_constructor(opcode)
+    {
         return Err(BaselineGeneratedRuntimeBoundaryRejectionReason::FunctionOrConstructor);
     }
     if baseline_opcode_is_exception(opcode) {
@@ -5365,12 +6449,26 @@ const fn baseline_opcode_is_call(opcode: CoreOpcode) -> bool {
 
 #[allow(dead_code)]
 const fn baseline_opcode_is_generated_js_call_handoff(opcode: CoreOpcode) -> bool {
-    matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis)
+    matches!(
+        opcode,
+        CoreOpcode::Call | CoreOpcode::CallWithThis | CoreOpcode::Construct
+    )
 }
 
 #[allow(dead_code)]
 const fn baseline_opcode_is_generated_property_handoff(opcode: CoreOpcode) -> bool {
-    matches!(opcode, CoreOpcode::GetByName | CoreOpcode::PutByName)
+    matches!(
+        opcode,
+        CoreOpcode::GetByName
+            | CoreOpcode::GetGlobalObjectProperty
+            | CoreOpcode::GetLength
+            | CoreOpcode::PutByName
+            | CoreOpcode::PutGlobalObjectProperty
+            | CoreOpcode::GetByValue
+            | CoreOpcode::PutByValue
+            | CoreOpcode::InById
+            | CoreOpcode::InByVal
+    )
 }
 
 #[allow(dead_code)]
@@ -5379,9 +6477,17 @@ const fn baseline_opcode_is_no_js_call_heap_runtime_helper(opcode: CoreOpcode) -
         opcode,
         CoreOpcode::LoadString
             | CoreOpcode::LoadBigInt
+            | CoreOpcode::LoadFunction
+            | CoreOpcode::InitializeGlobalLexical
             | CoreOpcode::TypeOf
             | CoreOpcode::NewObject
             | CoreOpcode::NewArray
+            | CoreOpcode::LoadCapture
+            | CoreOpcode::NewClosureCell
+            | CoreOpcode::GetClosureCell
+            | CoreOpcode::PutClosureCell
+            | CoreOpcode::ArrayAppend
+            | CoreOpcode::ForInKeys
     )
 }
 
@@ -5458,6 +6564,7 @@ const fn baseline_opcode_is_allocation_or_object(opcode: CoreOpcode) -> bool {
             | CoreOpcode::ArrayAppend
             | CoreOpcode::ArrayAppendSpread
             | CoreOpcode::ArrayAppendRest
+            | CoreOpcode::ForInKeys
             | CoreOpcode::CopyObjectRest
             | CoreOpcode::CreateRestParameter
             | CoreOpcode::CreateArgumentsObject
@@ -5475,11 +6582,15 @@ const fn baseline_opcode_is_property_access(opcode: CoreOpcode) -> bool {
         CoreOpcode::ArrayLength
             | CoreOpcode::GetSuperByName
             | CoreOpcode::GetByName
+            | CoreOpcode::GetGlobalObjectProperty
             | CoreOpcode::PutByName
+            | CoreOpcode::PutGlobalObjectProperty
             | CoreOpcode::DeleteByName
             | CoreOpcode::GetByValue
             | CoreOpcode::PutByValue
             | CoreOpcode::DeleteByValue
+            | CoreOpcode::InById
+            | CoreOpcode::InByVal
             | CoreOpcode::GetByIndex
             | CoreOpcode::PutByIndex
             | CoreOpcode::GetLength
@@ -5985,6 +7096,7 @@ mod tests {
             CoreOpcode::DivNumber,
             CoreOpcode::ModNumber,
             CoreOpcode::Void,
+            CoreOpcode::LoadCallee,
         ] {
             assert!(subset.supports(opcode));
             let effect = baseline_opcode_effect(opcode);
@@ -6000,6 +7112,8 @@ mod tests {
         for opcode in [
             CoreOpcode::LoadString,
             CoreOpcode::LoadBigInt,
+            CoreOpcode::LoadFunction,
+            CoreOpcode::InitializeGlobalLexical,
             CoreOpcode::TypeOf,
             CoreOpcode::NewObject,
             CoreOpcode::NewArray,
@@ -6068,6 +7182,198 @@ mod tests {
             assert_eq!(effect.opcode, opcode);
             assert_eq!(baseline_generated_effect_rejection_reason(effect), None);
         }
+    }
+
+    #[test]
+    fn p6_bitand_or_exact_native_subset_excludes_unlowered_bitwise_ops() {
+        let subset = BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr;
+        let contract = subset.generated_effect_contract();
+        assert!(contract.permits_no_heap_allocation_no_runtime_call());
+        assert!(!contract.summary.reads_heap);
+        assert!(!contract.summary.writes_heap);
+        assert!(!contract.summary.allocates);
+        assert!(!contract.summary.may_call_js);
+        assert!(!contract.summary.may_throw);
+        assert!(!contract.may_call_runtime);
+        assert!(!contract.touches_gc_roots);
+
+        assert!(subset.supports(CoreOpcode::BitAndInt32));
+        assert!(subset.supports(CoreOpcode::BitOrInt32));
+        assert!(subset.supports(CoreOpcode::BitXorInt32));
+        assert!(subset.supports(CoreOpcode::RightShiftInt32));
+        for opcode in [
+            CoreOpcode::BitNotInt32,
+            CoreOpcode::LeftShiftInt32,
+            CoreOpcode::UnsignedRightShiftInt32,
+            CoreOpcode::Jump,
+            CoreOpcode::JumpIfFalse,
+        ] {
+            assert!(!subset.supports(opcode), "{opcode:?}");
+        }
+
+        assert!(
+            BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullish
+                .supports(CoreOpcode::JumpIfNotNullish)
+        );
+        assert!(
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullishFalse
+                .supports(CoreOpcode::JumpIfFalse)
+        );
+    }
+
+    #[test]
+    fn p6_bitand_or_equality_exact_native_subset_adds_only_int32_equality_ops() {
+        let subset =
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEquality;
+        let contract = subset.generated_effect_contract();
+        assert!(contract.permits_no_heap_allocation_no_runtime_call());
+        assert!(!contract.summary.reads_heap);
+        assert!(!contract.summary.writes_heap);
+        assert!(!contract.summary.allocates);
+        assert!(!contract.summary.may_call_js);
+        assert!(!contract.summary.may_throw);
+        assert!(!contract.may_call_runtime);
+        assert!(!contract.touches_gc_roots);
+
+        for opcode in [
+            CoreOpcode::BitAndInt32,
+            CoreOpcode::BitOrInt32,
+            CoreOpcode::BitXorInt32,
+            CoreOpcode::RightShiftInt32,
+            CoreOpcode::Equal,
+            CoreOpcode::NotEqual,
+        ] {
+            assert!(subset.supports(opcode), "{opcode:?}");
+            let effect = baseline_opcode_effect(opcode);
+            assert_eq!(effect.opcode, opcode);
+            assert_eq!(baseline_generated_effect_rejection_reason(effect), None);
+        }
+
+        for opcode in [
+            CoreOpcode::StrictEqual,
+            CoreOpcode::StrictNotEqual,
+            CoreOpcode::LeftShiftInt32,
+            CoreOpcode::Jump,
+            CoreOpcode::JumpIfFalse,
+        ] {
+            assert!(!subset.supports(opcode), "{opcode:?}");
+        }
+
+        assert!(
+            BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullish
+                .supports(CoreOpcode::JumpIfNotNullish)
+        );
+        assert!(
+            !BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullish
+                .supports(CoreOpcode::JumpIfFalse)
+        );
+        assert!(
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullishFalse
+                .supports(CoreOpcode::JumpIfFalse)
+        );
+    }
+
+    #[test]
+    fn p6_bitand_or_equality_relational_exact_native_subset_adds_only_int32_relational_ops() {
+        let subset =
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelational;
+        let contract = subset.generated_effect_contract();
+        assert!(contract.permits_no_heap_allocation_no_runtime_call());
+        assert!(!contract.summary.reads_heap);
+        assert!(!contract.summary.writes_heap);
+        assert!(!contract.summary.allocates);
+        assert!(!contract.summary.may_call_js);
+        assert!(!contract.summary.may_throw);
+        assert!(!contract.may_call_runtime);
+        assert!(!contract.touches_gc_roots);
+
+        for opcode in [
+            CoreOpcode::BitAndInt32,
+            CoreOpcode::BitOrInt32,
+            CoreOpcode::BitXorInt32,
+            CoreOpcode::RightShiftInt32,
+            CoreOpcode::Equal,
+            CoreOpcode::NotEqual,
+            CoreOpcode::LessThanInt32,
+            CoreOpcode::LessEqualInt32,
+            CoreOpcode::GreaterThanInt32,
+            CoreOpcode::GreaterEqualInt32,
+        ] {
+            assert!(subset.supports(opcode), "{opcode:?}");
+            let effect = baseline_opcode_effect(opcode);
+            assert_eq!(effect.opcode, opcode);
+            assert_eq!(baseline_generated_effect_rejection_reason(effect), None);
+        }
+
+        for opcode in [
+            CoreOpcode::StrictEqual,
+            CoreOpcode::StrictNotEqual,
+            CoreOpcode::LogicalNot,
+            CoreOpcode::LeftShiftInt32,
+            CoreOpcode::ToNumber,
+            CoreOpcode::Jump,
+            CoreOpcode::JumpIfFalse,
+        ] {
+            assert!(!subset.supports(opcode), "{opcode:?}");
+        }
+
+        assert!(
+            BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullish
+                .supports(CoreOpcode::JumpIfNotNullish)
+        );
+        assert!(
+            !BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullish
+                .supports(CoreOpcode::JumpIfFalse)
+        );
+        assert!(
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullishFalse
+                .supports(CoreOpcode::JumpIfFalse)
+        );
+    }
+
+    #[test]
+    fn p6_no_call_loose_equality_native_subsets_preserve_no_heap_contract() {
+        let subset =
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEquality;
+        let relational_subset =
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelational;
+        for subset in [subset, relational_subset] {
+            let contract = subset.generated_effect_contract();
+            assert!(contract.permits_no_heap_allocation_no_runtime_call());
+            assert!(!contract.summary.reads_heap);
+            assert!(!contract.summary.writes_heap);
+            assert!(!contract.summary.allocates);
+            assert!(!contract.summary.may_call_js);
+            assert!(!contract.summary.may_throw);
+            assert!(!contract.may_call_runtime);
+            assert!(!contract.touches_gc_roots);
+            assert!(subset.supports(CoreOpcode::BitXorInt32));
+            assert!(subset.supports(CoreOpcode::RightShiftInt32));
+            assert!(subset.supports(CoreOpcode::Equal));
+            assert!(subset.supports(CoreOpcode::NotEqual));
+        }
+
+        for opcode in [
+            CoreOpcode::LessThanInt32,
+            CoreOpcode::LessEqualInt32,
+            CoreOpcode::GreaterThanInt32,
+            CoreOpcode::GreaterEqualInt32,
+        ] {
+            assert!(!subset.supports(opcode));
+            assert!(relational_subset.supports(opcode));
+        }
+        assert!(
+            BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityBranchNullish
+                .supports(CoreOpcode::JumpIfNotNullish)
+        );
+        assert!(
+            !BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityBranchNullish
+                .supports(CoreOpcode::JumpIfFalse)
+        );
+        assert!(
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullishFalse
+                .supports(CoreOpcode::JumpIfFalse)
+        );
     }
 
     #[test]
@@ -6618,6 +7924,57 @@ mod tests {
     }
 
     #[test]
+    fn p6_primitive_to_number_emitted_effect_contract_is_guarded_no_call_surface() {
+        let base_subset =
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelational;
+        let subset =
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumber;
+        let p8a_subset =
+            BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullish;
+        let p8b_subset =
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullishFalse;
+        let contract = subset.generated_effect_contract();
+
+        assert!(!base_subset.supports(CoreOpcode::ToNumber));
+        assert!(subset.supports(CoreOpcode::ToNumber));
+        assert!(!subset.supports(CoreOpcode::Void));
+        assert!(p8a_subset.supports(CoreOpcode::JumpIfNotNullish));
+        assert!(!p8a_subset.supports(CoreOpcode::JumpIfFalse));
+        assert!(p8b_subset.supports(CoreOpcode::JumpIfFalse));
+        assert!(contract.permits_no_heap_allocation_no_runtime_call());
+        assert!(contract.summary.may_exit);
+        assert!(!contract.summary.reads_heap);
+        assert!(!contract.summary.writes_heap);
+        assert!(!contract.summary.allocates);
+        assert!(!contract.summary.may_call_js);
+        assert!(!contract.summary.may_throw);
+        assert!(!contract.may_call_runtime);
+        assert!(!contract.touches_gc_roots);
+
+        let mut record = baseline_eligibility_record(vec![
+            baseline_instruction(0, CoreOpcode::LoadBool),
+            baseline_instruction(1, CoreOpcode::ToNumber),
+            baseline_instruction(2, CoreOpcode::Return),
+        ]);
+        record.opcode_subset = base_subset;
+        assert_eq!(
+            record.validate(),
+            Err(
+                JitPlanValidationError::BaselineEligibilityUnsupportedOpcode {
+                    bytecode_index: BytecodeIndex::from_offset(1),
+                    opcode: CoreOpcode::ToNumber,
+                    reason: BaselineOpcodeRejectionReason::Unsupported,
+                }
+            )
+        );
+
+        record.opcode_subset = subset;
+        let proof = record.validate().unwrap();
+        assert_eq!(proof.opcode_subset(), subset);
+        assert_eq!(proof.generated_effect_contract(), contract);
+    }
+
+    #[test]
     fn p6_pure_number_binary_generated_effect_contract_keeps_clean_binary_surface() {
         let previous_subset =
             BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitwiseRelationalJumpsPrimitiveTruthinessPrimitiveBooleanPrimitiveNumberPrimitiveToNumberVoid;
@@ -6799,6 +8156,47 @@ mod tests {
         assert_eq!(proof.contract.opcode, CoreOpcode::NewObject);
         assert!(proof.contract.effects.calls_runtime_helper);
         assert!(proof.contract.effects.allocates);
+        assert_eq!(proof.may_throw, proof.contract.effects.may_throw);
+        assert!(proof.contract.requirements.complete_safepoint_root_map);
+        assert!(proof.contract.requirements.no_gc_exit_reentry);
+    }
+
+    #[test]
+    fn generated_runtime_boundary_candidate_accepts_throw_exception_exit() {
+        let index = BytecodeIndex::from_offset(20);
+        let root_map_id = BytecodeRootMapId(43);
+        let root_map = complete_root_map(
+            root_map_id,
+            Some(baseline_owner()),
+            index,
+            vec![BytecodeRootSlotDescriptor::virtual_register(
+                index,
+                VirtualRegister::local(0),
+                BytecodeRootSlotKind::VirtualRegister,
+            )],
+        );
+        let candidate = BaselineGeneratedRuntimeBoundaryCandidate {
+            opcode: CoreOpcode::Throw,
+            safepoint: baseline_safepoint_referencing(root_map_id, Vec::new()),
+            root_map: Some(root_map),
+            no_gc_exit_reentry: true,
+        };
+
+        let proof = candidate.validate().unwrap();
+
+        assert_eq!(proof.safepoint, CompilerSafepointId(1));
+        assert_eq!(proof.root_map, Some(root_map_id));
+        assert_eq!(proof.root_count, 1);
+        assert!(proof.no_gc_exit_reentry);
+        assert!(proof.may_throw);
+        assert_eq!(proof.contract.opcode, CoreOpcode::Throw);
+        assert_eq!(
+            proof.contract.category,
+            BaselineGeneratedRuntimeBoundaryCategory::ExceptionThrow
+        );
+        assert!(proof.contract.effects.calls_runtime_helper);
+        assert!(!proof.contract.effects.allocates);
+        assert!(proof.contract.effects.touches_gc_roots);
         assert_eq!(proof.may_throw, proof.contract.effects.may_throw);
         assert!(proof.contract.requirements.complete_safepoint_root_map);
         assert!(proof.contract.requirements.no_gc_exit_reentry);
@@ -6999,6 +8397,120 @@ mod tests {
                 complete_safepoint_root_map_count: 1,
             }
         );
+    }
+
+    #[test]
+    fn generated_runtime_helper_derives_closure_capture_family_from_root_maps() {
+        let owner = baseline_owner();
+        let helper_index = BytecodeIndex::from_offset(0);
+        let destination = VirtualRegister::local(2);
+        let source = VirtualRegister::argument_or_header(5);
+        let value = VirtualRegister::argument_or_header(6);
+
+        for (ordinal, (opcode, operands, return_register, slots, root_count, may_allocate)) in [
+            (
+                CoreOpcode::LoadCapture,
+                vec![
+                    Operand::Register(destination),
+                    Operand::UnsignedImmediate(0),
+                ],
+                destination,
+                vec![register_root_slot(
+                    helper_index,
+                    destination,
+                    BytecodeRootSlotKind::VirtualRegister,
+                )],
+                1,
+                false,
+            ),
+            (
+                CoreOpcode::NewClosureCell,
+                vec![Operand::Register(destination), Operand::Register(source)],
+                destination,
+                vec![
+                    register_root_slot(
+                        helper_index,
+                        destination,
+                        BytecodeRootSlotKind::VirtualRegister,
+                    ),
+                    register_root_slot(helper_index, source, BytecodeRootSlotKind::Argument),
+                ],
+                2,
+                true,
+            ),
+            (
+                CoreOpcode::GetClosureCell,
+                vec![Operand::Register(destination), Operand::Register(source)],
+                destination,
+                vec![
+                    register_root_slot(
+                        helper_index,
+                        destination,
+                        BytecodeRootSlotKind::VirtualRegister,
+                    ),
+                    register_root_slot(helper_index, source, BytecodeRootSlotKind::Argument),
+                ],
+                2,
+                false,
+            ),
+            (
+                CoreOpcode::PutClosureCell,
+                vec![Operand::Register(source), Operand::Register(value)],
+                value,
+                vec![
+                    register_root_slot(helper_index, source, BytecodeRootSlotKind::Argument),
+                    register_root_slot(helper_index, value, BytecodeRootSlotKind::Argument),
+                ],
+                2,
+                false,
+            ),
+            (
+                CoreOpcode::ArrayAppend,
+                vec![Operand::Register(source), Operand::Register(value)],
+                source,
+                vec![
+                    register_root_slot(helper_index, source, BytecodeRootSlotKind::Argument),
+                    register_root_slot(helper_index, value, BytecodeRootSlotKind::Argument),
+                ],
+                2,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root_map = BytecodeRootMapId(70 + ordinal as u32);
+            let code_block = code_block_from_typed_instructions(vec![
+                typed_instruction(0, opcode, operands),
+                typed_instruction(
+                    1,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(return_register)],
+                ),
+            ])
+            .with_side_tables(LinkedSideTables {
+                root_maps: vec![complete_root_map(
+                    root_map,
+                    Some(owner),
+                    helper_index,
+                    slots,
+                )],
+                ..LinkedSideTables::default()
+            });
+
+            let derivation =
+                derive_baseline_generated_runtime_helper_plan_from_code_block(&code_block, owner)
+                    .unwrap();
+            let metadata = derivation.metadata.expect("derived helper metadata");
+            assert!(baseline_generated_runtime_helper_plan_is_native_exit_eligible(&metadata));
+            assert_eq!(metadata.proof_count(), 1);
+            let helper = metadata.proof_at(0).unwrap();
+            assert_eq!(helper.bytecode_index, helper_index);
+            assert_eq!(helper.proof.contract.opcode, opcode);
+            assert_eq!(helper.proof.root_map, Some(root_map));
+            assert_eq!(helper.proof.root_count, root_count);
+            assert_eq!(derivation.safepoints[0].may_allocate, may_allocate);
+        }
     }
 
     #[test]
@@ -8222,6 +9734,195 @@ mod tests {
     }
 
     #[test]
+    fn generated_runtime_helper_derivation_accepts_throw_source_root() {
+        let owner = baseline_owner();
+        let helper_index = BytecodeIndex::from_offset(0);
+        let source = argument_including_this(1);
+        let root_map_id = BytecodeRootMapId(77);
+        let code_block = throw_code_block_with_root_maps(
+            source,
+            vec![complete_root_map(
+                root_map_id,
+                Some(owner),
+                helper_index,
+                vec![register_root_slot(
+                    helper_index,
+                    source,
+                    BytecodeRootSlotKind::Argument,
+                )],
+            )],
+        );
+
+        let derivation =
+            derive_baseline_generated_runtime_helper_plan_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation.metadata.expect("derived throw metadata");
+        let helper = metadata.proof_at(0).unwrap();
+
+        assert_eq!(metadata.proof_count(), 1);
+        assert_eq!(helper.proof.contract.opcode, CoreOpcode::Throw);
+        assert_eq!(
+            helper.proof.contract.category,
+            BaselineGeneratedRuntimeBoundaryCategory::ExceptionThrow
+        );
+        assert!(helper.proof.may_throw);
+        assert_eq!(helper.proof.root_map, Some(root_map_id));
+        assert_eq!(helper.proof.root_count, 1);
+    }
+
+    #[test]
+    fn generated_runtime_helper_derivation_accepts_load_function_capture_roots() {
+        let owner = baseline_owner();
+        let helper_index = BytecodeIndex::from_offset(0);
+        let destination = VirtualRegister::local(0);
+        let capture_a = argument_including_this(1);
+        let capture_b = VirtualRegister::local(2);
+        let root_map_id = BytecodeRootMapId(78);
+        let code_block = load_function_code_block_with_root_maps(
+            destination,
+            14,
+            vec![capture_a, capture_b],
+            vec![complete_root_map(
+                root_map_id,
+                Some(owner),
+                helper_index,
+                vec![
+                    register_root_slot(
+                        helper_index,
+                        destination,
+                        BytecodeRootSlotKind::VirtualRegister,
+                    ),
+                    register_root_slot(helper_index, capture_a, BytecodeRootSlotKind::Argument),
+                    register_root_slot(
+                        helper_index,
+                        capture_b,
+                        BytecodeRootSlotKind::VirtualRegister,
+                    ),
+                ],
+            )],
+        );
+
+        let derivation =
+            derive_baseline_generated_runtime_helper_plan_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation.metadata.expect("derived helper metadata");
+        let helper = metadata.proof_at(0).unwrap();
+
+        assert_eq!(metadata.proof_count(), 1);
+        assert_eq!(helper.proof.contract.opcode, CoreOpcode::LoadFunction);
+        assert_eq!(helper.proof.root_map, Some(root_map_id));
+        assert_eq!(helper.proof.root_count, 3);
+    }
+
+    #[test]
+    fn generated_runtime_helper_derivation_rejects_load_function_missing_capture_root_slot() {
+        let owner = baseline_owner();
+        let helper_index = BytecodeIndex::from_offset(0);
+        let destination = VirtualRegister::local(0);
+        let capture = VirtualRegister::local(2);
+        let root_map_id = BytecodeRootMapId(78);
+        let code_block = load_function_code_block_with_root_maps(
+            destination,
+            14,
+            vec![capture],
+            vec![complete_root_map(
+                root_map_id,
+                Some(owner),
+                helper_index,
+                vec![register_root_slot(
+                    helper_index,
+                    destination,
+                    BytecodeRootSlotKind::VirtualRegister,
+                )],
+            )],
+        );
+
+        assert_eq!(
+            derive_baseline_generated_runtime_helper_plan_from_code_block(&code_block, owner),
+            Err(
+                JitPlanValidationError::BaselineGeneratedRuntimeHelperDerivationMissingSourceSlot {
+                    bytecode_index: helper_index,
+                    opcode: CoreOpcode::LoadFunction,
+                    root_map: root_map_id,
+                    register: capture,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn generated_runtime_helper_derivation_accepts_initialize_global_lexical_source_root() {
+        let owner = baseline_owner();
+        let helper_index = BytecodeIndex::from_offset(0);
+        let source = argument_including_this(1);
+        let root_map_id = BytecodeRootMapId(79);
+        let code_block = initialize_global_lexical_code_block_with_root_maps(
+            21,
+            source,
+            vec![complete_root_map(
+                root_map_id,
+                Some(owner),
+                helper_index,
+                vec![register_root_slot(
+                    helper_index,
+                    source,
+                    BytecodeRootSlotKind::Argument,
+                )],
+            )],
+        );
+
+        let derivation =
+            derive_baseline_generated_runtime_helper_plan_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation.metadata.expect("derived helper metadata");
+        let helper = metadata.proof_at(0).unwrap();
+
+        assert_eq!(metadata.proof_count(), 1);
+        assert_eq!(
+            helper.proof.contract.opcode,
+            CoreOpcode::InitializeGlobalLexical
+        );
+        assert_eq!(helper.proof.root_map, Some(root_map_id));
+        assert_eq!(helper.proof.root_count, 1);
+    }
+
+    #[test]
+    fn generated_runtime_helper_derivation_rejects_initialize_global_lexical_missing_source_root_slot(
+    ) {
+        let owner = baseline_owner();
+        let helper_index = BytecodeIndex::from_offset(0);
+        let source = VirtualRegister::local(2);
+        let unrelated = VirtualRegister::local(3);
+        let root_map_id = BytecodeRootMapId(80);
+        let code_block = initialize_global_lexical_code_block_with_root_maps(
+            21,
+            source,
+            vec![complete_root_map(
+                root_map_id,
+                Some(owner),
+                helper_index,
+                vec![register_root_slot(
+                    helper_index,
+                    unrelated,
+                    BytecodeRootSlotKind::VirtualRegister,
+                )],
+            )],
+        );
+
+        assert_eq!(
+            derive_baseline_generated_runtime_helper_plan_from_code_block(&code_block, owner),
+            Err(
+                JitPlanValidationError::BaselineGeneratedRuntimeHelperDerivationMissingSourceSlot {
+                    bytecode_index: helper_index,
+                    opcode: CoreOpcode::InitializeGlobalLexical,
+                    root_map: root_map_id,
+                    register: source,
+                }
+            )
+        );
+    }
+
+    #[test]
     fn generated_runtime_helper_derivation_skips_bigint_constructor_opcode_without_descriptor() {
         let owner = baseline_owner();
         let code_block =
@@ -8246,6 +9947,14 @@ mod tests {
                 BaselineGeneratedRuntimeBoundaryRejectionReason::PropertyAccess,
             ),
             (
+                CoreOpcode::InById,
+                BaselineGeneratedRuntimeBoundaryRejectionReason::PropertyAccess,
+            ),
+            (
+                CoreOpcode::InByVal,
+                BaselineGeneratedRuntimeBoundaryRejectionReason::PropertyAccess,
+            ),
+            (
                 CoreOpcode::Call,
                 BaselineGeneratedRuntimeBoundaryRejectionReason::JsCallOrConstructor,
             ),
@@ -8262,15 +9971,11 @@ mod tests {
                 BaselineGeneratedRuntimeBoundaryRejectionReason::PowNumber,
             ),
             (
-                CoreOpcode::LoadFunction,
-                BaselineGeneratedRuntimeBoundaryRejectionReason::FunctionOrConstructor,
-            ),
-            (
                 CoreOpcode::LoadObjectConstructor,
                 BaselineGeneratedRuntimeBoundaryRejectionReason::FunctionOrConstructor,
             ),
             (
-                CoreOpcode::Throw,
+                CoreOpcode::TakeException,
                 BaselineGeneratedRuntimeBoundaryRejectionReason::Exception,
             ),
         ] {
@@ -8282,8 +9987,12 @@ mod tests {
     }
 
     #[test]
-    fn mixed_baseline_classifies_call_and_call_with_this_as_js_call_handoff() {
-        for opcode in [CoreOpcode::Call, CoreOpcode::CallWithThis] {
+    fn mixed_baseline_classifies_call_call_with_this_and_construct_as_js_call_handoff() {
+        for opcode in [
+            CoreOpcode::Call,
+            CoreOpcode::CallWithThis,
+            CoreOpcode::Construct,
+        ] {
             let record = baseline_eligibility_record(vec![
                 baseline_instruction(0, CoreOpcode::LoadInt32),
                 baseline_instruction(1, opcode),
@@ -8321,12 +10030,15 @@ mod tests {
     }
 
     #[test]
-    fn mixed_baseline_classifies_named_load_and_store_as_property_handoff() {
+    fn mixed_baseline_classifies_named_and_by_value_load_store_as_property_handoff() {
         let record = baseline_eligibility_record(vec![
             baseline_instruction(0, CoreOpcode::LoadInt32),
             baseline_instruction(1, CoreOpcode::GetByName),
             baseline_instruction(2, CoreOpcode::PutByName),
-            baseline_instruction(3, CoreOpcode::Return),
+            baseline_instruction(3, CoreOpcode::PutGlobalObjectProperty),
+            baseline_instruction(4, CoreOpcode::GetByValue),
+            baseline_instruction(5, CoreOpcode::PutByValue),
+            baseline_instruction(6, CoreOpcode::Return),
         ]);
 
         let sites = record.validate_mixed_bytecode_sites(None).unwrap();
@@ -8351,6 +10063,21 @@ mod tests {
                 },
                 BaselineMixedBytecodeSite {
                     bytecode_index: BytecodeIndex::from_offset(3),
+                    opcode: CoreOpcode::PutGlobalObjectProperty,
+                    kind: BaselineMixedBytecodeSiteKind::PropertyHandoff,
+                },
+                BaselineMixedBytecodeSite {
+                    bytecode_index: BytecodeIndex::from_offset(4),
+                    opcode: CoreOpcode::GetByValue,
+                    kind: BaselineMixedBytecodeSiteKind::PropertyHandoff,
+                },
+                BaselineMixedBytecodeSite {
+                    bytecode_index: BytecodeIndex::from_offset(5),
+                    opcode: CoreOpcode::PutByValue,
+                    kind: BaselineMixedBytecodeSiteKind::PropertyHandoff,
+                },
+                BaselineMixedBytecodeSite {
+                    bytecode_index: BytecodeIndex::from_offset(6),
                     opcode: CoreOpcode::Return,
                     kind: BaselineMixedBytecodeSiteKind::Generated,
                 },
@@ -8366,6 +10093,82 @@ mod tests {
             baseline_generated_runtime_boundary_contract(CoreOpcode::PutByName),
             Err(BaselineGeneratedRuntimeBoundaryRejectionReason::PropertyAccess)
         );
+        assert!(!record
+            .opcode_subset
+            .supports(CoreOpcode::PutGlobalObjectProperty));
+        assert_eq!(
+            baseline_generated_runtime_boundary_contract(CoreOpcode::PutGlobalObjectProperty),
+            Err(BaselineGeneratedRuntimeBoundaryRejectionReason::PropertyAccess)
+        );
+        assert!(!record.opcode_subset.supports(CoreOpcode::GetByValue));
+        assert_eq!(
+            baseline_generated_runtime_boundary_contract(CoreOpcode::GetByValue),
+            Err(BaselineGeneratedRuntimeBoundaryRejectionReason::PropertyAccess)
+        );
+        assert!(!record.opcode_subset.supports(CoreOpcode::PutByValue));
+        assert_eq!(
+            baseline_generated_runtime_boundary_contract(CoreOpcode::PutByValue),
+            Err(BaselineGeneratedRuntimeBoundaryRejectionReason::PropertyAccess)
+        );
+    }
+
+    #[test]
+    fn mixed_baseline_routes_in_opcodes_to_property_handoff() {
+        let record = baseline_eligibility_record(vec![
+            baseline_instruction(0, CoreOpcode::LoadInt32),
+            baseline_instruction(1, CoreOpcode::InById),
+            baseline_instruction(2, CoreOpcode::InByVal),
+            baseline_instruction(3, CoreOpcode::GetLength),
+            baseline_instruction(4, CoreOpcode::Return),
+        ]);
+
+        let sites = record.validate_mixed_bytecode_sites(None).unwrap();
+
+        assert_eq!(
+            sites,
+            vec![
+                BaselineMixedBytecodeSite {
+                    bytecode_index: BytecodeIndex::from_offset(0),
+                    opcode: CoreOpcode::LoadInt32,
+                    kind: BaselineMixedBytecodeSiteKind::Generated,
+                },
+                BaselineMixedBytecodeSite {
+                    bytecode_index: BytecodeIndex::from_offset(1),
+                    opcode: CoreOpcode::InById,
+                    kind: BaselineMixedBytecodeSiteKind::PropertyHandoff,
+                },
+                BaselineMixedBytecodeSite {
+                    bytecode_index: BytecodeIndex::from_offset(2),
+                    opcode: CoreOpcode::InByVal,
+                    kind: BaselineMixedBytecodeSiteKind::PropertyHandoff,
+                },
+                BaselineMixedBytecodeSite {
+                    bytecode_index: BytecodeIndex::from_offset(3),
+                    opcode: CoreOpcode::GetLength,
+                    kind: BaselineMixedBytecodeSiteKind::PropertyHandoff,
+                },
+                BaselineMixedBytecodeSite {
+                    bytecode_index: BytecodeIndex::from_offset(4),
+                    opcode: CoreOpcode::Return,
+                    kind: BaselineMixedBytecodeSiteKind::Generated,
+                },
+            ]
+        );
+        for opcode in [
+            CoreOpcode::InById,
+            CoreOpcode::InByVal,
+            CoreOpcode::GetLength,
+        ] {
+            assert!(!record.opcode_subset.supports(opcode));
+            assert_eq!(
+                baseline_opcode_rejection_reason(opcode),
+                BaselineOpcodeRejectionReason::PropertyAccess
+            );
+            assert_eq!(
+                baseline_generated_runtime_boundary_contract(opcode),
+                Err(BaselineGeneratedRuntimeBoundaryRejectionReason::PropertyAccess)
+            );
+        }
     }
 
     #[test]
@@ -8387,7 +10190,10 @@ mod tests {
         assert_eq!(site.cache_kind, InlineCacheKind::PropertyLoad);
         assert_eq!(site.access, PropertyAccessType::GetById);
         assert_eq!(site.property_cache_kind, PropertyCacheKind::GetById);
-        assert_eq!(site.property_key, identifier_property_key(17));
+        assert_eq!(
+            site.property_key,
+            PropertyCacheKey::Key(identifier_property_key(17))
+        );
         assert_eq!(site.fallback, InlineCacheFallbackSemantics::SlowPathLookup);
         assert_eq!(site.cold_miss_handoff.owner, owner);
         assert_eq!(site.cold_miss_handoff.slot, site.slot);
@@ -8407,6 +10213,38 @@ mod tests {
         assert_eq!(site.cold_miss_handoff.boundary, None);
         assert_eq!(site.cold_miss_handoff.call_link, None);
         assert!(site.cold_miss_handoff.preserves_operand_registers);
+        assert_eq!(site.cold_miss_handoff.validate(), Ok(()));
+    }
+
+    #[test]
+    fn generated_property_handoff_derives_get_length_ic_site_metadata() {
+        let owner = baseline_owner();
+        let code_block = get_length_code_block(17);
+
+        let derivation =
+            derive_baseline_generated_property_handoff_plan_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation.metadata.expect("get length handoff metadata");
+        let site = metadata.site_at(0).unwrap();
+
+        assert_eq!(metadata.site_count(), 1);
+        assert_eq!(site.owner, owner);
+        assert_eq!(site.slot, InlineCacheSlotId(0));
+        assert_eq!(site.bytecode_index, BytecodeIndex::from_offset(1));
+        assert_eq!(site.opcode, CoreOpcode::GetLength);
+        assert_eq!(site.cache_kind, InlineCacheKind::PropertyLoad);
+        assert_eq!(site.access, PropertyAccessType::GetById);
+        assert_eq!(site.property_cache_kind, PropertyCacheKind::GetById);
+        assert_eq!(
+            site.property_key,
+            PropertyCacheKey::Key(identifier_property_key(17))
+        );
+        assert_eq!(site.fallback, InlineCacheFallbackSemantics::SlowPathLookup);
+        assert_eq!(
+            site.cold_miss_handoff.cache_kind,
+            InlineCacheKind::PropertyLoad
+        );
+        assert_eq!(site.cold_miss_handoff.miss_kind, InlineCacheMissKind::Cold);
         assert_eq!(site.cold_miss_handoff.validate(), Ok(()));
     }
 
@@ -8431,7 +10269,10 @@ mod tests {
         assert_eq!(site.cache_kind, InlineCacheKind::PropertyStore);
         assert_eq!(site.access, PropertyAccessType::PutByIdSloppy);
         assert_eq!(site.property_cache_kind, PropertyCacheKind::PutById);
-        assert_eq!(site.property_key, identifier_property_key(19));
+        assert_eq!(
+            site.property_key,
+            PropertyCacheKey::Key(identifier_property_key(19))
+        );
         assert_eq!(site.fallback, InlineCacheFallbackSemantics::SlowPathLookup);
         assert_eq!(site.cold_miss_handoff.owner, owner);
         assert_eq!(site.cold_miss_handoff.slot, site.slot);
@@ -8452,6 +10293,266 @@ mod tests {
         assert_eq!(site.cold_miss_handoff.call_link, None);
         assert!(site.cold_miss_handoff.preserves_operand_registers);
         assert_eq!(site.cold_miss_handoff.validate(), Ok(()));
+    }
+
+    #[test]
+    fn generated_property_handoff_derives_put_global_object_property_store_ic_site_metadata() {
+        let owner = baseline_owner();
+        let code_block = put_global_object_property_code_block(23);
+
+        let derivation =
+            derive_baseline_generated_property_handoff_plan_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation
+            .metadata
+            .expect("global property store handoff metadata");
+        let site = metadata.site_at(0).unwrap();
+
+        assert_eq!(metadata.site_count(), 1);
+        assert_eq!(site.owner, owner);
+        assert_eq!(site.slot, InlineCacheSlotId(0));
+        assert_eq!(site.bytecode_index, BytecodeIndex::from_offset(1));
+        assert_eq!(site.opcode, CoreOpcode::PutGlobalObjectProperty);
+        assert_eq!(site.cache_kind, InlineCacheKind::PropertyStore);
+        assert_eq!(site.access, PropertyAccessType::PutByIdSloppy);
+        assert_eq!(site.property_cache_kind, PropertyCacheKind::PutById);
+        assert_eq!(
+            site.property_key,
+            PropertyCacheKey::Key(identifier_property_key(23))
+        );
+        assert_eq!(
+            site.cold_miss_handoff.cache_kind,
+            InlineCacheKind::PropertyStore
+        );
+        assert_eq!(site.cold_miss_handoff.miss_kind, InlineCacheMissKind::Cold);
+        assert_eq!(
+            site.cold_miss_handoff.fallback,
+            InlineCacheFallbackSemantics::SlowPathLookup
+        );
+        assert!(site.cold_miss_handoff.preserves_operand_registers);
+        assert_eq!(site.cold_miss_handoff.validate(), Ok(()));
+    }
+
+    #[test]
+    fn generated_property_handoff_derives_get_global_object_property_load_ic_site_metadata() {
+        let owner = baseline_owner();
+        let code_block = get_global_object_property_code_block(23);
+
+        let derivation =
+            derive_baseline_generated_property_handoff_plan_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation
+            .metadata
+            .expect("global property load handoff metadata");
+        let site = metadata.site_at(0).unwrap();
+
+        assert_eq!(metadata.site_count(), 1);
+        assert_eq!(site.owner, owner);
+        assert_eq!(site.slot, InlineCacheSlotId(0));
+        assert_eq!(site.bytecode_index, BytecodeIndex::from_offset(1));
+        assert_eq!(site.opcode, CoreOpcode::GetGlobalObjectProperty);
+        assert_eq!(site.cache_kind, InlineCacheKind::PropertyLoad);
+        assert_eq!(site.access, PropertyAccessType::GetById);
+        assert_eq!(site.property_cache_kind, PropertyCacheKind::GetById);
+        assert_eq!(
+            site.property_key,
+            PropertyCacheKey::Key(identifier_property_key(23))
+        );
+        assert_eq!(
+            site.cold_miss_handoff.cache_kind,
+            InlineCacheKind::PropertyLoad
+        );
+        assert_eq!(site.cold_miss_handoff.miss_kind, InlineCacheMissKind::Cold);
+        assert_eq!(
+            site.cold_miss_handoff.fallback,
+            InlineCacheFallbackSemantics::SlowPathLookup
+        );
+        assert!(site.cold_miss_handoff.preserves_operand_registers);
+        assert_eq!(site.cold_miss_handoff.validate(), Ok(()));
+    }
+
+    #[test]
+    fn generated_property_handoff_derives_get_by_value_element_ic_site_metadata() {
+        let owner = baseline_owner();
+        let code_block = get_by_value_code_block();
+
+        let derivation =
+            derive_baseline_generated_property_handoff_plan_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation.metadata.expect("element load handoff metadata");
+        let site = metadata.site_at(0).unwrap();
+
+        assert_eq!(metadata.site_count(), 1);
+        assert_eq!(site.owner, owner);
+        assert_eq!(site.slot, InlineCacheSlotId(0));
+        assert_eq!(site.bytecode_index, BytecodeIndex::from_offset(1));
+        assert_eq!(site.opcode, CoreOpcode::GetByValue);
+        assert_eq!(site.cache_kind, InlineCacheKind::ElementLoad);
+        assert_eq!(site.access, PropertyAccessType::GetByVal);
+        assert_eq!(site.property_cache_kind, PropertyCacheKind::GetByVal);
+        assert_eq!(
+            site.property_key,
+            PropertyCacheKey::RuntimeValue(VirtualRegister::local(3))
+        );
+        assert_eq!(site.fallback, InlineCacheFallbackSemantics::SlowPathLookup);
+        assert_eq!(
+            site.cold_miss_handoff.cache_kind,
+            InlineCacheKind::ElementLoad
+        );
+        assert_eq!(site.cold_miss_handoff.validate(), Ok(()));
+    }
+
+    #[test]
+    fn generated_property_handoff_derives_put_by_value_element_ic_site_metadata() {
+        let owner = baseline_owner();
+        let code_block = put_by_value_code_block();
+
+        let derivation =
+            derive_baseline_generated_property_handoff_plan_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation.metadata.expect("element store handoff metadata");
+        let site = metadata.site_at(0).unwrap();
+
+        assert_eq!(metadata.site_count(), 1);
+        assert_eq!(site.owner, owner);
+        assert_eq!(site.slot, InlineCacheSlotId(0));
+        assert_eq!(site.bytecode_index, BytecodeIndex::from_offset(1));
+        assert_eq!(site.opcode, CoreOpcode::PutByValue);
+        assert_eq!(site.cache_kind, InlineCacheKind::ElementStore);
+        assert_eq!(site.access, PropertyAccessType::PutByValSloppy);
+        assert_eq!(site.property_cache_kind, PropertyCacheKind::PutByVal);
+        assert_eq!(
+            site.property_key,
+            PropertyCacheKey::RuntimeValue(VirtualRegister::local(3))
+        );
+        assert_eq!(site.fallback, InlineCacheFallbackSemantics::SlowPathLookup);
+        assert_eq!(
+            site.cold_miss_handoff.cache_kind,
+            InlineCacheKind::ElementStore
+        );
+        assert_eq!(site.cold_miss_handoff.validate(), Ok(()));
+    }
+
+    #[test]
+    fn generated_property_handoff_derives_in_by_has_ic_site_metadata() {
+        let owner = baseline_owner();
+        let code_block = code_block_from_typed_instructions(vec![
+            typed_instruction(
+                0,
+                CoreOpcode::InById,
+                vec![
+                    Operand::Register(VirtualRegister::local(0)),
+                    Operand::Register(VirtualRegister::local(1)),
+                    Operand::IdentifierIndex(31),
+                ],
+            ),
+            typed_instruction(
+                1,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(VirtualRegister::local(2)),
+                    Operand::Register(VirtualRegister::local(1)),
+                    Operand::Register(VirtualRegister::local(3)),
+                ],
+            ),
+            typed_instruction(
+                2,
+                CoreOpcode::Return,
+                vec![Operand::Register(VirtualRegister::local(2))],
+            ),
+        ]);
+        let property_accesses = &code_block.side_tables().inline_caches.property_accesses;
+
+        assert_eq!(property_accesses.len(), 2);
+        assert_eq!(property_accesses[0].access, PropertyAccessType::InById);
+        assert_eq!(property_accesses[0].kind, PropertyCacheKind::InById);
+        assert_eq!(property_accesses[1].access, PropertyAccessType::InByVal);
+        assert_eq!(property_accesses[1].kind, PropertyCacheKind::InByVal);
+
+        let derivation =
+            derive_baseline_generated_property_handoff_plan_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation.metadata.expect("in has handoff metadata");
+        assert_eq!(metadata.site_count(), 2);
+        let by_id = metadata.site_at(0).unwrap();
+        assert_eq!(by_id.owner, owner);
+        assert_eq!(by_id.slot, InlineCacheSlotId(0));
+        assert_eq!(by_id.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(by_id.opcode, CoreOpcode::InById);
+        assert_eq!(by_id.cache_kind, InlineCacheKind::HasProperty);
+        assert_eq!(by_id.access, PropertyAccessType::InById);
+        assert_eq!(by_id.property_cache_kind, PropertyCacheKind::InById);
+        assert_eq!(
+            by_id.property_key,
+            PropertyCacheKey::Key(identifier_property_key(31))
+        );
+        assert_eq!(
+            by_id.cold_miss_handoff.cache_kind,
+            InlineCacheKind::HasProperty
+        );
+        assert_eq!(by_id.cold_miss_handoff.miss_kind, InlineCacheMissKind::Cold);
+        assert_eq!(
+            by_id.cold_miss_handoff.fallback,
+            InlineCacheFallbackSemantics::SlowPathLookup
+        );
+        assert!(by_id.cold_miss_handoff.preserves_operand_registers);
+        assert_eq!(by_id.cold_miss_handoff.validate(), Ok(()));
+
+        let by_val = metadata.site_at(1).unwrap();
+        assert_eq!(by_val.owner, owner);
+        assert_eq!(by_val.slot, InlineCacheSlotId(1));
+        assert_eq!(by_val.bytecode_index, BytecodeIndex::from_offset(1));
+        assert_eq!(by_val.opcode, CoreOpcode::InByVal);
+        assert_eq!(by_val.cache_kind, InlineCacheKind::HasProperty);
+        assert_eq!(by_val.access, PropertyAccessType::InByVal);
+        assert_eq!(by_val.property_cache_kind, PropertyCacheKind::InByVal);
+        assert_eq!(
+            by_val.property_key,
+            PropertyCacheKey::RuntimeValue(VirtualRegister::local(3))
+        );
+        assert_eq!(
+            by_val.cold_miss_handoff.cache_kind,
+            InlineCacheKind::HasProperty
+        );
+        assert_eq!(by_val.cold_miss_handoff.validate(), Ok(()));
+
+        let current_derivation =
+            derive_baseline_generated_property_handoff_plan_from_current_code_block_metadata(
+                &code_block,
+                owner,
+            )
+            .unwrap();
+        assert_eq!(current_derivation.metadata, Some(metadata));
+    }
+
+    #[test]
+    fn generated_property_handoff_metadata_scales_past_inline_site_count() {
+        let owner = baseline_owner();
+        let code_block = many_get_by_name_code_block(20);
+
+        let derivation =
+            derive_baseline_generated_property_handoff_plan_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation.metadata.expect("property handoff metadata");
+
+        assert_eq!(metadata.site_count(), 20);
+        for index in 0..20 {
+            let bytecode_index = BytecodeIndex::from_offset(index + 1);
+            let site = metadata
+                .site_for_bytecode_index(bytecode_index)
+                .expect("property handoff site");
+            assert_eq!(site.owner, owner);
+            assert_eq!(site.slot, InlineCacheSlotId(index));
+            assert_eq!(site.bytecode_index, bytecode_index);
+            assert_eq!(site.opcode, CoreOpcode::GetByName);
+            assert_eq!(
+                site.property_key,
+                PropertyCacheKey::Key(identifier_property_key(100 + index))
+            );
+        }
+        assert!(metadata
+            .site_for_bytecode_index(BytecodeIndex::from_offset(25))
+            .is_none());
     }
 
     #[test]
@@ -8510,6 +10611,48 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn generated_property_handoff_current_metadata_accepts_warmed_named_and_global_load_ics() {
+        let owner = baseline_owner();
+        for (opcode, code_block) in [
+            (CoreOpcode::GetByName, get_by_name_code_block(17)),
+            (
+                CoreOpcode::GetGlobalObjectProperty,
+                get_global_object_property_code_block(23),
+            ),
+        ] {
+            let mut side_tables = code_block.side_tables().clone();
+            let cache = &mut side_tables.inline_caches.property_accesses[0];
+            cache.state = BytecodeInlineCacheState::Monomorphic;
+            cache.dispatch = PropertyInlineCacheDispatch::Handler;
+            cache.mutation_authority = InlineCacheMutationAuthority::BaselineJit;
+            let code_block = code_block.with_side_tables(side_tables);
+
+            assert!(
+                derive_baseline_generated_property_handoff_plan_from_code_block(&code_block, owner)
+                    .is_err(),
+                "cold generated-code install must reject warmed {:?} ICs",
+                opcode
+            );
+
+            let derivation =
+                derive_baseline_generated_property_handoff_plan_from_current_code_block_metadata(
+                    &code_block,
+                    owner,
+                )
+                .unwrap();
+            let metadata = derivation
+                .metadata
+                .expect("current property handoff metadata");
+            let site = metadata.site_at(0).unwrap();
+
+            assert_eq!(metadata.site_count(), 1);
+            assert_eq!(site.owner, owner);
+            assert_eq!(site.bytecode_index, BytecodeIndex::from_offset(1));
+            assert_eq!(site.opcode, opcode);
+        }
     }
 
     #[test]
@@ -8580,7 +10723,7 @@ mod tests {
         );
 
         let mut wrong_key = site;
-        wrong_key.property_key = identifier_property_key(18);
+        wrong_key.property_key = PropertyCacheKey::Key(identifier_property_key(18));
         let wrong_key_metadata =
             BaselineGeneratedPropertyHandoffPlanMetadata::from_code_block_snapshot(
                 &code_block,
@@ -8610,7 +10753,7 @@ mod tests {
         let owner = baseline_owner();
         let code_block = get_by_name_code_block(17);
         let mut site = property_handoff_site(owner, BytecodeIndex::from_offset(1), 17);
-        site.opcode = CoreOpcode::GetByValue;
+        site.opcode = CoreOpcode::DeleteByName;
 
         assert_eq!(
             BaselineGeneratedPropertyHandoffPlanMetadata::from_code_block_snapshot(
@@ -8620,7 +10763,7 @@ mod tests {
             Err(
                 JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanUnsupportedOpcode {
                     bytecode_index: BytecodeIndex::from_offset(1),
-                    opcode: CoreOpcode::GetByValue,
+                    opcode: CoreOpcode::DeleteByName,
                 }
             )
         );
@@ -8833,11 +10976,8 @@ mod tests {
     #[test]
     fn generated_property_handoff_derivation_ignores_other_property_ops() {
         for opcode in [
-            CoreOpcode::GetByValue,
-            CoreOpcode::PutByValue,
             CoreOpcode::PutByIndex,
             CoreOpcode::DeleteByName,
-            CoreOpcode::GetLength,
             CoreOpcode::ArrayLength,
         ] {
             let code_block = code_block_from_typed_instructions(vec![
@@ -8871,16 +11011,11 @@ mod tests {
     fn mixed_baseline_does_not_promote_other_call_or_property_opcodes_to_typed_handoffs() {
         for opcode in [
             CoreOpcode::CallDirect,
-            CoreOpcode::Construct,
             CoreOpcode::ConstructSuper,
-            CoreOpcode::GetByValue,
-            CoreOpcode::PutByValue,
             CoreOpcode::PutByIndex,
             CoreOpcode::DeleteByName,
             CoreOpcode::DeleteByValue,
-            CoreOpcode::GetLength,
             CoreOpcode::ArrayLength,
-            CoreOpcode::LoadFunction,
         ] {
             let record = baseline_eligibility_record(vec![
                 baseline_instruction(0, CoreOpcode::LoadInt32),
@@ -8899,13 +11034,273 @@ mod tests {
 
     #[test]
     fn mixed_baseline_accepts_js_call_handoff_without_generated_prefix_or_helper_site() {
-        for opcode in [CoreOpcode::Call, CoreOpcode::CallWithThis] {
+        for opcode in [
+            CoreOpcode::Call,
+            CoreOpcode::CallWithThis,
+            CoreOpcode::Construct,
+        ] {
             let record = baseline_eligibility_record(vec![baseline_instruction(0, opcode)]);
             let sites = record.validate_mixed_bytecode_sites(None).unwrap();
             assert_eq!(sites.len(), 1);
             assert_eq!(sites[0].kind, BaselineMixedBytecodeSiteKind::JsCallHandoff);
             assert!(record.validate_mixed_for_vm_install(None).is_ok());
         }
+    }
+
+    #[test]
+    fn generated_js_call_native_exit_metadata_scales_past_inline_argument_register_count() {
+        let owner = baseline_owner();
+        let code_block = many_construct_code_block(20);
+
+        let derivation =
+            derive_baseline_generated_js_call_native_exit_plan_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation.metadata.expect("construct handoff metadata");
+
+        assert_eq!(metadata.site_count(), 20);
+        for index in 0..20 {
+            let bytecode_index = BytecodeIndex::from_offset(index);
+            let site = metadata
+                .site_for_bytecode_index(bytecode_index)
+                .expect("construct handoff site");
+            assert_eq!(site.owner, owner);
+            assert_eq!(site.bytecode_index, bytecode_index);
+            assert_eq!(site.opcode, CoreOpcode::Construct);
+            assert_eq!(site.destination, VirtualRegister::local(index + 1));
+            assert_eq!(site.callee, VirtualRegister::local(0));
+            assert_eq!(site.provided_argument_count, 0);
+            assert!(site.argument_registers.is_empty());
+        }
+    }
+
+    #[test]
+    fn baseline_generated_owner_continuation_map_derives_call_call_with_this_and_construct_sites() {
+        let owner = baseline_owner();
+        let code_block = owner_continuation_code_block();
+
+        let derivation =
+            derive_baseline_generated_owner_continuation_map_from_code_block(&code_block, owner)
+                .unwrap();
+        let metadata = derivation.metadata.expect("owner continuation map");
+
+        assert_eq!(metadata.label_count(), 5);
+        assert_eq!(metadata.call_site_count(), 3);
+        assert_eq!(
+            metadata.label_for_bytecode_index(BytecodeIndex::from_offset(1)),
+            Some(&BaselineGeneratedOwnerBytecodeLabel {
+                owner,
+                bytecode_index: BytecodeIndex::from_offset(1),
+                opcode: CoreOpcode::Call,
+                next_bytecode_index: Some(BytecodeIndex::from_offset(2)),
+            })
+        );
+
+        let call = metadata.call_site_at(0).unwrap();
+        assert_eq!(call.owner, owner);
+        assert_eq!(call.call_bytecode_index, BytecodeIndex::from_offset(1));
+        assert_eq!(call.opcode, CoreOpcode::Call);
+        assert_eq!(call.destination, VirtualRegister::local(1));
+        assert_eq!(call.argument_count_including_this, 3);
+        assert_eq!(
+            call.resume_bytecode_index,
+            Some(BytecodeIndex::from_offset(2))
+        );
+        assert_eq!(call.kind, BaselineGeneratedOwnerContinuationKind::Call);
+        let call_profile = call.result_profile.expect("Call result profile site");
+        assert_eq!(call_profile.profile_slot, RuntimeSlot(1));
+        assert_eq!(call_profile.bytecode_index, BytecodeIndex::from_offset(1));
+        assert_eq!(call_profile.checkpoint, Checkpoint::NONE);
+        assert_eq!(call_profile.bucket_kind, ValueProfileBucketKind::Sample);
+        assert_eq!(
+            call_profile.storage_generation,
+            ValueProfileJitStorageGeneration(1)
+        );
+        assert_eq!(call_profile.value_profile_offset, 1);
+        assert_eq!(call_profile.metadata_table_displacement, -32);
+        assert_ne!(call_profile.metadata_table_base_address, 0);
+        assert_eq!(
+            call_profile
+                .metadata_table_base_address
+                .checked_sub((-call_profile.metadata_table_displacement) as usize),
+            Some(call_profile.raw_bucket_address)
+        );
+        assert_ne!(call_profile.raw_bucket_address, 0);
+        assert_eq!(call_profile.raw_bucket_bytes, 8);
+        assert_eq!(
+            call_profile.emission_policy,
+            ValueProfileEmissionPolicy::default()
+        );
+
+        let call_with_this = metadata.call_site_at(1).unwrap();
+        assert_eq!(call_with_this.opcode, CoreOpcode::CallWithThis);
+        assert_eq!(call_with_this.destination, VirtualRegister::local(5));
+        assert_eq!(call_with_this.argument_count_including_this, 2);
+        assert_eq!(
+            call_with_this.resume_bytecode_index,
+            Some(BytecodeIndex::from_offset(3))
+        );
+        assert_eq!(
+            metadata.call_site_for_bytecode_index(BytecodeIndex::from_offset(2)),
+            Some(call_with_this)
+        );
+        let call_with_this_profile = call_with_this
+            .result_profile
+            .expect("CallWithThis result profile site");
+        assert_eq!(call_with_this_profile.profile_slot, RuntimeSlot(2));
+        assert_eq!(
+            call_with_this_profile.bytecode_index,
+            BytecodeIndex::from_offset(2)
+        );
+        assert_eq!(call_with_this_profile.checkpoint, Checkpoint::NONE);
+        assert_eq!(
+            call_with_this_profile.bucket_kind,
+            ValueProfileBucketKind::Sample
+        );
+        assert_eq!(
+            call_with_this_profile.storage_generation,
+            ValueProfileJitStorageGeneration(1)
+        );
+        assert_eq!(call_with_this_profile.value_profile_offset, 2);
+        assert_eq!(call_with_this_profile.metadata_table_displacement, -48);
+        assert_ne!(call_with_this_profile.metadata_table_base_address, 0);
+        assert_eq!(
+            call_with_this_profile
+                .metadata_table_base_address
+                .checked_sub((-call_with_this_profile.metadata_table_displacement) as usize),
+            Some(call_with_this_profile.raw_bucket_address)
+        );
+        assert_ne!(call_with_this_profile.raw_bucket_address, 0);
+        assert_eq!(call_with_this_profile.raw_bucket_bytes, 8);
+        assert_eq!(
+            call_with_this_profile.emission_policy,
+            ValueProfileEmissionPolicy::default()
+        );
+
+        let construct = metadata.call_site_at(2).unwrap();
+        assert_eq!(construct.opcode, CoreOpcode::Construct);
+        assert_eq!(construct.destination, VirtualRegister::local(9));
+        assert_eq!(construct.argument_count_including_this, 1);
+        assert_eq!(
+            construct.resume_bytecode_index,
+            Some(BytecodeIndex::from_offset(4))
+        );
+        assert_eq!(
+            construct.kind,
+            BaselineGeneratedOwnerContinuationKind::Construct
+        );
+        assert_eq!(construct.result_profile, None);
+    }
+
+    #[test]
+    fn baseline_generated_owner_continuation_map_rejects_duplicate_or_malformed_sites() {
+        let owner = baseline_owner();
+        let code_block = owner_continuation_code_block();
+        let snapshot = baseline_bytecode_snapshot_fingerprint_from_code_block(&code_block).unwrap();
+        let label = BaselineGeneratedOwnerBytecodeLabel {
+            owner,
+            bytecode_index: BytecodeIndex::from_offset(1),
+            opcode: CoreOpcode::Call,
+            next_bytecode_index: Some(BytecodeIndex::from_offset(2)),
+        };
+        let site = BaselineGeneratedOwnerContinuationSite {
+            owner,
+            call_bytecode_index: BytecodeIndex::from_offset(1),
+            opcode: CoreOpcode::Call,
+            destination: VirtualRegister::local(1),
+            argument_count_including_this: 1,
+            resume_bytecode_index: Some(BytecodeIndex::from_offset(2)),
+            kind: BaselineGeneratedOwnerContinuationKind::Call,
+            result_profile: Some(BaselineGeneratedOwnerCallResultProfileSite {
+                profile_slot: RuntimeSlot(1),
+                bytecode_index: BytecodeIndex::from_offset(1),
+                checkpoint: Checkpoint::NONE,
+                bucket_kind: ValueProfileBucketKind::Sample,
+                storage_generation: ValueProfileJitStorageGeneration(1),
+                value_profile_offset: 1,
+                metadata_table_displacement: -32,
+                metadata_table_base_address: 33,
+                raw_bucket_address: 1,
+                raw_bucket_bytes: 8,
+                emission_policy: ValueProfileEmissionPolicy::default(),
+            }),
+        };
+
+        assert_eq!(
+            BaselineGeneratedOwnerContinuationMapMetadata::new(
+                snapshot,
+                vec![label],
+                vec![site, site],
+            ),
+            Err(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapDuplicateSite {
+                    bytecode_index: BytecodeIndex::from_offset(1),
+                }
+            )
+        );
+
+        assert_eq!(
+            BaselineGeneratedOwnerContinuationMapMetadata::new(
+                snapshot,
+                vec![label, label],
+                vec![],
+            ),
+            Err(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapDuplicateLabel {
+                    bytecode_index: BytecodeIndex::from_offset(1),
+                }
+            )
+        );
+
+        let malformed_site = BaselineGeneratedOwnerContinuationSite {
+            opcode: CoreOpcode::Return,
+            ..site
+        };
+        assert_eq!(
+            BaselineGeneratedOwnerContinuationMapMetadata::new(
+                snapshot,
+                vec![label],
+                vec![malformed_site],
+            ),
+            Err(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapUnsupportedOpcode {
+                    bytecode_index: BytecodeIndex::from_offset(1),
+                    opcode: CoreOpcode::Return,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn baseline_generated_owner_continuation_map_validation_rejects_stale_code_block_snapshot() {
+        let owner = baseline_owner();
+        let code_block = owner_continuation_code_block();
+        let stale_code_block = owner_continuation_code_block_with_wider_first_call();
+        let stale_metadata = derive_baseline_generated_owner_continuation_map_from_code_block(
+            &stale_code_block,
+            owner,
+        )
+        .unwrap()
+        .metadata
+        .expect("stale owner continuation map");
+
+        assert_eq!(
+            validate_baseline_generated_owner_continuation_map_against_code_block(
+                &code_block,
+                owner,
+                &stale_metadata,
+            ),
+            Err(
+                JitPlanValidationError::BaselineGeneratedOwnerContinuationMapCodeBlockDerivationMismatch {
+                    expected_label_count: 5,
+                    actual_label_count: 5,
+                    first_label_mismatch: None,
+                    expected_site_count: 3,
+                    actual_site_count: 3,
+                    first_site_mismatch: Some(0),
+                    bytecode_snapshot_matches: Some(false),
+                }
+            )
+        );
     }
 
     #[test]
@@ -9796,6 +12191,125 @@ mod tests {
         assert!(plan.roots.is_empty());
     }
 
+    fn owner_continuation_code_block() -> CodeBlock {
+        owner_continuation_code_block_with_first_call_arguments(vec![
+            VirtualRegister::local(3),
+            VirtualRegister::local(4),
+        ])
+    }
+
+    fn owner_continuation_code_block_with_wider_first_call() -> CodeBlock {
+        owner_continuation_code_block_with_first_call_arguments(vec![
+            VirtualRegister::local(3),
+            VirtualRegister::local(4),
+            VirtualRegister::local(11),
+        ])
+    }
+
+    fn owner_continuation_code_block_with_first_call_arguments(
+        first_call_arguments: Vec<VirtualRegister>,
+    ) -> CodeBlock {
+        code_block_from_typed_instructions(vec![
+            typed_instruction(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![
+                    Operand::Register(VirtualRegister::local(0)),
+                    Operand::SignedImmediate(7),
+                ],
+            ),
+            call_instruction(
+                1,
+                VirtualRegister::local(1),
+                VirtualRegister::local(2),
+                first_call_arguments,
+            ),
+            call_with_this_instruction(
+                2,
+                VirtualRegister::local(5),
+                VirtualRegister::local(6),
+                VirtualRegister::local(7),
+                vec![VirtualRegister::local(8)],
+            ),
+            construct_instruction(
+                3,
+                VirtualRegister::local(9),
+                VirtualRegister::local(10),
+                Vec::new(),
+            ),
+            typed_instruction(
+                4,
+                CoreOpcode::Return,
+                vec![Operand::Register(VirtualRegister::local(9))],
+            ),
+        ])
+    }
+
+    fn call_instruction(
+        offset: u32,
+        destination: VirtualRegister,
+        callee: VirtualRegister,
+        arguments: Vec<VirtualRegister>,
+    ) -> TypedInstruction {
+        let mut operands = vec![
+            Operand::Register(destination),
+            Operand::Register(callee),
+            Operand::UnsignedImmediate(arguments.len().try_into().unwrap_or(u32::MAX)),
+        ];
+        operands.extend(arguments.into_iter().map(Operand::Register));
+        typed_instruction(offset, CoreOpcode::Call, operands)
+    }
+
+    fn call_with_this_instruction(
+        offset: u32,
+        destination: VirtualRegister,
+        callee: VirtualRegister,
+        this_value: VirtualRegister,
+        arguments: Vec<VirtualRegister>,
+    ) -> TypedInstruction {
+        let mut operands = vec![
+            Operand::Register(destination),
+            Operand::Register(callee),
+            Operand::Register(this_value),
+            Operand::UnsignedImmediate(arguments.len().try_into().unwrap_or(u32::MAX)),
+        ];
+        operands.extend(arguments.into_iter().map(Operand::Register));
+        typed_instruction(offset, CoreOpcode::CallWithThis, operands)
+    }
+
+    fn construct_instruction(
+        offset: u32,
+        destination: VirtualRegister,
+        callee: VirtualRegister,
+        arguments: Vec<VirtualRegister>,
+    ) -> TypedInstruction {
+        let mut operands = vec![
+            Operand::Register(destination),
+            Operand::Register(callee),
+            Operand::UnsignedImmediate(arguments.len().try_into().unwrap_or(u32::MAX)),
+        ];
+        operands.extend(arguments.into_iter().map(Operand::Register));
+        typed_instruction(offset, CoreOpcode::Construct, operands)
+    }
+
+    fn many_construct_code_block(count: u32) -> CodeBlock {
+        let mut instructions = Vec::new();
+        for index in 0..count {
+            instructions.push(construct_instruction(
+                index,
+                VirtualRegister::local(index.saturating_add(1)),
+                VirtualRegister::local(0),
+                Vec::new(),
+            ));
+        }
+        instructions.push(typed_instruction(
+            count,
+            CoreOpcode::Return,
+            vec![Operand::Register(VirtualRegister::local(count))],
+        ));
+        code_block_from_typed_instructions(instructions)
+    }
+
     fn baseline_eligibility_record(
         instructions: Vec<BaselineBytecodeInstruction>,
     ) -> BaselineBytecodeEligibilityRecord {
@@ -9953,6 +12467,33 @@ mod tests {
         ])
     }
 
+    fn get_length_code_block(identifier_index: u32) -> CodeBlock {
+        code_block_from_typed_instructions(vec![
+            typed_instruction(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![
+                    Operand::Register(VirtualRegister::local(0)),
+                    Operand::SignedImmediate(7),
+                ],
+            ),
+            typed_instruction(
+                1,
+                CoreOpcode::GetLength,
+                vec![
+                    Operand::Register(VirtualRegister::local(1)),
+                    Operand::Register(VirtualRegister::local(2)),
+                    Operand::IdentifierIndex(identifier_index),
+                ],
+            ),
+            typed_instruction(
+                2,
+                CoreOpcode::Return,
+                vec![Operand::Register(VirtualRegister::local(1))],
+            ),
+        ])
+    }
+
     fn put_by_name_code_block(identifier_index: u32) -> CodeBlock {
         code_block_from_typed_instructions(vec![
             typed_instruction(
@@ -9978,6 +12519,149 @@ mod tests {
                 vec![Operand::Register(VirtualRegister::local(0))],
             ),
         ])
+    }
+
+    fn put_global_object_property_code_block(identifier_index: u32) -> CodeBlock {
+        code_block_from_typed_instructions(vec![
+            typed_instruction(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![
+                    Operand::Register(VirtualRegister::local(0)),
+                    Operand::SignedImmediate(7),
+                ],
+            ),
+            typed_instruction(
+                1,
+                CoreOpcode::PutGlobalObjectProperty,
+                vec![
+                    Operand::IdentifierIndex(identifier_index),
+                    Operand::Register(VirtualRegister::local(0)),
+                ],
+            ),
+            typed_instruction(
+                2,
+                CoreOpcode::Return,
+                vec![Operand::Register(VirtualRegister::local(0))],
+            ),
+        ])
+    }
+
+    fn get_global_object_property_code_block(identifier_index: u32) -> CodeBlock {
+        code_block_from_typed_instructions(vec![
+            typed_instruction(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![
+                    Operand::Register(VirtualRegister::local(0)),
+                    Operand::SignedImmediate(1),
+                ],
+            ),
+            typed_instruction(
+                1,
+                CoreOpcode::GetGlobalObjectProperty,
+                vec![
+                    Operand::Register(VirtualRegister::local(1)),
+                    Operand::IdentifierIndex(identifier_index),
+                ],
+            ),
+            typed_instruction(
+                2,
+                CoreOpcode::AddInt32,
+                vec![
+                    Operand::Register(VirtualRegister::local(2)),
+                    Operand::Register(VirtualRegister::local(1)),
+                    Operand::Register(VirtualRegister::local(0)),
+                ],
+            ),
+            typed_instruction(
+                3,
+                CoreOpcode::Return,
+                vec![Operand::Register(VirtualRegister::local(2))],
+            ),
+        ])
+    }
+
+    fn get_by_value_code_block() -> CodeBlock {
+        code_block_from_typed_instructions(vec![
+            typed_instruction(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![
+                    Operand::Register(VirtualRegister::local(0)),
+                    Operand::SignedImmediate(7),
+                ],
+            ),
+            typed_instruction(
+                1,
+                CoreOpcode::GetByValue,
+                vec![
+                    Operand::Register(VirtualRegister::local(1)),
+                    Operand::Register(VirtualRegister::local(2)),
+                    Operand::Register(VirtualRegister::local(3)),
+                ],
+            ),
+            typed_instruction(
+                2,
+                CoreOpcode::Return,
+                vec![Operand::Register(VirtualRegister::local(1))],
+            ),
+        ])
+    }
+
+    fn put_by_value_code_block() -> CodeBlock {
+        code_block_from_typed_instructions(vec![
+            typed_instruction(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![
+                    Operand::Register(VirtualRegister::local(0)),
+                    Operand::SignedImmediate(7),
+                ],
+            ),
+            typed_instruction(
+                1,
+                CoreOpcode::PutByValue,
+                vec![
+                    Operand::Register(VirtualRegister::local(2)),
+                    Operand::Register(VirtualRegister::local(3)),
+                    Operand::Register(VirtualRegister::local(0)),
+                ],
+            ),
+            typed_instruction(
+                2,
+                CoreOpcode::Return,
+                vec![Operand::Register(VirtualRegister::local(0))],
+            ),
+        ])
+    }
+
+    fn many_get_by_name_code_block(count: u32) -> CodeBlock {
+        let mut instructions = vec![typed_instruction(
+            0,
+            CoreOpcode::LoadInt32,
+            vec![
+                Operand::Register(VirtualRegister::local(0)),
+                Operand::SignedImmediate(7),
+            ],
+        )];
+        for index in 0..count {
+            instructions.push(typed_instruction(
+                index + 1,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(VirtualRegister::local(index + 1)),
+                    Operand::Register(VirtualRegister::local(0)),
+                    Operand::IdentifierIndex(100 + index),
+                ],
+            ));
+        }
+        instructions.push(typed_instruction(
+            count + 1,
+            CoreOpcode::Return,
+            vec![Operand::Register(VirtualRegister::local(count))],
+        ));
+        code_block_from_typed_instructions(instructions)
     }
 
     fn new_object_code_block_with_root_maps(
@@ -10041,6 +12725,20 @@ mod tests {
                 CoreOpcode::Return,
                 vec![Operand::Register(return_register)],
             ),
+        ])
+        .with_side_tables(LinkedSideTables {
+            root_maps,
+            ..LinkedSideTables::default()
+        })
+    }
+
+    fn throw_code_block_with_root_maps(
+        source: VirtualRegister,
+        root_maps: Vec<BytecodeRootMap>,
+    ) -> CodeBlock {
+        code_block_from_typed_instructions(vec![
+            typed_instruction(0, CoreOpcode::Throw, vec![Operand::Register(source)]),
+            typed_instruction(1, CoreOpcode::Return, vec![Operand::Register(source)]),
         ])
         .with_side_tables(LinkedSideTables {
             root_maps,
@@ -10122,6 +12820,50 @@ mod tests {
             ],
             literals,
         )
+        .with_side_tables(LinkedSideTables {
+            root_maps,
+            ..LinkedSideTables::default()
+        })
+    }
+
+    fn load_function_code_block_with_root_maps(
+        destination: VirtualRegister,
+        function_index: u32,
+        captures: Vec<VirtualRegister>,
+        root_maps: Vec<BytecodeRootMap>,
+    ) -> CodeBlock {
+        let mut operands = vec![
+            Operand::Register(destination),
+            Operand::UnsignedImmediate(function_index),
+            Operand::UnsignedImmediate(captures.len().min(u32::MAX as usize) as u32),
+        ];
+        operands.extend(captures.into_iter().map(Operand::Register));
+        code_block_from_typed_instructions(vec![
+            typed_instruction(0, CoreOpcode::LoadFunction, operands),
+            typed_instruction(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_side_tables(LinkedSideTables {
+            root_maps,
+            ..LinkedSideTables::default()
+        })
+    }
+
+    fn initialize_global_lexical_code_block_with_root_maps(
+        identifier: u32,
+        source: VirtualRegister,
+        root_maps: Vec<BytecodeRootMap>,
+    ) -> CodeBlock {
+        code_block_from_typed_instructions(vec![
+            typed_instruction(
+                0,
+                CoreOpcode::InitializeGlobalLexical,
+                vec![
+                    Operand::IdentifierIndex(identifier),
+                    Operand::Register(source),
+                ],
+            ),
+            typed_instruction(1, CoreOpcode::Return, vec![Operand::Register(source)]),
+        ])
         .with_side_tables(LinkedSideTables {
             root_maps,
             ..LinkedSideTables::default()

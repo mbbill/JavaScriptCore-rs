@@ -167,6 +167,7 @@ impl ExecutableMemoryMapping {
         entry_offset: usize,
         vm: NonNull<c_void>,
         frame_base: NonNull<c_void>,
+        callee_value_bits: u64,
     ) -> Result<u64, ExecutableMemoryPlatformError> {
         let ptr = self
             .ptr
@@ -182,8 +183,50 @@ impl ExecutableMemoryMapping {
         // linked executable lifecycle before reaching this backend. The checked
         // offset above ensures the private entry address lies inside the live
         // mapping. The P6 byte contract defines this entry as
-        // `extern "C" fn(*mut c_void, *mut c_void) -> u64`.
-        unsafe { call_p6_x86_64_entry(ptr.as_ptr().add(entry_offset).cast_const(), vm, frame_base) }
+        // `extern "C" fn(*mut c_void, *mut c_void, u64) -> u64`.
+        unsafe {
+            call_p6_x86_64_entry(
+                ptr.as_ptr().add(entry_offset).cast_const(),
+                vm,
+                frame_base,
+                callee_value_bits,
+            )
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn call_p9_x86_64_owner_post_call_reentry(
+        &self,
+        entry_offset: usize,
+        vm: NonNull<c_void>,
+        frame_base: NonNull<c_void>,
+        result_bits: u64,
+        metadata_table_base: NonNull<c_void>,
+        callee_value_bits: u64,
+    ) -> Result<u64, ExecutableMemoryPlatformError> {
+        let ptr = self
+            .ptr
+            .ok_or(ExecutableMemoryPlatformError::AlreadyReleased)?;
+        let entry_end = entry_offset
+            .checked_add(1)
+            .ok_or(ExecutableMemoryPlatformError::RangeOutOfBounds)?;
+        if entry_end > self.byte_len {
+            return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
+        }
+
+        // SAFETY: the safe compartment wrapper performs the same RX lifecycle
+        // and range checks as the ordinary P6 callable entry. This reentry ABI
+        // extends the C shape with raw JSValue bits plus a metadata-table base.
+        unsafe {
+            call_p9_x86_64_owner_post_call_reentry(
+                ptr.as_ptr().add(entry_offset).cast_const(),
+                vm,
+                frame_base,
+                result_bits,
+                metadata_table_base,
+                callee_value_bits,
+            )
+        }
     }
 
     pub(super) fn release(&mut self) -> Result<(), ExecutableMemoryPlatformError> {
@@ -262,8 +305,9 @@ unsafe fn call_p6_x86_64_entry(
     entry: *const u8,
     vm: NonNull<c_void>,
     frame_base: NonNull<c_void>,
+    callee_value_bits: u64,
 ) -> Result<u64, ExecutableMemoryPlatformError> {
-    type P6Entry = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64;
+    type P6Entry = unsafe extern "C" fn(*mut c_void, *mut c_void, u64) -> u64;
 
     if entry.is_null() {
         return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
@@ -276,7 +320,41 @@ unsafe fn call_p6_x86_64_entry(
     // SAFETY: the function pointer was just formed from the checked RX entry
     // address above, and the opaque arguments are non-null values supplied by
     // the VM-owned call boundary.
-    Ok(unsafe { entry(vm.as_ptr(), frame_base.as_ptr()) })
+    Ok(unsafe { entry(vm.as_ptr(), frame_base.as_ptr(), callee_value_bits) })
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn call_p9_x86_64_owner_post_call_reentry(
+    entry: *const u8,
+    vm: NonNull<c_void>,
+    frame_base: NonNull<c_void>,
+    result_bits: u64,
+    metadata_table_base: NonNull<c_void>,
+    callee_value_bits: u64,
+) -> Result<u64, ExecutableMemoryPlatformError> {
+    type P9PostCallReentry =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64) -> u64;
+
+    if entry.is_null() {
+        return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
+    }
+
+    // SAFETY: callers pass a non-null address inside a live RX mapping and the
+    // P9 owner reentry proof says the bytes at this address implement the
+    // five-argument C ABI represented by `P9PostCallReentry`.
+    let entry: P9PostCallReentry = unsafe { std::mem::transmute(entry) };
+    // SAFETY: the checked RX function pointer receives VM/frame opaque pointers
+    // plus raw JSValue bits for rax, a metadata-table base for r12, and the
+    // active callee JSValue bits for the Rust callee carrier.
+    Ok(unsafe {
+        entry(
+            vm.as_ptr(),
+            frame_base.as_ptr(),
+            result_bits,
+            metadata_table_base.as_ptr(),
+            callee_value_bits,
+        )
+    })
 }
 
 fn map_failed() -> *mut c_void {

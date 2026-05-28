@@ -46,12 +46,33 @@ pub struct ExecutableMemoryCompartmentRequest {
 ///
 /// `entry_offset` is an allocation-relative offset. The opaque VM and frame-base
 /// pointers are passed through to generated code without exposing the
-/// executable address to callers.
+/// executable address to callers. `callee_value_bits` is Rust's current native
+/// carrier for JSC's active call-frame callee slot while the raw frame base
+/// still points at local0 rather than a full JSC-compatible frame header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutableMemoryP6CallRequest {
     pub entry_offset: u32,
     pub vm: NonNull<c_void>,
     pub frame_base: NonNull<c_void>,
+    pub callee_value_bits: u64,
+}
+
+/// Request to invoke a result-seeded P9 owner post-call reentry stub.
+///
+/// `result_bits` is passed as the third C-ABI argument so the reentry stub can
+/// move it into the platform return-value register. `metadata_table_base` is
+/// passed as the fourth C-ABI argument for post-call profile stores that use
+/// JSC's metadata-table register shape before joining the owner post-call
+/// block. `callee_value_bits` is passed as the fifth C-ABI argument and seeded
+/// into the same Rust callee carrier used by ordinary P6 entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutableMemoryP9PostCallReentryRequest {
+    pub entry_offset: u32,
+    pub vm: NonNull<c_void>,
+    pub frame_base: NonNull<c_void>,
+    pub result_bits: u64,
+    pub metadata_table_base: NonNull<c_void>,
+    pub callee_value_bits: u64,
 }
 
 /// Raw EncodedJsValue bits returned by a sealed P6 call.
@@ -68,6 +89,7 @@ pub enum ExecutableMemoryPlatformOperation {
     CopyBytes,
     ProtectExecutable,
     CallP6Entry,
+    CallP9PostCallReentry,
     Release,
     ReadBytesForTesting,
 }
@@ -177,11 +199,37 @@ impl ExecutableMemoryCompartmentRequest {
 }
 
 impl ExecutableMemoryP6CallRequest {
-    pub const fn new(entry_offset: u32, vm: NonNull<c_void>, frame_base: NonNull<c_void>) -> Self {
+    pub const fn new(
+        entry_offset: u32,
+        vm: NonNull<c_void>,
+        frame_base: NonNull<c_void>,
+        callee_value_bits: u64,
+    ) -> Self {
         Self {
             entry_offset,
             vm,
             frame_base,
+            callee_value_bits,
+        }
+    }
+}
+
+impl ExecutableMemoryP9PostCallReentryRequest {
+    pub const fn new(
+        entry_offset: u32,
+        vm: NonNull<c_void>,
+        frame_base: NonNull<c_void>,
+        result_bits: u64,
+        metadata_table_base: NonNull<c_void>,
+        callee_value_bits: u64,
+    ) -> Self {
+        Self {
+            entry_offset,
+            vm,
+            frame_base,
+            result_bits,
+            metadata_table_base,
+            callee_value_bits,
         }
     }
 }
@@ -399,8 +447,50 @@ impl ExecutableMemoryCompartment {
                     request.entry_offset as usize,
                     request.vm,
                     request.frame_base,
+                    request.callee_value_bits,
                 )
-                .map_err(map_call_platform_error)?;
+                .map_err(|error| {
+                    map_call_platform_error(error, ExecutableMemoryPlatformOperation::CallP6Entry)
+                })?;
+            Ok(ExecutableMemoryP6CallResult {
+                encoded_js_value_bits,
+            })
+        }
+        #[cfg(any(not(unix), not(target_arch = "x86_64")))]
+        {
+            let _ = request;
+            Err(ExecutableMemoryCompartmentError::UnsupportedPlatform)
+        }
+    }
+
+    pub fn call_p9_x86_64_owner_post_call_reentry(
+        &self,
+        request: ExecutableMemoryP9PostCallReentryRequest,
+    ) -> Result<ExecutableMemoryP6CallResult, ExecutableMemoryCompartmentError> {
+        self.require_executable_lifecycle()?;
+        self.validate_entry_offset(request.entry_offset)?;
+
+        #[cfg(all(unix, target_arch = "x86_64"))]
+        {
+            let mapping = self
+                .mapping
+                .as_ref()
+                .ok_or(ExecutableMemoryCompartmentError::AlreadyReleased)?;
+            let encoded_js_value_bits = mapping
+                .call_p9_x86_64_owner_post_call_reentry(
+                    request.entry_offset as usize,
+                    request.vm,
+                    request.frame_base,
+                    request.result_bits,
+                    request.metadata_table_base,
+                    request.callee_value_bits,
+                )
+                .map_err(|error| {
+                    map_call_platform_error(
+                        error,
+                        ExecutableMemoryPlatformOperation::CallP9PostCallReentry,
+                    )
+                })?;
             Ok(ExecutableMemoryP6CallResult {
                 encoded_js_value_bits,
             })
@@ -594,11 +684,12 @@ fn map_platform_error(
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn map_call_platform_error(
     error: unix_executable_memory::ExecutableMemoryPlatformError,
+    operation: ExecutableMemoryPlatformOperation,
 ) -> ExecutableMemoryCompartmentError {
     match error {
         unix_executable_memory::ExecutableMemoryPlatformError::RangeOutOfBounds => {
             ExecutableMemoryCompartmentError::PlatformFailure {
-                operation: ExecutableMemoryPlatformOperation::CallP6Entry,
+                operation,
                 errno: None,
             }
         }
@@ -720,7 +811,51 @@ mod tests {
 
     #[cfg(all(unix, target_arch = "x86_64"))]
     fn p6_call_request(entry_offset: u32) -> ExecutableMemoryP6CallRequest {
-        ExecutableMemoryP6CallRequest::new(entry_offset, opaque_test_ptr(), opaque_test_ptr())
+        ExecutableMemoryP6CallRequest::new(entry_offset, opaque_test_ptr(), opaque_test_ptr(), 0)
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    fn p6_call_request_with_callee(
+        entry_offset: u32,
+        callee_value_bits: u64,
+    ) -> ExecutableMemoryP6CallRequest {
+        ExecutableMemoryP6CallRequest::new(
+            entry_offset,
+            opaque_test_ptr(),
+            opaque_test_ptr(),
+            callee_value_bits,
+        )
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    fn p9_reentry_request(
+        entry_offset: u32,
+        result_bits: u64,
+    ) -> ExecutableMemoryP9PostCallReentryRequest {
+        ExecutableMemoryP9PostCallReentryRequest::new(
+            entry_offset,
+            opaque_test_ptr(),
+            opaque_test_ptr(),
+            result_bits,
+            opaque_test_ptr(),
+            0,
+        )
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    fn p9_reentry_request_with_callee(
+        entry_offset: u32,
+        result_bits: u64,
+        callee_value_bits: u64,
+    ) -> ExecutableMemoryP9PostCallReentryRequest {
+        ExecutableMemoryP9PostCallReentryRequest::new(
+            entry_offset,
+            opaque_test_ptr(),
+            opaque_test_ptr(),
+            result_bits,
+            opaque_test_ptr(),
+            callee_value_bits,
+        )
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]
@@ -744,6 +879,80 @@ mod tests {
                 .unwrap(),
             ExecutableMemoryP6CallResult {
                 encoded_js_value_bits: EXPECTED,
+            }
+        );
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn p9_x86_64_post_call_reentry_passes_seeded_result_bits_as_third_argument() {
+        const EXPECTED: u64 = 0x8877_6655_4433_2211;
+        let bytes = [0x48, 0x89, 0xd0, 0xc3];
+
+        let mut compartment =
+            ExecutableMemoryCompartment::allocate(test_request(bytes.len() as u32)).unwrap();
+        compartment
+            .copy_from_slice(compartment.machine_range(), &bytes)
+            .unwrap();
+        compartment.protect_executable().unwrap();
+
+        assert_eq!(
+            compartment
+                .call_p9_x86_64_owner_post_call_reentry(p9_reentry_request(0, EXPECTED))
+                .unwrap(),
+            ExecutableMemoryP6CallResult {
+                encoded_js_value_bits: EXPECTED,
+            }
+        );
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn p6_x86_64_call_passes_callee_bits_as_third_argument() {
+        const EXPECTED: u64 = 0x1020_3040_5060_7080;
+        let bytes = [0x48, 0x89, 0xd0, 0xc3];
+
+        let mut compartment =
+            ExecutableMemoryCompartment::allocate(test_request(bytes.len() as u32)).unwrap();
+        compartment
+            .copy_from_slice(compartment.machine_range(), &bytes)
+            .unwrap();
+        compartment.protect_executable().unwrap();
+
+        assert_eq!(
+            compartment
+                .call_p6_x86_64_entry(p6_call_request_with_callee(0, EXPECTED))
+                .unwrap(),
+            ExecutableMemoryP6CallResult {
+                encoded_js_value_bits: EXPECTED,
+            }
+        );
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn p9_x86_64_post_call_reentry_passes_callee_bits_as_fifth_argument() {
+        const RESULT: u64 = 0x8877_6655_4433_2211;
+        const EXPECTED_CALLEE: u64 = 0x1122_3344_5566_7788;
+        let bytes = [0x4c, 0x89, 0xc0, 0xc3];
+
+        let mut compartment =
+            ExecutableMemoryCompartment::allocate(test_request(bytes.len() as u32)).unwrap();
+        compartment
+            .copy_from_slice(compartment.machine_range(), &bytes)
+            .unwrap();
+        compartment.protect_executable().unwrap();
+
+        assert_eq!(
+            compartment
+                .call_p9_x86_64_owner_post_call_reentry(p9_reentry_request_with_callee(
+                    0,
+                    RESULT,
+                    EXPECTED_CALLEE,
+                ))
+                .unwrap(),
+            ExecutableMemoryP6CallResult {
+                encoded_js_value_bits: EXPECTED_CALLEE,
             }
         );
     }

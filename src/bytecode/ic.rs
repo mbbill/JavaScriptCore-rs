@@ -111,6 +111,124 @@ impl PropertyInlineCache {
             watchpoint: None,
         }
     }
+
+    pub fn get_global_object_property_load(
+        bytecode_index: BytecodeIndex,
+        property: PropertyKey,
+    ) -> Self {
+        Self {
+            bytecode_index,
+            access: PropertyAccessType::GetById,
+            kind: PropertyCacheKind::GetById,
+            dispatch: PropertyInlineCacheDispatch::Unlinked,
+            mutation_authority: InlineCacheMutationAuthority::LinkedCodeBlock,
+            state: InlineCacheState::Unset,
+            base: None,
+            property: PropertyCacheKey::Key(property),
+            get_by_id: Some(GetByIdModeMetadata::default()),
+            put_by_id: None,
+            watchpoint: None,
+        }
+    }
+
+    pub fn put_global_object_property_store(
+        bytecode_index: BytecodeIndex,
+        property: PropertyKey,
+    ) -> Self {
+        Self {
+            bytecode_index,
+            access: PropertyAccessType::PutByIdSloppy,
+            kind: PropertyCacheKind::PutById,
+            dispatch: PropertyInlineCacheDispatch::Unlinked,
+            mutation_authority: InlineCacheMutationAuthority::LinkedCodeBlock,
+            state: InlineCacheState::Unset,
+            base: None,
+            property: PropertyCacheKey::Key(property),
+            get_by_id: None,
+            put_by_id: Some(PutByIdModeMetadata::default()),
+            watchpoint: None,
+        }
+    }
+
+    pub fn get_by_value_load(
+        bytecode_index: BytecodeIndex,
+        base: VirtualRegister,
+        property: VirtualRegister,
+    ) -> Self {
+        Self {
+            bytecode_index,
+            access: PropertyAccessType::GetByVal,
+            kind: PropertyCacheKind::GetByVal,
+            dispatch: PropertyInlineCacheDispatch::Unlinked,
+            mutation_authority: InlineCacheMutationAuthority::LinkedCodeBlock,
+            state: InlineCacheState::Unset,
+            base: Some(base),
+            property: PropertyCacheKey::RuntimeValue(property),
+            get_by_id: None,
+            put_by_id: None,
+            watchpoint: None,
+        }
+    }
+
+    pub fn put_by_value_store(
+        bytecode_index: BytecodeIndex,
+        base: VirtualRegister,
+        property: VirtualRegister,
+    ) -> Self {
+        Self {
+            bytecode_index,
+            access: PropertyAccessType::PutByValSloppy,
+            kind: PropertyCacheKind::PutByVal,
+            dispatch: PropertyInlineCacheDispatch::Unlinked,
+            mutation_authority: InlineCacheMutationAuthority::LinkedCodeBlock,
+            state: InlineCacheState::Unset,
+            base: Some(base),
+            property: PropertyCacheKey::RuntimeValue(property),
+            get_by_id: None,
+            put_by_id: None,
+            watchpoint: None,
+        }
+    }
+
+    pub fn in_by_id_has(
+        bytecode_index: BytecodeIndex,
+        base: VirtualRegister,
+        property: PropertyKey,
+    ) -> Self {
+        Self {
+            bytecode_index,
+            access: PropertyAccessType::InById,
+            kind: PropertyCacheKind::InById,
+            dispatch: PropertyInlineCacheDispatch::Unlinked,
+            mutation_authority: InlineCacheMutationAuthority::LinkedCodeBlock,
+            state: InlineCacheState::Unset,
+            base: Some(base),
+            property: PropertyCacheKey::Key(property),
+            get_by_id: None,
+            put_by_id: None,
+            watchpoint: None,
+        }
+    }
+
+    pub fn in_by_value_has(
+        bytecode_index: BytecodeIndex,
+        base: VirtualRegister,
+        property: VirtualRegister,
+    ) -> Self {
+        Self {
+            bytecode_index,
+            access: PropertyAccessType::InByVal,
+            kind: PropertyCacheKind::InByVal,
+            dispatch: PropertyInlineCacheDispatch::Unlinked,
+            mutation_authority: InlineCacheMutationAuthority::LinkedCodeBlock,
+            state: InlineCacheState::Unset,
+            base: Some(base),
+            property: PropertyCacheKey::RuntimeValue(property),
+            get_by_id: None,
+            put_by_id: None,
+            watchpoint: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -830,24 +948,54 @@ pub struct CallLinkInfo {
 }
 
 impl CallLinkInfo {
-    pub fn metadata_only_unlinked_call(
+    fn metadata_only_unlinked(
         call_site: CallSiteIndex,
         bytecode_index: BytecodeIndex,
         opcode: CoreOpcode,
+        call_type: CallType,
+        specialization: CodeSpecialization,
     ) -> Self {
         Self {
             call_site,
             bytecode_index,
             opcode,
-            call_type: CallType::Call,
+            call_type,
             mode: CallLinkMode::Init,
-            specialization: CodeSpecialization::Call,
+            specialization,
             origin: CodeOrigin::new(bytecode_index),
             target: CallTarget::Unlinked,
             slow_path_count: 0,
             max_argument_count_including_this_for_varargs: 0,
             flags: CallLinkFlags::default(),
         }
+    }
+
+    pub fn metadata_only_unlinked_call(
+        call_site: CallSiteIndex,
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+    ) -> Self {
+        Self::metadata_only_unlinked(
+            call_site,
+            bytecode_index,
+            opcode,
+            CallType::Call,
+            CodeSpecialization::Call,
+        )
+    }
+
+    pub fn metadata_only_unlinked_construct(
+        call_site: CallSiteIndex,
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+    ) -> Self {
+        Self::metadata_only_unlinked(
+            call_site,
+            bytecode_index,
+            opcode,
+            CallType::Construct,
+            CodeSpecialization::Construct,
+        )
     }
 }
 

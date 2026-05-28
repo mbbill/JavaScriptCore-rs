@@ -1,8 +1,7 @@
 //! Yarr regular-expression engine contracts.
 //!
-//! This module reserves regexp parsing, bytecode/JIT compilation, match state,
-//! Unicode handling, and runtime integration surfaces without implementing a
-//! regexp engine.
+//! This module owns regexp parsing, bytecode/JIT compilation, match state,
+//! Unicode handling, and runtime integration surfaces.
 
 #![forbid(unsafe_code)]
 
@@ -11,6 +10,7 @@ pub(crate) mod execution;
 pub(crate) mod jit;
 pub(crate) mod matching;
 pub(crate) mod parse;
+pub(crate) mod simple_exec;
 pub(crate) mod unicode;
 
 pub use bytecode::{
@@ -53,6 +53,9 @@ pub use parse::{
     RegexFlagSemanticError, RegexFlags, RegexModifierFlagKind, UnicodeParseContext, YarrErrorCode,
     YarrParseError, YarrParsePlan, YarrParsePlanAtom, YarrParsePlanAtomKind, YarrPattern,
     YarrPatternId, YarrSyntaxDelegate,
+};
+pub use simple_exec::{
+    execute_simple_yarr, YarrSimpleExecError, YarrSimpleMatch, YarrSimpleMatchRange,
 };
 pub use unicode::{
     built_in_character_class_descriptor, canonicalization_mode_for_flags,

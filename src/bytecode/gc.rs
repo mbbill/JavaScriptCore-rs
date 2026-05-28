@@ -131,6 +131,11 @@ pub enum BytecodeRootMapBuildError {
         opcode: CoreOpcode,
         source: OperandAccessError,
     },
+    MissingCaptureCount {
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+        source: OperandAccessError,
+    },
     MissingSourceRegister {
         bytecode_index: BytecodeIndex,
         opcode: CoreOpcode,
@@ -172,7 +177,8 @@ pub fn build_p6_no_js_call_helper_root_map(
         CoreOpcode::NewObject
         | CoreOpcode::NewArray
         | CoreOpcode::LoadString
-        | CoreOpcode::LoadBigInt => {
+        | CoreOpcode::LoadBigInt
+        | CoreOpcode::LoadCapture => {
             let destination = instruction.register_operand(0).map_err(|source| {
                 BytecodeRootMapBuildError::MissingDestinationRegister {
                     bytecode_index,
@@ -182,7 +188,115 @@ pub fn build_p6_no_js_call_helper_root_map(
             })?;
             vec![root_slot_for_register(bytecode_index, destination)]
         }
-        CoreOpcode::TypeOf | CoreOpcode::ToString => {
+        CoreOpcode::LoadFunction => {
+            let destination = instruction.register_operand(0).map_err(|source| {
+                BytecodeRootMapBuildError::MissingDestinationRegister {
+                    bytecode_index,
+                    opcode,
+                    source,
+                }
+            })?;
+            let capture_count = instruction
+                .unsigned_immediate_operand(2)
+                .map_err(|source| BytecodeRootMapBuildError::MissingCaptureCount {
+                    bytecode_index,
+                    opcode,
+                    source,
+                })?;
+            let mut slots = vec![root_slot_for_register(bytecode_index, destination)];
+            for capture_index in 0..capture_count {
+                let operand_index = usize::try_from(capture_index)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(3);
+                let capture = instruction
+                    .register_operand(operand_index)
+                    .map_err(|source| BytecodeRootMapBuildError::MissingSourceRegister {
+                        bytecode_index,
+                        opcode,
+                        source,
+                    })?;
+                push_unique_root_slot(&mut slots, bytecode_index, capture);
+            }
+            slots
+        }
+        CoreOpcode::NewClosureCell | CoreOpcode::GetClosureCell => {
+            let destination = instruction.register_operand(0).map_err(|source| {
+                BytecodeRootMapBuildError::MissingDestinationRegister {
+                    bytecode_index,
+                    opcode,
+                    source,
+                }
+            })?;
+            let source = instruction.register_operand(1).map_err(|source| {
+                BytecodeRootMapBuildError::MissingSourceRegister {
+                    bytecode_index,
+                    opcode,
+                    source,
+                }
+            })?;
+            let mut slots = vec![root_slot_for_register(bytecode_index, destination)];
+            push_unique_root_slot(&mut slots, bytecode_index, source);
+            slots
+        }
+        CoreOpcode::ArrayAppend => {
+            let array = instruction.register_operand(0).map_err(|source| {
+                BytecodeRootMapBuildError::MissingSourceRegister {
+                    bytecode_index,
+                    opcode,
+                    source,
+                }
+            })?;
+            let value = instruction.register_operand(1).map_err(|source| {
+                BytecodeRootMapBuildError::MissingSourceRegister {
+                    bytecode_index,
+                    opcode,
+                    source,
+                }
+            })?;
+            let mut slots = vec![root_slot_for_register(bytecode_index, array)];
+            push_unique_root_slot(&mut slots, bytecode_index, value);
+            slots
+        }
+        CoreOpcode::PutClosureCell => {
+            let cell = instruction.register_operand(0).map_err(|source| {
+                BytecodeRootMapBuildError::MissingSourceRegister {
+                    bytecode_index,
+                    opcode,
+                    source,
+                }
+            })?;
+            let value = instruction.register_operand(1).map_err(|source| {
+                BytecodeRootMapBuildError::MissingSourceRegister {
+                    bytecode_index,
+                    opcode,
+                    source,
+                }
+            })?;
+            let mut slots = vec![root_slot_for_register(bytecode_index, cell)];
+            push_unique_root_slot(&mut slots, bytecode_index, value);
+            slots
+        }
+        CoreOpcode::InitializeGlobalLexical => {
+            let source = instruction.register_operand(1).map_err(|source| {
+                BytecodeRootMapBuildError::MissingSourceRegister {
+                    bytecode_index,
+                    opcode,
+                    source,
+                }
+            })?;
+            vec![root_slot_for_register(bytecode_index, source)]
+        }
+        CoreOpcode::Throw => {
+            let source = instruction.register_operand(0).map_err(|source| {
+                BytecodeRootMapBuildError::MissingSourceRegister {
+                    bytecode_index,
+                    opcode,
+                    source,
+                }
+            })?;
+            vec![root_slot_for_register(bytecode_index, source)]
+        }
+        CoreOpcode::TypeOf | CoreOpcode::ToString | CoreOpcode::ForInKeys => {
             let destination = instruction.register_operand(0).map_err(|source| {
                 BytecodeRootMapBuildError::MissingDestinationRegister {
                     bytecode_index,
@@ -199,7 +313,7 @@ pub fn build_p6_no_js_call_helper_root_map(
             })?;
             let mut slots = vec![root_slot_for_register(bytecode_index, destination)];
             if source != destination {
-                slots.push(root_slot_for_register(bytecode_index, source));
+                push_unique_root_slot(&mut slots, bytecode_index, source);
             }
             slots
         }
@@ -243,6 +357,19 @@ pub const fn root_slot_kind_for_register(register: VirtualRegister) -> BytecodeR
         BytecodeRootSlotKind::Argument
     } else {
         BytecodeRootSlotKind::VirtualRegister
+    }
+}
+
+fn push_unique_root_slot(
+    slots: &mut Vec<BytecodeRootSlotDescriptor>,
+    bytecode_index: BytecodeIndex,
+    register: VirtualRegister,
+) {
+    if !slots
+        .iter()
+        .any(|slot| slot.storage == BytecodeRootSlotStorage::Register(register))
+    {
+        slots.push(root_slot_for_register(bytecode_index, register));
     }
 }
 
@@ -502,11 +629,19 @@ mod tests {
 
     #[test]
     fn builds_literal_load_helper_root_maps_without_literal_validation() {
-        for opcode in [CoreOpcode::LoadString, CoreOpcode::LoadBigInt] {
+        for opcode in [
+            CoreOpcode::LoadString,
+            CoreOpcode::LoadBigInt,
+            CoreOpcode::LoadCapture,
+        ] {
             let destination = VirtualRegister::local(1);
+            let literal_or_index = match opcode {
+                CoreOpcode::LoadCapture => Operand::UnsignedImmediate(17),
+                _ => Operand::IdentifierIndex(17),
+            };
             let maps = single_instruction_root_maps(
                 opcode,
-                vec![Operand::Register(destination), Operand::IdentifierIndex(17)],
+                vec![Operand::Register(destination), literal_or_index],
             );
 
             assert_eq!(maps.len(), 1);
@@ -519,6 +654,164 @@ mod tests {
                 )]
             );
         }
+    }
+
+    #[test]
+    fn builds_closure_cell_destination_source_root_maps() {
+        let destination = VirtualRegister::local(2);
+        let source = VirtualRegister::argument_or_header(5);
+        for opcode in [CoreOpcode::NewClosureCell, CoreOpcode::GetClosureCell] {
+            let maps = single_instruction_root_maps(
+                opcode,
+                vec![Operand::Register(destination), Operand::Register(source)],
+            );
+
+            assert_eq!(maps.len(), 1);
+            assert_eq!(
+                maps[0].slots,
+                vec![
+                    BytecodeRootSlotDescriptor::virtual_register(
+                        BytecodeIndex::from_offset(0),
+                        destination,
+                        BytecodeRootSlotKind::VirtualRegister,
+                    ),
+                    BytecodeRootSlotDescriptor::virtual_register(
+                        BytecodeIndex::from_offset(0),
+                        source,
+                        BytecodeRootSlotKind::Argument,
+                    ),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn builds_put_closure_cell_source_root_map() {
+        let cell = VirtualRegister::local(2);
+        let value = VirtualRegister::argument_or_header(5);
+        let maps = single_instruction_root_maps(
+            CoreOpcode::PutClosureCell,
+            vec![Operand::Register(cell), Operand::Register(value)],
+        );
+
+        assert_eq!(maps.len(), 1);
+        assert_eq!(
+            maps[0].slots,
+            vec![
+                BytecodeRootSlotDescriptor::virtual_register(
+                    BytecodeIndex::from_offset(0),
+                    cell,
+                    BytecodeRootSlotKind::VirtualRegister,
+                ),
+                BytecodeRootSlotDescriptor::virtual_register(
+                    BytecodeIndex::from_offset(0),
+                    value,
+                    BytecodeRootSlotKind::Argument,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_array_append_source_root_map() {
+        let array = VirtualRegister::local(2);
+        let value = VirtualRegister::argument_or_header(5);
+        let maps = single_instruction_root_maps(
+            CoreOpcode::ArrayAppend,
+            vec![Operand::Register(array), Operand::Register(value)],
+        );
+
+        assert_eq!(maps.len(), 1);
+        assert_eq!(
+            maps[0].slots,
+            vec![
+                BytecodeRootSlotDescriptor::virtual_register(
+                    BytecodeIndex::from_offset(0),
+                    array,
+                    BytecodeRootSlotKind::VirtualRegister,
+                ),
+                BytecodeRootSlotDescriptor::virtual_register(
+                    BytecodeIndex::from_offset(0),
+                    value,
+                    BytecodeRootSlotKind::Argument,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_load_function_root_map_for_destination_and_captures() {
+        let destination = VirtualRegister::local(1);
+        let capture_a = VirtualRegister::argument_or_header(5);
+        let capture_b = VirtualRegister::local(3);
+        let maps = single_instruction_root_maps(
+            CoreOpcode::LoadFunction,
+            vec![
+                Operand::Register(destination),
+                Operand::UnsignedImmediate(7),
+                Operand::UnsignedImmediate(3),
+                Operand::Register(capture_a),
+                Operand::Register(destination),
+                Operand::Register(capture_b),
+            ],
+        );
+
+        assert_eq!(maps.len(), 1);
+        assert_eq!(
+            maps[0].slots,
+            vec![
+                BytecodeRootSlotDescriptor::virtual_register(
+                    BytecodeIndex::from_offset(0),
+                    destination,
+                    BytecodeRootSlotKind::VirtualRegister,
+                ),
+                BytecodeRootSlotDescriptor::virtual_register(
+                    BytecodeIndex::from_offset(0),
+                    capture_a,
+                    BytecodeRootSlotKind::Argument,
+                ),
+                BytecodeRootSlotDescriptor::virtual_register(
+                    BytecodeIndex::from_offset(0),
+                    capture_b,
+                    BytecodeRootSlotKind::VirtualRegister,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_initialize_global_lexical_root_map_for_value_source() {
+        let source = VirtualRegister::argument_or_header(4);
+        let maps = single_instruction_root_maps(
+            CoreOpcode::InitializeGlobalLexical,
+            vec![Operand::IdentifierIndex(11), Operand::Register(source)],
+        );
+
+        assert_eq!(maps.len(), 1);
+        assert_eq!(
+            maps[0].slots,
+            vec![BytecodeRootSlotDescriptor::virtual_register(
+                BytecodeIndex::from_offset(0),
+                source,
+                BytecodeRootSlotKind::Argument,
+            )]
+        );
+    }
+
+    #[test]
+    fn builds_throw_root_map_for_thrown_value_source() {
+        let source = VirtualRegister::argument_or_header(4);
+        let maps = single_instruction_root_maps(CoreOpcode::Throw, vec![Operand::Register(source)]);
+
+        assert_eq!(maps.len(), 1);
+        assert_eq!(
+            maps[0].slots,
+            vec![BytecodeRootSlotDescriptor::virtual_register(
+                BytecodeIndex::from_offset(0),
+                source,
+                BytecodeRootSlotKind::Argument,
+            )]
+        );
     }
 
     #[test]

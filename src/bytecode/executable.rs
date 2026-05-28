@@ -132,7 +132,7 @@ pub enum ExecutableBaselineNativeEntrySelection {
     ArityCheckUnavailable(BaselineArityCheckUnavailableReason),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutableEntryPublicationRequest {
     /// Metadata-only bridge from the VM's validated native-entry launch
     /// descriptor into the executable-owned publication slot.
@@ -1168,7 +1168,7 @@ mod tests {
         let mut entrypoints = ExecutableEntrypoints::default();
 
         assert_eq!(
-            entrypoints.publish_baseline_native_entry(request, wrong_owner, &code_block),
+            entrypoints.publish_baseline_native_entry(request.clone(), wrong_owner, &code_block),
             Err(
                 ExecutableEntryPublicationError::InstalledCodeBlockMismatch {
                     expected: owner,
@@ -1185,7 +1185,7 @@ mod tests {
         );
         assert_eq!(
             entrypoints.publish_baseline_native_entry(
-                request,
+                request.clone(),
                 owner,
                 &mismatched_executable_code_block
             ),

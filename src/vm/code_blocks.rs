@@ -13,14 +13,16 @@ use crate::bytecode::ic::{
     StructureStubAccessCaseLinkOutcome, StructureStubAccessCaseLinkRequest,
 };
 use crate::bytecode::{
-    BytecodeIndex, CodeBlock, CodeBlockMutationAuthority, ExecutableEntryCacheRecord,
-    ExecutableEntryPublicationError, ExecutableEntryPublicationRequest, ExecutableEntrypoints,
-    JitCodeSlot,
+    BytecodeIndex, Checkpoint, CodeBlock, CodeBlockMutationAuthority, CoreOpcode,
+    ExecutableEntryCacheRecord, ExecutableEntryPublicationError, ExecutableEntryPublicationRequest,
+    ExecutableEntrypoints, JitCodeSlot, ValueProfileBucketKind, ValueProfileBucketSample,
+    ValueProfileJitStoreTarget, ValueProfileSampleError, VirtualRegister,
 };
 use crate::gc::{CellDestructionState, CellType, Heap, HeapAllocationRecord};
 use crate::jit::plan::BaselineBytecodeSnapshotFingerprint;
 use crate::jit::{CacheKey, InlineCacheSlotId};
 use crate::runtime::CodeBlockId;
+use crate::value::JsValue;
 use crate::vm::tiering::{
     VmAttachedPropertyInlineCacheCandidate, VmCallLinkInlineCacheAttachmentLifecycle,
     VmCallLinkInlineCacheAttachmentOutcome, VmCallLinkInlineCacheAttachmentRecord,
@@ -298,6 +300,112 @@ impl CodeBlockRegistry {
             Ok(outcome) => CodeBlockRegistryCallLinkInlineCacheClear::Cleared(outcome),
             Err(error) => CodeBlockRegistryCallLinkInlineCacheClear::Rejected(error),
         }
+    }
+
+    pub(crate) fn record_call_result_value_profile_sample(
+        &mut self,
+        owner: CodeBlockId,
+        opcode: CoreOpcode,
+        bytecode_index: BytecodeIndex,
+        destination: VirtualRegister,
+        value: JsValue,
+    ) -> Result<Option<ValueProfileBucketSample>, CodeBlockMutationError> {
+        let Some(record) = self.records.get_mut(&owner) else {
+            return Ok(None);
+        };
+        let Ok(decoded) = record.code_block.decoded_instruction_at(bytecode_index) else {
+            return Err(CodeBlockMutationError::ValueProfileSample(
+                ValueProfileSampleError::MissingProfile {
+                    bytecode_index,
+                    checkpoint: Checkpoint::NONE,
+                },
+            ));
+        };
+        if CoreOpcode::from_opcode(decoded.opcode) != Some(opcode) {
+            return Err(CodeBlockMutationError::ValueProfileSample(
+                ValueProfileSampleError::MissingProfile {
+                    bytecode_index,
+                    checkpoint: Checkpoint::NONE,
+                },
+            ));
+        }
+        if !matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+            return Ok(None);
+        }
+        if decoded.register_operand(0).ok() != Some(destination) {
+            return Err(CodeBlockMutationError::ValueProfileSample(
+                ValueProfileSampleError::MissingProfile {
+                    bytecode_index,
+                    checkpoint: Checkpoint::NONE,
+                },
+            ));
+        }
+
+        match record.code_block.record_value_profile_sample(
+            CodeBlockMutationAuthority::VmMainThread,
+            bytecode_index,
+            Checkpoint::NONE,
+            ValueProfileBucketKind::Sample,
+            value,
+        ) {
+            Ok(sample) => Ok(Some(sample)),
+            Err(CodeBlockMutationError::ValueProfileSample(
+                ValueProfileSampleError::MissingProfile { .. }
+                | ValueProfileSampleError::MissingBucket { .. },
+            )) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn call_result_value_profile_store_target(
+        &self,
+        owner: CodeBlockId,
+        opcode: CoreOpcode,
+        bytecode_index: BytecodeIndex,
+        destination: VirtualRegister,
+    ) -> Result<Option<ValueProfileJitStoreTarget>, CodeBlockMutationError> {
+        let Some(record) = self.records.get(&owner) else {
+            return Ok(None);
+        };
+        let Ok(decoded) = record.code_block.decoded_instruction_at(bytecode_index) else {
+            return Err(CodeBlockMutationError::ValueProfileSample(
+                ValueProfileSampleError::MissingProfile {
+                    bytecode_index,
+                    checkpoint: Checkpoint::NONE,
+                },
+            ));
+        };
+        if CoreOpcode::from_opcode(decoded.opcode) != Some(opcode) {
+            return Err(CodeBlockMutationError::ValueProfileSample(
+                ValueProfileSampleError::MissingProfile {
+                    bytecode_index,
+                    checkpoint: Checkpoint::NONE,
+                },
+            ));
+        }
+        if !matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+            return Ok(None);
+        }
+        if decoded.register_operand(0).ok() != Some(destination) {
+            return Err(CodeBlockMutationError::ValueProfileSample(
+                ValueProfileSampleError::MissingProfile {
+                    bytecode_index,
+                    checkpoint: Checkpoint::NONE,
+                },
+            ));
+        }
+
+        record
+            .code_block
+            .side_tables()
+            .value_profiles
+            .jit_store_target(
+                bytecode_index,
+                Checkpoint::NONE,
+                ValueProfileBucketKind::Sample,
+            )
+            .map(Some)
+            .map_err(CodeBlockMutationError::ValueProfileSample)
     }
 
     #[allow(dead_code)]

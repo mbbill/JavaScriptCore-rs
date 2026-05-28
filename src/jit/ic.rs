@@ -7,7 +7,8 @@
 
 use crate::bytecode::{CodeSpecialization, CoreOpcode};
 use crate::gc::{
-    BarrierFieldKind, BarrierKind, BarrierRequirementOutcome, BarrierThreshold, StructureId,
+    BarrierFieldKind, BarrierKind, BarrierNotRequiredReason, BarrierRequirementOutcome,
+    BarrierThreshold, CellId, StructureId,
 };
 use crate::jit::{
     AbiValue, CallBoundaryId, CallBoundaryMetadata, DependencyStrength, EffectSummary, EntryAbi,
@@ -328,6 +329,13 @@ pub enum InlineCacheValidationError {
         expected: PropertyLoadObservationReadiness,
         actual: PropertyLoadObservationReadiness,
     },
+    PropertyHasObservationResultMismatch {
+        result: bool,
+        access_case_kind: AccessCaseKind,
+    },
+    PropertyHasObservationUnsupportedOpcode {
+        opcode: CoreOpcode,
+    },
     CallObservationUnsupportedOpcode {
         opcode: CoreOpcode,
     },
@@ -427,6 +435,11 @@ pub enum InlineCacheValidationError {
         offset: PropertyOffset,
         new_structure: Option<StructureId>,
     },
+    PropertyHasPlanOwnerMismatch {
+        expected: CodeBlockId,
+        actual: CodeBlockId,
+    },
+    PropertyHasPlanUnsupportedKey(CacheKey),
     PropertyLoadGuardedCandidateOwnerMismatch {
         expected: CodeBlockId,
         actual: CodeBlockId,
@@ -725,9 +738,43 @@ pub enum AccessCaseKind {
     ModuleNamespaceLoad,
     ProxyObject,
     InstanceOf,
+    InHit,
+    InMiss,
+    InMegamorphic,
+    ProxyObjectIn,
     IndexedLoad,
     IndexedStore,
     IndexedIn,
+    IndexedMegamorphicIn,
+    IndexedInt32InHit,
+    IndexedDoubleInHit,
+    IndexedContiguousInHit,
+    IndexedArrayStorageInHit,
+    IndexedScopedArgumentsInHit,
+    IndexedDirectArgumentsInHit,
+    IndexedTypedArrayInt8In,
+    IndexedTypedArrayUint8In,
+    IndexedTypedArrayUint8ClampedIn,
+    IndexedTypedArrayInt16In,
+    IndexedTypedArrayUint16In,
+    IndexedTypedArrayInt32In,
+    IndexedTypedArrayUint32In,
+    IndexedTypedArrayFloat16In,
+    IndexedTypedArrayFloat32In,
+    IndexedTypedArrayFloat64In,
+    IndexedResizableTypedArrayInt8In,
+    IndexedResizableTypedArrayUint8In,
+    IndexedResizableTypedArrayUint8ClampedIn,
+    IndexedResizableTypedArrayInt16In,
+    IndexedResizableTypedArrayUint16In,
+    IndexedResizableTypedArrayInt32In,
+    IndexedResizableTypedArrayUint32In,
+    IndexedResizableTypedArrayFloat16In,
+    IndexedResizableTypedArrayFloat32In,
+    IndexedResizableTypedArrayFloat64In,
+    IndexedStringInHit,
+    IndexedNoIndexingInMiss,
+    IndexedProxyObjectIn,
     Megamorphic,
 }
 
@@ -748,6 +795,14 @@ pub struct AccessCaseDescriptor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PropertyLoadAccessCasePlanKind {
     DataOnlyOwnLoad,
+    DataOnlyIndexedLoad,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PropertyLoadBaseNormalization {
+    #[default]
+    None,
+    StringPrototype,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -819,6 +874,10 @@ impl PropertyLoadAccessCasePlanContract {
     pub fn supports_generated_data_only_own_load(self) -> bool {
         self == Self::DATA_ONLY_OWN_LOAD
     }
+
+    pub fn supports_generated_data_only_indexed_load(self) -> bool {
+        self == Self::DATA_ONLY_OWN_LOAD
+    }
 }
 
 /// Data-only plan for a future property-load access case attachment.
@@ -841,6 +900,7 @@ pub struct PropertyLoadAccessCasePlan {
 pub enum PropertyStoreAccessCasePlanKind {
     DataOnlyReplace,
     DataOnlyTransition,
+    DataOnlyIndexedStore,
     Unsupported,
 }
 
@@ -848,6 +908,7 @@ pub enum PropertyStoreAccessCasePlanKind {
 pub enum PropertyStoreHeapEffect {
     WritesExistingOwnDataSlot,
     TransitionsStructureAndWritesOwnDataSlot,
+    WritesExistingIndexedSlot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -894,9 +955,18 @@ pub struct PropertyStoreDataOnlyTransitionEffects {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PropertyStoreDataOnlyIndexedStoreEffects {
+    pub heap: PropertyStoreHeapEffect,
+    pub stored_value: PropertyStoreStoredValueEffect,
+    pub exit: PropertyStoreExitEffect,
+    pub host_boundary: PropertyStoreHostBoundaryEffect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PropertyStoreAccessCaseEffects {
     DataOnlyReplace(PropertyStoreDataOnlyReplaceEffects),
     DataOnlyTransition(PropertyStoreDataOnlyTransitionEffects),
+    DataOnlyIndexedStore(PropertyStoreDataOnlyIndexedStoreEffects),
     Unsupported,
 }
 
@@ -937,6 +1007,18 @@ impl PropertyStoreAccessCasePlanContract {
             PropertyStoreBarrierEffect::RequiresRuntimeStoredValueAndStructureTransitionBarrierProof,
     };
 
+    pub const DATA_ONLY_INDEXED_STORE: Self = Self {
+        effects: PropertyStoreAccessCaseEffects::DataOnlyIndexedStore(
+            PropertyStoreDataOnlyIndexedStoreEffects {
+                heap: PropertyStoreHeapEffect::WritesExistingIndexedSlot,
+                stored_value: PropertyStoreStoredValueEffect::StoresProvidedValue,
+                exit: PropertyStoreExitEffect::MayExitToSlowPathBeforeHeapMutation,
+                host_boundary: PropertyStoreHostBoundaryEffect::NoAllocationNoCallsNoGcBoundary,
+            },
+        ),
+        barrier: PropertyStoreBarrierEffect::RequiresRuntimeStoredValueBarrierProof,
+    };
+
     pub const fn carries_runtime_barrier_requirement(self) -> bool {
         !matches!(self.barrier, PropertyStoreBarrierEffect::Unsupported)
     }
@@ -947,6 +1029,10 @@ impl PropertyStoreAccessCasePlanContract {
 
     pub fn supports_metadata_only_transition_plan(self) -> bool {
         self == Self::DATA_ONLY_TRANSITION
+    }
+
+    pub fn supports_metadata_only_indexed_store_plan(self) -> bool {
+        self == Self::DATA_ONLY_INDEXED_STORE
     }
 }
 
@@ -1203,6 +1289,16 @@ impl PropertyLoadAccessCasePlanTable {
             .iter()
             .filter(move |plan| plan.bytecode_index == bytecode_index)
     }
+
+    pub fn candidates_for_bytecode_index_newest_first(
+        &self,
+        bytecode_index: u32,
+    ) -> impl Iterator<Item = &PropertyLoadAccessCasePlan> {
+        self.plans
+            .iter()
+            .rev()
+            .filter(move |plan| plan.bytecode_index == bytecode_index)
+    }
 }
 
 /// Validated, immutable table for future property-store access-case metadata.
@@ -1400,6 +1496,867 @@ impl PropertyStoreMutationCandidateTable {
             .iter()
             .filter(move |candidate| candidate.plan.bytecode_index == bytecode_index)
     }
+
+    pub fn candidates_for_bytecode_index_newest_first(
+        &self,
+        bytecode_index: u32,
+    ) -> impl Iterator<Item = &PropertyStoreMutationCandidate> {
+        self.candidates
+            .iter()
+            .rev()
+            .filter(move |candidate| candidate.plan.bytecode_index == bytecode_index)
+    }
+}
+
+/// Megamorphic load site metadata projected for generated property sidecars.
+///
+/// This names the bytecode site that C++ JSC would patch to a
+/// `LoadMegamorphic` access case. The mutable cache table itself remains
+/// VM-owned; generated execution receives an immutable snapshot and performs a
+/// direct primary/secondary lookup from the active base structure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedPropertyLoadMegamorphicSite {
+    pub owner: CodeBlockId,
+    pub slot: InlineCacheSlotId,
+    pub bytecode_index: u32,
+    pub key: CacheKey,
+}
+
+/// One load entry from the VM-wide megamorphic cache snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedPropertyLoadMegamorphicCacheEntry {
+    pub key: CacheKey,
+    pub base_structure: StructureId,
+    pub epoch: u16,
+    pub kind: GeneratedPropertyLoadMegamorphicCacheEntryKind,
+}
+
+/// Safe-Rust spelling of C++ JSC's load megamorphic holder encoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratedPropertyLoadMegamorphicCacheEntryKind {
+    /// C++ uses `JSCell::seenMultipleCalleeObjects()` as an own-property
+    /// sentinel and stores a `uint16_t` offset.
+    OwnData { offset: PropertyOffset },
+    /// C++ stores the actual prototype/holder object and a `uint16_t` offset.
+    PrototypeData {
+        holder: ObjectId,
+        offset: PropertyOffset,
+    },
+    /// C++ uses a null holder and returns `undefined`.
+    Missing,
+}
+
+/// Result of a generated-side megamorphic lookup for one load site.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GeneratedPropertyLoadMegamorphicLookup {
+    NoSite,
+    Miss,
+    Hit(PropertyLoadAccessCasePlan),
+    PrototypeData {
+        key: CacheKey,
+        base_structure: StructureId,
+        holder: ObjectId,
+        offset: PropertyOffset,
+    },
+    Missing,
+}
+
+/// Immutable generated-side view of the VM-owned load megamorphic cache.
+///
+/// Lookup intentionally mirrors C++ JSC's primary-then-secondary behavior. If
+/// the primary entry matches `(StructureID, uid)` but has a stale epoch, lookup
+/// stops and reports a miss; secondary is considered only when the primary
+/// entry is for a different structure or uid.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedPropertyLoadMegamorphicCandidateTable {
+    owner: CodeBlockId,
+    epoch: u16,
+    sites: Vec<GeneratedPropertyLoadMegamorphicSite>,
+    primary_entries: Vec<Option<GeneratedPropertyLoadMegamorphicCacheEntry>>,
+    secondary_entries: Vec<Option<GeneratedPropertyLoadMegamorphicCacheEntry>>,
+}
+
+impl GeneratedPropertyLoadMegamorphicCandidateTable {
+    pub fn new(
+        owner: CodeBlockId,
+        epoch: u16,
+        sites: Vec<GeneratedPropertyLoadMegamorphicSite>,
+        primary_entries: Vec<Option<GeneratedPropertyLoadMegamorphicCacheEntry>>,
+        secondary_entries: Vec<Option<GeneratedPropertyLoadMegamorphicCacheEntry>>,
+    ) -> Result<Self, InlineCacheValidationError> {
+        for site in &sites {
+            if site.owner != owner {
+                return Err(InlineCacheValidationError::PropertyLoadPlanOwnerMismatch {
+                    expected: owner,
+                    actual: site.owner,
+                });
+            }
+            if !generated_property_load_megamorphic_cache_key_supported(site.key) {
+                return Err(InlineCacheValidationError::PropertyLoadPlanUnsupportedKey(
+                    site.key,
+                ));
+            }
+        }
+
+        Ok(Self {
+            owner,
+            epoch,
+            sites,
+            primary_entries,
+            secondary_entries,
+        })
+    }
+
+    pub const fn owner(&self) -> CodeBlockId {
+        self.owner
+    }
+
+    pub const fn epoch(&self) -> u16 {
+        self.epoch
+    }
+
+    pub fn sites(&self) -> &[GeneratedPropertyLoadMegamorphicSite] {
+        &self.sites
+    }
+
+    pub fn current_entry_count(&self) -> usize {
+        self.primary_entries
+            .iter()
+            .chain(self.secondary_entries.iter())
+            .filter_map(Option::as_ref)
+            .filter(|entry| entry.epoch == self.epoch)
+            .count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sites.is_empty() || self.current_entry_count() == 0
+    }
+
+    pub fn contains_site(
+        &self,
+        slot: InlineCacheSlotId,
+        bytecode_index: u32,
+        key: CacheKey,
+    ) -> bool {
+        self.sites.iter().any(|site| {
+            site.slot == slot && site.bytecode_index == bytecode_index && site.key == key
+        })
+    }
+
+    pub fn lookup(
+        &self,
+        slot: InlineCacheSlotId,
+        bytecode_index: u32,
+        key: CacheKey,
+        base_structure: StructureId,
+    ) -> GeneratedPropertyLoadMegamorphicLookup {
+        let Some(site) = self.sites.iter().find(|site| {
+            site.slot == slot && site.bytecode_index == bytecode_index && site.key == key
+        }) else {
+            return GeneratedPropertyLoadMegamorphicLookup::NoSite;
+        };
+        if base_structure == StructureId::INVALID
+            || !generated_property_load_megamorphic_cache_key_supported(key)
+        {
+            return GeneratedPropertyLoadMegamorphicLookup::Miss;
+        }
+
+        let primary_index = generated_property_load_megamorphic_cache_primary_index(
+            base_structure,
+            key,
+            self.primary_entries.len(),
+        );
+        let Some(primary_index) = primary_index else {
+            return GeneratedPropertyLoadMegamorphicLookup::Miss;
+        };
+        if let Some(Some(entry)) = self.primary_entries.get(primary_index) {
+            if entry.base_structure == base_structure && entry.key == key {
+                return if self.entry_is_current_hit(entry) {
+                    self.lookup_result_for_current_entry(site, entry)
+                } else {
+                    GeneratedPropertyLoadMegamorphicLookup::Miss
+                };
+            }
+        }
+
+        let secondary_index = generated_property_load_megamorphic_cache_secondary_index(
+            base_structure,
+            key,
+            self.secondary_entries.len(),
+        );
+        let Some(secondary_index) = secondary_index else {
+            return GeneratedPropertyLoadMegamorphicLookup::Miss;
+        };
+        let Some(Some(entry)) = self.secondary_entries.get(secondary_index) else {
+            return GeneratedPropertyLoadMegamorphicLookup::Miss;
+        };
+        if entry.base_structure == base_structure
+            && entry.key == key
+            && self.entry_is_current_hit(entry)
+        {
+            self.lookup_result_for_current_entry(site, entry)
+        } else {
+            GeneratedPropertyLoadMegamorphicLookup::Miss
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_primary_entry(
+        owner: CodeBlockId,
+        epoch: u16,
+        site: GeneratedPropertyLoadMegamorphicSite,
+        entry: GeneratedPropertyLoadMegamorphicCacheEntry,
+    ) -> Self {
+        let mut primary_entries = vec![None; 2048];
+        let secondary_entries = vec![None; 512];
+        let primary_index = generated_property_load_megamorphic_cache_primary_index(
+            entry.base_structure,
+            entry.key,
+            primary_entries.len(),
+        )
+        .expect("primary index");
+        primary_entries[primary_index] = Some(entry);
+        Self::new(owner, epoch, vec![site], primary_entries, secondary_entries)
+            .expect("test megamorphic table")
+    }
+
+    fn entry_is_current_hit(&self, entry: &GeneratedPropertyLoadMegamorphicCacheEntry) -> bool {
+        entry.epoch == self.epoch
+            && entry.base_structure != StructureId::INVALID
+            && match entry.kind {
+                GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData { offset } => {
+                    offset != PropertyOffset::INVALID
+                        && offset.raw() >= 0
+                        && offset.raw() <= u16::MAX as i32
+                }
+                GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData {
+                    holder,
+                    offset,
+                } => {
+                    holder.0 != CellId::default()
+                        && offset != PropertyOffset::INVALID
+                        && offset.raw() >= 0
+                        && offset.raw() <= u16::MAX as i32
+                }
+                GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing => true,
+            }
+    }
+
+    fn lookup_result_for_current_entry(
+        &self,
+        site: &GeneratedPropertyLoadMegamorphicSite,
+        entry: &GeneratedPropertyLoadMegamorphicCacheEntry,
+    ) -> GeneratedPropertyLoadMegamorphicLookup {
+        match entry.kind {
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData { .. } => {
+                GeneratedPropertyLoadMegamorphicLookup::Hit(self.plan_for_entry(site, entry))
+            }
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData { holder, offset } => {
+                GeneratedPropertyLoadMegamorphicLookup::PrototypeData {
+                    key: site.key,
+                    base_structure: entry.base_structure,
+                    holder,
+                    offset,
+                }
+            }
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing => {
+                GeneratedPropertyLoadMegamorphicLookup::Missing
+            }
+        }
+    }
+
+    fn plan_for_entry(
+        &self,
+        site: &GeneratedPropertyLoadMegamorphicSite,
+        entry: &GeneratedPropertyLoadMegamorphicCacheEntry,
+    ) -> PropertyLoadAccessCasePlan {
+        let GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData { offset } = entry.kind else {
+            unreachable!("missing megamorphic load entries do not synthesize own-load plans")
+        };
+        let access_case = AccessCaseDescriptor {
+            kind: AccessCaseKind::Load,
+            key: site.key,
+            base_structure: Some(entry.base_structure),
+            new_structure: None,
+            holder: None,
+            offset: Some(offset),
+            via_global_proxy: false,
+            may_call_js: false,
+            dependencies: Vec::new(),
+        };
+
+        PropertyLoadAccessCasePlan {
+            plan_kind: PropertyLoadAccessCasePlanKind::DataOnlyOwnLoad,
+            owner: site.owner,
+            slot: site.slot,
+            bytecode_index: site.bytecode_index,
+            key: site.key,
+            access_case,
+            planned_stub_kind: InlineCacheStubKind::DataOnlyHandler,
+            effect_contract: PropertyLoadAccessCasePlanContract::DATA_ONLY_OWN_LOAD,
+        }
+    }
+}
+
+fn generated_property_load_megamorphic_cache_key_supported(key: CacheKey) -> bool {
+    matches!(key, CacheKey::Property(PropertyKey::String(_)))
+}
+
+fn generated_property_load_megamorphic_cache_key_hash(key: CacheKey) -> Option<u32> {
+    let CacheKey::Property(PropertyKey::String(identifier)) = key else {
+        return None;
+    };
+    // C++ hashes the UID and uses the UID pointer for secondary indexing. Rust
+    // currently exposes atom identity to the generated side, so the hash is a
+    // stable atom-slot surrogate and every consumed hit still requires exact
+    // key equality.
+    Some(
+        identifier
+            .atom()
+            .table_slot()
+            .wrapping_mul(0x9E37_79B1)
+            .rotate_left(5),
+    )
+}
+
+fn generated_property_load_megamorphic_cache_primary_index(
+    structure: StructureId,
+    key: CacheKey,
+    table_len: usize,
+) -> Option<usize> {
+    if table_len == 0 || !table_len.is_power_of_two() {
+        return None;
+    }
+    let sid = structure.0;
+    let hash = ((sid >> 4) ^ (sid >> 15))
+        .wrapping_add(generated_property_load_megamorphic_cache_key_hash(key)?);
+    Some((hash as usize) & (table_len - 1))
+}
+
+fn generated_property_load_megamorphic_cache_secondary_index(
+    structure: StructureId,
+    key: CacheKey,
+    table_len: usize,
+) -> Option<usize> {
+    if table_len == 0 || !table_len.is_power_of_two() {
+        return None;
+    }
+    let key_hash = generated_property_load_megamorphic_cache_key_hash(key)?;
+    let hash = structure.0.wrapping_add(key_hash);
+    Some(((hash.wrapping_add(hash >> 13)) as usize) & (table_len - 1))
+}
+
+/// Megamorphic store site metadata projected for generated property sidecars.
+///
+/// This is the Rust spelling of C++ JSC's `StoreMegamorphic` access case for
+/// named put-by-id sites. The VM owns the mutable cache table; generated
+/// execution receives a snapshot and still routes the heap mutation through the
+/// host-owned store commit boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedPropertyStoreMegamorphicSite {
+    pub owner: CodeBlockId,
+    pub slot: InlineCacheSlotId,
+    pub bytecode_index: u32,
+    pub key: CacheKey,
+}
+
+/// One store entry from the VM-wide megamorphic cache snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedPropertyStoreMegamorphicCacheEntry {
+    pub key: CacheKey,
+    pub old_structure: StructureId,
+    pub new_structure: StructureId,
+    pub epoch: u16,
+    pub offset: PropertyOffset,
+    pub reallocating: bool,
+}
+
+/// Result of a generated-side megamorphic lookup for one store site.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GeneratedPropertyStoreMegamorphicLookup {
+    NoSite,
+    Miss,
+    Hit(PropertyStoreAccessCasePlan),
+}
+
+/// Immutable generated-side view of the VM-owned store megamorphic cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedPropertyStoreMegamorphicCandidateTable {
+    owner: CodeBlockId,
+    epoch: u16,
+    sites: Vec<GeneratedPropertyStoreMegamorphicSite>,
+    primary_entries: Vec<Option<GeneratedPropertyStoreMegamorphicCacheEntry>>,
+    secondary_entries: Vec<Option<GeneratedPropertyStoreMegamorphicCacheEntry>>,
+}
+
+impl GeneratedPropertyStoreMegamorphicCandidateTable {
+    pub fn new(
+        owner: CodeBlockId,
+        epoch: u16,
+        sites: Vec<GeneratedPropertyStoreMegamorphicSite>,
+        primary_entries: Vec<Option<GeneratedPropertyStoreMegamorphicCacheEntry>>,
+        secondary_entries: Vec<Option<GeneratedPropertyStoreMegamorphicCacheEntry>>,
+    ) -> Result<Self, InlineCacheValidationError> {
+        for site in &sites {
+            if site.owner != owner {
+                return Err(InlineCacheValidationError::PropertyStorePlanOwnerMismatch {
+                    expected: owner,
+                    actual: site.owner,
+                });
+            }
+            if !generated_property_store_megamorphic_cache_key_supported(site.key) {
+                return Err(InlineCacheValidationError::PropertyStorePlanUnsupportedKey(
+                    site.key,
+                ));
+            }
+        }
+
+        Ok(Self {
+            owner,
+            epoch,
+            sites,
+            primary_entries,
+            secondary_entries,
+        })
+    }
+
+    pub const fn owner(&self) -> CodeBlockId {
+        self.owner
+    }
+
+    pub const fn epoch(&self) -> u16 {
+        self.epoch
+    }
+
+    pub fn sites(&self) -> &[GeneratedPropertyStoreMegamorphicSite] {
+        &self.sites
+    }
+
+    pub fn current_entry_count(&self) -> usize {
+        self.primary_entries
+            .iter()
+            .chain(self.secondary_entries.iter())
+            .filter_map(Option::as_ref)
+            .filter(|entry| entry.epoch == self.epoch)
+            .count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sites.is_empty() || self.current_entry_count() == 0
+    }
+
+    pub fn lookup(
+        &self,
+        slot: InlineCacheSlotId,
+        bytecode_index: u32,
+        key: CacheKey,
+        base_structure: StructureId,
+    ) -> GeneratedPropertyStoreMegamorphicLookup {
+        let Some(site) = self.sites.iter().find(|site| {
+            site.slot == slot && site.bytecode_index == bytecode_index && site.key == key
+        }) else {
+            return GeneratedPropertyStoreMegamorphicLookup::NoSite;
+        };
+        if base_structure == StructureId::INVALID
+            || !generated_property_store_megamorphic_cache_key_supported(key)
+        {
+            return GeneratedPropertyStoreMegamorphicLookup::Miss;
+        }
+
+        let primary_index = generated_property_store_megamorphic_cache_primary_index(
+            base_structure,
+            key,
+            self.primary_entries.len(),
+        );
+        let Some(primary_index) = primary_index else {
+            return GeneratedPropertyStoreMegamorphicLookup::Miss;
+        };
+        if let Some(Some(entry)) = self.primary_entries.get(primary_index) {
+            if entry.old_structure == base_structure && entry.key == key {
+                return if self.entry_is_current_hit(entry) {
+                    GeneratedPropertyStoreMegamorphicLookup::Hit(self.plan_for_entry(site, entry))
+                } else {
+                    GeneratedPropertyStoreMegamorphicLookup::Miss
+                };
+            }
+        }
+
+        let secondary_index = generated_property_store_megamorphic_cache_secondary_index(
+            base_structure,
+            key,
+            self.secondary_entries.len(),
+        );
+        let Some(secondary_index) = secondary_index else {
+            return GeneratedPropertyStoreMegamorphicLookup::Miss;
+        };
+        let Some(Some(entry)) = self.secondary_entries.get(secondary_index) else {
+            return GeneratedPropertyStoreMegamorphicLookup::Miss;
+        };
+        if entry.old_structure == base_structure
+            && entry.key == key
+            && self.entry_is_current_hit(entry)
+        {
+            GeneratedPropertyStoreMegamorphicLookup::Hit(self.plan_for_entry(site, entry))
+        } else {
+            GeneratedPropertyStoreMegamorphicLookup::Miss
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_primary_entry(
+        owner: CodeBlockId,
+        epoch: u16,
+        site: GeneratedPropertyStoreMegamorphicSite,
+        entry: GeneratedPropertyStoreMegamorphicCacheEntry,
+    ) -> Self {
+        let mut primary_entries = vec![None; 2048];
+        let secondary_entries = vec![None; 512];
+        let primary_index = generated_property_store_megamorphic_cache_primary_index(
+            entry.old_structure,
+            entry.key,
+            primary_entries.len(),
+        )
+        .expect("primary index");
+        primary_entries[primary_index] = Some(entry);
+        Self::new(owner, epoch, vec![site], primary_entries, secondary_entries)
+            .expect("test megamorphic store table")
+    }
+
+    fn entry_is_current_hit(&self, entry: &GeneratedPropertyStoreMegamorphicCacheEntry) -> bool {
+        entry.epoch == self.epoch
+            && entry.old_structure != StructureId::INVALID
+            && entry.new_structure != StructureId::INVALID
+            && entry.offset != PropertyOffset::INVALID
+            && entry.offset.raw() >= 0
+            && entry.offset.raw() <= u16::MAX as i32
+            && generated_property_store_megamorphic_cache_key_supported(entry.key)
+    }
+
+    fn plan_for_entry(
+        &self,
+        site: &GeneratedPropertyStoreMegamorphicSite,
+        entry: &GeneratedPropertyStoreMegamorphicCacheEntry,
+    ) -> PropertyStoreAccessCasePlan {
+        let is_replace = entry.old_structure == entry.new_structure;
+        let (plan_kind, access_case_kind, new_structure, effect_contract) = if is_replace {
+            (
+                PropertyStoreAccessCasePlanKind::DataOnlyReplace,
+                AccessCaseKind::Replace,
+                None,
+                PropertyStoreAccessCasePlanContract::DATA_ONLY_REPLACE,
+            )
+        } else {
+            (
+                PropertyStoreAccessCasePlanKind::DataOnlyTransition,
+                AccessCaseKind::Transition,
+                Some(entry.new_structure),
+                PropertyStoreAccessCasePlanContract::DATA_ONLY_TRANSITION,
+            )
+        };
+        let access_case = AccessCaseDescriptor {
+            kind: access_case_kind,
+            key: site.key,
+            base_structure: Some(entry.old_structure),
+            new_structure,
+            holder: None,
+            offset: Some(entry.offset),
+            via_global_proxy: false,
+            may_call_js: false,
+            dependencies: Vec::new(),
+        };
+
+        PropertyStoreAccessCasePlan {
+            plan_kind,
+            owner: site.owner,
+            slot: site.slot,
+            bytecode_index: site.bytecode_index,
+            key: site.key,
+            access_case,
+            planned_stub_kind: InlineCacheStubKind::RepatchingStub,
+            effect_contract,
+        }
+    }
+}
+
+fn generated_property_store_megamorphic_cache_key_supported(key: CacheKey) -> bool {
+    matches!(key, CacheKey::Property(property_key) if property_key.as_identifier().is_some())
+}
+
+fn generated_property_store_megamorphic_cache_key_hash(key: CacheKey) -> Option<u32> {
+    let CacheKey::Property(PropertyKey::String(identifier)) = key else {
+        return None;
+    };
+    Some(
+        identifier
+            .atom()
+            .table_slot()
+            .wrapping_mul(0x9E37_79B1)
+            .rotate_left(5),
+    )
+}
+
+fn generated_property_store_megamorphic_cache_primary_index(
+    structure: StructureId,
+    key: CacheKey,
+    table_len: usize,
+) -> Option<usize> {
+    if table_len == 0 || !table_len.is_power_of_two() {
+        return None;
+    }
+    let sid = structure.0;
+    let hash = ((sid >> 4) ^ (sid >> 15))
+        .wrapping_add(generated_property_store_megamorphic_cache_key_hash(key)?);
+    Some((hash as usize) & (table_len - 1))
+}
+
+fn generated_property_store_megamorphic_cache_secondary_index(
+    structure: StructureId,
+    key: CacheKey,
+    table_len: usize,
+) -> Option<usize> {
+    if table_len == 0 || !table_len.is_power_of_two() {
+        return None;
+    }
+    let key_hash = generated_property_store_megamorphic_cache_key_hash(key)?;
+    let hash = structure.0.wrapping_add(key_hash);
+    Some(((hash.wrapping_add(hash >> 13)) as usize) & (table_len - 1))
+}
+
+/// Megamorphic has/in site metadata projected for generated property sidecars.
+///
+/// C++ JSC uses this cache for `InById` and eligible `InByVal` string/symbol
+/// keys. The current Rust frontend parses `in` but has no executable core
+/// opcode yet, so this table is a faithful substrate for that future boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedPropertyHasMegamorphicSite {
+    pub owner: CodeBlockId,
+    pub slot: InlineCacheSlotId,
+    pub bytecode_index: u32,
+    pub key: CacheKey,
+}
+
+/// One has/in entry from the VM-wide megamorphic cache snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedPropertyHasMegamorphicCacheEntry {
+    pub key: CacheKey,
+    pub base_structure: StructureId,
+    pub epoch: u16,
+    pub result: bool,
+}
+
+/// Result of a generated-side megamorphic lookup for one has/in site.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratedPropertyHasMegamorphicLookup {
+    NoSite,
+    Miss,
+    Hit(bool),
+}
+
+/// Immutable generated-side view of the VM-owned has/in megamorphic cache.
+///
+/// Lookup mirrors C++ JSC's `hasMegamorphicProperty`: primary lookup first,
+/// stale primary `(StructureID, uid)` matches stop without consulting
+/// secondary, and secondary is only checked after primary structure/key miss.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedPropertyHasMegamorphicCandidateTable {
+    owner: CodeBlockId,
+    epoch: u16,
+    sites: Vec<GeneratedPropertyHasMegamorphicSite>,
+    primary_entries: Vec<Option<GeneratedPropertyHasMegamorphicCacheEntry>>,
+    secondary_entries: Vec<Option<GeneratedPropertyHasMegamorphicCacheEntry>>,
+}
+
+impl GeneratedPropertyHasMegamorphicCandidateTable {
+    pub fn new(
+        owner: CodeBlockId,
+        epoch: u16,
+        sites: Vec<GeneratedPropertyHasMegamorphicSite>,
+        primary_entries: Vec<Option<GeneratedPropertyHasMegamorphicCacheEntry>>,
+        secondary_entries: Vec<Option<GeneratedPropertyHasMegamorphicCacheEntry>>,
+    ) -> Result<Self, InlineCacheValidationError> {
+        for site in &sites {
+            if site.owner != owner {
+                return Err(InlineCacheValidationError::PropertyHasPlanOwnerMismatch {
+                    expected: owner,
+                    actual: site.owner,
+                });
+            }
+            if !generated_property_has_megamorphic_cache_key_supported(site.key) {
+                return Err(InlineCacheValidationError::PropertyHasPlanUnsupportedKey(
+                    site.key,
+                ));
+            }
+        }
+
+        Ok(Self {
+            owner,
+            epoch,
+            sites,
+            primary_entries,
+            secondary_entries,
+        })
+    }
+
+    pub const fn owner(&self) -> CodeBlockId {
+        self.owner
+    }
+
+    pub const fn epoch(&self) -> u16 {
+        self.epoch
+    }
+
+    pub fn sites(&self) -> &[GeneratedPropertyHasMegamorphicSite] {
+        &self.sites
+    }
+
+    pub fn current_entry_count(&self) -> usize {
+        self.primary_entries
+            .iter()
+            .chain(self.secondary_entries.iter())
+            .filter_map(Option::as_ref)
+            .filter(|entry| entry.epoch == self.epoch)
+            .count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sites.is_empty() || self.current_entry_count() == 0
+    }
+
+    pub fn contains_site(
+        &self,
+        slot: InlineCacheSlotId,
+        bytecode_index: u32,
+        key: CacheKey,
+    ) -> bool {
+        self.sites.iter().any(|site| {
+            site.slot == slot && site.bytecode_index == bytecode_index && site.key == key
+        })
+    }
+
+    pub fn lookup(
+        &self,
+        slot: InlineCacheSlotId,
+        bytecode_index: u32,
+        key: CacheKey,
+        base_structure: StructureId,
+    ) -> GeneratedPropertyHasMegamorphicLookup {
+        if !self.contains_site(slot, bytecode_index, key) {
+            return GeneratedPropertyHasMegamorphicLookup::NoSite;
+        }
+        if base_structure == StructureId::INVALID
+            || !generated_property_has_megamorphic_cache_key_supported(key)
+        {
+            return GeneratedPropertyHasMegamorphicLookup::Miss;
+        }
+
+        let primary_index = generated_property_has_megamorphic_cache_primary_index(
+            base_structure,
+            key,
+            self.primary_entries.len(),
+        );
+        let Some(primary_index) = primary_index else {
+            return GeneratedPropertyHasMegamorphicLookup::Miss;
+        };
+        if let Some(Some(entry)) = self.primary_entries.get(primary_index) {
+            if entry.base_structure == base_structure && entry.key == key {
+                return if self.entry_is_current_hit(entry) {
+                    GeneratedPropertyHasMegamorphicLookup::Hit(entry.result)
+                } else {
+                    GeneratedPropertyHasMegamorphicLookup::Miss
+                };
+            }
+        }
+
+        let secondary_index = generated_property_has_megamorphic_cache_secondary_index(
+            base_structure,
+            key,
+            self.secondary_entries.len(),
+        );
+        let Some(secondary_index) = secondary_index else {
+            return GeneratedPropertyHasMegamorphicLookup::Miss;
+        };
+        let Some(Some(entry)) = self.secondary_entries.get(secondary_index) else {
+            return GeneratedPropertyHasMegamorphicLookup::Miss;
+        };
+        if entry.base_structure == base_structure
+            && entry.key == key
+            && self.entry_is_current_hit(entry)
+        {
+            GeneratedPropertyHasMegamorphicLookup::Hit(entry.result)
+        } else {
+            GeneratedPropertyHasMegamorphicLookup::Miss
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_primary_entry(
+        owner: CodeBlockId,
+        epoch: u16,
+        site: GeneratedPropertyHasMegamorphicSite,
+        entry: GeneratedPropertyHasMegamorphicCacheEntry,
+    ) -> Self {
+        let mut primary_entries = vec![None; 512];
+        let secondary_entries = vec![None; 128];
+        let primary_index = generated_property_has_megamorphic_cache_primary_index(
+            entry.base_structure,
+            entry.key,
+            primary_entries.len(),
+        )
+        .expect("primary index");
+        primary_entries[primary_index] = Some(entry);
+        Self::new(owner, epoch, vec![site], primary_entries, secondary_entries)
+            .expect("test megamorphic has table")
+    }
+
+    fn entry_is_current_hit(&self, entry: &GeneratedPropertyHasMegamorphicCacheEntry) -> bool {
+        entry.epoch == self.epoch
+            && entry.base_structure != StructureId::INVALID
+            && generated_property_has_megamorphic_cache_key_supported(entry.key)
+    }
+}
+
+fn generated_property_has_megamorphic_cache_key_supported(key: CacheKey) -> bool {
+    matches!(key, CacheKey::Property(PropertyKey::String(_)))
+}
+
+fn generated_property_has_megamorphic_cache_key_hash(key: CacheKey) -> Option<u32> {
+    let CacheKey::Property(PropertyKey::String(identifier)) = key else {
+        return None;
+    };
+    Some(
+        identifier
+            .atom()
+            .table_slot()
+            .wrapping_mul(0x9E37_79B1)
+            .rotate_left(5),
+    )
+}
+
+fn generated_property_has_megamorphic_cache_primary_index(
+    structure: StructureId,
+    key: CacheKey,
+    table_len: usize,
+) -> Option<usize> {
+    if table_len == 0 || !table_len.is_power_of_two() {
+        return None;
+    }
+    let sid = structure.0;
+    let hash = ((sid >> 4) ^ (sid >> 13))
+        .wrapping_add(generated_property_has_megamorphic_cache_key_hash(key)?);
+    Some((hash as usize) & (table_len - 1))
+}
+
+fn generated_property_has_megamorphic_cache_secondary_index(
+    structure: StructureId,
+    key: CacheKey,
+    table_len: usize,
+) -> Option<usize> {
+    if table_len == 0 || !table_len.is_power_of_two() {
+        return None;
+    }
+    let key_hash = generated_property_has_megamorphic_cache_key_hash(key)?;
+    let hash = structure.0.wrapping_add(key_hash);
+    Some(((hash.wrapping_add(hash >> 11)) as usize) & (table_len - 1))
 }
 
 fn validate_property_load_access_case_plan_for_table(
@@ -1412,31 +2369,45 @@ fn validate_property_load_access_case_plan_for_table(
             actual: plan.owner,
         });
     }
-    if plan.plan_kind != PropertyLoadAccessCasePlanKind::DataOnlyOwnLoad {
-        return Err(InlineCacheValidationError::PropertyLoadPlanUnsupportedKind(
-            plan.plan_kind,
-        ));
-    }
+    let indexed_load = match plan.plan_kind {
+        PropertyLoadAccessCasePlanKind::DataOnlyOwnLoad => false,
+        PropertyLoadAccessCasePlanKind::DataOnlyIndexedLoad => true,
+    };
     if plan.planned_stub_kind != InlineCacheStubKind::DataOnlyHandler {
         return Err(
             InlineCacheValidationError::PropertyLoadPlanUnsupportedStubKind(plan.planned_stub_kind),
         );
     }
-    if !plan.effect_contract.supports_generated_data_only_own_load() {
+    if (!indexed_load && !plan.effect_contract.supports_generated_data_only_own_load())
+        || (indexed_load
+            && !plan
+                .effect_contract
+                .supports_generated_data_only_indexed_load())
+    {
         return Err(
             InlineCacheValidationError::PropertyLoadPlanUnsupportedEffectContract(
                 plan.effect_contract,
             ),
         );
     }
-    if plan.access_case.kind != AccessCaseKind::Load {
+    let expected_access_case = if indexed_load {
+        AccessCaseKind::IndexedLoad
+    } else {
+        AccessCaseKind::Load
+    };
+    if plan.access_case.kind != expected_access_case {
         return Err(
             InlineCacheValidationError::PropertyLoadPlanUnsupportedAccessCase(
                 plan.access_case.kind,
             ),
         );
     }
-    if !property_load_access_case_key_supports_generated_own_data_plan(plan.key) {
+    let key_supported = if indexed_load {
+        property_load_access_case_key_supports_generated_indexed_plan(plan.key)
+    } else {
+        property_load_access_case_key_supports_generated_own_data_plan(plan.key)
+    };
+    if !key_supported {
         return Err(InlineCacheValidationError::PropertyLoadPlanUnsupportedKey(
             plan.key,
         ));
@@ -1449,7 +2420,12 @@ fn validate_property_load_access_case_plan_for_table(
             },
         );
     }
-    if !property_load_access_case_key_supports_generated_own_data_plan(plan.access_case.key) {
+    let access_case_key_supported = if indexed_load {
+        property_load_access_case_key_supports_generated_indexed_plan(plan.access_case.key)
+    } else {
+        property_load_access_case_key_supports_generated_own_data_plan(plan.access_case.key)
+    };
+    if !access_case_key_supported {
         return Err(InlineCacheValidationError::PropertyLoadPlanUnsupportedKey(
             plan.access_case.key,
         ));
@@ -1463,14 +2439,22 @@ fn validate_property_load_access_case_plan_for_table(
             InlineCacheValidationError::PropertyLoadPlanInvalidBaseStructure(base_structure),
         );
     }
-    let offset = plan
-        .access_case
-        .offset
-        .ok_or(InlineCacheValidationError::PropertyLoadPlanMissingOffset)?;
-    if offset.raw() < 0 {
-        return Err(InlineCacheValidationError::PropertyLoadPlanInvalidOffset(
-            offset,
-        ));
+    if indexed_load {
+        if let Some(offset) = plan.access_case.offset {
+            return Err(InlineCacheValidationError::PropertyLoadPlanInvalidOffset(
+                offset,
+            ));
+        }
+    } else {
+        let offset = plan
+            .access_case
+            .offset
+            .ok_or(InlineCacheValidationError::PropertyLoadPlanMissingOffset)?;
+        if offset.raw() < 0 {
+            return Err(InlineCacheValidationError::PropertyLoadPlanInvalidOffset(
+                offset,
+            ));
+        }
     }
     if let Some(holder) = plan.access_case.holder {
         return Err(InlineCacheValidationError::PropertyLoadPlanUnsupportedHolder(holder));
@@ -1501,9 +2485,7 @@ fn property_load_access_case_plan_duplicate_key(
         plan.access_case
             .base_structure
             .expect("validated property-load plan base structure"),
-        plan.access_case
-            .offset
-            .expect("validated property-load plan offset"),
+        plan.access_case.offset.unwrap_or(PropertyOffset::INVALID),
         plan.key,
     )
 }
@@ -1523,6 +2505,7 @@ fn validate_property_store_access_case_plan_for_table(
     let expected_access_case = match plan.plan_kind {
         PropertyStoreAccessCasePlanKind::DataOnlyReplace => AccessCaseKind::Replace,
         PropertyStoreAccessCasePlanKind::DataOnlyTransition => AccessCaseKind::Transition,
+        PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => AccessCaseKind::IndexedStore,
         PropertyStoreAccessCasePlanKind::Unsupported => {
             return Err(
                 InlineCacheValidationError::PropertyStorePlanUnsupportedKind(plan.plan_kind),
@@ -1544,7 +2527,7 @@ fn validate_property_store_access_case_plan_for_table(
             ),
         );
     }
-    if !property_store_access_case_key_supports_metadata_plan(plan.key) {
+    if !property_store_access_case_key_supports_metadata_plan(plan.plan_kind, plan.key) {
         return Err(InlineCacheValidationError::PropertyStorePlanUnsupportedKey(
             plan.key,
         ));
@@ -1557,7 +2540,8 @@ fn validate_property_store_access_case_plan_for_table(
             },
         );
     }
-    if !property_store_access_case_key_supports_metadata_plan(plan.access_case.key) {
+    if !property_store_access_case_key_supports_metadata_plan(plan.plan_kind, plan.access_case.key)
+    {
         return Err(InlineCacheValidationError::PropertyStorePlanUnsupportedKey(
             plan.access_case.key,
         ));
@@ -1574,6 +2558,9 @@ fn validate_property_store_access_case_plan_for_table(
         PropertyStoreAccessCasePlanKind::DataOnlyTransition => plan
             .effect_contract
             .supports_metadata_only_transition_plan(),
+        PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => plan
+            .effect_contract
+            .supports_metadata_only_indexed_store_plan(),
         PropertyStoreAccessCasePlanKind::Unsupported => unreachable!("validated plan kind"),
     };
     if !expected_contract_supported {
@@ -1593,15 +2580,30 @@ fn validate_property_store_access_case_plan_for_table(
             InlineCacheValidationError::PropertyStorePlanInvalidBaseStructure(base_structure),
         );
     }
-    let offset = plan
-        .access_case
-        .offset
-        .ok_or(InlineCacheValidationError::PropertyStorePlanMissingOffset)?;
-    if offset.raw() < 0 {
-        return Err(InlineCacheValidationError::PropertyStorePlanInvalidOffset(
-            offset,
-        ));
-    }
+    let offset = match plan.plan_kind {
+        PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
+            if let Some(offset) = plan.access_case.offset {
+                return Err(InlineCacheValidationError::PropertyStorePlanInvalidOffset(
+                    offset,
+                ));
+            }
+            None
+        }
+        PropertyStoreAccessCasePlanKind::DataOnlyReplace
+        | PropertyStoreAccessCasePlanKind::DataOnlyTransition => {
+            let offset = plan
+                .access_case
+                .offset
+                .ok_or(InlineCacheValidationError::PropertyStorePlanMissingOffset)?;
+            if offset.raw() < 0 {
+                return Err(InlineCacheValidationError::PropertyStorePlanInvalidOffset(
+                    offset,
+                ));
+            }
+            Some(offset)
+        }
+        PropertyStoreAccessCasePlanKind::Unsupported => unreachable!("validated plan kind"),
+    };
     if let Some(holder) = plan.access_case.holder {
         return Err(InlineCacheValidationError::PropertyStorePlanUnsupportedHolder(holder));
     }
@@ -1643,6 +2645,16 @@ fn validate_property_store_access_case_plan_for_table(
                 );
             }
         }
+        PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
+            if let Some(new_structure) = plan.access_case.new_structure {
+                return Err(
+                    InlineCacheValidationError::PropertyStorePlanUnsupportedNewStructure(
+                        new_structure,
+                    ),
+                );
+            }
+            debug_assert!(offset.is_none());
+        }
         PropertyStoreAccessCasePlanKind::Unsupported => unreachable!("validated plan kind"),
     }
 
@@ -1665,9 +2677,7 @@ fn property_store_access_case_plan_duplicate_key(
         plan.access_case
             .base_structure
             .expect("validated property-store plan base structure"),
-        plan.access_case
-            .offset
-            .expect("validated property-store plan offset"),
+        plan.access_case.offset.unwrap_or(PropertyOffset::INVALID),
         plan.access_case.new_structure,
     )
 }
@@ -1728,7 +2738,19 @@ fn validate_property_store_mutation_candidate_barrier_evidence(
             },
         );
     }
-    if evidence.observed_write_barrier_count == 0 {
+    if evidence.observed_write_barrier_count == 0
+        && !(matches!(
+            candidate.stored_value_kind,
+            ValueKind::Int32
+                | ValueKind::Double
+                | ValueKind::Boolean
+                | ValueKind::Null
+                | ValueKind::Undefined
+        ) && evidence.last_write_barrier
+            == BarrierRequirementOutcome::NotRequired(
+                BarrierNotRequiredReason::NullOrNonCellTarget,
+            ))
+    {
         return Err(
             InlineCacheValidationError::PropertyStoreMutationCandidateInvalidBarrierObservationCount(
                 evidence.observed_write_barrier_count,
@@ -2035,6 +3057,14 @@ pub struct GeneratedPropertyLoadProbeRequest<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GeneratedPropertyLoadMegamorphicHolderProbeRequest {
+    pub key: CacheKey,
+    pub base_structure: StructureId,
+    pub holder: ObjectId,
+    pub offset: PropertyOffset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GeneratedPropertyStoreProbeRequest<'a> {
     pub plan: &'a PropertyStoreAccessCasePlan,
     pub base: RuntimeValue,
@@ -2164,6 +3194,7 @@ impl GeneratedPropertyStoreProbeHit {
         let expected_access_case = match plan.plan_kind {
             PropertyStoreAccessCasePlanKind::DataOnlyReplace => AccessCaseKind::Replace,
             PropertyStoreAccessCasePlanKind::DataOnlyTransition => AccessCaseKind::Transition,
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => AccessCaseKind::IndexedStore,
             PropertyStoreAccessCasePlanKind::Unsupported => {
                 return Err(GeneratedPropertyStoreProbeMissReason::UnsupportedPlan);
             }
@@ -2179,13 +3210,17 @@ impl GeneratedPropertyStoreProbeHit {
             return Err(GeneratedPropertyStoreProbeMissReason::UnsupportedPlanMetadata);
         }
 
-        if let Some(reason) = generated_property_store_probe_key_miss_reason(plan.key) {
+        if let Some(reason) =
+            generated_property_store_probe_key_miss_reason(plan.plan_kind, plan.key)
+        {
             return Err(reason);
         }
         if plan.access_case.key != plan.key {
             return Err(GeneratedPropertyStoreProbeMissReason::ExistingPropertyMismatch);
         }
-        if let Some(reason) = generated_property_store_probe_key_miss_reason(plan.access_case.key) {
+        if let Some(reason) =
+            generated_property_store_probe_key_miss_reason(plan.plan_kind, plan.access_case.key)
+        {
             return Err(reason);
         }
 
@@ -2199,6 +3234,9 @@ impl GeneratedPropertyStoreProbeHit {
             PropertyStoreAccessCasePlanKind::DataOnlyTransition => plan
                 .effect_contract
                 .supports_metadata_only_transition_plan(),
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => plan
+                .effect_contract
+                .supports_metadata_only_indexed_store_plan(),
             PropertyStoreAccessCasePlanKind::Unsupported => unreachable!("checked above"),
         };
         if !contract_matches {
@@ -2210,14 +3248,30 @@ impl GeneratedPropertyStoreProbeHit {
             .base_structure
             .filter(|structure| *structure != StructureId::INVALID)
             .ok_or(GeneratedPropertyStoreProbeMissReason::MissingBaseStructure)?;
-        let planned_offset = plan
-            .access_case
-            .offset
-            .filter(|offset| offset.raw() >= 0)
-            .ok_or(GeneratedPropertyStoreProbeMissReason::MissingOrInvalidOffset)?;
+        let planned_offset = match plan.plan_kind {
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
+                if plan.access_case.offset.is_some() {
+                    return Err(GeneratedPropertyStoreProbeMissReason::MissingOrInvalidOffset);
+                }
+                PropertyOffset::INVALID
+            }
+            PropertyStoreAccessCasePlanKind::DataOnlyReplace
+            | PropertyStoreAccessCasePlanKind::DataOnlyTransition => plan
+                .access_case
+                .offset
+                .filter(|offset| offset.raw() >= 0)
+                .ok_or(GeneratedPropertyStoreProbeMissReason::MissingOrInvalidOffset)?,
+            PropertyStoreAccessCasePlanKind::Unsupported => unreachable!("checked above"),
+        };
 
         let planned_new_structure = match plan.plan_kind {
             PropertyStoreAccessCasePlanKind::DataOnlyReplace => {
+                if plan.access_case.new_structure.is_some() {
+                    return Err(GeneratedPropertyStoreProbeMissReason::TransitionStructureMismatch);
+                }
+                None
+            }
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
                 if plan.access_case.new_structure.is_some() {
                     return Err(GeneratedPropertyStoreProbeMissReason::TransitionStructureMismatch);
                 }
@@ -2529,14 +3583,27 @@ impl GeneratedPropertyStoreMutationResult {
 }
 
 fn generated_property_store_probe_key_miss_reason(
+    plan_kind: PropertyStoreAccessCasePlanKind,
     key: CacheKey,
 ) -> Option<GeneratedPropertyStoreProbeMissReason> {
-    match key {
-        CacheKey::Property(property_key) if property_key.as_identifier().is_some() => None,
-        CacheKey::Property(property_key) if property_key.as_index().is_some() => {
+    match (plan_kind, key) {
+        (
+            PropertyStoreAccessCasePlanKind::DataOnlyReplace
+            | PropertyStoreAccessCasePlanKind::DataOnlyTransition,
+            CacheKey::Property(property_key),
+        ) if property_key.as_identifier().is_some() => None,
+        (
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore,
+            CacheKey::Property(property_key),
+        ) if property_key.as_index().is_some() => None,
+        (
+            PropertyStoreAccessCasePlanKind::DataOnlyReplace
+            | PropertyStoreAccessCasePlanKind::DataOnlyTransition,
+            CacheKey::Property(property_key),
+        ) if property_key.as_index().is_some() => {
             Some(GeneratedPropertyStoreProbeMissReason::IndexedProperty)
         }
-        CacheKey::Property(_) | CacheKey::Dynamic => {
+        (_, CacheKey::Property(_)) | (_, CacheKey::Dynamic) => {
             Some(GeneratedPropertyStoreProbeMissReason::KeyNotRepresentable)
         }
     }
@@ -2782,14 +3849,17 @@ fn validate_call_link_attachment_plan_for_table(
     owner: CodeBlockId,
     plan: &CallLinkAttachmentPlan,
 ) -> Result<(), InlineCacheValidationError> {
+    let Some(expected_call_kind) = linked_call_kind_for_opcode(plan.opcode) else {
+        return Err(InlineCacheValidationError::CallLinkMismatch);
+    };
+    let expected_specialization = call_link_specialization_for_kind(expected_call_kind);
     if plan.owner != owner
-        || !matches!(plan.opcode, CoreOpcode::Call | CoreOpcode::CallWithThis)
         || plan.descriptor.owner != Some(owner)
         || plan.descriptor.boundary.is_none()
         || plan.descriptor.executable.is_none()
         || plan.descriptor.callee.is_none()
         || plan.descriptor.target_code_block.is_none()
-        || plan.descriptor.call_kind != LinkedCallKind::Call
+        || plan.descriptor.call_kind != expected_call_kind
         || !matches!(
             plan.descriptor.mode,
             CallLinkMode::Init | CallLinkMode::Monomorphic | CallLinkMode::Direct
@@ -2800,7 +3870,7 @@ fn validate_call_link_attachment_plan_for_table(
     if plan.descriptor.executable != Some(plan.target.executable)
         || plan.descriptor.callee != Some(plan.target.callee)
         || plan.descriptor.target_code_block != Some(plan.target.target_code_block)
-        || plan.target.specialization != CodeSpecialization::Call
+        || plan.target.specialization != expected_specialization
         || plan.descriptor.boundary != Some(plan.boundary.id)
         || plan.boundary.owner != Some(owner)
         || plan.boundary.abi != EntryAbi::LlIntCompatible
@@ -2840,11 +3910,14 @@ fn validate_call_link_attachment_plan_for_table(
         return Err(InlineCacheValidationError::CallLinkMismatch);
     }
 
-    let slot = InlineCacheSlot::builder(plan.slot, InlineCacheKind::Call)
-        .owner(owner)
-        .bytecode_index(plan.bytecode_index)
-        .stub(plan.stub.clone())
-        .build()?;
+    let slot = InlineCacheSlot::builder(
+        plan.slot,
+        inline_cache_kind_for_call_link_opcode(plan.opcode),
+    )
+    .owner(owner)
+    .bytecode_index(plan.bytecode_index)
+    .stub(plan.stub.clone())
+    .build()?;
     let classification = classify_inline_cache_slot(&slot)?;
     if classification != InlineCacheCaseClassification::CallLinking {
         return Err(InlineCacheValidationError::CallLinkMismatch);
@@ -2856,17 +3929,45 @@ fn validate_call_link_attachment_plan_for_table(
 fn call_link_attachment_plan_duplicate_key(
     plan: &CallLinkAttachmentPlan,
 ) -> (
+    CoreOpcode,
+    LinkedCallKind,
     u32,
     Option<ExecutableId>,
     Option<ObjectId>,
     Option<CodeBlockId>,
 ) {
     (
+        plan.opcode,
+        plan.descriptor.call_kind,
         plan.bytecode_index,
         plan.descriptor.executable,
         plan.descriptor.callee,
         plan.descriptor.target_code_block,
     )
+}
+
+const fn linked_call_kind_for_opcode(opcode: CoreOpcode) -> Option<LinkedCallKind> {
+    match opcode {
+        CoreOpcode::Call | CoreOpcode::CallWithThis => Some(LinkedCallKind::Call),
+        CoreOpcode::Construct => Some(LinkedCallKind::Construct),
+        _ => None,
+    }
+}
+
+const fn call_link_specialization_for_kind(kind: LinkedCallKind) -> CodeSpecialization {
+    match kind {
+        LinkedCallKind::Construct | LinkedCallKind::VarargsConstruct => {
+            CodeSpecialization::Construct
+        }
+        _ => CodeSpecialization::Call,
+    }
+}
+
+const fn inline_cache_kind_for_call_link_opcode(opcode: CoreOpcode) -> InlineCacheKind {
+    match opcode {
+        CoreOpcode::Construct => InlineCacheKind::Construct,
+        _ => InlineCacheKind::Call,
+    }
 }
 
 /// Whether an active call-link projection may transfer control directly through
@@ -3198,13 +4299,14 @@ fn generated_call_link_probe_miss_reason(
 fn generated_call_link_probe_unsupported_candidate_metadata(
     candidate: &GeneratedCallLinkCandidate,
 ) -> bool {
-    if !matches!(
-        candidate.opcode,
-        CoreOpcode::Call | CoreOpcode::CallWithThis
-    ) || candidate.descriptor.owner != Some(candidate.owner)
-        || candidate.descriptor.call_kind != LinkedCallKind::Call
+    let Some(expected_call_kind) = linked_call_kind_for_opcode(candidate.opcode) else {
+        return true;
+    };
+    let expected_specialization = call_link_specialization_for_kind(expected_call_kind);
+    if candidate.descriptor.owner != Some(candidate.owner)
+        || candidate.descriptor.call_kind != expected_call_kind
         || candidate.descriptor.mode != CallLinkMode::Monomorphic
-        || candidate.target.specialization != CodeSpecialization::Call
+        || candidate.target.specialization != expected_specialization
     {
         return true;
     }
@@ -3238,15 +4340,15 @@ fn validate_generated_call_link_candidate_for_table(
     owner: CodeBlockId,
     candidate: &GeneratedCallLinkCandidate,
 ) -> Result<(), InlineCacheValidationError> {
+    let Some(expected_call_kind) = linked_call_kind_for_opcode(candidate.opcode) else {
+        return Err(InlineCacheValidationError::CallLinkMismatch);
+    };
+    let expected_specialization = call_link_specialization_for_kind(expected_call_kind);
     if candidate.owner != owner
-        || !matches!(
-            candidate.opcode,
-            CoreOpcode::Call | CoreOpcode::CallWithThis
-        )
         || candidate.descriptor.owner != Some(owner)
-        || candidate.descriptor.call_kind != LinkedCallKind::Call
+        || candidate.descriptor.call_kind != expected_call_kind
         || candidate.descriptor.mode != CallLinkMode::Monomorphic
-        || candidate.target.specialization != CodeSpecialization::Call
+        || candidate.target.specialization != expected_specialization
     {
         return Err(InlineCacheValidationError::CallLinkMismatch);
     }
@@ -3382,8 +4484,17 @@ fn validate_generated_call_link_candidate_ordinals(
 
 fn generated_call_link_candidate_semantic_key(
     candidate: &GeneratedCallLinkCandidate,
-) -> (u32, ExecutableId, ObjectId, CodeBlockId) {
+) -> (
+    CoreOpcode,
+    LinkedCallKind,
+    u32,
+    ExecutableId,
+    ObjectId,
+    CodeBlockId,
+) {
     (
+        candidate.opcode,
+        candidate.descriptor.call_kind,
         candidate.bytecode_index,
         candidate
             .descriptor
@@ -3511,15 +4622,223 @@ pub struct PropertyLoadObservationDescriptor {
     pub key: CacheKey,
     pub base_object: Option<ObjectId>,
     pub holder_object: Option<ObjectId>,
+    pub base_normalization: PropertyLoadBaseNormalization,
     pub base_structure: Option<StructureId>,
     pub offset: Option<PropertyOffset>,
     pub prototype_depth: u16,
     pub observed_access_case_kind: Option<AccessCaseKind>,
     pub may_call_js: bool,
     pub cacheability: PropertyCacheability,
+    /// True only when the runtime proved this named property load satisfies
+    /// JSC's GetById megamorphic key gate. Tiering must not infer this from an
+    /// atom slot because the excluded names are text-sensitive.
+    pub can_use_get_by_id_megamorphic: bool,
     pub readiness: PropertyLoadObservationReadiness,
     pub cold_miss_handoff: InlineCacheMissHandoffDescriptor,
     pub chain: Vec<PropertyLoadObservationChainEntry>,
+}
+
+/// Metadata-only record of one slow `InById`/`InByVal` has-property
+/// observation.
+///
+/// This is deliberately separate from load observations: C++ JSC's
+/// `HasProperty` slot records boolean presence and must not be consumed as a
+/// value load or attach generated load code. VM tiering may later evolve
+/// eligible named cases into has-megamorphic metadata using the same IC
+/// thresholds as JSC.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertyHasObservationDescriptor {
+    pub owner: CodeBlockId,
+    pub slot: InlineCacheSlotId,
+    pub bytecode_index: u32,
+    pub opcode: CoreOpcode,
+    pub cache_kind: InlineCacheKind,
+    pub fallback: InlineCacheFallbackSemantics,
+    pub key: CacheKey,
+    pub base_object: Option<ObjectId>,
+    pub holder_object: Option<ObjectId>,
+    pub base_structure: Option<StructureId>,
+    pub offset: Option<PropertyOffset>,
+    pub prototype_depth: u16,
+    pub observed_access_case_kind: Option<AccessCaseKind>,
+    pub result: bool,
+    pub may_call_js: bool,
+    pub cacheability: PropertyCacheability,
+    pub can_use_in_by_id_megamorphic: bool,
+    pub cold_miss_handoff: InlineCacheMissHandoffDescriptor,
+    pub chain: Vec<PropertyLoadObservationChainEntry>,
+}
+
+impl PropertyHasObservationDescriptor {
+    pub fn validate(&self) -> Result<(), InlineCacheValidationError> {
+        if self.cold_miss_handoff.owner != self.owner {
+            return Err(
+                InlineCacheValidationError::PropertyObservationHandoffOwnerMismatch {
+                    observation: self.owner,
+                    handoff: self.cold_miss_handoff.owner,
+                },
+            );
+        }
+        if self.cold_miss_handoff.slot != self.slot {
+            return Err(
+                InlineCacheValidationError::PropertyObservationHandoffSlotMismatch {
+                    observation: self.slot,
+                    handoff: self.cold_miss_handoff.slot,
+                },
+            );
+        }
+        if self.cold_miss_handoff.bytecode_index != self.bytecode_index {
+            return Err(
+                InlineCacheValidationError::PropertyObservationHandoffBytecodeIndexMismatch {
+                    observation: self.bytecode_index,
+                    handoff: self.cold_miss_handoff.bytecode_index,
+                },
+            );
+        }
+        if self.cold_miss_handoff.cache_kind != self.cache_kind {
+            return Err(
+                InlineCacheValidationError::PropertyObservationHandoffCacheKindMismatch {
+                    observation: self.cache_kind,
+                    handoff: self.cold_miss_handoff.cache_kind,
+                },
+            );
+        }
+        if self.cold_miss_handoff.fallback != self.fallback {
+            return Err(
+                InlineCacheValidationError::PropertyObservationHandoffFallbackMismatch {
+                    observation: self.fallback,
+                    handoff: self.cold_miss_handoff.fallback,
+                },
+            );
+        }
+        if self.cache_kind != InlineCacheKind::HasProperty {
+            return Err(
+                InlineCacheValidationError::PropertyObservationUnsupportedCacheKind {
+                    expected: InlineCacheKind::HasProperty,
+                    actual: self.cache_kind,
+                },
+            );
+        }
+        if !matches!(self.opcode, CoreOpcode::InById | CoreOpcode::InByVal) {
+            return Err(
+                InlineCacheValidationError::PropertyHasObservationUnsupportedOpcode {
+                    opcode: self.opcode,
+                },
+            );
+        }
+        if self.fallback != InlineCacheFallbackSemantics::SlowPathLookup {
+            return Err(
+                InlineCacheValidationError::PropertyObservationUnsupportedFallback {
+                    expected: InlineCacheFallbackSemantics::SlowPathLookup,
+                    actual: self.fallback,
+                },
+            );
+        }
+        if self.cold_miss_handoff.miss_kind != InlineCacheMissKind::Cold {
+            return Err(
+                InlineCacheValidationError::PropertyObservationHandoffMissKindMismatch {
+                    expected: InlineCacheMissKind::Cold,
+                    actual: self.cold_miss_handoff.miss_kind,
+                },
+            );
+        }
+        if self.cold_miss_handoff.boundary.is_some() {
+            return Err(InlineCacheValidationError::PropertyObservationBoundaryContamination);
+        }
+        if self.cold_miss_handoff.call_link.is_some() {
+            return Err(InlineCacheValidationError::PropertyObservationCallLinkContamination);
+        }
+        if !self.cold_miss_handoff.preserves_operand_registers {
+            return Err(
+                InlineCacheValidationError::PropertyObservationHandoffClobbersOperandRegisters,
+            );
+        }
+        self.cold_miss_handoff.validate()?;
+
+        let schema = INLINE_CACHE_SCHEMA_REGISTRY
+            .schema_for_kind(self.cache_kind)
+            .ok_or(InlineCacheValidationError::DispatchMismatch)?;
+        if let Some(access_case_kind) = self.observed_access_case_kind {
+            if !schema.allowed_cases.contains(&access_case_kind) {
+                return Err(InlineCacheValidationError::CaseNotAllowed(access_case_kind));
+            }
+            if property_has_observation_true_case(access_case_kind) && !self.result {
+                return Err(
+                    InlineCacheValidationError::PropertyHasObservationResultMismatch {
+                        result: self.result,
+                        access_case_kind,
+                    },
+                );
+            }
+            if property_has_observation_false_case(access_case_kind) && self.result {
+                return Err(
+                    InlineCacheValidationError::PropertyHasObservationResultMismatch {
+                        result: self.result,
+                        access_case_kind,
+                    },
+                );
+            }
+            if property_has_observation_proxy_case(access_case_kind) && !self.may_call_js {
+                return Err(InlineCacheValidationError::CallLinkMismatch);
+            }
+            if self.may_call_js && !schema.may_call_js {
+                return Err(InlineCacheValidationError::CallLinkMismatch);
+            }
+        }
+
+        if matches!(self.key, CacheKey::Dynamic) {
+            if self.cacheability == PropertyCacheability::Allowed
+                || self.can_use_in_by_id_megamorphic
+            {
+                return Err(InlineCacheValidationError::PropertyHasPlanUnsupportedKey(
+                    self.key,
+                ));
+            }
+        }
+        if self.can_use_in_by_id_megamorphic
+            && !matches!(self.key, CacheKey::Property(PropertyKey::String(_)))
+        {
+            return Err(InlineCacheValidationError::PropertyHasPlanUnsupportedKey(
+                self.key,
+            ));
+        }
+        if self.base_structure == Some(StructureId::INVALID) {
+            return Err(
+                InlineCacheValidationError::PropertyLoadPlanInvalidBaseStructure(
+                    StructureId::INVALID,
+                ),
+            );
+        }
+        Ok(())
+    }
+}
+
+const fn property_has_observation_true_case(kind: AccessCaseKind) -> bool {
+    matches!(
+        kind,
+        AccessCaseKind::InHit
+            | AccessCaseKind::IndexedInt32InHit
+            | AccessCaseKind::IndexedDoubleInHit
+            | AccessCaseKind::IndexedContiguousInHit
+            | AccessCaseKind::IndexedArrayStorageInHit
+            | AccessCaseKind::IndexedScopedArgumentsInHit
+            | AccessCaseKind::IndexedDirectArgumentsInHit
+            | AccessCaseKind::IndexedStringInHit
+    )
+}
+
+const fn property_has_observation_false_case(kind: AccessCaseKind) -> bool {
+    matches!(
+        kind,
+        AccessCaseKind::InMiss | AccessCaseKind::IndexedNoIndexingInMiss
+    )
+}
+
+const fn property_has_observation_proxy_case(kind: AccessCaseKind) -> bool {
+    matches!(
+        kind,
+        AccessCaseKind::ProxyObjectIn | AccessCaseKind::IndexedProxyObjectIn
+    )
 }
 
 impl PropertyLoadObservationDescriptor {
@@ -3618,7 +4937,10 @@ impl PropertyLoadObservationDescriptor {
             );
         }
 
-        if self.cache_kind != InlineCacheKind::PropertyLoad {
+        if !matches!(
+            self.cache_kind,
+            InlineCacheKind::PropertyLoad | InlineCacheKind::ElementLoad
+        ) {
             return Err(
                 InlineCacheValidationError::PropertyObservationUnsupportedCacheKind {
                     expected: InlineCacheKind::PropertyLoad,
@@ -3694,14 +5016,23 @@ pub fn plan_property_load_access_case_from_observation(
 ) -> Result<Option<PropertyLoadAccessCasePlan>, InlineCacheValidationError> {
     observation.validate()?;
 
+    if observation.base_normalization != PropertyLoadBaseNormalization::None {
+        return Ok(None);
+    }
+
+    let is_named_own_load = observation.cache_kind == InlineCacheKind::PropertyLoad
+        && observation.observed_access_case_kind == Some(AccessCaseKind::Load)
+        && property_load_access_case_key_supports_generated_own_data_plan(observation.key);
+    let is_indexed_load = observation.cache_kind == InlineCacheKind::ElementLoad
+        && observation.observed_access_case_kind == Some(AccessCaseKind::IndexedLoad)
+        && property_load_access_case_key_supports_generated_indexed_plan(observation.key);
+
     if observation.readiness != PropertyLoadObservationReadiness::ReadyForAttachment
-        || observation.cache_kind != InlineCacheKind::PropertyLoad
         || observation.fallback != InlineCacheFallbackSemantics::SlowPathLookup
-        || observation.observed_access_case_kind != Some(AccessCaseKind::Load)
         || observation.cacheability != PropertyCacheability::Allowed
         || observation.may_call_js
         || observation.prototype_depth != 0
-        || !property_load_access_case_key_supports_generated_own_data_plan(observation.key)
+        || (!is_named_own_load && !is_indexed_load)
         || observation.base_object.is_none()
         || observation.holder_object != observation.base_object
     {
@@ -3715,26 +5046,44 @@ pub fn plan_property_load_access_case_from_observation(
         return Ok(None);
     }
 
-    let Some(offset) = observation.offset else {
-        return Ok(None);
+    let (plan_kind, access_case_kind, offset, cache_kind) = if is_indexed_load {
+        if observation.offset.is_some() {
+            return Ok(None);
+        }
+        (
+            PropertyLoadAccessCasePlanKind::DataOnlyIndexedLoad,
+            AccessCaseKind::IndexedLoad,
+            None,
+            InlineCacheKind::ElementLoad,
+        )
+    } else {
+        let Some(offset) = observation.offset else {
+            return Ok(None);
+        };
+        if !property_load_observation_has_valid_offset(Some(offset)) {
+            return Ok(None);
+        }
+        (
+            PropertyLoadAccessCasePlanKind::DataOnlyOwnLoad,
+            AccessCaseKind::Load,
+            Some(offset),
+            InlineCacheKind::PropertyLoad,
+        )
     };
-    if !property_load_observation_has_valid_offset(Some(offset)) {
-        return Ok(None);
-    }
 
     let access_case = AccessCaseDescriptor {
-        kind: AccessCaseKind::Load,
+        kind: access_case_kind,
         key: observation.key,
         base_structure: Some(base_structure),
         new_structure: None,
         holder: None,
-        offset: Some(offset),
+        offset,
         via_global_proxy: false,
         may_call_js: false,
         dependencies: Vec::new(),
     };
 
-    let temporary_slot = InlineCacheSlot::builder(observation.slot, InlineCacheKind::PropertyLoad)
+    let temporary_slot = InlineCacheSlot::builder(observation.slot, cache_kind)
         .owner(observation.owner)
         .bytecode_index(observation.bytecode_index)
         .state(InlineCacheState::Monomorphic)
@@ -3743,7 +5092,7 @@ pub fn plan_property_load_access_case_from_observation(
     classify_inline_cache_slot(&temporary_slot)?;
 
     Ok(Some(PropertyLoadAccessCasePlan {
-        plan_kind: PropertyLoadAccessCasePlanKind::DataOnlyOwnLoad,
+        plan_kind,
         owner: observation.owner,
         slot: observation.slot,
         bytecode_index: observation.bytecode_index,
@@ -3917,11 +5266,30 @@ fn property_load_access_case_key_supports_generated_own_data_plan(key: CacheKey)
     }
 }
 
-#[allow(dead_code)]
-fn property_store_access_case_key_supports_metadata_plan(key: CacheKey) -> bool {
+fn property_load_access_case_key_supports_generated_indexed_plan(key: CacheKey) -> bool {
     match key {
-        CacheKey::Property(property_key) => property_key.as_identifier().is_some(),
+        CacheKey::Property(property_key) => property_key.as_index().is_some(),
         CacheKey::Dynamic => false,
+    }
+}
+
+#[allow(dead_code)]
+fn property_store_access_case_key_supports_metadata_plan(
+    plan_kind: PropertyStoreAccessCasePlanKind,
+    key: CacheKey,
+) -> bool {
+    match (plan_kind, key) {
+        (
+            PropertyStoreAccessCasePlanKind::DataOnlyReplace
+            | PropertyStoreAccessCasePlanKind::DataOnlyTransition,
+            CacheKey::Property(property_key),
+        ) => property_key.as_identifier().is_some(),
+        (
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore,
+            CacheKey::Property(property_key),
+        ) => property_key.as_index().is_some(),
+        (_, CacheKey::Dynamic) => false,
+        (PropertyStoreAccessCasePlanKind::Unsupported, _) => false,
     }
 }
 
@@ -3997,6 +5365,7 @@ fn property_load_observation_requires_base_structure_guard(
                 | AccessCaseKind::ArrayLength
                 | AccessCaseKind::StringLength
                 | AccessCaseKind::ModuleNamespaceLoad
+                | AccessCaseKind::IndexedLoad
                 | AccessCaseKind::Miss
         )
     )
@@ -4074,6 +5443,38 @@ fn effects_for_access_case(case: &AccessCaseDescriptor) -> EffectSummary {
         | AccessCaseKind::ModuleNamespaceLoad
         | AccessCaseKind::IndexedLoad
         | AccessCaseKind::IndexedIn
+        | AccessCaseKind::InHit
+        | AccessCaseKind::InMiss
+        | AccessCaseKind::InMegamorphic
+        | AccessCaseKind::IndexedMegamorphicIn
+        | AccessCaseKind::IndexedInt32InHit
+        | AccessCaseKind::IndexedDoubleInHit
+        | AccessCaseKind::IndexedContiguousInHit
+        | AccessCaseKind::IndexedArrayStorageInHit
+        | AccessCaseKind::IndexedScopedArgumentsInHit
+        | AccessCaseKind::IndexedDirectArgumentsInHit
+        | AccessCaseKind::IndexedTypedArrayInt8In
+        | AccessCaseKind::IndexedTypedArrayUint8In
+        | AccessCaseKind::IndexedTypedArrayUint8ClampedIn
+        | AccessCaseKind::IndexedTypedArrayInt16In
+        | AccessCaseKind::IndexedTypedArrayUint16In
+        | AccessCaseKind::IndexedTypedArrayInt32In
+        | AccessCaseKind::IndexedTypedArrayUint32In
+        | AccessCaseKind::IndexedTypedArrayFloat16In
+        | AccessCaseKind::IndexedTypedArrayFloat32In
+        | AccessCaseKind::IndexedTypedArrayFloat64In
+        | AccessCaseKind::IndexedResizableTypedArrayInt8In
+        | AccessCaseKind::IndexedResizableTypedArrayUint8In
+        | AccessCaseKind::IndexedResizableTypedArrayUint8ClampedIn
+        | AccessCaseKind::IndexedResizableTypedArrayInt16In
+        | AccessCaseKind::IndexedResizableTypedArrayUint16In
+        | AccessCaseKind::IndexedResizableTypedArrayInt32In
+        | AccessCaseKind::IndexedResizableTypedArrayUint32In
+        | AccessCaseKind::IndexedResizableTypedArrayFloat16In
+        | AccessCaseKind::IndexedResizableTypedArrayFloat32In
+        | AccessCaseKind::IndexedResizableTypedArrayFloat64In
+        | AccessCaseKind::IndexedStringInHit
+        | AccessCaseKind::IndexedNoIndexingInMiss
         | AccessCaseKind::InstanceOf => EffectSummary {
             reads_heap: true,
             ..EffectSummary::pure()
@@ -4090,7 +5491,9 @@ fn effects_for_access_case(case: &AccessCaseDescriptor) -> EffectSummary {
         AccessCaseKind::Getter
         | AccessCaseKind::Setter
         | AccessCaseKind::CustomAccessor
-        | AccessCaseKind::ProxyObject => EffectSummary::for_call(),
+        | AccessCaseKind::ProxyObject
+        | AccessCaseKind::ProxyObjectIn
+        | AccessCaseKind::IndexedProxyObjectIn => EffectSummary::for_call(),
         AccessCaseKind::IntrinsicGetter => EffectSummary {
             reads_heap: true,
             may_throw: true,
@@ -4269,6 +5672,42 @@ const ELEMENT_CASES: &[AccessCaseKind] = &[
     AccessCaseKind::Miss,
     AccessCaseKind::Megamorphic,
 ];
+const HAS_PROPERTY_CASES: &[AccessCaseKind] = &[
+    AccessCaseKind::InHit,
+    AccessCaseKind::InMiss,
+    AccessCaseKind::InMegamorphic,
+    AccessCaseKind::ProxyObjectIn,
+    AccessCaseKind::IndexedMegamorphicIn,
+    AccessCaseKind::IndexedInt32InHit,
+    AccessCaseKind::IndexedDoubleInHit,
+    AccessCaseKind::IndexedContiguousInHit,
+    AccessCaseKind::IndexedArrayStorageInHit,
+    AccessCaseKind::IndexedScopedArgumentsInHit,
+    AccessCaseKind::IndexedDirectArgumentsInHit,
+    AccessCaseKind::IndexedTypedArrayInt8In,
+    AccessCaseKind::IndexedTypedArrayUint8In,
+    AccessCaseKind::IndexedTypedArrayUint8ClampedIn,
+    AccessCaseKind::IndexedTypedArrayInt16In,
+    AccessCaseKind::IndexedTypedArrayUint16In,
+    AccessCaseKind::IndexedTypedArrayInt32In,
+    AccessCaseKind::IndexedTypedArrayUint32In,
+    AccessCaseKind::IndexedTypedArrayFloat16In,
+    AccessCaseKind::IndexedTypedArrayFloat32In,
+    AccessCaseKind::IndexedTypedArrayFloat64In,
+    AccessCaseKind::IndexedResizableTypedArrayInt8In,
+    AccessCaseKind::IndexedResizableTypedArrayUint8In,
+    AccessCaseKind::IndexedResizableTypedArrayUint8ClampedIn,
+    AccessCaseKind::IndexedResizableTypedArrayInt16In,
+    AccessCaseKind::IndexedResizableTypedArrayUint16In,
+    AccessCaseKind::IndexedResizableTypedArrayInt32In,
+    AccessCaseKind::IndexedResizableTypedArrayUint32In,
+    AccessCaseKind::IndexedResizableTypedArrayFloat16In,
+    AccessCaseKind::IndexedResizableTypedArrayFloat32In,
+    AccessCaseKind::IndexedResizableTypedArrayFloat64In,
+    AccessCaseKind::IndexedStringInHit,
+    AccessCaseKind::IndexedNoIndexingInMiss,
+    AccessCaseKind::IndexedProxyObjectIn,
+];
 const CALL_CASES: &[AccessCaseKind] = &[AccessCaseKind::Megamorphic];
 const DEFAULT_STUB_KINDS: &[InlineCacheStubKind] = &[
     InlineCacheStubKind::SlowPathHandler,
@@ -4320,6 +5759,18 @@ pub const STATIC_INLINE_CACHE_SCHEMAS: &[StaticInlineCacheSchema] = &[
         provenance: "static Rust IC schema table",
     },
     StaticInlineCacheSchema {
+        kind: InlineCacheKind::ElementStore,
+        name: "element-store",
+        dispatch: InlineCacheDispatch::RepatchingSlab,
+        allowed_cases: ELEMENT_CASES,
+        allowed_stub_kinds: DEFAULT_STUB_KINDS,
+        may_call_js: false,
+        owns_watchpoints: true,
+        owner: InlineCacheSchemaOwner::BaselineJit,
+        mutation_authority: InlineCacheRegistryMutationAuthority::GeneratedStaticDataRefresh,
+        provenance: "static Rust IC schema table",
+    },
+    StaticInlineCacheSchema {
         kind: InlineCacheKind::Call,
         name: "call-link",
         dispatch: InlineCacheDispatch::SharedStatelessStub,
@@ -4328,6 +5779,30 @@ pub const STATIC_INLINE_CACHE_SCHEMAS: &[StaticInlineCacheSchema] = &[
         may_call_js: true,
         owns_watchpoints: true,
         owner: InlineCacheSchemaOwner::InlineCacheRegistry,
+        mutation_authority: InlineCacheRegistryMutationAuthority::GeneratedStaticDataRefresh,
+        provenance: "static Rust IC schema table",
+    },
+    StaticInlineCacheSchema {
+        kind: InlineCacheKind::Construct,
+        name: "construct-link",
+        dispatch: InlineCacheDispatch::SharedStatelessStub,
+        allowed_cases: CALL_CASES,
+        allowed_stub_kinds: CALL_STUB_KINDS,
+        may_call_js: true,
+        owns_watchpoints: true,
+        owner: InlineCacheSchemaOwner::InlineCacheRegistry,
+        mutation_authority: InlineCacheRegistryMutationAuthority::GeneratedStaticDataRefresh,
+        provenance: "static Rust IC schema table",
+    },
+    StaticInlineCacheSchema {
+        kind: InlineCacheKind::HasProperty,
+        name: "has-property",
+        dispatch: InlineCacheDispatch::RepatchingSlab,
+        allowed_cases: HAS_PROPERTY_CASES,
+        allowed_stub_kinds: DEFAULT_STUB_KINDS,
+        may_call_js: true,
+        owns_watchpoints: true,
+        owner: InlineCacheSchemaOwner::BaselineJit,
         mutation_authority: InlineCacheRegistryMutationAuthority::GeneratedStaticDataRefresh,
         provenance: "static Rust IC schema table",
     },
@@ -4354,6 +5829,24 @@ mod tests {
             owner,
             bytecode_index,
             cache_kind: InlineCacheKind::PropertyLoad,
+            miss_kind: InlineCacheMissKind::Cold,
+            fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+            boundary: None,
+            call_link: None,
+            preserves_operand_registers: true,
+        }
+    }
+
+    fn property_has_cold_miss_handoff(
+        owner: CodeBlockId,
+        slot: InlineCacheSlotId,
+        bytecode_index: u32,
+    ) -> InlineCacheMissHandoffDescriptor {
+        InlineCacheMissHandoffDescriptor {
+            slot,
+            owner,
+            bytecode_index,
+            cache_kind: InlineCacheKind::HasProperty,
             miss_kind: InlineCacheMissKind::Cold,
             fallback: InlineCacheFallbackSemantics::SlowPathLookup,
             boundary: None,
@@ -4392,18 +5885,58 @@ mod tests {
             key: CacheKey::Dynamic,
             base_object: Some(base_object),
             holder_object: None,
+            base_normalization: PropertyLoadBaseNormalization::None,
             base_structure,
             offset,
             prototype_depth,
             observed_access_case_kind,
             may_call_js,
             cacheability,
+            can_use_get_by_id_megamorphic: false,
             readiness: PropertyLoadObservationReadiness::ReadyForAttachment,
             cold_miss_handoff: property_load_cold_miss_handoff(owner, slot, bytecode_index),
             chain,
         };
         observation.readiness = observation.classify_readiness();
         observation
+    }
+
+    fn property_has_observation(
+        observed_access_case_kind: Option<AccessCaseKind>,
+        result: bool,
+    ) -> PropertyHasObservationDescriptor {
+        let owner = CodeBlockId(CellId(131));
+        let slot = InlineCacheSlotId(141);
+        let bytecode_index = 19;
+        let base_object = ObjectId(CellId(151));
+        let base_structure = StructureId(17);
+        PropertyHasObservationDescriptor {
+            owner,
+            slot,
+            bytecode_index,
+            opcode: CoreOpcode::InById,
+            cache_kind: InlineCacheKind::HasProperty,
+            fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+            key: CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+                AtomId::from_table_slot(11),
+            ))),
+            base_object: Some(base_object),
+            holder_object: Some(base_object),
+            base_structure: Some(base_structure),
+            offset: Some(PropertyOffset::new(3)),
+            prototype_depth: 0,
+            observed_access_case_kind,
+            result,
+            may_call_js: false,
+            cacheability: PropertyCacheability::Allowed,
+            can_use_in_by_id_megamorphic: true,
+            cold_miss_handoff: property_has_cold_miss_handoff(owner, slot, bytecode_index),
+            chain: vec![PropertyLoadObservationChainEntry {
+                object: base_object,
+                structure: base_structure,
+                next_prototype: None,
+            }],
+        }
     }
 
     fn blockers(blockers: &[PropertyLoadObservationBlocker]) -> PropertyLoadObservationBlockers {
@@ -4431,6 +5964,25 @@ mod tests {
         );
         observation.key = test_property_key();
         observation.holder_object = observation.base_object;
+        observation.readiness = observation.classify_readiness();
+        observation
+    }
+
+    fn ready_indexed_element_load_observation() -> PropertyLoadObservationDescriptor {
+        let mut observation = property_load_observation(
+            Some(AccessCaseKind::IndexedLoad),
+            false,
+            PropertyCacheability::Allowed,
+            Some(StructureId(7)),
+            None,
+            0,
+        );
+        observation.cache_kind = InlineCacheKind::ElementLoad;
+        observation.key = CacheKey::Property(PropertyKey::from_index(
+            PropertyIndex::from_canonical_index(0),
+        ));
+        observation.holder_object = observation.base_object;
+        observation.cold_miss_handoff.cache_kind = InlineCacheKind::ElementLoad;
         observation.readiness = observation.classify_readiness();
         observation
     }
@@ -4539,6 +6091,21 @@ mod tests {
         plan.access_case.kind = AccessCaseKind::Transition;
         plan.access_case.new_structure = Some(StructureId(152));
         plan.effect_contract = PropertyStoreAccessCasePlanContract::DATA_ONLY_TRANSITION;
+        plan
+    }
+
+    fn ready_property_store_indexed_plan() -> PropertyStoreAccessCasePlan {
+        let mut plan = ready_property_store_replace_plan();
+        plan.plan_kind = PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore;
+        plan.bytecode_index = 25;
+        plan.key = CacheKey::Property(PropertyKey::from_index(
+            PropertyIndex::from_canonical_index(0),
+        ));
+        plan.access_case.kind = AccessCaseKind::IndexedStore;
+        plan.access_case.key = plan.key;
+        plan.access_case.new_structure = None;
+        plan.access_case.offset = None;
+        plan.effect_contract = PropertyStoreAccessCasePlanContract::DATA_ONLY_INDEXED_STORE;
         plan
     }
 
@@ -4796,6 +6363,82 @@ mod tests {
     #[test]
     fn static_inline_cache_registry_validates() {
         assert_eq!(INLINE_CACHE_SCHEMA_REGISTRY.validate(), Ok(()));
+    }
+
+    #[test]
+    fn has_property_observation_descriptor_validates_boolean_cases() {
+        assert_eq!(
+            property_has_observation(Some(AccessCaseKind::InHit), true).validate(),
+            Ok(())
+        );
+        let mut missing = property_has_observation(Some(AccessCaseKind::InMiss), false);
+        missing.offset = None;
+        assert_eq!(missing.validate(), Ok(()));
+
+        let mut indexed =
+            property_has_observation(Some(AccessCaseKind::IndexedArrayStorageInHit), true);
+        indexed.opcode = CoreOpcode::InByVal;
+        indexed.key = CacheKey::Property(PropertyKey::from_index(
+            PropertyIndex::from_canonical_index(0),
+        ));
+        indexed.offset = None;
+        indexed.cacheability = PropertyCacheability::Disallowed;
+        indexed.can_use_in_by_id_megamorphic = false;
+        assert_eq!(indexed.validate(), Ok(()));
+
+        let mut typed_array_false =
+            property_has_observation(Some(AccessCaseKind::IndexedTypedArrayUint8In), false);
+        typed_array_false.opcode = CoreOpcode::InByVal;
+        typed_array_false.key = CacheKey::Property(PropertyKey::from_index(
+            PropertyIndex::from_canonical_index(9),
+        ));
+        typed_array_false.offset = None;
+        typed_array_false.cacheability = PropertyCacheability::Disallowed;
+        typed_array_false.can_use_in_by_id_megamorphic = false;
+        assert_eq!(typed_array_false.validate(), Ok(()));
+    }
+
+    #[test]
+    fn has_property_observation_rejects_load_miss_and_result_mismatch() {
+        assert_eq!(
+            property_has_observation(Some(AccessCaseKind::Miss), false).validate(),
+            Err(InlineCacheValidationError::CaseNotAllowed(
+                AccessCaseKind::Miss
+            ))
+        );
+        assert_eq!(
+            property_has_observation(Some(AccessCaseKind::IndexedIn), true).validate(),
+            Err(InlineCacheValidationError::CaseNotAllowed(
+                AccessCaseKind::IndexedIn
+            ))
+        );
+        assert_eq!(
+            property_has_observation(Some(AccessCaseKind::ProxyObject), true).validate(),
+            Err(InlineCacheValidationError::CaseNotAllowed(
+                AccessCaseKind::ProxyObject
+            ))
+        );
+        assert_eq!(
+            property_has_observation(Some(AccessCaseKind::InHit), false).validate(),
+            Err(
+                InlineCacheValidationError::PropertyHasObservationResultMismatch {
+                    result: false,
+                    access_case_kind: AccessCaseKind::InHit
+                }
+            )
+        );
+
+        let mut dynamic = property_has_observation(None, true);
+        dynamic.key = CacheKey::Dynamic;
+        assert_eq!(
+            dynamic.validate(),
+            Err(InlineCacheValidationError::PropertyHasPlanUnsupportedKey(
+                CacheKey::Dynamic
+            ))
+        );
+        dynamic.cacheability = PropertyCacheability::Disallowed;
+        dynamic.can_use_in_by_id_megamorphic = false;
+        assert_eq!(dynamic.validate(), Ok(()));
     }
 
     #[test]
@@ -5491,21 +7134,63 @@ mod tests {
     }
 
     #[test]
-    fn property_store_mutation_candidate_table_accepts_replace_and_transition_readiness_metadata() {
+    fn property_store_access_case_plan_table_accepts_indexed_store_metadata() {
+        let indexed = ready_property_store_indexed_plan();
+
+        let table = PropertyStoreAccessCasePlanTable::new(indexed.owner, vec![indexed.clone()])
+            .expect("valid indexed property-store plan table");
+
+        assert_eq!(table.owner(), indexed.owner);
+        assert_eq!(table.len(), 1);
+        assert!(!table.is_empty());
+        assert_eq!(table.plans(), &[indexed.clone()]);
+        assert_eq!(
+            table
+                .candidates_for_bytecode_index(indexed.bytecode_index)
+                .collect::<Vec<_>>(),
+            vec![&indexed]
+        );
+        assert_eq!(
+            indexed.effect_contract,
+            PropertyStoreAccessCasePlanContract::DATA_ONLY_INDEXED_STORE
+        );
+        assert!(indexed
+            .effect_contract
+            .supports_metadata_only_indexed_store_plan());
+        assert_eq!(
+            indexed.effect_contract.barrier,
+            PropertyStoreBarrierEffect::RequiresRuntimeStoredValueBarrierProof
+        );
+        assert_eq!(
+            indexed.planned_stub_kind,
+            InlineCacheStubKind::RepatchingStub
+        );
+        assert_eq!(indexed.access_case.kind, AccessCaseKind::IndexedStore);
+        assert_eq!(indexed.access_case.offset, None);
+        assert_eq!(indexed.access_case.new_structure, None);
+    }
+
+    #[test]
+    fn property_store_mutation_candidate_table_accepts_replace_transition_and_indexed_readiness_metadata(
+    ) {
         let replace = property_store_mutation_candidate(ready_property_store_replace_plan(), 1);
         let transition =
             property_store_mutation_candidate(ready_property_store_transition_plan(), 2);
+        let indexed = property_store_mutation_candidate(ready_property_store_indexed_plan(), 3);
 
         let table = PropertyStoreMutationCandidateTable::new(
             replace.plan.owner,
-            vec![replace.clone(), transition.clone()],
+            vec![replace.clone(), transition.clone(), indexed.clone()],
         )
         .expect("valid property-store mutation candidate table");
 
         assert_eq!(table.owner(), replace.plan.owner);
-        assert_eq!(table.len(), 2);
+        assert_eq!(table.len(), 3);
         assert!(!table.is_empty());
-        assert_eq!(table.candidates(), &[replace.clone(), transition.clone()]);
+        assert_eq!(
+            table.candidates(),
+            &[replace.clone(), transition.clone(), indexed.clone()]
+        );
         assert_eq!(
             table
                 .candidates_for_bytecode_index(replace.plan.bytecode_index)
@@ -5518,6 +7203,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&transition]
         );
+        assert_eq!(
+            table
+                .candidates_for_bytecode_index(indexed.plan.bytecode_index)
+                .collect::<Vec<_>>(),
+            vec![&indexed]
+        );
         assert_eq!(replace.store_plan_ordinal, 1);
         assert_eq!(replace.install_recheck_ordinal, 101);
         assert_eq!(replace.readiness_ordinal, 301);
@@ -5527,6 +7218,75 @@ mod tests {
             replace.barrier_evidence.last_write_barrier,
             BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier)
         );
+    }
+
+    #[test]
+    fn property_store_mutation_candidate_table_accepts_non_cell_no_barrier_readiness_metadata() {
+        let mut replace = property_store_mutation_candidate(ready_property_store_replace_plan(), 1);
+        replace.barrier_evidence.observed_write_barrier_count = 0;
+        replace.barrier_evidence.last_write_barrier =
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::NullOrNonCellTarget);
+        replace.stored_value_kind = ValueKind::Int32;
+
+        let table =
+            PropertyStoreMutationCandidateTable::new(replace.plan.owner, vec![replace.clone()])
+                .expect("valid non-cell no-barrier property-store candidate table");
+
+        assert_eq!(table.candidates(), std::slice::from_ref(&replace));
+
+        let mut cell = replace.clone();
+        cell.stored_value_kind = ValueKind::Cell;
+        assert_eq!(
+            PropertyStoreMutationCandidateTable::new(cell.plan.owner, vec![cell]),
+            Err(
+                InlineCacheValidationError::PropertyStoreMutationCandidateInvalidBarrierObservationCount(
+                    0,
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn property_store_mutation_candidate_table_newest_first_filters_without_reordering_storage() {
+        let replace = property_store_mutation_candidate(ready_property_store_replace_plan(), 1);
+        let mut newer_replace_plan = replace.plan.clone();
+        newer_replace_plan.access_case.base_structure = Some(StructureId(161));
+        newer_replace_plan.access_case.offset = Some(PropertyOffset::new(6));
+        let newer_replace = property_store_mutation_candidate(newer_replace_plan, 2);
+        let indexed = property_store_mutation_candidate(ready_property_store_indexed_plan(), 3);
+
+        let table = PropertyStoreMutationCandidateTable::new(
+            replace.plan.owner,
+            vec![replace.clone(), newer_replace.clone(), indexed.clone()],
+        )
+        .expect("valid property-store mutation candidate table");
+
+        assert_eq!(
+            table.candidates(),
+            &[replace.clone(), newer_replace.clone(), indexed.clone()]
+        );
+        assert_eq!(
+            table
+                .candidates_for_bytecode_index(replace.plan.bytecode_index)
+                .collect::<Vec<_>>(),
+            vec![&replace, &newer_replace]
+        );
+        assert_eq!(
+            table
+                .candidates_for_bytecode_index_newest_first(replace.plan.bytecode_index)
+                .collect::<Vec<_>>(),
+            vec![&newer_replace, &replace]
+        );
+        assert_eq!(
+            table
+                .candidates_for_bytecode_index_newest_first(indexed.plan.bytecode_index)
+                .collect::<Vec<_>>(),
+            vec![&indexed]
+        );
+        assert!(table
+            .candidates_for_bytecode_index_newest_first(1234)
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -5856,6 +7616,28 @@ mod tests {
             transition_hit.planned_offset,
             transition.access_case.offset.unwrap()
         );
+
+        let indexed = ready_property_store_indexed_plan();
+        let indexed_hit =
+            match GeneratedPropertyStoreProbeResult::hit_for_plan(&indexed, stored_value) {
+                GeneratedPropertyStoreProbeResult::Hit(hit) => hit,
+                other => panic!("expected indexed store hit metadata, got {other:?}"),
+            };
+
+        assert_eq!(
+            indexed_hit.continuation_plan_kind,
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore
+        );
+        assert_eq!(indexed_hit.key, indexed.key);
+        assert_eq!(indexed_hit.stored_value, stored_value);
+        assert_eq!(indexed_hit.effect_contract, indexed.effect_contract);
+        assert_eq!(indexed_hit.barrier_effect, indexed.effect_contract.barrier);
+        assert_eq!(
+            indexed_hit.base_structure,
+            indexed.access_case.base_structure.unwrap()
+        );
+        assert_eq!(indexed_hit.planned_new_structure, None);
+        assert_eq!(indexed_hit.planned_offset, PropertyOffset::INVALID);
     }
 
     #[test]
@@ -6565,6 +8347,58 @@ mod tests {
     }
 
     #[test]
+    fn inline_cache_property_load_normalized_string_base_skips_finite_own_plan() {
+        let mut observation = ready_own_data_property_observation();
+        observation.base_normalization = PropertyLoadBaseNormalization::StringPrototype;
+        observation.readiness = observation.classify_readiness();
+
+        assert_eq!(
+            plan_property_load_access_case_from_observation(&observation),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn inline_cache_element_load_ready_indexed_observation_derives_indexed_plan() {
+        let observation = ready_indexed_element_load_observation();
+
+        let plan = plan_property_load_access_case_from_observation(&observation)
+            .unwrap()
+            .expect("ready indexed element-load plan");
+
+        assert_eq!(
+            plan.plan_kind,
+            PropertyLoadAccessCasePlanKind::DataOnlyIndexedLoad
+        );
+        assert_eq!(plan.owner, observation.owner);
+        assert_eq!(plan.slot, observation.slot);
+        assert_eq!(plan.bytecode_index, observation.bytecode_index);
+        assert_eq!(plan.key, observation.key);
+        assert_eq!(plan.planned_stub_kind, InlineCacheStubKind::DataOnlyHandler);
+        assert_eq!(plan.access_case.kind, AccessCaseKind::IndexedLoad);
+        assert_eq!(plan.access_case.key, observation.key);
+        assert_eq!(plan.access_case.base_structure, observation.base_structure);
+        assert_eq!(plan.access_case.offset, None);
+        assert_eq!(plan.access_case.new_structure, None);
+        assert_eq!(plan.access_case.holder, None);
+        assert!(!plan.access_case.via_global_proxy);
+        assert!(!plan.access_case.may_call_js);
+        assert!(plan.access_case.dependencies.is_empty());
+
+        let slot = InlineCacheSlot::builder(plan.slot, InlineCacheKind::ElementLoad)
+            .owner(plan.owner)
+            .bytecode_index(plan.bytecode_index)
+            .state(InlineCacheState::Monomorphic)
+            .case(plan.access_case.clone())
+            .build()
+            .unwrap();
+        assert_eq!(
+            classify_inline_cache_slot(&slot),
+            Ok(InlineCacheCaseClassification::Monomorphic)
+        );
+    }
+
+    #[test]
     fn inline_cache_property_load_index_key_observation_does_not_derive_data_only_plan() {
         let mut observation = ready_own_data_property_observation();
         observation.key = CacheKey::Property(PropertyKey::from_index(
@@ -7155,6 +8989,444 @@ mod tests {
         assert_eq!(table.plans(), &[first.clone(), second.clone()]);
         let candidates = table.candidates_for_bytecode_index(21).collect::<Vec<_>>();
         assert_eq!(candidates, vec![&first, &second]);
+    }
+
+    #[test]
+    fn property_load_access_case_plan_table_newest_first_filters_without_reordering_storage() {
+        let mut first = ready_own_data_property_plan();
+        first.bytecode_index = 21;
+        let mut second = first.clone();
+        second.access_case.base_structure = Some(StructureId(8));
+        second.access_case.offset = Some(PropertyOffset::new(4));
+        let mut other_bytecode = second.clone();
+        other_bytecode.bytecode_index = 22;
+        other_bytecode.access_case.base_structure = Some(StructureId(9));
+
+        let table = PropertyLoadAccessCasePlanTable::new(
+            first.owner,
+            vec![first.clone(), second.clone(), other_bytecode.clone()],
+        )
+        .expect("valid same-bytecode polymorphic table");
+
+        assert_eq!(
+            table.plans(),
+            &[first.clone(), second.clone(), other_bytecode.clone()]
+        );
+        assert_eq!(
+            table.candidates_for_bytecode_index(21).collect::<Vec<_>>(),
+            vec![&first, &second]
+        );
+        assert_eq!(
+            table
+                .candidates_for_bytecode_index_newest_first(21)
+                .collect::<Vec<_>>(),
+            vec![&second, &first]
+        );
+        assert_eq!(
+            table
+                .candidates_for_bytecode_index_newest_first(22)
+                .collect::<Vec<_>>(),
+            vec![&other_bytecode]
+        );
+        assert!(table
+            .candidates_for_bytecode_index_newest_first(1234)
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn generated_property_load_megamorphic_lookup_keeps_same_primary_stale_terminal() {
+        let owner = CodeBlockId(CellId(940));
+        let slot = InlineCacheSlotId(3);
+        let bytecode_index = 17;
+        let key = test_property_key();
+        let structure = StructureId(971);
+        let epoch = 2;
+        let mut primary_entries = vec![None; 2048];
+        let mut secondary_entries = vec![None; 512];
+        let primary_index = generated_property_load_megamorphic_cache_primary_index(
+            structure,
+            key,
+            primary_entries.len(),
+        )
+        .expect("primary index");
+        let secondary_index = generated_property_load_megamorphic_cache_secondary_index(
+            structure,
+            key,
+            secondary_entries.len(),
+        )
+        .expect("secondary index");
+        primary_entries[primary_index] = Some(GeneratedPropertyLoadMegamorphicCacheEntry {
+            key,
+            base_structure: structure,
+            epoch: epoch - 1,
+            kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData {
+                offset: PropertyOffset::new(3),
+            },
+        });
+        secondary_entries[secondary_index] = Some(GeneratedPropertyLoadMegamorphicCacheEntry {
+            key,
+            base_structure: structure,
+            epoch,
+            kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData {
+                offset: PropertyOffset::new(4),
+            },
+        });
+        let table = GeneratedPropertyLoadMegamorphicCandidateTable::new(
+            owner,
+            epoch,
+            vec![GeneratedPropertyLoadMegamorphicSite {
+                owner,
+                slot,
+                bytecode_index,
+                key,
+            }],
+            primary_entries,
+            secondary_entries,
+        )
+        .expect("megamorphic table");
+
+        assert_eq!(
+            table.lookup(slot, bytecode_index, key, structure),
+            GeneratedPropertyLoadMegamorphicLookup::Miss
+        );
+    }
+
+    #[test]
+    fn generated_property_load_megamorphic_lookup_uses_secondary_after_primary_key_mismatch() {
+        let owner = CodeBlockId(CellId(941));
+        let slot = InlineCacheSlotId(3);
+        let bytecode_index = 17;
+        let key = test_property_key();
+        let structure = StructureId(972);
+        let epoch = 2;
+        let mut primary_entries = vec![None; 2048];
+        let mut secondary_entries = vec![None; 512];
+        let primary_index = generated_property_load_megamorphic_cache_primary_index(
+            structure,
+            key,
+            primary_entries.len(),
+        )
+        .expect("primary index");
+        let secondary_index = generated_property_load_megamorphic_cache_secondary_index(
+            structure,
+            key,
+            secondary_entries.len(),
+        )
+        .expect("secondary index");
+        primary_entries[primary_index] = Some(GeneratedPropertyLoadMegamorphicCacheEntry {
+            key,
+            base_structure: StructureId(973),
+            epoch,
+            kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData {
+                offset: PropertyOffset::new(3),
+            },
+        });
+        secondary_entries[secondary_index] = Some(GeneratedPropertyLoadMegamorphicCacheEntry {
+            key,
+            base_structure: structure,
+            epoch,
+            kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData {
+                offset: PropertyOffset::new(4),
+            },
+        });
+        let table = GeneratedPropertyLoadMegamorphicCandidateTable::new(
+            owner,
+            epoch,
+            vec![GeneratedPropertyLoadMegamorphicSite {
+                owner,
+                slot,
+                bytecode_index,
+                key,
+            }],
+            primary_entries,
+            secondary_entries,
+        )
+        .expect("megamorphic table");
+
+        let GeneratedPropertyLoadMegamorphicLookup::Hit(plan) =
+            table.lookup(slot, bytecode_index, key, structure)
+        else {
+            panic!("expected secondary megamorphic hit");
+        };
+        assert_eq!(plan.access_case.base_structure, Some(structure));
+        assert_eq!(plan.access_case.offset, Some(PropertyOffset::new(4)));
+    }
+
+    #[test]
+    fn generated_property_store_megamorphic_lookup_uses_secondary_after_primary_key_mismatch() {
+        let owner = CodeBlockId(CellId(944));
+        let slot = InlineCacheSlotId(3);
+        let bytecode_index = 17;
+        let key = test_property_key();
+        let structure = StructureId(982);
+        let epoch = 2;
+        let mut primary_entries = vec![None; 2048];
+        let mut secondary_entries = vec![None; 512];
+        let primary_index = generated_property_store_megamorphic_cache_primary_index(
+            structure,
+            key,
+            primary_entries.len(),
+        )
+        .expect("primary index");
+        let secondary_index = generated_property_store_megamorphic_cache_secondary_index(
+            structure,
+            key,
+            secondary_entries.len(),
+        )
+        .expect("secondary index");
+        primary_entries[primary_index] = Some(GeneratedPropertyStoreMegamorphicCacheEntry {
+            key,
+            old_structure: StructureId(983),
+            new_structure: StructureId(983),
+            epoch,
+            offset: PropertyOffset::new(3),
+            reallocating: false,
+        });
+        secondary_entries[secondary_index] = Some(GeneratedPropertyStoreMegamorphicCacheEntry {
+            key,
+            old_structure: structure,
+            new_structure: structure,
+            epoch,
+            offset: PropertyOffset::new(4),
+            reallocating: false,
+        });
+        let table = GeneratedPropertyStoreMegamorphicCandidateTable::new(
+            owner,
+            epoch,
+            vec![GeneratedPropertyStoreMegamorphicSite {
+                owner,
+                slot,
+                bytecode_index,
+                key,
+            }],
+            primary_entries,
+            secondary_entries,
+        )
+        .expect("store megamorphic table");
+
+        let GeneratedPropertyStoreMegamorphicLookup::Hit(plan) =
+            table.lookup(slot, bytecode_index, key, structure)
+        else {
+            panic!("expected secondary megamorphic store hit");
+        };
+        assert_eq!(
+            plan.plan_kind,
+            PropertyStoreAccessCasePlanKind::DataOnlyReplace
+        );
+        assert_eq!(plan.access_case.base_structure, Some(structure));
+        assert_eq!(plan.access_case.offset, Some(PropertyOffset::new(4)));
+    }
+
+    #[test]
+    fn generated_property_has_megamorphic_lookup_keeps_same_primary_stale_terminal() {
+        let owner = CodeBlockId(CellId(945));
+        let slot = InlineCacheSlotId(3);
+        let bytecode_index = 17;
+        let key = test_property_key();
+        let structure = StructureId(984);
+        let epoch = 2;
+        let mut primary_entries = vec![None; 512];
+        let mut secondary_entries = vec![None; 128];
+        let primary_index = generated_property_has_megamorphic_cache_primary_index(
+            structure,
+            key,
+            primary_entries.len(),
+        )
+        .expect("primary index");
+        let secondary_index = generated_property_has_megamorphic_cache_secondary_index(
+            structure,
+            key,
+            secondary_entries.len(),
+        )
+        .expect("secondary index");
+        primary_entries[primary_index] = Some(GeneratedPropertyHasMegamorphicCacheEntry {
+            key,
+            base_structure: structure,
+            epoch: epoch - 1,
+            result: false,
+        });
+        secondary_entries[secondary_index] = Some(GeneratedPropertyHasMegamorphicCacheEntry {
+            key,
+            base_structure: structure,
+            epoch,
+            result: true,
+        });
+        let table = GeneratedPropertyHasMegamorphicCandidateTable::new(
+            owner,
+            epoch,
+            vec![GeneratedPropertyHasMegamorphicSite {
+                owner,
+                slot,
+                bytecode_index,
+                key,
+            }],
+            primary_entries,
+            secondary_entries,
+        )
+        .expect("has megamorphic table");
+
+        assert_eq!(
+            table.lookup(slot, bytecode_index, key, structure),
+            GeneratedPropertyHasMegamorphicLookup::Miss
+        );
+    }
+
+    #[test]
+    fn generated_property_has_megamorphic_lookup_uses_secondary_after_primary_key_mismatch() {
+        let owner = CodeBlockId(CellId(946));
+        let slot = InlineCacheSlotId(3);
+        let bytecode_index = 17;
+        let key = test_property_key();
+        let structure = StructureId(985);
+        let epoch = 2;
+        let mut primary_entries = vec![None; 512];
+        let mut secondary_entries = vec![None; 128];
+        let primary_index = generated_property_has_megamorphic_cache_primary_index(
+            structure,
+            key,
+            primary_entries.len(),
+        )
+        .expect("primary index");
+        let secondary_index = generated_property_has_megamorphic_cache_secondary_index(
+            structure,
+            key,
+            secondary_entries.len(),
+        )
+        .expect("secondary index");
+        primary_entries[primary_index] = Some(GeneratedPropertyHasMegamorphicCacheEntry {
+            key,
+            base_structure: StructureId(986),
+            epoch,
+            result: false,
+        });
+        secondary_entries[secondary_index] = Some(GeneratedPropertyHasMegamorphicCacheEntry {
+            key,
+            base_structure: structure,
+            epoch,
+            result: true,
+        });
+        let table = GeneratedPropertyHasMegamorphicCandidateTable::new(
+            owner,
+            epoch,
+            vec![GeneratedPropertyHasMegamorphicSite {
+                owner,
+                slot,
+                bytecode_index,
+                key,
+            }],
+            primary_entries,
+            secondary_entries,
+        )
+        .expect("has megamorphic table");
+
+        assert_eq!(
+            table.lookup(slot, bytecode_index, key, structure),
+            GeneratedPropertyHasMegamorphicLookup::Hit(true)
+        );
+    }
+
+    #[test]
+    fn generated_property_has_megamorphic_lookup_returns_cached_false_result() {
+        let owner = CodeBlockId(CellId(947));
+        let slot = InlineCacheSlotId(3);
+        let bytecode_index = 17;
+        let key = test_property_key();
+        let structure = StructureId(987);
+        let epoch = 2;
+        let table = GeneratedPropertyHasMegamorphicCandidateTable::test_with_primary_entry(
+            owner,
+            epoch,
+            GeneratedPropertyHasMegamorphicSite {
+                owner,
+                slot,
+                bytecode_index,
+                key,
+            },
+            GeneratedPropertyHasMegamorphicCacheEntry {
+                key,
+                base_structure: structure,
+                epoch,
+                result: false,
+            },
+        );
+
+        assert_eq!(
+            table.lookup(slot, bytecode_index, key, structure),
+            GeneratedPropertyHasMegamorphicLookup::Hit(false)
+        );
+    }
+
+    #[test]
+    fn generated_property_load_megamorphic_lookup_returns_missing_for_null_holder_entry() {
+        let owner = CodeBlockId(CellId(942));
+        let slot = InlineCacheSlotId(3);
+        let bytecode_index = 17;
+        let key = test_property_key();
+        let structure = StructureId(974);
+        let epoch = 2;
+        let table = GeneratedPropertyLoadMegamorphicCandidateTable::test_with_primary_entry(
+            owner,
+            epoch,
+            GeneratedPropertyLoadMegamorphicSite {
+                owner,
+                slot,
+                bytecode_index,
+                key,
+            },
+            GeneratedPropertyLoadMegamorphicCacheEntry {
+                key,
+                base_structure: structure,
+                epoch,
+                kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing,
+            },
+        );
+
+        assert_eq!(
+            table.lookup(slot, bytecode_index, key, structure),
+            GeneratedPropertyLoadMegamorphicLookup::Missing
+        );
+    }
+
+    #[test]
+    fn generated_property_load_megamorphic_lookup_returns_prototype_holder_entry() {
+        let owner = CodeBlockId(CellId(943));
+        let slot = InlineCacheSlotId(3);
+        let bytecode_index = 17;
+        let key = test_property_key();
+        let structure = StructureId(975);
+        let holder = ObjectId(CellId(976));
+        let offset = PropertyOffset::new(6);
+        let epoch = 2;
+        let table = GeneratedPropertyLoadMegamorphicCandidateTable::test_with_primary_entry(
+            owner,
+            epoch,
+            GeneratedPropertyLoadMegamorphicSite {
+                owner,
+                slot,
+                bytecode_index,
+                key,
+            },
+            GeneratedPropertyLoadMegamorphicCacheEntry {
+                key,
+                base_structure: structure,
+                epoch,
+                kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData {
+                    holder,
+                    offset,
+                },
+            },
+        );
+
+        assert_eq!(
+            table.lookup(slot, bytecode_index, key, structure),
+            GeneratedPropertyLoadMegamorphicLookup::PrototypeData {
+                key,
+                base_structure: structure,
+                holder,
+                offset,
+            }
+        );
     }
 
     #[test]

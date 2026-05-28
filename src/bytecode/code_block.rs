@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use crate::gc::StructureId;
 use crate::runtime::{CodeBlockId, ExecutableId, GlobalObjectId, ScopeId};
 use crate::strings::{AtomId, Identifier, PropertyKey};
 use crate::value::JsValue;
@@ -34,7 +35,12 @@ use crate::bytecode::instruction::{
 use crate::bytecode::metadata::{InstructionMetadataPlan, MetadataLayout, MetadataLinkingData};
 use crate::bytecode::opcode::{CoreOpcode, MetadataFieldSpec, Opcode, OpcodeSchemaVersion};
 use crate::bytecode::origin::{CodeOrigin, CodeOriginTable, SourceNoteLookup};
-use crate::bytecode::profiling::{ProfilingCounterSet, ValueProfileTable};
+use crate::bytecode::profiling::{
+    ArrayProfile, ProfileUpdatePolicy, ProfilingCounterSet, SpeculatedTypeSet,
+    UnlinkedValueProfile, ValueProfile, ValueProfileBucket, ValueProfileBucketKind,
+    ValueProfileBucketSample, ValueProfileEmissionCapability, ValueProfileEmissionPolicy,
+    ValueProfileSampleError, ValueProfileTable,
+};
 use crate::bytecode::register::{RegisterFrameShape, SpecialRegisters, VirtualRegister};
 
 pub const BYTECODE_INDEX_CHECKPOINTS: u8 = 4;
@@ -497,6 +503,7 @@ pub enum CodeBlockMutationError {
         expected: CodeBlockLifecycleState,
         actual: CodeBlockLifecycleState,
     },
+    ValueProfileSample(ValueProfileSampleError),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -583,8 +590,24 @@ impl CodeBlock {
         &self.side_tables
     }
 
+    pub fn array_profile_for_bytecode_index(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<&ArrayProfile> {
+        self.side_tables
+            .array_profiles
+            .iter()
+            .find(|profile| profile.bytecode_index == bytecode_index)
+    }
+
     pub fn tier_state(&self) -> &CodeBlockTierState {
         &self.tier_state
+    }
+
+    pub fn value_profile_emission_policy(&self) -> ValueProfileEmissionPolicy {
+        ValueProfileEmissionPolicy::from_capability(
+            self.tier_state.value_profile_emission_capability,
+        )
     }
 
     pub fn entrypoints(&self) -> &CodeBlockEntrypoints {
@@ -627,6 +650,13 @@ impl CodeBlock {
 
     pub fn with_tier_state(mut self, tier_state: CodeBlockTierState) -> Self {
         self.tier_state = tier_state;
+        let emission_policy = self.value_profile_emission_policy();
+        if self.side_tables.value_profiles.emission_policy != emission_policy {
+            self.side_tables.value_profiles.emission_policy = emission_policy;
+            self.side_tables
+                .value_profiles
+                .materialize_jit_storage_from_profiles();
+        }
         self
     }
 
@@ -666,6 +696,89 @@ impl CodeBlock {
         self.tier_state.current_tier = ExecutionTier::BaselineJit;
         self.lifecycle = CodeBlockLifecycleState::BaselineInstalled;
         Ok(())
+    }
+
+    pub fn record_value_profile_sample(
+        &mut self,
+        authority: CodeBlockMutationAuthority,
+        bytecode_index: BytecodeIndex,
+        checkpoint: Checkpoint,
+        kind: ValueProfileBucketKind,
+        value: JsValue,
+    ) -> Result<ValueProfileBucketSample, CodeBlockMutationError> {
+        let expected_authority = CodeBlockMutationAuthority::VmMainThread;
+        if authority != expected_authority {
+            return Err(CodeBlockMutationError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: authority,
+            });
+        }
+        if self.mutation_authority != expected_authority {
+            return Err(CodeBlockMutationError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: self.mutation_authority,
+            });
+        }
+
+        match self.lifecycle {
+            CodeBlockLifecycleState::LinkedInterpreter
+            | CodeBlockLifecycleState::BaselineInstalled => {}
+            actual => {
+                return Err(CodeBlockMutationError::InvalidLifecycle {
+                    expected: CodeBlockLifecycleState::LinkedInterpreter,
+                    actual,
+                });
+            }
+        }
+
+        self.side_tables
+            .value_profiles
+            .record_sample(bytecode_index, checkpoint, kind, value)
+            .map_err(CodeBlockMutationError::ValueProfileSample)
+    }
+
+    pub fn record_array_profile_indexed_read(
+        &mut self,
+        authority: CodeBlockMutationAuthority,
+        bytecode_index: BytecodeIndex,
+        structure: StructureId,
+        out_of_bounds: bool,
+    ) -> Result<Option<ArrayProfile>, CodeBlockMutationError> {
+        let expected_authority = CodeBlockMutationAuthority::VmMainThread;
+        if authority != expected_authority {
+            return Err(CodeBlockMutationError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: authority,
+            });
+        }
+        if self.mutation_authority != expected_authority {
+            return Err(CodeBlockMutationError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: self.mutation_authority,
+            });
+        }
+
+        match self.lifecycle {
+            CodeBlockLifecycleState::LinkedInterpreter
+            | CodeBlockLifecycleState::BaselineInstalled => {}
+            actual => {
+                return Err(CodeBlockMutationError::InvalidLifecycle {
+                    expected: CodeBlockLifecycleState::LinkedInterpreter,
+                    actual,
+                });
+            }
+        }
+
+        let Some(profile) = self
+            .side_tables
+            .array_profiles
+            .iter_mut()
+            .find(|profile| profile.bytecode_index == bytecode_index)
+        else {
+            return Ok(None);
+        };
+        profile.observe_indexed_read(structure, out_of_bounds);
+        Ok(Some(*profile))
     }
 
     pub fn attach_property_inline_cache_case(
@@ -1067,9 +1180,14 @@ impl CodeBlock {
             max_argument_count_including_this_for_varargs,
         ) = {
             let call = &mut self.side_tables.inline_caches.calls[request.slot];
-            call.call_type = CallType::Call;
+            let (call_type, specialization) = call_link_descriptor_shape_for_opcode(call.opcode)
+                .ok_or(CallLinkInlineCacheClearError::UnsupportedOpcode {
+                    slot: request.slot,
+                    opcode: call.opcode,
+                })?;
+            call.call_type = call_type;
             call.mode = CallLinkMode::Init;
-            call.specialization = CodeSpecialization::Call;
+            call.specialization = specialization;
             call.target = CallTarget::Unlinked;
             call.slow_path_count = 0;
             call.max_argument_count_including_this_for_varargs = 0;
@@ -1427,7 +1545,7 @@ fn validate_call_link_inline_cache_attachment_opcode(
             },
         );
     };
-    if !matches!(decoded_opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+    if call_link_descriptor_shape_for_opcode(decoded_opcode).is_none() {
         return Err(CallLinkInlineCacheAttachmentError::UnsupportedOpcode {
             slot: request.slot,
             opcode: decoded_opcode,
@@ -1456,20 +1574,27 @@ fn validate_call_link_inline_cache_attachment_descriptor(
     request: &CallLinkInlineCacheAttachmentRequest,
     call: &CallLinkInfo,
 ) -> Result<(), CallLinkInlineCacheAttachmentError> {
-    if call.call_type != CallType::Call {
+    let (expected_call_type, expected_specialization) = call_link_descriptor_shape_for_opcode(
+        call.opcode,
+    )
+    .ok_or(CallLinkInlineCacheAttachmentError::UnsupportedOpcode {
+        slot: request.slot,
+        opcode: call.opcode,
+    })?;
+    if call.call_type != expected_call_type {
         return Err(
             CallLinkInlineCacheAttachmentError::InvalidExistingCallType {
                 slot: request.slot,
-                expected: CallType::Call,
+                expected: expected_call_type,
                 actual: call.call_type,
             },
         );
     }
-    if call.specialization != CodeSpecialization::Call {
+    if call.specialization != expected_specialization {
         return Err(
             CallLinkInlineCacheAttachmentError::InvalidExistingSpecialization {
                 slot: request.slot,
-                expected: CodeSpecialization::Call,
+                expected: expected_specialization,
                 actual: call.specialization,
             },
         );
@@ -1555,7 +1680,7 @@ fn validate_call_link_inline_cache_clear_opcode(
             },
         );
     };
-    if !matches!(decoded_opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+    if call_link_descriptor_shape_for_opcode(decoded_opcode).is_none() {
         return Err(CallLinkInlineCacheClearError::UnsupportedOpcode {
             slot: request.slot,
             opcode: decoded_opcode,
@@ -1584,18 +1709,25 @@ fn validate_call_link_inline_cache_clear_descriptor(
     request: &CallLinkInlineCacheClearRequest,
     call: &CallLinkInfo,
 ) -> Result<(), CallLinkInlineCacheClearError> {
-    if call.call_type != CallType::Call {
+    let (expected_call_type, expected_specialization) = call_link_descriptor_shape_for_opcode(
+        call.opcode,
+    )
+    .ok_or(CallLinkInlineCacheClearError::UnsupportedOpcode {
+        slot: request.slot,
+        opcode: call.opcode,
+    })?;
+    if call.call_type != expected_call_type {
         return Err(CallLinkInlineCacheClearError::InvalidExistingCallType {
             slot: request.slot,
-            expected: CallType::Call,
+            expected: expected_call_type,
             actual: call.call_type,
         });
     }
-    if call.specialization != CodeSpecialization::Call {
+    if call.specialization != expected_specialization {
         return Err(
             CallLinkInlineCacheClearError::InvalidExistingSpecialization {
                 slot: request.slot,
-                expected: CodeSpecialization::Call,
+                expected: expected_specialization,
                 actual: call.specialization,
             },
         );
@@ -1744,7 +1876,7 @@ fn validate_call_link_inline_cache_attached_metadata_opcode(
             },
         );
     };
-    if !matches!(decoded_opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+    if call_link_descriptor_shape_for_opcode(decoded_opcode).is_none() {
         return Err(
             CallLinkInlineCacheAttachedMetadataError::UnsupportedOpcode {
                 slot: request.slot,
@@ -1775,20 +1907,27 @@ fn validate_call_link_inline_cache_attached_metadata_descriptor(
     request: &CallLinkInlineCacheAttachedMetadataRequest,
     call: &CallLinkInfo,
 ) -> Result<(), CallLinkInlineCacheAttachedMetadataError> {
-    if call.call_type != CallType::Call {
+    let (expected_call_type, expected_specialization) =
+        call_link_descriptor_shape_for_opcode(call.opcode).ok_or(
+            CallLinkInlineCacheAttachedMetadataError::UnsupportedOpcode {
+                slot: request.slot,
+                opcode: call.opcode,
+            },
+        )?;
+    if call.call_type != expected_call_type {
         return Err(
             CallLinkInlineCacheAttachedMetadataError::InvalidExistingCallType {
                 slot: request.slot,
-                expected: CallType::Call,
+                expected: expected_call_type,
                 actual: call.call_type,
             },
         );
     }
-    if call.specialization != CodeSpecialization::Call {
+    if call.specialization != expected_specialization {
         return Err(
             CallLinkInlineCacheAttachedMetadataError::InvalidExistingSpecialization {
                 slot: request.slot,
-                expected: CodeSpecialization::Call,
+                expected: expected_specialization,
                 actual: call.specialization,
             },
         );
@@ -2619,19 +2758,40 @@ fn linked_side_tables_from_unlinked(unlinked: &UnlinkedCodeBlock) -> LinkedSideT
         exception_handlers: unlinked_side_tables.exception_handlers.clone(),
         root_maps: unlinked_side_tables.root_maps.clone(),
         inline_caches: InlineCacheTable {
-            property_accesses: derive_named_property_inline_caches(unlinked),
+            property_accesses: derive_property_inline_caches(unlinked),
             calls: derive_call_link_inline_caches(unlinked),
             ..InlineCacheTable::default()
         },
+        array_profiles: derive_simple_array_profiles(unlinked),
+        value_profiles: derive_call_result_value_profiles(
+            unlinked,
+            ValueProfileEmissionPolicy::default(),
+        ),
         ..LinkedSideTables::default()
     }
 }
 
-fn derive_named_property_inline_caches(unlinked: &UnlinkedCodeBlock) -> Vec<PropertyInlineCache> {
+fn derive_property_inline_caches(unlinked: &UnlinkedCodeBlock) -> Vec<PropertyInlineCache> {
     let mut caches = Vec::new();
     for decoded in unlinked.instructions().decoded_instructions().flatten() {
         match crate::bytecode::opcode::CoreOpcode::from_opcode(decoded.opcode) {
             Some(crate::bytecode::opcode::CoreOpcode::GetByName) => {
+                let Ok(base) = decoded.register_operand(1) else {
+                    continue;
+                };
+                let Ok(Operand::IdentifierIndex(identifier_index)) = decoded.operand(2) else {
+                    continue;
+                };
+                let property = PropertyKey::from_identifier(Identifier::from_atom(
+                    AtomId::from_table_slot(identifier_index),
+                ));
+                caches.push(PropertyInlineCache::get_by_name_load(
+                    decoded.bytecode_index,
+                    base,
+                    property,
+                ));
+            }
+            Some(crate::bytecode::opcode::CoreOpcode::GetLength) => {
                 let Ok(base) = decoded.register_operand(1) else {
                     continue;
                 };
@@ -2663,10 +2823,99 @@ fn derive_named_property_inline_caches(unlinked: &UnlinkedCodeBlock) -> Vec<Prop
                     property,
                 ));
             }
+            Some(crate::bytecode::opcode::CoreOpcode::GetGlobalObjectProperty) => {
+                let Ok(Operand::IdentifierIndex(identifier_index)) = decoded.operand(1) else {
+                    continue;
+                };
+                let property = PropertyKey::from_identifier(Identifier::from_atom(
+                    AtomId::from_table_slot(identifier_index),
+                ));
+                caches.push(PropertyInlineCache::get_global_object_property_load(
+                    decoded.bytecode_index,
+                    property,
+                ));
+            }
+            Some(crate::bytecode::opcode::CoreOpcode::PutGlobalObjectProperty) => {
+                let Ok(Operand::IdentifierIndex(identifier_index)) = decoded.operand(0) else {
+                    continue;
+                };
+                let property = PropertyKey::from_identifier(Identifier::from_atom(
+                    AtomId::from_table_slot(identifier_index),
+                ));
+                caches.push(PropertyInlineCache::put_global_object_property_store(
+                    decoded.bytecode_index,
+                    property,
+                ));
+            }
+            Some(crate::bytecode::opcode::CoreOpcode::GetByValue) => {
+                let Ok(base) = decoded.register_operand(1) else {
+                    continue;
+                };
+                let Ok(property) = decoded.register_operand(2) else {
+                    continue;
+                };
+                caches.push(PropertyInlineCache::get_by_value_load(
+                    decoded.bytecode_index,
+                    base,
+                    property,
+                ));
+            }
+            Some(crate::bytecode::opcode::CoreOpcode::PutByValue) => {
+                let Ok(base) = decoded.register_operand(0) else {
+                    continue;
+                };
+                let Ok(property) = decoded.register_operand(1) else {
+                    continue;
+                };
+                caches.push(PropertyInlineCache::put_by_value_store(
+                    decoded.bytecode_index,
+                    base,
+                    property,
+                ));
+            }
+            Some(crate::bytecode::opcode::CoreOpcode::InById) => {
+                let Ok(base) = decoded.register_operand(1) else {
+                    continue;
+                };
+                let Ok(Operand::IdentifierIndex(identifier_index)) = decoded.operand(2) else {
+                    continue;
+                };
+                let property = PropertyKey::from_identifier(Identifier::from_atom(
+                    AtomId::from_table_slot(identifier_index),
+                ));
+                caches.push(PropertyInlineCache::in_by_id_has(
+                    decoded.bytecode_index,
+                    base,
+                    property,
+                ));
+            }
+            Some(crate::bytecode::opcode::CoreOpcode::InByVal) => {
+                let Ok(base) = decoded.register_operand(1) else {
+                    continue;
+                };
+                let Ok(property) = decoded.register_operand(2) else {
+                    continue;
+                };
+                caches.push(PropertyInlineCache::in_by_value_has(
+                    decoded.bytecode_index,
+                    base,
+                    property,
+                ));
+            }
             _ => {}
         }
     }
     caches
+}
+
+fn derive_simple_array_profiles(unlinked: &UnlinkedCodeBlock) -> Vec<ArrayProfile> {
+    let mut profiles = Vec::new();
+    for decoded in unlinked.instructions().decoded_instructions().flatten() {
+        if CoreOpcode::from_opcode(decoded.opcode) == Some(CoreOpcode::InByVal) {
+            profiles.push(ArrayProfile::for_bytecode_index(decoded.bytecode_index));
+        }
+    }
+    profiles
 }
 
 fn derive_call_link_inline_caches(unlinked: &UnlinkedCodeBlock) -> Vec<CallLinkInfo> {
@@ -2675,17 +2924,72 @@ fn derive_call_link_inline_caches(unlinked: &UnlinkedCodeBlock) -> Vec<CallLinkI
         let Some(opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
             continue;
         };
-        if !matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+        if call_link_descriptor_shape_for_opcode(opcode).is_none() {
             continue;
         }
         let call_site = call_site_for_decoded_call(&decoded);
-        calls.push(CallLinkInfo::metadata_only_unlinked_call(
-            call_site,
-            decoded.bytecode_index,
-            opcode,
-        ));
+        let call = match opcode {
+            CoreOpcode::Call | CoreOpcode::CallWithThis => {
+                CallLinkInfo::metadata_only_unlinked_call(call_site, decoded.bytecode_index, opcode)
+            }
+            CoreOpcode::Construct => CallLinkInfo::metadata_only_unlinked_construct(
+                call_site,
+                decoded.bytecode_index,
+                opcode,
+            ),
+            _ => unreachable!(),
+        };
+        calls.push(call);
     }
     calls
+}
+
+fn derive_call_result_value_profiles(
+    unlinked: &UnlinkedCodeBlock,
+    emission_policy: ValueProfileEmissionPolicy,
+) -> ValueProfileTable {
+    let mut table = ValueProfileTable::default();
+    table.emission_policy = emission_policy;
+    for decoded in unlinked.instructions().decoded_instructions().flatten() {
+        let Some(opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
+            continue;
+        };
+        if !matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+            continue;
+        }
+        let Ok(destination) = decoded.register_operand(0) else {
+            continue;
+        };
+        let slot = RuntimeSlot(table.profiles.len().saturating_add(1) as u32);
+        table.profiles.push(ValueProfile {
+            bytecode_index: decoded.bytecode_index,
+            checkpoint: Checkpoint::NONE,
+            operand: Some(destination),
+            buckets: vec![ValueProfileBucket {
+                slot,
+                kind: ValueProfileBucketKind::Sample,
+            }],
+            prediction: SpeculatedTypeSet(0),
+            update_policy: ProfileUpdatePolicy::ConcurrentBuckets,
+        });
+        table
+            .unlinked_predictions
+            .push(UnlinkedValueProfile::default());
+    }
+    table.materialize_jit_storage_from_profiles();
+    table
+}
+
+const fn call_link_descriptor_shape_for_opcode(
+    opcode: CoreOpcode,
+) -> Option<(CallType, CodeSpecialization)> {
+    match opcode {
+        CoreOpcode::Call | CoreOpcode::CallWithThis => {
+            Some((CallType::Call, CodeSpecialization::Call))
+        }
+        CoreOpcode::Construct => Some((CallType::Construct, CodeSpecialization::Construct)),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3031,6 +3335,7 @@ pub struct LinkedSideTables {
     pub exception_handlers: ExceptionHandlerTable,
     pub bytecode_hooks: BytecodeHookTable,
     pub inline_caches: InlineCacheTable,
+    pub array_profiles: Vec<ArrayProfile>,
     pub value_profiles: ValueProfileTable,
     pub root_maps: Vec<BytecodeRootMap>,
     pub direct_eval_cache: Option<DirectEvalCacheRef>,
@@ -3265,6 +3570,7 @@ pub struct CodeBlockTierState {
     pub baseline_counter: TierCounterState,
     pub optimizing_counter: TierCounterState,
     pub profiling_counters: ProfilingCounterSet,
+    pub value_profile_emission_capability: ValueProfileEmissionCapability,
     pub current_tier: ExecutionTier,
     pub replacement: Option<CodeBlockId>,
     pub osr_exit_count: u32,
@@ -3383,6 +3689,23 @@ mod tests {
         }
     }
 
+    fn get_global_object_property_instruction(
+        offset: u32,
+        result: VirtualRegister,
+        identifier_index: u32,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: CoreOpcode::GetGlobalObjectProperty.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![
+                Operand::Register(result),
+                Operand::IdentifierIndex(identifier_index),
+            ],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
     fn put_by_name_instruction(
         offset: u32,
         base: VirtualRegister,
@@ -3396,6 +3719,99 @@ mod tests {
                 Operand::Register(base),
                 Operand::IdentifierIndex(identifier_index),
                 Operand::Register(value),
+            ],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn put_global_object_property_instruction(
+        offset: u32,
+        identifier_index: u32,
+        value: VirtualRegister,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: CoreOpcode::PutGlobalObjectProperty.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![
+                Operand::IdentifierIndex(identifier_index),
+                Operand::Register(value),
+            ],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn get_by_value_instruction(
+        offset: u32,
+        result: VirtualRegister,
+        base: VirtualRegister,
+        property: VirtualRegister,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: CoreOpcode::GetByValue.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![
+                Operand::Register(result),
+                Operand::Register(base),
+                Operand::Register(property),
+            ],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn put_by_value_instruction(
+        offset: u32,
+        base: VirtualRegister,
+        property: VirtualRegister,
+        value: VirtualRegister,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: CoreOpcode::PutByValue.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![
+                Operand::Register(base),
+                Operand::Register(property),
+                Operand::Register(value),
+            ],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn in_by_id_instruction(
+        offset: u32,
+        result: VirtualRegister,
+        base: VirtualRegister,
+        identifier_index: u32,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: CoreOpcode::InById.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![
+                Operand::Register(result),
+                Operand::Register(base),
+                Operand::IdentifierIndex(identifier_index),
+            ],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn in_by_value_instruction(
+        offset: u32,
+        result: VirtualRegister,
+        base: VirtualRegister,
+        property: VirtualRegister,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: CoreOpcode::InByVal.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![
+                Operand::Register(result),
+                Operand::Register(base),
+                Operand::Register(property),
             ],
             schema: None,
             bytecode_index: Some(BytecodeIndex::from_offset(offset)),
@@ -3439,6 +3855,27 @@ mod tests {
         operands.extend(arguments.into_iter().map(Operand::Register));
         TypedInstruction {
             opcode: CoreOpcode::CallWithThis.opcode(),
+            width: OperandWidth::Narrow,
+            operands,
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn construct_instruction(
+        offset: u32,
+        destination: VirtualRegister,
+        callee: VirtualRegister,
+        arguments: Vec<VirtualRegister>,
+    ) -> TypedInstruction {
+        let mut operands = vec![
+            Operand::Register(destination),
+            Operand::Register(callee),
+            Operand::UnsignedImmediate(arguments.len().try_into().unwrap_or(u32::MAX)),
+        ];
+        operands.extend(arguments.into_iter().map(Operand::Register));
+        TypedInstruction {
+            opcode: CoreOpcode::Construct.opcode(),
             width: OperandWidth::Narrow,
             operands,
             schema: None,
@@ -3604,6 +4041,34 @@ mod tests {
     }
 
     #[test]
+    fn linked_code_block_derives_get_global_object_property_inline_cache_site() {
+        let code_block =
+            linked_property_ic_code_block(vec![get_global_object_property_instruction(
+                0,
+                VirtualRegister::local(0),
+                23,
+            )]);
+        let cache = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("GetGlobalObjectProperty property IC metadata");
+
+        assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(cache.access, PropertyAccessType::GetById);
+        assert_eq!(cache.kind, PropertyCacheKind::GetById);
+        assert_eq!(cache.base, None);
+        assert_eq!(
+            cache.property,
+            PropertyCacheKey::Key(PropertyKey::from_identifier(Identifier::from_atom(
+                AtomId::from_table_slot(23),
+            )))
+        );
+        assert!(cache.get_by_id.is_some());
+        assert!(cache.put_by_id.is_none());
+    }
+
+    #[test]
     fn linked_code_block_derives_put_by_name_property_inline_cache_site() {
         let instructions = PackedInstructionStream::from_typed_placeholder(vec![
             TypedInstruction {
@@ -3650,37 +4115,203 @@ mod tests {
     }
 
     #[test]
-    fn linked_code_block_keeps_get_by_name_and_put_by_name_property_metadata_separate() {
+    fn linked_code_block_derives_put_global_object_property_inline_cache_site() {
+        let code_block =
+            linked_property_ic_code_block(vec![put_global_object_property_instruction(
+                0,
+                23,
+                VirtualRegister::local(2),
+            )]);
+        let cache = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("PutGlobalObjectProperty property IC metadata");
+
+        assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(cache.access, PropertyAccessType::PutByIdSloppy);
+        assert_eq!(cache.kind, PropertyCacheKind::PutById);
+        assert_eq!(cache.base, None);
+        assert_eq!(
+            cache.property,
+            PropertyCacheKey::Key(PropertyKey::from_identifier(Identifier::from_atom(
+                AtomId::from_table_slot(23),
+            )))
+        );
+        assert!(cache.get_by_id.is_none());
+        assert!(cache.put_by_id.is_some());
+    }
+
+    #[test]
+    fn linked_code_block_derives_get_by_value_property_inline_cache_site() {
+        let code_block = linked_property_ic_code_block(vec![get_by_value_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            VirtualRegister::local(2),
+        )]);
+        let cache = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("GetByValue property IC metadata");
+
+        assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(cache.access, PropertyAccessType::GetByVal);
+        assert_eq!(cache.kind, PropertyCacheKind::GetByVal);
+        assert_eq!(cache.base, Some(VirtualRegister::local(1)));
+        assert_eq!(
+            cache.property,
+            PropertyCacheKey::RuntimeValue(VirtualRegister::local(2))
+        );
+        assert!(cache.get_by_id.is_none());
+        assert!(cache.put_by_id.is_none());
+    }
+
+    #[test]
+    fn linked_code_block_derives_put_by_value_property_inline_cache_site() {
+        let code_block = linked_property_ic_code_block(vec![put_by_value_instruction(
+            0,
+            VirtualRegister::local(1),
+            VirtualRegister::local(2),
+            VirtualRegister::local(3),
+        )]);
+        let cache = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("PutByValue property IC metadata");
+
+        assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(cache.access, PropertyAccessType::PutByValSloppy);
+        assert_eq!(cache.kind, PropertyCacheKind::PutByVal);
+        assert_eq!(cache.base, Some(VirtualRegister::local(1)));
+        assert_eq!(
+            cache.property,
+            PropertyCacheKey::RuntimeValue(VirtualRegister::local(2))
+        );
+        assert!(cache.get_by_id.is_none());
+        assert!(cache.put_by_id.is_none());
+    }
+
+    #[test]
+    fn linked_code_block_derives_in_by_id_property_inline_cache_site() {
+        let code_block = linked_property_ic_code_block(vec![in_by_id_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            29,
+        )]);
+        let cache = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("InById property IC metadata");
+
+        assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(cache.access, PropertyAccessType::InById);
+        assert_eq!(cache.kind, PropertyCacheKind::InById);
+        assert_eq!(cache.base, Some(VirtualRegister::local(1)));
+        assert_eq!(
+            cache.property,
+            PropertyCacheKey::Key(PropertyKey::from_identifier(Identifier::from_atom(
+                AtomId::from_table_slot(29),
+            )))
+        );
+        assert!(cache.get_by_id.is_none());
+        assert!(cache.put_by_id.is_none());
+    }
+
+    #[test]
+    fn linked_code_block_derives_in_by_value_property_inline_cache_site() {
+        let code_block = linked_property_ic_code_block(vec![in_by_value_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            VirtualRegister::local(2),
+        )]);
+        let cache = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("InByVal property IC metadata");
+
+        assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(cache.access, PropertyAccessType::InByVal);
+        assert_eq!(cache.kind, PropertyCacheKind::InByVal);
+        assert_eq!(cache.base, Some(VirtualRegister::local(1)));
+        assert_eq!(
+            cache.property,
+            PropertyCacheKey::RuntimeValue(VirtualRegister::local(2))
+        );
+        assert!(cache.get_by_id.is_none());
+        assert!(cache.put_by_id.is_none());
+
+        let profile = code_block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("InByVal array profile metadata");
+        assert_eq!(profile.bytecode_index, BytecodeIndex::from_offset(0));
+        assert!(profile.last_seen_structure.is_none());
+        assert!(profile.observed_modes.is_clear());
+    }
+
+    #[test]
+    fn code_block_records_in_by_value_indexed_array_profile_read() {
+        let mut code_block = linked_property_ic_code_block(vec![in_by_value_instruction(
+            0,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            VirtualRegister::local(2),
+        )])
+        .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter);
+        let structure = StructureId::new(77);
+
+        let profile = code_block
+            .record_array_profile_indexed_read(
+                CodeBlockMutationAuthority::VmMainThread,
+                BytecodeIndex::from_offset(0),
+                structure,
+                true,
+            )
+            .expect("array profile mutation succeeds")
+            .expect("InByVal array profile exists");
+
+        assert_eq!(profile.last_seen_structure, Some(structure));
+        assert!(profile.flags.out_of_bounds);
+        assert_eq!(
+            code_block
+                .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+                .expect("profile")
+                .last_seen_structure,
+            Some(structure)
+        );
+    }
+
+    #[test]
+    fn linked_code_block_keeps_by_name_and_by_value_property_metadata_separate() {
         let instructions = PackedInstructionStream::from_typed_placeholder(vec![
-            TypedInstruction {
-                opcode: CoreOpcode::GetByName.opcode(),
-                width: OperandWidth::Narrow,
-                operands: vec![
-                    Operand::Register(VirtualRegister::local(0)),
-                    Operand::Register(VirtualRegister::local(1)),
-                    Operand::IdentifierIndex(17),
-                ],
-                schema: None,
-                bytecode_index: Some(BytecodeIndex::from_offset(0)),
-            },
-            TypedInstruction {
-                opcode: CoreOpcode::PutByName.opcode(),
-                width: OperandWidth::Narrow,
-                operands: vec![
-                    Operand::Register(VirtualRegister::local(2)),
-                    Operand::IdentifierIndex(19),
-                    Operand::Register(VirtualRegister::local(3)),
-                ],
-                schema: None,
-                bytecode_index: Some(BytecodeIndex::from_offset(1)),
-            },
+            get_by_name_instruction(0, VirtualRegister::local(0), VirtualRegister::local(1), 17),
+            put_by_name_instruction(1, VirtualRegister::local(2), 19, VirtualRegister::local(3)),
+            put_global_object_property_instruction(2, 23, VirtualRegister::local(4)),
+            get_by_value_instruction(
+                3,
+                VirtualRegister::local(5),
+                VirtualRegister::local(6),
+                VirtualRegister::local(7),
+            ),
+            put_by_value_instruction(
+                4,
+                VirtualRegister::local(8),
+                VirtualRegister::local(9),
+                VirtualRegister::local(10),
+            ),
         ]);
         let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, instructions)
             .with_phase(UnlinkedCodeBlockPhase::Finalized);
 
         let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
         let caches = &code_block.side_tables().inline_caches.property_accesses;
-        assert_eq!(caches.len(), 2);
+        assert_eq!(caches.len(), 5);
 
         let load = code_block
             .side_tables()
@@ -3703,6 +4334,43 @@ mod tests {
         assert_eq!(store.base, Some(VirtualRegister::local(2)));
         assert!(store.get_by_id.is_none());
         assert!(store.put_by_id.is_some());
+
+        let global_store = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(2))
+            .expect("PutGlobalObjectProperty property IC metadata");
+        assert_eq!(global_store.access, PropertyAccessType::PutByIdSloppy);
+        assert_eq!(global_store.kind, PropertyCacheKind::PutById);
+        assert_eq!(global_store.base, None);
+        assert!(global_store.get_by_id.is_none());
+        assert!(global_store.put_by_id.is_some());
+
+        let value_load = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(3))
+            .expect("GetByValue property IC metadata");
+        assert_eq!(value_load.access, PropertyAccessType::GetByVal);
+        assert_eq!(value_load.kind, PropertyCacheKind::GetByVal);
+        assert_eq!(value_load.base, Some(VirtualRegister::local(6)));
+        assert_eq!(
+            value_load.property,
+            PropertyCacheKey::RuntimeValue(VirtualRegister::local(7))
+        );
+
+        let value_store = code_block
+            .side_tables()
+            .inline_caches
+            .property_access_for_bytecode_index(BytecodeIndex::from_offset(4))
+            .expect("PutByValue property IC metadata");
+        assert_eq!(value_store.access, PropertyAccessType::PutByValSloppy);
+        assert_eq!(value_store.kind, PropertyCacheKind::PutByVal);
+        assert_eq!(value_store.base, Some(VirtualRegister::local(8)));
+        assert_eq!(
+            value_store.property,
+            PropertyCacheKey::RuntimeValue(VirtualRegister::local(9))
+        );
     }
 
     #[test]
@@ -3721,10 +4389,16 @@ mod tests {
                 VirtualRegister::local(5),
                 Vec::new(),
             ),
+            construct_instruction(
+                30,
+                VirtualRegister::local(6),
+                VirtualRegister::local(7),
+                vec![VirtualRegister::local(8)],
+            ),
         ]);
 
         let caches = &code_block.side_tables().inline_caches.calls;
-        assert_eq!(caches.len(), 2);
+        assert_eq!(caches.len(), 3);
 
         let call = code_block
             .side_tables()
@@ -3751,6 +4425,148 @@ mod tests {
         assert_eq!(call_with_this.call_type, CallType::Call);
         assert_eq!(call_with_this.mode, CallLinkMode::Init);
         assert_eq!(call_with_this.target, CallTarget::Unlinked);
+
+        let (slot, construct) = code_block
+            .side_tables()
+            .inline_caches
+            .call_slot_for_bytecode_index(BytecodeIndex::from_offset(30))
+            .expect("Construct link IC metadata");
+        assert_eq!(slot, 2);
+        assert_eq!(construct.call_site, CallSiteIndex(30));
+        assert_eq!(construct.opcode, CoreOpcode::Construct);
+        assert_eq!(construct.call_type, CallType::Construct);
+        assert_eq!(construct.mode, CallLinkMode::Init);
+        assert_eq!(construct.specialization, CodeSpecialization::Construct);
+        assert_eq!(construct.target, CallTarget::Unlinked);
+    }
+
+    #[test]
+    fn linked_code_block_derives_call_result_value_profile_sites() {
+        let code_block = linked_call_link_code_block(vec![
+            call_instruction(
+                10,
+                VirtualRegister::local(0),
+                VirtualRegister::local(1),
+                vec![VirtualRegister::local(2)],
+            ),
+            call_with_this_instruction(
+                20,
+                VirtualRegister::local(3),
+                VirtualRegister::local(4),
+                VirtualRegister::local(5),
+                Vec::new(),
+            ),
+            construct_instruction(
+                30,
+                VirtualRegister::local(6),
+                VirtualRegister::local(7),
+                vec![VirtualRegister::local(8)],
+            ),
+        ]);
+
+        let profiles = &code_block.side_tables().value_profiles;
+        assert_eq!(profiles.profiles.len(), 2);
+        assert_eq!(profiles.unlinked_predictions.len(), 2);
+        assert!(
+            profiles.root_metadata.is_empty(),
+            "call-result value-profile samples are raw buckets, not strong roots"
+        );
+
+        let call = &profiles.profiles[0];
+        assert_eq!(call.bytecode_index, BytecodeIndex::from_offset(10));
+        assert_eq!(call.checkpoint, Checkpoint::NONE);
+        assert_eq!(call.operand, Some(VirtualRegister::local(0)));
+        assert_eq!(
+            call.buckets,
+            vec![ValueProfileBucket {
+                slot: RuntimeSlot(1),
+                kind: ValueProfileBucketKind::Sample,
+            }]
+        );
+        let call_target = profiles
+            .jit_store_target(
+                BytecodeIndex::from_offset(10),
+                Checkpoint::NONE,
+                ValueProfileBucketKind::Sample,
+            )
+            .expect("Call result JIT profile store target");
+        assert_eq!(call_target.binding.profile_slot, RuntimeSlot(1));
+        assert_eq!(call_target.binding.value_profile_offset, 1);
+        assert_eq!(call_target.binding.metadata_table_displacement, -32);
+        assert_eq!(
+            call_target.binding.emission_policy,
+            ValueProfileEmissionPolicy::from_capability(ValueProfileEmissionCapability::CanCompile)
+        );
+        assert_ne!(call_target.raw_bucket_address, 0);
+
+        let call_with_this = &profiles.profiles[1];
+        assert_eq!(
+            call_with_this.bytecode_index,
+            BytecodeIndex::from_offset(20)
+        );
+        assert_eq!(call_with_this.operand, Some(VirtualRegister::local(3)));
+        assert_eq!(
+            call_with_this.buckets,
+            vec![ValueProfileBucket {
+                slot: RuntimeSlot(2),
+                kind: ValueProfileBucketKind::Sample,
+            }]
+        );
+        let call_with_this_target = profiles
+            .jit_store_target(
+                BytecodeIndex::from_offset(20),
+                Checkpoint::NONE,
+                ValueProfileBucketKind::Sample,
+            )
+            .expect("CallWithThis result JIT profile store target");
+        assert_eq!(call_with_this_target.binding.profile_slot, RuntimeSlot(2));
+        assert_eq!(call_with_this_target.binding.value_profile_offset, 2);
+        assert_eq!(
+            call_with_this_target.binding.metadata_table_displacement,
+            -48
+        );
+        assert_eq!(
+            call_with_this_target.binding.emission_policy,
+            ValueProfileEmissionPolicy::from_capability(ValueProfileEmissionCapability::CanCompile)
+        );
+        assert!(
+            profiles
+                .profiles
+                .iter()
+                .all(|profile| profile.bytecode_index != BytecodeIndex::from_offset(30)),
+            "construct result profiling stays explicit pending until construct normalization is wired"
+        );
+    }
+
+    #[test]
+    fn linked_code_block_rebinds_value_profile_policy_from_tier_capability() {
+        let code_block = linked_call_link_code_block(vec![call_instruction(
+            10,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            vec![VirtualRegister::local(2)],
+        )])
+        .with_tier_state(CodeBlockTierState {
+            value_profile_emission_capability: ValueProfileEmissionCapability::CannotCompile,
+            ..CodeBlockTierState::default()
+        });
+        let target = code_block
+            .side_tables()
+            .value_profiles
+            .jit_store_target(
+                BytecodeIndex::from_offset(10),
+                Checkpoint::NONE,
+                ValueProfileBucketKind::Sample,
+            )
+            .expect("Call result JIT profile store target");
+
+        assert_eq!(
+            target.binding.emission_policy,
+            ValueProfileEmissionPolicy::from_capability(
+                ValueProfileEmissionCapability::CannotCompile
+            )
+        );
+        assert!(!target.binding.emission_policy.should_emit);
     }
 
     #[test]
@@ -3919,6 +4735,44 @@ mod tests {
             before_clear.calls[0].max_argument_count_including_this_for_varargs
         );
         assert_eq!(call.flags, before_clear.calls[0].flags);
+    }
+
+    #[test]
+    fn code_block_clears_metadata_only_construct_link_inline_cache_to_construct_shape() {
+        let mut code_block = linked_call_link_code_block(vec![construct_instruction(
+            30,
+            VirtualRegister::local(0),
+            VirtualRegister::local(1),
+            vec![VirtualRegister::local(2)],
+        )]);
+        let request =
+            call_link_attachment_request(0, BytecodeIndex::from_offset(30), CoreOpcode::Construct);
+        code_block
+            .attach_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                request.clone(),
+            )
+            .expect("initial construct link metadata attachment succeeds");
+
+        let outcome = code_block
+            .clear_call_link_inline_cache(
+                CodeBlockMutationAuthority::VmMainThread,
+                call_link_clear_request(&request),
+            )
+            .expect("construct link metadata clear succeeds");
+
+        assert_eq!(outcome.opcode, CoreOpcode::Construct);
+        assert_eq!(outcome.call_type, CallType::Construct);
+        assert_eq!(outcome.mode, CallLinkMode::Init);
+        assert_eq!(outcome.specialization, CodeSpecialization::Construct);
+        assert_eq!(outcome.target, CallTarget::Unlinked);
+
+        let call = &code_block.side_tables().inline_caches.calls[0];
+        assert_eq!(call.opcode, CoreOpcode::Construct);
+        assert_eq!(call.call_type, CallType::Construct);
+        assert_eq!(call.mode, CallLinkMode::Init);
+        assert_eq!(call.specialization, CodeSpecialization::Construct);
+        assert_eq!(call.target, CallTarget::Unlinked);
     }
 
     #[test]

@@ -6,7 +6,6 @@
 //! `DefaultBenchmark` scoring math used by JetStream 3.
 
 use std::cmp::Ordering;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -14,11 +13,19 @@ use super::{
 };
 use crate::bytecode::{SourceOriginId, SourceProviderId};
 use crate::interpreter::{
-    CoreHostOutputRecord, CoreHostOutputSink, ExecutionCompletion, ExecutionError,
+    CoreHostOutputRecord, CoreHostOutputSink, CoreHostResultRecord, DispatchConfig,
+    ExecutionCompletion, ExecutionError,
 };
 use crate::syntax::source::SourceText;
 use crate::vm::{
-    SourceExecutionError, SourceSessionHostGlobalConfig, SourceSessionSource, Vm, VmConfig,
+    SourceExecutionError, SourceSessionHandle, SourceSessionHostGlobalConfig, SourceSessionSource,
+    Vm, VmBaselineGeneratedExecutionSummary, VmConfig,
+    VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
+    VmGeneratedDirectCallRootlessRejectionCounts,
+    VmGeneratedDirectCallRootlessRetainedSideExitCount,
+    VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount,
+    VmGeneratedDirectCallTransactionSummary, VmPropertyInlineCacheEvolutionDecision,
+    VmPropertyInlineCacheEvolutionTerminalState,
 };
 
 pub const OCTANE_DEFAULT_ITERATION_COUNT: usize = 120;
@@ -306,10 +313,11 @@ pub enum OctaneSuiteFailurePolicy {
     CollectAll,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OctaneExecutionConfig {
     pub mode: OctaneExecutionMode,
     pub failure_policy: OctaneSuiteFailurePolicy,
+    pub dispatch_config: DispatchConfig,
 }
 
 impl OctaneExecutionConfig {
@@ -317,7 +325,22 @@ impl OctaneExecutionConfig {
         Self {
             mode,
             failure_policy,
+            dispatch_config: DispatchConfig::unbounded(),
         }
+    }
+
+    pub const fn with_dispatch_config(mut self, dispatch_config: DispatchConfig) -> Self {
+        self.dispatch_config = dispatch_config;
+        self
+    }
+}
+
+impl Default for OctaneExecutionConfig {
+    fn default() -> Self {
+        Self::new(
+            OctaneExecutionMode::default(),
+            OctaneSuiteFailurePolicy::default(),
+        )
     }
 }
 
@@ -338,7 +361,779 @@ pub struct OctaneBenchmarkExecutionReport {
     pub run_config: OctaneDefaultBenchmarkRunConfig,
     pub source_records: Vec<OctaneSourceExecutionRecord>,
     pub host_output_records: Vec<CoreHostOutputRecord>,
+    /// Per-benchmark VM tiering activity. Suite execution reuses one VM, so
+    /// these counts are deltas from the start of this benchmark.
+    pub tiering_delta: OctaneTieringSummary,
     pub outcome: OctaneExecutionOutcome,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OctaneTieringSummary {
+    pub entry_decisions: usize,
+    pub fallback_records: usize,
+    pub diagnostics: usize,
+    pub baseline_installs: usize,
+    pub baseline_entry_artifacts: usize,
+    pub baseline_materializations: usize,
+    pub baseline_generated_code_artifacts: usize,
+    pub baseline_generated_executions: usize,
+    pub baseline_generated_executed_bytecodes: u64,
+    pub baseline_entry_auto_materializations: usize,
+    pub baseline_native_lowering_failures: usize,
+    pub baseline_native_semantic_byte_emission_failures: usize,
+    pub baseline_native_entry_readiness: usize,
+    pub baseline_generated_execution_summaries: Vec<VmBaselineGeneratedExecutionSummary>,
+    pub generated_direct_call_transactions: usize,
+    pub generated_direct_call_generated_entries: usize,
+    pub generated_direct_call_native_entries: usize,
+    pub generated_direct_call_native_interpreter_fallbacks: usize,
+    pub generated_direct_call_nested_interpreter_fallbacks: usize,
+    pub generated_direct_call_hot_slot_hits: usize,
+    pub generated_direct_call_sidecar_hot_slot_hits: usize,
+    pub generated_direct_call_preferred_route_hits: usize,
+    pub generated_direct_call_rootless_generated_entries: usize,
+    pub generated_direct_call_rootless_generated_entry_proof_cache_hits: usize,
+    pub generated_direct_call_rootless_native_entries: usize,
+    pub generated_direct_call_rootless_rejections: VmGeneratedDirectCallRootlessRejectionCounts,
+    pub generated_direct_call_rootless_native_entry_rejections:
+        VmGeneratedDirectCallRootlessRejectionCounts,
+    pub generated_direct_call_rootless_unsupported_body_opcode_counts:
+        Vec<VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount>,
+    pub generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts:
+        Vec<VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount>,
+    pub generated_direct_call_rootless_native_entry_retained_side_exit_counts:
+        Vec<VmGeneratedDirectCallRootlessRetainedSideExitCount>,
+    pub generated_direct_call_rootless_preferred_native_entry_counts:
+        VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
+    pub generated_direct_call_transaction_summaries: Vec<VmGeneratedDirectCallTransactionSummary>,
+    pub launch_descriptors: usize,
+    pub call_observations: usize,
+    pub call_link_boundary_validations: usize,
+    pub call_link_inline_cache_attachments: usize,
+    pub property_load_observations: usize,
+    pub property_store_observations: usize,
+    pub property_inline_cache_evolution_records: usize,
+    pub property_inline_cache_evolution_admitted: usize,
+    pub property_inline_cache_evolution_buffered: usize,
+    pub property_inline_cache_evolution_buffered_duplicates: usize,
+    pub property_inline_cache_evolution_cooldowns: usize,
+    pub property_inline_cache_evolution_final_gave_up: usize,
+    pub property_inline_cache_evolution_gave_up_skips: usize,
+    pub property_inline_cache_evolution_generated_megamorphic_load: usize,
+    pub property_inline_cache_evolution_megamorphic_load_skips: usize,
+    pub property_inline_cache_evolution_generated_megamorphic_store: usize,
+    pub property_inline_cache_evolution_megamorphic_store_skips: usize,
+    pub property_inline_cache_evolution_generated_megamorphic_has: usize,
+    pub property_inline_cache_evolution_megamorphic_has_skips: usize,
+    pub property_load_megamorphic_cache_records: usize,
+    pub property_store_megamorphic_cache_records: usize,
+    pub property_has_megamorphic_cache_records: usize,
+    pub property_inline_cache_attachments: usize,
+}
+
+impl OctaneTieringSummary {
+    fn from_vm(vm: &Vm) -> Self {
+        let tiering = vm.tiering_integration();
+        let property_inline_cache_evolution_records =
+            tiering.property_inline_cache_evolution_records();
+        let property_inline_cache_evolution_admitted = property_inline_cache_evolution_records
+            .iter()
+            .filter(|record| record.decision == VmPropertyInlineCacheEvolutionDecision::Admitted)
+            .count();
+        let property_inline_cache_evolution_buffered = property_inline_cache_evolution_records
+            .iter()
+            .filter(|record| {
+                record.counters_after.buffered_structure_count
+                    > record.counters_before.buffered_structure_count
+            })
+            .count();
+        let property_inline_cache_evolution_buffered_duplicates =
+            property_inline_cache_evolution_records
+                .iter()
+                .filter(|record| {
+                    record.decision
+                        == VmPropertyInlineCacheEvolutionDecision::SkippedBufferedDuplicate
+                })
+                .count();
+        let property_inline_cache_evolution_cooldowns = property_inline_cache_evolution_records
+            .iter()
+            .filter(|record| {
+                record.decision == VmPropertyInlineCacheEvolutionDecision::SkippedCooldown
+            })
+            .count();
+        let property_inline_cache_evolution_final_gave_up = property_inline_cache_evolution_records
+            .iter()
+            .filter(|record| {
+                record.counters_before.terminal
+                    != Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp)
+                    && record.counters_after.terminal
+                        == Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp)
+            })
+            .count();
+        let property_inline_cache_evolution_gave_up_skips = property_inline_cache_evolution_records
+            .iter()
+            .filter(|record| {
+                record.decision == VmPropertyInlineCacheEvolutionDecision::SkippedGaveUp
+            })
+            .count();
+        let property_inline_cache_evolution_generated_megamorphic_load =
+            property_inline_cache_evolution_records
+                .iter()
+                .filter(|record| {
+                    record.decision
+                        == VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad
+                })
+                .count();
+        let property_inline_cache_evolution_megamorphic_load_skips =
+            property_inline_cache_evolution_records
+                .iter()
+                .filter(|record| {
+                    record.decision
+                        == VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicLoad
+                })
+                .count();
+        let property_inline_cache_evolution_generated_megamorphic_store =
+            property_inline_cache_evolution_records
+                .iter()
+                .filter(|record| {
+                    record.decision
+                        == VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicStore
+                })
+                .count();
+        let property_inline_cache_evolution_megamorphic_store_skips =
+            property_inline_cache_evolution_records
+                .iter()
+                .filter(|record| {
+                    record.decision
+                        == VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicStore
+                })
+                .count();
+        let property_inline_cache_evolution_generated_megamorphic_has =
+            property_inline_cache_evolution_records
+                .iter()
+                .filter(|record| {
+                    record.decision
+                        == VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicHas
+                })
+                .count();
+        let property_inline_cache_evolution_megamorphic_has_skips =
+            property_inline_cache_evolution_records
+                .iter()
+                .filter(|record| {
+                    record.decision == VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicHas
+                })
+                .count();
+        Self {
+            entry_decisions: tiering.entry_decisions().len(),
+            fallback_records: tiering.fallback_records().len(),
+            diagnostics: tiering.diagnostics().len(),
+            baseline_installs: tiering.baseline_install_records().len(),
+            baseline_entry_artifacts: tiering.baseline_entry_artifacts().len(),
+            baseline_materializations: tiering.baseline_executable_materializations().len(),
+            baseline_generated_code_artifacts: tiering.baseline_generated_code_artifacts().len(),
+            baseline_generated_executions: tiering.baseline_generated_execution_count(),
+            baseline_generated_executed_bytecodes: tiering
+                .baseline_generated_executed_bytecode_count(),
+            baseline_entry_auto_materializations: tiering
+                .baseline_entry_auto_materializations()
+                .len(),
+            baseline_native_lowering_failures: tiering.baseline_native_lowering_failure_count(),
+            baseline_native_semantic_byte_emission_failures: tiering
+                .baseline_native_semantic_byte_emission_failure_count(),
+            baseline_native_entry_readiness: tiering
+                .baseline_native_entry_readiness_records()
+                .len(),
+            baseline_generated_execution_summaries: tiering
+                .baseline_generated_execution_summaries()
+                .to_vec(),
+            generated_direct_call_transactions: tiering.generated_direct_call_transaction_count(),
+            generated_direct_call_generated_entries: tiering
+                .generated_direct_call_generated_entry_count(),
+            generated_direct_call_native_entries: tiering
+                .generated_direct_call_native_entry_count(),
+            generated_direct_call_native_interpreter_fallbacks: tiering
+                .generated_direct_call_native_interpreter_fallback_count(),
+            generated_direct_call_nested_interpreter_fallbacks: tiering
+                .generated_direct_call_nested_interpreter_fallback_count(),
+            generated_direct_call_hot_slot_hits: tiering.generated_direct_call_hot_slot_hit_count(),
+            generated_direct_call_sidecar_hot_slot_hits: tiering
+                .generated_direct_call_sidecar_hot_slot_hit_count(),
+            generated_direct_call_preferred_route_hits: tiering
+                .generated_direct_call_preferred_route_hit_count(),
+            generated_direct_call_rootless_generated_entries: tiering
+                .generated_direct_call_rootless_generated_entry_count(),
+            generated_direct_call_rootless_generated_entry_proof_cache_hits: tiering
+                .generated_direct_call_rootless_generated_entry_proof_cache_hit_count(),
+            generated_direct_call_rootless_native_entries: tiering
+                .generated_direct_call_rootless_native_entry_count(),
+            generated_direct_call_rootless_rejections: tiering
+                .generated_direct_call_rootless_rejection_counts(),
+            generated_direct_call_rootless_native_entry_rejections: tiering
+                .generated_direct_call_rootless_native_entry_rejection_counts(),
+            generated_direct_call_rootless_unsupported_body_opcode_counts: tiering
+                .generated_direct_call_rootless_unsupported_body_opcode_counts()
+                .to_vec(),
+            generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts: tiering
+                .generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts()
+                .to_vec(),
+            generated_direct_call_rootless_native_entry_retained_side_exit_counts: tiering
+                .generated_direct_call_rootless_native_entry_retained_side_exit_counts()
+                .to_vec(),
+            generated_direct_call_rootless_preferred_native_entry_counts: tiering
+                .generated_direct_call_rootless_preferred_native_entry_counts(),
+            generated_direct_call_transaction_summaries: tiering
+                .generated_direct_call_transaction_summaries()
+                .to_vec(),
+            launch_descriptors: vm.entry_state().launch_descriptors().len(),
+            call_observations: tiering.call_observations().len(),
+            call_link_boundary_validations: tiering.call_link_boundary_validation_records().len(),
+            call_link_inline_cache_attachments: tiering
+                .call_link_inline_cache_attachment_records()
+                .len(),
+            property_load_observations: tiering.property_load_observations().len(),
+            property_store_observations: tiering.property_store_observations().len(),
+            property_inline_cache_evolution_records: property_inline_cache_evolution_records.len(),
+            property_inline_cache_evolution_admitted,
+            property_inline_cache_evolution_buffered,
+            property_inline_cache_evolution_buffered_duplicates,
+            property_inline_cache_evolution_cooldowns,
+            property_inline_cache_evolution_final_gave_up,
+            property_inline_cache_evolution_gave_up_skips,
+            property_inline_cache_evolution_generated_megamorphic_load,
+            property_inline_cache_evolution_megamorphic_load_skips,
+            property_inline_cache_evolution_generated_megamorphic_store,
+            property_inline_cache_evolution_megamorphic_store_skips,
+            property_inline_cache_evolution_generated_megamorphic_has,
+            property_inline_cache_evolution_megamorphic_has_skips,
+            property_load_megamorphic_cache_records: tiering
+                .property_load_megamorphic_cache_records()
+                .len(),
+            property_store_megamorphic_cache_records: tiering
+                .property_store_megamorphic_cache_records()
+                .len(),
+            property_has_megamorphic_cache_records: tiering
+                .property_has_megamorphic_cache_records()
+                .len(),
+            property_inline_cache_attachments: tiering
+                .property_inline_cache_attachment_records()
+                .len(),
+        }
+    }
+
+    fn delta_since(self, start: Self) -> Self {
+        let baseline_generated_execution_summaries =
+            octane_baseline_generated_execution_summary_delta(
+                &self.baseline_generated_execution_summaries,
+                &start.baseline_generated_execution_summaries,
+            );
+        let generated_direct_call_rootless_unsupported_body_opcode_counts =
+            octane_rootless_unsupported_body_opcode_count_delta(
+                &self.generated_direct_call_rootless_unsupported_body_opcode_counts,
+                &start.generated_direct_call_rootless_unsupported_body_opcode_counts,
+            );
+        let generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts =
+            octane_rootless_unsupported_body_opcode_count_delta(
+                &self.generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts,
+                &start.generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts,
+            );
+        let generated_direct_call_rootless_native_entry_retained_side_exit_counts =
+            octane_rootless_retained_side_exit_count_delta(
+                &self.generated_direct_call_rootless_native_entry_retained_side_exit_counts,
+                &start.generated_direct_call_rootless_native_entry_retained_side_exit_counts,
+            );
+        let generated_direct_call_rootless_preferred_native_entry_counts =
+            octane_rootless_preferred_native_entry_counts_delta(
+                self.generated_direct_call_rootless_preferred_native_entry_counts,
+                start.generated_direct_call_rootless_preferred_native_entry_counts,
+            );
+        let generated_direct_call_transaction_summaries =
+            octane_generated_direct_call_transaction_summary_delta(
+                &self.generated_direct_call_transaction_summaries,
+                &start.generated_direct_call_transaction_summaries,
+            );
+
+        Self {
+            entry_decisions: self.entry_decisions.saturating_sub(start.entry_decisions),
+            fallback_records: self.fallback_records.saturating_sub(start.fallback_records),
+            diagnostics: self.diagnostics.saturating_sub(start.diagnostics),
+            baseline_installs: self
+                .baseline_installs
+                .saturating_sub(start.baseline_installs),
+            baseline_entry_artifacts: self
+                .baseline_entry_artifacts
+                .saturating_sub(start.baseline_entry_artifacts),
+            baseline_materializations: self
+                .baseline_materializations
+                .saturating_sub(start.baseline_materializations),
+            baseline_generated_code_artifacts: self
+                .baseline_generated_code_artifacts
+                .saturating_sub(start.baseline_generated_code_artifacts),
+            baseline_generated_executions: self
+                .baseline_generated_executions
+                .saturating_sub(start.baseline_generated_executions),
+            baseline_generated_executed_bytecodes: self
+                .baseline_generated_executed_bytecodes
+                .saturating_sub(start.baseline_generated_executed_bytecodes),
+            baseline_entry_auto_materializations: self
+                .baseline_entry_auto_materializations
+                .saturating_sub(start.baseline_entry_auto_materializations),
+            baseline_native_lowering_failures: self
+                .baseline_native_lowering_failures
+                .saturating_sub(start.baseline_native_lowering_failures),
+            baseline_native_semantic_byte_emission_failures: self
+                .baseline_native_semantic_byte_emission_failures
+                .saturating_sub(start.baseline_native_semantic_byte_emission_failures),
+            baseline_native_entry_readiness: self
+                .baseline_native_entry_readiness
+                .saturating_sub(start.baseline_native_entry_readiness),
+            baseline_generated_execution_summaries,
+            generated_direct_call_transactions: self
+                .generated_direct_call_transactions
+                .saturating_sub(start.generated_direct_call_transactions),
+            generated_direct_call_generated_entries: self
+                .generated_direct_call_generated_entries
+                .saturating_sub(start.generated_direct_call_generated_entries),
+            generated_direct_call_native_entries: self
+                .generated_direct_call_native_entries
+                .saturating_sub(start.generated_direct_call_native_entries),
+            generated_direct_call_native_interpreter_fallbacks: self
+                .generated_direct_call_native_interpreter_fallbacks
+                .saturating_sub(start.generated_direct_call_native_interpreter_fallbacks),
+            generated_direct_call_nested_interpreter_fallbacks: self
+                .generated_direct_call_nested_interpreter_fallbacks
+                .saturating_sub(start.generated_direct_call_nested_interpreter_fallbacks),
+            generated_direct_call_hot_slot_hits: self
+                .generated_direct_call_hot_slot_hits
+                .saturating_sub(start.generated_direct_call_hot_slot_hits),
+            generated_direct_call_sidecar_hot_slot_hits: self
+                .generated_direct_call_sidecar_hot_slot_hits
+                .saturating_sub(start.generated_direct_call_sidecar_hot_slot_hits),
+            generated_direct_call_preferred_route_hits: self
+                .generated_direct_call_preferred_route_hits
+                .saturating_sub(start.generated_direct_call_preferred_route_hits),
+            generated_direct_call_rootless_generated_entries: self
+                .generated_direct_call_rootless_generated_entries
+                .saturating_sub(start.generated_direct_call_rootless_generated_entries),
+            generated_direct_call_rootless_generated_entry_proof_cache_hits: self
+                .generated_direct_call_rootless_generated_entry_proof_cache_hits
+                .saturating_sub(
+                    start.generated_direct_call_rootless_generated_entry_proof_cache_hits,
+                ),
+            generated_direct_call_rootless_native_entries: self
+                .generated_direct_call_rootless_native_entries
+                .saturating_sub(start.generated_direct_call_rootless_native_entries),
+            generated_direct_call_rootless_rejections: self
+                .generated_direct_call_rootless_rejections
+                .saturating_sub(start.generated_direct_call_rootless_rejections),
+            generated_direct_call_rootless_native_entry_rejections: self
+                .generated_direct_call_rootless_native_entry_rejections
+                .saturating_sub(start.generated_direct_call_rootless_native_entry_rejections),
+            generated_direct_call_rootless_unsupported_body_opcode_counts,
+            generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts,
+            generated_direct_call_rootless_native_entry_retained_side_exit_counts,
+            generated_direct_call_rootless_preferred_native_entry_counts,
+            generated_direct_call_transaction_summaries,
+            launch_descriptors: self
+                .launch_descriptors
+                .saturating_sub(start.launch_descriptors),
+            call_observations: self
+                .call_observations
+                .saturating_sub(start.call_observations),
+            call_link_boundary_validations: self
+                .call_link_boundary_validations
+                .saturating_sub(start.call_link_boundary_validations),
+            call_link_inline_cache_attachments: self
+                .call_link_inline_cache_attachments
+                .saturating_sub(start.call_link_inline_cache_attachments),
+            property_load_observations: self
+                .property_load_observations
+                .saturating_sub(start.property_load_observations),
+            property_store_observations: self
+                .property_store_observations
+                .saturating_sub(start.property_store_observations),
+            property_inline_cache_evolution_records: self
+                .property_inline_cache_evolution_records
+                .saturating_sub(start.property_inline_cache_evolution_records),
+            property_inline_cache_evolution_admitted: self
+                .property_inline_cache_evolution_admitted
+                .saturating_sub(start.property_inline_cache_evolution_admitted),
+            property_inline_cache_evolution_buffered: self
+                .property_inline_cache_evolution_buffered
+                .saturating_sub(start.property_inline_cache_evolution_buffered),
+            property_inline_cache_evolution_buffered_duplicates: self
+                .property_inline_cache_evolution_buffered_duplicates
+                .saturating_sub(start.property_inline_cache_evolution_buffered_duplicates),
+            property_inline_cache_evolution_cooldowns: self
+                .property_inline_cache_evolution_cooldowns
+                .saturating_sub(start.property_inline_cache_evolution_cooldowns),
+            property_inline_cache_evolution_final_gave_up: self
+                .property_inline_cache_evolution_final_gave_up
+                .saturating_sub(start.property_inline_cache_evolution_final_gave_up),
+            property_inline_cache_evolution_gave_up_skips: self
+                .property_inline_cache_evolution_gave_up_skips
+                .saturating_sub(start.property_inline_cache_evolution_gave_up_skips),
+            property_inline_cache_evolution_generated_megamorphic_load: self
+                .property_inline_cache_evolution_generated_megamorphic_load
+                .saturating_sub(start.property_inline_cache_evolution_generated_megamorphic_load),
+            property_inline_cache_evolution_megamorphic_load_skips: self
+                .property_inline_cache_evolution_megamorphic_load_skips
+                .saturating_sub(start.property_inline_cache_evolution_megamorphic_load_skips),
+            property_inline_cache_evolution_generated_megamorphic_store: self
+                .property_inline_cache_evolution_generated_megamorphic_store
+                .saturating_sub(start.property_inline_cache_evolution_generated_megamorphic_store),
+            property_inline_cache_evolution_megamorphic_store_skips: self
+                .property_inline_cache_evolution_megamorphic_store_skips
+                .saturating_sub(start.property_inline_cache_evolution_megamorphic_store_skips),
+            property_inline_cache_evolution_generated_megamorphic_has: self
+                .property_inline_cache_evolution_generated_megamorphic_has
+                .saturating_sub(start.property_inline_cache_evolution_generated_megamorphic_has),
+            property_inline_cache_evolution_megamorphic_has_skips: self
+                .property_inline_cache_evolution_megamorphic_has_skips
+                .saturating_sub(start.property_inline_cache_evolution_megamorphic_has_skips),
+            property_load_megamorphic_cache_records: self
+                .property_load_megamorphic_cache_records
+                .saturating_sub(start.property_load_megamorphic_cache_records),
+            property_store_megamorphic_cache_records: self
+                .property_store_megamorphic_cache_records
+                .saturating_sub(start.property_store_megamorphic_cache_records),
+            property_has_megamorphic_cache_records: self
+                .property_has_megamorphic_cache_records
+                .saturating_sub(start.property_has_megamorphic_cache_records),
+            property_inline_cache_attachments: self
+                .property_inline_cache_attachments
+                .saturating_sub(start.property_inline_cache_attachments),
+        }
+    }
+}
+
+fn octane_rootless_unsupported_body_opcode_count_delta(
+    current: &[VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount],
+    start: &[VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount],
+) -> Vec<VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount> {
+    current
+        .iter()
+        .filter_map(|current_count| {
+            let start_count = start
+                .iter()
+                .find(|start_count| start_count.opcode == current_count.opcode)
+                .map(|start_count| start_count.count)
+                .unwrap_or(0);
+            let count = current_count.count.saturating_sub(start_count);
+            (count > 0).then_some(VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount {
+                opcode: current_count.opcode,
+                count,
+            })
+        })
+        .collect()
+}
+
+fn octane_rootless_retained_side_exit_count_delta(
+    current: &[VmGeneratedDirectCallRootlessRetainedSideExitCount],
+    start: &[VmGeneratedDirectCallRootlessRetainedSideExitCount],
+) -> Vec<VmGeneratedDirectCallRootlessRetainedSideExitCount> {
+    current
+        .iter()
+        .filter_map(|current_count| {
+            let start_count = start
+                .iter()
+                .find(|start_count| {
+                    start_count.target_code_block == current_count.target_code_block
+                        && start_count.bytecode_index == current_count.bytecode_index
+                        && start_count.opcode == current_count.opcode
+                        && start_count.reason == current_count.reason
+                })
+                .map(|start_count| start_count.count)
+                .unwrap_or(0);
+            let count = current_count.count.saturating_sub(start_count);
+            (count > 0).then_some(VmGeneratedDirectCallRootlessRetainedSideExitCount {
+                target_code_block: current_count.target_code_block,
+                bytecode_index: current_count.bytecode_index,
+                opcode: current_count.opcode,
+                reason: current_count.reason,
+                count,
+            })
+        })
+        .collect()
+}
+
+fn octane_rootless_preferred_native_entry_counts_delta(
+    current: VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
+    start: VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
+) -> VmGeneratedDirectCallRootlessPreferredNativeEntryCounts {
+    VmGeneratedDirectCallRootlessPreferredNativeEntryCounts {
+        pure_baseline_shim: current
+            .pure_baseline_shim
+            .saturating_sub(start.pure_baseline_shim),
+        emitted_semantic_c_abi_entry: current
+            .emitted_semantic_c_abi_entry
+            .saturating_sub(start.emitted_semantic_c_abi_entry),
+        unknown: current.unknown.saturating_sub(start.unknown),
+    }
+}
+
+fn octane_baseline_generated_execution_summary_delta(
+    current: &[VmBaselineGeneratedExecutionSummary],
+    start: &[VmBaselineGeneratedExecutionSummary],
+) -> Vec<VmBaselineGeneratedExecutionSummary> {
+    current
+        .iter()
+        .filter_map(|current_summary| {
+            let start_summary = start
+                .iter()
+                .find(|start_summary| start_summary.owner == current_summary.owner);
+            let delta = VmBaselineGeneratedExecutionSummary {
+                owner: current_summary.owner,
+                execution_count: current_summary.execution_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.execution_count)
+                        .unwrap_or(0),
+                ),
+                executed_bytecode_count: current_summary.executed_bytecode_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.executed_bytecode_count)
+                        .unwrap_or(0),
+                ),
+                returned_count: current_summary.returned_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.returned_count)
+                        .unwrap_or(0),
+                ),
+                threw_count: current_summary.threw_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.threw_count)
+                        .unwrap_or(0),
+                ),
+                ordinary_bytecode_call_count: current_summary
+                    .ordinary_bytecode_call_count
+                    .saturating_sub(
+                        start_summary
+                            .map(|start_summary| start_summary.ordinary_bytecode_call_count)
+                            .unwrap_or(0),
+                    ),
+                ordinary_bytecode_construct_count: current_summary
+                    .ordinary_bytecode_construct_count
+                    .saturating_sub(
+                        start_summary
+                            .map(|start_summary| start_summary.ordinary_bytecode_construct_count)
+                            .unwrap_or(0),
+                    ),
+                function_value_call_count: current_summary
+                    .function_value_call_count
+                    .saturating_sub(
+                        start_summary
+                            .map(|start_summary| start_summary.function_value_call_count)
+                            .unwrap_or(0),
+                    ),
+                terminated_count: current_summary.terminated_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.terminated_count)
+                        .unwrap_or(0),
+                ),
+                suspended_count: current_summary.suspended_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.suspended_count)
+                        .unwrap_or(0),
+                ),
+                failed_count: current_summary.failed_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.failed_count)
+                        .unwrap_or(0),
+                ),
+                fallback_count: current_summary.fallback_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.fallback_count)
+                        .unwrap_or(0),
+                ),
+                js_call_count: current_summary.js_call_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.js_call_count)
+                        .unwrap_or(0),
+                ),
+                property_count: current_summary.property_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.property_count)
+                        .unwrap_or(0),
+                ),
+                runtime_helper_count: current_summary.runtime_helper_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.runtime_helper_count)
+                        .unwrap_or(0),
+                ),
+                rejected_count: current_summary.rejected_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.rejected_count)
+                        .unwrap_or(0),
+                ),
+            };
+            octane_baseline_generated_execution_summary_has_activity(delta).then_some(delta)
+        })
+        .collect()
+}
+
+fn octane_baseline_generated_execution_summary_has_activity(
+    summary: VmBaselineGeneratedExecutionSummary,
+) -> bool {
+    summary.execution_count > 0
+        || summary.executed_bytecode_count > 0
+        || summary.returned_count > 0
+        || summary.threw_count > 0
+        || summary.ordinary_bytecode_call_count > 0
+        || summary.ordinary_bytecode_construct_count > 0
+        || summary.function_value_call_count > 0
+        || summary.terminated_count > 0
+        || summary.suspended_count > 0
+        || summary.failed_count > 0
+        || summary.fallback_count > 0
+        || summary.js_call_count > 0
+        || summary.property_count > 0
+        || summary.runtime_helper_count > 0
+        || summary.rejected_count > 0
+}
+
+fn octane_generated_direct_call_transaction_summary_delta(
+    current: &[VmGeneratedDirectCallTransactionSummary],
+    start: &[VmGeneratedDirectCallTransactionSummary],
+) -> Vec<VmGeneratedDirectCallTransactionSummary> {
+    current
+        .iter()
+        .filter_map(|current_summary| {
+            let start_summary = start.iter().find(|start_summary| {
+                start_summary.caller == current_summary.caller
+                    && start_summary.call_bytecode_index == current_summary.call_bytecode_index
+                    && start_summary.target_code_block == current_summary.target_code_block
+                    && start_summary.argument_count_including_this
+                        == current_summary.argument_count_including_this
+                    && start_summary.route == current_summary.route
+            });
+            let delta = VmGeneratedDirectCallTransactionSummary {
+                caller: current_summary.caller,
+                call_bytecode_index: current_summary.call_bytecode_index,
+                target_code_block: current_summary.target_code_block,
+                argument_count_including_this: current_summary.argument_count_including_this,
+                route: current_summary.route,
+                transaction_count: current_summary.transaction_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.transaction_count)
+                        .unwrap_or(0),
+                ),
+                continue_count: current_summary.continue_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.continue_count)
+                        .unwrap_or(0),
+                ),
+                jump_count: current_summary.jump_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.jump_count)
+                        .unwrap_or(0),
+                ),
+                return_count: current_summary.return_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.return_count)
+                        .unwrap_or(0),
+                ),
+                threw_count: current_summary.threw_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.threw_count)
+                        .unwrap_or(0),
+                ),
+                ordinary_bytecode_call_count: current_summary
+                    .ordinary_bytecode_call_count
+                    .saturating_sub(
+                        start_summary
+                            .map(|start_summary| start_summary.ordinary_bytecode_call_count)
+                            .unwrap_or(0),
+                    ),
+                ordinary_bytecode_construct_count: current_summary
+                    .ordinary_bytecode_construct_count
+                    .saturating_sub(
+                        start_summary
+                            .map(|start_summary| start_summary.ordinary_bytecode_construct_count)
+                            .unwrap_or(0),
+                    ),
+                function_value_call_count: current_summary
+                    .function_value_call_count
+                    .saturating_sub(
+                        start_summary
+                            .map(|start_summary| start_summary.function_value_call_count)
+                            .unwrap_or(0),
+                    ),
+                suspended_count: current_summary.suspended_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.suspended_count)
+                        .unwrap_or(0),
+                ),
+                failed_count: current_summary.failed_count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.failed_count)
+                        .unwrap_or(0),
+                ),
+            };
+            octane_generated_direct_call_transaction_summary_has_activity(delta).then_some(delta)
+        })
+        .collect()
+}
+
+fn octane_generated_direct_call_transaction_summary_has_activity(
+    summary: VmGeneratedDirectCallTransactionSummary,
+) -> bool {
+    summary.transaction_count > 0
+        || summary.continue_count > 0
+        || summary.jump_count > 0
+        || summary.return_count > 0
+        || summary.threw_count > 0
+        || summary.ordinary_bytecode_call_count > 0
+        || summary.ordinary_bytecode_construct_count > 0
+        || summary.function_value_call_count > 0
+        || summary.suspended_count > 0
+        || summary.failed_count > 0
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OctaneExecutionProgress {
+    BenchmarkStarted {
+        benchmark: &'static str,
+        mode: OctaneExecutionMode,
+    },
+    SourceSessionStarted {
+        benchmark: &'static str,
+        mode: OctaneExecutionMode,
+    },
+    SourceSessionOpened {
+        benchmark: &'static str,
+        mode: OctaneExecutionMode,
+    },
+    SourceSessionErrored {
+        benchmark: &'static str,
+        mode: OctaneExecutionMode,
+        error: SourceExecutionError,
+    },
+    SourceStarted {
+        benchmark: &'static str,
+        mode: OctaneExecutionMode,
+        order_index: usize,
+        order_entry: OctanePreparedSourceOrderEntry,
+        label: String,
+    },
+    SourceCompleted {
+        benchmark: &'static str,
+        mode: OctaneExecutionMode,
+        order_index: usize,
+        order_entry: OctanePreparedSourceOrderEntry,
+        label: String,
+        completion: ExecutionCompletion,
+    },
+    SourceErrored {
+        benchmark: &'static str,
+        mode: OctaneExecutionMode,
+        order_index: usize,
+        order_entry: OctanePreparedSourceOrderEntry,
+        label: String,
+        error: SourceExecutionError,
+    },
+    ScoreTelemetryStarted {
+        benchmark: &'static str,
+        mode: OctaneExecutionMode,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -376,6 +1171,19 @@ pub struct OctaneBenchmarkModeComparisonRecord {
     pub benchmark: &'static str,
     pub interpreter_only: OctaneBenchmarkExecutionReport,
     pub baseline_allowed: OctaneBenchmarkExecutionReport,
+}
+
+#[derive(Debug)]
+struct OctaneBenchmarkExecutionRun {
+    report: OctaneBenchmarkExecutionReport,
+    retained_session: Option<SourceSessionHandle>,
+}
+
+#[derive(Debug)]
+struct OctaneBenchmarkModeComparisonRun {
+    record: OctaneBenchmarkModeComparisonRecord,
+    interpreter_session: Option<SourceSessionHandle>,
+    baseline_session: Option<SourceSessionHandle>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -485,6 +1293,9 @@ pub enum OctaneScoreTelemetryError {
     NonFiniteScore {
         component: OctaneScoreComponent,
         value: String,
+    },
+    RejectedResult {
+        reason: String,
     },
 }
 
@@ -783,50 +1594,121 @@ pub fn execute_prepared_octane_benchmark(
     config: OctaneExecutionConfig,
 ) -> OctaneBenchmarkExecutionReport {
     let mut vm = Vm::new(config.mode.vm_config());
+    let mut progress = None;
+    execute_prepared_octane_benchmark_run_with_vm(&mut vm, prepared, config, &mut progress).report
+}
+
+pub fn execute_prepared_octane_benchmark_with_progress(
+    prepared: &OctanePreparedBenchmark,
+    config: OctaneExecutionConfig,
+    progress: &mut dyn FnMut(OctaneExecutionProgress),
+) -> OctaneBenchmarkExecutionReport {
+    let mut vm = Vm::new(config.mode.vm_config());
+    let mut progress = Some(progress);
+    execute_prepared_octane_benchmark_run_with_vm(&mut vm, prepared, config, &mut progress).report
+}
+
+fn execute_prepared_octane_benchmark_run_with_vm(
+    vm: &mut Vm,
+    prepared: &OctanePreparedBenchmark,
+    config: OctaneExecutionConfig,
+    progress: &mut Option<&mut dyn FnMut(OctaneExecutionProgress)>,
+) -> OctaneBenchmarkExecutionRun {
     let mut source_records = Vec::with_capacity(prepared.source_order.len());
-    let mut session = match vm.open_source_session_with_host_globals(
+    let tiering_start = OctaneTieringSummary::from_vm(vm);
+    emit_octane_execution_progress(
+        progress,
+        OctaneExecutionProgress::BenchmarkStarted {
+            benchmark: prepared.plan.name,
+            mode: config.mode,
+        },
+    );
+    emit_octane_execution_progress(
+        progress,
+        OctaneExecutionProgress::SourceSessionStarted {
+            benchmark: prepared.plan.name,
+            mode: config.mode,
+        },
+    );
+    let mut session = match vm.open_source_session_with_host_globals_and_dispatch_config(
         SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+        config.dispatch_config,
     ) {
-        Ok(session) => session,
+        Ok(session) => {
+            emit_octane_execution_progress(
+                progress,
+                OctaneExecutionProgress::SourceSessionOpened {
+                    benchmark: prepared.plan.name,
+                    mode: config.mode,
+                },
+            );
+            session
+        }
         Err(error) => {
-            return OctaneBenchmarkExecutionReport {
-                benchmark: prepared.plan.name,
-                mode: config.mode,
-                run_config: prepared.run_config,
-                source_records,
-                host_output_records: Vec::new(),
-                outcome: OctaneExecutionOutcome::Failed(classify_source_execution_error(
-                    config.mode,
-                    None,
-                    None,
-                    None,
-                    error,
-                )),
+            emit_octane_execution_progress(
+                progress,
+                OctaneExecutionProgress::SourceSessionErrored {
+                    benchmark: prepared.plan.name,
+                    mode: config.mode,
+                    error: error.clone(),
+                },
+            );
+            return OctaneBenchmarkExecutionRun {
+                report: OctaneBenchmarkExecutionReport {
+                    benchmark: prepared.plan.name,
+                    mode: config.mode,
+                    run_config: prepared.run_config,
+                    source_records,
+                    host_output_records: Vec::new(),
+                    tiering_delta: OctaneTieringSummary::from_vm(vm).delta_since(tiering_start),
+                    outcome: OctaneExecutionOutcome::Failed(classify_source_execution_error(
+                        config.mode,
+                        None,
+                        None,
+                        None,
+                        error,
+                    )),
+                },
+                retained_session: None,
             };
         }
     };
 
     for (order_index, order_entry) in prepared.source_order.iter().copied().enumerate() {
         let Some(source) = prepared_source_for_order_entry(prepared, order_entry) else {
-            return OctaneBenchmarkExecutionReport {
-                benchmark: prepared.plan.name,
-                mode: config.mode,
-                run_config: prepared.run_config,
-                source_records,
-                host_output_records: session.host_output_records().to_vec(),
-                outcome: OctaneExecutionOutcome::Failed(OctaneExecutionFailure {
-                    phase: OctaneExecutionPhase::SessionLink,
-                    order_index: Some(order_index),
-                    order_entry: Some(order_entry),
-                    label: None,
-                    detail: OctaneExecutionFailureDetail::MissingPreparedSource {
-                        entry: order_entry,
-                    },
-                }),
+            return OctaneBenchmarkExecutionRun {
+                report: OctaneBenchmarkExecutionReport {
+                    benchmark: prepared.plan.name,
+                    mode: config.mode,
+                    run_config: prepared.run_config,
+                    source_records,
+                    host_output_records: session.host_output_records().to_vec(),
+                    tiering_delta: OctaneTieringSummary::from_vm(vm).delta_since(tiering_start),
+                    outcome: OctaneExecutionOutcome::Failed(OctaneExecutionFailure {
+                        phase: OctaneExecutionPhase::SessionLink,
+                        order_index: Some(order_index),
+                        order_entry: Some(order_entry),
+                        label: None,
+                        detail: OctaneExecutionFailureDetail::MissingPreparedSource {
+                            entry: order_entry,
+                        },
+                    }),
+                },
+                retained_session: Some(session),
             };
         };
 
         let label = source.label.to_string();
+        emit_octane_execution_progress(
+            progress,
+            OctaneExecutionProgress::SourceStarted {
+                benchmark: prepared.plan.name,
+                mode: config.mode,
+                order_index,
+                order_entry,
+                label: label.clone(),
+            },
+        );
         let mut source_record = OctaneSourceExecutionRecord {
             order_index,
             order_entry,
@@ -836,51 +1718,97 @@ pub fn execute_prepared_octane_benchmark(
 
         match vm.append_source_session_source(&mut session, source.source.clone()) {
             Ok(completion) => {
+                emit_octane_execution_progress(
+                    progress,
+                    OctaneExecutionProgress::SourceCompleted {
+                        benchmark: prepared.plan.name,
+                        mode: config.mode,
+                        order_index,
+                        order_entry,
+                        label: label.clone(),
+                        completion: completion.clone(),
+                    },
+                );
                 source_record.completion = Some(completion.clone());
                 source_records.push(source_record);
                 if let Some(failure) =
                     classify_completion(config.mode, order_index, order_entry, label, completion)
                 {
-                    return OctaneBenchmarkExecutionReport {
+                    return OctaneBenchmarkExecutionRun {
+                        report: OctaneBenchmarkExecutionReport {
+                            benchmark: prepared.plan.name,
+                            mode: config.mode,
+                            run_config: prepared.run_config,
+                            source_records,
+                            host_output_records: session.host_output_records().to_vec(),
+                            tiering_delta: OctaneTieringSummary::from_vm(vm)
+                                .delta_since(tiering_start),
+                            outcome: OctaneExecutionOutcome::Failed(failure),
+                        },
+                        retained_session: Some(session),
+                    };
+                }
+            }
+            Err(error) => {
+                emit_octane_execution_progress(
+                    progress,
+                    OctaneExecutionProgress::SourceErrored {
+                        benchmark: prepared.plan.name,
+                        mode: config.mode,
+                        order_index,
+                        order_entry,
+                        label: label.clone(),
+                        error: error.clone(),
+                    },
+                );
+                source_records.push(source_record);
+                return OctaneBenchmarkExecutionRun {
+                    report: OctaneBenchmarkExecutionReport {
                         benchmark: prepared.plan.name,
                         mode: config.mode,
                         run_config: prepared.run_config,
                         source_records,
                         host_output_records: session.host_output_records().to_vec(),
-                        outcome: OctaneExecutionOutcome::Failed(failure),
-                    };
-                }
-            }
-            Err(error) => {
-                source_records.push(source_record);
-                return OctaneBenchmarkExecutionReport {
-                    benchmark: prepared.plan.name,
-                    mode: config.mode,
-                    run_config: prepared.run_config,
-                    source_records,
-                    host_output_records: session.host_output_records().to_vec(),
-                    outcome: OctaneExecutionOutcome::Failed(classify_source_execution_error(
-                        config.mode,
-                        Some(order_index),
-                        Some(order_entry),
-                        Some(label),
-                        error,
-                    )),
+                        tiering_delta: OctaneTieringSummary::from_vm(vm).delta_since(tiering_start),
+                        outcome: OctaneExecutionOutcome::Failed(classify_source_execution_error(
+                            config.mode,
+                            Some(order_index),
+                            Some(order_entry),
+                            Some(label),
+                            error,
+                        )),
+                    },
+                    retained_session: Some(session),
                 };
             }
         }
     }
 
-    OctaneBenchmarkExecutionReport {
-        benchmark: prepared.plan.name,
-        mode: config.mode,
-        run_config: prepared.run_config,
-        source_records,
-        host_output_records: session.host_output_records().to_vec(),
-        outcome: match extract_octane_benchmark_success(prepared, session.host_output_records()) {
-            Ok(success) => OctaneExecutionOutcome::Succeeded(success),
-            Err(failure) => OctaneExecutionOutcome::Failed(failure),
+    emit_octane_execution_progress(
+        progress,
+        OctaneExecutionProgress::ScoreTelemetryStarted {
+            benchmark: prepared.plan.name,
+            mode: config.mode,
         },
+    );
+    OctaneBenchmarkExecutionRun {
+        report: OctaneBenchmarkExecutionReport {
+            benchmark: prepared.plan.name,
+            mode: config.mode,
+            run_config: prepared.run_config,
+            source_records,
+            host_output_records: session.host_output_records().to_vec(),
+            tiering_delta: OctaneTieringSummary::from_vm(vm).delta_since(tiering_start),
+            outcome: match extract_octane_benchmark_success(
+                prepared,
+                session.host_result_records(),
+                session.host_output_records(),
+            ) {
+                Ok(success) => OctaneExecutionOutcome::Succeeded(success),
+                Err(failure) => OctaneExecutionOutcome::Failed(failure),
+            },
+        },
+        retained_session: Some(session),
     }
 }
 
@@ -888,11 +1816,39 @@ pub fn execute_prepared_octane_suite(
     prepared: &OctanePreparedSuite,
     config: OctaneExecutionConfig,
 ) -> OctanePreparedSuiteExecutionReport {
+    execute_prepared_octane_suite_with_optional_progress(prepared, config, None)
+}
+
+pub fn execute_prepared_octane_suite_with_progress(
+    prepared: &OctanePreparedSuite,
+    config: OctaneExecutionConfig,
+    progress: &mut dyn FnMut(OctaneExecutionProgress),
+) -> OctanePreparedSuiteExecutionReport {
+    execute_prepared_octane_suite_with_optional_progress(prepared, config, Some(progress))
+}
+
+fn execute_prepared_octane_suite_with_optional_progress(
+    prepared: &OctanePreparedSuite,
+    config: OctaneExecutionConfig,
+    progress: Option<&mut dyn FnMut(OctaneExecutionProgress)>,
+) -> OctanePreparedSuiteExecutionReport {
+    let mut progress = progress;
+    let mut vm = Vm::new(config.mode.vm_config());
+    let mut retained_sessions = Vec::new();
     let mut benchmarks = Vec::with_capacity(prepared.benchmarks.len());
     let mut stopped_early = false;
 
-    for benchmark in &prepared.benchmarks {
-        let report = execute_prepared_octane_benchmark(benchmark, config);
+    for benchmark in octane_driver_benchmark_execution_order(&prepared.benchmarks) {
+        let run = execute_prepared_octane_benchmark_run_with_vm(
+            &mut vm,
+            benchmark,
+            config,
+            &mut progress,
+        );
+        if let Some(session) = run.retained_session {
+            retained_sessions.push(session);
+        }
+        let report = run.report;
         let should_stop = config.failure_policy == OctaneSuiteFailurePolicy::FailFast
             && !report.outcome.is_success();
         benchmarks.push(report);
@@ -912,23 +1868,58 @@ pub fn execute_prepared_octane_suite(
     }
 }
 
+fn emit_octane_execution_progress(
+    progress: &mut Option<&mut dyn FnMut(OctaneExecutionProgress)>,
+    event: OctaneExecutionProgress,
+) {
+    if let Some(progress) = progress.as_deref_mut() {
+        progress(event);
+    }
+}
+
 pub fn execute_prepared_octane_benchmark_mode_comparison(
     prepared: &OctanePreparedBenchmark,
     failure_policy: OctaneSuiteFailurePolicy,
 ) -> OctaneBenchmarkModeComparisonRecord {
-    let interpreter_only = execute_prepared_octane_benchmark(
+    let mut interpreter_vm = Vm::new(OctaneExecutionMode::InterpreterOnly.vm_config());
+    let mut baseline_vm = Vm::new(OctaneExecutionMode::BaselineAllowed.vm_config());
+    execute_prepared_octane_benchmark_mode_comparison_run_with_vms(
+        &mut interpreter_vm,
+        &mut baseline_vm,
+        prepared,
+        failure_policy,
+    )
+    .record
+}
+
+fn execute_prepared_octane_benchmark_mode_comparison_run_with_vms(
+    interpreter_vm: &mut Vm,
+    baseline_vm: &mut Vm,
+    prepared: &OctanePreparedBenchmark,
+    failure_policy: OctaneSuiteFailurePolicy,
+) -> OctaneBenchmarkModeComparisonRun {
+    let mut no_progress = None;
+    let interpreter_run = execute_prepared_octane_benchmark_run_with_vm(
+        interpreter_vm,
         prepared,
         OctaneExecutionConfig::new(OctaneExecutionMode::InterpreterOnly, failure_policy),
+        &mut no_progress,
     );
-    let baseline_allowed = execute_prepared_octane_benchmark(
+    let baseline_run = execute_prepared_octane_benchmark_run_with_vm(
+        baseline_vm,
         prepared,
         OctaneExecutionConfig::new(OctaneExecutionMode::BaselineAllowed, failure_policy),
+        &mut no_progress,
     );
 
-    OctaneBenchmarkModeComparisonRecord {
-        benchmark: prepared.plan.name,
-        interpreter_only,
-        baseline_allowed,
+    OctaneBenchmarkModeComparisonRun {
+        record: OctaneBenchmarkModeComparisonRecord {
+            benchmark: prepared.plan.name,
+            interpreter_only: interpreter_run.report,
+            baseline_allowed: baseline_run.report,
+        },
+        interpreter_session: interpreter_run.retained_session,
+        baseline_session: baseline_run.retained_session,
     }
 }
 
@@ -936,11 +1927,27 @@ pub fn execute_prepared_octane_suite_mode_comparison(
     prepared: &OctanePreparedSuite,
     failure_policy: OctaneSuiteFailurePolicy,
 ) -> OctanePreparedSuiteModeComparisonReport {
+    let mut interpreter_vm = Vm::new(OctaneExecutionMode::InterpreterOnly.vm_config());
+    let mut baseline_vm = Vm::new(OctaneExecutionMode::BaselineAllowed.vm_config());
+    let mut interpreter_sessions = Vec::new();
+    let mut baseline_sessions = Vec::new();
     let mut benchmarks = Vec::with_capacity(prepared.benchmarks.len());
     let mut stopped_early = false;
 
-    for benchmark in &prepared.benchmarks {
-        let record = execute_prepared_octane_benchmark_mode_comparison(benchmark, failure_policy);
+    for benchmark in octane_driver_benchmark_execution_order(&prepared.benchmarks) {
+        let run = execute_prepared_octane_benchmark_mode_comparison_run_with_vms(
+            &mut interpreter_vm,
+            &mut baseline_vm,
+            benchmark,
+            failure_policy,
+        );
+        if let Some(session) = run.interpreter_session {
+            interpreter_sessions.push(session);
+        }
+        if let Some(session) = run.baseline_session {
+            baseline_sessions.push(session);
+        }
+        let record = run.record;
         let should_stop = failure_policy == OctaneSuiteFailurePolicy::FailFast
             && (!record.interpreter_only.outcome.is_success()
                 || !record.baseline_allowed.outcome.is_success());
@@ -957,6 +1964,22 @@ pub fn execute_prepared_octane_suite_mode_comparison(
         benchmarks,
         stopped_early,
     }
+}
+
+fn octane_driver_benchmark_execution_order(
+    benchmarks: &[OctanePreparedBenchmark],
+) -> Vec<&OctanePreparedBenchmark> {
+    let mut ordered = benchmarks.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        reverse_case_insensitive_octane_name_order(left.plan.name, right.plan.name)
+    });
+    ordered
+}
+
+fn reverse_case_insensitive_octane_name_order(left: &str, right: &str) -> Ordering {
+    let left_lower = left.to_ascii_lowercase();
+    let right_lower = right.to_ascii_lowercase();
+    right_lower.cmp(&left_lower).then_with(|| right.cmp(left))
 }
 
 fn octane_suite_score_record(
@@ -993,15 +2016,17 @@ fn octane_suite_score_record(
 
 fn extract_octane_benchmark_success(
     prepared: &OctanePreparedBenchmark,
+    host_result_records: &[CoreHostResultRecord],
     host_output_records: &[CoreHostOutputRecord],
 ) -> Result<OctaneBenchmarkExecutionSuccess, OctaneExecutionFailure> {
     if let Some(failure) = classify_octane_oracle_alert(prepared, host_output_records) {
         return Err(failure);
     }
 
-    match extract_octane_default_benchmark_telemetry(
+    match extract_octane_default_benchmark_results(
         prepared.plan,
         prepared.run_config,
+        host_result_records,
         host_output_records,
     )
     .and_then(|telemetry| score_octane_default_benchmark_telemetry(prepared.run_config, telemetry))
@@ -1029,6 +2054,43 @@ fn classify_octane_oracle_alert(
                 detail: OctaneExecutionFailureDetail::OracleAlert(record),
             }
         })
+}
+
+fn extract_octane_default_benchmark_results(
+    plan: &'static OctaneBenchmarkPlan,
+    run_config: OctaneDefaultBenchmarkRunConfig,
+    host_result_records: &[CoreHostResultRecord],
+    host_output_records: &[CoreHostOutputRecord],
+) -> Result<OctaneDefaultBenchmarkTelemetry, OctaneScoreTelemetryError> {
+    if !host_result_records.is_empty() {
+        return extract_octane_default_benchmark_resolved_result(host_result_records);
+    }
+
+    extract_octane_default_benchmark_telemetry(plan, run_config, host_output_records)
+}
+
+fn extract_octane_default_benchmark_resolved_result(
+    host_result_records: &[CoreHostResultRecord],
+) -> Result<OctaneDefaultBenchmarkTelemetry, OctaneScoreTelemetryError> {
+    let [record] = host_result_records else {
+        return Err(OctaneScoreTelemetryError::Duplicate {
+            count: host_result_records.len(),
+        });
+    };
+
+    match record {
+        CoreHostResultRecord::Resolved { elapsed_times_ms } => {
+            Ok(OctaneDefaultBenchmarkTelemetry {
+                elapsed_times_ms: elapsed_times_ms.clone(),
+                validation_state: OctaneBenchmarkValidationState::Passed,
+            })
+        }
+        CoreHostResultRecord::Rejected { reason } => {
+            Err(OctaneScoreTelemetryError::RejectedResult {
+                reason: reason.clone(),
+            })
+        }
+    }
 }
 
 fn extract_octane_default_benchmark_telemetry(
@@ -1235,26 +2297,6 @@ fn octane_telemetry_text_matches_prefix(text: &str) -> bool {
     text.starts_with(OCTANE_DEFAULT_BENCHMARK_TELEMETRY_PREFIX)
 }
 
-fn octane_js_double_quoted_string(value: &str) -> String {
-    let mut literal = String::from("\"");
-    for character in value.chars() {
-        match character {
-            '"' => literal.push_str("\\\""),
-            '\\' => literal.push_str("\\\\"),
-            '\n' => literal.push_str("\\n"),
-            '\r' => literal.push_str("\\r"),
-            '\t' => literal.push_str("\\t"),
-            character if character.is_control() => {
-                write!(&mut literal, "\\u{:04x}", character as u32)
-                    .expect("writing to a String should not fail");
-            }
-            character => literal.push(character),
-        }
-    }
-    literal.push('"');
-    literal
-}
-
 struct OctaneOrderedPreparedSource<'a> {
     label: &'a str,
     source: &'a SourceSessionSource,
@@ -1432,7 +2474,6 @@ fn generate_octane_prelude_source() -> String {
     [
         "var isInBrowser = false;",
         "var self = this;",
-        "var top = this;",
         "if (typeof performance === \"undefined\")",
         "    var performance = Date;",
         "",
@@ -1476,13 +2517,10 @@ fn generate_octane_runner_source(
             } else {
                 ""
             };
-            let benchmark_name = octane_js_double_quoted_string(plan.name);
             Ok(format!(
                 "\
 let __octaneBenchmark = new Benchmark({iterations});
 let __octaneResults = [];
-let __octaneResultsText = \"\";
-let __octaneValidationState = \"not-run\";
 for (let i = 0; i < {iterations}; i++) {{
     if (typeof __octaneBenchmark.prepareForNextIteration === \"function\")
         __octaneBenchmark.prepareForNextIteration();
@@ -1491,23 +2529,17 @@ for (let i = 0; i < {iterations}; i++) {{
     let end = performance.now();
     let __octaneElapsed = Math.max(1, end - start);
     __octaneResults.push(__octaneElapsed);
-    if (i > 0)
-        __octaneResultsText = __octaneResultsText + \",\";
-    __octaneResultsText = __octaneResultsText + __octaneElapsed;
 }}
 if (typeof __octaneBenchmark.validate === \"function\") {{
     let __octaneValidationResult = __octaneBenchmark.validate();
     if (__octaneValidationResult === false)
         alert(\"Octane validation failed\");
-    __octaneValidationState = \"passed\";
 }}
-print(\"{telemetry_prefix}\" + {benchmark_name} + \"|{iterations}|\" + __octaneValidationState + \"|\" + __octaneResultsText);
+top.currentResolve(__octaneResults);
 __octaneResults;
 ",
                 iterations = run_config.iterations,
-                random_reset = random_reset,
-                benchmark_name = benchmark_name,
-                telemetry_prefix = OCTANE_DEFAULT_BENCHMARK_TELEMETRY_PREFIX
+                random_reset = random_reset
             ))
         }
     }
@@ -1676,6 +2708,11 @@ fn geometric_mean(values: &[f64]) -> f64 {
 mod tests {
     use super::super::ShellFilesystemOperation;
     use super::*;
+    use crate::bytecode::{BytecodeIndex, CoreOpcode};
+    use crate::gc::CellId;
+    use crate::jit::P6X86_64BaselineSelectedSideExitReason;
+    use crate::runtime::CodeBlockId;
+    use crate::vm::VmGeneratedDirectCallTransactionRoute;
     use std::collections::HashSet;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1710,6 +2747,24 @@ mod tests {
     static OCTANE_TEST_SECOND_PLAN: OctaneBenchmarkPlan = OctaneBenchmarkPlan {
         name: "test-second",
         files: &["./Octane/test-second.js"],
+        deterministic_random: false,
+        iterations: Some(3),
+        worst_case_count: Some(1),
+        benchmark_class: OctaneBenchmarkClass::DefaultBenchmark,
+    };
+
+    static OCTANE_TEST_ALPHA_PLAN: OctaneBenchmarkPlan = OctaneBenchmarkPlan {
+        name: "alpha-test",
+        files: &["./Octane/alpha-test.js"],
+        deterministic_random: false,
+        iterations: Some(3),
+        worst_case_count: Some(1),
+        benchmark_class: OctaneBenchmarkClass::DefaultBenchmark,
+    };
+
+    static OCTANE_TEST_ZULU_PLAN: OctaneBenchmarkPlan = OctaneBenchmarkPlan {
+        name: "zulu-test",
+        files: &["./Octane/zulu-test.js"],
         deterministic_random: false,
         iterations: Some(3),
         worst_case_count: Some(1),
@@ -1823,6 +2878,19 @@ Benchmark.prototype.validate = function() {
     ) -> OctanePreparedBenchmark {
         prepare_octane_benchmark(root.path(), plan, OctaneBenchmarkRunOverrides::none())
             .expect("test benchmark should prepare")
+    }
+
+    fn octane_progress_phase_name(event: &OctaneExecutionProgress) -> &'static str {
+        match event {
+            OctaneExecutionProgress::BenchmarkStarted { .. } => "benchmark-start",
+            OctaneExecutionProgress::SourceSessionStarted { .. } => "session-open-start",
+            OctaneExecutionProgress::SourceSessionOpened { .. } => "session-open-done",
+            OctaneExecutionProgress::SourceSessionErrored { .. } => "session-open-error",
+            OctaneExecutionProgress::SourceStarted { .. } => "source-start",
+            OctaneExecutionProgress::SourceCompleted { .. } => "source-done",
+            OctaneExecutionProgress::SourceErrored { .. } => "source-error",
+            OctaneExecutionProgress::ScoreTelemetryStarted { .. } => "score-telemetry-start",
+        }
     }
 
     #[test]
@@ -2300,9 +3368,9 @@ Benchmark.prototype.validate = function() {
             .expect("runner should run benchmark");
         assert!(reset_index < run_index);
         assert!(crypto_runner.contains("let __octaneBenchmark = new Benchmark(120);"));
-        assert!(crypto_runner.contains(OCTANE_DEFAULT_BENCHMARK_TELEMETRY_PREFIX));
-        assert!(!crypto_runner.contains("return __octaneResults;"));
-        assert!(crypto_runner.contains("print("));
+        assert!(crypto_runner.contains("top.currentResolve(__octaneResults);"));
+        assert!(!crypto_runner.contains(OCTANE_DEFAULT_BENCHMARK_TELEMETRY_PREFIX));
+        assert!(!crypto_runner.contains("print("));
         assert!(crypto_runner.ends_with("__octaneResults;\n"));
 
         let prepared_raytrace =
@@ -2421,7 +3489,572 @@ Benchmark.prototype.validate = function() {
             .source_records
             .iter()
             .all(|record| matches!(record.completion, Some(ExecutionCompletion::Returned(_)))));
-        assert_eq!(report.host_output_records.len(), 1);
+        assert!(report.host_output_records.is_empty());
+        assert!(report.tiering_delta.entry_decisions > 0);
+        assert!(report.tiering_delta.diagnostics > 0);
+        assert_eq!(report.tiering_delta.fallback_records, 0);
+        assert_eq!(report.tiering_delta.baseline_installs, 0);
+        assert_eq!(report.tiering_delta.launch_descriptors, 0);
+    }
+
+    #[test]
+    fn octane_tiering_summary_delta_preserves_detailed_rootless_telemetry() {
+        let owner = CodeBlockId(CellId(11));
+        let second_owner = CodeBlockId(CellId(12));
+        let caller = CodeBlockId(CellId(21));
+        let target = CodeBlockId(CellId(22));
+        let call_bytecode_index = BytecodeIndex::from_offset(16);
+        let side_exit_bytecode_index = BytecodeIndex::from_offset(24);
+
+        let start = OctaneTieringSummary {
+            generated_direct_call_rootless_rejections:
+                VmGeneratedDirectCallRootlessRejectionCounts {
+                    hot_slot_miss: 2,
+                    unsupported_body_opcode: 1,
+                    ..VmGeneratedDirectCallRootlessRejectionCounts::default()
+                },
+            generated_direct_call_rootless_native_entry_rejections:
+                VmGeneratedDirectCallRootlessRejectionCounts {
+                    missing_generated_artifact: 1,
+                    ..VmGeneratedDirectCallRootlessRejectionCounts::default()
+                },
+            generated_direct_call_rootless_unsupported_body_opcode_counts: vec![
+                VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount {
+                    opcode: CoreOpcode::RightShiftInt32,
+                    count: 2,
+                },
+                VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount {
+                    opcode: CoreOpcode::BitAndInt32,
+                    count: 4,
+                },
+            ],
+            generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts: vec![
+                VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount {
+                    opcode: CoreOpcode::LoadInt32,
+                    count: 1,
+                },
+            ],
+            generated_direct_call_rootless_native_entry_retained_side_exit_counts: vec![
+                VmGeneratedDirectCallRootlessRetainedSideExitCount {
+                    target_code_block: target,
+                    bytecode_index: side_exit_bytecode_index,
+                    opcode: Some(CoreOpcode::AddInt32),
+                    reason: P6X86_64BaselineSelectedSideExitReason::NonInt32Operand,
+                    count: 2,
+                },
+            ],
+            generated_direct_call_rootless_preferred_native_entry_counts:
+                VmGeneratedDirectCallRootlessPreferredNativeEntryCounts {
+                    pure_baseline_shim: 1,
+                    emitted_semantic_c_abi_entry: 3,
+                    unknown: 2,
+                },
+            baseline_generated_execution_summaries: vec![VmBaselineGeneratedExecutionSummary {
+                owner,
+                execution_count: 2,
+                executed_bytecode_count: 10,
+                returned_count: 1,
+                threw_count: 0,
+                ordinary_bytecode_call_count: 0,
+                ordinary_bytecode_construct_count: 0,
+                function_value_call_count: 0,
+                terminated_count: 0,
+                suspended_count: 0,
+                failed_count: 0,
+                fallback_count: 0,
+                js_call_count: 1,
+                property_count: 0,
+                runtime_helper_count: 0,
+                rejected_count: 0,
+            }],
+            generated_direct_call_transaction_summaries: vec![
+                VmGeneratedDirectCallTransactionSummary {
+                    caller,
+                    call_bytecode_index,
+                    target_code_block: target,
+                    argument_count_including_this: 2,
+                    route: VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
+                    transaction_count: 2,
+                    continue_count: 1,
+                    jump_count: 0,
+                    return_count: 1,
+                    threw_count: 0,
+                    ordinary_bytecode_call_count: 0,
+                    ordinary_bytecode_construct_count: 0,
+                    function_value_call_count: 0,
+                    suspended_count: 0,
+                    failed_count: 0,
+                },
+            ],
+            property_inline_cache_evolution_records: 7,
+            property_inline_cache_evolution_admitted: 5,
+            property_inline_cache_evolution_buffered: 3,
+            property_inline_cache_evolution_buffered_duplicates: 2,
+            property_inline_cache_evolution_cooldowns: 1,
+            property_inline_cache_evolution_final_gave_up: 1,
+            property_inline_cache_evolution_gave_up_skips: 2,
+            property_inline_cache_evolution_generated_megamorphic_load: 1,
+            property_inline_cache_evolution_megamorphic_load_skips: 3,
+            property_inline_cache_evolution_generated_megamorphic_store: 2,
+            property_inline_cache_evolution_megamorphic_store_skips: 4,
+            property_inline_cache_evolution_generated_megamorphic_has: 1,
+            property_inline_cache_evolution_megamorphic_has_skips: 2,
+            property_load_megamorphic_cache_records: 4,
+            property_store_megamorphic_cache_records: 6,
+            property_has_megamorphic_cache_records: 8,
+            ..OctaneTieringSummary::default()
+        };
+        let current = OctaneTieringSummary {
+            generated_direct_call_rootless_rejections:
+                VmGeneratedDirectCallRootlessRejectionCounts {
+                    hot_slot_miss: 5,
+                    effect_contract: 2,
+                    unsupported_body_opcode: 4,
+                    ..VmGeneratedDirectCallRootlessRejectionCounts::default()
+                },
+            generated_direct_call_rootless_native_entry_rejections:
+                VmGeneratedDirectCallRootlessRejectionCounts {
+                    missing_generated_artifact: 3,
+                    ..VmGeneratedDirectCallRootlessRejectionCounts::default()
+                },
+            generated_direct_call_rootless_unsupported_body_opcode_counts: vec![
+                VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount {
+                    opcode: CoreOpcode::RightShiftInt32,
+                    count: 5,
+                },
+                VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount {
+                    opcode: CoreOpcode::UnsignedRightShiftInt32,
+                    count: 3,
+                },
+            ],
+            generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts: vec![
+                VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount {
+                    opcode: CoreOpcode::LoadInt32,
+                    count: 4,
+                },
+            ],
+            generated_direct_call_rootless_native_entry_retained_side_exit_counts: vec![
+                VmGeneratedDirectCallRootlessRetainedSideExitCount {
+                    target_code_block: target,
+                    bytecode_index: side_exit_bytecode_index,
+                    opcode: Some(CoreOpcode::AddInt32),
+                    reason: P6X86_64BaselineSelectedSideExitReason::NonInt32Operand,
+                    count: 5,
+                },
+                VmGeneratedDirectCallRootlessRetainedSideExitCount {
+                    target_code_block: target,
+                    bytecode_index: BytecodeIndex::from_offset(28),
+                    opcode: Some(CoreOpcode::MulInt32),
+                    reason: P6X86_64BaselineSelectedSideExitReason::NegativeZero,
+                    count: 1,
+                },
+            ],
+            generated_direct_call_rootless_preferred_native_entry_counts:
+                VmGeneratedDirectCallRootlessPreferredNativeEntryCounts {
+                    pure_baseline_shim: 4,
+                    emitted_semantic_c_abi_entry: 3,
+                    unknown: 5,
+                },
+            baseline_generated_execution_summaries: vec![
+                VmBaselineGeneratedExecutionSummary {
+                    owner,
+                    execution_count: 5,
+                    executed_bytecode_count: 30,
+                    returned_count: 4,
+                    threw_count: 0,
+                    ordinary_bytecode_call_count: 0,
+                    ordinary_bytecode_construct_count: 0,
+                    function_value_call_count: 0,
+                    terminated_count: 0,
+                    suspended_count: 0,
+                    failed_count: 0,
+                    fallback_count: 0,
+                    js_call_count: 2,
+                    property_count: 0,
+                    runtime_helper_count: 0,
+                    rejected_count: 1,
+                },
+                VmBaselineGeneratedExecutionSummary {
+                    owner: second_owner,
+                    execution_count: 1,
+                    executed_bytecode_count: 9,
+                    returned_count: 0,
+                    threw_count: 0,
+                    ordinary_bytecode_call_count: 0,
+                    ordinary_bytecode_construct_count: 0,
+                    function_value_call_count: 0,
+                    terminated_count: 0,
+                    suspended_count: 0,
+                    failed_count: 0,
+                    fallback_count: 1,
+                    js_call_count: 0,
+                    property_count: 0,
+                    runtime_helper_count: 0,
+                    rejected_count: 0,
+                },
+            ],
+            generated_direct_call_transaction_summaries: vec![
+                VmGeneratedDirectCallTransactionSummary {
+                    caller,
+                    call_bytecode_index,
+                    target_code_block: target,
+                    argument_count_including_this: 2,
+                    route: VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
+                    transaction_count: 5,
+                    continue_count: 2,
+                    jump_count: 0,
+                    return_count: 3,
+                    threw_count: 0,
+                    ordinary_bytecode_call_count: 0,
+                    ordinary_bytecode_construct_count: 0,
+                    function_value_call_count: 0,
+                    suspended_count: 0,
+                    failed_count: 1,
+                },
+                VmGeneratedDirectCallTransactionSummary {
+                    caller,
+                    call_bytecode_index,
+                    target_code_block: target,
+                    argument_count_including_this: 2,
+                    route: VmGeneratedDirectCallTransactionRoute::NativeEntry,
+                    transaction_count: 1,
+                    continue_count: 0,
+                    jump_count: 0,
+                    return_count: 1,
+                    threw_count: 0,
+                    ordinary_bytecode_call_count: 0,
+                    ordinary_bytecode_construct_count: 0,
+                    function_value_call_count: 0,
+                    suspended_count: 0,
+                    failed_count: 0,
+                },
+            ],
+            property_inline_cache_evolution_records: 12,
+            property_inline_cache_evolution_admitted: 8,
+            property_inline_cache_evolution_buffered: 4,
+            property_inline_cache_evolution_buffered_duplicates: 5,
+            property_inline_cache_evolution_cooldowns: 3,
+            property_inline_cache_evolution_final_gave_up: 2,
+            property_inline_cache_evolution_gave_up_skips: 6,
+            property_inline_cache_evolution_generated_megamorphic_load: 4,
+            property_inline_cache_evolution_megamorphic_load_skips: 8,
+            property_inline_cache_evolution_generated_megamorphic_store: 6,
+            property_inline_cache_evolution_megamorphic_store_skips: 9,
+            property_inline_cache_evolution_generated_megamorphic_has: 4,
+            property_inline_cache_evolution_megamorphic_has_skips: 6,
+            property_load_megamorphic_cache_records: 9,
+            property_store_megamorphic_cache_records: 11,
+            property_has_megamorphic_cache_records: 14,
+            ..OctaneTieringSummary::default()
+        };
+
+        let delta = current.delta_since(start);
+
+        assert_eq!(
+            delta
+                .generated_direct_call_rootless_rejections
+                .hot_slot_miss,
+            3
+        );
+        assert_eq!(
+            delta
+                .generated_direct_call_rootless_rejections
+                .effect_contract,
+            2
+        );
+        assert_eq!(
+            delta
+                .generated_direct_call_rootless_rejections
+                .unsupported_body_opcode,
+            3
+        );
+        assert_eq!(
+            delta
+                .generated_direct_call_rootless_native_entry_rejections
+                .missing_generated_artifact,
+            2
+        );
+        assert_eq!(
+            delta.generated_direct_call_rootless_unsupported_body_opcode_counts,
+            vec![
+                VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount {
+                    opcode: CoreOpcode::RightShiftInt32,
+                    count: 3,
+                },
+                VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount {
+                    opcode: CoreOpcode::UnsignedRightShiftInt32,
+                    count: 3,
+                },
+            ]
+        );
+        assert_eq!(
+            delta.generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts,
+            vec![VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount {
+                opcode: CoreOpcode::LoadInt32,
+                count: 3,
+            }]
+        );
+        assert_eq!(
+            delta.generated_direct_call_rootless_native_entry_retained_side_exit_counts,
+            vec![
+                VmGeneratedDirectCallRootlessRetainedSideExitCount {
+                    target_code_block: target,
+                    bytecode_index: side_exit_bytecode_index,
+                    opcode: Some(CoreOpcode::AddInt32),
+                    reason: P6X86_64BaselineSelectedSideExitReason::NonInt32Operand,
+                    count: 3,
+                },
+                VmGeneratedDirectCallRootlessRetainedSideExitCount {
+                    target_code_block: target,
+                    bytecode_index: BytecodeIndex::from_offset(28),
+                    opcode: Some(CoreOpcode::MulInt32),
+                    reason: P6X86_64BaselineSelectedSideExitReason::NegativeZero,
+                    count: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            delta.generated_direct_call_rootless_preferred_native_entry_counts,
+            VmGeneratedDirectCallRootlessPreferredNativeEntryCounts {
+                pure_baseline_shim: 3,
+                emitted_semantic_c_abi_entry: 0,
+                unknown: 3,
+            }
+        );
+        assert_eq!(delta.baseline_generated_execution_summaries.len(), 2);
+        assert_eq!(
+            delta.baseline_generated_execution_summaries[0],
+            VmBaselineGeneratedExecutionSummary {
+                owner,
+                execution_count: 3,
+                executed_bytecode_count: 20,
+                returned_count: 3,
+                threw_count: 0,
+                ordinary_bytecode_call_count: 0,
+                ordinary_bytecode_construct_count: 0,
+                function_value_call_count: 0,
+                terminated_count: 0,
+                suspended_count: 0,
+                failed_count: 0,
+                fallback_count: 0,
+                js_call_count: 1,
+                property_count: 0,
+                runtime_helper_count: 0,
+                rejected_count: 1,
+            }
+        );
+        assert_eq!(
+            delta.baseline_generated_execution_summaries[1],
+            VmBaselineGeneratedExecutionSummary {
+                owner: second_owner,
+                execution_count: 1,
+                executed_bytecode_count: 9,
+                returned_count: 0,
+                threw_count: 0,
+                ordinary_bytecode_call_count: 0,
+                ordinary_bytecode_construct_count: 0,
+                function_value_call_count: 0,
+                terminated_count: 0,
+                suspended_count: 0,
+                failed_count: 0,
+                fallback_count: 1,
+                js_call_count: 0,
+                property_count: 0,
+                runtime_helper_count: 0,
+                rejected_count: 0,
+            }
+        );
+        assert_eq!(delta.generated_direct_call_transaction_summaries.len(), 2);
+        assert_eq!(
+            delta.generated_direct_call_transaction_summaries[0],
+            VmGeneratedDirectCallTransactionSummary {
+                caller,
+                call_bytecode_index,
+                target_code_block: target,
+                argument_count_including_this: 2,
+                route: VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
+                transaction_count: 3,
+                continue_count: 1,
+                jump_count: 0,
+                return_count: 2,
+                threw_count: 0,
+                ordinary_bytecode_call_count: 0,
+                ordinary_bytecode_construct_count: 0,
+                function_value_call_count: 0,
+                suspended_count: 0,
+                failed_count: 1,
+            }
+        );
+        assert_eq!(
+            delta.generated_direct_call_transaction_summaries[1],
+            VmGeneratedDirectCallTransactionSummary {
+                caller,
+                call_bytecode_index,
+                target_code_block: target,
+                argument_count_including_this: 2,
+                route: VmGeneratedDirectCallTransactionRoute::NativeEntry,
+                transaction_count: 1,
+                continue_count: 0,
+                jump_count: 0,
+                return_count: 1,
+                threw_count: 0,
+                ordinary_bytecode_call_count: 0,
+                ordinary_bytecode_construct_count: 0,
+                function_value_call_count: 0,
+                suspended_count: 0,
+                failed_count: 0,
+            }
+        );
+        assert_eq!(delta.property_inline_cache_evolution_records, 5);
+        assert_eq!(delta.property_inline_cache_evolution_admitted, 3);
+        assert_eq!(delta.property_inline_cache_evolution_buffered, 1);
+        assert_eq!(delta.property_inline_cache_evolution_buffered_duplicates, 3);
+        assert_eq!(delta.property_inline_cache_evolution_cooldowns, 2);
+        assert_eq!(delta.property_inline_cache_evolution_final_gave_up, 1);
+        assert_eq!(delta.property_inline_cache_evolution_gave_up_skips, 4);
+        assert_eq!(
+            delta.property_inline_cache_evolution_generated_megamorphic_load,
+            3
+        );
+        assert_eq!(
+            delta.property_inline_cache_evolution_megamorphic_load_skips,
+            5
+        );
+        assert_eq!(
+            delta.property_inline_cache_evolution_generated_megamorphic_store,
+            4
+        );
+        assert_eq!(
+            delta.property_inline_cache_evolution_megamorphic_store_skips,
+            5
+        );
+        assert_eq!(
+            delta.property_inline_cache_evolution_generated_megamorphic_has,
+            3
+        );
+        assert_eq!(
+            delta.property_inline_cache_evolution_megamorphic_has_skips,
+            4
+        );
+        assert_eq!(delta.property_load_megamorphic_cache_records, 5);
+        assert_eq!(delta.property_store_megamorphic_cache_records, 5);
+        assert_eq!(delta.property_has_megamorphic_cache_records, 6);
+    }
+
+    #[test]
+    fn octane_execution_defaults_to_unbounded_dispatch_budget() {
+        let config = OctaneExecutionConfig::new(
+            OctaneExecutionMode::InterpreterOnly,
+            OctaneSuiteFailurePolicy::FailFast,
+        );
+
+        assert_eq!(config.dispatch_config, DispatchConfig::unbounded());
+    }
+
+    #[test]
+    fn octane_execution_honors_explicit_dispatch_budget() {
+        let root = TempJetStreamRoot::new();
+        root.write_manifest_file(
+            "./Octane/test-function.js",
+            minimal_function_benchmark_source(),
+        );
+        let prepared = prepare_test_benchmark(&root, &OCTANE_TEST_FUNCTION_PLAN);
+
+        let report = execute_prepared_octane_benchmark(
+            &prepared,
+            OctaneExecutionConfig::new(
+                OctaneExecutionMode::InterpreterOnly,
+                OctaneSuiteFailurePolicy::FailFast,
+            )
+            .with_dispatch_config(DispatchConfig::new(0)),
+        );
+
+        assert!(matches!(
+            report.outcome,
+            OctaneExecutionOutcome::Failed(OctaneExecutionFailure {
+                detail: OctaneExecutionFailureDetail::Completion(ExecutionCompletion::Failed(
+                    ExecutionError::DispatchStepLimitExceeded
+                )),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn octane_execution_progress_reports_source_boundaries_in_order() {
+        let root = TempJetStreamRoot::new();
+        root.write_manifest_file(
+            "./Octane/test-function.js",
+            deterministic_timing_benchmark_source(),
+        );
+        let prepared = prepare_test_benchmark(&root, &OCTANE_TEST_FUNCTION_PLAN);
+        let mut events = Vec::new();
+
+        let report = execute_prepared_octane_benchmark_with_progress(
+            &prepared,
+            OctaneExecutionConfig::new(
+                OctaneExecutionMode::InterpreterOnly,
+                OctaneSuiteFailurePolicy::FailFast,
+            ),
+            &mut |event| events.push(event),
+        );
+
+        assert!(report.outcome.is_success(), "{report:#?}");
+        assert_eq!(
+            events
+                .iter()
+                .map(octane_progress_phase_name)
+                .collect::<Vec<_>>(),
+            vec![
+                "benchmark-start",
+                "session-open-start",
+                "session-open-done",
+                "source-start",
+                "source-done",
+                "source-start",
+                "source-done",
+                "source-start",
+                "source-done",
+                "score-telemetry-start",
+            ]
+        );
+
+        let source_starts = events
+            .iter()
+            .filter_map(|event| match event {
+                OctaneExecutionProgress::SourceStarted {
+                    order_index,
+                    order_entry,
+                    label,
+                    ..
+                } => Some((*order_index, *order_entry, label.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source_starts,
+            vec![
+                (
+                    0,
+                    OctanePreparedSourceOrderEntry::Generated(
+                        OctanePreparedGeneratedSourceKind::Prelude
+                    ),
+                    "octane://test-function/prelude",
+                ),
+                (
+                    1,
+                    OctanePreparedSourceOrderEntry::BenchmarkFile(0),
+                    "test-function:./Octane/test-function.js",
+                ),
+                (
+                    2,
+                    OctanePreparedSourceOrderEntry::Generated(
+                        OctanePreparedGeneratedSourceKind::Runner
+                    ),
+                    "octane://test-function/runner",
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -2658,5 +4291,64 @@ function Benchmark() {
         assert_eq!(collect_all.benchmarks[1].benchmark, "test-second");
         assert!(collect_all.benchmarks[1].outcome.is_success());
         assert!(collect_all.suite_score.is_none());
+    }
+
+    #[test]
+    fn octane_suite_execution_uses_jetstream_reverse_case_insensitive_order() {
+        let root = TempJetStreamRoot::new();
+        root.write_manifest_file(
+            "./Octane/alpha-test.js",
+            minimal_function_benchmark_source(),
+        );
+        root.write_manifest_file(
+            "./Octane/test-second.js",
+            minimal_function_benchmark_source(),
+        );
+        root.write_manifest_file("./Octane/zulu-test.js", minimal_function_benchmark_source());
+        let alpha = prepare_test_benchmark(&root, &OCTANE_TEST_ALPHA_PLAN);
+        let second = prepare_test_benchmark(&root, &OCTANE_TEST_SECOND_PLAN);
+        let zulu = prepare_test_benchmark(&root, &OCTANE_TEST_ZULU_PLAN);
+        let prepared_suite = OctanePreparedSuite {
+            config: OctanePreparationConfig::new(
+                root.path(),
+                OctaneRunConfig::new(OctaneSuite::Core),
+            ),
+            benchmarks: vec![alpha, second, zulu],
+        };
+
+        let report = execute_prepared_octane_suite(
+            &prepared_suite,
+            OctaneExecutionConfig::new(
+                OctaneExecutionMode::InterpreterOnly,
+                OctaneSuiteFailurePolicy::CollectAll,
+            ),
+        );
+
+        assert_eq!(
+            report
+                .benchmarks
+                .iter()
+                .map(|benchmark| benchmark.benchmark)
+                .collect::<Vec<_>>(),
+            vec!["zulu-test", "test-second", "alpha-test"]
+        );
+        assert!(
+            report
+                .benchmarks
+                .iter()
+                .all(|benchmark| benchmark.outcome.is_success()),
+            "{report:#?}"
+        );
+        assert_eq!(
+            report
+                .suite_score
+                .as_ref()
+                .expect("all benchmark scores should produce a suite score")
+                .benchmark_scores
+                .iter()
+                .map(|record| record.benchmark)
+                .collect::<Vec<_>>(),
+            vec!["zulu-test", "test-second", "alpha-test"]
+        );
     }
 }

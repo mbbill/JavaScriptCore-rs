@@ -127,8 +127,10 @@ pub use profiling::{
     ControlFlowProfileRecord, CountingVariant, ExecutionCounterState, LoopOsrCounter,
     ObservedResults, ObservedType, ProfileUpdatePolicy, ProfilingCounterSet, SpeculatedTypeSet,
     TypeProfilerRecord, UnlinkedValueProfile, ValueProfile, ValueProfileBucket,
-    ValueProfileBucketKind, ValueProfileRootMetadata, ValueProfileRootValidationError,
-    ValueProfileTable,
+    ValueProfileBucketKind, ValueProfileBucketSample, ValueProfileEmissionCapability,
+    ValueProfileEmissionPolicy, ValueProfileJitBucketBinding, ValueProfileJitStorageGeneration,
+    ValueProfileJitStoreTarget, ValueProfileRootMetadata, ValueProfileRootValidationError,
+    ValueProfileSampleError, ValueProfileTable,
 };
 pub use register::{
     RegisterClass, RegisterFrameShape, RegisterOperandEncoding, RegisterOperandWidth,

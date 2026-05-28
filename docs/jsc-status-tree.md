@@ -20,6 +20,10 @@ Legend:
     [done] benchmark/probe command surface for current investigations
   [wip] Current proof path
     [wip] honest subset execution toward full Octane
+      [done] richards correctness (interpreter, scored)
+      [done] navier-stokes correctness (interpreter, scored)
+      [done] crypto correctness (interpreter, scored)
+      [wip] delta-blue, splay, raytrace (running, slow interpreter)
     [wip] TypeScript parser-prefix execution and throughput
     [missing] full TypeScript benchmark correctness
     [missing] full Octane correctness
@@ -81,7 +85,17 @@ Legend:
     [missing] full JSC Yarr parse/execute/Unicode semantics
     [missing] RegExp JIT and full String regex methods
   [missing] typed arrays and ArrayBuffer breadth
-  [missing] Date, Math, Number, and standard-library completeness
+  [wip] Number autoboxing and prototype methods
+    [done] Number.prototype.toString with radix (faithful C++ port)
+    [done] Number.prototype.valueOf
+    [done] number/boolean autoboxing in property access
+    [done] Number/Boolean/String wrapper object construction
+    [missing] Boolean.prototype.toString/valueOf
+  [wip] Array.prototype completeness for array-like objects
+    [done] Array.prototype.slice.call on arguments/array-likes
+    [done] Array.prototype.toString calls join
+    [risk] other Array methods may not support non-Array this
+  [missing] Date, Math, and standard-library completeness
   [missing] modules, jobs, microtasks, async ordering
   [deferred] Wasm
 

@@ -5,12 +5,13 @@ use crate::syntax::ast::{
     ArrayLiteralElement, ArrayLiteralExpr, AssignmentContext, AssignmentExpr, AssignmentOperator,
     AstPropertyKey, AstRoot, BinaryExpr, BinaryOperator as AstBinaryOperator, CallExpr,
     ClassElement, ClassElementKind, ClassElementName, ClassExpr, ConditionalExpr, ControlKind,
-    ControlStmt, DeclarationStmt, DeclarationSyntaxKind, DoWhileStmt, Expr, ForInit, ForOfBinding,
-    ForOfStmt, ForStmt, FunctionDecl, FunctionMetadata, FunctionParameter, FunctionSyntaxMode,
-    IfStmt, LiteralExpr, LiteralKind, MemberExpr, MemberKind, ModuleItem, NameExpr, NameKind,
-    NewExpr, NumberLiteralValue, ObjectLiteralExpr, ObjectLiteralProperty,
-    ObjectLiteralPropertyKind, Pattern, ScopeBlock, ScopeNode, ScopeNodeKind, Stmt, SwitchCase,
-    SwitchStmt, TemplateExpr, TemplatePart, TryStmt, UnaryExpr, UnaryOperator, WhileStmt,
+    ControlStmt, DeclarationStmt, DeclarationSyntaxKind, DoWhileStmt, Expr, ForInBinding,
+    ForInStmt, ForInit, ForOfBinding, ForOfStmt, ForStmt, FunctionDecl, FunctionMetadata,
+    FunctionParameter, FunctionSyntaxMode, IfStmt, LabelStmt, LiteralExpr, LiteralKind, MemberExpr,
+    MemberKind, ModuleItem, NameExpr, NameKind, NewExpr, NumberLiteralValue, ObjectLiteralExpr,
+    ObjectLiteralProperty, ObjectLiteralPropertyKind, Pattern, ScopeBlock, ScopeNode,
+    ScopeNodeKind, SequenceExpr, Stmt, SwitchCase, SwitchStmt, TemplateExpr, TemplatePart, TryStmt,
+    UnaryExpr, UnaryOperator, WhileStmt,
 };
 use crate::syntax::lexer::{
     KeywordPolicy, LexDeferred, LexGoal, LexRequest, LexResult, Lexer, LexerError, RawStringMode,
@@ -443,11 +444,31 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             }
             TokenKind::EndOfFile => syntax_error(&token, "unexpected end of input in statement"),
             _ => {
+                if let Some(label) = identifier_from_token(&token) {
+                    if cursor.peek_punctuator(1, Punctuator::Colon) {
+                        return self.parse_label_statement(cursor, label);
+                    }
+                }
                 let expr = self.parse_expression(cursor)?;
                 self.consume_statement_terminator(cursor)?;
                 Ok(self.arena.alloc_statement(Stmt::Expression(expr)))
             }
         }
+    }
+
+    fn parse_label_statement(
+        &mut self,
+        cursor: &mut TokenCursor<'_>,
+        label: ParserIdentifier,
+    ) -> Result<AstRef<Stmt>, ParserError> {
+        let start = cursor.bump().span();
+        cursor.expect_punctuator(Punctuator::Colon)?;
+        let body = self.parse_statement(cursor)?;
+        Ok(self.arena.alloc_statement(Stmt::Label(LabelStmt {
+            span: join_spans(start, self.stmt_span(body)),
+            label,
+            body,
+        })))
     }
 
     fn parse_block_statement(
@@ -504,7 +525,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             let binding = self.parse_binding_pattern(cursor)?;
             bindings.push(binding);
             let initializer = if cursor.consume_punctuator(Punctuator::Equal).is_some() {
-                Some(self.parse_expression(cursor)?)
+                Some(self.parse_assignment_expression(cursor)?)
             } else {
                 None
             };
@@ -847,7 +868,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             Some(self.parse_binding_identifier(cursor)?)
         };
         let heritage = if cursor.consume_keyword(Keyword::Extends).is_some() {
-            Some(self.parse_expression(cursor)?)
+            Some(self.parse_assignment_expression(cursor)?)
         } else {
             None
         };
@@ -947,7 +968,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
         let name = self.parse_class_element_name(cursor)?;
         if !cursor.at_punctuator(Punctuator::OpenParen) {
             let initializer = if cursor.consume_punctuator(Punctuator::Equal).is_some() {
-                Some(self.parse_expression(cursor)?)
+                Some(self.parse_assignment_expression(cursor)?)
             } else {
                 None
             };
@@ -1267,6 +1288,19 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
         } else if let Some(kind) = cursor.current_declaration_keyword() {
             let declaration_start = cursor.bump().span();
             if let Some(name) = identifier_from_token(cursor.current()) {
+                if cursor.peek_keyword(1, Keyword::In) {
+                    cursor.bump();
+                    cursor.expect_keyword(Keyword::In)?;
+                    let object = self.parse_expression(cursor)?;
+                    cursor.expect_punctuator(Punctuator::CloseParen)?;
+                    let body = self.parse_statement(cursor)?;
+                    return Ok(self.arena.alloc_statement(Stmt::ForIn(ForInStmt {
+                        span: join_spans(start, self.stmt_span(body)),
+                        binding: ForInBinding::Declaration { kind, name },
+                        object,
+                        body,
+                    })));
+                }
                 if cursor.peek_contextual_keyword(1, ContextualKeyword::Of) {
                     cursor.bump();
                     cursor.expect_contextual_keyword(ContextualKeyword::Of)?;
@@ -1290,6 +1324,19 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
                 initializers,
             }))
         } else if let Some(name) = identifier_from_token(cursor.current()) {
+            if cursor.peek_keyword(1, Keyword::In) {
+                cursor.bump();
+                cursor.expect_keyword(Keyword::In)?;
+                let object = self.parse_expression(cursor)?;
+                cursor.expect_punctuator(Punctuator::CloseParen)?;
+                let body = self.parse_statement(cursor)?;
+                return Ok(self.arena.alloc_statement(Stmt::ForIn(ForInStmt {
+                    span: join_spans(start, self.stmt_span(body)),
+                    binding: ForInBinding::Assignment(name),
+                    object,
+                    body,
+                })));
+            }
             if cursor.peek_contextual_keyword(1, ContextualKeyword::Of) {
                 cursor.bump();
                 cursor.expect_contextual_keyword(ContextualKeyword::Of)?;
@@ -1468,7 +1515,29 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
         &mut self,
         cursor: &mut TokenCursor<'_>,
     ) -> Result<AstRef<Expr>, ParserError> {
-        self.parse_assignment_expression(cursor)
+        let first = self.parse_assignment_expression(cursor)?;
+        if cursor.consume_punctuator(Punctuator::Comma).is_none() {
+            return Ok(first);
+        }
+
+        let mut expressions = vec![first];
+        loop {
+            expressions.push(self.parse_assignment_expression(cursor)?);
+            if cursor.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+        }
+        let span = join_spans(
+            self.expr_span(first),
+            expressions
+                .last()
+                .copied()
+                .map(|expr| self.expr_span(expr))
+                .unwrap_or_else(|| self.expr_span(first)),
+        );
+        Ok(self
+            .arena
+            .alloc_expression(Expr::Sequence(SequenceExpr { span, expressions })))
     }
 
     fn parse_assignment_expression(
@@ -1653,7 +1722,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
         let mut arguments = Vec::new();
         if !cursor.at_punctuator(Punctuator::CloseParen) {
             loop {
-                arguments.push(self.parse_expression(cursor)?);
+                arguments.push(self.parse_assignment_expression(cursor)?);
                 if cursor.consume_punctuator(Punctuator::Comma).is_none() {
                     break;
                 }
@@ -1939,7 +2008,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
                     } else {
                         let key = self.parse_object_literal_property_key(cursor)?;
                         let value = if cursor.consume_punctuator(Punctuator::Colon).is_some() {
-                            self.parse_expression(cursor)?
+                            self.parse_assignment_expression(cursor)?
                         } else {
                             let AstPropertyKey::Identifier(name) = key else {
                                 return syntax_error(
@@ -2047,7 +2116,7 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
                 continue;
             }
             if let Some(spread) = cursor.consume_punctuator(Punctuator::DotDotDot) {
-                let value = self.parse_expression(cursor)?;
+                let value = self.parse_assignment_expression(cursor)?;
                 elements.push(ArrayLiteralElement::Spread {
                     span: join_spans(spread.span(), self.expr_span(value)),
                     value,
@@ -2129,9 +2198,11 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             Some(Stmt::While(statement)) => statement.span,
             Some(Stmt::Switch(statement)) => statement.span,
             Some(Stmt::For(statement)) => statement.span,
+            Some(Stmt::ForIn(statement)) => statement.span,
             Some(Stmt::ForOf(statement)) => statement.span,
             Some(Stmt::Try(statement)) => statement.span,
             Some(Stmt::Control(control)) => control.span,
+            Some(Stmt::Label(label)) => label.span,
             Some(Stmt::Module(module)) => match module {
                 ModuleItem::Import(declaration) => declaration.span,
                 ModuleItem::Export(declaration) => declaration.span,
@@ -2277,8 +2348,14 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
             let escaped = bytes[index];
             index += 1;
             match escaped {
-                b'\'' if quote == b'\'' => text.push('\''),
-                b'"' if quote == b'"' => text.push('"'),
+                b'\n' => {}
+                b'\r' => {
+                    if bytes.get(index) == Some(&b'\n') {
+                        index += 1;
+                    }
+                }
+                b'\'' => text.push('\''),
+                b'"' => text.push('"'),
                 b'\\' => text.push('\\'),
                 b'n' => text.push('\n'),
                 b'r' => text.push('\r'),
@@ -2286,15 +2363,55 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
                 b'b' => text.push('\u{0008}'),
                 b'f' => text.push('\u{000c}'),
                 b'v' => text.push('\u{000b}'),
-                b'0' => text.push('\0'),
-                _ => {
-                    return Err(ParserError {
+                b'x' => {
+                    let (unit, next) =
+                        parse_fixed_hex_escape(bytes, index, 2).ok_or_else(|| ParserError {
+                            span: Some(token.span()),
+                            kind: ParserErrorKind::Syntax("invalid string hex escape".into()),
+                        })?;
+                    index = next;
+                    text.push(char::from_u32(unit).ok_or_else(|| ParserError {
                         span: Some(token.span()),
-                        kind: ParserErrorKind::Syntax(
-                            "unsupported string escape in core parser".into(),
-                        ),
-                    });
+                        kind: ParserErrorKind::Syntax("invalid string hex escape".into()),
+                    })?);
                 }
+                b'u' if bytes.get(index) == Some(&b'{') => {
+                    let (unit, next) = parse_braced_unicode_escape(
+                        bytes,
+                        index + 1,
+                        bytes.len() - 1,
+                    )
+                    .ok_or_else(|| ParserError {
+                        span: Some(token.span()),
+                        kind: ParserErrorKind::Syntax("invalid string unicode escape".into()),
+                    })?;
+                    index = next;
+                    text.push(char::from_u32(unit).ok_or_else(|| ParserError {
+                        span: Some(token.span()),
+                        kind: ParserErrorKind::Syntax("invalid string unicode escape".into()),
+                    })?);
+                }
+                b'u' => {
+                    let (unit, next) =
+                        parse_fixed_hex_escape(bytes, index, 4).ok_or_else(|| ParserError {
+                            span: Some(token.span()),
+                            kind: ParserErrorKind::Syntax("invalid string unicode escape".into()),
+                        })?;
+                    index = next;
+                    text.push(char::from_u32(unit).ok_or_else(|| ParserError {
+                        span: Some(token.span()),
+                        kind: ParserErrorKind::Syntax("invalid string unicode escape".into()),
+                    })?);
+                }
+                b'0'..=b'7' => {
+                    let (unit, next) = parse_legacy_octal_escape(bytes, index - 1, bytes.len() - 1);
+                    index = next;
+                    text.push(char::from_u32(unit).ok_or_else(|| ParserError {
+                        span: Some(token.span()),
+                        kind: ParserErrorKind::Syntax("invalid string octal escape".into()),
+                    })?);
+                }
+                _ => text.push(char::from(escaped)),
             }
         }
         Ok(self
@@ -2532,6 +2649,10 @@ impl<'a> TokenCursor<'a> {
         matches!(self.current().kind, TokenKind::Punctuator(current) if current == punctuator)
     }
 
+    fn peek_punctuator(&self, lookahead: usize, punctuator: Punctuator) -> bool {
+        matches!(self.peek(lookahead).kind, TokenKind::Punctuator(current) if current == punctuator)
+    }
+
     fn consume_punctuator(&mut self, punctuator: Punctuator) -> Option<&'a Token> {
         if self.at_punctuator(punctuator) {
             Some(self.bump())
@@ -2562,6 +2683,10 @@ impl<'a> TokenCursor<'a> {
         } else {
             None
         }
+    }
+
+    fn peek_keyword(&self, lookahead: usize, keyword: Keyword) -> bool {
+        matches!(self.peek(lookahead).kind, TokenKind::Keyword(current) if current == keyword)
     }
 
     fn at_contextual_keyword(&self, keyword: ContextualKeyword) -> bool {
@@ -2850,6 +2975,42 @@ fn parse_fixed_hex_escape(bytes: &[u8], start: usize, count: usize) -> Option<(u
     Some((unit, index))
 }
 
+fn parse_braced_unicode_escape(bytes: &[u8], start: usize, end: usize) -> Option<(u32, usize)> {
+    let mut unit = 0_u32;
+    let mut index = start;
+    while index < end && bytes.get(index) != Some(&b'}') {
+        let digit = hex_value(bytes[index])?;
+        unit = unit.checked_mul(16)?.checked_add(u32::from(digit))?;
+        if unit > 0x10ffff {
+            return None;
+        }
+        index += 1;
+    }
+    if index == start || index >= end || bytes.get(index) != Some(&b'}') {
+        return None;
+    }
+    Some((unit, index + 1))
+}
+
+fn parse_legacy_octal_escape(bytes: &[u8], start: usize, end: usize) -> (u32, usize) {
+    let first = bytes[start];
+    let mut value = u32::from(first - b'0');
+    let mut index = start + 1;
+    if index < end && is_octal_digit(bytes[index]) {
+        value = value * 8 + u32::from(bytes[index] - b'0');
+        index += 1;
+        if first <= b'3' && index < end && is_octal_digit(bytes[index]) {
+            value = value * 8 + u32::from(bytes[index] - b'0');
+            index += 1;
+        }
+    }
+    (value, index)
+}
+
+fn is_octal_digit(byte: u8) -> bool {
+    matches!(byte, b'0'..=b'7')
+}
+
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -2884,6 +3045,7 @@ fn expr_span(expr: &Expr) -> SourceSpan {
         Expr::Unary(expr) => expr.span,
         Expr::Binary(expr) => expr.span,
         Expr::Assignment(expr) => expr.span,
+        Expr::Sequence(expr) => expr.span,
         Expr::Conditional(expr) => expr.span,
         Expr::Call(expr) => expr.span,
         Expr::New(expr) => expr.span,
@@ -3361,6 +3523,23 @@ mod tests {
         *value
     }
 
+    fn string_literal_initializer_text(text: &str) -> String {
+        let mut arena = ParserArena::new();
+        let expression = parse_first_class_expression(&mut arena, text);
+        let Some(Expr::Literal(LiteralExpr {
+            kind: LiteralKind::String { text },
+            ..
+        })) = arena.expression(expression)
+        else {
+            panic!("expected string literal expression");
+        };
+        arena
+            .identifiers()
+            .identifier_text(*text)
+            .expect("expected string literal text")
+            .to_string()
+    }
+
     fn class_element_name(arena: &ParserArena, element: &ClassElement) -> String {
         match element.name {
             ClassElementName::Public(name) => arena
@@ -3835,6 +4014,112 @@ mod tests {
     }
 
     #[test]
+    fn parser_builds_for_in_statement_with_var_binding() {
+        let source = source("for (var k in e) {}");
+        let mut arena = ParserArena::new();
+        let parsed = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            ParseMode::Program,
+        )
+        .parse()
+        .unwrap();
+        let root = match parsed.root {
+            AstRoot::Script(root) => root,
+            other => {
+                assert!(matches!(other, AstRoot::Script(_)));
+                return;
+            }
+        };
+        let scope = arena.scope_node(root).unwrap();
+
+        let Some(Stmt::ForIn(statement)) = arena.statement(scope.statements[0]) else {
+            assert!(matches!(
+                arena.statement(scope.statements[0]),
+                Some(Stmt::ForIn(_))
+            ));
+            return;
+        };
+        assert!(matches!(
+            statement.binding,
+            ForInBinding::Declaration {
+                kind: DeclarationSyntaxKind::Var,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parser_builds_sequence_expression_in_for_initializer() {
+        let source = source("for (i = 0, len = xs.length; i < len; i = i + 1) {}");
+        let mut arena = ParserArena::new();
+        let parsed = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            ParseMode::Program,
+        )
+        .parse()
+        .unwrap();
+        let root = match parsed.root {
+            AstRoot::Script(root) => root,
+            other => {
+                assert!(matches!(other, AstRoot::Script(_)));
+                return;
+            }
+        };
+        let scope = arena.scope_node(root).unwrap();
+
+        let Some(Stmt::For(statement)) = arena.statement(scope.statements[0]) else {
+            assert!(matches!(
+                arena.statement(scope.statements[0]),
+                Some(Stmt::For(_))
+            ));
+            return;
+        };
+        let Some(ForInit::Expression(initializer)) = statement.init else {
+            assert!(matches!(statement.init, Some(ForInit::Expression(_))));
+            return;
+        };
+        assert!(matches!(
+            arena.expression(initializer),
+            Some(Expr::Sequence(SequenceExpr { expressions, .. })) if expressions.len() == 2
+        ));
+    }
+
+    #[test]
+    fn parser_builds_labelled_loop_statement() {
+        let source = source("start: while (true) { break start; }");
+        let mut arena = ParserArena::new();
+        let parsed = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            ParseMode::Program,
+        )
+        .parse()
+        .unwrap();
+        let root = match parsed.root {
+            AstRoot::Script(root) => root,
+            other => {
+                assert!(matches!(other, AstRoot::Script(_)));
+                return;
+            }
+        };
+        let scope = arena.scope_node(root).unwrap();
+
+        let Some(Stmt::Label(label)) = arena.statement(scope.statements[0]) else {
+            assert!(matches!(
+                arena.statement(scope.statements[0]),
+                Some(Stmt::Label(_))
+            ));
+            return;
+        };
+        assert!(matches!(arena.statement(label.body), Some(Stmt::While(_))));
+    }
+
+    #[test]
     fn parser_builds_function_declaration_metadata() {
         let source = source("function add(a, b) { return a + b; } add(1, 2);");
         let mut arena = ParserArena::new();
@@ -3971,6 +4256,39 @@ mod tests {
         assert_eq!(
             arena.identifiers().identifier_text(*text),
             Some("line\ntext")
+        );
+    }
+
+    #[test]
+    fn parser_cooks_cross_quote_string_escapes() {
+        assert_eq!(string_literal_initializer_text(r#"let value = "\'";"#), "'");
+        assert_eq!(
+            string_literal_initializer_text(r#"let value = "\\\'";"#),
+            "\\'"
+        );
+    }
+
+    #[test]
+    fn parser_cooks_hex_unicode_and_identity_string_escapes() {
+        assert_eq!(
+            string_literal_initializer_text(r#"let value = "\x41\u0042\u{43}\q\/";"#),
+            "ABCq/"
+        );
+    }
+
+    #[test]
+    fn parser_cooks_legacy_octal_string_escapes() {
+        assert_eq!(
+            string_literal_initializer_text(r#"let value = "\141\0\8";"#),
+            "a\08"
+        );
+    }
+
+    #[test]
+    fn parser_cooks_string_line_continuations() {
+        assert_eq!(
+            string_literal_initializer_text("let value = \"line\\\ntext\";"),
+            "linetext"
         );
     }
 

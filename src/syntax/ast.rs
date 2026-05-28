@@ -57,6 +57,7 @@ pub enum Expr {
     Unary(UnaryExpr),
     Binary(BinaryExpr),
     Assignment(AssignmentExpr),
+    Sequence(SequenceExpr),
     Conditional(ConditionalExpr),
     Call(CallExpr),
     New(NewExpr),
@@ -83,9 +84,11 @@ pub enum Stmt {
     While(WhileStmt),
     Switch(SwitchStmt),
     For(ForStmt),
+    ForIn(ForInStmt),
     ForOf(ForOfStmt),
     Try(TryStmt),
     Control(ControlStmt),
+    Label(LabelStmt),
     Module(ModuleItem),
 }
 
@@ -273,6 +276,12 @@ pub struct AssignmentExpr {
     pub target: AstRef<Pattern>,
     pub value: AstRef<Expr>,
     pub context: AssignmentContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceExpr {
+    pub span: SourceSpan,
+    pub expressions: Vec<AstRef<Expr>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -549,8 +558,25 @@ pub struct ForOfStmt {
     pub body: AstRef<Stmt>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForInStmt {
+    pub span: SourceSpan,
+    pub binding: ForInBinding,
+    pub object: AstRef<Expr>,
+    pub body: AstRef<Stmt>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForOfBinding {
+    Declaration {
+        kind: DeclarationSyntaxKind,
+        name: ParserIdentifier,
+    },
+    Assignment(ParserIdentifier),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForInBinding {
     Declaration {
         kind: DeclarationSyntaxKind,
         name: ParserIdentifier,
@@ -570,6 +596,13 @@ pub struct TryStmt {
 pub struct CatchClause {
     pub span: SourceSpan,
     pub binding: Option<ParserIdentifier>,
+    pub body: AstRef<Stmt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LabelStmt {
+    pub span: SourceSpan,
+    pub label: ParserIdentifier,
     pub body: AstRef<Stmt>,
 }
 

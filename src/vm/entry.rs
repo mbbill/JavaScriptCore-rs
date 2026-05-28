@@ -213,7 +213,7 @@ pub struct VmExitRecord {
     pub closed_root_scope: VmEntryRootScope,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmEntryLaunchDescriptor {
     pub owner: CodeBlockId,
     pub code_block: CodeBlockId,
@@ -234,7 +234,7 @@ impl VmEntryLaunchDescriptor {
         baseline_entry_gate: BaselineEntryGateRecord,
         readiness: &BaselineNativeEntryReadinessRecord,
     ) -> Result<Self, VmEntryLaunchValidationError> {
-        validate_baseline_native_launch_scope(scope, call_frame, baseline_entry_gate, readiness)?;
+        validate_baseline_native_launch_scope(scope, call_frame, &baseline_entry_gate, readiness)?;
         let native_entry = readiness.descriptor.ok_or(
             VmEntryLaunchValidationError::ReadinessDescriptorMissing {
                 readiness_ordinal: readiness.ordinal,
@@ -492,7 +492,7 @@ pub enum VmEntryLaunchValidationError {
 fn validate_baseline_native_launch_scope(
     scope: VmEntryLaunchScope,
     call_frame: VmEntryCallFrameMetadata,
-    baseline_entry_gate: BaselineEntryGateRecord,
+    baseline_entry_gate: &BaselineEntryGateRecord,
     readiness: &BaselineNativeEntryReadinessRecord,
 ) -> Result<(), VmEntryLaunchValidationError> {
     let (expected_readiness_outcome, expected_execution_policy) = match baseline_entry_gate.outcome
@@ -781,7 +781,10 @@ mod tests {
         let scope = launch_scope(owner);
         let call_frame = launch_call_frame(owner);
         assert!(VmEntryLaunchDescriptor::baseline_native_entry(
-            scope, call_frame, gate, &readiness,
+            scope,
+            call_frame,
+            gate.clone(),
+            &readiness,
         )
         .is_ok());
 
@@ -794,7 +797,7 @@ mod tests {
             VmEntryLaunchDescriptor::baseline_native_entry(
                 wrong_owner_scope,
                 call_frame,
-                gate,
+                gate.clone(),
                 &readiness,
             ),
             Err(VmEntryLaunchValidationError::OwnerMismatch {
@@ -803,7 +806,7 @@ mod tests {
             })
         );
 
-        let mut wrong_artifact_gate = gate;
+        let mut wrong_artifact_gate = gate.clone();
         wrong_artifact_gate.native_artifact = Some(baseline_entry_artifact(owner, 31));
         assert!(matches!(
             VmEntryLaunchDescriptor::baseline_native_entry(

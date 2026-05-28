@@ -32,6 +32,25 @@ pub enum BaselineMachineCodeEmitterKind {
     P6X86_64NoCallNoHeapSubset,
     P8aX86_64NoCallNoHeapBranchSubset,
     P8bX86_64NoCallNoHeapBranchTruthinessSubset,
+    P6X86_64NoCallNoHeapBitAndOrSubset,
+    P8aX86_64NoCallNoHeapBitAndOrBranchSubset,
+    P8bX86_64NoCallNoHeapBitAndOrBranchTruthinessSubset,
+    P6X86_64NoCallNoHeapBitAndOrEqualitySubset,
+    P8aX86_64NoCallNoHeapBitAndOrEqualityBranchSubset,
+    P8bX86_64NoCallNoHeapBitAndOrEqualityBranchTruthinessSubset,
+    P6X86_64NoCallNoHeapBitAndOrEqualityRelationalSubset,
+    P8aX86_64NoCallNoHeapBitAndOrEqualityRelationalBranchSubset,
+    P8bX86_64NoCallNoHeapBitAndOrEqualityRelationalBranchTruthinessSubset,
+    P6X86_64NoCallNoHeapBitAndOrNoCallLooseEqualitySubset,
+    P8aX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityBranchSubset,
+    P8bX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityBranchTruthinessSubset,
+    P6X86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalSubset,
+    P8aX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalBranchSubset,
+    P8bX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalBranchTruthinessSubset,
+    P6X86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberSubset,
+    P8aX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchSubset,
+    P8bX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchTruthinessSubset,
+    P6X86_64NoCallNoHeapBitwiseRelationalJumpsPrimitiveTruthinessPrimitiveBooleanSubset,
 }
 
 impl BaselineMachineCodeEmitterKind {
@@ -39,7 +58,28 @@ impl BaselineMachineCodeEmitterKind {
         match self {
             Self::P6X86_64NoCallNoHeapSubset
             | Self::P8aX86_64NoCallNoHeapBranchSubset
-            | Self::P8bX86_64NoCallNoHeapBranchTruthinessSubset => AssemblerArchitecture::X86_64,
+            | Self::P8bX86_64NoCallNoHeapBranchTruthinessSubset
+            | Self::P6X86_64NoCallNoHeapBitAndOrSubset
+            | Self::P8aX86_64NoCallNoHeapBitAndOrBranchSubset
+            | Self::P8bX86_64NoCallNoHeapBitAndOrBranchTruthinessSubset
+            | Self::P6X86_64NoCallNoHeapBitAndOrEqualitySubset
+            | Self::P8aX86_64NoCallNoHeapBitAndOrEqualityBranchSubset
+            | Self::P8bX86_64NoCallNoHeapBitAndOrEqualityBranchTruthinessSubset
+            | Self::P6X86_64NoCallNoHeapBitAndOrEqualityRelationalSubset
+            | Self::P8aX86_64NoCallNoHeapBitAndOrEqualityRelationalBranchSubset
+            | Self::P8bX86_64NoCallNoHeapBitAndOrEqualityRelationalBranchTruthinessSubset
+            | Self::P6X86_64NoCallNoHeapBitAndOrNoCallLooseEqualitySubset
+            | Self::P8aX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityBranchSubset
+            | Self::P8bX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityBranchTruthinessSubset
+            | Self::P6X86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalSubset
+            | Self::P8aX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalBranchSubset
+            | Self::P8bX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalBranchTruthinessSubset
+            | Self::P6X86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberSubset
+            | Self::P8aX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchSubset
+            | Self::P8bX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchTruthinessSubset
+            | Self::P6X86_64NoCallNoHeapBitwiseRelationalJumpsPrimitiveTruthinessPrimitiveBooleanSubset => {
+                AssemblerArchitecture::X86_64
+            }
         }
     }
 
@@ -53,6 +93,63 @@ impl BaselineMachineCodeEmitterKind {
             }
             Self::P8bX86_64NoCallNoHeapBranchTruthinessSubset => {
                 BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBranchNullishFalse
+            }
+            Self::P6X86_64NoCallNoHeapBitAndOrSubset => {
+                BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr
+            }
+            Self::P8aX86_64NoCallNoHeapBitAndOrBranchSubset => {
+                BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullish
+            }
+            Self::P8bX86_64NoCallNoHeapBitAndOrBranchTruthinessSubset => {
+                BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullishFalse
+            }
+            Self::P6X86_64NoCallNoHeapBitAndOrEqualitySubset => {
+                BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEquality
+            }
+            Self::P8aX86_64NoCallNoHeapBitAndOrEqualityBranchSubset => {
+                BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullish
+            }
+            Self::P8bX86_64NoCallNoHeapBitAndOrEqualityBranchTruthinessSubset => {
+                BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullishFalse
+            }
+            Self::P6X86_64NoCallNoHeapBitAndOrEqualityRelationalSubset => {
+                BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelational
+            }
+            Self::P8aX86_64NoCallNoHeapBitAndOrEqualityRelationalBranchSubset => {
+                BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullish
+            }
+            Self::P8bX86_64NoCallNoHeapBitAndOrEqualityRelationalBranchTruthinessSubset => {
+                BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullishFalse
+            }
+            Self::P6X86_64NoCallNoHeapBitAndOrNoCallLooseEqualitySubset => {
+                BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEquality
+            }
+            Self::P8aX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityBranchSubset => {
+                BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityBranchNullish
+            }
+            Self::P8bX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityBranchTruthinessSubset => {
+                BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityBranchNullishFalse
+            }
+            Self::P6X86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalSubset => {
+                BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelational
+            }
+            Self::P8aX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalBranchSubset => {
+                BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullish
+            }
+            Self::P8bX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalBranchTruthinessSubset => {
+                BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullishFalse
+            }
+            Self::P6X86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberSubset => {
+                BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumber
+            }
+            Self::P8aX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchSubset => {
+                BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullish
+            }
+            Self::P8bX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchTruthinessSubset => {
+                BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullishFalse
+            }
+            Self::P6X86_64NoCallNoHeapBitwiseRelationalJumpsPrimitiveTruthinessPrimitiveBooleanSubset => {
+                BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitwiseRelationalJumpsPrimitiveTruthinessPrimitiveBoolean
             }
         }
     }
@@ -1109,6 +1206,126 @@ mod tests {
                     expected: BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBranchNullish,
                     actual:
                         BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBranchNullishFalse,
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn bitand_or_emitter_kinds_require_exact_native_subsets() {
+        let entry_artifact = entry_artifact();
+        let buffer = frozen_buffer(AssemblerArchitecture::X86_64);
+        let image = source_image(&buffer);
+        let linked = linked_image(&buffer, &image);
+
+        let proof = proof_for_subset(
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr,
+        );
+        let mut p6_request = request(&entry_artifact, &proof, &buffer, &image, Some(&linked));
+        p6_request.emitter_kind =
+            BaselineMachineCodeEmitterKind::P6X86_64NoCallNoHeapBitAndOrSubset;
+        let record = record_baseline_machine_code_emission(p6_request).unwrap();
+        assert_eq!(
+            record.supported_opcode_subset,
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr
+        );
+
+        let proof = proof_for_subset(
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullishFalse,
+        );
+        let mut p8b_request = request(&entry_artifact, &proof, &buffer, &image, Some(&linked));
+        p8b_request.emitter_kind =
+            BaselineMachineCodeEmitterKind::P8bX86_64NoCallNoHeapBitAndOrBranchTruthinessSubset;
+        let record = record_baseline_machine_code_emission(p8b_request).unwrap();
+        assert_eq!(
+            record.supported_opcode_subset,
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullishFalse
+        );
+
+        let proof = proof_for_subset(
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEquality,
+        );
+        let mut p6_equality_request =
+            request(&entry_artifact, &proof, &buffer, &image, Some(&linked));
+        p6_equality_request.emitter_kind =
+            BaselineMachineCodeEmitterKind::P6X86_64NoCallNoHeapBitAndOrEqualitySubset;
+        let record = record_baseline_machine_code_emission(p6_equality_request).unwrap();
+        assert_eq!(
+            record.supported_opcode_subset,
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEquality
+        );
+
+        let proof = proof_for_subset(
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullishFalse,
+        );
+        let mut p8b_equality_request =
+            request(&entry_artifact, &proof, &buffer, &image, Some(&linked));
+        p8b_equality_request.emitter_kind =
+            BaselineMachineCodeEmitterKind::P8bX86_64NoCallNoHeapBitAndOrEqualityBranchTruthinessSubset;
+        let record = record_baseline_machine_code_emission(p8b_equality_request).unwrap();
+        assert_eq!(
+            record.supported_opcode_subset,
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityBranchNullishFalse
+        );
+
+        let proof = proof_for_subset(
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelational,
+        );
+        let mut p6_relational_request =
+            request(&entry_artifact, &proof, &buffer, &image, Some(&linked));
+        p6_relational_request.emitter_kind =
+            BaselineMachineCodeEmitterKind::P6X86_64NoCallNoHeapBitAndOrEqualityRelationalSubset;
+        let record = record_baseline_machine_code_emission(p6_relational_request).unwrap();
+        assert_eq!(
+            record.supported_opcode_subset,
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelational
+        );
+
+        let proof = proof_for_subset(
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullishFalse,
+        );
+        let mut p8b_relational_request =
+            request(&entry_artifact, &proof, &buffer, &image, Some(&linked));
+        p8b_relational_request.emitter_kind =
+            BaselineMachineCodeEmitterKind::P8bX86_64NoCallNoHeapBitAndOrEqualityRelationalBranchTruthinessSubset;
+        let record = record_baseline_machine_code_emission(p8b_relational_request).unwrap();
+        assert_eq!(
+            record.supported_opcode_subset,
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullishFalse
+        );
+
+        let no_call_loose_relational_proof = proof_for_subset(
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullishFalse,
+        );
+        let mut p8b_no_call_loose_relational_request = request(
+            &entry_artifact,
+            &no_call_loose_relational_proof,
+            &buffer,
+            &image,
+            Some(&linked),
+        );
+        p8b_no_call_loose_relational_request.emitter_kind =
+            BaselineMachineCodeEmitterKind::P8bX86_64NoCallNoHeapBitAndOrNoCallLooseEqualityRelationalBranchTruthinessSubset;
+        let record =
+            record_baseline_machine_code_emission(p8b_no_call_loose_relational_request).unwrap();
+        assert_eq!(
+            record.supported_opcode_subset,
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalBranchNullishFalse
+        );
+
+        let mut wrong_request = request(&entry_artifact, &proof, &buffer, &image, Some(&linked));
+        wrong_request.emitter_kind =
+            BaselineMachineCodeEmitterKind::P8aX86_64NoCallNoHeapBitAndOrEqualityRelationalBranchSubset;
+        assert_eq!(
+            record_baseline_machine_code_emission(wrong_request),
+            Err(
+                BaselineMachineCodeEmissionValidationError::UnsupportedOpcodeSubset {
+                    emitter:
+                        BaselineMachineCodeEmitterKind::P8aX86_64NoCallNoHeapBitAndOrEqualityRelationalBranchSubset,
+                    expected:
+                        BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullish,
+                    actual:
+                        BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrEqualityRelationalBranchNullishFalse,
                 },
             )
         );

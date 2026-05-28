@@ -8,9 +8,9 @@
 use crate::jit::abi::{BaselineAbiDescriptor, BaselineAbiValidationError, BASELINE_ABI_DESCRIPTOR};
 use crate::jit::plan::{
     BaselineBytecodeEligibilityProof, BaselineGeneratedEffectContract,
-    BaselineGeneratedPropertyHandoffPlan, BaselineGeneratedPropertyHandoffPlanMetadata,
-    BaselineGeneratedRuntimeHelperPlan, BaselineGeneratedRuntimeHelperPlanMetadata,
-    BaselineSupportedOpcodeSubset,
+    BaselineGeneratedOwnerContinuationMapMetadata, BaselineGeneratedPropertyHandoffPlan,
+    BaselineGeneratedPropertyHandoffPlanMetadata, BaselineGeneratedRuntimeHelperPlan,
+    BaselineGeneratedRuntimeHelperPlanMetadata, BaselineSupportedOpcodeSubset,
 };
 use crate::jit::{
     DisassemblyMetadata, EntryAbi, Entrypoint, EntrypointKind, ExecutableAllocationLifecycle,
@@ -124,6 +124,7 @@ pub enum JitCodeValidationError {
     BaselineGeneratedCodeAbiDescriptorInvalid,
     BaselineGeneratedRuntimeHelperPlanSnapshotMismatch,
     BaselineGeneratedPropertyHandoffPlanSnapshotMismatch,
+    BaselineGeneratedOwnerContinuationMapSnapshotMismatch,
 }
 
 /// JIT-visible side-data slots reserved on linked code state.
@@ -284,7 +285,7 @@ impl BaselineNativeEntryCallableKind {
                 BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitwiseRelationalJumpsPrimitiveTruthinessPrimitiveBooleanPrimitiveNumberPrimitiveToNumberVoidPureNumberBinary
             }
             Self::P6X86_64EmittedSemanticCAbiEntry => {
-                BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic
+                BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullishFalse
             }
         }
     }
@@ -519,7 +520,7 @@ impl BaselineGeneratedCodeBody {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaselineGeneratedCodeArtifact {
     pub id: JitCodeId,
     pub owner: CodeBlockId,
@@ -528,24 +529,28 @@ pub struct BaselineGeneratedCodeArtifact {
     pub body: BaselineGeneratedCodeBody,
     pub(crate) runtime_helper_plan: Option<BaselineGeneratedRuntimeHelperPlanMetadata>,
     pub(crate) property_handoff_plan: Option<BaselineGeneratedPropertyHandoffPlanMetadata>,
+    pub(crate) owner_continuation_map: Option<BaselineGeneratedOwnerContinuationMapMetadata>,
     pub liveness: CodeLiveness,
     pub finalization_authority: CodeFinalizationAuthority,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BaselineGeneratedCodeMetadataPlans {
     pub(crate) runtime_helper_plan: Option<BaselineGeneratedRuntimeHelperPlanMetadata>,
     pub(crate) property_handoff_plan: Option<BaselineGeneratedPropertyHandoffPlanMetadata>,
+    pub(crate) owner_continuation_map: Option<BaselineGeneratedOwnerContinuationMapMetadata>,
 }
 
 impl BaselineGeneratedCodeMetadataPlans {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         runtime_helper_plan: Option<BaselineGeneratedRuntimeHelperPlanMetadata>,
         property_handoff_plan: Option<BaselineGeneratedPropertyHandoffPlanMetadata>,
+        owner_continuation_map: Option<BaselineGeneratedOwnerContinuationMapMetadata>,
     ) -> Self {
         Self {
             runtime_helper_plan,
             property_handoff_plan,
+            owner_continuation_map,
         }
     }
 }
@@ -609,6 +614,7 @@ impl BaselineGeneratedCodeArtifact {
             body,
             None,
             Some(property_handoff_plan),
+            None,
             liveness,
             finalization_authority,
             &BASELINE_ABI_DESCRIPTOR,
@@ -632,6 +638,7 @@ impl BaselineGeneratedCodeArtifact {
             body,
             metadata_plans.runtime_helper_plan,
             metadata_plans.property_handoff_plan,
+            metadata_plans.owner_continuation_map,
             liveness,
             finalization_authority,
             &BASELINE_ABI_DESCRIPTOR,
@@ -677,6 +684,7 @@ impl BaselineGeneratedCodeArtifact {
             body,
             runtime_helper_plan,
             None,
+            None,
             liveness,
             finalization_authority,
             baseline_abi_descriptor,
@@ -691,6 +699,7 @@ impl BaselineGeneratedCodeArtifact {
         body: BaselineGeneratedCodeBody,
         runtime_helper_plan: Option<BaselineGeneratedRuntimeHelperPlanMetadata>,
         property_handoff_plan: Option<BaselineGeneratedPropertyHandoffPlanMetadata>,
+        owner_continuation_map: Option<BaselineGeneratedOwnerContinuationMapMetadata>,
         liveness: CodeLiveness,
         finalization_authority: CodeFinalizationAuthority,
         baseline_abi_descriptor: &BaselineAbiDescriptor,
@@ -705,6 +714,7 @@ impl BaselineGeneratedCodeArtifact {
             body,
             runtime_helper_plan,
             property_handoff_plan,
+            owner_continuation_map,
             liveness,
             finalization_authority,
         };
@@ -749,6 +759,15 @@ impl BaselineGeneratedCodeArtifact {
                 );
             }
         }
+        if let Some(owner_continuation_map) = &self.owner_continuation_map {
+            if owner_continuation_map.bytecode_snapshot()
+                != self.eligibility_proof.bytecode_snapshot_fingerprint()
+            {
+                return Err(
+                    JitCodeValidationError::BaselineGeneratedOwnerContinuationMapSnapshotMismatch,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -764,6 +783,13 @@ impl BaselineGeneratedCodeArtifact {
         self.property_handoff_plan
             .as_ref()
             .map(BaselineGeneratedPropertyHandoffPlanMetadata::borrowed_plan)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn owner_continuation_map(
+        &self,
+    ) -> Option<&BaselineGeneratedOwnerContinuationMapMetadata> {
+        self.owner_continuation_map.as_ref()
     }
 
     #[allow(dead_code)]
@@ -1030,6 +1056,7 @@ mod tests {
     };
     use crate::gc::CellId;
     use crate::jit::plan::{
+        BaselineGeneratedOwnerBytecodeLabel, BaselineGeneratedOwnerContinuationMapMetadata,
         BaselineGeneratedRuntimeBoundaryCandidate, BaselineGeneratedRuntimeBoundaryProof,
         BaselineGeneratedRuntimeHelperPlanMetadata, BaselineGeneratedRuntimeHelperProof,
         CompilerSafepointDescriptor, CompilerSafepointId, CompilerSafepointKind,
@@ -1190,6 +1217,31 @@ mod tests {
         .unwrap()
     }
 
+    fn owner_continuation_map_for_proof(
+        proof: BaselineBytecodeEligibilityProof,
+    ) -> BaselineGeneratedOwnerContinuationMapMetadata {
+        let owner = proof.owner();
+        BaselineGeneratedOwnerContinuationMapMetadata::new(
+            proof.bytecode_snapshot_fingerprint(),
+            vec![
+                BaselineGeneratedOwnerBytecodeLabel {
+                    owner,
+                    bytecode_index: BytecodeIndex::from_offset(0),
+                    opcode: CoreOpcode::LoadInt32,
+                    next_bytecode_index: Some(BytecodeIndex::from_offset(1)),
+                },
+                BaselineGeneratedOwnerBytecodeLabel {
+                    owner,
+                    bytecode_index: BytecodeIndex::from_offset(1),
+                    opcode: CoreOpcode::Return,
+                    next_bytecode_index: None,
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
     fn runtime_helper_boundary_proof(
         owner: CodeBlockId,
         bytecode_index: BytecodeIndex,
@@ -1346,7 +1398,7 @@ mod tests {
         assert_eq!(
             BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
                 .supported_opcode_subset(),
-            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullishFalse
         );
     }
 
@@ -1506,6 +1558,56 @@ mod tests {
         assert_eq!(
             borrowed.proof_at(0).unwrap().bytecode_index,
             BytecodeIndex::from_offset(0)
+        );
+    }
+
+    #[test]
+    fn baseline_generated_code_artifact_owns_matching_owner_continuation_map() {
+        let owner = owner();
+        let proof = baseline_eligibility_proof(owner);
+        let owner_continuation_map = owner_continuation_map_for_proof(proof);
+
+        let artifact =
+            BaselineGeneratedCodeArtifact::new_with_runtime_helper_and_property_handoff_plans(
+                JitCodeId(30),
+                owner,
+                proof,
+                baseline_generated_code_body(),
+                BaselineGeneratedCodeMetadataPlans::new(None, None, Some(owner_continuation_map)),
+                CodeLiveness::Live,
+                CodeFinalizationAuthority::CompilerThread,
+            )
+            .unwrap();
+
+        let owner_map = artifact
+            .owner_continuation_map()
+            .expect("owner continuation map");
+        assert_eq!(
+            owner_map.bytecode_snapshot(),
+            proof.bytecode_snapshot_fingerprint()
+        );
+        assert_eq!(owner_map.label_count(), 2);
+        assert_eq!(owner_map.call_site_count(), 0);
+    }
+
+    #[test]
+    fn baseline_generated_code_artifact_rejects_owner_continuation_map_snapshot_mismatch() {
+        let owner = owner();
+        let proof = baseline_eligibility_proof(owner);
+        let stale_map =
+            owner_continuation_map_for_proof(different_baseline_eligibility_proof(owner));
+
+        assert_eq!(
+            BaselineGeneratedCodeArtifact::new_with_runtime_helper_and_property_handoff_plans(
+                JitCodeId(31),
+                owner,
+                proof,
+                baseline_generated_code_body(),
+                BaselineGeneratedCodeMetadataPlans::new(None, None, Some(stale_map)),
+                CodeLiveness::Live,
+                CodeFinalizationAuthority::CompilerThread,
+            ),
+            Err(JitCodeValidationError::BaselineGeneratedOwnerContinuationMapSnapshotMismatch)
         );
     }
 

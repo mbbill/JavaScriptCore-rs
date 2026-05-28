@@ -388,6 +388,7 @@ pub struct RegExpParseSemanticDescriptor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GroupFrame {
     assertion: Option<PatternAssertion>,
+    atom_index: usize,
 }
 
 pub fn compile_mode_for_flags(flags: RegexFlags) -> CompileMode {
@@ -801,7 +802,7 @@ impl<'a> ParsePlanner<'a> {
     fn parse_group(&mut self) -> Result<(), YarrParseError> {
         let start = self.offset;
         self.offset += 1;
-        let mut frame = GroupFrame { assertion: None };
+        let mut assertion = None;
         let atom_kind = if self.offset < self.bytes.len() && self.bytes[self.offset] == b'?' {
             self.offset += 1;
             match self.bytes.get(self.offset).copied() {
@@ -811,25 +812,25 @@ impl<'a> ParsePlanner<'a> {
                 }
                 Some(b'=') => {
                     self.offset += 1;
-                    frame.assertion = Some(PatternAssertion::LookAhead);
+                    assertion = Some(PatternAssertion::LookAhead);
                     YarrParsePlanAtomKind::Lookaround(PatternAssertion::LookAhead)
                 }
                 Some(b'!') => {
                     self.offset += 1;
-                    frame.assertion = Some(PatternAssertion::NegativeLookAhead);
+                    assertion = Some(PatternAssertion::NegativeLookAhead);
                     YarrParsePlanAtomKind::Lookaround(PatternAssertion::NegativeLookAhead)
                 }
                 Some(b'<') => match self.bytes.get(self.offset + 1).copied() {
                     Some(b'=') => {
                         self.offset += 2;
                         self.contains_lookbehinds = true;
-                        frame.assertion = Some(PatternAssertion::LookBehind);
+                        assertion = Some(PatternAssertion::LookBehind);
                         YarrParsePlanAtomKind::Lookaround(PatternAssertion::LookBehind)
                     }
                     Some(b'!') => {
                         self.offset += 2;
                         self.contains_lookbehinds = true;
-                        frame.assertion = Some(PatternAssertion::NegativeLookBehind);
+                        assertion = Some(PatternAssertion::NegativeLookBehind);
                         YarrParsePlanAtomKind::Lookaround(PatternAssertion::NegativeLookBehind)
                     }
                     _ => {
@@ -846,9 +847,14 @@ impl<'a> ParsePlanner<'a> {
             YarrParsePlanAtomKind::CaptureGroup
         };
 
+        let atom_index = self.push_atom(atom_kind, start, 0);
+        self.last_atom = None;
+        let frame = GroupFrame {
+            assertion,
+            atom_index,
+        };
         self.groups.push(frame);
         self.max_group_depth = self.max_group_depth.max(self.groups.len() as u32);
-        self.push_atom(atom_kind, start, 0);
         Ok(())
     }
 
@@ -866,11 +872,12 @@ impl<'a> ParsePlanner<'a> {
     }
 
     fn close_group(&mut self, start: usize) -> Result<(), YarrParseError> {
-        if self.groups.pop().is_none() {
+        let Some(frame) = self.groups.pop() else {
             return self.error(YarrErrorCode::ParenthesesUnmatched, start);
-        }
+        };
         self.offset += 1;
-        self.last_atom = Some(self.atoms.len().saturating_sub(1));
+        self.last_atom = yarr_parse_plan_atom_can_be_quantified(self.atoms[frame.atom_index].kind)
+            .then_some(frame.atom_index);
         Ok(())
     }
 
@@ -932,24 +939,34 @@ impl<'a> ParsePlanner<'a> {
         let Some(index) = self.last_atom else {
             return self.error(YarrErrorCode::QuantifierWithoutAtom, start);
         };
-        if self.atoms[index].quantified || self.atoms[index].minimum_size == 0 {
+        if self.atoms[index].quantified
+            || !yarr_parse_plan_atom_can_be_quantified(self.atoms[index].kind)
+        {
             return self.error(YarrErrorCode::CantQuantifyAtom, start);
         }
         self.atoms[index].quantified = true;
         Ok(())
     }
 
-    fn push_atom(&mut self, kind: YarrParsePlanAtomKind, offset: usize, minimum_size: u32) {
+    fn push_atom(
+        &mut self,
+        kind: YarrParsePlanAtomKind,
+        offset: usize,
+        minimum_size: u32,
+    ) -> usize {
         if minimum_size > 0 {
             self.minimum_size = self.minimum_size.saturating_add(minimum_size);
         }
+        let index = self.atoms.len();
         self.atoms.push(YarrParsePlanAtom {
             kind,
             offset: offset as u32,
             minimum_size,
             quantified: false,
         });
-        self.last_atom = (minimum_size > 0).then_some(self.atoms.len() - 1);
+        self.last_atom =
+            (minimum_size > 0 || yarr_parse_plan_atom_can_be_quantified(kind)).then_some(index);
+        index
     }
 
     fn error<T>(&self, code: YarrErrorCode, offset: usize) -> Result<T, YarrParseError> {
@@ -958,6 +975,13 @@ impl<'a> ParsePlanner<'a> {
             offset: offset as u32,
         })
     }
+}
+
+fn yarr_parse_plan_atom_can_be_quantified(kind: YarrParsePlanAtomKind) -> bool {
+    !matches!(
+        kind,
+        YarrParsePlanAtomKind::Assertion(_) | YarrParsePlanAtomKind::Lookaround(_)
+    )
 }
 
 #[cfg(test)]
@@ -975,6 +999,48 @@ mod tests {
         assert_eq!(plan.character_class_count, 1);
         assert!(plan.contains_bol);
         assert!(plan.minimum_size >= 2);
+    }
+
+    #[test]
+    fn parse_plan_quantifies_parenthesized_subpattern() {
+        let plan = plan_yarr_parse(r"(?:ab)*c", RegexFlags::default()).unwrap();
+
+        assert_eq!(plan.capture_count, 0);
+        assert!(matches!(
+            plan.atoms.first().map(|atom| atom.kind),
+            Some(YarrParsePlanAtomKind::NonCaptureGroup)
+        ));
+        assert!(plan.atoms[0].quantified);
+        assert!(!plan.atoms[2].quantified);
+    }
+
+    #[test]
+    fn parse_plan_allows_quantified_backreference() {
+        let plan = plan_yarr_parse(r"(a)\1*", RegexFlags::default()).unwrap();
+
+        assert_eq!(plan.capture_count, 1);
+        assert!(plan.contains_backreferences);
+        assert!(plan
+            .atoms
+            .iter()
+            .any(|atom| atom.kind == YarrParsePlanAtomKind::BackReference && atom.quantified));
+    }
+
+    #[test]
+    fn parse_plan_accepts_typescript_amd_dependency_pattern() {
+        let flags = parse_regex_flags("gim").unwrap();
+        let pattern =
+            r#"^(\/\/\/\s*<amd-dependency\s+path=)('|")(.+?)\2\s*(static=('|")(.+?)\2\s*)*\/>"#;
+        let plan = plan_yarr_parse(pattern, flags).unwrap();
+
+        assert_eq!(plan.capture_count, 6);
+        assert_eq!(plan.disjunction_count, 3);
+        assert!(plan.contains_backreferences);
+        assert!(plan.contains_bol);
+        assert!(plan
+            .atoms
+            .iter()
+            .any(|atom| atom.kind == YarrParsePlanAtomKind::CaptureGroup && atom.quantified));
     }
 
     #[test]

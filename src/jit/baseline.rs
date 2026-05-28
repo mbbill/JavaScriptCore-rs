@@ -6,17 +6,19 @@
 //! interpreter as an explicit baseline fallback request.
 
 use crate::bytecode::instruction::{
-    DecodedInstruction, InstructionDecodeError, OperandAccessError,
+    DecodedInstruction, InstructionDecodeError, Operand, OperandAccessError,
 };
 use crate::bytecode::{
-    BytecodeIndex, BytecodeRootMapId, CodeBlock, CoreOpcode, Opcode, VirtualRegister,
+    BytecodeIndex, BytecodeRootMapId, CodeBlock, CoreOpcode, Opcode, PropertyCacheKey,
+    VirtualRegister,
 };
 use crate::gc::StructureId;
 use crate::interpreter::{
     baseline_active_frame, baseline_read_register, baseline_return_register,
     baseline_write_register, create_call_return_continuation, BaselineFallbackRequest,
     CallReturnContinuation, CallReturnContinuationRequest, CallReturnKind, DispatchHost,
-    ExecutionCompletion, ExecutionError, InterpreterExecutionState, RegisterWindow,
+    ExecutionCompletion, ExecutionError, GeneratedNativeIntrinsicCallRequest,
+    GeneratedNativeIntrinsicCallResult, InterpreterExecutionState, RegisterWindow,
 };
 use crate::jit::ic::{
     GeneratedCallLinkDirectCall, GeneratedPropertyStoreMutationCommit,
@@ -27,9 +29,10 @@ use crate::jit::ic::{
 pub(crate) use crate::jit::plan::BaselineGeneratedRuntimeHelperProof;
 use crate::jit::plan::{
     derive_baseline_generated_property_handoff_plan_from_code_block,
-    validate_baseline_generated_property_handoff_site_against_code_block,
+    validate_baseline_generated_property_handoff_site_against_current_code_block,
     validate_baseline_generated_property_handoff_site_metadata,
-    BaselineBytecodeSnapshotFingerprint, BaselineGeneratedRuntimeBoundaryProof,
+    BaselineBytecodeSnapshotFingerprint, BaselineGeneratedOwnerContinuationMapMetadata,
+    BaselineGeneratedOwnerContinuationSite, BaselineGeneratedRuntimeBoundaryProof,
     CompilerSafepointId,
 };
 pub(crate) use crate::jit::plan::{
@@ -43,18 +46,23 @@ use crate::jit::{
     GeneratedCallLinkCandidateTable, GeneratedCallLinkDirectCallStatus,
     GeneratedCallLinkProbeMissReason, GeneratedCallLinkProbeRequest, GeneratedCallLinkProbeResult,
     GeneratedGuardedPropertyLoadProbeMissReason, GeneratedGuardedPropertyLoadProbeRequest,
-    GeneratedGuardedPropertyLoadProbeResult, GeneratedPropertyLoadProbeMissReason,
-    GeneratedPropertyLoadProbeRequest, GeneratedPropertyLoadProbeResult,
-    GeneratedPropertyStoreProbeMissReason, GeneratedPropertyStoreProbeRequest,
-    GeneratedPropertyStoreProbeResult, InlineCacheFallbackSemantics, InlineCacheKind,
-    InlineCacheSlotId, JitCodeValidationError, JitPlanValidationError,
+    GeneratedGuardedPropertyLoadProbeResult, GeneratedPropertyHasMegamorphicCandidateTable,
+    GeneratedPropertyHasMegamorphicLookup, GeneratedPropertyLoadMegamorphicCandidateTable,
+    GeneratedPropertyLoadMegamorphicHolderProbeRequest, GeneratedPropertyLoadMegamorphicLookup,
+    GeneratedPropertyLoadProbeMissReason, GeneratedPropertyLoadProbeRequest,
+    GeneratedPropertyLoadProbeResult, GeneratedPropertyStoreMegamorphicCandidateTable,
+    GeneratedPropertyStoreMegamorphicLookup, GeneratedPropertyStoreProbeMissReason,
+    GeneratedPropertyStoreProbeRequest, GeneratedPropertyStoreProbeResult,
+    InlineCacheFallbackSemantics, InlineCacheKind, InlineCacheSlotId, JitCodeValidationError,
+    JitPlanValidationError, PropertyLoadAccessCasePlan, PropertyLoadAccessCasePlanKind,
     PropertyLoadAccessCasePlanTable, PropertyLoadGuardChainOutcome, PropertyLoadGuardRequirement,
     PropertyLoadGuardedCandidateKind, PropertyLoadGuardedCandidateTable,
-    PropertyStoreAccessCasePlanKind, PropertyStoreMutationCandidate,
+    PropertyStoreAccessCasePlan, PropertyStoreAccessCasePlanKind, PropertyStoreMutationCandidate,
     PropertyStoreMutationCandidateTable, WatchpointSetId,
 };
 use crate::object::PropertyOffset;
 use crate::runtime::{CallFrameId, CodeBlockId, ExecutableId, ObjectId, RuntimeValue};
+use crate::strings::{PropertyIndex, PropertyKey};
 use crate::value::{NumberValue, ValueKind};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +80,19 @@ pub(crate) enum BaselineGeneratedExecutionWithRuntimeHelpersResult {
     JsCall(BaselineGeneratedJsCallHandoff),
     Property(BaselineGeneratedPropertyHandoff),
     RuntimeHelper(BaselineGeneratedRuntimeHelperHandoff),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BaselineGeneratedExecutionMetrics {
+    pub(crate) executed_bytecode_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BaselineGeneratedExecutionValidation {
+    Full,
+    Prevalidated {
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,6 +192,18 @@ pub(crate) struct BaselineGeneratedPropertyLoadSidecarProbeHit {
     pub(crate) next_bytecode_index: Option<BytecodeIndex>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BaselineGeneratedPropertyLoadOrIncrementSidecarProbeResult {
+    Hit(BaselineGeneratedPropertyLoadSidecarProbeHit),
+    Property(BaselineGeneratedPropertyHandoff),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BaselineGeneratedPropertyIncrementNumericMode {
+    AnyNumber,
+    Int32NoOverflow,
+}
+
 #[allow(dead_code)]
 pub(crate) fn execute_baseline_generated_property_load_sidecar_probe(
     sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
@@ -197,6 +230,63 @@ pub(crate) fn execute_baseline_generated_property_load_sidecar_probe(
                 next_bytecode_index,
             }))
         }
+        Ok(Some(BaselineInstructionOutcome::ContinueTo(target))) => {
+            Ok(Some(BaselineGeneratedPropertyLoadSidecarProbeHit {
+                next_bytecode_index: Some(target),
+            }))
+        }
+        Ok(Some(_)) => Err(ExecutionError::BaselineGeneratedExecutionRejected.into()),
+        Ok(None) | Err(BaselineInstructionAbort::Fallback(_)) => Ok(None),
+        Err(BaselineInstructionAbort::Error(error)) => Err(error),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn execute_baseline_generated_property_load_or_increment_sidecar_probe(
+    sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
+    execution: &mut InterpreterExecutionState<'_>,
+    attempt: BaselineGeneratedPropertyLoadSidecarProbeAttempt<'_, '_, '_>,
+    property_handoff_plan: Option<BaselineGeneratedPropertyHandoffPlan<'_>>,
+    increment_numeric_mode: BaselineGeneratedPropertyIncrementNumericMode,
+) -> Result<
+    Option<BaselineGeneratedPropertyLoadOrIncrementSidecarProbeResult>,
+    BaselineGeneratedExecutionError,
+> {
+    let fallback = fallback_site(attempt.owner, attempt.frame, attempt.instruction);
+    let next_bytecode_index =
+        next_baseline_generated_bytecode_index(attempt.code_block, attempt.instruction);
+    match execute_property_load_or_increment_sidecar_candidate(
+        sidecars,
+        execution,
+        PropertyLoadSidecarAttempt {
+            window: attempt.window,
+            code_block: attempt.code_block,
+            fallback,
+            frame: attempt.frame,
+            instruction: attempt.instruction,
+            site: attempt.site,
+        },
+        attempt.owner,
+        property_handoff_plan,
+        increment_numeric_mode,
+    ) {
+        Ok(Some(BaselineInstructionOutcome::Continue)) => Ok(Some(
+            BaselineGeneratedPropertyLoadOrIncrementSidecarProbeResult::Hit(
+                BaselineGeneratedPropertyLoadSidecarProbeHit {
+                    next_bytecode_index,
+                },
+            ),
+        )),
+        Ok(Some(BaselineInstructionOutcome::ContinueTo(target))) => Ok(Some(
+            BaselineGeneratedPropertyLoadOrIncrementSidecarProbeResult::Hit(
+                BaselineGeneratedPropertyLoadSidecarProbeHit {
+                    next_bytecode_index: Some(target),
+                },
+            ),
+        )),
+        Ok(Some(BaselineInstructionOutcome::Property(handoff))) => Ok(Some(
+            BaselineGeneratedPropertyLoadOrIncrementSidecarProbeResult::Property(handoff),
+        )),
         Ok(Some(_)) => Err(ExecutionError::BaselineGeneratedExecutionRejected.into()),
         Ok(None) | Err(BaselineInstructionAbort::Fallback(_)) => Ok(None),
         Err(BaselineInstructionAbort::Error(error)) => Err(error),
@@ -242,6 +332,62 @@ pub(crate) fn execute_baseline_generated_property_store_sidecar_probe(
         Ok(Some(BaselineInstructionOutcome::Continue)) => {
             Ok(Some(BaselineGeneratedPropertyStoreSidecarProbeHit {
                 next_bytecode_index,
+            }))
+        }
+        Ok(Some(BaselineInstructionOutcome::ContinueTo(target))) => {
+            Ok(Some(BaselineGeneratedPropertyStoreSidecarProbeHit {
+                next_bytecode_index: Some(target),
+            }))
+        }
+        Ok(Some(_)) => Err(ExecutionError::BaselineGeneratedExecutionRejected.into()),
+        Ok(None) | Err(BaselineInstructionAbort::Fallback(_)) => Ok(None),
+        Err(BaselineInstructionAbort::Error(error)) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BaselineGeneratedPropertyHasSidecarProbeAttempt<'code, 'instruction, 'site> {
+    pub(crate) owner: CodeBlockId,
+    pub(crate) frame: CallFrameId,
+    pub(crate) window: RegisterWindow,
+    pub(crate) code_block: &'code CodeBlock,
+    pub(crate) instruction: DecodedInstruction<'instruction>,
+    pub(crate) site: &'site BaselineGeneratedPropertyHandoffSite,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BaselineGeneratedPropertyHasSidecarProbeHit {
+    pub(crate) next_bytecode_index: Option<BytecodeIndex>,
+}
+
+#[allow(dead_code)]
+pub(crate) fn execute_baseline_generated_property_has_sidecar_probe(
+    sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
+    execution: &mut InterpreterExecutionState<'_>,
+    attempt: BaselineGeneratedPropertyHasSidecarProbeAttempt<'_, '_, '_>,
+) -> Result<Option<BaselineGeneratedPropertyHasSidecarProbeHit>, BaselineGeneratedExecutionError> {
+    let fallback = fallback_site(attempt.owner, attempt.frame, attempt.instruction);
+    let next_bytecode_index =
+        next_baseline_generated_bytecode_index(attempt.code_block, attempt.instruction);
+    match execute_property_has_sidecar_candidate(
+        sidecars,
+        execution,
+        PropertyHasSidecarAttempt {
+            window: attempt.window,
+            code_block: attempt.code_block,
+            fallback,
+            instruction: attempt.instruction,
+            site: attempt.site,
+        },
+    ) {
+        Ok(Some(BaselineInstructionOutcome::Continue)) => {
+            Ok(Some(BaselineGeneratedPropertyHasSidecarProbeHit {
+                next_bytecode_index,
+            }))
+        }
+        Ok(Some(BaselineInstructionOutcome::ContinueTo(target))) => {
+            Ok(Some(BaselineGeneratedPropertyHasSidecarProbeHit {
+                next_bytecode_index: Some(target),
             }))
         }
         Ok(Some(_)) => Err(ExecutionError::BaselineGeneratedExecutionRejected.into()),
@@ -380,9 +526,11 @@ pub(crate) struct BaselineGeneratedCallLinkProbeBlockedRecord {
 
 pub(crate) struct BaselineGeneratedCallLinkExecutionSidecar<'plan, 'host> {
     candidate_table: &'plan GeneratedCallLinkCandidateTable,
+    direct_call_hot_slots: &'plan [BaselineGeneratedJsDirectCallHotSlot],
     dispatch_host: &'host mut dyn DispatchHost,
     probe_miss_records: Vec<BaselineGeneratedCallLinkProbeMissRecord>,
     probe_blocked_records: Vec<BaselineGeneratedCallLinkProbeBlockedRecord>,
+    direct_call_hot_slot_hits: usize,
 }
 
 impl<'plan, 'host> BaselineGeneratedCallLinkExecutionSidecar<'plan, 'host> {
@@ -391,11 +539,21 @@ impl<'plan, 'host> BaselineGeneratedCallLinkExecutionSidecar<'plan, 'host> {
         candidate_table: &'plan GeneratedCallLinkCandidateTable,
         dispatch_host: &'host mut dyn DispatchHost,
     ) -> Self {
+        Self::new_with_direct_call_hot_slots(candidate_table, &[], dispatch_host)
+    }
+
+    pub(crate) fn new_with_direct_call_hot_slots(
+        candidate_table: &'plan GeneratedCallLinkCandidateTable,
+        direct_call_hot_slots: &'plan [BaselineGeneratedJsDirectCallHotSlot],
+        dispatch_host: &'host mut dyn DispatchHost,
+    ) -> Self {
         Self {
             candidate_table,
+            direct_call_hot_slots,
             dispatch_host,
             probe_miss_records: Vec::new(),
             probe_blocked_records: Vec::new(),
+            direct_call_hot_slot_hits: 0,
         }
     }
 
@@ -408,13 +566,24 @@ impl<'plan, 'host> BaselineGeneratedCallLinkExecutionSidecar<'plan, 'host> {
     pub(crate) fn probe_blocked_records(&self) -> &[BaselineGeneratedCallLinkProbeBlockedRecord] {
         &self.probe_blocked_records
     }
+
+    pub(crate) fn direct_call_hot_slot_hits(&self) -> usize {
+        self.direct_call_hot_slot_hits
+    }
 }
 
 pub(crate) struct BaselineGeneratedPropertyExecutionSidecars<'plan, 'host> {
     property_load_plan_table: Option<&'plan PropertyLoadAccessCasePlanTable>,
     property_load_guarded_candidate_table: Option<&'plan PropertyLoadGuardedCandidateTable>,
+    property_load_megamorphic_candidate_table:
+        Option<&'plan GeneratedPropertyLoadMegamorphicCandidateTable>,
     property_store_candidate_table: Option<&'plan PropertyStoreMutationCandidateTable>,
+    property_store_megamorphic_candidate_table:
+        Option<&'plan GeneratedPropertyStoreMegamorphicCandidateTable>,
+    property_has_megamorphic_candidate_table:
+        Option<&'plan GeneratedPropertyHasMegamorphicCandidateTable>,
     generated_call_link_candidate_table: Option<&'plan GeneratedCallLinkCandidateTable>,
+    generated_direct_call_hot_slots: &'plan [BaselineGeneratedJsDirectCallHotSlot],
     dispatch_host: &'host mut dyn DispatchHost,
     destination_root_sync_requests: Vec<BaselineGeneratedPropertyLoadDestinationRootSyncRequest>,
     property_load_probe_miss_records: Vec<BaselineGeneratedPropertyLoadProbeMissRecord>,
@@ -426,6 +595,7 @@ pub(crate) struct BaselineGeneratedPropertyExecutionSidecars<'plan, 'host> {
     property_store_mutation_commit_records: Vec<BaselineGeneratedPropertyStoreMutationCommitRecord>,
     generated_call_link_probe_miss_records: Vec<BaselineGeneratedCallLinkProbeMissRecord>,
     generated_call_link_probe_blocked_records: Vec<BaselineGeneratedCallLinkProbeBlockedRecord>,
+    generated_direct_call_hot_slot_hits: usize,
 }
 
 impl<'plan, 'host> BaselineGeneratedPropertyExecutionSidecars<'plan, 'host> {
@@ -449,8 +619,12 @@ impl<'plan, 'host> BaselineGeneratedPropertyExecutionSidecars<'plan, 'host> {
         Self {
             property_load_plan_table,
             property_load_guarded_candidate_table,
+            property_load_megamorphic_candidate_table: None,
             property_store_candidate_table,
+            property_store_megamorphic_candidate_table: None,
+            property_has_megamorphic_candidate_table: None,
             generated_call_link_candidate_table: None,
+            generated_direct_call_hot_slots: &[],
             dispatch_host,
             destination_root_sync_requests: Vec::new(),
             property_load_probe_miss_records: Vec::new(),
@@ -460,6 +634,7 @@ impl<'plan, 'host> BaselineGeneratedPropertyExecutionSidecars<'plan, 'host> {
             property_store_mutation_commit_records: Vec::new(),
             generated_call_link_probe_miss_records: Vec::new(),
             generated_call_link_probe_blocked_records: Vec::new(),
+            generated_direct_call_hot_slot_hits: 0,
         }
     }
 
@@ -479,6 +654,50 @@ impl<'plan, 'host> BaselineGeneratedPropertyExecutionSidecars<'plan, 'host> {
         );
         sidecars.generated_call_link_candidate_table = Some(generated_call_link_candidate_table);
         sidecars
+    }
+
+    pub(crate) fn new_with_generated_call_link_and_direct_call_hot_slots(
+        dispatch_host: &'host mut dyn DispatchHost,
+        property_load_tables: Option<(
+            &'plan PropertyLoadAccessCasePlanTable,
+            &'plan PropertyLoadGuardedCandidateTable,
+        )>,
+        property_store_candidate_table: Option<&'plan PropertyStoreMutationCandidateTable>,
+        generated_call_link_candidate_table: &'plan GeneratedCallLinkCandidateTable,
+        hot_slots: &'plan [BaselineGeneratedJsDirectCallHotSlot],
+    ) -> Self {
+        let mut sidecars = Self::new_with_generated_call_link(
+            dispatch_host,
+            property_load_tables,
+            property_store_candidate_table,
+            generated_call_link_candidate_table,
+        );
+        sidecars.generated_direct_call_hot_slots = hot_slots;
+        sidecars
+    }
+
+    pub(crate) fn with_property_load_megamorphic_candidate_table(
+        mut self,
+        table: Option<&'plan GeneratedPropertyLoadMegamorphicCandidateTable>,
+    ) -> Self {
+        self.property_load_megamorphic_candidate_table = table;
+        self
+    }
+
+    pub(crate) fn with_property_store_megamorphic_candidate_table(
+        mut self,
+        table: Option<&'plan GeneratedPropertyStoreMegamorphicCandidateTable>,
+    ) -> Self {
+        self.property_store_megamorphic_candidate_table = table;
+        self
+    }
+
+    pub(crate) fn with_property_has_megamorphic_candidate_table(
+        mut self,
+        table: Option<&'plan GeneratedPropertyHasMegamorphicCandidateTable>,
+    ) -> Self {
+        self.property_has_megamorphic_candidate_table = table;
+        self
     }
 
     #[allow(dead_code)]
@@ -528,6 +747,10 @@ impl<'plan, 'host> BaselineGeneratedPropertyExecutionSidecars<'plan, 'host> {
         &self,
     ) -> &[BaselineGeneratedCallLinkProbeBlockedRecord] {
         &self.generated_call_link_probe_blocked_records
+    }
+
+    pub(crate) fn generated_direct_call_hot_slot_hits(&self) -> usize {
+        self.generated_direct_call_hot_slot_hits
     }
 }
 
@@ -658,10 +881,67 @@ pub(crate) struct BaselineGeneratedJsCallResume {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BaselineGeneratedJsCallHandoff {
     pub(crate) resume: BaselineGeneratedJsCallResume,
-    pub(crate) continuation: CallReturnContinuation,
+    pub(crate) continuation: BaselineGeneratedJsCallHandoffContinuation,
+    pub(crate) owner_continuation: Option<BaselineGeneratedOwnerContinuationSite>,
     pub(crate) direct_call: Option<Box<BaselineGeneratedJsDirectCall>>,
     pub(crate) requires_no_gc_exit_reentry: bool,
     pub(crate) may_throw: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BaselineGeneratedJsCallHandoffContinuation {
+    Call(CallReturnContinuation),
+    Construct(BaselineGeneratedJsConstructContinuation),
+}
+
+impl BaselineGeneratedJsCallHandoffContinuation {
+    pub(crate) const fn as_call(&self) -> Option<&CallReturnContinuation> {
+        match self {
+            Self::Call(continuation) => Some(continuation),
+            Self::Construct(_) => None,
+        }
+    }
+
+    pub(crate) const fn as_construct(&self) -> Option<&BaselineGeneratedJsConstructContinuation> {
+        match self {
+            Self::Call(_) => None,
+            Self::Construct(continuation) => Some(continuation),
+        }
+    }
+
+    pub(crate) const fn destination(&self) -> VirtualRegister {
+        match self {
+            Self::Call(continuation) => continuation.destination,
+            Self::Construct(continuation) => continuation.destination,
+        }
+    }
+
+    pub(crate) const fn resume_bytecode_index(&self) -> Option<BytecodeIndex> {
+        match self {
+            Self::Call(continuation) => continuation.resume_bytecode_index,
+            Self::Construct(continuation) => continuation.resume_bytecode_index,
+        }
+    }
+
+    pub(crate) const fn argument_count_including_this(&self) -> u32 {
+        match self {
+            Self::Call(continuation) => continuation.argument_count_including_this,
+            Self::Construct(continuation) => continuation.argument_count_including_this,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BaselineGeneratedJsConstructContinuation {
+    pub(crate) caller_frame: CallFrameId,
+    pub(crate) caller_window: RegisterWindow,
+    pub(crate) owner: CodeBlockId,
+    pub(crate) construct_bytecode_index: BytecodeIndex,
+    pub(crate) resume_bytecode_index: Option<BytecodeIndex>,
+    pub(crate) destination: VirtualRegister,
+    pub(crate) argument_count_including_this: u32,
+    pub(crate) callee_value: RuntimeValue,
+    pub(crate) callee_object: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -672,6 +952,14 @@ pub(crate) struct BaselineGeneratedJsDirectCall {
     pub(crate) callee_object: ObjectId,
     pub(crate) this_value: RuntimeValue,
     pub(crate) this_object: Option<ObjectId>,
+    pub(crate) argument_count_including_this: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BaselineGeneratedJsDirectCallHotSlot {
+    pub(crate) candidate: GeneratedCallLinkCandidate,
+    pub(crate) authorization: GeneratedCallLinkDirectCall,
+    pub(crate) callee_object: ObjectId,
     pub(crate) argument_count_including_this: u32,
 }
 
@@ -702,11 +990,12 @@ pub(crate) fn baseline_generated_js_call_handoff(
     if !bytecode_index.is_valid() {
         return Err(BaselineGeneratedJsCallHandoffError::InvalidBytecodeIndex { bytecode_index });
     }
-    if !matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+    if !matches!(
+        opcode,
+        CoreOpcode::Call | CoreOpcode::CallWithThis | CoreOpcode::Construct
+    ) {
         return Err(BaselineGeneratedJsCallHandoffError::UnsupportedOpcode { opcode });
     }
-    let kind = CallReturnKind::from_opcode(opcode)
-        .ok_or(BaselineGeneratedJsCallHandoffError::UnsupportedOpcode { opcode })?;
     let destination = instruction
         .register_operand(0)
         .map_err(|error| BaselineGeneratedJsCallHandoffError::OperandAccess { error })?;
@@ -717,30 +1006,54 @@ pub(crate) fn baseline_generated_js_call_handoff(
         baseline_read_register(execution.registers, code_block, window, callee_register)
             .map_err(|error| BaselineGeneratedJsCallHandoffError::RegisterRead { error })?;
     let provided_argument_count = match opcode {
-        CoreOpcode::Call => instruction.unsigned_immediate_operand(2),
+        CoreOpcode::Call | CoreOpcode::Construct => instruction.unsigned_immediate_operand(2),
         CoreOpcode::CallWithThis => instruction.unsigned_immediate_operand(3),
         _ => unreachable!(),
     }
     .map_err(|error| BaselineGeneratedJsCallHandoffError::OperandAccess { error })?;
     let resume_bytecode_index = next_decoded_bytecode_index(code_block, bytecode_index)
         .map_err(|error| BaselineGeneratedJsCallHandoffError::Continuation { error })?;
-    let continuation = create_call_return_continuation(
-        execution.stack,
-        execution.registers,
-        execution.heap,
-        CallReturnContinuationRequest {
-            caller_frame: frame,
-            caller_window: window,
-            owner,
-            call_bytecode_index: bytecode_index,
-            resume_bytecode_index,
-            destination,
-            argument_count_including_this: provided_argument_count.saturating_add(1),
-            callee_value: Some(callee_value),
-            kind,
-        },
-    )
-    .map_err(|error| BaselineGeneratedJsCallHandoffError::Continuation { error })?;
+    let argument_count_including_this = provided_argument_count.saturating_add(1);
+    let continuation = match opcode {
+        CoreOpcode::Call | CoreOpcode::CallWithThis => {
+            let kind = CallReturnKind::from_opcode(opcode)
+                .ok_or(BaselineGeneratedJsCallHandoffError::UnsupportedOpcode { opcode })?;
+            BaselineGeneratedJsCallHandoffContinuation::Call(
+                create_call_return_continuation(
+                    execution.stack,
+                    execution.registers,
+                    execution.heap,
+                    CallReturnContinuationRequest {
+                        caller_frame: frame,
+                        caller_window: window,
+                        owner,
+                        call_bytecode_index: bytecode_index,
+                        resume_bytecode_index,
+                        destination,
+                        argument_count_including_this,
+                        callee_value: Some(callee_value),
+                        kind,
+                    },
+                )
+                .map_err(|error| BaselineGeneratedJsCallHandoffError::Continuation { error })?,
+            )
+        }
+        CoreOpcode::Construct => BaselineGeneratedJsCallHandoffContinuation::Construct(
+            create_generated_js_construct_continuation(
+                owner,
+                frame,
+                window,
+                bytecode_index,
+                resume_bytecode_index,
+                destination,
+                argument_count_including_this,
+                callee_value,
+                execution,
+            )
+            .map_err(|error| BaselineGeneratedJsCallHandoffError::Continuation { error })?,
+        ),
+        _ => unreachable!(),
+    };
 
     Ok(BaselineGeneratedJsCallHandoff {
         resume: BaselineGeneratedJsCallResume {
@@ -750,9 +1063,62 @@ pub(crate) fn baseline_generated_js_call_handoff(
             opcode,
         },
         continuation,
+        owner_continuation: None,
         direct_call: None,
         requires_no_gc_exit_reentry: true,
         may_throw: true,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_generated_js_construct_continuation(
+    owner: CodeBlockId,
+    frame: CallFrameId,
+    window: RegisterWindow,
+    construct_bytecode_index: BytecodeIndex,
+    resume_bytecode_index: Option<BytecodeIndex>,
+    destination: VirtualRegister,
+    argument_count_including_this: u32,
+    callee_value: RuntimeValue,
+    execution: &InterpreterExecutionState<'_>,
+) -> Result<BaselineGeneratedJsConstructContinuation, ExecutionError> {
+    let Some(active_frame) = execution.stack.top_frame() else {
+        return Err(ExecutionError::NoActiveFrame);
+    };
+    if active_frame.id != frame {
+        return Err(ExecutionError::FrameMismatch {
+            expected: frame,
+            actual: Some(active_frame.id),
+        });
+    }
+    if active_frame.code_block != Some(owner) {
+        return Err(ExecutionError::CodeBlockMismatch {
+            expected: owner,
+            actual: active_frame.code_block,
+        });
+    }
+    if active_frame.register_window != window {
+        return Err(ExecutionError::RegisterWindowMismatch);
+    }
+    if argument_count_including_this == 0 {
+        return Err(ExecutionError::InvalidArgumentCount);
+    }
+    let _ = execution.registers.active_window_authority(frame, window)?;
+    execution
+        .registers
+        .validate_writable_register(window, destination)?;
+    let callee_object = object_id_for_runtime_value(execution, callee_value);
+
+    Ok(BaselineGeneratedJsConstructContinuation {
+        caller_frame: frame,
+        caller_window: window,
+        owner,
+        construct_bytecode_index,
+        resume_bytecode_index,
+        destination,
+        argument_count_including_this,
+        callee_value,
+        callee_object,
     })
 }
 
@@ -841,7 +1207,18 @@ pub(crate) fn baseline_generated_property_handoff(
     if !bytecode_index.is_valid() {
         return Err(BaselineGeneratedPropertyHandoffError::InvalidBytecodeIndex { bytecode_index });
     }
-    if !matches!(opcode, CoreOpcode::GetByName | CoreOpcode::PutByName) {
+    if !matches!(
+        opcode,
+        CoreOpcode::GetByName
+            | CoreOpcode::GetGlobalObjectProperty
+            | CoreOpcode::GetLength
+            | CoreOpcode::PutByName
+            | CoreOpcode::PutGlobalObjectProperty
+            | CoreOpcode::GetByValue
+            | CoreOpcode::PutByValue
+            | CoreOpcode::InById
+            | CoreOpcode::InByVal
+    ) {
         return Err(BaselineGeneratedPropertyHandoffError::UnsupportedOpcode { opcode });
     }
     if site.owner != owner {
@@ -865,8 +1242,16 @@ pub(crate) fn baseline_generated_property_handoff(
         });
     }
     let expected_cache_kind = match opcode {
-        CoreOpcode::GetByName => InlineCacheKind::PropertyLoad,
-        CoreOpcode::PutByName => InlineCacheKind::PropertyStore,
+        CoreOpcode::GetByName | CoreOpcode::GetGlobalObjectProperty => {
+            InlineCacheKind::PropertyLoad
+        }
+        CoreOpcode::GetLength => InlineCacheKind::PropertyLoad,
+        CoreOpcode::PutByName | CoreOpcode::PutGlobalObjectProperty => {
+            InlineCacheKind::PropertyStore
+        }
+        CoreOpcode::GetByValue => InlineCacheKind::ElementLoad,
+        CoreOpcode::PutByValue => InlineCacheKind::ElementStore,
+        CoreOpcode::InById | CoreOpcode::InByVal => InlineCacheKind::HasProperty,
         _ => unreachable!(),
     };
     if site.cache_kind != expected_cache_kind {
@@ -1179,6 +1564,13 @@ pub(crate) fn execute_baseline_p6_native_entry_shim(
                 }
                 pc = BytecodeIndex::from_offset(next as u32);
             }
+            BaselineInstructionOutcome::ContinueTo(target) => {
+                let target_ordinal = target.offset() as usize;
+                if target_ordinal >= instruction_count {
+                    return Err(ExecutionError::InvalidBytecodeIndex(target).into());
+                }
+                pc = target;
+            }
             BaselineInstructionOutcome::Jump(target) => {
                 if target.offset() as usize >= instruction_count {
                     return Err(ExecutionError::InvalidBytecodeIndex(target).into());
@@ -1202,10 +1594,61 @@ pub(crate) fn execute_baseline_p6_native_entry_shim(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn execute_baseline_generated_code(
     request: BaselineGeneratedExecutionRequest<'_, '_>,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
-    match execute_baseline_generated_code_internal(request, None, None, None)? {
+    match execute_baseline_generated_code_internal(
+        request,
+        None,
+        None,
+        None,
+        None,
+        BaselineGeneratedExecutionValidation::Full,
+    )? {
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
+            Ok(BaselineGeneratedExecutionResult::Completed(completion))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::Fallback(fallback) => {
+            Ok(BaselineGeneratedExecutionResult::Fallback(fallback))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::JsCall(handoff) => {
+            Ok(BaselineGeneratedExecutionResult::JsCall(handoff))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::Property(handoff) => {
+            Ok(BaselineGeneratedExecutionResult::Property(handoff))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::RuntimeHelper(handoff) => Err(
+            BaselineGeneratedExecutionError::UnexpectedRuntimeHelper(handoff),
+        ),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn execute_baseline_generated_code_with_metrics(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    execute_baseline_generated_code_with_metrics_and_validation(
+        request,
+        metrics,
+        BaselineGeneratedExecutionValidation::Full,
+    )
+}
+
+pub(crate) fn execute_baseline_generated_code_with_metrics_and_validation(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+    validation: BaselineGeneratedExecutionValidation,
+) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    match execute_baseline_generated_code_internal(
+        request,
+        None,
+        None,
+        None,
+        Some(metrics),
+        validation,
+    )? {
         BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
             Ok(BaselineGeneratedExecutionResult::Completed(completion))
         }
@@ -1253,7 +1696,60 @@ pub(crate) fn execute_baseline_generated_code_with_generated_call_link_sidecar(
     request: BaselineGeneratedExecutionRequest<'_, '_>,
     sidecar: &mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
-    match execute_baseline_generated_code_internal(request, None, None, Some(sidecar))? {
+    match execute_baseline_generated_code_internal(
+        request,
+        None,
+        None,
+        Some(sidecar),
+        None,
+        BaselineGeneratedExecutionValidation::Full,
+    )? {
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
+            Ok(BaselineGeneratedExecutionResult::Completed(completion))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::Fallback(fallback) => {
+            Ok(BaselineGeneratedExecutionResult::Fallback(fallback))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::JsCall(handoff) => {
+            Ok(BaselineGeneratedExecutionResult::JsCall(handoff))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::Property(handoff) => {
+            Ok(BaselineGeneratedExecutionResult::Property(handoff))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::RuntimeHelper(handoff) => Err(
+            BaselineGeneratedExecutionError::UnexpectedRuntimeHelper(handoff),
+        ),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    sidecar: &mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation(
+        request,
+        sidecar,
+        metrics,
+        BaselineGeneratedExecutionValidation::Full,
+    )
+}
+
+pub(crate) fn execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    sidecar: &mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+    validation: BaselineGeneratedExecutionValidation,
+) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    match execute_baseline_generated_code_internal(
+        request,
+        None,
+        None,
+        Some(sidecar),
+        Some(metrics),
+        validation,
+    )? {
         BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
             Ok(BaselineGeneratedExecutionResult::Completed(completion))
         }
@@ -1301,7 +1797,60 @@ pub(crate) fn execute_baseline_generated_code_with_property_sidecars(
     request: BaselineGeneratedExecutionRequest<'_, '_>,
     property_sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
-    match execute_baseline_generated_code_internal(request, None, Some(property_sidecars), None)? {
+    match execute_baseline_generated_code_internal(
+        request,
+        None,
+        Some(property_sidecars),
+        None,
+        None,
+        BaselineGeneratedExecutionValidation::Full,
+    )? {
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
+            Ok(BaselineGeneratedExecutionResult::Completed(completion))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::Fallback(fallback) => {
+            Ok(BaselineGeneratedExecutionResult::Fallback(fallback))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::JsCall(handoff) => {
+            Ok(BaselineGeneratedExecutionResult::JsCall(handoff))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::Property(handoff) => {
+            Ok(BaselineGeneratedExecutionResult::Property(handoff))
+        }
+        BaselineGeneratedExecutionWithRuntimeHelpersResult::RuntimeHelper(handoff) => Err(
+            BaselineGeneratedExecutionError::UnexpectedRuntimeHelper(handoff),
+        ),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn execute_baseline_generated_code_with_property_sidecars_and_metrics(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    property_sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation(
+        request,
+        property_sidecars,
+        metrics,
+        BaselineGeneratedExecutionValidation::Full,
+    )
+}
+
+pub(crate) fn execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    property_sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+    validation: BaselineGeneratedExecutionValidation,
+) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    match execute_baseline_generated_code_internal(
+        request,
+        None,
+        Some(property_sidecars),
+        None,
+        Some(metrics),
+        validation,
+    )? {
         BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
             Ok(BaselineGeneratedExecutionResult::Completed(completion))
         }
@@ -1331,6 +1880,8 @@ pub(crate) fn execute_baseline_generated_code_with_property_and_call_link_sideca
         None,
         Some(property_sidecars),
         Some(generated_call_link_sidecar),
+        None,
+        BaselineGeneratedExecutionValidation::Full,
     )? {
         BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
             Ok(BaselineGeneratedExecutionResult::Completed(completion))
@@ -1355,7 +1906,103 @@ pub(crate) fn execute_baseline_generated_code_with_runtime_helpers<'proof>(
     request: BaselineGeneratedExecutionRequest<'_, '_>,
     runtime_helper_plan: BaselineGeneratedRuntimeHelperPlan<'proof>,
 ) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
-    execute_baseline_generated_code_internal(request, Some(runtime_helper_plan), None, None)
+    execute_baseline_generated_code_internal(
+        request,
+        Some(runtime_helper_plan),
+        None,
+        None,
+        None,
+        BaselineGeneratedExecutionValidation::Full,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_metrics<'proof>(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    runtime_helper_plan: BaselineGeneratedRuntimeHelperPlan<'proof>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation(
+        request,
+        runtime_helper_plan,
+        metrics,
+        BaselineGeneratedExecutionValidation::Full,
+    )
+}
+
+pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation<
+    'proof,
+>(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    runtime_helper_plan: BaselineGeneratedRuntimeHelperPlan<'proof>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+    validation: BaselineGeneratedExecutionValidation,
+) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    execute_baseline_generated_code_internal(
+        request,
+        Some(runtime_helper_plan),
+        None,
+        None,
+        Some(metrics),
+        validation,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_sidecars<'proof>(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    runtime_helper_plan: BaselineGeneratedRuntimeHelperPlan<'proof>,
+    property_sidecars: Option<&mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>>,
+    generated_call_link_sidecar: Option<&mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>>,
+) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    execute_baseline_generated_code_internal(
+        request,
+        Some(runtime_helper_plan),
+        property_sidecars,
+        generated_call_link_sidecar,
+        None,
+        BaselineGeneratedExecutionValidation::Full,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics<
+    'proof,
+>(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    runtime_helper_plan: BaselineGeneratedRuntimeHelperPlan<'proof>,
+    property_sidecars: Option<&mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>>,
+    generated_call_link_sidecar: Option<&mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation(
+        request,
+        runtime_helper_plan,
+        property_sidecars,
+        generated_call_link_sidecar,
+        metrics,
+        BaselineGeneratedExecutionValidation::Full,
+    )
+}
+
+pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation<
+    'proof,
+>(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    runtime_helper_plan: BaselineGeneratedRuntimeHelperPlan<'proof>,
+    property_sidecars: Option<&mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>>,
+    generated_call_link_sidecar: Option<&mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+    validation: BaselineGeneratedExecutionValidation,
+) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    execute_baseline_generated_code_internal(
+        request,
+        Some(runtime_helper_plan),
+        property_sidecars,
+        generated_call_link_sidecar,
+        Some(metrics),
+        validation,
+    )
 }
 
 fn execute_baseline_generated_code_internal(
@@ -1363,6 +2010,8 @@ fn execute_baseline_generated_code_internal(
     runtime_helper_plan: Option<BaselineGeneratedRuntimeHelperPlan<'_>>,
     mut property_sidecars: Option<&mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>>,
     mut generated_call_link_sidecar: Option<&mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>>,
+    mut metrics: Option<&mut BaselineGeneratedExecutionMetrics>,
+    validation: BaselineGeneratedExecutionValidation,
 ) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
     let BaselineGeneratedExecutionRequest {
         artifact,
@@ -1372,14 +2021,28 @@ fn execute_baseline_generated_code_internal(
         mut execution,
     } = request;
 
-    if let Some(plan) = runtime_helper_plan {
-        validate_generated_artifact_with_runtime_helpers(artifact, owner, code_block, plan)?;
-    } else {
-        validate_generated_artifact(artifact, owner, code_block)?;
-    }
+    validate_generated_artifact_for_execution(
+        artifact,
+        owner,
+        code_block,
+        runtime_helper_plan,
+        validation,
+    )?;
     let property_handoff_plan = artifact.property_handoff_plan();
     if let Some(plan) = property_handoff_plan {
-        validate_property_handoff_plan_snapshot(code_block, plan)?;
+        match validation {
+            BaselineGeneratedExecutionValidation::Full => {
+                validate_property_handoff_plan_snapshot(code_block, plan)?;
+            }
+            BaselineGeneratedExecutionValidation::Prevalidated { bytecode_snapshot } => {
+                if plan.bytecode_snapshot != bytecode_snapshot {
+                    return Err(BaselineGeneratedExecutionError::CodeBlockSnapshotMismatch {
+                        expected: bytecode_snapshot,
+                        actual: plan.bytecode_snapshot,
+                    });
+                }
+            }
+        }
     }
     let opcode_subset = artifact.eligibility_proof.opcode_subset();
     let (frame, window) = baseline_active_frame(execution.stack, expected_frame, owner)?;
@@ -1412,6 +2075,9 @@ fn execute_baseline_generated_code_internal(
             return Err(ExecutionError::InvalidBytecodeIndex(bytecode_index).into());
         }
         execution.stack.mark_top_bytecode_index(bytecode_index);
+        if let Some(metrics) = metrics.as_deref_mut() {
+            metrics.executed_bytecode_count = metrics.executed_bytecode_count.saturating_add(1);
+        }
 
         let outcome = match execute_instruction(
             BaselineInstructionContext::new(
@@ -1420,7 +2086,8 @@ fn execute_baseline_generated_code_internal(
                 expected_frame,
                 code_block,
                 property_handoff_plan,
-            ),
+            )
+            .with_owner_continuation_map(artifact.owner_continuation_map()),
             window,
             &mut execution,
             instruction,
@@ -1444,6 +2111,19 @@ fn execute_baseline_generated_code_internal(
                     );
                 }
                 pc = BytecodeIndex::from_offset(next as u32);
+            }
+            BaselineInstructionOutcome::ContinueTo(target) => {
+                let target_ordinal = target.offset() as usize;
+                if target_ordinal >= instruction_count {
+                    return Err(ExecutionError::InvalidBytecodeIndex(target).into());
+                }
+                if let Some(metrics) = metrics.as_deref_mut() {
+                    let skipped = target_ordinal.saturating_sub(ordinal.saturating_add(1));
+                    metrics.executed_bytecode_count = metrics
+                        .executed_bytecode_count
+                        .saturating_add(skipped as u64);
+                }
+                pc = target;
             }
             BaselineInstructionOutcome::Jump(target) => {
                 if target.offset() as usize >= instruction_count {
@@ -1480,6 +2160,43 @@ fn execute_baseline_generated_code_internal(
                 }
                 return Ok(BaselineGeneratedExecutionWithRuntimeHelpersResult::Fallback(fallback));
             }
+        }
+    }
+}
+
+fn validate_generated_artifact_for_execution(
+    artifact: &BaselineGeneratedCodeArtifact,
+    owner: CodeBlockId,
+    code_block: &CodeBlock,
+    runtime_helper_plan: Option<BaselineGeneratedRuntimeHelperPlan<'_>>,
+    validation: BaselineGeneratedExecutionValidation,
+) -> Result<(), BaselineGeneratedExecutionError> {
+    match validation {
+        BaselineGeneratedExecutionValidation::Full => {
+            if let Some(plan) = runtime_helper_plan {
+                validate_generated_artifact_with_runtime_helpers(artifact, owner, code_block, plan)
+            } else {
+                validate_generated_artifact(artifact, owner, code_block)
+            }
+        }
+        BaselineGeneratedExecutionValidation::Prevalidated { bytecode_snapshot } => {
+            validate_generated_artifact_header(artifact, owner)?;
+            let expected = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
+            if expected != bytecode_snapshot {
+                return Err(BaselineGeneratedExecutionError::CodeBlockSnapshotMismatch {
+                    expected,
+                    actual: bytecode_snapshot,
+                });
+            }
+            if let Some(plan) = runtime_helper_plan {
+                if plan.bytecode_snapshot != bytecode_snapshot {
+                    return Err(BaselineGeneratedExecutionError::CodeBlockSnapshotMismatch {
+                        expected: bytecode_snapshot,
+                        actual: plan.bytecode_snapshot,
+                    });
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -1670,7 +2387,7 @@ fn property_handoff_site_for_instruction(
             )?
             .copied()
             .ok_or(BaselineGeneratedPropertyHandoffError::MissingSiteMetadata { bytecode_index })?;
-        validate_baseline_generated_property_handoff_site_against_code_block(
+        validate_baseline_generated_property_handoff_site_against_current_code_block(
             code_block, owner, &site,
         )
         .map_err(BaselineGeneratedPropertyHandoffError::SiteMetadata)?;
@@ -1692,6 +2409,7 @@ fn property_handoff_site_for_instruction(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BaselineInstructionOutcome {
     Continue,
+    ContinueTo(BytecodeIndex),
     Jump(BytecodeIndex),
     Return(RuntimeValue),
     JsCall(BaselineGeneratedJsCallHandoff),
@@ -1712,6 +2430,7 @@ struct BaselineInstructionContext<'code, 'plan> {
     frame: CallFrameId,
     code_block: &'code CodeBlock,
     property_handoff_plan: Option<BaselineGeneratedPropertyHandoffPlan<'plan>>,
+    owner_continuation_map: Option<&'plan BaselineGeneratedOwnerContinuationMapMetadata>,
 }
 
 impl<'code, 'plan> BaselineInstructionContext<'code, 'plan> {
@@ -1728,7 +2447,37 @@ impl<'code, 'plan> BaselineInstructionContext<'code, 'plan> {
             frame,
             code_block,
             property_handoff_plan,
+            owner_continuation_map: None,
         }
+    }
+
+    const fn with_owner_continuation_map(
+        mut self,
+        owner_continuation_map: Option<&'plan BaselineGeneratedOwnerContinuationMapMetadata>,
+    ) -> Self {
+        self.owner_continuation_map = owner_continuation_map;
+        self
+    }
+}
+
+fn owner_continuation_site_for_handoff(
+    owner_continuation_map: Option<&BaselineGeneratedOwnerContinuationMapMetadata>,
+    handoff: &BaselineGeneratedJsCallHandoff,
+) -> Option<BaselineGeneratedOwnerContinuationSite> {
+    let site = owner_continuation_map?
+        .call_site_for_bytecode_index(handoff.resume.bytecode_index)
+        .copied()?;
+    if site.owner == handoff.resume.owner
+        && site.call_bytecode_index == handoff.resume.bytecode_index
+        && site.opcode == handoff.resume.opcode
+        && site.destination == handoff.continuation.destination()
+        && site.argument_count_including_this
+            == handoff.continuation.argument_count_including_this()
+        && site.resume_bytecode_index == handoff.continuation.resume_bytecode_index()
+    {
+        Some(site)
+    } else {
+        None
     }
 }
 
@@ -1737,8 +2486,8 @@ fn execute_instruction(
     window: RegisterWindow,
     execution: &mut InterpreterExecutionState<'_>,
     instruction: DecodedInstruction<'_>,
-    property_sidecars: Option<&mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>>,
-    generated_call_link_sidecar: Option<&mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>>,
+    mut property_sidecars: Option<&mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>>,
+    mut generated_call_link_sidecar: Option<&mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>>,
 ) -> Result<BaselineInstructionOutcome, BaselineInstructionAbort> {
     let BaselineInstructionContext {
         opcode_subset,
@@ -1746,6 +2495,7 @@ fn execute_instruction(
         frame,
         code_block,
         property_handoff_plan,
+        owner_continuation_map,
     } = context;
     let fallback = fallback_site(owner, frame, instruction);
     let Some(opcode) = CoreOpcode::from_opcode(instruction.opcode) else {
@@ -1754,33 +2504,74 @@ fn execute_instruction(
         ));
     };
     if !opcode_subset.supports(opcode) {
-        if matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
-            let direct_call = if let Some(sidecar) = generated_call_link_sidecar {
-                execute_generated_call_link_sidecar_probe(
-                    sidecar,
-                    execution,
-                    GeneratedCallLinkSidecarAttempt {
-                        window,
-                        code_block,
-                        fallback,
-                        owner,
-                        opcode,
-                        instruction,
-                    },
-                )?
-            } else if let Some(sidecars) = property_sidecars {
-                execute_generated_call_link_property_sidecar_probe(
-                    sidecars,
-                    execution,
-                    GeneratedCallLinkSidecarAttempt {
-                        window,
-                        code_block,
-                        fallback,
-                        owner,
-                        opcode,
-                        instruction,
-                    },
-                )?
+        if matches!(
+            opcode,
+            CoreOpcode::Call | CoreOpcode::CallWithThis | CoreOpcode::Construct
+        ) {
+            if matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+                let native_intrinsic = if let Some(sidecar) = generated_call_link_sidecar.as_mut() {
+                    execute_generated_native_intrinsic_call_sidecar_probe(
+                        *sidecar,
+                        execution,
+                        GeneratedCallLinkSidecarAttempt {
+                            window,
+                            code_block,
+                            fallback,
+                            owner,
+                            opcode,
+                            instruction,
+                        },
+                    )?
+                } else if let Some(sidecars) = property_sidecars.as_mut() {
+                    execute_generated_native_intrinsic_call_property_sidecar_probe(
+                        *sidecars,
+                        execution,
+                        GeneratedCallLinkSidecarAttempt {
+                            window,
+                            code_block,
+                            fallback,
+                            owner,
+                            opcode,
+                            instruction,
+                        },
+                    )?
+                } else {
+                    None
+                };
+                if let Some(outcome) = native_intrinsic {
+                    return Ok(outcome);
+                }
+            }
+            let direct_call = if matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+                if let Some(sidecar) = generated_call_link_sidecar {
+                    execute_generated_call_link_sidecar_probe(
+                        sidecar,
+                        execution,
+                        GeneratedCallLinkSidecarAttempt {
+                            window,
+                            code_block,
+                            fallback,
+                            owner,
+                            opcode,
+                            instruction,
+                        },
+                    )?
+                } else if let Some(sidecars) = property_sidecars {
+                    execute_generated_call_link_property_sidecar_probe(
+                        sidecars,
+                        execution,
+                        GeneratedCallLinkSidecarAttempt {
+                            window,
+                            code_block,
+                            fallback,
+                            owner,
+                            opcode,
+                            instruction,
+                        },
+                    )?
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -1799,10 +2590,23 @@ fn execute_instruction(
                     error,
                 })
             })?;
+            handoff.owner_continuation =
+                owner_continuation_site_for_handoff(owner_continuation_map, &handoff);
             handoff.direct_call = direct_call.map(Box::new);
             return Ok(BaselineInstructionOutcome::JsCall(handoff));
         }
-        if matches!(opcode, CoreOpcode::GetByName | CoreOpcode::PutByName) {
+        if matches!(
+            opcode,
+            CoreOpcode::GetByName
+                | CoreOpcode::GetGlobalObjectProperty
+                | CoreOpcode::GetLength
+                | CoreOpcode::PutByName
+                | CoreOpcode::PutGlobalObjectProperty
+                | CoreOpcode::GetByValue
+                | CoreOpcode::PutByValue
+                | CoreOpcode::InById
+                | CoreOpcode::InByVal
+        ) {
             let site = property_handoff_site_for_instruction(
                 owner,
                 code_block,
@@ -1817,8 +2621,14 @@ fn execute_instruction(
                 })
             })?;
             if let Some(sidecars) = property_sidecars {
-                if opcode == CoreOpcode::GetByName {
-                    if let Some(outcome) = execute_property_load_sidecar_candidate(
+                if matches!(
+                    opcode,
+                    CoreOpcode::GetByName
+                        | CoreOpcode::GetGlobalObjectProperty
+                        | CoreOpcode::GetLength
+                        | CoreOpcode::GetByValue
+                ) {
+                    if let Some(outcome) = execute_property_load_or_increment_sidecar_candidate(
                         sidecars,
                         execution,
                         PropertyLoadSidecarAttempt {
@@ -1829,15 +2639,38 @@ fn execute_instruction(
                             instruction,
                             site: &site,
                         },
+                        owner,
+                        property_handoff_plan,
+                        BaselineGeneratedPropertyIncrementNumericMode::AnyNumber,
                     )? {
                         return Ok(outcome);
                     }
                 }
-                if opcode == CoreOpcode::PutByName {
+                if matches!(
+                    opcode,
+                    CoreOpcode::PutByName
+                        | CoreOpcode::PutGlobalObjectProperty
+                        | CoreOpcode::PutByValue
+                ) {
                     if let Some(outcome) = execute_property_store_sidecar_candidate(
                         sidecars,
                         execution,
                         PropertyStoreSidecarAttempt {
+                            window,
+                            code_block,
+                            fallback,
+                            instruction,
+                            site: &site,
+                        },
+                    )? {
+                        return Ok(outcome);
+                    }
+                }
+                if matches!(opcode, CoreOpcode::InById | CoreOpcode::InByVal) {
+                    if let Some(outcome) = execute_property_has_sidecar_candidate(
+                        sidecars,
+                        execution,
+                        PropertyHasSidecarAttempt {
                             window,
                             code_block,
                             fallback,
@@ -1968,6 +2801,19 @@ fn execute_instruction(
             let value = read_register_or_outcome(execution, code_block, window, source, fallback)?;
             write_register_or_outcome(execution, window, destination, value, fallback)
         }
+        CoreOpcode::LoadCallee => {
+            let destination = register_operand_or_fallback(instruction, 0, fallback)?;
+            let Some(callee) = execution
+                .stack
+                .top_frame()
+                .and_then(|frame| frame.callee_value)
+            else {
+                return Ok(BaselineInstructionOutcome::Fallback(
+                    fallback.with_cause(BaselineGeneratedFallbackCause::UnsupportedOpcode),
+                ));
+            };
+            write_register_or_outcome(execution, window, destination, callee, fallback)
+        }
         CoreOpcode::ToNumber => {
             execute_to_number(code_block, window, execution, instruction, fallback)
         }
@@ -2067,6 +2913,14 @@ fn execute_instruction(
         CoreOpcode::StrictEqual | CoreOpcode::StrictNotEqual => {
             execute_strict_equality(opcode, code_block, window, execution, instruction, fallback)
         }
+        CoreOpcode::Equal | CoreOpcode::NotEqual => execute_local_loose_equality(
+            opcode,
+            code_block,
+            window,
+            execution,
+            instruction,
+            fallback,
+        ),
         _ => Ok(BaselineInstructionOutcome::Fallback(
             fallback.with_cause(BaselineGeneratedFallbackCause::UnsupportedOpcode),
         )),
@@ -2113,6 +2967,112 @@ struct GeneratedCallLinkSidecarOperands {
     this_object: Option<ObjectId>,
 }
 
+fn execute_generated_native_intrinsic_call_sidecar_probe(
+    sidecar: &mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>,
+    execution: &mut InterpreterExecutionState<'_>,
+    attempt: GeneratedCallLinkSidecarAttempt<'_, '_>,
+) -> Result<Option<BaselineInstructionOutcome>, BaselineInstructionAbort> {
+    let BaselineGeneratedCallLinkExecutionSidecar { dispatch_host, .. } = sidecar;
+    execute_generated_native_intrinsic_call_probe_with_host(
+        &mut **dispatch_host,
+        execution,
+        attempt,
+    )
+}
+
+fn execute_generated_native_intrinsic_call_property_sidecar_probe(
+    sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
+    execution: &mut InterpreterExecutionState<'_>,
+    attempt: GeneratedCallLinkSidecarAttempt<'_, '_>,
+) -> Result<Option<BaselineInstructionOutcome>, BaselineInstructionAbort> {
+    let BaselineGeneratedPropertyExecutionSidecars { dispatch_host, .. } = sidecars;
+    execute_generated_native_intrinsic_call_probe_with_host(
+        &mut **dispatch_host,
+        execution,
+        attempt,
+    )
+}
+
+fn execute_generated_native_intrinsic_call_probe_with_host(
+    dispatch_host: &mut dyn DispatchHost,
+    execution: &mut InterpreterExecutionState<'_>,
+    attempt: GeneratedCallLinkSidecarAttempt<'_, '_>,
+) -> Result<Option<BaselineInstructionOutcome>, BaselineInstructionAbort> {
+    let GeneratedCallLinkSidecarAttempt {
+        window,
+        code_block,
+        fallback,
+        owner,
+        opcode,
+        instruction,
+    } = attempt;
+    let destination = register_operand_or_fallback(instruction, 0, fallback)?;
+    let callee_register = register_operand_or_fallback(instruction, 1, fallback)?;
+    let callee_value =
+        read_register_or_outcome(execution, code_block, window, callee_register, fallback)?;
+    let (this_value, provided_argument_count, first_argument_operand) = match opcode {
+        CoreOpcode::CallWithThis => {
+            let this_register = register_operand_or_fallback(instruction, 2, fallback)?;
+            let this_value =
+                read_register_or_outcome(execution, code_block, window, this_register, fallback)?;
+            let argument_count = unsigned_immediate_operand_or_fallback(instruction, 3, fallback)?;
+            (this_value, argument_count, 4)
+        }
+        CoreOpcode::Call => {
+            let argument_count = unsigned_immediate_operand_or_fallback(instruction, 2, fallback)?;
+            (RuntimeValue::undefined(), argument_count, 3)
+        }
+        _ => return Ok(None),
+    };
+    let first_argument = if provided_argument_count == 0 {
+        None
+    } else {
+        let argument_register =
+            register_operand_or_fallback(instruction, first_argument_operand, fallback)?;
+        Some(read_register_or_outcome(
+            execution,
+            code_block,
+            window,
+            argument_register,
+            fallback,
+        )?)
+    };
+    let second_argument = if provided_argument_count <= 1 {
+        None
+    } else {
+        let second_argument_operand = first_argument_operand.saturating_add(1);
+        let argument_register =
+            register_operand_or_fallback(instruction, second_argument_operand, fallback)?;
+        Some(read_register_or_outcome(
+            execution,
+            code_block,
+            window,
+            argument_register,
+            fallback,
+        )?)
+    };
+    let request = GeneratedNativeIntrinsicCallRequest {
+        owner,
+        bytecode_index: instruction.bytecode_index,
+        opcode,
+        callee_value,
+        this_value,
+        provided_argument_count,
+        first_argument,
+        second_argument,
+    };
+    match DispatchHost::dispatch_generated_native_intrinsic_call(
+        dispatch_host,
+        execution.heap,
+        request,
+    ) {
+        GeneratedNativeIntrinsicCallResult::Hit(hit) => {
+            write_register_or_outcome(execution, window, destination, hit.value, fallback).map(Some)
+        }
+        GeneratedNativeIntrinsicCallResult::Miss(_) => Ok(None),
+    }
+}
+
 fn execute_generated_call_link_sidecar_probe(
     sidecar: &mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>,
     execution: &mut InterpreterExecutionState<'_>,
@@ -2120,15 +3080,19 @@ fn execute_generated_call_link_sidecar_probe(
 ) -> Result<Option<BaselineGeneratedJsDirectCall>, BaselineInstructionAbort> {
     let BaselineGeneratedCallLinkExecutionSidecar {
         candidate_table,
+        direct_call_hot_slots,
         dispatch_host,
         probe_miss_records,
         probe_blocked_records,
+        direct_call_hot_slot_hits,
     } = sidecar;
     execute_generated_call_link_sidecar_probe_with_host(
         candidate_table,
+        direct_call_hot_slots,
         &mut **dispatch_host,
         probe_miss_records,
         probe_blocked_records,
+        direct_call_hot_slot_hits,
         execution,
         attempt,
     )
@@ -2141,9 +3105,11 @@ fn execute_generated_call_link_property_sidecar_probe(
 ) -> Result<Option<BaselineGeneratedJsDirectCall>, BaselineInstructionAbort> {
     let BaselineGeneratedPropertyExecutionSidecars {
         generated_call_link_candidate_table,
+        generated_direct_call_hot_slots,
         dispatch_host,
         generated_call_link_probe_miss_records,
         generated_call_link_probe_blocked_records,
+        generated_direct_call_hot_slot_hits,
         ..
     } = sidecars;
     let Some(candidate_table) = *generated_call_link_candidate_table else {
@@ -2151,9 +3117,11 @@ fn execute_generated_call_link_property_sidecar_probe(
     };
     execute_generated_call_link_sidecar_probe_with_host(
         candidate_table,
+        generated_direct_call_hot_slots,
         &mut **dispatch_host,
         generated_call_link_probe_miss_records,
         generated_call_link_probe_blocked_records,
+        generated_direct_call_hot_slot_hits,
         execution,
         attempt,
     )
@@ -2161,9 +3129,11 @@ fn execute_generated_call_link_property_sidecar_probe(
 
 fn execute_generated_call_link_sidecar_probe_with_host(
     candidate_table: &GeneratedCallLinkCandidateTable,
+    direct_call_hot_slots: &[BaselineGeneratedJsDirectCallHotSlot],
     dispatch_host: &mut dyn DispatchHost,
     probe_miss_records: &mut Vec<BaselineGeneratedCallLinkProbeMissRecord>,
     probe_blocked_records: &mut Vec<BaselineGeneratedCallLinkProbeBlockedRecord>,
+    direct_call_hot_slot_hits: &mut usize,
     execution: &mut InterpreterExecutionState<'_>,
     attempt: GeneratedCallLinkSidecarAttempt<'_, '_>,
 ) -> Result<Option<BaselineGeneratedJsDirectCall>, BaselineInstructionAbort> {
@@ -2195,7 +3165,39 @@ fn execute_generated_call_link_sidecar_probe_with_host(
 
     let operands =
         generated_call_link_sidecar_operands(execution, code_block, window, instruction, fallback)?;
-    for candidate in candidates {
+    if let Some(direct_call) = generated_call_link_hot_slot_direct_call(
+        direct_call_hot_slots,
+        &candidates,
+        owner,
+        opcode,
+        bytecode_index,
+        operands,
+    ) {
+        *direct_call_hot_slot_hits = direct_call_hot_slot_hits.saturating_add(1);
+        return Ok(Some(direct_call));
+    }
+
+    let candidates_to_probe = match operands.callee_object {
+        Some(callee_object) => {
+            let matching = candidates
+                .iter()
+                .copied()
+                .filter(|candidate| candidate.target.callee == callee_object)
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                probe_miss_records.push(call_link_probe_miss_record(
+                    owner,
+                    bytecode_index,
+                    candidates.first().copied(),
+                    GeneratedCallLinkProbeMissReason::CalleeMismatch,
+                ));
+                return Ok(None);
+            }
+            matching
+        }
+        None => candidates,
+    };
+    for candidate in candidates_to_probe {
         let request = GeneratedCallLinkProbeRequest::new(
             candidate,
             owner,
@@ -2246,6 +3248,41 @@ fn execute_generated_call_link_sidecar_probe_with_host(
     }
 
     Ok(None)
+}
+
+fn generated_call_link_hot_slot_direct_call(
+    hot_slots: &[BaselineGeneratedJsDirectCallHotSlot],
+    current_candidates: &[&GeneratedCallLinkCandidate],
+    owner: CodeBlockId,
+    opcode: CoreOpcode,
+    bytecode_index: BytecodeIndex,
+    operands: GeneratedCallLinkSidecarOperands,
+) -> Option<BaselineGeneratedJsDirectCall> {
+    let callee_object = operands.callee_object?;
+    hot_slots
+        .iter()
+        .find(|slot| {
+            slot.candidate.owner == owner
+                && slot.candidate.opcode == opcode
+                && slot.candidate.bytecode_index == bytecode_index.offset()
+                && slot.candidate.direct_call_status
+                    == GeneratedCallLinkDirectCallStatus::Authorized
+                && current_candidates
+                    .iter()
+                    .any(|candidate| *candidate == &slot.candidate)
+                && slot.candidate.target.callee == callee_object
+                && slot.callee_object == callee_object
+                && slot.argument_count_including_this == operands.argument_count_including_this
+        })
+        .map(|slot| BaselineGeneratedJsDirectCall {
+            candidate: slot.candidate.clone(),
+            authorization: slot.authorization,
+            callee_value: operands.callee_value,
+            callee_object,
+            this_value: operands.this_value,
+            this_object: operands.this_object,
+            argument_count_including_this: operands.argument_count_including_this,
+        })
 }
 
 fn generated_call_link_sidecar_operands(
@@ -2392,6 +3429,279 @@ struct PropertyLoadSidecarAttempt<'code, 'instruction, 'site> {
     site: &'site BaselineGeneratedPropertyHandoffSite,
 }
 
+fn named_property_sidecar_cache_key(
+    site: &BaselineGeneratedPropertyHandoffSite,
+) -> Option<CacheKey> {
+    match site.property_key {
+        PropertyCacheKey::Key(property_key) => Some(CacheKey::Property(property_key)),
+        PropertyCacheKey::None | PropertyCacheKey::RuntimeValue(_) => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PropertyIncrementSidecarShape<'code> {
+    to_number_destination: VirtualRegister,
+    post_update_result_destination: Option<VirtualRegister>,
+    one_destination: VirtualRegister,
+    add_destination: VirtualRegister,
+    put_instruction: DecodedInstruction<'code>,
+    put_site: BaselineGeneratedPropertyHandoffSite,
+    resume_after_put: Option<BytecodeIndex>,
+}
+
+fn execute_property_load_or_increment_sidecar_candidate(
+    sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
+    execution: &mut InterpreterExecutionState<'_>,
+    attempt: PropertyLoadSidecarAttempt<'_, '_, '_>,
+    owner: CodeBlockId,
+    property_handoff_plan: Option<BaselineGeneratedPropertyHandoffPlan<'_>>,
+    increment_numeric_mode: BaselineGeneratedPropertyIncrementNumericMode,
+) -> Result<Option<BaselineInstructionOutcome>, BaselineInstructionAbort> {
+    let shape = property_increment_sidecar_shape_after_get_by_name(
+        owner,
+        attempt.code_block,
+        attempt.instruction,
+        attempt.site,
+        property_handoff_plan,
+    );
+    let window = attempt.window;
+    let code_block = attempt.code_block;
+    let fallback = attempt.fallback;
+    let load_destination = register_operand_or_fallback(attempt.instruction, 0, fallback)?;
+    let Some(load_outcome) = execute_property_load_sidecar_candidate(sidecars, execution, attempt)?
+    else {
+        return Ok(None);
+    };
+    if !matches!(load_outcome, BaselineInstructionOutcome::Continue) {
+        return Ok(Some(load_outcome));
+    }
+
+    let Some(shape) = shape else {
+        return Ok(Some(BaselineInstructionOutcome::Continue));
+    };
+    let old_value =
+        read_register_or_outcome(execution, code_block, window, load_destination, fallback)?;
+    if old_value.as_number().is_none() {
+        return Ok(Some(BaselineInstructionOutcome::Continue));
+    }
+
+    let to_number_fallback = fallback_site(owner, fallback.request.frame, shape.put_instruction);
+    write_register_or_outcome(
+        execution,
+        window,
+        shape.to_number_destination,
+        old_value,
+        to_number_fallback,
+    )?;
+    if let Some(destination) = shape.post_update_result_destination {
+        write_register_or_outcome(
+            execution,
+            window,
+            destination,
+            old_value,
+            to_number_fallback,
+        )?;
+    }
+    write_register_or_outcome(
+        execution,
+        window,
+        shape.one_destination,
+        RuntimeValue::from_i32(1),
+        to_number_fallback,
+    )?;
+    let left_value = read_register_or_outcome(
+        execution,
+        code_block,
+        window,
+        shape.to_number_destination,
+        to_number_fallback,
+    )?;
+    let right_value = read_register_or_outcome(
+        execution,
+        code_block,
+        window,
+        shape.one_destination,
+        to_number_fallback,
+    )?;
+    let (Some(left_number), Some(right_number)) = (left_value.as_number(), right_value.as_number())
+    else {
+        return Ok(Some(BaselineInstructionOutcome::Continue));
+    };
+    let updated_value = match increment_numeric_mode {
+        BaselineGeneratedPropertyIncrementNumericMode::AnyNumber => {
+            let Some(updated_value) =
+                pure_number_arithmetic_result(CoreOpcode::AddInt32, left_number, right_number)
+            else {
+                return Ok(Some(BaselineInstructionOutcome::Continue));
+            };
+            updated_value
+        }
+        BaselineGeneratedPropertyIncrementNumericMode::Int32NoOverflow => {
+            let (NumberValue::Int32(left), NumberValue::Int32(right)) = (left_number, right_number)
+            else {
+                return Ok(Some(BaselineInstructionOutcome::Continue));
+            };
+            let Some(updated_value) = left.checked_add(right) else {
+                return Ok(Some(BaselineInstructionOutcome::Continue));
+            };
+            RuntimeValue::from_i32(updated_value)
+        }
+    };
+    write_register_or_outcome(
+        execution,
+        window,
+        shape.add_destination,
+        updated_value,
+        to_number_fallback,
+    )?;
+
+    let put_fallback = fallback_site(owner, fallback.request.frame, shape.put_instruction);
+    if let Some(resume_after_put) = shape.resume_after_put {
+        match execute_property_store_sidecar_candidate(
+            sidecars,
+            execution,
+            PropertyStoreSidecarAttempt {
+                window,
+                code_block,
+                fallback: put_fallback,
+                instruction: shape.put_instruction,
+                site: &shape.put_site,
+            },
+        )? {
+            Some(BaselineInstructionOutcome::Continue) => {
+                return Ok(Some(BaselineInstructionOutcome::ContinueTo(
+                    resume_after_put,
+                )));
+            }
+            Some(other) => return Ok(Some(other)),
+            None => {}
+        }
+    }
+
+    baseline_generated_property_handoff(
+        owner,
+        fallback.request.frame,
+        shape.put_instruction,
+        &shape.put_site,
+    )
+    .map(BaselineInstructionOutcome::Property)
+    .map(Some)
+    .map_err(|error| {
+        BaselineInstructionAbort::Error(BaselineGeneratedExecutionError::PropertyHandoff {
+            bytecode_index: shape.put_instruction.bytecode_index,
+            opcode: fallback_opcode(shape.put_instruction.opcode),
+            error,
+        })
+    })
+}
+
+fn property_increment_sidecar_shape_after_get_by_name<'code>(
+    owner: CodeBlockId,
+    code_block: &'code CodeBlock,
+    get_instruction: DecodedInstruction<'code>,
+    get_site: &BaselineGeneratedPropertyHandoffSite,
+    property_handoff_plan: Option<BaselineGeneratedPropertyHandoffPlan<'_>>,
+) -> Option<PropertyIncrementSidecarShape<'code>> {
+    if get_site.opcode != CoreOpcode::GetByName
+        || CoreOpcode::from_opcode(get_instruction.opcode) != Some(CoreOpcode::GetByName)
+    {
+        return None;
+    }
+    let get_destination = get_instruction.register_operand(0).ok()?;
+    let get_base = get_instruction.register_operand(1).ok()?;
+    let get_identifier = identifier_index_operand(get_instruction, 2)?;
+    let get_key = named_property_sidecar_cache_key(get_site)?;
+
+    let mut cursor = get_instruction.bytecode_index.offset().checked_add(1)?;
+    let to_number = decoded_core_instruction_at(code_block, cursor, CoreOpcode::ToNumber)?;
+    let to_number_destination = to_number.register_operand(0).ok()?;
+    if to_number.register_operand(1).ok()? != get_destination {
+        return None;
+    }
+    cursor = cursor.checked_add(1)?;
+
+    let mut post_update_result_destination = None;
+    if let Some(move_instruction) =
+        decoded_core_instruction_at(code_block, cursor, CoreOpcode::Move)
+    {
+        if move_instruction.register_operand(1).ok()? != to_number_destination {
+            return None;
+        }
+        post_update_result_destination = Some(move_instruction.register_operand(0).ok()?);
+        cursor = cursor.checked_add(1)?;
+    }
+
+    let load_one = decoded_core_instruction_at(code_block, cursor, CoreOpcode::LoadInt32)?;
+    let one_destination = load_one.register_operand(0).ok()?;
+    if load_one.signed_immediate_operand(1).ok()? != 1 {
+        return None;
+    }
+    cursor = cursor.checked_add(1)?;
+
+    let add = decoded_core_instruction_at(code_block, cursor, CoreOpcode::AddInt32)?;
+    let add_destination = add.register_operand(0).ok()?;
+    if add.register_operand(1).ok()? != to_number_destination
+        || add.register_operand(2).ok()? != one_destination
+    {
+        return None;
+    }
+    cursor = cursor.checked_add(1)?;
+
+    let put = decoded_core_instruction_at(code_block, cursor, CoreOpcode::PutByName)?;
+    if put.register_operand(0).ok()? != get_base
+        || identifier_index_operand(put, 1)? != get_identifier
+        || put.register_operand(2).ok()? != add_destination
+    {
+        return None;
+    }
+    let put_site =
+        property_handoff_site_for_instruction(owner, code_block, put, property_handoff_plan)
+            .ok()?;
+    if put_site.opcode != CoreOpcode::PutByName
+        || named_property_sidecar_cache_key(&put_site)? != get_key
+    {
+        return None;
+    }
+
+    Some(PropertyIncrementSidecarShape {
+        to_number_destination,
+        post_update_result_destination,
+        one_destination,
+        add_destination,
+        put_instruction: put,
+        put_site,
+        resume_after_put: next_baseline_generated_bytecode_index(code_block, put),
+    })
+}
+
+fn decoded_core_instruction_at(
+    code_block: &CodeBlock,
+    offset: u32,
+    opcode: CoreOpcode,
+) -> Option<DecodedInstruction<'_>> {
+    let instruction = code_block
+        .decoded_instruction_at(BytecodeIndex::from_offset(offset))
+        .ok()?;
+    (CoreOpcode::from_opcode(instruction.opcode) == Some(opcode)).then_some(instruction)
+}
+
+fn identifier_index_operand(instruction: DecodedInstruction<'_>, index: usize) -> Option<u32> {
+    match instruction.operand(index).ok()? {
+        Operand::IdentifierIndex(identifier_index) => Some(identifier_index),
+        _ => None,
+    }
+}
+
+fn element_sidecar_cache_key_from_runtime_value(value: RuntimeValue) -> Option<CacheKey> {
+    let NumberValue::Int32(index) = value.as_number()? else {
+        return None;
+    };
+    let index = u32::try_from(index).ok()?;
+    Some(CacheKey::Property(PropertyKey::from_index(
+        PropertyIndex::from_canonical_index(index),
+    )))
+}
+
 fn execute_property_load_sidecar_candidate(
     sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
     execution: &mut InterpreterExecutionState<'_>,
@@ -2406,154 +3716,389 @@ fn execute_property_load_sidecar_candidate(
         site,
     } = attempt;
 
-    let site_key = CacheKey::Property(site.property_key);
     let mut operands = None;
     let BaselineGeneratedPropertyExecutionSidecars {
         property_load_plan_table,
         property_load_guarded_candidate_table,
+        property_load_megamorphic_candidate_table,
         dispatch_host,
         destination_root_sync_requests,
         property_load_probe_miss_records,
         guarded_property_load_probe_miss_records,
         ..
     } = sidecars;
-    let Some(plan_table) = *property_load_plan_table else {
-        return Ok(None);
-    };
-    let Some(guarded_candidate_table) = *property_load_guarded_candidate_table else {
-        return Ok(None);
-    };
 
-    if plan_table.owner() == site.owner {
-        for plan in plan_table.candidates_for_bytecode_index(site.bytecode_index.offset()) {
-            if plan.key != site_key {
-                continue;
-            }
-
-            let (destination, base) = property_load_sidecar_operands(
-                &mut operands,
-                execution,
-                code_block,
-                window,
-                instruction,
-                fallback,
-            )?;
-
-            let result = dispatch_host
-                .probe_generated_property_load(GeneratedPropertyLoadProbeRequest { plan, base });
-            let hit = match result {
-                GeneratedPropertyLoadProbeResult::Hit(hit) => hit,
-                GeneratedPropertyLoadProbeResult::Miss(miss) => {
-                    property_load_probe_miss_records.push(
-                        BaselineGeneratedPropertyLoadProbeMissRecord {
-                            owner: plan.owner,
-                            bytecode_index: BytecodeIndex::from_offset(plan.bytecode_index),
-                            key: plan.key,
-                            base_structure: plan.access_case.base_structure,
-                            offset: plan.access_case.offset,
-                            reason: miss.reason,
-                        },
-                    );
-                    continue;
-                }
+    let mut current_base_structure = None;
+    if let Some(megamorphic_table) = *property_load_megamorphic_candidate_table {
+        if megamorphic_table.owner() == site.owner && site.opcode == CoreOpcode::GetByName {
+            let Some(site_key) = named_property_sidecar_cache_key(site) else {
+                return Ok(None);
             };
+            if megamorphic_table.contains_site(site.slot, site.bytecode_index.offset(), site_key) {
+                if dispatch_host.has_pending_structure_chain_invalidation_events() {
+                    return Ok(None);
+                }
+                let (destination, base, _) = property_load_sidecar_operands(
+                    &mut operands,
+                    execution,
+                    code_block,
+                    window,
+                    instruction,
+                    fallback,
+                )?;
+                let actual_structure = *current_base_structure.get_or_insert_with(|| {
+                    dispatch_host.generated_property_sidecar_base_structure(base)
+                });
+                let lookup = match actual_structure {
+                    Some(actual_structure) => megamorphic_table.lookup(
+                        site.slot,
+                        site.bytecode_index.offset(),
+                        site_key,
+                        actual_structure,
+                    ),
+                    None => return Ok(None),
+                };
+                match lookup {
+                    GeneratedPropertyLoadMegamorphicLookup::NoSite => {}
+                    GeneratedPropertyLoadMegamorphicLookup::Miss => return Ok(None),
+                    GeneratedPropertyLoadMegamorphicLookup::Missing => {
+                        let outcome = write_register_or_outcome(
+                            execution,
+                            window,
+                            destination,
+                            RuntimeValue::undefined(),
+                            fallback,
+                        )?;
+                        return Ok(Some(outcome));
+                    }
+                    GeneratedPropertyLoadMegamorphicLookup::PrototypeData {
+                        key,
+                        base_structure,
+                        holder,
+                        offset,
+                    } => {
+                        let result = dispatch_host
+                            .probe_generated_property_load_megamorphic_holder(
+                                GeneratedPropertyLoadMegamorphicHolderProbeRequest {
+                                    key,
+                                    base_structure,
+                                    holder,
+                                    offset,
+                                },
+                            );
+                        let hit = match result {
+                            GeneratedPropertyLoadProbeResult::Hit(hit) => hit,
+                            GeneratedPropertyLoadProbeResult::Miss(miss) => {
+                                property_load_probe_miss_records.push(
+                                    BaselineGeneratedPropertyLoadProbeMissRecord {
+                                        owner: site.owner,
+                                        bytecode_index: site.bytecode_index,
+                                        key,
+                                        base_structure: Some(base_structure),
+                                        offset: Some(offset),
+                                        reason: miss.reason,
+                                    },
+                                );
+                                return Ok(None);
+                            }
+                        };
 
-            let outcome =
-                write_register_or_outcome(execution, window, destination, hit.value, fallback)?;
-            if hit.destination_root_sync.requires_targeted_register_sync() {
-                destination_root_sync_requests.push(
-                    BaselineGeneratedPropertyLoadDestinationRootSyncRequest {
-                        frame,
-                        bytecode_index: site.bytecode_index,
-                        destination,
-                    },
-                );
+                        let outcome = write_register_or_outcome(
+                            execution,
+                            window,
+                            destination,
+                            hit.value,
+                            fallback,
+                        )?;
+                        if hit.destination_root_sync.requires_targeted_register_sync() {
+                            destination_root_sync_requests.push(
+                                BaselineGeneratedPropertyLoadDestinationRootSyncRequest {
+                                    frame,
+                                    bytecode_index: site.bytecode_index,
+                                    destination,
+                                },
+                            );
+                        }
+                        return Ok(Some(outcome));
+                    }
+                    GeneratedPropertyLoadMegamorphicLookup::Hit(plan) => {
+                        let result = dispatch_host.probe_generated_property_load(
+                            GeneratedPropertyLoadProbeRequest { plan: &plan, base },
+                        );
+                        let hit = match result {
+                            GeneratedPropertyLoadProbeResult::Hit(hit) => hit,
+                            GeneratedPropertyLoadProbeResult::Miss(miss) => {
+                                property_load_probe_miss_records.push(
+                                    BaselineGeneratedPropertyLoadProbeMissRecord {
+                                        owner: plan.owner,
+                                        bytecode_index: BytecodeIndex::from_offset(
+                                            plan.bytecode_index,
+                                        ),
+                                        key: plan.key,
+                                        base_structure: plan.access_case.base_structure,
+                                        offset: plan.access_case.offset,
+                                        reason: miss.reason,
+                                    },
+                                );
+                                return Ok(None);
+                            }
+                        };
+
+                        let outcome = write_register_or_outcome(
+                            execution,
+                            window,
+                            destination,
+                            hit.value,
+                            fallback,
+                        )?;
+                        if hit.destination_root_sync.requires_targeted_register_sync() {
+                            destination_root_sync_requests.push(
+                                BaselineGeneratedPropertyLoadDestinationRootSyncRequest {
+                                    frame,
+                                    bytecode_index: site.bytecode_index,
+                                    destination,
+                                },
+                            );
+                        }
+                        return Ok(Some(outcome));
+                    }
+                }
             }
-            return Ok(Some(outcome));
         }
     }
 
-    if guarded_candidate_table.owner() == site.owner {
-        for candidate in
-            guarded_candidate_table.candidates_for_bytecode_index(site.bytecode_index.offset())
-        {
-            let plan = &candidate.plan;
-            if plan.descriptor.key != site_key {
-                continue;
-            }
+    if let Some(plan_table) = *property_load_plan_table {
+        if plan_table.owner() == site.owner {
+            for plan in
+                plan_table.candidates_for_bytecode_index_newest_first(site.bytecode_index.offset())
+            {
+                let (destination, base, runtime_key) = property_load_sidecar_operands(
+                    &mut operands,
+                    execution,
+                    code_block,
+                    window,
+                    instruction,
+                    fallback,
+                )?;
+                let probe_plan;
+                let plan = match site.opcode {
+                    CoreOpcode::GetByName
+                    | CoreOpcode::GetGlobalObjectProperty
+                    | CoreOpcode::GetLength => {
+                        let Some(site_key) = named_property_sidecar_cache_key(site) else {
+                            return Ok(None);
+                        };
+                        if plan.plan_kind != PropertyLoadAccessCasePlanKind::DataOnlyOwnLoad
+                            || plan.key != site_key
+                        {
+                            continue;
+                        }
+                        plan
+                    }
+                    CoreOpcode::GetByValue => {
+                        if plan.plan_kind != PropertyLoadAccessCasePlanKind::DataOnlyIndexedLoad {
+                            continue;
+                        }
+                        let Some(runtime_key) = runtime_key else {
+                            return Ok(None);
+                        };
+                        probe_plan = property_load_plan_with_runtime_key(plan, runtime_key);
+                        &probe_plan
+                    }
+                    _ => return Ok(None),
+                };
 
-            let (destination, base) = property_load_sidecar_operands(
-                &mut operands,
-                execution,
-                code_block,
-                window,
-                instruction,
-                fallback,
-            )?;
-
-            let result = dispatch_host.probe_generated_guarded_property_load(
-                GeneratedGuardedPropertyLoadProbeRequest::new(plan, base),
-            );
-            let hit = match result {
-                GeneratedGuardedPropertyLoadProbeResult::Hit(hit) => hit,
-                GeneratedGuardedPropertyLoadProbeResult::Miss(miss) => {
-                    guarded_property_load_probe_miss_records.push(
-                        BaselineGeneratedGuardedPropertyLoadProbeMissRecord {
-                            owner: plan.owner,
-                            bytecode_index: BytecodeIndex::from_offset(plan.bytecode_index),
-                            slot: plan.slot,
-                            guard_plan_ordinal: candidate.guard_plan_ordinal,
-                            materialization_ordinal: candidate.materialization_ordinal,
-                            dependency_ordinals: candidate.dependency_ordinals.clone(),
-                            binding_set_ids: candidate.binding_set_ids.clone(),
-                            candidate_kind: candidate.candidate_kind,
-                            base_structure: plan.descriptor.base_structure,
-                            reason: miss.reason,
-                            requirement: miss.requirement,
-                            key: miss.key,
-                            prototype_depth: miss.prototype_depth,
-                            chain_index: miss.chain_index,
-                            outcome: miss.outcome,
-                        },
-                    );
+                if property_load_sidecar_structure_guard_misses(
+                    &mut **dispatch_host,
+                    &mut current_base_structure,
+                    base,
+                    plan,
+                ) {
                     continue;
                 }
-            };
 
-            let outcome =
-                write_register_or_outcome(execution, window, destination, hit.value, fallback)?;
-            if hit.destination_root_sync.requires_targeted_register_sync() {
-                destination_root_sync_requests.push(
-                    BaselineGeneratedPropertyLoadDestinationRootSyncRequest {
-                        frame,
-                        bytecode_index: site.bytecode_index,
-                        destination,
-                    },
+                let result = dispatch_host.probe_generated_property_load(
+                    GeneratedPropertyLoadProbeRequest { plan, base },
                 );
+                let hit = match result {
+                    GeneratedPropertyLoadProbeResult::Hit(hit) => hit,
+                    GeneratedPropertyLoadProbeResult::Miss(miss) => {
+                        property_load_probe_miss_records.push(
+                            BaselineGeneratedPropertyLoadProbeMissRecord {
+                                owner: plan.owner,
+                                bytecode_index: BytecodeIndex::from_offset(plan.bytecode_index),
+                                key: plan.key,
+                                base_structure: plan.access_case.base_structure,
+                                offset: plan.access_case.offset,
+                                reason: miss.reason,
+                            },
+                        );
+                        continue;
+                    }
+                };
+
+                let outcome =
+                    write_register_or_outcome(execution, window, destination, hit.value, fallback)?;
+                if hit.destination_root_sync.requires_targeted_register_sync() {
+                    destination_root_sync_requests.push(
+                        BaselineGeneratedPropertyLoadDestinationRootSyncRequest {
+                            frame,
+                            bytecode_index: site.bytecode_index,
+                            destination,
+                        },
+                    );
+                }
+                return Ok(Some(outcome));
             }
-            return Ok(Some(outcome));
+        }
+    }
+
+    if let Some(guarded_candidate_table) = *property_load_guarded_candidate_table {
+        if guarded_candidate_table.owner() == site.owner {
+            for candidate in
+                guarded_candidate_table.candidates_for_bytecode_index(site.bytecode_index.offset())
+            {
+                if !matches!(site.opcode, CoreOpcode::GetByName | CoreOpcode::GetLength) {
+                    continue;
+                }
+                let Some(site_key) = named_property_sidecar_cache_key(site) else {
+                    return Ok(None);
+                };
+                let plan = &candidate.plan;
+                if plan.descriptor.key != site_key {
+                    continue;
+                }
+
+                let (destination, base, _) = property_load_sidecar_operands(
+                    &mut operands,
+                    execution,
+                    code_block,
+                    window,
+                    instruction,
+                    fallback,
+                )?;
+
+                let result = dispatch_host.probe_generated_guarded_property_load(
+                    GeneratedGuardedPropertyLoadProbeRequest::new(plan, base),
+                );
+                let hit = match result {
+                    GeneratedGuardedPropertyLoadProbeResult::Hit(hit) => hit,
+                    GeneratedGuardedPropertyLoadProbeResult::Miss(miss) => {
+                        guarded_property_load_probe_miss_records.push(
+                            BaselineGeneratedGuardedPropertyLoadProbeMissRecord {
+                                owner: plan.owner,
+                                bytecode_index: BytecodeIndex::from_offset(plan.bytecode_index),
+                                slot: plan.slot,
+                                guard_plan_ordinal: candidate.guard_plan_ordinal,
+                                materialization_ordinal: candidate.materialization_ordinal,
+                                dependency_ordinals: candidate.dependency_ordinals.clone(),
+                                binding_set_ids: candidate.binding_set_ids.clone(),
+                                candidate_kind: candidate.candidate_kind,
+                                base_structure: plan.descriptor.base_structure,
+                                reason: miss.reason,
+                                requirement: miss.requirement,
+                                key: miss.key,
+                                prototype_depth: miss.prototype_depth,
+                                chain_index: miss.chain_index,
+                                outcome: miss.outcome,
+                            },
+                        );
+                        continue;
+                    }
+                };
+
+                let outcome =
+                    write_register_or_outcome(execution, window, destination, hit.value, fallback)?;
+                if hit.destination_root_sync.requires_targeted_register_sync() {
+                    destination_root_sync_requests.push(
+                        BaselineGeneratedPropertyLoadDestinationRootSyncRequest {
+                            frame,
+                            bytecode_index: site.bytecode_index,
+                            destination,
+                        },
+                    );
+                }
+                return Ok(Some(outcome));
+            }
         }
     }
 
     Ok(None)
 }
 
+fn property_load_sidecar_structure_guard_misses(
+    dispatch_host: &mut dyn DispatchHost,
+    current_base_structure: &mut Option<Option<StructureId>>,
+    base: RuntimeValue,
+    plan: &PropertyLoadAccessCasePlan,
+) -> bool {
+    if plan.plan_kind != PropertyLoadAccessCasePlanKind::DataOnlyOwnLoad {
+        return false;
+    }
+    let Some(expected_structure) = plan.access_case.base_structure else {
+        return false;
+    };
+    if expected_structure == StructureId::INVALID {
+        return false;
+    }
+    let actual_structure = *current_base_structure
+        .get_or_insert_with(|| dispatch_host.generated_property_sidecar_base_structure(base));
+    matches!(actual_structure, Some(actual_structure) if actual_structure != expected_structure)
+}
+
+fn property_load_plan_with_runtime_key(
+    plan: &crate::jit::PropertyLoadAccessCasePlan,
+    runtime_key: CacheKey,
+) -> crate::jit::PropertyLoadAccessCasePlan {
+    let mut plan = plan.clone();
+    plan.key = runtime_key;
+    plan.access_case.key = runtime_key;
+    plan
+}
+
 fn property_load_sidecar_operands(
-    operands: &mut Option<(VirtualRegister, RuntimeValue)>,
+    operands: &mut Option<(VirtualRegister, RuntimeValue, Option<CacheKey>)>,
     execution: &mut InterpreterExecutionState<'_>,
     code_block: &CodeBlock,
     window: RegisterWindow,
     instruction: DecodedInstruction<'_>,
     fallback: BaselineGeneratedFallbackSite,
-) -> Result<(VirtualRegister, RuntimeValue), BaselineInstructionAbort> {
+) -> Result<(VirtualRegister, RuntimeValue, Option<CacheKey>), BaselineInstructionAbort> {
     if let Some(operands) = *operands {
         return Ok(operands);
     }
 
     let destination = register_operand_or_fallback(instruction, 0, fallback)?;
-    let base_register = register_operand_or_fallback(instruction, 1, fallback)?;
-    let base = read_register_or_outcome(execution, code_block, window, base_register, fallback)?;
-    let decoded_operands = (destination, base);
+    let opcode = CoreOpcode::from_opcode(instruction.opcode);
+    let (base, runtime_key) = match opcode {
+        Some(CoreOpcode::GetGlobalObjectProperty) => (
+            execution
+                .stack
+                .active_global_this_value()
+                .map_err(execution_error_abort)?,
+            None,
+        ),
+        Some(CoreOpcode::GetByValue) => {
+            let base_register = register_operand_or_fallback(instruction, 1, fallback)?;
+            let base =
+                read_register_or_outcome(execution, code_block, window, base_register, fallback)?;
+            let key_register = register_operand_or_fallback(instruction, 2, fallback)?;
+            let key_value =
+                read_register_or_outcome(execution, code_block, window, key_register, fallback)?;
+            (
+                base,
+                element_sidecar_cache_key_from_runtime_value(key_value),
+            )
+        }
+        _ => {
+            let base_register = register_operand_or_fallback(instruction, 1, fallback)?;
+            (
+                read_register_or_outcome(execution, code_block, window, base_register, fallback)?,
+                None,
+            )
+        }
+    };
+    let decoded_operands = (destination, base, runtime_key);
     *operands = Some(decoded_operands);
     Ok(decoded_operands)
 }
@@ -2565,6 +4110,104 @@ fn next_baseline_generated_bytecode_index(
     let next = (instruction.bytecode_index.offset() as usize).saturating_add(1);
     (next < code_block.unlinked().instructions().instruction_count())
         .then(|| BytecodeIndex::from_offset(next as u32))
+}
+
+struct PropertyHasSidecarAttempt<'code, 'instruction, 'site> {
+    window: RegisterWindow,
+    code_block: &'code CodeBlock,
+    fallback: BaselineGeneratedFallbackSite,
+    instruction: DecodedInstruction<'instruction>,
+    site: &'site BaselineGeneratedPropertyHandoffSite,
+}
+
+fn execute_property_has_sidecar_candidate(
+    sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
+    execution: &mut InterpreterExecutionState<'_>,
+    attempt: PropertyHasSidecarAttempt<'_, '_, '_>,
+) -> Result<Option<BaselineInstructionOutcome>, BaselineInstructionAbort> {
+    let PropertyHasSidecarAttempt {
+        window,
+        code_block,
+        fallback,
+        instruction,
+        site,
+    } = attempt;
+
+    let BaselineGeneratedPropertyExecutionSidecars {
+        property_has_megamorphic_candidate_table,
+        dispatch_host,
+        ..
+    } = sidecars;
+    let Some(megamorphic_table) = *property_has_megamorphic_candidate_table else {
+        return Ok(None);
+    };
+    if megamorphic_table.owner() != site.owner {
+        return Ok(None);
+    }
+    let site_key = match site.opcode {
+        CoreOpcode::InById => {
+            let Some(site_key) = named_property_sidecar_cache_key(site) else {
+                return Ok(None);
+            };
+            site_key
+        }
+        CoreOpcode::InByVal => {
+            let property_register = register_operand_or_fallback(instruction, 2, fallback)?;
+            if !matches!(
+                site.property_key,
+                PropertyCacheKey::RuntimeValue(expected) if expected == property_register
+            ) {
+                return Ok(None);
+            }
+            let property = read_register_or_outcome(
+                execution,
+                code_block,
+                window,
+                property_register,
+                fallback,
+            )?;
+            let Some(runtime_key) =
+                dispatch_host.generated_property_has_sidecar_runtime_key(property)
+            else {
+                return Ok(None);
+            };
+            runtime_key
+        }
+        _ => return Ok(None),
+    };
+    if !megamorphic_table.contains_site(site.slot, site.bytecode_index.offset(), site_key) {
+        return Ok(None);
+    }
+    if dispatch_host.has_pending_structure_chain_invalidation_events() {
+        return Ok(None);
+    }
+
+    let destination = register_operand_or_fallback(instruction, 0, fallback)?;
+    let base_register = register_operand_or_fallback(instruction, 1, fallback)?;
+    let base = read_register_or_outcome(execution, code_block, window, base_register, fallback)?;
+    let Some(actual_structure) = dispatch_host.generated_property_has_sidecar_base_structure(base)
+    else {
+        return Ok(None);
+    };
+    let result = match megamorphic_table.lookup(
+        site.slot,
+        site.bytecode_index.offset(),
+        site_key,
+        actual_structure,
+    ) {
+        GeneratedPropertyHasMegamorphicLookup::Hit(result) => result,
+        GeneratedPropertyHasMegamorphicLookup::NoSite
+        | GeneratedPropertyHasMegamorphicLookup::Miss => return Ok(None),
+    };
+
+    write_register_or_outcome(
+        execution,
+        window,
+        destination,
+        RuntimeValue::from_bool(result),
+        fallback,
+    )
+    .map(Some)
 }
 
 struct PropertyStoreSidecarAttempt<'code, 'instruction, 'site> {
@@ -2588,16 +4231,77 @@ fn execute_property_store_sidecar_candidate(
         site,
     } = attempt;
 
-    let site_key = CacheKey::Property(site.property_key);
     let mut operands = None;
     let BaselineGeneratedPropertyExecutionSidecars {
         property_store_candidate_table,
+        property_store_megamorphic_candidate_table,
         dispatch_host,
         property_store_probe_miss_records,
         property_store_mutation_rejection_records,
         property_store_mutation_commit_records,
         ..
     } = sidecars;
+    let mut current_base_structure = None;
+    if let Some(megamorphic_table) = *property_store_megamorphic_candidate_table {
+        if megamorphic_table.owner() == site.owner {
+            match site.opcode {
+                CoreOpcode::PutByName | CoreOpcode::PutGlobalObjectProperty => {
+                    let Some(site_key) = named_property_sidecar_cache_key(site) else {
+                        return Ok(None);
+                    };
+                    let (base, stored_value, _) = property_store_sidecar_operands(
+                        &mut operands,
+                        execution,
+                        code_block,
+                        window,
+                        instruction,
+                        fallback,
+                    )?;
+                    let Some(base_structure) = *current_base_structure.get_or_insert_with(|| {
+                        dispatch_host.generated_property_sidecar_base_structure(base)
+                    }) else {
+                        return Ok(None);
+                    };
+                    match megamorphic_table.lookup(
+                        site.slot,
+                        site.bytecode_index.offset(),
+                        site_key,
+                        base_structure,
+                    ) {
+                        GeneratedPropertyStoreMegamorphicLookup::NoSite => {}
+                        GeneratedPropertyStoreMegamorphicLookup::Miss => return Ok(None),
+                        GeneratedPropertyStoreMegamorphicLookup::Hit(plan) => {
+                            if site.opcode == CoreOpcode::PutGlobalObjectProperty
+                                && plan.plan_kind
+                                    != PropertyStoreAccessCasePlanKind::DataOnlyReplace
+                            {
+                                return Ok(None);
+                            }
+                            let result = dispatch_host.probe_generated_property_store(
+                                GeneratedPropertyStoreProbeRequest::new(&plan, base, stored_value),
+                            );
+                            let hit = match result {
+                                GeneratedPropertyStoreProbeResult::Hit(hit) => hit,
+                                GeneratedPropertyStoreProbeResult::Miss(_) => return Ok(None),
+                            };
+                            let request = GeneratedPropertyStoreMutationRequest::new(base, hit);
+                            return match dispatch_host
+                                .commit_generated_property_store(execution.heap, request)
+                            {
+                                GeneratedPropertyStoreMutationResult::Committed(_) => {
+                                    Ok(Some(BaselineInstructionOutcome::Continue))
+                                }
+                                GeneratedPropertyStoreMutationResult::Rejected(_) => Ok(None),
+                            };
+                        }
+                    }
+                }
+                CoreOpcode::PutByValue => {}
+                _ => return Ok(None),
+            }
+        }
+    }
+
     let Some(candidate_table) = *property_store_candidate_table else {
         return Ok(None);
     };
@@ -2606,13 +4310,11 @@ fn execute_property_store_sidecar_candidate(
         return Ok(None);
     }
 
-    for candidate in candidate_table.candidates_for_bytecode_index(site.bytecode_index.offset()) {
+    for candidate in
+        candidate_table.candidates_for_bytecode_index_newest_first(site.bytecode_index.offset())
+    {
         let plan = &candidate.plan;
-        if plan.key != site_key {
-            continue;
-        }
-
-        let (base, stored_value) = property_store_sidecar_operands(
+        let (base, stored_value, runtime_key) = property_store_sidecar_operands(
             &mut operands,
             execution,
             code_block,
@@ -2620,6 +4322,42 @@ fn execute_property_store_sidecar_candidate(
             instruction,
             fallback,
         )?;
+        let probe_plan;
+        let plan = match site.opcode {
+            CoreOpcode::PutByName | CoreOpcode::PutGlobalObjectProperty => {
+                let Some(site_key) = named_property_sidecar_cache_key(site) else {
+                    return Ok(None);
+                };
+                if plan.plan_kind == PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore
+                    || plan.key != site_key
+                    || (site.opcode == CoreOpcode::PutGlobalObjectProperty
+                        && plan.plan_kind != PropertyStoreAccessCasePlanKind::DataOnlyReplace)
+                {
+                    continue;
+                }
+                plan
+            }
+            CoreOpcode::PutByValue => {
+                if plan.plan_kind != PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore {
+                    continue;
+                }
+                let Some(runtime_key) = runtime_key else {
+                    return Ok(None);
+                };
+                probe_plan = property_store_plan_with_runtime_key(plan, runtime_key);
+                &probe_plan
+            }
+            _ => return Ok(None),
+        };
+
+        if property_store_sidecar_structure_guard_misses(
+            &mut **dispatch_host,
+            &mut current_base_structure,
+            base,
+            plan,
+        ) {
+            continue;
+        }
 
         let result = dispatch_host.probe_generated_property_store(
             GeneratedPropertyStoreProbeRequest::new(plan, base, stored_value),
@@ -2651,21 +4389,69 @@ fn execute_property_store_sidecar_candidate(
     Ok(None)
 }
 
+fn property_store_sidecar_structure_guard_misses(
+    dispatch_host: &mut dyn DispatchHost,
+    current_base_structure: &mut Option<Option<StructureId>>,
+    base: RuntimeValue,
+    plan: &PropertyStoreAccessCasePlan,
+) -> bool {
+    if !matches!(
+        plan.plan_kind,
+        PropertyStoreAccessCasePlanKind::DataOnlyReplace
+            | PropertyStoreAccessCasePlanKind::DataOnlyTransition
+    ) {
+        return false;
+    }
+    let Some(expected_structure) = plan.access_case.base_structure else {
+        return false;
+    };
+    if expected_structure == StructureId::INVALID {
+        return false;
+    }
+    let actual_structure = *current_base_structure
+        .get_or_insert_with(|| dispatch_host.generated_property_sidecar_base_structure(base));
+    matches!(actual_structure, Some(actual_structure) if actual_structure != expected_structure)
+}
+
+fn property_store_plan_with_runtime_key(
+    plan: &crate::jit::PropertyStoreAccessCasePlan,
+    runtime_key: CacheKey,
+) -> crate::jit::PropertyStoreAccessCasePlan {
+    let mut plan = plan.clone();
+    plan.key = runtime_key;
+    plan.access_case.key = runtime_key;
+    plan
+}
+
 fn property_store_sidecar_operands(
-    operands: &mut Option<(RuntimeValue, RuntimeValue)>,
+    operands: &mut Option<(RuntimeValue, RuntimeValue, Option<CacheKey>)>,
     execution: &mut InterpreterExecutionState<'_>,
     code_block: &CodeBlock,
     window: RegisterWindow,
     instruction: DecodedInstruction<'_>,
     fallback: BaselineGeneratedFallbackSite,
-) -> Result<(RuntimeValue, RuntimeValue), BaselineInstructionAbort> {
+) -> Result<(RuntimeValue, RuntimeValue, Option<CacheKey>), BaselineInstructionAbort> {
     if let Some(operands) = *operands {
         return Ok(operands);
     }
 
-    let base_register = register_operand_or_fallback(instruction, 0, fallback)?;
-    let stored_value_register = register_operand_or_fallback(instruction, 2, fallback)?;
-    let base = read_register_or_outcome(execution, code_block, window, base_register, fallback)?;
+    let opcode = CoreOpcode::from_opcode(instruction.opcode);
+    let (base, stored_value_register) = match opcode {
+        Some(CoreOpcode::PutGlobalObjectProperty) => (
+            execution
+                .stack
+                .active_global_this_value()
+                .map_err(execution_error_abort)?,
+            register_operand_or_fallback(instruction, 1, fallback)?,
+        ),
+        _ => {
+            let base_register = register_operand_or_fallback(instruction, 0, fallback)?;
+            (
+                read_register_or_outcome(execution, code_block, window, base_register, fallback)?,
+                register_operand_or_fallback(instruction, 2, fallback)?,
+            )
+        }
+    };
     let stored_value = read_register_or_outcome(
         execution,
         code_block,
@@ -2673,7 +4459,15 @@ fn property_store_sidecar_operands(
         stored_value_register,
         fallback,
     )?;
-    let decoded_operands = (base, stored_value);
+    let runtime_key = if opcode == Some(CoreOpcode::PutByValue) {
+        let key_register = register_operand_or_fallback(instruction, 1, fallback)?;
+        let key_value =
+            read_register_or_outcome(execution, code_block, window, key_register, fallback)?;
+        element_sidecar_cache_key_from_runtime_value(key_value)
+    } else {
+        None
+    };
+    let decoded_operands = (base, stored_value, runtime_key);
     *operands = Some(decoded_operands);
     Ok(decoded_operands)
 }
@@ -2744,6 +4538,10 @@ const fn baseline_generated_executor_supports_subset(
         subset,
         BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic
             | BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBranchNullish
+            | BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBranchNullishFalse
+            | BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr
+            | BaselineSupportedOpcodeSubset::P8aConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullish
+            | BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrBranchNullishFalse
             | BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitwise
             | BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitwiseRelational
             | BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitwiseRelationalJumps
@@ -3381,6 +5179,72 @@ fn execute_strict_equality(
     )
 }
 
+fn execute_local_loose_equality(
+    opcode: CoreOpcode,
+    code_block: &CodeBlock,
+    window: RegisterWindow,
+    execution: &mut InterpreterExecutionState<'_>,
+    instruction: DecodedInstruction<'_>,
+    fallback: BaselineGeneratedFallbackSite,
+) -> Result<BaselineInstructionOutcome, BaselineInstructionAbort> {
+    let destination = register_operand_or_fallback(instruction, 0, fallback)?;
+    let left_register = register_operand_or_fallback(instruction, 1, fallback)?;
+    let left = read_register_or_outcome(execution, code_block, window, left_register, fallback)?;
+    let right_register = register_operand_or_fallback(instruction, 2, fallback)?;
+    let right = read_register_or_outcome(execution, code_block, window, right_register, fallback)?;
+    let Some(equals) = local_no_call_loose_equals(left, right) else {
+        let (operand_index, register) = if !matches!(left.as_number(), Some(NumberValue::Int32(_)))
+        {
+            (1, left_register)
+        } else {
+            (2, right_register)
+        };
+        return Ok(BaselineInstructionOutcome::Fallback(fallback.with_cause(
+            BaselineGeneratedFallbackCause::NonInt32Operand {
+                operand_index,
+                register,
+            },
+        )));
+    };
+    let result = matches!(opcode, CoreOpcode::Equal) == equals;
+    write_register_or_outcome(
+        execution,
+        window,
+        destination,
+        RuntimeValue::from_bool(result),
+        fallback,
+    )
+}
+
+fn local_no_call_loose_equals(left: RuntimeValue, right: RuntimeValue) -> Option<bool> {
+    match (left.as_number(), right.as_number()) {
+        (Some(NumberValue::Int32(left)), Some(NumberValue::Int32(right))) => {
+            return Some(left == right);
+        }
+        (Some(_), Some(_)) => return None,
+        _ => {}
+    }
+
+    let left_nullish = matches!(left.kind(), ValueKind::Undefined | ValueKind::Null);
+    let right_nullish = matches!(right.kind(), ValueKind::Undefined | ValueKind::Null);
+    if left_nullish || right_nullish {
+        return Some(left_nullish && right_nullish);
+    }
+
+    if left.kind() == ValueKind::Boolean && right.kind() == ValueKind::Boolean {
+        return Some(left.as_bool() == right.as_bool());
+    }
+
+    match (left.as_cell(), right.as_cell()) {
+        (Some(left), Some(right))
+            if left.pointer_payload_bits() == right.pointer_payload_bits() =>
+        {
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
 fn local_primitive_strict_equals(left: RuntimeValue, right: RuntimeValue) -> Option<bool> {
     if unsupported_strict_equality_value(left) || unsupported_strict_equality_value(right) {
         None
@@ -3600,12 +5464,16 @@ mod tests {
         BytecodeRootMap, BytecodeRootSlotDescriptor, BytecodeRootSlotKind, CodeSpecialization,
         OperandKind, RegisterFrameShape,
     };
-    use crate::gc::{BarrierAction, BarrierRequirementOutcome, CellId, Heap, StructureId};
+    use crate::gc::{
+        static_cell_metadata_registry, AllocationMode, BarrierAction, BarrierRequirementOutcome,
+        CellId, CellType, Heap, HeapAllocationRequest, StructureId,
+    };
     use crate::interpreter::{
         execute_code_block, CoreOpcodeDispatchHost, DispatchConfig, DispatchInstruction,
         DispatchOutcome, DispatchState, ExecutionContextStack, ExecutionEntryRecord,
         FramePushRequest, ProgramExecutionEntry, RegisterFile,
     };
+    use crate::jit::ic::GeneratedCallLinkDirectCall;
     use crate::jit::plan::{
         BaselineGeneratedRuntimeBoundaryCandidate, BaselineGeneratedRuntimeBoundaryProof,
         BaselineGeneratedRuntimeHelperPlanMetadata, CompilerSafepointDescriptor,
@@ -3621,18 +5489,22 @@ mod tests {
         GeneratedCallLinkProbeMissReason, GeneratedCallLinkProbeRequest,
         GeneratedCallLinkProbeResult, GeneratedGuardedPropertyLoadProbeMissReason,
         GeneratedGuardedPropertyLoadProbeRequest, GeneratedGuardedPropertyLoadProbeResult,
-        GeneratedPropertyLoadProbeMissReason, GeneratedPropertyStoreProbeMissReason,
-        GeneratedPropertyStoreProbeRequest, GeneratedPropertyStoreProbeResult, InlineCacheSlotId,
-        InlineCacheStubKind, JitCodeId, JitType, LinkedCallKind, PropertyLoadAccessCasePlan,
-        PropertyLoadAccessCasePlanContract, PropertyLoadAccessCasePlanKind,
-        PropertyLoadGuardChainCertificate, PropertyLoadGuardChainEntry,
-        PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome,
-        PropertyLoadGuardDescriptor, PropertyLoadGuardPlan, PropertyLoadGuardRequirement,
-        PropertyLoadGuardedCandidate, PropertyLoadGuardedCandidateKind,
-        PropertyLoadGuardedCandidateTable, PropertyStoreAccessCasePlan,
-        PropertyStoreAccessCasePlanContract, PropertyStoreAccessCasePlanKind,
-        PropertyStoreMutationBarrierEvidence, PropertyStoreMutationCandidate,
-        PropertyStoreMutationCandidateTable, TieringSnapshot, TieringTrigger, WatchpointSetId,
+        GeneratedPropertyHasMegamorphicCacheEntry, GeneratedPropertyHasMegamorphicCandidateTable,
+        GeneratedPropertyHasMegamorphicSite, GeneratedPropertyLoadMegamorphicHolderProbeRequest,
+        GeneratedPropertyLoadProbeMissReason, GeneratedPropertyLoadProbeRequest,
+        GeneratedPropertyLoadProbeResult, GeneratedPropertyStoreMegamorphicCandidateTable,
+        GeneratedPropertyStoreProbeMissReason, GeneratedPropertyStoreProbeRequest,
+        GeneratedPropertyStoreProbeResult, InlineCacheSlotId, InlineCacheStubKind, JitCodeId,
+        JitType, LinkedCallKind, PropertyLoadAccessCasePlan, PropertyLoadAccessCasePlanContract,
+        PropertyLoadAccessCasePlanKind, PropertyLoadGuardChainCertificate,
+        PropertyLoadGuardChainEntry, PropertyLoadGuardChainEntryProof,
+        PropertyLoadGuardChainOutcome, PropertyLoadGuardDescriptor, PropertyLoadGuardPlan,
+        PropertyLoadGuardRequirement, PropertyLoadGuardedCandidate,
+        PropertyLoadGuardedCandidateKind, PropertyLoadGuardedCandidateTable,
+        PropertyStoreAccessCasePlan, PropertyStoreAccessCasePlanContract,
+        PropertyStoreAccessCasePlanKind, PropertyStoreMutationBarrierEvidence,
+        PropertyStoreMutationCandidate, PropertyStoreMutationCandidateTable, TieringSnapshot,
+        TieringTrigger, WatchpointSetId,
     };
     use crate::object::PropertyOffset;
     use crate::runtime::{ExecutableId, GlobalObjectId, ObjectId};
@@ -3732,7 +5604,7 @@ mod tests {
 
     fn js_call_handoff_instruction(opcode: CoreOpcode) -> TypedInstruction {
         let operands = match opcode {
-            CoreOpcode::Call => vec![
+            CoreOpcode::Call | CoreOpcode::Construct => vec![
                 Operand::Register(local(1)),
                 Operand::Register(local(2)),
                 Operand::UnsignedImmediate(0),
@@ -3758,8 +5630,8 @@ mod tests {
         destination: VirtualRegister,
         argument_count_including_this: u32,
         callee_value: RuntimeValue,
-    ) -> CallReturnContinuation {
-        CallReturnContinuation {
+    ) -> BaselineGeneratedJsCallHandoffContinuation {
+        BaselineGeneratedJsCallHandoffContinuation::Call(CallReturnContinuation {
             caller_frame: frame,
             callee_frame: None,
             owner,
@@ -3770,7 +5642,17 @@ mod tests {
             callee_value: Some(callee_value),
             callee_object: None,
             kind: CallReturnKind::from_opcode(opcode).unwrap(),
-        }
+        })
+    }
+
+    fn expected_owner_continuation_site(
+        artifact: &BaselineGeneratedCodeArtifact,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<BaselineGeneratedOwnerContinuationSite> {
+        artifact
+            .owner_continuation_map()
+            .and_then(|map| map.call_site_for_bytecode_index(bytecode_index))
+            .copied()
     }
 
     fn baseline_generated_js_call_handoff_for_test(
@@ -3833,10 +5715,112 @@ mod tests {
         )
     }
 
+    fn get_length_handoff_site(
+        owner: CodeBlockId,
+        index: BytecodeIndex,
+        identifier_index: u32,
+    ) -> BaselineGeneratedPropertyHandoffSite {
+        BaselineGeneratedPropertyHandoffSite::get_length_property_load(
+            owner,
+            InlineCacheSlotId(0),
+            index,
+            PropertyKey::from_identifier(Identifier::from_atom(AtomId::from_table_slot(
+                identifier_index,
+            ))),
+        )
+    }
+
+    fn in_by_id_handoff_site(
+        owner: CodeBlockId,
+        index: BytecodeIndex,
+        identifier_index: u32,
+    ) -> BaselineGeneratedPropertyHandoffSite {
+        BaselineGeneratedPropertyHandoffSite::in_by_id_has(
+            owner,
+            InlineCacheSlotId(0),
+            index,
+            PropertyKey::from_identifier(Identifier::from_atom(AtomId::from_table_slot(
+                identifier_index,
+            ))),
+        )
+    }
+
+    fn in_by_value_handoff_site(
+        owner: CodeBlockId,
+        index: BytecodeIndex,
+        property_register: VirtualRegister,
+    ) -> BaselineGeneratedPropertyHandoffSite {
+        BaselineGeneratedPropertyHandoffSite::in_by_value_has(
+            owner,
+            InlineCacheSlotId(0),
+            index,
+            property_register,
+        )
+    }
+
+    fn element_load_handoff_site(
+        owner: CodeBlockId,
+        index: BytecodeIndex,
+        property_register: VirtualRegister,
+    ) -> BaselineGeneratedPropertyHandoffSite {
+        BaselineGeneratedPropertyHandoffSite::get_by_value_element_load(
+            owner,
+            InlineCacheSlotId(0),
+            index,
+            property_register,
+        )
+    }
+
+    fn element_store_handoff_site(
+        owner: CodeBlockId,
+        index: BytecodeIndex,
+        property_register: VirtualRegister,
+    ) -> BaselineGeneratedPropertyHandoffSite {
+        BaselineGeneratedPropertyHandoffSite::put_by_value_element_store(
+            owner,
+            InlineCacheSlotId(0),
+            index,
+            property_register,
+        )
+    }
+
     fn property_cache_key(identifier_index: u32) -> CacheKey {
         CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
             AtomId::from_table_slot(identifier_index),
         )))
+    }
+
+    fn indexed_property_cache_key(index: u32) -> CacheKey {
+        CacheKey::Property(PropertyKey::from_index(
+            PropertyIndex::from_canonical_index(index),
+        ))
+    }
+
+    fn property_has_megamorphic_candidate_table(
+        owner: CodeBlockId,
+        site_bytecode_index: BytecodeIndex,
+        key: CacheKey,
+        base_structure: StructureId,
+        table_epoch: u16,
+        entry_epoch: u16,
+        result: bool,
+    ) -> GeneratedPropertyHasMegamorphicCandidateTable {
+        GeneratedPropertyHasMegamorphicCandidateTable::test_with_primary_entry(
+            owner,
+            table_epoch,
+            GeneratedPropertyHasMegamorphicSite {
+                owner,
+                slot: InlineCacheSlotId(0),
+                bytecode_index: site_bytecode_index.offset(),
+                key,
+            },
+            GeneratedPropertyHasMegamorphicCacheEntry {
+                key,
+                base_structure,
+                epoch: entry_epoch,
+                result,
+            },
+        )
     }
 
     fn property_load_plan(
@@ -3919,6 +5903,35 @@ mod tests {
         }
     }
 
+    fn property_store_indexed_plan(
+        owner: CodeBlockId,
+        bytecode_index: BytecodeIndex,
+        index: u32,
+        base_structure: StructureId,
+    ) -> PropertyStoreAccessCasePlan {
+        let key = indexed_property_cache_key(index);
+        PropertyStoreAccessCasePlan {
+            plan_kind: PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore,
+            owner,
+            slot: InlineCacheSlotId(0),
+            bytecode_index: bytecode_index.offset(),
+            key,
+            access_case: AccessCaseDescriptor {
+                kind: AccessCaseKind::IndexedStore,
+                key,
+                base_structure: Some(base_structure),
+                new_structure: None,
+                holder: None,
+                offset: None,
+                via_global_proxy: false,
+                may_call_js: false,
+                dependencies: Vec::new(),
+            },
+            planned_stub_kind: InlineCacheStubKind::RepatchingStub,
+            effect_contract: PropertyStoreAccessCasePlanContract::DATA_ONLY_INDEXED_STORE,
+        }
+    }
+
     fn property_store_mutation_candidate_table(
         owner: CodeBlockId,
         candidates: Vec<PropertyStoreMutationCandidate>,
@@ -3957,10 +5970,27 @@ mod tests {
         target_code_block_cell: u32,
         attachment_ordinal: u64,
     ) -> GeneratedCallLinkCandidate {
+        generated_call_link_candidate_for_target(
+            opcode,
+            slot,
+            bytecode_index,
+            ExecutableId(CellId(executable_cell.into())),
+            ObjectId(CellId(callee_cell.into())),
+            CodeBlockId(CellId(target_code_block_cell.into())),
+            attachment_ordinal,
+        )
+    }
+
+    fn generated_call_link_candidate_for_target(
+        opcode: CoreOpcode,
+        slot: InlineCacheSlotId,
+        bytecode_index: BytecodeIndex,
+        executable: ExecutableId,
+        callee: ObjectId,
+        target_code_block: CodeBlockId,
+        attachment_ordinal: u64,
+    ) -> GeneratedCallLinkCandidate {
         let owner = owner();
-        let executable = ExecutableId(CellId(executable_cell));
-        let callee = ObjectId(CellId(callee_cell));
-        let target_code_block = CodeBlockId(CellId(target_code_block_cell));
         let boundary = CallBoundaryId(10_000 + u64::from(slot.0));
         let max_argument_count_including_this = 1;
         let descriptor = CallLinkInfoDescriptor {
@@ -4028,6 +6058,26 @@ mod tests {
                 .encode_cell_payload(payload)
                 .unwrap(),
         )
+    }
+
+    fn allocate_test_object_cell(heap: &mut Heap, payload: usize) -> CellId {
+        let metadata = static_cell_metadata_registry()
+            .metadata_for_type(CellType::Object)
+            .expect("object metadata")
+            .metadata;
+        let allocation = heap
+            .allocate_record(HeapAllocationRequest {
+                heap: heap.id(),
+                subspace: "object",
+                metadata,
+                byte_size: std::mem::size_of::<RuntimeValue>().max(1),
+                mode: AllocationMode::Normal,
+                may_trigger_collection: false,
+            })
+            .expect("object allocation");
+        heap.bind_cell_payload(allocation.cell, payload)
+            .expect("payload binding");
+        allocation.cell
     }
 
     fn prototype_data_guarded_candidate(
@@ -4144,50 +6194,102 @@ mod tests {
     #[derive(Debug, Default)]
     struct SequencedPropertyLoadProbeHost {
         results: Vec<GeneratedPropertyLoadProbeResult>,
+        holder_results: Vec<GeneratedPropertyLoadProbeResult>,
         guarded_results: Vec<GeneratedGuardedPropertyLoadProbeResult>,
         call_link_results: Vec<GeneratedCallLinkProbeResult>,
         probed_base_values: Vec<RuntimeValue>,
         probed_plan_keys: Vec<CacheKey>,
         probed_base_structures: Vec<Option<StructureId>>,
+        holder_requests: Vec<GeneratedPropertyLoadMegamorphicHolderProbeRequest>,
         guarded_probed_base_values: Vec<RuntimeValue>,
         guarded_probed_plan_keys: Vec<CacheKey>,
         guarded_probed_base_structures: Vec<StructureId>,
         call_link_requests: Vec<GeneratedCallLinkProbeSnapshot>,
+        sidecar_base_structure: Option<StructureId>,
+        sidecar_base_structure_queries: Vec<RuntimeValue>,
+        has_sidecar_runtime_key_results: Vec<Option<CacheKey>>,
+        has_sidecar_runtime_key_queries: Vec<RuntimeValue>,
+        pending_structure_chain_invalidations: bool,
     }
 
     impl SequencedPropertyLoadProbeHost {
         fn new(results: Vec<GeneratedPropertyLoadProbeResult>) -> Self {
             Self {
                 results,
+                holder_results: Vec::new(),
                 guarded_results: Vec::new(),
                 call_link_results: Vec::new(),
                 probed_base_values: Vec::new(),
                 probed_plan_keys: Vec::new(),
                 probed_base_structures: Vec::new(),
+                holder_requests: Vec::new(),
                 guarded_probed_base_values: Vec::new(),
                 guarded_probed_plan_keys: Vec::new(),
                 guarded_probed_base_structures: Vec::new(),
                 call_link_requests: Vec::new(),
+                sidecar_base_structure: None,
+                sidecar_base_structure_queries: Vec::new(),
+                has_sidecar_runtime_key_results: Vec::new(),
+                has_sidecar_runtime_key_queries: Vec::new(),
+                pending_structure_chain_invalidations: false,
             }
         }
 
         fn new_guarded(results: Vec<GeneratedGuardedPropertyLoadProbeResult>) -> Self {
             Self {
                 results: Vec::new(),
+                holder_results: Vec::new(),
                 guarded_results: results,
                 call_link_results: Vec::new(),
                 probed_base_values: Vec::new(),
                 probed_plan_keys: Vec::new(),
                 probed_base_structures: Vec::new(),
+                holder_requests: Vec::new(),
                 guarded_probed_base_values: Vec::new(),
                 guarded_probed_plan_keys: Vec::new(),
                 guarded_probed_base_structures: Vec::new(),
                 call_link_requests: Vec::new(),
+                sidecar_base_structure: None,
+                sidecar_base_structure_queries: Vec::new(),
+                has_sidecar_runtime_key_results: Vec::new(),
+                has_sidecar_runtime_key_queries: Vec::new(),
+                pending_structure_chain_invalidations: false,
             }
         }
     }
 
     impl DispatchHost for SequencedPropertyLoadProbeHost {
+        fn generated_property_sidecar_base_structure(
+            &mut self,
+            base: RuntimeValue,
+        ) -> Option<StructureId> {
+            self.sidecar_base_structure_queries.push(base);
+            self.sidecar_base_structure
+        }
+
+        fn generated_property_has_sidecar_base_structure(
+            &mut self,
+            base: RuntimeValue,
+        ) -> Option<StructureId> {
+            self.sidecar_base_structure_queries.push(base);
+            base.as_cell().and(self.sidecar_base_structure)
+        }
+
+        fn generated_property_has_sidecar_runtime_key(
+            &mut self,
+            property: RuntimeValue,
+        ) -> Option<CacheKey> {
+            self.has_sidecar_runtime_key_queries.push(property);
+            if self.has_sidecar_runtime_key_results.is_empty() {
+                return None;
+            }
+            self.has_sidecar_runtime_key_results.remove(0)
+        }
+
+        fn has_pending_structure_chain_invalidation_events(&mut self) -> bool {
+            self.pending_structure_chain_invalidations
+        }
+
         fn probe_generated_property_load(
             &mut self,
             request: GeneratedPropertyLoadProbeRequest<'_>,
@@ -4202,6 +6304,19 @@ mod tests {
                 );
             }
             self.results.remove(0)
+        }
+
+        fn probe_generated_property_load_megamorphic_holder(
+            &mut self,
+            request: GeneratedPropertyLoadMegamorphicHolderProbeRequest,
+        ) -> GeneratedPropertyLoadProbeResult {
+            self.holder_requests.push(request);
+            if self.holder_results.is_empty() {
+                return GeneratedPropertyLoadProbeResult::miss(
+                    GeneratedPropertyLoadProbeMissReason::HostUnavailable,
+                );
+            }
+            self.holder_results.remove(0)
         }
 
         fn probe_generated_guarded_property_load(
@@ -4274,6 +6389,8 @@ mod tests {
         committed_base_values: Vec<RuntimeValue>,
         committed_keys: Vec<CacheKey>,
         committed_stored_values: Vec<RuntimeValue>,
+        sidecar_base_structure: Option<StructureId>,
+        sidecar_base_structure_queries: Vec<RuntimeValue>,
     }
 
     impl SequencedPropertyStoreMutationHost {
@@ -4294,11 +6411,21 @@ mod tests {
                 committed_base_values: Vec::new(),
                 committed_keys: Vec::new(),
                 committed_stored_values: Vec::new(),
+                sidecar_base_structure: None,
+                sidecar_base_structure_queries: Vec::new(),
             }
         }
     }
 
     impl DispatchHost for SequencedPropertyStoreMutationHost {
+        fn generated_property_sidecar_base_structure(
+            &mut self,
+            base: RuntimeValue,
+        ) -> Option<StructureId> {
+            self.sidecar_base_structure_queries.push(base);
+            self.sidecar_base_structure
+        }
+
         fn probe_generated_property_load(
             &mut self,
             request: GeneratedPropertyLoadProbeRequest<'_>,
@@ -4818,7 +6945,7 @@ mod tests {
     }
 
     #[test]
-    fn js_call_handoff_accepts_core_call_and_call_with_this_only() {
+    fn js_call_handoff_accepts_core_call_call_with_this_and_construct() {
         let owner = owner();
 
         for opcode in [CoreOpcode::Call, CoreOpcode::CallWithThis] {
@@ -4850,19 +6977,62 @@ mod tests {
                         1,
                         RuntimeValue::undefined(),
                     ),
+                    owner_continuation: None,
                     direct_call: None,
                     requires_no_gc_exit_reentry: true,
                     may_throw: true,
                 }
             );
         }
+        let construct_block = code_block(vec![js_call_handoff_instruction(CoreOpcode::Construct)]);
+        let construct_instruction = construct_block
+            .decoded_instruction_at(BytecodeIndex::from_offset(0))
+            .unwrap();
+        let construct_handoff = baseline_generated_js_call_handoff_for_test(
+            owner,
+            &construct_block,
+            construct_instruction,
+            &[],
+        )
+        .unwrap();
+        let construct_frame = construct_handoff.resume.frame;
+        let construct_window = construct_handoff
+            .continuation
+            .as_construct()
+            .expect("construct continuation")
+            .caller_window;
+
+        assert_eq!(
+            construct_handoff,
+            BaselineGeneratedJsCallHandoff {
+                resume: BaselineGeneratedJsCallResume {
+                    owner,
+                    frame: construct_frame,
+                    bytecode_index: BytecodeIndex::from_offset(0),
+                    opcode: CoreOpcode::Construct,
+                },
+                continuation: BaselineGeneratedJsCallHandoffContinuation::Construct(
+                    BaselineGeneratedJsConstructContinuation {
+                        caller_frame: construct_frame,
+                        caller_window: construct_window,
+                        owner,
+                        construct_bytecode_index: BytecodeIndex::from_offset(0),
+                        resume_bytecode_index: None,
+                        destination: local(1),
+                        argument_count_including_this: 1,
+                        callee_value: RuntimeValue::undefined(),
+                        callee_object: None,
+                    },
+                ),
+                owner_continuation: None,
+                direct_call: None,
+                requires_no_gc_exit_reentry: true,
+                may_throw: true,
+            }
+        );
         let block = code_block(vec![js_call_handoff_instruction(CoreOpcode::Call)]);
         let index = BytecodeIndex::from_offset(20);
-        for opcode in [
-            CoreOpcode::CallDirect,
-            CoreOpcode::Construct,
-            CoreOpcode::ConstructSuper,
-        ] {
+        for opcode in [CoreOpcode::CallDirect, CoreOpcode::ConstructSuper] {
             assert_eq!(
                 baseline_generated_js_call_handoff_for_test(
                     owner,
@@ -4946,12 +7116,109 @@ mod tests {
             }
         );
 
+        let instruction = decoded_core_handoff_instruction(index, CoreOpcode::GetByValue);
+        let site = element_load_handoff_site(owner, index, VirtualRegister::local(3));
+        let handoff =
+            baseline_generated_property_handoff(owner, frame, instruction, &site).unwrap();
+
+        assert_eq!(
+            handoff,
+            BaselineGeneratedPropertyHandoff {
+                resume: BaselineGeneratedPropertyResume {
+                    owner,
+                    frame,
+                    bytecode_index: index,
+                    opcode: CoreOpcode::GetByValue,
+                },
+                site,
+                requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                may_throw: site.may_throw,
+            }
+        );
+
+        let instruction = decoded_core_handoff_instruction(index, CoreOpcode::PutByValue);
+        let site = element_store_handoff_site(owner, index, VirtualRegister::local(3));
+        let handoff =
+            baseline_generated_property_handoff(owner, frame, instruction, &site).unwrap();
+
+        assert_eq!(
+            handoff,
+            BaselineGeneratedPropertyHandoff {
+                resume: BaselineGeneratedPropertyResume {
+                    owner,
+                    frame,
+                    bytecode_index: index,
+                    opcode: CoreOpcode::PutByValue,
+                },
+                site,
+                requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                may_throw: site.may_throw,
+            }
+        );
+
+        let instruction = decoded_core_handoff_instruction(index, CoreOpcode::GetLength);
+        let site = get_length_handoff_site(owner, index, 11);
+        let handoff =
+            baseline_generated_property_handoff(owner, frame, instruction, &site).unwrap();
+
+        assert_eq!(
+            handoff,
+            BaselineGeneratedPropertyHandoff {
+                resume: BaselineGeneratedPropertyResume {
+                    owner,
+                    frame,
+                    bytecode_index: index,
+                    opcode: CoreOpcode::GetLength,
+                },
+                site,
+                requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                may_throw: site.may_throw,
+            }
+        );
+
+        let instruction = decoded_core_handoff_instruction(index, CoreOpcode::InById);
+        let site = in_by_id_handoff_site(owner, index, 11);
+        let handoff =
+            baseline_generated_property_handoff(owner, frame, instruction, &site).unwrap();
+
+        assert_eq!(
+            handoff,
+            BaselineGeneratedPropertyHandoff {
+                resume: BaselineGeneratedPropertyResume {
+                    owner,
+                    frame,
+                    bytecode_index: index,
+                    opcode: CoreOpcode::InById,
+                },
+                site,
+                requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                may_throw: site.may_throw,
+            }
+        );
+
+        let instruction = decoded_core_handoff_instruction(index, CoreOpcode::InByVal);
+        let site = in_by_value_handoff_site(owner, index, VirtualRegister::local(3));
+        let handoff =
+            baseline_generated_property_handoff(owner, frame, instruction, &site).unwrap();
+
+        assert_eq!(
+            handoff,
+            BaselineGeneratedPropertyHandoff {
+                resume: BaselineGeneratedPropertyResume {
+                    owner,
+                    frame,
+                    bytecode_index: index,
+                    opcode: CoreOpcode::InByVal,
+                },
+                site,
+                requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                may_throw: site.may_throw,
+            }
+        );
+
         for opcode in [
-            CoreOpcode::GetByValue,
-            CoreOpcode::PutByValue,
             CoreOpcode::DeleteByName,
             CoreOpcode::DeleteByValue,
-            CoreOpcode::GetLength,
             CoreOpcode::ArrayLength,
             CoreOpcode::CallWithThis,
             CoreOpcode::Construct,
@@ -4996,6 +7263,26 @@ mod tests {
     }
 
     #[test]
+    fn generated_executor_load_callee_reads_active_frame_callee_without_fallback() {
+        let block = code_block(vec![
+            core_typed(0, CoreOpcode::LoadCallee, vec![Operand::Register(local(0))]),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let callee = cell_runtime_value();
+        let (result, stack, registers) =
+            execute_generated_with_frame_callee(owner(), &block, &artifact, callee);
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(callee)
+            ))
+        );
+        assert_eq!(read_local(&registers, &stack, 0), callee);
+    }
+
+    #[test]
     fn generated_executor_returns_js_call_handoff_after_generated_prefix() {
         let block = code_block(vec![
             core_typed(
@@ -5037,6 +7324,10 @@ mod tests {
                         local(1),
                         1,
                         RuntimeValue::undefined(),
+                    ),
+                    owner_continuation: expected_owner_continuation_site(
+                        &artifact,
+                        BytecodeIndex::from_offset(1),
                     ),
                     direct_call: None,
                     requires_no_gc_exit_reentry: true,
@@ -5091,6 +7382,10 @@ mod tests {
                         local(1),
                         1,
                         RuntimeValue::undefined(),
+                    ),
+                    owner_continuation: expected_owner_continuation_site(
+                        &artifact,
+                        BytecodeIndex::from_offset(1),
                     ),
                     direct_call: None,
                     requires_no_gc_exit_reentry: true,
@@ -5172,6 +7467,7 @@ mod tests {
                         1,
                         callee_value,
                     ),
+                    owner_continuation: expected_owner_continuation_site(&artifact, bytecode_index),
                     direct_call: None,
                     requires_no_gc_exit_reentry: true,
                     may_throw: true,
@@ -5301,6 +7597,7 @@ mod tests {
                         1,
                         callee_value,
                     ),
+                    owner_continuation: expected_owner_continuation_site(&artifact, bytecode_index),
                     direct_call: None,
                     requires_no_gc_exit_reentry: true,
                     may_throw: true,
@@ -5397,6 +7694,7 @@ mod tests {
                         1,
                         callee_value,
                     ),
+                    owner_continuation: expected_owner_continuation_site(&artifact, bytecode_index),
                     direct_call: None,
                     requires_no_gc_exit_reentry: true,
                     may_throw: true,
@@ -5426,6 +7724,222 @@ mod tests {
                 reason: GeneratedCallLinkProbeMissReason::CandidateNotFound,
             }]
         );
+    }
+
+    #[test]
+    fn generated_call_link_sidecar_skips_nonmatching_candidates_for_known_callee() {
+        let bytecode_index = BytecodeIndex::from_offset(1);
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(0)), Operand::SignedImmediate(7)],
+            ),
+            core_typed(
+                1,
+                CoreOpcode::Call,
+                vec![
+                    Operand::Register(local(1)),
+                    Operand::Register(local(2)),
+                    Operand::UnsignedImmediate(0),
+                ],
+            ),
+            core_typed(2, CoreOpcode::Return, vec![Operand::Register(local(1))]),
+        ]);
+        let nonmatching_candidate = generated_call_link_candidate(
+            CoreOpcode::Call,
+            InlineCacheSlotId(75),
+            bytecode_index,
+            85,
+            95,
+            105,
+            24,
+        );
+        let matching_payload = 0x6002;
+        let matching_value = generated_call_link_cell_value(matching_payload);
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let matching_cell = allocate_test_object_cell(&mut heap, matching_payload);
+        let matching_candidate = generated_call_link_candidate_for_target(
+            CoreOpcode::Call,
+            InlineCacheSlotId(76),
+            bytecode_index,
+            ExecutableId(CellId(86)),
+            ObjectId(matching_cell),
+            CodeBlockId(CellId(106)),
+            25,
+        );
+        let table = generated_call_link_candidate_table(
+            owner(),
+            vec![nonmatching_candidate.clone(), matching_candidate.clone()],
+        );
+        let frame = enter_program_frame(&mut stack, &mut registers, owner(), &block);
+        let window = stack.top_frame().unwrap().register_window;
+        registers.write(window, local(2), matching_value).unwrap();
+        let instruction = block.decoded_instruction_at(bytecode_index).unwrap();
+        let fallback = fallback_site(owner(), frame, instruction);
+        let mut miss_records = Vec::new();
+        let mut blocked_records = Vec::new();
+        let mut hot_slot_hits = 0;
+        let mut host = SequencedGeneratedCallLinkProbeHost::new(vec![
+            GeneratedCallLinkProbeResult::DirectCall(GeneratedCallLinkDirectCall::from_candidate(
+                &matching_candidate,
+            )),
+        ]);
+
+        let direct_call = execute_generated_call_link_sidecar_probe_with_host(
+            &table,
+            &[],
+            &mut host,
+            &mut miss_records,
+            &mut blocked_records,
+            &mut hot_slot_hits,
+            &mut InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            GeneratedCallLinkSidecarAttempt {
+                window,
+                code_block: &block,
+                fallback,
+                owner: owner(),
+                opcode: CoreOpcode::Call,
+                instruction,
+            },
+        )
+        .expect("call-link sidecar probe");
+
+        assert_eq!(
+            direct_call.as_ref().map(|direct| direct.candidate.slot),
+            Some(matching_candidate.slot)
+        );
+        assert_eq!(
+            host.requests,
+            vec![GeneratedCallLinkProbeSnapshot {
+                owner: owner(),
+                opcode: CoreOpcode::Call,
+                bytecode_index: bytecode_index.offset(),
+                argument_count_including_this: 1,
+                candidate_slot: matching_candidate.slot,
+                candidate_attachment_ordinal: matching_candidate.attachment_ordinal,
+                callee_value: matching_value,
+                callee_value_kind: ValueKind::Cell,
+                callee_object: Some(ObjectId(matching_cell)),
+                this_value: RuntimeValue::undefined(),
+                this_value_kind: ValueKind::Undefined,
+                this_object: None,
+            }]
+        );
+        assert!(miss_records.is_empty());
+        assert!(blocked_records.is_empty());
+    }
+
+    #[test]
+    fn generated_call_link_sidecar_uses_hot_slot_before_host_probe() {
+        let bytecode_index = BytecodeIndex::from_offset(1);
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(0)), Operand::SignedImmediate(7)],
+            ),
+            core_typed(
+                1,
+                CoreOpcode::Call,
+                vec![
+                    Operand::Register(local(1)),
+                    Operand::Register(local(2)),
+                    Operand::UnsignedImmediate(0),
+                ],
+            ),
+            core_typed(2, CoreOpcode::Return, vec![Operand::Register(local(1))]),
+        ]);
+        let matching_payload = 0x6102;
+        let matching_value = generated_call_link_cell_value(matching_payload);
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let matching_cell = allocate_test_object_cell(&mut heap, matching_payload);
+        let mut candidate = generated_call_link_candidate_for_target(
+            CoreOpcode::Call,
+            InlineCacheSlotId(77),
+            bytecode_index,
+            ExecutableId(CellId(87)),
+            ObjectId(matching_cell),
+            CodeBlockId(CellId(107)),
+            26,
+        );
+        candidate.remaining_blockers =
+            CallLinkReadinessBlockers::from_blocker(CallLinkReadinessBlocker::MayCallJsBoundary);
+        candidate.direct_call_status = GeneratedCallLinkDirectCallStatus::Authorized;
+        candidate.observation_ordinal = Some(100);
+        candidate.descriptor_ordinal = Some(200);
+        candidate.readiness_ordinal = Some(300);
+        candidate.boundary_validation_ordinal = Some(400);
+        candidate.attachment_plan_ordinal = 500;
+        candidate.install_recheck_ordinal = 600;
+        candidate.attachment_ordinal = 700;
+        let authorization = GeneratedCallLinkDirectCall::from_candidate(&candidate);
+        let hot_slots = vec![BaselineGeneratedJsDirectCallHotSlot {
+            candidate: candidate.clone(),
+            authorization,
+            callee_object: ObjectId(matching_cell),
+            argument_count_including_this: 1,
+        }];
+        let table = generated_call_link_candidate_table(owner(), vec![candidate.clone()]);
+        let frame = enter_program_frame(&mut stack, &mut registers, owner(), &block);
+        let window = stack.top_frame().unwrap().register_window;
+        registers.write(window, local(2), matching_value).unwrap();
+        let instruction = block.decoded_instruction_at(bytecode_index).unwrap();
+        let fallback = fallback_site(owner(), frame, instruction);
+        let mut miss_records = Vec::new();
+        let mut blocked_records = Vec::new();
+        let mut hot_slot_hits = 0;
+        let mut host = SequencedGeneratedCallLinkProbeHost::new(Vec::new());
+
+        let direct_call = execute_generated_call_link_sidecar_probe_with_host(
+            &table,
+            &hot_slots,
+            &mut host,
+            &mut miss_records,
+            &mut blocked_records,
+            &mut hot_slot_hits,
+            &mut InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            GeneratedCallLinkSidecarAttempt {
+                window,
+                code_block: &block,
+                fallback,
+                owner: owner(),
+                opcode: CoreOpcode::Call,
+                instruction,
+            },
+        )
+        .expect("call-link hot-slot sidecar probe")
+        .expect("hot-slot direct call");
+
+        assert_eq!(direct_call.candidate, candidate);
+        assert_eq!(direct_call.authorization, authorization);
+        assert_eq!(direct_call.callee_value, matching_value);
+        assert_eq!(direct_call.callee_object, ObjectId(matching_cell));
+        assert_eq!(direct_call.this_value, RuntimeValue::undefined());
+        assert_eq!(direct_call.argument_count_including_this, 1);
+        assert_eq!(hot_slot_hits, 1);
+        assert!(
+            host.requests.is_empty(),
+            "monomorphic hot slot hit should avoid DispatchHost::probe_generated_call_link"
+        );
+        assert!(miss_records.is_empty());
+        assert!(blocked_records.is_empty());
     }
 
     #[test]
@@ -5563,6 +8077,7 @@ mod tests {
                         1,
                         callee_value,
                     ),
+                    owner_continuation: expected_owner_continuation_site(&artifact, call_index),
                     direct_call: None,
                     requires_no_gc_exit_reentry: true,
                     may_throw: true,
@@ -5661,6 +8176,7 @@ mod tests {
                         1,
                         RuntimeValue::undefined(),
                     ),
+                    owner_continuation: expected_owner_continuation_site(&artifact, bytecode_index),
                     direct_call: None,
                     requires_no_gc_exit_reentry: true,
                     may_throw: true,
@@ -5866,7 +8382,7 @@ mod tests {
         assert!(root_sync_requests.is_empty());
         assert_eq!(
             host.probed_base_structures,
-            vec![Some(StructureId::new(1)), Some(StructureId::new(2))]
+            vec![Some(StructureId::new(2)), Some(StructureId::new(1))]
         );
         assert_eq!(
             host.probed_plan_keys,
@@ -5878,11 +8394,561 @@ mod tests {
                 owner: owner(),
                 bytecode_index: BytecodeIndex::from_offset(0),
                 key: property_cache_key(11),
-                base_structure: Some(StructureId::new(1)),
-                offset: Some(PropertyOffset::new(0)),
+                base_structure: Some(StructureId::new(2)),
+                offset: Some(PropertyOffset::new(1)),
                 reason: GeneratedPropertyLoadProbeMissReason::StructureMismatch,
             }]
         );
+    }
+
+    #[test]
+    fn generated_get_by_name_sidecar_skips_known_structure_mismatch_before_host_probe() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let table = property_load_plan_table(
+            owner(),
+            vec![
+                property_load_plan(
+                    owner(),
+                    BytecodeIndex::from_offset(0),
+                    11,
+                    StructureId::new(2),
+                    PropertyOffset::new(1),
+                ),
+                property_load_plan(
+                    owner(),
+                    BytecodeIndex::from_offset(0),
+                    11,
+                    StructureId::new(1),
+                    PropertyOffset::new(0),
+                ),
+            ],
+        );
+        let base = cell_runtime_value();
+        let mut host =
+            SequencedPropertyLoadProbeHost::new(vec![GeneratedPropertyLoadProbeResult::hit(
+                RuntimeValue::from_i32(42),
+            )]);
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, _, _, root_sync_requests, probe_miss_records) =
+            execute_generated_with_property_load_sidecar(
+                owner(),
+                &block,
+                &artifact,
+                &table,
+                &mut host,
+                &[(local(1), base)],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+            ))
+        );
+        assert!(root_sync_requests.is_empty());
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert_eq!(host.probed_base_values, vec![base]);
+        assert_eq!(host.probed_base_structures, vec![Some(StructureId::new(2))]);
+        assert!(probe_miss_records.is_empty());
+    }
+
+    #[test]
+    fn generated_get_by_name_megamorphic_sidecar_hits_by_active_structure() {
+        use crate::jit::{
+            GeneratedPropertyLoadMegamorphicCacheEntry,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind, GeneratedPropertyLoadMegamorphicSite,
+        };
+
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = GeneratedPropertyLoadMegamorphicCandidateTable::test_with_primary_entry(
+            owner(),
+            1,
+            GeneratedPropertyLoadMegamorphicSite {
+                owner: owner(),
+                slot: InlineCacheSlotId(0),
+                bytecode_index: 0,
+                key,
+            },
+            GeneratedPropertyLoadMegamorphicCacheEntry {
+                key,
+                base_structure: StructureId::new(2),
+                epoch: 1,
+                kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData {
+                    offset: PropertyOffset::new(7),
+                },
+            },
+        );
+        let base = cell_runtime_value();
+        let mut host =
+            SequencedPropertyLoadProbeHost::new(vec![GeneratedPropertyLoadProbeResult::hit(
+                RuntimeValue::from_i32(42),
+            )]);
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, _, _, root_sync_requests, probe_miss_records, guarded_records) =
+            execute_generated_with_megamorphic_property_load_sidecar(
+                owner(),
+                &block,
+                &artifact,
+                &table,
+                &mut host,
+                &[(local(1), base)],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+            ))
+        );
+        assert!(root_sync_requests.is_empty());
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_records.is_empty());
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert_eq!(host.probed_base_values, vec![base]);
+        assert_eq!(host.probed_plan_keys, vec![key]);
+        assert_eq!(host.probed_base_structures, vec![Some(StructureId::new(2))]);
+    }
+
+    #[test]
+    fn generated_get_by_name_megamorphic_sidecar_needs_base_structure_before_probe() {
+        use crate::jit::{
+            GeneratedPropertyLoadMegamorphicCacheEntry,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind, GeneratedPropertyLoadMegamorphicSite,
+        };
+
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = GeneratedPropertyLoadMegamorphicCandidateTable::test_with_primary_entry(
+            owner(),
+            1,
+            GeneratedPropertyLoadMegamorphicSite {
+                owner: owner(),
+                slot: InlineCacheSlotId(0),
+                bytecode_index: 0,
+                key,
+            },
+            GeneratedPropertyLoadMegamorphicCacheEntry {
+                key,
+                base_structure: StructureId::new(2),
+                epoch: 1,
+                kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData {
+                    offset: PropertyOffset::new(7),
+                },
+            },
+        );
+        let base = cell_runtime_value();
+        let mut host =
+            SequencedPropertyLoadProbeHost::new(vec![GeneratedPropertyLoadProbeResult::hit(
+                RuntimeValue::from_i32(42),
+            )]);
+
+        let (result, _, _, root_sync_requests, probe_miss_records, guarded_records) =
+            execute_generated_with_megamorphic_property_load_sidecar(
+                owner(),
+                &block,
+                &artifact,
+                &table,
+                &mut host,
+                &[(local(1), base)],
+            );
+
+        assert!(matches!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(_))
+        ));
+        assert!(root_sync_requests.is_empty());
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_records.is_empty());
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert!(host.probed_base_values.is_empty());
+    }
+
+    #[test]
+    fn generated_get_by_name_megamorphic_sidecar_skips_pending_structure_chain_invalidation() {
+        use crate::jit::{
+            GeneratedPropertyLoadMegamorphicCacheEntry,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind, GeneratedPropertyLoadMegamorphicSite,
+        };
+
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = GeneratedPropertyLoadMegamorphicCandidateTable::test_with_primary_entry(
+            owner(),
+            1,
+            GeneratedPropertyLoadMegamorphicSite {
+                owner: owner(),
+                slot: InlineCacheSlotId(0),
+                bytecode_index: 0,
+                key,
+            },
+            GeneratedPropertyLoadMegamorphicCacheEntry {
+                key,
+                base_structure: StructureId::new(2),
+                epoch: 1,
+                kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData {
+                    offset: PropertyOffset::new(7),
+                },
+            },
+        );
+        let base = cell_runtime_value();
+        let mut host =
+            SequencedPropertyLoadProbeHost::new(vec![GeneratedPropertyLoadProbeResult::hit(
+                RuntimeValue::from_i32(42),
+            )]);
+        host.sidecar_base_structure = Some(StructureId::new(2));
+        host.pending_structure_chain_invalidations = true;
+
+        let (result, _, _, root_sync_requests, probe_miss_records, guarded_records) =
+            execute_generated_with_megamorphic_property_load_sidecar(
+                owner(),
+                &block,
+                &artifact,
+                &table,
+                &mut host,
+                &[(local(1), base)],
+            );
+
+        assert!(matches!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(_))
+        ));
+        assert!(root_sync_requests.is_empty());
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_records.is_empty());
+        assert!(host.sidecar_base_structure_queries.is_empty());
+        assert!(host.probed_base_values.is_empty());
+    }
+
+    #[test]
+    fn generated_get_by_name_megamorphic_sidecar_missing_entry_writes_undefined_without_host_probe()
+    {
+        use crate::jit::{
+            GeneratedPropertyLoadMegamorphicCacheEntry,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind, GeneratedPropertyLoadMegamorphicSite,
+        };
+
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = GeneratedPropertyLoadMegamorphicCandidateTable::test_with_primary_entry(
+            owner(),
+            1,
+            GeneratedPropertyLoadMegamorphicSite {
+                owner: owner(),
+                slot: InlineCacheSlotId(0),
+                bytecode_index: 0,
+                key,
+            },
+            GeneratedPropertyLoadMegamorphicCacheEntry {
+                key,
+                base_structure: StructureId::new(2),
+                epoch: 1,
+                kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing,
+            },
+        );
+        let base = cell_runtime_value();
+        let mut host =
+            SequencedPropertyLoadProbeHost::new(vec![GeneratedPropertyLoadProbeResult::hit(
+                RuntimeValue::from_i32(42),
+            )]);
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, _, _, root_sync_requests, probe_miss_records, guarded_records) =
+            execute_generated_with_megamorphic_property_load_sidecar(
+                owner(),
+                &block,
+                &artifact,
+                &table,
+                &mut host,
+                &[(local(1), base)],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(RuntimeValue::undefined())
+            ))
+        );
+        assert!(root_sync_requests.is_empty());
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_records.is_empty());
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert!(host.probed_base_values.is_empty());
+    }
+
+    #[test]
+    fn generated_get_by_name_megamorphic_sidecar_prototype_entry_uses_holder_probe() {
+        use crate::jit::{
+            GeneratedPropertyLoadMegamorphicCacheEntry,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind, GeneratedPropertyLoadMegamorphicSite,
+        };
+
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let holder = ObjectId(CellId(902));
+        let offset = PropertyOffset::new(5);
+        let base_structure = StructureId::new(2);
+        let table = GeneratedPropertyLoadMegamorphicCandidateTable::test_with_primary_entry(
+            owner(),
+            1,
+            GeneratedPropertyLoadMegamorphicSite {
+                owner: owner(),
+                slot: InlineCacheSlotId(0),
+                bytecode_index: 0,
+                key,
+            },
+            GeneratedPropertyLoadMegamorphicCacheEntry {
+                key,
+                base_structure,
+                epoch: 1,
+                kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData {
+                    holder,
+                    offset,
+                },
+            },
+        );
+        let base = cell_runtime_value();
+        let loaded = RuntimeValue::from_i32(84);
+        let mut host = SequencedPropertyLoadProbeHost::new(Vec::new());
+        host.holder_results = vec![GeneratedPropertyLoadProbeResult::hit(loaded)];
+        host.sidecar_base_structure = Some(base_structure);
+
+        let (result, _, _, root_sync_requests, probe_miss_records, guarded_records) =
+            execute_generated_with_megamorphic_property_load_sidecar(
+                owner(),
+                &block,
+                &artifact,
+                &table,
+                &mut host,
+                &[(local(1), base)],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(loaded)
+            ))
+        );
+        assert!(root_sync_requests.is_empty());
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_records.is_empty());
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert!(host.probed_base_values.is_empty());
+        assert!(host.guarded_probed_base_values.is_empty());
+        assert_eq!(
+            host.holder_requests,
+            vec![GeneratedPropertyLoadMegamorphicHolderProbeRequest {
+                key,
+                base_structure,
+                holder,
+                offset,
+            }]
+        );
+    }
+
+    #[test]
+    fn generated_get_by_name_megamorphic_sidecar_ignores_unrelated_sites_without_host_query() {
+        use crate::jit::{
+            GeneratedPropertyLoadMegamorphicCacheEntry,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind, GeneratedPropertyLoadMegamorphicSite,
+        };
+
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = GeneratedPropertyLoadMegamorphicCandidateTable::test_with_primary_entry(
+            owner(),
+            1,
+            GeneratedPropertyLoadMegamorphicSite {
+                owner: owner(),
+                slot: InlineCacheSlotId(0),
+                bytecode_index: 99,
+                key,
+            },
+            GeneratedPropertyLoadMegamorphicCacheEntry {
+                key,
+                base_structure: StructureId::new(2),
+                epoch: 1,
+                kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData {
+                    offset: PropertyOffset::new(7),
+                },
+            },
+        );
+        let base = cell_runtime_value();
+        let mut host =
+            SequencedPropertyLoadProbeHost::new(vec![GeneratedPropertyLoadProbeResult::hit(
+                RuntimeValue::from_i32(42),
+            )]);
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, _, _, root_sync_requests, probe_miss_records, guarded_records) =
+            execute_generated_with_megamorphic_property_load_sidecar(
+                owner(),
+                &block,
+                &artifact,
+                &table,
+                &mut host,
+                &[(local(1), base)],
+            );
+
+        assert!(matches!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(_))
+        ));
+        assert!(root_sync_requests.is_empty());
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_records.is_empty());
+        assert!(host.sidecar_base_structure_queries.is_empty());
+        assert!(host.probed_base_values.is_empty());
+    }
+
+    #[test]
+    fn generated_get_by_name_sidecar_probes_newest_matching_candidate_first() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let table = property_load_plan_table(
+            owner(),
+            vec![
+                property_load_plan(
+                    owner(),
+                    BytecodeIndex::from_offset(0),
+                    11,
+                    StructureId::new(1),
+                    PropertyOffset::new(0),
+                ),
+                property_load_plan(
+                    owner(),
+                    BytecodeIndex::from_offset(0),
+                    11,
+                    StructureId::new(2),
+                    PropertyOffset::new(1),
+                ),
+            ],
+        );
+        let base = cell_runtime_value();
+        let mut host =
+            SequencedPropertyLoadProbeHost::new(vec![GeneratedPropertyLoadProbeResult::hit(
+                RuntimeValue::from_i32(42),
+            )]);
+
+        let (result, _, _, root_sync_requests, probe_miss_records) =
+            execute_generated_with_property_load_sidecar(
+                owner(),
+                &block,
+                &artifact,
+                &table,
+                &mut host,
+                &[(local(1), base)],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+            ))
+        );
+        assert!(root_sync_requests.is_empty());
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert_eq!(host.probed_base_values, vec![base]);
+        assert_eq!(host.probed_base_structures, vec![Some(StructureId::new(2))]);
+        assert_eq!(host.probed_plan_keys, vec![property_cache_key(11)]);
+        assert!(probe_miss_records.is_empty());
     }
 
     #[test]
@@ -6091,6 +9157,845 @@ mod tests {
     }
 
     #[test]
+    fn baseline_generated_property_store_megamorphic_sidecar_hits_by_active_structure() {
+        use crate::jit::{
+            GeneratedPropertyStoreMegamorphicCacheEntry,
+            GeneratedPropertyStoreMegamorphicCandidateTable, GeneratedPropertyStoreMegamorphicSite,
+        };
+
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::PutByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::IdentifierIndex(11),
+                    Operand::Register(local(2)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(3))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = GeneratedPropertyStoreMegamorphicCandidateTable::test_with_primary_entry(
+            owner(),
+            1,
+            GeneratedPropertyStoreMegamorphicSite {
+                owner: owner(),
+                slot: InlineCacheSlotId(0),
+                bytecode_index: 0,
+                key,
+            },
+            GeneratedPropertyStoreMegamorphicCacheEntry {
+                key,
+                old_structure: StructureId::new(2),
+                new_structure: StructureId::new(2),
+                epoch: 1,
+                offset: PropertyOffset::new(7),
+                reallocating: false,
+            },
+        );
+        let base = cell_runtime_value();
+        let stored_value = RuntimeValue::from_i32(99);
+        let return_value = RuntimeValue::from_i32(13);
+        let mut host = SequencedPropertyStoreMutationHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, stack, registers) = execute_generated_with_megamorphic_property_store_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[
+                (local(0), base),
+                (local(2), stored_value),
+                (local(3), return_value),
+            ],
+        );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(return_value)
+            ))
+        );
+        assert_eq!(read_local(&registers, &stack, 2), stored_value);
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert_eq!(host.probed_base_values, vec![base]);
+        assert_eq!(host.probed_stored_values, vec![stored_value]);
+        assert_eq!(host.probed_plan_keys, vec![key]);
+        assert_eq!(host.probed_base_structures, vec![Some(StructureId::new(2))]);
+        assert_eq!(host.committed_base_values, vec![base]);
+        assert_eq!(host.committed_keys, vec![key]);
+        assert_eq!(host.committed_stored_values, vec![stored_value]);
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_hits_true_by_active_structure() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InById,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            true,
+        );
+        let base = cell_runtime_value();
+        let mut host = SequencedPropertyLoadProbeHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, stack, registers) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), base)],
+        );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+            ))
+        );
+        assert_eq!(
+            read_local(&registers, &stack, 0),
+            RuntimeValue::from_bool(true)
+        );
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_hits_false_by_active_structure() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InById,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            false,
+        );
+        let base = cell_runtime_value();
+        let mut host = SequencedPropertyLoadProbeHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, stack, registers) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), base)],
+        );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(RuntimeValue::from_bool(false))
+            ))
+        );
+        assert_eq!(
+            read_local(&registers, &stack, 0),
+            RuntimeValue::from_bool(false)
+        );
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_stale_entry_falls_back() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InById,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            2,
+            1,
+            true,
+        );
+        let base = cell_runtime_value();
+        let initial_destination = RuntimeValue::from_i32(17);
+        let mut host = SequencedPropertyLoadProbeHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, stack, registers) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(0), initial_destination), (local(1), base)],
+        );
+        let frame = stack.top_frame().unwrap();
+        let site = in_by_id_handoff_site(owner(), BytecodeIndex::from_offset(0), 11);
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(
+                BaselineGeneratedPropertyHandoff {
+                    resume: BaselineGeneratedPropertyResume {
+                        owner: owner(),
+                        frame: frame.id,
+                        bytecode_index: BytecodeIndex::from_offset(0),
+                        opcode: CoreOpcode::InById,
+                    },
+                    site,
+                    requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                    may_throw: site.may_throw,
+                }
+            ))
+        );
+        assert_eq!(read_local(&registers, &stack, 0), initial_destination);
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_skips_pending_structure_chain_invalidation(
+    ) {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InById,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            true,
+        );
+        let base = cell_runtime_value();
+        let mut host = SequencedPropertyLoadProbeHost {
+            pending_structure_chain_invalidations: true,
+            ..Default::default()
+        };
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, stack, _) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), base)],
+        );
+        let frame = stack.top_frame().unwrap();
+        let site = in_by_id_handoff_site(owner(), BytecodeIndex::from_offset(0), 11);
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(
+                BaselineGeneratedPropertyHandoff {
+                    resume: BaselineGeneratedPropertyResume {
+                        owner: owner(),
+                        frame: frame.id,
+                        bytecode_index: BytecodeIndex::from_offset(0),
+                        opcode: CoreOpcode::InById,
+                    },
+                    site,
+                    requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                    may_throw: site.may_throw,
+                }
+            ))
+        );
+        assert!(host.sidecar_base_structure_queries.is_empty());
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_ignores_unrelated_sites_without_host_query(
+    ) {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InById,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(9),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            true,
+        );
+        let mut host = SequencedPropertyLoadProbeHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, stack, _) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), cell_runtime_value())],
+        );
+        let frame = stack.top_frame().unwrap();
+        let site = in_by_id_handoff_site(owner(), BytecodeIndex::from_offset(0), 11);
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(
+                BaselineGeneratedPropertyHandoff {
+                    resume: BaselineGeneratedPropertyResume {
+                        owner: owner(),
+                        frame: frame.id,
+                        bytecode_index: BytecodeIndex::from_offset(0),
+                        opcode: CoreOpcode::InById,
+                    },
+                    site,
+                    requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                    may_throw: site.may_throw,
+                }
+            ))
+        );
+        assert!(host.sidecar_base_structure_queries.is_empty());
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_keeps_primitive_base_on_handoff() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InById,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            true,
+        );
+        let base = RuntimeValue::from_i32(7);
+        let mut host = SequencedPropertyLoadProbeHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, stack, _) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), base)],
+        );
+        let frame = stack.top_frame().unwrap();
+        let site = in_by_id_handoff_site(owner(), BytecodeIndex::from_offset(0), 11);
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(
+                BaselineGeneratedPropertyHandoff {
+                    resume: BaselineGeneratedPropertyResume {
+                        owner: owner(),
+                        frame: frame.id,
+                        bytecode_index: BytecodeIndex::from_offset(0),
+                        opcode: CoreOpcode::InById,
+                    },
+                    site,
+                    requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                    may_throw: site.may_throw,
+                }
+            ))
+        );
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_hits_in_by_val_atom_key() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(3)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            true,
+        );
+        let mut host = SequencedPropertyLoadProbeHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+        host.has_sidecar_runtime_key_results = vec![Some(key)];
+        let base = cell_runtime_value();
+        let runtime_key = generated_call_link_cell_value(0x5678);
+
+        let (result, stack, registers) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), base), (local(3), runtime_key)],
+        );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+            ))
+        );
+        assert_eq!(
+            read_local(&registers, &stack, 0),
+            RuntimeValue::from_bool(true)
+        );
+        assert_eq!(host.has_sidecar_runtime_key_queries, vec![runtime_key]);
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_hits_in_by_val_cached_false() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(3)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            false,
+        );
+        let base = cell_runtime_value();
+        let runtime_key = generated_call_link_cell_value(0x5678);
+        let mut host = SequencedPropertyLoadProbeHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+        host.has_sidecar_runtime_key_results = vec![Some(key)];
+
+        let (result, stack, registers) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), base), (local(3), runtime_key)],
+        );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(RuntimeValue::from_bool(false))
+            ))
+        );
+        assert_eq!(
+            read_local(&registers, &stack, 0),
+            RuntimeValue::from_bool(false)
+        );
+        assert_eq!(host.has_sidecar_runtime_key_queries, vec![runtime_key]);
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_in_by_val_pending_invalidation_skips_base_query(
+    ) {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(3)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            true,
+        );
+        let runtime_key = generated_call_link_cell_value(0x5678);
+        let mut host = SequencedPropertyLoadProbeHost {
+            pending_structure_chain_invalidations: true,
+            ..Default::default()
+        };
+        host.sidecar_base_structure = Some(StructureId::new(2));
+        host.has_sidecar_runtime_key_results = vec![Some(key)];
+
+        let (result, stack, _) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), cell_runtime_value()), (local(3), runtime_key)],
+        );
+        let frame = stack.top_frame().unwrap();
+        let site = in_by_value_handoff_site(owner(), BytecodeIndex::from_offset(0), local(3));
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(
+                BaselineGeneratedPropertyHandoff {
+                    resume: BaselineGeneratedPropertyResume {
+                        owner: owner(),
+                        frame: frame.id,
+                        bytecode_index: BytecodeIndex::from_offset(0),
+                        opcode: CoreOpcode::InByVal,
+                    },
+                    site,
+                    requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                    may_throw: site.may_throw,
+                }
+            ))
+        );
+        assert_eq!(host.has_sidecar_runtime_key_queries, vec![runtime_key]);
+        assert!(host.sidecar_base_structure_queries.is_empty());
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_in_by_val_mismatched_key_falls_back_without_base_query(
+    ) {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(3)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            true,
+        );
+        let runtime_key = generated_call_link_cell_value(0x5678);
+        let mut host = SequencedPropertyLoadProbeHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+        host.has_sidecar_runtime_key_results = vec![Some(property_cache_key(12))];
+
+        let (result, stack, _) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), cell_runtime_value()), (local(3), runtime_key)],
+        );
+        let frame = stack.top_frame().unwrap();
+        let site = in_by_value_handoff_site(owner(), BytecodeIndex::from_offset(0), local(3));
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(
+                BaselineGeneratedPropertyHandoff {
+                    resume: BaselineGeneratedPropertyResume {
+                        owner: owner(),
+                        frame: frame.id,
+                        bytecode_index: BytecodeIndex::from_offset(0),
+                        opcode: CoreOpcode::InByVal,
+                    },
+                    site,
+                    requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                    may_throw: site.may_throw,
+                }
+            ))
+        );
+        assert_eq!(host.has_sidecar_runtime_key_queries, vec![runtime_key]);
+        assert!(host.sidecar_base_structure_queries.is_empty());
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_in_by_val_dynamic_key_falls_back_without_base_query(
+    ) {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(3)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            true,
+        );
+        let runtime_key = RuntimeValue::from_i32(11);
+        let mut host = SequencedPropertyLoadProbeHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, stack, _) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), cell_runtime_value()), (local(3), runtime_key)],
+        );
+        let frame = stack.top_frame().unwrap();
+        let site = in_by_value_handoff_site(owner(), BytecodeIndex::from_offset(0), local(3));
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(
+                BaselineGeneratedPropertyHandoff {
+                    resume: BaselineGeneratedPropertyResume {
+                        owner: owner(),
+                        frame: frame.id,
+                        bytecode_index: BytecodeIndex::from_offset(0),
+                        opcode: CoreOpcode::InByVal,
+                    },
+                    site,
+                    requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                    may_throw: site.may_throw,
+                }
+            ))
+        );
+        assert_eq!(host.has_sidecar_runtime_key_queries, vec![runtime_key]);
+        assert!(host.sidecar_base_structure_queries.is_empty());
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_in_by_val_index_key_falls_back_without_base_query(
+    ) {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(3)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            true,
+        );
+        let runtime_key = generated_call_link_cell_value(0x5678);
+        let mut host = SequencedPropertyLoadProbeHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+        host.has_sidecar_runtime_key_results = vec![Some(indexed_property_cache_key(0))];
+
+        let (result, stack, _) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), cell_runtime_value()), (local(3), runtime_key)],
+        );
+        let frame = stack.top_frame().unwrap();
+        let site = in_by_value_handoff_site(owner(), BytecodeIndex::from_offset(0), local(3));
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(
+                BaselineGeneratedPropertyHandoff {
+                    resume: BaselineGeneratedPropertyResume {
+                        owner: owner(),
+                        frame: frame.id,
+                        bytecode_index: BytecodeIndex::from_offset(0),
+                        opcode: CoreOpcode::InByVal,
+                    },
+                    site,
+                    requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                    may_throw: site.may_throw,
+                }
+            ))
+        );
+        assert_eq!(host.has_sidecar_runtime_key_queries, vec![runtime_key]);
+        assert!(host.sidecar_base_structure_queries.is_empty());
+    }
+
+    #[test]
+    fn baseline_generated_property_has_megamorphic_sidecar_in_by_val_primitive_base_falls_back() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(3)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let key = property_cache_key(11);
+        let table = property_has_megamorphic_candidate_table(
+            owner(),
+            BytecodeIndex::from_offset(0),
+            key,
+            StructureId::new(2),
+            1,
+            1,
+            true,
+        );
+        let base = RuntimeValue::from_i32(7);
+        let runtime_key = generated_call_link_cell_value(0x5678);
+        let mut host = SequencedPropertyLoadProbeHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+        host.has_sidecar_runtime_key_results = vec![Some(key)];
+
+        let (result, stack, _) = execute_generated_with_megamorphic_property_has_sidecar(
+            owner(),
+            &block,
+            &artifact,
+            &table,
+            &mut host,
+            &[(local(1), base), (local(3), runtime_key)],
+        );
+        let frame = stack.top_frame().unwrap();
+        let site = in_by_value_handoff_site(owner(), BytecodeIndex::from_offset(0), local(3));
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(
+                BaselineGeneratedPropertyHandoff {
+                    resume: BaselineGeneratedPropertyResume {
+                        owner: owner(),
+                        frame: frame.id,
+                        bytecode_index: BytecodeIndex::from_offset(0),
+                        opcode: CoreOpcode::InByVal,
+                    },
+                    site,
+                    requires_no_gc_exit_reentry: site.requires_no_gc_exit_reentry,
+                    may_throw: site.may_throw,
+                }
+            ))
+        );
+        assert_eq!(host.has_sidecar_runtime_key_queries, vec![runtime_key]);
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+    }
+
+    #[test]
     fn baseline_generated_property_store_mixed_load_store_sidecars_share_one_host() {
         let block = code_block(vec![
             core_typed(
@@ -6220,6 +10125,402 @@ mod tests {
     }
 
     #[test]
+    fn baseline_generated_property_increment_sidecar_skips_numeric_update_chain() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(5)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(
+                1,
+                CoreOpcode::ToNumber,
+                vec![Operand::Register(local(1)), Operand::Register(local(0))],
+            ),
+            core_typed(
+                2,
+                CoreOpcode::Move,
+                vec![Operand::Register(local(2)), Operand::Register(local(1))],
+            ),
+            core_typed(
+                3,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(3)), Operand::SignedImmediate(1)],
+            ),
+            core_typed(
+                4,
+                CoreOpcode::AddInt32,
+                vec![
+                    Operand::Register(local(4)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(3)),
+                ],
+            ),
+            core_typed(
+                5,
+                CoreOpcode::PutByName,
+                vec![
+                    Operand::Register(local(5)),
+                    Operand::IdentifierIndex(11),
+                    Operand::Register(local(4)),
+                ],
+            ),
+            core_typed(6, CoreOpcode::Return, vec![Operand::Register(local(2))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let load_table = property_load_plan_table(
+            owner(),
+            vec![property_load_plan(
+                owner(),
+                BytecodeIndex::from_offset(0),
+                11,
+                StructureId::new(1),
+                PropertyOffset::new(0),
+            )],
+        );
+        let guarded_table = empty_property_load_guarded_candidate_table(owner());
+        let store_candidate = property_store_mutation_candidate(
+            property_store_plan(
+                owner(),
+                BytecodeIndex::from_offset(5),
+                11,
+                StructureId::new(1),
+                PropertyOffset::new(0),
+            ),
+            1,
+        );
+        let store_table =
+            property_store_mutation_candidate_table(owner(), vec![store_candidate.clone()]);
+        let base = cell_runtime_value();
+        let old_value = RuntimeValue::from_i32(41);
+        let updated_value = RuntimeValue::from_i32(42);
+        let mut host = SequencedPropertyStoreMutationHost {
+            load_results: vec![GeneratedPropertyLoadProbeResult::hit(old_value)],
+            ..Default::default()
+        };
+
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let frame = enter_program_frame(&mut stack, &mut registers, owner(), &block);
+        let window = stack.top_frame().unwrap().register_window;
+        registers.write(window, local(5), base).unwrap();
+
+        let result;
+        let property_load_probe_miss_records;
+        let property_store_probe_miss_records;
+        let property_store_mutation_rejection_records;
+        let property_store_mutation_commit_records;
+        {
+            let mut sidecars = BaselineGeneratedPropertyExecutionSidecars::new(
+                &mut host,
+                Some((&load_table, &guarded_table)),
+                Some(&store_table),
+            );
+            result = execute_baseline_generated_code_with_property_sidecars(
+                BaselineGeneratedExecutionRequest {
+                    artifact: &artifact,
+                    owner: owner(),
+                    code_block: &block,
+                    expected_frame: frame,
+                    execution: InterpreterExecutionState {
+                        stack: &mut stack,
+                        registers: &mut registers,
+                        exceptions: &mut exceptions,
+                        heap: &mut heap,
+                    },
+                },
+                &mut sidecars,
+            );
+            property_load_probe_miss_records = sidecars.property_load_probe_miss_records().to_vec();
+            property_store_probe_miss_records =
+                sidecars.property_store_probe_miss_records().to_vec();
+            property_store_mutation_rejection_records = sidecars
+                .property_store_mutation_rejection_records()
+                .to_vec();
+            property_store_mutation_commit_records =
+                sidecars.property_store_mutation_commit_records().to_vec();
+        }
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(old_value)
+            ))
+        );
+        assert!(property_load_probe_miss_records.is_empty());
+        assert!(property_store_probe_miss_records.is_empty());
+        assert!(property_store_mutation_rejection_records.is_empty());
+        assert_eq!(property_store_mutation_commit_records.len(), 1);
+        assert_eq!(read_local(&registers, &stack, 0), old_value);
+        assert_eq!(read_local(&registers, &stack, 1), old_value);
+        assert_eq!(read_local(&registers, &stack, 2), old_value);
+        assert_eq!(read_local(&registers, &stack, 3), RuntimeValue::from_i32(1));
+        assert_eq!(read_local(&registers, &stack, 4), updated_value);
+        assert_eq!(host.load_probed_base_values, vec![base]);
+        assert_eq!(host.load_probed_plan_keys, vec![property_cache_key(11)]);
+        assert_eq!(host.probed_base_values, vec![base]);
+        assert_eq!(host.probed_stored_values, vec![updated_value]);
+        assert_eq!(host.probed_plan_keys, vec![property_cache_key(11)]);
+        assert_eq!(host.committed_base_values, vec![base]);
+        assert_eq!(host.committed_stored_values, vec![updated_value]);
+    }
+
+    #[test]
+    fn baseline_generated_property_increment_sidecar_preserves_register_aliasing_order() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(5)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(
+                1,
+                CoreOpcode::ToNumber,
+                vec![Operand::Register(local(1)), Operand::Register(local(0))],
+            ),
+            core_typed(
+                2,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(1)), Operand::SignedImmediate(1)],
+            ),
+            core_typed(
+                3,
+                CoreOpcode::AddInt32,
+                vec![
+                    Operand::Register(local(4)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(1)),
+                ],
+            ),
+            core_typed(
+                4,
+                CoreOpcode::PutByName,
+                vec![
+                    Operand::Register(local(5)),
+                    Operand::IdentifierIndex(11),
+                    Operand::Register(local(4)),
+                ],
+            ),
+            core_typed(5, CoreOpcode::Return, vec![Operand::Register(local(4))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let load_table = property_load_plan_table(
+            owner(),
+            vec![property_load_plan(
+                owner(),
+                BytecodeIndex::from_offset(0),
+                11,
+                StructureId::new(1),
+                PropertyOffset::new(0),
+            )],
+        );
+        let guarded_table = empty_property_load_guarded_candidate_table(owner());
+        let store_candidate = property_store_mutation_candidate(
+            property_store_plan(
+                owner(),
+                BytecodeIndex::from_offset(4),
+                11,
+                StructureId::new(1),
+                PropertyOffset::new(0),
+            ),
+            1,
+        );
+        let store_table =
+            property_store_mutation_candidate_table(owner(), vec![store_candidate.clone()]);
+        let base = cell_runtime_value();
+        let mut host = SequencedPropertyStoreMutationHost {
+            load_results: vec![GeneratedPropertyLoadProbeResult::hit(
+                RuntimeValue::from_i32(41),
+            )],
+            ..Default::default()
+        };
+
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let frame = enter_program_frame(&mut stack, &mut registers, owner(), &block);
+        let window = stack.top_frame().unwrap().register_window;
+        registers.write(window, local(5), base).unwrap();
+
+        let result;
+        {
+            let mut sidecars = BaselineGeneratedPropertyExecutionSidecars::new(
+                &mut host,
+                Some((&load_table, &guarded_table)),
+                Some(&store_table),
+            );
+            result = execute_baseline_generated_code_with_property_sidecars(
+                BaselineGeneratedExecutionRequest {
+                    artifact: &artifact,
+                    owner: owner(),
+                    code_block: &block,
+                    expected_frame: frame,
+                    execution: InterpreterExecutionState {
+                        stack: &mut stack,
+                        registers: &mut registers,
+                        exceptions: &mut exceptions,
+                        heap: &mut heap,
+                    },
+                },
+                &mut sidecars,
+            );
+        }
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(2))
+            ))
+        );
+        assert_eq!(read_local(&registers, &stack, 1), RuntimeValue::from_i32(1));
+        assert_eq!(read_local(&registers, &stack, 4), RuntimeValue::from_i32(2));
+        assert_eq!(host.probed_stored_values, vec![RuntimeValue::from_i32(2)]);
+        assert_eq!(
+            host.committed_stored_values,
+            vec![RuntimeValue::from_i32(2)]
+        );
+    }
+
+    #[test]
+    fn baseline_generated_property_increment_sidecar_store_miss_resumes_at_put() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(5)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(
+                1,
+                CoreOpcode::ToNumber,
+                vec![Operand::Register(local(1)), Operand::Register(local(0))],
+            ),
+            core_typed(
+                2,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(3)), Operand::SignedImmediate(1)],
+            ),
+            core_typed(
+                3,
+                CoreOpcode::AddInt32,
+                vec![
+                    Operand::Register(local(4)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(3)),
+                ],
+            ),
+            core_typed(
+                4,
+                CoreOpcode::PutByName,
+                vec![
+                    Operand::Register(local(5)),
+                    Operand::IdentifierIndex(11),
+                    Operand::Register(local(4)),
+                ],
+            ),
+            core_typed(5, CoreOpcode::Return, vec![Operand::Register(local(4))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let load_table = property_load_plan_table(
+            owner(),
+            vec![property_load_plan(
+                owner(),
+                BytecodeIndex::from_offset(0),
+                11,
+                StructureId::new(1),
+                PropertyOffset::new(0),
+            )],
+        );
+        let guarded_table = empty_property_load_guarded_candidate_table(owner());
+        let store_candidate = property_store_mutation_candidate(
+            property_store_plan(
+                owner(),
+                BytecodeIndex::from_offset(4),
+                11,
+                StructureId::new(1),
+                PropertyOffset::new(0),
+            ),
+            1,
+        );
+        let store_table =
+            property_store_mutation_candidate_table(owner(), vec![store_candidate.clone()]);
+        let base = cell_runtime_value();
+        let old_value = RuntimeValue::from_i32(41);
+        let updated_value = RuntimeValue::from_i32(42);
+        let mut host = SequencedPropertyStoreMutationHost {
+            load_results: vec![GeneratedPropertyLoadProbeResult::hit(old_value)],
+            probe_results: vec![GeneratedPropertyStoreProbeResult::miss(
+                GeneratedPropertyStoreProbeMissReason::StructureMismatch,
+            )],
+            ..Default::default()
+        };
+
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let frame = enter_program_frame(&mut stack, &mut registers, owner(), &block);
+        let window = stack.top_frame().unwrap().register_window;
+        registers.write(window, local(5), base).unwrap();
+
+        let result;
+        let property_store_probe_miss_records;
+        {
+            let mut sidecars = BaselineGeneratedPropertyExecutionSidecars::new(
+                &mut host,
+                Some((&load_table, &guarded_table)),
+                Some(&store_table),
+            );
+            result = execute_baseline_generated_code_with_property_sidecars(
+                BaselineGeneratedExecutionRequest {
+                    artifact: &artifact,
+                    owner: owner(),
+                    code_block: &block,
+                    expected_frame: frame,
+                    execution: InterpreterExecutionState {
+                        stack: &mut stack,
+                        registers: &mut registers,
+                        exceptions: &mut exceptions,
+                        heap: &mut heap,
+                    },
+                },
+                &mut sidecars,
+            );
+            property_store_probe_miss_records =
+                sidecars.property_store_probe_miss_records().to_vec();
+        }
+
+        let Ok(BaselineGeneratedExecutionResult::Property(handoff)) = result else {
+            panic!("expected PutByName property handoff after fused numeric prefix");
+        };
+        assert_eq!(handoff.site.bytecode_index, BytecodeIndex::from_offset(4));
+        assert_eq!(handoff.site.opcode, CoreOpcode::PutByName);
+        assert_eq!(read_local(&registers, &stack, 1), old_value);
+        assert_eq!(read_local(&registers, &stack, 3), RuntimeValue::from_i32(1));
+        assert_eq!(read_local(&registers, &stack, 4), updated_value);
+        assert_eq!(host.probed_stored_values, vec![updated_value]);
+        assert_eq!(property_store_probe_miss_records.len(), 1);
+        assert_eq!(
+            property_store_probe_miss_records[0].bytecode_index,
+            BytecodeIndex::from_offset(4)
+        );
+    }
+
+    #[test]
     fn baseline_generated_property_store_probe_miss_falls_back_and_records_miss() {
         let block = code_block(vec![
             core_typed(
@@ -6303,6 +10604,226 @@ mod tests {
                 stored_value_kind: ValueKind::Int32,
                 reason: GeneratedPropertyStoreProbeMissReason::StructureMismatch,
             }]
+        );
+    }
+
+    #[test]
+    fn baseline_generated_property_store_sidecar_skips_known_structure_mismatch_before_host_probe()
+    {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::PutByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::IdentifierIndex(11),
+                    Operand::Register(local(2)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(3))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let skipped_candidate = property_store_mutation_candidate(
+            property_store_plan(
+                owner(),
+                BytecodeIndex::from_offset(0),
+                11,
+                StructureId::new(1),
+                PropertyOffset::new(0),
+            ),
+            1,
+        );
+        let matching_candidate = property_store_mutation_candidate(
+            property_store_plan(
+                owner(),
+                BytecodeIndex::from_offset(0),
+                11,
+                StructureId::new(2),
+                PropertyOffset::new(1),
+            ),
+            2,
+        );
+        let table = property_store_mutation_candidate_table(
+            owner(),
+            vec![matching_candidate, skipped_candidate],
+        );
+        let base = cell_runtime_value();
+        let stored_value = RuntimeValue::from_i32(99);
+        let return_value = RuntimeValue::from_i32(13);
+        let mut host = SequencedPropertyStoreMutationHost::default();
+        host.sidecar_base_structure = Some(StructureId::new(2));
+
+        let (result, stack, registers, probe_miss_records, rejection_records, commit_records) =
+            execute_generated_with_property_store_sidecar(
+                owner(),
+                &block,
+                &artifact,
+                &table,
+                &mut host,
+                &[
+                    (local(0), base),
+                    (local(2), stored_value),
+                    (local(3), return_value),
+                ],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(return_value)
+            ))
+        );
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert_eq!(host.probed_base_values, vec![base]);
+        assert_eq!(host.probed_base_structures, vec![Some(StructureId::new(2))]);
+        assert!(probe_miss_records.is_empty());
+        assert!(rejection_records.is_empty());
+        assert_eq!(commit_records.len(), 1);
+        assert_eq!(commit_records[0].store_plan_ordinal, 2);
+        assert_eq!(read_local(&registers, &stack, 2), stored_value);
+    }
+
+    #[test]
+    fn baseline_generated_property_store_sidecar_probes_newest_matching_candidate_first() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::PutByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::IdentifierIndex(11),
+                    Operand::Register(local(2)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(3))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let older_candidate = property_store_mutation_candidate(
+            property_store_plan(
+                owner(),
+                BytecodeIndex::from_offset(0),
+                11,
+                StructureId::new(1),
+                PropertyOffset::new(0),
+            ),
+            1,
+        );
+        let newer_candidate = property_store_mutation_candidate(
+            property_store_plan(
+                owner(),
+                BytecodeIndex::from_offset(0),
+                11,
+                StructureId::new(2),
+                PropertyOffset::new(1),
+            ),
+            2,
+        );
+        let table = property_store_mutation_candidate_table(
+            owner(),
+            vec![older_candidate, newer_candidate],
+        );
+        let base = cell_runtime_value();
+        let stored_value = RuntimeValue::from_i32(99);
+        let return_value = RuntimeValue::from_i32(13);
+        let mut host = SequencedPropertyStoreMutationHost::default();
+
+        let (result, stack, registers, probe_miss_records, rejection_records, commit_records) =
+            execute_generated_with_property_store_sidecar(
+                owner(),
+                &block,
+                &artifact,
+                &table,
+                &mut host,
+                &[
+                    (local(0), base),
+                    (local(2), stored_value),
+                    (local(3), return_value),
+                ],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(return_value)
+            ))
+        );
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert_eq!(host.probed_base_values, vec![base]);
+        assert_eq!(host.probed_base_structures, vec![Some(StructureId::new(2))]);
+        assert_eq!(host.probed_stored_values, vec![stored_value]);
+        assert_eq!(host.probed_plan_keys, vec![property_cache_key(11)]);
+        assert!(probe_miss_records.is_empty());
+        assert!(rejection_records.is_empty());
+        assert_eq!(commit_records.len(), 1);
+        assert_eq!(commit_records[0].store_plan_ordinal, 2);
+        assert_eq!(read_local(&registers, &stack, 2), stored_value);
+    }
+
+    #[test]
+    fn baseline_generated_property_store_put_by_value_sidecar_rereads_runtime_key() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::PutByValue,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(2)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(2))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let candidate = property_store_mutation_candidate(
+            property_store_indexed_plan(
+                owner(),
+                BytecodeIndex::from_offset(0),
+                0,
+                StructureId::new(1),
+            ),
+            1,
+        );
+        let table = property_store_mutation_candidate_table(owner(), vec![candidate.clone()]);
+        let base = cell_runtime_value();
+        let stored_value = RuntimeValue::from_i32(99);
+        let runtime_key = RuntimeValue::from_i32(1);
+        let mut host = SequencedPropertyStoreMutationHost::default();
+
+        let (result, stack, registers, probe_miss_records, rejection_records, commit_records) =
+            execute_generated_with_property_store_sidecar(
+                owner(),
+                &block,
+                &artifact,
+                &table,
+                &mut host,
+                &[
+                    (local(0), base),
+                    (local(1), runtime_key),
+                    (local(2), stored_value),
+                ],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(stored_value)
+            ))
+        );
+        assert_eq!(read_local(&registers, &stack, 2), stored_value);
+        assert_eq!(host.probed_base_values, vec![base]);
+        assert_eq!(host.probed_stored_values, vec![stored_value]);
+        assert_eq!(host.probed_plan_keys, vec![indexed_property_cache_key(1)]);
+        assert_eq!(host.committed_base_values, vec![base]);
+        assert_eq!(host.committed_keys, vec![indexed_property_cache_key(1)]);
+        assert_eq!(host.committed_stored_values, vec![stored_value]);
+        assert!(probe_miss_records.is_empty());
+        assert!(rejection_records.is_empty());
+        assert_eq!(commit_records.len(), 1);
+        assert_eq!(commit_records[0].key, indexed_property_cache_key(0));
+        assert_eq!(commit_records[0].commit.key, indexed_property_cache_key(1));
+        assert_eq!(
+            commit_records[0].plan_kind,
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore
         );
     }
 
@@ -6956,6 +11477,37 @@ mod tests {
         (result, stack, registers)
     }
 
+    fn execute_generated_with_frame_callee(
+        owner: CodeBlockId,
+        code_block: &CodeBlock,
+        artifact: &BaselineGeneratedCodeArtifact,
+        callee: RuntimeValue,
+    ) -> (
+        Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError>,
+        ExecutionContextStack,
+        RegisterFile,
+    ) {
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let frame = enter_program_frame(&mut stack, &mut registers, owner, code_block);
+        stack.top_frame_mut().unwrap().callee_value = Some(callee);
+        let result = execute_baseline_generated_code(BaselineGeneratedExecutionRequest {
+            artifact,
+            owner,
+            code_block,
+            expected_frame: frame,
+            execution: InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+        });
+        (result, stack, registers)
+    }
+
     fn execute_generated_with_property_load_sidecar(
         owner: CodeBlockId,
         code_block: &CodeBlock,
@@ -7059,6 +11611,68 @@ mod tests {
         )
     }
 
+    fn execute_generated_with_megamorphic_property_load_sidecar(
+        owner: CodeBlockId,
+        code_block: &CodeBlock,
+        artifact: &BaselineGeneratedCodeArtifact,
+        megamorphic_table: &GeneratedPropertyLoadMegamorphicCandidateTable,
+        host: &mut dyn DispatchHost,
+        initial_locals: &[(VirtualRegister, RuntimeValue)],
+    ) -> PropertyLoadSidecarTablesExecutionResult {
+        let plan_table = property_load_plan_table(owner, Vec::new());
+        let guarded_candidate_table = empty_property_load_guarded_candidate_table(owner);
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let frame = enter_program_frame(&mut stack, &mut registers, owner, code_block);
+        let window = stack.top_frame().unwrap().register_window;
+        for (register, value) in initial_locals {
+            registers.write(window, *register, *value).unwrap();
+        }
+
+        let result;
+        let root_sync_requests;
+        let probe_miss_records;
+        let guarded_probe_miss_records;
+        {
+            let mut sidecars = BaselineGeneratedPropertyExecutionSidecars::new(
+                host,
+                Some((&plan_table, &guarded_candidate_table)),
+                None,
+            )
+            .with_property_load_megamorphic_candidate_table(Some(megamorphic_table));
+            result = execute_baseline_generated_code_with_property_sidecars(
+                BaselineGeneratedExecutionRequest {
+                    artifact,
+                    owner,
+                    code_block,
+                    expected_frame: frame,
+                    execution: InterpreterExecutionState {
+                        stack: &mut stack,
+                        registers: &mut registers,
+                        exceptions: &mut exceptions,
+                        heap: &mut heap,
+                    },
+                },
+                &mut sidecars,
+            );
+            root_sync_requests = sidecars.destination_root_sync_requests().to_vec();
+            probe_miss_records = sidecars.property_load_probe_miss_records().to_vec();
+            guarded_probe_miss_records =
+                sidecars.guarded_property_load_probe_miss_records().to_vec();
+        }
+
+        (
+            result,
+            stack,
+            registers,
+            root_sync_requests,
+            probe_miss_records,
+            guarded_probe_miss_records,
+        )
+    }
+
     type PropertyStoreSidecarExecutionResult = (
         Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError>,
         ExecutionContextStack,
@@ -7121,6 +11735,98 @@ mod tests {
             mutation_rejection_records,
             mutation_commit_records,
         )
+    }
+
+    fn execute_generated_with_megamorphic_property_store_sidecar(
+        owner: CodeBlockId,
+        code_block: &CodeBlock,
+        artifact: &BaselineGeneratedCodeArtifact,
+        megamorphic_table: &GeneratedPropertyStoreMegamorphicCandidateTable,
+        host: &mut dyn DispatchHost,
+        initial_locals: &[(VirtualRegister, RuntimeValue)],
+    ) -> (
+        Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError>,
+        ExecutionContextStack,
+        RegisterFile,
+    ) {
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let frame = enter_program_frame(&mut stack, &mut registers, owner, code_block);
+        let window = stack.top_frame().unwrap().register_window;
+        for (register, value) in initial_locals {
+            registers.write(window, *register, *value).unwrap();
+        }
+
+        let result;
+        {
+            let mut sidecars = BaselineGeneratedPropertyExecutionSidecars::new(host, None, None)
+                .with_property_store_megamorphic_candidate_table(Some(megamorphic_table));
+            result = execute_baseline_generated_code_with_property_sidecars(
+                BaselineGeneratedExecutionRequest {
+                    artifact,
+                    owner,
+                    code_block,
+                    expected_frame: frame,
+                    execution: InterpreterExecutionState {
+                        stack: &mut stack,
+                        registers: &mut registers,
+                        exceptions: &mut exceptions,
+                        heap: &mut heap,
+                    },
+                },
+                &mut sidecars,
+            );
+        }
+
+        (result, stack, registers)
+    }
+
+    fn execute_generated_with_megamorphic_property_has_sidecar(
+        owner: CodeBlockId,
+        code_block: &CodeBlock,
+        artifact: &BaselineGeneratedCodeArtifact,
+        megamorphic_table: &GeneratedPropertyHasMegamorphicCandidateTable,
+        host: &mut dyn DispatchHost,
+        initial_locals: &[(VirtualRegister, RuntimeValue)],
+    ) -> (
+        Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError>,
+        ExecutionContextStack,
+        RegisterFile,
+    ) {
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let frame = enter_program_frame(&mut stack, &mut registers, owner, code_block);
+        let window = stack.top_frame().unwrap().register_window;
+        for (register, value) in initial_locals {
+            registers.write(window, *register, *value).unwrap();
+        }
+
+        let result;
+        {
+            let mut sidecars = BaselineGeneratedPropertyExecutionSidecars::new(host, None, None)
+                .with_property_has_megamorphic_candidate_table(Some(megamorphic_table));
+            result = execute_baseline_generated_code_with_property_sidecars(
+                BaselineGeneratedExecutionRequest {
+                    artifact,
+                    owner,
+                    code_block,
+                    expected_frame: frame,
+                    execution: InterpreterExecutionState {
+                        stack: &mut stack,
+                        registers: &mut registers,
+                        exceptions: &mut exceptions,
+                        heap: &mut heap,
+                    },
+                },
+                &mut sidecars,
+            );
+        }
+
+        (result, stack, registers)
     }
 
     type GeneratedCallLinkSidecarExecutionResult = (
@@ -9848,7 +14554,7 @@ mod tests {
                         &artifact,
                         &initial_locals,
                     );
-                    let equals = local_primitive_strict_equals(left, right).unwrap();
+                    let equals = left.strict_equals(right);
                     let expected = matches!(opcode, CoreOpcode::StrictEqual) == equals;
 
                     assert_eq!(
@@ -10817,7 +15523,7 @@ mod tests {
         );
         assert!(owner_registers.barrier_handoffs().is_empty());
 
-        let mut invalid_artifact = artifact;
+        let mut invalid_artifact = artifact.clone();
         invalid_artifact.liveness = CodeLiveness::Unallocated;
         let (artifact_result, _, artifact_registers) =
             execute_generated(owner(), &block, &invalid_artifact);
@@ -10829,7 +15535,7 @@ mod tests {
         );
         assert!(artifact_registers.barrier_handoffs().is_empty());
 
-        let mut invalid_effect_artifact = artifact;
+        let mut invalid_effect_artifact = artifact.clone();
         invalid_effect_artifact.body.effect_contract = None;
         let (effect_result, _, effect_registers) =
             execute_generated(owner(), &block, &invalid_effect_artifact);

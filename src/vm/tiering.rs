@@ -26,7 +26,10 @@ use crate::bytecode::ic::{
 };
 use crate::bytecode::instruction::OperandAccessError;
 use crate::bytecode::{BytecodeIndex, CodeSpecialization, CoreOpcode, Opcode, VirtualRegister};
-use crate::gc::{BarrierRequirementOutcome, HeapId, RootRecord, RootSetSemanticError, StructureId};
+use crate::gc::{
+    BarrierNotRequiredReason, BarrierRequirementOutcome, CollectionKind, HeapId, RootRecord,
+    RootSetSemanticError, StructureId,
+};
 use crate::interpreter::{
     CallObservationDescriptor, CallObservationDirectCallReadiness, CallObservationOutcome,
     CallObservationRootSafety, CallObservationTargetKind, ExecutionCompletion, ExecutionEntryKind,
@@ -34,38 +37,52 @@ use crate::interpreter::{
 };
 use crate::jit::code::{
     BaselineAbiProof, BaselineEntryArtifact, BaselineGeneratedCodeArtifact,
-    BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableValidationError,
-    BaselineNativeEntryDescriptor,
+    BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableKind,
+    BaselineNativeEntryCallableValidationError, BaselineNativeEntryDescriptor,
 };
 use crate::jit::ic::GeneratedPropertyStoreMutationMissReason;
 use crate::jit::plan::BaselineBytecodeSnapshotFingerprint;
 use crate::jit::{
     derive_property_load_guard_dependencies, plan_property_load_access_case_from_observation,
     plan_property_load_guard_plan_from_observation, select_tier_plan, AbiValue,
-    AccessCaseDescriptor, AccessCaseKind, BaselineBytecodeEligibilityProof,
-    BaselineMachineCodeEmissionRecord, BaselineMachineCodeEmissionValidationError, CacheKey,
-    CallBoundaryId, CallBoundaryMetadata, CallLinkAttachmentPlan, CallLinkAttachmentPlanTable,
-    CallLinkAttachmentTargetDescriptor, CallLinkInfoDescriptor, CallLinkMode,
-    CallLinkReadinessBlocker, CallLinkReadinessBlockers, CodeFinalizationAuthority,
-    CodeInvalidationReason, CodeLiveness, CodeOrigin, CodeOriginKind, CodeOwnership, CodePatchPlan,
-    CodePatchRecord, CodePatchState, DependencyStrength, EntryAbi, Entrypoint, EntrypointKind,
-    ExecutableAllocationId, ExecutableAllocationLifecycle, ExecutableLedgerValidationError,
-    ExecutableMemoryProtection, GeneratedCallLinkCandidate, GeneratedCallLinkCandidateTable,
-    GeneratedCallLinkDirectCallStatus, GeneratedCallLinkProbeMissReason,
-    GeneratedGuardedPropertyLoadProbeMissReason, GeneratedPropertyLoadProbeMissReason,
-    GeneratedPropertyStoreProbeMissReason, InlineCacheSlotId, InlineCacheStub, InlineCacheStubId,
-    InlineCacheStubKind, InlineCacheValidationError, JitCodeArtifact, JitCodeId,
-    JitCodeValidationError, JitPlanValidationError, JitType, LinkBufferFinalizationOutcome,
-    LinkBufferFinalizationRecord, LinkedCallKind, MachineCodeHandle, MachineCodeOwnership,
-    MachineCodeRange, MachineCodeValidationError, OsrState, PatchWriteBarrier,
-    PatchpointDescriptor, PatchpointKind, PropertyLoadAccessCasePlan,
-    PropertyLoadAccessCasePlanKind, PropertyLoadAccessCasePlanTable, PropertyLoadGuardChainOutcome,
+    AccessCaseDescriptor, AccessCaseKind, BaselineBytecodeEligibilityProof, BaselineBytecodeRange,
+    BaselineGeneratedEffectContract, BaselineMachineCodeEmissionRecord,
+    BaselineMachineCodeEmissionValidationError, BaselineMachineCodeEmitterKind,
+    BaselineSupportedOpcodeSubset, CacheKey, CallBoundaryId, CallBoundaryMetadata,
+    CallLinkAttachmentPlan, CallLinkAttachmentPlanTable, CallLinkAttachmentTargetDescriptor,
+    CallLinkInfoDescriptor, CallLinkMode, CallLinkReadinessBlocker, CallLinkReadinessBlockers,
+    CodeFinalizationAuthority, CodeInvalidationReason, CodeLiveness, CodeOrigin, CodeOriginKind,
+    CodeOwnership, CodePatchPlan, CodePatchRecord, CodePatchState, DependencyStrength, EntryAbi,
+    Entrypoint, EntrypointKind, ExecutableAllocationId, ExecutableAllocationLifecycle,
+    ExecutableLedgerValidationError, ExecutableMemoryProtection, GeneratedCallLinkCandidate,
+    GeneratedCallLinkCandidateTable, GeneratedCallLinkDirectCallStatus,
+    GeneratedCallLinkProbeMissReason, GeneratedGuardedPropertyLoadProbeMissReason,
+    GeneratedPropertyHasMegamorphicCacheEntry, GeneratedPropertyHasMegamorphicCandidateTable,
+    GeneratedPropertyHasMegamorphicSite, GeneratedPropertyLoadMegamorphicCacheEntry,
+    GeneratedPropertyLoadMegamorphicCacheEntryKind, GeneratedPropertyLoadMegamorphicCandidateTable,
+    GeneratedPropertyLoadMegamorphicSite, GeneratedPropertyLoadProbeMissReason,
+    GeneratedPropertyStoreMegamorphicCacheEntry, GeneratedPropertyStoreMegamorphicCandidateTable,
+    GeneratedPropertyStoreMegamorphicSite, GeneratedPropertyStoreProbeMissReason, InlineCacheKind,
+    InlineCacheSlotId, InlineCacheStub, InlineCacheStubId, InlineCacheStubKind,
+    InlineCacheValidationError, JitCodeArtifact, JitCodeId, JitCodeValidationError,
+    JitPlanValidationError, JitType, LinkBufferFinalizationOutcome, LinkBufferFinalizationRecord,
+    LinkedCallKind, MachineCodeHandle, MachineCodeOwnership, MachineCodeRange,
+    MachineCodeValidationError, OsrState, P6X86_64BaselineBranchTargetRejectionReason,
+    P6X86_64BaselineLoweringError, P6X86_64BaselineLoweringRequirement,
+    P6X86_64BaselineLoweringValidationShape, P6X86_64BaselineMachineInstruction,
+    P6X86_64BaselineOperandLocation, P6X86_64BaselineSelectedInstructionEffects,
+    P6X86_64BaselineSelectedSideExitReason, P6X86_64BaselineSemanticByteEmissionError,
+    P6X86_64BaselineSemanticOperandRejectionReason, P6X86_64BaselineSymbolicRegister,
+    PatchWriteBarrier, PatchpointDescriptor, PatchpointKind, PropertyHasObservationDescriptor,
+    PropertyLoadAccessCasePlan, PropertyLoadAccessCasePlanKind, PropertyLoadAccessCasePlanTable,
+    PropertyLoadBaseNormalization, PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome,
     PropertyLoadGuardPlan, PropertyLoadGuardRequirement,
     PropertyLoadGuardedCandidate as JitPropertyLoadGuardedCandidate,
     PropertyLoadGuardedCandidateKind as JitPropertyLoadGuardedCandidateKind,
     PropertyLoadGuardedCandidateTable, PropertyLoadObservationDescriptor,
-    PropertyStoreAccessCasePlan, PropertyStoreAccessCasePlanContract,
-    PropertyStoreAccessCasePlanKind, PropertyStoreAccessCasePlanTable, PropertyStoreBarrierEffect,
+    PropertyLoadObservationReadiness, PropertyStoreAccessCasePlan,
+    PropertyStoreAccessCasePlanContract, PropertyStoreAccessCasePlanKind,
+    PropertyStoreAccessCasePlanTable, PropertyStoreBarrierEffect,
     PropertyStoreMutationBarrierEvidence, PropertyStoreMutationCandidate,
     PropertyStoreMutationCandidateTable, RelocationKind, TierCounters, TierFallbackReason,
     TierFallbackResultRecord, TierFallbackSemantics, TierFallbackTarget, TierPlanDescriptor,
@@ -82,9 +99,39 @@ use crate::runtime::{
     CallFrameId, CodeBlockId, ExecutableId, NativeCodeId, ObjectId, StackFrameId,
     WatchpointGeneration,
 };
+use crate::strings::PropertyKey;
 use crate::value::ValueKind;
 
 const STRUCTURE_STUB_REPATCH_CODE_ID_BASE: u64 = 1 << 48;
+const HOT_TELEMETRY_RECORD_RETAIN_LIMIT: usize = 1024;
+const PROPERTY_IC_REPATCH_COUNT_FOR_COOLDOWN: u8 = 8;
+const PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE: u8 = 8;
+const PROPERTY_IC_INITIAL_COUNTDOWN: u8 = 1;
+const PROPERTY_IC_INITIAL_COOLDOWN_COUNT: u8 = 20;
+const PROPERTY_IC_INITIAL_REPATCH_BUFFERING_COUNTDOWN: u8 = 6;
+const PROPERTY_IC_REPATCH_BUFFERING_COUNTDOWN: u8 = 6;
+const PROPERTY_LOAD_MEGAMORPHIC_CACHE_PRIMARY_SIZE: usize = 2048;
+const PROPERTY_LOAD_MEGAMORPHIC_CACHE_PRIMARY_MASK: usize =
+    PROPERTY_LOAD_MEGAMORPHIC_CACHE_PRIMARY_SIZE - 1;
+const PROPERTY_LOAD_MEGAMORPHIC_CACHE_SECONDARY_SIZE: usize = 512;
+const PROPERTY_LOAD_MEGAMORPHIC_CACHE_SECONDARY_MASK: usize =
+    PROPERTY_LOAD_MEGAMORPHIC_CACHE_SECONDARY_SIZE - 1;
+const PROPERTY_MEGAMORPHIC_CACHE_INVALID_EPOCH: u16 = 0;
+const PROPERTY_MEGAMORPHIC_CACHE_INITIAL_EPOCH: u16 = 1;
+const PROPERTY_LOAD_MEGAMORPHIC_CACHE_MAX_OFFSET: i32 = u16::MAX as i32;
+const PROPERTY_STORE_MEGAMORPHIC_CACHE_PRIMARY_SIZE: usize = 2048;
+const PROPERTY_STORE_MEGAMORPHIC_CACHE_PRIMARY_MASK: usize =
+    PROPERTY_STORE_MEGAMORPHIC_CACHE_PRIMARY_SIZE - 1;
+const PROPERTY_STORE_MEGAMORPHIC_CACHE_SECONDARY_SIZE: usize = 512;
+const PROPERTY_STORE_MEGAMORPHIC_CACHE_SECONDARY_MASK: usize =
+    PROPERTY_STORE_MEGAMORPHIC_CACHE_SECONDARY_SIZE - 1;
+const PROPERTY_STORE_MEGAMORPHIC_CACHE_MAX_OFFSET: i32 = u16::MAX as i32;
+const PROPERTY_HAS_MEGAMORPHIC_CACHE_PRIMARY_SIZE: usize = 512;
+const PROPERTY_HAS_MEGAMORPHIC_CACHE_PRIMARY_MASK: usize =
+    PROPERTY_HAS_MEGAMORPHIC_CACHE_PRIMARY_SIZE - 1;
+const PROPERTY_HAS_MEGAMORPHIC_CACHE_SECONDARY_SIZE: usize = 128;
+const PROPERTY_HAS_MEGAMORPHIC_CACHE_SECONDARY_MASK: usize =
+    PROPERTY_HAS_MEGAMORPHIC_CACHE_SECONDARY_SIZE - 1;
 
 #[derive(Clone, Debug, Default)]
 pub struct VmTieringIntegration {
@@ -93,9 +140,15 @@ pub struct VmTieringIntegration {
     fallback_records: Vec<OptimizedFallbackRecord>,
     osr_boundaries: Vec<OsrBoundaryRecord>,
     profile_records: Vec<TierProfileRecord>,
+    profile_entry_count: usize,
+    profile_loop_backedge_count: usize,
     property_load_observations: Vec<VmPropertyLoadObservationRecord>,
     property_store_observations: Vec<VmPropertyStoreObservationRecord>,
+    property_has_observations: Vec<VmPropertyHasObservationRecord>,
+    property_inline_cache_evolution_states: Vec<VmPropertyInlineCacheEvolutionState>,
+    property_inline_cache_evolution_records: Vec<VmPropertyInlineCacheEvolutionRecord>,
     call_observations: Vec<VmCallObservationRecord>,
+    vm_owned_call_target_validation_records: Vec<VmOwnedCallTargetValidationRecord>,
     call_link_readiness_records: Vec<VmCallLinkReadinessRecord>,
     call_link_descriptor_records: Vec<VmCallLinkDescriptorRecord>,
     call_link_boundary_validation_records: Vec<VmCallLinkBoundaryValidationRecord>,
@@ -118,17 +171,31 @@ pub struct VmTieringIntegration {
     property_load_guard_watchpoint_event_dispatches:
         Vec<VmPropertyLoadGuardWatchpointEventDispatchRecord>,
     generated_property_load_probe_misses: Vec<VmGeneratedPropertyLoadProbeMissRecord>,
+    generated_property_load_probe_miss_count: usize,
     generated_property_store_mutation_readiness_records:
         Vec<VmGeneratedPropertyStoreMutationReadinessRecord>,
     generated_property_store_probe_misses: Vec<VmGeneratedPropertyStoreProbeMissRecord>,
+    generated_property_store_probe_miss_count: usize,
     generated_property_store_mutation_rejections:
         Vec<VmGeneratedPropertyStoreMutationRejectionRecord>,
     property_inline_cache_attachment_records: Vec<VmPropertyInlineCacheAttachmentRecord>,
     property_inline_cache_clear_records: Vec<VmPropertyInlineCacheClearRecord>,
+    property_megamorphic_cache_epoch: VmMegamorphicCacheEpoch,
+    property_load_megamorphic_sites: Vec<VmPropertyLoadMegamorphicSiteRecord>,
+    property_load_megamorphic_cache: VmPropertyLoadMegamorphicCache,
+    property_load_megamorphic_cache_records: Vec<VmPropertyLoadMegamorphicCacheRecord>,
+    property_load_megamorphic_cache_aging_records: Vec<VmPropertyLoadMegamorphicCacheAgingRecord>,
+    property_store_megamorphic_sites: Vec<VmPropertyStoreMegamorphicSiteRecord>,
+    property_store_megamorphic_cache: VmPropertyStoreMegamorphicCache,
+    property_store_megamorphic_cache_records: Vec<VmPropertyStoreMegamorphicCacheRecord>,
+    property_has_megamorphic_sites: Vec<VmPropertyHasMegamorphicSiteRecord>,
+    property_has_megamorphic_cache: VmPropertyHasMegamorphicCache,
+    property_has_megamorphic_cache_records: Vec<VmPropertyHasMegamorphicCacheRecord>,
     structure_stub_repatch_transactions: Vec<VmStructureStubRepatchTransactionRecord>,
     structure_stub_access_case_links: Vec<VmStructureStubAccessCaseLinkRecord>,
     generated_guarded_property_load_probe_misses:
         Vec<VmGeneratedGuardedPropertyLoadProbeMissRecord>,
+    generated_guarded_property_load_probe_miss_count: usize,
     diagnostics: Vec<ExecutionDiagnosticRecord>,
     baseline_entry_artifacts: Vec<BaselineEntryArtifact>,
     baseline_executable_materializations: Vec<BaselineExecutableMaterializationRecord>,
@@ -137,6 +204,35 @@ pub struct VmTieringIntegration {
         Vec<BaselineMachineCodeEmissionProvenanceRecord>,
     baseline_generated_code_artifacts: Vec<BaselineGeneratedCodeArtifact>,
     baseline_generated_code_invalidations: Vec<BaselineGeneratedCodeInvalidationRecord>,
+    baseline_generated_execution_records: Vec<VmBaselineGeneratedExecutionRecord>,
+    baseline_generated_execution_summaries: Vec<VmBaselineGeneratedExecutionSummary>,
+    baseline_generated_execution_count: usize,
+    baseline_generated_executed_bytecode_count: u64,
+    generated_direct_call_transaction_records: Vec<VmGeneratedDirectCallTransactionRecord>,
+    generated_direct_call_transaction_summaries: Vec<VmGeneratedDirectCallTransactionSummary>,
+    generated_direct_call_transaction_count: usize,
+    generated_direct_call_generated_entry_count: usize,
+    generated_direct_call_native_entry_count: usize,
+    generated_direct_call_native_interpreter_fallback_count: usize,
+    generated_direct_call_nested_interpreter_fallback_count: usize,
+    generated_direct_call_hot_slot_hit_count: usize,
+    generated_direct_call_sidecar_hot_slot_hit_count: usize,
+    generated_direct_call_preferred_route_hit_count: usize,
+    generated_direct_call_rootless_generated_entry_count: usize,
+    generated_direct_call_rootless_generated_entry_proof_cache_hit_count: usize,
+    generated_direct_call_rootless_native_entry_count: usize,
+    generated_direct_call_rootless_rejection_counts: VmGeneratedDirectCallRootlessRejectionCounts,
+    generated_direct_call_rootless_native_entry_rejection_counts:
+        VmGeneratedDirectCallRootlessRejectionCounts,
+    generated_direct_call_rootless_unsupported_body_opcode_counts:
+        Vec<VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount>,
+    generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts:
+        Vec<VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount>,
+    generated_direct_call_rootless_native_entry_retained_side_exit_counts:
+        Vec<VmGeneratedDirectCallRootlessRetainedSideExitCount>,
+    generated_direct_call_rootless_preferred_native_entry_counts:
+        VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
+    baseline_entry_auto_materializations: Vec<BaselineEntryAutoMaterializationRecord>,
     baseline_install_records: Vec<BaselineInstallRecord>,
     next_ordinal: u64,
     next_plan: u64,
@@ -162,6 +258,18 @@ impl VmTieringIntegration {
         &self.profile_records
     }
 
+    pub fn profile_entry_count(&self) -> usize {
+        self.profile_entry_count
+    }
+
+    pub fn profile_loop_backedge_count(&self) -> usize {
+        self.profile_loop_backedge_count
+    }
+
+    pub fn record_ordinal_count(&self) -> u64 {
+        self.next_ordinal
+    }
+
     pub fn property_load_observations(&self) -> &[VmPropertyLoadObservationRecord] {
         &self.property_load_observations
     }
@@ -170,8 +278,217 @@ impl VmTieringIntegration {
         &self.property_store_observations
     }
 
+    pub fn property_has_observations(&self) -> &[VmPropertyHasObservationRecord] {
+        &self.property_has_observations
+    }
+
+    pub fn property_inline_cache_evolution_records(
+        &self,
+    ) -> &[VmPropertyInlineCacheEvolutionRecord] {
+        &self.property_inline_cache_evolution_records
+    }
+
+    pub fn property_load_megamorphic_cache_records(
+        &self,
+    ) -> &[VmPropertyLoadMegamorphicCacheRecord] {
+        &self.property_load_megamorphic_cache_records
+    }
+
+    pub fn property_load_megamorphic_cache_aging_records(
+        &self,
+    ) -> &[VmPropertyLoadMegamorphicCacheAgingRecord] {
+        &self.property_load_megamorphic_cache_aging_records
+    }
+
+    pub fn property_megamorphic_cache_aging_records(
+        &self,
+    ) -> &[VmPropertyLoadMegamorphicCacheAgingRecord] {
+        &self.property_load_megamorphic_cache_aging_records
+    }
+
+    pub fn property_megamorphic_cache_epoch(&self) -> u16 {
+        self.property_megamorphic_cache_epoch.current()
+    }
+
+    pub fn property_load_megamorphic_cache_current_entry_count(&self) -> usize {
+        self.property_load_megamorphic_cache
+            .current_entry_count(self.property_megamorphic_cache_epoch.current())
+    }
+
+    pub fn property_load_megamorphic_cache_epoch(&self) -> u16 {
+        self.property_megamorphic_cache_epoch.current()
+    }
+
+    pub fn property_store_megamorphic_cache_records(
+        &self,
+    ) -> &[VmPropertyStoreMegamorphicCacheRecord] {
+        &self.property_store_megamorphic_cache_records
+    }
+
+    pub fn property_store_megamorphic_cache_current_entry_count(&self) -> usize {
+        self.property_store_megamorphic_cache
+            .current_entry_count(self.property_megamorphic_cache_epoch.current())
+    }
+
+    pub fn property_store_megamorphic_cache_epoch(&self) -> u16 {
+        self.property_megamorphic_cache_epoch.current()
+    }
+
+    pub fn property_has_megamorphic_cache_records(&self) -> &[VmPropertyHasMegamorphicCacheRecord] {
+        &self.property_has_megamorphic_cache_records
+    }
+
+    pub fn property_has_megamorphic_cache_current_entry_count(&self) -> usize {
+        self.property_has_megamorphic_cache
+            .current_entry_count(self.property_megamorphic_cache_epoch.current())
+    }
+
+    pub fn property_has_megamorphic_cache_epoch(&self) -> u16 {
+        self.property_megamorphic_cache_epoch.current()
+    }
+
+    pub(crate) fn generated_property_load_megamorphic_candidate_table_for_owner(
+        &self,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    ) -> Result<GeneratedPropertyLoadMegamorphicCandidateTable, InlineCacheValidationError> {
+        let sites = self
+            .property_load_megamorphic_sites
+            .iter()
+            .filter(|site| site.owner == owner && site.bytecode_snapshot == bytecode_snapshot)
+            .map(|site| GeneratedPropertyLoadMegamorphicSite {
+                owner: site.owner,
+                slot: site.slot,
+                bytecode_index: site.bytecode_index.offset(),
+                key: site.key,
+            })
+            .collect();
+        let primary_entries = self
+            .property_load_megamorphic_cache
+            .primary_entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(generated_property_load_megamorphic_cache_entry)
+            })
+            .collect();
+        let secondary_entries = self
+            .property_load_megamorphic_cache
+            .secondary_entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(generated_property_load_megamorphic_cache_entry)
+            })
+            .collect();
+        GeneratedPropertyLoadMegamorphicCandidateTable::new(
+            owner,
+            self.property_megamorphic_cache_epoch.current(),
+            sites,
+            primary_entries,
+            secondary_entries,
+        )
+    }
+
+    pub(crate) fn generated_property_store_megamorphic_candidate_table_for_owner(
+        &self,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    ) -> Result<GeneratedPropertyStoreMegamorphicCandidateTable, InlineCacheValidationError> {
+        let sites = self
+            .property_store_megamorphic_sites
+            .iter()
+            .filter(|site| site.owner == owner && site.bytecode_snapshot == bytecode_snapshot)
+            .map(|site| GeneratedPropertyStoreMegamorphicSite {
+                owner: site.owner,
+                slot: site.slot,
+                bytecode_index: site.bytecode_index.offset(),
+                key: site.key,
+            })
+            .collect();
+        let primary_entries = self
+            .property_store_megamorphic_cache
+            .primary_entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(generated_property_store_megamorphic_cache_entry)
+            })
+            .collect();
+        let secondary_entries = self
+            .property_store_megamorphic_cache
+            .secondary_entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(generated_property_store_megamorphic_cache_entry)
+            })
+            .collect();
+        GeneratedPropertyStoreMegamorphicCandidateTable::new(
+            owner,
+            self.property_megamorphic_cache_epoch.current(),
+            sites,
+            primary_entries,
+            secondary_entries,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn generated_property_has_megamorphic_candidate_table_for_owner(
+        &self,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    ) -> Result<GeneratedPropertyHasMegamorphicCandidateTable, InlineCacheValidationError> {
+        let sites = self
+            .property_has_megamorphic_sites
+            .iter()
+            .filter(|site| site.owner == owner && site.bytecode_snapshot == bytecode_snapshot)
+            .map(|site| GeneratedPropertyHasMegamorphicSite {
+                owner: site.owner,
+                slot: site.slot,
+                bytecode_index: site.bytecode_index.offset(),
+                key: site.key,
+            })
+            .collect();
+        let primary_entries = self
+            .property_has_megamorphic_cache
+            .primary_entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(generated_property_has_megamorphic_cache_entry)
+            })
+            .collect();
+        let secondary_entries = self
+            .property_has_megamorphic_cache
+            .secondary_entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(generated_property_has_megamorphic_cache_entry)
+            })
+            .collect();
+        GeneratedPropertyHasMegamorphicCandidateTable::new(
+            owner,
+            self.property_megamorphic_cache_epoch.current(),
+            sites,
+            primary_entries,
+            secondary_entries,
+        )
+    }
+
     pub fn call_observations(&self) -> &[VmCallObservationRecord] {
         &self.call_observations
+    }
+
+    pub fn vm_owned_call_target_validation_records(&self) -> &[VmOwnedCallTargetValidationRecord] {
+        &self.vm_owned_call_target_validation_records
     }
 
     pub fn call_link_readiness_records(&self) -> &[VmCallLinkReadinessRecord] {
@@ -196,8 +513,7 @@ impl VmTieringIntegration {
         &self.call_link_attachment_install_rechecks
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn call_link_inline_cache_attachment_records(
+    pub fn call_link_inline_cache_attachment_records(
         &self,
     ) -> &[VmCallLinkInlineCacheAttachmentRecord] {
         &self.call_link_inline_cache_attachment_records
@@ -210,13 +526,11 @@ impl VmTieringIntegration {
         &self.call_link_inline_cache_clear_records
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn generated_call_link_probe_misses(&self) -> &[VmGeneratedCallLinkProbeMissRecord] {
+    pub fn generated_call_link_probe_misses(&self) -> &[VmGeneratedCallLinkProbeMissRecord] {
         &self.generated_call_link_probe_misses
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn generated_call_link_probe_blocked_records(
+    pub fn generated_call_link_probe_blocked_records(
         &self,
     ) -> &[VmGeneratedCallLinkProbeBlockedRecord] {
         &self.generated_call_link_probe_blocked_records
@@ -268,57 +582,79 @@ impl VmTieringIntegration {
         &self.property_load_guard_watchpoint_event_dispatches
     }
 
-    #[cfg(test)]
-    pub(crate) fn generated_property_load_probe_misses(
+    pub fn generated_property_load_probe_misses(
         &self,
     ) -> &[VmGeneratedPropertyLoadProbeMissRecord] {
         &self.generated_property_load_probe_misses
     }
 
-    #[cfg(test)]
-    pub(crate) fn generated_property_store_probe_misses(
+    pub fn generated_property_load_probe_miss_count(&self) -> usize {
+        self.generated_property_load_probe_miss_count
+    }
+
+    pub(crate) fn should_record_generated_property_load_probe_miss_detail(
+        &self,
+        reason: GeneratedPropertyLoadProbeMissReason,
+    ) -> bool {
+        self.generated_property_load_probe_misses.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+            || generated_property_load_probe_miss_invalidates_plan(reason)
+    }
+
+    pub(crate) fn record_generated_property_load_probe_miss_count(&mut self, count: usize) {
+        self.generated_property_load_probe_miss_count = self
+            .generated_property_load_probe_miss_count
+            .saturating_add(count);
+    }
+
+    pub fn generated_property_store_probe_misses(
         &self,
     ) -> &[VmGeneratedPropertyStoreProbeMissRecord] {
         &self.generated_property_store_probe_misses
     }
 
-    #[cfg(test)]
-    pub(crate) fn generated_property_store_mutation_rejections(
+    pub fn generated_property_store_probe_miss_count(&self) -> usize {
+        self.generated_property_store_probe_miss_count
+    }
+
+    pub(crate) fn should_record_generated_property_store_probe_miss_detail(&self) -> bool {
+        self.generated_property_store_probe_misses.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+    }
+
+    pub(crate) fn record_generated_property_store_probe_miss_count(&mut self, count: usize) {
+        self.generated_property_store_probe_miss_count = self
+            .generated_property_store_probe_miss_count
+            .saturating_add(count);
+    }
+
+    pub fn generated_property_store_mutation_rejections(
         &self,
     ) -> &[VmGeneratedPropertyStoreMutationRejectionRecord] {
         &self.generated_property_store_mutation_rejections
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn generated_property_store_mutation_readiness_records(
+    pub fn generated_property_store_mutation_readiness_records(
         &self,
     ) -> &[VmGeneratedPropertyStoreMutationReadinessRecord] {
         &self.generated_property_store_mutation_readiness_records
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn property_inline_cache_attachment_records(
+    pub fn property_inline_cache_attachment_records(
         &self,
     ) -> &[VmPropertyInlineCacheAttachmentRecord] {
         &self.property_inline_cache_attachment_records
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn property_inline_cache_clear_records(
-        &self,
-    ) -> &[VmPropertyInlineCacheClearRecord] {
+    pub fn property_inline_cache_clear_records(&self) -> &[VmPropertyInlineCacheClearRecord] {
         &self.property_inline_cache_clear_records
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn structure_stub_repatch_transactions(
+    pub fn structure_stub_repatch_transactions(
         &self,
     ) -> &[VmStructureStubRepatchTransactionRecord] {
         &self.structure_stub_repatch_transactions
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn structure_stub_access_case_link_records(
+    pub fn structure_stub_access_case_link_records(
         &self,
     ) -> &[VmStructureStubAccessCaseLinkRecord] {
         &self.structure_stub_access_case_links
@@ -391,11 +727,28 @@ impl VmTieringIntegration {
                 .any(|transaction| transaction.code_id == code_id)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn generated_guarded_property_load_probe_misses(
+    pub fn generated_guarded_property_load_probe_misses(
         &self,
     ) -> &[VmGeneratedGuardedPropertyLoadProbeMissRecord] {
         &self.generated_guarded_property_load_probe_misses
+    }
+
+    pub fn generated_guarded_property_load_probe_miss_count(&self) -> usize {
+        self.generated_guarded_property_load_probe_miss_count
+    }
+
+    pub(crate) fn should_record_generated_guarded_property_load_probe_miss_detail(
+        &self,
+        reason: GeneratedGuardedPropertyLoadProbeMissReason,
+    ) -> bool {
+        self.generated_guarded_property_load_probe_misses.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+            || generated_guarded_property_load_probe_miss_terminal(reason)
+    }
+
+    pub(crate) fn record_generated_guarded_property_load_probe_miss_count(&mut self, count: usize) {
+        self.generated_guarded_property_load_probe_miss_count = self
+            .generated_guarded_property_load_probe_miss_count
+            .saturating_add(count);
     }
 
     #[allow(dead_code)]
@@ -442,20 +795,29 @@ impl VmTieringIntegration {
                     && record.lifecycle.is_active()
             })
         {
+            if self.property_inline_cache_site_is_megamorphic_load(
+                record.owner,
+                record.bytecode_snapshot,
+                record.plan.slot,
+                record.bytecode_index,
+            ) {
+                continue;
+            }
             let plan = record.plan.clone();
             // Projection only suppresses repeated valid observations, not malformed metadata.
             PropertyLoadAccessCasePlanTable::new(owner, vec![plan.clone()])?;
-            let key = vm_property_load_access_case_plan_table_key(&plan);
-            if plans
-                .iter()
-                .any(|plan| vm_property_load_access_case_plan_table_key(plan) == key)
-            {
-                continue;
-            }
-            plans.push(plan);
+            vm_push_projected_property_load_access_case_plan(&mut plans, plan);
         }
 
         for attached in attached {
+            if self.property_inline_cache_site_is_megamorphic_load(
+                attached.owner,
+                attached.bytecode_snapshot,
+                attached.slot,
+                attached.bytecode_index,
+            ) {
+                continue;
+            }
             let Some(plan) = self.property_load_access_case_plan_from_attached_inline_cache(
                 owner,
                 bytecode_snapshot,
@@ -466,17 +828,18 @@ impl VmTieringIntegration {
             };
             // Projection only suppresses repeated valid attached metadata, not malformed metadata.
             PropertyLoadAccessCasePlanTable::new(owner, vec![plan.clone()])?;
-            let key = vm_property_load_access_case_plan_table_key(&plan);
-            if plans
-                .iter()
-                .any(|plan| vm_property_load_access_case_plan_table_key(plan) == key)
-            {
-                continue;
-            }
-            plans.push(plan);
+            vm_push_projected_property_load_access_case_plan(&mut plans, plan);
         }
 
         for candidate in structure_stubs {
+            if self.property_inline_cache_site_is_megamorphic_load(
+                candidate.owner,
+                candidate.bytecode_snapshot,
+                candidate.slot,
+                candidate.bytecode_index,
+            ) {
+                continue;
+            }
             let Some(plan) = self.property_load_access_case_plan_from_structure_stub_descriptor(
                 owner,
                 bytecode_snapshot,
@@ -487,17 +850,30 @@ impl VmTieringIntegration {
             };
             // Projection only suppresses repeated valid descriptor metadata, not malformed metadata.
             PropertyLoadAccessCasePlanTable::new(owner, vec![plan.clone()])?;
-            let key = vm_property_load_access_case_plan_table_key(&plan);
-            if plans
-                .iter()
-                .any(|plan| vm_property_load_access_case_plan_table_key(plan) == key)
-            {
-                continue;
-            }
-            plans.push(plan);
+            vm_push_projected_property_load_access_case_plan(&mut plans, plan);
         }
 
         PropertyLoadAccessCasePlanTable::new(owner, plans)
+    }
+
+    pub(crate) fn property_inline_cache_site_is_megamorphic_load(
+        &self,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        slot: InlineCacheSlotId,
+        bytecode_index: BytecodeIndex,
+    ) -> bool {
+        self.property_inline_cache_evolution_states
+            .iter()
+            .any(|state| {
+                state.site.owner == owner
+                    && state.site.bytecode_snapshot == bytecode_snapshot
+                    && state.site.slot == slot
+                    && state.site.bytecode_index == bytecode_index
+                    && state.site.kind == VmPropertyInlineCacheEvolutionKind::Load
+                    && state.terminal
+                        == Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad)
+            })
     }
 
     #[allow(dead_code)]
@@ -519,14 +895,7 @@ impl VmTieringIntegration {
             let plan = record.plan.clone();
             // Projection only suppresses repeated valid observations, not malformed metadata.
             PropertyStoreAccessCasePlanTable::new(owner, vec![plan.clone()])?;
-            let key = vm_property_store_access_case_plan_table_key(&plan);
-            if plans
-                .iter()
-                .any(|plan| vm_property_store_access_case_plan_table_key(plan) == key)
-            {
-                continue;
-            }
-            plans.push(plan);
+            vm_push_projected_property_store_access_case_plan(&mut plans, plan);
         }
         PropertyStoreAccessCasePlanTable::new(owner, plans)
     }
@@ -568,14 +937,7 @@ impl VmTieringIntegration {
 
             // Projection only suppresses repeated valid readiness records, not malformed metadata.
             PropertyStoreMutationCandidateTable::new(owner, vec![candidate.clone()])?;
-            let key = vm_property_store_mutation_candidate_table_key(&candidate);
-            if candidates
-                .iter()
-                .any(|candidate| vm_property_store_mutation_candidate_table_key(candidate) == key)
-            {
-                continue;
-            }
-            candidates.push(candidate);
+            vm_push_projected_property_store_mutation_candidate(&mut candidates, candidate);
         }
 
         for attached in attached {
@@ -590,14 +952,7 @@ impl VmTieringIntegration {
             };
             // Projection only suppresses repeated valid attached metadata, not malformed metadata.
             PropertyStoreMutationCandidateTable::new(owner, vec![candidate.clone()])?;
-            let key = vm_property_store_mutation_candidate_table_key(&candidate);
-            if candidates
-                .iter()
-                .any(|candidate| vm_property_store_mutation_candidate_table_key(candidate) == key)
-            {
-                continue;
-            }
-            candidates.push(candidate);
+            vm_push_projected_property_store_mutation_candidate(&mut candidates, candidate);
         }
 
         PropertyStoreMutationCandidateTable::new(owner, candidates)
@@ -1214,15 +1569,11 @@ impl VmTieringIntegration {
         &self.baseline_executable_materializations
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn baseline_native_entry_readiness_records(
-        &self,
-    ) -> &[BaselineNativeEntryReadinessRecord] {
+    pub fn baseline_native_entry_readiness_records(&self) -> &[BaselineNativeEntryReadinessRecord] {
         &self.baseline_native_entry_readiness_records
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn baseline_machine_code_emission_provenance_records(
+    pub fn baseline_machine_code_emission_provenance_records(
         &self,
     ) -> &[BaselineMachineCodeEmissionProvenanceRecord] {
         &self.baseline_machine_code_emission_provenance_records
@@ -1230,6 +1581,144 @@ impl VmTieringIntegration {
 
     pub fn baseline_generated_code_artifacts(&self) -> &[BaselineGeneratedCodeArtifact] {
         &self.baseline_generated_code_artifacts
+    }
+
+    pub fn baseline_generated_execution_records(&self) -> &[VmBaselineGeneratedExecutionRecord] {
+        &self.baseline_generated_execution_records
+    }
+
+    pub fn baseline_generated_execution_summaries(&self) -> &[VmBaselineGeneratedExecutionSummary] {
+        &self.baseline_generated_execution_summaries
+    }
+
+    pub fn baseline_generated_execution_count(&self) -> usize {
+        self.baseline_generated_execution_count
+    }
+
+    pub fn baseline_generated_executed_bytecode_count(&self) -> u64 {
+        self.baseline_generated_executed_bytecode_count
+    }
+
+    pub fn generated_direct_call_transaction_records(
+        &self,
+    ) -> &[VmGeneratedDirectCallTransactionRecord] {
+        &self.generated_direct_call_transaction_records
+    }
+
+    pub fn generated_direct_call_transaction_summaries(
+        &self,
+    ) -> &[VmGeneratedDirectCallTransactionSummary] {
+        &self.generated_direct_call_transaction_summaries
+    }
+
+    pub fn generated_direct_call_transaction_count(&self) -> usize {
+        self.generated_direct_call_transaction_count
+    }
+
+    pub fn generated_direct_call_generated_entry_count(&self) -> usize {
+        self.generated_direct_call_generated_entry_count
+    }
+
+    pub fn generated_direct_call_native_entry_count(&self) -> usize {
+        self.generated_direct_call_native_entry_count
+    }
+
+    pub fn generated_direct_call_native_interpreter_fallback_count(&self) -> usize {
+        self.generated_direct_call_native_interpreter_fallback_count
+    }
+
+    pub fn generated_direct_call_nested_interpreter_fallback_count(&self) -> usize {
+        self.generated_direct_call_nested_interpreter_fallback_count
+    }
+
+    pub fn generated_direct_call_hot_slot_hit_count(&self) -> usize {
+        self.generated_direct_call_hot_slot_hit_count
+    }
+
+    pub fn generated_direct_call_sidecar_hot_slot_hit_count(&self) -> usize {
+        self.generated_direct_call_sidecar_hot_slot_hit_count
+    }
+
+    pub fn generated_direct_call_preferred_route_hit_count(&self) -> usize {
+        self.generated_direct_call_preferred_route_hit_count
+    }
+
+    pub fn generated_direct_call_rootless_generated_entry_count(&self) -> usize {
+        self.generated_direct_call_rootless_generated_entry_count
+    }
+
+    pub fn generated_direct_call_rootless_generated_entry_proof_cache_hit_count(&self) -> usize {
+        self.generated_direct_call_rootless_generated_entry_proof_cache_hit_count
+    }
+
+    pub fn generated_direct_call_rootless_native_entry_count(&self) -> usize {
+        self.generated_direct_call_rootless_native_entry_count
+    }
+
+    pub fn generated_direct_call_rootless_rejection_counts(
+        &self,
+    ) -> VmGeneratedDirectCallRootlessRejectionCounts {
+        self.generated_direct_call_rootless_rejection_counts
+    }
+
+    pub fn generated_direct_call_rootless_native_entry_rejection_counts(
+        &self,
+    ) -> VmGeneratedDirectCallRootlessRejectionCounts {
+        self.generated_direct_call_rootless_native_entry_rejection_counts
+    }
+
+    pub fn generated_direct_call_rootless_unsupported_body_opcode_counts(
+        &self,
+    ) -> &[VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount] {
+        &self.generated_direct_call_rootless_unsupported_body_opcode_counts
+    }
+
+    pub fn generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts(
+        &self,
+    ) -> &[VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount] {
+        &self.generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts
+    }
+
+    pub fn generated_direct_call_rootless_native_entry_retained_side_exit_counts(
+        &self,
+    ) -> &[VmGeneratedDirectCallRootlessRetainedSideExitCount] {
+        &self.generated_direct_call_rootless_native_entry_retained_side_exit_counts
+    }
+
+    pub fn generated_direct_call_rootless_preferred_native_entry_counts(
+        &self,
+    ) -> VmGeneratedDirectCallRootlessPreferredNativeEntryCounts {
+        self.generated_direct_call_rootless_preferred_native_entry_counts
+    }
+
+    pub fn baseline_entry_auto_materializations(
+        &self,
+    ) -> &[BaselineEntryAutoMaterializationRecord] {
+        &self.baseline_entry_auto_materializations
+    }
+
+    pub fn baseline_native_lowering_failure_count(&self) -> usize {
+        self.baseline_entry_auto_materializations
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.native_detail,
+                    Some(BaselineEntryAutoNativeMaterializationDetail::Lowering(_))
+                )
+            })
+            .count()
+    }
+
+    pub fn baseline_native_semantic_byte_emission_failure_count(&self) -> usize {
+        self.baseline_entry_auto_materializations
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.native_detail,
+                    Some(BaselineEntryAutoNativeMaterializationDetail::SemanticByteEmission(_))
+                )
+            })
+            .count()
     }
 
     #[allow(dead_code)]
@@ -1736,7 +2225,7 @@ impl VmTieringIntegration {
                             },
                         )
                     } else if let Some(invalidation) =
-                        self.baseline_generated_code_invalidation_for_artifact(artifact)
+                        self.baseline_generated_code_invalidation_for_artifact(&artifact)
                     {
                         (
                             Some(artifact.id),
@@ -1753,7 +2242,7 @@ impl VmTieringIntegration {
                         )
                     }
                 } else if let Some(invalidation) =
-                    self.baseline_generated_code_invalidation_for_artifact(artifact)
+                    self.baseline_generated_code_invalidation_for_artifact(&artifact)
                 {
                     (
                         Some(artifact.id),
@@ -1788,6 +2277,231 @@ impl VmTieringIntegration {
         };
         self.baseline_generated_code_invalidations.push(record);
         record
+    }
+
+    pub(crate) fn record_baseline_generated_execution(
+        &mut self,
+        request: VmBaselineGeneratedExecutionRequest,
+    ) -> VmBaselineGeneratedExecutionRecord {
+        let record = VmBaselineGeneratedExecutionRecord {
+            ordinal: self.next_record_ordinal(),
+            owner: request.owner,
+            bytecode_snapshot: request.bytecode_snapshot,
+            entry_kind: request.entry_kind,
+            current_tier: request.current_tier,
+            executed_bytecode_count: request.executed_bytecode_count,
+            outcome: request.outcome,
+        };
+        self.baseline_generated_execution_count =
+            self.baseline_generated_execution_count.saturating_add(1);
+        self.baseline_generated_executed_bytecode_count = self
+            .baseline_generated_executed_bytecode_count
+            .saturating_add(request.executed_bytecode_count);
+        if let Some(summary) = self
+            .baseline_generated_execution_summaries
+            .iter_mut()
+            .find(|summary| summary.owner == request.owner)
+        {
+            summary.record(request.executed_bytecode_count, request.outcome);
+        } else {
+            let mut summary = VmBaselineGeneratedExecutionSummary::new(request.owner);
+            summary.record(request.executed_bytecode_count, request.outcome);
+            self.baseline_generated_execution_summaries.push(summary);
+        }
+        if self.baseline_generated_execution_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.baseline_generated_execution_records.push(record);
+        }
+        record
+    }
+
+    pub(crate) fn record_generated_direct_call_transaction(
+        &mut self,
+        request: VmGeneratedDirectCallTransactionRequest,
+    ) -> VmGeneratedDirectCallTransactionRecord {
+        let record = VmGeneratedDirectCallTransactionRecord {
+            ordinal: self.next_record_ordinal(),
+            caller: request.caller,
+            call_bytecode_index: request.call_bytecode_index,
+            callee: request.callee,
+            target_code_block: request.target_code_block,
+            argument_count_including_this: request.argument_count_including_this,
+            route: request.route,
+            outcome: request.outcome,
+        };
+        self.generated_direct_call_transaction_count = self
+            .generated_direct_call_transaction_count
+            .saturating_add(1);
+        match request.route {
+            VmGeneratedDirectCallTransactionRoute::GeneratedEntry => {
+                self.generated_direct_call_generated_entry_count = self
+                    .generated_direct_call_generated_entry_count
+                    .saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionRoute::NativeEntry => {
+                self.generated_direct_call_native_entry_count = self
+                    .generated_direct_call_native_entry_count
+                    .saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionRoute::NativeEntryInterpreterFallback => {
+                self.generated_direct_call_native_interpreter_fallback_count = self
+                    .generated_direct_call_native_interpreter_fallback_count
+                    .saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionRoute::NestedInterpreterFallback => {
+                self.generated_direct_call_nested_interpreter_fallback_count = self
+                    .generated_direct_call_nested_interpreter_fallback_count
+                    .saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionRoute::FrameSetupFailed
+            | VmGeneratedDirectCallTransactionRoute::ContinuationAttachFailed => {}
+        }
+        if let Some(summary) = self
+            .generated_direct_call_transaction_summaries
+            .iter_mut()
+            .find(|summary| {
+                summary.caller == request.caller
+                    && summary.call_bytecode_index == request.call_bytecode_index
+                    && summary.target_code_block == request.target_code_block
+                    && summary.argument_count_including_this
+                        == request.argument_count_including_this
+                    && summary.route == request.route
+            })
+        {
+            summary.record(request.outcome);
+        } else {
+            let mut summary = VmGeneratedDirectCallTransactionSummary::new(
+                request.caller,
+                request.call_bytecode_index,
+                request.target_code_block,
+                request.argument_count_including_this,
+                request.route,
+            );
+            summary.record(request.outcome);
+            self.generated_direct_call_transaction_summaries
+                .push(summary);
+        }
+        if self.generated_direct_call_transaction_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        {
+            self.generated_direct_call_transaction_records.push(record);
+        }
+        record
+    }
+
+    pub(crate) fn record_generated_direct_call_hot_slot_hit(&mut self) {
+        self.generated_direct_call_hot_slot_hit_count = self
+            .generated_direct_call_hot_slot_hit_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_generated_direct_call_sidecar_hot_slot_hits(&mut self, count: usize) {
+        self.generated_direct_call_sidecar_hot_slot_hit_count = self
+            .generated_direct_call_sidecar_hot_slot_hit_count
+            .saturating_add(count);
+    }
+
+    pub(crate) fn record_generated_direct_call_preferred_route_hit(&mut self) {
+        self.generated_direct_call_preferred_route_hit_count = self
+            .generated_direct_call_preferred_route_hit_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_generated_direct_call_rootless_generated_entry(&mut self) {
+        self.generated_direct_call_rootless_generated_entry_count = self
+            .generated_direct_call_rootless_generated_entry_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_generated_direct_call_rootless_generated_entry_proof_cache_hit(&mut self) {
+        self.generated_direct_call_rootless_generated_entry_proof_cache_hit_count = self
+            .generated_direct_call_rootless_generated_entry_proof_cache_hit_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_generated_direct_call_rootless_native_entry(&mut self) {
+        self.generated_direct_call_rootless_native_entry_count = self
+            .generated_direct_call_rootless_native_entry_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_generated_direct_call_rootless_rejection(
+        &mut self,
+        reason: VmGeneratedDirectCallRootlessRejectionReason,
+    ) {
+        self.generated_direct_call_rootless_rejection_counts
+            .record(reason);
+        if let VmGeneratedDirectCallRootlessRejectionReason::PreferredRouteNotGeneratedEntry {
+            native_entry_kind,
+        } = reason
+        {
+            self.generated_direct_call_rootless_preferred_native_entry_counts
+                .record(native_entry_kind);
+        }
+        let VmGeneratedDirectCallRootlessRejectionReason::UnsupportedBodyOpcode { opcode } = reason
+        else {
+            return;
+        };
+        if let Some(count) = self
+            .generated_direct_call_rootless_unsupported_body_opcode_counts
+            .iter_mut()
+            .find(|count| count.opcode == opcode)
+        {
+            count.count = count.count.saturating_add(1);
+            return;
+        }
+        self.generated_direct_call_rootless_unsupported_body_opcode_counts
+            .push(VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount { opcode, count: 1 });
+    }
+
+    pub(crate) fn record_generated_direct_call_rootless_native_entry_rejection(
+        &mut self,
+        reason: VmGeneratedDirectCallRootlessRejectionReason,
+    ) {
+        self.generated_direct_call_rootless_native_entry_rejection_counts
+            .record(reason);
+        let VmGeneratedDirectCallRootlessRejectionReason::UnsupportedBodyOpcode { opcode } = reason
+        else {
+            return;
+        };
+        if let Some(count) = self
+            .generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts
+            .iter_mut()
+            .find(|count| count.opcode == opcode)
+        {
+            count.count = count.count.saturating_add(1);
+            return;
+        }
+        self.generated_direct_call_rootless_native_entry_unsupported_body_opcode_counts
+            .push(VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount { opcode, count: 1 });
+    }
+
+    pub(crate) fn record_generated_direct_call_rootless_native_entry_retained_side_exit(
+        &mut self,
+        target_code_block: CodeBlockId,
+        bytecode_index: BytecodeIndex,
+        opcode: Option<CoreOpcode>,
+        reason: P6X86_64BaselineSelectedSideExitReason,
+    ) {
+        if let Some(count) = self
+            .generated_direct_call_rootless_native_entry_retained_side_exit_counts
+            .iter_mut()
+            .find(|count| {
+                count.target_code_block == target_code_block
+                    && count.bytecode_index == bytecode_index
+                    && count.opcode == opcode
+                    && count.reason == reason
+            })
+        {
+            count.count = count.count.saturating_add(1);
+            return;
+        }
+        self.generated_direct_call_rootless_native_entry_retained_side_exit_counts
+            .push(VmGeneratedDirectCallRootlessRetainedSideExitCount {
+                target_code_block,
+                bytecode_index,
+                opcode,
+                reason,
+                count: 1,
+            });
     }
 
     pub fn observe_interpreter_entry(
@@ -1853,7 +2567,7 @@ impl VmTieringIntegration {
         let thresholds = selection.thresholds;
         let baseline_entry_gate =
             self.baseline_entry_gate_for_plan(request.owner, selection.selected_plan);
-        let decision = decision_for_plan(selected_plan, policy, baseline_entry_gate);
+        let decision = decision_for_plan(selected_plan, policy, baseline_entry_gate.as_ref());
         let execution_path = execution_path_for_decision(decision);
         let profile = TierExecutionProfile {
             counters,
@@ -1898,14 +2612,17 @@ impl VmTieringIntegration {
             record.fallback_record_index = Some(fallback.ordinal);
         }
 
-        self.profile_records.push(TierProfileRecord {
-            ordinal,
-            owner: request.owner,
-            event: TierProfileEvent::Entry,
-            bytecode_index: request.bytecode_index,
-            counters,
-            selected_plan,
-        });
+        self.profile_entry_count = self.profile_entry_count.saturating_add(1);
+        if self.profile_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.profile_records.push(TierProfileRecord {
+                ordinal,
+                owner: request.owner,
+                event: TierProfileEvent::Entry,
+                bytecode_index: request.bytecode_index,
+                counters,
+                selected_plan,
+            });
+        }
         self.entry_decisions.push(record.clone());
         record
     }
@@ -1935,14 +2652,17 @@ impl VmTieringIntegration {
             (selected_plan, state.tiering.counters)
         };
         let ordinal = self.next_record_ordinal();
-        self.profile_records.push(TierProfileRecord {
-            ordinal,
-            owner,
-            event: TierProfileEvent::LoopBackedge,
-            bytecode_index: Some(bytecode_index),
-            counters,
-            selected_plan,
-        });
+        self.profile_loop_backedge_count = self.profile_loop_backedge_count.saturating_add(1);
+        if self.profile_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.profile_records.push(TierProfileRecord {
+                ordinal,
+                owner,
+                event: TierProfileEvent::LoopBackedge,
+                bytecode_index: Some(bytecode_index),
+                counters,
+                selected_plan,
+            });
+        }
         selected_plan
     }
 
@@ -2071,7 +2791,36 @@ impl VmTieringIntegration {
             descriptor: request.descriptor.clone(),
         };
         self.property_load_observations.push(record.clone());
+        let has_access_case_plan = plan.is_some();
         if let Some(plan) = plan {
+            let replaced_by_existing_case = self
+                .property_load_access_case_replaced_by_existing_handler_case(
+                    request.bytecode_snapshot,
+                    &plan,
+                );
+            let can_use_get_by_id_megamorphic =
+                vm_property_load_plan_can_use_get_by_id_megamorphic(&request.descriptor, &plan);
+            let evolution = self.consider_property_inline_cache_evolution_for_load_plan(
+                &request,
+                &plan,
+                replaced_by_existing_case,
+                can_use_get_by_id_megamorphic,
+            );
+            if matches!(
+                evolution.decision,
+                VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad
+                    | VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicLoad
+            ) {
+                self.record_property_load_megamorphic_cache_entry(
+                    &request,
+                    record.ordinal,
+                    evolution.ordinal,
+                    &plan,
+                );
+            }
+            if !evolution.decision.admits_plan() {
+                return Ok(record);
+            }
             let ordinal = self.next_record_ordinal();
             self.property_load_access_case_plans
                 .push(VmPropertyLoadAccessCasePlanRecord {
@@ -2084,6 +2833,59 @@ impl VmTieringIntegration {
                     lifecycle: VmPropertyLoadAccessCasePlanLifecycle::Active,
                     plan,
                 });
+        }
+        if !has_access_case_plan {
+            if vm_property_load_normalized_base_can_use_get_by_id_megamorphic(&request.descriptor) {
+                let evolution = self
+                    .consider_property_inline_cache_evolution_for_load_normalized(&request, true);
+                if matches!(
+                    evolution.decision,
+                    VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad
+                        | VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicLoad
+                ) {
+                    self.record_property_load_megamorphic_cache_prototype_entry_from_descriptor(
+                        &request,
+                        record.ordinal,
+                        evolution.ordinal,
+                    );
+                }
+            } else if vm_property_load_direct_prototype_can_use_get_by_id_megamorphic(
+                &request.descriptor,
+            ) {
+                let evolution = self
+                    .consider_property_inline_cache_evolution_for_load_prototype(&request, true);
+                if matches!(
+                    evolution.decision,
+                    VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad
+                        | VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicLoad
+                ) {
+                    self.record_property_load_megamorphic_cache_prototype_entry_from_descriptor(
+                        &request,
+                        record.ordinal,
+                        evolution.ordinal,
+                    );
+                }
+            } else {
+                let can_use_get_by_id_megamorphic =
+                    vm_property_load_miss_can_use_get_by_id_megamorphic(&request.descriptor);
+                if can_use_get_by_id_megamorphic {
+                    let evolution = self.consider_property_inline_cache_evolution_for_load_miss(
+                        &request,
+                        can_use_get_by_id_megamorphic,
+                    );
+                    if matches!(
+                        evolution.decision,
+                        VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad
+                            | VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicLoad
+                    ) {
+                        self.record_property_load_megamorphic_cache_miss_entry(
+                            &request,
+                            record.ordinal,
+                            evolution.ordinal,
+                        );
+                    }
+                }
+            }
         }
         if let Some(plan) = guard_plan {
             let ordinal = self.next_record_ordinal();
@@ -2127,6 +2929,1070 @@ impl VmTieringIntegration {
         Ok(record)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn record_property_has_observation(
+        &mut self,
+        request: VmPropertyHasObservationRequest,
+    ) -> Result<VmPropertyHasObservationRecord, InlineCacheValidationError> {
+        request.descriptor.validate()?;
+        if request.descriptor.owner != request.owner {
+            return Err(
+                InlineCacheValidationError::PropertyObservationHandoffOwnerMismatch {
+                    observation: request.owner,
+                    handoff: request.descriptor.owner,
+                },
+            );
+        }
+        if request.descriptor.bytecode_index != request.bytecode_index.offset() {
+            return Err(
+                InlineCacheValidationError::PropertyObservationHandoffBytecodeIndexMismatch {
+                    observation: request.bytecode_index.offset(),
+                    handoff: request.descriptor.bytecode_index,
+                },
+            );
+        }
+
+        let record = VmPropertyHasObservationRecord {
+            ordinal: self.next_record_ordinal(),
+            owner: request.owner,
+            frame: request.frame,
+            bytecode_index: request.bytecode_index,
+            bytecode_snapshot: request.bytecode_snapshot,
+            descriptor: request.descriptor.clone(),
+        };
+        self.property_has_observations.push(record.clone());
+        if vm_property_has_descriptor_can_use_in_by_id_megamorphic(&request.descriptor) {
+            let evolution =
+                self.consider_property_inline_cache_evolution_for_has_descriptor(&request, true);
+            if matches!(
+                evolution.decision,
+                VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicHas
+                    | VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicHas
+            ) {
+                let Some(base_structure) = request.descriptor.base_structure else {
+                    return Ok(record);
+                };
+                self.record_property_has_megamorphic_cache_entry(
+                    VmPropertyHasMegamorphicCacheEntryRequest {
+                        observation_ordinal: record.ordinal,
+                        evolution_ordinal: evolution.ordinal,
+                        owner: request.owner,
+                        frame: request.frame,
+                        bytecode_index: request.bytecode_index,
+                        bytecode_snapshot: request.bytecode_snapshot,
+                        slot: request.descriptor.slot,
+                        key: request.descriptor.key,
+                        base_structure,
+                        result: request.descriptor.result,
+                    },
+                );
+            }
+        }
+        Ok(record)
+    }
+
+    fn consider_property_inline_cache_evolution_for_load_plan(
+        &mut self,
+        request: &VmPropertyLoadObservationRequest,
+        plan: &PropertyLoadAccessCasePlan,
+        replaced_by_existing_case: bool,
+        can_use_get_by_id_megamorphic: bool,
+    ) -> VmPropertyInlineCacheEvolutionRecord {
+        let structure = plan
+            .access_case
+            .base_structure
+            .filter(|structure| *structure != StructureId::INVALID);
+        let key = matches!(
+            request.descriptor.cache_kind,
+            crate::jit::InlineCacheKind::ElementLoad
+        )
+        .then_some(plan.key);
+        self.consider_property_inline_cache_evolution(
+            VmPropertyInlineCacheEvolutionSite {
+                owner: request.owner,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot: plan.slot,
+                kind: VmPropertyInlineCacheEvolutionKind::Load,
+            },
+            structure,
+            key,
+            replaced_by_existing_case,
+            can_use_get_by_id_megamorphic,
+            false,
+            false,
+        )
+    }
+
+    fn consider_property_inline_cache_evolution_for_load_miss(
+        &mut self,
+        request: &VmPropertyLoadObservationRequest,
+        can_use_get_by_id_megamorphic: bool,
+    ) -> VmPropertyInlineCacheEvolutionRecord {
+        let structure = request
+            .descriptor
+            .base_structure
+            .filter(|structure| *structure != StructureId::INVALID);
+        self.consider_property_inline_cache_evolution(
+            VmPropertyInlineCacheEvolutionSite {
+                owner: request.owner,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot: request.descriptor.slot,
+                kind: VmPropertyInlineCacheEvolutionKind::Load,
+            },
+            structure,
+            None,
+            false,
+            can_use_get_by_id_megamorphic,
+            false,
+            false,
+        )
+    }
+
+    fn consider_property_inline_cache_evolution_for_load_normalized(
+        &mut self,
+        request: &VmPropertyLoadObservationRequest,
+        can_use_get_by_id_megamorphic: bool,
+    ) -> VmPropertyInlineCacheEvolutionRecord {
+        let structure = request
+            .descriptor
+            .base_structure
+            .filter(|structure| *structure != StructureId::INVALID);
+        self.consider_property_inline_cache_evolution(
+            VmPropertyInlineCacheEvolutionSite {
+                owner: request.owner,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot: request.descriptor.slot,
+                kind: VmPropertyInlineCacheEvolutionKind::Load,
+            },
+            structure,
+            None,
+            false,
+            can_use_get_by_id_megamorphic,
+            false,
+            false,
+        )
+    }
+
+    fn consider_property_inline_cache_evolution_for_load_prototype(
+        &mut self,
+        request: &VmPropertyLoadObservationRequest,
+        can_use_get_by_id_megamorphic: bool,
+    ) -> VmPropertyInlineCacheEvolutionRecord {
+        let structure = request
+            .descriptor
+            .base_structure
+            .filter(|structure| *structure != StructureId::INVALID);
+        self.consider_property_inline_cache_evolution(
+            VmPropertyInlineCacheEvolutionSite {
+                owner: request.owner,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot: request.descriptor.slot,
+                kind: VmPropertyInlineCacheEvolutionKind::Load,
+            },
+            structure,
+            None,
+            false,
+            can_use_get_by_id_megamorphic,
+            false,
+            false,
+        )
+    }
+
+    fn consider_property_inline_cache_evolution_for_has_descriptor(
+        &mut self,
+        request: &VmPropertyHasObservationRequest,
+        can_use_in_by_id_megamorphic: bool,
+    ) -> VmPropertyInlineCacheEvolutionRecord {
+        let structure = request
+            .descriptor
+            .base_structure
+            .filter(|structure| *structure != StructureId::INVALID);
+        self.consider_property_inline_cache_evolution(
+            VmPropertyInlineCacheEvolutionSite {
+                owner: request.owner,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot: request.descriptor.slot,
+                kind: VmPropertyInlineCacheEvolutionKind::Has,
+            },
+            structure,
+            Some(request.descriptor.key),
+            false,
+            false,
+            false,
+            can_use_in_by_id_megamorphic,
+        )
+    }
+
+    fn record_property_load_megamorphic_cache_entry(
+        &mut self,
+        request: &VmPropertyLoadObservationRequest,
+        observation_ordinal: u64,
+        evolution_ordinal: u64,
+        plan: &PropertyLoadAccessCasePlan,
+    ) {
+        self.register_property_load_megamorphic_site(
+            request,
+            observation_ordinal,
+            evolution_ordinal,
+            plan.key,
+            plan.slot,
+        );
+
+        let Some(base_structure) = plan.access_case.base_structure else {
+            return;
+        };
+        let Some(offset) = plan.access_case.offset else {
+            return;
+        };
+        let Some(insert) = self.property_load_megamorphic_cache.insert_hit(
+            self.property_megamorphic_cache_epoch.current(),
+            plan.key,
+            base_structure,
+            offset,
+        ) else {
+            return;
+        };
+
+        if self
+            .property_load_megamorphic_cache_records
+            .iter()
+            .any(|record| {
+                record.owner == request.owner
+                    && record.bytecode_snapshot == request.bytecode_snapshot
+                    && record.plan.as_ref().is_some_and(|record_plan| {
+                        vm_property_load_access_case_plan_table_key(record_plan)
+                            == vm_property_load_access_case_plan_table_key(plan)
+                            || vm_property_load_access_case_can_replace(record_plan, plan)
+                    })
+            })
+        {
+            return;
+        }
+
+        let ordinal = self.next_record_ordinal();
+        self.property_load_megamorphic_cache_records
+            .push(VmPropertyLoadMegamorphicCacheRecord {
+                ordinal,
+                observation_ordinal,
+                evolution_ordinal,
+                owner: request.owner,
+                frame: request.frame,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot: plan.slot,
+                base_structure,
+                entry_kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData { offset },
+                plan: Some(plan.clone()),
+                cache_tier: insert.tier,
+                cache_index: insert.index,
+                cache_epoch: insert.epoch,
+            });
+    }
+
+    fn record_property_load_megamorphic_cache_miss_entry(
+        &mut self,
+        request: &VmPropertyLoadObservationRequest,
+        observation_ordinal: u64,
+        evolution_ordinal: u64,
+    ) {
+        let key = request.descriptor.key;
+        let slot = request.descriptor.slot;
+        self.register_property_load_megamorphic_site(
+            request,
+            observation_ordinal,
+            evolution_ordinal,
+            key,
+            slot,
+        );
+
+        let Some(base_structure) = request.descriptor.base_structure else {
+            return;
+        };
+        let Some(insert) = self.property_load_megamorphic_cache.insert_miss(
+            self.property_megamorphic_cache_epoch.current(),
+            key,
+            base_structure,
+        ) else {
+            return;
+        };
+
+        if self
+            .property_load_megamorphic_cache_records
+            .iter()
+            .any(|record| {
+                record.owner == request.owner
+                    && record.bytecode_snapshot == request.bytecode_snapshot
+                    && record.slot == slot
+                    && record.bytecode_index == request.bytecode_index
+                    && record.base_structure == base_structure
+                    && record.entry_kind == GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing
+                    && record.plan.is_none()
+            })
+        {
+            return;
+        }
+
+        let ordinal = self.next_record_ordinal();
+        self.property_load_megamorphic_cache_records
+            .push(VmPropertyLoadMegamorphicCacheRecord {
+                ordinal,
+                observation_ordinal,
+                evolution_ordinal,
+                owner: request.owner,
+                frame: request.frame,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot,
+                base_structure,
+                entry_kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing,
+                plan: None,
+                cache_tier: insert.tier,
+                cache_index: insert.index,
+                cache_epoch: insert.epoch,
+            });
+    }
+
+    fn record_property_load_megamorphic_cache_prototype_entry_from_descriptor(
+        &mut self,
+        request: &VmPropertyLoadObservationRequest,
+        observation_ordinal: u64,
+        evolution_ordinal: u64,
+    ) {
+        let key = request.descriptor.key;
+        let slot = request.descriptor.slot;
+        self.register_property_load_megamorphic_site(
+            request,
+            observation_ordinal,
+            evolution_ordinal,
+            key,
+            slot,
+        );
+
+        let Some(base_structure) = request.descriptor.base_structure else {
+            return;
+        };
+        let Some(holder) = request.descriptor.holder_object else {
+            return;
+        };
+        let Some(offset) = request.descriptor.offset else {
+            return;
+        };
+        let entry_kind =
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData { holder, offset };
+        let Some(insert) = self.property_load_megamorphic_cache.insert_prototype(
+            self.property_megamorphic_cache_epoch.current(),
+            key,
+            base_structure,
+            holder,
+            offset,
+        ) else {
+            return;
+        };
+
+        if self
+            .property_load_megamorphic_cache_records
+            .iter()
+            .any(|record| {
+                record.owner == request.owner
+                    && record.bytecode_snapshot == request.bytecode_snapshot
+                    && record.slot == slot
+                    && record.bytecode_index == request.bytecode_index
+                    && record.base_structure == base_structure
+                    && record.entry_kind == entry_kind
+                    && record.plan.is_none()
+            })
+        {
+            return;
+        }
+
+        let ordinal = self.next_record_ordinal();
+        self.property_load_megamorphic_cache_records
+            .push(VmPropertyLoadMegamorphicCacheRecord {
+                ordinal,
+                observation_ordinal,
+                evolution_ordinal,
+                owner: request.owner,
+                frame: request.frame,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot,
+                base_structure,
+                entry_kind,
+                plan: None,
+                cache_tier: insert.tier,
+                cache_index: insert.index,
+                cache_epoch: insert.epoch,
+            });
+    }
+
+    fn record_property_load_megamorphic_cache_prototype_entry_from_materialization(
+        &mut self,
+        materialization: &VmPropertyLoadGuardWatchpointMaterializationRecord,
+    ) {
+        if !matches!(
+            materialization.outcome,
+            VmPropertyLoadGuardWatchpointMaterializationOutcome::Accepted { .. }
+        ) || materialization.lifecycle
+            != VmPropertyLoadGuardWatchpointMaterializationLifecycle::Active
+        {
+            return;
+        }
+        let Some(guard_plan_ordinal) = materialization.guard_plan_ordinal else {
+            return;
+        };
+        let Some(guard_plan_record) = self
+            .property_load_guard_plans
+            .iter()
+            .find(|record| record.ordinal == guard_plan_ordinal && record.lifecycle.is_active())
+            .cloned()
+        else {
+            return;
+        };
+        let Some(observation) = self
+            .property_load_observations
+            .iter()
+            .find(|record| record.ordinal == guard_plan_record.observation_ordinal)
+        else {
+            return;
+        };
+        if !vm_property_load_prototype_can_use_get_by_id_megamorphic(
+            &observation.descriptor,
+            &guard_plan_record.plan,
+        ) {
+            return;
+        }
+        let Some(evolution_ordinal) = self.property_load_megamorphic_terminal_evolution_ordinal(
+            guard_plan_record.owner,
+            guard_plan_record.bytecode_snapshot,
+            guard_plan_record.plan.slot,
+            guard_plan_record.bytecode_index,
+        ) else {
+            return;
+        };
+
+        let key = guard_plan_record.plan.descriptor.key;
+        let base_structure = guard_plan_record.plan.descriptor.base_structure;
+        let Some(holder) = guard_plan_record.plan.descriptor.holder_object else {
+            return;
+        };
+        let Some(offset) = guard_plan_record.plan.descriptor.offset else {
+            return;
+        };
+        let entry_kind =
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData { holder, offset };
+        let Some(insert) = self.property_load_megamorphic_cache.insert_prototype(
+            self.property_megamorphic_cache_epoch.current(),
+            key,
+            base_structure,
+            holder,
+            offset,
+        ) else {
+            return;
+        };
+
+        if self
+            .property_load_megamorphic_cache_records
+            .iter()
+            .any(|record| {
+                record.owner == guard_plan_record.owner
+                    && record.bytecode_snapshot == guard_plan_record.bytecode_snapshot
+                    && record.slot == guard_plan_record.plan.slot
+                    && record.bytecode_index == guard_plan_record.bytecode_index
+                    && record.base_structure == base_structure
+                    && record.entry_kind == entry_kind
+                    && record.plan.is_none()
+            })
+        {
+            return;
+        }
+
+        let ordinal = self.next_record_ordinal();
+        self.property_load_megamorphic_cache_records
+            .push(VmPropertyLoadMegamorphicCacheRecord {
+                ordinal,
+                observation_ordinal: guard_plan_record.observation_ordinal,
+                evolution_ordinal,
+                owner: guard_plan_record.owner,
+                frame: guard_plan_record.frame,
+                bytecode_index: guard_plan_record.bytecode_index,
+                bytecode_snapshot: guard_plan_record.bytecode_snapshot,
+                slot: guard_plan_record.plan.slot,
+                base_structure,
+                entry_kind,
+                plan: None,
+                cache_tier: insert.tier,
+                cache_index: insert.index,
+                cache_epoch: insert.epoch,
+            });
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_property_load_megamorphic_cache_collection_completion(
+        &mut self,
+        kind: CollectionKind,
+    ) -> Option<VmPropertyLoadMegamorphicCacheAgingRecord> {
+        let full_collection = match kind {
+            CollectionKind::Eden => false,
+            CollectionKind::Full => true,
+            CollectionKind::Any => return None,
+        };
+        Some(self.record_property_load_megamorphic_cache_age(
+            VmPropertyLoadMegamorphicCacheAgingTrigger::CollectionCompletion { kind },
+            full_collection,
+        ))
+    }
+
+    pub(crate) fn record_property_load_megamorphic_cache_structure_chain_invalidation(
+        &mut self,
+    ) -> VmPropertyLoadMegamorphicCacheAgingRecord {
+        self.record_property_load_megamorphic_cache_age(
+            VmPropertyLoadMegamorphicCacheAgingTrigger::StructureChainInvalidation,
+            false,
+        )
+    }
+
+    fn record_property_load_megamorphic_cache_age(
+        &mut self,
+        trigger: VmPropertyLoadMegamorphicCacheAgingTrigger,
+        full_collection: bool,
+    ) -> VmPropertyLoadMegamorphicCacheAgingRecord {
+        let sequence = self
+            .property_load_megamorphic_cache_aging_records
+            .len()
+            .saturating_add(1);
+        let epoch_before = self.property_megamorphic_cache_epoch.current();
+        let entry_count_before = self
+            .property_load_megamorphic_cache
+            .current_entry_count(epoch_before);
+        let store_entry_count_before = self
+            .property_store_megamorphic_cache
+            .current_entry_count(epoch_before);
+        let has_entry_count_before = self
+            .property_has_megamorphic_cache
+            .current_entry_count(epoch_before);
+        let wrapped_epoch = self.property_megamorphic_cache_epoch.age();
+        if full_collection || wrapped_epoch {
+            self.property_load_megamorphic_cache.invalidate_entries();
+            self.property_store_megamorphic_cache.invalidate_entries();
+            self.property_has_megamorphic_cache.invalidate_entries();
+        }
+        let epoch_after = self.property_megamorphic_cache_epoch.current();
+        let record = VmPropertyLoadMegamorphicCacheAgingRecord {
+            sequence,
+            trigger,
+            epoch_before,
+            epoch_after,
+            entry_count_before,
+            entry_count_after: self
+                .property_load_megamorphic_cache
+                .current_entry_count(epoch_after),
+            store_entry_count_before,
+            store_entry_count_after: self
+                .property_store_megamorphic_cache
+                .current_entry_count(epoch_after),
+            has_entry_count_before,
+            has_entry_count_after: self
+                .property_has_megamorphic_cache
+                .current_entry_count(epoch_after),
+            full_collection,
+        };
+        self.property_load_megamorphic_cache_aging_records
+            .push(record);
+        record
+    }
+
+    fn property_load_megamorphic_terminal_evolution_ordinal(
+        &self,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        slot: InlineCacheSlotId,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<u64> {
+        let site = VmPropertyInlineCacheEvolutionSite {
+            owner,
+            bytecode_index,
+            bytecode_snapshot,
+            slot,
+            kind: VmPropertyInlineCacheEvolutionKind::Load,
+        };
+        let state = self
+            .property_inline_cache_evolution_states
+            .iter()
+            .find(|state| state.site == site)?;
+        if state.terminal != Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad) {
+            return None;
+        }
+        self.property_inline_cache_evolution_records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.owner == owner
+                    && record.bytecode_snapshot == bytecode_snapshot
+                    && record.slot == slot
+                    && record.bytecode_index == bytecode_index
+                    && record.kind == VmPropertyInlineCacheEvolutionKind::Load
+                    && record.counters_after.terminal
+                        == Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad)
+            })
+            .map(|record| record.ordinal)
+    }
+
+    fn register_property_load_megamorphic_site(
+        &mut self,
+        request: &VmPropertyLoadObservationRequest,
+        observation_ordinal: u64,
+        evolution_ordinal: u64,
+        key: CacheKey,
+        slot: InlineCacheSlotId,
+    ) {
+        if self.property_load_megamorphic_sites.iter().any(|site| {
+            site.owner == request.owner
+                && site.bytecode_snapshot == request.bytecode_snapshot
+                && site.slot == slot
+                && site.bytecode_index == request.bytecode_index
+                && site.key == key
+        }) {
+            return;
+        }
+
+        let ordinal = self.next_record_ordinal();
+        self.property_load_megamorphic_sites
+            .push(VmPropertyLoadMegamorphicSiteRecord {
+                ordinal,
+                observation_ordinal,
+                evolution_ordinal,
+                owner: request.owner,
+                frame: request.frame,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot,
+                key,
+            });
+    }
+
+    fn record_property_store_megamorphic_cache_entry(
+        &mut self,
+        request: &VmPropertyStoreObservationRequest,
+        observation_ordinal: u64,
+        evolution_ordinal: u64,
+        plan: &PropertyStoreAccessCasePlan,
+    ) {
+        if !vm_property_store_plan_can_use_put_by_id_megamorphic(&request.descriptor, plan) {
+            return;
+        }
+        self.register_property_store_megamorphic_site(
+            request,
+            observation_ordinal,
+            evolution_ordinal,
+            plan.key,
+            plan.slot,
+        );
+
+        let Some(old_structure) = plan.access_case.base_structure else {
+            return;
+        };
+        let Some(offset) = plan.access_case.offset else {
+            return;
+        };
+        let (new_structure, insert) = match plan.plan_kind {
+            PropertyStoreAccessCasePlanKind::DataOnlyReplace => {
+                let Some(insert) = self.property_store_megamorphic_cache.insert_replace(
+                    self.property_megamorphic_cache_epoch.current(),
+                    plan.key,
+                    old_structure,
+                    offset,
+                ) else {
+                    return;
+                };
+                (old_structure, insert)
+            }
+            PropertyStoreAccessCasePlanKind::DataOnlyTransition => {
+                let Some(new_structure) = plan.access_case.new_structure else {
+                    return;
+                };
+                let Some(insert) = self.property_store_megamorphic_cache.insert_transition(
+                    self.property_megamorphic_cache_epoch.current(),
+                    plan.key,
+                    old_structure,
+                    new_structure,
+                    offset,
+                    false,
+                ) else {
+                    return;
+                };
+                (new_structure, insert)
+            }
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore
+            | PropertyStoreAccessCasePlanKind::Unsupported => return,
+        };
+
+        if self
+            .property_store_megamorphic_cache_records
+            .iter()
+            .any(|record| {
+                record.owner == request.owner
+                    && record.bytecode_snapshot == request.bytecode_snapshot
+                    && (vm_property_store_access_case_plan_table_key(&record.plan)
+                        == vm_property_store_access_case_plan_table_key(plan)
+                        || vm_property_store_access_case_can_replace(&record.plan, plan))
+            })
+        {
+            return;
+        }
+
+        let ordinal = self.next_record_ordinal();
+        self.property_store_megamorphic_cache_records
+            .push(VmPropertyStoreMegamorphicCacheRecord {
+                ordinal,
+                observation_ordinal,
+                evolution_ordinal,
+                owner: request.owner,
+                frame: request.frame,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot: plan.slot,
+                key: plan.key,
+                plan_kind: plan.plan_kind,
+                old_structure,
+                new_structure,
+                offset,
+                reallocating: false,
+                plan: plan.clone(),
+                cache_tier: insert.tier,
+                cache_index: insert.index,
+                cache_epoch: insert.epoch,
+            });
+    }
+
+    fn register_property_store_megamorphic_site(
+        &mut self,
+        request: &VmPropertyStoreObservationRequest,
+        observation_ordinal: u64,
+        evolution_ordinal: u64,
+        key: CacheKey,
+        slot: InlineCacheSlotId,
+    ) {
+        if self.property_store_megamorphic_sites.iter().any(|site| {
+            site.owner == request.owner
+                && site.bytecode_snapshot == request.bytecode_snapshot
+                && site.slot == slot
+                && site.bytecode_index == request.bytecode_index
+                && site.key == key
+        }) {
+            return;
+        }
+
+        let ordinal = self.next_record_ordinal();
+        self.property_store_megamorphic_sites
+            .push(VmPropertyStoreMegamorphicSiteRecord {
+                ordinal,
+                observation_ordinal,
+                evolution_ordinal,
+                owner: request.owner,
+                frame: request.frame,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot,
+                key,
+            });
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_property_has_megamorphic_cache_entry(
+        &mut self,
+        request: VmPropertyHasMegamorphicCacheEntryRequest,
+    ) -> Option<VmPropertyHasMegamorphicCacheRecord> {
+        if !vm_property_has_megamorphic_cache_key_supported(request.key)
+            || request.base_structure == StructureId::INVALID
+        {
+            return None;
+        }
+
+        self.register_property_has_megamorphic_site(&request);
+        let insert = if request.result {
+            self.property_has_megamorphic_cache.insert_hit(
+                self.property_megamorphic_cache_epoch.current(),
+                request.key,
+                request.base_structure,
+            )
+        } else {
+            self.property_has_megamorphic_cache.insert_miss(
+                self.property_megamorphic_cache_epoch.current(),
+                request.key,
+                request.base_structure,
+            )
+        }?;
+
+        if self
+            .property_has_megamorphic_cache_records
+            .iter()
+            .any(|record| {
+                record.owner == request.owner
+                    && record.bytecode_snapshot == request.bytecode_snapshot
+                    && record.slot == request.slot
+                    && record.bytecode_index == request.bytecode_index
+                    && record.key == request.key
+                    && record.base_structure == request.base_structure
+                    && record.result == request.result
+            })
+        {
+            return None;
+        }
+
+        let record = VmPropertyHasMegamorphicCacheRecord {
+            ordinal: self.next_record_ordinal(),
+            observation_ordinal: request.observation_ordinal,
+            evolution_ordinal: request.evolution_ordinal,
+            owner: request.owner,
+            frame: request.frame,
+            bytecode_index: request.bytecode_index,
+            bytecode_snapshot: request.bytecode_snapshot,
+            slot: request.slot,
+            key: request.key,
+            base_structure: request.base_structure,
+            result: request.result,
+            cache_tier: insert.tier,
+            cache_index: insert.index,
+            cache_epoch: insert.epoch,
+        };
+        self.property_has_megamorphic_cache_records
+            .push(record.clone());
+        Some(record)
+    }
+
+    fn register_property_has_megamorphic_site(
+        &mut self,
+        request: &VmPropertyHasMegamorphicCacheEntryRequest,
+    ) {
+        if self.property_has_megamorphic_sites.iter().any(|site| {
+            site.owner == request.owner
+                && site.bytecode_snapshot == request.bytecode_snapshot
+                && site.slot == request.slot
+                && site.bytecode_index == request.bytecode_index
+                && site.key == request.key
+        }) {
+            return;
+        }
+
+        let ordinal = self.next_record_ordinal();
+        self.property_has_megamorphic_sites
+            .push(VmPropertyHasMegamorphicSiteRecord {
+                ordinal,
+                observation_ordinal: request.observation_ordinal,
+                evolution_ordinal: request.evolution_ordinal,
+                owner: request.owner,
+                frame: request.frame,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot: request.slot,
+                key: request.key,
+            });
+    }
+
+    fn property_load_access_case_replaced_by_existing_handler_case(
+        &self,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        candidate: &PropertyLoadAccessCasePlan,
+    ) -> bool {
+        self.property_load_access_case_plans.iter().any(|record| {
+            record.bytecode_snapshot == bytecode_snapshot
+                && matches!(
+                    record.lifecycle,
+                    VmPropertyLoadAccessCasePlanLifecycle::Active
+                        | VmPropertyLoadAccessCasePlanLifecycle::Attached { .. }
+                )
+                && vm_property_load_access_case_can_replace(&record.plan, candidate)
+        })
+    }
+
+    fn property_store_access_case_replaced_by_existing_handler_case(
+        &self,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        candidate: &PropertyStoreAccessCasePlan,
+    ) -> bool {
+        self.property_store_access_case_plans.iter().any(|record| {
+            record.bytecode_snapshot == bytecode_snapshot
+                && matches!(
+                    record.lifecycle,
+                    VmPropertyStoreAccessCasePlanLifecycle::Active
+                        | VmPropertyStoreAccessCasePlanLifecycle::Attached { .. }
+                )
+                && vm_property_store_access_case_can_replace(&record.plan, candidate)
+        })
+    }
+
+    fn consider_property_inline_cache_evolution_for_store_plan(
+        &mut self,
+        request: &VmPropertyStoreObservationRequest,
+        plan: &PropertyStoreAccessCasePlan,
+        replaced_by_existing_case: bool,
+    ) -> VmPropertyInlineCacheEvolutionRecord {
+        let structure = plan
+            .access_case
+            .base_structure
+            .filter(|structure| *structure != StructureId::INVALID);
+        let key = matches!(
+            request.descriptor.cache_kind,
+            crate::jit::InlineCacheKind::ElementStore
+        )
+        .then_some(plan.key);
+        self.consider_property_inline_cache_evolution(
+            VmPropertyInlineCacheEvolutionSite {
+                owner: request.owner,
+                bytecode_index: request.bytecode_index,
+                bytecode_snapshot: request.bytecode_snapshot,
+                slot: plan.slot,
+                kind: VmPropertyInlineCacheEvolutionKind::Store,
+            },
+            structure,
+            key,
+            replaced_by_existing_case,
+            false,
+            vm_property_store_plan_can_use_put_by_id_megamorphic(&request.descriptor, plan),
+            false,
+        )
+    }
+
+    fn consider_property_inline_cache_evolution(
+        &mut self,
+        site: VmPropertyInlineCacheEvolutionSite,
+        structure: Option<StructureId>,
+        key: Option<CacheKey>,
+        replaced_by_existing_case: bool,
+        can_use_get_by_id_megamorphic: bool,
+        can_use_put_by_id_megamorphic: bool,
+        can_use_in_by_id_megamorphic: bool,
+    ) -> VmPropertyInlineCacheEvolutionRecord {
+        let state_index = if let Some(index) = self
+            .property_inline_cache_evolution_states
+            .iter()
+            .position(|state| state.site == site)
+        {
+            index
+        } else {
+            self.property_inline_cache_evolution_states
+                .push(VmPropertyInlineCacheEvolutionState::new(site));
+            self.property_inline_cache_evolution_states.len() - 1
+        };
+
+        let (decision, counters_before, counters_after) = {
+            let state = &mut self.property_inline_cache_evolution_states[state_index];
+            let counters_before = state.counters();
+            let mut decision = match state.terminal {
+                Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp) => {
+                    VmPropertyInlineCacheEvolutionDecision::SkippedGaveUp
+                }
+                Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad) => {
+                    VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicLoad
+                }
+                Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicStore) => {
+                    VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicStore
+                }
+                Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicHas) => {
+                    VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicHas
+                }
+                None if state.countdown == 0 => {
+                    state.repatch_count = state.repatch_count.saturating_add(1);
+                    let decision = if state.repatch_count > PROPERTY_IC_REPATCH_COUNT_FOR_COOLDOWN {
+                        state.repatch_count = 0;
+                        state.countdown =
+                            property_inline_cache_evolution_cooldown(state.number_of_cooldowns);
+                        state.number_of_cooldowns = state.number_of_cooldowns.saturating_add(1);
+                        state.buffering_countdown = 0;
+                        VmPropertyInlineCacheEvolutionDecision::Admitted
+                    } else if state.buffering_countdown == 0 {
+                        VmPropertyInlineCacheEvolutionDecision::Admitted
+                    } else {
+                        state.buffering_countdown = state.buffering_countdown.saturating_sub(1);
+                        if let Some(structure) = structure {
+                            let buffered =
+                                VmPropertyInlineCacheBufferedStructureKey { structure, key };
+                            if state.buffered_structures.contains(&buffered) {
+                                VmPropertyInlineCacheEvolutionDecision::SkippedBufferedDuplicate
+                            } else {
+                                state.buffered_structures.push(buffered);
+                                VmPropertyInlineCacheEvolutionDecision::Admitted
+                            }
+                        } else {
+                            VmPropertyInlineCacheEvolutionDecision::Admitted
+                        }
+                    };
+                    decision
+                }
+                None => {
+                    state.countdown = state.countdown.saturating_sub(1);
+                    if state.number_of_cooldowns == 0 && state.repatch_count == 0 {
+                        VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
+                    } else {
+                        VmPropertyInlineCacheEvolutionDecision::SkippedCooldown
+                    }
+                }
+            };
+            if decision == VmPropertyInlineCacheEvolutionDecision::Admitted
+                && replaced_by_existing_case
+            {
+                decision = VmPropertyInlineCacheEvolutionDecision::SkippedReplacedByExistingCase;
+            }
+            if decision == VmPropertyInlineCacheEvolutionDecision::Admitted {
+                state.all_accepted_cases_can_use_get_by_id_megamorphic &=
+                    can_use_get_by_id_megamorphic
+                        && site.kind == VmPropertyInlineCacheEvolutionKind::Load;
+                state.all_accepted_cases_can_use_put_by_id_megamorphic &=
+                    can_use_put_by_id_megamorphic
+                        && site.kind == VmPropertyInlineCacheEvolutionKind::Store;
+                state.all_accepted_cases_can_use_in_by_id_megamorphic &=
+                    can_use_in_by_id_megamorphic
+                        && site.kind == VmPropertyInlineCacheEvolutionKind::Has;
+                state.accepted_access_case_count = state
+                    .accepted_access_case_count
+                    .saturating_add(1)
+                    .min(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE);
+                if state.accepted_access_case_count >= PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE {
+                    if state.all_accepted_cases_can_use_get_by_id_megamorphic {
+                        state.terminal =
+                            Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad);
+                        decision = VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad;
+                    } else if state.all_accepted_cases_can_use_put_by_id_megamorphic {
+                        state.terminal =
+                            Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicStore);
+                        decision =
+                            VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicStore;
+                    } else if state.all_accepted_cases_can_use_in_by_id_megamorphic {
+                        state.terminal =
+                            Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicHas);
+                        decision = VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicHas;
+                    } else {
+                        state.terminal = Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp);
+                    }
+                }
+            }
+            let counters_after = state.counters();
+            (decision, counters_before, counters_after)
+        };
+
+        let record = VmPropertyInlineCacheEvolutionRecord {
+            ordinal: self.next_record_ordinal(),
+            owner: site.owner,
+            bytecode_index: site.bytecode_index,
+            bytecode_snapshot: site.bytecode_snapshot,
+            slot: site.slot,
+            kind: site.kind,
+            structure,
+            key,
+            decision,
+            counters_before,
+            counters_after,
+        };
+        self.property_inline_cache_evolution_records
+            .push(record.clone());
+        record
+    }
+
     pub(crate) fn record_property_store_observation(
         &mut self,
         request: VmPropertyStoreObservationRequest,
@@ -2167,6 +4033,31 @@ impl VmTieringIntegration {
         self.property_store_observations.push(record.clone());
         if let Some(plan) = vm_property_store_access_case_plan_from_observation(&record.descriptor)
         {
+            let replaced_by_existing_case = self
+                .property_store_access_case_replaced_by_existing_handler_case(
+                    request.bytecode_snapshot,
+                    &plan,
+                );
+            let evolution = self.consider_property_inline_cache_evolution_for_store_plan(
+                &request,
+                &plan,
+                replaced_by_existing_case,
+            );
+            if matches!(
+                evolution.decision,
+                VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicStore
+                    | VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicStore
+            ) {
+                self.record_property_store_megamorphic_cache_entry(
+                    &request,
+                    record.ordinal,
+                    evolution.ordinal,
+                    &plan,
+                );
+            }
+            if !evolution.decision.admits_plan() {
+                return Ok(record);
+            }
             let ordinal = self.next_record_ordinal();
             self.property_store_access_case_plans
                 .push(VmPropertyStoreAccessCasePlanRecord {
@@ -2262,6 +4153,25 @@ impl VmTieringIntegration {
                 });
         }
         Ok(record)
+    }
+
+    pub(crate) fn record_vm_owned_call_target_validation(
+        &mut self,
+        request: VmOwnedCallTargetValidationRequest,
+    ) -> VmOwnedCallTargetValidationRecord {
+        let record = VmOwnedCallTargetValidationRecord {
+            ordinal: self.next_record_ordinal(),
+            owner: request.owner,
+            frame: request.frame,
+            bytecode_index: request.bytecode_index,
+            opcode: request.opcode,
+            target_code_block: request.target_code_block,
+            expected_specialization: request.expected_specialization,
+            outcome: request.outcome,
+        };
+        self.vm_owned_call_target_validation_records
+            .push(record.clone());
+        record
     }
 
     pub(crate) fn record_call_link_boundary_validation(
@@ -2667,6 +4577,32 @@ impl VmTieringIntegration {
             candidates.push(candidate);
         }
 
+        for attachment in self
+            .call_link_inline_cache_attachment_records
+            .iter()
+            .filter(|attachment| {
+                attachment.owner == owner && attachment.bytecode_snapshot == bytecode_snapshot
+            })
+        {
+            let Some(plan) = validate_generated_call_link_metadata_only_polymorphic_candidate(
+                self,
+                owner,
+                bytecode_snapshot,
+                attachment,
+            )?
+            else {
+                continue;
+            };
+            let candidate =
+                generated_call_link_candidate_from_metadata_only_attachment(attachment, plan)?;
+            let semantic_key = generated_call_link_candidate_key_from_target(&candidate);
+            if semantic_keys.contains(&semantic_key) {
+                continue;
+            }
+            semantic_keys.push(semantic_key);
+            candidates.push(candidate);
+        }
+
         GeneratedCallLinkCandidateTable::new(owner, candidates)
     }
 
@@ -2711,6 +4647,7 @@ impl VmTieringIntegration {
         };
         self.property_load_guard_watchpoint_materializations
             .push(record.clone());
+        self.record_property_load_megamorphic_cache_prototype_entry_from_materialization(&record);
         record
     }
 
@@ -2950,8 +4887,13 @@ impl VmTieringIntegration {
             terminal,
             invalidated_plan_ordinals,
         };
-        self.generated_property_load_probe_misses
-            .push(record.clone());
+        self.generated_property_load_probe_miss_count = self
+            .generated_property_load_probe_miss_count
+            .saturating_add(1);
+        if self.generated_property_load_probe_misses.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.generated_property_load_probe_misses
+                .push(record.clone());
+        }
         record
     }
 
@@ -2980,8 +4922,13 @@ impl VmTieringIntegration {
             terminal: false,
             outcome,
         };
-        self.generated_property_store_probe_misses
-            .push(record.clone());
+        self.generated_property_store_probe_miss_count = self
+            .generated_property_store_probe_miss_count
+            .saturating_add(1);
+        if self.generated_property_store_probe_misses.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.generated_property_store_probe_misses
+                .push(record.clone());
+        }
         record
     }
 
@@ -3581,12 +5528,39 @@ impl VmTieringIntegration {
                     event_dispatch_ordinal: request.triggering_event_dispatch_ordinal,
                 };
             }
+            self.reset_property_inline_cache_evolution_after_clear(&request);
             self.retire_structure_stub_descriptor_records_for_clear(&record);
         }
 
         self.property_inline_cache_clear_records
             .push(record.clone());
         record
+    }
+
+    fn reset_property_inline_cache_evolution_after_clear(
+        &mut self,
+        request: &VmPropertyInlineCacheClearRequest,
+    ) {
+        let Some(kind) = property_inline_cache_evolution_kind_for_attachment_kind(request.kind)
+        else {
+            return;
+        };
+        let site = VmPropertyInlineCacheEvolutionSite {
+            owner: request.owner,
+            bytecode_index: request.bytecode_index,
+            bytecode_snapshot: request.bytecode_snapshot,
+            slot: request.slot,
+            kind,
+        };
+        let Some(state) = self
+            .property_inline_cache_evolution_states
+            .iter_mut()
+            .find(|state| state.site == site)
+        else {
+            return;
+        };
+        state.buffered_structures.clear();
+        state.buffering_countdown = PROPERTY_IC_REPATCH_BUFFERING_COUNTDOWN;
     }
 
     fn retire_structure_stub_descriptor_records_for_clear(
@@ -3769,8 +5743,15 @@ impl VmTieringIntegration {
             terminal,
             retired_guard_plan_ordinal,
         };
-        self.generated_guarded_property_load_probe_misses
-            .push(record.clone());
+        self.generated_guarded_property_load_probe_miss_count = self
+            .generated_guarded_property_load_probe_miss_count
+            .saturating_add(1);
+        if self.generated_guarded_property_load_probe_misses.len()
+            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        {
+            self.generated_guarded_property_load_probe_misses
+                .push(record.clone());
+        }
         record
     }
 
@@ -3917,6 +5898,36 @@ impl VmTieringIntegration {
             .find(|artifact| artifact.owner == owner)
     }
 
+    pub(crate) fn baseline_native_entry_gate_for_owner(
+        &self,
+        owner: CodeBlockId,
+    ) -> Option<BaselineEntryGateRecord> {
+        let native_artifact = self.baseline_entry_artifact_for(owner)?;
+        let native_artifact_has_valid_abi = native_artifact.has_valid_baseline_abi_proof();
+        let native_entry_readiness = self
+            .baseline_native_entry_readiness_for_artifact(native_artifact)
+            .cloned();
+        let native_entry_readiness_ordinal = native_entry_readiness
+            .as_ref()
+            .map(|readiness| readiness.ordinal);
+        let outcome = if !native_artifact_has_valid_abi {
+            BaselineEntryGateOutcome::InvalidAbiProof
+        } else {
+            native_entry_readiness
+                .as_ref()
+                .and_then(baseline_native_entry_readiness_gate_outcome)
+                .unwrap_or(BaselineEntryGateOutcome::NativeEntryReadinessMissing)
+        };
+        Some(BaselineEntryGateRecord {
+            owner,
+            requested_tier: JitType::Baseline,
+            native_artifact: Some(native_artifact),
+            native_entry_readiness_ordinal,
+            generated_artifact: None,
+            outcome,
+        })
+    }
+
     pub(crate) fn baseline_native_entry_readiness_by_ordinal(
         &self,
         ordinal: u64,
@@ -3996,32 +6007,64 @@ impl VmTieringIntegration {
         if artifact.owner != owner {
             return Err(JitCodeValidationError::BaselineGeneratedCodeOwnerMismatch);
         }
-        self.replace_baseline_generated_code_artifact(artifact);
+        self.replace_baseline_generated_code_artifact(artifact.clone());
         Ok(artifact)
+    }
+
+    pub(crate) fn record_baseline_entry_auto_materialization(
+        &mut self,
+        request: BaselineEntryAutoMaterializationRequest,
+    ) -> BaselineEntryAutoMaterializationRecord {
+        let record = BaselineEntryAutoMaterializationRecord {
+            ordinal: self.next_record_ordinal(),
+            owner: request.owner,
+            requested_tier: request.requested_tier,
+            native: request.native,
+            native_detail: request.native_detail,
+            generated: request.generated,
+        };
+        self.baseline_entry_auto_materializations
+            .push(record.clone());
+        record
     }
 
     pub(crate) fn baseline_generated_code_artifact_for(
         &self,
         owner: CodeBlockId,
     ) -> Option<BaselineGeneratedCodeArtifact> {
-        self.raw_baseline_generated_code_artifact_for(owner)
-            .filter(|artifact| !self.baseline_generated_code_artifact_is_invalidated(*artifact))
+        self.baseline_generated_code_artifact_ref_for(owner)
+            .cloned()
+    }
+
+    pub(crate) fn baseline_generated_code_artifact_ref_for(
+        &self,
+        owner: CodeBlockId,
+    ) -> Option<&BaselineGeneratedCodeArtifact> {
+        self.raw_baseline_generated_code_artifact_ref_for(owner)
+            .filter(|artifact| !self.baseline_generated_code_artifact_is_invalidated(artifact))
     }
 
     fn raw_baseline_generated_code_artifact_for(
         &self,
         owner: CodeBlockId,
     ) -> Option<BaselineGeneratedCodeArtifact> {
+        self.raw_baseline_generated_code_artifact_ref_for(owner)
+            .cloned()
+    }
+
+    fn raw_baseline_generated_code_artifact_ref_for(
+        &self,
+        owner: CodeBlockId,
+    ) -> Option<&BaselineGeneratedCodeArtifact> {
         self.baseline_generated_code_artifacts
             .iter()
             .rev()
-            .copied()
             .find(|artifact| artifact.owner == owner)
     }
 
     fn baseline_generated_code_artifact_is_invalidated(
         &self,
-        artifact: BaselineGeneratedCodeArtifact,
+        artifact: &BaselineGeneratedCodeArtifact,
     ) -> bool {
         self.baseline_generated_code_invalidation_for_artifact(artifact)
             .is_some()
@@ -4029,7 +6072,7 @@ impl VmTieringIntegration {
 
     fn baseline_generated_code_invalidation_for_artifact(
         &self,
-        artifact: BaselineGeneratedCodeArtifact,
+        artifact: &BaselineGeneratedCodeArtifact,
     ) -> Option<&BaselineGeneratedCodeInvalidationRecord> {
         let bytecode_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
         self.baseline_generated_code_invalidations
@@ -4070,7 +6113,8 @@ impl VmTieringIntegration {
         let native_artifact = self.baseline_entry_artifact_for(owner);
         let raw_generated_artifact = self.raw_baseline_generated_code_artifact_for(owner);
         let generated_artifact = raw_generated_artifact
-            .filter(|artifact| !self.baseline_generated_code_artifact_is_invalidated(*artifact));
+            .clone()
+            .filter(|artifact| !self.baseline_generated_code_artifact_is_invalidated(artifact));
         let invalidated_generated_artifact =
             raw_generated_artifact.is_some() && generated_artifact.is_none();
         let native_artifact_has_valid_abi = native_artifact
@@ -4083,7 +6127,9 @@ impl VmTieringIntegration {
         let native_entry_readiness_ordinal = native_entry_readiness
             .as_ref()
             .map(|readiness| readiness.ordinal);
-        let outcome = match (native_artifact, generated_artifact) {
+        let generated_artifact_for_gate = generated_artifact.clone();
+        let raw_generated_artifact_for_gate = raw_generated_artifact.clone();
+        let outcome = match (native_artifact, generated_artifact.as_ref()) {
             _ if !native_artifact_has_valid_abi => BaselineEntryGateOutcome::InvalidAbiProof,
             (_, Some(_)) => BaselineEntryGateOutcome::Eligible,
             (Some(_), None) => native_entry_readiness
@@ -4100,10 +6146,10 @@ impl VmTieringIntegration {
             requested_tier: plan.to_tier,
             native_artifact,
             native_entry_readiness_ordinal,
-            generated_artifact: if generated_artifact.is_some()
+            generated_artifact: if generated_artifact_for_gate.is_some()
                 || outcome == BaselineEntryGateOutcome::InvalidatedGeneratedArtifact
             {
-                generated_artifact.or(raw_generated_artifact)
+                generated_artifact_for_gate.or(raw_generated_artifact_for_gate)
             } else {
                 None
             },
@@ -4756,6 +6802,474 @@ pub(crate) enum BaselineGeneratedCodeInvalidationOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VmBaselineGeneratedExecutionRequest {
+    pub owner: CodeBlockId,
+    pub bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub entry_kind: ExecutionEntryKind,
+    pub current_tier: JitType,
+    pub executed_bytecode_count: u64,
+    pub outcome: VmBaselineGeneratedExecutionOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmBaselineGeneratedExecutionRecord {
+    pub ordinal: u64,
+    pub owner: CodeBlockId,
+    pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub entry_kind: ExecutionEntryKind,
+    pub current_tier: JitType,
+    pub executed_bytecode_count: u64,
+    pub outcome: VmBaselineGeneratedExecutionOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmBaselineGeneratedExecutionSummary {
+    pub owner: CodeBlockId,
+    pub execution_count: usize,
+    pub executed_bytecode_count: u64,
+    pub returned_count: usize,
+    pub threw_count: usize,
+    pub ordinary_bytecode_call_count: usize,
+    pub ordinary_bytecode_construct_count: usize,
+    pub function_value_call_count: usize,
+    pub terminated_count: usize,
+    pub suspended_count: usize,
+    pub failed_count: usize,
+    pub fallback_count: usize,
+    pub js_call_count: usize,
+    pub property_count: usize,
+    pub runtime_helper_count: usize,
+    pub rejected_count: usize,
+}
+
+impl VmBaselineGeneratedExecutionSummary {
+    const fn new(owner: CodeBlockId) -> Self {
+        Self {
+            owner,
+            execution_count: 0,
+            executed_bytecode_count: 0,
+            returned_count: 0,
+            threw_count: 0,
+            ordinary_bytecode_call_count: 0,
+            ordinary_bytecode_construct_count: 0,
+            function_value_call_count: 0,
+            terminated_count: 0,
+            suspended_count: 0,
+            failed_count: 0,
+            fallback_count: 0,
+            js_call_count: 0,
+            property_count: 0,
+            runtime_helper_count: 0,
+            rejected_count: 0,
+        }
+    }
+
+    fn record(
+        &mut self,
+        executed_bytecode_count: u64,
+        outcome: VmBaselineGeneratedExecutionOutcome,
+    ) {
+        self.execution_count = self.execution_count.saturating_add(1);
+        self.executed_bytecode_count = self
+            .executed_bytecode_count
+            .saturating_add(executed_bytecode_count);
+        match outcome {
+            VmBaselineGeneratedExecutionOutcome::Returned => {
+                self.returned_count = self.returned_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::Threw => {
+                self.threw_count = self.threw_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::OrdinaryBytecodeCall => {
+                self.ordinary_bytecode_call_count =
+                    self.ordinary_bytecode_call_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::OrdinaryBytecodeConstruct => {
+                self.ordinary_bytecode_construct_count =
+                    self.ordinary_bytecode_construct_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::FunctionValueCall => {
+                self.function_value_call_count = self.function_value_call_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::Terminated => {
+                self.terminated_count = self.terminated_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::Suspended => {
+                self.suspended_count = self.suspended_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::Failed => {
+                self.failed_count = self.failed_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::Fallback => {
+                self.fallback_count = self.fallback_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::JsCall => {
+                self.js_call_count = self.js_call_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::Property => {
+                self.property_count = self.property_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::RuntimeHelper => {
+                self.runtime_helper_count = self.runtime_helper_count.saturating_add(1);
+            }
+            VmBaselineGeneratedExecutionOutcome::Rejected => {
+                self.rejected_count = self.rejected_count.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmBaselineGeneratedExecutionOutcome {
+    Returned,
+    Threw,
+    OrdinaryBytecodeCall,
+    OrdinaryBytecodeConstruct,
+    FunctionValueCall,
+    Terminated,
+    Suspended,
+    Failed,
+    Fallback,
+    JsCall,
+    Property,
+    RuntimeHelper,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VmGeneratedDirectCallTransactionRequest {
+    pub caller: CodeBlockId,
+    pub call_bytecode_index: BytecodeIndex,
+    pub callee: Option<ObjectId>,
+    pub target_code_block: CodeBlockId,
+    pub argument_count_including_this: u32,
+    pub route: VmGeneratedDirectCallTransactionRoute,
+    pub outcome: VmGeneratedDirectCallTransactionOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGeneratedDirectCallTransactionRecord {
+    pub ordinal: u64,
+    pub caller: CodeBlockId,
+    pub call_bytecode_index: BytecodeIndex,
+    pub callee: Option<ObjectId>,
+    pub target_code_block: CodeBlockId,
+    pub argument_count_including_this: u32,
+    pub route: VmGeneratedDirectCallTransactionRoute,
+    pub outcome: VmGeneratedDirectCallTransactionOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmGeneratedDirectCallTransactionRoute {
+    FrameSetupFailed,
+    ContinuationAttachFailed,
+    GeneratedEntry,
+    NativeEntry,
+    NativeEntryInterpreterFallback,
+    NestedInterpreterFallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmGeneratedDirectCallTransactionOutcome {
+    Continue,
+    Jump,
+    Return,
+    Threw,
+    OrdinaryBytecodeCall,
+    OrdinaryBytecodeConstruct,
+    FunctionValueCall,
+    Suspended,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGeneratedDirectCallTransactionSummary {
+    pub caller: CodeBlockId,
+    pub call_bytecode_index: BytecodeIndex,
+    pub target_code_block: CodeBlockId,
+    pub argument_count_including_this: u32,
+    pub route: VmGeneratedDirectCallTransactionRoute,
+    pub transaction_count: usize,
+    pub continue_count: usize,
+    pub jump_count: usize,
+    pub return_count: usize,
+    pub threw_count: usize,
+    pub ordinary_bytecode_call_count: usize,
+    pub ordinary_bytecode_construct_count: usize,
+    pub function_value_call_count: usize,
+    pub suspended_count: usize,
+    pub failed_count: usize,
+}
+
+impl VmGeneratedDirectCallTransactionSummary {
+    const fn new(
+        caller: CodeBlockId,
+        call_bytecode_index: BytecodeIndex,
+        target_code_block: CodeBlockId,
+        argument_count_including_this: u32,
+        route: VmGeneratedDirectCallTransactionRoute,
+    ) -> Self {
+        Self {
+            caller,
+            call_bytecode_index,
+            target_code_block,
+            argument_count_including_this,
+            route,
+            transaction_count: 0,
+            continue_count: 0,
+            jump_count: 0,
+            return_count: 0,
+            threw_count: 0,
+            ordinary_bytecode_call_count: 0,
+            ordinary_bytecode_construct_count: 0,
+            function_value_call_count: 0,
+            suspended_count: 0,
+            failed_count: 0,
+        }
+    }
+
+    fn record(&mut self, outcome: VmGeneratedDirectCallTransactionOutcome) {
+        self.transaction_count = self.transaction_count.saturating_add(1);
+        match outcome {
+            VmGeneratedDirectCallTransactionOutcome::Continue => {
+                self.continue_count = self.continue_count.saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionOutcome::Jump => {
+                self.jump_count = self.jump_count.saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionOutcome::Return => {
+                self.return_count = self.return_count.saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionOutcome::Threw => {
+                self.threw_count = self.threw_count.saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionOutcome::OrdinaryBytecodeCall => {
+                self.ordinary_bytecode_call_count =
+                    self.ordinary_bytecode_call_count.saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionOutcome::OrdinaryBytecodeConstruct => {
+                self.ordinary_bytecode_construct_count =
+                    self.ordinary_bytecode_construct_count.saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionOutcome::FunctionValueCall => {
+                self.function_value_call_count = self.function_value_call_count.saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionOutcome::Suspended => {
+                self.suspended_count = self.suspended_count.saturating_add(1);
+            }
+            VmGeneratedDirectCallTransactionOutcome::Failed => {
+                self.failed_count = self.failed_count.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmGeneratedDirectCallRootlessRejectionReason {
+    HotSlotMiss,
+    PreferredRouteNotGeneratedEntry {
+        native_entry_kind: Option<BaselineNativeEntryCallableKind>,
+    },
+    MissingGeneratedArtifact,
+    InvalidGeneratedArtifact,
+    SnapshotMismatch,
+    RuntimeHelperPlan,
+    EffectContract,
+    RetainedSideExit,
+    RetainedRuntimeHelperExit,
+    RetainedJsCallExit,
+    RetainedLoopBackedgeExit,
+    InvalidBodyInstruction,
+    InvalidBodyBytecodeIndex,
+    UnsupportedBodyOpcode {
+        opcode: CoreOpcode,
+    },
+    MissingReturn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount {
+    pub opcode: CoreOpcode,
+    pub count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGeneratedDirectCallRootlessRetainedSideExitCount {
+    pub target_code_block: CodeBlockId,
+    pub bytecode_index: BytecodeIndex,
+    pub opcode: Option<CoreOpcode>,
+    pub reason: P6X86_64BaselineSelectedSideExitReason,
+    pub count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VmGeneratedDirectCallRootlessPreferredNativeEntryCounts {
+    pub pure_baseline_shim: usize,
+    pub emitted_semantic_c_abi_entry: usize,
+    pub unknown: usize,
+}
+
+impl VmGeneratedDirectCallRootlessPreferredNativeEntryCounts {
+    pub const fn total(self) -> usize {
+        self.pure_baseline_shim + self.emitted_semantic_c_abi_entry + self.unknown
+    }
+
+    fn record(&mut self, native_entry_kind: Option<BaselineNativeEntryCallableKind>) {
+        match native_entry_kind {
+            Some(BaselineNativeEntryCallableKind::P6PureBaselineNativeEntryShim) => {
+                self.pure_baseline_shim = self.pure_baseline_shim.saturating_add(1);
+            }
+            Some(BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry) => {
+                self.emitted_semantic_c_abi_entry =
+                    self.emitted_semantic_c_abi_entry.saturating_add(1);
+            }
+            None => {
+                self.unknown = self.unknown.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VmGeneratedDirectCallRootlessRejectionCounts {
+    pub hot_slot_miss: usize,
+    pub preferred_route_not_generated_entry: usize,
+    pub missing_generated_artifact: usize,
+    pub invalid_generated_artifact: usize,
+    pub snapshot_mismatch: usize,
+    pub runtime_helper_plan: usize,
+    pub effect_contract: usize,
+    pub retained_side_exit: usize,
+    pub retained_runtime_helper_exit: usize,
+    pub retained_js_call_exit: usize,
+    pub retained_loop_backedge_exit: usize,
+    pub invalid_body_instruction: usize,
+    pub invalid_body_bytecode_index: usize,
+    pub unsupported_body_opcode: usize,
+    pub missing_return: usize,
+}
+
+impl VmGeneratedDirectCallRootlessRejectionCounts {
+    pub const fn total(self) -> usize {
+        self.hot_slot_miss
+            + self.preferred_route_not_generated_entry
+            + self.missing_generated_artifact
+            + self.invalid_generated_artifact
+            + self.snapshot_mismatch
+            + self.runtime_helper_plan
+            + self.effect_contract
+            + self.retained_side_exit
+            + self.retained_runtime_helper_exit
+            + self.retained_js_call_exit
+            + self.retained_loop_backedge_exit
+            + self.invalid_body_instruction
+            + self.invalid_body_bytecode_index
+            + self.unsupported_body_opcode
+            + self.missing_return
+    }
+
+    pub fn saturating_sub(self, start: Self) -> Self {
+        Self {
+            hot_slot_miss: self.hot_slot_miss.saturating_sub(start.hot_slot_miss),
+            preferred_route_not_generated_entry: self
+                .preferred_route_not_generated_entry
+                .saturating_sub(start.preferred_route_not_generated_entry),
+            missing_generated_artifact: self
+                .missing_generated_artifact
+                .saturating_sub(start.missing_generated_artifact),
+            invalid_generated_artifact: self
+                .invalid_generated_artifact
+                .saturating_sub(start.invalid_generated_artifact),
+            snapshot_mismatch: self
+                .snapshot_mismatch
+                .saturating_sub(start.snapshot_mismatch),
+            runtime_helper_plan: self
+                .runtime_helper_plan
+                .saturating_sub(start.runtime_helper_plan),
+            effect_contract: self.effect_contract.saturating_sub(start.effect_contract),
+            retained_side_exit: self
+                .retained_side_exit
+                .saturating_sub(start.retained_side_exit),
+            retained_runtime_helper_exit: self
+                .retained_runtime_helper_exit
+                .saturating_sub(start.retained_runtime_helper_exit),
+            retained_js_call_exit: self
+                .retained_js_call_exit
+                .saturating_sub(start.retained_js_call_exit),
+            retained_loop_backedge_exit: self
+                .retained_loop_backedge_exit
+                .saturating_sub(start.retained_loop_backedge_exit),
+            invalid_body_instruction: self
+                .invalid_body_instruction
+                .saturating_sub(start.invalid_body_instruction),
+            invalid_body_bytecode_index: self
+                .invalid_body_bytecode_index
+                .saturating_sub(start.invalid_body_bytecode_index),
+            unsupported_body_opcode: self
+                .unsupported_body_opcode
+                .saturating_sub(start.unsupported_body_opcode),
+            missing_return: self.missing_return.saturating_sub(start.missing_return),
+        }
+    }
+
+    fn record(&mut self, reason: VmGeneratedDirectCallRootlessRejectionReason) {
+        match reason {
+            VmGeneratedDirectCallRootlessRejectionReason::HotSlotMiss => {
+                self.hot_slot_miss = self.hot_slot_miss.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::PreferredRouteNotGeneratedEntry {
+                ..
+            } => {
+                self.preferred_route_not_generated_entry =
+                    self.preferred_route_not_generated_entry.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::MissingGeneratedArtifact => {
+                self.missing_generated_artifact = self.missing_generated_artifact.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::InvalidGeneratedArtifact => {
+                self.invalid_generated_artifact = self.invalid_generated_artifact.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::SnapshotMismatch => {
+                self.snapshot_mismatch = self.snapshot_mismatch.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::RuntimeHelperPlan => {
+                self.runtime_helper_plan = self.runtime_helper_plan.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::EffectContract => {
+                self.effect_contract = self.effect_contract.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::RetainedSideExit => {
+                self.retained_side_exit = self.retained_side_exit.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::RetainedRuntimeHelperExit => {
+                self.retained_runtime_helper_exit =
+                    self.retained_runtime_helper_exit.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::RetainedJsCallExit => {
+                self.retained_js_call_exit = self.retained_js_call_exit.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::RetainedLoopBackedgeExit => {
+                self.retained_loop_backedge_exit =
+                    self.retained_loop_backedge_exit.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::InvalidBodyInstruction => {
+                self.invalid_body_instruction = self.invalid_body_instruction.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::InvalidBodyBytecodeIndex => {
+                self.invalid_body_bytecode_index =
+                    self.invalid_body_bytecode_index.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::UnsupportedBodyOpcode { .. } => {
+                self.unsupported_body_opcode = self.unsupported_body_opcode.saturating_add(1);
+            }
+            VmGeneratedDirectCallRootlessRejectionReason::MissingReturn => {
+                self.missing_return = self.missing_return.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BaselineInstallOwnerLiveness {
     Live,
     NotLive,
@@ -4848,7 +7362,7 @@ pub enum BaselineInstallDeferReason {
     DependencyPolicy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaselineEntryGateRecord {
     pub owner: CodeBlockId,
     pub requested_tier: JitType,
@@ -4868,6 +7382,513 @@ pub enum BaselineEntryGateOutcome {
     NativeEntryReadyButExecutionDisabled,
     /// Code-shape validation and baseline ABI descriptor proof are both present.
     Eligible,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BaselineEntryAutoMaterializationRecord {
+    pub ordinal: u64,
+    pub owner: CodeBlockId,
+    pub requested_tier: JitType,
+    pub native: BaselineEntryAutoNativeMaterializationOutcome,
+    pub native_detail: Option<BaselineEntryAutoNativeMaterializationDetail>,
+    pub generated: Option<BaselineEntryAutoGeneratedMaterializationOutcome>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BaselineEntryAutoMaterializationRequest {
+    pub owner: CodeBlockId,
+    pub requested_tier: JitType,
+    pub native: BaselineEntryAutoNativeMaterializationOutcome,
+    pub native_detail: Option<BaselineEntryAutoNativeMaterializationDetail>,
+    pub generated: Option<BaselineEntryAutoGeneratedMaterializationOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaselineEntryAutoNativeMaterializationOutcome {
+    Installed,
+    Failed {
+        reason: BaselineEntryAutoNativeMaterializationFailure,
+        generated_fallback_allowed: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaselineEntryAutoNativeMaterializationFailure {
+    CodeBlockOwnerNotLive,
+    CodeBlockNotRegistered,
+    EligibilityProof,
+    Lowering,
+    BackendContract,
+    InstructionSelection,
+    SemanticByteEmission,
+    OwnerContinuationMap,
+    OwnerContinuationNativeBinding,
+    CurrentCodeBlockSnapshotInvalid,
+    CurrentCodeBlockSnapshotMismatch,
+    ArtifactInvalid,
+    MachineCodeEmission,
+    LinkBufferLayout,
+    LinkCopyRejected,
+    LinkFinalizationRejected,
+    LinkFinalizationByteEvidence,
+    PlatformResidency,
+    MaterializationRejected,
+    PlatformResidencyStorageMissing,
+    InstallRejected,
+    DisabledReadinessMissing,
+    DisabledReadinessRejected,
+    DisabledReadinessCallableAuthority,
+    EnabledReadinessRejected,
+    EnabledReadinessCallableAuthority,
+    EmissionProvenance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaselineEntryAutoNativeMaterializationDetail {
+    Lowering(BaselineNativeLoweringFailureDetail),
+    SemanticByteEmission(BaselineNativeSemanticByteEmissionFailureDetail),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaselineNativeLoweringFailureDetail {
+    UnsupportedOpcodeSubset {
+        emitter: BaselineMachineCodeEmitterKind,
+        expected: BaselineSupportedOpcodeSubset,
+        actual: BaselineSupportedOpcodeSubset,
+    },
+    UnsupportedEffectContract {
+        emitter: BaselineMachineCodeEmitterKind,
+        expected: BaselineGeneratedEffectContract,
+        actual: BaselineGeneratedEffectContract,
+    },
+    OwnerWitnessMismatch {
+        owner_witness: CodeBlockId,
+        proof_owner: CodeBlockId,
+    },
+    ProofSnapshotOwnerMismatch {
+        owner: CodeBlockId,
+        snapshot_owner: CodeBlockId,
+    },
+    ProofSnapshotTierMismatch {
+        from_tier: JitType,
+        to_tier: JitType,
+    },
+    UnsupportedValidationShape {
+        emitter: BaselineMachineCodeEmitterKind,
+        requirement: P6X86_64BaselineLoweringRequirement,
+        actual: P6X86_64BaselineLoweringValidationShape,
+    },
+    CodeBlockSnapshotInvalid,
+    CodeBlockSnapshotMismatch {
+        owner: CodeBlockId,
+    },
+    InstructionDecode,
+    EmptyCodeBlock,
+    BytecodeRangeMismatch {
+        expected: BaselineBytecodeRange,
+        actual: BaselineBytecodeRange,
+    },
+    UnsupportedOpcode {
+        bytecode_index: BytecodeIndex,
+        opcode: Opcode,
+        core_opcode: Option<CoreOpcode>,
+    },
+    UnexpectedOperandCount {
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+        expected: usize,
+        actual: usize,
+    },
+    UnsupportedOperandShape {
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+    },
+    InvalidBranchTarget {
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+        target: BytecodeIndex,
+        reason: P6X86_64BaselineBranchTargetRejectionReason,
+    },
+}
+
+impl BaselineNativeLoweringFailureDetail {
+    pub(crate) fn from_lowering_error(error: &P6X86_64BaselineLoweringError) -> Self {
+        match error {
+            P6X86_64BaselineLoweringError::UnsupportedOpcodeSubset {
+                emitter,
+                expected,
+                actual,
+            } => Self::UnsupportedOpcodeSubset {
+                emitter: *emitter,
+                expected: *expected,
+                actual: *actual,
+            },
+            P6X86_64BaselineLoweringError::UnsupportedEffectContract {
+                emitter,
+                expected,
+                actual,
+            } => Self::UnsupportedEffectContract {
+                emitter: *emitter,
+                expected: *expected,
+                actual: *actual,
+            },
+            P6X86_64BaselineLoweringError::OwnerWitnessMismatch {
+                owner_witness,
+                proof_owner,
+            } => Self::OwnerWitnessMismatch {
+                owner_witness: *owner_witness,
+                proof_owner: *proof_owner,
+            },
+            P6X86_64BaselineLoweringError::ProofSnapshotOwnerMismatch {
+                owner,
+                snapshot_owner,
+            } => Self::ProofSnapshotOwnerMismatch {
+                owner: *owner,
+                snapshot_owner: *snapshot_owner,
+            },
+            P6X86_64BaselineLoweringError::ProofSnapshotTierMismatch { from_tier, to_tier } => {
+                Self::ProofSnapshotTierMismatch {
+                    from_tier: *from_tier,
+                    to_tier: *to_tier,
+                }
+            }
+            P6X86_64BaselineLoweringError::UnsupportedValidationShape {
+                emitter,
+                requirement,
+                actual,
+            } => Self::UnsupportedValidationShape {
+                emitter: *emitter,
+                requirement: *requirement,
+                actual: *actual,
+            },
+            P6X86_64BaselineLoweringError::CodeBlockSnapshotInvalid { .. } => {
+                Self::CodeBlockSnapshotInvalid
+            }
+            P6X86_64BaselineLoweringError::CodeBlockSnapshotMismatch { owner } => {
+                Self::CodeBlockSnapshotMismatch { owner: *owner }
+            }
+            P6X86_64BaselineLoweringError::InstructionDecode { .. } => Self::InstructionDecode,
+            P6X86_64BaselineLoweringError::EmptyCodeBlock => Self::EmptyCodeBlock,
+            P6X86_64BaselineLoweringError::BytecodeRangeMismatch { expected, actual } => {
+                Self::BytecodeRangeMismatch {
+                    expected: *expected,
+                    actual: *actual,
+                }
+            }
+            P6X86_64BaselineLoweringError::UnsupportedOpcode {
+                bytecode_index,
+                opcode,
+                core_opcode,
+            } => Self::UnsupportedOpcode {
+                bytecode_index: *bytecode_index,
+                opcode: *opcode,
+                core_opcode: *core_opcode,
+            },
+            P6X86_64BaselineLoweringError::UnexpectedOperandCount {
+                bytecode_index,
+                opcode,
+                expected,
+                actual,
+            } => Self::UnexpectedOperandCount {
+                bytecode_index: *bytecode_index,
+                opcode: *opcode,
+                expected: *expected,
+                actual: *actual,
+            },
+            P6X86_64BaselineLoweringError::UnsupportedOperandShape {
+                bytecode_index,
+                opcode,
+                ..
+            } => Self::UnsupportedOperandShape {
+                bytecode_index: *bytecode_index,
+                opcode: *opcode,
+            },
+            P6X86_64BaselineLoweringError::InvalidBranchTarget {
+                bytecode_index,
+                opcode,
+                target,
+                reason,
+            } => Self::InvalidBranchTarget {
+                bytecode_index: *bytecode_index,
+                opcode: *opcode,
+                target: *target,
+                reason: *reason,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaselineNativeSemanticByteEmissionFailureDetail {
+    Selection,
+    UnexpectedInstructionEffects {
+        bytecode_index: BytecodeIndex,
+        effects: P6X86_64BaselineSelectedInstructionEffects,
+    },
+    UnexpectedSideExitEffects {
+        bytecode_index: BytecodeIndex,
+        reason: P6X86_64BaselineSelectedSideExitReason,
+    },
+    MissingReturn,
+    MultipleReturns {
+        first: BytecodeIndex,
+        second: BytecodeIndex,
+    },
+    NonFinalReturn {
+        bytecode_index: BytecodeIndex,
+        next_bytecode_index: BytecodeIndex,
+    },
+    UnsupportedOperandLocation {
+        bytecode_index: BytecodeIndex,
+        location: P6X86_64BaselineOperandLocation,
+        reason: P6X86_64BaselineSemanticOperandRejectionReason,
+    },
+    UnsupportedMemoryBase {
+        bytecode_index: BytecodeIndex,
+        base: P6X86_64BaselineSymbolicRegister,
+    },
+    UnsupportedMachineInstruction {
+        bytecode_index: BytecodeIndex,
+        instruction: P6X86_64BaselineMachineInstruction,
+    },
+    UnsupportedImmediateTag {
+        bytecode_index: BytecodeIndex,
+        tag: u64,
+    },
+    UnsupportedValueLayout {
+        field: &'static str,
+        actual: u64,
+    },
+    FrameOffsetOutOfDisp32 {
+        bytecode_index: BytecodeIndex,
+        location: P6X86_64BaselineOperandLocation,
+        byte_offset: u64,
+    },
+    ImageLengthExceedsU32 {
+        actual: usize,
+    },
+    BranchDisplacementOutOfRange {
+        branch_offset: u32,
+        branch_end_offset: u32,
+        target_offset: u32,
+    },
+    SideExitIndexExceedsPayloadCapacity {
+        side_exit_index: usize,
+    },
+    BranchPatchOutOfRange {
+        branch_offset: u32,
+    },
+    BranchTargetMissing {
+        bytecode_index: BytecodeIndex,
+        target: BytecodeIndex,
+    },
+    RuntimeHelperNativeExitRequiresCallable {
+        bytecode_index: BytecodeIndex,
+    },
+    JsCallNativeExitRequiresCallable {
+        bytecode_index: BytecodeIndex,
+    },
+    PropertyNativeExitRequiresCallable {
+        bytecode_index: BytecodeIndex,
+    },
+    MalformedJsCallNativeExit {
+        bytecode_index: BytecodeIndex,
+    },
+    SourceBufferInvalid,
+    SourceImageInvalid,
+    LinkBufferLayoutInvalid,
+    LinkedImageInvalid,
+    SourceBufferInvariant {
+        field: &'static str,
+    },
+    SourceImageInvariant {
+        field: &'static str,
+    },
+    LinkedImageInvariant {
+        field: &'static str,
+    },
+    EntryOffsetOutOfRange {
+        entry_offset: u32,
+        image_size_bytes: u32,
+    },
+}
+
+impl BaselineNativeSemanticByteEmissionFailureDetail {
+    pub(crate) fn from_semantic_byte_emission_error(
+        error: &P6X86_64BaselineSemanticByteEmissionError,
+    ) -> Self {
+        match error {
+            P6X86_64BaselineSemanticByteEmissionError::Selection { .. } => Self::Selection,
+            P6X86_64BaselineSemanticByteEmissionError::UnexpectedInstructionEffects {
+                bytecode_index,
+                effects,
+            } => Self::UnexpectedInstructionEffects {
+                bytecode_index: *bytecode_index,
+                effects: *effects,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::UnexpectedSideExitEffects {
+                bytecode_index,
+                reason,
+            } => Self::UnexpectedSideExitEffects {
+                bytecode_index: *bytecode_index,
+                reason: *reason,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::MissingReturn => Self::MissingReturn,
+            P6X86_64BaselineSemanticByteEmissionError::MultipleReturns { first, second } => {
+                Self::MultipleReturns {
+                    first: *first,
+                    second: *second,
+                }
+            }
+            P6X86_64BaselineSemanticByteEmissionError::NonFinalReturn {
+                bytecode_index,
+                next_bytecode_index,
+            } => Self::NonFinalReturn {
+                bytecode_index: *bytecode_index,
+                next_bytecode_index: *next_bytecode_index,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::UnsupportedOperandLocation {
+                bytecode_index,
+                location,
+                reason,
+            } => Self::UnsupportedOperandLocation {
+                bytecode_index: *bytecode_index,
+                location: *location,
+                reason: *reason,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::UnsupportedMemoryBase {
+                bytecode_index,
+                base,
+            } => Self::UnsupportedMemoryBase {
+                bytecode_index: *bytecode_index,
+                base: *base,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::UnsupportedMachineInstruction {
+                bytecode_index,
+                instruction,
+            } => Self::UnsupportedMachineInstruction {
+                bytecode_index: *bytecode_index,
+                instruction: *instruction,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::UnsupportedImmediateTag {
+                bytecode_index,
+                tag,
+            } => Self::UnsupportedImmediateTag {
+                bytecode_index: *bytecode_index,
+                tag: *tag,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::UnsupportedValueLayout {
+                field,
+                actual,
+            } => Self::UnsupportedValueLayout {
+                field: *field,
+                actual: *actual,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::FrameOffsetOutOfDisp32 {
+                bytecode_index,
+                location,
+                byte_offset,
+            } => Self::FrameOffsetOutOfDisp32 {
+                bytecode_index: *bytecode_index,
+                location: *location,
+                byte_offset: *byte_offset,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::ImageLengthExceedsU32 { actual } => {
+                Self::ImageLengthExceedsU32 { actual: *actual }
+            }
+            P6X86_64BaselineSemanticByteEmissionError::BranchDisplacementOutOfRange {
+                branch_offset,
+                branch_end_offset,
+                target_offset,
+            } => Self::BranchDisplacementOutOfRange {
+                branch_offset: *branch_offset,
+                branch_end_offset: *branch_end_offset,
+                target_offset: *target_offset,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::SideExitIndexExceedsPayloadCapacity {
+                side_exit_index,
+            } => Self::SideExitIndexExceedsPayloadCapacity {
+                side_exit_index: *side_exit_index,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::BranchPatchOutOfRange {
+                branch_offset,
+            } => Self::BranchPatchOutOfRange {
+                branch_offset: *branch_offset,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::BranchTargetMissing {
+                bytecode_index,
+                target,
+            } => Self::BranchTargetMissing {
+                bytecode_index: *bytecode_index,
+                target: *target,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::RuntimeHelperNativeExitRequiresCallable {
+                bytecode_index,
+            } => Self::RuntimeHelperNativeExitRequiresCallable {
+                bytecode_index: *bytecode_index,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::JsCallNativeExitRequiresCallable {
+                bytecode_index,
+            } => Self::JsCallNativeExitRequiresCallable {
+                bytecode_index: *bytecode_index,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::PropertyNativeExitRequiresCallable {
+                bytecode_index,
+            } => Self::PropertyNativeExitRequiresCallable {
+                bytecode_index: *bytecode_index,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::MalformedJsCallNativeExit {
+                bytecode_index,
+            } => Self::MalformedJsCallNativeExit {
+                bytecode_index: *bytecode_index,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::SourceBufferInvalid { .. } => {
+                Self::SourceBufferInvalid
+            }
+            P6X86_64BaselineSemanticByteEmissionError::SourceImageInvalid { .. } => {
+                Self::SourceImageInvalid
+            }
+            P6X86_64BaselineSemanticByteEmissionError::LinkBufferLayoutInvalid { .. } => {
+                Self::LinkBufferLayoutInvalid
+            }
+            P6X86_64BaselineSemanticByteEmissionError::LinkedImageInvalid { .. } => {
+                Self::LinkedImageInvalid
+            }
+            P6X86_64BaselineSemanticByteEmissionError::SourceBufferInvariant { field } => {
+                Self::SourceBufferInvariant { field: *field }
+            }
+            P6X86_64BaselineSemanticByteEmissionError::SourceImageInvariant { field } => {
+                Self::SourceImageInvariant { field: *field }
+            }
+            P6X86_64BaselineSemanticByteEmissionError::LinkedImageInvariant { field } => {
+                Self::LinkedImageInvariant { field: *field }
+            }
+            P6X86_64BaselineSemanticByteEmissionError::EntryOffsetOutOfRange {
+                entry_offset,
+                image_size_bytes,
+            } => Self::EntryOffsetOutOfRange {
+                entry_offset: *entry_offset,
+                image_size_bytes: *image_size_bytes,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaselineEntryAutoGeneratedMaterializationOutcome {
+    Installed,
+    Failed {
+        reason: BaselineEntryAutoGeneratedMaterializationFailure,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaselineEntryAutoGeneratedMaterializationFailure {
+    OwnerNotLive,
+    CodeBlockNotRegistered,
+    DependencyPolicy,
+    Eligibility,
+    Artifact,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4922,6 +7943,158 @@ pub struct VmPropertyStoreObservationRecord {
     pub descriptor: PropertyStoreObservationDescriptor,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VmPropertyHasObservationRequest {
+    pub owner: CodeBlockId,
+    pub frame: Option<CallFrameId>,
+    pub bytecode_index: BytecodeIndex,
+    pub bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub descriptor: PropertyHasObservationDescriptor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmPropertyHasObservationRecord {
+    pub ordinal: u64,
+    pub owner: CodeBlockId,
+    pub frame: Option<CallFrameId>,
+    pub bytecode_index: BytecodeIndex,
+    pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub descriptor: PropertyHasObservationDescriptor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmPropertyInlineCacheEvolutionKind {
+    Load,
+    Store,
+    Has,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmPropertyInlineCacheEvolutionDecision {
+    Admitted,
+    GeneratedMegamorphicLoad,
+    GeneratedMegamorphicStore,
+    GeneratedMegamorphicHas,
+    SkippedBufferedDuplicate,
+    SkippedReplacedByExistingCase,
+    SkippedGaveUp,
+    SkippedMegamorphicLoad,
+    SkippedMegamorphicStore,
+    SkippedMegamorphicHas,
+    SkippedInitialCountdown,
+    SkippedCooldown,
+}
+
+impl VmPropertyInlineCacheEvolutionDecision {
+    pub const fn admits_plan(self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmPropertyInlineCacheEvolutionTerminalState {
+    GaveUp,
+    MegamorphicLoad,
+    MegamorphicStore,
+    MegamorphicHas,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmPropertyInlineCacheEvolutionCounters {
+    pub countdown: u8,
+    pub repatch_count: u8,
+    pub number_of_cooldowns: u8,
+    pub buffering_countdown: u8,
+    pub buffered_structure_count: usize,
+    pub accepted_access_case_count: u8,
+    pub all_accepted_cases_can_use_get_by_id_megamorphic: bool,
+    pub all_accepted_cases_can_use_put_by_id_megamorphic: bool,
+    pub all_accepted_cases_can_use_in_by_id_megamorphic: bool,
+    pub terminal: Option<VmPropertyInlineCacheEvolutionTerminalState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VmPropertyInlineCacheEvolutionSite {
+    owner: CodeBlockId,
+    bytecode_index: BytecodeIndex,
+    bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    slot: InlineCacheSlotId,
+    kind: VmPropertyInlineCacheEvolutionKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VmPropertyInlineCacheBufferedStructureKey {
+    structure: StructureId,
+    key: Option<CacheKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmPropertyInlineCacheEvolutionState {
+    site: VmPropertyInlineCacheEvolutionSite,
+    countdown: u8,
+    repatch_count: u8,
+    number_of_cooldowns: u8,
+    buffering_countdown: u8,
+    buffered_structures: Vec<VmPropertyInlineCacheBufferedStructureKey>,
+    accepted_access_case_count: u8,
+    all_accepted_cases_can_use_get_by_id_megamorphic: bool,
+    all_accepted_cases_can_use_put_by_id_megamorphic: bool,
+    all_accepted_cases_can_use_in_by_id_megamorphic: bool,
+    terminal: Option<VmPropertyInlineCacheEvolutionTerminalState>,
+}
+
+impl VmPropertyInlineCacheEvolutionState {
+    fn new(site: VmPropertyInlineCacheEvolutionSite) -> Self {
+        Self {
+            site,
+            countdown: PROPERTY_IC_INITIAL_COUNTDOWN,
+            repatch_count: 0,
+            number_of_cooldowns: 0,
+            buffering_countdown: PROPERTY_IC_INITIAL_REPATCH_BUFFERING_COUNTDOWN,
+            buffered_structures: Vec::new(),
+            accepted_access_case_count: 0,
+            all_accepted_cases_can_use_get_by_id_megamorphic: true,
+            all_accepted_cases_can_use_put_by_id_megamorphic: true,
+            all_accepted_cases_can_use_in_by_id_megamorphic: true,
+            terminal: None,
+        }
+    }
+
+    fn counters(&self) -> VmPropertyInlineCacheEvolutionCounters {
+        VmPropertyInlineCacheEvolutionCounters {
+            countdown: self.countdown,
+            repatch_count: self.repatch_count,
+            number_of_cooldowns: self.number_of_cooldowns,
+            buffering_countdown: self.buffering_countdown,
+            buffered_structure_count: self.buffered_structures.len(),
+            accepted_access_case_count: self.accepted_access_case_count,
+            all_accepted_cases_can_use_get_by_id_megamorphic: self
+                .all_accepted_cases_can_use_get_by_id_megamorphic,
+            all_accepted_cases_can_use_put_by_id_megamorphic: self
+                .all_accepted_cases_can_use_put_by_id_megamorphic,
+            all_accepted_cases_can_use_in_by_id_megamorphic: self
+                .all_accepted_cases_can_use_in_by_id_megamorphic,
+            terminal: self.terminal,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmPropertyInlineCacheEvolutionRecord {
+    pub ordinal: u64,
+    pub owner: CodeBlockId,
+    pub bytecode_index: BytecodeIndex,
+    pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub slot: InlineCacheSlotId,
+    pub kind: VmPropertyInlineCacheEvolutionKind,
+    pub structure: Option<StructureId>,
+    pub key: Option<CacheKey>,
+    pub decision: VmPropertyInlineCacheEvolutionDecision,
+    pub counters_before: VmPropertyInlineCacheEvolutionCounters,
+    pub counters_after: VmPropertyInlineCacheEvolutionCounters,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VmCallObservationRequest {
     pub owner: CodeBlockId,
@@ -4941,6 +8114,86 @@ pub struct VmCallObservationRecord {
     pub opcode: CoreOpcode,
     pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
     pub descriptor: CallObservationDescriptor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VmOwnedCallTargetValidationRequest {
+    pub owner: CodeBlockId,
+    pub frame: Option<CallFrameId>,
+    pub bytecode_index: BytecodeIndex,
+    pub opcode: CoreOpcode,
+    pub target_code_block: CodeBlockId,
+    pub expected_specialization: CodeSpecialization,
+    pub outcome: VmOwnedCallTargetValidationOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmOwnedCallTargetValidationRecord {
+    pub ordinal: u64,
+    pub owner: CodeBlockId,
+    pub frame: Option<CallFrameId>,
+    pub bytecode_index: BytecodeIndex,
+    pub opcode: CoreOpcode,
+    pub target_code_block: CodeBlockId,
+    pub expected_specialization: CodeSpecialization,
+    pub outcome: VmOwnedCallTargetValidationOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmOwnedCallTargetValidationOutcome {
+    Accepted,
+    Rejected(VmOwnedCallTargetValidationRejection),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmOwnedCallTargetValidationRejection {
+    TargetCodeBlockNotRegistered {
+        target: CodeBlockId,
+    },
+    RequestSnapshotUnavailable {
+        target: CodeBlockId,
+    },
+    RegisteredSnapshotUnavailable {
+        target: CodeBlockId,
+    },
+    SnapshotMismatch {
+        target: CodeBlockId,
+    },
+    TargetCodeBlockNotLive {
+        target: CodeBlockId,
+    },
+    RequestSpecializationMismatch {
+        target: CodeBlockId,
+        expected: CodeSpecialization,
+        actual: CodeSpecialization,
+    },
+    RegisteredSpecializationMismatch {
+        target: CodeBlockId,
+        expected: CodeSpecialization,
+        actual: CodeSpecialization,
+    },
+    MissingRegisteredExecutable {
+        target: CodeBlockId,
+    },
+    ExecutableNotRegistered {
+        target: CodeBlockId,
+        executable: ExecutableId,
+    },
+    ExecutableInstalledCodeMissing {
+        target: CodeBlockId,
+        executable: ExecutableId,
+        specialization: CodeSpecialization,
+    },
+    ExecutableInstalledCodeBlockMismatch {
+        target: CodeBlockId,
+        executable: ExecutableId,
+        actual: CodeBlockId,
+    },
+    RequestExecutableMismatch {
+        target: CodeBlockId,
+        expected: ExecutableId,
+        actual: Option<ExecutableId>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5865,12 +9118,16 @@ fn call_link_attachment_metadata_mismatch(
 fn call_link_attachment_plan_key(
     plan: &CallLinkAttachmentPlan,
 ) -> (
+    CoreOpcode,
+    LinkedCallKind,
     u32,
     Option<ExecutableId>,
     Option<ObjectId>,
     Option<CodeBlockId>,
 ) {
     (
+        plan.opcode,
+        plan.descriptor.call_kind,
         plan.bytecode_index,
         plan.descriptor.executable,
         plan.descriptor.callee,
@@ -5890,6 +9147,59 @@ fn active_call_link_inline_cache_attachment_outcome(
     };
 
     Some(outcome)
+}
+
+fn validate_generated_call_link_metadata_only_polymorphic_candidate<'a>(
+    tiering: &'a VmTieringIntegration,
+    owner: CodeBlockId,
+    bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    attachment: &'a VmCallLinkInlineCacheAttachmentRecord,
+) -> Result<Option<&'a CallLinkAttachmentPlan>, InlineCacheValidationError> {
+    if attachment.owner != owner || attachment.bytecode_snapshot != bytecode_snapshot {
+        return Ok(None);
+    }
+    if attachment.lifecycle != VmCallLinkInlineCacheAttachmentLifecycle::Rejected {
+        return Ok(None);
+    }
+    if attachment.code_block_outcome.is_some() {
+        return Err(InlineCacheValidationError::CallLinkMismatch);
+    }
+    if !matches!(
+        &attachment.outcome,
+        VmCallLinkInlineCacheAttachmentOutcome::Rejected {
+            reason: VmCallLinkInlineCacheAttachmentRejectionReason::CodeBlockAttachmentError {
+                error: CallLinkInlineCacheAttachmentError::InvalidExistingMode {
+                    expected: BytecodeCallLinkMode::Init,
+                    actual: BytecodeCallLinkMode::Monomorphic,
+                    ..
+                },
+            },
+        }
+    ) {
+        return Ok(None);
+    }
+
+    let request = VmCallLinkInlineCacheAttachmentRequest {
+        owner: attachment.owner,
+        bytecode_index: attachment.bytecode_index,
+        bytecode_snapshot: attachment.bytecode_snapshot,
+        slot: attachment.slot,
+        attachment_plan_ordinal: attachment.attachment_plan_ordinal,
+        install_recheck_ordinal: attachment.install_recheck_ordinal,
+    };
+    let plan = validate_vm_call_link_inline_cache_attachment_request(tiering, &request)
+        .map_err(|_| InlineCacheValidationError::CallLinkMismatch)?;
+    let current_ordinals =
+        call_link_inline_cache_attachment_ordinals_for_request(tiering, &request);
+    if current_ordinals.boundary_validation_ordinal != attachment.boundary_validation_ordinal
+        || current_ordinals.descriptor_ordinal != attachment.descriptor_ordinal
+        || current_ordinals.observation_ordinal != attachment.observation_ordinal
+        || current_ordinals.readiness_ordinal != attachment.readiness_ordinal
+    {
+        return Err(InlineCacheValidationError::CallLinkMismatch);
+    }
+
+    Ok(Some(plan))
 }
 
 fn validate_generated_call_link_attached_candidate<'a>(
@@ -5965,13 +9275,47 @@ fn validate_generated_call_link_attached_candidate<'a>(
     Ok(plan)
 }
 
+fn generated_call_link_candidate_from_metadata_only_attachment(
+    attachment: &VmCallLinkInlineCacheAttachmentRecord,
+    plan: &CallLinkAttachmentPlan,
+) -> Result<GeneratedCallLinkCandidate, InlineCacheValidationError> {
+    let mut descriptor = plan.descriptor;
+    descriptor.mode = CallLinkMode::Monomorphic;
+    let remaining_blockers = plan.remaining_blockers;
+    let direct_call_status =
+        if remaining_blockers.contains(CallLinkReadinessBlocker::DirectCallDisallowed) {
+            GeneratedCallLinkDirectCallStatus::Disallowed
+        } else {
+            GeneratedCallLinkDirectCallStatus::Authorized
+        };
+
+    Ok(GeneratedCallLinkCandidate {
+        owner: attachment.owner,
+        opcode: plan.opcode,
+        slot: attachment.slot,
+        bytecode_index: attachment.bytecode_index.offset(),
+        descriptor,
+        target: plan.target,
+        boundary: plan.boundary.clone(),
+        attachment_ordinal: attachment.ordinal,
+        attachment_plan_ordinal: attachment.attachment_plan_ordinal,
+        install_recheck_ordinal: attachment.install_recheck_ordinal,
+        boundary_validation_ordinal: attachment.boundary_validation_ordinal,
+        descriptor_ordinal: attachment.descriptor_ordinal,
+        observation_ordinal: attachment.observation_ordinal,
+        readiness_ordinal: attachment.readiness_ordinal,
+        remaining_blockers,
+        direct_call_status,
+    })
+}
+
 fn generated_call_link_candidate_from_attachment(
     attachment: &VmCallLinkInlineCacheAttachmentRecord,
     attached_outcome: &CallLinkInlineCacheAttachmentOutcome,
     plan: &CallLinkAttachmentPlan,
 ) -> Result<GeneratedCallLinkCandidate, InlineCacheValidationError> {
     if attached_outcome.mode != BytecodeCallLinkMode::Monomorphic
-        || attached_outcome.specialization != CodeSpecialization::Call
+        || attached_outcome.specialization != plan.target.specialization
     {
         return Err(InlineCacheValidationError::CallLinkMismatch);
     }
@@ -6025,8 +9369,17 @@ fn generated_call_link_candidate_from_attachment(
 
 fn generated_call_link_candidate_key_from_target(
     candidate: &GeneratedCallLinkCandidate,
-) -> (u32, ExecutableId, ObjectId, CodeBlockId) {
+) -> (
+    CoreOpcode,
+    CodeSpecialization,
+    u32,
+    ExecutableId,
+    ObjectId,
+    CodeBlockId,
+) {
     (
+        candidate.opcode,
+        candidate.target.specialization,
         candidate.bytecode_index,
         candidate.target.executable,
         candidate.target.callee,
@@ -6179,10 +9532,16 @@ fn vm_call_link_attachment_install_recheck_outcome(
             },
         );
     }
+    let expected_specialization = match plan.descriptor.call_kind {
+        LinkedCallKind::Construct | LinkedCallKind::VarargsConstruct => {
+            CodeSpecialization::Construct
+        }
+        _ => CodeSpecialization::Call,
+    };
     if plan.descriptor.executable != Some(plan.target.executable)
         || plan.descriptor.callee != Some(plan.target.callee)
         || plan.descriptor.target_code_block != Some(plan.target.target_code_block)
-        || plan.target.specialization != CodeSpecialization::Call
+        || plan.target.specialization != expected_specialization
     {
         return rejected(
             derived_ordinals,
@@ -6815,7 +10174,13 @@ fn validate_call_link_inline_cache_attachment_plan_metadata(
             VmCallLinkInlineCacheAttachmentMetadataMismatchField::PlanDescriptorPayload,
         ));
     }
-    if plan.target.specialization != CodeSpecialization::Call {
+    let expected_specialization = match plan.descriptor.call_kind {
+        LinkedCallKind::Construct | LinkedCallKind::VarargsConstruct => {
+            CodeSpecialization::Construct
+        }
+        _ => CodeSpecialization::Call,
+    };
+    if plan.target.specialization != expected_specialization {
         return Err(metadata_mismatch(
             VmCallLinkInlineCacheAttachmentMetadataMismatchField::PlanTarget,
         ));
@@ -7335,7 +10700,18 @@ fn validate_call_link_inline_cache_clear_attached_metadata(
             VmCallLinkInlineCacheClearMetadataMismatchField::CodeBlockOpcode,
         ));
     }
-    if attached_outcome.call_type != BytecodeCallType::Call {
+    let expected_call_type = match plan.descriptor.call_kind {
+        LinkedCallKind::Construct => BytecodeCallType::Construct,
+        LinkedCallKind::VarargsConstruct => BytecodeCallType::ConstructVarargs,
+        _ => BytecodeCallType::Call,
+    };
+    let expected_specialization = match plan.descriptor.call_kind {
+        LinkedCallKind::Construct | LinkedCallKind::VarargsConstruct => {
+            CodeSpecialization::Construct
+        }
+        _ => CodeSpecialization::Call,
+    };
+    if attached_outcome.call_type != expected_call_type {
         return Err(mismatch(
             VmCallLinkInlineCacheClearMetadataMismatchField::CodeBlockCallType,
         ));
@@ -7345,7 +10721,7 @@ fn validate_call_link_inline_cache_clear_attached_metadata(
             VmCallLinkInlineCacheClearMetadataMismatchField::CodeBlockMode,
         ));
     }
-    if attached_outcome.specialization != CodeSpecialization::Call {
+    if attached_outcome.specialization != expected_specialization {
         return Err(mismatch(
             VmCallLinkInlineCacheClearMetadataMismatchField::CodeBlockSpecialization,
         ));
@@ -7414,7 +10790,13 @@ fn validate_call_link_boundary_request(
             },
         );
     }
-    if target.specialization != CodeSpecialization::Call {
+    let expected_specialization = match descriptor_record.descriptor.call_kind {
+        LinkedCallKind::Construct | LinkedCallKind::VarargsConstruct => {
+            CodeSpecialization::Construct
+        }
+        _ => CodeSpecialization::Call,
+    };
+    if target.specialization != expected_specialization {
         return VmCallLinkBoundaryValidationOutcome::Rejected(
             VmCallLinkBoundaryValidationRejection::DescriptorMetadataMismatch {
                 field: VmCallLinkBoundaryDescriptorMismatchField::Specialization,
@@ -7558,7 +10940,7 @@ fn call_observation_is_vm_generated_direct_call_eligible(
     has_call_link_descriptor
         && matches!(
             descriptor.opcode,
-            CoreOpcode::Call | CoreOpcode::CallWithThis
+            CoreOpcode::Call | CoreOpcode::CallWithThis | CoreOpcode::Construct
         )
         && descriptor.root_safety == CallObservationRootSafety::RootSafe
         && descriptor.outcome == CallObservationOutcome::Returned
@@ -7577,8 +10959,8 @@ fn metadata_only_call_link_descriptor_from_observation(
     opcode: CoreOpcode,
     descriptor: &CallObservationDescriptor,
 ) -> Option<CallLinkInfoDescriptor> {
-    if !matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis)
-        || descriptor.opcode != opcode
+    let call_kind = linked_call_kind_for_observation_opcode(opcode)?;
+    if descriptor.opcode != opcode
         || descriptor.root_safety != CallObservationRootSafety::RootSafe
         || descriptor.outcome != CallObservationOutcome::Returned
         || !matches!(
@@ -7597,7 +10979,7 @@ fn metadata_only_call_link_descriptor_from_observation(
 
     Some(CallLinkInfoDescriptor {
         mode: CallLinkMode::Init,
-        call_kind: LinkedCallKind::Call,
+        call_kind,
         owner: Some(descriptor.owner),
         executable: Some(executable),
         callee: Some(callee),
@@ -7608,10 +10990,21 @@ fn metadata_only_call_link_descriptor_from_observation(
     })
 }
 
+const fn linked_call_kind_for_observation_opcode(opcode: CoreOpcode) -> Option<LinkedCallKind> {
+    match opcode {
+        CoreOpcode::Call | CoreOpcode::CallWithThis => Some(LinkedCallKind::Call),
+        CoreOpcode::Construct => Some(LinkedCallKind::Construct),
+        _ => None,
+    }
+}
+
 fn validate_vm_call_observation_request(
     request: &VmCallObservationRequest,
 ) -> Result<(), InlineCacheValidationError> {
-    if !matches!(request.opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
+    if !matches!(
+        request.opcode,
+        CoreOpcode::Call | CoreOpcode::CallWithThis | CoreOpcode::Construct
+    ) {
         return Err(
             InlineCacheValidationError::CallObservationUnsupportedOpcode {
                 opcode: request.opcode,
@@ -7620,7 +11013,7 @@ fn validate_vm_call_observation_request(
     }
     if !matches!(
         request.descriptor.opcode,
-        CoreOpcode::Call | CoreOpcode::CallWithThis
+        CoreOpcode::Call | CoreOpcode::CallWithThis | CoreOpcode::Construct
     ) {
         return Err(
             InlineCacheValidationError::CallObservationUnsupportedOpcode {
@@ -8723,6 +12116,636 @@ pub struct VmPropertyLoadAccessCasePlanRecord {
     pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
     pub lifecycle: VmPropertyLoadAccessCasePlanLifecycle,
     pub plan: PropertyLoadAccessCasePlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmPropertyLoadMegamorphicSiteRecord {
+    pub ordinal: u64,
+    pub observation_ordinal: u64,
+    pub evolution_ordinal: u64,
+    pub owner: CodeBlockId,
+    pub frame: Option<CallFrameId>,
+    pub bytecode_index: BytecodeIndex,
+    pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub slot: InlineCacheSlotId,
+    pub key: CacheKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VmMegamorphicCacheEpoch {
+    current: u16,
+}
+
+impl Default for VmMegamorphicCacheEpoch {
+    fn default() -> Self {
+        Self {
+            current: PROPERTY_MEGAMORPHIC_CACHE_INITIAL_EPOCH,
+        }
+    }
+}
+
+impl VmMegamorphicCacheEpoch {
+    fn current(self) -> u16 {
+        self.current
+    }
+
+    fn age(&mut self) -> bool {
+        self.current = self.current.wrapping_add(1);
+        if self.current == PROPERTY_MEGAMORPHIC_CACHE_INVALID_EPOCH {
+            self.current = PROPERTY_MEGAMORPHIC_CACHE_INITIAL_EPOCH;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn set_for_test(&mut self, epoch: u16) {
+        self.current = epoch;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmPropertyLoadMegamorphicCacheTier {
+    Primary,
+    Secondary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmPropertyLoadMegamorphicCacheEntry {
+    key: CacheKey,
+    base_structure: StructureId,
+    epoch: u16,
+    kind: GeneratedPropertyLoadMegamorphicCacheEntryKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmPropertyLoadMegamorphicCacheInsert {
+    tier: VmPropertyLoadMegamorphicCacheTier,
+    index: usize,
+    epoch: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmPropertyLoadMegamorphicCache {
+    primary_entries: Vec<Option<VmPropertyLoadMegamorphicCacheEntry>>,
+    secondary_entries: Vec<Option<VmPropertyLoadMegamorphicCacheEntry>>,
+}
+
+impl Default for VmPropertyLoadMegamorphicCache {
+    fn default() -> Self {
+        Self {
+            primary_entries: vec![None; PROPERTY_LOAD_MEGAMORPHIC_CACHE_PRIMARY_SIZE],
+            secondary_entries: vec![None; PROPERTY_LOAD_MEGAMORPHIC_CACHE_SECONDARY_SIZE],
+        }
+    }
+}
+
+impl VmPropertyLoadMegamorphicCache {
+    fn insert_hit(
+        &mut self,
+        epoch: u16,
+        key: CacheKey,
+        base_structure: StructureId,
+        offset: PropertyOffset,
+    ) -> Option<VmPropertyLoadMegamorphicCacheInsert> {
+        if !vm_property_load_megamorphic_cache_key_supported(key)
+            || base_structure == StructureId::INVALID
+            || offset.raw() < 0
+            || offset.raw() > PROPERTY_LOAD_MEGAMORPHIC_CACHE_MAX_OFFSET
+        {
+            return None;
+        }
+
+        let primary_index = vm_property_load_megamorphic_cache_primary_index(base_structure, key)?;
+        if let Some(entry) = self.primary_entries[primary_index].take() {
+            if entry.epoch == epoch {
+                let secondary_index = vm_property_load_megamorphic_cache_secondary_index(
+                    entry.base_structure,
+                    entry.key,
+                )?;
+                self.secondary_entries[secondary_index] = Some(entry);
+            }
+        }
+
+        self.primary_entries[primary_index] = Some(VmPropertyLoadMegamorphicCacheEntry {
+            key,
+            base_structure,
+            epoch,
+            kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData { offset },
+        });
+        Some(VmPropertyLoadMegamorphicCacheInsert {
+            tier: VmPropertyLoadMegamorphicCacheTier::Primary,
+            index: primary_index,
+            epoch,
+        })
+    }
+
+    fn insert_miss(
+        &mut self,
+        epoch: u16,
+        key: CacheKey,
+        base_structure: StructureId,
+    ) -> Option<VmPropertyLoadMegamorphicCacheInsert> {
+        if !vm_property_load_megamorphic_cache_key_supported(key)
+            || base_structure == StructureId::INVALID
+        {
+            return None;
+        }
+
+        let primary_index = vm_property_load_megamorphic_cache_primary_index(base_structure, key)?;
+        if let Some(entry) = self.primary_entries[primary_index].take() {
+            if entry.epoch == epoch {
+                let secondary_index = vm_property_load_megamorphic_cache_secondary_index(
+                    entry.base_structure,
+                    entry.key,
+                )?;
+                self.secondary_entries[secondary_index] = Some(entry);
+            }
+        }
+
+        self.primary_entries[primary_index] = Some(VmPropertyLoadMegamorphicCacheEntry {
+            key,
+            base_structure,
+            epoch,
+            kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing,
+        });
+        Some(VmPropertyLoadMegamorphicCacheInsert {
+            tier: VmPropertyLoadMegamorphicCacheTier::Primary,
+            index: primary_index,
+            epoch,
+        })
+    }
+
+    fn insert_prototype(
+        &mut self,
+        epoch: u16,
+        key: CacheKey,
+        base_structure: StructureId,
+        holder: ObjectId,
+        offset: PropertyOffset,
+    ) -> Option<VmPropertyLoadMegamorphicCacheInsert> {
+        if !vm_property_load_megamorphic_cache_key_supported(key)
+            || base_structure == StructureId::INVALID
+            || holder == ObjectId::default()
+            || offset.raw() < 0
+            || offset.raw() > PROPERTY_LOAD_MEGAMORPHIC_CACHE_MAX_OFFSET
+        {
+            return None;
+        }
+
+        let primary_index = vm_property_load_megamorphic_cache_primary_index(base_structure, key)?;
+        if let Some(entry) = self.primary_entries[primary_index].take() {
+            if entry.epoch == epoch {
+                let secondary_index = vm_property_load_megamorphic_cache_secondary_index(
+                    entry.base_structure,
+                    entry.key,
+                )?;
+                self.secondary_entries[secondary_index] = Some(entry);
+            }
+        }
+
+        self.primary_entries[primary_index] = Some(VmPropertyLoadMegamorphicCacheEntry {
+            key,
+            base_structure,
+            epoch,
+            kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData { holder, offset },
+        });
+        Some(VmPropertyLoadMegamorphicCacheInsert {
+            tier: VmPropertyLoadMegamorphicCacheTier::Primary,
+            index: primary_index,
+            epoch,
+        })
+    }
+
+    fn current_entry_count(&self, epoch: u16) -> usize {
+        self.primary_entries
+            .iter()
+            .chain(self.secondary_entries.iter())
+            .filter_map(Option::as_ref)
+            .filter(|entry| entry.epoch == epoch)
+            .count()
+    }
+
+    fn invalidate_entries(&mut self) {
+        for entry in &mut self.primary_entries {
+            *entry = None;
+        }
+        for entry in &mut self.secondary_entries {
+            *entry = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn primary_entry(&self, index: usize) -> Option<&VmPropertyLoadMegamorphicCacheEntry> {
+        self.primary_entries.get(index).and_then(Option::as_ref)
+    }
+
+    #[cfg(test)]
+    fn secondary_entry(&self, index: usize) -> Option<&VmPropertyLoadMegamorphicCacheEntry> {
+        self.secondary_entries.get(index).and_then(Option::as_ref)
+    }
+}
+
+fn generated_property_load_megamorphic_cache_entry(
+    entry: &VmPropertyLoadMegamorphicCacheEntry,
+) -> GeneratedPropertyLoadMegamorphicCacheEntry {
+    GeneratedPropertyLoadMegamorphicCacheEntry {
+        key: entry.key,
+        base_structure: entry.base_structure,
+        epoch: entry.epoch,
+        kind: entry.kind,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmPropertyLoadMegamorphicCacheRecord {
+    pub ordinal: u64,
+    pub observation_ordinal: u64,
+    pub evolution_ordinal: u64,
+    pub owner: CodeBlockId,
+    pub frame: Option<CallFrameId>,
+    pub bytecode_index: BytecodeIndex,
+    pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub slot: InlineCacheSlotId,
+    pub base_structure: StructureId,
+    pub entry_kind: GeneratedPropertyLoadMegamorphicCacheEntryKind,
+    pub plan: Option<PropertyLoadAccessCasePlan>,
+    pub cache_tier: VmPropertyLoadMegamorphicCacheTier,
+    pub cache_index: usize,
+    pub cache_epoch: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmPropertyLoadMegamorphicCacheAgingTrigger {
+    CollectionCompletion { kind: CollectionKind },
+    StructureChainInvalidation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmPropertyLoadMegamorphicCacheAgingRecord {
+    pub sequence: usize,
+    pub trigger: VmPropertyLoadMegamorphicCacheAgingTrigger,
+    pub epoch_before: u16,
+    pub epoch_after: u16,
+    pub entry_count_before: usize,
+    pub entry_count_after: usize,
+    pub store_entry_count_before: usize,
+    pub store_entry_count_after: usize,
+    pub has_entry_count_before: usize,
+    pub has_entry_count_after: usize,
+    pub full_collection: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmPropertyStoreMegamorphicSiteRecord {
+    pub ordinal: u64,
+    pub observation_ordinal: u64,
+    pub evolution_ordinal: u64,
+    pub owner: CodeBlockId,
+    pub frame: Option<CallFrameId>,
+    pub bytecode_index: BytecodeIndex,
+    pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub slot: InlineCacheSlotId,
+    pub key: CacheKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmPropertyStoreMegamorphicCacheTier {
+    Primary,
+    Secondary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmPropertyStoreMegamorphicCacheEntry {
+    key: CacheKey,
+    old_structure: StructureId,
+    new_structure: StructureId,
+    epoch: u16,
+    offset: PropertyOffset,
+    reallocating: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmPropertyStoreMegamorphicCacheInsert {
+    tier: VmPropertyStoreMegamorphicCacheTier,
+    index: usize,
+    epoch: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmPropertyStoreMegamorphicCache {
+    primary_entries: Vec<Option<VmPropertyStoreMegamorphicCacheEntry>>,
+    secondary_entries: Vec<Option<VmPropertyStoreMegamorphicCacheEntry>>,
+}
+
+impl Default for VmPropertyStoreMegamorphicCache {
+    fn default() -> Self {
+        Self {
+            primary_entries: vec![None; PROPERTY_STORE_MEGAMORPHIC_CACHE_PRIMARY_SIZE],
+            secondary_entries: vec![None; PROPERTY_STORE_MEGAMORPHIC_CACHE_SECONDARY_SIZE],
+        }
+    }
+}
+
+impl VmPropertyStoreMegamorphicCache {
+    fn insert_replace(
+        &mut self,
+        epoch: u16,
+        key: CacheKey,
+        structure: StructureId,
+        offset: PropertyOffset,
+    ) -> Option<VmPropertyStoreMegamorphicCacheInsert> {
+        self.insert(epoch, key, structure, structure, offset, false)
+    }
+
+    fn insert_transition(
+        &mut self,
+        epoch: u16,
+        key: CacheKey,
+        old_structure: StructureId,
+        new_structure: StructureId,
+        offset: PropertyOffset,
+        reallocating: bool,
+    ) -> Option<VmPropertyStoreMegamorphicCacheInsert> {
+        if old_structure == new_structure {
+            return None;
+        }
+        self.insert(
+            epoch,
+            key,
+            old_structure,
+            new_structure,
+            offset,
+            reallocating,
+        )
+    }
+
+    fn insert(
+        &mut self,
+        epoch: u16,
+        key: CacheKey,
+        old_structure: StructureId,
+        new_structure: StructureId,
+        offset: PropertyOffset,
+        reallocating: bool,
+    ) -> Option<VmPropertyStoreMegamorphicCacheInsert> {
+        if !vm_property_store_megamorphic_cache_key_supported(key)
+            || old_structure == StructureId::INVALID
+            || new_structure == StructureId::INVALID
+            || offset.raw() < 0
+            || offset.raw() > PROPERTY_STORE_MEGAMORPHIC_CACHE_MAX_OFFSET
+        {
+            return None;
+        }
+
+        let primary_index = vm_property_store_megamorphic_cache_primary_index(old_structure, key)?;
+        if let Some(entry) = self.primary_entries[primary_index].take() {
+            if entry.epoch == epoch {
+                let secondary_index = vm_property_store_megamorphic_cache_secondary_index(
+                    entry.old_structure,
+                    entry.key,
+                )?;
+                self.secondary_entries[secondary_index] = Some(entry);
+            }
+        }
+
+        self.primary_entries[primary_index] = Some(VmPropertyStoreMegamorphicCacheEntry {
+            key,
+            old_structure,
+            new_structure,
+            epoch,
+            offset,
+            reallocating,
+        });
+        Some(VmPropertyStoreMegamorphicCacheInsert {
+            tier: VmPropertyStoreMegamorphicCacheTier::Primary,
+            index: primary_index,
+            epoch,
+        })
+    }
+
+    fn current_entry_count(&self, epoch: u16) -> usize {
+        self.primary_entries
+            .iter()
+            .chain(self.secondary_entries.iter())
+            .filter_map(Option::as_ref)
+            .filter(|entry| entry.epoch == epoch)
+            .count()
+    }
+
+    fn invalidate_entries(&mut self) {
+        for entry in &mut self.primary_entries {
+            *entry = None;
+        }
+        for entry in &mut self.secondary_entries {
+            *entry = None;
+        }
+    }
+}
+
+fn generated_property_store_megamorphic_cache_entry(
+    entry: &VmPropertyStoreMegamorphicCacheEntry,
+) -> GeneratedPropertyStoreMegamorphicCacheEntry {
+    GeneratedPropertyStoreMegamorphicCacheEntry {
+        key: entry.key,
+        old_structure: entry.old_structure,
+        new_structure: entry.new_structure,
+        epoch: entry.epoch,
+        offset: entry.offset,
+        reallocating: entry.reallocating,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmPropertyStoreMegamorphicCacheRecord {
+    pub ordinal: u64,
+    pub observation_ordinal: u64,
+    pub evolution_ordinal: u64,
+    pub owner: CodeBlockId,
+    pub frame: Option<CallFrameId>,
+    pub bytecode_index: BytecodeIndex,
+    pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub slot: InlineCacheSlotId,
+    pub key: CacheKey,
+    pub plan_kind: PropertyStoreAccessCasePlanKind,
+    pub old_structure: StructureId,
+    pub new_structure: StructureId,
+    pub offset: PropertyOffset,
+    pub reallocating: bool,
+    pub plan: PropertyStoreAccessCasePlan,
+    pub cache_tier: VmPropertyStoreMegamorphicCacheTier,
+    pub cache_index: usize,
+    pub cache_epoch: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmPropertyHasMegamorphicSiteRecord {
+    pub ordinal: u64,
+    pub observation_ordinal: u64,
+    pub evolution_ordinal: u64,
+    pub owner: CodeBlockId,
+    pub frame: Option<CallFrameId>,
+    pub bytecode_index: BytecodeIndex,
+    pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub slot: InlineCacheSlotId,
+    pub key: CacheKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmPropertyHasMegamorphicCacheTier {
+    Primary,
+    Secondary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmPropertyHasMegamorphicCacheEntry {
+    key: CacheKey,
+    base_structure: StructureId,
+    epoch: u16,
+    result: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmPropertyHasMegamorphicCacheInsert {
+    tier: VmPropertyHasMegamorphicCacheTier,
+    index: usize,
+    epoch: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmPropertyHasMegamorphicCache {
+    primary_entries: Vec<Option<VmPropertyHasMegamorphicCacheEntry>>,
+    secondary_entries: Vec<Option<VmPropertyHasMegamorphicCacheEntry>>,
+}
+
+impl Default for VmPropertyHasMegamorphicCache {
+    fn default() -> Self {
+        Self {
+            primary_entries: vec![None; PROPERTY_HAS_MEGAMORPHIC_CACHE_PRIMARY_SIZE],
+            secondary_entries: vec![None; PROPERTY_HAS_MEGAMORPHIC_CACHE_SECONDARY_SIZE],
+        }
+    }
+}
+
+impl VmPropertyHasMegamorphicCache {
+    fn insert_hit(
+        &mut self,
+        epoch: u16,
+        key: CacheKey,
+        base_structure: StructureId,
+    ) -> Option<VmPropertyHasMegamorphicCacheInsert> {
+        self.insert(epoch, key, base_structure, true)
+    }
+
+    fn insert_miss(
+        &mut self,
+        epoch: u16,
+        key: CacheKey,
+        base_structure: StructureId,
+    ) -> Option<VmPropertyHasMegamorphicCacheInsert> {
+        self.insert(epoch, key, base_structure, false)
+    }
+
+    fn insert(
+        &mut self,
+        epoch: u16,
+        key: CacheKey,
+        base_structure: StructureId,
+        result: bool,
+    ) -> Option<VmPropertyHasMegamorphicCacheInsert> {
+        if !vm_property_has_megamorphic_cache_key_supported(key)
+            || base_structure == StructureId::INVALID
+        {
+            return None;
+        }
+
+        let primary_index = vm_property_has_megamorphic_cache_primary_index(base_structure, key)?;
+        if let Some(entry) = self.primary_entries[primary_index].take() {
+            if entry.epoch == epoch {
+                let secondary_index = vm_property_has_megamorphic_cache_secondary_index(
+                    entry.base_structure,
+                    entry.key,
+                )?;
+                self.secondary_entries[secondary_index] = Some(entry);
+            }
+        }
+
+        self.primary_entries[primary_index] = Some(VmPropertyHasMegamorphicCacheEntry {
+            key,
+            base_structure,
+            epoch,
+            result,
+        });
+        Some(VmPropertyHasMegamorphicCacheInsert {
+            tier: VmPropertyHasMegamorphicCacheTier::Primary,
+            index: primary_index,
+            epoch,
+        })
+    }
+
+    fn current_entry_count(&self, epoch: u16) -> usize {
+        self.primary_entries
+            .iter()
+            .chain(self.secondary_entries.iter())
+            .filter_map(Option::as_ref)
+            .filter(|entry| entry.epoch == epoch)
+            .count()
+    }
+
+    fn invalidate_entries(&mut self) {
+        for entry in &mut self.primary_entries {
+            *entry = None;
+        }
+        for entry in &mut self.secondary_entries {
+            *entry = None;
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn generated_property_has_megamorphic_cache_entry(
+    entry: &VmPropertyHasMegamorphicCacheEntry,
+) -> GeneratedPropertyHasMegamorphicCacheEntry {
+    GeneratedPropertyHasMegamorphicCacheEntry {
+        key: entry.key,
+        base_structure: entry.base_structure,
+        epoch: entry.epoch,
+        result: entry.result,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmPropertyHasMegamorphicCacheRecord {
+    pub ordinal: u64,
+    pub observation_ordinal: u64,
+    pub evolution_ordinal: u64,
+    pub owner: CodeBlockId,
+    pub frame: Option<CallFrameId>,
+    pub bytecode_index: BytecodeIndex,
+    pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub slot: InlineCacheSlotId,
+    pub key: CacheKey,
+    pub base_structure: StructureId,
+    pub result: bool,
+    pub cache_tier: VmPropertyHasMegamorphicCacheTier,
+    pub cache_index: usize,
+    pub cache_epoch: u16,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VmPropertyHasMegamorphicCacheEntryRequest {
+    pub observation_ordinal: u64,
+    pub evolution_ordinal: u64,
+    pub owner: CodeBlockId,
+    pub frame: Option<CallFrameId>,
+    pub bytecode_index: BytecodeIndex,
+    pub bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    pub slot: InlineCacheSlotId,
+    pub key: CacheKey,
+    pub base_structure: StructureId,
+    pub result: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10506,7 +14529,7 @@ fn validate_baseline_install_eligibility(
 fn decision_for_plan(
     selected_plan: Option<TierPlanDescriptor>,
     policy: TieringPolicy,
-    baseline_entry_gate: Option<BaselineEntryGateRecord>,
+    baseline_entry_gate: Option<&BaselineEntryGateRecord>,
 ) -> TierEntryDecision {
     if matches!(
         policy,
@@ -10617,24 +14640,531 @@ const fn vm_store_candidate_plan_lifecycle_matches(
     }
 }
 
+fn property_inline_cache_evolution_cooldown(number_of_cooldowns: u8) -> u8 {
+    let shift = u32::from(number_of_cooldowns);
+    u16::from(PROPERTY_IC_INITIAL_COOLDOWN_COUNT)
+        .checked_shl(shift)
+        .unwrap_or(u16::from(u8::MAX - 1))
+        .min(u16::from(u8::MAX - 1)) as u8
+}
+
+const fn property_inline_cache_evolution_kind_for_attachment_kind(
+    kind: VmPropertyInlineCacheAttachmentKind,
+) -> Option<VmPropertyInlineCacheEvolutionKind> {
+    match kind {
+        VmPropertyInlineCacheAttachmentKind::OwnDataLoad => {
+            Some(VmPropertyInlineCacheEvolutionKind::Load)
+        }
+        VmPropertyInlineCacheAttachmentKind::StoreReplace
+        | VmPropertyInlineCacheAttachmentKind::StoreTransition => {
+            Some(VmPropertyInlineCacheEvolutionKind::Store)
+        }
+        VmPropertyInlineCacheAttachmentKind::GuardedPrototypeDataLoad
+        | VmPropertyInlineCacheAttachmentKind::GuardedNegativeLookup => None,
+    }
+}
+
+fn vm_push_projected_property_load_access_case_plan(
+    plans: &mut Vec<PropertyLoadAccessCasePlan>,
+    candidate: PropertyLoadAccessCasePlan,
+) {
+    let duplicate_key = vm_property_load_access_case_plan_table_key(&candidate);
+    if plans.iter().any(|existing| {
+        vm_property_load_access_case_plan_table_key(existing) == duplicate_key
+            || vm_property_load_access_case_can_replace(existing, &candidate)
+    }) {
+        return;
+    }
+
+    plans.push(candidate);
+}
+
+fn vm_property_load_descriptor_has_megamorphic_cacheable_get_by_id_base(
+    descriptor: &PropertyLoadObservationDescriptor,
+) -> bool {
+    // C++ only inserts GetById megamorphic entries for cacheable named loads
+    // that cannot call JS; shape-specific Load/Miss checks remain below.
+    descriptor.can_use_get_by_id_megamorphic
+        && descriptor.cache_kind == InlineCacheKind::PropertyLoad
+        && !descriptor.may_call_js
+        && descriptor.cacheability == PropertyCacheability::Allowed
+        && vm_property_load_megamorphic_cache_key_supported(descriptor.key)
+}
+
+fn vm_property_has_descriptor_can_use_in_by_id_megamorphic(
+    descriptor: &PropertyHasObservationDescriptor,
+) -> bool {
+    descriptor.can_use_in_by_id_megamorphic
+        && matches!(descriptor.opcode, CoreOpcode::InById | CoreOpcode::InByVal)
+        && descriptor.cache_kind == InlineCacheKind::HasProperty
+        && descriptor.fallback == crate::jit::InlineCacheFallbackSemantics::SlowPathLookup
+        && descriptor.cacheability == PropertyCacheability::Allowed
+        && !descriptor.may_call_js
+        && vm_property_has_megamorphic_cache_key_supported(descriptor.key)
+        && descriptor
+            .base_structure
+            .is_some_and(|structure| structure != StructureId::INVALID)
+        && matches!(
+            descriptor.observed_access_case_kind,
+            Some(AccessCaseKind::InHit | AccessCaseKind::InMiss)
+        )
+        && descriptor.result
+            == (descriptor.observed_access_case_kind == Some(AccessCaseKind::InHit))
+}
+
+fn vm_property_load_plan_can_use_get_by_id_megamorphic(
+    descriptor: &PropertyLoadObservationDescriptor,
+    plan: &PropertyLoadAccessCasePlan,
+) -> bool {
+    vm_property_load_descriptor_has_megamorphic_cacheable_get_by_id_base(descriptor)
+        && descriptor.observed_access_case_kind == Some(AccessCaseKind::Load)
+        && descriptor.prototype_depth == 0
+        && descriptor.readiness == PropertyLoadObservationReadiness::ReadyForAttachment
+        && plan.plan_kind == PropertyLoadAccessCasePlanKind::DataOnlyOwnLoad
+        && plan.access_case.kind == AccessCaseKind::Load
+        && plan.access_case.key == plan.key
+        && matches!(plan.key, CacheKey::Property(PropertyKey::String(_)))
+        && plan.access_case.base_structure.is_some()
+        && plan.access_case.offset.is_some()
+        && plan.access_case.holder.is_none()
+        && plan.access_case.new_structure.is_none()
+        && !plan.access_case.via_global_proxy
+        && !plan.access_case.may_call_js
+        && plan.access_case.dependencies.is_empty()
+        && plan.planned_stub_kind == InlineCacheStubKind::DataOnlyHandler
+        && plan.effect_contract.supports_generated_data_only_own_load()
+}
+
+fn vm_property_load_normalized_base_can_use_get_by_id_megamorphic(
+    descriptor: &PropertyLoadObservationDescriptor,
+) -> bool {
+    vm_property_load_descriptor_has_megamorphic_cacheable_get_by_id_base(descriptor)
+        && descriptor.observed_access_case_kind == Some(AccessCaseKind::Load)
+        && descriptor.base_normalization == PropertyLoadBaseNormalization::StringPrototype
+        && descriptor.prototype_depth == 0
+        && descriptor.readiness == PropertyLoadObservationReadiness::ReadyForAttachment
+        && descriptor
+            .base_structure
+            .is_some_and(|structure| structure != StructureId::INVALID)
+        && descriptor.base_object.is_some()
+        && descriptor.holder_object == descriptor.base_object
+        && descriptor
+            .offset
+            .is_some_and(|offset| offset != PropertyOffset::INVALID && offset.raw() >= 0)
+        && descriptor.chain.len() == 1
+        && descriptor.chain.first().is_some_and(|entry| {
+            Some(entry.object) == descriptor.base_object && entry.next_prototype.is_none()
+        })
+}
+
+fn vm_property_load_direct_prototype_can_use_get_by_id_megamorphic(
+    descriptor: &PropertyLoadObservationDescriptor,
+) -> bool {
+    if !vm_property_load_descriptor_has_megamorphic_cacheable_get_by_id_base(descriptor)
+        || descriptor.observed_access_case_kind != Some(AccessCaseKind::Load)
+        || !matches!(
+            descriptor.base_normalization,
+            PropertyLoadBaseNormalization::None | PropertyLoadBaseNormalization::StringPrototype
+        )
+        || descriptor.prototype_depth == 0
+    {
+        return false;
+    }
+    let Some(base_object) = descriptor.base_object else {
+        return false;
+    };
+    let Some(holder_object) = descriptor.holder_object else {
+        return false;
+    };
+    if holder_object == base_object {
+        return false;
+    }
+    let Some(base_structure) = descriptor
+        .base_structure
+        .filter(|structure| *structure != StructureId::INVALID)
+    else {
+        return false;
+    };
+    if !descriptor.offset.is_some_and(|offset| {
+        offset != PropertyOffset::INVALID
+            && offset.raw() >= 0
+            && offset.raw() <= PROPERTY_LOAD_MEGAMORPHIC_CACHE_MAX_OFFSET
+    }) {
+        return false;
+    }
+    let expected_chain_length = usize::from(descriptor.prototype_depth).saturating_add(1);
+    if descriptor.chain.len() != expected_chain_length {
+        return false;
+    }
+    let holder_index = usize::from(descriptor.prototype_depth);
+    let Some(base_entry) = descriptor.chain.first() else {
+        return false;
+    };
+    let Some(holder_entry) = descriptor.chain.get(holder_index) else {
+        return false;
+    };
+    base_entry.object == base_object
+        && base_entry.structure == base_structure
+        && descriptor
+            .chain
+            .iter()
+            .all(|entry| entry.structure != StructureId::INVALID)
+        && descriptor
+            .chain
+            .windows(2)
+            .all(|window| window[0].next_prototype == Some(window[1].object))
+        && holder_entry.object == holder_object
+        && holder_entry.structure != StructureId::INVALID
+        && holder_entry.next_prototype.is_none()
+}
+
+fn vm_property_load_miss_can_use_get_by_id_megamorphic(
+    descriptor: &PropertyLoadObservationDescriptor,
+) -> bool {
+    if !vm_property_load_descriptor_has_megamorphic_cacheable_get_by_id_base(descriptor)
+        || descriptor.observed_access_case_kind != Some(AccessCaseKind::Miss)
+        || !matches!(
+            descriptor.base_normalization,
+            PropertyLoadBaseNormalization::None | PropertyLoadBaseNormalization::StringPrototype
+        )
+        || descriptor.holder_object.is_some()
+        || descriptor.offset.is_some()
+    {
+        return false;
+    }
+    let Some(base_object) = descriptor.base_object else {
+        return false;
+    };
+    let Some(base_structure) = descriptor
+        .base_structure
+        .filter(|structure| *structure != StructureId::INVALID)
+    else {
+        return false;
+    };
+    let expected_chain_length = usize::from(descriptor.prototype_depth).saturating_add(1);
+    if descriptor.chain.len() != expected_chain_length {
+        return false;
+    }
+    descriptor
+        .chain
+        .first()
+        .is_some_and(|entry| entry.object == base_object && entry.structure == base_structure)
+        && descriptor
+            .chain
+            .iter()
+            .all(|entry| entry.structure != StructureId::INVALID)
+        && descriptor
+            .chain
+            .windows(2)
+            .all(|window| window[0].next_prototype == Some(window[1].object))
+        && descriptor
+            .chain
+            .last()
+            .is_some_and(|entry| entry.next_prototype.is_none())
+}
+
+fn vm_property_load_prototype_can_use_get_by_id_megamorphic(
+    descriptor: &PropertyLoadObservationDescriptor,
+    plan: &PropertyLoadGuardPlan,
+) -> bool {
+    if !vm_property_load_descriptor_has_megamorphic_cacheable_get_by_id_base(descriptor)
+        || descriptor.observed_access_case_kind != Some(AccessCaseKind::Load)
+        || descriptor.prototype_depth == 0
+        || descriptor
+            .base_structure
+            .is_none_or(|structure| structure == StructureId::INVALID)
+        || descriptor.holder_object.is_none()
+        || descriptor.offset.is_none_or(|offset| {
+            offset == PropertyOffset::INVALID
+                || offset.raw() < 0
+                || offset.raw() > PROPERTY_LOAD_MEGAMORPHIC_CACHE_MAX_OFFSET
+        })
+    {
+        return false;
+    }
+    if plan.descriptor.requirement != PropertyLoadGuardRequirement::PrototypeChain
+        || plan.descriptor.key != descriptor.key
+        || Some(plan.descriptor.base_object) != descriptor.base_object
+        || Some(plan.descriptor.base_structure) != descriptor.base_structure
+        || plan.descriptor.holder_object != descriptor.holder_object
+        || plan.descriptor.offset != descriptor.offset
+        || plan.descriptor.prototype_depth != descriptor.prototype_depth
+    {
+        return false;
+    }
+    let PropertyLoadGuardChainOutcome::PrototypeData {
+        holder_index,
+        offset,
+    } = plan.descriptor.chain.outcome
+    else {
+        return false;
+    };
+    if descriptor.offset != Some(offset)
+        || holder_index == 0
+        || holder_index + 1 != plan.descriptor.chain.entries.len()
+        || usize::from(descriptor.prototype_depth) != holder_index
+    {
+        return false;
+    }
+    let Some(holder) = descriptor.holder_object else {
+        return false;
+    };
+    plan.descriptor.chain.entries.first().is_some_and(|entry| {
+        Some(entry.object) == descriptor.base_object
+            && Some(entry.structure) == descriptor.base_structure
+    }) && plan
+        .descriptor
+        .chain
+        .entries
+        .get(holder_index)
+        .is_some_and(|entry| {
+            entry.object == holder
+                && entry.proof == PropertyLoadGuardChainEntryProof::DataProperty { offset }
+        })
+        && plan.descriptor.chain.entries[..holder_index]
+            .iter()
+            .all(|entry| entry.proof == PropertyLoadGuardChainEntryProof::NoOwnProperty)
+        && plan
+            .descriptor
+            .chain
+            .entries
+            .windows(2)
+            .all(|window| window[0].next_prototype == Some(window[1].object))
+}
+
+fn vm_property_load_megamorphic_cache_key_supported(key: CacheKey) -> bool {
+    matches!(key, CacheKey::Property(PropertyKey::String(_)))
+}
+
+fn vm_property_load_megamorphic_cache_key_hash(key: CacheKey) -> Option<u32> {
+    let CacheKey::Property(PropertyKey::String(identifier)) = key else {
+        return None;
+    };
+    // C++ hashes the UniquedStringImpl. Rust's current cache key owns only the
+    // VM atom identity, so this uses a stable atom-slot mix while still
+    // requiring an exact key equality check before any hit is consumed.
+    Some(
+        identifier
+            .atom()
+            .table_slot()
+            .wrapping_mul(0x9E37_79B1)
+            .rotate_left(5),
+    )
+}
+
+fn vm_property_load_megamorphic_cache_primary_index(
+    structure: StructureId,
+    key: CacheKey,
+) -> Option<usize> {
+    let sid = structure.0;
+    let hash =
+        ((sid >> 4) ^ (sid >> 15)).wrapping_add(vm_property_load_megamorphic_cache_key_hash(key)?);
+    Some((hash as usize) & PROPERTY_LOAD_MEGAMORPHIC_CACHE_PRIMARY_MASK)
+}
+
+fn vm_property_load_megamorphic_cache_secondary_index(
+    structure: StructureId,
+    key: CacheKey,
+) -> Option<usize> {
+    let key_hash = vm_property_load_megamorphic_cache_key_hash(key)?;
+    let hash = structure.0.wrapping_add(key_hash);
+    Some(
+        ((hash.wrapping_add(hash >> 13)) as usize) & PROPERTY_LOAD_MEGAMORPHIC_CACHE_SECONDARY_MASK,
+    )
+}
+
+fn vm_property_store_megamorphic_cache_key_supported(key: CacheKey) -> bool {
+    matches!(key, CacheKey::Property(property_key) if property_key.as_identifier().is_some())
+}
+
+fn vm_property_store_megamorphic_cache_key_hash(key: CacheKey) -> Option<u32> {
+    let CacheKey::Property(PropertyKey::String(identifier)) = key else {
+        return None;
+    };
+    Some(
+        identifier
+            .atom()
+            .table_slot()
+            .wrapping_mul(0x9E37_79B1)
+            .rotate_left(5),
+    )
+}
+
+fn vm_property_store_megamorphic_cache_primary_index(
+    structure: StructureId,
+    key: CacheKey,
+) -> Option<usize> {
+    let sid = structure.0;
+    let hash =
+        ((sid >> 4) ^ (sid >> 15)).wrapping_add(vm_property_store_megamorphic_cache_key_hash(key)?);
+    Some((hash as usize) & PROPERTY_STORE_MEGAMORPHIC_CACHE_PRIMARY_MASK)
+}
+
+fn vm_property_store_megamorphic_cache_secondary_index(
+    structure: StructureId,
+    key: CacheKey,
+) -> Option<usize> {
+    let key_hash = vm_property_store_megamorphic_cache_key_hash(key)?;
+    let hash = structure.0.wrapping_add(key_hash);
+    Some(
+        ((hash.wrapping_add(hash >> 13)) as usize)
+            & PROPERTY_STORE_MEGAMORPHIC_CACHE_SECONDARY_MASK,
+    )
+}
+
+fn vm_property_has_megamorphic_cache_key_supported(key: CacheKey) -> bool {
+    matches!(key, CacheKey::Property(PropertyKey::String(_)))
+}
+
+fn vm_property_has_megamorphic_cache_key_hash(key: CacheKey) -> Option<u32> {
+    let CacheKey::Property(PropertyKey::String(identifier)) = key else {
+        return None;
+    };
+    Some(
+        identifier
+            .atom()
+            .table_slot()
+            .wrapping_mul(0x9E37_79B1)
+            .rotate_left(5),
+    )
+}
+
+fn vm_property_has_megamorphic_cache_primary_index(
+    structure: StructureId,
+    key: CacheKey,
+) -> Option<usize> {
+    let sid = structure.0;
+    let hash =
+        ((sid >> 4) ^ (sid >> 13)).wrapping_add(vm_property_has_megamorphic_cache_key_hash(key)?);
+    Some((hash as usize) & PROPERTY_HAS_MEGAMORPHIC_CACHE_PRIMARY_MASK)
+}
+
+fn vm_property_has_megamorphic_cache_secondary_index(
+    structure: StructureId,
+    key: CacheKey,
+) -> Option<usize> {
+    let key_hash = vm_property_has_megamorphic_cache_key_hash(key)?;
+    let hash = structure.0.wrapping_add(key_hash);
+    Some(((hash.wrapping_add(hash >> 11)) as usize) & PROPERTY_HAS_MEGAMORPHIC_CACHE_SECONDARY_MASK)
+}
+
+fn vm_push_projected_property_store_access_case_plan(
+    plans: &mut Vec<PropertyStoreAccessCasePlan>,
+    candidate: PropertyStoreAccessCasePlan,
+) {
+    let duplicate_key = vm_property_store_access_case_plan_table_key(&candidate);
+    if plans.iter().any(|existing| {
+        vm_property_store_access_case_plan_table_key(existing) == duplicate_key
+            || vm_property_store_access_case_can_replace(existing, &candidate)
+    }) {
+        return;
+    }
+
+    plans.push(candidate);
+}
+
+fn vm_push_projected_property_store_mutation_candidate(
+    candidates: &mut Vec<PropertyStoreMutationCandidate>,
+    candidate: PropertyStoreMutationCandidate,
+) {
+    let duplicate_key = vm_property_store_mutation_candidate_table_key(&candidate);
+    if candidates.iter().any(|existing| {
+        existing.store_plan_ordinal == candidate.store_plan_ordinal
+            || existing.readiness_ordinal == candidate.readiness_ordinal
+            || vm_property_store_mutation_candidate_table_key(existing) == duplicate_key
+            || vm_property_store_access_case_can_replace(&existing.plan, &candidate.plan)
+    }) {
+        return;
+    }
+
+    candidates.push(candidate);
+}
+
+fn vm_property_load_access_case_can_replace(
+    existing: &PropertyLoadAccessCasePlan,
+    candidate: &PropertyLoadAccessCasePlan,
+) -> bool {
+    existing.owner == candidate.owner
+        && existing.slot == candidate.slot
+        && existing.bytecode_index == candidate.bytecode_index
+        && existing.key == candidate.key
+        && existing.plan_kind == candidate.plan_kind
+        && existing.planned_stub_kind == candidate.planned_stub_kind
+        && existing.effect_contract == candidate.effect_contract
+        && vm_access_case_descriptor_can_replace(&existing.access_case, &candidate.access_case)
+}
+
+fn vm_property_store_access_case_can_replace(
+    existing: &PropertyStoreAccessCasePlan,
+    candidate: &PropertyStoreAccessCasePlan,
+) -> bool {
+    existing.owner == candidate.owner
+        && existing.slot == candidate.slot
+        && existing.bytecode_index == candidate.bytecode_index
+        && existing.key == candidate.key
+        && existing.plan_kind == candidate.plan_kind
+        && existing.planned_stub_kind == candidate.planned_stub_kind
+        && existing.effect_contract == candidate.effect_contract
+        && vm_access_case_descriptor_can_replace(&existing.access_case, &candidate.access_case)
+        && existing.access_case.new_structure == candidate.access_case.new_structure
+}
+
+fn vm_access_case_descriptor_can_replace(
+    existing: &AccessCaseDescriptor,
+    candidate: &AccessCaseDescriptor,
+) -> bool {
+    existing.key == candidate.key
+        && existing.kind == candidate.kind
+        && existing.base_structure == candidate.base_structure
+        && existing.holder == candidate.holder
+        && existing.via_global_proxy == candidate.via_global_proxy
+        && existing.may_call_js == candidate.may_call_js
+        && existing.dependencies == candidate.dependencies
+}
+
 fn vm_property_load_access_case_plan_table_key(
     plan: &PropertyLoadAccessCasePlan,
-) -> (
-    u32,
-    crate::gc::StructureId,
-    crate::object::PropertyOffset,
-    crate::jit::CacheKey,
-) {
+) -> (u32, StructureId, PropertyOffset, CacheKey) {
     (
         plan.bytecode_index,
         plan.access_case
             .base_structure
             .expect("validated property-load plan base structure"),
-        plan.access_case
-            .offset
-            .expect("validated property-load plan offset"),
+        plan.access_case.offset.unwrap_or(PropertyOffset::INVALID),
         plan.key,
     )
+}
+
+fn vm_property_store_access_case_plan_table_key(
+    plan: &PropertyStoreAccessCasePlan,
+) -> (
+    u32,
+    CacheKey,
+    StructureId,
+    PropertyOffset,
+    Option<StructureId>,
+) {
+    (
+        plan.bytecode_index,
+        plan.key,
+        plan.access_case
+            .base_structure
+            .expect("validated property-store plan base structure"),
+        plan.access_case.offset.unwrap_or(PropertyOffset::INVALID),
+        plan.access_case.new_structure,
+    )
+}
+
+fn vm_property_store_mutation_candidate_table_key(
+    candidate: &PropertyStoreMutationCandidate,
+) -> (
+    u32,
+    CacheKey,
+    StructureId,
+    PropertyOffset,
+    Option<StructureId>,
+) {
+    vm_property_store_access_case_plan_table_key(&candidate.plan)
 }
 
 fn vm_property_load_guarded_candidate_table_key(
@@ -10655,51 +15185,12 @@ fn vm_property_load_guarded_candidate_table_key(
     )
 }
 
-#[allow(dead_code)]
-fn vm_property_store_access_case_plan_table_key(
-    plan: &PropertyStoreAccessCasePlan,
-) -> (
-    u32,
-    CacheKey,
-    StructureId,
-    PropertyOffset,
-    Option<StructureId>,
-) {
-    (
-        plan.bytecode_index,
-        plan.key,
-        plan.access_case
-            .base_structure
-            .expect("validated property-store plan base structure"),
-        plan.access_case
-            .offset
-            .expect("validated property-store plan offset"),
-        plan.access_case.new_structure,
-    )
-}
-
-fn vm_property_store_mutation_candidate_table_key(
-    candidate: &PropertyStoreMutationCandidate,
-) -> (
-    u32,
-    CacheKey,
-    StructureId,
-    PropertyOffset,
-    Option<StructureId>,
-) {
-    vm_property_store_access_case_plan_table_key(&candidate.plan)
-}
-
 fn vm_property_store_access_case_plan_from_observation(
     observation: &PropertyStoreObservationDescriptor,
 ) -> Option<PropertyStoreAccessCasePlan> {
-    if observation.cache_kind != crate::jit::InlineCacheKind::PropertyStore
-        || observation.fallback != crate::jit::InlineCacheFallbackSemantics::SlowPathLookup
+    if observation.fallback != crate::jit::InlineCacheFallbackSemantics::SlowPathLookup
         || observation.may_call_js
-        || !vm_property_store_access_case_key_supports_metadata_plan(observation.key)
         || observation.base_object.is_none()
-        || observation.write_barrier_count == 0
-        || observation.last_write_barrier.is_none()
     {
         return None;
     }
@@ -10711,34 +15202,69 @@ fn vm_property_store_access_case_plan_from_observation(
         return None;
     }
 
-    let offset = observation.offset_after?;
-    if offset.raw() < 0 {
+    let (plan_kind, access_case_kind, new_structure, offset, effect_contract) =
+        match observation.cache_kind {
+            crate::jit::InlineCacheKind::PropertyStore => {
+                if !vm_property_store_access_case_key_supports_metadata_plan(
+                    PropertyStoreAccessCasePlanKind::DataOnlyReplace,
+                    observation.key,
+                ) {
+                    return None;
+                }
+                let offset = observation.offset_after?;
+                if offset.raw() < 0 {
+                    return None;
+                }
+                match observation.outcome {
+                    PropertyStoreObservationOutcome::OwnDataStore
+                        if base_structure_before == base_structure_after =>
+                    {
+                        (
+                            PropertyStoreAccessCasePlanKind::DataOnlyReplace,
+                            AccessCaseKind::Replace,
+                            None,
+                            Some(offset),
+                            PropertyStoreAccessCasePlanContract::DATA_ONLY_REPLACE,
+                        )
+                    }
+                    PropertyStoreObservationOutcome::CreatedProperty
+                        if base_structure_before != base_structure_after =>
+                    {
+                        (
+                            PropertyStoreAccessCasePlanKind::DataOnlyTransition,
+                            AccessCaseKind::Transition,
+                            Some(base_structure_after),
+                            Some(offset),
+                            PropertyStoreAccessCasePlanContract::DATA_ONLY_TRANSITION,
+                        )
+                    }
+                    _ => return None,
+                }
+            }
+            crate::jit::InlineCacheKind::ElementStore => {
+                if observation.outcome != PropertyStoreObservationOutcome::IndexedStore
+                    || base_structure_before != base_structure_after
+                    || observation.offset_after.is_some()
+                    || !vm_property_store_access_case_key_supports_metadata_plan(
+                        PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore,
+                        observation.key,
+                    )
+                {
+                    return None;
+                }
+                (
+                    PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore,
+                    AccessCaseKind::IndexedStore,
+                    None,
+                    None,
+                    PropertyStoreAccessCasePlanContract::DATA_ONLY_INDEXED_STORE,
+                )
+            }
+            _ => return None,
+        };
+    if !vm_property_store_observation_has_barrier_or_no_barrier_proof(observation, plan_kind) {
         return None;
     }
-
-    let (plan_kind, access_case_kind, new_structure, effect_contract) = match observation.outcome {
-        PropertyStoreObservationOutcome::OwnDataStore
-            if base_structure_before == base_structure_after =>
-        {
-            (
-                PropertyStoreAccessCasePlanKind::DataOnlyReplace,
-                AccessCaseKind::Replace,
-                None,
-                PropertyStoreAccessCasePlanContract::DATA_ONLY_REPLACE,
-            )
-        }
-        PropertyStoreObservationOutcome::CreatedProperty
-            if base_structure_before != base_structure_after =>
-        {
-            (
-                PropertyStoreAccessCasePlanKind::DataOnlyTransition,
-                AccessCaseKind::Transition,
-                Some(base_structure_after),
-                PropertyStoreAccessCasePlanContract::DATA_ONLY_TRANSITION,
-            )
-        }
-        _ => return None,
-    };
 
     Some(PropertyStoreAccessCasePlan {
         plan_kind,
@@ -10752,7 +15278,7 @@ fn vm_property_store_access_case_plan_from_observation(
             base_structure: Some(base_structure_before),
             new_structure,
             holder: None,
-            offset: Some(offset),
+            offset,
             via_global_proxy: false,
             may_call_js: false,
             dependencies: Vec::new(),
@@ -10762,11 +15288,158 @@ fn vm_property_store_access_case_plan_from_observation(
     })
 }
 
-fn vm_property_store_access_case_key_supports_metadata_plan(key: CacheKey) -> bool {
-    match key {
-        CacheKey::Property(property_key) => property_key.as_identifier().is_some(),
-        CacheKey::Dynamic => false,
+fn vm_property_store_plan_can_use_put_by_id_megamorphic(
+    descriptor: &PropertyStoreObservationDescriptor,
+    plan: &PropertyStoreAccessCasePlan,
+) -> bool {
+    if descriptor.cache_kind != InlineCacheKind::PropertyStore
+        || descriptor.fallback != crate::jit::InlineCacheFallbackSemantics::SlowPathLookup
+        || descriptor.may_call_js
+        || descriptor.cacheability != PropertyCacheability::Disallowed
+        || !descriptor.can_use_put_by_id_megamorphic
+        || descriptor.base_object.is_none()
+        || !vm_property_store_observation_has_barrier_or_no_barrier_proof(
+            descriptor,
+            plan.plan_kind,
+        )
+        || !vm_property_store_megamorphic_cache_key_supported(descriptor.key)
+        || plan.owner != descriptor.owner
+        || plan.slot != descriptor.slot
+        || plan.bytecode_index != descriptor.bytecode_index
+        || plan.key != descriptor.key
+        || plan.access_case.key != descriptor.key
+        || !vm_property_store_megamorphic_cache_key_supported(plan.key)
+        || plan.planned_stub_kind != InlineCacheStubKind::RepatchingStub
+        || plan.access_case.holder.is_some()
+        || !plan.access_case.dependencies.is_empty()
+        || plan.access_case.via_global_proxy
+        || plan.access_case.may_call_js
+    {
+        return false;
     }
+
+    let Some(base_structure_before) = descriptor
+        .base_structure_before
+        .filter(|structure| *structure != StructureId::INVALID)
+    else {
+        return false;
+    };
+    let Some(base_structure_after) = descriptor
+        .base_structure_after
+        .filter(|structure| *structure != StructureId::INVALID)
+    else {
+        return false;
+    };
+    let Some(offset) = descriptor.offset_after.filter(|offset| {
+        *offset != PropertyOffset::INVALID
+            && offset.raw() >= 0
+            && offset.raw() <= PROPERTY_STORE_MEGAMORPHIC_CACHE_MAX_OFFSET
+    }) else {
+        return false;
+    };
+    if plan.access_case.base_structure != Some(base_structure_before)
+        || plan.access_case.offset != Some(offset)
+    {
+        return false;
+    }
+
+    match (descriptor.outcome, plan.plan_kind, plan.access_case.kind) {
+        (
+            PropertyStoreObservationOutcome::OwnDataStore,
+            PropertyStoreAccessCasePlanKind::DataOnlyReplace,
+            AccessCaseKind::Replace,
+        ) => {
+            base_structure_before == base_structure_after
+                && plan.access_case.new_structure.is_none()
+                && plan.effect_contract.supports_metadata_only_replace_plan()
+        }
+        (
+            PropertyStoreObservationOutcome::CreatedProperty,
+            PropertyStoreAccessCasePlanKind::DataOnlyTransition,
+            AccessCaseKind::Transition,
+        ) => {
+            base_structure_before != base_structure_after
+                && plan.access_case.new_structure == Some(base_structure_after)
+                && plan
+                    .effect_contract
+                    .supports_metadata_only_transition_plan()
+        }
+        _ => false,
+    }
+}
+
+fn vm_property_store_access_case_key_supports_metadata_plan(
+    plan_kind: PropertyStoreAccessCasePlanKind,
+    key: CacheKey,
+) -> bool {
+    match (plan_kind, key) {
+        (
+            PropertyStoreAccessCasePlanKind::DataOnlyReplace
+            | PropertyStoreAccessCasePlanKind::DataOnlyTransition,
+            CacheKey::Property(property_key),
+        ) => property_key.as_identifier().is_some(),
+        (
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore,
+            CacheKey::Property(property_key),
+        ) => property_key.as_index().is_some(),
+        (_, CacheKey::Dynamic) => false,
+        (PropertyStoreAccessCasePlanKind::Unsupported, _) => false,
+    }
+}
+
+fn vm_property_store_stored_value_requires_runtime_barrier(
+    plan_kind: PropertyStoreAccessCasePlanKind,
+    stored_value_kind: ValueKind,
+) -> bool {
+    match plan_kind {
+        PropertyStoreAccessCasePlanKind::DataOnlyTransition => true,
+        PropertyStoreAccessCasePlanKind::DataOnlyReplace
+        | PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
+            matches!(stored_value_kind, ValueKind::Cell | ValueKind::Unknown)
+        }
+        PropertyStoreAccessCasePlanKind::Unsupported => true,
+    }
+}
+
+fn vm_property_store_observation_has_barrier_or_no_barrier_proof(
+    descriptor: &PropertyStoreObservationDescriptor,
+    plan_kind: PropertyStoreAccessCasePlanKind,
+) -> bool {
+    if vm_property_store_stored_value_requires_runtime_barrier(
+        plan_kind,
+        descriptor.stored_value.kind(),
+    ) {
+        descriptor.write_barrier_count > 0 && descriptor.last_write_barrier.is_some()
+    } else {
+        descriptor.write_barrier_count == 0 || descriptor.last_write_barrier.is_some()
+    }
+}
+
+fn vm_property_store_access_case_barrier_evidence(
+    descriptor: &PropertyStoreObservationDescriptor,
+    plan: &PropertyStoreAccessCasePlan,
+) -> Option<VmPropertyStoreAccessCaseBarrierEvidenceSummary> {
+    let last_write_barrier = if vm_property_store_stored_value_requires_runtime_barrier(
+        plan.plan_kind,
+        descriptor.stored_value.kind(),
+    ) {
+        if descriptor.write_barrier_count == 0 {
+            return None;
+        }
+        descriptor.last_write_barrier?
+    } else if descriptor.write_barrier_count == 0 {
+        BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::NullOrNonCellTarget)
+    } else {
+        descriptor.last_write_barrier?
+    };
+
+    Some(VmPropertyStoreAccessCaseBarrierEvidenceSummary {
+        plan_kind: plan.plan_kind,
+        effect_contract: plan.effect_contract,
+        barrier_effect: plan.effect_contract.barrier,
+        observed_write_barrier_count: descriptor.write_barrier_count,
+        last_write_barrier,
+    })
 }
 
 fn vm_property_store_access_case_expected_barrier_effect(
@@ -10779,6 +15452,9 @@ fn vm_property_store_access_case_expected_barrier_effect(
         PropertyStoreAccessCasePlanKind::DataOnlyTransition => Some(
             PropertyStoreBarrierEffect::RequiresRuntimeStoredValueAndStructureTransitionBarrierProof,
         ),
+        PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
+            Some(PropertyStoreBarrierEffect::RequiresRuntimeStoredValueBarrierProof)
+        }
         PropertyStoreAccessCasePlanKind::Unsupported => None,
     }
 }
@@ -10952,7 +15628,21 @@ fn vm_property_store_access_case_install_recheck_outcome_with_plan_lifecycle(
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::BytecodeSnapshot,
         );
     }
-    if descriptor.cache_kind != crate::jit::InlineCacheKind::PropertyStore {
+    let expected_cache_kind = match plan.plan_kind {
+        PropertyStoreAccessCasePlanKind::DataOnlyReplace
+        | PropertyStoreAccessCasePlanKind::DataOnlyTransition => {
+            crate::jit::InlineCacheKind::PropertyStore
+        }
+        PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
+            crate::jit::InlineCacheKind::ElementStore
+        }
+        PropertyStoreAccessCasePlanKind::Unsupported => {
+            return metadata_mismatch(
+                VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::AccessCaseKind,
+            );
+        }
+    };
+    if descriptor.cache_kind != expected_cache_kind {
         return metadata_mismatch(
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::CacheKind,
         );
@@ -11048,6 +15738,39 @@ fn vm_property_store_access_case_install_recheck_outcome_with_plan_lifecycle(
                 );
             }
         }
+        PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
+            if plan.access_case.kind != AccessCaseKind::IndexedStore {
+                return metadata_mismatch(
+                    VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::AccessCaseKind,
+                );
+            }
+            if descriptor.outcome != PropertyStoreObservationOutcome::IndexedStore {
+                return metadata_mismatch(
+                    VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Outcome,
+                );
+            }
+            if descriptor.base_structure_before != descriptor.base_structure_after {
+                return metadata_mismatch(
+                    VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::NewStructure,
+                );
+            }
+            if plan.access_case.new_structure.is_some() {
+                return metadata_mismatch(
+                    VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::NewStructure,
+                );
+            }
+            if descriptor.offset_after.is_some() || plan.access_case.offset.is_some() {
+                return metadata_mismatch(
+                    VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Offset,
+                );
+            }
+            if plan.effect_contract != PropertyStoreAccessCasePlanContract::DATA_ONLY_INDEXED_STORE
+            {
+                return metadata_mismatch(
+                    VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Contract,
+                );
+            }
+        }
         PropertyStoreAccessCasePlanKind::Unsupported => {
             return metadata_mismatch(
                 VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::AccessCaseKind,
@@ -11055,25 +15778,12 @@ fn vm_property_store_access_case_install_recheck_outcome_with_plan_lifecycle(
         }
     }
 
-    let Some(last_write_barrier) = descriptor.last_write_barrier else {
+    let Some(barrier_evidence) = vm_property_store_access_case_barrier_evidence(descriptor, plan)
+    else {
         return rejected(
             observation_ordinal,
             VmPropertyStoreAccessCaseInstallRecheckRejectionReason::MissingBarrierEvidence,
         );
-    };
-    if descriptor.write_barrier_count == 0 {
-        return rejected(
-            observation_ordinal,
-            VmPropertyStoreAccessCaseInstallRecheckRejectionReason::MissingBarrierEvidence,
-        );
-    }
-
-    let barrier_evidence = VmPropertyStoreAccessCaseBarrierEvidenceSummary {
-        plan_kind: plan.plan_kind,
-        effect_contract: plan.effect_contract,
-        barrier_effect: plan.effect_contract.barrier,
-        observed_write_barrier_count: descriptor.write_barrier_count,
-        last_write_barrier,
     };
 
     (
@@ -14223,7 +18933,9 @@ mod tests {
         AssemblerBufferId, AssemblerBufferLifecycle, AssemblerByteImageDigest,
         AssemblerByteImageId, JitPermissionTransition, LinkBufferProfile, LinkBufferState,
     };
-    use crate::bytecode::{CodeSpecialization, CoreOpcode, ThisArgumentOffset, VirtualRegister};
+    use crate::bytecode::{
+        BytecodeIndex, CodeSpecialization, CoreOpcode, ThisArgumentOffset, VirtualRegister,
+    };
     use crate::gc::{
         BarrierAction, BarrierRequirementOutcome, CellId, RootId, RootKind, StructureId,
     };
@@ -14248,15 +18960,16 @@ mod tests {
         CompilationMode, CompilationPlanId, CompilationRequest, CompilationRequestKind,
         DependencyStrength, EntryAbi, Entrypoint, EntrypointKind, ExecutableAllocationId,
         ExecutableAllocationLifecycle, ExecutableAllocationRecord, ExecutableAllocationRequest,
-        ExecutableMemoryProtection, ExecutableMutationAuthority, InlineCacheFallbackSemantics,
-        InlineCacheKind, InlineCacheMissHandoffDescriptor, InlineCacheMissKind, InlineCacheSlotId,
-        JitCodeId, JitCodeValidationError, LinkBufferCopyLinkOutcome, LinkBufferCopyLinkRequest,
+        ExecutableMemoryProtection, ExecutableMutationAuthority,
+        GeneratedPropertyHasMegamorphicLookup, InlineCacheFallbackSemantics, InlineCacheKind,
+        InlineCacheMissHandoffDescriptor, InlineCacheMissKind, InlineCacheSlotId, JitCodeId,
+        JitCodeValidationError, LinkBufferCopyLinkOutcome, LinkBufferCopyLinkRequest,
         LinkBufferFinalizationOutcome, LinkBufferFinalizationRecord, LinkBufferFinalizationRequest,
         LinkedCallKind, MachineCodeHandle, MachineCodeOwnership, MachineCodeRange,
-        PropertyLoadGuardChainOutcome, PropertyLoadGuardRequirement,
-        PropertyLoadObservationChainEntry, PropertyLoadObservationReadiness, TieringSnapshot,
-        TieringTrigger, WatchpointFirePolicy, WatchpointOwner, WatchpointSetState,
-        WatchpointTarget, JIT_PLAN_DESCRIPTOR_REGISTRY,
+        P10X86_64BaselinePropertyNativeExitReturnPayload, PropertyLoadGuardChainOutcome,
+        PropertyLoadGuardRequirement, PropertyLoadObservationChainEntry,
+        PropertyLoadObservationReadiness, TieringSnapshot, TieringTrigger, WatchpointFirePolicy,
+        WatchpointOwner, WatchpointSetState, WatchpointTarget, JIT_PLAN_DESCRIPTOR_REGISTRY,
     };
     use crate::object::{PropertyOffset, WatchpointKind, WatchpointState};
     use crate::platform::executable_memory::{
@@ -14271,7 +18984,7 @@ mod tests {
         InstructionCacheFlushRequest,
     };
     use crate::runtime::{ExecutableId, NativeCodeId, WatchpointGeneration};
-    use crate::strings::{AtomId, Identifier, PropertyKey};
+    use crate::strings::{AtomId, Identifier, PropertyIndex, PropertyKey};
     use crate::value::ValueKind;
 
     fn boundary() -> FallbackBoundarySnapshot {
@@ -14286,6 +18999,124 @@ mod tests {
             1,
             1,
         )
+    }
+
+    #[test]
+    fn baseline_native_lowering_failure_detail_preserves_unsupported_opcode() {
+        let detail = BaselineNativeLoweringFailureDetail::from_lowering_error(
+            &P6X86_64BaselineLoweringError::UnsupportedOpcode {
+                bytecode_index: BytecodeIndex::from_offset(2),
+                opcode: CoreOpcode::BitAndInt32.opcode(),
+                core_opcode: Some(CoreOpcode::BitAndInt32),
+            },
+        );
+
+        assert_eq!(
+            detail,
+            BaselineNativeLoweringFailureDetail::UnsupportedOpcode {
+                bytecode_index: BytecodeIndex::from_offset(2),
+                opcode: CoreOpcode::BitAndInt32.opcode(),
+                core_opcode: Some(CoreOpcode::BitAndInt32),
+            }
+        );
+    }
+
+    #[test]
+    fn baseline_native_semantic_emission_detail_preserves_unsupported_machine_instruction() {
+        let instruction = P6X86_64BaselineMachineInstruction::ReturnPropertyNativeExitPayload {
+            encoded_payload: P10X86_64BaselinePropertyNativeExitReturnPayload::encode(3),
+        };
+        let detail =
+            BaselineNativeSemanticByteEmissionFailureDetail::from_semantic_byte_emission_error(
+                &P6X86_64BaselineSemanticByteEmissionError::UnsupportedMachineInstruction {
+                    bytecode_index: BytecodeIndex::from_offset(7),
+                    instruction,
+                },
+            );
+
+        assert_eq!(
+            detail,
+            BaselineNativeSemanticByteEmissionFailureDetail::UnsupportedMachineInstruction {
+                bytecode_index: BytecodeIndex::from_offset(7),
+                instruction,
+            }
+        );
+    }
+
+    #[test]
+    fn baseline_native_semantic_emission_detail_preserves_property_exit_callable_requirement() {
+        let detail =
+            BaselineNativeSemanticByteEmissionFailureDetail::from_semantic_byte_emission_error(
+                &P6X86_64BaselineSemanticByteEmissionError::PropertyNativeExitRequiresCallable {
+                    bytecode_index: BytecodeIndex::from_offset(11),
+                },
+            );
+
+        assert_eq!(
+            detail,
+            BaselineNativeSemanticByteEmissionFailureDetail::PropertyNativeExitRequiresCallable {
+                bytecode_index: BytecodeIndex::from_offset(11),
+            }
+        );
+    }
+
+    #[test]
+    fn baseline_native_failure_counts_split_lowering_and_semantic_byte_emission() {
+        let mut tiering = VmTieringIntegration::default();
+        tiering
+            .baseline_entry_auto_materializations
+            .push(BaselineEntryAutoMaterializationRecord {
+                ordinal: 1,
+                owner: CodeBlockId(CellId(1)),
+                requested_tier: JitType::Baseline,
+                native: BaselineEntryAutoNativeMaterializationOutcome::Failed {
+                    reason: BaselineEntryAutoNativeMaterializationFailure::Lowering,
+                    generated_fallback_allowed: true,
+                },
+                native_detail: Some(BaselineEntryAutoNativeMaterializationDetail::Lowering(
+                    BaselineNativeLoweringFailureDetail::UnsupportedOpcode {
+                        bytecode_index: BytecodeIndex::from_offset(3),
+                        opcode: CoreOpcode::BitAndInt32.opcode(),
+                        core_opcode: Some(CoreOpcode::BitAndInt32),
+                    },
+                )),
+                generated: None,
+            });
+        tiering
+            .baseline_entry_auto_materializations
+            .push(BaselineEntryAutoMaterializationRecord {
+                ordinal: 2,
+                owner: CodeBlockId(CellId(2)),
+                requested_tier: JitType::Baseline,
+                native: BaselineEntryAutoNativeMaterializationOutcome::Failed {
+                    reason: BaselineEntryAutoNativeMaterializationFailure::SemanticByteEmission,
+                    generated_fallback_allowed: true,
+                },
+                native_detail: Some(
+                    BaselineEntryAutoNativeMaterializationDetail::SemanticByteEmission(
+                        BaselineNativeSemanticByteEmissionFailureDetail::PropertyNativeExitRequiresCallable {
+                            bytecode_index: BytecodeIndex::from_offset(5),
+                        },
+                    ),
+                ),
+                generated: None,
+            });
+        tiering
+            .baseline_entry_auto_materializations
+            .push(BaselineEntryAutoMaterializationRecord {
+                ordinal: 3,
+                owner: CodeBlockId(CellId(3)),
+                requested_tier: JitType::Baseline,
+                native: BaselineEntryAutoNativeMaterializationOutcome::Installed,
+                native_detail: None,
+                generated: None,
+            });
+
+        assert_eq!(tiering.baseline_native_lowering_failure_count(), 1);
+        assert_eq!(
+            tiering.baseline_native_semantic_byte_emission_failure_count(),
+            1
+        );
     }
 
     fn baseline_artifact(owner: CodeBlockId, id: u64) -> JitCodeArtifact {
@@ -14877,12 +19708,14 @@ mod tests {
             ))),
             base_object: Some(base_object),
             holder_object: Some(base_object),
+            base_normalization: PropertyLoadBaseNormalization::None,
             base_structure: Some(base_structure),
             offset: Some(crate::object::PropertyOffset::new(3)),
             prototype_depth: 0,
             observed_access_case_kind: Some(AccessCaseKind::Load),
             may_call_js: false,
             cacheability: crate::object::PropertyCacheability::Allowed,
+            can_use_get_by_id_megamorphic: true,
             readiness: PropertyLoadObservationReadiness::ReadyForAttachment,
             cold_miss_handoff: InlineCacheMissHandoffDescriptor {
                 owner,
@@ -14905,6 +19738,52 @@ mod tests {
         descriptor
     }
 
+    fn property_has_handoff_observation(
+        owner: CodeBlockId,
+        slot: InlineCacheSlotId,
+        bytecode_index: BytecodeIndex,
+    ) -> PropertyHasObservationDescriptor {
+        let base_object = crate::runtime::ObjectId(CellId(61));
+        let base_structure = StructureId(17);
+        PropertyHasObservationDescriptor {
+            owner,
+            slot,
+            bytecode_index: bytecode_index.offset(),
+            opcode: CoreOpcode::InById,
+            cache_kind: InlineCacheKind::HasProperty,
+            fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+            key: CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+                AtomId::from_table_slot(11),
+            ))),
+            base_object: Some(base_object),
+            holder_object: Some(base_object),
+            base_structure: Some(base_structure),
+            offset: Some(crate::object::PropertyOffset::new(3)),
+            prototype_depth: 0,
+            observed_access_case_kind: Some(AccessCaseKind::InHit),
+            result: true,
+            may_call_js: false,
+            cacheability: crate::object::PropertyCacheability::Allowed,
+            can_use_in_by_id_megamorphic: true,
+            cold_miss_handoff: InlineCacheMissHandoffDescriptor {
+                owner,
+                slot,
+                bytecode_index: bytecode_index.offset(),
+                cache_kind: InlineCacheKind::HasProperty,
+                miss_kind: InlineCacheMissKind::Cold,
+                fallback: InlineCacheFallbackSemantics::SlowPathLookup,
+                boundary: None,
+                call_link: None,
+                preserves_operand_registers: true,
+            },
+            chain: vec![PropertyLoadObservationChainEntry {
+                object: base_object,
+                structure: base_structure,
+                next_prototype: None,
+            }],
+        }
+    }
+
     fn record_property_load_descriptor(
         tiering: &mut VmTieringIntegration,
         owner: CodeBlockId,
@@ -14921,6 +19800,1926 @@ mod tests {
                 descriptor,
             })
             .expect("property-load observation")
+    }
+
+    fn record_property_has_descriptor(
+        tiering: &mut VmTieringIntegration,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        descriptor: PropertyHasObservationDescriptor,
+    ) -> VmPropertyHasObservationRecord {
+        let bytecode_index = BytecodeIndex::from_offset(descriptor.bytecode_index);
+        tiering
+            .record_property_has_observation(VmPropertyHasObservationRequest {
+                owner,
+                frame: None,
+                bytecode_index,
+                bytecode_snapshot,
+                descriptor,
+            })
+            .expect("property-has observation")
+    }
+
+    fn record_property_load_descriptor_after_initial_countdown(
+        tiering: &mut VmTieringIntegration,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        descriptor: PropertyLoadObservationDescriptor,
+    ) -> VmPropertyLoadObservationRecord {
+        record_property_load_descriptor(tiering, owner, bytecode_snapshot, descriptor.clone());
+        record_property_load_descriptor(tiering, owner, bytecode_snapshot, descriptor)
+    }
+
+    #[test]
+    fn record_property_has_observation_records_initial_evolution_without_cache_entry() {
+        let owner = CodeBlockId(CellId(1901));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let descriptor =
+            property_has_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+        let key = descriptor.key;
+
+        let record =
+            record_property_has_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+
+        assert_eq!(record.owner, owner);
+        assert_eq!(record.bytecode_index, bytecode_index);
+        assert_eq!(tiering.property_has_observations().len(), 1);
+        let evolution = tiering.property_inline_cache_evolution_records();
+        assert_eq!(evolution.len(), 1);
+        assert_eq!(
+            evolution[0].decision,
+            VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
+        );
+        assert_eq!(evolution[0].kind, VmPropertyInlineCacheEvolutionKind::Has);
+        assert_eq!(evolution[0].structure, Some(StructureId(17)));
+        assert_eq!(evolution[0].key, Some(key));
+        assert_eq!(tiering.property_has_megamorphic_cache_records().len(), 0);
+        assert_eq!(
+            tiering.property_has_megamorphic_cache_current_entry_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn vm_property_has_evolution_folds_named_in_by_id_cases_to_megamorphic_cache() {
+        let owner = CodeBlockId(CellId(1902));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(3);
+        let key = property_has_handoff_observation(owner, slot, bytecode_index).key;
+        let mut tiering = VmTieringIntegration::default();
+
+        for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
+            let mut descriptor = property_has_handoff_observation(owner, slot, bytecode_index);
+            let structure = StructureId(2701 + index);
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            if index % 2 == 1 {
+                descriptor.holder_object = None;
+                descriptor.offset = None;
+                descriptor.observed_access_case_kind = Some(AccessCaseKind::InMiss);
+                descriptor.result = false;
+            }
+            record_property_has_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        assert_eq!(
+            tiering.property_has_observations().len(),
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize + 2
+        );
+        assert_eq!(tiering.property_has_megamorphic_cache_records().len(), 2);
+        assert_eq!(tiering.property_has_megamorphic_sites.len(), 1);
+        assert_eq!(
+            tiering.property_has_megamorphic_cache_current_entry_count(),
+            2
+        );
+        let evolution = tiering.property_inline_cache_evolution_records();
+        assert_eq!(
+            evolution[0].decision,
+            VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
+        );
+        let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
+        assert_eq!(
+            evolution[final_case_index].decision,
+            VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicHas
+        );
+        assert_eq!(
+            evolution[final_case_index].kind,
+            VmPropertyInlineCacheEvolutionKind::Has
+        );
+        assert_eq!(
+            evolution[final_case_index]
+                .counters_before
+                .accepted_access_case_count,
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE - 1
+        );
+        assert_eq!(
+            evolution[final_case_index]
+                .counters_after
+                .accepted_access_case_count,
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE
+        );
+        assert_eq!(
+            evolution[final_case_index].counters_after.terminal,
+            Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicHas)
+        );
+        assert_eq!(
+            evolution.last().map(|record| record.decision),
+            Some(VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicHas)
+        );
+        assert_eq!(
+            evolution
+                .last()
+                .map(|record| record.counters_after.terminal),
+            Some(Some(
+                VmPropertyInlineCacheEvolutionTerminalState::MegamorphicHas
+            ))
+        );
+
+        let generated_structure =
+            StructureId(2701 + PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32);
+        let skipped_structure =
+            StructureId(2701 + PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 1);
+        let table = tiering
+            .generated_property_has_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("generated has table");
+        assert_eq!(table.current_entry_count(), 2);
+        assert_eq!(
+            table.lookup(slot, bytecode_index.offset(), key, generated_structure),
+            GeneratedPropertyHasMegamorphicLookup::Hit(true)
+        );
+        assert_eq!(
+            table.lookup(slot, bytecode_index.offset(), key, skipped_structure),
+            GeneratedPropertyHasMegamorphicLookup::Hit(false)
+        );
+    }
+
+    #[test]
+    fn vm_property_has_evolution_folds_named_in_by_val_cases_to_megamorphic_cache() {
+        let owner = CodeBlockId(CellId(1904));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(3);
+        let key = property_has_handoff_observation(owner, slot, bytecode_index).key;
+        let mut tiering = VmTieringIntegration::default();
+
+        for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
+            let mut descriptor = property_has_handoff_observation(owner, slot, bytecode_index);
+            let structure = StructureId(3701 + index);
+            descriptor.opcode = CoreOpcode::InByVal;
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            record_property_has_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        assert_eq!(tiering.property_has_megamorphic_cache_records().len(), 2);
+        assert_eq!(
+            tiering.property_has_megamorphic_cache_current_entry_count(),
+            2
+        );
+        let evolution = tiering.property_inline_cache_evolution_records();
+        let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
+        assert_eq!(
+            evolution[final_case_index].decision,
+            VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicHas
+        );
+        assert_eq!(
+            evolution.last().map(|record| record.decision),
+            Some(VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicHas)
+        );
+
+        let generated_structure =
+            StructureId(3701 + PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32);
+        let table = tiering
+            .generated_property_has_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("generated has table");
+        assert_eq!(
+            table.lookup(slot, bytecode_index.offset(), key, generated_structure),
+            GeneratedPropertyHasMegamorphicLookup::Hit(true)
+        );
+    }
+
+    #[test]
+    fn vm_property_has_evolution_keeps_ineligible_cases_dormant() {
+        let owner = CodeBlockId(CellId(1903));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(3);
+
+        let assert_dormant = |descriptor: PropertyHasObservationDescriptor| {
+            let mut tiering = VmTieringIntegration::default();
+            record_property_has_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+            assert_eq!(tiering.property_has_observations().len(), 1);
+            assert_eq!(tiering.property_inline_cache_evolution_records().len(), 0);
+            assert_eq!(tiering.property_has_megamorphic_cache_records().len(), 0);
+            assert_eq!(
+                tiering.property_has_megamorphic_cache_current_entry_count(),
+                0
+            );
+        };
+
+        let mut indexed = property_has_handoff_observation(owner, slot, bytecode_index);
+        indexed.opcode = CoreOpcode::InByVal;
+        indexed.cold_miss_handoff.cache_kind = InlineCacheKind::HasProperty;
+        indexed.observed_access_case_kind = Some(AccessCaseKind::IndexedInt32InHit);
+        indexed.can_use_in_by_id_megamorphic = false;
+        assert_dormant(indexed);
+
+        let mut dynamic = property_has_handoff_observation(owner, slot, bytecode_index);
+        dynamic.key = CacheKey::Dynamic;
+        dynamic.cacheability = PropertyCacheability::Disallowed;
+        dynamic.base_structure = None;
+        dynamic.holder_object = None;
+        dynamic.offset = None;
+        dynamic.observed_access_case_kind = None;
+        dynamic.can_use_in_by_id_megamorphic = false;
+        assert_dormant(dynamic);
+
+        let mut proxy = property_has_handoff_observation(owner, slot, bytecode_index);
+        proxy.observed_access_case_kind = Some(AccessCaseKind::ProxyObjectIn);
+        proxy.may_call_js = true;
+        proxy.can_use_in_by_id_megamorphic = false;
+        assert_dormant(proxy);
+
+        let mut disallowed = property_has_handoff_observation(owner, slot, bytecode_index);
+        disallowed.cacheability = PropertyCacheability::Disallowed;
+        disallowed.can_use_in_by_id_megamorphic = false;
+        assert_dormant(disallowed);
+    }
+
+    #[test]
+    fn vm_property_inline_cache_evolution_suppresses_duplicate_named_load_structure() {
+        let owner = CodeBlockId(CellId(901));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let mut descriptor =
+            property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+        descriptor.base_structure = Some(StructureId(701));
+        descriptor.chain[0].structure = StructureId(701);
+
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            descriptor.clone(),
+        );
+        record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+
+        assert_eq!(tiering.property_load_observations().len(), 3);
+        assert_eq!(tiering.property_load_access_case_plans().len(), 1);
+        let evolution = tiering.property_inline_cache_evolution_records();
+        assert_eq!(evolution.len(), 3);
+        assert_eq!(
+            evolution[0].decision,
+            VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
+        );
+        assert_eq!(
+            evolution[1].decision,
+            VmPropertyInlineCacheEvolutionDecision::Admitted
+        );
+        assert_eq!(
+            evolution[2].decision,
+            VmPropertyInlineCacheEvolutionDecision::SkippedBufferedDuplicate
+        );
+        assert_eq!(evolution[2].structure, Some(StructureId(701)));
+        assert_eq!(evolution[2].key, None);
+    }
+
+    #[test]
+    fn vm_property_inline_cache_evolution_suppresses_load_case_replaced_by_existing_handler_case() {
+        let owner = CodeBlockId(CellId(904));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let mut descriptor =
+            property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+        descriptor.base_structure = Some(StructureId(701));
+        descriptor.chain[0].structure = StructureId(701);
+
+        for _ in 0..8 {
+            record_property_load_descriptor(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                descriptor.clone(),
+            );
+        }
+
+        assert_eq!(tiering.property_load_observations().len(), 8);
+        assert_eq!(tiering.property_load_access_case_plans().len(), 1);
+        let evolution = tiering.property_inline_cache_evolution_records();
+        assert_eq!(
+            evolution.last().map(|record| record.decision),
+            Some(VmPropertyInlineCacheEvolutionDecision::SkippedReplacedByExistingCase)
+        );
+        assert_eq!(
+            evolution
+                .last()
+                .map(|record| record.counters_before.buffering_countdown),
+            Some(0)
+        );
+        assert_eq!(
+            evolution
+                .last()
+                .map(|record| record.counters_after.accepted_access_case_count),
+            Some(1)
+        );
+        assert_eq!(
+            evolution
+                .last()
+                .map(|record| record.counters_after.terminal),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn vm_property_inline_cache_evolution_folds_eighth_get_by_id_load_case_to_megamorphic() {
+        let owner = CodeBlockId(CellId(906));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let key = property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index).key;
+
+        for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
+            let mut descriptor =
+                property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+            let structure = StructureId(701 + index);
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        assert_eq!(
+            tiering.property_load_observations().len(),
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize + 2
+        );
+        assert_eq!(
+            tiering.property_load_access_case_plans().len(),
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize - 1
+        );
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 2);
+        assert_eq!(tiering.property_load_megamorphic_sites.len(), 1);
+        assert_eq!(
+            tiering.property_load_megamorphic_cache_current_entry_count(),
+            2
+        );
+        let evolution = tiering.property_inline_cache_evolution_records();
+        assert_eq!(
+            evolution[0].decision,
+            VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
+        );
+        let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
+        assert_eq!(
+            evolution[final_case_index].decision,
+            VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad
+        );
+        assert_eq!(
+            evolution[final_case_index]
+                .counters_before
+                .accepted_access_case_count,
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE - 1
+        );
+        assert_eq!(
+            evolution[final_case_index]
+                .counters_after
+                .accepted_access_case_count,
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE
+        );
+        assert_eq!(evolution[final_case_index].counters_before.terminal, None);
+        assert_eq!(
+            evolution[final_case_index].counters_after.terminal,
+            Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad)
+        );
+        assert_eq!(
+            evolution.last().map(|record| record.decision),
+            Some(VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicLoad)
+        );
+        assert_eq!(
+            evolution
+                .last()
+                .map(|record| record.counters_after.terminal),
+            Some(Some(
+                VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad
+            ))
+        );
+        let table = tiering
+            .property_load_access_case_plan_table_for_owner(owner, bytecode_snapshot)
+            .expect("finite property-load table");
+        assert!(table.is_empty());
+        let megamorphic_table = tiering
+            .generated_property_load_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("megamorphic property-load table");
+        assert_eq!(megamorphic_table.current_entry_count(), 2);
+        let crate::jit::GeneratedPropertyLoadMegamorphicLookup::Hit(plan) = megamorphic_table
+            .lookup(
+                InlineCacheSlotId(3),
+                bytecode_index.offset(),
+                key,
+                StructureId(709),
+            )
+        else {
+            panic!("expected direct megamorphic load hit");
+        };
+        assert_eq!(plan.slot, InlineCacheSlotId(3));
+        assert_eq!(plan.bytecode_index, bytecode_index.offset());
+        assert_eq!(plan.key, key);
+        assert_eq!(plan.access_case.base_structure, Some(StructureId(709)));
+        assert_eq!(plan.access_case.offset, Some(PropertyOffset::new(8)));
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_records_normalized_string_prototype_holder() {
+        let owner = CodeBlockId(CellId(907));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let slot = InlineCacheSlotId(3);
+        let key = property_handoff_observation(owner, slot, bytecode_index).key;
+        let string_prototype = ObjectId(CellId(902));
+
+        for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
+            let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
+            let structure = StructureId(860 + index);
+            descriptor.base_object = Some(string_prototype);
+            descriptor.holder_object = Some(string_prototype);
+            descriptor.base_normalization = PropertyLoadBaseNormalization::StringPrototype;
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].object = string_prototype;
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            descriptor.readiness = descriptor.classify_readiness();
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        assert_eq!(
+            tiering.property_load_observations().len(),
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize + 2
+        );
+        assert!(tiering
+            .property_load_access_case_plan_table_for_owner(owner, bytecode_snapshot)
+            .expect("finite property-load table")
+            .is_empty());
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 2);
+        let final_record = tiering
+            .property_load_megamorphic_cache_records()
+            .last()
+            .expect("normalized string prototype cache record");
+        let final_offset = PropertyOffset::new(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as i32 + 1);
+        assert_eq!(
+            final_record.entry_kind,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData {
+                holder: string_prototype,
+                offset: final_offset,
+            }
+        );
+        assert!(final_record.plan.is_none());
+
+        let final_structure =
+            StructureId(860 + PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 1);
+        let megamorphic_table = tiering
+            .generated_property_load_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("megamorphic property-load table");
+        assert_eq!(megamorphic_table.current_entry_count(), 2);
+        assert_eq!(
+            megamorphic_table.lookup(slot, bytecode_index.offset(), key, final_structure),
+            crate::jit::GeneratedPropertyLoadMegamorphicLookup::PrototypeData {
+                key,
+                base_structure: final_structure,
+                holder: string_prototype,
+                offset: final_offset,
+            }
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_records_normalized_string_prototype_chain_holder() {
+        let owner = CodeBlockId(CellId(912));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let slot = InlineCacheSlotId(3);
+        let key = property_handoff_observation(owner, slot, bytecode_index).key;
+        let string_prototype = ObjectId(CellId(922));
+        let holder = ObjectId(CellId(923));
+
+        for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
+            let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
+            let structure = StructureId(1860 + index);
+            let holder_structure = StructureId(2860 + index);
+            descriptor.base_object = Some(string_prototype);
+            descriptor.holder_object = Some(holder);
+            descriptor.base_normalization = PropertyLoadBaseNormalization::StringPrototype;
+            descriptor.base_structure = Some(structure);
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            descriptor.prototype_depth = 1;
+            descriptor.chain = vec![
+                PropertyLoadObservationChainEntry {
+                    object: string_prototype,
+                    structure,
+                    next_prototype: Some(holder),
+                },
+                PropertyLoadObservationChainEntry {
+                    object: holder,
+                    structure: holder_structure,
+                    next_prototype: None,
+                },
+            ];
+            descriptor.readiness = descriptor.classify_readiness();
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        assert!(tiering
+            .property_load_access_case_plan_table_for_owner(owner, bytecode_snapshot)
+            .expect("finite property-load table")
+            .is_empty());
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 2);
+        let final_record = tiering
+            .property_load_megamorphic_cache_records()
+            .last()
+            .expect("normalized string prototype-chain holder cache record");
+        let final_offset = PropertyOffset::new(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as i32 + 1);
+        assert_eq!(
+            final_record.entry_kind,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData {
+                holder,
+                offset: final_offset,
+            }
+        );
+        assert!(final_record.plan.is_none());
+
+        let final_structure =
+            StructureId(1860 + PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 1);
+        let megamorphic_table = tiering
+            .generated_property_load_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("megamorphic property-load table");
+        assert_eq!(megamorphic_table.current_entry_count(), 2);
+        assert_eq!(
+            megamorphic_table.lookup(slot, bytecode_index.offset(), key, final_structure),
+            crate::jit::GeneratedPropertyLoadMegamorphicLookup::PrototypeData {
+                key,
+                base_structure: final_structure,
+                holder,
+                offset: final_offset,
+            }
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_records_immediate_prototype_holder() {
+        let owner = CodeBlockId(CellId(910));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let slot = InlineCacheSlotId(3);
+        let key = property_handoff_observation(owner, slot, bytecode_index).key;
+        let base_object = ObjectId(CellId(901));
+        let prototype = ObjectId(CellId(902));
+
+        for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
+            let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
+            let structure = StructureId(960 + index);
+            let prototype_structure = StructureId(1960 + index);
+            descriptor.base_object = Some(base_object);
+            descriptor.holder_object = Some(prototype);
+            descriptor.base_structure = Some(structure);
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            descriptor.prototype_depth = 1;
+            descriptor.chain = vec![
+                PropertyLoadObservationChainEntry {
+                    object: base_object,
+                    structure,
+                    next_prototype: Some(prototype),
+                },
+                PropertyLoadObservationChainEntry {
+                    object: prototype,
+                    structure: prototype_structure,
+                    next_prototype: None,
+                },
+            ];
+            descriptor.readiness = descriptor.classify_readiness();
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        assert_eq!(
+            tiering.property_load_observations().len(),
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize + 2
+        );
+        assert!(tiering
+            .property_load_access_case_plan_table_for_owner(owner, bytecode_snapshot)
+            .expect("finite property-load table")
+            .is_empty());
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 2);
+        let final_record = tiering
+            .property_load_megamorphic_cache_records()
+            .last()
+            .expect("immediate prototype cache record");
+        let final_offset = PropertyOffset::new(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as i32 + 1);
+        assert_eq!(
+            final_record.entry_kind,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData {
+                holder: prototype,
+                offset: final_offset,
+            }
+        );
+        assert!(final_record.plan.is_none());
+
+        let final_structure =
+            StructureId(960 + PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 1);
+        let megamorphic_table = tiering
+            .generated_property_load_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("megamorphic property-load table");
+        assert_eq!(megamorphic_table.current_entry_count(), 2);
+        assert_eq!(
+            megamorphic_table.lookup(slot, bytecode_index.offset(), key, final_structure),
+            crate::jit::GeneratedPropertyLoadMegamorphicLookup::PrototypeData {
+                key,
+                base_structure: final_structure,
+                holder: prototype,
+                offset: final_offset,
+            }
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_records_deeper_prototype_holder() {
+        let owner = CodeBlockId(CellId(911));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let slot = InlineCacheSlotId(3);
+        let key = property_handoff_observation(owner, slot, bytecode_index).key;
+        let base_object = ObjectId(CellId(911));
+        let first_prototype = ObjectId(CellId(912));
+        let holder = ObjectId(CellId(913));
+
+        for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
+            let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
+            let structure = StructureId(1060 + index);
+            let first_prototype_structure = StructureId(2060 + index);
+            let holder_structure = StructureId(3060 + index);
+            descriptor.base_object = Some(base_object);
+            descriptor.holder_object = Some(holder);
+            descriptor.base_structure = Some(structure);
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            descriptor.prototype_depth = 2;
+            descriptor.chain = vec![
+                PropertyLoadObservationChainEntry {
+                    object: base_object,
+                    structure,
+                    next_prototype: Some(first_prototype),
+                },
+                PropertyLoadObservationChainEntry {
+                    object: first_prototype,
+                    structure: first_prototype_structure,
+                    next_prototype: Some(holder),
+                },
+                PropertyLoadObservationChainEntry {
+                    object: holder,
+                    structure: holder_structure,
+                    next_prototype: None,
+                },
+            ];
+            descriptor.readiness = descriptor.classify_readiness();
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        assert!(tiering
+            .property_load_access_case_plan_table_for_owner(owner, bytecode_snapshot)
+            .expect("finite property-load table")
+            .is_empty());
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 2);
+        let final_record = tiering
+            .property_load_megamorphic_cache_records()
+            .last()
+            .expect("deeper prototype cache record");
+        let final_offset = PropertyOffset::new(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as i32 + 1);
+        assert_eq!(
+            final_record.entry_kind,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData {
+                holder,
+                offset: final_offset,
+            }
+        );
+        assert!(final_record.plan.is_none());
+
+        let final_structure =
+            StructureId(1060 + PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 1);
+        let megamorphic_table = tiering
+            .generated_property_load_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("megamorphic property-load table");
+        assert_eq!(megamorphic_table.current_entry_count(), 2);
+        assert_eq!(
+            megamorphic_table.lookup(slot, bytecode_index.offset(), key, final_structure),
+            crate::jit::GeneratedPropertyLoadMegamorphicLookup::PrototypeData {
+                key,
+                base_structure: final_structure,
+                holder,
+                offset: final_offset,
+            }
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_moves_primary_collision_to_secondary() {
+        let key = CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+            AtomId::from_table_slot(31),
+        )));
+        let first = StructureId(7001);
+        let primary_index =
+            vm_property_load_megamorphic_cache_primary_index(first, key).expect("primary index");
+        let second = (7002..20_000)
+            .map(StructureId)
+            .find(|structure| {
+                vm_property_load_megamorphic_cache_primary_index(*structure, key)
+                    == Some(primary_index)
+            })
+            .expect("deterministic primary collision");
+
+        let mut cache = VmPropertyLoadMegamorphicCache::default();
+        let epoch = PROPERTY_MEGAMORPHIC_CACHE_INITIAL_EPOCH;
+        cache
+            .insert_hit(epoch, key, first, PropertyOffset::new(1))
+            .expect("first insert");
+        cache
+            .insert_hit(epoch, key, second, PropertyOffset::new(2))
+            .expect("second insert");
+
+        let primary = cache
+            .primary_entry(primary_index)
+            .expect("current primary entry");
+        assert_eq!(primary.base_structure, second);
+        assert_eq!(
+            primary.kind,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData {
+                offset: PropertyOffset::new(2)
+            }
+        );
+
+        let secondary_index = vm_property_load_megamorphic_cache_secondary_index(first, key)
+            .expect("secondary index");
+        let secondary = cache
+            .secondary_entry(secondary_index)
+            .expect("evicted secondary entry");
+        assert_eq!(secondary.base_structure, first);
+        assert_eq!(
+            secondary.kind,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData {
+                offset: PropertyOffset::new(1)
+            }
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_epoch_filters_stale_entries() {
+        let key = CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+            AtomId::from_table_slot(32),
+        )));
+        let mut cache = VmPropertyLoadMegamorphicCache::default();
+        let mut epoch = VmMegamorphicCacheEpoch::default();
+        cache
+            .insert_hit(
+                epoch.current(),
+                key,
+                StructureId(7101),
+                PropertyOffset::new(3),
+            )
+            .expect("insert");
+        assert_eq!(cache.current_entry_count(epoch.current()), 1);
+
+        assert!(!epoch.age());
+        assert_eq!(cache.current_entry_count(epoch.current()), 0);
+
+        cache
+            .insert_hit(
+                epoch.current(),
+                key,
+                StructureId(7102),
+                PropertyOffset::new(4),
+            )
+            .expect("reinsert after minor age");
+        assert_eq!(cache.current_entry_count(epoch.current()), 1);
+        let epoch_before_full = epoch.current();
+
+        assert!(!epoch.age());
+        cache.invalidate_entries();
+        assert_eq!(cache.current_entry_count(epoch.current()), 0);
+        assert_eq!(epoch.current(), epoch_before_full.wrapping_add(1));
+
+        epoch.set_for_test(PROPERTY_MEGAMORPHIC_CACHE_INVALID_EPOCH.wrapping_sub(1));
+        cache
+            .insert_hit(
+                epoch.current(),
+                key,
+                StructureId(7103),
+                PropertyOffset::new(5),
+            )
+            .expect("insert before epoch wrap");
+        assert_eq!(cache.current_entry_count(epoch.current()), 1);
+
+        assert!(epoch.age());
+        cache.invalidate_entries();
+        assert_eq!(cache.current_entry_count(epoch.current()), 0);
+        assert_eq!(epoch.current(), PROPERTY_MEGAMORPHIC_CACHE_INITIAL_EPOCH);
+    }
+
+    #[test]
+    fn vm_property_store_megamorphic_cache_epoch_filters_stale_entries() {
+        let key = CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+            AtomId::from_table_slot(35),
+        )));
+        let mut cache = VmPropertyStoreMegamorphicCache::default();
+        let mut epoch = VmMegamorphicCacheEpoch::default();
+        cache
+            .insert_replace(
+                epoch.current(),
+                key,
+                StructureId(8101),
+                PropertyOffset::new(3),
+            )
+            .expect("insert");
+        assert_eq!(cache.current_entry_count(epoch.current()), 1);
+
+        assert!(!epoch.age());
+        assert_eq!(cache.current_entry_count(epoch.current()), 0);
+
+        cache
+            .insert_transition(
+                epoch.current(),
+                key,
+                StructureId(8102),
+                StructureId(8103),
+                PropertyOffset::new(4),
+                false,
+            )
+            .expect("transition insert after minor age");
+        assert_eq!(cache.current_entry_count(epoch.current()), 1);
+
+        epoch.set_for_test(PROPERTY_MEGAMORPHIC_CACHE_INVALID_EPOCH.wrapping_sub(1));
+        cache
+            .insert_replace(
+                epoch.current(),
+                key,
+                StructureId(8104),
+                PropertyOffset::new(5),
+            )
+            .expect("insert before epoch wrap");
+        assert_eq!(cache.current_entry_count(epoch.current()), 1);
+
+        assert!(epoch.age());
+        cache.invalidate_entries();
+        assert_eq!(cache.current_entry_count(epoch.current()), 0);
+        assert_eq!(epoch.current(), PROPERTY_MEGAMORPHIC_CACHE_INITIAL_EPOCH);
+    }
+
+    #[test]
+    fn vm_property_has_megamorphic_cache_epoch_filters_stale_entries() {
+        let key = CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+            AtomId::from_table_slot(36),
+        )));
+        let mut cache = VmPropertyHasMegamorphicCache::default();
+        let mut epoch = VmMegamorphicCacheEpoch::default();
+        cache
+            .insert_hit(epoch.current(), key, StructureId(9101))
+            .expect("insert hit");
+        assert_eq!(cache.current_entry_count(epoch.current()), 1);
+
+        assert!(!epoch.age());
+        assert_eq!(cache.current_entry_count(epoch.current()), 0);
+
+        cache
+            .insert_miss(epoch.current(), key, StructureId(9102))
+            .expect("insert miss after minor age");
+        assert_eq!(cache.current_entry_count(epoch.current()), 1);
+
+        epoch.set_for_test(PROPERTY_MEGAMORPHIC_CACHE_INVALID_EPOCH.wrapping_sub(1));
+        cache
+            .insert_hit(epoch.current(), key, StructureId(9103))
+            .expect("insert before epoch wrap");
+        assert_eq!(cache.current_entry_count(epoch.current()), 1);
+
+        assert!(epoch.age());
+        cache.invalidate_entries();
+        assert_eq!(cache.current_entry_count(epoch.current()), 0);
+        assert_eq!(epoch.current(), PROPERTY_MEGAMORPHIC_CACHE_INITIAL_EPOCH);
+    }
+
+    #[test]
+    fn vm_property_has_megamorphic_cache_records_and_projects_generated_table() {
+        let owner = CodeBlockId(CellId(911));
+        let bytecode_index = BytecodeIndex::from_offset(19);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(5);
+        let key = CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+            AtomId::from_table_slot(37),
+        )));
+        let structure = StructureId(9301);
+        let mut tiering = VmTieringIntegration::default();
+
+        let request = VmPropertyHasMegamorphicCacheEntryRequest {
+            observation_ordinal: 101,
+            evolution_ordinal: 102,
+            owner,
+            frame: None,
+            bytecode_index,
+            bytecode_snapshot,
+            slot,
+            key,
+            base_structure: structure,
+            result: true,
+        };
+        let record = tiering
+            .record_property_has_megamorphic_cache_entry(request)
+            .expect("has cache record");
+
+        assert_eq!(
+            record.cache_tier,
+            VmPropertyHasMegamorphicCacheTier::Primary
+        );
+        assert_eq!(
+            record.cache_epoch,
+            tiering.property_megamorphic_cache_epoch()
+        );
+        assert_eq!(tiering.property_has_megamorphic_cache_records().len(), 1);
+        assert_eq!(
+            tiering.property_has_megamorphic_cache_current_entry_count(),
+            1
+        );
+        assert_eq!(
+            tiering.property_has_megamorphic_cache_epoch(),
+            tiering.property_load_megamorphic_cache_epoch()
+        );
+
+        let table = tiering
+            .generated_property_has_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("generated has table");
+        assert_eq!(table.epoch(), tiering.property_megamorphic_cache_epoch());
+        assert_eq!(table.current_entry_count(), 1);
+        assert_eq!(
+            table.lookup(slot, bytecode_index.offset(), key, structure),
+            GeneratedPropertyHasMegamorphicLookup::Hit(true)
+        );
+        assert_eq!(
+            table.lookup(slot, bytecode_index.offset(), key, StructureId(9302)),
+            GeneratedPropertyHasMegamorphicLookup::Miss
+        );
+        assert_eq!(
+            table.lookup(
+                InlineCacheSlotId(6),
+                bytecode_index.offset(),
+                key,
+                structure
+            ),
+            GeneratedPropertyHasMegamorphicLookup::NoSite
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_ages_after_collection_completion() {
+        let key = CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+            AtomId::from_table_slot(33),
+        )));
+        let mut tiering = VmTieringIntegration::default();
+        let epoch = tiering.property_megamorphic_cache_epoch.current();
+        tiering
+            .property_load_megamorphic_cache
+            .insert_hit(epoch, key, StructureId(7201), PropertyOffset::new(3))
+            .expect("insert before eden completion");
+        tiering
+            .property_store_megamorphic_cache
+            .insert_replace(epoch, key, StructureId(8201), PropertyOffset::new(7))
+            .expect("store insert before eden completion");
+        tiering
+            .property_has_megamorphic_cache
+            .insert_hit(epoch, key, StructureId(9201))
+            .expect("has insert before eden completion");
+        let epoch_before = tiering.property_load_megamorphic_cache_epoch();
+
+        let eden = tiering
+            .record_property_load_megamorphic_cache_collection_completion(CollectionKind::Eden)
+            .expect("eden completion ages cache");
+        assert_eq!(
+            eden.trigger,
+            VmPropertyLoadMegamorphicCacheAgingTrigger::CollectionCompletion {
+                kind: CollectionKind::Eden
+            }
+        );
+        assert!(!eden.full_collection);
+        assert_eq!(eden.epoch_before, epoch_before);
+        assert_ne!(eden.epoch_after, epoch_before);
+        assert_eq!(eden.entry_count_before, 1);
+        assert_eq!(eden.entry_count_after, 0);
+        assert_eq!(eden.store_entry_count_before, 1);
+        assert_eq!(eden.store_entry_count_after, 0);
+        assert_eq!(eden.has_entry_count_before, 1);
+        assert_eq!(eden.has_entry_count_after, 0);
+        assert_eq!(
+            tiering.property_store_megamorphic_cache_epoch(),
+            tiering.property_load_megamorphic_cache_epoch()
+        );
+        assert_eq!(
+            tiering.property_has_megamorphic_cache_epoch(),
+            tiering.property_megamorphic_cache_epoch()
+        );
+        assert_eq!(
+            tiering.property_load_megamorphic_cache_current_entry_count(),
+            0
+        );
+        assert_eq!(
+            tiering.property_store_megamorphic_cache_current_entry_count(),
+            0
+        );
+        assert_eq!(
+            tiering.property_has_megamorphic_cache_current_entry_count(),
+            0
+        );
+
+        let epoch = tiering.property_megamorphic_cache_epoch.current();
+        tiering
+            .property_load_megamorphic_cache
+            .insert_hit(epoch, key, StructureId(7202), PropertyOffset::new(4))
+            .expect("insert before full completion");
+        tiering
+            .property_store_megamorphic_cache
+            .insert_replace(epoch, key, StructureId(8202), PropertyOffset::new(8))
+            .expect("store insert before full completion");
+        tiering
+            .property_has_megamorphic_cache
+            .insert_miss(epoch, key, StructureId(9202))
+            .expect("has insert before full completion");
+        let epoch_before_full = tiering.property_load_megamorphic_cache_epoch();
+        let full = tiering
+            .record_property_load_megamorphic_cache_collection_completion(CollectionKind::Full)
+            .expect("full completion clears cache");
+        assert_eq!(
+            full.trigger,
+            VmPropertyLoadMegamorphicCacheAgingTrigger::CollectionCompletion {
+                kind: CollectionKind::Full
+            }
+        );
+        assert!(full.full_collection);
+        assert_eq!(full.epoch_before, epoch_before_full);
+        assert_eq!(full.entry_count_before, 1);
+        assert_eq!(full.entry_count_after, 0);
+        assert_eq!(full.store_entry_count_before, 1);
+        assert_eq!(full.store_entry_count_after, 0);
+        assert_eq!(full.has_entry_count_before, 1);
+        assert_eq!(full.has_entry_count_after, 0);
+        assert_eq!(full.epoch_after, epoch_before_full.wrapping_add(1));
+        assert!(tiering
+            .property_load_megamorphic_cache
+            .primary_entries
+            .iter()
+            .all(Option::is_none));
+        assert!(tiering
+            .property_load_megamorphic_cache
+            .secondary_entries
+            .iter()
+            .all(Option::is_none));
+        assert!(tiering
+            .property_store_megamorphic_cache
+            .primary_entries
+            .iter()
+            .all(Option::is_none));
+        assert!(tiering
+            .property_store_megamorphic_cache
+            .secondary_entries
+            .iter()
+            .all(Option::is_none));
+        assert!(tiering
+            .property_has_megamorphic_cache
+            .primary_entries
+            .iter()
+            .all(Option::is_none));
+        assert!(tiering
+            .property_has_megamorphic_cache
+            .secondary_entries
+            .iter()
+            .all(Option::is_none));
+
+        assert_eq!(
+            tiering
+                .record_property_load_megamorphic_cache_collection_completion(CollectionKind::Any),
+            None
+        );
+        assert_eq!(
+            tiering
+                .property_load_megamorphic_cache_aging_records()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_ages_after_structure_chain_invalidation() {
+        let key = CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+            AtomId::from_table_slot(34),
+        )));
+        let mut tiering = VmTieringIntegration::default();
+        let epoch = tiering.property_megamorphic_cache_epoch.current();
+        tiering
+            .property_load_megamorphic_cache
+            .insert_hit(epoch, key, StructureId(7251), PropertyOffset::new(6))
+            .expect("insert before structure-chain invalidation");
+        tiering
+            .property_store_megamorphic_cache
+            .insert_replace(epoch, key, StructureId(8251), PropertyOffset::new(9))
+            .expect("store insert before structure-chain invalidation");
+        tiering
+            .property_has_megamorphic_cache
+            .insert_hit(epoch, key, StructureId(9251))
+            .expect("has insert before structure-chain invalidation");
+        let epoch_before = tiering.property_load_megamorphic_cache_epoch();
+
+        let record = tiering.record_property_load_megamorphic_cache_structure_chain_invalidation();
+
+        assert_eq!(
+            record.trigger,
+            VmPropertyLoadMegamorphicCacheAgingTrigger::StructureChainInvalidation
+        );
+        assert!(!record.full_collection);
+        assert_eq!(record.epoch_before, epoch_before);
+        assert_ne!(record.epoch_after, epoch_before);
+        assert_eq!(record.entry_count_before, 1);
+        assert_eq!(record.entry_count_after, 0);
+        assert_eq!(record.store_entry_count_before, 1);
+        assert_eq!(record.store_entry_count_after, 0);
+        assert_eq!(record.has_entry_count_before, 1);
+        assert_eq!(record.has_entry_count_after, 0);
+        assert_eq!(
+            tiering.property_load_megamorphic_cache_current_entry_count(),
+            0
+        );
+        assert_eq!(
+            tiering.property_store_megamorphic_cache_current_entry_count(),
+            0
+        );
+        assert_eq!(
+            tiering.property_has_megamorphic_cache_current_entry_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_records_own_missing_entry_after_terminal_load() {
+        let owner = CodeBlockId(CellId(908));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let key = property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index).key;
+
+        for index in 0..=PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 {
+            let mut descriptor =
+                property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+            let structure = StructureId(760 + index);
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        let mut missing = property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+        let missing_structure = StructureId(9001);
+        missing.base_structure = Some(missing_structure);
+        missing.chain[0].structure = missing_structure;
+        missing.chain[0].next_prototype = None;
+        missing.holder_object = None;
+        missing.offset = None;
+        missing.prototype_depth = 0;
+        missing.observed_access_case_kind = Some(AccessCaseKind::Miss);
+        missing.readiness = missing.classify_readiness();
+        record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, missing);
+
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 2);
+        let miss_record = tiering
+            .property_load_megamorphic_cache_records()
+            .last()
+            .expect("miss cache record");
+        assert_eq!(
+            miss_record.entry_kind,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing
+        );
+        assert_eq!(miss_record.base_structure, missing_structure);
+        assert!(miss_record.plan.is_none());
+
+        let megamorphic_table = tiering
+            .generated_property_load_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("megamorphic property-load table");
+        assert_eq!(megamorphic_table.current_entry_count(), 2);
+        assert_eq!(
+            megamorphic_table.lookup(
+                InlineCacheSlotId(3),
+                bytecode_index.offset(),
+                key,
+                missing_structure,
+            ),
+            crate::jit::GeneratedPropertyLoadMegamorphicLookup::Missing
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_records_prototype_chain_miss_entry() {
+        let owner = CodeBlockId(CellId(909));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+
+        for index in 0..=PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 {
+            let mut descriptor =
+                property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+            let structure = StructureId(1760 + index);
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 1);
+
+        let mut missing = property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+        let base_object = missing.base_object.expect("base object");
+        let prototype = ObjectId(CellId(771));
+        let base_structure = StructureId(9101);
+        let prototype_structure = StructureId(9102);
+        missing.base_structure = Some(base_structure);
+        missing.chain[0].object = base_object;
+        missing.chain[0].structure = base_structure;
+        missing.chain[0].next_prototype = Some(prototype);
+        missing.chain.push(PropertyLoadObservationChainEntry {
+            object: prototype,
+            structure: prototype_structure,
+            next_prototype: None,
+        });
+        missing.holder_object = None;
+        missing.offset = None;
+        missing.prototype_depth = 1;
+        missing.observed_access_case_kind = Some(AccessCaseKind::Miss);
+        missing.readiness = missing.classify_readiness();
+        let missing_key = missing.key;
+        record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, missing);
+
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 2);
+        let miss_record = tiering
+            .property_load_megamorphic_cache_records()
+            .last()
+            .expect("prototype-chain miss cache record");
+        assert_eq!(
+            miss_record.entry_kind,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing
+        );
+        assert_eq!(miss_record.base_structure, base_structure);
+        assert!(miss_record.plan.is_none());
+        let megamorphic_table = tiering
+            .generated_property_load_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("megamorphic property-load table");
+        assert_eq!(megamorphic_table.current_entry_count(), 2);
+        assert_eq!(
+            megamorphic_table.lookup(
+                InlineCacheSlotId(3),
+                bytecode_index.offset(),
+                missing_key,
+                base_structure,
+            ),
+            crate::jit::GeneratedPropertyLoadMegamorphicLookup::Missing
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_records_normalized_string_prototype_chain_miss_entry() {
+        let owner = CodeBlockId(CellId(914));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let slot = InlineCacheSlotId(3);
+
+        for index in 0..=PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 {
+            let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
+            let structure = StructureId(3760 + index);
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 1);
+
+        let string_prototype = ObjectId(CellId(924));
+        let object_prototype = ObjectId(CellId(925));
+        let string_prototype_structure = StructureId(9201);
+        let object_prototype_structure = StructureId(9202);
+        let mut missing = property_handoff_observation(owner, slot, bytecode_index);
+        missing.base_object = Some(string_prototype);
+        missing.base_normalization = PropertyLoadBaseNormalization::StringPrototype;
+        missing.base_structure = Some(string_prototype_structure);
+        missing.chain = vec![
+            PropertyLoadObservationChainEntry {
+                object: string_prototype,
+                structure: string_prototype_structure,
+                next_prototype: Some(object_prototype),
+            },
+            PropertyLoadObservationChainEntry {
+                object: object_prototype,
+                structure: object_prototype_structure,
+                next_prototype: None,
+            },
+        ];
+        missing.holder_object = None;
+        missing.offset = None;
+        missing.prototype_depth = 1;
+        missing.observed_access_case_kind = Some(AccessCaseKind::Miss);
+        missing.readiness = missing.classify_readiness();
+        let missing_key = missing.key;
+        record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, missing);
+
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 2);
+        let miss_record = tiering
+            .property_load_megamorphic_cache_records()
+            .last()
+            .expect("normalized string prototype-chain miss cache record");
+        assert_eq!(
+            miss_record.entry_kind,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing
+        );
+        assert_eq!(miss_record.base_structure, string_prototype_structure);
+        assert!(miss_record.plan.is_none());
+        let megamorphic_table = tiering
+            .generated_property_load_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("megamorphic property-load table");
+        assert_eq!(megamorphic_table.current_entry_count(), 2);
+        assert_eq!(
+            megamorphic_table.lookup(
+                slot,
+                bytecode_index.offset(),
+                missing_key,
+                string_prototype_structure,
+            ),
+            crate::jit::GeneratedPropertyLoadMegamorphicLookup::Missing
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_records_prototype_holder_after_guard_materialization() {
+        let (mut tiering, guard_plan, bytecode_snapshot) = record_prototype_data_guard_fixture();
+        let owner = guard_plan.owner;
+        let bytecode_index = guard_plan.bytecode_index;
+        let slot = guard_plan.plan.slot;
+        let key = guard_plan.plan.descriptor.key;
+
+        for index in 0..PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 {
+            let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
+            let structure = StructureId(960 + index);
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 1);
+
+        let materialization = accepted_watchpoint_materialization(
+            &mut tiering,
+            &guard_plan,
+            WatchpointState::Clear,
+            None,
+            310,
+        );
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 2);
+        let holder = guard_plan
+            .plan
+            .descriptor
+            .holder_object
+            .expect("prototype holder");
+        let offset = guard_plan.plan.descriptor.offset.expect("prototype offset");
+        let prototype_record = tiering
+            .property_load_megamorphic_cache_records()
+            .last()
+            .expect("prototype holder megamorphic record");
+        assert_eq!(
+            prototype_record.entry_kind,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind::PrototypeData { holder, offset }
+        );
+        assert_eq!(
+            prototype_record.base_structure,
+            guard_plan.plan.descriptor.base_structure
+        );
+        assert!(prototype_record.plan.is_none());
+
+        let megamorphic_table = tiering
+            .generated_property_load_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("megamorphic property-load table");
+        assert_eq!(megamorphic_table.current_entry_count(), 2);
+        assert_eq!(
+            megamorphic_table.lookup(
+                slot,
+                bytecode_index.offset(),
+                key,
+                guard_plan.plan.descriptor.base_structure,
+            ),
+            crate::jit::GeneratedPropertyLoadMegamorphicLookup::PrototypeData {
+                key,
+                base_structure: guard_plan.plan.descriptor.base_structure,
+                holder,
+                offset,
+            }
+        );
+
+        let epoch_before = tiering.property_load_megamorphic_cache_epoch();
+        let binding = materialization.bindings[1].clone();
+        let invalidation = tiering.record_property_load_guard_watchpoint_invalidation(
+            VmPropertyLoadGuardWatchpointInvalidationRequest {
+                materialization_ordinal: materialization.ordinal,
+                event: watchpoint_fire_event_for_binding(
+                    &binding,
+                    WatchpointGeneration(binding.sampled_generation.0 + 1),
+                ),
+            },
+        );
+
+        assert!(matches!(
+            invalidation.outcome,
+            VmPropertyLoadGuardWatchpointInvalidationOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            tiering.property_load_megamorphic_cache_epoch(),
+            epoch_before
+        );
+        assert_eq!(
+            tiering.property_load_megamorphic_cache_current_entry_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_does_not_record_prototype_holder_before_terminal_load() {
+        let (mut tiering, guard_plan, _) = record_prototype_data_guard_fixture();
+
+        accepted_watchpoint_materialization(
+            &mut tiering,
+            &guard_plan,
+            WatchpointState::Clear,
+            None,
+            330,
+        );
+
+        assert!(tiering.property_load_megamorphic_cache_records().is_empty());
+        assert_eq!(
+            tiering.property_load_megamorphic_cache_current_entry_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_does_not_record_prototype_holder_from_rejected_materialization(
+    ) {
+        let (mut tiering, guard_plan, bytecode_snapshot) = record_prototype_data_guard_fixture();
+        let owner = guard_plan.owner;
+        let bytecode_index = guard_plan.bytecode_index;
+        let slot = guard_plan.plan.slot;
+
+        for index in 0..PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 {
+            let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
+            let structure = StructureId(1960 + index);
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 1);
+
+        let recheck = tiering.record_property_load_guard_install_recheck(
+            property_load_guard_install_recheck_request(&guard_plan),
+        );
+        let rejected = tiering.record_property_load_guard_watchpoint_materialization(
+            property_load_guard_watchpoint_materialization_request(&recheck, Vec::new()),
+        );
+
+        assert!(matches!(
+            rejected.outcome,
+            VmPropertyLoadGuardWatchpointMaterializationOutcome::Rejected { .. }
+        ));
+        assert_eq!(tiering.property_load_megamorphic_cache_records().len(), 1);
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_does_not_age_for_rejected_watchpoint_dispatch() {
+        let mut tiering = VmTieringIntegration::default();
+        let dispatch = tiering
+            .record_property_load_guard_watchpoint_event_dispatch(dummy_watchpoint_fire_event());
+
+        assert!(matches!(
+            dispatch.outcome,
+            VmPropertyLoadGuardWatchpointEventDispatchOutcome::Rejected {
+                reason:
+                    VmPropertyLoadGuardWatchpointEventDispatchRejectionReason::NoActiveMaterialization {
+                        ..
+                    }
+            }
+        ));
+        assert!(tiering
+            .property_load_megamorphic_cache_aging_records()
+            .is_empty());
+    }
+
+    #[test]
+    fn vm_property_load_megamorphic_cache_requires_cacheable_get_by_id_descriptor() {
+        let owner = CodeBlockId(CellId(916));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(3);
+        let mut tiering = VmTieringIntegration::default();
+
+        for index in 0..=PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 {
+            let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
+            let structure = StructureId(4060 + index);
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = Some(PropertyOffset::new(index as i32));
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        let expected_records = tiering.property_load_megamorphic_cache_records().len();
+        let expected_entries = tiering.property_load_megamorphic_cache_current_entry_count();
+        assert_eq!(expected_records, 1);
+        assert_eq!(expected_entries, 1);
+        assert_eq!(
+            tiering
+                .property_inline_cache_evolution_records()
+                .last()
+                .map(|record| record.decision),
+            Some(VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad)
+        );
+
+        let rejected_descriptor = |structure_raw: u32, offset_raw: i32| {
+            let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
+            let structure = StructureId(structure_raw);
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = Some(PropertyOffset::new(offset_raw));
+            descriptor
+        };
+
+        let assert_not_recorded =
+            |tiering: &mut VmTieringIntegration,
+             mut descriptor: PropertyLoadObservationDescriptor| {
+                descriptor.readiness = descriptor.classify_readiness();
+                record_property_load_descriptor(tiering, owner, bytecode_snapshot, descriptor);
+                assert_eq!(
+                    tiering.property_load_megamorphic_cache_records().len(),
+                    expected_records
+                );
+                assert_eq!(
+                    tiering.property_load_megamorphic_cache_current_entry_count(),
+                    expected_entries
+                );
+            };
+
+        let mut disallowed = rejected_descriptor(5060, 30);
+        disallowed.cacheability = PropertyCacheability::Disallowed;
+        assert_not_recorded(&mut tiering, disallowed);
+
+        let mut opaque = rejected_descriptor(5061, 31);
+        opaque.cacheability = PropertyCacheability::TaintedByOpaqueObject;
+        assert_not_recorded(&mut tiering, opaque);
+
+        let mut may_call_js = rejected_descriptor(5062, 32);
+        may_call_js.may_call_js = true;
+        assert_not_recorded(&mut tiering, may_call_js);
+
+        let mut getter = rejected_descriptor(5063, 33);
+        getter.observed_access_case_kind = Some(AccessCaseKind::Getter);
+        getter.offset = None;
+        assert_not_recorded(&mut tiering, getter);
+    }
+
+    #[test]
+    fn vm_property_inline_cache_evolution_folds_eighth_put_by_id_store_case_to_megamorphic() {
+        let owner = CodeBlockId(CellId(917));
+        let bytecode_index = BytecodeIndex::from_offset(9);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(4);
+        let mut tiering = VmTieringIntegration::default();
+        let key = property_store_observation(
+            owner,
+            slot,
+            bytecode_index,
+            PropertyStoreObservationOutcome::OwnDataStore,
+        )
+        .key;
+
+        for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
+            let mut descriptor = property_store_observation(
+                owner,
+                slot,
+                bytecode_index,
+                PropertyStoreObservationOutcome::OwnDataStore,
+            );
+            let structure = StructureId(6100 + index);
+            descriptor.base_structure_before = Some(structure);
+            descriptor.base_structure_after = Some(structure);
+            descriptor.offset_after = Some(PropertyOffset::new(index as i32));
+            record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        assert_eq!(
+            tiering.property_store_observations().len(),
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize + 2
+        );
+        assert_eq!(
+            tiering.property_store_access_case_plans().len(),
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize - 1
+        );
+        assert_eq!(tiering.property_store_megamorphic_cache_records().len(), 2);
+        assert_eq!(tiering.property_store_megamorphic_sites.len(), 1);
+        assert_eq!(
+            tiering.property_store_megamorphic_cache_current_entry_count(),
+            2
+        );
+        let evolution = tiering.property_inline_cache_evolution_records();
+        let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
+        assert_eq!(
+            evolution[final_case_index].decision,
+            VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicStore
+        );
+        assert_eq!(
+            evolution[final_case_index].counters_after.terminal,
+            Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicStore)
+        );
+        assert_eq!(
+            evolution.last().map(|record| record.decision),
+            Some(VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicStore)
+        );
+        let table = tiering
+            .property_store_mutation_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("finite property-store mutation table");
+        assert!(table.is_empty());
+        let megamorphic_table = tiering
+            .generated_property_store_megamorphic_candidate_table_for_owner(
+                owner,
+                bytecode_snapshot,
+            )
+            .expect("megamorphic property-store table");
+        assert_eq!(megamorphic_table.current_entry_count(), 2);
+        let crate::jit::GeneratedPropertyStoreMegamorphicLookup::Hit(plan) = megamorphic_table
+            .lookup(
+                slot,
+                bytecode_index.offset(),
+                key,
+                StructureId(6100 + PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32),
+            )
+        else {
+            panic!("expected direct megamorphic store hit");
+        };
+        assert_eq!(plan.slot, slot);
+        assert_eq!(plan.bytecode_index, bytecode_index.offset());
+        assert_eq!(plan.key, key);
+        assert_eq!(
+            plan.plan_kind,
+            PropertyStoreAccessCasePlanKind::DataOnlyReplace
+        );
+        assert_eq!(
+            plan.access_case.base_structure,
+            Some(StructureId(
+                6100 + PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32
+            ))
+        );
+        assert_eq!(
+            plan.access_case.offset,
+            Some(PropertyOffset::new(
+                PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as i32
+            ))
+        );
+    }
+
+    #[test]
+    fn vm_property_inline_cache_evolution_keeps_put_by_id_store_with_excluded_key_final_gave_up() {
+        let owner = CodeBlockId(CellId(918));
+        let bytecode_index = BytecodeIndex::from_offset(9);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(4);
+        let mut tiering = VmTieringIntegration::default();
+
+        for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
+            let mut descriptor = property_store_observation(
+                owner,
+                slot,
+                bytecode_index,
+                PropertyStoreObservationOutcome::OwnDataStore,
+            );
+            let structure = StructureId(6200 + index);
+            descriptor.base_structure_before = Some(structure);
+            descriptor.base_structure_after = Some(structure);
+            descriptor.offset_after = Some(PropertyOffset::new(index as i32));
+            descriptor.can_use_put_by_id_megamorphic = false;
+            record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        assert_eq!(
+            tiering.property_store_access_case_plans().len(),
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize
+        );
+        assert!(tiering
+            .property_store_megamorphic_cache_records()
+            .is_empty());
+        assert_eq!(
+            tiering.property_store_megamorphic_cache_current_entry_count(),
+            0
+        );
+        let evolution = tiering.property_inline_cache_evolution_records();
+        let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
+        assert_eq!(
+            evolution[final_case_index].decision,
+            VmPropertyInlineCacheEvolutionDecision::Admitted
+        );
+        assert_eq!(
+            evolution[final_case_index].counters_after.terminal,
+            Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp)
+        );
+        assert_eq!(
+            evolution.last().map(|record| record.decision),
+            Some(VmPropertyInlineCacheEvolutionDecision::SkippedGaveUp)
+        );
+    }
+
+    #[test]
+    fn vm_property_inline_cache_evolution_keeps_ineligible_indexed_load_final_gave_up() {
+        let owner = CodeBlockId(CellId(907));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+
+        for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
+            let mut descriptor =
+                property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+            let structure = StructureId(721 + index);
+            descriptor.cache_kind = InlineCacheKind::ElementLoad;
+            descriptor.cold_miss_handoff.cache_kind = InlineCacheKind::ElementLoad;
+            descriptor.key = CacheKey::Property(PropertyKey::from_index(
+                PropertyIndex::from_canonical_index(index),
+            ));
+            descriptor.base_structure = Some(structure);
+            descriptor.chain[0].structure = structure;
+            descriptor.offset = None;
+            descriptor.observed_access_case_kind = Some(AccessCaseKind::IndexedLoad);
+            descriptor.can_use_get_by_id_megamorphic = false;
+            descriptor.readiness = descriptor.classify_readiness();
+            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        assert_eq!(
+            tiering.property_load_access_case_plans().len(),
+            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize
+        );
+        assert!(tiering.property_load_megamorphic_cache_records().is_empty());
+        let evolution = tiering.property_inline_cache_evolution_records();
+        let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
+        assert_eq!(
+            evolution[final_case_index].decision,
+            VmPropertyInlineCacheEvolutionDecision::Admitted
+        );
+        assert_eq!(
+            evolution[final_case_index].counters_after.terminal,
+            Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp)
+        );
+        assert_eq!(
+            evolution.last().map(|record| record.decision),
+            Some(VmPropertyInlineCacheEvolutionDecision::SkippedGaveUp)
+        );
+    }
+
+    #[test]
+    fn vm_property_inline_cache_evolution_suppresses_store_case_replaced_by_existing_handler_case()
+    {
+        let owner = CodeBlockId(CellId(905));
+        let bytecode_index = BytecodeIndex::from_offset(9);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let mut descriptor = property_store_observation(
+            owner,
+            InlineCacheSlotId(4),
+            bytecode_index,
+            PropertyStoreObservationOutcome::OwnDataStore,
+        );
+        descriptor.base_structure_before = Some(StructureId(801));
+        descriptor.base_structure_after = Some(StructureId(801));
+
+        for _ in 0..8 {
+            record_property_store_descriptor(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                descriptor.clone(),
+            );
+        }
+
+        assert_eq!(tiering.property_store_observations().len(), 8);
+        assert_eq!(tiering.property_store_access_case_plans().len(), 1);
+        let evolution = tiering.property_inline_cache_evolution_records();
+        assert_eq!(
+            evolution.last().map(|record| record.decision),
+            Some(VmPropertyInlineCacheEvolutionDecision::SkippedReplacedByExistingCase)
+        );
+        assert_eq!(
+            evolution
+                .last()
+                .map(|record| record.counters_before.buffering_countdown),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn vm_property_inline_cache_evolution_uses_key_for_indexed_store_duplicates() {
+        let owner = CodeBlockId(CellId(902));
+        let bytecode_index = BytecodeIndex::from_offset(9);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let mut first = property_store_observation(
+            owner,
+            InlineCacheSlotId(4),
+            bytecode_index,
+            PropertyStoreObservationOutcome::IndexedStore,
+        );
+        first.base_structure_before = Some(StructureId(801));
+        first.base_structure_after = Some(StructureId(801));
+        let mut second_key = first.clone();
+        second_key.key = CacheKey::Property(PropertyKey::from_index(
+            PropertyIndex::from_canonical_index(1),
+        ));
+
+        record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, first.clone());
+        record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, first.clone());
+        record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, first);
+        record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, second_key);
+
+        assert_eq!(tiering.property_store_observations().len(), 4);
+        assert_eq!(tiering.property_store_access_case_plans().len(), 2);
+        let evolution = tiering.property_inline_cache_evolution_records();
+        assert_eq!(evolution.len(), 4);
+        assert_eq!(
+            evolution
+                .iter()
+                .map(|record| record.decision)
+                .collect::<Vec<_>>(),
+            vec![
+                VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown,
+                VmPropertyInlineCacheEvolutionDecision::Admitted,
+                VmPropertyInlineCacheEvolutionDecision::SkippedBufferedDuplicate,
+                VmPropertyInlineCacheEvolutionDecision::Admitted,
+            ]
+        );
+        assert_eq!(evolution[1].structure, Some(StructureId(801)));
+        assert_eq!(evolution[1].key, evolution[2].key);
+        assert_ne!(evolution[1].key, evolution[3].key);
+    }
+
+    #[test]
+    fn vm_property_inline_cache_evolution_enters_cooldown_after_repatch_threshold() {
+        let owner = CodeBlockId(CellId(903));
+        let bytecode_index = BytecodeIndex::from_offset(10);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let mut descriptor =
+            property_handoff_observation(owner, InlineCacheSlotId(5), bytecode_index);
+        descriptor.base_structure = Some(StructureId(900));
+        descriptor.chain[0].structure = StructureId(900);
+
+        for _ in 0..11 {
+            record_property_load_descriptor(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                descriptor.clone(),
+            );
+        }
+
+        assert_eq!(tiering.property_load_observations().len(), 11);
+        assert_eq!(tiering.property_load_access_case_plans().len(), 1);
+        let evolution = tiering.property_inline_cache_evolution_records();
+        assert_eq!(
+            evolution[0].decision,
+            VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
+        );
+        assert_eq!(
+            evolution[9].decision,
+            VmPropertyInlineCacheEvolutionDecision::SkippedReplacedByExistingCase
+        );
+        assert_eq!(
+            evolution[9].counters_after.countdown,
+            PROPERTY_IC_INITIAL_COOLDOWN_COUNT
+        );
+        assert_eq!(
+            evolution[10].decision,
+            VmPropertyInlineCacheEvolutionDecision::SkippedCooldown
+        );
+        assert_eq!(
+            evolution[10].counters_before.countdown,
+            PROPERTY_IC_INITIAL_COOLDOWN_COUNT
+        );
+        assert_eq!(
+            evolution[10].counters_after.countdown,
+            PROPERTY_IC_INITIAL_COOLDOWN_COUNT - 1
+        );
     }
 
     fn structure_stub_info_for_plan(
@@ -14995,7 +21794,12 @@ mod tests {
         let bytecode_snapshot = baseline_bytecode_snapshot(owner);
         let mut tiering = VmTieringIntegration::default();
         let descriptor = property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
-        record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            descriptor,
+        );
         let plan = tiering
             .property_load_access_case_plans()
             .last()
@@ -15532,24 +22336,41 @@ mod tests {
             PropertyStoreObservationOutcome::CreatedProperty => StructureId(18),
             _ => base_structure_before,
         };
+        let (cache_kind, key, offset_after) =
+            if outcome == PropertyStoreObservationOutcome::IndexedStore {
+                (
+                    InlineCacheKind::ElementStore,
+                    CacheKey::Property(PropertyKey::from_index(
+                        PropertyIndex::from_canonical_index(0),
+                    )),
+                    None,
+                )
+            } else {
+                (
+                    InlineCacheKind::PropertyStore,
+                    CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+                        AtomId::from_table_slot(21),
+                    ))),
+                    Some(PropertyOffset::new(3)),
+                )
+            };
         PropertyStoreObservationDescriptor {
             owner,
             frame: CallFrameId(1),
             slot,
             bytecode_index: bytecode_index.offset(),
-            cache_kind: InlineCacheKind::PropertyStore,
+            cache_kind,
             fallback: InlineCacheFallbackSemantics::SlowPathLookup,
-            key: CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
-                AtomId::from_table_slot(21),
-            ))),
+            key,
             base_object: Some(base_object),
             base_structure_before: Some(base_structure_before),
             base_structure_after: Some(base_structure_after),
-            offset_after: Some(PropertyOffset::new(3)),
+            offset_after,
             stored_value: crate::runtime::RuntimeValue::from_i32(43),
             outcome,
             may_call_js: false,
             cacheability: crate::object::PropertyCacheability::Disallowed,
+            can_use_put_by_id_megamorphic: true,
             write_barrier_count: 1,
             last_write_barrier: Some(BarrierRequirementOutcome::Required(
                 BarrierAction::MarkingBarrier,
@@ -15558,7 +22379,7 @@ mod tests {
                 owner,
                 slot,
                 bytecode_index: bytecode_index.offset(),
-                cache_kind: InlineCacheKind::PropertyStore,
+                cache_kind,
                 miss_kind: InlineCacheMissKind::Cold,
                 fallback: InlineCacheFallbackSemantics::SlowPathLookup,
                 boundary: None,
@@ -15566,6 +22387,14 @@ mod tests {
                 preserves_operand_registers: true,
             },
         }
+    }
+
+    fn cell_runtime_value_for_test(payload: usize) -> crate::runtime::RuntimeValue {
+        crate::runtime::RuntimeValue::from_encoded(
+            crate::value::static_value_representation_layout()
+                .encode_cell_payload(payload)
+                .expect("test cell value payload"),
+        )
     }
 
     fn record_property_store_descriptor(
@@ -15586,6 +22415,16 @@ mod tests {
             .expect("property-store observation")
     }
 
+    fn record_property_store_descriptor_after_initial_countdown(
+        tiering: &mut VmTieringIntegration,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        descriptor: PropertyStoreObservationDescriptor,
+    ) -> VmPropertyStoreObservationRecord {
+        record_property_store_descriptor(tiering, owner, bytecode_snapshot, descriptor.clone());
+        record_property_store_descriptor(tiering, owner, bytecode_snapshot, descriptor)
+    }
+
     fn record_property_store_install_recheck_fixture(
         outcome: PropertyStoreObservationOutcome,
     ) -> (
@@ -15600,8 +22439,12 @@ mod tests {
         let mut tiering = VmTieringIntegration::default();
         let descriptor =
             property_store_observation(owner, InlineCacheSlotId(2), bytecode_index, outcome);
-        let observation =
-            record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        let observation = record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            descriptor,
+        );
         let plan = tiering
             .property_store_access_case_plans()
             .first()
@@ -15674,14 +22517,17 @@ mod tests {
                 CoreOpcode::CallWithThis => CallObservationThisSource::ExplicitRegister(
                     VirtualRegister::argument_including_this(2, ThisArgumentOffset(0)),
                 ),
+                CoreOpcode::Construct => CallObservationThisSource::ConstructAllocatedReceiver,
                 _ => CallObservationThisSource::ImplicitUndefined,
             },
             this_value_kind: match opcode {
-                CoreOpcode::CallWithThis => ValueKind::Cell,
+                CoreOpcode::CallWithThis | CoreOpcode::Construct => ValueKind::Cell,
                 _ => ValueKind::Undefined,
             },
             this_object: match opcode {
-                CoreOpcode::CallWithThis => Some(crate::runtime::ObjectId(CellId(61))),
+                CoreOpcode::CallWithThis | CoreOpcode::Construct => {
+                    Some(crate::runtime::ObjectId(CellId(61)))
+                }
                 _ => None,
             },
             provided_argument_count: 0,
@@ -17988,6 +24834,7 @@ mod tests {
         let mut native = call_observation(owner, frame, bytecode_index, CoreOpcode::Call);
         native.target_kind = CallObservationTargetKind::NativeFunction {
             native: "hostPrint".to_string(),
+            intrinsic: None,
         };
         native.outcome = CallObservationOutcome::Threw;
         native.may_call_js = false;
@@ -18384,6 +25231,9 @@ mod tests {
                 PropertyStoreAccessCasePlanKind::DataOnlyTransition => {
                     VmPropertyInlineCacheAttachmentKind::StoreTransition
                 }
+                PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
+                    unreachable!("indexed store plan has no bytecode IC attachment kind")
+                }
                 PropertyStoreAccessCasePlanKind::Unsupported => unreachable!("test store plan"),
             },
             source_plan_ordinal: record.ordinal,
@@ -18479,7 +25329,7 @@ mod tests {
         let bytecode_index = BytecodeIndex::from_offset(5);
         let bytecode_snapshot = baseline_bytecode_snapshot(owner);
         let mut tiering = VmTieringIntegration::default();
-        record_property_load_descriptor(
+        record_property_load_descriptor_after_initial_countdown(
             &mut tiering,
             owner,
             bytecode_snapshot,
@@ -18655,19 +25505,12 @@ mod tests {
         );
 
         let mut own_load_tiering = VmTieringIntegration::default();
-        own_load_tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(2)),
-                bytecode_index,
-                bytecode_snapshot,
-                descriptor: property_handoff_observation(
-                    owner,
-                    InlineCacheSlotId(1),
-                    bytecode_index,
-                ),
-            })
-            .expect("own load observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut own_load_tiering,
+            owner,
+            bytecode_snapshot,
+            property_handoff_observation(owner, InlineCacheSlotId(1), bytecode_index),
+        );
         own_load_tiering.property_load_access_case_plans[0]
             .plan
             .access_case
@@ -19358,15 +26201,12 @@ mod tests {
         let own_data_bytecode_index = BytecodeIndex::from_offset(5);
         let own_data =
             property_handoff_observation(owner, InlineCacheSlotId(5), own_data_bytecode_index);
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(5)),
-                bytecode_index: own_data_bytecode_index,
-                bytecode_snapshot,
-                descriptor: own_data.clone(),
-            })
-            .expect("own data property-load observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            own_data.clone(),
+        );
 
         let recheck = tiering.record_property_load_guard_install_recheck(
             property_load_guard_install_recheck_request(&guard_plan),
@@ -19737,15 +26577,12 @@ mod tests {
         let own_data_bytecode_index = BytecodeIndex::from_offset(5);
         let own_data =
             property_handoff_observation(owner, InlineCacheSlotId(5), own_data_bytecode_index);
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(5)),
-                bytecode_index: own_data_bytecode_index,
-                bytecode_snapshot,
-                descriptor: own_data.clone(),
-            })
-            .expect("own data property-load observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            own_data.clone(),
+        );
         let recheck = tiering.record_property_load_guard_install_recheck(
             property_load_guard_install_recheck_request(&guard_plan),
         );
@@ -20244,15 +27081,12 @@ mod tests {
         let own_data_bytecode_index = BytecodeIndex::from_offset(5);
         let own_data =
             property_handoff_observation(owner, InlineCacheSlotId(5), own_data_bytecode_index);
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(5)),
-                bytecode_index: own_data_bytecode_index,
-                bytecode_snapshot,
-                descriptor: own_data.clone(),
-            })
-            .expect("own data property-load observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            own_data.clone(),
+        );
         accepted_watchpoint_materialization(
             &mut tiering,
             &guard_plan,
@@ -20751,7 +27585,7 @@ mod tests {
         assert!(tiering.baseline_generated_code_invalidations().is_empty());
         assert_eq!(
             tiering.baseline_generated_code_artifact_for(owner),
-            Some(generated_artifact)
+            Some(generated_artifact.clone())
         );
 
         let terminal_request = generated_guarded_property_load_probe_miss_request(
@@ -20794,7 +27628,7 @@ mod tests {
             Some(bytecode_snapshot)
         );
         assert_eq!(
-            entry.baseline_entry_gate.map(|gate| gate.outcome),
+            entry.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::InvalidatedGeneratedArtifact)
         );
         assert_eq!(entry.execution_path, TierEntryExecutionPath::Interpreter);
@@ -20947,15 +27781,12 @@ mod tests {
         let own_data_bytecode_index = BytecodeIndex::from_offset(5);
         let own_data =
             property_handoff_observation(owner, InlineCacheSlotId(5), own_data_bytecode_index);
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(5)),
-                bytecode_index: own_data_bytecode_index,
-                bytecode_snapshot,
-                descriptor: own_data.clone(),
-            })
-            .expect("own data property-load observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            own_data.clone(),
+        );
         accepted_watchpoint_materialization(
             &mut tiering,
             &guard_plan,
@@ -21113,7 +27944,7 @@ mod tests {
             Some(bytecode_snapshot)
         );
         assert_eq!(
-            entry.baseline_entry_gate.map(|gate| gate.outcome),
+            entry.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::InvalidatedGeneratedArtifact)
         );
         assert_eq!(entry.execution_path, TierEntryExecutionPath::Interpreter);
@@ -21702,15 +28533,12 @@ mod tests {
         let own_data_bytecode_index = BytecodeIndex::from_offset(5);
         let own_data =
             property_handoff_observation(owner, InlineCacheSlotId(5), own_data_bytecode_index);
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(5)),
-                bytecode_index: own_data_bytecode_index,
-                bytecode_snapshot,
-                descriptor: own_data.clone(),
-            })
-            .expect("own data property-load observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            own_data.clone(),
+        );
         let materialization = accepted_watchpoint_materialization(
             &mut tiering,
             &guard_plan,
@@ -21992,6 +28820,15 @@ mod tests {
             BytecodeIndex::from_offset(2),
         );
 
+        let first_warmup = tiering
+            .record_property_load_observation(VmPropertyLoadObservationRequest {
+                owner,
+                frame: Some(CallFrameId(1)),
+                bytecode_index: BytecodeIndex::from_offset(1),
+                bytecode_snapshot,
+                descriptor: first_descriptor.clone(),
+            })
+            .expect("first property handoff warmup observation");
         let first = tiering
             .record_property_load_observation(VmPropertyLoadObservationRequest {
                 owner,
@@ -22001,6 +28838,15 @@ mod tests {
                 descriptor: first_descriptor.clone(),
             })
             .expect("first property handoff observation");
+        let second_warmup = tiering
+            .record_property_load_observation(VmPropertyLoadObservationRequest {
+                owner,
+                frame: Some(CallFrameId(2)),
+                bytecode_index: BytecodeIndex::from_offset(2),
+                bytecode_snapshot,
+                descriptor: second_descriptor.clone(),
+            })
+            .expect("second property handoff warmup observation");
         let second = tiering
             .record_property_load_observation(VmPropertyLoadObservationRequest {
                 owner,
@@ -22014,14 +28860,19 @@ mod tests {
         assert!(first.ordinal < second.ordinal);
         assert_eq!(
             tiering.property_load_observations(),
-            &[first.clone(), second.clone()]
+            &[
+                first_warmup.clone(),
+                first.clone(),
+                second_warmup.clone(),
+                second.clone()
+            ]
         );
         assert_eq!(
             tiering.property_load_observations()[0].descriptor,
             first_descriptor
         );
         assert_eq!(
-            tiering.property_load_observations()[1].descriptor,
+            tiering.property_load_observations()[2].descriptor,
             second_descriptor
         );
 
@@ -22299,15 +29150,12 @@ mod tests {
             InlineCacheSlotId(0),
             BytecodeIndex::from_offset(1),
         );
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(1)),
-                bytecode_index: BytecodeIndex::from_offset(1),
-                bytecode_snapshot,
-                descriptor: own_data.clone(),
-            })
-            .expect("own data observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            own_data.clone(),
+        );
 
         let mut prototype = property_handoff_observation(
             owner,
@@ -22358,7 +29206,7 @@ mod tests {
             })
             .expect("negative guard observation");
 
-        assert_eq!(tiering.property_load_observations().len(), 3);
+        assert_eq!(tiering.property_load_observations().len(), 4);
         assert_eq!(tiering.property_load_access_case_plans().len(), 1);
         assert_eq!(tiering.property_load_guard_plans().len(), 2);
         assert_eq!(tiering.property_load_guard_dependencies().len(), 3);
@@ -22390,15 +29238,12 @@ mod tests {
         first_descriptor.base_structure = Some(StructureId(17));
         first_descriptor.offset = Some(PropertyOffset::new(5));
         first_descriptor.readiness = first_descriptor.classify_readiness();
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(1)),
-                bytecode_index: BytecodeIndex::from_offset(3),
-                bytecode_snapshot,
-                descriptor: first_descriptor.clone(),
-            })
-            .expect("first owner property handoff observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            first_descriptor.clone(),
+        );
 
         let mut other_descriptor = property_handoff_observation(
             other_owner,
@@ -22408,15 +29253,12 @@ mod tests {
         other_descriptor.base_structure = Some(StructureId(27));
         other_descriptor.offset = Some(PropertyOffset::new(7));
         other_descriptor.readiness = other_descriptor.classify_readiness();
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner: other_owner,
-                frame: Some(CallFrameId(2)),
-                bytecode_index: BytecodeIndex::from_offset(1),
-                bytecode_snapshot: other_bytecode_snapshot,
-                descriptor: other_descriptor,
-            })
-            .expect("other owner property handoff observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            other_owner,
+            other_bytecode_snapshot,
+            other_descriptor,
+        );
 
         let mut second_descriptor = property_handoff_observation(
             owner,
@@ -22426,15 +29268,12 @@ mod tests {
         second_descriptor.base_structure = Some(StructureId(18));
         second_descriptor.offset = Some(PropertyOffset::new(6));
         second_descriptor.readiness = second_descriptor.classify_readiness();
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(3)),
-                bytecode_index: BytecodeIndex::from_offset(1),
-                bytecode_snapshot,
-                descriptor: second_descriptor.clone(),
-            })
-            .expect("second owner property handoff observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            second_descriptor.clone(),
+        );
 
         let mut blocked_descriptor = property_handoff_observation(
             owner,
@@ -22454,7 +29293,7 @@ mod tests {
             })
             .expect("blocked prototype property handoff observation");
 
-        assert_eq!(tiering.property_load_observations().len(), 4);
+        assert_eq!(tiering.property_load_observations().len(), 7);
         assert_eq!(tiering.property_load_access_case_plans().len(), 3);
 
         let table = tiering
@@ -22509,27 +29348,21 @@ mod tests {
         duplicate_descriptor.slot = InlineCacheSlotId(7);
         duplicate_descriptor.cold_miss_handoff.slot = InlineCacheSlotId(7);
 
-        let first = tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(1)),
-                bytecode_index,
-                bytecode_snapshot,
-                descriptor: first_descriptor,
-            })
-            .expect("first property handoff observation");
-        let duplicate = tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(2)),
-                bytecode_index,
-                bytecode_snapshot,
-                descriptor: duplicate_descriptor,
-            })
-            .expect("duplicate-key property handoff observation");
+        let first = record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            first_descriptor,
+        );
+        let duplicate = record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            duplicate_descriptor,
+        );
 
         assert!(first.ordinal < duplicate.ordinal);
-        assert_eq!(tiering.property_load_observations().len(), 2);
+        assert_eq!(tiering.property_load_observations().len(), 4);
         assert_eq!(tiering.property_load_access_case_plans().len(), 2);
         assert_eq!(
             tiering.property_load_access_case_plans()[0].plan.slot,
@@ -22563,6 +29396,59 @@ mod tests {
     }
 
     #[test]
+    fn vm_property_load_plan_table_suppresses_new_case_replaced_by_existing_handler_case() {
+        let owner = CodeBlockId(CellId(44));
+        let mut tiering = VmTieringIntegration::default();
+        let bytecode_index = BytecodeIndex::from_offset(6);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+
+        let mut first_descriptor =
+            property_handoff_observation(owner, InlineCacheSlotId(0), bytecode_index);
+        first_descriptor.base_structure = Some(StructureId(17));
+        first_descriptor.chain[0].structure = StructureId(17);
+        first_descriptor.offset = Some(PropertyOffset::new(5));
+        first_descriptor.readiness = first_descriptor.classify_readiness();
+        let mut second_descriptor = first_descriptor.clone();
+        second_descriptor.slot = InlineCacheSlotId(7);
+        second_descriptor.cold_miss_handoff.slot = InlineCacheSlotId(7);
+        second_descriptor.base_structure = Some(StructureId(18));
+        second_descriptor.chain[0].structure = StructureId(18);
+        second_descriptor.offset = Some(PropertyOffset::new(9));
+        second_descriptor.readiness = second_descriptor.classify_readiness();
+
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            first_descriptor,
+        );
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            second_descriptor,
+        );
+
+        assert_eq!(tiering.property_load_access_case_plans().len(), 2);
+        tiering.property_load_access_case_plans[1].plan.slot = InlineCacheSlotId(0);
+        tiering.property_load_access_case_plans[1]
+            .plan
+            .access_case
+            .base_structure = Some(StructureId(17));
+
+        let table = tiering
+            .property_load_access_case_plan_table_for_owner(owner, bytecode_snapshot)
+            .expect("canReplace-projected property-load plan table");
+
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.plans()[0].slot, InlineCacheSlotId(0));
+        assert_eq!(
+            table.plans()[0].access_case.offset,
+            Some(PropertyOffset::new(5))
+        );
+    }
+
+    #[test]
     fn vm_property_load_plan_table_scopes_duplicate_keys_by_bytecode_snapshot() {
         let owner = CodeBlockId(CellId(41));
         let mut tiering = VmTieringIntegration::default();
@@ -22580,33 +29466,24 @@ mod tests {
         first_snapshot_duplicate.slot = InlineCacheSlotId(9);
         first_snapshot_duplicate.cold_miss_handoff.slot = InlineCacheSlotId(9);
 
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(1)),
-                bytecode_index,
-                bytecode_snapshot: first_snapshot,
-                descriptor: first_descriptor,
-            })
-            .expect("first snapshot property handoff observation");
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(2)),
-                bytecode_index,
-                bytecode_snapshot: second_snapshot,
-                descriptor: second_snapshot_descriptor,
-            })
-            .expect("second snapshot duplicate-key property handoff observation");
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(3)),
-                bytecode_index,
-                bytecode_snapshot: first_snapshot,
-                descriptor: first_snapshot_duplicate,
-            })
-            .expect("first snapshot duplicate-key property handoff observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            first_snapshot,
+            first_descriptor,
+        );
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            second_snapshot,
+            second_snapshot_descriptor,
+        );
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            first_snapshot,
+            first_snapshot_duplicate,
+        );
 
         assert_eq!(tiering.property_load_access_case_plans().len(), 3);
 
@@ -22647,17 +29524,15 @@ mod tests {
             PropertyStoreObservationOutcome::OwnDataStore,
         );
 
-        let record = record_property_store_descriptor(
+        let record = record_property_store_descriptor_after_initial_countdown(
             &mut tiering,
             owner,
             bytecode_snapshot,
             descriptor.clone(),
         );
 
-        assert_eq!(
-            tiering.property_store_observations(),
-            std::slice::from_ref(&record)
-        );
+        assert_eq!(tiering.property_store_observations().len(), 2);
+        assert_eq!(tiering.property_store_observations().last(), Some(&record));
         assert_eq!(tiering.property_store_access_case_plans().len(), 1);
         let plan_record = &tiering.property_store_access_case_plans()[0];
         assert!(record.ordinal < plan_record.ordinal);
@@ -22708,6 +29583,41 @@ mod tests {
     }
 
     #[test]
+    fn vm_property_store_access_case_plan_records_replace_from_non_cell_store_without_barrier_evidence(
+    ) {
+        let owner = CodeBlockId(CellId(5010));
+        let mut tiering = VmTieringIntegration::default();
+        let bytecode_index = BytecodeIndex::from_offset(4);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut descriptor = property_store_observation(
+            owner,
+            InlineCacheSlotId(0),
+            bytecode_index,
+            PropertyStoreObservationOutcome::OwnDataStore,
+        );
+        descriptor.write_barrier_count = 0;
+        descriptor.last_write_barrier = None;
+
+        let record = record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            descriptor,
+        );
+
+        let plan_record = tiering
+            .property_store_access_case_plans()
+            .first()
+            .expect("non-cell store replace plan");
+        assert_eq!(plan_record.observation_ordinal, record.ordinal);
+        assert_eq!(
+            plan_record.plan.plan_kind,
+            PropertyStoreAccessCasePlanKind::DataOnlyReplace
+        );
+        assert_eq!(plan_record.plan.access_case.kind, AccessCaseKind::Replace);
+    }
+
+    #[test]
     fn vm_property_store_access_case_plan_records_transition_from_created_property_with_barrier_evidence(
     ) {
         let owner = CodeBlockId(CellId(51));
@@ -22721,7 +29631,7 @@ mod tests {
             PropertyStoreObservationOutcome::CreatedProperty,
         );
 
-        let record = record_property_store_descriptor(
+        let record = record_property_store_descriptor_after_initial_countdown(
             &mut tiering,
             owner,
             bytecode_snapshot,
@@ -22757,6 +29667,63 @@ mod tests {
         assert_eq!(
             plan_record.plan.effect_contract,
             PropertyStoreAccessCasePlanContract::DATA_ONLY_TRANSITION
+        );
+    }
+
+    #[test]
+    fn vm_property_store_access_case_plan_records_indexed_store_from_element_store_with_barrier_evidence(
+    ) {
+        let owner = CodeBlockId(CellId(515));
+        let mut tiering = VmTieringIntegration::default();
+        let bytecode_index = BytecodeIndex::from_offset(5);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let descriptor = property_store_observation(
+            owner,
+            InlineCacheSlotId(1),
+            bytecode_index,
+            PropertyStoreObservationOutcome::IndexedStore,
+        );
+
+        let record = record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            descriptor.clone(),
+        );
+
+        let plan_record = tiering
+            .property_store_access_case_plans()
+            .first()
+            .expect("indexed store plan");
+        assert_eq!(plan_record.observation_ordinal, record.ordinal);
+        assert_eq!(
+            plan_record.plan.plan_kind,
+            PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore
+        );
+        assert_eq!(
+            plan_record.plan.access_case.kind,
+            AccessCaseKind::IndexedStore
+        );
+        assert_eq!(
+            plan_record.plan.access_case.base_structure,
+            descriptor.base_structure_before
+        );
+        assert_eq!(plan_record.plan.access_case.new_structure, None);
+        assert_eq!(plan_record.plan.access_case.offset, None);
+        assert_eq!(
+            plan_record.plan.planned_stub_kind,
+            InlineCacheStubKind::RepatchingStub
+        );
+        assert_eq!(
+            plan_record.plan.effect_contract,
+            PropertyStoreAccessCasePlanContract::DATA_ONLY_INDEXED_STORE
+        );
+        assert_eq!(
+            tiering
+                .property_store_access_case_plan_table_for_owner(owner, bytecode_snapshot)
+                .expect("indexed property-store table")
+                .plans(),
+            std::slice::from_ref(&plan_record.plan)
         );
     }
 
@@ -22817,6 +29784,7 @@ mod tests {
             BytecodeIndex::from_offset(0),
             PropertyStoreObservationOutcome::OwnDataStore,
         );
+        missing_barrier.stored_value = cell_runtime_value_for_test(0x5200);
         missing_barrier.write_barrier_count = 0;
         missing_barrier.last_write_barrier = None;
         record_without_plan(missing_barrier);
@@ -22923,16 +29891,31 @@ mod tests {
         other_descriptor.base_structure_before = Some(StructureId(51));
         other_descriptor.base_structure_after = Some(StructureId(52));
 
-        record_property_store_descriptor(&mut tiering, owner, first_snapshot, first_descriptor);
-        record_property_store_descriptor(
+        record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            first_snapshot,
+            first_descriptor,
+        );
+        record_property_store_descriptor_after_initial_countdown(
             &mut tiering,
             owner,
             second_snapshot,
             second_snapshot_duplicate,
         );
-        record_property_store_descriptor(&mut tiering, owner, first_snapshot, duplicate_descriptor);
-        record_property_store_descriptor(&mut tiering, owner, first_snapshot, second_descriptor);
-        record_property_store_descriptor(
+        record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            first_snapshot,
+            duplicate_descriptor,
+        );
+        record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            first_snapshot,
+            second_descriptor,
+        );
+        record_property_store_descriptor_after_initial_countdown(
             &mut tiering,
             other_owner,
             other_snapshot,
@@ -22970,6 +29953,61 @@ mod tests {
     }
 
     #[test]
+    fn vm_property_store_plan_table_suppresses_new_case_replaced_by_existing_handler_case() {
+        let owner = CodeBlockId(CellId(57));
+        let mut tiering = VmTieringIntegration::default();
+        let bytecode_index = BytecodeIndex::from_offset(4);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+
+        let mut first_descriptor = property_store_observation(
+            owner,
+            InlineCacheSlotId(0),
+            bytecode_index,
+            PropertyStoreObservationOutcome::OwnDataStore,
+        );
+        first_descriptor.base_structure_before = Some(StructureId(17));
+        first_descriptor.base_structure_after = Some(StructureId(17));
+        first_descriptor.offset_after = Some(PropertyOffset::new(5));
+        let mut second_descriptor = first_descriptor.clone();
+        second_descriptor.slot = InlineCacheSlotId(7);
+        second_descriptor.cold_miss_handoff.slot = InlineCacheSlotId(7);
+        second_descriptor.base_structure_before = Some(StructureId(18));
+        second_descriptor.base_structure_after = Some(StructureId(18));
+        second_descriptor.offset_after = Some(PropertyOffset::new(9));
+
+        record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            first_descriptor,
+        );
+        record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            second_descriptor,
+        );
+
+        assert_eq!(tiering.property_store_access_case_plans().len(), 2);
+        tiering.property_store_access_case_plans[1].plan.slot = InlineCacheSlotId(0);
+        tiering.property_store_access_case_plans[1]
+            .plan
+            .access_case
+            .base_structure = Some(StructureId(17));
+
+        let table = tiering
+            .property_store_access_case_plan_table_for_owner(owner, bytecode_snapshot)
+            .expect("canReplace-projected property-store plan table");
+
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.plans()[0].slot, InlineCacheSlotId(0));
+        assert_eq!(
+            table.plans()[0].access_case.offset,
+            Some(PropertyOffset::new(5))
+        );
+    }
+
+    #[test]
     fn vm_property_store_plan_table_surfaces_malformed_stored_metadata() {
         let owner = CodeBlockId(CellId(55));
         let mut tiering = VmTieringIntegration::default();
@@ -22980,7 +30018,12 @@ mod tests {
             BytecodeIndex::from_offset(4),
             PropertyStoreObservationOutcome::OwnDataStore,
         );
-        record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            descriptor,
+        );
         tiering.property_store_access_case_plans[0]
             .plan
             .access_case
@@ -23025,6 +30068,42 @@ mod tests {
         assert_eq!(
             tiering.property_store_access_case_install_rechecks(),
             std::slice::from_ref(&recheck)
+        );
+    }
+
+    #[test]
+    fn vm_property_store_access_case_install_recheck_accepts_non_cell_replace_no_barrier_evidence()
+    {
+        let (mut tiering, observation, plan, _) = record_property_store_install_recheck_fixture(
+            PropertyStoreObservationOutcome::OwnDataStore,
+        );
+        tiering.property_store_observations[1]
+            .descriptor
+            .write_barrier_count = 0;
+        tiering.property_store_observations[1]
+            .descriptor
+            .last_write_barrier = None;
+
+        let recheck = tiering.record_property_store_access_case_install_recheck(
+            property_store_access_case_install_recheck_request(&plan),
+        );
+
+        let expected_evidence = VmPropertyStoreAccessCaseBarrierEvidenceSummary {
+            plan_kind: PropertyStoreAccessCasePlanKind::DataOnlyReplace,
+            effect_contract: PropertyStoreAccessCasePlanContract::DATA_ONLY_REPLACE,
+            barrier_effect: PropertyStoreBarrierEffect::RequiresRuntimeStoredValueBarrierProof,
+            observed_write_barrier_count: 0,
+            last_write_barrier: BarrierRequirementOutcome::NotRequired(
+                BarrierNotRequiredReason::NullOrNonCellTarget,
+            ),
+        };
+        assert_eq!(recheck.observation_ordinal, Some(observation.ordinal));
+        assert_eq!(recheck.barrier_evidence, Some(expected_evidence));
+        assert_eq!(
+            recheck.outcome,
+            VmPropertyStoreAccessCaseInstallRecheckOutcome::Accepted {
+                barrier_evidence: expected_evidence
+            }
         );
     }
 
@@ -23134,43 +30213,43 @@ mod tests {
     #[test]
     fn vm_property_store_access_case_install_recheck_rejects_observation_metadata_drift() {
         assert_store_install_recheck_metadata_mismatch(
-            |tiering| tiering.property_store_observations[0].owner = CodeBlockId(CellId(502)),
+            |tiering| tiering.property_store_observations[1].owner = CodeBlockId(CellId(502)),
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Owner,
         );
         assert_store_install_recheck_metadata_mismatch(
-            |tiering| tiering.property_store_observations[0].frame = Some(CallFrameId(502)),
+            |tiering| tiering.property_store_observations[1].frame = Some(CallFrameId(502)),
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Frame,
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[0].bytecode_index =
+                tiering.property_store_observations[1].bytecode_index =
                     BytecodeIndex::from_offset(502);
             },
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::BytecodeIndex,
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                let owner = tiering.property_store_observations[0].owner;
-                tiering.property_store_observations[0].bytecode_snapshot =
+                let owner = tiering.property_store_observations[1].owner;
+                tiering.property_store_observations[1].bytecode_snapshot =
                     alternate_baseline_bytecode_snapshot(owner);
             },
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::BytecodeSnapshot,
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[0].descriptor.slot = InlineCacheSlotId(502);
+                tiering.property_store_observations[1].descriptor.slot = InlineCacheSlotId(502);
             },
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Slot,
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[0].descriptor.key = CacheKey::Dynamic;
+                tiering.property_store_observations[1].descriptor.key = CacheKey::Dynamic;
             },
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Key,
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[0]
+                tiering.property_store_observations[1]
                     .descriptor
                     .base_structure_before = Some(StructureId(502));
             },
@@ -23178,7 +30257,7 @@ mod tests {
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[0]
+                tiering.property_store_observations[1]
                     .descriptor
                     .offset_after = Some(PropertyOffset::new(502));
             },
@@ -23186,7 +30265,7 @@ mod tests {
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[0]
+                tiering.property_store_observations[1]
                     .descriptor
                     .base_structure_after = Some(StructureId(502));
             },
@@ -23194,14 +30273,14 @@ mod tests {
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[0].descriptor.outcome =
+                tiering.property_store_observations[1].descriptor.outcome =
                     PropertyStoreObservationOutcome::CreatedProperty;
             },
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Outcome,
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[0]
+                tiering.property_store_observations[1]
                     .descriptor
                     .may_call_js = true
             },
@@ -23209,7 +30288,7 @@ mod tests {
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[0]
+                tiering.property_store_observations[1]
                     .descriptor
                     .cacheability = PropertyCacheability::Allowed;
             },
@@ -23223,10 +30302,13 @@ mod tests {
         let (mut tiering, _, plan, _) = record_property_store_install_recheck_fixture(
             PropertyStoreObservationOutcome::OwnDataStore,
         );
-        tiering.property_store_observations[0]
+        tiering.property_store_observations[1]
+            .descriptor
+            .stored_value = cell_runtime_value_for_test(0x5300);
+        tiering.property_store_observations[1]
             .descriptor
             .write_barrier_count = 0;
-        tiering.property_store_observations[0]
+        tiering.property_store_observations[1]
             .descriptor
             .last_write_barrier = None;
 
@@ -23625,7 +30707,7 @@ mod tests {
         );
         assert_eq!(
             tiering.baseline_generated_code_artifact_for(plan.owner),
-            Some(generated_artifact)
+            Some(generated_artifact.clone())
         );
 
         let entry = observe_baseline_entry(&mut tiering, plan.owner, 603);
@@ -23636,7 +30718,7 @@ mod tests {
             }
         );
         assert_eq!(
-            entry.baseline_entry_gate.map(|gate| gate.outcome),
+            entry.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::Eligible)
         );
     }
@@ -23765,10 +30847,10 @@ mod tests {
                 stale_recheck.ordinal,
             ),
         );
-        stale_recheck_tiering.property_store_observations[0]
+        stale_recheck_tiering.property_store_observations[1]
             .descriptor
             .write_barrier_count = 0;
-        stale_recheck_tiering.property_store_observations[0]
+        stale_recheck_tiering.property_store_observations[1]
             .descriptor
             .last_write_barrier = None;
         assert!(stale_recheck_tiering
@@ -23860,6 +30942,88 @@ mod tests {
     }
 
     #[test]
+    fn vm_property_store_mutation_candidate_table_suppresses_new_case_replaced_by_existing_handler_case(
+    ) {
+        let owner = CodeBlockId(CellId(58));
+        let bytecode_index = BytecodeIndex::from_offset(4);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+
+        let mut first_descriptor = property_store_observation(
+            owner,
+            InlineCacheSlotId(0),
+            bytecode_index,
+            PropertyStoreObservationOutcome::OwnDataStore,
+        );
+        first_descriptor.base_structure_before = Some(StructureId(17));
+        first_descriptor.base_structure_after = Some(StructureId(17));
+        first_descriptor.offset_after = Some(PropertyOffset::new(5));
+        let mut second_descriptor = first_descriptor.clone();
+        second_descriptor.slot = InlineCacheSlotId(7);
+        second_descriptor.cold_miss_handoff.slot = InlineCacheSlotId(7);
+        second_descriptor.base_structure_before = Some(StructureId(18));
+        second_descriptor.base_structure_after = Some(StructureId(18));
+        second_descriptor.offset_after = Some(PropertyOffset::new(9));
+
+        record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            first_descriptor,
+        );
+        record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            second_descriptor,
+        );
+        assert_eq!(tiering.property_store_access_case_plans().len(), 2);
+
+        let first_plan = tiering.property_store_access_case_plans()[0].clone();
+        let second_observation_ordinal =
+            tiering.property_store_access_case_plans()[1].observation_ordinal;
+        tiering.property_store_access_case_plans[1].plan.slot = InlineCacheSlotId(0);
+        tiering.property_store_access_case_plans[1]
+            .plan
+            .access_case
+            .base_structure = Some(StructureId(17));
+        let second_observation = tiering
+            .property_store_observations
+            .iter_mut()
+            .find(|record| record.ordinal == second_observation_ordinal)
+            .expect("second store observation");
+        second_observation.descriptor.slot = InlineCacheSlotId(0);
+        second_observation.descriptor.cold_miss_handoff.slot = InlineCacheSlotId(0);
+        second_observation.descriptor.base_structure_before = Some(StructureId(17));
+        second_observation.descriptor.base_structure_after = Some(StructureId(17));
+
+        for index in 0..2 {
+            let plan = tiering.property_store_access_case_plans()[index].clone();
+            let recheck = tiering.record_property_store_access_case_install_recheck(
+                property_store_access_case_install_recheck_request(&plan),
+            );
+            assert!(matches!(
+                recheck.outcome,
+                VmPropertyStoreAccessCaseInstallRecheckOutcome::Accepted { .. }
+            ));
+            tiering.record_generated_property_store_mutation_readiness(
+                generated_property_store_mutation_readiness_request(&plan, recheck.ordinal),
+            );
+        }
+
+        let table = tiering
+            .property_store_mutation_candidate_table_for_owner(owner, bytecode_snapshot)
+            .expect("canReplace-projected property-store mutation candidate table");
+
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.candidates()[0].store_plan_ordinal, first_plan.ordinal);
+        assert_eq!(
+            table.candidates()[0].plan.access_case.offset,
+            Some(PropertyOffset::new(5))
+        );
+    }
+
+    #[test]
     fn vm_property_store_mutation_candidate_projection_is_record_only() {
         let (mut tiering, _, plan, bytecode_snapshot) =
             record_property_store_install_recheck_fixture(
@@ -23936,7 +31100,7 @@ mod tests {
         assert_eq!(tiering.baseline_install_records(), original_install_records);
         assert_eq!(
             tiering.baseline_generated_code_artifact_for(plan.owner),
-            Some(generated_artifact)
+            Some(generated_artifact.clone())
         );
 
         let entry = observe_baseline_entry(&mut tiering, plan.owner, 604);
@@ -23947,7 +31111,7 @@ mod tests {
             }
         );
         assert_eq!(
-            entry.baseline_entry_gate.map(|gate| gate.outcome),
+            entry.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::Eligible)
         );
     }
@@ -24209,7 +31373,7 @@ mod tests {
         assert!(tiering.baseline_generated_code_invalidations().is_empty());
         assert_eq!(
             tiering.baseline_generated_code_artifact_for(plan.owner),
-            Some(generated_artifact)
+            Some(generated_artifact.clone())
         );
         let entry = observe_baseline_entry(&mut tiering, plan.owner, 602);
         assert_eq!(
@@ -24219,7 +31383,7 @@ mod tests {
             }
         );
         assert_eq!(
-            entry.baseline_entry_gate.map(|gate| gate.outcome),
+            entry.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::Eligible)
         );
         assert_eq!(
@@ -24314,7 +31478,7 @@ mod tests {
         assert!(tiering.baseline_generated_code_invalidations().is_empty());
         assert_eq!(
             tiering.baseline_generated_code_artifact_for(plan.owner),
-            Some(generated_artifact)
+            Some(generated_artifact.clone())
         );
         let entry = observe_baseline_entry(&mut tiering, plan.owner, 605);
         assert_eq!(
@@ -24377,15 +31541,12 @@ mod tests {
         let bytecode_index = BytecodeIndex::from_offset(6);
         let descriptor = property_handoff_observation(owner, InlineCacheSlotId(0), bytecode_index);
 
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(1)),
-                bytecode_index,
-                bytecode_snapshot,
-                descriptor,
-            })
-            .expect("property handoff observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            descriptor,
+        );
 
         let structure_mismatch_request = generated_property_load_probe_miss_request(
             &tiering.property_load_access_case_plans()[0],
@@ -24450,15 +31611,12 @@ mod tests {
             )
             .unwrap();
         let descriptor = property_handoff_observation(owner, InlineCacheSlotId(0), bytecode_index);
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(1)),
-                bytecode_index,
-                bytecode_snapshot,
-                descriptor,
-            })
-            .expect("property handoff observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            descriptor,
+        );
 
         let non_terminal_request = generated_property_load_probe_miss_request(
             &tiering.property_load_access_case_plans()[0],
@@ -24469,7 +31627,7 @@ mod tests {
         assert!(tiering.baseline_generated_code_invalidations().is_empty());
         assert_eq!(
             tiering.baseline_generated_code_artifact_for(owner),
-            Some(generated_artifact)
+            Some(generated_artifact.clone())
         );
 
         let terminal_request = generated_property_load_probe_miss_request(
@@ -24506,7 +31664,7 @@ mod tests {
             Some(bytecode_snapshot)
         );
         assert_eq!(
-            entry.baseline_entry_gate.map(|gate| gate.outcome),
+            entry.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::InvalidatedGeneratedArtifact)
         );
     }
@@ -24519,15 +31677,12 @@ mod tests {
         let bytecode_index = BytecodeIndex::from_offset(6);
         let descriptor = property_handoff_observation(owner, InlineCacheSlotId(0), bytecode_index);
 
-        tiering
-            .record_property_load_observation(VmPropertyLoadObservationRequest {
-                owner,
-                frame: Some(CallFrameId(1)),
-                bytecode_index,
-                bytecode_snapshot,
-                descriptor,
-            })
-            .expect("property handoff observation");
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            descriptor,
+        );
 
         let request = generated_property_load_probe_miss_request(
             &tiering.property_load_access_case_plans()[0],
@@ -24581,7 +31736,7 @@ mod tests {
             }
         );
         assert_eq!(
-            record.baseline_entry_gate.map(|gate| gate.outcome),
+            record.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::MissingArtifact)
         );
         assert_eq!(tiering.fallback_records().len(), 1);
@@ -24620,6 +31775,113 @@ mod tests {
                 .counters
                 .loop_count,
             1
+        );
+    }
+
+    #[test]
+    fn loop_profile_retains_hot_records_but_counts_all_backedges() {
+        let owner = CodeBlockId(CellId(16));
+        let mut tiering = VmTieringIntegration::default();
+        let observed_backedges = HOT_TELEMETRY_RECORD_RETAIN_LIMIT + 3;
+
+        for _ in 0..observed_backedges {
+            tiering.observe_loop_backedge(
+                owner,
+                TieringPolicy::OptimizingAllowed,
+                BytecodeIndex::from_offset(4),
+            );
+        }
+
+        assert_eq!(tiering.profile_loop_backedge_count(), observed_backedges);
+        assert_eq!(tiering.profile_entry_count(), 0);
+        assert_eq!(
+            tiering.profile_records().len(),
+            HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        );
+        assert!(tiering
+            .profile_records()
+            .iter()
+            .all(|record| record.event == TierProfileEvent::LoopBackedge));
+        assert_eq!(
+            tiering
+                .profile_records()
+                .last()
+                .expect("retained backedge profile record")
+                .counters
+                .loop_count as usize,
+            HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        );
+        assert_eq!(
+            tiering
+                .state_for(owner)
+                .expect("tiering state")
+                .tiering
+                .counters
+                .loop_count as usize,
+            observed_backedges
+        );
+    }
+
+    #[test]
+    fn generated_property_probe_misses_retain_hot_records_but_count_all_misses() {
+        let owner = CodeBlockId(CellId(17));
+        let mut tiering = VmTieringIntegration::default();
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        record_property_load_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            property_handoff_observation(
+                owner,
+                InlineCacheSlotId(0),
+                BytecodeIndex::from_offset(4),
+            ),
+        );
+        let load_plan = tiering.property_load_access_case_plans()[0].clone();
+        record_property_store_descriptor_after_initial_countdown(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            property_store_observation(
+                owner,
+                InlineCacheSlotId(1),
+                BytecodeIndex::from_offset(8),
+                PropertyStoreObservationOutcome::OwnDataStore,
+            ),
+        );
+        let store_plan = tiering.property_store_access_case_plans()[0].clone();
+        let observed_misses = HOT_TELEMETRY_RECORD_RETAIN_LIMIT + 3;
+
+        for _ in 0..observed_misses {
+            tiering.record_generated_property_load_probe_miss(
+                generated_property_load_probe_miss_request(
+                    &load_plan,
+                    GeneratedPropertyLoadProbeMissReason::StructureMismatch,
+                ),
+            );
+            tiering.record_generated_property_store_probe_miss(
+                generated_property_store_probe_miss_request(
+                    &store_plan,
+                    GeneratedPropertyStoreProbeMissReason::StructureMismatch,
+                ),
+            );
+        }
+
+        assert_eq!(
+            tiering.generated_property_load_probe_miss_count(),
+            observed_misses
+        );
+        assert_eq!(
+            tiering.generated_property_store_probe_miss_count(),
+            observed_misses
+        );
+        assert_eq!(
+            tiering.generated_property_load_probe_misses().len(),
+            HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        );
+        assert_eq!(
+            tiering.generated_property_store_probe_misses().len(),
+            HOT_TELEMETRY_RECORD_RETAIN_LIMIT
         );
     }
 
@@ -24740,7 +32002,7 @@ mod tests {
             }
         );
         assert_eq!(
-            record.baseline_entry_gate.map(|gate| gate.outcome),
+            record.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::MissingArtifact)
         );
         assert_eq!(record.execution_path, TierEntryExecutionPath::Interpreter);
@@ -24803,7 +32065,10 @@ mod tests {
                 outcome: BaselineEntryGateOutcome::NativeEntryReadyButExecutionDisabled
             })
         );
-        let gate = record.baseline_entry_gate.expect("baseline gate record");
+        let gate = record
+            .baseline_entry_gate
+            .clone()
+            .expect("baseline gate record");
         assert!(gate
             .native_artifact
             .expect("baseline entry artifact")
@@ -24862,13 +32127,13 @@ mod tests {
             Some(readiness.ordinal)
         );
 
-        let mut wrong_ordinal = gate;
+        let mut wrong_ordinal = gate.clone();
         wrong_ordinal.native_entry_readiness_ordinal = Some(readiness.ordinal + 1);
         assert!(tiering
             .baseline_native_entry_readiness_for_gate(&wrong_ordinal)
             .is_none());
 
-        let mut wrong_artifact = gate;
+        let mut wrong_artifact = gate.clone();
         wrong_artifact.native_artifact = Some(
             baseline_artifact(owner, 116)
                 .validate_baseline_entry_artifact(owner)
@@ -24937,7 +32202,7 @@ mod tests {
                 requested_tier: JitType::Baseline,
                 native_artifact: None,
                 native_entry_readiness_ordinal: None,
-                generated_artifact: Some(generated_artifact),
+                generated_artifact: Some(generated_artifact.clone()),
                 outcome: BaselineEntryGateOutcome::Eligible
             })
         );
@@ -24986,7 +32251,7 @@ mod tests {
             .is_none());
         assert_eq!(
             tiering.baseline_generated_code_artifacts(),
-            &[generated_artifact]
+            &[generated_artifact.clone()]
         );
         assert_eq!(
             record.decision,
@@ -25002,7 +32267,7 @@ mod tests {
                 requested_tier: JitType::Baseline,
                 native_artifact: None,
                 native_entry_readiness_ordinal: None,
-                generated_artifact: Some(generated_artifact),
+                generated_artifact: Some(generated_artifact.clone()),
                 outcome: BaselineEntryGateOutcome::InvalidatedGeneratedArtifact,
             })
         );
@@ -25045,7 +32310,7 @@ mod tests {
         assert_eq!(invalidation.artifact_id, Some(generated_artifact.id));
         assert_eq!(
             tiering.baseline_generated_code_artifact_for(owner),
-            Some(generated_artifact)
+            Some(generated_artifact.clone())
         );
         assert_eq!(
             record.decision,
@@ -25054,7 +32319,7 @@ mod tests {
             }
         );
         assert_eq!(
-            record.baseline_entry_gate.map(|gate| gate.outcome),
+            record.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::Eligible)
         );
     }
@@ -25097,7 +32362,7 @@ mod tests {
 
         assert_eq!(
             tiering.baseline_generated_code_artifact_for(owner),
-            Some(replacement)
+            Some(replacement.clone())
         );
         assert_eq!(tiering.baseline_generated_code_invalidations().len(), 1);
         assert_eq!(
@@ -25113,7 +32378,7 @@ mod tests {
                 requested_tier: JitType::Baseline,
                 native_artifact: None,
                 native_entry_readiness_ordinal: None,
-                generated_artifact: Some(replacement),
+                generated_artifact: Some(replacement.clone()),
                 outcome: BaselineEntryGateOutcome::Eligible,
             })
         );
@@ -25170,7 +32435,7 @@ mod tests {
             }
         );
         assert_eq!(
-            record.baseline_entry_gate.map(|gate| gate.outcome),
+            record.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::MissingArtifact)
         );
         assert_eq!(record.execution_path, TierEntryExecutionPath::Interpreter);
@@ -25824,7 +33089,7 @@ mod tests {
 
         let record = observe_baseline_entry(&mut tiering, owner, 442);
         assert_eq!(
-            record.baseline_entry_gate.map(|gate| gate.outcome),
+            record.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::NativeEntryReadyButExecutionDisabled)
         );
         assert_eq!(
@@ -26431,12 +33696,16 @@ mod tests {
             boundary(),
         );
         assert_eq!(
-            installed_entry.baseline_entry_gate.map(|gate| gate.outcome),
+            installed_entry
+                .baseline_entry_gate
+                .as_ref()
+                .map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::NativeEntryReadyButExecutionDisabled)
         );
         assert_eq!(
             installed_entry
                 .baseline_entry_gate
+                .as_ref()
                 .and_then(|gate| gate.native_entry_readiness_ordinal),
             Some(readiness_ordinal)
         );
@@ -26480,7 +33749,10 @@ mod tests {
             boundary(),
         );
         assert_eq!(
-            deferred_entry.baseline_entry_gate.map(|gate| gate.outcome),
+            deferred_entry
+                .baseline_entry_gate
+                .as_ref()
+                .map(|gate| gate.outcome),
             Some(BaselineEntryGateOutcome::MissingArtifact)
         );
         assert_eq!(
