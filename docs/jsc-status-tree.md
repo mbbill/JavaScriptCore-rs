@@ -38,10 +38,11 @@ Legend:
                  arithmetic ToNumeric primitives and relational object ToPrimitive;
                  LoopHint opcode/placement and generated-baseline LoopHint counters
                  are in; generated property IC dependency invalidation now retires
-                 the latest owner artifact when IC snapshots drift. Current
-                 baseline proof `MakeNewWorld(); true` still rejects after bytecode
-                 640 (`x.Add(deltaX)`) during generated/fallback resume, so
-                 world.Step remains blocked.
+                 the latest owner artifact when IC snapshots drift; duplicate
+                 guarded property-load sidecar candidates now collapse like C++
+                 AccessCase replacement. Baseline proof `MakeNewWorld(); true`
+                 passes; `world.Step(1 / 60, 10, 3)` still times out at 120s in
+                 the b2World.Solve throughput path.
                  Object/BigInt bitwise and shift coercion remains a separate risk.
       [blocked] regexp <= complex Yarr patterns throw (match works, exec/replace
                  subset works; needs fuller Yarr execute)

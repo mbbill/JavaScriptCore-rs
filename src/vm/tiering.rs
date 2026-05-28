@@ -1506,14 +1506,26 @@ impl VmTieringIntegration {
                 ),
             };
 
-            candidates.push(JitPropertyLoadGuardedCandidate {
+            let candidate = JitPropertyLoadGuardedCandidate {
                 plan: guard_plan.plan.clone(),
                 guard_plan_ordinal: record.guard_plan_ordinal,
                 materialization_ordinal: record.materialization_ordinal,
                 dependency_ordinals: record.dependency_ordinals.clone(),
                 binding_set_ids,
                 candidate_kind,
-            });
+            };
+            let key = vm_property_load_guarded_candidate_table_key(&candidate);
+            if let Some(existing_index) = candidates.iter().position(|candidate| {
+                vm_property_load_guarded_candidate_table_key(candidate) == key
+            }) {
+                // C++ PolymorphicAccess keeps access cases in addition order and, during
+                // regeneration, removes older cases that a later AccessCase::canReplace().
+                // Rust rebuilds this immutable sidecar table from VM records, so collapse
+                // semantically equivalent guarded plans here and keep the newest active plan.
+                candidates[existing_index] = candidate;
+            } else {
+                candidates.push(candidate);
+            }
         }
 
         for attached in attached {
@@ -27791,6 +27803,55 @@ mod tests {
         assert_eq!(table.len(), 1);
         assert_eq!(table.candidates()[0].guard_plan_ordinal, guard_plan.ordinal);
         assert_eq!(table.candidates()[0].materialization_ordinal, first.ordinal);
+        assert_ne!(first.ordinal, second.ordinal);
+    }
+
+    #[test]
+    fn vm_property_guarded_candidate_table_builder_keeps_newest_semantic_duplicate_guard_plan() {
+        let (mut tiering, first_guard_plan, bytecode_snapshot) =
+            record_prototype_data_guard_fixture();
+        let descriptor = tiering.property_load_observations()[0].descriptor.clone();
+        tiering
+            .record_property_load_observation(VmPropertyLoadObservationRequest {
+                owner: first_guard_plan.owner,
+                frame: Some(CallFrameId(2)),
+                bytecode_index: first_guard_plan.bytecode_index,
+                bytecode_snapshot,
+                descriptor,
+            })
+            .expect("duplicate prototype data guard observation");
+        let second_guard_plan = tiering.property_load_guard_plans()[1].clone();
+        let first = accepted_watchpoint_materialization(
+            &mut tiering,
+            &first_guard_plan,
+            WatchpointState::Clear,
+            None,
+            205,
+        );
+        let second = accepted_watchpoint_materialization(
+            &mut tiering,
+            &second_guard_plan,
+            WatchpointState::Watching,
+            Some(WatchpointKind::StructureTransition),
+            215,
+        );
+
+        let table = tiering
+            .property_load_guarded_candidate_table_for_owner(
+                first_guard_plan.owner,
+                bytecode_snapshot,
+            )
+            .expect("deduped guarded candidate table");
+
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table.candidates()[0].guard_plan_ordinal,
+            second_guard_plan.ordinal
+        );
+        assert_eq!(
+            table.candidates()[0].materialization_ordinal,
+            second.ordinal
+        );
         assert_ne!(first.ordinal, second.ordinal);
     }
 
