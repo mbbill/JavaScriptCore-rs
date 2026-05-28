@@ -131,6 +131,19 @@ impl<'src, 'arena, E> Lexer<'src, 'arena, E> {
                 begins_at_line_start,
             );
         }
+        // C++ JSC: `.5` is a valid numeric literal (DecimalLiteral starting
+        // with DecimalDigits omitted before the dot).
+        if unit == b'.'
+            && matches!(self.peek_next_unit(), Some(next) if is_decimal_digit(next))
+        {
+            return self.scan_numeric_literal(
+                start,
+                start_line,
+                start_line_start,
+                start_column,
+                begins_at_line_start,
+            );
+        }
 
         match self.scan_punctuator() {
             Some(punctuator) => LexResult::Ready(self.make_token(
@@ -434,7 +447,19 @@ impl<'src, 'arena, E> Lexer<'src, 'arena, E> {
         begins_at_line_start: bool,
     ) -> LexResult<Token> {
         let mut kind = NumericLiteralKind::Integer;
-        if self.peek_unit() == Some(b'0') {
+        // C++ JSC: handle `.5` style literals (DecimalLiteral with leading dot)
+        if self.peek_unit() == Some(b'.') {
+            kind = NumericLiteralKind::Double;
+            self.advance_unit();
+            self.scan_digits(is_decimal_digit);
+            if matches!(self.peek_unit(), Some(b'e' | b'E')) {
+                self.advance_unit();
+                if matches!(self.peek_unit(), Some(b'+' | b'-')) {
+                    self.advance_unit();
+                }
+                self.scan_digits(is_decimal_digit);
+            }
+        } else if self.peek_unit() == Some(b'0') {
             match self.peek_next_unit() {
                 Some(b'x' | b'X') => {
                     self.advance_unit();
