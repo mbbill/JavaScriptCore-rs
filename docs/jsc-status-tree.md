@@ -21,7 +21,10 @@ Legend:
   [wip] Current proof path — core 4/6 pass, full 4/15
     [wip] Octane core (6 benchmarks)
       [done] richards, navier-stokes, crypto, delta-blue (interpreter, scored)
-      [wip] splay, raytrace (running, slow interpreter, expected pass)
+      [wip] raytrace (same execution path, expected pass)
+      [risk] splay functionally expected pass but pathologically slow (48min+,
+             killed): it is the GC-stress benchmark and the engine runs no GC, so
+             it allocates unboundedly -> reinforces GC is needed for splay perf
     [wip] Octane non-core (9 benchmarks)
       [done] non-ASCII strings, replace-with-fn, .5 literals, String.match,
              __defineGetter__/__defineSetter__, global Function, standard Math
