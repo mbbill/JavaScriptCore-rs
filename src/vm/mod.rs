@@ -15163,23 +15163,39 @@ impl Vm {
             return Err(ExecutionError::BaselineGeneratedExecutionRejected);
         }
 
-        let registered_code_block = self
-            .code_blocks
-            .get(handoff.resume.owner)
-            .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?
-            .code_block();
+        // C++ JSC baseline JITCode stays native and dispatches the next opcode
+        // directly with no per-opcode revalidation. The runtime-helper slow path
+        // emitted by the baseline JIT calls the helper using compile-time-baked
+        // operand info from the installed JITCode and resumes; it does NOT
+        // re-fingerprint the CodeBlock twice or re-derive the runtime-helper plan
+        // by a full O(N) decode on every single-opcode exit. Rust previously did
+        // both here (two full fingerprint_code_block_snapshot passes plus a full
+        // derive_baseline_generated_runtime_helper_plan_from_code_block pass per
+        // RuntimeHelper exit; on Box2D that is ~62% of exits, paid against ~2
+        // bytecodes of useful work).
+        //
+        // This exit path is shared by two producers: (a) the generated tier,
+        // which installs a BaselineGeneratedCodeArtifact (the JITCode analog),
+        // and (b) the emitted-native P6 tier, which installs only a native-entry
+        // readiness table and has no generated artifact. When the generated
+        // artifact is present we use it as the compile-time source of truth: one
+        // current fingerprint of the executing CodeBlock compared to the
+        // artifact's recorded compile-time snapshot, plus the artifact's own
+        // stored runtime-helper plan proof for the handoff/may-throw check, and we
+        // skip the redundant second fingerprint and the O(N) plan re-derivation.
+        // This is the Box2D regression path. When no generated artifact is
+        // installed (emitted-native producer) we keep the derivation as the source
+        // of truth, since there is no JITCode-side plan to trust. IC-driven owner
+        // retirement (commit "Invalidate generated property IC artifacts by
+        // owner") removes the generated artifact, so a retired generated owner
+        // simply falls into the derivation branch and is re-validated there. The
+        // correctness-load-bearing instruction/opcode check, root-map resolution,
+        // and destination-register/root-slot resolution below are unchanged.
         let current_snapshot =
             BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(code_block)
                 .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
-        let registered_snapshot =
-            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(
-                registered_code_block,
-            )
-            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
-        if registered_snapshot != current_snapshot {
-            return Err(ExecutionError::BaselineGeneratedExecutionRejected);
-        }
 
+        let mut proof_may_throw: Option<bool> = None;
         if let Some(artifact) = self
             .tiering
             .baseline_generated_code_artifact_for(handoff.resume.owner)
@@ -15196,13 +15212,14 @@ impl Vm {
             if artifact_plan.bytecode_snapshot != current_snapshot {
                 return Err(ExecutionError::BaselineGeneratedExecutionRejected);
             }
-            let artifact_proof = artifact_plan
+            let proof = artifact_plan
                 .proof_for_bytecode_index(handoff.resume.bytecode_index)
                 .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?
                 .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
-            if !runtime_helper_handoff_matches_proof(&handoff, artifact_proof) {
+            if !runtime_helper_handoff_matches_proof(&handoff, proof) {
                 return Err(ExecutionError::BaselineGeneratedExecutionRejected);
             }
+            proof_may_throw = Some(proof.may_throw);
         }
 
         let instruction = code_block
@@ -15217,23 +15234,32 @@ impl Vm {
             return Err(ExecutionError::BaselineGeneratedExecutionRejected);
         }
 
-        let derivation = derive_baseline_generated_runtime_helper_plan_from_code_block(
-            code_block,
-            handoff.resume.owner,
-        )
-        .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
-        let metadata = derivation
-            .metadata
-            .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
-        if metadata.bytecode_snapshot() != current_snapshot {
-            return Err(ExecutionError::BaselineGeneratedExecutionRejected);
-        }
-        let proof = metadata
-            .proof_for_bytecode_index(handoff.resume.bytecode_index)
-            .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
-        if !runtime_helper_handoff_matches_proof(&handoff, proof) {
-            return Err(ExecutionError::BaselineGeneratedExecutionRejected);
-        }
+        // Emitted-native producer (no generated artifact): the derived plan is
+        // the only available source of truth, so re-derive and validate here.
+        // The generated tier (artifact present) skipped this above.
+        let may_throw = match proof_may_throw {
+            Some(may_throw) => may_throw,
+            None => {
+                let derivation = derive_baseline_generated_runtime_helper_plan_from_code_block(
+                    code_block,
+                    handoff.resume.owner,
+                )
+                .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+                let metadata = derivation
+                    .metadata
+                    .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
+                if metadata.bytecode_snapshot() != current_snapshot {
+                    return Err(ExecutionError::BaselineGeneratedExecutionRejected);
+                }
+                let proof = metadata
+                    .proof_for_bytecode_index(handoff.resume.bytecode_index)
+                    .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
+                if !runtime_helper_handoff_matches_proof(&handoff, proof) {
+                    return Err(ExecutionError::BaselineGeneratedExecutionRejected);
+                }
+                proof.may_throw
+            }
+        };
 
         let root_maps = code_block
             .side_tables()
@@ -15255,7 +15281,7 @@ impl Vm {
 
         Ok(GeneratedRuntimeHelperExitValidation {
             root_slots,
-            may_throw: proof.may_throw,
+            may_throw,
         })
     }
 
@@ -15749,15 +15775,34 @@ impl Vm {
                 code_block,
                 host,
             );
-            if self
+            // C++ JSC baseline JITCode stays native and dispatches the next
+            // opcode directly with no per-opcode revalidation
+            // (JIT::privateCompileMainPass / emitNextOpcode in jit/JIT.cpp emit
+            // native code once at compile time; the installed JITCode's
+            // addressForCall() returns a stable native entry). Rust previously
+            // re-validated the whole CodeBlock on every single-opcode generated
+            // exit (Full: 5-6 O(N) decode/hash/plan-derivation passes paid
+            // against ~2 bytecodes of useful work). We collapse to a
+            // Prevalidated fingerprint-identity check using the artifact's
+            // already-recorded compile-time snapshot, matching the direct-call
+            // generated-entry path (try_execute_generated_direct_call_callee_with_generated_entry)
+            // and C++ stay-native behavior. The artifact is re-fetched every
+            // loop iteration, so IC-driven owner retirement (see commit "Invalidate
+            // generated property IC artifacts by owner") still routes to the
+            // fallback below; the Prevalidated snapshot compare in
+            // execute_baseline_generated_code_internal rejects any drifted
+            // artifact. The correctness-load-bearing per-instruction root sync
+            // (execute_single_dispatch) and destination-register resolution are
+            // unchanged.
+            let Some(artifact) = self
                 .tiering
                 .baseline_generated_code_artifact_for(request.code_block)
-                .is_none()
-            {
+            else {
                 return self.execute_baseline_fallback_in_current_region(
                     request, code_block, host, config,
                 );
-            }
+            };
+            let bytecode_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
 
             self.execution
                 .mark_top_bytecode_index(request.bytecode_index);
@@ -15773,7 +15818,7 @@ impl Vm {
                 current_tier,
                 host,
                 config,
-                BaselineGeneratedExecutionValidation::Full,
+                BaselineGeneratedExecutionValidation::Prevalidated { bytecode_snapshot },
             );
         }
     }
