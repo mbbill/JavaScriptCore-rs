@@ -1,7 +1,7 @@
 //! Heap ownership and allocation contracts.
 
 use core::marker::PhantomData;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::gc::{
     evaluate_heap_semantics, static_allocation_schema_registry, static_barrier_schema_registry,
@@ -1259,12 +1259,16 @@ impl RootSet {
     }
 
     pub fn validate(&self) -> Result<(), RootSetSemanticError> {
-        for (index, root) in self.records.iter().enumerate() {
+        // O(n) duplicate detection via a seen-set instead of the previous
+        // O(n^2) `records[..index]` nested scan. This validate runs per
+        // bytecode instruction (interpreter desired-root-set construction),
+        // so the quadratic form dominated hot loops. `insert` returns false
+        // on the second occurrence of an id, yielding the same first-duplicate
+        // `DuplicateRoot(root.id)` error as the original scan.
+        let mut seen = HashSet::with_capacity(self.records.len());
+        for root in &self.records {
             validate_root_record(*root)?;
-            if self.records[..index]
-                .iter()
-                .any(|previous| previous.id == root.id)
-            {
+            if !seen.insert(root.id) {
                 return Err(RootSetSemanticError::DuplicateRoot(root.id));
             }
         }
