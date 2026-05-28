@@ -2227,6 +2227,23 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
         String::from_utf8(bytes).ok()
     }
 
+    /// Return the raw source units (Latin1 bytes or UTF-16 code units) for a
+    /// span.  Unlike `source_ascii` this does not reject non-ASCII content,
+    /// which is needed for string/template literals that may contain arbitrary
+    /// Unicode text.  C++ JSC stores source as `LChar*` (Latin1) or
+    /// `UChar*` (UTF-16); this mirrors that representation.
+    fn source_units(&self, span: SourceSpan) -> Option<Vec<u32>> {
+        let mut units = Vec::with_capacity((span.end.0 - span.start.0) as usize);
+        for offset in span.start.0..span.end.0 {
+            let unit = self
+                .session
+                .source
+                .unit_at(crate::syntax::source::SourcePosition(offset))?;
+            units.push(unit);
+        }
+        Some(units)
+    }
+
     fn parse_number_literal_value(
         &self,
         token: &Token,
@@ -2309,48 +2326,90 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
         &mut self,
         token: &Token,
     ) -> Result<ParserIdentifier, ParserError> {
-        let raw = self.source_ascii(token.span()).ok_or_else(|| ParserError {
+        // C++ JSC handles full Latin1/UTF-16 source in string literals.
+        // Use source_units instead of source_ascii so non-ASCII content
+        // (e.g. Latin1 bytes 128-255, or arbitrary UTF-16 code units)
+        // passes through correctly.
+        let units = self.source_units(token.span()).ok_or_else(|| ParserError {
             span: Some(token.span()),
-            kind: ParserErrorKind::Syntax(
-                "core parser string literals currently require ascii source text".into(),
-            ),
+            kind: ParserErrorKind::Syntax("failed to read source units for string literal".into()),
         })?;
-        let bytes = raw.as_bytes();
-        if bytes.len() < 2 || !matches!(bytes.first(), Some(b'\'' | b'"')) {
+        let quote_single = u32::from(b'\'');
+        let quote_double = u32::from(b'"');
+        if units.len() < 2
+            || !matches!(units.first(), Some(&q) if q == quote_single || q == quote_double)
+        {
             return Err(ParserError {
                 span: Some(token.span()),
                 kind: ParserErrorKind::Syntax("invalid string literal token".into()),
             });
         }
-        let quote = bytes[0];
-        if bytes.last().copied() != Some(quote) {
+        let quote = units[0];
+        if units.last().copied() != Some(quote) {
             return Err(ParserError {
                 span: Some(token.span()),
                 kind: ParserErrorKind::Syntax("unterminated string literal token".into()),
             });
         }
 
+        // Build a narrowed byte slice for the escape-sequence helpers.
+        // Escape syntax is always ASCII, so we only need the bytes view
+        // when processing backslash sequences. Non-ASCII source units are
+        // handled directly in the non-escape branch below.
+        let ascii_bytes: Vec<u8> = units
+            .iter()
+            .map(|&u| u8::try_from(u).unwrap_or(0xFF))
+            .collect();
+
         let mut text = String::new();
         let mut index = 1;
-        while index + 1 < bytes.len() {
-            let byte = bytes[index];
+        while index + 1 < units.len() {
+            let unit = units[index];
             index += 1;
-            if byte != b'\\' {
-                text.push(char::from(byte));
+            if unit != u32::from(b'\\') {
+                // Non-ASCII source units: convert directly to char.
+                // Latin1 values 0-255 map 1:1 to Unicode code points.
+                // UTF-16 BMP code points (0-0xFFFF) also map directly.
+                // C++ JSC: LChar and UChar are widened to UChar for string
+                // content; Rust char::from_u32 mirrors this.
+                if let Some(ch) = char::from_u32(unit) {
+                    text.push(ch);
+                } else {
+                    // Surrogate halves (0xD800-0xDFFF) cannot be represented as
+                    // a Rust char. Use the Unicode replacement character.
+                    // C++ JSC keeps raw surrogates in StringImpl; this is a
+                    // minimal Rust divergence for safety.
+                    text.push('\u{FFFD}');
+                }
                 continue;
             }
-            if index + 1 > bytes.len() {
+            if index + 1 > units.len() {
                 return Err(ParserError {
                     span: Some(token.span()),
                     kind: ParserErrorKind::Syntax("invalid string escape".into()),
                 });
             }
-            let escaped = bytes[index];
+            // Escape sequences are always ASCII.  If the unit after the
+            // backslash is non-ASCII, JavaScript treats `\<char>` as just
+            // `<char>` (identity escape).
+            let escaped_unit = units[index];
             index += 1;
+            let escaped = match u8::try_from(escaped_unit) {
+                Ok(b) => b,
+                Err(_) => {
+                    // Non-ASCII identity escape: push the character directly.
+                    if let Some(ch) = char::from_u32(escaped_unit) {
+                        text.push(ch);
+                    } else {
+                        text.push('\u{FFFD}');
+                    }
+                    continue;
+                }
+            };
             match escaped {
                 b'\n' => {}
                 b'\r' => {
-                    if bytes.get(index) == Some(&b'\n') {
+                    if units.get(index) == Some(&u32::from(b'\n')) {
                         index += 1;
                     }
                 }
@@ -2365,9 +2424,11 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
                 b'v' => text.push('\u{000b}'),
                 b'x' => {
                     let (unit, next) =
-                        parse_fixed_hex_escape(bytes, index, 2).ok_or_else(|| ParserError {
-                            span: Some(token.span()),
-                            kind: ParserErrorKind::Syntax("invalid string hex escape".into()),
+                        parse_fixed_hex_escape(&ascii_bytes, index, 2).ok_or_else(|| {
+                            ParserError {
+                                span: Some(token.span()),
+                                kind: ParserErrorKind::Syntax("invalid string hex escape".into()),
+                            }
                         })?;
                     index = next;
                     text.push(char::from_u32(unit).ok_or_else(|| ParserError {
@@ -2375,16 +2436,15 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
                         kind: ParserErrorKind::Syntax("invalid string hex escape".into()),
                     })?);
                 }
-                b'u' if bytes.get(index) == Some(&b'{') => {
-                    let (unit, next) = parse_braced_unicode_escape(
-                        bytes,
-                        index + 1,
-                        bytes.len() - 1,
-                    )
-                    .ok_or_else(|| ParserError {
-                        span: Some(token.span()),
-                        kind: ParserErrorKind::Syntax("invalid string unicode escape".into()),
-                    })?;
+                b'u' if ascii_bytes.get(index) == Some(&b'{') => {
+                    let (unit, next) =
+                        parse_braced_unicode_escape(&ascii_bytes, index + 1, ascii_bytes.len() - 1)
+                            .ok_or_else(|| ParserError {
+                                span: Some(token.span()),
+                                kind: ParserErrorKind::Syntax(
+                                    "invalid string unicode escape".into(),
+                                ),
+                            })?;
                     index = next;
                     text.push(char::from_u32(unit).ok_or_else(|| ParserError {
                         span: Some(token.span()),
@@ -2393,9 +2453,13 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
                 }
                 b'u' => {
                     let (unit, next) =
-                        parse_fixed_hex_escape(bytes, index, 4).ok_or_else(|| ParserError {
-                            span: Some(token.span()),
-                            kind: ParserErrorKind::Syntax("invalid string unicode escape".into()),
+                        parse_fixed_hex_escape(&ascii_bytes, index, 4).ok_or_else(|| {
+                            ParserError {
+                                span: Some(token.span()),
+                                kind: ParserErrorKind::Syntax(
+                                    "invalid string unicode escape".into(),
+                                ),
+                            }
                         })?;
                     index = next;
                     text.push(char::from_u32(unit).ok_or_else(|| ParserError {
@@ -2404,7 +2468,8 @@ impl<'src, 'arena, B: TreeBuilder> Parser<'src, 'arena, B> {
                     })?);
                 }
                 b'0'..=b'7' => {
-                    let (unit, next) = parse_legacy_octal_escape(bytes, index - 1, bytes.len() - 1);
+                    let (unit, next) =
+                        parse_legacy_octal_escape(&ascii_bytes, index - 1, ascii_bytes.len() - 1);
                     index = next;
                     text.push(char::from_u32(unit).ok_or_else(|| ParserError {
                         span: Some(token.span()),

@@ -17918,7 +17918,7 @@ impl CoreOpcodeDispatchHost {
                 self.native_string_split(state.heap, this_value, arguments)
             }
             CoreNativeFunction::StringReplace => {
-                self.native_string_replace(state.heap, this_value, arguments)
+                self.native_string_replace(state, this_value, arguments)
             }
             CoreNativeFunction::StringToLowerCase => {
                 self.native_string_to_lower_case(state.heap, this_value)
@@ -22481,7 +22481,7 @@ impl CoreOpcodeDispatchHost {
 
     fn native_string_replace(
         &mut self,
-        heap: &mut Heap,
+        state: &mut DispatchState<'_>,
         this_value: RuntimeValue,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, DispatchOutcome> {
@@ -22494,25 +22494,45 @@ impl CoreOpcodeDispatchHost {
             .get(1)
             .copied()
             .unwrap_or_else(RuntimeValue::undefined);
-        if self.objects.function_call_target(replacement_value).is_ok() {
-            return Err(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion));
-        }
-        let replacement = self
-            .strings
-            .primitive_to_string(replacement_value)
-            .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
-        let result = if self.objects.is_regexp(search_value) {
-            self.string_replace_regexp(heap, &text, search_value, &replacement)?
+        // C++ JSC: getCallData(replaceValue) determines if replacer is callable.
+        // If callable, invoke it per match instead of using string replacement.
+        let replacer_is_function = self.objects.function_call_target(replacement_value).is_ok();
+        if replacer_is_function {
+            let result = if self.objects.is_regexp(search_value) {
+                self.string_replace_regexp_with_function(
+                    state,
+                    &text,
+                    search_value,
+                    replacement_value,
+                )?
+            } else {
+                let search = self
+                    .strings
+                    .primitive_to_string(search_value)
+                    .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
+                self.string_replace_once_with_function(state, &text, &search, replacement_value)?
+            };
+            self.strings
+                .allocate_with_heap(state.heap, &result)
+                .map_err(DispatchOutcome::Fail)
         } else {
-            let search = self
+            let replacement = self
                 .strings
-                .primitive_to_string(search_value)
+                .primitive_to_string(replacement_value)
                 .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
-            string_replace_once(&text, &search, &replacement)
-        };
-        self.strings
-            .allocate_with_heap(heap, &result)
-            .map_err(DispatchOutcome::Fail)
+            let result = if self.objects.is_regexp(search_value) {
+                self.string_replace_regexp(state.heap, &text, search_value, &replacement)?
+            } else {
+                let search = self
+                    .strings
+                    .primitive_to_string(search_value)
+                    .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
+                string_replace_once(&text, &search, &replacement)
+            };
+            self.strings
+                .allocate_with_heap(state.heap, &result)
+                .map_err(DispatchOutcome::Fail)
+        }
     }
 
     fn string_replace_regexp(
@@ -22568,6 +22588,156 @@ impl CoreOpcodeDispatchHost {
         if flags.global {
             self.set_regexp_last_index(heap, regexp, 0)?;
         }
+        Ok(result)
+    }
+
+    /// Call the replacer function and convert its return value to a Rust String.
+    /// C++ JSC: replacement.toWTFString(globalObject) after call().
+    fn call_replacer_function(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        replacer: RuntimeValue,
+        args: &[RuntimeValue],
+    ) -> Result<String, DispatchOutcome> {
+        let result =
+            self.execute_function_value(state, replacer, RuntimeValue::undefined(), args)?;
+        // Convert the return value to a string, mirroring jsResult.toWTFString().
+        if let Some(text) = self.primitive_to_string(result) {
+            return Ok(text);
+        }
+        let string_value = self.coerce_to_string_value(state, result)?;
+        Ok(self.strings.text(string_value).unwrap_or("").to_owned())
+    }
+
+    /// C++ JSC: replaceUsingRegExpSearch with callData.type != None.
+    /// For each regex match, calls replacer(matched, ...captures, offset, string).
+    fn string_replace_regexp_with_function(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        text: &str,
+        regexp: RuntimeValue,
+        replacer: RuntimeValue,
+    ) -> Result<String, DispatchOutcome> {
+        let (source, flags, _) = self.regexp_source_and_flags_or_throw(state.heap, regexp)?;
+        if flags.global {
+            self.set_regexp_last_index(state.heap, regexp, 0)?;
+        }
+        let original_text = text.to_owned();
+        let original_string = self
+            .strings
+            .allocate_with_heap(state.heap, &original_text)
+            .map_err(DispatchOutcome::Fail)?;
+        let mut result = String::new();
+        let mut last_end = 0usize;
+        let mut search_index = 0usize;
+        loop {
+            let matched = execute_simple_yarr(&source, flags, &original_text, search_index)
+                .map_err(|_| {
+                    self.type_error_outcome_with_heap(
+                        state.heap,
+                        "Unsupported regular expression execution",
+                    )
+                })?;
+            let Some(matched) = matched else {
+                break;
+            };
+            if matched.start < last_end {
+                break;
+            }
+            result.push_str(
+                original_text
+                    .get(last_end..matched.start)
+                    .unwrap_or_default(),
+            );
+
+            // Build args: matched_substring, ...captures, offset, original_string
+            // C++ JSC: for (i = 0..numSubpatterns+1) { append(substring or undefined) }
+            //          append(jsNumber(result.start)); append(string);
+            let mut args: Vec<RuntimeValue> = Vec::new();
+            // First arg: the matched substring
+            let matched_str = original_text
+                .get(matched.start..matched.end)
+                .unwrap_or_default();
+            let matched_value = self
+                .strings
+                .allocate_with_heap(state.heap, matched_str)
+                .map_err(DispatchOutcome::Fail)?;
+            args.push(matched_value);
+            // Capture groups
+            for capture in &matched.captures {
+                if let Some(range) = capture {
+                    let capture_str = original_text
+                        .get(range.start..range.end)
+                        .unwrap_or_default();
+                    let capture_value = self
+                        .strings
+                        .allocate_with_heap(state.heap, capture_str)
+                        .map_err(DispatchOutcome::Fail)?;
+                    args.push(capture_value);
+                } else {
+                    args.push(RuntimeValue::undefined());
+                }
+            }
+            // Offset (byte index, consistent with existing regexp exec behavior)
+            args.push(RuntimeValue::from_i32(
+                matched.start.try_into().unwrap_or(i32::MAX),
+            ));
+            // Original string
+            args.push(original_string);
+
+            let replacement = self.call_replacer_function(state, replacer, &args)?;
+            result.push_str(&replacement);
+
+            last_end = matched.end;
+            if !flags.global {
+                break;
+            }
+            if matched.end == search_index {
+                search_index = advance_string_byte_index(&original_text, search_index);
+                if search_index > original_text.len() {
+                    break;
+                }
+            } else {
+                search_index = matched.end;
+            }
+        }
+        result.push_str(original_text.get(last_end..).unwrap_or_default());
+        if flags.global {
+            self.set_regexp_last_index(state.heap, regexp, 0)?;
+        }
+        Ok(result)
+    }
+
+    /// C++ JSC: replaceUsingStringSearch with callData.type != None.
+    /// For a single string match, calls replacer(matched, offset, string).
+    fn string_replace_once_with_function(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        text: &str,
+        search: &str,
+        replacer: RuntimeValue,
+    ) -> Result<String, DispatchOutcome> {
+        let Some(index) = text.find(search) else {
+            return Ok(text.to_owned());
+        };
+        let original_string = self
+            .strings
+            .allocate_with_heap(state.heap, text)
+            .map_err(DispatchOutcome::Fail)?;
+        let matched_value = self
+            .strings
+            .allocate_with_heap(state.heap, search)
+            .map_err(DispatchOutcome::Fail)?;
+        let args = [
+            matched_value,
+            RuntimeValue::from_i32(index.try_into().unwrap_or(i32::MAX)),
+            original_string,
+        ];
+        let replacement = self.call_replacer_function(state, replacer, &args)?;
+        let mut result = String::new();
+        result.push_str(&text[..index]);
+        result.push_str(&replacement);
+        result.push_str(&text[index.saturating_add(search.len())..]);
         Ok(result)
     }
 
