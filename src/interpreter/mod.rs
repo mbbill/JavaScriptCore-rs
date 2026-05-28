@@ -12868,6 +12868,7 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 };
                 write_register(state, window, destination, RuntimeValue::from_bool(result))
             }
+            CoreOpcode::LoopHint => DispatchOutcome::Continue,
             CoreOpcode::Jump => match bytecode_index_operand(instruction, 0) {
                 Ok(target) => DispatchOutcome::Jump(target),
                 Err(error) => DispatchOutcome::Fail(error),
@@ -35005,6 +35006,56 @@ mod tests {
                 .read(window, destination, Some(block.constants()))
                 .unwrap(),
             RuntimeValue::from_i32(42)
+        );
+        assert_eq!(
+            stack.top_frame().unwrap().bytecode_index,
+            Some(BytecodeIndex::from_offset(0))
+        );
+        assert!(heap.targeted_roots().records().is_empty());
+    }
+
+    #[test]
+    fn single_dispatch_loop_hint_is_plain_interpreter_no_op() {
+        let destination = VirtualRegister::local(0);
+        let block = code_block(vec![
+            core_typed(0, CoreOpcode::LoopHint, Vec::new()),
+            core_typed(
+                1,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(destination), Operand::SignedImmediate(42)],
+            ),
+            core_typed(2, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ]);
+        let code_block_id = CodeBlockId(CellId(108));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(
+            &mut stack,
+            &mut registers,
+            code_block_id,
+            &block,
+            Vec::new(),
+        );
+        let frame = stack.top_frame().unwrap().id;
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        let outcome = execute_single_dispatch(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            SingleDispatchRequest::new(code_block_id, frame, BytecodeIndex::from_offset(0)),
+            &block,
+            &mut host,
+        );
+
+        assert_eq!(
+            outcome,
+            SingleDispatchOutcome::Continue(Some(BytecodeIndex::from_offset(1)))
         );
         assert_eq!(
             stack.top_frame().unwrap().bytecode_index,

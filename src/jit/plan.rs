@@ -3532,7 +3532,8 @@ impl BaselineSupportedOpcodeSubset {
         match self {
             Self::P6ConstantsMovesReturnInt32Arithmetic => matches!(
                 opcode,
-                CoreOpcode::LoadUndefined
+                CoreOpcode::LoopHint
+                    | CoreOpcode::LoadUndefined
                     | CoreOpcode::LoadNull
                     | CoreOpcode::LoadBool
                     | CoreOpcode::LoadInt32
@@ -6057,6 +6058,15 @@ fn baseline_exception_metadata_from_code_block(
 }
 
 const fn baseline_opcode_effect(opcode: CoreOpcode) -> BaselineOpcodeEffect {
+    if matches!(opcode, CoreOpcode::LoopHint) {
+        return BaselineOpcodeEffect {
+            opcode,
+            summary: local_effect_summary(false, false, false, false),
+            may_call_runtime: false,
+            touches_gc_roots: false,
+            records_write_barrier_handoff: false,
+        };
+    }
     if matches!(
         opcode,
         CoreOpcode::LoadUndefined

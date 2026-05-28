@@ -269,6 +269,7 @@ pub struct P6X86_64BaselineLoweredInstruction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum P6X86_64BaselineLoweredOperation {
+    LoopHint,
     LoadUndefined {
         destination: VirtualRegister,
     },
@@ -6880,6 +6881,7 @@ fn p6_x86_64_baseline_backend_instruction_contract(
     let mut branch_target = None;
 
     match lowered.operation {
+        P6X86_64BaselineLoweredOperation::LoopHint => {}
         P6X86_64BaselineLoweredOperation::LoadUndefined { destination } => {
             operand_locations.push(p6_operand_location_record(
                 bytecode_index,
@@ -8141,6 +8143,7 @@ fn p6_select_x86_64_instruction(
     instruction: &P6X86_64BaselineBackendInstructionContract,
 ) -> Result<P6X86_64BaselineSelectedInstruction, P6X86_64BaselineInstructionSelectionError> {
     let machine_instructions = match instruction.lowered.operation {
+        P6X86_64BaselineLoweredOperation::LoopHint => Vec::new(),
         P6X86_64BaselineLoweredOperation::LoadUndefined { .. } => p6_select_immediate_load(
             contract,
             instruction,
@@ -10087,6 +10090,16 @@ fn lower_p6_x86_64_decoded_instruction_for_subset(
     }
 
     let operation = match opcode {
+        CoreOpcode::LoopHint => {
+            validate_p6_operand_count(instruction, opcode, 0)?;
+            // C++ baseline JIT's emit_op_loop_hint increments optimization
+            // counters and may enter the slow optimizer path. Rust lowers the
+            // hint as a generated no-op for now: VM interpreter dispatch records
+            // LoopBackedge telemetry at this bytecode index, while native
+            // generated execution keeps the existing P14 backward-branch
+            // safepoints as the native loop telemetry point.
+            P6X86_64BaselineLoweredOperation::LoopHint
+        }
         CoreOpcode::LoadUndefined => {
             validate_p6_operand_count(instruction, opcode, 1)?;
             P6X86_64BaselineLoweredOperation::LoadUndefined {

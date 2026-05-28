@@ -57,20 +57,23 @@ use crate::interpreter::{
     pop_call_return_callee, sync_targeted_frame_roots, sync_targeted_nonlocal_frame_roots,
     sync_targeted_nonlocal_register_roots, sync_targeted_register_roots,
     validate_call_return_continuation, validate_construct_return_continuation,
-    BaselineFallbackRequest, CallObservationDrainRequest, CallObservationOutcome,
-    CallReturnContinuation, ConstructReturnContinuation, CoreGlobalLexicalDeclaration,
-    CoreGlobalLexicalDeclarationKind, CoreHostOutputRecord, CoreHostResultRecord,
-    CoreOpcodeDispatchHost, DispatchConfig, DispatchHost, DispatchInstruction, DispatchOutcome,
-    DispatchState, ExecutionCompletion, ExecutionContextStack, ExecutionEntryRecord,
-    ExecutionError, ExecutionRootSnapshot, FramePushRequest, FunctionValueCallCompletion,
-    FunctionValueCallHandling, FunctionValueCallRequest, FunctionValueCallTailCompletion,
+    BaselineFallbackRequest, CallObservationDescriptor, CallObservationDrainRequest,
+    CallObservationOutcome, CallReturnContinuation, ConstructReturnContinuation,
+    CoreGlobalLexicalDeclaration, CoreGlobalLexicalDeclarationKind, CoreHostOutputRecord,
+    CoreHostResultRecord, CoreOpcodeDispatchHost, DispatchConfig, DispatchHost,
+    DispatchInstruction, DispatchOutcome, DispatchState, ExecutionCompletion,
+    ExecutionContextStack, ExecutionEntryRecord, ExecutionError, ExecutionRootSnapshot,
+    FramePushRequest, FunctionValueCallCompletion, FunctionValueCallHandling,
+    FunctionValueCallRequest, FunctionValueCallTailCompletion, FunctionValuePropertyObservation,
     FunctionValuePropertyOperationCompletion, FunctionValuePropertyOperationOutcome,
-    FunctionValuePropertyOperationResume, FunctionValueReturnTransform, InterpreterExecutionState,
-    InterpreterFunctionCodeBlock, InterpreterWriteBarrierRecord, OrdinaryBytecodeCallHandling,
-    OrdinaryBytecodeCallRequest, OrdinaryBytecodeConstructRequest, ProgramExecutionEntry,
-    PropertyHasObservationDrainRequest, PropertyLoadObservationDrainRequest,
-    PropertyStoreObservationDrainRequest, RegisterFile, RegisterWindow, SingleDispatchOutcome,
-    SingleDispatchRequest, StructureChainInvalidationEvent, StructureTransitionWatchpointRequest,
+    FunctionValuePropertyOperationResume, FunctionValueReturnTransform,
+    GeneratedNativeIntrinsicCallRequest, GeneratedNativeIntrinsicCallResult,
+    InterpreterExecutionState, InterpreterFunctionCodeBlock, InterpreterWriteBarrierRecord,
+    OrdinaryBytecodeCallHandling, OrdinaryBytecodeCallRequest, OrdinaryBytecodeConstructRequest,
+    ProgramExecutionEntry, PropertyHasObservationDrainRequest, PropertyLoadObservationDrainRequest,
+    PropertyStoreObservationDescriptor, PropertyStoreObservationDrainRequest, RegisterFile,
+    RegisterWindow, SingleDispatchOutcome, SingleDispatchRequest, StructureChainInvalidationEvent,
+    StructureTransitionWatchpointRequest, StructureTransitionWatchpointSnapshot,
 };
 use crate::jit::baseline::{
     baseline_generated_js_call_handoff, baseline_generated_property_handoff,
@@ -121,7 +124,10 @@ use crate::jit::emitter::{
 use crate::jit::executable::{
     record_link_buffer_copy_link_with_linked_image, LinkBufferLinkedCopyLinkRequest,
 };
-use crate::jit::ic::GeneratedCallLinkDirectCall;
+use crate::jit::ic::{
+    GeneratedCallLinkDirectCall, GeneratedPropertyStoreMutationRequest,
+    GeneratedPropertyStoreMutationResult,
+};
 use crate::jit::plan::{
     baseline_generated_runtime_helper_plan_is_native_exit_eligible,
     derive_baseline_generated_js_call_native_exit_plan_from_code_block,
@@ -160,17 +166,21 @@ use crate::jit::{
     ExecutableLedgerValidationError, ExecutableMemoryProtection, ExecutableMutationAuthority,
     GeneratedCallLinkCandidate, GeneratedCallLinkCandidateTable, GeneratedCallLinkDirectCallStatus,
     GeneratedCallLinkProbeMissReason, GeneratedCallLinkProbeRequest, GeneratedCallLinkProbeResult,
-    InlineCacheSlotId, JitCodeArtifact, JitCodeId, JitCodeValidationError, JitPlanValidationError,
-    JitType, LinkBufferCopyLinkRecord, LinkBufferFinalizationRecord, LinkBufferFinalizationRequest,
-    LinkedCallKind, MachineCodeHandle, MachineCodeOwnership, MachineCodeRange,
-    P14X86_64BaselineBackedgeSafepointAuthority, P14X86_64BaselineLoopBackedgeReturnPayload,
-    P6X86_64BaselineBackendContractError, P6X86_64BaselineBytecodeBranchKind,
-    P6X86_64BaselineInstructionSelectionError, P6X86_64BaselineLoweringError,
-    P6X86_64BaselineLoweringRequest, P6X86_64BaselineSelectedSideExitReason,
-    P6X86_64BaselineSemanticByteEmissionError, P6X86_64BaselineSemanticByteEmissionResult,
-    P6X86_64BaselineSideExitReturnPayload, PropertyLoadAccessCasePlanKind,
-    PropertyStoreAccessCasePlanKind, TierFallbackReason, TierPlanKind, TieringPolicy,
-    P14_X86_64_BASELINE_LOOP_BACKEDGE_RETURN_PAYLOAD_LOW_TAG,
+    GeneratedGuardedPropertyLoadProbeRequest, GeneratedGuardedPropertyLoadProbeResult,
+    GeneratedPropertyLoadMegamorphicHolderProbeRequest, GeneratedPropertyLoadProbeRequest,
+    GeneratedPropertyLoadProbeResult, GeneratedPropertyStoreProbeRequest,
+    GeneratedPropertyStoreProbeResult, InlineCacheSlotId, JitCodeArtifact, JitCodeId,
+    JitCodeValidationError, JitPlanValidationError, JitType, LinkBufferCopyLinkRecord,
+    LinkBufferFinalizationRecord, LinkBufferFinalizationRequest, LinkedCallKind, MachineCodeHandle,
+    MachineCodeOwnership, MachineCodeRange, P14X86_64BaselineBackedgeSafepointAuthority,
+    P14X86_64BaselineLoopBackedgeReturnPayload, P6X86_64BaselineBackendContractError,
+    P6X86_64BaselineBytecodeBranchKind, P6X86_64BaselineInstructionSelectionError,
+    P6X86_64BaselineLoweringError, P6X86_64BaselineLoweringRequest,
+    P6X86_64BaselineSelectedSideExitReason, P6X86_64BaselineSemanticByteEmissionError,
+    P6X86_64BaselineSemanticByteEmissionResult, P6X86_64BaselineSideExitReturnPayload,
+    PropertyHasObservationDescriptor, PropertyLoadAccessCasePlanKind,
+    PropertyLoadObservationDescriptor, PropertyStoreAccessCasePlanKind, TierFallbackReason,
+    TierPlanKind, TieringPolicy, P14_X86_64_BASELINE_LOOP_BACKEDGE_RETURN_PAYLOAD_LOW_TAG,
     P6_X86_64_BASELINE_SIDE_EXIT_RETURN_PAYLOAD_LOW_TAG,
 };
 use crate::platform::executable_memory::{
@@ -183,7 +193,7 @@ use crate::platform::executable_memory_compartment::{
 };
 use crate::runtime::{
     ArityCheckMode, CallFrameId, CodeBlockId, CodeSpecializationKind, NativeCodeId, ObjectId,
-    RuntimeValue, ScriptExecutionStatus,
+    RuntimeValue, ScriptExecutionStatus, StructureId,
 };
 use crate::strings::{AtomId, Identifier, PropertyKey};
 use crate::syntax::{AstBuilder, ParseMode, Parser, ParserArena, ParserError, SourceCode};
@@ -1424,6 +1434,249 @@ impl<H: DispatchHost> DispatchHost for RuntimeHelperRootMapDispatchHost<'_, H> {
         state: &mut DispatchState<'_>,
         instruction: DispatchInstruction<'_>,
     ) -> DispatchOutcome {
+        self.inner.dispatch_instruction(state, instruction)
+    }
+}
+
+// C++ JSC's LLInt handles op_loop_hint inside the interpreter/tiering slow path.
+// Rust needs a host wrapper so interpreter dispatch can borrow VM tiering state
+// while still forwarding the existing DispatchHost hooks for roots, ICs, calls,
+// watchpoints, and generated handoffs. This records the loop hint as telemetry;
+// real loop OSR entry remains a separate tiering batch.
+struct VmLoopHintDispatchHost<'host, H> {
+    inner: &'host mut H,
+    tiering: &'host mut tiering::VmTieringIntegration,
+    owner: CodeBlockId,
+    policy: TieringPolicy,
+}
+
+impl<'host, H> VmLoopHintDispatchHost<'host, H> {
+    fn new(
+        inner: &'host mut H,
+        tiering: &'host mut tiering::VmTieringIntegration,
+        owner: CodeBlockId,
+        policy: TieringPolicy,
+    ) -> Self {
+        Self {
+            inner,
+            tiering,
+            owner,
+            policy,
+        }
+    }
+
+    const fn observes_loop_hints(&self) -> bool {
+        matches!(
+            self.policy,
+            TieringPolicy::BaselineAllowed | TieringPolicy::OptimizingAllowed
+        )
+    }
+}
+
+impl<H: DispatchHost> DispatchHost for VmLoopHintDispatchHost<'_, H> {
+    fn targeted_register_roots(
+        &mut self,
+        heap: &mut Heap,
+        snapshot: &ExecutionRootSnapshot,
+    ) -> Result<Vec<TargetedRootRecord>, ExecutionError> {
+        self.inner.targeted_register_roots(heap, snapshot)
+    }
+
+    fn targeted_register_roots_into(
+        &mut self,
+        heap: &mut Heap,
+        snapshot: &ExecutionRootSnapshot,
+        out: &mut Vec<TargetedRootRecord>,
+    ) -> Result<(), ExecutionError> {
+        self.inner.targeted_register_roots_into(heap, snapshot, out)
+    }
+
+    fn drain_property_load_observation(
+        &mut self,
+        heap: &mut Heap,
+        request: PropertyLoadObservationDrainRequest,
+    ) -> Result<Option<PropertyLoadObservationDescriptor>, ExecutionError> {
+        self.inner.drain_property_load_observation(heap, request)
+    }
+
+    fn drain_property_store_observation(
+        &mut self,
+        heap: &mut Heap,
+        request: PropertyStoreObservationDrainRequest,
+    ) -> Result<Option<PropertyStoreObservationDescriptor>, ExecutionError> {
+        self.inner.drain_property_store_observation(heap, request)
+    }
+
+    fn discard_property_store_observations(&mut self) {
+        self.inner.discard_property_store_observations()
+    }
+
+    fn drain_property_has_observation(
+        &mut self,
+        heap: &mut Heap,
+        request: PropertyHasObservationDrainRequest,
+    ) -> Result<Option<PropertyHasObservationDescriptor>, ExecutionError> {
+        self.inner.drain_property_has_observation(heap, request)
+    }
+
+    fn drain_call_observation(
+        &mut self,
+        heap: &mut Heap,
+        request: CallObservationDrainRequest,
+    ) -> Result<Option<CallObservationDescriptor>, ExecutionError> {
+        self.inner.drain_call_observation(heap, request)
+    }
+
+    fn finalize_function_value_property_observation(
+        &mut self,
+        heap: &mut Heap,
+        observation: FunctionValuePropertyObservation,
+        outcome: FunctionValuePropertyOperationOutcome,
+    ) -> Result<(), ExecutionError> {
+        self.inner
+            .finalize_function_value_property_observation(heap, observation, outcome)
+    }
+
+    fn function_value_property_return_truthy(&mut self, value: RuntimeValue) -> bool {
+        self.inner.function_value_property_return_truthy(value)
+    }
+
+    fn normalize_constructor_return(
+        &mut self,
+        returned: RuntimeValue,
+        constructor_this: RuntimeValue,
+    ) -> RuntimeValue {
+        self.inner
+            .normalize_constructor_return(returned, constructor_this)
+    }
+
+    fn initialize_construct_return_fields(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        constructors: &[RuntimeValue],
+        receiver: RuntimeValue,
+    ) -> Result<(), DispatchOutcome> {
+        self.inner
+            .initialize_construct_return_fields(state, constructors, receiver)
+    }
+
+    fn snapshot_structure_transition_watchpoints(
+        &mut self,
+        requests: &[StructureTransitionWatchpointRequest],
+    ) -> Result<Vec<StructureTransitionWatchpointSnapshot>, ExecutionError> {
+        self.inner
+            .snapshot_structure_transition_watchpoints(requests)
+    }
+
+    fn start_structure_transition_watchpoints(
+        &mut self,
+        requests: &[StructureTransitionWatchpointRequest],
+    ) -> Result<Vec<StructureTransitionWatchpointSnapshot>, ExecutionError> {
+        self.inner.start_structure_transition_watchpoints(requests)
+    }
+
+    fn drain_watchpoint_fire_events(&mut self) -> Vec<crate::jit::WatchpointFireEvent> {
+        self.inner.drain_watchpoint_fire_events()
+    }
+
+    fn has_pending_structure_chain_invalidation_events(&mut self) -> bool {
+        self.inner.has_pending_structure_chain_invalidation_events()
+    }
+
+    fn drain_structure_chain_invalidation_events(
+        &mut self,
+    ) -> Vec<StructureChainInvalidationEvent> {
+        self.inner.drain_structure_chain_invalidation_events()
+    }
+
+    fn generated_property_sidecar_base_structure(
+        &mut self,
+        base: RuntimeValue,
+    ) -> Option<StructureId> {
+        self.inner.generated_property_sidecar_base_structure(base)
+    }
+
+    fn generated_property_has_sidecar_base_structure(
+        &mut self,
+        base: RuntimeValue,
+    ) -> Option<StructureId> {
+        self.inner
+            .generated_property_has_sidecar_base_structure(base)
+    }
+
+    fn generated_property_has_sidecar_runtime_key(
+        &mut self,
+        property: RuntimeValue,
+    ) -> Option<CacheKey> {
+        self.inner
+            .generated_property_has_sidecar_runtime_key(property)
+    }
+
+    fn probe_generated_property_load(
+        &mut self,
+        request: GeneratedPropertyLoadProbeRequest<'_>,
+    ) -> GeneratedPropertyLoadProbeResult {
+        self.inner.probe_generated_property_load(request)
+    }
+
+    fn probe_generated_property_load_megamorphic_holder(
+        &mut self,
+        request: GeneratedPropertyLoadMegamorphicHolderProbeRequest,
+    ) -> GeneratedPropertyLoadProbeResult {
+        self.inner
+            .probe_generated_property_load_megamorphic_holder(request)
+    }
+
+    fn probe_generated_property_store(
+        &mut self,
+        request: GeneratedPropertyStoreProbeRequest<'_>,
+    ) -> GeneratedPropertyStoreProbeResult {
+        self.inner.probe_generated_property_store(request)
+    }
+
+    fn commit_generated_property_store(
+        &mut self,
+        heap: &mut Heap,
+        request: GeneratedPropertyStoreMutationRequest,
+    ) -> GeneratedPropertyStoreMutationResult {
+        self.inner.commit_generated_property_store(heap, request)
+    }
+
+    fn probe_generated_guarded_property_load(
+        &mut self,
+        request: GeneratedGuardedPropertyLoadProbeRequest<'_>,
+    ) -> GeneratedGuardedPropertyLoadProbeResult {
+        self.inner.probe_generated_guarded_property_load(request)
+    }
+
+    fn probe_generated_call_link(
+        &mut self,
+        heap: &mut Heap,
+        request: GeneratedCallLinkProbeRequest<'_>,
+    ) -> GeneratedCallLinkProbeResult {
+        self.inner.probe_generated_call_link(heap, request)
+    }
+
+    fn dispatch_generated_native_intrinsic_call(
+        &mut self,
+        heap: &mut Heap,
+        request: GeneratedNativeIntrinsicCallRequest,
+    ) -> GeneratedNativeIntrinsicCallResult {
+        self.inner
+            .dispatch_generated_native_intrinsic_call(heap, request)
+    }
+
+    fn dispatch_instruction(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        instruction: DispatchInstruction<'_>,
+    ) -> DispatchOutcome {
+        if self.observes_loop_hints()
+            && CoreOpcode::from_opcode(instruction.opcode) == Some(CoreOpcode::LoopHint)
+        {
+            self.tiering
+                .observe_loop_backedge(self.owner, self.policy, instruction.bytecode_index);
+        }
         self.inner.dispatch_instruction(state, instruction)
     }
 }
@@ -3956,13 +4209,7 @@ impl Vm {
                     }
                 }
             }
-            _ => execute_code_block_deferring_ordinary_calls(
-                InterpreterExecutionState {
-                    stack: &mut self.execution,
-                    registers: &mut self.registers,
-                    exceptions: &mut self.exceptions,
-                    heap: &mut self.heap,
-                },
+            _ => self.execute_interpreter_code_block_in_current_region(
                 code_block_id,
                 code_block,
                 host,
@@ -4301,6 +4548,12 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> ExecutionCompletion {
+        let mut host = VmLoopHintDispatchHost::new(
+            host,
+            &mut self.tiering,
+            code_block_id,
+            self.config.tiering_policy(),
+        );
         execute_code_block_deferring_ordinary_calls(
             InterpreterExecutionState {
                 stack: &mut self.execution,
@@ -4310,7 +4563,7 @@ impl Vm {
             },
             code_block_id,
             code_block,
-            host,
+            &mut host,
             config,
         )
     }
@@ -19237,6 +19490,118 @@ mod tests {
                 5,
                 CoreOpcode::Return,
                 vec![Operand::Register(local(1))],
+            ),
+        ])
+    }
+
+    fn loop_hint_counter_code_block() -> CodeBlock {
+        linked_p6_test_code_block(vec![
+            typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(0)), Operand::SignedImmediate(0)],
+            ),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(1)), Operand::SignedImmediate(3)],
+            ),
+            typed_core_instruction_with_operands(
+                2,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(2)), Operand::SignedImmediate(1)],
+            ),
+            typed_core_instruction_with_operands(
+                3,
+                CoreOpcode::LessThanInt32,
+                vec![
+                    Operand::Register(local(3)),
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                4,
+                CoreOpcode::JumpIfFalse,
+                vec![
+                    Operand::Register(local(3)),
+                    Operand::BytecodeIndex(BytecodeIndex::from_offset(10)),
+                ],
+            ),
+            typed_core_instruction(5, CoreOpcode::LoopHint),
+            typed_core_instruction_with_operands(
+                6,
+                CoreOpcode::AddInt32,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(0)),
+                    Operand::Register(local(2)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                7,
+                CoreOpcode::LessThanInt32,
+                vec![
+                    Operand::Register(local(3)),
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                8,
+                CoreOpcode::JumpIfFalse,
+                vec![
+                    Operand::Register(local(3)),
+                    Operand::BytecodeIndex(BytecodeIndex::from_offset(10)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                9,
+                CoreOpcode::Jump,
+                vec![Operand::BytecodeIndex(BytecodeIndex::from_offset(5))],
+            ),
+            typed_core_instruction_with_operands(
+                10,
+                CoreOpcode::Return,
+                vec![Operand::Register(local(0))],
+            ),
+        ])
+    }
+
+    fn loop_hint_zero_iteration_code_block() -> CodeBlock {
+        linked_p6_test_code_block(vec![
+            typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(0)), Operand::SignedImmediate(0)],
+            ),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(1)), Operand::SignedImmediate(0)],
+            ),
+            typed_core_instruction_with_operands(
+                2,
+                CoreOpcode::LessThanInt32,
+                vec![
+                    Operand::Register(local(2)),
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                3,
+                CoreOpcode::JumpIfFalse,
+                vec![
+                    Operand::Register(local(2)),
+                    Operand::BytecodeIndex(BytecodeIndex::from_offset(5)),
+                ],
+            ),
+            typed_core_instruction(4, CoreOpcode::LoopHint),
+            typed_core_instruction_with_operands(
+                5,
+                CoreOpcode::Return,
+                vec![Operand::Register(local(0))],
             ),
         ])
     }
@@ -54045,6 +54410,190 @@ mod tests {
         );
         assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
         assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+    }
+
+    #[test]
+    fn vm_baseline_allowed_interpreter_records_loop_hint_backedges() {
+        let code_block = loop_hint_counter_code_block();
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let mut host = CoreOpcodeDispatchHost::new();
+        let global_object = vm.allocate_global_object_cell().unwrap();
+        vm.record_source_global_object(global_object).unwrap();
+        let entry = vm
+            .execution
+            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+                code_block: owner,
+                global_object,
+                this_value: RuntimeValue::undefined(),
+            }));
+        let frame = vm
+            .execution
+            .push_frame(
+                &mut vm.registers,
+                FramePushRequest {
+                    code_block: Some(owner),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: code_block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: Vec::new(),
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let profile_count_before = vm.tiering_integration().profile_records().len();
+        let loop_count_before = vm.tiering_integration().profile_loop_backedge_count();
+
+        let completion = vm.execute_interpreter_code_block_in_current_region(
+            owner,
+            &code_block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(3))
+        );
+        if vm.execution.frame(frame).is_some() {
+            vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
+        }
+        vm.execution.leave(entry).unwrap();
+        assert_eq!(
+            vm.tiering_integration().profile_loop_backedge_count(),
+            loop_count_before + 3
+        );
+        let backedge_records = vm
+            .tiering_integration()
+            .profile_records()
+            .iter()
+            .skip(profile_count_before)
+            .filter(|record| {
+                record.owner == owner
+                    && record.event == TierProfileEvent::LoopBackedge
+                    && record.bytecode_index == Some(BytecodeIndex::from_offset(5))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backedge_records.len(), 3);
+        assert_eq!(backedge_records.last().unwrap().counters.loop_count, 3);
+    }
+
+    #[test]
+    fn vm_baseline_allowed_interpreter_skips_loop_hint_for_zero_iteration_loop() {
+        let code_block = loop_hint_zero_iteration_code_block();
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let mut host = CoreOpcodeDispatchHost::new();
+        let global_object = vm.allocate_global_object_cell().unwrap();
+        vm.record_source_global_object(global_object).unwrap();
+        let entry = vm
+            .execution
+            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+                code_block: owner,
+                global_object,
+                this_value: RuntimeValue::undefined(),
+            }));
+        let frame = vm
+            .execution
+            .push_frame(
+                &mut vm.registers,
+                FramePushRequest {
+                    code_block: Some(owner),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: code_block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: Vec::new(),
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let profile_count_before = vm.tiering_integration().profile_records().len();
+        let loop_count_before = vm.tiering_integration().profile_loop_backedge_count();
+
+        let completion = vm.execute_interpreter_code_block_in_current_region(
+            owner,
+            &code_block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(0))
+        );
+        if vm.execution.frame(frame).is_some() {
+            vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
+        }
+        vm.execution.leave(entry).unwrap();
+        assert_eq!(
+            vm.tiering_integration().profile_loop_backedge_count(),
+            loop_count_before
+        );
+        assert!(vm
+            .tiering_integration()
+            .profile_records()
+            .iter()
+            .skip(profile_count_before)
+            .all(|record| record.event != TierProfileEvent::LoopBackedge));
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn vm_p14_callable_native_executes_loop_hint_noop_without_eligibility_regression() {
+        let code_block = loop_hint_counter_code_block();
+        let expected = execute_interpreter_registered_code_block(&code_block, Vec::new());
+        assert_eq!(
+            expected,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(3))
+        );
+
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let record = vm
+            .install_p6_x86_64_callable_semantic_baseline_native_entry(p6_semantic_install_request(
+                owner, 2_205,
+            ))
+            .expect("LoopHint no-op should not reject generated baseline install");
+        assert_eq!(
+            record.semantic_emission.loop_backedge_safepoint_stubs.len(),
+            1
+        );
+        let stub = &record.semantic_emission.loop_backedge_safepoint_stubs[0];
+        assert_eq!(stub.bytecode_index, BytecodeIndex::from_offset(9));
+        assert_eq!(stub.target_bytecode_index, BytecodeIndex::from_offset(5));
+        let loop_hint = record
+            .semantic_emission
+            .instruction_bytes
+            .iter()
+            .find(|instruction| instruction.bytecode_index == BytecodeIndex::from_offset(5))
+            .expect("LoopHint byte record");
+        assert_eq!(loop_hint.machine_instruction_count, 0);
+        let fallback_count_before = vm.tiering_integration().fallback_records().len();
+        let mut host = InterpreterDispatchMustNotRun;
+
+        let completion =
+            execute_registered_code_block_with_host(&mut vm, owner, &code_block, &mut host);
+
+        assert_eq!(completion, expected);
+        assert_eq!(
+            vm.tiering_integration().fallback_records().len(),
+            fallback_count_before
+        );
+        assert!(vm
+            .tiering_integration()
+            .profile_records()
+            .iter()
+            .any(|record| {
+                record.owner == owner
+                    && record.event == TierProfileEvent::LoopBackedge
+                    && record.bytecode_index == Some(BytecodeIndex::from_offset(9))
+            }));
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]

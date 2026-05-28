@@ -3991,11 +3991,13 @@ impl AstBytecodeEmitter<'_, '_> {
         statement: &crate::syntax::ast::WhileStmt,
         named_label: Option<ParserIdentifier>,
     ) -> Result<StatementEmission, BytecompilerEmissionError> {
+        let loop_start = self.declare_label(Some("while_start"));
         let continue_target = self.declare_label(Some("while_continue"));
         let break_target = self.declare_label(Some("while_break"));
-        self.bind_label(continue_target)?;
         let condition = self.emit_expression(statement.condition)?;
         self.emit_jump_if_false(condition, break_target);
+        self.bind_label(loop_start)?;
+        self.emit_loop_hint();
         let break_labels = BreakControlLabels {
             break_target,
             finally_stack_depth: self.finally_stack.len(),
@@ -4010,7 +4012,7 @@ impl AstBytecodeEmitter<'_, '_> {
         }
         self.loop_stack.push(loop_labels);
         self.break_stack.push(break_labels);
-        let body = self.emit_statement(statement.body)?;
+        let _body = self.emit_statement(statement.body)?;
         let Some(labels) = self.loop_stack.pop() else {
             return Err(BytecompilerEmissionError::UnsupportedStatement(
                 "loop control stack underflow",
@@ -4024,9 +4026,10 @@ impl AstBytecodeEmitter<'_, '_> {
         if let Some(name) = named_label {
             self.pop_named_label(name)?;
         }
-        if !body.terminated {
-            self.emit_jump(labels.continue_target);
-        }
+        self.bind_label(labels.continue_target)?;
+        let condition = self.emit_expression(statement.condition)?;
+        self.emit_jump_if_false(condition, labels.break_target);
+        self.emit_jump(loop_start);
         self.bind_label(labels.break_target)?;
         Ok(StatementEmission::default())
     }
@@ -4047,11 +4050,12 @@ impl AstBytecodeEmitter<'_, '_> {
         let loop_start = self.declare_label(Some("for_start"));
         let continue_target = self.declare_label(Some("for_continue"));
         let break_target = self.declare_label(Some("for_break"));
-        self.bind_label(loop_start)?;
         if let Some(condition) = statement.condition {
             let condition = self.emit_expression(condition)?;
             self.emit_jump_if_false(condition, break_target);
         }
+        self.bind_label(loop_start)?;
+        self.emit_loop_hint();
         let break_labels = BreakControlLabels {
             break_target,
             finally_stack_depth: self.finally_stack.len(),
@@ -4066,7 +4070,7 @@ impl AstBytecodeEmitter<'_, '_> {
         }
         self.loop_stack.push(loop_labels);
         self.break_stack.push(break_labels);
-        let body = self.emit_statement(statement.body)?;
+        let _body = self.emit_statement(statement.body)?;
         let Some(labels) = self.loop_stack.pop() else {
             return Err(BytecompilerEmissionError::UnsupportedStatement(
                 "loop control stack underflow",
@@ -4084,9 +4088,11 @@ impl AstBytecodeEmitter<'_, '_> {
         if let Some(update) = statement.update {
             self.emit_expression(update)?;
         }
-        if !body.terminated {
-            self.emit_jump(loop_start);
+        if let Some(condition) = statement.condition {
+            let condition = self.emit_expression(condition)?;
+            self.emit_jump_if_false(condition, labels.break_target);
         }
+        self.emit_jump(loop_start);
         self.bind_label(labels.break_target)?;
         Ok(StatementEmission::default())
     }
@@ -4167,6 +4173,7 @@ impl AstBytecodeEmitter<'_, '_> {
         let continue_target = self.declare_label(Some("do_while_continue"));
         let break_target = self.declare_label(Some("do_while_break"));
         self.bind_label(loop_start)?;
+        self.emit_loop_hint();
         let break_labels = BreakControlLabels {
             break_target,
             finally_stack_depth: self.finally_stack.len(),
@@ -4227,8 +4234,11 @@ impl AstBytecodeEmitter<'_, '_> {
         let loop_start = self.declare_label(Some("for_in_start"));
         let continue_target = self.declare_label(Some("for_in_continue"));
         let break_target = self.declare_label(Some("for_in_break"));
-        self.bind_label(loop_start)?;
         let length = self.emit_array_length(keys)?;
+        let condition = self.emit_binary_opcode(CoreOpcode::LessThanInt32, index, length)?;
+        self.emit_jump_if_false(condition, break_target);
+        self.bind_label(loop_start)?;
+        self.emit_loop_hint();
         let condition = self.emit_binary_opcode(CoreOpcode::LessThanInt32, index, length)?;
         self.emit_jump_if_false(condition, break_target);
         let value = self.emit_get_by_index(keys, index)?;
@@ -4247,7 +4257,7 @@ impl AstBytecodeEmitter<'_, '_> {
         }
         self.loop_stack.push(loop_labels);
         self.break_stack.push(break_labels);
-        let body = self.emit_statement(statement.body)?;
+        let _body = self.emit_statement(statement.body)?;
         let Some(labels) = self.loop_stack.pop() else {
             return Err(BytecompilerEmissionError::UnsupportedStatement(
                 "loop control stack underflow",
@@ -4264,9 +4274,7 @@ impl AstBytecodeEmitter<'_, '_> {
         self.bind_label(labels.continue_target)?;
         let next_index = self.emit_binary_opcode(CoreOpcode::AddInt32, index, one)?;
         self.emit_move(index, next_index);
-        if !body.terminated {
-            self.emit_jump(loop_start);
-        }
+        self.emit_jump(loop_start);
         self.bind_label(labels.break_target)?;
         Ok(StatementEmission::default())
     }
@@ -4292,6 +4300,7 @@ impl AstBytecodeEmitter<'_, '_> {
         let continue_target = self.declare_label(Some("for_of_continue"));
         let break_target = self.declare_label(Some("for_of_break"));
         self.bind_label(loop_start)?;
+        self.emit_loop_hint();
         let length = self.emit_array_length(values)?;
         let condition = self.emit_binary_opcode(CoreOpcode::LessThanInt32, index, length)?;
         self.emit_jump_if_false(condition, break_target);
@@ -4311,7 +4320,7 @@ impl AstBytecodeEmitter<'_, '_> {
         }
         self.loop_stack.push(loop_labels);
         self.break_stack.push(break_labels);
-        let body = self.emit_statement(statement.body)?;
+        let _body = self.emit_statement(statement.body)?;
         let Some(labels) = self.loop_stack.pop() else {
             return Err(BytecompilerEmissionError::UnsupportedStatement(
                 "loop control stack underflow",
@@ -4328,9 +4337,7 @@ impl AstBytecodeEmitter<'_, '_> {
         self.bind_label(labels.continue_target)?;
         let next_index = self.emit_binary_opcode(CoreOpcode::AddInt32, index, one)?;
         self.emit_move(index, next_index);
-        if !body.terminated {
-            self.emit_jump(loop_start);
-        }
+        self.emit_jump(loop_start);
         self.bind_label(labels.break_target)?;
         Ok(StatementEmission::default())
     }
@@ -5626,6 +5633,19 @@ impl AstBytecodeEmitter<'_, '_> {
             vec![Operand::Register(destination), Operand::Register(object)],
         );
         destination
+    }
+
+    fn emit_loop_hint(&mut self) {
+        // C++ JSC emits op_loop_hint at loop OSR boundaries; the Rust opcode is
+        // no-result glue so tiering can observe the same loop-header bytecode
+        // index without changing loop semantics. C++ immediately follows it
+        // with CheckTraps; Rust has no CheckTraps opcode yet, so trap polling is
+        // a separate control-flow fidelity gap rather than part of this helper.
+        self.generator.instructions_mut().declare_instruction(
+            CoreOpcode::LoopHint.opcode(),
+            OperandWidth::Narrow,
+            Vec::new(),
+        );
     }
 
     fn emit_array_rest(
@@ -8047,6 +8067,31 @@ mod tests {
             .any(|instruction| CoreOpcode::from_opcode(instruction.opcode) == Some(opcode))
     }
 
+    fn unlinked_opcode_count(code_block: &UnlinkedCodeBlock, opcode: CoreOpcode) -> usize {
+        code_block
+            .instructions()
+            .declarations()
+            .iter()
+            .filter(|instruction| CoreOpcode::from_opcode(instruction.opcode) == Some(opcode))
+            .count()
+    }
+
+    fn unlinked_adjacent_opcode_pair_count(
+        code_block: &UnlinkedCodeBlock,
+        first: CoreOpcode,
+        second: CoreOpcode,
+    ) -> usize {
+        code_block
+            .instructions()
+            .declarations()
+            .windows(2)
+            .filter(|window| {
+                CoreOpcode::from_opcode(window[0].opcode) == Some(first)
+                    && CoreOpcode::from_opcode(window[1].opcode) == Some(second)
+            })
+            .count()
+    }
+
     fn unlinked_contains_put_to_source_global(code_block: &UnlinkedCodeBlock) -> bool {
         code_block
             .instructions()
@@ -9278,6 +9323,28 @@ mod tests {
         assert_eq!(
             completion,
             ExecutionCompletion::Returned(RuntimeValue::from_i32(3))
+        );
+    }
+
+    #[test]
+    fn parsed_ast_emits_loop_hint_at_loop_headers() {
+        let unlinked = emit_program_source(
+            "while (false) { } \
+             for (let i = 0; i < 1; i = i + 1) { } \
+             do { } while (false); \
+             for (let key in { a: 1 }) { } \
+             for (let value of [1]) { }",
+            214,
+        );
+
+        assert_eq!(unlinked_opcode_count(&unlinked, CoreOpcode::LoopHint), 5);
+        assert_eq!(
+            unlinked_adjacent_opcode_pair_count(
+                &unlinked,
+                CoreOpcode::JumpIfFalse,
+                CoreOpcode::LoopHint
+            ),
+            3
         );
     }
 
