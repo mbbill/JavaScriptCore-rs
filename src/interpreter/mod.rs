@@ -4511,9 +4511,34 @@ impl CoreOpcodeDispatchHost {
                 None,
             );
         };
-        if base_cell.cell_id == CellId::default()
-            || plan.descriptor.base_object.0 == CellId::default()
-            || base_cell.cell_id != plan.descriptor.base_object.0
+        // C++ JSC AccessCase::Load guards the RECEIVER by STRUCTURE only
+        // (m_structureID; guardedByStructureCheckSkippingConstantIdentifierCheck,
+        // AccessCase.cpp:369) and pins ONLY the constant prototype/holder objects via
+        // m_conditionSet (forEachDependentCell, AccessCase.cpp:818-822 reports the
+        // conditionSet's cells plus m_structureID, never the receiver identity). A
+        // prototype-chain (holder) load therefore matches every same-structure
+        // receiver, not just the one instance captured at observation; richards calls
+        // obj.run()/obj.isHeldOrSuspended() across many TaskControlBlock instances
+        // that share one structure.
+        //
+        // DIVERGENCE from the self-load / negative-lookup paths: those keep a
+        // receiver-identity gate here. For PrototypeChain/PrototypeData we DROP the
+        // receiver-identity gate and rely on the per-entry structure recheck inside
+        // probe_generated_guarded_prototype_data_load (cell.structure_id ==
+        // entry.structure for the receiver entry), which is the only safe way to
+        // detect that the cached holder offset/path no longer applies. The constant
+        // prototype/holder entries (chain index >= 1) keep identity pinning.
+        let receiver_matched_by_structure = matches!(
+            (plan.descriptor.requirement, plan.descriptor.chain.outcome),
+            (
+                PropertyLoadGuardRequirement::PrototypeChain,
+                PropertyLoadGuardChainOutcome::PrototypeData { .. },
+            )
+        );
+        if !receiver_matched_by_structure
+            && (base_cell.cell_id == CellId::default()
+                || plan.descriptor.base_object.0 == CellId::default()
+                || base_cell.cell_id != plan.descriptor.base_object.0)
         {
             return Self::generated_guarded_property_load_miss(
                 plan,
@@ -4557,12 +4582,27 @@ impl CoreOpcodeDispatchHost {
         use GeneratedGuardedPropertyLoadProbeMissReason as Miss;
 
         let entries = plan.descriptor.chain.entries.as_slice();
+        // First cut mirrors richards' dominant GetById sites: a single prototype hop
+        // (prototype_depth == 1, chain.len() == 2) holder data load. C++
+        // AccessCase::Load supports arbitrary-depth conditionSets, but deeper chains
+        // and poly-proto stay deferred (fresh fallback) so this batch is minimal and
+        // matches what richards exercises.
+        if holder_index != 1 {
+            return Self::generated_guarded_property_load_miss(
+                plan,
+                Miss::UnsupportedGuardRequirement,
+                None,
+            );
+        }
+        // DIVERGENCE: the receiver entry (chain index 0) is matched by STRUCTURE only
+        // (entry.structure == base_structure), not by object identity, mirroring C++
+        // AccessCase::Load (receiver = m_structureID). descriptor.base_object is
+        // retained only to anchor the observed chain head and is NOT used to gate the
+        // receiver here; the prototype/holder entries (index >= 1) stay identity
+        // pinned because they are shared constants (m_conditionSet).
         if holder_index.checked_add(1) != Some(entries.len())
             || usize::from(plan.descriptor.prototype_depth) != holder_index
             || plan.descriptor.offset != Some(offset)
-            || entries
-                .first()
-                .is_none_or(|entry| entry.object != plan.descriptor.base_object)
             || entries
                 .first()
                 .is_none_or(|entry| entry.structure != plan.descriptor.base_structure)
@@ -4589,7 +4629,16 @@ impl CoreOpcodeDispatchHost {
                     Some(index),
                 );
             };
-            if cell.cell_id == CellId::default() || cell.cell_id != entry.object.0 {
+            // DIVERGENCE: the receiver (chain index 0) is matched by STRUCTURE only,
+            // not object identity (C++ AccessCase::Load guards the receiver by
+            // m_structureID). Skipping the identity gate here lets every same-structure
+            // receiver match; a genuine receiver-structure change is caught by the
+            // structure recheck below (cell.structure_id != entry.structure ->
+            // GuardStructureMismatch, terminal). The constant prototype/holder entries
+            // (index >= 1) stay identity pinned because they are shared constants
+            // (m_conditionSet objects); their identity is also re-validated by the
+            // prototype-link walk for the preceding entry (next_entry.object check).
+            if index != 0 && (cell.cell_id == CellId::default() || cell.cell_id != entry.object.0) {
                 return Self::generated_guarded_property_load_miss(
                     plan,
                     Miss::UnknownGuardObject,
@@ -34240,6 +34289,154 @@ mod tests {
             }
             GeneratedGuardedPropertyLoadProbeResult::Miss(_) => unreachable!(),
         }
+    }
+
+    // C++ JSC AccessCase::Load guards the receiver by STRUCTURE (m_structureID), not
+    // identity, so a prototype-chain (holder) load resident plan must Hit for EVERY
+    // same-structure receiver, not just the instance observed. This is exactly the
+    // richards case: obj.run()/obj.isHeldOrSuspended() called across many
+    // TaskControlBlock instances that share one structure with the method on the
+    // shared prototype.
+    #[test]
+    fn generated_guarded_prototype_data_probe_hits_sibling_receiver_sharing_structure() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let owner = CodeBlockId(CellId(141));
+        let prototype = host.objects.allocate_with_prototype(None);
+        // Two distinct receiver instances allocated with the same prototype + same
+        // (empty) shape converge under one structure id (StructureTransitionTable /
+        // seed_structure_id), matching C++ JSC same-shape-sibling Structure sharing.
+        let observed_receiver = host.objects.allocate_with_prototype(Some(prototype));
+        let sibling_receiver = host.objects.allocate_with_prototype(Some(prototype));
+        let key = CorePropertyKey::Identifier(11);
+        let method = host.objects.allocate_with_prototype(None);
+        host.objects.set_data_own(prototype, &key, method).unwrap();
+
+        // The two siblings must genuinely share one base structure for this test to
+        // exercise the structure-only receiver guard.
+        assert_eq!(
+            object_structure_id(&host.objects, observed_receiver),
+            object_structure_id(&host.objects, sibling_receiver)
+        );
+        assert_ne!(observed_receiver, sibling_receiver);
+
+        let plan = generated_guarded_property_load_plan(
+            &mut host,
+            &mut heap,
+            owner,
+            observed_receiver,
+            &key,
+            61,
+            11,
+        );
+        assert_eq!(
+            plan.descriptor.requirement,
+            PropertyLoadGuardRequirement::PrototypeChain
+        );
+
+        // The observed receiver hits.
+        assert_eq!(
+            host.probe_generated_guarded_property_load(
+                generated_guarded_property_load_probe_request(&plan, observed_receiver)
+            ),
+            GeneratedGuardedPropertyLoadProbeResult::hit(method)
+        );
+        // The DISTINCT sibling receiver (different cell identity, same structure) must
+        // ALSO hit -- previously this produced Miss::UnknownGuardObject and exited to
+        // the interpreter on every distinct instance.
+        assert_eq!(
+            host.probe_generated_guarded_property_load(
+                generated_guarded_property_load_probe_request(&plan, sibling_receiver)
+            ),
+            GeneratedGuardedPropertyLoadProbeResult::hit(method)
+        );
+
+        // A receiver with a DIFFERENT structure (own property added -> structure
+        // transition) must NOT hit; the receiver structure recheck fires
+        // GuardStructureMismatch (terminal), not a false hit.
+        host.objects
+            .set_data_own(
+                sibling_receiver,
+                &CorePropertyKey::Identifier(99),
+                RuntimeValue::from_i32(7),
+            )
+            .unwrap();
+        assert_ne!(
+            object_structure_id(&host.objects, observed_receiver),
+            object_structure_id(&host.objects, sibling_receiver)
+        );
+        assert_eq!(
+            guarded_probe_miss_reason(host.probe_generated_guarded_property_load(
+                generated_guarded_property_load_probe_request(&plan, sibling_receiver)
+            )),
+            GeneratedGuardedPropertyLoadProbeMissReason::GuardStructureMismatch
+        );
+    }
+
+    // CORRECTNESS-CRITICAL: a wrong prototype-load hit returns the wrong method
+    // (silent corruption). C++ JSC backs each conditionSet condition with a
+    // structure-transition watchpoint on the prototype structure; when the prototype
+    // shape changes the cached holder offset is no longer valid. The resident probe
+    // mirrors this with a defensive holder-structure recheck: a prototype-shape change
+    // MUST make the cached plan MISS (terminal), and a fresh re-observation must build
+    // a new plan that loads the new value -- never the stale offset/method.
+    #[test]
+    fn generated_guarded_prototype_data_probe_invalidates_on_prototype_shape_change() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let owner = CodeBlockId(CellId(142));
+        let prototype = host.objects.allocate_with_prototype(None);
+        let receiver = host.objects.allocate_with_prototype(Some(prototype));
+        let key = CorePropertyKey::Identifier(11);
+        let original_method = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_data_own(prototype, &key, original_method)
+            .unwrap();
+
+        let plan = generated_guarded_property_load_plan(
+            &mut host, &mut heap, owner, receiver, &key, 63, 11,
+        );
+        assert_eq!(
+            host.probe_generated_guarded_property_load(
+                generated_guarded_property_load_probe_request(&plan, receiver)
+            ),
+            GeneratedGuardedPropertyLoadProbeResult::hit(original_method)
+        );
+
+        // Mutate the PROTOTYPE shape: adding a new own property transitions the
+        // prototype's structure and (for the forward offset allocator) shifts the
+        // holder offset of the cached key. The cached plan must NOT return the stale
+        // method -- the holder-structure recheck must fire GuardStructureMismatch
+        // (terminal), retiring the stale plan.
+        let replacement_method = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_data_own(
+                prototype,
+                &CorePropertyKey::Identifier(98),
+                RuntimeValue::from_i32(5),
+            )
+            .unwrap();
+        host.objects
+            .set_data_own(prototype, &key, replacement_method)
+            .unwrap();
+        assert_eq!(
+            guarded_probe_miss_reason(host.probe_generated_guarded_property_load(
+                generated_guarded_property_load_probe_request(&plan, receiver)
+            )),
+            GeneratedGuardedPropertyLoadProbeMissReason::GuardStructureMismatch
+        );
+
+        // Re-observing after the prototype reshape builds a fresh plan that loads the
+        // CURRENT method, never the stale one.
+        let refreshed_plan = generated_guarded_property_load_plan(
+            &mut host, &mut heap, owner, receiver, &key, 65, 11,
+        );
+        assert_eq!(
+            host.probe_generated_guarded_property_load(
+                generated_guarded_property_load_probe_request(&refreshed_plan, receiver)
+            ),
+            GeneratedGuardedPropertyLoadProbeResult::hit(replacement_method)
+        );
     }
 
     #[test]

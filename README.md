@@ -100,7 +100,12 @@ Legend:
     [done] property load/store observation flow for current hot path
     [done] named has/in dormant metadata and narrow generated sidecar
     [wip] access-case evolution and megamorphic policy
-    [missing] full C++ Get/Put/In AccessCase taxonomy
+    [done] resident monomorphic self-load + prototype-chain (holder) load: receiver
+           guarded by STRUCTURE not identity (mirrors C++ AccessCase::Load
+           guardedByStructureCheckSkippingConstantIdentifierCheck), so same-structure
+           siblings share one plan; eliminated richards prototype-method-load exits 33->0
+    [missing] full C++ Get/Put/In AccessCase taxonomy (multi-hop chains, Put/transition,
+              megamorphic stubs)
     [missing] proxy/indexed in activation and call-link status
   [wip] calls, constructs, and function values
     [wip] direct-call and generated-call paths

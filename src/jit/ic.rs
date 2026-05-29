@@ -5133,7 +5133,14 @@ pub fn plan_property_load_guard_plan_from_observation(
     };
 
     let descriptor = match observation.observed_access_case_kind {
-        Some(AccessCaseKind::Load) if observation.prototype_depth > 0 => {
+        // First cut: only a single prototype hop (prototype_depth == 1, the holder is
+        // the receiver's direct prototype) is attached as a resident PrototypeChain
+        // plan, matching richards' dominant GetById sites (obj.run /
+        // obj.isHeldOrSuspended, where the method lives on the direct prototype). C++
+        // AccessCase::Load supports arbitrary-depth ObjectPropertyConditionSets, but
+        // deeper chains stay deferred (fresh fallback) so this batch stays minimal and
+        // the resident probe only walks one hop.
+        Some(AccessCaseKind::Load) if observation.prototype_depth == 1 => {
             let Some(holder_object) = observation.holder_object else {
                 return Ok(None);
             };
