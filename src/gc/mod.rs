@@ -17,6 +17,7 @@
 
 mod barrier;
 mod cell;
+mod fast_hash;
 mod heap;
 mod phase;
 mod refs;
@@ -45,18 +46,19 @@ pub use cell::{
     TypeInfoDescriptor, STATIC_CELL_METADATA_DESCRIPTORS, STATIC_CELL_METADATA_REGISTRY,
     STATIC_TYPE_INFO_DESCRIPTORS,
 };
+pub use fast_hash::{FxIntBuildHasher, FxIntHasher};
 pub use heap::{
     static_heap_schema_descriptor, AllocationPlan, CellArena, CellInit, ConservativeRootSpan,
     FinalizationRegistry, FinalizerId, FinalizerQueueRecord, FinalizerQueueTransitionRecord, Heap,
     HeapAllocationRecord, HeapAllocationRequest, HeapAllocationResponse,
     HeapCellInvalidationRequest, HeapEpoch, HeapId, HeapIntegrationError, HeapSchemaDescriptor,
     HeapSchemaDescriptorBuilder, HeapSchemaOwner, HeapSchemaRegistryAuthority,
-    HeapSchemaValidationError, NoGcScopeDepth, RootId, RootKind, RootReachabilitySemantics,
-    RootRecord, RootSet, RootSetMutation, RootSetMutationAuthority, RootSetMutationKind,
-    RootSetMutationOutcome, RootSetSemanticError, RootVisitor, Subspace, TargetedRootRecord,
-    TargetedRootSet, WeakId, WeakProcessingPhase, WeakProcessingTransitionRecord,
-    WeakRegistrationRecord, WeakRegistry, WriteBarrierApplicationRecord,
-    WriteBarrierApplicationRequest, STATIC_HEAP_SCHEMA_DESCRIPTOR,
+    HeapSchemaValidationError, NoGcScopeDepth, RootId, RootIdSet, RootKind,
+    RootReachabilitySemantics, RootRecord, RootSet, RootSetMutation, RootSetMutationAuthority,
+    RootSetMutationKind, RootSetMutationOutcome, RootSetSemanticError, RootVisitor, Subspace,
+    TargetedRootRecord, TargetedRootSet, WeakId, WeakProcessingPhase,
+    WeakProcessingTransitionRecord, WeakRegistrationRecord, WeakRegistry,
+    WriteBarrierApplicationRecord, WriteBarrierApplicationRequest, STATIC_HEAP_SCHEMA_DESCRIPTOR,
 };
 pub use phase::{
     evaluate_heap_semantics, CollectionCompletionCallbackId, CollectionKind, CollectionRequest,

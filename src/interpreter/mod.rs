@@ -32,7 +32,7 @@ use crate::gc::{
     static_barrier_schema_registry, static_cell_metadata_registry, AllocationMode,
     BarrierDecisionError, BarrierFieldKind, BarrierMutationAuthority, BarrierRequirementOutcome,
     BarrierRequirementRequest, BarrierWriteContext, CellId, CellState, CellType, GcRef, Heap,
-    HeapAllocationRequest, HeapId, HeapIntegrationError, RootId, RootKind, RootRecord,
+    HeapAllocationRequest, HeapId, HeapIntegrationError, RootId, RootIdSet, RootKind, RootRecord,
     RootSetMutationAuthority, RootSetSemanticError, StructureId, TargetedRootRecord,
     TargetedRootSet, WriteBarrierApplicationRequest,
 };
@@ -27694,7 +27694,11 @@ pub(crate) struct RegisterRootSyncScratch {
     snapshot_registers: Vec<RegisterRootDescriptor>,
     targeted_records: Vec<TargetedRootRecord>,
     desired_set: TargetedRootSet,
-    desired_root_ids: HashSet<RootId>,
+    // `RootId`-keyed set using the in-tree integer hasher rather than std's
+    // DoS-resistant SipHash. `RootId` is a VM-internal integer, so SipHash is
+    // pure overhead on this per-bytecode buffer; only set membership is read,
+    // so the swap is semantically inert.
+    desired_root_ids: RootIdSet,
     stale_roots: Vec<RootRecord>,
 }
 

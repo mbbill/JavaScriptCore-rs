@@ -7716,6 +7716,30 @@ impl Vm {
                     )
                 }
             };
+            // The property/candidate sidecar tables below are rebuilt on every
+            // region entry. Unlike the call-link candidate table above (cached
+            // via the record-sequence-epoch pattern), they are intentionally NOT
+            // cached: their inputs include state that is mutated IN PLACE on
+            // existing records without a guaranteed append to any epoch-tracked
+            // log, so a (len, last_ordinal) record-sequence epoch cannot observe
+            // the change and a cache would silently serve stale tables.
+            // Specifically:
+            //   - megamorphic load/store/has tables read the megamorphic cache's
+            //     fixed-size primary/secondary arrays, overwritten in place by
+            //     insert_hit/insert_miss/... (tiering.rs ~12230-12303) with no
+            //     bump of property_megamorphic_cache_epoch on a fill;
+            //   - the property-load access-case / guarded tables read
+            //     property_load_guard_plans[..].lifecycle and
+            //     property_inline_cache_evolution_states[..].terminal, which are
+            //     retired/flipped in place (e.g. guard-plan watchpoint retirement
+            //     at tiering.rs ~4750) whose only unconditional append is to a Vec
+            //     the proof epoch does not track.
+            // Caching these faithfully would require a new per-Vec
+            // revision-counter invalidation scheme rather than the established
+            // record-sequence pattern, so it is deferred. The call-link cache is
+            // sound only because its in-place lifecycle flips are always preceded
+            // by an append to call_link_inline_cache_clear_records, which the
+            // epoch does track.
             let attached_property_ic_candidates = self
                 .code_blocks
                 .attached_property_inline_cache_candidates_for_owner(
@@ -8102,6 +8126,14 @@ impl Vm {
                     )
                 }
             };
+            // See the matching note in the runtime-helper-plan branch above: the
+            // property/candidate sidecar tables below are intentionally NOT cached
+            // because their inputs are mutated in place (megamorphic cache arrays;
+            // property_load_guard_plans/evolution_states lifecycle+terminal) in a
+            // way the record-sequence epoch cannot observe, so caching them would
+            // serve stale tables. Deferred until a per-Vec revision-counter scheme
+            // exists; the call-link cache above is sound only because its in-place
+            // flips are always preceded by a tracked clear-record append.
             let attached_property_ic_candidates = self
                 .code_blocks
                 .attached_property_inline_cache_candidates_for_owner(

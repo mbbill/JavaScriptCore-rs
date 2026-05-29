@@ -10,15 +10,15 @@ use crate::gc::{
     BarrierWriteContext, CellDestructionState, CellId, CellLifecycleRecord, CellMetadata,
     CellZapReason, CollectionRequest, ConservativeRoots, FinalizerKind, FinalizerPlan,
     FinalizerPlanningError, FinalizerPlanningRecord, FinalizerRecord, FinalizerState,
-    FinalizerStateTransitionError, FinalizerTransitionRequest, GcActivityCallbackState,
-    GcConductor, GcPhase, GcRef, HeapFinalizerCallback, HeapFinalizerCallbackId,
-    HeapMutationAuthority, HeapSemanticError, HeapSemanticOperation, HeapSnapshotBuilder,
-    HeapSnapshotCellRecord, HeapSnapshotEdge, HeapSnapshotId, HeapSnapshotKind, HeapSnapshotNodeId,
-    HeapSnapshotRecord, HeapSnapshotValidationError, HeapStateDescriptor, HeapStatistics,
-    MarkedSpaceDescriptor, MutatorState, RootMarkingPlan, RootPlanningError, SlotVisitorDescriptor,
-    SubspaceDescriptor, SubspaceKind, TraceCell, WeakEdgeKind, WeakHandleOwnerContract,
-    WeakHandleOwnerId, WeakSetDescriptor, WeakSetId, WeakSlotState, WeakSlotTransitionOutcome,
-    WeakSlotTransitionRequest, WeakStateTransitionError,
+    FinalizerStateTransitionError, FinalizerTransitionRequest, FxIntBuildHasher,
+    GcActivityCallbackState, GcConductor, GcPhase, GcRef, HeapFinalizerCallback,
+    HeapFinalizerCallbackId, HeapMutationAuthority, HeapSemanticError, HeapSemanticOperation,
+    HeapSnapshotBuilder, HeapSnapshotCellRecord, HeapSnapshotEdge, HeapSnapshotId,
+    HeapSnapshotKind, HeapSnapshotNodeId, HeapSnapshotRecord, HeapSnapshotValidationError,
+    HeapStateDescriptor, HeapStatistics, MarkedSpaceDescriptor, MutatorState, RootMarkingPlan,
+    RootPlanningError, SlotVisitorDescriptor, SubspaceDescriptor, SubspaceKind, TraceCell,
+    WeakEdgeKind, WeakHandleOwnerContract, WeakHandleOwnerId, WeakSetDescriptor, WeakSetId,
+    WeakSlotState, WeakSlotTransitionOutcome, WeakSlotTransitionRequest, WeakStateTransitionError,
 };
 
 /// Opaque identity for one VM-owned heap.
@@ -1357,6 +1357,18 @@ impl RootSet {
     }
 }
 
+/// `RootId`-keyed map using the in-tree integer hasher instead of std's
+/// DoS-resistant `SipHasher13`. `RootId` is a VM-internal integer minted from
+/// sequential/base-offset counters (never attacker-controlled), so SipHash's
+/// DoS resistance is pure overhead on the per-bytecode root-sync hot path. The
+/// swap is semantically inert (membership/lookup/`len` are hasher-independent).
+pub(crate) type RootIdMap<V> = HashMap<RootId, V, FxIntBuildHasher>;
+
+/// `RootId`-keyed set using the in-tree integer hasher (see [`RootIdMap`]).
+/// Used by the interpreter's per-instruction root-sync scratch buffer; the
+/// hasher swap is semantically inert (only set membership is observed).
+pub type RootIdSet = HashSet<RootId, FxIntBuildHasher>;
+
 /// Precise roots paired with the cell IDs they keep reachable.
 ///
 /// `records` is the authoritative live set. `index` mirrors it as a
@@ -1366,11 +1378,13 @@ impl RootSet {
 /// Rust-internal acceleration structure with no C++ JSC counterpart (C++ JSC
 /// roots VM registers via conservative stack scanning rather than an eager
 /// per-instruction precise targeted-root registry), so it is maintained in
-/// lock-step with `records` on every register/retarget/unregister.
+/// lock-step with `records` on every register/retarget/unregister. The index
+/// uses the in-tree `FxIntBuildHasher` ([`RootIdMap`]) so the per-op rebuild
+/// does not pay SipHash cost.
 #[derive(Clone, Debug, Default)]
 pub struct TargetedRootSet {
     records: Vec<TargetedRootRecord>,
-    index: HashMap<RootId, usize>,
+    index: RootIdMap<usize>,
 }
 
 impl TargetedRootSet {
@@ -1406,7 +1420,7 @@ impl TargetedRootSet {
     ) -> Result<Self, RootSetSemanticError> {
         let mut set = Self {
             records,
-            index: HashMap::new(),
+            index: RootIdMap::default(),
         };
         set.validate(heap)?;
         set.rebuild_index();
