@@ -90,6 +90,9 @@ Legend:
     [done] shared add-property StructureTransitionTable: same-(kind,prototype)
            siblings share one structure_id (mirrors C++ Structure transitions),
            so structure-keyed ICs hit cross-instance incl. the new-Foo() path
+    [done] offset-indexed Butterfly storage (out_of_line_storage Vec, getDirect/
+           locationForOffset) written lockstep w/ the authoritative HashMap; hot
+           load reads by offset (batch-3 machine-code mov target). INLINE_CAPACITY=0
     [missing] full C++ structure/watchpoint invalidation fidelity
     [missing] dictionary, override, and static-class-table predicates
   [wip] property access and inline caches

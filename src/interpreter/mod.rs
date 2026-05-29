@@ -4431,6 +4431,9 @@ impl CoreOpcodeDispatchHost {
                         );
                     };
                     *value = hit.stored_value;
+                    // putDirectOffset analog: keep the out-of-line mirror in lockstep
+                    // with the authoritative in-place HashMap update above.
+                    cell.write_data_property_offset_slot(&mutation_key, hit.stored_value);
                     None
                 }
                 PropertyStoreAccessCasePlanKind::DataOnlyTransition => {
@@ -4452,6 +4455,9 @@ impl CoreOpcodeDispatchHost {
                         .ensure_named_data_property_offset(&mutation_key)
                         .expect("validated generated store transition key");
                     assert_eq!(assigned_offset, hit.planned_offset);
+                    // putDirectOffset analog: write the value into the out-of-line
+                    // mirror in lockstep with the authoritative HashMap insert above.
+                    cell.write_data_property_offset_slot(&mutation_key, hit.stored_value);
                     cell.structure_id = new_structure;
                     Some(old_structure)
                 }
@@ -5399,6 +5405,36 @@ struct CoreObjectCell {
     properties: HashMap<CorePropertyKey, CoreProperty>,
     property_offsets: HashMap<CorePropertyKey, PropertyOffset>,
     next_property_offset: i32,
+    // C++ JSC: a JSObject's named data properties live in either inline storage
+    // (offset < firstOutOfLineOffset) or the Butterfly out-of-line region
+    // (JSObject.h locationForOffset:711, Butterfly.h), and putDirectOffset writes
+    // the value at offsetInRespectiveStorage(offset). `out_of_line_storage` is the
+    // Rust mirror of that Butterfly out-of-line property region: a contiguous
+    // [RuntimeValue] (RuntimeValue == EncodedJsValue == 8 bytes), indexable as
+    // [base + idx*8], which is what the batch-3 machine-code GET_BY_ID will mov
+    // from. The HashMap `properties` remains authoritative this batch; this Vec is
+    // written in lockstep (the putDirectOffset analog) and read by the offset path.
+    //
+    // DIVERGENCE: C++ indexes the out-of-line region with NEGATIVE indices growing
+    // backward from the Butterfly base (offsetInOutOfLineStorage returns
+    // -(offset-firstOutOfLineOffset)-1). The Rust mirror uses a FORWARD-indexed Vec
+    // (slot index = offset_storage_index(offset)); for the batch-3 base register the
+    // sign of the displacement is a codegen detail, and forward indexing is the
+    // natural Rust spill. See offset_storage_index.
+    //
+    // DIVERGENCE: INLINE_CAPACITY == 0 for this first cut, so EVERY data property is
+    // out-of-line and the flat per-cell offset allocator (0,1,2,...) doubles as the
+    // storage index. The inline/out-of-line split and offsetForPropertyNumber's
+    // jump-to-64 are deferred until INLINE_CAPACITY > 0; see the offset helper free
+    // functions below CoreObjectCell.
+    out_of_line_storage: Vec<RuntimeValue>,
+    // C++ JSC: PropertyTable::m_deletedOffsets (PropertyTable.h) records offsets
+    // freed by deletion so a later addition can reuse them instead of growing
+    // storage. The Rust mirror records freed offsets here; reuse is not yet wired
+    // into the offset allocator (the allocator still monotonically increments
+    // next_property_offset), so this currently only tracks freed slots and clears
+    // them. Faithful reuse is deferred with the inline-split work.
+    deleted_offsets: Vec<PropertyOffset>,
     property_order: Vec<CorePropertyKey>,
     elements: Vec<Option<RuntimeValue>>,
     map_entries: Vec<(RuntimeValue, RuntimeValue)>,
@@ -5795,6 +5831,32 @@ impl<'a> GeneratedPropertyLoadCoreKey<'a> {
             Self::String(text) => CorePropertyKey::String(text.to_owned()),
         }
     }
+
+    /// Cheap is-Data + offset-validity check for the offset-indexed read path.
+    ///
+    /// Returns true iff this key currently maps to `expected_offset` in the cell's
+    /// property_offsets table. property_offsets holds only live DATA-property offsets
+    /// (accessor installs / deletions call remove_property_offset), so a match proves
+    /// the slot at `expected_offset` is a live data property without scanning
+    /// `properties` for the value. The Identifier path constructs a stack-only key
+    /// (no allocation); the String path falls back to an offset-map scan keyed by the
+    /// matched key (GET_BY_ID by string literal is rare vs. by identifier).
+    fn cell_named_data_offset_matches(
+        self,
+        cell: &CoreObjectCell,
+        expected_offset: PropertyOffset,
+    ) -> bool {
+        match self {
+            Self::Identifier(identifier) => {
+                cell.property_offsets
+                    .get(&CorePropertyKey::Identifier(identifier))
+                    == Some(&expected_offset)
+            }
+            Self::String(text) => cell.property_offsets.iter().any(|(stored_key, offset)| {
+                *offset == expected_offset && stored_key.is_string(text)
+            }),
+        }
+    }
 }
 
 fn generated_property_load_cell_has_own_property(
@@ -5811,14 +5873,22 @@ fn generated_property_load_cell_data_property_at_offset(
     key: GeneratedPropertyLoadCoreKey<'_>,
     expected_offset: PropertyOffset,
 ) -> Option<RuntimeValue> {
-    let (stored_key, property) = cell
-        .properties
-        .iter()
-        .find(|(stored_key, _)| key.matches(stored_key))?;
-    let CorePropertyKind::Data(value) = property.kind else {
+    // C++ JSC JSObject::getDirect(offset)/locationForOffset (JSObject.h:711,748):
+    // once the structure guard holds (verified by the caller against entry.structure),
+    // the value is read directly at the structure-assigned offset with NO key
+    // comparison or HashMap scan. This is exactly the offset-indexed load batch 3 will
+    // emit as `mov reg <- [storage_base + offset*8]` from out_of_line_storage.
+    //
+    // The is-Data check is kept cheap and structure-keyed: property_offsets only ever
+    // holds live DATA-property offsets (accessor installs and deletions call
+    // remove_property_offset, which drops the entry and clears the slot), so confirming
+    // the guarded key still maps to expected_offset proves the slot is a live data
+    // property without scanning `properties` for the value. The Vec read then replaces
+    // the former O(n) properties scan.
+    if !key.cell_named_data_offset_matches(cell, expected_offset) {
         return None;
-    };
-    (cell.property_offset(stored_key) == Some(expected_offset)).then_some(value)
+    }
+    cell.read_data_property_offset_slot(expected_offset)
 }
 
 fn core_property_key_supports_named_property_offset(key: &CorePropertyKey) -> bool {
@@ -5826,6 +5896,60 @@ fn core_property_key_supports_named_property_offset(key: &CorePropertyKey) -> bo
         key,
         CorePropertyKey::Identifier(_) | CorePropertyKey::String(_)
     ) && key_array_index(key).is_none()
+}
+
+// C++ JSC PropertyOffset.h mirror. firstOutOfLineOffset == 64 is the boundary
+// between inline storage (object header slots) and the Butterfly out-of-line
+// region. For this first cut INLINE_CAPACITY == 0, so isInlineOffset is never true
+// for a real data property and every offset is out-of-line; the inline split and
+// offsetForPropertyNumber's jump-to-64 (PropertyOffset.h:136) are deferred until
+// INLINE_CAPACITY > 0.
+const FIRST_OUT_OF_LINE_OFFSET: i32 = 64;
+const INLINE_CAPACITY: i32 = 0;
+
+/// C++ JSC PropertyOffset.h isInlineOffset: offset < firstOutOfLineOffset.
+/// With INLINE_CAPACITY == 0 the per-cell allocator never produces offsets in the
+/// inline band [0, INLINE_CAPACITY); offset_storage_index still spills any such
+/// offset forward into out_of_line_storage because this cut keeps the flat
+/// allocator (deferral noted on offset_storage_index).
+fn is_inline_offset(offset: PropertyOffset) -> bool {
+    offset.raw() >= 0 && offset.raw() < INLINE_CAPACITY
+}
+
+/// C++ JSC PropertyOffset.h isOutOfLineOffset.
+///
+/// Part of the PropertyOffset.h mirror; reactivated when INLINE_CAPACITY > 0 splits
+/// the offset space into inline vs out-of-line bands. Unused in the INLINE_CAPACITY==0
+/// first cut, which indexes out_of_line_storage by the raw offset directly.
+#[allow(dead_code)]
+fn is_out_of_line_offset(offset: PropertyOffset) -> bool {
+    offset.raw() >= FIRST_OUT_OF_LINE_OFFSET
+}
+
+/// Index of an offset within `out_of_line_storage`.
+///
+/// C++ JSC offsetInOutOfLineStorage (PropertyOffset.h:106) maps an out-of-line
+/// offset to a NEGATIVE Butterfly index: -(offset - firstOutOfLineOffset) - 1.
+/// DIVERGENCE: the Rust mirror uses a FORWARD-indexed Vec, so this returns the
+/// non-negative slot index. Because INLINE_CAPACITY == 0 and the flat allocator
+/// emits offsets 0,1,2,... directly, the storage index is simply offset.raw().
+/// When INLINE_CAPACITY > 0 lands, the out-of-line band becomes
+/// (offset - firstOutOfLineOffset) (offsetInOutOfLineStorage without the sign flip)
+/// and the inline band moves to separate inline storage instead of this Vec.
+fn offset_storage_index(offset: PropertyOffset) -> usize {
+    debug_assert!(offset.raw() >= 0, "negative property offset has no slot");
+    // INLINE_CAPACITY == 0 first cut: the flat allocator emits offsets 0,1,2,...
+    // contiguously, so every data property lives in out_of_line_storage at its raw
+    // index. SINGLE FORWARD FORMULA (index == raw): do NOT apply C++'s out-of-line
+    // subtraction (raw - FIRST_OUT_OF_LINE_OFFSET) here -- mixing that with the 0-based
+    // flat allocator aliased offset 0 with offset 64 (silent wrong read at >=65 props).
+    // The inline/out-of-line split + offsetForPropertyNumber's jump-to-64 land together
+    // with INLINE_CAPACITY > 0.
+    debug_assert!(
+        !is_inline_offset(offset),
+        "INLINE_CAPACITY==0 cut classifies no offset as inline"
+    );
+    offset.raw() as usize
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6196,6 +6320,13 @@ impl CoreObjectCell {
     fn install_initial_shape_metadata(&mut self) {
         self.property_offsets.clear();
         self.next_property_offset = 0;
+        // C++ JSC: a cell born with initial own properties reaches its shape by
+        // applying addPropertyTransition per property; the Butterfly out-of-line
+        // region is sized/filled in lockstep. The Rust mirror rebuilds the flat
+        // offset allocation here, so reset the out-of-line mirror too and re-fill it
+        // in lockstep below (putDirectOffset analog).
+        self.out_of_line_storage.clear();
+        self.deleted_offsets.clear();
 
         for key in self.property_order.clone() {
             if self
@@ -6219,6 +6350,17 @@ impl CoreObjectCell {
             .collect::<Vec<_>>();
         for key in unordered_data_keys {
             self.ensure_named_data_property_offset(&key);
+        }
+
+        // Lockstep fill: every offset-bearing data property writes its current value
+        // into the out-of-line storage mirror at its assigned slot.
+        let offset_keys = self.property_offsets.keys().cloned().collect::<Vec<_>>();
+        for key in offset_keys {
+            if let Some(CorePropertyKind::Data(value)) =
+                self.properties.get(&key).map(|property| property.kind)
+            {
+                self.write_data_property_offset_slot(&key, value);
+            }
         }
     }
 
@@ -6256,7 +6398,57 @@ impl CoreObjectCell {
     }
 
     fn remove_property_offset(&mut self, key: &CorePropertyKey) {
-        self.property_offsets.remove(key);
+        if let Some(offset) = self.property_offsets.remove(key) {
+            // C++ JSC: a deletion frees the property's offset; PropertyTable records
+            // it in m_deletedOffsets (PropertyTable.h) for later reuse and the slot
+            // is cleared. The HashMap stays authoritative this batch, but keep the
+            // out-of-line mirror consistent: clear the freed slot to undefined and
+            // record the offset. Reuse is deferred (see deleted_offsets comment).
+            let index = offset_storage_index(offset);
+            if let Some(slot) = self.out_of_line_storage.get_mut(index) {
+                *slot = RuntimeValue::undefined();
+            }
+            self.deleted_offsets.push(offset);
+        }
+    }
+
+    /// Write a data value into the out-of-line storage mirror at `key`'s offset.
+    ///
+    /// C++ JSC JSObject::putDirectOffset / locationForOffset (JSObject.h:711): given
+    /// the structure-assigned offset, store the value at offsetInRespectiveStorage.
+    /// This is the lockstep companion to every `properties` data insert; the HashMap
+    /// remains authoritative this batch and this mirror is what the offset read path
+    /// (and batch-3 machine code) consumes. Grows the Vec with undefined fill so the
+    /// slot exists, mirroring Butterfly growth on out-of-line property addition.
+    /// No-op for keys without a named data offset (symbols, indices, accessors).
+    fn write_data_property_offset_slot(&mut self, key: &CorePropertyKey, value: RuntimeValue) {
+        let Some(offset) = self.property_offset(key) else {
+            return;
+        };
+        let index = offset_storage_index(offset);
+        if index >= self.out_of_line_storage.len() {
+            self.out_of_line_storage
+                .resize(index + 1, RuntimeValue::undefined());
+        }
+        self.out_of_line_storage[index] = value;
+    }
+
+    /// Read the out-of-line storage mirror at `expected_offset`.
+    ///
+    /// C++ JSC JSObject::getDirect(offset) / locationForOffset: read the value at
+    /// offsetInRespectiveStorage(offset). The structure guard upstream proves the
+    /// offset is valid for this cell's shape; this is the offset-indexed load
+    /// batch-3 will emit as `mov reg <- [storage_base + idx*8]`.
+    fn read_data_property_offset_slot(
+        &self,
+        expected_offset: PropertyOffset,
+    ) -> Option<RuntimeValue> {
+        if expected_offset.raw() < 0 {
+            return None;
+        }
+        self.out_of_line_storage
+            .get(offset_storage_index(expected_offset))
+            .copied()
     }
 }
 
@@ -9076,6 +9268,9 @@ impl CoreObjectStore {
                     transition = Some((old_structure, offset));
                 }
             }
+            // putDirectOffset analog: write the value into the out-of-line storage
+            // mirror in lockstep with the authoritative HashMap insert above.
+            object.write_data_property_offset_slot(key, value);
             if shape_changed {
                 Some(old_structure)
             } else {
@@ -9159,6 +9354,9 @@ impl CoreObjectStore {
                 },
             );
             let offset = object.ensure_named_data_property_offset(key);
+            // putDirectOffset analog: write the value into the out-of-line storage
+            // mirror in lockstep with the authoritative HashMap insert above.
+            object.write_data_property_offset_slot(key, value);
             if shape_changed {
                 if is_addition {
                     if let Some(offset) = offset {
@@ -9244,6 +9442,9 @@ impl CoreObjectStore {
                 },
             );
             let offset = object.ensure_named_data_property_offset(key);
+            // putDirectOffset analog: write the value into the out-of-line storage
+            // mirror in lockstep with the authoritative HashMap insert above.
+            object.write_data_property_offset_slot(key, value);
             if shape_changed {
                 if is_addition {
                     if let Some(offset) = offset {
@@ -33343,6 +33544,119 @@ mod tests {
             Some(host.objects.cell_id(stored_value).expect("target cell")),
             BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
         );
+    }
+
+    #[test]
+    fn offset_indexed_read_matches_hashmap_across_structure_transition() {
+        // Batch 2: the offset-indexed read of out_of_line_storage (the batch-3
+        // machine-code `mov reg <- [base + offset*8]` analog, JSObject::getDirect)
+        // must return exactly the authoritative HashMap value for a multi-property
+        // object, including after a structure transition adds a later property.
+        let mut host = CoreOpcodeDispatchHost::new();
+        let object = host.objects.allocate_with_prototype(None);
+
+        let key_a = CorePropertyKey::Identifier(100);
+        let key_b = CorePropertyKey::Identifier(101);
+        let key_c = CorePropertyKey::Identifier(102);
+        let value_a = RuntimeValue::from_i32(11);
+        let value_b = RuntimeValue::from_i32(22);
+        let value_c = RuntimeValue::from_i32(33);
+
+        host.objects.set_data_own(object, &key_a, value_a).unwrap();
+        host.objects.set_data_own(object, &key_b, value_b).unwrap();
+        let structure_before = object_structure_id(&host.objects, object);
+
+        // Helper: read a key via the offset-indexed Vec path and assert it equals the
+        // authoritative HashMap value.
+        let assert_offset_read_matches_hashmap =
+            |objects: &CoreObjectStore, key: &CorePropertyKey, identifier: u32| {
+                let cell = objects.find(object).expect("object cell");
+                let offset = cell.property_offset(key).expect("named data offset");
+                let offset_value = generated_property_load_cell_data_property_at_offset(
+                    cell,
+                    GeneratedPropertyLoadCoreKey::Identifier(identifier),
+                    offset,
+                );
+                let CorePropertyKind::Data(hashmap_value) =
+                    cell.properties.get(key).expect("hashmap property").kind
+                else {
+                    panic!("expected data property in authoritative HashMap");
+                };
+                assert_eq!(
+                    offset_value,
+                    Some(hashmap_value),
+                    "offset-indexed read must equal HashMap value"
+                );
+            };
+
+        // Both pre-transition properties read identically through the offset path.
+        assert_offset_read_matches_hashmap(&host.objects, &key_a, 100);
+        assert_offset_read_matches_hashmap(&host.objects, &key_b, 101);
+
+        // Structure transition: adding key_c changes the structure id (new shape).
+        host.objects.set_data_own(object, &key_c, value_c).unwrap();
+        let structure_after = object_structure_id(&host.objects, object);
+        assert_ne!(
+            structure_before, structure_after,
+            "adding a property must transition the structure id"
+        );
+
+        // After the transition every data property still reads identically, and the
+        // newly added one resolves through the offset path too.
+        assert_offset_read_matches_hashmap(&host.objects, &key_a, 100);
+        assert_offset_read_matches_hashmap(&host.objects, &key_b, 101);
+        assert_offset_read_matches_hashmap(&host.objects, &key_c, 102);
+
+        // An in-place value update of an existing property is reflected by the offset
+        // read (putDirectOffset lockstep on the DataOnlyReplace-style path).
+        let updated_a = RuntimeValue::from_i32(99);
+        host.objects
+            .set_data_own(object, &key_a, updated_a)
+            .unwrap();
+        let cell = host.objects.find(object).expect("object cell");
+        let offset_a = cell.property_offset(&key_a).expect("named data offset");
+        assert_eq!(
+            generated_property_load_cell_data_property_at_offset(
+                cell,
+                GeneratedPropertyLoadCoreKey::Identifier(100),
+                offset_a,
+            ),
+            Some(updated_a),
+        );
+    }
+
+    #[test]
+    fn offset_indexed_read_no_aliasing_across_64_property_boundary() {
+        // Regression for an offset_storage_index collision: the INLINE_CAPACITY==0 flat
+        // allocator emits offsets 0,1,2,...; a prior cut subtracted FIRST_OUT_OF_LINE_
+        // OFFSET(=64) for offsets >=64, aliasing offset 0 with offset 64, so the 65th
+        // property silently overwrote the 1st property's slot. Add >64 distinct data
+        // properties and assert each reads back its OWN value via the offset-indexed path.
+        let mut host = CoreOpcodeDispatchHost::new();
+        let object = host.objects.allocate_with_prototype(None);
+
+        const N: u32 = 70; // crosses the 64 boundary
+        for i in 0..N {
+            let key = CorePropertyKey::Identifier(1000 + i);
+            host.objects
+                .set_data_own(object, &key, RuntimeValue::from_i32(i as i32))
+                .unwrap();
+        }
+
+        for i in 0..N {
+            let key = CorePropertyKey::Identifier(1000 + i);
+            let cell = host.objects.find(object).expect("object cell");
+            let offset = cell.property_offset(&key).expect("named data offset");
+            assert_eq!(
+                generated_property_load_cell_data_property_at_offset(
+                    cell,
+                    GeneratedPropertyLoadCoreKey::Identifier(1000 + i),
+                    offset,
+                ),
+                Some(RuntimeValue::from_i32(i as i32)),
+                "property {i} must read its own value, not an aliased slot"
+            );
+        }
     }
 
     #[test]
