@@ -15010,7 +15010,7 @@ mod tests {
     #[test]
     fn p6_backend_contract_has_no_byte_artifact_or_code_block_side_effects() {
         let code_block = p6_lowering_code_block();
-        let entrypoints_before = *code_block.entrypoints();
+        let entrypoints_before = code_block.entrypoints().clone();
         let lifecycle_before = code_block.lifecycle();
         let proof = p6_lowering_proof(&code_block);
         let lowering = plan_p6_x86_64_baseline_lowering(P6X86_64BaselineLoweringRequest::new(
@@ -15031,9 +15031,9 @@ mod tests {
             P6X86_64BaselineLoweringCallableAuthority::NoCallableAuthority
         );
         assert_absent_artifacts(&contract.artifact_contract);
-        assert_eq!(*code_block.entrypoints(), entrypoints_before);
+        assert_eq!(code_block.entrypoints(), &entrypoints_before);
         assert_eq!(code_block.lifecycle(), lifecycle_before);
-        assert!(code_block.entrypoints().baseline_jit.is_none());
+        assert!(code_block.entrypoints().baseline_jit().is_none());
     }
 
     #[test]
@@ -15125,7 +15125,7 @@ mod tests {
     #[test]
     fn p6_instruction_selection_preserves_no_byte_no_callable_artifact_or_readiness_authority() {
         let code_block = p6_lowering_code_block();
-        let entrypoints_before = *code_block.entrypoints();
+        let entrypoints_before = code_block.entrypoints().clone();
         let lifecycle_before = code_block.lifecycle();
         let proof = p6_lowering_proof(&code_block);
         let lowering = plan_p6_x86_64_baseline_lowering(P6X86_64BaselineLoweringRequest::new(
@@ -15155,9 +15155,9 @@ mod tests {
             instruction.effects
                 == P6X86_64BaselineSelectedInstructionEffects::no_runtime_allocation_or_roots()
         }));
-        assert_eq!(*code_block.entrypoints(), entrypoints_before);
+        assert_eq!(code_block.entrypoints(), &entrypoints_before);
         assert_eq!(code_block.lifecycle(), lifecycle_before);
-        assert!(code_block.entrypoints().baseline_jit.is_none());
+        assert!(code_block.entrypoints().baseline_jit().is_none());
     }
 
     #[test]
@@ -17918,7 +17918,7 @@ mod tests {
     #[test]
     fn p6_lowering_has_no_byte_or_callability_side_effects() {
         let code_block = p6_lowering_code_block();
-        let entrypoints_before = *code_block.entrypoints();
+        let entrypoints_before = code_block.entrypoints().clone();
         let lifecycle_before = code_block.lifecycle();
         let proof = p6_lowering_proof(&code_block);
 
@@ -17937,9 +17937,9 @@ mod tests {
             result.callable_authority,
             P6X86_64BaselineLoweringCallableAuthority::NoCallableAuthority
         );
-        assert_eq!(*code_block.entrypoints(), entrypoints_before);
+        assert_eq!(code_block.entrypoints(), &entrypoints_before);
         assert_eq!(code_block.lifecycle(), lifecycle_before);
-        assert!(code_block.entrypoints().baseline_jit.is_none());
+        assert!(code_block.entrypoints().baseline_jit().is_none());
         assert_eq!(result.plan.operations.len(), 11);
     }
 

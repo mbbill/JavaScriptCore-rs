@@ -1,6 +1,11 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 use crate::gc::StructureId;
+use crate::jit::plan::BaselineBytecodeSnapshotFingerprint;
 use crate::runtime::{CodeBlockId, ExecutableId, GlobalObjectId, ScopeId};
 use crate::strings::{AtomId, Identifier, PropertyKey};
 use crate::value::JsValue;
@@ -534,8 +539,46 @@ pub struct CodeBlock {
     side_tables: LinkedSideTables,
     tier_state: CodeBlockTierState,
     entrypoints: CodeBlockEntrypoints,
-    lifecycle: CodeBlockLifecycleState,
+    // C++ JSC divergence (install-time interior mutability): C++ `installCode`
+    // (ScriptExecutable.cpp:121-186) mutates `m_jitCode`/`m_jitType` and the
+    // executable's tier/lifecycle IN PLACE through the shared `CodeBlock*`/
+    // `ScriptExecutable*` under the VM lock; there is no per-call copy. Rust
+    // shares one `Rc<CodeBlock>` (see `CodeBlockRecord`), so the three
+    // install-time fields baseline-JIT-installed mutates — `lifecycle`,
+    // `tier_state.current_tier`, and `entrypoints.baseline_jit` — are wrapped in
+    // `Cell` so `install_baseline_jit_slot` can mutate through `&self`. Only
+    // these three Copy fields are interior-mutable; the rest of `tier_state`/
+    // `entrypoints` stay plain data, so only the readers of these three fields
+    // use `.get()`, not every accessor of the parent structs.
+    lifecycle: Cell<CodeBlockLifecycleState>,
     mutation_authority: CodeBlockMutationAuthority,
+    // Memoized baseline-bytecode snapshot fingerprint.
+    //
+    // C++ JSC divergence: C++ JSC never re-hashes the bytecode stream to decide
+    // an artifact is valid. It establishes identity once at install/link and
+    // validates on the hot path by cheap pointer/enum/generation reads:
+    // CodeBlock::m_jitCode + const JITCode::m_jitType (CodeBlock.h:361,
+    // JITCode.h:256,308), PropertyInlineCache::m_cacheType + watchpoint/GC
+    // invalidation (PropertyInlineCache.h:207,391), and
+    // CallLinkInfo::isLinked()'s stored Mode (CallLinkInfo.h:124). Rust instead
+    // guards/keys baseline artifacts with
+    // `baseline_bytecode_snapshot_fingerprint_from_code_block`, which the
+    // profiler showed was a per-call O(N-instructions) re-hash on the hottest
+    // dispatch paths. Everything that fingerprint hashes is immutable after this
+    // CodeBlock is registered (the unlinked instruction stream + string literals
+    // live behind `Arc<UnlinkedCodeBlock>` with no `&mut` accessor; exception
+    // handler counts are link-fixed; root_map owner is stamped once at register;
+    // and the property-IC term hashes only a structural projection that the IC
+    // attach/clear mutators never flip). So Rust caches the compute-once value
+    // here, matching the C++ "establish identity once at link, never recompute"
+    // model. `Cell` gives interior-mutability memoization under the shared
+    // `&CodeBlock` borrow the hot fingerprint callers hold (the VM is
+    // single-threaded, `CodeBlockMutationAuthority::VmMainThread`). The builders
+    // (`&mut self`) and the per-call interior-mutable feedback mutators (`&self`,
+    // writing the `RefCell` IC table) that touch a hashed field call
+    // `invalidate_snapshot_fingerprint()` so the memo tracks the actual mutation
+    // surface rather than relying on the current structural-invariance fact.
+    snapshot_fingerprint: Cell<Option<BaselineBytecodeSnapshotFingerprint>>,
 }
 
 impl CodeBlock {
@@ -553,8 +596,9 @@ impl CodeBlock {
             side_tables,
             tier_state: CodeBlockTierState::default(),
             entrypoints: CodeBlockEntrypoints::default(),
-            lifecycle: CodeBlockLifecycleState::Linking,
+            lifecycle: Cell::new(CodeBlockLifecycleState::Linking),
             mutation_authority: CodeBlockMutationAuthority::VmMainThread,
+            snapshot_fingerprint: Cell::new(None),
         }
     }
 
@@ -590,6 +634,36 @@ impl CodeBlock {
         &self.side_tables
     }
 
+    /// Return the memoized baseline-bytecode snapshot fingerprint, computing it
+    /// once via `compute` on first use and caching the result.
+    ///
+    /// See the `snapshot_fingerprint` field comment for the C++ JSC divergence:
+    /// this replaces a per-call O(N) re-hash with compute-once identity, mirroring
+    /// C++ JSC's "establish identity at link, validate by pointer/enum/watchpoint"
+    /// model. Only the success value is cached; a decode failure is deterministic
+    /// on the immutable instruction stream, is not on the hot path, and simply
+    /// recomputes (and fails again) the next time.
+    pub(crate) fn cached_baseline_snapshot_fingerprint<E>(
+        &self,
+        compute: impl FnOnce() -> Result<BaselineBytecodeSnapshotFingerprint, E>,
+    ) -> Result<BaselineBytecodeSnapshotFingerprint, E> {
+        if let Some(cached) = self.snapshot_fingerprint.get() {
+            return Ok(cached);
+        }
+        let fingerprint = compute()?;
+        self.snapshot_fingerprint.set(Some(fingerprint));
+        Ok(fingerprint)
+    }
+
+    /// Drop the memoized snapshot fingerprint so the next read recomputes it.
+    ///
+    /// Called from every `&mut` path that touches a hashed field so the memo
+    /// tracks the actual mutation surface rather than relying on the current
+    /// invariant that the hashed projection happens to stay constant.
+    fn invalidate_snapshot_fingerprint(&self) {
+        self.snapshot_fingerprint.set(None);
+    }
+
     pub fn array_profile_for_bytecode_index(
         &self,
         bytecode_index: BytecodeIndex,
@@ -615,7 +689,7 @@ impl CodeBlock {
     }
 
     pub fn lifecycle(&self) -> CodeBlockLifecycleState {
-        self.lifecycle
+        self.lifecycle.get()
     }
 
     pub fn mutation_authority(&self) -> CodeBlockMutationAuthority {
@@ -634,6 +708,9 @@ impl CodeBlock {
 
     pub fn with_side_tables(mut self, side_tables: LinkedSideTables) -> Self {
         self.side_tables = side_tables;
+        // Replaces the side tables (root_maps + property-IC table feed the hashed
+        // side-table term); drop any memo cached against the old tables.
+        self.invalidate_snapshot_fingerprint();
         self
     }
 
@@ -646,27 +723,42 @@ impl CodeBlock {
         for root_map in &mut self.side_tables.root_maps {
             root_map.owner = Some(owner);
         }
+        // root_map.owner is a hashed field; clone+restamp (e.g. the stale-block
+        // re-registration path) would otherwise carry a stale memo from the clone.
+        self.invalidate_snapshot_fingerprint();
     }
 
     pub fn with_tier_state(mut self, tier_state: CodeBlockTierState) -> Self {
         self.tier_state = tier_state;
         let emission_policy = self.value_profile_emission_policy();
-        if self.side_tables.value_profiles.emission_policy != emission_policy {
-            self.side_tables.value_profiles.emission_policy = emission_policy;
-            self.side_tables
-                .value_profiles
-                .materialize_jit_storage_from_profiles();
+        {
+            let mut value_profiles = self.side_tables.value_profiles.borrow_mut();
+            if value_profiles.emission_policy != emission_policy {
+                value_profiles.emission_policy = emission_policy;
+                value_profiles.materialize_jit_storage_from_profiles();
+            }
         }
+        // Value profiles are not hashed today, but this builder mutates side_tables
+        // and runs during construction; invalidate defensively so no half-built memo
+        // survives.
+        self.invalidate_snapshot_fingerprint();
         self
     }
 
-    pub fn with_lifecycle(mut self, lifecycle: CodeBlockLifecycleState) -> Self {
-        self.lifecycle = lifecycle;
+    pub fn with_lifecycle(self, lifecycle: CodeBlockLifecycleState) -> Self {
+        self.lifecycle.set(lifecycle);
         self
     }
 
+    // C++ JSC divergence (install through shared instance): C++ `installCode`
+    // (ScriptExecutable.cpp:121-186) installs the baseline JIT artifact by
+    // mutating `m_jitCode`/`m_jitType` and the executable's tier/lifecycle IN
+    // PLACE through the shared `CodeBlock*`, never by copying. Rust shares one
+    // `Rc<CodeBlock>`, so this mutates the three Copy install-time fields
+    // (`entrypoints.baseline_jit`, `tier_state.current_tier`, `lifecycle`)
+    // through their `Cell`s under `&self`, exactly mirroring the in-place install.
     pub fn install_baseline_jit_slot(
-        &mut self,
+        &self,
         authority: CodeBlockMutationAuthority,
         slot: JitCodeSlot,
     ) -> Result<(), CodeBlockMutationError> {
@@ -685,21 +777,27 @@ impl CodeBlock {
         }
 
         let expected_lifecycle = CodeBlockLifecycleState::LinkedInterpreter;
-        if self.lifecycle != expected_lifecycle {
+        if self.lifecycle.get() != expected_lifecycle {
             return Err(CodeBlockMutationError::InvalidLifecycle {
                 expected: expected_lifecycle,
-                actual: self.lifecycle,
+                actual: self.lifecycle.get(),
             });
         }
 
-        self.entrypoints.baseline_jit = Some(slot);
-        self.tier_state.current_tier = ExecutionTier::BaselineJit;
-        self.lifecycle = CodeBlockLifecycleState::BaselineInstalled;
+        self.entrypoints.baseline_jit.set(Some(slot));
+        self.tier_state.current_tier.set(ExecutionTier::BaselineJit);
+        self.lifecycle
+            .set(CodeBlockLifecycleState::BaselineInstalled);
         Ok(())
     }
 
+    // C++ JSC divergence: value-profile sampling mutates `m_metadata` through the
+    // shared `CodeBlock*` on the hot return path, with no per-call copy. Rust shares
+    // one `Rc<CodeBlock>`, so this takes `&self` and writes through the
+    // interior-mutable `value_profiles` `RefCell`. Value profiles are not hashed by
+    // the snapshot fingerprint, so no memo invalidation is needed here.
     pub fn record_value_profile_sample(
-        &mut self,
+        &self,
         authority: CodeBlockMutationAuthority,
         bytecode_index: BytecodeIndex,
         checkpoint: Checkpoint,
@@ -720,7 +818,7 @@ impl CodeBlock {
             });
         }
 
-        match self.lifecycle {
+        match self.lifecycle.get() {
             CodeBlockLifecycleState::LinkedInterpreter
             | CodeBlockLifecycleState::BaselineInstalled => {}
             actual => {
@@ -732,7 +830,7 @@ impl CodeBlock {
         }
 
         self.side_tables
-            .value_profiles
+            .value_profiles_mut()
             .record_sample(bytecode_index, checkpoint, kind, value)
             .map_err(CodeBlockMutationError::ValueProfileSample)
     }
@@ -758,7 +856,7 @@ impl CodeBlock {
             });
         }
 
-        match self.lifecycle {
+        match self.lifecycle.get() {
             CodeBlockLifecycleState::LinkedInterpreter
             | CodeBlockLifecycleState::BaselineInstalled => {}
             actual => {
@@ -781,8 +879,11 @@ impl CodeBlock {
         Ok(Some(*profile))
     }
 
+    // C++ JSC divergence: IC attach mutates the shared `CodeBlock`'s metadata
+    // through `CodeBlock*`. Rust shares one `Rc<CodeBlock>`, so this takes `&self`
+    // and mutates through the interior-mutable `inline_caches` `RefCell`.
     pub fn attach_property_inline_cache_case(
-        &mut self,
+        &self,
         authority: CodeBlockMutationAuthority,
         request: PropertyInlineCacheAttachmentRequest,
     ) -> PropertyInlineCacheAttachmentResult {
@@ -804,7 +905,7 @@ impl CodeBlock {
             );
         }
 
-        match self.lifecycle {
+        match self.lifecycle.get() {
             CodeBlockLifecycleState::LinkedInterpreter
             | CodeBlockLifecycleState::BaselineInstalled => {}
             actual => {
@@ -813,12 +914,19 @@ impl CodeBlock {
         }
 
         validate_property_inline_cache_attachment_request(
-            &self.side_tables.inline_caches,
+            &self.side_tables.inline_caches.borrow(),
             &request,
         )?;
 
+        // The property-IC table feeds the hashed side-table term; drop the memo so
+        // the next fingerprint read reflects this attach. The hashed projection is
+        // invariant under attach today, but invalidating keeps the memo tracking the
+        // real mutation surface (see the field comment).
+        self.invalidate_snapshot_fingerprint();
+
+        let mut inline_caches = self.side_tables.inline_caches.borrow_mut();
         let (state, dispatch) = {
-            let cache = &mut self.side_tables.inline_caches.property_accesses[request.slot];
+            let cache = &mut inline_caches.property_accesses[request.slot];
             cache.state = InlineCacheState::Monomorphic;
             cache.dispatch = request.dispatch;
             match request.attachment_kind {
@@ -879,8 +987,8 @@ impl CodeBlock {
 
         let structure_stub_index =
             if request.stub_mode == PropertyInlineCacheStubMode::StructureStub {
-                let index = self.side_tables.inline_caches.structure_stubs.len();
-                self.side_tables.inline_caches.structure_stubs.push(
+                let index = inline_caches.structure_stubs.len();
+                inline_caches.structure_stubs.push(
                     structure_stub_info_for_property_inline_cache_request(&request),
                 );
                 Some(index)
@@ -904,8 +1012,11 @@ impl CodeBlock {
         })
     }
 
+    // C++ JSC divergence: IC clear mutates the shared `CodeBlock`'s metadata
+    // through `CodeBlock*`; Rust mutates through the interior-mutable
+    // `inline_caches` `RefCell` under `&self` since the instance is shared by `Rc`.
     pub fn clear_property_inline_cache_case(
-        &mut self,
+        &self,
         authority: CodeBlockMutationAuthority,
         request: PropertyInlineCacheClearRequest,
     ) -> PropertyInlineCacheClearResult {
@@ -923,7 +1034,7 @@ impl CodeBlock {
             });
         }
 
-        match self.lifecycle {
+        match self.lifecycle.get() {
             CodeBlockLifecycleState::LinkedInterpreter
             | CodeBlockLifecycleState::BaselineInstalled => {}
             actual => {
@@ -931,9 +1042,19 @@ impl CodeBlock {
             }
         }
 
-        validate_property_inline_cache_clear_request(&self.side_tables.inline_caches, &request)?;
+        validate_property_inline_cache_clear_request(
+            &self.side_tables.inline_caches.borrow(),
+            &request,
+        )?;
 
-        let cache = &mut self.side_tables.inline_caches.property_accesses[request.slot];
+        // The property-IC table feeds the hashed side-table term; drop the memo so
+        // the next fingerprint read reflects this clear. The hashed projection is
+        // invariant under clear today, but invalidating keeps the memo tracking the
+        // real mutation surface (see the field comment).
+        self.invalidate_snapshot_fingerprint();
+
+        let mut inline_caches = self.side_tables.inline_caches.borrow_mut();
+        let cache = &mut inline_caches.property_accesses[request.slot];
         // Metadata-only clears return the slot to the cold interpreter state. There is
         // no native patch to disable here, and `Unset` allows a later validated
         // observation to attach fresh metadata instead of preserving stale guards.
@@ -962,8 +1083,10 @@ impl CodeBlock {
                 });
             }
         }
+        let cache_state = cache.state;
+        let cache_dispatch = cache.dispatch;
         if let Some(structure_stub_index) = request.structure_stub_index {
-            let stub = &mut self.side_tables.inline_caches.structure_stubs[structure_stub_index];
+            let stub = &mut inline_caches.structure_stubs[structure_stub_index];
             stub.cache_state = InlineCacheState::Unset;
             stub.access_cases.clear();
         }
@@ -973,8 +1096,8 @@ impl CodeBlock {
             bytecode_index: request.bytecode_index,
             key: request.key,
             attachment_kind: request.attachment_kind,
-            state: cache.state,
-            dispatch: cache.dispatch,
+            state: cache_state,
+            dispatch: cache_dispatch,
             base_structure: request.base_structure,
             holder_structure: request.holder_structure,
             new_structure: request.new_structure,
@@ -984,8 +1107,11 @@ impl CodeBlock {
         })
     }
 
+    // C++ JSC divergence: structure-stub linking mutates the shared `CodeBlock`'s
+    // metadata through `CodeBlock*`; Rust mutates through the interior-mutable
+    // `inline_caches` `RefCell` under `&self` since the instance is shared by `Rc`.
     pub fn link_structure_stub_access_case(
-        &mut self,
+        &self,
         authority: CodeBlockMutationAuthority,
         request: StructureStubAccessCaseLinkRequest,
     ) -> StructureStubAccessCaseLinkResult {
@@ -1003,7 +1129,7 @@ impl CodeBlock {
             });
         }
 
-        match self.lifecycle {
+        match self.lifecycle.get() {
             CodeBlockLifecycleState::LinkedInterpreter
             | CodeBlockLifecycleState::BaselineInstalled => {}
             actual => {
@@ -1012,18 +1138,19 @@ impl CodeBlock {
         }
 
         validate_structure_stub_access_case_link_request(
-            &self.side_tables.inline_caches,
+            &self.side_tables.inline_caches.borrow(),
             &request,
         )?;
 
-        let stub =
-            &mut self.side_tables.inline_caches.structure_stubs[request.structure_stub_index];
+        let mut inline_caches = self.side_tables.inline_caches.borrow_mut();
+        let stub = &mut inline_caches.structure_stubs[request.structure_stub_index];
         let inserted = if stub.access_cases.contains(&request.access_case_ref) {
             false
         } else {
             stub.access_cases.push(request.access_case_ref);
             true
         };
+        let access_case_count = stub.access_cases.len();
 
         Ok(StructureStubAccessCaseLinkOutcome {
             structure_stub_index: request.structure_stub_index,
@@ -1037,7 +1164,7 @@ impl CodeBlock {
             offset: request.offset,
             access_case_ref: request.access_case_ref,
             inserted,
-            access_case_count: stub.access_cases.len(),
+            access_case_count,
         })
     }
 
@@ -1045,7 +1172,7 @@ impl CodeBlock {
         &self,
         request: PropertyInlineCacheAttachedMetadataRequest,
     ) -> PropertyInlineCacheAttachedMetadataResult {
-        match self.lifecycle {
+        match self.lifecycle.get() {
             CodeBlockLifecycleState::LinkedInterpreter
             | CodeBlockLifecycleState::BaselineInstalled => {}
             actual => {
@@ -1054,7 +1181,7 @@ impl CodeBlock {
         }
 
         validate_property_inline_cache_attached_metadata_request(
-            &self.side_tables.inline_caches,
+            &self.side_tables.inline_caches.borrow(),
             &request,
         )?;
 
@@ -1072,8 +1199,11 @@ impl CodeBlock {
         })
     }
 
+    // C++ JSC divergence: call-link IC attach mutates the shared `CodeBlock`'s
+    // metadata through `CodeBlock*`; Rust mutates through the interior-mutable
+    // `inline_caches` `RefCell` under `&self` since the instance is shared by `Rc`.
     pub fn attach_call_link_inline_cache(
-        &mut self,
+        &self,
         authority: CodeBlockMutationAuthority,
         request: CallLinkInlineCacheAttachmentRequest,
     ) -> CallLinkInlineCacheAttachmentResult {
@@ -1095,7 +1225,7 @@ impl CodeBlock {
             );
         }
 
-        match self.lifecycle {
+        match self.lifecycle.get() {
             CodeBlockLifecycleState::LinkedInterpreter
             | CodeBlockLifecycleState::BaselineInstalled => {}
             actual => {
@@ -1104,40 +1234,45 @@ impl CodeBlock {
         }
 
         validate_call_link_inline_cache_attachment_request(
-            &self.side_tables.inline_caches,
+            &self.side_tables.inline_caches.borrow(),
             self.unlinked.as_ref(),
             &request,
         )?;
 
         let target = call_target_for_call_link_inline_cache_attachment_request(&request);
-        let (mode, target, slow_path_count, max_argument_count_including_this_for_varargs) = {
-            let call = &mut self.side_tables.inline_caches.calls[request.slot];
-            call.mode = CallLinkMode::Monomorphic;
-            call.target = target;
-            (
-                call.mode,
-                call.target.clone(),
-                call.slow_path_count,
-                call.max_argument_count_including_this_for_varargs,
-            )
-        };
+        let mut inline_caches = self.side_tables.inline_caches.borrow_mut();
+        let call = &mut inline_caches.calls[request.slot];
+        call.mode = CallLinkMode::Monomorphic;
+        call.target = target;
+        let mode = call.mode;
+        let target = call.target.clone();
+        let slow_path_count = call.slow_path_count;
+        let max_argument_count_including_this_for_varargs =
+            call.max_argument_count_including_this_for_varargs;
+        let call_site = call.call_site;
+        let opcode = call.opcode;
+        let call_type = call.call_type;
+        let specialization = call.specialization;
 
         Ok(CallLinkInlineCacheAttachmentOutcome {
             slot: request.slot,
             bytecode_index: request.bytecode_index,
-            call_site: self.side_tables.inline_caches.calls[request.slot].call_site,
-            opcode: self.side_tables.inline_caches.calls[request.slot].opcode,
-            call_type: self.side_tables.inline_caches.calls[request.slot].call_type,
+            call_site,
+            opcode,
+            call_type,
             mode,
-            specialization: self.side_tables.inline_caches.calls[request.slot].specialization,
+            specialization,
             target,
             slow_path_count,
             max_argument_count_including_this_for_varargs,
         })
     }
 
+    // C++ JSC divergence: call-link IC clear (relink/jettison) mutates the shared
+    // `CodeBlock`'s metadata through `CodeBlock*`; Rust mutates through the
+    // interior-mutable `inline_caches` `RefCell` under `&self` (instance shared by `Rc`).
     pub fn clear_call_link_inline_cache(
-        &mut self,
+        &self,
         authority: CodeBlockMutationAuthority,
         request: CallLinkInlineCacheClearRequest,
     ) -> CallLinkInlineCacheClearResult {
@@ -1155,7 +1290,7 @@ impl CodeBlock {
             });
         }
 
-        match self.lifecycle {
+        match self.lifecycle.get() {
             CodeBlockLifecycleState::LinkedInterpreter
             | CodeBlockLifecycleState::BaselineInstalled => {}
             actual => {
@@ -1164,11 +1299,12 @@ impl CodeBlock {
         }
 
         validate_call_link_inline_cache_clear_request(
-            &self.side_tables.inline_caches,
+            &self.side_tables.inline_caches.borrow(),
             self.unlinked.as_ref(),
             &request,
         )?;
 
+        let mut inline_caches = self.side_tables.inline_caches.borrow_mut();
         let (
             call_site,
             opcode,
@@ -1179,7 +1315,7 @@ impl CodeBlock {
             slow_path_count,
             max_argument_count_including_this_for_varargs,
         ) = {
-            let call = &mut self.side_tables.inline_caches.calls[request.slot];
+            let call = &mut inline_caches.calls[request.slot];
             let (call_type, specialization) = call_link_descriptor_shape_for_opcode(call.opcode)
                 .ok_or(CallLinkInlineCacheClearError::UnsupportedOpcode {
                     slot: request.slot,
@@ -1222,7 +1358,7 @@ impl CodeBlock {
         &self,
         request: CallLinkInlineCacheAttachedMetadataRequest,
     ) -> CallLinkInlineCacheAttachedMetadataResult {
-        match self.lifecycle {
+        match self.lifecycle.get() {
             CodeBlockLifecycleState::LinkedInterpreter
             | CodeBlockLifecycleState::BaselineInstalled => {}
             actual => {
@@ -1231,12 +1367,13 @@ impl CodeBlock {
         }
 
         validate_call_link_inline_cache_attached_metadata_request(
-            &self.side_tables.inline_caches,
+            &self.side_tables.inline_caches.borrow(),
             self.unlinked.as_ref(),
             &request,
         )?;
 
-        let call = &self.side_tables.inline_caches.calls[request.slot];
+        let inline_caches = self.side_tables.inline_caches.borrow();
+        let call = &inline_caches.calls[request.slot];
         Ok(CallLinkInlineCacheAttachedMetadata {
             slot: request.slot,
             bytecode_index: request.bytecode_index,
@@ -1274,12 +1411,13 @@ impl CodeBlock {
         UnlinkedToLinkedBytecodeRecord {
             context: self.link_context.clone(),
             unlinked_phase: self.unlinked.phase(),
-            linked_lifecycle: self.lifecycle,
+            linked_lifecycle: self.lifecycle.get(),
             instruction_count: self.unlinked.instructions().instruction_count() as u32,
             unlinked_metadata_entries: self.unlinked.metadata().entries().len() as u32,
             linked_metadata_entries: self.metadata.entries().len() as u32,
             root_map_count: self.side_tables.root_maps.len() as u32,
-            value_profile_root_count: self.side_tables.value_profiles.root_metadata.len() as u32,
+            value_profile_root_count: self.side_tables.value_profiles.borrow().root_metadata.len()
+                as u32,
             has_interpreter_entry: self.entrypoints.interpreter.is_some(),
         }
     }
@@ -2757,16 +2895,16 @@ fn linked_side_tables_from_unlinked(unlinked: &UnlinkedCodeBlock) -> LinkedSideT
         code_origins: unlinked_side_tables.code_origins.clone(),
         exception_handlers: unlinked_side_tables.exception_handlers.clone(),
         root_maps: unlinked_side_tables.root_maps.clone(),
-        inline_caches: InlineCacheTable {
+        inline_caches: RefCell::new(InlineCacheTable {
             property_accesses: derive_property_inline_caches(unlinked),
             calls: derive_call_link_inline_caches(unlinked),
             ..InlineCacheTable::default()
-        },
+        }),
         array_profiles: derive_simple_array_profiles(unlinked),
-        value_profiles: derive_call_result_value_profiles(
+        value_profiles: RefCell::new(derive_call_result_value_profiles(
             unlinked,
             ValueProfileEmissionPolicy::default(),
-        ),
+        )),
         ..LinkedSideTables::default()
     }
 }
@@ -3327,19 +3465,73 @@ pub struct UnlinkedSideTables {
     pub root_maps: Vec<BytecodeRootMap>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct LinkedSideTables {
     pub handlers: Vec<HandlerInfo>,
     pub call_sites: Vec<CallSiteRecord>,
     pub code_origins: CodeOriginTable,
     pub exception_handlers: ExceptionHandlerTable,
     pub bytecode_hooks: BytecodeHookTable,
-    pub inline_caches: InlineCacheTable,
+    // C++ JSC divergence: in C++ the inline-cache state and value profiles live in
+    // the metadata of the single stable CodeBlock heap object and are mutated in
+    // place through a shared `CodeBlock*` (under the VM lock) on the runtime
+    // feedback path -- there is no per-call copy. Rust now shares one stable
+    // `Rc<CodeBlock>` per (executable, specialization) (see the
+    // `CodeBlockRecord`/`InterpreterFunctionCodeBlock` divergence comments), so the
+    // feedback path can no longer take `&mut CodeBlock`. These two tables -- the only
+    // post-link, per-call-mutated side tables -- are therefore interior-mutable so
+    // the IC attach/clear and value-profile writes go through `&CodeBlock`, exactly
+    // as C++ mutates `m_metadata`/IC state through `CodeBlock*`. All other side
+    // tables are link-fixed and stay plain.
+    pub inline_caches: RefCell<InlineCacheTable>,
     pub array_profiles: Vec<ArrayProfile>,
-    pub value_profiles: ValueProfileTable,
+    pub value_profiles: RefCell<ValueProfileTable>,
     pub root_maps: Vec<BytecodeRootMap>,
     pub direct_eval_cache: Option<DirectEvalCacheRef>,
     pub catch_liveness: Vec<CatchLivenessRecord>,
+}
+
+// `RefCell` is neither `Eq` nor `PartialEq`; compare through a short borrow so the
+// interior-mutable tables still participate in structural equality (used by tests
+// and the request-struct fallback comparison).
+impl PartialEq for LinkedSideTables {
+    fn eq(&self, other: &Self) -> bool {
+        self.handlers == other.handlers
+            && self.call_sites == other.call_sites
+            && self.code_origins == other.code_origins
+            && self.exception_handlers == other.exception_handlers
+            && self.bytecode_hooks == other.bytecode_hooks
+            && *self.inline_caches.borrow() == *other.inline_caches.borrow()
+            && self.array_profiles == other.array_profiles
+            && *self.value_profiles.borrow() == *other.value_profiles.borrow()
+            && self.root_maps == other.root_maps
+            && self.direct_eval_cache == other.direct_eval_cache
+            && self.catch_liveness == other.catch_liveness
+    }
+}
+
+impl Eq for LinkedSideTables {}
+
+impl LinkedSideTables {
+    /// Shared read borrow of the interior-mutable inline-cache table.
+    pub fn inline_caches(&self) -> std::cell::Ref<'_, InlineCacheTable> {
+        self.inline_caches.borrow()
+    }
+
+    /// Exclusive borrow of the interior-mutable inline-cache table.
+    pub fn inline_caches_mut(&self) -> std::cell::RefMut<'_, InlineCacheTable> {
+        self.inline_caches.borrow_mut()
+    }
+
+    /// Shared read borrow of the interior-mutable value-profile table.
+    pub fn value_profiles(&self) -> std::cell::Ref<'_, ValueProfileTable> {
+        self.value_profiles.borrow()
+    }
+
+    /// Exclusive borrow of the interior-mutable value-profile table.
+    pub fn value_profiles_mut(&self) -> std::cell::RefMut<'_, ValueProfileTable> {
+        self.value_profiles.borrow_mut()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3549,12 +3741,38 @@ pub enum CodeSpecialization {
     Construct,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+// C++ JSC divergence (install-time interior mutability): `baseline_jit` is one
+// of the three install-time fields `installCode` mutates in place through the
+// shared `CodeBlock*` (see the `CodeBlock::lifecycle` field comment). Rust shares
+// one `Rc<CodeBlock>`, so this single field is a `Cell` to allow the in-place
+// install under `&self`; the other two fields stay plain data. Wrapping one field
+// in `Cell` removes the `Copy`/`Eq`/`PartialEq`/`Hash` derives, so `PartialEq`
+// (used by the call-request structural comparison) is implemented by hand over
+// `.get()`; `Hash` is unused on this type.
+#[derive(Clone, Debug, Default)]
 pub struct CodeBlockEntrypoints {
     pub interpreter: Option<InterpreterEntrySlot>,
-    pub baseline_jit: Option<JitCodeSlot>,
+    pub baseline_jit: Cell<Option<JitCodeSlot>>,
     pub optimizing_jit: Option<JitCodeSlot>,
 }
+
+impl CodeBlockEntrypoints {
+    /// Currently-installed baseline JIT entry slot (interior-mutable; see the
+    /// type comment for the C++ in-place-install divergence).
+    pub fn baseline_jit(&self) -> Option<JitCodeSlot> {
+        self.baseline_jit.get()
+    }
+}
+
+impl PartialEq for CodeBlockEntrypoints {
+    fn eq(&self, other: &Self) -> bool {
+        self.interpreter == other.interpreter
+            && self.baseline_jit.get() == other.baseline_jit.get()
+            && self.optimizing_jit == other.optimizing_jit
+    }
+}
+
+impl Eq for CodeBlockEntrypoints {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(transparent)]
@@ -3564,19 +3782,50 @@ pub struct InterpreterEntrySlot(pub u32);
 #[repr(transparent)]
 pub struct JitCodeSlot(pub u32);
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// C++ JSC divergence (install-time interior mutability): `current_tier` is one of
+// the three install-time fields `installCode` mutates in place through the shared
+// `CodeBlock*` (see the `CodeBlock::lifecycle` field comment). Rust shares one
+// `Rc<CodeBlock>`, so this single field is a `Cell` to allow the in-place install
+// under `&self`; the remaining counters/flags stay plain data. The `Cell` removes
+// the `Eq`/`PartialEq` derives, so equality is implemented by hand over `.get()`.
+#[derive(Clone, Debug, Default)]
 pub struct CodeBlockTierState {
     pub llint_counter: TierCounterState,
     pub baseline_counter: TierCounterState,
     pub optimizing_counter: TierCounterState,
     pub profiling_counters: ProfilingCounterSet,
     pub value_profile_emission_capability: ValueProfileEmissionCapability,
-    pub current_tier: ExecutionTier,
+    pub current_tier: Cell<ExecutionTier>,
     pub replacement: Option<CodeBlockId>,
     pub osr_exit_count: u32,
     pub did_fail_jit: bool,
     pub did_fail_ftl: bool,
 }
+
+impl CodeBlockTierState {
+    /// Currently-active execution tier (interior-mutable; see the type comment
+    /// for the C++ in-place-install divergence).
+    pub fn current_tier(&self) -> ExecutionTier {
+        self.current_tier.get()
+    }
+}
+
+impl PartialEq for CodeBlockTierState {
+    fn eq(&self, other: &Self) -> bool {
+        self.llint_counter == other.llint_counter
+            && self.baseline_counter == other.baseline_counter
+            && self.optimizing_counter == other.optimizing_counter
+            && self.profiling_counters == other.profiling_counters
+            && self.value_profile_emission_capability == other.value_profile_emission_capability
+            && self.current_tier.get() == other.current_tier.get()
+            && self.replacement == other.replacement
+            && self.osr_exit_count == other.osr_exit_count
+            && self.did_fail_jit == other.did_fail_jit
+            && self.did_fail_ftl == other.did_fail_ftl
+    }
+}
+
+impl Eq for CodeBlockTierState {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct TierCounterState {
@@ -4022,8 +4271,9 @@ mod tests {
         let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
         let cache = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .cloned()
             .expect("GetByName property IC metadata");
 
         assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
@@ -4050,8 +4300,9 @@ mod tests {
             )]);
         let cache = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .cloned()
             .expect("GetGlobalObjectProperty property IC metadata");
 
         assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
@@ -4096,8 +4347,9 @@ mod tests {
         let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
         let cache = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .cloned()
             .expect("PutByName property IC metadata");
 
         assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
@@ -4124,8 +4376,9 @@ mod tests {
             )]);
         let cache = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .cloned()
             .expect("PutGlobalObjectProperty property IC metadata");
 
         assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
@@ -4152,8 +4405,9 @@ mod tests {
         )]);
         let cache = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .cloned()
             .expect("GetByValue property IC metadata");
 
         assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
@@ -4178,8 +4432,9 @@ mod tests {
         )]);
         let cache = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .cloned()
             .expect("PutByValue property IC metadata");
 
         assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
@@ -4204,8 +4459,9 @@ mod tests {
         )]);
         let cache = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .cloned()
             .expect("InById property IC metadata");
 
         assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
@@ -4232,8 +4488,9 @@ mod tests {
         )]);
         let cache = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .cloned()
             .expect("InByVal property IC metadata");
 
         assert_eq!(cache.bytecode_index, BytecodeIndex::from_offset(0));
@@ -4310,13 +4567,18 @@ mod tests {
             .with_phase(UnlinkedCodeBlockPhase::Finalized);
 
         let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
-        let caches = &code_block.side_tables().inline_caches.property_accesses;
+        let caches = code_block
+            .side_tables()
+            .inline_caches()
+            .property_accesses
+            .clone();
         assert_eq!(caches.len(), 5);
 
         let load = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .cloned()
             .expect("GetByName property IC metadata");
         assert_eq!(load.access, PropertyAccessType::GetById);
         assert_eq!(load.kind, PropertyCacheKind::GetById);
@@ -4326,8 +4588,9 @@ mod tests {
 
         let store = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(1))
+            .cloned()
             .expect("PutByName property IC metadata");
         assert_eq!(store.access, PropertyAccessType::PutByIdSloppy);
         assert_eq!(store.kind, PropertyCacheKind::PutById);
@@ -4337,8 +4600,9 @@ mod tests {
 
         let global_store = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(2))
+            .cloned()
             .expect("PutGlobalObjectProperty property IC metadata");
         assert_eq!(global_store.access, PropertyAccessType::PutByIdSloppy);
         assert_eq!(global_store.kind, PropertyCacheKind::PutById);
@@ -4348,8 +4612,9 @@ mod tests {
 
         let value_load = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(3))
+            .cloned()
             .expect("GetByValue property IC metadata");
         assert_eq!(value_load.access, PropertyAccessType::GetByVal);
         assert_eq!(value_load.kind, PropertyCacheKind::GetByVal);
@@ -4361,8 +4626,9 @@ mod tests {
 
         let value_store = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_access_for_bytecode_index(BytecodeIndex::from_offset(4))
+            .cloned()
             .expect("PutByValue property IC metadata");
         assert_eq!(value_store.access, PropertyAccessType::PutByValSloppy);
         assert_eq!(value_store.kind, PropertyCacheKind::PutByVal);
@@ -4397,13 +4663,14 @@ mod tests {
             ),
         ]);
 
-        let caches = &code_block.side_tables().inline_caches.calls;
+        let caches = code_block.side_tables().inline_caches().calls.clone();
         assert_eq!(caches.len(), 3);
 
         let call = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .call_for_bytecode_index(BytecodeIndex::from_offset(10))
+            .cloned()
             .expect("Call link IC metadata");
         assert_eq!(call.call_site, CallSiteIndex(10));
         assert_eq!(call.bytecode_index, BytecodeIndex::from_offset(10));
@@ -4416,8 +4683,9 @@ mod tests {
 
         let (slot, call_with_this) = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .call_slot_for_bytecode_index(BytecodeIndex::from_offset(20))
+            .map(|(slot, call)| (slot, call.clone()))
             .expect("CallWithThis link IC metadata");
         assert_eq!(slot, 1);
         assert_eq!(call_with_this.call_site, CallSiteIndex(20));
@@ -4428,8 +4696,9 @@ mod tests {
 
         let (slot, construct) = code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .call_slot_for_bytecode_index(BytecodeIndex::from_offset(30))
+            .map(|(slot, call)| (slot, call.clone()))
             .expect("Construct link IC metadata");
         assert_eq!(slot, 2);
         assert_eq!(construct.call_site, CallSiteIndex(30));
@@ -4464,7 +4733,7 @@ mod tests {
             ),
         ]);
 
-        let profiles = &code_block.side_tables().value_profiles;
+        let profiles = code_block.side_tables().value_profiles().clone();
         assert_eq!(profiles.profiles.len(), 2);
         assert_eq!(profiles.unlinked_predictions.len(), 2);
         assert!(
@@ -4552,7 +4821,7 @@ mod tests {
         });
         let target = code_block
             .side_tables()
-            .value_profiles
+            .value_profiles()
             .jit_store_target(
                 BytecodeIndex::from_offset(10),
                 Checkpoint::NONE,
@@ -4571,7 +4840,7 @@ mod tests {
 
     #[test]
     fn code_block_attaches_metadata_only_call_link_inline_cache() {
-        let mut code_block = linked_call_link_code_block(vec![call_instruction(
+        let code_block = linked_call_link_code_block(vec![call_instruction(
             10,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -4605,7 +4874,7 @@ mod tests {
         assert_eq!(metadata.mode, CallLinkMode::Monomorphic);
         assert_eq!(metadata.target, expected_target);
 
-        let call = &code_block.side_tables().inline_caches.calls[0];
+        let call = code_block.side_tables().inline_caches().calls[0].clone();
         assert_eq!(call.mode, CallLinkMode::Monomorphic);
         assert_eq!(call.target, expected_target);
         assert_eq!(call.slow_path_count, 0);
@@ -4614,7 +4883,7 @@ mod tests {
 
     #[test]
     fn code_block_rejects_call_link_inline_cache_attachment_without_mutation() {
-        let mut code_block = linked_call_link_code_block(vec![call_instruction(
+        let code_block = linked_call_link_code_block(vec![call_instruction(
             10,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -4623,7 +4892,7 @@ mod tests {
         let mut request =
             call_link_attachment_request(0, BytecodeIndex::from_offset(10), CoreOpcode::Call);
         request.target = CallTarget::DirectExecutable(ExecutableId(CellId(99)));
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .attach_call_link_inline_cache(CodeBlockMutationAuthority::VmMainThread, request)
@@ -4635,7 +4904,7 @@ mod tests {
                 actual: CallTarget::DirectExecutable(ExecutableId(CellId(99))),
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
 
         let request =
             call_link_attachment_request(0, BytecodeIndex::from_offset(10), CoreOpcode::Call);
@@ -4645,7 +4914,7 @@ mod tests {
                 request.clone(),
             )
             .expect("initial call link metadata attachment succeeds");
-        let before_duplicate = code_block.side_tables().inline_caches.clone();
+        let before_duplicate = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .attach_call_link_inline_cache(CodeBlockMutationAuthority::VmMainThread, request)
@@ -4659,12 +4928,15 @@ mod tests {
                 actual: CallLinkMode::Monomorphic,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before_duplicate);
+        assert_eq!(
+            &*code_block.side_tables().inline_caches(),
+            &before_duplicate
+        );
     }
 
     #[test]
     fn code_block_clears_metadata_only_call_link_inline_cache() {
-        let mut code_block = linked_call_link_code_block(vec![
+        let code_block = linked_call_link_code_block(vec![
             call_instruction(
                 10,
                 VirtualRegister::local(0),
@@ -4690,7 +4962,7 @@ mod tests {
             )
             .expect("initial call link metadata attachment succeeds");
 
-        let before_clear = code_block.side_tables().inline_caches.clone();
+        let before_clear = code_block.side_tables().inline_caches().clone();
         assert_eq!(before_clear.calls[0].target, attached_target);
 
         let outcome = code_block
@@ -4711,7 +4983,7 @@ mod tests {
         assert_eq!(outcome.slow_path_count, 0);
         assert_eq!(outcome.max_argument_count_including_this_for_varargs, 0);
 
-        let after_clear = &code_block.side_tables().inline_caches;
+        let after_clear = code_block.side_tables().inline_caches().clone();
         assert_eq!(
             after_clear.property_accesses,
             before_clear.property_accesses
@@ -4739,7 +5011,7 @@ mod tests {
 
     #[test]
     fn code_block_clears_metadata_only_construct_link_inline_cache_to_construct_shape() {
-        let mut code_block = linked_call_link_code_block(vec![construct_instruction(
+        let code_block = linked_call_link_code_block(vec![construct_instruction(
             30,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -4767,7 +5039,7 @@ mod tests {
         assert_eq!(outcome.specialization, CodeSpecialization::Construct);
         assert_eq!(outcome.target, CallTarget::Unlinked);
 
-        let call = &code_block.side_tables().inline_caches.calls[0];
+        let call = code_block.side_tables().inline_caches().calls[0].clone();
         assert_eq!(call.opcode, CoreOpcode::Construct);
         assert_eq!(call.call_type, CallType::Construct);
         assert_eq!(call.mode, CallLinkMode::Init);
@@ -4792,7 +5064,7 @@ mod tests {
             )
             .expect("initial call link metadata attachment succeeds");
         let clear_request = call_link_clear_request(&request);
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .clear_call_link_inline_cache(
@@ -4808,7 +5080,7 @@ mod tests {
                 actual: CodeBlockMutationAuthority::ReadOnlyObserver,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
 
         code_block.mutation_authority = CodeBlockMutationAuthority::ReadOnlyObserver;
         let error = code_block
@@ -4822,9 +5094,9 @@ mod tests {
                 actual: CodeBlockMutationAuthority::ReadOnlyObserver,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
 
-        let mut optimizing_code_block = linked_call_link_code_block(vec![call_instruction(
+        let optimizing_code_block = linked_call_link_code_block(vec![call_instruction(
             10,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -4836,8 +5108,10 @@ mod tests {
                 request.clone(),
             )
             .expect("initial call link metadata attachment succeeds");
-        optimizing_code_block.lifecycle = CodeBlockLifecycleState::OptimizingInstalled;
-        let before_lifecycle = optimizing_code_block.side_tables().inline_caches.clone();
+        optimizing_code_block
+            .lifecycle
+            .set(CodeBlockLifecycleState::OptimizingInstalled);
+        let before_lifecycle = optimizing_code_block.side_tables().inline_caches().clone();
 
         let error = optimizing_code_block
             .clear_call_link_inline_cache(
@@ -4853,14 +5127,14 @@ mod tests {
             }
         );
         assert_eq!(
-            &optimizing_code_block.side_tables().inline_caches,
+            &*optimizing_code_block.side_tables().inline_caches(),
             &before_lifecycle
         );
     }
 
     #[test]
     fn code_block_rejects_call_link_inline_cache_clear_target_mismatches_without_mutation() {
-        let mut code_block = linked_call_link_code_block(vec![call_instruction(
+        let code_block = linked_call_link_code_block(vec![call_instruction(
             10,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -4868,7 +5142,7 @@ mod tests {
         )]);
         let request =
             call_link_attachment_request(0, BytecodeIndex::from_offset(10), CoreOpcode::Call);
-        let before_missing = code_block.side_tables().inline_caches.clone();
+        let before_missing = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .clear_call_link_inline_cache(
@@ -4885,7 +5159,7 @@ mod tests {
                 actual: CallLinkMode::Init,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before_missing);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before_missing);
 
         code_block
             .attach_call_link_inline_cache(
@@ -4893,7 +5167,7 @@ mod tests {
                 request.clone(),
             )
             .expect("initial call link metadata attachment succeeds");
-        let before_wrong_target = code_block.side_tables().inline_caches.clone();
+        let before_wrong_target = code_block.side_tables().inline_caches().clone();
         let mut wrong_target = call_link_clear_request(&request);
         wrong_target.target = CallTarget::MetadataOnlyMonomorphic {
             callee: ObjectId(CellId(61)),
@@ -4914,7 +5188,7 @@ mod tests {
             }
         );
         assert_eq!(
-            &code_block.side_tables().inline_caches,
+            &*code_block.side_tables().inline_caches(),
             &before_wrong_target
         );
 
@@ -4924,7 +5198,7 @@ mod tests {
                 call_link_clear_request(&request),
             )
             .expect("first call link metadata clear succeeds");
-        let after_clear = code_block.side_tables().inline_caches.clone();
+        let after_clear = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .clear_call_link_inline_cache(
@@ -4941,12 +5215,12 @@ mod tests {
                 actual: CallLinkMode::Init,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &after_clear);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &after_clear);
     }
 
     #[test]
     fn code_block_attaches_get_by_name_own_data_load_property_ic_case() {
-        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -4972,7 +5246,7 @@ mod tests {
         assert_eq!(outcome.dispatch, PropertyInlineCacheDispatch::Handler);
         assert_eq!(outcome.structure_stub_index, None);
 
-        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        let cache = code_block.side_tables().inline_caches().property_accesses[0].clone();
         assert_eq!(cache.state, InlineCacheState::Monomorphic);
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
         let get_by_id = cache.get_by_id.expect("get metadata");
@@ -4984,7 +5258,7 @@ mod tests {
         assert!(cache.put_by_id.is_none());
         assert!(code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .structure_stubs
             .is_empty());
     }
@@ -4992,7 +5266,7 @@ mod tests {
     #[test]
     fn code_block_property_inline_cache_attachment_attaches_get_by_name_own_data_load_structure_stub_case(
     ) {
-        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -5020,7 +5294,7 @@ mod tests {
         );
         assert_eq!(outcome.structure_stub_index, Some(0));
 
-        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        let cache = code_block.side_tables().inline_caches().property_accesses[0].clone();
         assert_eq!(cache.state, InlineCacheState::Monomorphic);
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
         let get_by_id = cache.get_by_id.expect("get metadata");
@@ -5029,7 +5303,11 @@ mod tests {
         assert_eq!(get_by_id.holder_structure, None);
         assert_eq!(get_by_id.cached_offset, request.offset);
 
-        let stubs = &code_block.side_tables().inline_caches.structure_stubs;
+        let stubs = code_block
+            .side_tables()
+            .inline_caches()
+            .structure_stubs
+            .clone();
         assert_eq!(stubs.len(), 1);
         let stub = &stubs[0];
         assert_eq!(stub.bytecode_index, request.bytecode_index);
@@ -5066,7 +5344,7 @@ mod tests {
         assert!(link_outcome.inserted);
         assert_eq!(link_outcome.access_case_count, 1);
         assert_eq!(
-            code_block.side_tables().inline_caches.structure_stubs[0].access_cases,
+            code_block.side_tables().inline_caches().structure_stubs[0].access_cases,
             vec![access_case_ref]
         );
 
@@ -5076,7 +5354,7 @@ mod tests {
         assert!(!duplicate_link_outcome.inserted);
         assert_eq!(duplicate_link_outcome.access_case_count, 1);
         assert_eq!(
-            code_block.side_tables().inline_caches.structure_stubs[0].access_cases,
+            code_block.side_tables().inline_caches().structure_stubs[0].access_cases,
             vec![access_case_ref]
         );
 
@@ -5091,21 +5369,21 @@ mod tests {
 
         assert_eq!(clear_outcome.structure_stub_index, Some(0));
         assert_eq!(clear_outcome.state, InlineCacheState::Unset);
-        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        let cache = code_block.side_tables().inline_caches().property_accesses[0].clone();
         assert_eq!(cache.state, InlineCacheState::Unset);
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Unlinked);
         assert_eq!(
-            code_block.side_tables().inline_caches.structure_stubs[0].cache_state,
+            code_block.side_tables().inline_caches().structure_stubs[0].cache_state,
             InlineCacheState::Unset
         );
-        assert!(code_block.side_tables().inline_caches.structure_stubs[0]
+        assert!(code_block.side_tables().inline_caches().structure_stubs[0]
             .access_cases
             .is_empty());
     }
 
     #[test]
     fn code_block_attaches_guarded_get_by_name_prototype_data_property_ic_case() {
-        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -5131,7 +5409,7 @@ mod tests {
         assert_eq!(outcome.offset, request.offset);
         assert_eq!(outcome.holder_structure, request.holder_structure);
 
-        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        let cache = code_block.side_tables().inline_caches().property_accesses[0].clone();
         assert_eq!(cache.state, InlineCacheState::Monomorphic);
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
         let get_by_id = cache.get_by_id.expect("get metadata");
@@ -5143,14 +5421,14 @@ mod tests {
         assert!(cache.put_by_id.is_none());
         assert!(code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .structure_stubs
             .is_empty());
     }
 
     #[test]
     fn code_block_attaches_guarded_get_by_name_negative_lookup_property_ic_case_without_offset() {
-        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -5175,7 +5453,7 @@ mod tests {
         assert_eq!(outcome.structure_stub_index, None);
         assert_eq!(outcome.offset, None);
 
-        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        let cache = code_block.side_tables().inline_caches().property_accesses[0].clone();
         assert_eq!(cache.state, InlineCacheState::Monomorphic);
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
         let get_by_id = cache.get_by_id.expect("get metadata");
@@ -5187,14 +5465,14 @@ mod tests {
         assert!(cache.put_by_id.is_none());
         assert!(code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .structure_stubs
             .is_empty());
     }
 
     #[test]
     fn code_block_clears_attached_guarded_get_by_name_prototype_data_property_ic_case() {
-        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -5223,7 +5501,7 @@ mod tests {
         );
         assert_eq!(outcome.state, InlineCacheState::Unset);
         assert_eq!(outcome.dispatch, PropertyInlineCacheDispatch::Unlinked);
-        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        let cache = code_block.side_tables().inline_caches().property_accesses[0].clone();
         assert_eq!(cache.state, InlineCacheState::Unset);
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Unlinked);
         let get_by_id = cache.get_by_id.expect("cleared get metadata");
@@ -5234,7 +5512,7 @@ mod tests {
         assert!(cache.put_by_id.is_none());
         assert!(code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .structure_stubs
             .is_empty());
     }
@@ -5242,7 +5520,7 @@ mod tests {
     #[test]
     fn code_block_clears_attached_guarded_get_by_name_negative_lookup_property_ic_case_without_offset(
     ) {
-        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -5272,7 +5550,7 @@ mod tests {
         assert_eq!(outcome.offset, None);
         assert_eq!(outcome.state, InlineCacheState::Unset);
         assert_eq!(outcome.dispatch, PropertyInlineCacheDispatch::Unlinked);
-        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        let cache = code_block.side_tables().inline_caches().property_accesses[0].clone();
         assert_eq!(cache.state, InlineCacheState::Unset);
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Unlinked);
         let get_by_id = cache.get_by_id.expect("cleared get metadata");
@@ -5285,7 +5563,7 @@ mod tests {
 
     #[test]
     fn code_block_rejects_property_ic_clear_mismatches_without_partial_mutation() {
-        let mut code_block = linked_property_ic_code_block(vec![
+        let code_block = linked_property_ic_code_block(vec![
             get_by_name_instruction(0, VirtualRegister::local(0), VirtualRegister::local(1), 17),
             put_by_name_instruction(1, VirtualRegister::local(2), 19, VirtualRegister::local(3)),
         ]);
@@ -5298,7 +5576,7 @@ mod tests {
         code_block
             .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, attachment)
             .expect("prototype data guarded load attachment succeeds");
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let mut wrong_slot = property_ic_clear_request(attachment);
         wrong_slot.slot = 1;
@@ -5309,7 +5587,7 @@ mod tests {
             ),
             Err(ClearError::BytecodeIndexMismatch { .. })
         ));
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
 
         let mut wrong_index = property_ic_clear_request(attachment);
         wrong_index.bytecode_index = BytecodeIndex::from_offset(99);
@@ -5320,7 +5598,7 @@ mod tests {
             ),
             Err(ClearError::BytecodeIndexMismatch { .. })
         ));
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
 
         let mut wrong_key = property_ic_clear_request(attachment);
         wrong_key.key = identifier_property_key(18);
@@ -5331,7 +5609,7 @@ mod tests {
             ),
             Err(ClearError::PropertyKeyMismatch { .. })
         ));
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
 
         let mut wrong_kind = property_ic_clear_request(attachment);
         wrong_kind.attachment_kind = AttachmentKind::GetByNameOwnDataLoad;
@@ -5346,7 +5624,7 @@ mod tests {
                 field: ClearMetadataMismatchField::GetByIdMode,
             })
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
 
         code_block
             .clear_property_inline_cache_case(
@@ -5354,7 +5632,7 @@ mod tests {
                 property_ic_clear_request(attachment),
             )
             .expect("first clear succeeds");
-        let after_clear = code_block.side_tables().inline_caches.clone();
+        let after_clear = code_block.side_tables().inline_caches().clone();
         assert!(matches!(
             code_block.clear_property_inline_cache_case(
                 CodeBlockMutationAuthority::VmMainThread,
@@ -5366,12 +5644,12 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(&code_block.side_tables().inline_caches, &after_clear);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &after_clear);
     }
 
     #[test]
     fn code_block_attaches_put_by_name_store_replace_property_ic_case() {
-        let mut code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
             0,
             VirtualRegister::local(1),
             19,
@@ -5394,7 +5672,7 @@ mod tests {
         );
         assert_eq!(outcome.structure_stub_index, None);
 
-        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        let cache = code_block.side_tables().inline_caches().property_accesses[0].clone();
         assert_eq!(cache.state, InlineCacheState::Monomorphic);
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
         assert!(cache.get_by_id.is_none());
@@ -5405,14 +5683,14 @@ mod tests {
         assert_eq!(put_by_id.cached_offset, request.offset);
         assert!(code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .structure_stubs
             .is_empty());
     }
 
     #[test]
     fn code_block_attaches_put_by_name_store_transition_property_ic_case() {
-        let mut code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
             0,
             VirtualRegister::local(1),
             19,
@@ -5437,7 +5715,7 @@ mod tests {
         assert_eq!(outcome.new_structure, request.new_structure);
         assert_eq!(outcome.structure_stub_index, None);
 
-        let cache = &code_block.side_tables().inline_caches.property_accesses[0];
+        let cache = code_block.side_tables().inline_caches().property_accesses[0].clone();
         assert_eq!(cache.state, InlineCacheState::Monomorphic);
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
         let put_by_id = cache.put_by_id.expect("put metadata");
@@ -5447,7 +5725,7 @@ mod tests {
         assert_eq!(put_by_id.cached_offset, request.offset);
         assert!(code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .structure_stubs
             .is_empty());
     }
@@ -5457,7 +5735,7 @@ mod tests {
     ) {
         let reject_structure_stub =
             |instruction: TypedInstruction, identifier_index: u32, kind: AttachmentKind| {
-                let mut code_block = linked_property_ic_code_block(vec![instruction]);
+                let code_block = linked_property_ic_code_block(vec![instruction]);
                 let mut request = property_ic_attachment_request(
                     0,
                     BytecodeIndex::from_offset(0),
@@ -5465,7 +5743,7 @@ mod tests {
                     kind,
                 );
                 request.stub_mode = PropertyInlineCacheStubMode::StructureStub;
-                let before = code_block.side_tables().inline_caches.clone();
+                let before = code_block.side_tables().inline_caches().clone();
 
                 let error = code_block
                     .attach_property_inline_cache_case(
@@ -5480,10 +5758,10 @@ mod tests {
                         actual: PropertyInlineCacheStubMode::StructureStub,
                     }
                 );
-                assert_eq!(&code_block.side_tables().inline_caches, &before);
+                assert_eq!(&*code_block.side_tables().inline_caches(), &before);
                 assert!(code_block
                     .side_tables()
-                    .inline_caches
+                    .inline_caches()
                     .structure_stubs
                     .is_empty());
             };
@@ -5524,7 +5802,7 @@ mod tests {
             17,
             AttachmentKind::GetByNameOwnDataLoad,
         );
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .attach_property_inline_cache_case(
@@ -5540,7 +5818,7 @@ mod tests {
                 actual: CodeBlockMutationAuthority::ReadOnlyObserver,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
 
         code_block.mutation_authority = CodeBlockMutationAuthority::ReadOnlyObserver;
         let error = code_block
@@ -5554,12 +5832,12 @@ mod tests {
                 actual: CodeBlockMutationAuthority::ReadOnlyObserver,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
     }
 
     #[test]
     fn code_block_rejects_property_ic_attachment_from_disallowed_lifecycle() {
-        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -5572,7 +5850,7 @@ mod tests {
             17,
             AttachmentKind::GetByNameOwnDataLoad,
         );
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
@@ -5584,12 +5862,12 @@ mod tests {
                 actual: CodeBlockLifecycleState::OptimizingInstalled,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
     }
 
     #[test]
     fn code_block_rejects_property_ic_attachment_for_slot_mismatch() {
-        let mut code_block = linked_property_ic_code_block(vec![
+        let code_block = linked_property_ic_code_block(vec![
             get_by_name_instruction(0, VirtualRegister::local(0), VirtualRegister::local(1), 17),
             put_by_name_instruction(1, VirtualRegister::local(2), 19, VirtualRegister::local(3)),
         ]);
@@ -5599,7 +5877,7 @@ mod tests {
             17,
             AttachmentKind::GetByNameOwnDataLoad,
         );
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
@@ -5613,12 +5891,12 @@ mod tests {
                 actual: BytecodeIndex::from_offset(0),
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
     }
 
     #[test]
     fn code_block_rejects_property_ic_attachment_for_key_or_bytecode_mismatch() {
-        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -5630,7 +5908,7 @@ mod tests {
             18,
             AttachmentKind::GetByNameOwnDataLoad,
         );
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .attach_property_inline_cache_case(
@@ -5647,7 +5925,7 @@ mod tests {
                 actual: identifier_property_key(18),
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
 
         let bytecode_mismatch = property_ic_attachment_request(
             0,
@@ -5670,12 +5948,12 @@ mod tests {
                 actual: BytecodeIndex::from_offset(99),
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
     }
 
     #[test]
     fn code_block_rejects_property_ic_attachment_for_access_kind_mismatch() {
-        let mut code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
             0,
             VirtualRegister::local(1),
             17,
@@ -5687,7 +5965,7 @@ mod tests {
             17,
             AttachmentKind::GetByNameOwnDataLoad,
         );
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
@@ -5703,12 +5981,12 @@ mod tests {
                 actual_kind: PropertyCacheKind::PutById,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
     }
 
     #[test]
     fn code_block_rejects_property_ic_attachment_that_requires_watchpoints() {
-        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -5721,7 +5999,7 @@ mod tests {
             AttachmentKind::GetByNameOwnDataLoad,
         );
         request.requirements.requires_watchpoint = true;
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
@@ -5733,13 +6011,13 @@ mod tests {
                 attachment_kind: AttachmentKind::GetByNameOwnDataLoad,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
     }
 
     #[test]
     fn code_block_rejects_guarded_property_ic_attachment_without_watchpoint_evidence_or_coherent_metadata(
     ) {
-        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -5752,7 +6030,7 @@ mod tests {
             AttachmentKind::GetByNamePrototypeDataLoad,
         );
         no_watchpoint.requirements.requires_watchpoint = false;
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .attach_property_inline_cache_case(
@@ -5767,7 +6045,7 @@ mod tests {
                 attachment_kind: AttachmentKind::GetByNamePrototypeDataLoad,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
 
         let mut missing_holder = property_ic_attachment_request(
             0,
@@ -5789,7 +6067,7 @@ mod tests {
                 attachment_kind: AttachmentKind::GetByNamePrototypeDataLoad,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
 
         let mut fake_offset = property_ic_attachment_request(
             0,
@@ -5812,12 +6090,12 @@ mod tests {
                 offset: PropertyOffset(7),
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
     }
 
     #[test]
     fn code_block_rejects_store_property_ic_attachment_without_barrier_evidence() {
-        let mut code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![put_by_name_instruction(
             0,
             VirtualRegister::local(1),
             19,
@@ -5830,7 +6108,7 @@ mod tests {
             AttachmentKind::PutByNameStoreReplace,
         );
         request.requirements.has_barrier_evidence = false;
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
@@ -5842,12 +6120,12 @@ mod tests {
                 attachment_kind: AttachmentKind::PutByNameStoreReplace,
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
     }
 
     #[test]
     fn code_block_property_ic_attachment_rejection_does_not_partially_mutate() {
-        let mut code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
+        let code_block = linked_property_ic_code_block(vec![get_by_name_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
@@ -5860,7 +6138,7 @@ mod tests {
             AttachmentKind::GetByNameOwnDataLoad,
         );
         request.new_structure = Some(StructureId::new(99));
-        let before = code_block.side_tables().inline_caches.clone();
+        let before = code_block.side_tables().inline_caches().clone();
 
         let error = code_block
             .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
@@ -5873,10 +6151,10 @@ mod tests {
                 new_structure: Some(StructureId::new(99)),
             }
         );
-        assert_eq!(&code_block.side_tables().inline_caches, &before);
+        assert_eq!(&*code_block.side_tables().inline_caches(), &before);
         assert!(code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .structure_stubs
             .is_empty());
     }
@@ -6010,16 +6288,16 @@ mod tests {
 
     #[test]
     fn code_block_installs_baseline_slot_with_vm_authority() {
-        let mut code_block = linked_interpreter_code_block();
+        let code_block = linked_interpreter_code_block();
         let slot = JitCodeSlot(11);
 
         let result =
             code_block.install_baseline_jit_slot(CodeBlockMutationAuthority::VmMainThread, slot);
 
         assert_eq!(result, Ok(()));
-        assert_eq!(code_block.entrypoints().baseline_jit, Some(slot));
+        assert_eq!(code_block.entrypoints().baseline_jit(), Some(slot));
         assert_eq!(
-            code_block.tier_state().current_tier,
+            code_block.tier_state().current_tier(),
             ExecutionTier::BaselineJit
         );
         assert_eq!(
@@ -6030,8 +6308,8 @@ mod tests {
 
     #[test]
     fn code_block_rejects_baseline_slot_update_with_wrong_authority() {
-        let mut code_block = linked_interpreter_code_block();
-        let entrypoints = *code_block.entrypoints();
+        let code_block = linked_interpreter_code_block();
+        let entrypoints = code_block.entrypoints().clone();
         let tier_state = code_block.tier_state().clone();
         let lifecycle = code_block.lifecycle();
 
@@ -6049,16 +6327,16 @@ mod tests {
                 actual: CodeBlockMutationAuthority::ReadOnlyObserver,
             }
         );
-        assert_eq!(*code_block.entrypoints(), entrypoints);
+        assert_eq!(code_block.entrypoints(), &entrypoints);
         assert_eq!(code_block.tier_state(), &tier_state);
         assert_eq!(code_block.lifecycle(), lifecycle);
     }
 
     #[test]
     fn code_block_rejects_baseline_slot_update_from_stale_lifecycle() {
-        let mut code_block = linked_interpreter_code_block()
+        let code_block = linked_interpreter_code_block()
             .with_lifecycle(CodeBlockLifecycleState::BaselineInstalled);
-        let entrypoints = *code_block.entrypoints();
+        let entrypoints = code_block.entrypoints().clone();
         let tier_state = code_block.tier_state().clone();
 
         let error = code_block
@@ -6072,7 +6350,7 @@ mod tests {
                 actual: CodeBlockLifecycleState::BaselineInstalled,
             }
         );
-        assert_eq!(*code_block.entrypoints(), entrypoints);
+        assert_eq!(code_block.entrypoints(), &entrypoints);
         assert_eq!(code_block.tier_state(), &tier_state);
         assert_eq!(
             code_block.lifecycle(),

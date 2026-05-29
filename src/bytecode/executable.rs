@@ -255,7 +255,7 @@ impl ExecutableEntrypoints {
         validate_publication_request(&request, installed_code_block, code_block, key)?;
         let baseline_jit_slot = code_block
             .entrypoints()
-            .baseline_jit
+            .baseline_jit()
             .ok_or(ExecutableEntryPublicationError::BaselineJitSlotMissing)?;
         if let Some(expected) = request.baseline_jit_slot {
             if expected != baseline_jit_slot {
@@ -372,7 +372,7 @@ fn validate_publication_request(
             },
         );
     }
-    if code_block.entrypoints().baseline_jit.is_none() {
+    if code_block.entrypoints().baseline_jit().is_none() {
         return Err(ExecutableEntryPublicationError::BaselineJitSlotMissing);
     }
     if let (Some(expected), Some(actual)) = (
@@ -1308,7 +1308,7 @@ mod tests {
             },
         )
         .with_entrypoints(CodeBlockEntrypoints {
-            baseline_jit: Some(slot),
+            baseline_jit: std::cell::Cell::new(Some(slot)),
             ..CodeBlockEntrypoints::default()
         })
         .with_lifecycle(lifecycle)

@@ -10,6 +10,7 @@ use core::ffi::c_void;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::Arc;
 
 mod code_blocks;
@@ -1265,7 +1266,10 @@ struct GeneratedJsDirectCallValidation {
     bytecode_index: BytecodeIndex,
     continuation: CallReturnContinuation,
     target_code_block_id: CodeBlockId,
-    target_code_block: CodeBlock,
+    // C++ JSC divergence (one shared instance): the generated-direct-call hot path
+    // (box2d/raytrace residency) holds the shared `Rc<CodeBlock>` (refcount bump)
+    // instead of a deep registry copy, so the per-instance memo + feedback persist.
+    target_code_block: Rc<CodeBlock>,
     argument_values: Vec<crate::runtime::RuntimeValue>,
     direct_call: BaselineGeneratedJsDirectCall,
     hot_slot_hit: bool,
@@ -1728,7 +1732,7 @@ fn runtime_helper_handoff_matches_proof(
 }
 
 fn vm_owned_call_target_validation_outcome(
-    result: &Result<CodeBlock, VmOwnedCallTargetValidationRejection>,
+    result: &Result<Rc<CodeBlock>, VmOwnedCallTargetValidationRejection>,
 ) -> VmOwnedCallTargetValidationOutcome {
     match result {
         Ok(_) => VmOwnedCallTargetValidationOutcome::Accepted,
@@ -4488,7 +4492,7 @@ impl Vm {
             let mut publication_request =
                 ExecutableEntryPublicationRequest::from_launch_descriptor(descriptor.clone())
                     .with_executable(executable);
-            if let Some(slot) = code_block.entrypoints().baseline_jit {
+            if let Some(slot) = code_block.entrypoints().baseline_jit() {
                 publication_request = publication_request.with_baseline_jit_slot(slot);
             }
             match executable {
@@ -12207,7 +12211,7 @@ impl Vm {
         &self,
         request: &OrdinaryBytecodeCallRequest,
         direct_call: &BaselineGeneratedJsDirectCall,
-    ) -> Option<CodeBlock> {
+    ) -> Option<Rc<CodeBlock>> {
         let target_code_block = self.validate_ordinary_bytecode_call_vm_target(request)?;
         let executable = target_code_block.link_context().owner_executable?;
         if direct_call.authorization.target_executable != executable
@@ -12238,7 +12242,7 @@ impl Vm {
     fn validate_ordinary_bytecode_call_vm_target(
         &self,
         request: &OrdinaryBytecodeCallRequest,
-    ) -> Option<CodeBlock> {
+    ) -> Option<Rc<CodeBlock>> {
         let registered = self
             .validate_ordinary_bytecode_call_registered_target(request)
             .ok()?;
@@ -12252,7 +12256,7 @@ impl Vm {
     fn validate_ordinary_bytecode_call_registered_target(
         &self,
         request: &OrdinaryBytecodeCallRequest,
-    ) -> Result<CodeBlock, VmOwnedCallTargetValidationRejection> {
+    ) -> Result<Rc<CodeBlock>, VmOwnedCallTargetValidationRejection> {
         self.validate_registered_vm_owned_call_target(
             request.target_code_block_id,
             &request.target_code_block,
@@ -12263,7 +12267,7 @@ impl Vm {
     fn record_ordinary_bytecode_call_registered_target_validation(
         &mut self,
         request: &OrdinaryBytecodeCallRequest,
-        result: &Result<CodeBlock, VmOwnedCallTargetValidationRejection>,
+        result: &Result<Rc<CodeBlock>, VmOwnedCallTargetValidationRejection>,
     ) {
         self.tiering
             .record_vm_owned_call_target_validation(VmOwnedCallTargetValidationRequest {
@@ -12394,7 +12398,7 @@ impl Vm {
     fn validate_ordinary_bytecode_construct_vm_target(
         &self,
         request: &OrdinaryBytecodeConstructRequest,
-    ) -> Option<CodeBlock> {
+    ) -> Option<Rc<CodeBlock>> {
         let registered = self
             .validate_ordinary_bytecode_construct_registered_target(request)
             .ok()?;
@@ -12420,7 +12424,7 @@ impl Vm {
     fn validate_ordinary_bytecode_construct_registered_target(
         &self,
         request: &OrdinaryBytecodeConstructRequest,
-    ) -> Result<CodeBlock, VmOwnedCallTargetValidationRejection> {
+    ) -> Result<Rc<CodeBlock>, VmOwnedCallTargetValidationRejection> {
         self.validate_registered_vm_owned_call_target(
             request.target_code_block_id,
             &request.target_code_block,
@@ -12431,7 +12435,7 @@ impl Vm {
     fn record_ordinary_bytecode_construct_registered_target_validation(
         &mut self,
         request: &OrdinaryBytecodeConstructRequest,
-        result: &Result<CodeBlock, VmOwnedCallTargetValidationRejection>,
+        result: &Result<Rc<CodeBlock>, VmOwnedCallTargetValidationRejection>,
     ) {
         self.tiering
             .record_vm_owned_call_target_validation(VmOwnedCallTargetValidationRequest {
@@ -12526,7 +12530,7 @@ impl Vm {
         &self,
         request: &OrdinaryBytecodeConstructRequest,
         direct_call: &BaselineGeneratedJsDirectCall,
-    ) -> Option<CodeBlock> {
+    ) -> Option<Rc<CodeBlock>> {
         let target_code_block = self.validate_ordinary_bytecode_construct_vm_target(request)?;
         let executable = target_code_block.link_context().owner_executable?;
         if direct_call.authorization.target_executable != executable
@@ -12622,7 +12626,7 @@ impl Vm {
     fn validate_function_value_call_registered_target(
         &self,
         request: &FunctionValueCallRequest,
-    ) -> Result<CodeBlock, VmOwnedCallTargetValidationRejection> {
+    ) -> Result<Rc<CodeBlock>, VmOwnedCallTargetValidationRejection> {
         self.validate_registered_vm_owned_call_target(
             request.target_code_block_id,
             &request.target_code_block,
@@ -12633,7 +12637,7 @@ impl Vm {
     fn record_function_value_call_registered_target_validation(
         &mut self,
         request: &FunctionValueCallRequest,
-        result: &Result<CodeBlock, VmOwnedCallTargetValidationRejection>,
+        result: &Result<Rc<CodeBlock>, VmOwnedCallTargetValidationRejection>,
     ) {
         let resume = Self::function_value_call_resume(&request.completion);
         self.tiering
@@ -12653,7 +12657,7 @@ impl Vm {
         target_code_block_id: CodeBlockId,
         request_target_code_block: &CodeBlock,
         expected_specialization: CodeSpecialization,
-    ) -> Result<CodeBlock, VmOwnedCallTargetValidationRejection> {
+    ) -> Result<Rc<CodeBlock>, VmOwnedCallTargetValidationRejection> {
         let registered = self.code_blocks.get(target_code_block_id).ok_or(
             VmOwnedCallTargetValidationRejection::TargetCodeBlockNotRegistered {
                 target: target_code_block_id,
@@ -12749,7 +12753,11 @@ impl Vm {
                 },
             );
         }
-        Ok(registered.code_block().clone())
+        // C++ JSC divergence (one shared instance): return the shared `Rc` of the
+        // single registered instance (refcount bump) instead of a deep
+        // `CodeBlock::clone`, so the snapshot-fingerprint memo and interior-mutable
+        // feedback stay warm on the one instance the prevalidated entry re-reads.
+        Ok(registered.code_block_shared())
     }
 
     fn function_value_call_resume(
@@ -12773,7 +12781,10 @@ impl Vm {
         &mut self,
         request: FunctionValueCallRequest,
         caller_code_block: &CodeBlock,
-        target_code_block: CodeBlock,
+        // Shared `Rc<CodeBlock>` from validation (refcount bump; used only as
+        // `&target_code_block`, deref-coerced to `&CodeBlock`). See divergence note
+        // on `validate_registered_vm_owned_call_target`.
+        target_code_block: Rc<CodeBlock>,
         host: &mut H,
         config: DispatchConfig,
     ) -> SingleDispatchOutcome {
@@ -13212,7 +13223,10 @@ impl Vm {
         &mut self,
         request: OrdinaryBytecodeCallRequest,
         caller_code_block: &CodeBlock,
-        target_code_block: CodeBlock,
+        // Shared `Rc<CodeBlock>` from validation (refcount bump; used only as
+        // `&target_code_block`, deref-coerced to `&CodeBlock`). See divergence note
+        // on `validate_registered_vm_owned_call_target`.
+        target_code_block: Rc<CodeBlock>,
         host: &mut H,
         config: DispatchConfig,
     ) -> SingleDispatchOutcome {
@@ -13401,7 +13415,10 @@ impl Vm {
         &mut self,
         request: OrdinaryBytecodeCallRequest,
         caller_code_block: &CodeBlock,
-        target_code_block: CodeBlock,
+        // Shared `Rc<CodeBlock>` from validation (refcount bump; used only as
+        // `&target_code_block`, deref-coerced to `&CodeBlock`). See divergence note
+        // on `validate_registered_vm_owned_call_target`.
+        target_code_block: Rc<CodeBlock>,
         host: &mut H,
         config: DispatchConfig,
     ) -> SingleDispatchOutcome {
@@ -13611,7 +13628,10 @@ impl Vm {
         &mut self,
         request: OrdinaryBytecodeConstructRequest,
         caller_code_block: &CodeBlock,
-        target_code_block: CodeBlock,
+        // Shared `Rc<CodeBlock>` from validation (refcount bump; used only as
+        // `&target_code_block`, deref-coerced to `&CodeBlock`). See divergence note
+        // on `validate_registered_vm_owned_call_target`.
+        target_code_block: Rc<CodeBlock>,
         host: &mut H,
         config: DispatchConfig,
     ) -> SingleDispatchOutcome {
@@ -13695,7 +13715,10 @@ impl Vm {
         &mut self,
         request: OrdinaryBytecodeConstructRequest,
         caller_code_block: &CodeBlock,
-        target_code_block: CodeBlock,
+        // Shared `Rc<CodeBlock>` from validation (refcount bump; used only as
+        // `&target_code_block`, deref-coerced to `&CodeBlock`). See divergence note
+        // on `validate_registered_vm_owned_call_target`.
+        target_code_block: Rc<CodeBlock>,
         host: &mut H,
         config: DispatchConfig,
     ) -> SingleDispatchOutcome {
@@ -14178,12 +14201,12 @@ impl Vm {
             return Err(ExecutionError::BaselineGeneratedExecutionRejected);
         }
 
+        // C++ JSC divergence (one shared instance): share the registered `Rc`
+        // (refcount bump) instead of a deep clone so the per-instance memo stays warm.
         let target_code_block = self
             .code_blocks
-            .get(target.target_code_block)
-            .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?
-            .code_block()
-            .clone();
+            .code_block_shared(target.target_code_block)
+            .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
         let argument_values = self.generated_js_direct_call_argument_values(
             handoff,
             code_block,
@@ -14418,12 +14441,12 @@ impl Vm {
             return Err(ExecutionError::BaselineGeneratedExecutionRejected);
         }
 
+        // C++ JSC divergence (one shared instance): share the registered `Rc`
+        // (refcount bump) instead of a deep clone so the per-instance memo stays warm.
         let target_code_block = self
             .code_blocks
-            .get(target.target_code_block)
-            .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?
-            .code_block()
-            .clone();
+            .code_block_shared(target.target_code_block)
+            .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
         let argument_values = self.generated_js_direct_call_argument_values(
             handoff,
             code_block,
@@ -16652,8 +16675,19 @@ impl Vm {
             self.executables
                 .register_function(executable_id, shared_unlinked)
                 .map_err(SourceExecutionError::ExecutableRegistration)?;
+            // C++ JSC divergence (one shared instance): build ONE `Rc<CodeBlock>`
+            // per (id, specialization) and share it by `Rc::clone` into BOTH the
+            // registry record AND the interpreter host's `function_blocks`,
+            // mirroring C++'s single stable `CodeBlock*` referenced by both
+            // interpreter and runtime. This is what makes the compute-once
+            // snapshot-fingerprint memo and interior-mutable feedback persist on
+            // one instance instead of being reset by per-call deep copies. The
+            // root-map owner is already stamped above (`with_root_map_owner`), so
+            // `register` re-stamps the same owner as a no-op.
+            let call_code_block = Rc::new(call_code_block);
+            let construct_code_block = Rc::new(construct_code_block);
             self.code_blocks
-                .register(call_code_block_id, call_code_block.clone());
+                .register(call_code_block_id, Rc::clone(&call_code_block));
             let call_install_record = self.executables.install_function_code(
                 executable_id,
                 call_code_block_id,
@@ -16664,7 +16698,7 @@ impl Vm {
                 return Err(SourceExecutionError::ExecutableInstall(reason));
             }
             self.code_blocks
-                .register(construct_code_block_id, construct_code_block.clone());
+                .register(construct_code_block_id, Rc::clone(&construct_code_block));
             let construct_install_record = self.executables.install_function_code(
                 executable_id,
                 construct_code_block_id,
@@ -18873,7 +18907,7 @@ fn generated_baseline_register_fallback_cause(
 }
 
 fn inline_cache_count(code_block: &CodeBlock) -> u32 {
-    let table = &code_block.side_tables().inline_caches;
+    let table = code_block.side_tables().inline_caches();
     table
         .property_accesses
         .len()
@@ -20139,7 +20173,7 @@ mod tests {
             .get(owner)
             .expect("registered code block after rejected P6 semantic install")
             .code_block();
-        assert_ne!(registered.entrypoints().baseline_jit, Some(slot));
+        assert_ne!(registered.entrypoints().baseline_jit(), Some(slot));
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]
@@ -25441,11 +25475,14 @@ mod tests {
             }
         );
         let registered = vm.code_blocks.get(owner).expect("registered code block");
-        let cache = &registered
+        // Clone the cache element so no `Ref` borrow of `vm`'s registry is held across
+        // the later `&mut vm` mutation (the table now lives behind a `RefCell`).
+        let cache = registered
             .code_block()
             .side_tables()
-            .inline_caches
-            .property_accesses[0];
+            .inline_caches()
+            .property_accesses[0]
+            .clone();
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
         assert_eq!(
             cache
@@ -25527,7 +25564,11 @@ mod tests {
         assert_eq!(record.code_block_outcome, Some(outcome));
 
         let registered = vm.code_blocks.get(owner).expect("registered code block");
-        let side_tables = &registered.code_block().side_tables().inline_caches;
+        let side_tables = registered
+            .code_block()
+            .side_tables()
+            .inline_caches()
+            .clone();
         assert_eq!(side_tables.structure_stubs.len(), 1);
         let stub = &side_tables.structure_stubs[0];
         assert_eq!(stub.bytecode_index, plan.bytecode_index);
@@ -25641,7 +25682,7 @@ mod tests {
             registered
                 .code_block()
                 .side_tables()
-                .inline_caches
+                .inline_caches()
                 .structure_stubs[0]
                 .access_cases,
             vec![expected_access_case_ref]
@@ -25706,7 +25747,7 @@ mod tests {
             registered
                 .code_block()
                 .side_tables()
-                .inline_caches
+                .inline_caches()
                 .structure_stubs[0]
                 .access_cases,
             vec![first_link.access_case_ref]
@@ -25759,8 +25800,8 @@ mod tests {
             .code_blocks
             .code_block_mut_for_test(owner)
             .expect("registered code block");
-        let mut side_tables = registered.side_tables().clone();
-        side_tables.inline_caches.structure_stubs[0].offset =
+        let side_tables = registered.side_tables().clone();
+        side_tables.inline_caches_mut().structure_stubs[0].offset =
             Some(crate::bytecode::ic::PropertyOffset(99));
         *registered = registered.clone().with_side_tables(side_tables);
 
@@ -25790,7 +25831,7 @@ mod tests {
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .structure_stubs[0]
             .access_cases
             .is_empty());
@@ -25854,7 +25895,7 @@ mod tests {
                 .expect("registered code block")
                 .code_block()
                 .side_tables()
-                .inline_caches
+                .inline_caches()
                 .structure_stubs[0]
                 .access_cases,
             vec![link_before.access_case_ref]
@@ -25936,13 +25977,14 @@ mod tests {
                 attachment_ordinal: attachment.ordinal,
             }
         );
-        let cache = &vm
+        let cache = vm
             .code_blocks
             .get(owner)
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches;
+            .inline_caches()
+            .clone();
         assert_eq!(
             cache.property_accesses[0].state,
             crate::bytecode::ic::InlineCacheState::Unset
@@ -26149,7 +26191,7 @@ mod tests {
                 .expect("registered structure code block")
                 .code_block()
                 .side_tables()
-                .inline_caches
+                .inline_caches()
                 .structure_stubs[0]
                 .access_cases,
             vec![link_before.access_case_ref]
@@ -26249,7 +26291,7 @@ mod tests {
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_accesses[0];
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Handler);
         assert_eq!(
@@ -26350,14 +26392,15 @@ mod tests {
                 attachment_ordinal: record.ordinal,
             }
         );
-        let cache = &vm
+        let cache = vm
             .code_blocks
             .get(owner)
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches
-            .property_accesses[0];
+            .inline_caches()
+            .property_accesses[0]
+            .clone();
         let get_by_id = cache.get_by_id.expect("get metadata");
         assert_eq!(get_by_id.mode, GetByIdMode::ProtoLoad);
         assert_eq!(
@@ -26449,7 +26492,7 @@ mod tests {
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_accesses[0];
         assert_eq!(cache.state, crate::bytecode::ic::InlineCacheState::Unset);
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Unlinked);
@@ -26513,7 +26556,7 @@ mod tests {
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_accesses[0];
         let get_by_id = cache.get_by_id.expect("get metadata");
         assert_eq!(get_by_id.mode, GetByIdMode::NegativeLookup);
@@ -26673,7 +26716,7 @@ mod tests {
                 .expect("registered code block")
                 .code_block()
                 .side_tables()
-                .inline_caches
+                .inline_caches()
                 .property_accesses[0];
             (cache.state, cache.dispatch)
         };
@@ -26772,7 +26815,7 @@ mod tests {
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .clone();
 
         let base_request = guarded_clear_request(
@@ -26797,12 +26840,12 @@ mod tests {
             }
         );
         assert_eq!(
-            &vm.code_blocks
+            &*vm.code_blocks
                 .get(owner)
                 .expect("registered code block")
                 .code_block()
                 .side_tables()
-                .inline_caches,
+                .inline_caches(),
             &before
         );
 
@@ -26820,12 +26863,12 @@ mod tests {
             }
         );
         assert_eq!(
-            &vm.code_blocks
+            &*vm.code_blocks
                 .get(owner)
                 .expect("registered code block")
                 .code_block()
                 .side_tables()
-                .inline_caches,
+                .inline_caches(),
             &before
         );
 
@@ -26887,7 +26930,7 @@ mod tests {
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .clone();
 
         let mut stale = request.clone();
@@ -26904,12 +26947,12 @@ mod tests {
             }
         ));
         assert_eq!(
-            &vm.code_blocks
+            &*vm.code_blocks
                 .get(owner)
                 .expect("registered code block")
                 .code_block()
                 .side_tables()
-                .inline_caches,
+                .inline_caches(),
             &before
         );
 
@@ -26924,12 +26967,12 @@ mod tests {
             }
         );
         assert_eq!(
-            &vm.code_blocks
+            &*vm.code_blocks
                 .get(owner)
                 .expect("registered code block")
                 .code_block()
                 .side_tables()
-                .inline_caches,
+                .inline_caches(),
             &before
         );
 
@@ -26955,12 +26998,12 @@ mod tests {
                 != VmPropertyLoadGuardWatchpointMaterializationLifecycle::Active
         );
         assert_eq!(
-            &vm.code_blocks
+            &*vm.code_blocks
                 .get(owner)
                 .expect("registered code block")
                 .code_block()
                 .side_tables()
-                .inline_caches,
+                .inline_caches(),
             &before
         );
         assert_eq!(
@@ -27005,7 +27048,7 @@ mod tests {
             .expect("registered dead-owner code block")
             .code_block()
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .property_accesses[0];
         assert_eq!(cache.dispatch, PropertyInlineCacheDispatch::Unlinked);
     }
@@ -30325,7 +30368,7 @@ mod tests {
             CodeBlockLifecycleState::BaselineInstalled
         );
         assert!(registered_code_block.entrypoints().interpreter.is_some());
-        assert!(registered_code_block.entrypoints().baseline_jit.is_some());
+        assert!(registered_code_block.entrypoints().baseline_jit().is_some());
         let executable = registered_code_block
             .link_context()
             .owner_executable
@@ -30657,13 +30700,13 @@ mod tests {
             .get(owner)
             .expect("registered source code block")
             .code_block();
-        assert_eq!(registered.entrypoints().baseline_jit, Some(slot));
+        assert_eq!(registered.entrypoints().baseline_jit(), Some(slot));
         assert_eq!(
             registered.lifecycle(),
             CodeBlockLifecycleState::BaselineInstalled
         );
         assert_eq!(
-            registered.tier_state().current_tier,
+            registered.tier_state().current_tier(),
             crate::bytecode::ExecutionTier::BaselineJit
         );
     }
@@ -30830,7 +30873,7 @@ mod tests {
             .get(owner)
             .expect("registered source code block")
             .code_block();
-        assert_eq!(registered.entrypoints().baseline_jit, None);
+        assert_eq!(registered.entrypoints().baseline_jit(), None);
         assert_eq!(
             registered.lifecycle(),
             CodeBlockLifecycleState::LinkedInterpreter
@@ -30884,7 +30927,7 @@ mod tests {
             .get(owner)
             .expect("registered source code block")
             .code_block();
-        assert_eq!(registered.entrypoints().baseline_jit, None);
+        assert_eq!(registered.entrypoints().baseline_jit(), None);
         assert_eq!(
             registered.lifecycle(),
             CodeBlockLifecycleState::LinkedInterpreter
@@ -30925,7 +30968,7 @@ mod tests {
             .get(owner)
             .expect("registered source code block")
             .code_block();
-        assert_eq!(registered.entrypoints().baseline_jit, None);
+        assert_eq!(registered.entrypoints().baseline_jit(), None);
         assert_eq!(
             registered.lifecycle(),
             CodeBlockLifecycleState::LinkedInterpreter
@@ -30984,7 +31027,7 @@ mod tests {
             .get(owner)
             .expect("registered stale code block")
             .code_block();
-        assert_ne!(registered.entrypoints().baseline_jit, Some(slot));
+        assert_ne!(registered.entrypoints().baseline_jit(), Some(slot));
     }
 
     #[test]
@@ -31042,7 +31085,7 @@ mod tests {
             .get(owner)
             .expect("registered unsupported code block")
             .code_block();
-        assert_ne!(registered.entrypoints().baseline_jit, Some(slot));
+        assert_ne!(registered.entrypoints().baseline_jit(), Some(slot));
         assert_eq!(
             registered.lifecycle(),
             CodeBlockLifecycleState::LinkedInterpreter
@@ -31106,7 +31149,7 @@ mod tests {
             .get(owner)
             .expect("registered handler code block")
             .code_block();
-        assert_ne!(registered.entrypoints().baseline_jit, Some(slot));
+        assert_ne!(registered.entrypoints().baseline_jit(), Some(slot));
         assert_eq!(
             registered.lifecycle(),
             CodeBlockLifecycleState::LinkedInterpreter
@@ -34056,7 +34099,7 @@ mod tests {
 
         let code_block = generated_js_call_return_consumed_code_block();
         let owner = register_test_code_block(&mut vm, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 1022);
         let bytecode_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
@@ -34485,7 +34528,7 @@ mod tests {
             .get(owner)
             .expect("registered owner code block")
             .code_block();
-        let registered_inline_caches = &registered_code_block.side_tables().inline_caches;
+        let registered_inline_caches = registered_code_block.side_tables().inline_caches().clone();
         assert_eq!(
             &registered_inline_caches.property_accesses, &inline_caches_before.property_accesses,
             "call-link attachment must not mutate property IC metadata"
@@ -36295,22 +36338,14 @@ mod tests {
                 }],
                 ..UnlinkedSideTables::default()
             });
-        let mut function_blocks = vm
+        let function_blocks = vm
             .install_source_function_blocks(vec![function_unlinked])
             .expect("owned P6 runtime-helper native-exit function code");
         let callee_owner = function_blocks[0].id;
-        vm.code_blocks
-            .code_block_mut_for_test(callee_owner)
-            .expect("registered runtime-helper callee")
-            .stamp_root_map_owner(callee_owner);
-        function_blocks[0]
-            .code_block
-            .stamp_root_map_owner(callee_owner);
-        let construct_id = function_blocks[0].construct_id;
-        if let Some(construct_code_block) = &mut function_blocks[0].construct_code_block {
-            construct_code_block
-                .stamp_root_map_owner(construct_id.expect("construct code block id"));
-        }
+        // Root-map owners are already stamped at install time
+        // (`install_source_function_blocks` -> `with_root_map_owner`), and the
+        // registry now shares the one `Rc<CodeBlock>` with `function_blocks`, so the
+        // previous manual re-stamp of the same owner is redundant and removed.
         let mut host = RecordingCoreHost::with_function_code_blocks(function_blocks);
         let callee = load_function_value_for_test(&mut vm, &mut host, 0);
         let callee_object = ObjectId(heap_cell_for_value(&vm, callee));
@@ -38573,7 +38608,7 @@ mod tests {
         let code_block = generated_property_get_by_name_return_consumed_code_block();
         let fixture =
             install_real_p10_retained_property_native_exit(&mut vm, 1_980, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
 
         let (warmup_completion, _) =
@@ -38657,7 +38692,7 @@ mod tests {
         );
         assert_eq!(access_case_plans[0].owner, fixture.owner);
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "P10 property native exit must not mutate bytecode IC metadata"
         );
@@ -38694,7 +38729,7 @@ mod tests {
             code_block.clone(),
             CoreOpcode::GetGlobalObjectProperty,
         );
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
 
         let (warmup_completion, _) =
@@ -38782,7 +38817,7 @@ mod tests {
         );
         assert_eq!(access_case_plans[0].owner, fixture.owner);
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "P10 global property native exit must not mutate bytecode IC metadata"
         );
@@ -38805,7 +38840,7 @@ mod tests {
         host.clear_observations();
 
         let code_block = generated_property_get_by_value_return_value_code_block();
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fixture = install_real_p10_retained_property_native_exit_with_opcode(
             &mut vm,
             2_010,
@@ -38903,7 +38938,7 @@ mod tests {
         );
         assert_eq!(access_case_plans[0].plan.access_case.offset, None);
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "P10 emitted-native GetByValue must not mutate bytecode IC metadata"
         );
@@ -39012,7 +39047,7 @@ mod tests {
         host.clear_observations();
 
         let code_block = generated_property_put_by_name_return_value_code_block();
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fixture = install_real_p10_retained_property_native_exit_with_opcode(
             &mut vm,
             2_020,
@@ -39117,7 +39152,7 @@ mod tests {
             PropertyStoreAccessCasePlanKind::DataOnlyTransition
         );
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "P12 emitted-native PutByName must not mutate bytecode IC metadata"
         );
@@ -39140,7 +39175,7 @@ mod tests {
         host.clear_observations();
 
         let code_block = generated_property_put_by_value_return_value_code_block();
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fixture = install_real_p10_retained_property_native_exit_with_opcode(
             &mut vm,
             2_021,
@@ -39256,7 +39291,7 @@ mod tests {
         assert_eq!(store_plans[0].plan.access_case.offset, None);
         assert_eq!(store_plans[0].plan.access_case.new_structure, None);
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "P12 emitted-native PutByValue must not mutate bytecode IC metadata"
         );
@@ -39275,7 +39310,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
         let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
         let code_block = generated_property_put_global_object_property_return_value_code_block();
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fixture = install_real_p10_retained_property_native_exit_with_opcode(
             &mut vm,
             2_026,
@@ -39348,7 +39383,7 @@ mod tests {
             "global first-property creation must not attach a transition sidecar"
         );
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "P12 emitted-native PutGlobalObjectProperty must not mutate bytecode IC metadata"
         );
@@ -39383,7 +39418,7 @@ mod tests {
         host.clear_observations();
 
         let code_block = generated_property_put_by_name_argument_value_code_block();
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fixture = install_real_p10_retained_property_native_exit_with_opcode(
             &mut vm,
             2_022,
@@ -39489,7 +39524,7 @@ mod tests {
             PropertyStoreAccessCasePlanKind::DataOnlyReplace
         );
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "P12 emitted-native PutByName cell store must not mutate bytecode IC metadata"
         );
@@ -39563,7 +39598,7 @@ mod tests {
         host.clear_observations();
         host.force_generated_property_store_probe_hit();
         host.force_generated_property_store_mutation_commit();
-        let inline_caches_before_second = fixture.code_block.side_tables().inline_caches.clone();
+        let inline_caches_before_second = fixture.code_block.side_tables().inline_caches().clone();
         let observations_before_second =
             vm.tiering_integration().property_store_observations().len();
         let fallback_count_before_second = vm.tiering_integration().fallback_records().len();
@@ -39621,7 +39656,7 @@ mod tests {
             fallback_count_before_second
         );
         assert_eq!(
-            fixture.code_block.side_tables().inline_caches,
+            *fixture.code_block.side_tables().inline_caches(),
             inline_caches_before_second,
             "P13 emitted-native PutByName sidecar hit must not mutate bytecode IC metadata"
         );
@@ -39708,7 +39743,7 @@ mod tests {
         host.clear_observations();
         host.force_generated_property_store_probe_hit();
         host.force_generated_property_store_mutation_commit();
-        let inline_caches_before_third = fixture.code_block.side_tables().inline_caches.clone();
+        let inline_caches_before_third = fixture.code_block.side_tables().inline_caches().clone();
         let observations_before_third =
             vm.tiering_integration().property_store_observations().len();
         let fallback_count_before_third = vm.tiering_integration().fallback_records().len();
@@ -39764,7 +39799,7 @@ mod tests {
             fallback_count_before_third
         );
         assert_eq!(
-            fixture.code_block.side_tables().inline_caches,
+            *fixture.code_block.side_tables().inline_caches(),
             inline_caches_before_third,
             "global store sidecar hit must not mutate bytecode IC metadata"
         );
@@ -39841,7 +39876,7 @@ mod tests {
             .put_array_element_for_test(array, 0, RuntimeValue::from_i32(5))
             .unwrap();
         host.clear_observations();
-        let inline_caches_before_second = fixture.code_block.side_tables().inline_caches.clone();
+        let inline_caches_before_second = fixture.code_block.side_tables().inline_caches().clone();
         let observations_before_second =
             vm.tiering_integration().property_store_observations().len();
         let fallback_count_before_second = vm.tiering_integration().fallback_records().len();
@@ -39909,7 +39944,7 @@ mod tests {
             fallback_count_before_second
         );
         assert_eq!(
-            fixture.code_block.side_tables().inline_caches,
+            *fixture.code_block.side_tables().inline_caches(),
             inline_caches_before_second,
             "P13 emitted-native PutByValue sidecar hit must not mutate bytecode IC metadata"
         );
@@ -40428,7 +40463,7 @@ mod tests {
         host.clear_observations();
 
         let code_block = generated_property_put_by_name_return_value_code_block();
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fixture = install_real_p10_retained_property_native_exit_with_opcode(
             &mut vm,
             2_023,
@@ -40504,7 +40539,7 @@ mod tests {
             .generated_property_store_mutation_rejections()
             .is_empty());
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "P12 emitted-native throwing setter must not mutate bytecode IC metadata"
         );
@@ -41654,7 +41689,7 @@ mod tests {
         assert_eq!(
             registered_code_block
                 .side_tables()
-                .inline_caches
+                .inline_caches()
                 .property_accesses[0]
                 .dispatch,
             PropertyInlineCacheDispatch::Handler
@@ -42187,7 +42222,7 @@ mod tests {
             .expect("registered P9 owner")
             .code_block()
             .side_tables()
-            .value_profiles
+            .value_profiles()
             .bucket_samples[0];
         assert_eq!(first_sample.bytecode_index, BytecodeIndex::from_offset(1));
         assert_eq!(first_sample.bucket.kind, ValueProfileBucketKind::Sample);
@@ -42199,7 +42234,7 @@ mod tests {
                 .expect("registered P9 owner")
                 .code_block()
                 .side_tables()
-                .value_profiles
+                .value_profiles()
                 .jit_storage
                 .raw_value_for_slot(first_sample.bucket.slot),
             Some(RuntimeValue::from_i32(41).encoded())
@@ -42235,7 +42270,7 @@ mod tests {
             .expect("registered P9 owner")
             .code_block()
             .side_tables()
-            .value_profiles
+            .value_profiles()
             .bucket_samples[0];
         assert_eq!(second_sample.value, RuntimeValue::from_i32(41));
         assert_eq!(
@@ -42248,7 +42283,7 @@ mod tests {
                 .expect("registered P9 owner")
                 .code_block()
                 .side_tables()
-                .value_profiles
+                .value_profiles()
                 .jit_storage
                 .raw_value_for_slot(second_sample.bucket.slot),
             Some(RuntimeValue::from_i32(41).encoded())
@@ -42339,7 +42374,7 @@ mod tests {
                 .expect("registered generated-origin P9 owner")
                 .code_block()
                 .side_tables()
-                .value_profiles
+                .value_profiles()
                 .bucket_samples[0];
             assert_eq!(first_sample.bytecode_index, BytecodeIndex::from_offset(1));
             assert_eq!(first_sample.value, RuntimeValue::from_i32(41));
@@ -42378,7 +42413,7 @@ mod tests {
                 .expect("registered generated-origin P9 owner")
                 .code_block()
                 .side_tables()
-                .value_profiles
+                .value_profiles()
                 .bucket_samples[0];
             assert_eq!(second_sample.value, RuntimeValue::from_i32(41));
             assert_eq!(
@@ -42391,7 +42426,7 @@ mod tests {
                     .expect("registered generated-origin P9 owner")
                     .code_block()
                     .side_tables()
-                    .value_profiles
+                    .value_profiles()
                     .jit_storage
                     .raw_value_for_slot(second_sample.bucket.slot),
                 Some(RuntimeValue::from_i32(41).encoded()),
@@ -42715,7 +42750,7 @@ mod tests {
             .expect("registered CallWithThis P9 owner")
             .code_block()
             .side_tables()
-            .value_profiles
+            .value_profiles()
             .bucket_samples[0];
         assert_eq!(first_sample.bytecode_index, BytecodeIndex::from_offset(1));
         assert_eq!(first_sample.bucket.kind, ValueProfileBucketKind::Sample);
@@ -42728,7 +42763,7 @@ mod tests {
                 .expect("registered CallWithThis P9 owner")
                 .code_block()
                 .side_tables()
-                .value_profiles
+                .value_profiles()
                 .jit_storage
                 .raw_value_for_slot(first_sample.bucket.slot),
             Some(this_value.encoded())
@@ -42752,7 +42787,7 @@ mod tests {
             .expect("registered CallWithThis P9 owner")
             .code_block()
             .side_tables()
-            .value_profiles
+            .value_profiles()
             .bucket_samples[0];
         assert_eq!(second_sample.value, this_value);
         assert_eq!(
@@ -42765,7 +42800,7 @@ mod tests {
                 .expect("registered CallWithThis P9 owner")
                 .code_block()
                 .side_tables()
-                .value_profiles
+                .value_profiles()
                 .jit_storage
                 .raw_value_for_slot(second_sample.bucket.slot),
             Some(this_value.encoded())
@@ -44171,8 +44206,11 @@ mod tests {
             .get(owner)
             .expect("registered owner code block")
             .code_block();
-        let call =
-            &registered_code_block.side_tables().inline_caches.calls[attachment.slot.0 as usize];
+        // Clone so no `Ref` borrow of the registry table outlives into the later
+        // `&mut vm` safepoint call (table now lives behind a `RefCell`).
+        let call = registered_code_block.side_tables().inline_caches().calls
+            [attachment.slot.0 as usize]
+            .clone();
         assert_eq!(call.mode, crate::bytecode::ic::CallLinkMode::Init);
         assert_eq!(call.target, CallTarget::Unlinked);
 
@@ -44195,7 +44233,7 @@ mod tests {
 
         let code_block = generated_native_call_return_object_code_block();
         let owner = register_test_code_block(&mut vm, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 1125);
         let bytecode_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
@@ -44286,7 +44324,7 @@ mod tests {
                 .is_some_and(|object| record.target == object.0)
         }));
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "native call observation must not mutate bytecode IC metadata"
         );
@@ -44672,7 +44710,7 @@ mod tests {
 
         let code_block = generated_js_call_throwing_code_block();
         let owner = register_test_code_block(&mut vm, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 1023);
         let bytecode_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
@@ -44777,7 +44815,7 @@ mod tests {
             .call_link_inline_cache_attachment_records()
             .is_empty());
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "throwing call observation handoff must not mutate bytecode IC metadata"
         );
@@ -44905,7 +44943,7 @@ mod tests {
 
         let code_block = generated_js_call_with_this_return_result_code_block();
         let owner = register_test_code_block(&mut vm, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 1124);
         let bytecode_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
@@ -45283,7 +45321,7 @@ mod tests {
             .get(owner)
             .expect("registered owner code block")
             .code_block();
-        let registered_inline_caches = &registered_code_block.side_tables().inline_caches;
+        let registered_inline_caches = registered_code_block.side_tables().inline_caches().clone();
         assert_eq!(
             &registered_inline_caches.property_accesses, &inline_caches_before.property_accesses,
             "CallWithThis attachment must not mutate property IC metadata"
@@ -45506,7 +45544,7 @@ mod tests {
 
         let code_block = generated_property_get_by_name_return_consumed_code_block();
         let owner = register_test_code_block(&mut vm, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 1024);
         assert!(artifact.runtime_helper_plan().is_none());
@@ -45660,7 +45698,7 @@ mod tests {
         assert!(!plan_record.plan.access_case.may_call_js);
         assert!(plan_record.plan.access_case.dependencies.is_empty());
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "property handoff slow dispatch must not mutate bytecode IC metadata"
         );
@@ -45804,7 +45842,7 @@ mod tests {
 
         let code_block = generated_property_put_by_name_return_value_code_block();
         let owner = register_test_code_block(&mut vm, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 1031);
         assert!(artifact.runtime_helper_plan().is_none());
@@ -45988,7 +46026,7 @@ mod tests {
             .generated_guarded_property_load_probe_misses()
             .is_empty());
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "property store handoff slow dispatch must not mutate bytecode IC metadata"
         );
@@ -46862,7 +46900,7 @@ mod tests {
 
         let code_block = generated_property_put_by_name_return_value_code_block();
         let owner = register_test_code_block(&mut vm, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 1152);
 
         let warmup = execute_registered_code_block_with_host_and_arguments(
@@ -46980,7 +47018,10 @@ mod tests {
                 .property_load_guard_watchpoint_materializations(),
             watchpoint_materializations_before
         );
-        assert_eq!(code_block.side_tables().inline_caches, inline_caches_before);
+        assert_eq!(
+            *code_block.side_tables().inline_caches(),
+            inline_caches_before
+        );
         assert_latest_generated_entry_evidence(&vm, owner, artifact);
     }
 
@@ -46993,7 +47034,7 @@ mod tests {
 
         let code_block = generated_property_put_by_name_return_value_code_block();
         let owner = register_test_code_block(&mut vm, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 1153);
 
         let warmup = execute_registered_code_block_with_host_and_arguments(
@@ -47109,7 +47150,10 @@ mod tests {
                 .baseline_generated_code_invalidations(),
             invalidations_before
         );
-        assert_eq!(code_block.side_tables().inline_caches, inline_caches_before);
+        assert_eq!(
+            *code_block.side_tables().inline_caches(),
+            inline_caches_before
+        );
         assert_latest_generated_entry_evidence(&vm, owner, artifact);
     }
 
@@ -47675,7 +47719,7 @@ mod tests {
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .clone();
 
         let second = execute_registered_code_block_with_host_and_arguments(
@@ -47718,12 +47762,12 @@ mod tests {
             invalidations_before_second.as_slice()
         );
         assert_eq!(
-            vm.code_blocks
+            *vm.code_blocks
                 .get(owner)
                 .expect("registered code block")
                 .code_block()
                 .side_tables()
-                .inline_caches,
+                .inline_caches(),
             inline_caches_before_second
         );
         assert_eq!(
@@ -47763,7 +47807,7 @@ mod tests {
                 .expect("registered code block")
                 .code_block()
                 .side_tables()
-                .inline_caches
+                .inline_caches()
                 .structure_stubs[0]
                 .access_cases;
             assert_eq!(access_cases.len(), 1);
@@ -47774,8 +47818,8 @@ mod tests {
             .code_blocks
             .code_block_mut_for_test(owner)
             .expect("registered code block");
-        let mut side_tables = registered.side_tables().clone();
-        side_tables.inline_caches.structure_stubs[0]
+        let side_tables = registered.side_tables().clone();
+        side_tables.inline_caches_mut().structure_stubs[0]
             .access_cases
             .clear();
         *registered = registered.clone().with_side_tables(side_tables);
@@ -47928,7 +47972,7 @@ mod tests {
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .structure_stubs[0]
             .access_cases
             .is_empty());
@@ -48025,7 +48069,7 @@ mod tests {
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .structure_stubs
             .is_empty());
 
@@ -50009,7 +50053,7 @@ mod tests {
 
         let code_block = generated_property_get_by_name_return_consumed_code_block();
         let owner = register_test_code_block(&mut vm, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 1024);
         let bytecode_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
@@ -50027,7 +50071,7 @@ mod tests {
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "property handoff slow dispatch must not mutate bytecode IC metadata"
         );
@@ -50141,7 +50185,7 @@ mod tests {
 
         let code_block = generated_property_get_by_name_throwing_code_block();
         let owner = register_test_code_block(&mut vm, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 1135);
         let bytecode_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
@@ -50167,7 +50211,7 @@ mod tests {
         );
         assert!(host.property_load_probes.is_empty());
         assert_eq!(
-            code_block.side_tables().inline_caches,
+            *code_block.side_tables().inline_caches(),
             inline_caches_before,
             "missing-property handoff must not mutate bytecode IC metadata"
         );
@@ -50302,7 +50346,10 @@ mod tests {
             .property_load_access_case_plan_table_for_owner(owner, bytecode_snapshot)
             .expect("own-missing second-run property-load table")
             .is_empty());
-        assert_eq!(code_block.side_tables().inline_caches, inline_caches_before);
+        assert_eq!(
+            *code_block.side_tables().inline_caches(),
+            inline_caches_before
+        );
         assert_latest_generated_entry_evidence(&vm, owner, artifact);
     }
 
@@ -50317,7 +50364,7 @@ mod tests {
 
         let code_block = generated_property_get_by_name_throwing_code_block();
         let owner = register_test_code_block(&mut vm, code_block.clone());
-        let inline_caches_before = code_block.side_tables().inline_caches.clone();
+        let inline_caches_before = code_block.side_tables().inline_caches().clone();
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 1136);
         let bytecode_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
 
@@ -50334,7 +50381,10 @@ mod tests {
             ExecutionCompletion::Returned(RuntimeValue::undefined())
         );
         assert!(host.property_load_probes.is_empty());
-        assert_eq!(code_block.side_tables().inline_caches, inline_caches_before);
+        assert_eq!(
+            *code_block.side_tables().inline_caches(),
+            inline_caches_before
+        );
 
         let object_cell = heap_cell_for_value(&vm, object);
         let terminal_cell = heap_cell_for_value(&vm, terminal);
@@ -50424,7 +50474,10 @@ mod tests {
             vm.tiering_integration().property_load_guard_plans().len(),
             1
         );
-        assert_eq!(code_block.side_tables().inline_caches, inline_caches_before);
+        assert_eq!(
+            *code_block.side_tables().inline_caches(),
+            inline_caches_before
+        );
         assert_latest_generated_entry_evidence(&vm, owner, artifact);
     }
 
@@ -53908,7 +53961,7 @@ mod tests {
             .code_block()
             .clone();
         assert_eq!(
-            installed_code_block.entrypoints().baseline_jit,
+            installed_code_block.entrypoints().baseline_jit(),
             Some(request.slot)
         );
         assert_eq!(
@@ -56393,8 +56446,10 @@ mod tests {
                         vec![Operand::Register(local(0))],
                     ),
                 ]);
-                entry.construct_code_block =
-                    Some(construct_code_block_for_executable(&stale_body, executable));
+                entry.construct_code_block = Some(Rc::new(construct_code_block_for_executable(
+                    &stale_body,
+                    executable,
+                )));
                 entry
             }
         }
@@ -57694,7 +57749,7 @@ mod tests {
                 .expect("registered supplemental generated-origin P9 owner")
                 .code_block()
                 .side_tables()
-                .value_profiles
+                .value_profiles()
                 .bucket_samples[0];
             assert_eq!(first_sample.bytecode_index, BytecodeIndex::from_offset(1));
             assert_eq!(first_sample.value, RuntimeValue::from_i32(41));
@@ -57744,7 +57799,7 @@ mod tests {
                 .expect("registered supplemental generated-origin P9 owner")
                 .code_block()
                 .side_tables()
-                .value_profiles
+                .value_profiles()
                 .bucket_samples[0];
             assert_eq!(second_sample.value, RuntimeValue::from_i32(41));
             assert_eq!(
@@ -57757,7 +57812,7 @@ mod tests {
                     .expect("registered supplemental generated-origin P9 owner")
                     .code_block()
                     .side_tables()
-                    .value_profiles
+                    .value_profiles()
                     .jit_storage
                     .raw_value_for_slot(second_sample.bucket.slot),
                 Some(RuntimeValue::from_i32(41).encoded()),

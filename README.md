@@ -144,12 +144,13 @@ Legend:
 
 [wip] Execution tiers and JIT
   [done] generated baseline execution for accepted (number/move/jump) subset
-  [risk] baseline is a NET REGRESSION on real code (box2d ~8.5x slower): no native
-         get_by_id/put_by_id/get_by_val/call lowering -> whole-block emitter rejects
-         on first unsupported opcode; executor exits on property (when IC unattached)
-         and on ALL user-JS calls -> ~2 bytecodes/entry on box2d. C++ JIT.cpp compiles
-         EVERY opcode w/ fast path + out-of-line slow-case-callout-that-RETURNS to
-         native. Faithful fix: stay-resident property-IC hits + resident direct-call.
+  [done] stable CodeBlock identity (faithful to C++ single CodeBlock*): memoized
+         snapshot fingerprint + Rc-shared instance + interior-mutable runtime state
+         (IC/value-profiles/tier); removed per-call O(N) re-fingerprint (~60-70%
+         profiled self-time) and per-call deep clone
+  [risk] baseline is still a Rust bytecode RE-INTERPRETER (~1.6x over interpreter,
+         ~1.3M bytecodes/sec); top-level blocks get no generated execution. Parity
+         needs machine-code dispatch: no native get_by_id/put_by_id/call lowering yet
   [wip] emitted native entry
     [done] number-number arithmetic fast path subset
     [wip] native-entry retained side-exit handling

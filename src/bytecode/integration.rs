@@ -53,9 +53,9 @@ impl BytecodeTierExecutionSummary {
         let tier_state = code_block.tier_state();
         let entrypoints = code_block.entrypoints();
         Self {
-            current_tier: tier_state.current_tier,
+            current_tier: tier_state.current_tier(),
             has_interpreter_entry: entrypoints.interpreter.is_some(),
-            has_baseline_entry: entrypoints.baseline_jit.is_some(),
+            has_baseline_entry: entrypoints.baseline_jit().is_some(),
             has_optimizing_entry: entrypoints.optimizing_jit.is_some(),
             llint_threshold: tier_state.llint_counter.threshold,
             baseline_threshold: tier_state.baseline_counter.threshold,
@@ -189,7 +189,7 @@ pub fn summarize_bytecode_integration(code_block: &CodeBlock) -> BytecodeIntegra
 
     if let Err(error) = code_block
         .side_tables()
-        .value_profiles
+        .value_profiles()
         .validate_root_metadata()
     {
         let bytecode_index = match error {
@@ -247,8 +247,11 @@ fn summarize_roots(code_block: &CodeBlock) -> BytecodeRootIntegrationSummary {
             .flat_map(|map| &map.slots)
             .filter(|slot| !slot.precise)
             .count() as u32,
-        value_profile_root_count: code_block.side_tables().value_profiles.root_metadata.len()
-            as u32,
+        value_profile_root_count: code_block
+            .side_tables()
+            .value_profiles()
+            .root_metadata
+            .len() as u32,
     }
 }
 
@@ -323,7 +326,7 @@ mod tests {
                     slots: vec![root_slot],
                     complete: true,
                 }],
-                value_profiles: ValueProfileTable {
+                value_profiles: std::cell::RefCell::new(ValueProfileTable {
                     profiles: vec![ValueProfile {
                         bytecode_index,
                         checkpoint: crate::bytecode::Checkpoint::NONE,
@@ -342,7 +345,7 @@ mod tests {
                         crate::bytecode::ProfileUpdatePolicy::ConcurrentBuckets,
                     )],
                     ..ValueProfileTable::default()
-                },
+                }),
                 ..LinkedSideTables::default()
             })
             .with_entrypoints(CodeBlockEntrypoints {

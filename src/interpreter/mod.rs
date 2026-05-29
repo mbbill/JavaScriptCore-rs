@@ -11,6 +11,7 @@ use std::fs;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bytecode::code_block::{
@@ -151,7 +152,11 @@ pub struct ConstructReturnContinuation {
 pub struct OrdinaryBytecodeCallRequest {
     pub(crate) continuation: CallReturnContinuation,
     pub(crate) target_code_block_id: CodeBlockId,
-    pub(crate) target_code_block: CodeBlock,
+    // C++ JSC divergence (one shared instance): carries the shared `Rc<CodeBlock>`
+    // (refcount bump, not a deep copy) so the dispatch path operates on the single
+    // registered instance whose snapshot-fingerprint memo + interior-mutable
+    // feedback persist. Mirrors C++ holding the stable `CodeBlock*`.
+    pub(crate) target_code_block: Rc<CodeBlock>,
     pub(crate) argument_values: Vec<RuntimeValue>,
 }
 
@@ -159,13 +164,7 @@ impl PartialEq for OrdinaryBytecodeCallRequest {
     fn eq(&self, other: &Self) -> bool {
         self.continuation == other.continuation
             && self.target_code_block_id == other.target_code_block_id
-            && std::sync::Arc::ptr_eq(
-                self.target_code_block.shared_unlinked(),
-                other.target_code_block.shared_unlinked(),
-            )
-            && self.target_code_block.link_context() == other.target_code_block.link_context()
-            && self.target_code_block.entrypoints() == other.target_code_block.entrypoints()
-            && self.target_code_block.lifecycle() == other.target_code_block.lifecycle()
+            && code_blocks_request_eq(&self.target_code_block, &other.target_code_block)
             && self.argument_values == other.argument_values
     }
 }
@@ -176,7 +175,8 @@ impl Eq for OrdinaryBytecodeCallRequest {}
 pub struct OrdinaryBytecodeConstructRequest {
     pub(crate) continuation: ConstructReturnContinuation,
     pub(crate) target_code_block_id: CodeBlockId,
-    pub(crate) target_code_block: CodeBlock,
+    // C++ JSC divergence (one shared instance): see `OrdinaryBytecodeCallRequest`.
+    pub(crate) target_code_block: Rc<CodeBlock>,
     pub(crate) argument_values: Vec<RuntimeValue>,
 }
 
@@ -184,13 +184,7 @@ impl PartialEq for OrdinaryBytecodeConstructRequest {
     fn eq(&self, other: &Self) -> bool {
         self.continuation == other.continuation
             && self.target_code_block_id == other.target_code_block_id
-            && std::sync::Arc::ptr_eq(
-                self.target_code_block.shared_unlinked(),
-                other.target_code_block.shared_unlinked(),
-            )
-            && self.target_code_block.link_context() == other.target_code_block.link_context()
-            && self.target_code_block.entrypoints() == other.target_code_block.entrypoints()
-            && self.target_code_block.lifecycle() == other.target_code_block.lifecycle()
+            && code_blocks_request_eq(&self.target_code_block, &other.target_code_block)
             && self.argument_values == other.argument_values
     }
 }
@@ -420,7 +414,8 @@ pub struct FunctionValueCallRequest {
     pub(crate) callee_value: RuntimeValue,
     pub(crate) callee_object: Option<ObjectId>,
     pub(crate) target_code_block_id: CodeBlockId,
-    pub(crate) target_code_block: CodeBlock,
+    // C++ JSC divergence (one shared instance): see `OrdinaryBytecodeCallRequest`.
+    pub(crate) target_code_block: Rc<CodeBlock>,
     pub(crate) argument_values: Vec<RuntimeValue>,
 }
 
@@ -430,18 +425,28 @@ impl PartialEq for FunctionValueCallRequest {
             && self.callee_value == other.callee_value
             && self.callee_object == other.callee_object
             && self.target_code_block_id == other.target_code_block_id
-            && std::sync::Arc::ptr_eq(
-                self.target_code_block.shared_unlinked(),
-                other.target_code_block.shared_unlinked(),
-            )
-            && self.target_code_block.link_context() == other.target_code_block.link_context()
-            && self.target_code_block.entrypoints() == other.target_code_block.entrypoints()
-            && self.target_code_block.lifecycle() == other.target_code_block.lifecycle()
+            && code_blocks_request_eq(&self.target_code_block, &other.target_code_block)
             && self.argument_values == other.argument_values
     }
 }
 
 impl Eq for FunctionValueCallRequest {}
+
+// C++ JSC divergence (instance identity): C++ compares call targets by
+// `CodeBlock*` identity. When two requests share the one stable `Rc<CodeBlock>`
+// (the runtime path), `Rc::ptr_eq` is an O(1) identity match — strictly more
+// faithful than the old structural compare. The structural fallback (used by
+// test-constructed, non-shared blocks) preserves the previous equality so tests
+// that build two distinct-but-equal blocks still compare equal.
+fn code_blocks_request_eq(left: &Rc<CodeBlock>, right: &Rc<CodeBlock>) -> bool {
+    if Rc::ptr_eq(left, right) {
+        return true;
+    }
+    std::sync::Arc::ptr_eq(left.shared_unlinked(), right.shared_unlinked())
+        && left.link_context() == right.link_context()
+        && left.entrypoints() == right.entrypoints()
+        && left.lifecycle() == right.lifecycle()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CallReturnContinuationRequest {
@@ -2719,32 +2724,46 @@ impl CoreGlobalLexicalDeclarationKind {
 #[derive(Clone, Debug)]
 pub struct InterpreterFunctionCodeBlock {
     pub id: CodeBlockId,
-    pub code_block: CodeBlock,
+    // C++ JSC divergence (one shared instance): the interpreter host references the
+    // same stable `CodeBlock` instance the VM registry holds, mirroring C++'s
+    // single `CodeBlock*` shared by interpreter and runtime. `Rc` stands in for
+    // C++ `WriteBarrier<CodeBlock>` (Rc, not Arc: VM is single-threaded,
+    // `CodeBlock` is `!Sync`). Cloning this entry / building a call request is now
+    // a cheap refcount bump, so the per-call deep copy that defeated the snapshot
+    // memo is gone. Call and Construct stay distinct instances (distinct ids).
+    pub code_block: Rc<CodeBlock>,
     pub construct_id: Option<CodeBlockId>,
-    pub construct_code_block: Option<CodeBlock>,
+    pub construct_code_block: Option<Rc<CodeBlock>>,
 }
 
 impl InterpreterFunctionCodeBlock {
-    pub fn new(id: CodeBlockId, code_block: CodeBlock) -> Self {
+    // Accepts anything convertible into `Rc<CodeBlock>` so the install path can hand
+    // in the pre-built shared `Rc` while existing by-value `CodeBlock` callers keep
+    // working (a fresh per-block `Rc`).
+    pub fn new(id: CodeBlockId, code_block: impl Into<Rc<CodeBlock>>) -> Self {
         Self {
             id,
-            code_block,
+            code_block: code_block.into(),
             construct_id: None,
             construct_code_block: None,
         }
     }
 
-    pub fn with_construct(mut self, id: CodeBlockId, code_block: CodeBlock) -> Self {
+    pub fn with_construct(mut self, id: CodeBlockId, code_block: impl Into<Rc<CodeBlock>>) -> Self {
         self.construct_id = Some(id);
-        self.construct_code_block = Some(code_block);
+        self.construct_code_block = Some(code_block.into());
         self
     }
 
-    fn synthetic(function_index: u32, code_block: CodeBlock) -> Self {
+    fn synthetic(function_index: u32, code_block: impl Into<Rc<CodeBlock>>) -> Self {
         Self::new(synthetic_function_code_block_id(function_index), code_block)
     }
 }
 
+// Test/helper convenience: wrap each freshly-built `CodeBlock` into its own
+// `Rc`. These synthetic blocks are not shared with a VM registry, so a fresh
+// per-block `Rc` is correct; the request `PartialEq` structural fallback handles
+// comparing such non-shared blocks.
 fn indexed_function_code_blocks(
     function_blocks: Vec<CodeBlock>,
 ) -> Vec<InterpreterFunctionCodeBlock> {
@@ -17828,6 +17847,7 @@ impl CoreOpcodeDispatchHost {
                 argument_count: request.argument_count,
                 first_argument_operand: request.first_argument_operand,
                 this_value: request.this_value,
+                // Borrow the shared `Rc<CodeBlock>` as `&CodeBlock` (no copy).
                 construct_code_block: &construct_code_block,
             },
         )?;

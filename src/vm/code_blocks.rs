@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::bytecode::code_block::CodeBlockMutationError;
 use crate::bytecode::ic::{
@@ -36,8 +37,26 @@ pub(crate) struct CodeBlockRegistry {
 }
 
 impl CodeBlockRegistry {
-    pub(crate) fn register(&mut self, owner: CodeBlockId, code_block: CodeBlock) {
-        let code_block = code_block.with_root_map_owner(owner);
+    // C++ JSC divergence (one shared instance per (executable, specialization)):
+    // C++ keeps exactly one stable `CodeBlock` heap object per function and
+    // specialization (FunctionExecutable::m_codeBlockForCall/m_codeBlockForConstruct
+    // as `WriteBarrier<CodeBlock>`), referenced everywhere by raw `CodeBlock*` and
+    // never copied per call. Rust shares one instance via `Rc<CodeBlock>` (Rc, not
+    // Arc: the VM is single-threaded — `CodeBlockMutationAuthority::VmMainThread` —
+    // and `CodeBlock` is `!Sync` via its `Cell`s; `Rc` stands in for
+    // `WriteBarrier<CodeBlock>`). `register` accepts anything convertible into an
+    // `Rc<CodeBlock>` so existing by-value `CodeBlock` callers keep working while
+    // the install path can hand in a pre-built shared `Rc` (shared by `Rc::clone`
+    // into both this registry and the interpreter host).
+    pub(crate) fn register(&mut self, owner: CodeBlockId, code_block: impl Into<Rc<CodeBlock>>) {
+        let mut code_block = code_block.into();
+        // The root-map owner is a hashed field. When this `Rc` is uniquely owned
+        // (the common by-value-`CodeBlock` callers), stamp it in place via
+        // `Rc::get_mut`; the install path stamps before sharing, so an already
+        // shared `Rc` re-stamps to the same owner and the no-op is safe.
+        if let Some(code_block_mut) = Rc::get_mut(&mut code_block) {
+            code_block_mut.stamp_root_map_owner(owner);
+        }
         self.records.insert(owner, CodeBlockRecord::new(code_block));
     }
 
@@ -46,11 +65,24 @@ impl CodeBlockRegistry {
         self.records.get(&owner)
     }
 
+    /// Shared handle to the one registered `CodeBlock` instance (refcount bump,
+    /// not a deep copy), mirroring C++ handing out the stable `CodeBlock*`. The
+    /// hot dispatch path uses this so the per-instance snapshot-fingerprint memo
+    /// and interior-mutable feedback persist on the single instance.
+    pub(crate) fn code_block_shared(&self, owner: CodeBlockId) -> Option<Rc<CodeBlock>> {
+        self.records
+            .get(&owner)
+            .map(|record| record.code_block_shared())
+    }
+
+    // Test-only `&mut` access to the registered instance via `Rc::get_mut`, which
+    // succeeds only while the registry is the sole owner (no live dispatch alias).
+    // Tests mutate the block before sharing it, so this holds.
     #[cfg(test)]
     pub(crate) fn code_block_mut_for_test(&mut self, owner: CodeBlockId) -> Option<&mut CodeBlock> {
         self.records
             .get_mut(&owner)
-            .map(|record| &mut record.code_block)
+            .and_then(|record| Rc::get_mut(&mut record.code_block))
     }
 
     #[allow(dead_code)]
@@ -146,7 +178,7 @@ impl CodeBlockRegistry {
         let (slot, _) = record
             .code_block
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .call_slot_for_bytecode_index(bytecode_index)?;
         Some(InlineCacheSlotId(slot as u32))
     }
@@ -232,12 +264,8 @@ impl CodeBlockRegistry {
                     return None;
                 }
                 let structure_stub_index = code_block_outcome.structure_stub_index?;
-                let structure_stub_info = record
-                    .code_block
-                    .side_tables()
-                    .inline_caches
-                    .structure_stubs
-                    .get(structure_stub_index)?;
+                let inline_caches = record.code_block.side_tables().inline_caches();
+                let structure_stub_info = inline_caches.structure_stubs.get(structure_stub_index)?;
                 VmStructureStubPropertyInlineCacheCandidate::from_attachment_record_and_structure_stub_info(
                     attachment,
                     structure_stub_index,
@@ -398,7 +426,7 @@ impl CodeBlockRegistry {
         record
             .code_block
             .side_tables()
-            .value_profiles
+            .value_profiles()
             .jit_store_target(
                 bytecode_index,
                 Checkpoint::NONE,
@@ -587,13 +615,17 @@ pub(crate) enum CodeBlockRegistryExecutableEntryPublication {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CodeBlockRecord {
-    code_block: CodeBlock,
+    // C++ JSC divergence: the canonical `CodeBlock` is the single shared instance
+    // (see `CodeBlockRegistry::register`). `Rc` stands in for C++
+    // `WriteBarrier<CodeBlock>`; runtime feedback mutates it in place through the
+    // interior-mutable fields (`&self`), so no `&mut` through the `Rc` is needed.
+    code_block: Rc<CodeBlock>,
     executable_entrypoints: ExecutableEntrypoints,
     executable_entry_publications: Vec<ExecutableEntryCacheRecord>,
 }
 
 impl CodeBlockRecord {
-    fn new(code_block: CodeBlock) -> Self {
+    fn new(code_block: Rc<CodeBlock>) -> Self {
         Self {
             code_block,
             executable_entrypoints: ExecutableEntrypoints::default(),
@@ -601,9 +633,17 @@ impl CodeBlockRecord {
         }
     }
 
+    /// Borrow the shared instance as `&CodeBlock` (auto-derefs through `Rc`) for
+    /// read-only callers; unchanged from before the `Rc` migration.
     #[allow(dead_code)]
     pub(crate) fn code_block(&self) -> &CodeBlock {
         &self.code_block
+    }
+
+    /// Shared handle to the one instance (refcount bump). Used by the hot dispatch
+    /// path so the memo + interior-mutable feedback persist on the single instance.
+    pub(crate) fn code_block_shared(&self) -> Rc<CodeBlock> {
+        Rc::clone(&self.code_block)
     }
 
     #[allow(dead_code)]
@@ -1006,9 +1046,10 @@ mod tests {
 
         let (mut registry, owner, bytecode_snapshot, _, attachment) = call_link_registry_fixture();
         let record = registry.records.get_mut(&owner).expect("registered record");
-        let mut side_tables = record.code_block.side_tables().clone();
-        side_tables.inline_caches.calls[0].target = call_link_metadata_target(90);
-        record.code_block = record.code_block.clone().with_side_tables(side_tables);
+        let side_tables = record.code_block.side_tables().clone();
+        side_tables.inline_caches_mut().calls[0].target = call_link_metadata_target(90);
+        record.code_block =
+            std::rc::Rc::new((*record.code_block).clone().with_side_tables(side_tables));
 
         assert!(registry
             .attached_call_link_inline_cache_candidates_for_owner(
@@ -1173,7 +1214,7 @@ mod tests {
             .expect("registered code block")
             .code_block()
             .side_tables()
-            .inline_caches
+            .inline_caches()
             .structure_stubs[0]
             .clone();
         assert_eq!(candidate.structure_stub_info, registered_stub);
@@ -1227,9 +1268,10 @@ mod tests {
         let (mut registry, owner, bytecode_snapshot, _, attachment) =
             structure_stub_registry_fixture();
         let record = registry.records.get_mut(&owner).expect("registered record");
-        let mut side_tables = record.code_block.side_tables().clone();
-        side_tables.inline_caches.structure_stubs[0].offset = Some(PropertyOffset(99));
-        record.code_block = record.code_block.clone().with_side_tables(side_tables);
+        let side_tables = record.code_block.side_tables().clone();
+        side_tables.inline_caches_mut().structure_stubs[0].offset = Some(PropertyOffset(99));
+        record.code_block =
+            std::rc::Rc::new((*record.code_block).clone().with_side_tables(side_tables));
 
         assert!(registry
             .structure_stub_property_inline_cache_candidates_for_owner(

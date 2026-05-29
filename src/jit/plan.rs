@@ -1708,7 +1708,7 @@ fn baseline_generated_owner_call_result_profile_site(
 
     let target = code_block
         .side_tables()
-        .value_profiles
+        .value_profiles()
         .jit_store_target(
             bytecode_index,
             crate::bytecode::Checkpoint::NONE,
@@ -2030,7 +2030,7 @@ fn derive_baseline_generated_property_handoff_site_with_cache_validation(
     let property_key = property_cache_key_from_instruction(instruction, opcode)?;
     let (slot, cache) = unique_property_access_slot_for_bytecode_index(code_block, bytecode_index)?;
     validate_property_inline_cache(
-        cache,
+        &cache,
         bytecode_index,
         opcode,
         base,
@@ -2165,13 +2165,16 @@ fn derive_property_miss_handoff_descriptor(
     )
 }
 
+// Returns the matching property IC by value (clone) rather than by reference: the
+// table now lives behind a `RefCell` (see `LinkedSideTables`), so a borrowed
+// `&PropertyInlineCache` cannot outlive the transient `Ref` guard. The cache is
+// only used for one local validation at the caller, so a clone is faithful and cheap.
 fn unique_property_access_slot_for_bytecode_index(
     code_block: &CodeBlock,
     bytecode_index: BytecodeIndex,
-) -> Result<(InlineCacheSlotId, &PropertyInlineCache), JitPlanValidationError> {
-    let mut matching = code_block
-        .side_tables()
-        .inline_caches
+) -> Result<(InlineCacheSlotId, PropertyInlineCache), JitPlanValidationError> {
+    let inline_caches = code_block.side_tables().inline_caches();
+    let mut matching = inline_caches
         .property_accesses
         .iter()
         .enumerate()
@@ -2183,6 +2186,7 @@ fn unique_property_access_slot_for_bytecode_index(
             },
         );
     };
+    let cache = cache.clone();
     if matching.next().is_some() {
         return Err(
             JitPlanValidationError::BaselineGeneratedPropertyHandoffPlanDuplicateBytecodeCache {
@@ -5019,7 +5023,29 @@ fn collect_baseline_bytecode_instructions<'a>(
     Ok(instructions)
 }
 
+// C++ JSC divergence: C++ JSC never re-hashes the bytecode stream to validate a
+// baseline/JIT artifact. It establishes identity once at install/link and checks
+// it on the hot path by cheap reads — CodeBlock::m_jitCode + const
+// JITCode::m_jitType (CodeBlock.h:361, JITCode.h:256,308),
+// PropertyInlineCache::m_cacheType + watchpoint/GC invalidation
+// (PropertyInlineCache.h:207,391), and CallLinkInfo::isLinked()'s stored Mode
+// (CallLinkInfo.h:124) — never an O(N-instructions) re-hash. This function is the
+// single funnel through which ~131 hot guard/key call sites reach the fingerprint,
+// and the profiler showed the per-call full re-decode + re-hash here dominated
+// self-time. Everything hashed is immutable after the CodeBlock is registered (see
+// the `CodeBlock::snapshot_fingerprint` field comment), so the value is identical
+// across all calls for a given CodeBlock. We therefore compute it once and cache it
+// on the CodeBlock, matching the C++ "identity once at link, never recompute" model.
+// All callers keep using this same name/signature; the memoization is transparent.
 fn baseline_bytecode_snapshot_fingerprint_from_code_block(
+    code_block: &CodeBlock,
+) -> Result<BaselineBytecodeSnapshotFingerprint, JitPlanValidationError> {
+    code_block.cached_baseline_snapshot_fingerprint(|| {
+        compute_baseline_bytecode_snapshot_fingerprint_from_code_block(code_block)
+    })
+}
+
+fn compute_baseline_bytecode_snapshot_fingerprint_from_code_block(
     code_block: &CodeBlock,
 ) -> Result<BaselineBytecodeSnapshotFingerprint, JitPlanValidationError> {
     let mut instruction_hasher = BaselineSnapshotHasher::new(0x6a09_e667_f3bc_c909);
@@ -5049,7 +5075,7 @@ fn baseline_bytecode_snapshot_fingerprint_from_code_block(
     write_code_block_string_literal_table_fingerprint(&mut side_table_hasher, code_block);
     write_property_inline_cache_table_fingerprint(
         &mut side_table_hasher,
-        &code_block.side_tables().inline_caches.property_accesses,
+        &code_block.side_tables().inline_caches().property_accesses,
     );
 
     Ok(BaselineBytecodeSnapshotFingerprint {
@@ -5737,6 +5763,18 @@ fn write_root_map_fingerprint(hasher: &mut BaselineSnapshotHasher, root_maps: &[
     }
 }
 
+// Memoization-invariant requirement: this hashes only the STRUCTURAL projection of
+// each property IC (bytecode_index, access, kind, base, property, and the two
+// .is_some() booleans). The runtime IC attach/clear mutators write state/dispatch/
+// offsets and refill the same accessor slot the cache was born with, so today they do
+// not flip this projection. They are no longer `&mut` paths: the IC table is now
+// interior-mutable (`RefCell` in `LinkedSideTables`) so writes go through `&CodeBlock`
+// on the shared instance, mirroring C++ JSC mutating IC state through `CodeBlock*`.
+// Those mutators still call `invalidate_snapshot_fingerprint()`, so the compute-once
+// memo (see `CodeBlock::snapshot_fingerprint`) stays correct even if a future change
+// makes a mutator flip get_by_id/put_by_id between Some/None or grow/reorder
+// property_accesses on a live CodeBlock. This mirrors C++ JSC, where the IC structural
+// layout is fixed at link and only stub state mutates.
 fn write_property_inline_cache_table_fingerprint(
     hasher: &mut BaselineSnapshotHasher,
     property_accesses: &[PropertyInlineCache],
@@ -10489,7 +10527,11 @@ mod tests {
                 vec![Operand::Register(VirtualRegister::local(2))],
             ),
         ]);
-        let property_accesses = &code_block.side_tables().inline_caches.property_accesses;
+        let property_accesses = code_block
+            .side_tables()
+            .inline_caches()
+            .property_accesses
+            .clone();
 
         assert_eq!(property_accesses.len(), 2);
         assert_eq!(property_accesses[0].access, PropertyAccessType::InById);
@@ -10587,8 +10629,8 @@ mod tests {
     fn generated_property_handoff_rejects_get_by_name_without_bytecode_ic_site() {
         let owner = baseline_owner();
         let code_block = get_by_name_code_block(17);
-        let mut side_tables = code_block.side_tables().clone();
-        side_tables.inline_caches.property_accesses.clear();
+        let side_tables = code_block.side_tables().clone();
+        side_tables.inline_caches_mut().property_accesses.clear();
         let code_block = code_block.with_side_tables(side_tables);
 
         assert_eq!(
@@ -10605,9 +10647,12 @@ mod tests {
     fn generated_property_handoff_rejects_duplicate_get_by_name_bytecode_ic_sites() {
         let owner = baseline_owner();
         let code_block = get_by_name_code_block(17);
-        let mut side_tables = code_block.side_tables().clone();
-        let duplicate = side_tables.inline_caches.property_accesses[0].clone();
-        side_tables.inline_caches.property_accesses.push(duplicate);
+        let side_tables = code_block.side_tables().clone();
+        let duplicate = side_tables.inline_caches().property_accesses[0].clone();
+        side_tables
+            .inline_caches_mut()
+            .property_accesses
+            .push(duplicate);
         let code_block = code_block.with_side_tables(side_tables);
 
         assert_eq!(
@@ -10624,8 +10669,8 @@ mod tests {
     fn generated_property_handoff_rejects_warmed_bytecode_ic_state() {
         let owner = baseline_owner();
         let code_block = get_by_name_code_block(17);
-        let mut side_tables = code_block.side_tables().clone();
-        side_tables.inline_caches.property_accesses[0].state =
+        let side_tables = code_block.side_tables().clone();
+        side_tables.inline_caches_mut().property_accesses[0].state =
             BytecodeInlineCacheState::Monomorphic;
         let code_block = code_block.with_side_tables(side_tables);
 
@@ -10651,11 +10696,14 @@ mod tests {
                 get_global_object_property_code_block(23),
             ),
         ] {
-            let mut side_tables = code_block.side_tables().clone();
-            let cache = &mut side_tables.inline_caches.property_accesses[0];
-            cache.state = BytecodeInlineCacheState::Monomorphic;
-            cache.dispatch = PropertyInlineCacheDispatch::Handler;
-            cache.mutation_authority = InlineCacheMutationAuthority::BaselineJit;
+            let side_tables = code_block.side_tables().clone();
+            {
+                let mut inline_caches = side_tables.inline_caches_mut();
+                let cache = &mut inline_caches.property_accesses[0];
+                cache.state = BytecodeInlineCacheState::Monomorphic;
+                cache.dispatch = PropertyInlineCacheDispatch::Handler;
+                cache.mutation_authority = InlineCacheMutationAuthority::BaselineJit;
+            }
             let code_block = code_block.with_side_tables(side_tables);
 
             assert!(
@@ -10687,8 +10735,8 @@ mod tests {
     fn generated_property_handoff_rejects_mismatched_put_by_name_store_metadata() {
         let owner = baseline_owner();
         let code_block = put_by_name_code_block(19);
-        let mut side_tables = code_block.side_tables().clone();
-        side_tables.inline_caches.property_accesses[0].kind = PropertyCacheKind::GetById;
+        let side_tables = code_block.side_tables().clone();
+        side_tables.inline_caches_mut().property_accesses[0].kind = PropertyCacheKind::GetById;
         let mismatched_cache_kind = code_block.clone().with_side_tables(side_tables);
 
         assert_eq!(
