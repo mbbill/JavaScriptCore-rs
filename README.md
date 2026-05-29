@@ -13,6 +13,21 @@ Legend:
 - [risk] exists but needs fidelity or structure review
 - [deferred] intentionally later than the current path
 
+ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
+  Phase 1 [wip]  Interpreter performance: make rooting C++-faithful (conservative
+                 scan at safepoints, no per-op register-root registry). Goal: 3-10x
+                 faster iteration + first non-zero climbing Octane score; also the
+                 safepoint foundation the GC needs.
+  Phase 2 [next] Octane feature completeness (perf-independent): everything needed to
+                 RUN all 15 benchmarks correctly -- eval (runtime parse+compile;
+                 unblocks code-load/earley-boyer/gbemu/mandreel/pdfjs), full Yarr
+                 (regexp), remaining runtime/stdlib gaps. Interpreter/baseline, either.
+  Phase 3 [deferred] JIT as the perf path toward parity. NOTE: suite-SCORE parity is
+                 structurally owned by the DEFERRED optimizing tiers (DFG/FTL/B3
+                 ~283k LoC) + real GC; a baseline-only JIT asymptotes ~10-25%. Do NOT
+                 resume the per-opcode baseline-JIT residency grind until phases 1-2
+                 are done -- it is correct groundwork but not on the parity path alone.
+
 [wip] JetStream 3 Octane parity
   [done] Runner and benchmark contract
     [done] JetStreamDriver load order and shell globals
