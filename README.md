@@ -160,71 +160,28 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   [missing] modules, jobs, microtasks, async ordering
   [deferred] Wasm
 
-[wip] Execution tiers and JIT
-  [done] generated baseline execution for accepted (number/move/jump) subset
-  [done] stable CodeBlock identity (faithful to C++ single CodeBlock*): memoized
-         snapshot fingerprint + Rc-shared instance + interior-mutable runtime state
-         (IC/value-profiles/tier); removed per-call O(N) re-fingerprint (~60-70%
-         profiled self-time) and per-call deep clone
-  [risk] baseline is still a Rust bytecode RE-INTERPRETER (~1.6x over interpreter,
-         ~1.3M bytecodes/sec); top-level blocks get no generated execution. Parity
-         needs machine-code dispatch: get_by_id self+prototype DataIC machine code now
-         lands but is unreached on hot functions (see CONFIRMED CRITICAL GATE in proof
-         path: calls do not enter callee generated code, generated_direct_call=0)
-  [wip] CRITICAL PATH to a real machine-code tier (in order): 1 StructureTransition
-        Table [done] -> 2 fixed-offset Butterfly storage -> 3 inline mc GET/PUT_BY_ID
-        -> 4 monomorphic call-link -> 5 per-opcode fast+slow slow-case rejoin ->
-        6 inline alloc -> 7 real reg-alloc + retire the re-interpreter shim; GC deferred
-  [wip] emitted native entry
-    [done] number-number arithmetic fast path subset
-    [wip] native-entry retained side-exit handling
-    [blocked] remaining native-entry exits <= other owners and loop backedge proof
-  [wip] retained exits and continuations
-    [done] runtime-helper exits
-    [done] property exits
-    [done] JS-call exits
-    [done] P6 side-exit native reentry
-    [wip] opcode-specific side-exit cost reduction
-  [wip] scanner/property-increment hot path
-    [done] generated numeric load/inc/store sidecar
-    [done] P10 native-exit combined increment sidecar
-    [done] rootless admission for proven increment exits
-    [done] producer-derived Int32 proof
-    [done] hot scanner store-readiness coverage
-    [done] interpreter store observation harvest
-    [done] non-cell no-barrier store readiness proof
-    [missing] C++ ToNumeric/Inc update lowering
-  [wip] ToNumber/Add slow paths
-    [done] interpreter arithmetic/bitwise primitive numeric coercion for
-           current non-BigInt Number branch
-    [wip] ToNumber slow-path continuation
-    [wip] AddInt32 slow-path continuation/profiling
-    [deferred] static generic rootless ToNumber admission
-  [wip] property and call ICs
-    [wip] property IC evidence and attachment
-    [wip] call/direct-call telemetry and admission
-    [missing] full C++ IC invalidation/watchpoint integration
-  [missing] optimized JIT parity path
-  [wip] loop tiering and OSR
-    [done] LoopHint opcode, JSC loop-header placement, interpreter telemetry,
-           LLInt LoopHint generated-artifact handoff skeleton,
-           generated-baseline LoopHint counters, and native no-op lowering for
-           current baseline subset
-    [risk] LoopHint handoff TRIGGER already fires aggressively; residency (not the
-           trigger) is the box2d gate -> further widening admission is counterproductive
-    [missing] native inline LoopHint counter/operationOptimize flow matching
-              JSC emit_op_loop_hint
-    [missing] real loop OSR entry and optimized tier transition
-  [missing] DFG/FTL-equivalent strategy or justified parity route
+[deferred -> Phase 3] Execution tiers and JIT
+  [done] stable CodeBlock identity (C++ single CodeBlock*): memoized fingerprint +
+         Rc-shared instance + interior-mutable runtime state; no per-call re-fingerprint
+  [done] baseline machine-code groundwork: number/move/jump subset, get_by_id self +
+         prototype-chain DataIC (structure-guarded), retained exits (helper/property/
+         JS-call/P6 reentry), increment sidecar, LoopHint handoff skeleton. ALL on the
+         re-interpreter shim path; CORRECT but unreached on hot functions.
+  [risk] baseline is a Rust bytecode RE-INTERPRETER (no register allocation); the real
+         gate is call-dispatch-into-generated-code (generated_direct_call=0), then real
+         reg-alloc. Score is owned by the absent optimizing tiers.
+  [missing] CRITICAL PATH (deferred, in order): call-dispatch-into-generated -> mc
+         put_by_id/call/construct/get_by_val -> slow-case rejoin -> inline alloc ->
+         real reg-alloc; then DFG/FTL/B3-equivalent optimizing tier (where parity lives)
 
 [wip] GC, rooting, barriers, and handles
   [done] bytecode root maps for current generated paths
-  [done] targeted-root sync O(1) lookup + O(1) mutation + O(n) validate + buffer reuse
-         (was O(instr x records^2) + per-instruction alloc; richards 12:13 -> 8:15,
-         arith micro-bench 12.6s -> 8.0s)
-  [risk] per-instruction eager targeted-root registry diverges from C++ JSC
-         conservative-scan-at-safepoint; required by VM handoff UnresolvedRegisterRoot;
-         interpreter still ~1.6us/op (architecture floor) -> parity must come from JIT
+  [done] targeted-root sync now gated on register cell-membership (Phase 1 cut 1):
+         non-cell hot loops skip the per-op recompute (3.6-4.9x); register/stack
+         stores no longer barriered (cut 2, faithful: C++ barriers only heap fields)
+  [risk] still a per-op targeted-root registry (vs C++ conservative-scan-at-safepoint);
+         full safepoint rewrite is GC-coupled -> Phase 3. Cell-churning code (richards)
+         still pays the sync when it runs.
   [wip] targeted roots around helper exits
   [wip] write-barrier evidence for current property stores
   [missing] no GC collection runs during execution (unbounded heap growth)
