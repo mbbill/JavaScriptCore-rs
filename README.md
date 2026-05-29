@@ -87,6 +87,9 @@ Legend:
     [wip] prototype lookup and cacheability predicates
     [done] ordinary object ToPrimitive ordering for current relational path
     [wip] property mutation planning and readiness
+    [done] shared add-property StructureTransitionTable: same-(kind,prototype)
+           siblings share one structure_id (mirrors C++ Structure transitions),
+           so structure-keyed ICs hit cross-instance incl. the new-Foo() path
     [missing] full C++ structure/watchpoint invalidation fidelity
     [missing] dictionary, override, and static-class-table predicates
   [wip] property access and inline caches
@@ -151,6 +154,10 @@ Legend:
   [risk] baseline is still a Rust bytecode RE-INTERPRETER (~1.6x over interpreter,
          ~1.3M bytecodes/sec); top-level blocks get no generated execution. Parity
          needs machine-code dispatch: no native get_by_id/put_by_id/call lowering yet
+  [wip] CRITICAL PATH to a real machine-code tier (in order): 1 StructureTransition
+        Table [done] -> 2 fixed-offset Butterfly storage -> 3 inline mc GET/PUT_BY_ID
+        -> 4 monomorphic call-link -> 5 per-opcode fast+slow slow-case rejoin ->
+        6 inline alloc -> 7 real reg-alloc + retire the re-interpreter shim; GC deferred
   [wip] emitted native entry
     [done] number-number arithmetic fast path subset
     [wip] native-entry retained side-exit handling

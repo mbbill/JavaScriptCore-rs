@@ -23055,6 +23055,71 @@ mod tests {
         ])
     }
 
+    // Builds an object that still owns PROPERTY_HANDOFF_KEY at offset 0 but has a
+    // genuinely DIFFERENT structure than property_data_object_setup_code_block, by
+    // appending a second own property (identifier 12). This mirrors C++ JSC where
+    // adding a further property transitions to a distinct Structure: now that
+    // same-shape siblings share one structure id (Structure::addPropertyTransition),
+    // a known structure mismatch must come from a different shape, not from two
+    // identical-shape objects.
+    fn property_data_distinct_structure_setup_code_block() -> CodeBlock {
+        const EXTRA_PROPERTY_KEY: u32 = 12;
+        linked_p6_test_code_block(vec![
+            typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::NewObject,
+                vec![Operand::Register(local(0))],
+            ),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(1)), Operand::SignedImmediate(41)],
+            ),
+            typed_core_instruction_with_operands(
+                2,
+                CoreOpcode::PutByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::IdentifierIndex(PROPERTY_HANDOFF_KEY),
+                    Operand::Register(local(1)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                3,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(2)), Operand::SignedImmediate(7)],
+            ),
+            typed_core_instruction_with_operands(
+                4,
+                CoreOpcode::PutByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::IdentifierIndex(EXTRA_PROPERTY_KEY),
+                    Operand::Register(local(2)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                5,
+                CoreOpcode::Return,
+                vec![Operand::Register(local(0))],
+            ),
+        ])
+    }
+
+    fn create_data_property_object_with_distinct_structure_for_test(
+        vm: &mut Vm,
+        host: &mut RecordingCoreHost,
+    ) -> RuntimeValue {
+        let setup = property_data_distinct_structure_setup_code_block();
+        let owner = register_test_code_block(vm, setup.clone());
+        match execute_registered_code_block_with_host(vm, owner, &setup, host) {
+            ExecutionCompletion::Returned(value) => value,
+            completion => {
+                unreachable!("expected distinct-structure setup object, got {completion:?}")
+            }
+        }
+    }
+
     fn property_data_argument_setup_code_block() -> CodeBlock {
         linked_p6_test_code_block_with_parameters(
             vec![
@@ -46353,7 +46418,13 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
         let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
         let first_object = create_data_property_object_for_test(&mut vm, &mut host);
-        let second_object = create_data_property_object_for_test(&mut vm, &mut host);
+        // C++ JSC: a known structure mismatch needs a genuinely different shape.
+        // Same-shape siblings now share a structure id (Structure::
+        // addPropertyTransition), so the second object carries an extra own
+        // property to occupy a distinct structure while still holding
+        // PROPERTY_HANDOFF_KEY.
+        let second_object =
+            create_data_property_object_with_distinct_structure_for_test(&mut vm, &mut host);
         host.clear_observations();
 
         let code_block = generated_property_put_by_name_return_value_code_block();
@@ -47500,7 +47571,13 @@ mod tests {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
         let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
         let first_object = create_data_property_object_for_test(&mut vm, &mut host);
-        let second_object = create_data_property_object_for_test(&mut vm, &mut host);
+        // C++ JSC: a known structure mismatch needs a genuinely different shape.
+        // Same-shape siblings now share a structure id (Structure::
+        // addPropertyTransition), so the second object carries an extra own
+        // property to occupy a distinct structure while still holding
+        // PROPERTY_HANDOFF_KEY at offset 0.
+        let second_object =
+            create_data_property_object_with_distinct_structure_for_test(&mut vm, &mut host);
         host.clear_observations();
 
         let code_block = generated_property_get_by_name_return_consumed_code_block();

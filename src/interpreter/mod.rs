@@ -5122,6 +5122,23 @@ struct CoreObjectStore {
     objects: Vec<Pin<Box<CoreObjectCell>>>,
     object_indices_by_payload: HashMap<usize, usize>,
     structure_ids: CoreStructureIdAllocator,
+    // C++ JSC: Structure::m_transitionTable (runtime/StructureTransitionTable.h)
+    // plus the implicit StructureID identity from Structure::create. In C++ each
+    // Structure object IS the identity, and addPropertyTransition (Structure.cpp:561)
+    // walks m_transitionTable keyed by (uid, attributes, TransitionKind) to find or
+    // create the shared successor Structure, so two same-shape objects converge on
+    // ONE Structure pointer (== one StructureID). The Rust interpreter carries a
+    // flat StructureId per cell instead of a Structure object graph, so these two
+    // maps stand in for that graph: `add_property_transitions` is the union of all
+    // per-Structure m_transitionTable PropertyAddition edges, keyed by the source
+    // StructureId, and `structure_seed_roots` reconstructs the per-(kind, prototype)
+    // root Structure (the empty-shape Structure JSGlobalObject hands out at object
+    // allocation) so fresh siblings start from one shared root id. Add-property only:
+    // deletion / attribute-change / dictionary / megamorphic transitions keep the
+    // prior fresh-id fallback (see allocate_structure_id call sites).
+    add_property_transitions:
+        HashMap<(StructureId, CorePropertyKey, CorePropertyAttributes), TransitionRecord>,
+    structure_seed_roots: HashMap<(CoreObjectKind, CorePrototypeIdentity), StructureId>,
     structure_transition_watchpoints:
         HashMap<WatchpointSetId, CoreStructureTransitionWatchpointRecord>,
     structure_transition_watchpoints_by_structure: HashMap<StructureId, Vec<WatchpointSetId>>,
@@ -5257,6 +5274,14 @@ impl Clone for CoreObjectStore {
             objects: self.objects.clone(),
             object_indices_by_payload: HashMap::new(),
             structure_ids: self.structure_ids.clone(),
+            // add_property_transitions is keyed by StructureId (flat ids, stable across
+            // clone), so the transition graph stays valid. structure_seed_roots is keyed
+            // by each prototype cell's pinned pointer payload (FIX 2); clone re-pins
+            // `objects` to new addresses, so seed lookups for the re-pinned prototypes
+            // may miss and fall back to fresh ids — conservative (IC misses, never wrong
+            // reads), and clone is a snapshot/test path, not the hot path.
+            add_property_transitions: self.add_property_transitions.clone(),
+            structure_seed_roots: self.structure_seed_roots.clone(),
             structure_transition_watchpoints: self.structure_transition_watchpoints.clone(),
             structure_transition_watchpoints_by_structure: self
                 .structure_transition_watchpoints_by_structure
@@ -5320,6 +5345,42 @@ impl CoreStructureIdAllocator {
     }
 }
 
+/// C++ JSC: one PropertyAddition edge of Structure::m_transitionTable. In C++ the
+/// successor Structure carries both its StructureID identity (the Structure*) and
+/// the property's PropertyOffset via Structure::transitionOffset()
+/// (StructureInlines.h:561 reads it back on the existing-structure fast path). The
+/// Rust interpreter has no Structure object, so the edge records the shared
+/// successor StructureId plus the cached offset so the fast path can reuse the same
+/// id AND the same offset without re-minting either.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransitionRecord {
+    new_structure_id: StructureId,
+    offset: PropertyOffset,
+}
+
+/// Stable identity of a stored prototype for the structure seed key.
+///
+/// C++ JSC: Structure identity incorporates the stored prototype (Structure.h
+/// keeps m_prototype as part of the structure), so two objects with different
+/// prototypes never share a Structure even with identical own-property shape.
+/// The Rust seed map must mirror that, so we key the root structure by the
+/// prototype's pinned pointer payload bits and distinguish absent vs
+/// explicit-null prototypes.
+///
+/// FIX 2 divergence note: the prior keying used the prototype's CellId, but that
+/// id is assigned LAZILY at heap-publish (bind_object_to_heap, ~:8385). Two
+/// distinct but still-unpublished prototypes both carry CellId::default(), so
+/// they collapsed into one seed bucket and their instances wrongly shared a root
+/// structure. The pinned pointer payload bits (same value find()/find_mut() key
+/// on, never reused while a cell is live) are unique and stable from allocation,
+/// matching C++ where each distinct prototype object is a distinct m_prototype.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum CorePrototypeIdentity {
+    None,
+    Null,
+    Cell(usize),
+}
+
 #[derive(Clone, Debug, Default)]
 struct CoreObjectCell {
     cell_id: CellId,
@@ -5374,7 +5435,7 @@ struct CoreObjectCell {
     bound_args: Vec<RuntimeValue>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 enum CoreObjectKind {
     #[default]
     Ordinary,
@@ -5782,7 +5843,7 @@ enum CorePropertyKind {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct CorePropertyAttributes {
     writable: bool,
     enumerable: bool,
@@ -8036,10 +8097,28 @@ impl CoreObjectStore {
     }
 
     fn allocate_cell(&mut self, mut cell: CoreObjectCell) -> RuntimeValue {
-        if cell.structure_id == StructureId::INVALID {
-            cell.structure_id = self.allocate_structure_id();
-        }
         cell.install_initial_shape_metadata();
+        if cell.structure_id == StructureId::INVALID {
+            // C++ JSC: a fresh object adopts the shared empty Structure for its
+            // class+prototype instead of a private one, so same-shape siblings can
+            // converge under one property-transition graph. seed_structure_id
+            // reconstructs that shared root (see its comment); the prior behavior
+            // here minted a private id per object, defeating cross-instance ICs.
+            //
+            // FIX 3: some cells are born with initial own properties already
+            // installed (e.g. allocate_function_with_construct_ability builds the
+            // `.prototype` own-property BEFORE allocate_cell). C++ JSC reaches such
+            // a non-empty shape by applying addPropertyTransition once per initial
+            // property from the empty (class, prototype) Structure, so the resulting
+            // Structure reflects the real shape and same-shape siblings converge.
+            // Taking the empty seed root would instead make a 0-property object and
+            // a 1-property function share a structure id (different shapes, same id),
+            // corrupting cross-instance ICs. seed_initial_shape_structure_id mirrors
+            // C++ by chaining transitions from the empty root over the recorded
+            // initial-property order; for a 0-property cell it degenerates to the
+            // plain empty seed root.
+            cell.structure_id = self.seed_initial_shape_structure_id(&cell);
+        }
         let mut object = Box::pin(cell);
         let ptr = NonNull::from(object.as_mut().get_mut());
         let payload = ptr.as_ptr() as usize;
@@ -8065,6 +8144,138 @@ impl CoreObjectStore {
 
     fn allocate_structure_id(&mut self) -> StructureId {
         self.structure_ids.allocate()
+    }
+
+    /// Stable seed-key identity of a stored prototype.
+    ///
+    /// C++ JSC: the structure's stored prototype is part of structure identity, so
+    /// objects with distinct prototypes must seed from distinct root structures.
+    /// We map the prototype to its pinned pointer payload bits (durable since cells
+    /// are Pin<Box<_>> and never move; this is exactly the key find()/find_mut()
+    /// use). Absent and explicit-null prototypes get their own buckets. A prototype
+    /// value with no extractable cell payload (should not happen for real
+    /// prototypes) folds into Null, conservatively preventing collapse with
+    /// cell-prototype siblings.
+    ///
+    /// FIX 2: this used cell.cell_id, which is unset (CellId::default()) until the
+    /// prototype is heap-published, so distinct unpublished prototypes collapsed
+    /// into one bucket. The payload bits are unique and stable from allocation.
+    fn prototype_identity(&self, prototype: Option<RuntimeValue>) -> CorePrototypeIdentity {
+        match prototype {
+            None => CorePrototypeIdentity::None,
+            Some(value) => match value.as_cell().map(|cell| cell.pointer_payload_bits()) {
+                Some(payload) => CorePrototypeIdentity::Cell(payload),
+                None => CorePrototypeIdentity::Null,
+            },
+        }
+    }
+
+    /// Shared empty-shape root StructureId for a (kind, prototype) pair.
+    ///
+    /// C++ JSC: JSGlobalObject hands every fresh object of a given class+prototype
+    /// the same empty Structure, from which property additions transition. The Rust
+    /// interpreter reconstructs that shared root via structure_seed_roots so sibling
+    /// objects begin from ONE structure id and their first add-property transition
+    /// converges in add_property_transitions (cross-instance IC hits depend on this).
+    fn seed_structure_id(
+        &mut self,
+        kind: CoreObjectKind,
+        prototype: Option<RuntimeValue>,
+    ) -> StructureId {
+        let identity = self.prototype_identity(prototype);
+        if let Some(existing) = self.structure_seed_roots.get(&(kind, identity)).copied() {
+            return existing;
+        }
+        let id = self.allocate_structure_id();
+        self.structure_seed_roots.insert((kind, identity), id);
+        id
+    }
+
+    /// Structure id for a cell that may be born with initial own properties.
+    ///
+    /// C++ JSC: an object with N initial own properties has the Structure reached
+    /// by applying addPropertyTransition N times from the empty (class, prototype)
+    /// Structure (Structure.cpp:561), so its Structure encodes the full shape. The
+    /// Rust interpreter installs some initial properties before allocate_cell (e.g.
+    /// a function's `.prototype`), so we mirror that by seeding the empty root and
+    /// then chaining add_property_transition over the recorded initial-property
+    /// order. The chained offsets come from install_initial_shape_metadata's
+    /// deterministic per-cell allocator (0,1,2,... over data keys in order), which
+    /// is exactly the order this chain visits, so the transition-cached offsets
+    /// agree and same-shape siblings converge on one structure id.
+    ///
+    /// Requires install_initial_shape_metadata to have already run on `cell` so
+    /// property_offsets is populated. For a 0-property cell this is identical to
+    /// the plain seed_structure_id empty root.
+    ///
+    /// Symbol/indexed keys: conservative fresh-id fallback. C++ keys transitions by
+    /// the property's uid including symbols; the Rust transition key only covers
+    /// named-offset keys (Identifier/String), so an initial Symbol property folds
+    /// the rest of the chain onto a fresh id. Fidelity gap, deferred (no Octane
+    /// consumer builds Symbol-keyed initial shapes on the hot path).
+    fn seed_initial_shape_structure_id(&mut self, cell: &CoreObjectCell) -> StructureId {
+        let mut structure_id = self.seed_structure_id(cell.kind, cell.prototype);
+        let mut saw_unkeyed = false;
+        for key in &cell.property_order {
+            let Some(property) = cell.properties.get(key) else {
+                continue;
+            };
+            if !matches!(property.kind, CorePropertyKind::Data(_)) {
+                // Accessors do not occupy a named-data offset; skip without
+                // disturbing the shared shape chain.
+                continue;
+            }
+            let Some(offset) = cell.property_offsets.get(key).copied() else {
+                // Symbol / indexed key: no named-data offset, so it cannot key the
+                // transition table. Conservatively fall to a fresh id for the
+                // remainder of the shape (see method comment, fidelity gap).
+                saw_unkeyed = true;
+                continue;
+            };
+            structure_id =
+                self.add_property_transition(structure_id, key, property.attributes, offset);
+        }
+        if saw_unkeyed {
+            return self.allocate_structure_id();
+        }
+        structure_id
+    }
+
+    /// Find-or-create the PropertyAddition transition for (old_structure, key,
+    /// attributes), mirroring Structure::addPropertyTransition (Structure.cpp:561):
+    /// the existing-structure fast path (StructureInlines.h:549) returns a cached
+    /// successor + offset, otherwise addNewPropertyTransition mints a successor and
+    /// records the edge in m_transitionTable (Structure.cpp:620).
+    ///
+    /// `computed_offset` is the offset the per-object property-table allocator
+    /// (ensure_named_data_property_offset) just produced for this add. On the
+    /// create path it is cached into the edge; on the reuse path it MUST equal the
+    /// cached offset, since both objects build the same property_order from the same
+    /// shared root, so the deterministic per-object allocator agrees with the edge.
+    fn add_property_transition(
+        &mut self,
+        old_structure: StructureId,
+        key: &CorePropertyKey,
+        attributes: CorePropertyAttributes,
+        computed_offset: PropertyOffset,
+    ) -> StructureId {
+        let map_key = (old_structure, key.clone(), attributes);
+        if let Some(record) = self.add_property_transitions.get(&map_key).copied() {
+            debug_assert_eq!(
+                record.offset, computed_offset,
+                "transition-cached offset disagrees with per-object offset allocator"
+            );
+            return record.new_structure_id;
+        }
+        let new_structure_id = self.allocate_structure_id();
+        self.add_property_transitions.insert(
+            map_key,
+            TransitionRecord {
+                new_structure_id,
+                offset: computed_offset,
+            },
+        );
+        new_structure_id
     }
 
     fn snapshot_structure_transition_watchpoints(
@@ -8831,7 +9042,13 @@ impl CoreObjectStore {
         key: &CorePropertyKey,
         value: RuntimeValue,
     ) -> Result<(), ExecutionError> {
-        let new_structure = self.allocate_structure_id();
+        // C++ JSC: a pure property addition routes through
+        // Structure::addPropertyTransition so same-shape siblings share a structure
+        // id; an accessor->data kind change is NOT an addition and keeps a fresh id
+        // (the out-of-scope fallback). `transition` carries the (old_structure,
+        // computed_offset) needed to resolve the shared successor after the cell
+        // borrow ends.
+        let mut transition: Option<(StructureId, PropertyOffset)> = None;
         let old_structure = {
             let Some(object) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
@@ -8853,17 +9070,31 @@ impl CoreObjectStore {
                         attributes: CorePropertyAttributes::DATA_DEFAULT,
                     },
                 );
-                object.ensure_named_data_property_offset(key);
+                let offset = object.ensure_named_data_property_offset(key);
                 shape_changed = true;
+                if let Some(offset) = offset {
+                    transition = Some((old_structure, offset));
+                }
             }
             if shape_changed {
-                object.structure_id = new_structure;
                 Some(old_structure)
             } else {
                 None
             }
         };
         if let Some(old_structure) = old_structure {
+            let new_structure = match transition {
+                Some((from, offset)) => self.add_property_transition(
+                    from,
+                    key,
+                    CorePropertyAttributes::DATA_DEFAULT,
+                    offset,
+                ),
+                None => self.allocate_structure_id(),
+            };
+            if let Some(object) = self.find_mut(object) {
+                object.structure_id = new_structure;
+            }
             self.finish_structure_transition(old_structure);
         }
         Ok(())
@@ -8897,13 +9128,19 @@ impl CoreObjectStore {
         key: &CorePropertyKey,
         value: RuntimeValue,
     ) -> Result<(), ExecutionError> {
-        let new_structure = self.allocate_structure_id();
+        // C++ JSC: only the property-addition case (current property absent) routes
+        // through addPropertyTransition for shared structure ids. Converting an
+        // existing accessor/non-default-attribute property to a default data
+        // property is a non-addition shape change and keeps a fresh id (out of
+        // scope for the transition table).
+        let mut transition: Option<(StructureId, PropertyOffset)> = None;
         let old_structure = {
             let Some(object) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
             let old_structure = object.structure_id;
             let current = object.properties.get(key).copied();
+            let is_addition = current.is_none();
             let shape_changed = match current {
                 Some(current) => {
                     !matches!(current.kind, CorePropertyKind::Data(_))
@@ -8921,15 +9158,31 @@ impl CoreObjectStore {
                     attributes: CorePropertyAttributes::DATA_DEFAULT,
                 },
             );
-            object.ensure_named_data_property_offset(key);
+            let offset = object.ensure_named_data_property_offset(key);
             if shape_changed {
-                object.structure_id = new_structure;
+                if is_addition {
+                    if let Some(offset) = offset {
+                        transition = Some((old_structure, offset));
+                    }
+                }
                 Some(old_structure)
             } else {
                 None
             }
         };
         if let Some(old_structure) = old_structure {
+            let new_structure = match transition {
+                Some((from, offset)) => self.add_property_transition(
+                    from,
+                    key,
+                    CorePropertyAttributes::DATA_DEFAULT,
+                    offset,
+                ),
+                None => self.allocate_structure_id(),
+            };
+            if let Some(object) = self.find_mut(object) {
+                object.structure_id = new_structure;
+            }
             self.finish_structure_transition(old_structure);
         }
         Ok(())
@@ -8942,13 +9195,18 @@ impl CoreObjectStore {
         value: RuntimeValue,
         attributes: CorePropertyAttributes,
     ) -> Result<bool, ExecutionError> {
-        let new_structure = self.allocate_structure_id();
+        // C++ JSC: defining a brand-new property is a property-addition transition
+        // keyed by (uid, attributes) (StructureTransitionTable), so siblings defined
+        // with the same key+attributes share a structure id. Redefining an existing
+        // property (kind or attribute change) is out of scope and keeps a fresh id.
+        let mut transition: Option<(StructureId, PropertyOffset)> = None;
         let old_structure = {
             let Some(object) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
             let old_structure = object.structure_id;
             let current = object.properties.get(key).copied();
+            let is_addition = current.is_none();
             if let Some(current) = current {
                 if !current.attributes.configurable {
                     if attributes.configurable
@@ -8985,15 +9243,26 @@ impl CoreObjectStore {
                     attributes,
                 },
             );
-            object.ensure_named_data_property_offset(key);
+            let offset = object.ensure_named_data_property_offset(key);
             if shape_changed {
-                object.structure_id = new_structure;
+                if is_addition {
+                    if let Some(offset) = offset {
+                        transition = Some((old_structure, offset));
+                    }
+                }
                 Some(old_structure)
             } else {
                 None
             }
         };
         if let Some(old_structure) = old_structure {
+            let new_structure = match transition {
+                Some((from, offset)) => self.add_property_transition(from, key, attributes, offset),
+                None => self.allocate_structure_id(),
+            };
+            if let Some(object) = self.find_mut(object) {
+                object.structure_id = new_structure;
+            }
             self.finish_structure_transition(old_structure);
         }
         Ok(true)
@@ -9273,7 +9542,6 @@ impl CoreObjectStore {
         object: RuntimeValue,
         prototype: Option<RuntimeValue>,
     ) -> Result<(), ExecutionError> {
-        let new_structure = self.allocate_structure_id();
         if self.find(object).is_none() {
             return Err(ExecutionError::ExpectedObject);
         }
@@ -9285,6 +9553,34 @@ impl CoreObjectStore {
                 return Err(ExecutionError::InvalidCallCompletion);
             }
         }
+        // FIX 1: op_construct builds its this-receiver as an empty cell (seeded for
+        // the default Object prototype at allocate_cell) and then immediately routes
+        // here to install the constructor's `.prototype`. C++ JSC instead births a
+        // construct instance ALREADY carrying the (class, Foo.prototype) Structure
+        // (JSFinalObject::createStructure / the inheritor-structure cache), so two
+        // `new Foo()` siblings start from one Structure and converge under
+        // addPropertyTransition. Minting a fresh id here discarded that shared root,
+        // so siblings never converged and cross-instance ICs missed.
+        //
+        // When the object is still EMPTY (no own properties recorded yet, i.e. the
+        // just-allocated this-receiver), we therefore RE-SEED from the shared root
+        // for (kind, NEW prototype) instead of minting fresh. For a NON-empty object
+        // (a genuine later Object.setPrototypeOf / __proto__ assignment) we keep the
+        // fresh-id fallback: that is a real prototype-change structure transition,
+        // out of scope for the add-property transition table.
+        let kind = match self.find(object) {
+            Some(cell) => cell.kind,
+            None => return Err(ExecutionError::ExpectedObject),
+        };
+        let is_empty_object = self
+            .find(object)
+            .map(|cell| cell.properties.is_empty() && cell.property_order.is_empty())
+            .unwrap_or(false);
+        let new_structure = if is_empty_object {
+            self.seed_structure_id(kind, prototype)
+        } else {
+            self.allocate_structure_id()
+        };
         let old_structure = {
             let Some(object) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
@@ -31863,6 +32159,234 @@ mod tests {
                 destination_root_sync:
                     GeneratedPropertyLoadDestinationRootSync::NotRequiredForImmediate,
             })
+        );
+    }
+
+    // C++ JSC: same-(class, prototype) siblings that add the same property in the
+    // same order converge on ONE Structure via addPropertyTransition
+    // (Structure.cpp:561), so a GetById IC keyed on the first sibling's structure
+    // hits on every sibling. This pins the cross-instance success metric for the
+    // object-literal allocation path (NewObject -> allocate(), which seeds the
+    // prototype at allocation time so the shared seed root survives): an IC plan
+    // built from sibling A must HIT same-shape sibling B. Before the add-property
+    // transition table (per-object fresh structure ids) this missed with
+    // StructureMismatch. The op_construct path is now covered separately by
+    // generated_property_load_probe_hits_across_same_shape_construct_siblings (FIX 1
+    // re-seeds the empty this-receiver from the shared (kind, Foo.prototype) root).
+    #[test]
+    fn generated_property_load_probe_hits_across_same_shape_literal_siblings() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let key = CorePropertyKey::Identifier(11);
+
+        // Both objects use the object-literal path (shared object prototype seeded
+        // at allocation), mirroring NewObject in a hot loop.
+        let sibling_a = host.objects.allocate();
+        host.objects
+            .set_data_own(sibling_a, &key, RuntimeValue::from_i32(42))
+            .unwrap();
+
+        let sibling_b = host.objects.allocate();
+        let value_b = RuntimeValue::from_i32(7);
+        host.objects.set_data_own(sibling_b, &key, value_b).unwrap();
+
+        let structure_a = object_structure_id(&host.objects, sibling_a);
+        assert_eq!(
+            structure_a,
+            object_structure_id(&host.objects, sibling_b),
+            "same-shape literal siblings must share one structure id"
+        );
+        let offset_a =
+            object_property_offset(&host.objects, sibling_a, &key).expect("sibling A offset");
+        assert_eq!(
+            offset_a,
+            object_property_offset(&host.objects, sibling_b, &key).expect("sibling B offset"),
+            "shared transition must agree on offset"
+        );
+
+        let plan = generated_property_load_plan(structure_a, offset_a, 11);
+        let result = host
+            .probe_generated_property_load(generated_property_load_probe_request(&plan, sibling_b));
+        assert_eq!(
+            result,
+            GeneratedPropertyLoadProbeResult::Hit(GeneratedPropertyLoadProbeHit {
+                value: value_b,
+                destination_root_sync:
+                    GeneratedPropertyLoadDestinationRootSync::NotRequiredForImmediate,
+            }),
+            "sibling B must hit the IC keyed on sibling A's shared structure"
+        );
+    }
+
+    // FIX 1: the op_construct receiver is an empty cell whose prototype is set after
+    // allocation via set_prototype_or_null (allocate_with_prototype_with_write_barrier
+    // -> set_prototype_or_null_with_write_barrier). C++ JSC births a construct
+    // instance already carrying the (class, Foo.prototype) Structure, so two
+    // `new Foo()` siblings converge on one Structure and add-property transitions
+    // chain from there. This pins that convergence: two empty objects given the same
+    // prototype then the same property must share a structure id, and an IC plan
+    // built from one must HIT the other. Before FIX 1, set_prototype_or_null minted a
+    // private id per instance, so this missed with StructureMismatch.
+    #[test]
+    fn generated_property_load_probe_hits_across_same_shape_construct_siblings() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let key = CorePropertyKey::Identifier(11);
+
+        // One shared constructor `.prototype` object, mirroring `Foo.prototype`.
+        let foo_prototype = host.objects.allocate_with_prototype(None);
+
+        // Each instance is born empty (as op_construct does) and then has its
+        // prototype installed via set_prototype_or_null, the FIX 1 re-seed path.
+        let sibling_a = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_prototype_or_null(sibling_a, Some(foo_prototype))
+            .unwrap();
+        host.objects
+            .set_data_own(sibling_a, &key, RuntimeValue::from_i32(42))
+            .unwrap();
+
+        let sibling_b = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_prototype_or_null(sibling_b, Some(foo_prototype))
+            .unwrap();
+        let value_b = RuntimeValue::from_i32(7);
+        host.objects.set_data_own(sibling_b, &key, value_b).unwrap();
+
+        let structure_a = object_structure_id(&host.objects, sibling_a);
+        assert_eq!(
+            structure_a,
+            object_structure_id(&host.objects, sibling_b),
+            "same-shape construct siblings must share one structure id"
+        );
+        let offset_a =
+            object_property_offset(&host.objects, sibling_a, &key).expect("sibling A offset");
+        assert_eq!(
+            offset_a,
+            object_property_offset(&host.objects, sibling_b, &key).expect("sibling B offset"),
+            "shared transition must agree on offset"
+        );
+
+        let plan = generated_property_load_plan(structure_a, offset_a, 11);
+        let result = host
+            .probe_generated_property_load(generated_property_load_probe_request(&plan, sibling_b));
+        assert_eq!(
+            result,
+            GeneratedPropertyLoadProbeResult::Hit(GeneratedPropertyLoadProbeHit {
+                value: value_b,
+                destination_root_sync:
+                    GeneratedPropertyLoadDestinationRootSync::NotRequiredForImmediate,
+            }),
+            "construct sibling B must hit the IC keyed on sibling A's shared structure"
+        );
+    }
+
+    // FIX 1/FIX 2: instances with DIFFERENT prototypes must NEVER collapse onto one
+    // structure id, even when their own-property shape is identical. C++ JSC keeps
+    // the stored prototype as part of Structure identity (Structure.h m_prototype),
+    // so `new Foo()` and `new Bar()` get distinct Structures. FIX 2 makes the seed
+    // key the prototype's stable pinned-pointer payload (not the lazily-assigned
+    // CellId), so two distinct still-unpublished prototypes do not share a bucket.
+    #[test]
+    fn construct_instances_with_distinct_prototypes_do_not_collapse() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let key = CorePropertyKey::Identifier(11);
+
+        // Two distinct constructor prototypes, neither heap-published, so both carry
+        // CellId::default() (the FIX 2 collapse trap).
+        let foo_prototype = host.objects.allocate_with_prototype(None);
+        let bar_prototype = host.objects.allocate_with_prototype(None);
+        assert_ne!(foo_prototype, bar_prototype);
+
+        let foo_instance = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_prototype_or_null(foo_instance, Some(foo_prototype))
+            .unwrap();
+        host.objects
+            .set_data_own(foo_instance, &key, RuntimeValue::from_i32(1))
+            .unwrap();
+
+        let bar_instance = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_prototype_or_null(bar_instance, Some(bar_prototype))
+            .unwrap();
+        host.objects
+            .set_data_own(bar_instance, &key, RuntimeValue::from_i32(2))
+            .unwrap();
+
+        assert_ne!(
+            object_structure_id(&host.objects, foo_instance),
+            object_structure_id(&host.objects, bar_instance),
+            "instances with distinct prototypes must not share a structure id"
+        );
+
+        // The IC plan keyed on the Foo instance must MISS the Bar instance with a
+        // structure mismatch, never wrongly hit it.
+        let foo_structure = object_structure_id(&host.objects, foo_instance);
+        let foo_offset =
+            object_property_offset(&host.objects, foo_instance, &key).expect("foo offset");
+        let plan = generated_property_load_plan(foo_structure, foo_offset, 11);
+        let result = host.probe_generated_property_load(generated_property_load_probe_request(
+            &plan,
+            bar_instance,
+        ));
+        assert_eq!(
+            probe_miss_reason(result),
+            GeneratedPropertyLoadProbeMissReason::StructureMismatch,
+            "distinct-prototype instance must miss with a structure mismatch"
+        );
+    }
+
+    // FIX 3: a cell born with initial own properties (e.g. a constructable function
+    // carrying `.prototype`) must derive its structure id by chaining add-property
+    // transitions from the empty root, so its shape-bearing structure differs from a
+    // 0-property cell's empty root. C++ JSC reaches the function's Structure by one
+    // addPropertyTransition for `.prototype`. A plain object (no `.prototype`) and a
+    // constructable function therefore must NOT share a structure id even though both
+    // seed from the same (kind, prototype) family only if shapes match.
+    #[test]
+    fn prebuilt_property_cells_get_shape_distinct_structure_ids() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let prototype_key = host.prototype_key();
+
+        // A constructable function: allocate_function_with_construct_ability builds
+        // the `.prototype` own-property BEFORE allocate_cell (the FIX 3 path).
+        let ctor_a = host.objects.allocate_function_with_construct_ability(
+            0,
+            Vec::new(),
+            Some(prototype_key.clone()),
+            ConstructAbility::CanConstruct,
+        );
+        let ctor_b = host.objects.allocate_function_with_construct_ability(
+            1,
+            Vec::new(),
+            Some(prototype_key.clone()),
+            ConstructAbility::CanConstruct,
+        );
+        // A non-constructable function with NO `.prototype` own-property (empty
+        // shape) for the same function prototype.
+        let plain_fn = host.objects.allocate_function_with_construct_ability(
+            2,
+            Vec::new(),
+            None,
+            ConstructAbility::CannotConstruct,
+        );
+
+        // Two constructable functions share the same one-property shape -> one id.
+        assert_eq!(
+            object_structure_id(&host.objects, ctor_a),
+            object_structure_id(&host.objects, ctor_b),
+            "same-shape constructable functions must share one structure id"
+        );
+        // The `.prototype` offset is the deterministic offset 0 from the empty root,
+        // proving the transition-cached offset agreed with the per-cell allocator.
+        assert_eq!(
+            object_property_offset(&host.objects, ctor_a, &prototype_key).expect("ctor offset"),
+            PropertyOffset::new(0),
+        );
+        // A 0-property function must NOT collapse onto the 1-property root.
+        assert_ne!(
+            object_structure_id(&host.objects, ctor_a),
+            object_structure_id(&host.objects, plain_fn),
+            "different-shape functions must get different structure ids"
         );
     }
 
