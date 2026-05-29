@@ -5203,6 +5203,60 @@ fn p9_x86_64_owner_call_destination_disp32(
                 )
             }
         }
+        // C++ JSC divergence note: baseline JITCall.cpp emitPutCallResult
+        // (JITCall.cpp:58-61) stores the call result via
+        // emitPutVirtualRegister(destinationFor(...).virtualRegister(), ...),
+        // which targets the dst VirtualRegister's stack slot REGARDLESS of
+        // whether the bytecode classifies that register as a frame local or as
+        // an argument-including-this slot. The owner-post-call-reentry stub must
+        // mirror that for both classes: richards keeps hot call results in
+        // argument-classified slots (the exact call-path analog of the
+        // get_by_id base FrameLocal->FrameLocal+FrameArgument widening in
+        // e5ceee2). Compute the frame-base disp32 with the SAME formula proven
+        // for every other argument read/write in p6_operand_location
+        // (emitter.rs ~7992): frame_local_count*local_slot_stride_bytes +
+        // index*value_slot_width_bytes, reusing the identical i32::MAX bound and
+        // FrameOffsetOutOfDisp32 error so deep frames keep the faithful slow
+        // path. CallFrameHeader/Constant/Invalid stay None: a call result is
+        // never legitimately stored to a header or constant slot.
+        RegisterClass::ArgumentIncludingThis(index) => {
+            let byte_offset = u64::from(contract.frame_local_count)
+                .checked_mul(u64::from(contract.frame_layout.local_slot_stride_bytes))
+                .and_then(|frame_base| {
+                    u64::from(index)
+                        .checked_mul(u64::from(contract.frame_layout.value_slot_width_bytes))
+                        .and_then(|argument_offset| frame_base.checked_add(argument_offset))
+                })
+                .ok_or(
+                    P6X86_64BaselineSemanticByteEmissionError::FrameOffsetOutOfDisp32 {
+                        bytecode_index,
+                        location: P6X86_64BaselineOperandLocation::FrameArgument {
+                            argument_index_including_this: index,
+                            raw_virtual_register: destination.raw(),
+                            byte_offset_from_argument_base: u64::MAX,
+                            byte_offset_from_frame_base: u64::MAX,
+                        },
+                        byte_offset: u64::MAX,
+                    },
+                )?;
+            if byte_offset <= i32::MAX as u64 {
+                Ok(Some(byte_offset as i32))
+            } else {
+                Err(
+                    P6X86_64BaselineSemanticByteEmissionError::FrameOffsetOutOfDisp32 {
+                        bytecode_index,
+                        location: P6X86_64BaselineOperandLocation::FrameArgument {
+                            argument_index_including_this: index,
+                            raw_virtual_register: destination.raw(),
+                            byte_offset_from_argument_base: u64::from(index)
+                                * u64::from(contract.frame_layout.value_slot_width_bytes),
+                            byte_offset_from_frame_base: byte_offset,
+                        },
+                        byte_offset,
+                    },
+                )
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -12304,6 +12358,36 @@ mod tests {
         ])
     }
 
+    // CallWithThis whose RESULT destination is an argument-including-this slot
+    // (not a frame local). richards keeps hot call results in argument-classified
+    // slots, so the owner-post-call-reentry stub must be emitted for this shape,
+    // exactly as C++ JSC emitPutCallResult stores to the dst VirtualRegister's
+    // slot regardless of class. Destination argument_including_this(2),
+    // callee argument_including_this(1), this argument_including_this(2)'s base
+    // expressed via distinct argument slots for callee/this/args.
+    fn p9_call_with_this_argument_destination_code_block() -> CodeBlock {
+        code_block_from_typed_instructions(vec![
+            typed_instruction(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(0)), Operand::SignedImmediate(7)],
+            ),
+            typed_instruction(
+                1,
+                CoreOpcode::CallWithThis,
+                vec![
+                    Operand::Register(argument_including_this(2)),
+                    Operand::Register(argument_including_this(1)),
+                    Operand::Register(argument_including_this(2)),
+                    Operand::UnsignedImmediate(2),
+                    Operand::Register(argument_including_this(3)),
+                    Operand::Register(argument_including_this(4)),
+                ],
+            ),
+            typed_instruction(2, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ])
+    }
+
     fn p10_get_by_name_native_exit_code_block() -> CodeBlock {
         code_block_from_typed_instructions(vec![
             typed_instruction(
@@ -17213,6 +17297,104 @@ mod tests {
             .js_call_owner_post_call_reentry_stubs
             .iter()
             .all(|stub| stub.bytecode_index != construct.bytecode_index));
+    }
+
+    // Regression for the call-path residency gate analogous to the get_by_id
+    // FrameLocal->FrameLocal+FrameArgument widening in e5ceee2: a CallWithThis
+    // whose RESULT destination is an argument-including-this slot must still emit
+    // the owner-post-call and owner-post-call-reentry stubs, because C++ JSC
+    // emitPutCallResult (JITCall.cpp:58-61) stores to the dst VirtualRegister's
+    // slot regardless of class. Before the fix, p9_x86_64_owner_call_destination_disp32
+    // returned None for argument destinations and the stub loop `continue`d, so the
+    // P9 exit handler could never find a return-target proof and the site fell to
+    // the single-dispatch exit (never warming its call-link, never going resident).
+    #[test]
+    fn p9_argument_destination_call_with_this_emits_owner_post_call_reentry_stub() {
+        let code_block = p9_call_with_this_argument_destination_code_block();
+        let result = p9_callable_semantic_emission_for_code_block(&code_block).unwrap();
+
+        let call_with_this = result
+            .js_call_native_exit_stubs
+            .iter()
+            .find(|stub| stub.opcode == CoreOpcode::CallWithThis)
+            .expect("CallWithThis native-exit stub");
+        // The result destination is an argument-classified register, exactly the
+        // shape that was skipped before the widening.
+        assert_eq!(
+            call_with_this.destination.classify(ThisArgumentOffset(5)),
+            RegisterClass::ArgumentIncludingThis(2)
+        );
+
+        // The owner-post-call stub is now emitted for this argument destination
+        // (previously the loop `continue`d and produced nothing for this site).
+        let post_call = result
+            .js_call_owner_post_call_stubs
+            .iter()
+            .find(|stub| stub.bytecode_index == call_with_this.bytecode_index)
+            .expect("owner-post-call stub for argument-destination CallWithThis");
+        assert_eq!(post_call.opcode, CoreOpcode::CallWithThis);
+        assert_eq!(post_call.destination, call_with_this.destination);
+
+        // The matching owner-post-call-reentry stub exists, so at the P9 exit the
+        // return-target proof lookup will succeed and control returns into the
+        // owner region (no cross-compartment near-call).
+        let reentry = result
+            .js_call_owner_post_call_reentry_stubs
+            .iter()
+            .find(|stub| stub.bytecode_index == call_with_this.bytecode_index)
+            .expect("owner-post-call-reentry stub for argument-destination CallWithThis");
+        assert_eq!(reentry.opcode, CoreOpcode::CallWithThis);
+        assert_eq!(
+            reentry.post_call_target_start_offset,
+            post_call.start_offset
+        );
+        assert_eq!(
+            p9_owner_post_call_reentry_stub_target_for_test(reentry),
+            post_call.start_offset
+        );
+
+        // The result store writes rax (call result) to [rbp+disp32] where disp32 is
+        // the destination's frame-base offset, matching the formula every other
+        // argument read/write uses (frame_local_count*stride + index*width). Recompute
+        // it from the contract and assert the emitted store carries that exact disp32,
+        // so a wrong-slot store (which would corrupt the call result) is caught.
+        let js_call_plan =
+            crate::jit::plan::derive_baseline_generated_js_call_native_exit_plan_from_code_block(
+                &code_block,
+                owner(),
+            )
+            .unwrap()
+            .metadata
+            .expect("P9 call native-exit metadata");
+        let lowering = plan_p6_x86_64_baseline_lowering_with_native_exits(
+            P6X86_64BaselineLoweringRequest::new(
+                owner(),
+                &code_block,
+                p9_mixed_lowering_proof(&code_block),
+            ),
+            None,
+            Some(&js_call_plan),
+            None,
+        )
+        .unwrap();
+        let contract = record_p6_x86_64_baseline_backend_contract(&lowering).unwrap();
+        let expected_disp32 = p9_x86_64_owner_call_destination_disp32(
+            &contract,
+            call_with_this.bytecode_index,
+            call_with_this.destination,
+        )
+        .unwrap()
+        .expect("argument destination now resolves to a disp32");
+        let store_local_offset = (post_call.result_store_offset - post_call.start_offset) as usize;
+        // `48 89 85 <disp32>` = mov [rbp+disp32], rax
+        assert_eq!(
+            &post_call.bytes[store_local_offset..store_local_offset + 3],
+            &[0x48, 0x89, 0x85]
+        );
+        let mut emitted_disp = [0u8; 4];
+        emitted_disp
+            .copy_from_slice(&post_call.bytes[store_local_offset + 3..store_local_offset + 7]);
+        assert_eq!(i32::from_le_bytes(emitted_disp), expected_disp32);
     }
 
     #[test]
