@@ -600,6 +600,17 @@ pub enum P6X86_64BaselineOperandLocation {
         value: AbiValue,
     },
     Immediate(P6X86_64BaselineImmediateOperand),
+    // C++ JSC InlineAccess uses MacroAssembler::Address(base, displacement) where
+    // the base is the cell/storage pointer (PropertyBase) and displacement is a
+    // byte offset relative to that pointer: JSCell::structureIDOffset() for the
+    // structure guard and offsetRelativeToBase(offset) for the inline-storage
+    // load. This location names such a cell-relative addressing form; the disp32
+    // is the byte displacement the later opcode-wiring batch will fill from the
+    // structure id offset / inline-storage layout. bytecode/InlineAccess.cpp:193,204;
+    // runtime/JSObject.h offsetRelativeToBase:1572.
+    CellRelative {
+        disp32: i32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -825,6 +836,14 @@ pub enum P6X86_64BaselineSymbolicRegister {
     Scratch0,
     Scratch1,
     Scratch2,
+    // C++ JSC InlineAccess::generateSelfPropertyAccess uses propertyCache.m_baseGPR
+    // (BaselineJITRegisters::GetById::baseJSR == preferredArgumentJSR<...,0>(),
+    // i.e. argumentGPR0 == X86Registers::edi / rdi on x86-64) as the cell pointer
+    // base for the self-property structure guard + offset-indexed load. This
+    // symbolic register names that base; its physical binding is rdi in the
+    // register map. See bytecode/InlineAccess.cpp:188-204 and
+    // jit/BaselineJITRegisters.h GetById::baseJSR.
+    PropertyBase,
     PinnedCalleeValue,
     PinnedCallFrameBase,
     PinnedVm,
@@ -863,6 +882,21 @@ pub enum P6X86_64BaselineMachineInstruction {
         value: P6X86_64BaselineSymbolicRegister,
         tag_mask: u64,
         expected_tag: u64,
+        on_not_equal: P6X86_64BaselineSideExitLabel,
+    },
+    // C++ JSC InlineAccess::generateSelfPropertyAccess emits a structure guard:
+    //   branch32(NotEqual, Address(base, JSCell::structureIDOffset()),
+    //            TrustedImm32(structure->id())) -> slow path.
+    // We model it as: load32 [base + structure_id_offset] -> scratch; cmp32
+    // scratch, imm32(cached_structure_id); jne rel32 -> side exit. The
+    // structure_id_offset and cached_structure_id are parameters a later
+    // opcode-wiring batch fills from the real cell layout / cached structure.
+    // bytecode/InlineAccess.cpp:191-194; runtime/JSCell.h structureIDOffset:236.
+    GuardStructureId {
+        base: P6X86_64BaselineSymbolicRegister,
+        scratch: P6X86_64BaselineSymbolicRegister,
+        structure_id_offset: i32,
+        cached_structure_id: u32,
         on_not_equal: P6X86_64BaselineSideExitLabel,
     },
     ExtractInt32Payload {
@@ -1496,7 +1530,7 @@ pub enum P6X86_64BaselineSemanticByteEmissionAuthority {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct P6X86_64BaselinePhysicalRegisterMap {
-    pub bindings: [P6X86_64BaselinePhysicalRegisterBinding; 8],
+    pub bindings: [P6X86_64BaselinePhysicalRegisterBinding; 9],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2092,6 +2126,7 @@ pub enum P6X86_64BaselineSemanticOperandRejectionReason {
     ConstantMemoryUnsupported,
     ReturnCarrierMetadataOnly,
     ExpectedFrameLocalMemory,
+    ExpectedCellRelativeMemory,
 }
 
 impl BaselineMachineCodeByteGenerationRequest {
@@ -4371,6 +4406,13 @@ fn p6_x86_64_semantic_physical_register_map() -> P6X86_64BaselinePhysicalRegiste
                 symbolic: P6X86_64BaselineSymbolicRegister::Scratch2,
                 physical: "ecx/rcx",
             },
+            // C++ JSC GetById::baseJSR == argumentGPR0 == X86Registers::edi (rdi).
+            // InlineAccess::generateSelfPropertyAccess reads the cell + butterfly
+            // through this base register. bytecode/InlineAccess.cpp:188-204.
+            P6X86_64BaselinePhysicalRegisterBinding {
+                symbolic: P6X86_64BaselineSymbolicRegister::PropertyBase,
+                physical: "rdi",
+            },
             P6X86_64BaselinePhysicalRegisterBinding {
                 symbolic: P6X86_64BaselineSymbolicRegister::PinnedCalleeValue,
                 physical: "r9",
@@ -5238,6 +5280,48 @@ fn emit_p6_x86_64_semantic_machine_instruction(
                 instruction,
             },
         ),
+        // C++ JSC InlineAccess self-property load:
+        //   loadValue(Address(storage /* base == PropertyBase/rdi */,
+        //                     offsetRelativeToBase(offset)), value).
+        // For an inline-storage property the storage register is the base cell
+        // pointer, so this is a single quadword mov reg64, [rdi + disp32].
+        // Encoded REX.W 8B /r with ModRM mod=10 (disp32), rm=111 (rdi).
+        // bytecode/InlineAccess.cpp:196-204.
+        P6X86_64BaselineMachineInstruction::LoadQ {
+            destination,
+            source:
+                P6X86_64BaselineMachineOperand::Memory(
+                    memory @ P6X86_64BaselineMachineMemoryOperand {
+                        base: P6X86_64BaselineSymbolicRegister::PropertyBase,
+                        ..
+                    },
+                ),
+        } => {
+            let disp32 = p6_x86_64_semantic_cell_relative_disp32(bytecode_index, memory)?;
+            match destination {
+                // mov rax, [rdi+disp32]: REX.W 8B, ModRM 10 000 111 = 0x87.
+                P6X86_64BaselineSymbolicRegister::ReturnGpr => {
+                    builder.emit(&[0x48, 0x8b, 0x87])?;
+                    builder.emit_i32_le(disp32)
+                }
+                // mov r10, [rdi+disp32]: REX.WR 8B, ModRM 10 010 111 = 0x97.
+                P6X86_64BaselineSymbolicRegister::Scratch0 => {
+                    builder.emit(&[0x4c, 0x8b, 0x97])?;
+                    builder.emit_i32_le(disp32)
+                }
+                // mov r11, [rdi+disp32]: REX.WR 8B, ModRM 10 011 111 = 0x9F.
+                P6X86_64BaselineSymbolicRegister::Scratch1 => {
+                    builder.emit(&[0x4c, 0x8b, 0x9f])?;
+                    builder.emit_i32_le(disp32)
+                }
+                _ => Err(
+                    P6X86_64BaselineSemanticByteEmissionError::UnsupportedMachineInstruction {
+                        bytecode_index,
+                        instruction,
+                    },
+                ),
+            }
+        }
         P6X86_64BaselineMachineInstruction::LoadQ {
             destination,
             source,
@@ -5254,6 +5338,45 @@ fn emit_p6_x86_64_semantic_machine_instruction(
                 }
                 P6X86_64BaselineSymbolicRegister::ReturnGpr => {
                     builder.emit(&[0x48, 0x8b, 0x85])?;
+                    builder.emit_i32_le(disp32)
+                }
+                _ => Err(
+                    P6X86_64BaselineSemanticByteEmissionError::UnsupportedMachineInstruction {
+                        bytecode_index,
+                        instruction,
+                    },
+                ),
+            }
+        }
+        // C++ JSC writes a self-property via storeValue(value, Address(storage,
+        // offsetRelativeToBase(offset))); the inline-storage store mirrors the
+        // load: mov [rdi + disp32], reg64. Encoded REX.W 89 /r ModRM mod=10
+        // rm=111. bytecode/InlineAccess.cpp (put-by-id self property path).
+        P6X86_64BaselineMachineInstruction::StoreQ {
+            destination:
+                P6X86_64BaselineMachineOperand::Memory(
+                    memory @ P6X86_64BaselineMachineMemoryOperand {
+                        base: P6X86_64BaselineSymbolicRegister::PropertyBase,
+                        ..
+                    },
+                ),
+            source,
+        } => {
+            let disp32 = p6_x86_64_semantic_cell_relative_disp32(bytecode_index, memory)?;
+            match source {
+                // mov [rdi+disp32], rax: REX.W 89, ModRM 10 000 111 = 0x87.
+                P6X86_64BaselineSymbolicRegister::ReturnGpr => {
+                    builder.emit(&[0x48, 0x89, 0x87])?;
+                    builder.emit_i32_le(disp32)
+                }
+                // mov [rdi+disp32], r10: REX.WR 89, ModRM 10 010 111 = 0x97.
+                P6X86_64BaselineSymbolicRegister::Scratch0 => {
+                    builder.emit(&[0x4c, 0x89, 0x97])?;
+                    builder.emit_i32_le(disp32)
+                }
+                // mov [rdi+disp32], r11: REX.WR 89, ModRM 10 011 111 = 0x9F.
+                P6X86_64BaselineSymbolicRegister::Scratch1 => {
+                    builder.emit(&[0x4c, 0x89, 0x9f])?;
                     builder.emit_i32_le(disp32)
                 }
                 _ => Err(
@@ -5299,6 +5422,55 @@ fn emit_p6_x86_64_semantic_machine_instruction(
                 }
                 P6X86_64BaselineSymbolicRegister::Scratch1 => {
                     builder.emit(&[0x41, 0x80, 0xfb, tag])?
+                }
+                _ => {
+                    return Err(
+                        P6X86_64BaselineSemanticByteEmissionError::UnsupportedMachineInstruction {
+                            bytecode_index,
+                            instruction,
+                        },
+                    );
+                }
+            }
+            builder.emit_jcc_rel32_side_exit(bytecode_index, 0x85, on_not_equal)
+        }
+        // C++ JSC InlineAccess::generateSelfPropertyAccess structure guard:
+        //   branch32(NotEqual, Address(base, JSCell::structureIDOffset()),
+        //            TrustedImm32(structure->id())) -> slow path.
+        // Modeled as load32 [base+structure_id_offset] -> scratch; cmp32 scratch,
+        // imm32(cached_structure_id); jne rel32 -> side exit. base must be
+        // PropertyBase (rdi); scratch is r10/r11. bytecode/InlineAccess.cpp:191-194.
+        P6X86_64BaselineMachineInstruction::GuardStructureId {
+            base,
+            scratch,
+            structure_id_offset,
+            cached_structure_id,
+            on_not_equal,
+        } => {
+            if base != P6X86_64BaselineSymbolicRegister::PropertyBase {
+                return Err(
+                    P6X86_64BaselineSemanticByteEmissionError::UnsupportedMemoryBase {
+                        bytecode_index,
+                        base,
+                    },
+                );
+            }
+            match scratch {
+                // load32: mov r10d, [rdi+disp32] = REX.R 8B, ModRM 10 010 111 = 0x97.
+                // cmp32:  cmp r10d, imm32 = REX.B 81 /7, ModRM 11 111 010 = 0xFA.
+                P6X86_64BaselineSymbolicRegister::Scratch0 => {
+                    builder.emit(&[0x44, 0x8b, 0x97])?;
+                    builder.emit_i32_le(structure_id_offset)?;
+                    builder.emit(&[0x41, 0x81, 0xfa])?;
+                    builder.emit(&cached_structure_id.to_le_bytes())?;
+                }
+                // load32: mov r11d, [rdi+disp32] = REX.R 8B, ModRM 10 011 111 = 0x9F.
+                // cmp32:  cmp r11d, imm32 = REX.B 81 /7, ModRM 11 111 011 = 0xFB.
+                P6X86_64BaselineSymbolicRegister::Scratch1 => {
+                    builder.emit(&[0x44, 0x8b, 0x9f])?;
+                    builder.emit_i32_le(structure_id_offset)?;
+                    builder.emit(&[0x41, 0x81, 0xfb])?;
+                    builder.emit(&cached_structure_id.to_le_bytes())?;
                 }
                 _ => {
                     return Err(
@@ -6045,6 +6217,40 @@ fn p6_x86_64_semantic_frame_local_disp32(
     Ok(disp32)
 }
 
+// C++ JSC InlineAccess addresses the cell/storage through Address(base, disp)
+// where base is propertyCache.m_baseGPR (PropertyBase / rdi) and disp is a
+// byte displacement relative to the cell pointer (offsetRelativeToBase(offset)).
+// This extracts that disp32 and enforces base == PropertyBase, mirroring the
+// frame-local helper but for cell-relative addressing.
+// bytecode/InlineAccess.cpp:203-204.
+fn p6_x86_64_semantic_cell_relative_disp32(
+    bytecode_index: crate::bytecode::BytecodeIndex,
+    memory: P6X86_64BaselineMachineMemoryOperand,
+) -> Result<i32, P6X86_64BaselineSemanticByteEmissionError> {
+    let disp32 = match memory.location {
+        P6X86_64BaselineOperandLocation::CellRelative { disp32 } => disp32,
+        location => {
+            return Err(
+                P6X86_64BaselineSemanticByteEmissionError::UnsupportedOperandLocation {
+                    bytecode_index,
+                    location,
+                    reason:
+                        P6X86_64BaselineSemanticOperandRejectionReason::ExpectedCellRelativeMemory,
+                },
+            );
+        }
+    };
+    if memory.base != P6X86_64BaselineSymbolicRegister::PropertyBase {
+        return Err(
+            P6X86_64BaselineSemanticByteEmissionError::UnsupportedMemoryBase {
+                bytecode_index,
+                base: memory.base,
+            },
+        );
+    }
+    Ok(disp32)
+}
+
 fn p6_x86_64_disp32_for_frame_local(
     bytecode_index: crate::bytecode::BytecodeIndex,
     location: P6X86_64BaselineOperandLocation,
@@ -6101,6 +6307,15 @@ fn p6_x86_64_disp32_for_frame_local(
             },
         ),
         P6X86_64BaselineOperandLocation::Immediate(_) => Err(
+            P6X86_64BaselineSemanticByteEmissionError::UnsupportedOperandLocation {
+                bytecode_index,
+                location,
+                reason: P6X86_64BaselineSemanticOperandRejectionReason::ExpectedFrameLocalMemory,
+            },
+        ),
+        // A cell-relative address is not a frame local; it is handled by
+        // p6_x86_64_semantic_cell_relative_disp32 for the PropertyBase path.
+        P6X86_64BaselineOperandLocation::CellRelative { .. } => Err(
             P6X86_64BaselineSemanticByteEmissionError::UnsupportedOperandLocation {
                 bytecode_index,
                 location,
@@ -18073,5 +18288,307 @@ mod tests {
                 }
             })
         );
+    }
+
+    // ---- Batch 3a: assembler foundation primitives for inline machine-code
+    // monomorphic GET_BY_ID (structure guard + offset-indexed property load).
+    // Each test round-trips one new machine instruction through the full
+    // freeze->layout->link->validate pipeline (finish_p6_x86_64_semantic_byte_emission)
+    // and asserts the linked bytes equal the hand-encoded x86-64 mirroring
+    // bytecode/InlineAccess.cpp:191-204. ----
+
+    fn cell_relative(disp32: i32) -> P6X86_64BaselineMachineOperand {
+        memory_operand(
+            P6X86_64BaselineSymbolicRegister::PropertyBase,
+            P6X86_64BaselineOperandLocation::CellRelative { disp32 },
+        )
+    }
+
+    fn structure_mismatch_label(bytecode_offset: u32) -> P6X86_64BaselineSideExitLabel {
+        side_exit_label(
+            P6X86_64BaselineSelectedSideExitReason::NonInt32Operand,
+            bytecode_offset,
+        )
+    }
+
+    // Builds bytes for a single machine instruction, resolves its side-exit
+    // placeholders, and drives them through the same freeze->layout->link->validate
+    // pipeline production uses (finish_p6_x86_64_semantic_byte_emission). Returns
+    // the validated linked image bytes, which validate proves identical to the
+    // source bytes, so the returned bytes are exactly what the emitter produced.
+    fn round_trip_single_instruction(
+        instruction: P6X86_64BaselineMachineInstruction,
+        bytecode_index: BytecodeIndex,
+    ) -> Vec<u8> {
+        let contract = p6_backend_contract();
+        let mut builder = P6X86_64SemanticByteBuilder::default();
+        emit_p6_x86_64_semantic_machine_instruction(
+            &mut builder,
+            &contract,
+            bytecode_index,
+            instruction,
+            P6X86_64SemanticBranchEmissionMode::DirectBytecodeTargets,
+        )
+        .unwrap();
+        let normal_path_end_offset = builder.offset().unwrap();
+        let side_exit_placeholders = builder.finish_side_exit_placeholders().unwrap();
+        let encoded = P6X86_64SemanticEncodedSelection {
+            bytes: builder.bytes,
+            terminal_policy: P6X86_64BaselineTerminalPolicyRecord {
+                policy:
+                    P6X86_64BaselineTerminalPolicy::SingleFinalNormalReturnRetThenInlineUd2SideExits,
+                return_bytecode_index: bytecode_index,
+                ret_offset: 0,
+                normal_path_end_offset,
+            },
+            callable_prologue: None,
+            callable_normal_epilogue: None,
+            instruction_bytes: Vec::new(),
+            bytecode_branches: Vec::new(),
+            side_exit_placeholders,
+            side_exit_return_stubs: Vec::new(),
+            loop_backedge_safepoint_stubs: Vec::new(),
+            runtime_helper_native_exit_stubs: Vec::new(),
+            js_call_native_exit_stubs: Vec::new(),
+            js_call_owner_post_call_stubs: Vec::new(),
+            js_call_owner_post_call_reentry_stubs: Vec::new(),
+            property_native_exit_stubs: Vec::new(),
+        };
+        let result = finish_p6_x86_64_semantic_byte_emission(
+            &contract,
+            encoded,
+            P6X86_64BaselineSemanticByteEmissionShape::P2aSemanticX86_64FromAcceptedP6Selection,
+            P6X86_64BaselineSemanticByteEmissionAuthority::NonExecutableNonCallableSemanticBytesOnly,
+            p6_x86_64_semantic_source_buffer_id(&contract),
+            p6_x86_64_semantic_source_image_id(&contract),
+            0,
+        )
+        .unwrap();
+        // validate proved linked == source; assert it to make that explicit.
+        assert_eq!(result.linked_image.bytes(), result.source_image.bytes());
+        result.linked_image.bytes().to_vec()
+    }
+
+    #[test]
+    fn property_base_binds_to_rdi_in_register_map() {
+        // C++ JSC GetById::baseJSR == argumentGPR0 == X86Registers::edi (rdi).
+        let map = p6_x86_64_semantic_physical_register_map();
+        let binding = map
+            .bindings
+            .iter()
+            .find(|b| b.symbolic == P6X86_64BaselineSymbolicRegister::PropertyBase)
+            .expect("PropertyBase must be bound");
+        assert_eq!(binding.physical, "rdi");
+    }
+
+    #[test]
+    fn loadq_cell_relative_into_return_gpr_encodes_rex_w_8b_modrm10_disp32() {
+        // C++: loadValue(Address(base /* rdi */, offsetRelativeToBase(offset)), value)
+        // mov rax, [rdi+0x10] = REX.W 8B, ModRM mod=10 reg=000(rax) rm=111(rdi)=0x87.
+        let bytes = round_trip_single_instruction(
+            P6X86_64BaselineMachineInstruction::LoadQ {
+                destination: P6X86_64BaselineSymbolicRegister::ReturnGpr,
+                source: cell_relative(0x10),
+            },
+            BytecodeIndex::from_offset(0),
+        );
+        let mut expected = vec![0x48, 0x8b, 0x87];
+        expected.extend_from_slice(&0x10i32.to_le_bytes());
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn loadq_cell_relative_into_scratch0_encodes_rex_wr_8b_modrm10_disp32() {
+        // mov r10, [rdi+0x10] = REX.WR 4C 8B, ModRM mod=10 reg=010(r10) rm=111=0x97.
+        let bytes = round_trip_single_instruction(
+            P6X86_64BaselineMachineInstruction::LoadQ {
+                destination: P6X86_64BaselineSymbolicRegister::Scratch0,
+                source: cell_relative(0x18),
+            },
+            BytecodeIndex::from_offset(0),
+        );
+        let mut expected = vec![0x4c, 0x8b, 0x97];
+        expected.extend_from_slice(&0x18i32.to_le_bytes());
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn loadq_cell_relative_into_scratch1_encodes_rex_wr_8b_modrm10_disp32() {
+        // mov r11, [rdi-0x8] = REX.WR 4C 8B, ModRM mod=10 reg=011(r11) rm=111=0x9F.
+        let bytes = round_trip_single_instruction(
+            P6X86_64BaselineMachineInstruction::LoadQ {
+                destination: P6X86_64BaselineSymbolicRegister::Scratch1,
+                source: cell_relative(-8),
+            },
+            BytecodeIndex::from_offset(0),
+        );
+        let mut expected = vec![0x4c, 0x8b, 0x9f];
+        expected.extend_from_slice(&(-8i32).to_le_bytes());
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn storeq_cell_relative_from_return_gpr_encodes_rex_w_89_modrm10_disp32() {
+        // mov [rdi+0x10], rax = REX.W 48 89, ModRM mod=10 reg=000(rax) rm=111=0x87.
+        let bytes = round_trip_single_instruction(
+            P6X86_64BaselineMachineInstruction::StoreQ {
+                destination: cell_relative(0x10),
+                source: P6X86_64BaselineSymbolicRegister::ReturnGpr,
+            },
+            BytecodeIndex::from_offset(0),
+        );
+        let mut expected = vec![0x48, 0x89, 0x87];
+        expected.extend_from_slice(&0x10i32.to_le_bytes());
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn storeq_cell_relative_from_scratch0_encodes_rex_wr_89_modrm10_disp32() {
+        // mov [rdi+0x20], r10 = REX.WR 4C 89, ModRM mod=10 reg=010(r10) rm=111=0x97.
+        let bytes = round_trip_single_instruction(
+            P6X86_64BaselineMachineInstruction::StoreQ {
+                destination: cell_relative(0x20),
+                source: P6X86_64BaselineSymbolicRegister::Scratch0,
+            },
+            BytecodeIndex::from_offset(0),
+        );
+        let mut expected = vec![0x4c, 0x89, 0x97];
+        expected.extend_from_slice(&0x20i32.to_le_bytes());
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn storeq_cell_relative_from_scratch1_encodes_rex_wr_89_modrm10_disp32() {
+        // mov [rdi+0x28], r11 = REX.WR 4C 89, ModRM mod=10 reg=011(r11) rm=111=0x9F.
+        let bytes = round_trip_single_instruction(
+            P6X86_64BaselineMachineInstruction::StoreQ {
+                destination: cell_relative(0x28),
+                source: P6X86_64BaselineSymbolicRegister::Scratch1,
+            },
+            BytecodeIndex::from_offset(0),
+        );
+        let mut expected = vec![0x4c, 0x89, 0x9f];
+        expected.extend_from_slice(&0x28i32.to_le_bytes());
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn guard_structure_id_scratch0_encodes_load32_cmp32_imm32_jne_rel32() {
+        // C++: branch32(NotEqual, Address(base /* rdi */, structureIDOffset()),
+        //               TrustedImm32(structure->id())) -> slow path.
+        // Modeled: mov r10d, [rdi+0]; cmp r10d, 0xcafef00d; jne rel32 -> ud2 exit.
+        //   load32 mov r10d,[rdi+0]: 44 8B 97 disp32 (REX.R, ModRM 10 010 111).
+        //   cmp32  cmp r10d,imm32:   41 81 FA imm32  (REX.B, 81 /7, ModRM 11 111 010).
+        //   jne rel32:               0F 85 rel32.
+        // finish_side_exit_placeholders appends a 0x0F 0x0B (ud2) target and
+        // patches the rel32. The jne target is the ud2 just past the branch.
+        let bytecode_index = BytecodeIndex::from_offset(0);
+        let bytes = round_trip_single_instruction(
+            P6X86_64BaselineMachineInstruction::GuardStructureId {
+                base: P6X86_64BaselineSymbolicRegister::PropertyBase,
+                scratch: P6X86_64BaselineSymbolicRegister::Scratch0,
+                structure_id_offset: 0,
+                cached_structure_id: 0xcafe_f00d,
+                on_not_equal: structure_mismatch_label(0),
+            },
+            bytecode_index,
+        );
+        // load32 (7) + cmp32 (7) + jne rel32 (6) + ud2 (2) = 22 bytes.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0x44, 0x8b, 0x97]);
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        expected.extend_from_slice(&[0x41, 0x81, 0xfa]);
+        expected.extend_from_slice(&0xcafe_f00du32.to_le_bytes());
+        // jne rel32 -> ud2 placeholder immediately after the 6-byte branch (rel=0).
+        expected.extend_from_slice(&[0x0f, 0x85]);
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        expected.extend_from_slice(&[0x0f, 0x0b]);
+        assert_eq!(bytes, expected);
+        // Confirm the jne actually targets the ud2 side-exit.
+        let jne_end = 14 + 6;
+        assert_eq!(rel32_branch_target(&bytes, jne_end as u32), jne_end as i64);
+    }
+
+    #[test]
+    fn guard_structure_id_scratch1_encodes_load32_cmp32_imm32_jne_rel32() {
+        // Same as above but scratch == r11:
+        //   load32 mov r11d,[rdi+disp32]: 44 8B 9F disp32 (ModRM 10 011 111).
+        //   cmp32  cmp r11d,imm32:        41 81 FB imm32  (ModRM 11 111 011).
+        let bytecode_index = BytecodeIndex::from_offset(0);
+        let bytes = round_trip_single_instruction(
+            P6X86_64BaselineMachineInstruction::GuardStructureId {
+                base: P6X86_64BaselineSymbolicRegister::PropertyBase,
+                scratch: P6X86_64BaselineSymbolicRegister::Scratch1,
+                structure_id_offset: 0,
+                cached_structure_id: 0x0001_0002,
+                on_not_equal: structure_mismatch_label(0),
+            },
+            bytecode_index,
+        );
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0x44, 0x8b, 0x9f]);
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        expected.extend_from_slice(&[0x41, 0x81, 0xfb]);
+        expected.extend_from_slice(&0x0001_0002u32.to_le_bytes());
+        expected.extend_from_slice(&[0x0f, 0x85]);
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        expected.extend_from_slice(&[0x0f, 0x0b]);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn loadq_cell_relative_rejects_non_property_base() {
+        // Only PropertyBase (rdi) is a valid cell base; PinnedCallFrameBase is
+        // the frame-local path, so a cell-relative load from it is rejected.
+        let contract = p6_backend_contract();
+        let mut builder = P6X86_64SemanticByteBuilder::default();
+        let result = emit_p6_x86_64_semantic_machine_instruction(
+            &mut builder,
+            &contract,
+            BytecodeIndex::from_offset(0),
+            P6X86_64BaselineMachineInstruction::LoadQ {
+                destination: P6X86_64BaselineSymbolicRegister::ReturnGpr,
+                source: memory_operand(
+                    P6X86_64BaselineSymbolicRegister::Scratch2,
+                    P6X86_64BaselineOperandLocation::CellRelative { disp32: 0 },
+                ),
+            },
+            P6X86_64SemanticBranchEmissionMode::DirectBytecodeTargets,
+        );
+        // Scratch2 base is not the cell base / frame base, so the frame-local
+        // fallback rejects it as an unsupported memory base.
+        assert!(matches!(
+            result,
+            Err(P6X86_64BaselineSemanticByteEmissionError::UnsupportedOperandLocation { .. })
+                | Err(P6X86_64BaselineSemanticByteEmissionError::UnsupportedMemoryBase { .. })
+        ));
+    }
+
+    #[test]
+    fn guard_structure_id_rejects_non_property_base() {
+        let contract = p6_backend_contract();
+        let mut builder = P6X86_64SemanticByteBuilder::default();
+        let result = emit_p6_x86_64_semantic_machine_instruction(
+            &mut builder,
+            &contract,
+            BytecodeIndex::from_offset(0),
+            P6X86_64BaselineMachineInstruction::GuardStructureId {
+                base: P6X86_64BaselineSymbolicRegister::Scratch2,
+                scratch: P6X86_64BaselineSymbolicRegister::Scratch0,
+                structure_id_offset: 0,
+                cached_structure_id: 1,
+                on_not_equal: structure_mismatch_label(0),
+            },
+            P6X86_64SemanticBranchEmissionMode::DirectBytecodeTargets,
+        );
+        assert!(matches!(
+            result,
+            Err(
+                P6X86_64BaselineSemanticByteEmissionError::UnsupportedMemoryBase {
+                    base: P6X86_64BaselineSymbolicRegister::Scratch2,
+                    ..
+                }
+            )
+        ));
     }
 }
