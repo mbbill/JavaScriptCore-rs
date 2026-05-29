@@ -13,26 +13,28 @@ use crate::value::JsValue;
 use crate::bytecode::debug::{BytecodeHookTable, ExceptionHandlerTable};
 use crate::bytecode::gc::BytecodeRootMap;
 use crate::bytecode::ic::{
-    CallLinkInfo, CallLinkInlineCacheAttachedMetadata, CallLinkInlineCacheAttachedMetadataError,
-    CallLinkInlineCacheAttachedMetadataMismatchField, CallLinkInlineCacheAttachedMetadataRequest,
-    CallLinkInlineCacheAttachedMetadataResult, CallLinkInlineCacheAttachmentError,
-    CallLinkInlineCacheAttachmentOutcome, CallLinkInlineCacheAttachmentRequest,
-    CallLinkInlineCacheAttachmentResult, CallLinkInlineCacheClearError,
-    CallLinkInlineCacheClearMetadataMismatchField, CallLinkInlineCacheClearOutcome,
-    CallLinkInlineCacheClearRequest, CallLinkInlineCacheClearResult, CallLinkMode, CallTarget,
-    CallType, GetByIdMode, GetByIdModeMetadata, InlineCacheMutationAuthority, InlineCacheState,
-    InlineCacheTable, PropertyCacheKey, PropertyInlineCache, PropertyInlineCacheAttachedMetadata,
-    PropertyInlineCacheAttachedMetadataError, PropertyInlineCacheAttachedMetadataMismatchField,
-    PropertyInlineCacheAttachedMetadataRequest, PropertyInlineCacheAttachedMetadataResult,
-    PropertyInlineCacheAttachmentError, PropertyInlineCacheAttachmentKind,
-    PropertyInlineCacheAttachmentOutcome, PropertyInlineCacheAttachmentRequest,
-    PropertyInlineCacheAttachmentResult, PropertyInlineCacheClearError,
-    PropertyInlineCacheClearMetadataMismatchField, PropertyInlineCacheClearOutcome,
-    PropertyInlineCacheClearRequest, PropertyInlineCacheClearResult, PropertyInlineCacheDispatch,
-    PropertyInlineCacheStubMode, PutByIdMode, PutByIdModeMetadata,
-    StructureStubAccessCaseLinkError, StructureStubAccessCaseLinkOutcome,
-    StructureStubAccessCaseLinkRequest, StructureStubAccessCaseLinkResult, StructureStubInfo,
-    StructureStubKind, StructureStubMetadataMismatchField,
+    BaselineJitData, CallLinkInfo, CallLinkInlineCacheAttachedMetadata,
+    CallLinkInlineCacheAttachedMetadataError, CallLinkInlineCacheAttachedMetadataMismatchField,
+    CallLinkInlineCacheAttachedMetadataRequest, CallLinkInlineCacheAttachedMetadataResult,
+    CallLinkInlineCacheAttachmentError, CallLinkInlineCacheAttachmentOutcome,
+    CallLinkInlineCacheAttachmentRequest, CallLinkInlineCacheAttachmentResult,
+    CallLinkInlineCacheClearError, CallLinkInlineCacheClearMetadataMismatchField,
+    CallLinkInlineCacheClearOutcome, CallLinkInlineCacheClearRequest,
+    CallLinkInlineCacheClearResult, CallLinkMode, CallTarget, CallType, GetByIdMode,
+    GetByIdModeMetadata, HandlerPropertyInlineCacheRecord, InlineCacheMutationAuthority,
+    InlineCacheState, InlineCacheTable, PropertyCacheKey, PropertyInlineCache,
+    PropertyInlineCacheAttachedMetadata, PropertyInlineCacheAttachedMetadataError,
+    PropertyInlineCacheAttachedMetadataMismatchField, PropertyInlineCacheAttachedMetadataRequest,
+    PropertyInlineCacheAttachedMetadataResult, PropertyInlineCacheAttachmentError,
+    PropertyInlineCacheAttachmentKind, PropertyInlineCacheAttachmentOutcome,
+    PropertyInlineCacheAttachmentRequest, PropertyInlineCacheAttachmentResult,
+    PropertyInlineCacheClearError, PropertyInlineCacheClearMetadataMismatchField,
+    PropertyInlineCacheClearOutcome, PropertyInlineCacheClearRequest,
+    PropertyInlineCacheClearResult, PropertyInlineCacheDispatch, PropertyInlineCacheStubMode,
+    PutByIdMode, PutByIdModeMetadata, StructureStubAccessCaseLinkError,
+    StructureStubAccessCaseLinkOutcome, StructureStubAccessCaseLinkRequest,
+    StructureStubAccessCaseLinkResult, StructureStubInfo, StructureStubKind,
+    StructureStubMetadataMismatchField,
 };
 use crate::bytecode::instruction::{
     DecodedInstruction, InstructionDecodeError, Operand, PackedInstructionStream,
@@ -579,6 +581,21 @@ pub struct CodeBlock {
     // `invalidate_snapshot_fingerprint()` so the memo tracks the actual mutation
     // surface rather than relying on the current structural-invariance fact.
     snapshot_fingerprint: Cell<Option<BaselineBytecodeSnapshotFingerprint>>,
+    // C++ JSC map (install-time interior mutability): the per-CodeBlock baseline
+    // data-IC record store, mirroring C++ `CodeBlock::m_jitData`
+    // (CodeBlock.h:1002), a `BaselineJITData*` (BaselineJITCode.h:118)
+    // allocated once in `setupWithUnlinkedBaselineCode` and freed only when
+    // baseline code is discarded. Like the three Copy install-time fields above
+    // and the `inline_caches` `RefCell`, the shared `Rc<CodeBlock>` cannot take
+    // `&mut self` at baseline install, so the slot is interior-mutable. `None`
+    // before baseline install; `install_baseline_jit_data` allocates the `Box`
+    // exactly once and it is never reallocated, so its base address is stable
+    // for the lifetime of the baseline code (later IC misses mutate records in
+    // place). `RefCell` rather than `Cell` because callers need shared borrows
+    // of the records, and the `Box` itself is `Clone` for the derived
+    // `CodeBlock: Clone` (a clone copies the records into a fresh allocation,
+    // matching how the cloned `inline_caches` `RefCell` already behaves).
+    baseline_jit_data: RefCell<Option<Box<BaselineJitData>>>,
 }
 
 impl CodeBlock {
@@ -599,6 +616,7 @@ impl CodeBlock {
             lifecycle: Cell::new(CodeBlockLifecycleState::Linking),
             mutation_authority: CodeBlockMutationAuthority::VmMainThread,
             snapshot_fingerprint: Cell::new(None),
+            baseline_jit_data: RefCell::new(None),
         }
     }
 
@@ -789,6 +807,59 @@ impl CodeBlock {
         self.lifecycle
             .set(CodeBlockLifecycleState::BaselineInstalled);
         Ok(())
+    }
+
+    // C++ JSC map: mirrors `CodeBlock::setupWithUnlinkedBaselineCode`
+    // (CodeBlock.cpp:800-825), which allocates `BaselineJITData` once with
+    // `propertyCacheSize = jitCode->m_unlinkedPropertyInlineCaches.size()` and
+    // stores it in `m_jitData` (an allocate-once slot asserted empty:
+    // `ASSERT(!m_jitData)` at CodeBlock.cpp:801). This takes `&self` because the
+    // shared `Rc<CodeBlock>` install path has no `&mut self` (same in-place
+    // install model as `install_baseline_jit_slot`), writing through the
+    // interior-mutable `baseline_jit_data` `RefCell`. Allocates the `Box`
+    // exactly once with `count` zero-initialized (sentinel) records; the `Box`
+    // is never reallocated afterward, so its record-store base address is stable
+    // and later IC misses mutate records in place. Returns the stable
+    // record-store base address (what generated baseline code seeds into r13 =
+    // `GPRInfo::jitDataRegister`), or `None` when there are zero IC sites
+    // (`count == 0`), in which case generated code never dereferences the base.
+    pub fn install_baseline_jit_data(
+        &self,
+        count: usize,
+    ) -> Option<*const HandlerPropertyInlineCacheRecord> {
+        let data = Box::new(BaselineJitData::from_property_cache_count(count));
+        let base = if count == 0 {
+            None
+        } else {
+            Some(data.record_store_base())
+        };
+        // Allocate-once contract: assert the slot was empty, mirroring C++
+        // `ASSERT(!m_jitData)` (CodeBlock.cpp:801).
+        let mut slot = self.baseline_jit_data.borrow_mut();
+        debug_assert!(slot.is_none(), "baseline_jit_data installed more than once");
+        *slot = Some(data);
+        base
+    }
+
+    /// Borrow the installed baseline data-IC store, if any. `None` before
+    /// baseline install. Mirrors a read of `CodeBlock::m_jitData`
+    /// (CodeBlock.h:1002).
+    pub fn baseline_jit_data(&self) -> std::cell::Ref<'_, Option<Box<BaselineJitData>>> {
+        self.baseline_jit_data.borrow()
+    }
+
+    /// Stable base address of the installed baseline data-IC record store (the
+    /// value generated baseline code seeds into r13 = `GPRInfo::jitDataRegister`),
+    /// or `None` when no store is installed or the store has zero records.
+    /// Stable because the `Box` is never reallocated after install.
+    pub fn baseline_jit_data_record_store_base(
+        &self,
+    ) -> Option<*const HandlerPropertyInlineCacheRecord> {
+        self.baseline_jit_data
+            .borrow()
+            .as_ref()
+            .filter(|data| data.property_cache_count() != 0)
+            .map(|data| data.record_store_base())
     }
 
     // C++ JSC divergence: value-profile sampling mutates `m_metadata` through the
@@ -3911,6 +3982,58 @@ mod tests {
                 ..CodeBlockEntrypoints::default()
             })
             .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    #[test]
+    fn install_baseline_jit_data_allocates_stable_box_of_requested_size() {
+        let code_block = linked_interpreter_code_block();
+
+        // No baseline data-IC store before install.
+        assert!(code_block.baseline_jit_data().is_none());
+        assert!(code_block.baseline_jit_data_record_store_base().is_none());
+
+        // Install allocates the Box once with `count` sentinel records and
+        // returns the stable record-store base.
+        let count = 4usize;
+        let installed_base = code_block.install_baseline_jit_data(count);
+        assert!(installed_base.is_some());
+
+        {
+            let data = code_block.baseline_jit_data();
+            let data = data.as_ref().expect("store installed");
+            assert_eq!(data.property_cache_count(), count);
+            // All records are the never-matching sentinel.
+            assert!(data
+                .property_caches
+                .iter()
+                .all(|record| *record == HandlerPropertyInlineCacheRecord::SENTINEL));
+            assert_eq!(data.record_store_base(), installed_base.unwrap());
+        }
+
+        // The Box is never reallocated: the base address stays stable across
+        // repeated reads.
+        let base_again = code_block.baseline_jit_data_record_store_base();
+        assert_eq!(base_again, installed_base);
+    }
+
+    #[test]
+    fn install_baseline_jit_data_zero_sites_has_no_dereferenceable_base() {
+        let code_block = linked_interpreter_code_block();
+
+        // A zero-site store is still allocated (matching C++ allocate-once
+        // BaselineJITData with propertyCacheSize == 0), but exposes no
+        // dereferenceable record-store base: generated code seeds r13 from a
+        // dangling pointer it never reads.
+        let base = code_block.install_baseline_jit_data(0);
+        assert!(base.is_none());
+
+        {
+            let data = code_block.baseline_jit_data();
+            let data = data.as_ref().expect("zero-site store still installed");
+            assert_eq!(data.property_cache_count(), 0);
+        }
+
+        assert!(code_block.baseline_jit_data_record_store_base().is_none());
     }
 
     fn identifier_property_key(identifier_index: u32) -> PropertyKey {

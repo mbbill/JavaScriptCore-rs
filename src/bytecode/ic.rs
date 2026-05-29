@@ -1394,3 +1394,113 @@ pub struct IterationModes {
     pub fast_map: bool,
     pub fast_set: bool,
 }
+
+/// Fast-path fields of one baseline data IC site, read directly by generated
+/// baseline code from a stable record store.
+///
+/// C++-to-Rust map: mirrors the inline fast-path fields of C++
+/// `HandlerPropertyInlineCache`/`PropertyInlineCache` that generated baseline
+/// code loads at the call site (PropertyInlineCache.h:421-422):
+///   - `structure_id` <- `m_inlineAccessBaseStructureID`
+///     (offsetOfInlineAccessBaseStructureID(), a `StructureID`/`u32`),
+///   - `offset` <- `byIdSelfOffset` (offsetOfByIdSelfOffset(), a
+///     `PropertyOffset`/`i32`).
+/// These are the only two fields a `GetByIdSelf`/`PutByIdReplace` fast path
+/// needs: structure-check the base, then load/store at the inline offset. The
+/// full C++ `PropertyInlineCache` carries handler chains, watchpoints, and GC
+/// state; this batch ports only the two inline fast-path slots because that is
+/// all the upcoming `get_by_id` self-access emission consumes.
+///
+/// `#[repr(C)]` with these two fields in this order gives a fixed 8-byte layout
+/// (`structure_id` at +0, `offset` at +4) so generated code can read the slots
+/// by constant displacement. `structure_id == 0` is the never-matching
+/// sentinel: it mirrors a freshly created C++ IC whose
+/// `m_inlineAccessBaseStructureID` is null (no structure cached yet), so the
+/// inline structure check always misses and falls through to the slow path
+/// until a real miss fills the record in place.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[repr(C)]
+pub struct HandlerPropertyInlineCacheRecord {
+    /// Cached base `StructureID`; `0` = never-matching sentinel (no structure).
+    pub structure_id: u32,
+    /// Inline self-access `PropertyOffset` for the cached structure.
+    pub offset: i32,
+}
+
+impl HandlerPropertyInlineCacheRecord {
+    /// Sentinel record: `structure_id == 0`, so an inline structure check can
+    /// never match. Mirrors a freshly created C++ `PropertyInlineCache` with a
+    /// null `m_inlineAccessBaseStructureID`.
+    pub const SENTINEL: Self = Self {
+        structure_id: 0,
+        offset: 0,
+    };
+}
+
+impl Default for HandlerPropertyInlineCacheRecord {
+    fn default() -> Self {
+        Self::SENTINEL
+    }
+}
+
+/// Stable per-CodeBlock baseline data-IC record store, allocated once at
+/// baseline install and never reallocated.
+///
+/// C++-to-Rust map: mirrors C++ `BaselineJITData`
+/// (BaselineJITCode.h:118-159), which a baseline `CodeBlock` owns through
+/// `m_jitData` (CodeBlock.h:1002) and which generated baseline code addresses
+/// via `GPRInfo::jitDataRegister` (r13 on x86_64). C++ `BaselineJITData` is a
+/// `ButterflyArray<BaselineJITData, HandlerPropertyInlineCache, void*>`: the
+/// `HandlerPropertyInlineCache` records live in the *leading* span at a
+/// *negative* displacement from the `BaselineJITData` object pointer
+/// (ButterflyArray.h:119 `leadingData() = derived - m_leadingSize`), and
+/// `propertyCache(index)` reads them back-to-front as
+/// `span[span.size() - index - 1]` (BaselineJITCode.h:135-138). It is allocated
+/// once in `CodeBlock::setupWithUnlinkedBaselineCode`
+/// (CodeBlock.cpp:800-825) and freed only when baseline code is discarded.
+///
+/// Permanent Rust divergence (positive-disp32 vs C++ negative leading span):
+/// Rust stores the records in a plain `Box<[HandlerPropertyInlineCacheRecord]>`,
+/// a contiguous *positive*-displacement array indexed front-to-back, instead of
+/// the C++ negative leading-span ButterflyArray placement. Rust has no
+/// `void*` trailing constant-pool span to co-allocate behind the same object,
+/// and a forward `Box<[T]>` gives the same stable base address + constant
+/// per-record displacement that generated code needs, with simpler safe Rust
+/// ownership. Generated baseline code must therefore index this store with
+/// positive `record_base + index * 8`, not the C++ `derived - (index+1)*8`.
+/// The `Box` is allocated exactly once (`from_property_cache_count`) and the
+/// records are mutated in place on later misses; the `Box` is never reallocated
+/// so its base address stays stable for the lifetime of the baseline code,
+/// matching the C++ allocate-once `m_jitData` contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BaselineJitData {
+    /// Property data-IC records, one per baseline `get_by_id` self-access site.
+    pub property_caches: Box<[HandlerPropertyInlineCacheRecord]>,
+}
+
+impl BaselineJitData {
+    /// Allocate the record store once with `count` zero-initialized
+    /// (sentinel) records. Mirrors `BaselineJITData::create(propertyCacheSize,
+    /// ...)` where `propertyCacheSize` is the count of baseline property IC
+    /// sites (CodeBlock.cpp:802).
+    pub fn from_property_cache_count(count: usize) -> Self {
+        Self {
+            property_caches: vec![HandlerPropertyInlineCacheRecord::SENTINEL; count]
+                .into_boxed_slice(),
+        }
+    }
+
+    /// Number of property IC records in the store (stable after allocation).
+    pub fn property_cache_count(&self) -> usize {
+        self.property_caches.len()
+    }
+
+    /// Base address of the record array, the value generated baseline code
+    /// seeds into `GPRInfo::jitDataRegister` (r13). Stable for the store's
+    /// lifetime because the `Box` is never reallocated. For an empty store this
+    /// is a non-dereferenceable dangling slice base, which generated code never
+    /// reads when there are zero sites.
+    pub fn record_store_base(&self) -> *const HandlerPropertyInlineCacheRecord {
+        self.property_caches.as_ptr()
+    }
+}

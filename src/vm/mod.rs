@@ -5118,6 +5118,17 @@ impl Vm {
             else {
                 return fallback(self, host);
             };
+            // Baseline data-IC record store base seeded into r13
+            // (GPRInfo::jitDataRegister) by the P6 prologue. Mirrors C++ baseline
+            // code addressing `BaselineJITData` via the jitDataRegister. Supply
+            // the resident CodeBlock's installed store base, or a dangling
+            // pointer when the store is absent / has zero IC sites (the entry
+            // only moves it into the callee-saved r13 and never dereferences it
+            // this batch, mirroring the P9 dangling metadata-table fallback).
+            let ic_store_base = code_block
+                .baseline_jit_data_record_store_base()
+                .and_then(|base| NonNull::new(base as *mut c_void))
+                .unwrap_or_else(NonNull::<c_void>::dangling);
             let call_result = match invocation {
                 P6X86_64CallableNativeInvocation::Entry { entry_offset } => self
                     .baseline_platform_executable_residencies[platform_residency_index]
@@ -5128,6 +5139,7 @@ impl Vm {
                         vm,
                         frame_base.as_non_null(),
                         callee_value_bits,
+                        ic_store_base,
                     )),
                 P6X86_64CallableNativeInvocation::P9OwnerPostCallReentry(reentry) => {
                     let Some(metadata_table_base) =

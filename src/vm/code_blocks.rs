@@ -481,9 +481,27 @@ impl CodeBlockRegistry {
         authority: CodeBlockMutationAuthority,
         slot: JitCodeSlot,
     ) -> Option<Result<(), CodeBlockMutationError>> {
-        self.records
-            .get_mut(&owner)
-            .map(|record| record.code_block.install_baseline_jit_slot(authority, slot))
+        self.records.get_mut(&owner).map(|record| {
+            let outcome = record.code_block.install_baseline_jit_slot(authority, slot);
+            // C++ JSC map: `CodeBlock::setupWithUnlinkedBaselineCode`
+            // (CodeBlock.cpp:800-825) allocates `BaselineJITData` once with
+            // `propertyCacheSize = jitCode->m_unlinkedPropertyInlineCaches.size()`
+            // in the same install step that adopts the baseline JIT code. We
+            // mirror that here, right after adopting the baseline JIT slot.
+            //
+            // FOUNDATION batch: this batch emits no `get_by_id` self-access ICs,
+            // so the unlinked property-IC count is 0 for all currently generated
+            // baseline code. The store is therefore allocated with 0 records (a
+            // stable empty `Box`); the entry seeds r13 from a dangling base that
+            // generated code never dereferences. The next batch that emits
+            // `get_by_id` will size this store by the count of emitted property
+            // IC sites, the faithful analogue of
+            // `jitCode->m_unlinkedPropertyInlineCaches.size()`.
+            if outcome.is_ok() {
+                record.code_block.install_baseline_jit_data(0);
+            }
+            outcome
+        })
     }
 
     pub(crate) fn publish_executable_entry(

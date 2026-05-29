@@ -71,8 +71,9 @@ pub use generator::{
     RegisterAllocator, SpecialRegisterKind, YieldPointKind, YieldPointPlan,
 };
 pub use ic::{
-    AccessCaseRef, ArityCheckMode, CallLinkFlags, CallLinkInfo, CallLinkMode, CallSlot, CallTarget,
-    CallType, GetByIdMode, GetByIdModeMetadata, InlineCacheMutationAuthority, InlineCacheState,
+    AccessCaseRef, ArityCheckMode, BaselineJitData, CallLinkFlags, CallLinkInfo, CallLinkMode,
+    CallSlot, CallTarget, CallType, GetByIdMode, GetByIdModeMetadata,
+    HandlerPropertyInlineCacheRecord, InlineCacheMutationAuthority, InlineCacheState,
     InlineCacheTable, IterationModeMetadata, IterationModes, PropertyAccessType, PropertyCacheKey,
     PropertyCacheKind, PropertyInlineCache, PropertyInlineCacheDispatch, PropertyOffset,
     PutByIdMode, PutByIdModeMetadata, StructureStubAccessCaseLinkError,

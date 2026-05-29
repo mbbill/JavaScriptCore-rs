@@ -48,15 +48,31 @@ use crate::value::{
 use std::fmt::Debug;
 
 const P6_X86_64_NON_CALLABLE_RETURN_STUB_BYTES: &[u8] = &[0x55, 0x48, 0x89, 0xe5, 0x5d, 0xc3];
+// C++ JSC map: r13 = GPRInfo::jitDataRegister (regCS2) seeded with the baseline
+// data-IC record store base, mirroring how baseline code addresses
+// `BaselineJITData` via the jitDataRegister (GPRInfo.h:355,371). r12 stays
+// GPRInfo::metadataTableRegister (regCS1), untouched by this seed. Both r12 and
+// r13 are SysV callee-saved, so they are push/pop balanced across the prologue/
+// epilogue and seeding r13 is observationally inert for all existing generated
+// code (nothing reads r13 yet; get_by_id emission is a later batch). The IC
+// store base arrives as the 4th C-ABI argument in rcx (rdi=vm, rsi=frame_base,
+// rdx=callee carrier, rcx=ic_store_base); `mov r13, rcx` mirrors the P9 reentry
+// `mov r12, rcx` metadata-table seed. Prologue/epilogue lengths are recomputed
+// from these constants everywhere via `.len()`; offset records and side-exit
+// rel32 targets are computed from runtime `offset()` values, not a baked
+// prologue-length constant, so the added bytes propagate automatically.
 const P6_X86_64_CALLABLE_PROLOGUE_BYTES: &[u8] = &[
     0x55, // push rbp
     0x41, 0x57, // push r15
     0x41, 0x54, // push r12
+    0x41, 0x55, // push r13
     0x48, 0x89, 0xf5, // mov rbp, rsi
     0x49, 0x89, 0xff, // mov r15, rdi
     0x49, 0x89, 0xd1, // mov r9, rdx (Rust ABI callee JSValue carrier)
+    0x49, 0x89, 0xcb, // mov r13, rcx (GPRInfo::jitDataRegister = IC store base)
 ];
 const P6_X86_64_CALLABLE_EPILOGUE_BYTES: &[u8] = &[
+    0x41, 0x5d, // pop r13 (reverse of prologue push order: r13, then r12)
     0x41, 0x5c, // pop r12
     0x41, 0x5f, // pop r15
     0x5d, // pop rbp
@@ -72,10 +88,22 @@ pub const P14_X86_64_BASELINE_LOOP_BACKEDGE_RETURN_PAYLOAD_LOW_TAG: u8 = 0xfc;
 pub const P9_X86_64_BASELINE_JS_CALL_NATIVE_EXIT_MAX_ARGUMENT_REGISTERS: usize = 16;
 const P9_X86_64_BASELINE_OWNER_CALL_RESET_SP_NOOP_BYTE: u8 = 0x90;
 const P9_X86_64_BASELINE_OWNER_CALL_RESULT_PROFILE_PENDING_BYTE: u8 = 0x90;
+// The P9 owner post-call reentry stub jumps into the owner post-call block,
+// which rejoins the normal path and exits through the shared
+// `P6_X86_64_CALLABLE_EPILOGUE_BYTES`. That epilogue now `pop r13`s (balancing
+// the P6 prologue's added `push r13`), so this reentry prologue MUST also
+// `push r13` or the shared epilogue would pop into an unbalanced stack and
+// corrupt the return address. The P9 reentry receives its 4th C-ABI arg (rcx) as
+// the metadata-table base (seeded into r12 = metadataTableRegister later via
+// `mov r12, rcx`), not an IC store base, so r13 is not seeded with a meaningful
+// value here; this batch emits no get_by_id, so the reentry path never reads
+// r13. Pushing the incoming r13 and popping it in the shared epilogue preserves
+// the SysV callee-saved register for the caller and keeps the frame balanced.
 const P9_X86_64_BASELINE_OWNER_CALL_REENTRY_PROLOGUE_BYTES: &[u8] = &[
     0x55, // push rbp
     0x41, 0x57, // push r15
     0x41, 0x54, // push r12
+    0x41, 0x55, // push r13 (balances shared epilogue's pop r13; preserved callee-saved)
     0x48, 0x89, 0xf5, // mov rbp, rsi
     0x49, 0x89, 0xff, // mov r15, rdi
     0x4d, 0x89, 0xc1, // mov r9, r8 (Rust ABI callee JSValue carrier)
@@ -16145,6 +16173,90 @@ mod tests {
             &return_record.bytes
                 [return_record.bytes.len() - P6_X86_64_CALLABLE_EPILOGUE_BYTES.len()..],
             P6_X86_64_CALLABLE_EPILOGUE_BYTES
+        );
+    }
+
+    #[test]
+    fn p6_callable_prologue_epilogue_seed_r13_jit_data_register_and_stay_balanced() {
+        // Pin the exact prologue/epilogue byte shape after adding the r13
+        // (GPRInfo::jitDataRegister) seed. The prologue pushes rbp, r15, r12,
+        // r13 in that order and seeds r13 from rcx (the 4th C-ABI arg = IC store
+        // base); the epilogue pops in reverse (r13, r12, r15, rbp) then rets, so
+        // every callee-saved register pushed is popped exactly once and the
+        // frame stays balanced.
+        assert_eq!(
+            P6_X86_64_CALLABLE_PROLOGUE_BYTES,
+            &[
+                0x55, // push rbp
+                0x41, 0x57, // push r15
+                0x41, 0x54, // push r12
+                0x41, 0x55, // push r13
+                0x48, 0x89, 0xf5, // mov rbp, rsi
+                0x49, 0x89, 0xff, // mov r15, rdi
+                0x49, 0x89, 0xd1, // mov r9, rdx
+                0x49, 0x89, 0xcb, // mov r13, rcx (jitDataRegister = IC store base)
+            ]
+        );
+        assert_eq!(
+            P6_X86_64_CALLABLE_EPILOGUE_BYTES,
+            &[
+                0x41, 0x5d, // pop r13
+                0x41, 0x5c, // pop r12
+                0x41, 0x5f, // pop r15
+                0x5d, // pop rbp
+                0xc3, // ret
+            ]
+        );
+
+        // Frame balance: count push (0x50..=0x57, with optional 0x41 REX.B
+        // prefix for r8..r15) and pop (0x58..=0x5f) opcodes across the
+        // prologue and epilogue and require them to match.
+        fn count_push_pop(bytes: &[u8]) -> (usize, usize) {
+            let (mut pushes, mut pops) = (0usize, 0usize);
+            let mut i = 0;
+            while i < bytes.len() {
+                let mut op = bytes[i];
+                if op == 0x41 && i + 1 < bytes.len() {
+                    // REX.B prefix for a one-byte push/pop of r8..r15.
+                    let next = bytes[i + 1];
+                    if (0x50..=0x5f).contains(&next) {
+                        op = next;
+                        i += 1;
+                    }
+                }
+                if (0x50..=0x57).contains(&op) {
+                    pushes += 1;
+                } else if (0x58..=0x5f).contains(&op) {
+                    pops += 1;
+                }
+                i += 1;
+            }
+            (pushes, pops)
+        }
+        let (prologue_pushes, prologue_pops) = count_push_pop(P6_X86_64_CALLABLE_PROLOGUE_BYTES);
+        let (epilogue_pushes, epilogue_pops) = count_push_pop(P6_X86_64_CALLABLE_EPILOGUE_BYTES);
+        assert_eq!(prologue_pushes, 4, "prologue pushes rbp, r15, r12, r13");
+        assert_eq!(prologue_pops, 0);
+        assert_eq!(epilogue_pushes, 0);
+        assert_eq!(
+            epilogue_pops, prologue_pushes,
+            "epilogue must pop exactly what the prologue pushed"
+        );
+
+        // The P9 owner post-call reentry prologue rejoins the shared epilogue,
+        // so it must also push r13 to balance the epilogue's pop r13.
+        let (reentry_pushes, reentry_pops) =
+            count_push_pop(P9_X86_64_BASELINE_OWNER_CALL_REENTRY_PROLOGUE_BYTES);
+        assert_eq!(
+            reentry_pushes, prologue_pushes,
+            "P9 reentry prologue must push the same callee-saved set as the shared epilogue pops"
+        );
+        assert_eq!(reentry_pops, 0);
+        assert!(
+            P9_X86_64_BASELINE_OWNER_CALL_REENTRY_PROLOGUE_BYTES
+                .windows(2)
+                .any(|w| w == [0x41, 0x55]),
+            "P9 reentry prologue must contain push r13 (0x41 0x55)"
         );
     }
 

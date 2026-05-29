@@ -168,6 +168,7 @@ impl ExecutableMemoryMapping {
         vm: NonNull<c_void>,
         frame_base: NonNull<c_void>,
         callee_value_bits: u64,
+        ic_store_base: NonNull<c_void>,
     ) -> Result<u64, ExecutableMemoryPlatformError> {
         let ptr = self
             .ptr
@@ -183,13 +184,15 @@ impl ExecutableMemoryMapping {
         // linked executable lifecycle before reaching this backend. The checked
         // offset above ensures the private entry address lies inside the live
         // mapping. The P6 byte contract defines this entry as
-        // `extern "C" fn(*mut c_void, *mut c_void, u64) -> u64`.
+        // `extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> u64`,
+        // where the 4th argument is the baseline data-IC record store base.
         unsafe {
             call_p6_x86_64_entry(
                 ptr.as_ptr().add(entry_offset).cast_const(),
                 vm,
                 frame_base,
                 callee_value_bits,
+                ic_store_base,
             )
         }
     }
@@ -306,8 +309,12 @@ unsafe fn call_p6_x86_64_entry(
     vm: NonNull<c_void>,
     frame_base: NonNull<c_void>,
     callee_value_bits: u64,
+    ic_store_base: NonNull<c_void>,
 ) -> Result<u64, ExecutableMemoryPlatformError> {
-    type P6Entry = unsafe extern "C" fn(*mut c_void, *mut c_void, u64) -> u64;
+    // The 4th C-ABI argument (rcx) is the baseline data-IC record store base,
+    // which the P6 prologue seeds into r13 (GPRInfo::jitDataRegister). Mirrors
+    // how P9 reentry added a 4th metadata-table-base argument.
+    type P6Entry = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> u64;
 
     if entry.is_null() {
         return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
@@ -319,8 +326,17 @@ unsafe fn call_p6_x86_64_entry(
     let entry: P6Entry = unsafe { std::mem::transmute(entry) };
     // SAFETY: the function pointer was just formed from the checked RX entry
     // address above, and the opaque arguments are non-null values supplied by
-    // the VM-owned call boundary.
-    Ok(unsafe { entry(vm.as_ptr(), frame_base.as_ptr(), callee_value_bits) })
+    // the VM-owned call boundary. `ic_store_base` is the IC record store base
+    // (or a dangling pointer when there are zero IC sites, which the entry never
+    // dereferences); generated code only seeds it into the callee-saved r13.
+    Ok(unsafe {
+        entry(
+            vm.as_ptr(),
+            frame_base.as_ptr(),
+            callee_value_bits,
+            ic_store_base.as_ptr(),
+        )
+    })
 }
 
 #[cfg(target_arch = "x86_64")]

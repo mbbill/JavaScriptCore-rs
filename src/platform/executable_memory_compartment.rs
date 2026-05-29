@@ -49,12 +49,18 @@ pub struct ExecutableMemoryCompartmentRequest {
 /// executable address to callers. `callee_value_bits` is Rust's current native
 /// carrier for JSC's active call-frame callee slot while the raw frame base
 /// still points at local0 rather than a full JSC-compatible frame header.
+/// `ic_store_base` is the baseline data-IC record store base, passed as the 4th
+/// C-ABI argument (rcx); the P6 prologue seeds it into r13
+/// (GPRInfo::jitDataRegister). It is a dangling pointer when the CodeBlock has
+/// zero IC sites, in which case generated code never dereferences it (the entry
+/// only moves it into the callee-saved r13).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutableMemoryP6CallRequest {
     pub entry_offset: u32,
     pub vm: NonNull<c_void>,
     pub frame_base: NonNull<c_void>,
     pub callee_value_bits: u64,
+    pub ic_store_base: NonNull<c_void>,
 }
 
 /// Request to invoke a result-seeded P9 owner post-call reentry stub.
@@ -204,12 +210,14 @@ impl ExecutableMemoryP6CallRequest {
         vm: NonNull<c_void>,
         frame_base: NonNull<c_void>,
         callee_value_bits: u64,
+        ic_store_base: NonNull<c_void>,
     ) -> Self {
         Self {
             entry_offset,
             vm,
             frame_base,
             callee_value_bits,
+            ic_store_base,
         }
     }
 }
@@ -448,6 +456,7 @@ impl ExecutableMemoryCompartment {
                     request.vm,
                     request.frame_base,
                     request.callee_value_bits,
+                    request.ic_store_base,
                 )
                 .map_err(|error| {
                     map_call_platform_error(error, ExecutableMemoryPlatformOperation::CallP6Entry)
@@ -811,7 +820,13 @@ mod tests {
 
     #[cfg(all(unix, target_arch = "x86_64"))]
     fn p6_call_request(entry_offset: u32) -> ExecutableMemoryP6CallRequest {
-        ExecutableMemoryP6CallRequest::new(entry_offset, opaque_test_ptr(), opaque_test_ptr(), 0)
+        ExecutableMemoryP6CallRequest::new(
+            entry_offset,
+            opaque_test_ptr(),
+            opaque_test_ptr(),
+            0,
+            opaque_test_ptr(),
+        )
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]
@@ -824,6 +839,7 @@ mod tests {
             opaque_test_ptr(),
             opaque_test_ptr(),
             callee_value_bits,
+            opaque_test_ptr(),
         )
     }
 
