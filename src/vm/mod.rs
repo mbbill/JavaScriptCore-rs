@@ -22290,6 +22290,24 @@ mod tests {
         )
     }
 
+    fn js_call_return_7_function_code_block() -> CodeBlock {
+        linked_function_test_code_block_with_parameters(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(0)), Operand::SignedImmediate(7)],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(0))],
+                ),
+            ],
+            1,
+        )
+    }
+
     fn js_call_return_string_function_code_block() -> CodeBlock {
         linked_function_test_code_block_with_parameters_and_string_literals(
             vec![
@@ -34988,6 +35006,239 @@ mod tests {
         );
         boundary_snapshot.assert_no_gc_scope_depth(0);
         boundary_snapshot.assert_current_no_gc_scope_depth(&vm, 0);
+    }
+
+    // Mirrors vm_call_link_attachment_enables_vm_owned_direct_generated_call_dispatch (the Call
+    // case) for CallWithThis, i.e. user-JS method dispatch (the richards `obj.method(args)`
+    // shape: get_by_id loads the method, CallWithThis applies it with `this`). C++ JSC links
+    // both op_call and op_call_with_this through the same CallLinkInfo fast path
+    // (jit/JITCall.cpp compileOpCall). This proves a monomorphic user-JS CallWithThis stays
+    // resident on re-execution: the second call takes the generated owner-post-call-reentry
+    // direct call with no interpreter dispatch and no call-link probe miss/blocked.
+    #[test]
+    fn vm_call_with_this_attachment_enables_resident_user_js_method_dispatch() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let function_unlinked = js_call_return_41_function_code_block().unlinked().clone();
+        let function_blocks = vm
+            .install_source_function_blocks(vec![function_unlinked])
+            .expect("owned function executable call code");
+        let mut host = RecordingCoreHost::with_function_code_blocks(function_blocks);
+        let callee = load_function_value_for_test(&mut vm, &mut host, 0);
+        let this_value = create_empty_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let code_block = generated_js_call_with_this_return_consumed_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let _artifact = install_typed_baseline_for_test(&mut vm, owner, 1322);
+
+        let (first_completion, _) =
+            execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                &mut vm,
+                owner,
+                &code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), callee, this_value],
+            );
+        assert_eq!(
+            first_completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .call_link_inline_cache_attachment_records()
+                .len(),
+            1,
+            "CallWithThis should attach monomorphic call-link metadata after the first call"
+        );
+
+        host.clear_observations();
+        let probe_misses_before = vm
+            .tiering_integration()
+            .generated_call_link_probe_misses()
+            .len();
+        let probe_blocked_before = vm
+            .tiering_integration()
+            .generated_call_link_probe_blocked_records()
+            .len();
+        let (second_completion, _) =
+            execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                &mut vm,
+                owner,
+                &code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), callee, this_value],
+            );
+        assert_eq!(
+            second_completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        assert_eq!(
+            host.dispatches
+                .iter()
+                .map(|(_, index, opcode)| (*index, *opcode))
+                .collect::<Vec<_>>(),
+            vec![],
+            "monomorphic user-JS CallWithThis must enter the callee through the resident direct call \
+             and resume the owner in generated code without an interpreter exit"
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_call_link_probe_misses()
+                .len(),
+            probe_misses_before,
+            "resident CallWithThis must not record a call-link probe miss"
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_call_link_probe_blocked_records()
+                .len(),
+            probe_blocked_before,
+            "resident CallWithThis must not record a call-link probe block"
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .call_link_inline_cache_attachment_records()
+                .len(),
+            1,
+            "active call-link metadata must not be re-attached on the resident re-execution"
+        );
+    }
+
+    // Correctness-critical relink/invalidation test. Mirrors C++ CallLinkInfo emitFastPathImpl
+    // (bytecode/CallLinkInfo.cpp:338-364): the call site guards the live callee against the
+    // linked monomorphic callee with branchPtr and falls to the slow path on mismatch. After a
+    // site is warmed/linked to callee A, calling it with a DIFFERENT callee B must NOT take A's
+    // resident direct call (that would call the wrong function and corrupt state); it must miss
+    // the callee-identity guard (CalleeMismatch) and execute B, returning B's result.
+    #[test]
+    fn vm_call_link_callee_mismatch_guard_never_calls_wrong_function() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let function_a = js_call_return_41_function_code_block().unlinked().clone();
+        let function_b = js_call_return_7_function_code_block().unlinked().clone();
+        let function_blocks = vm
+            .install_source_function_blocks(vec![function_a, function_b])
+            .expect("owned function executable call code");
+        let mut host = RecordingCoreHost::with_function_code_blocks(function_blocks);
+        let callee_a = load_function_value_for_test(&mut vm, &mut host, 0);
+        let callee_b = load_function_value_for_test(&mut vm, &mut host, 1);
+        assert_ne!(
+            callee_a, callee_b,
+            "the two callees must be distinct function objects"
+        );
+        host.clear_observations();
+
+        let code_block = generated_js_call_return_consumed_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let _artifact = install_typed_baseline_for_test(&mut vm, owner, 1422);
+
+        // Warm the site to a monomorphic resident link on callee A (returns 41, owner adds 1 -> 42).
+        let (warm_completion, _) =
+            execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                &mut vm,
+                owner,
+                &code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), callee_a],
+            );
+        assert_eq!(
+            warm_completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        let (resident_completion, _) =
+            execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                &mut vm,
+                owner,
+                &code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), callee_a],
+            );
+        assert_eq!(
+            resident_completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+
+        host.clear_observations();
+        let probe_misses_before = vm
+            .tiering_integration()
+            .generated_call_link_probe_misses()
+            .len();
+
+        // Now call the SAME linked site with a DIFFERENT callee B (returns 7, owner adds 1 -> 8).
+        // The callee-identity guard must reject A's resident direct call and execute B instead.
+        let (mismatch_completion, _) =
+            execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                &mut vm,
+                owner,
+                &code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), callee_b],
+            );
+        assert_eq!(
+            mismatch_completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(8)),
+            "a different callee at a linked site must execute the NEW callee (B -> 7, +1 -> 8), \
+             never the stale linked callee (A -> 41); the callee-identity guard is load-bearing"
+        );
+        let new_misses = vm
+            .tiering_integration()
+            .generated_call_link_probe_misses()
+            .iter()
+            .skip(probe_misses_before)
+            .map(|miss| miss.reason)
+            .collect::<Vec<_>>();
+        assert!(
+            new_misses.contains(&GeneratedCallLinkProbeMissReason::CalleeMismatch),
+            "a different callee must trigger a CalleeMismatch callee-identity guard miss \
+             (mirrors C++ emitFastPathImpl branchPtr against the linked callee); got {new_misses:?}"
+        );
+
+        // After the mismatch the site re-observes and links B (C++ CallLinkInfo relink). Drive a
+        // few more calls on B and confirm B itself becomes resident: its own callee-identity guard
+        // matches and the resident direct call returns B's result (8), never A's (42). A's stale
+        // attachment coexisting in the candidate table must not mis-admit (only the candidate whose
+        // callee matches the live callee authorizes; see vm/mod.rs p9_x86_64_authorized_... probe
+        // loop, which builds a direct call only for the identity-matching candidate).
+        for _ in 0..3 {
+            host.clear_observations();
+            let (b_completion, _) =
+                execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                    &mut vm,
+                    owner,
+                    &code_block,
+                    &mut host,
+                    vec![RuntimeValue::undefined(), callee_b],
+                );
+            assert_eq!(
+                b_completion,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(8)),
+                "the relinked site must keep executing callee B (-> 7, +1 -> 8)"
+            );
+        }
+        assert_eq!(
+            host.dispatches
+                .iter()
+                .map(|(_, index, opcode)| (*index, *opcode))
+                .collect::<Vec<_>>(),
+            vec![],
+            "after relinking to B, the call site must be resident again (no interpreter exit)"
+        );
+
+        // Switching back to A must again execute A (42), proving the identity guard distinguishes
+        // both linked callees and never confuses their bodies.
+        host.clear_observations();
+        let (a_again_completion, _) =
+            execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                &mut vm,
+                owner,
+                &code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), callee_a],
+            );
+        assert_eq!(
+            a_again_completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            "switching the live callee back to A must execute A (-> 41, +1 -> 42), not B"
+        );
     }
 
     #[test]
