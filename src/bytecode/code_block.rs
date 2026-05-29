@@ -902,16 +902,68 @@ impl CodeBlock {
         };
         record.structure_id = structure_id;
         record.offset = offset;
+        // A self-load attach owns the whole record: clear any previously-baked
+        // prototype holder so a site that transitions from a prototype load to an
+        // own load can never read a stale holder pointer.
+        record.holder_ptr = 0;
         true
     }
 
-    // Test-only: reset a resident self-load DataIC record back to the never-matching
-    // SENTINEL, modelling a not-yet-resident (or invalidated) site so the next entry
-    // takes the slow-path exit. Used by P11 sidecar tests that must exercise the
-    // slow/miss path even though FIX 1 admits their argument-base GetByName to the
-    // resident DataIC. Returns `true` when a record was reset.
-    #[cfg(test)]
-    pub fn reset_self_load_data_ic_record_to_sentinel(&self, record_index: usize) -> bool {
+    // Arm a resident prototype-chain (holder) data-IC record IN PLACE so the next
+    // entry to the generated DataIC fast path loads the property from the cached
+    // prototype HOLDER instead of slow-pathing.
+    //
+    // C++ JSC map: mirrors `CacheType::GetByIdPrototype` filling the inline access
+    // fields a baseline `get_by_id` prototype DataIC reads
+    // (jit/JITInlineCacheGenerator.cpp:154-161): the receiver structure id
+    // (`offsetOfInlineAccessBaseStructureID`), the holder property offset
+    // (`offsetOfByIdSelfOffset`), and the constant holder pointer
+    // (`offsetOfInlineHolder`). The holder is pinned valid by the
+    // `m_conditionSet`/StructureTransition watchpoints (commit 6c035d6), not a
+    // per-call re-guard, exactly as C++.
+    //
+    // `holder_ptr` is the raw, pinned `CoreObjectCell*` of the holder object,
+    // resolved at the residency safepoint where the live objects store is
+    // reachable (the registry/CodeBlock has no objects store of its own). LOAD-
+    // BEARING: this must be reset to SENTINEL on a prototype shape change (the
+    // StructureTransition-watchpoint retire path) so generated code never reads a
+    // stale holder; see `reset_prototype_load_data_ic_record`.
+    //
+    // Returns `true` when a record was written. `structure_id == 0` (the
+    // never-matching SENTINEL) and `holder_ptr == 0` (no holder) are refused so a
+    // miss can never poison the record into "no cache" while claiming a holder, or
+    // arm a prototype record with a null holder that the fast path would
+    // dereference.
+    pub fn mirror_prototype_load_data_ic_record(
+        &self,
+        record_index: usize,
+        structure_id: u32,
+        offset: i32,
+        holder_ptr: u64,
+    ) -> bool {
+        if structure_id == 0 || holder_ptr == 0 {
+            return false;
+        }
+        let mut slot = self.baseline_jit_data.borrow_mut();
+        let Some(data) = slot.as_mut() else {
+            return false;
+        };
+        let Some(record) = data.property_caches.get_mut(record_index) else {
+            return false;
+        };
+        record.structure_id = structure_id;
+        record.offset = offset;
+        record.holder_ptr = holder_ptr;
+        true
+    }
+
+    // Reset a resident data-IC record back to the never-matching SENTINEL
+    // (structure_id == 0, holder_ptr == 0), so the next entry takes the slow-path
+    // exit. Used on the StructureTransition-watchpoint retire / IC-clear path to
+    // drop a baked prototype holder before its cell can become stale (a prototype
+    // shape change), and by sidecar tests that must exercise the slow/miss path.
+    // Returns `true` when a record was reset.
+    pub fn reset_prototype_load_data_ic_record(&self, record_index: usize) -> bool {
         let mut slot = self.baseline_jit_data.borrow_mut();
         let Some(data) = slot.as_mut() else {
             return false;
@@ -921,6 +973,14 @@ impl CodeBlock {
         };
         *record = crate::bytecode::ic::HandlerPropertyInlineCacheRecord::SENTINEL;
         true
+    }
+
+    // Test-only alias retained for the P11 sidecar tests that reset the self-load
+    // record to force the slow/miss path. Identical to
+    // `reset_prototype_load_data_ic_record` (both reset to SENTINEL).
+    #[cfg(test)]
+    pub fn reset_self_load_data_ic_record_to_sentinel(&self, record_index: usize) -> bool {
+        self.reset_prototype_load_data_ic_record(record_index)
     }
 
     // C++ JSC divergence: value-profile sampling mutates `m_metadata` through the

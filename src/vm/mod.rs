@@ -3792,6 +3792,30 @@ impl Vm {
         &mut self,
         request: VmPropertyInlineCacheClearRequest,
     ) -> VmPropertyInlineCacheClearRecord {
+        // LOAD-BEARING SAFETY: a cleared prototype-load IC means the prototype shape
+        // changed (StructureTransition watchpoint fired) or the cache was otherwise
+        // dropped. The resident prototype DataIC record still holds the baked holder
+        // pointer + offset; reset it to SENTINEL NOW so generated code can never
+        // dereference a stale holder before the next safepoint re-arm. The owning
+        // artifact is also invalidated on the same fire (belt-and-suspenders), but
+        // this record reset is the primary guard. This runs BEFORE the liveness /
+        // metadata-clear validation below and regardless of whether the
+        // bytecode-level clear is accepted: the record must be dropped on the shape
+        // change even if the metadata clear is rejected, and the reset is a safe
+        // no-op when the owner/store/site is absent. The receiver structure id
+        // changing (a different receiver shape) needs no reset -- the in-emit
+        // structure guard catches it. Only the guarded prototype kind bakes a holder;
+        // own-data self-load records are handled by their own attach/clear path.
+        if matches!(
+            request.kind,
+            VmPropertyInlineCacheAttachmentKind::GuardedPrototypeDataLoad
+        ) {
+            self.reset_resident_prototype_load_data_ic_record_at_clear(
+                request.owner,
+                request.bytecode_index,
+            );
+        }
+
         if !self
             .code_blocks
             .owner_cell_is_live(&self.heap, request.owner)
@@ -3840,6 +3864,27 @@ impl Vm {
 
         self.tiering
             .record_property_inline_cache_clear(request, outcome)
+    }
+
+    // Reset the resident prototype-load data-IC record for a cleared prototype IC
+    // site back to SENTINEL, so the generated DataIC slow-paths until the next
+    // safepoint re-arm (if the plan is still live). Resolves the dense record index
+    // from the current property-handoff plan, the same index basis the arm uses; a
+    // missing plan/site is a no-op (the record is then unreachable for this site or
+    // already absent). Mutates the registry-held shared instance r13 addresses.
+    fn reset_resident_prototype_load_data_ic_record_at_clear(
+        &mut self,
+        owner: CodeBlockId,
+        bytecode_index: BytecodeIndex,
+    ) {
+        let Some(record_index) =
+            self.resident_property_record_index_for_bytecode_index(owner, bytecode_index)
+        else {
+            return;
+        };
+        if let Some(code_block) = self.code_blocks.code_block_shared(owner) {
+            code_block.reset_prototype_load_data_ic_record(record_index);
+        }
     }
 
     #[allow(dead_code)]
@@ -17850,6 +17895,135 @@ impl Vm {
         }
 
         self.attach_metadata_only_guarded_property_inline_cache_cases(owner, bytecode_snapshot);
+        self.arm_resident_prototype_load_data_ic_records_at_safepoint(
+            owner,
+            bytecode_snapshot,
+            host,
+        );
+    }
+
+    // Arm the resident prototype-chain (holder) data-IC records for sites whose
+    // depth-1 prototype IC has attached, resolving the holder's raw pinned cell
+    // pointer from the live objects store (reachable only through the host at this
+    // safepoint) and writing it into the per-CodeBlock `BaselineJITData` record so
+    // the generated DataIC loads the property from the holder instead of slow-
+    // pathing. Mirrors `CacheType::GetByIdPrototype` filling
+    // `offsetOfInlineHolder`/`offsetOfByIdSelfOffset`
+    // (jit/JITInlineCacheGenerator.cpp:154-161).
+    //
+    // This re-resolves and re-writes the holder pointer on EVERY entry an
+    // attachment is live, not just at attach: a `Pin<Box<CoreObjectCell>>` never
+    // moves, but re-resolving against the current live store each entry is the
+    // strongest guard against a freed/realloc'd holder, and the prior entry's
+    // watchpoint drain (`drain_pending_property_load_runtime_invalidations`, run
+    // just before this safepoint) has already cleared the IC + retired the plan on
+    // a prototype shape change, so a stale attachment is gone before we re-arm.
+    // First cut: depth-1 monomorphic holder loads only (`holder_index == 1`),
+    // matching the sidecar plan's admission (jit/ic.rs prototype_depth == 1);
+    // deeper/poly chains and negative lookups keep the Rust sidecar/interpreter
+    // fallback and bake no machine-code holder.
+    fn arm_resident_prototype_load_data_ic_records_at_safepoint<H: DispatchHost>(
+        &mut self,
+        owner: CodeBlockId,
+        bytecode_snapshot: crate::jit::plan::BaselineBytecodeSnapshotFingerprint,
+        host: &mut H,
+    ) {
+        let attached = self
+            .code_blocks
+            .attached_property_inline_cache_candidates_for_owner(
+                owner,
+                bytecode_snapshot,
+                self.tiering.property_inline_cache_attachment_records(),
+            );
+        let guarded_table = match self
+            .tiering
+            .property_load_guarded_candidate_table_for_owner_with_attached(
+                owner,
+                bytecode_snapshot,
+                &attached,
+            ) {
+            Ok(table) => table,
+            Err(_) => return,
+        };
+        if guarded_table.is_empty() {
+            return;
+        }
+        // Resolve each prototype candidate's holder pointer + record index, then
+        // write the records. Collect first so the immutable host/registry borrows
+        // for resolution do not overlap the in-place record write.
+        let mut writes: Vec<(usize, u32, i32, u64)> = Vec::new();
+        for candidate in guarded_table.candidates() {
+            if candidate.candidate_kind
+                != crate::jit::PropertyLoadGuardedCandidateKind::PrototypeData
+            {
+                continue;
+            }
+            let descriptor = &candidate.plan.descriptor;
+            // First cut: depth-1 single-hop holder only.
+            if descriptor.prototype_depth != 1 {
+                continue;
+            }
+            let (Some(holder_object), Some(offset)) = (descriptor.holder_object, descriptor.offset)
+            else {
+                continue;
+            };
+            let Some(holder_ptr) = host.generated_prototype_holder_cell_pointer(holder_object)
+            else {
+                continue;
+            };
+            let Some(record_index) = self.resident_property_record_index_for_bytecode_index(
+                owner,
+                BytecodeIndex::from_offset(candidate.plan.bytecode_index),
+            ) else {
+                continue;
+            };
+            writes.push((
+                record_index,
+                descriptor.base_structure.0,
+                offset.0,
+                holder_ptr,
+            ));
+        }
+        if writes.is_empty() {
+            return;
+        }
+        // Mutate the REGISTRY-held shared instance (the one r13 addresses), via the
+        // interior-mutable record store, never a clone.
+        let Some(code_block) = self.code_blocks.code_block_shared(owner) else {
+            return;
+        };
+        for (record_index, structure_id, offset, holder_ptr) in writes {
+            code_block.mirror_prototype_load_data_ic_record(
+                record_index,
+                structure_id,
+                offset,
+                holder_ptr,
+            );
+        }
+    }
+
+    // Dense per-site `property_site_index` (the emitter's record index) for a
+    // bytecode index, derived from the current property-handoff plan -- the same
+    // index basis the self-load arm uses (`property_site_index_for_bytecode_index`,
+    // vm/code_blocks.rs). Returns `None` when the plan cannot be derived or the
+    // site is absent, so the record stays SENTINEL and the site slow-paths.
+    fn resident_property_record_index_for_bytecode_index(
+        &self,
+        owner: CodeBlockId,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<usize> {
+        use crate::jit::plan::derive_baseline_generated_property_handoff_plan_from_current_code_block_metadata;
+        let code_block = self.code_blocks.code_block_shared(owner)?;
+        let derivation =
+            derive_baseline_generated_property_handoff_plan_from_current_code_block_metadata(
+                &code_block,
+                owner,
+            )
+            .ok()?;
+        let metadata = derivation.metadata?;
+        metadata
+            .borrowed_plan()
+            .property_site_index_for_bytecode_index(bytecode_index)
     }
 
     fn attach_metadata_only_non_guarded_property_inline_cache_cases_at_safepoint(
@@ -27871,6 +28045,10 @@ mod tests {
                 return Some(structure);
             }
             self.core.generated_property_sidecar_base_structure(base)
+        }
+
+        fn generated_prototype_holder_cell_pointer(&mut self, holder: ObjectId) -> Option<u64> {
+            self.core.generated_prototype_holder_cell_pointer(holder)
         }
 
         fn probe_generated_property_load(
@@ -42431,25 +42609,32 @@ mod tests {
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
         assert!(host.property_load_probes.is_empty());
-        assert_eq!(
-            host.guarded_property_load_probes,
-            vec![(BytecodeIndex::from_offset(1), object)]
+        // RESIDENT PROTOTYPE DataIC: the depth-1 prototype IC attached on the first
+        // run and the safepoint armed the resident record with the holder pointer, so
+        // the SECOND run loads the prototype property THROUGH THE MACHINE CODE -- it no
+        // longer falls back to the Rust guarded sidecar probe. (Before the resident
+        // prototype DataIC, this run hit the guarded sidecar: a non-empty
+        // `guarded_property_load_probes`.)
+        assert!(
+            host.guarded_property_load_probes.is_empty(),
+            "resident prototype DataIC hit must not probe the guarded sidecar"
         );
         assert!(
             host.dispatches
                 .iter()
                 .all(|(_, _, opcode)| *opcode != Some(CoreOpcode::GetByName)),
-            "P11 guarded sidecar hit must not dispatch interpreter GetByName"
+            "resident prototype DataIC hit must not dispatch interpreter GetByName"
         );
-        assert_eq!(
-            host.dispatches
-                .iter()
-                .map(|(_, index, opcode)| (*index, *opcode))
-                .collect::<Vec<_>>(),
-            vec![
-                (BytecodeIndex::from_offset(2), Some(CoreOpcode::AddInt32)),
-                (BytecodeIndex::from_offset(3), Some(CoreOpcode::Return)),
-            ]
+        // With the get_by_id now served resident (no sidecar exit), the generated
+        // region continues resident through the trailing AddInt32/Return rather than
+        // re-entering the interpreter for them, so no interpreter dispatch is recorded
+        // for this run. (Before the resident prototype DataIC, the get_by_id exited to
+        // the guarded sidecar and AddInt32/Return ran in the interpreter, recorded
+        // here.) The load-bearing assertions are the correct value, no guarded probe,
+        // and no GetByName dispatch above.
+        assert!(
+            host.dispatches.is_empty(),
+            "resident prototype hit serves the region without interpreter dispatch"
         );
         assert_eq!(
             vm.tiering_integration().fallback_records().len(),
@@ -42459,6 +42644,288 @@ mod tests {
             .tiering_integration()
             .generated_guarded_property_load_probe_misses()
             .is_empty());
+    }
+
+    // Resident prototype-load DataIC: after the depth-1 prototype IC attaches and the
+    // safepoint arms the holder pointer into the resident record, the get_by_id loads
+    // its prototype method THROUGH THE MACHINE CODE (no sidecar guarded probe, no
+    // interpreter GetByName dispatch), returning the correct value the holder stores.
+    // Mirrors C++ CacheType::GetByIdPrototype serving the load from the holder
+    // (jit/JITInlineCacheGenerator.cpp:154-161).
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn vm_p10_real_emitted_native_get_by_name_resident_prototype_load_hits_machine_code() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+        let (object, _prototype) =
+            create_prototype_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let fixture = install_real_p10_retained_property_native_exit(
+            &mut vm,
+            2_080,
+            generated_property_get_by_name_return_consumed_code_block(),
+        );
+
+        // Warm the site until the resident prototype record is armed (holder_ptr != 0),
+        // re-entering past observation -> guard plan -> materialization -> attach ->
+        // safepoint arm. Each entry must return the correct prototype value (42).
+        let mut armed = false;
+        for _ in 0..8 {
+            let result = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                fixture.owner,
+                &fixture.code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), object],
+            );
+            assert_eq!(
+                result,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+                "every entry must return the correct prototype property value"
+            );
+            let holder_ptr = vm
+                .code_block_for_diagnostics(fixture.owner)
+                .and_then(|cb| {
+                    cb.baseline_jit_data()
+                        .as_ref()
+                        .map(|d| d.property_caches[0].holder_ptr)
+                })
+                .unwrap_or(0);
+            if holder_ptr != 0 {
+                armed = true;
+                break;
+            }
+        }
+        assert!(
+            armed,
+            "the resident prototype record must be armed with a holder pointer"
+        );
+
+        // Resident entry: the machine code reads the receiver structure, branches on the
+        // baked holder pointer, loads the property from the HOLDER, and returns the
+        // value -- no sidecar guarded probe and no interpreter GetByName dispatch.
+        host.clear_observations();
+        let resident = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            fixture.owner,
+            &fixture.code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), object],
+        );
+        assert_eq!(
+            resident,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            "resident prototype DataIC must load the correct value through machine code"
+        );
+        assert!(
+            host.property_load_probes.is_empty(),
+            "resident prototype DataIC hit must not probe the own-load sidecar"
+        );
+        assert!(
+            host.guarded_property_load_probes.is_empty(),
+            "resident prototype DataIC hit must not probe the guarded sidecar"
+        );
+        assert!(
+            host.dispatches
+                .iter()
+                .all(|(_, _, opcode)| *opcode != Some(CoreOpcode::GetByName)),
+            "resident prototype DataIC hit must not dispatch interpreter GetByName"
+        );
+    }
+
+    // Receiver-structure miss: once the resident prototype record is armed, an entry
+    // whose RECEIVER has a DIFFERENT structure than the cached one fails the in-emit
+    // structure guard (jne -> slow path) and slow-paths to the sidecar/interpreter
+    // rather than dereferencing the holder with a wrong receiver shape. Mirrors C++
+    // guarding the receiver by m_inlineAccessBaseStructureID
+    // (jit/JITInlineCacheGenerator.cpp:155-156).
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn vm_p10_real_emitted_native_get_by_name_resident_prototype_load_receiver_structure_miss_slow_paths(
+    ) {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+        let (object, prototype) =
+            create_prototype_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let fixture = install_real_p10_retained_property_native_exit(
+            &mut vm,
+            2_081,
+            generated_property_get_by_name_return_consumed_code_block(),
+        );
+
+        let mut armed = false;
+        for _ in 0..8 {
+            let result = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                fixture.owner,
+                &fixture.code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), object],
+            );
+            assert_eq!(
+                result,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+            );
+            let holder_ptr = vm
+                .code_block_for_diagnostics(fixture.owner)
+                .and_then(|cb| {
+                    cb.baseline_jit_data()
+                        .as_ref()
+                        .map(|d| d.property_caches[0].holder_ptr)
+                })
+                .unwrap_or(0);
+            if holder_ptr != 0 {
+                armed = true;
+                break;
+            }
+        }
+        assert!(armed, "the resident prototype record must be armed");
+
+        // A different-structure receiver: the prototype object itself owns the property
+        // as an OWN data load (its own structure differs from the cached receiver's), so
+        // the in-emit receiver structure guard misses and the site slow-paths instead of
+        // reading the holder with the wrong receiver shape.
+        host.clear_observations();
+        let miss = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            fixture.owner,
+            &fixture.code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), prototype],
+        );
+        assert_eq!(
+            miss,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            "a different-structure receiver must still resolve the correct value off the slow path"
+        );
+        // The structure guard missed in machine code, so the load resolved off the
+        // slow/sidecar/interpreter path -- a probe or interpreter GetByName dispatch is
+        // observed (the resident fast path did NOT silently serve a wrong-receiver read).
+        let slow_pathed = !host.property_load_probes.is_empty()
+            || !host.guarded_property_load_probes.is_empty()
+            || host
+                .dispatches
+                .iter()
+                .any(|(_, _, opcode)| *opcode == Some(CoreOpcode::GetByName));
+        assert!(
+            slow_pathed,
+            "a receiver-structure miss must slow-path, not be served by the resident fast path"
+        );
+    }
+
+    // Prototype-shape invalidation: after the resident prototype record is armed, a
+    // change to the prototype's shape fires the StructureTransition watchpoint, which
+    // clears the prototype IC and (the load-bearing safety guard) resets the resident
+    // record to SENTINEL so the machine code can never dereference a stale holder. The
+    // site then slow-paths and re-observes. Models C++ dropping the IC through the
+    // owning CodeBlock when m_conditionSet is invalidated.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn vm_p10_real_emitted_native_get_by_name_resident_prototype_load_invalidation_resets_record() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+        let (object, _prototype) =
+            create_prototype_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let fixture = install_real_p10_retained_property_native_exit(
+            &mut vm,
+            2_082,
+            generated_property_get_by_name_return_consumed_code_block(),
+        );
+
+        let mut armed = false;
+        for _ in 0..8 {
+            let result = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                fixture.owner,
+                &fixture.code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), object],
+            );
+            assert_eq!(
+                result,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+            );
+            let holder_ptr = vm
+                .code_block_for_diagnostics(fixture.owner)
+                .and_then(|cb| {
+                    cb.baseline_jit_data()
+                        .as_ref()
+                        .map(|d| d.property_caches[0].holder_ptr)
+                })
+                .unwrap_or(0);
+            if holder_ptr != 0 {
+                armed = true;
+                break;
+            }
+        }
+        assert!(armed, "the resident prototype record must be armed");
+
+        // Fire the prototype's StructureTransition watchpoint via the IC-clear path that
+        // a prototype shape change drives. The guarded attachment carries the bound
+        // watchpoint set ids; clearing the prototype IC resets the resident record to
+        // SENTINEL so a stale holder can never be dereferenced.
+        let guard_plan = vm.tiering_integration().property_load_guard_plans()[0].clone();
+        let attachment = accepted_guarded_attachment_for_plan(&vm, &guard_plan);
+        let clear = VmPropertyInlineCacheClearRequest {
+            owner: fixture.owner,
+            bytecode_index: attachment.bytecode_index,
+            bytecode_snapshot: attachment.bytecode_snapshot,
+            slot: attachment.slot,
+            kind: VmPropertyInlineCacheAttachmentKind::GuardedPrototypeDataLoad,
+            attachment_ordinal: attachment.ordinal,
+            source_plan_ordinal: guard_plan.ordinal,
+            guarded_materialization_ordinal: attachment.guarded_materialization_ordinal,
+            guarded_dependency_ordinals: attachment.guarded_dependency_ordinals.clone(),
+            guarded_binding_set_ids: attachment.guarded_binding_set_ids.clone(),
+            triggering_invalidation_ordinal: None,
+            triggering_event_dispatch_ordinal: None,
+            key: attachment.key,
+            base_structure: attachment.base_structure,
+            holder_structure: attachment.holder_structure,
+            new_structure: attachment.new_structure,
+            offset: attachment.offset,
+        };
+        vm.clear_property_inline_cache_case(clear);
+
+        // The resident record is now SENTINEL (structure_id == 0, holder_ptr == 0): the
+        // machine-code structure guard can never match, so the site slow-paths.
+        let record = vm
+            .code_block_for_diagnostics(fixture.owner)
+            .and_then(|cb| {
+                cb.baseline_jit_data()
+                    .as_ref()
+                    .map(|d| d.property_caches[0])
+            })
+            .unwrap();
+        assert_eq!(
+            record.structure_id, 0,
+            "invalidation must reset the resident record structure id to the sentinel"
+        );
+        assert_eq!(
+            record.holder_ptr, 0,
+            "invalidation must drop the baked holder pointer so a stale holder is never read"
+        );
+
+        // Re-entry after invalidation still returns the correct value off the slow path
+        // and safely re-observes (no crash from a stale holder).
+        host.clear_observations();
+        let after = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            fixture.owner,
+            &fixture.code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), object],
+        );
+        assert_eq!(
+            after,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+            "after invalidation the load must still resolve correctly off the slow path"
+        );
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]

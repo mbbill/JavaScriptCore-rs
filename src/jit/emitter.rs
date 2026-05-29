@@ -4149,6 +4149,15 @@ impl P6X86_64SemanticByteBuilder {
         self.emit_jcc_rel32_internal(0x85)
     }
 
+    // `jnz` shares the `jne` encoding (0x0F 0x85); a distinct name documents the
+    // "jump if the prior `test`/result was nonzero" intent at the prototype DataIC
+    // holder branch (holder_ptr != 0 -> prototype load).
+    fn emit_jnz_rel32_internal(
+        &mut self,
+    ) -> Result<P6X86_64PendingInternalBranch, P6X86_64BaselineSemanticByteEmissionError> {
+        self.emit_jcc_rel32_internal(0x85)
+    }
+
     fn emit_jl_rel32_internal(
         &mut self,
     ) -> Result<P6X86_64PendingInternalBranch, P6X86_64BaselineSemanticByteEmissionError> {
@@ -6762,31 +6771,51 @@ fn p10_x86_64_callable_property_native_exit_return_stub_bytes(return_value_bits:
     p6_x86_64_callable_payload_return_stub_bytes(return_value_bits)
 }
 
-// Emit the resident `get_by_id` self-load DataIC fast path immediately followed
-// by the slow-path native-exit return stub. Mirrors C++
-// `InlineAccess::generateSelfPropertyAccess` (bytecode/InlineAccess.cpp:188-204)
-// over a baseline `GetByIdSelf` DataIC (jit/JITInlineCacheGenerator.cpp:140-184):
-// structure-guard the base against the cached id, then load the inline self-offset
-// value. The cached `{structure_id:u32@+0, offset:i32@+4}` lives in the per-CodeBlock
-// `BaselineJITData` record store at `[r13 + record_index*8]` (r13 ==
-// `GPRInfo::jitDataRegister`).
+// Emit the resident `get_by_id` self-OR-prototype-load DataIC fast path
+// immediately followed by the slow-path native-exit return stub. Mirrors C++
+// `generateGetByIdInlineAccessBaselineDataIC` (jit/JITInlineCacheGenerator.cpp:140-183),
+// which shares the receiver structure guard between `CacheType::GetByIdSelf`
+// (:146-152) and `CacheType::GetByIdPrototype` (:154-161); the prototype case is
+// byte-for-byte the self case PLUS one delta: instead of `loadProperty` from the
+// receiver, it `loadPtr`s the constant HOLDER from `offsetOfInlineHolder()` (:158)
+// and `loadProperty`s from that holder (:159). The cached
+// `{structure_id:u32@+0, offset:i32@+4, holder_ptr:u64@+8}` lives in the
+// per-CodeBlock `BaselineJITData` record store at `[r13 + record_index*16]`
+// (r13 == `GPRInfo::jitDataRegister`).
 //
-// Rust ABI specifics not present in the C++ self-access path:
+// C++ emits two distinct `CacheType`s patched into the inline access at runtime;
+// the Rust artifact emits ONE inline-access shape per get_by_id site (the artifact
+// is built once and never repatched), so we cannot statically pick the self vs
+// prototype shape at emit time -- the IC outcome (own vs prototype load) is only
+// known at the residency safepoint. PERMANENT DIVERGENCE: we emit a UNIFIED fast
+// path whose only runtime branch is `holder_ptr == 0`. `holder_ptr == 0` is the
+// self case (storage base = the unboxed receiver, byte-for-byte the prior
+// self-load behavior); a nonzero `holder_ptr` is the prototype case (storage base
+// = the baked holder, the `offsetOfInlineHolder()` analog, NOT unboxed because the
+// arm stores the raw pinned `CoreObjectCell*`). The receiver structure guard is
+// IDENTICAL in both cases (C++ guards the receiver by `m_inlineAccessBaseStructureID`
+// for both `CacheType`s); prototype/holder validity is the StructureTransition
+// watchpoint's job (it resets `holder_ptr` to 0 on a prototype shape change), never
+// a per-call re-guard, exactly as C++ pins the holder via `m_conditionSet`.
+//
+// Rust ABI specifics not present in the C++ access path:
 //   - rbp == value frame base (P6 prologue `mov rbp, rsi`), so the base value and
 //     destination are `[rbp + disp32]` frame slots.
 //   - the base frame slot holds a BOXED RuntimeValue `(cell_ptr << 8) | TAG_CELL`
 //     (value/repr.rs:507); the fast path guards the low-byte cell tag, then `shr 8`
 //     to recover the raw `CoreObjectCell` pointer before reading the cell header.
+//     The baked `holder_ptr` is already a raw cell pointer, so it is NOT unboxed.
 //
 // Register use (all caller-clobberable here; rbp/r12/r13/r15/r9 are preserved):
-//   rax = boxed base -> cell ptr -> loaded value; r10 = structure id / storage ptr;
+//   rax = boxed base -> cell ptr -> loaded value; r10 = structure id / storage base;
 //   r11 = cached PropertyOffset.
 //
 // Any guard miss jumps to the slow-path stub (the existing P10 native exit, which
 // returns `encoded_payload`); a hit stores the value to the destination frame slot
 // and jumps over the slow-path stub, staying resident. SENTINEL records
 // (structure_id == 0) never match a real `StructureID`, so an unfilled site always
-// takes the slow path until the first miss writes back the cached id/offset.
+// takes the slow path until the first miss writes back the cached id/offset
+// (self load) or the prototype arm bakes the holder (prototype load).
 #[allow(clippy::too_many_arguments)]
 fn emit_p10_x86_64_property_data_ic_self_load_get_by_name_with_exit(
     builder: &mut P6X86_64SemanticByteBuilder,
@@ -6800,25 +6829,27 @@ fn emit_p10_x86_64_property_data_ic_self_load_get_by_name_with_exit(
     encoded_payload: P10X86_64BaselinePropertyNativeExitReturnPayload,
 ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
     let cell_tag = p6_x86_64_semantic_u8_tag(bytecode_index, cell_tag)?;
-    // record_index*8 (structure id) and record_index*8 + 4 (offset) must fit a
-    // disp32 from r13. record_index is the dense property-site ordinal, which is
-    // tiny, but check rather than silently wrap into a wrong record read.
+    // record_index*16 + {0,4,8} must fit a disp32 from r13. record_index is the
+    // dense property-site ordinal, which is tiny, but check rather than silently
+    // wrap into a wrong record read. (Record stride is 16 since the record grew to
+    // carry the prototype holder pointer at +8.)
     let record_byte_offset = (record_index as i64)
-        .checked_mul(8)
-        .filter(|&value| value <= i64::from(i32::MAX) - 4)
+        .checked_mul(16)
+        .filter(|&value| value <= i64::from(i32::MAX) - 8)
         .ok_or(
             P6X86_64BaselineSemanticByteEmissionError::FrameOffsetOutOfDisp32 {
                 bytecode_index,
                 location: P6X86_64BaselineOperandLocation::FrameLocal {
                     local_index: record_index,
                     slot_index: record_index,
-                    byte_offset: u64::from(record_index).saturating_mul(8),
+                    byte_offset: u64::from(record_index).saturating_mul(16),
                 },
-                byte_offset: u64::from(record_index).saturating_mul(8),
+                byte_offset: u64::from(record_index).saturating_mul(16),
             },
         )? as i32;
     let structure_id_record_disp32 = record_byte_offset;
     let offset_record_disp32 = record_byte_offset + 4;
+    let holder_record_disp32 = record_byte_offset + 8;
 
     // mov rax, [rbp + base_frame_disp32]  (load boxed base value)
     builder.emit(&[0x48, 0x8b, 0x85])?;
@@ -6828,20 +6859,49 @@ fn emit_p10_x86_64_property_data_ic_self_load_get_by_name_with_exit(
     let not_cell = builder.emit_jne_rel32_internal()?;
     // shr rax, 8  (unbox: recover the raw CoreObjectCell pointer)
     builder.emit(&[0x48, 0xc1, 0xe8, 0x08])?;
-    // mov r10d, [rax + structure_id_offset]  (cell structure id)
+    // mov r10d, [rax + structure_id_offset]  (receiver structure id)
     builder.emit(&[0x44, 0x8b, 0x90])?;
     builder.emit_i32_le(structure_id_offset)?;
-    // cmp r10d, [r13 + structure_id_record_disp32]  (cell id vs cached id)
+    // cmp r10d, [r13 + structure_id_record_disp32]  (receiver id vs cached id)
+    // C++ JITInlineCacheGenerator.cpp:155-156/:147-148 -- IDENTICAL guard for both
+    // the self and prototype CacheTypes.
     builder.emit(&[0x45, 0x3b, 0x95])?;
     builder.emit_i32_le(structure_id_record_disp32)?;
     let structure_miss = builder.emit_jne_rel32_internal()?;
-    // mov r11d, [r13 + offset_record_disp32]  (cached PropertyOffset)
+    // mov r11d, [r13 + offset_record_disp32]  (cached PropertyOffset; C++ :149/:157)
     builder.emit(&[0x45, 0x8b, 0x9d])?;
     builder.emit_i32_le(offset_record_disp32)?;
-    // mov r10, [rax + storage_ptr_disp]  (storage base pointer)
+    // mov r10, [r13 + holder_record_disp32]  (baked holder CoreObjectCell* or 0;
+    // the offsetOfInlineHolder() analog, C++ :158 loadPtr -- but loaded into the
+    // storage-base register r10, not resultJSR, since Rust reads the storage
+    // pointer one indirection further). REX.WRB=0x4D: r13 as the rm base needs
+    // REX.B=1 (rm=101 with REX.B addresses r13, not rbp).
+    builder.emit(&[0x4d, 0x8b, 0x95])?;
+    builder.emit_i32_le(holder_record_disp32)?;
+    // test r10, r10 ; jnz -> use the holder as storage base (prototype load).
+    builder.emit(&[0x4d, 0x85, 0xd2])?;
+    let use_holder = builder.emit_jnz_rel32_internal()?;
+    // SELF case (holder_ptr == 0): storage base comes from the unboxed receiver
+    // (rax), byte-for-byte the prior self-load behavior. C++ :150 loadProperty from
+    // baseJSR.
+    // mov r10, [rax + storage_ptr_disp]  (receiver storage base pointer)
     builder.emit(&[0x4c, 0x8b, 0x90])?;
     builder.emit_i32_le(storage_ptr_disp)?;
-    // mov rax, [r10 + r11*8]  (value at storage_base + offset*8, scale-8 SIB)
+    let storage_base_ready = builder.emit_jmp_rel32_internal()?;
+    // PROTOTYPE case (holder_ptr != 0): storage base comes from the baked holder
+    // (already in r10 as a raw cell ptr, so NO unbox). C++ :159 loadProperty from
+    // the holder (resultJSR). The receiver-structure guard above is the only
+    // per-call guard; the holder's validity is the watchpoint's job.
+    let use_holder_offset = builder.offset()?;
+    builder.patch_internal_branch_to_target(use_holder, use_holder_offset)?;
+    // mov r10, [r10 + storage_ptr_disp]  (holder storage base pointer)
+    builder.emit(&[0x4d, 0x8b, 0x92])?;
+    builder.emit_i32_le(storage_ptr_disp)?;
+
+    // storage_base_ready: r10 == storage base (receiver's or holder's).
+    builder.patch_internal_branch_to_current(storage_base_ready)?;
+    // mov rax, [r10 + r11*8]  (value at storage_base + offset*8, scale-8 SIB;
+    // IDENTICAL tail for self and prototype, just rooted at the chosen storage)
     builder.emit(&[0x4b, 0x8b, 0x04, 0xda])?;
     // mov [rbp + dest_frame_disp32], rax  (store value to destination frame slot)
     builder.emit(&[0x48, 0x89, 0x85])?;
@@ -17873,7 +17933,8 @@ mod tests {
             }
         );
 
-        // base local(1) -> [rbp + 8]; dest local(2) -> [rbp + 16]; record_index 0.
+        // base local(1) -> [rbp + 8]; dest local(2) -> [rbp + 16]; record_index 0
+        // (record stride is 16: structure_id@+0, offset@+4, holder_ptr@+8).
         let bytes = &property.bytes;
         // mov rax, [rbp+8]
         assert_eq!(&bytes[0..7], &[0x48, 0x8b, 0x85, 0x08, 0x00, 0x00, 0x00]);
@@ -17883,7 +17944,7 @@ mod tests {
         assert_eq!(&bytes[9..11], &[0x0f, 0x85]);
         // shr rax, 8  (unbox)
         assert_eq!(&bytes[15..19], &[0x48, 0xc1, 0xe8, 0x08]);
-        // mov r10d, [rax+0]  (structure id)
+        // mov r10d, [rax+0]  (receiver structure id)
         assert_eq!(&bytes[19..26], &[0x44, 0x8b, 0x90, 0x00, 0x00, 0x00, 0x00]);
         // cmp r10d, [r13+0]  (cached id)
         assert_eq!(&bytes[26..33], &[0x45, 0x3b, 0x95, 0x00, 0x00, 0x00, 0x00]);
@@ -17891,14 +17952,24 @@ mod tests {
         assert_eq!(&bytes[33..35], &[0x0f, 0x85]);
         // mov r11d, [r13+4]  (cached offset)
         assert_eq!(&bytes[39..46], &[0x45, 0x8b, 0x9d, 0x04, 0x00, 0x00, 0x00]);
-        // mov r10, [rax+8]  (storage ptr)
-        assert_eq!(&bytes[46..53], &[0x4c, 0x8b, 0x90, 0x08, 0x00, 0x00, 0x00]);
+        // mov r10, [r13+8]  (baked holder ptr or 0; offsetOfInlineHolder analog)
+        assert_eq!(&bytes[46..53], &[0x4d, 0x8b, 0x95, 0x08, 0x00, 0x00, 0x00]);
+        // test r10, r10
+        assert_eq!(&bytes[53..56], &[0x4d, 0x85, 0xd2]);
+        // jnz rel32 (holder_ptr != 0 -> prototype load uses the holder)
+        assert_eq!(&bytes[56..58], &[0x0f, 0x85]);
+        // SELF case: mov r10, [rax+8]  (receiver storage ptr)
+        assert_eq!(&bytes[62..69], &[0x4c, 0x8b, 0x90, 0x08, 0x00, 0x00, 0x00]);
+        // jmp rel32 (storage base ready)
+        assert_eq!(bytes[69], 0xe9);
+        // PROTOTYPE case: mov r10, [r10+8]  (holder storage ptr; no unbox)
+        assert_eq!(&bytes[74..81], &[0x4d, 0x8b, 0x92, 0x08, 0x00, 0x00, 0x00]);
         // mov rax, [r10+r11*8]  (value)
-        assert_eq!(&bytes[53..57], &[0x4b, 0x8b, 0x04, 0xda]);
+        assert_eq!(&bytes[81..85], &[0x4b, 0x8b, 0x04, 0xda]);
         // mov [rbp+16], rax  (store to dest)
-        assert_eq!(&bytes[57..64], &[0x48, 0x89, 0x85, 0x10, 0x00, 0x00, 0x00]);
+        assert_eq!(&bytes[85..92], &[0x48, 0x89, 0x85, 0x10, 0x00, 0x00, 0x00]);
         // jmp rel32 (resident, over the slow-path stub)
-        assert_eq!(bytes[64], 0xe9);
+        assert_eq!(bytes[92], 0xe9);
 
         // The slow-path return stub bytes must still appear (mov eax, payload + epilogue
         // ending in ret) so a guard miss exits the same way a standalone P10 exit would.

@@ -1411,29 +1411,56 @@ pub struct IterationModes {
 /// state; this batch ports only the two inline fast-path slots because that is
 /// all the upcoming `get_by_id` self-access emission consumes.
 ///
-/// `#[repr(C)]` with these two fields in this order gives a fixed 8-byte layout
-/// (`structure_id` at +0, `offset` at +4) so generated code can read the slots
-/// by constant displacement. `structure_id == 0` is the never-matching
-/// sentinel: it mirrors a freshly created C++ IC whose
+/// `#[repr(C)]` with these fields in this order gives a fixed 16-byte layout
+/// (`structure_id` at +0, `offset` at +4, `holder_ptr` at +8) so generated code
+/// can read the slots by constant displacement. `structure_id == 0` is the
+/// never-matching sentinel: it mirrors a freshly created C++ IC whose
 /// `m_inlineAccessBaseStructureID` is null (no structure cached yet), so the
 /// inline structure check always misses and falls through to the slow path
 /// until a real miss fills the record in place.
+///
+/// `holder_ptr` is the `offsetOfInlineHolder()` analog from the C++ prototype
+/// (`CacheType::GetByIdPrototype`) DataIC fast path
+/// (JITInlineCacheGenerator.cpp:158): `0` means a SELF load (no holder; the
+/// receiver IS the storage base, exactly the prior 8-byte layout's behavior),
+/// while a nonzero value is a raw, pinned `CoreObjectCell*` for the prototype
+/// HOLDER object, baked in by the prototype-load arm so generated code loads the
+/// property from the holder's storage instead of the receiver's. The pointer is
+/// raw-but-pinned: `CoreObjectCell`s are `Pin<Box<_>>` and never move
+/// (interpreter/mod.rs), so the baked pointer stays valid while the holder cell
+/// is live. The LOAD-BEARING invariant is that the prototype's
+/// `StructureTransition` watchpoint (commit 6c035d6) resets this field back to
+/// SENTINEL on any prototype shape change, so generated code can never
+/// dereference a stale holder; the holder's liveness for the artifact's lifetime
+/// is enforced by that watchpoint plus the owning-artifact invalidation. Unlike
+/// the receiver (a boxed `RuntimeValue` that the fast path unboxes with `shr 8`),
+/// `holder_ptr` is already the raw cell pointer, so the prototype tail reads
+/// `[holder_ptr + STORAGE_PTR_DISP]` with no unbox.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(C)]
 pub struct HandlerPropertyInlineCacheRecord {
     /// Cached base `StructureID`; `0` = never-matching sentinel (no structure).
     pub structure_id: u32,
-    /// Inline self-access `PropertyOffset` for the cached structure.
+    /// Inline self-access (own) or holder-access (prototype) `PropertyOffset`
+    /// for the cached structure.
     pub offset: i32,
+    /// `offsetOfInlineHolder()` analog: `0` = self load (receiver is the storage
+    /// base); nonzero = raw pinned `CoreObjectCell*` of the prototype holder. A
+    /// prototype record is only "armed" when `structure_id != 0` AND
+    /// `holder_ptr != 0`; the writeback refuses `holder_ptr == 0` (like the
+    /// `structure_id == 0` refusal) so a missing holder can never be
+    /// dereferenced.
+    pub holder_ptr: u64,
 }
 
 impl HandlerPropertyInlineCacheRecord {
     /// Sentinel record: `structure_id == 0`, so an inline structure check can
     /// never match. Mirrors a freshly created C++ `PropertyInlineCache` with a
-    /// null `m_inlineAccessBaseStructureID`.
+    /// null `m_inlineAccessBaseStructureID`. `holder_ptr == 0` (no holder).
     pub const SENTINEL: Self = Self {
         structure_id: 0,
         offset: 0,
+        holder_ptr: 0,
     };
 }
 

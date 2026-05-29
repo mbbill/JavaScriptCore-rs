@@ -2480,6 +2480,19 @@ pub trait DispatchHost {
         None
     }
 
+    // Resolve a prototype-load HOLDER object id to the raw, pinned
+    // `CoreObjectCell*` (as `usize` bits) that a resident prototype DataIC bakes
+    // into its record (`offsetOfInlineHolder` analog,
+    // jit/JITInlineCacheGenerator.cpp:158). The pointer is the never-moving
+    // `Pin<Box<CoreObjectCell>>` address. Returns `None` when the holder is not a
+    // live object the store knows, or is an opaque object (proxy) the resident
+    // DataIC must not bake. The default (test/non-production hosts) resolves
+    // nothing, so the prototype arm is a no-op and the site stays on the slow
+    // path. Only the production `CoreOpcodeDispatchHost` overrides this.
+    fn generated_prototype_holder_cell_pointer(&mut self, _holder: ObjectId) -> Option<u64> {
+        None
+    }
+
     fn generated_property_has_sidecar_base_structure(
         &mut self,
         _base: RuntimeValue,
@@ -11545,6 +11558,21 @@ impl CoreObjectStore {
             .find(|object| object.cell_id == object_id.0)
     }
 
+    // Raw, pinned `CoreObjectCell*` (as `usize` bits) for an object id, the value a
+    // resident prototype DataIC bakes as its holder pointer. The cell is a
+    // `Pin<Box<_>>` and never moves, so this address is stable while the cell is
+    // live. Returns `None` for an unknown id or a Proxy (opaque) holder, which the
+    // resident DataIC must not bake (no fixed structure/offset layout). The address
+    // matches `value.as_cell().pointer_payload_bits()` for the cell's boxed value,
+    // the same equality `find` debug-asserts.
+    fn holder_cell_pointer_for_object_id(&self, object_id: ObjectId) -> Option<u64> {
+        let cell = self.find_by_object_id(object_id)?;
+        if cell.kind == CoreObjectKind::Proxy {
+            return None;
+        }
+        Some(core::ptr::from_ref(cell) as usize as u64)
+    }
+
     fn find_mut(&mut self, value: RuntimeValue) -> Option<&mut CoreObjectCell> {
         let payload = value.as_cell()?.pointer_payload_bits();
         let index = self.object_indices_by_payload.get(&payload).copied()?;
@@ -12828,6 +12856,10 @@ impl DispatchHost for CoreOpcodeDispatchHost {
         }
         let cell = self.objects.find(base)?;
         (cell.kind != CoreObjectKind::Proxy).then_some(cell.structure_id)
+    }
+
+    fn generated_prototype_holder_cell_pointer(&mut self, holder: ObjectId) -> Option<u64> {
+        self.objects.holder_cell_pointer_for_object_id(holder)
     }
 
     fn generated_property_has_sidecar_base_structure(
