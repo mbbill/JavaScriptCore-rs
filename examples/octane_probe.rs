@@ -487,6 +487,18 @@ fn dump_vm_code_block(vm: &Vm, raw_cell_id: u32) {
 
 fn print_tiering_summary(vm: &Vm) {
     let tiering = vm.tiering_integration();
+    // FIX 3 get_by_id self-load DataIC residency telemetry: how many inline
+    // self-load fast paths the emitter baked, how many of those records were
+    // written back live (resident), and how many times a baked fast path still
+    // fell to the slow-path return stub (cell-tag/structure miss). On real
+    // richards this confirms the inline DataIC actually fires on the hot
+    // `this.field` sites instead of slow-pathing every entry.
+    println!(
+        "data-ic-self-load fast_path_emitted={} record_writeback={} slow_path_exit={}",
+        tiering.data_ic_self_load_fast_path_emitted_count(),
+        tiering.data_ic_self_load_record_writeback_count(),
+        tiering.data_ic_self_load_slow_path_exit_count(),
+    );
     let tail_limit = tiering_tail_record_limit();
     let record_filter = tiering_record_filter();
     let entry_decisions = tiering.entry_decisions();

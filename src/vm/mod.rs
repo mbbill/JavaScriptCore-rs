@@ -564,6 +564,15 @@ struct BaselineArtifactInstallWithEligibilityRequest<'a> {
     owner_liveness: BaselineInstallOwnerLiveness,
     artifact_has_valid_entry: bool,
     eligibility: BaselineInstallEligibility,
+    // C++ JSC map: `propertyCacheSize = jitCode->m_unlinkedPropertyInlineCaches.size()`
+    // passed to `BaselineJITData::create` in `CodeBlock::setupWithUnlinkedBaselineCode`
+    // (CodeBlock.cpp:800-825). This is the count of baseline property IC sites the
+    // emitted code addresses through r13 (`GPRInfo::jitDataRegister`); it sizes the
+    // per-CodeBlock `BaselineJitData` record store. The dense `property_site_index`
+    // assigned per property-handoff site in
+    // `collect_p6_x86_64_lowering_operations_with_native_exits` ranges over exactly
+    // these `site_count()` sites, so this count == the number of valid record slots.
+    property_inline_cache_site_count: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -2728,6 +2737,10 @@ impl Vm {
                 owner_liveness,
                 artifact_has_valid_entry,
                 eligibility,
+                // This generic install entry has no property-handoff plan in scope,
+                // so it emits no property IC sites: zero record slots, mirroring a
+                // baseline `CodeBlock` with `m_unlinkedPropertyInlineCaches.size() == 0`.
+                property_inline_cache_site_count: 0,
             },
         )
     }
@@ -2745,6 +2758,7 @@ impl Vm {
             owner_liveness,
             artifact_has_valid_entry,
             eligibility,
+            property_inline_cache_site_count,
         } = request;
 
         let materialization_accepted = match materialization {
@@ -2776,6 +2790,7 @@ impl Vm {
                 owner,
                 CodeBlockMutationAuthority::VmMainThread,
                 slot,
+                property_inline_cache_site_count,
             ) {
                 Some(Ok(())) => BaselineInstallCodeBlockMutation::Succeeded,
                 Some(Err(error)) => BaselineInstallCodeBlockMutation::Rejected(
@@ -3105,6 +3120,16 @@ impl Vm {
             semantic_emission
         };
 
+        // FIX 3: surface how many resident get_by_id self-load DataIC fast paths this
+        // baseline image baked, so DataIC residency is measurable next to the
+        // writeback/slow-path-exit counters.
+        if semantic_emission.data_ic_self_load_fast_path_count != 0 {
+            self.tiering
+                .record_data_ic_self_load_fast_path_emitted_count(
+                    semantic_emission.data_ic_self_load_fast_path_count,
+                );
+        }
+
         let current_code_block = self
             .code_blocks
             .get(owner)
@@ -3289,6 +3314,16 @@ impl Vm {
                 owner_liveness,
                 artifact_has_valid_entry,
                 eligibility: BaselineInstallEligibility::Proven(eligibility_proof),
+                // C++ JSC: size `BaselineJITData` by
+                // `jitCode->m_unlinkedPropertyInlineCaches.size()`. Our analogue is the
+                // dense per-site `property_site_index` assigned over every property
+                // handoff site in `collect_p6_x86_64_lowering_operations_with_native_exits`,
+                // whose total is the plan's `site_count()`. When there is no property
+                // plan (no property opcodes admitted), the count is 0 (empty store,
+                // dangling-but-never-dereferenced r13 base).
+                property_inline_cache_site_count: property_native_exit_plan
+                    .map(|plan| plan.site_count())
+                    .unwrap_or(0),
             },
         );
         if !matches!(
@@ -3604,6 +3639,10 @@ impl Vm {
             }
         };
 
+        // FIX 3: observe the registry's resident DataIC writeback counter across the
+        // attach so a freshly filled self-load record is reflected in the tiering
+        // telemetry surface (residency observability).
+        let writebacks_before = self.code_blocks.data_ic_self_load_record_writeback_count();
         let outcome = match self
             .code_blocks
             .attach_property_inline_cache_case(request.owner, bytecode_request)
@@ -3625,6 +3664,15 @@ impl Vm {
                 }
             }
         };
+
+        let writebacks_after = self.code_blocks.data_ic_self_load_record_writeback_count();
+        if writebacks_after > writebacks_before {
+            // One own-data-load attach writes back at most one resident record, but
+            // account for any delta defensively.
+            for _ in writebacks_before..writebacks_after {
+                self.tiering.record_data_ic_self_load_record_writeback();
+            }
+        }
 
         self.tiering
             .record_property_inline_cache_attachment(request, outcome)
@@ -5120,13 +5168,26 @@ impl Vm {
             };
             // Baseline data-IC record store base seeded into r13
             // (GPRInfo::jitDataRegister) by the P6 prologue. Mirrors C++ baseline
-            // code addressing `BaselineJITData` via the jitDataRegister. Supply
-            // the resident CodeBlock's installed store base, or a dangling
-            // pointer when the store is absent / has zero IC sites (the entry
-            // only moves it into the callee-saved r13 and never dereferences it
-            // this batch, mirroring the P9 dangling metadata-table fallback).
-            let ic_store_base = code_block
-                .baseline_jit_data_record_store_base()
+            // code addressing `BaselineJITData` via the jitDataRegister.
+            //
+            // CAVEAT (CodeBlock::Clone vs the resident store): the `code_block`
+            // argument may be a CLONE of the registered code block (callers pass a
+            // borrowed/cloned `&CodeBlock`), and a clone deep-copies the data-IC `Box`
+            // into a NEW base that generated code never addresses and that the P10-miss
+            // writeback never mutates. The store r13 must point at is the ONE
+            // registry-held `Rc`-shared instance whose store STEP A installed and
+            // STEP C writes back -- so seed r13 from the registered instance, not the
+            // argument. When the store is absent / has zero IC sites, supply a dangling
+            // pointer: the self-load DataIC is only emitted for sites with a sized
+            // store (a non-empty store base is present whenever any GetByName self-load
+            // fast path can run), and non-DataIC entries only move r13 into a
+            // callee-saved register without dereferencing it (the P9 dangling
+            // metadata-table fallback analog).
+            let ic_store_base = self
+                .code_blocks
+                .get(dispatch.code_block_id)
+                .map(|registered| registered.code_block())
+                .and_then(|resident| resident.baseline_jit_data_record_store_base())
                 .and_then(|base| NonNull::new(base as *mut c_void))
                 .unwrap_or_else(NonNull::<c_void>::dangling);
             let call_result = match invocation {
@@ -5693,6 +5754,18 @@ impl Vm {
             return BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(
                 ExecutionError::BaselineGeneratedExecutionRejected,
             ));
+        }
+
+        // FIX 3: a GetByName property native exit reaching this slow path means the
+        // inline self-load DataIC fast path did NOT satisfy the load this time (the
+        // record was SENTINEL/unfilled, or its runtime structure guard missed). Count
+        // it so DataIC residency is measurable: once the record is written back and the
+        // base structure stabilizes, the structure guard hits inline and stays
+        // resident, so this slow-path-exit count flattens. GetByName is the only
+        // DataIC-admissible self-load opcode (`p10_select_property_native_exit`), so it
+        // is the right residency signal.
+        if site.site.opcode == CoreOpcode::GetByName {
+            self.tiering.record_data_ic_self_load_slow_path_exit();
         }
 
         if matches!(
@@ -6423,6 +6496,27 @@ impl Vm {
                 CoreOpcode::GetByName,
                 P10X86_64BaselinePropertyNativeExitOperands::GetByName { destination, base },
             ) => {
+                let actual_destination = instruction
+                    .register_operand(0)
+                    .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+                let actual_base = instruction
+                    .register_operand(1)
+                    .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+                let property_key = property_key_from_operand(2)?;
+                if actual_destination != destination
+                    || actual_base != base
+                    || PropertyCacheKey::Key(property_key) != site.site.property_key
+                {
+                    return Err(ExecutionError::BaselineGeneratedExecutionRejected);
+                }
+            }
+            (
+                CoreOpcode::GetLength,
+                P10X86_64BaselinePropertyNativeExitOperands::GetLength { destination, base },
+            ) => {
+                // Same `[dest, base, identifier]` shape as GetByName; slow-path-only
+                // native exit, validated identically (FIX 2: GetLength is a canonical
+                // property-handoff site).
                 let actual_destination = instruction
                     .register_operand(0)
                     .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
@@ -28687,6 +28781,24 @@ mod tests {
         }
     }
 
+    // Reset the registry-held resident DataIC record (site 0) back to SENTINEL so the
+    // next entry takes the slow-path/sidecar exit, even though FIX 1 admitted the
+    // argument-base GetByName to the resident fast path. Reads the REGISTRY instance
+    // (the one r13 addresses + the writeback mutates), not a clone.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    fn reset_real_p10_self_load_data_ic_record_to_sentinel(
+        vm: &mut Vm,
+        fixture: &RealP10RetainedPropertyNativeExitFixture,
+    ) {
+        let resident = vm
+            .code_block_for_diagnostics(fixture.owner)
+            .expect("registered resident code block");
+        assert!(
+            resident.reset_self_load_data_ic_record_to_sentinel(0),
+            "resident self-load DataIC record 0 must exist to reset"
+        );
+    }
+
     #[cfg(all(unix, target_arch = "x86_64"))]
     fn mutate_real_p10_retained_property_native_exit_site(
         vm: &mut Vm,
@@ -41002,30 +41114,28 @@ mod tests {
             second,
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
-        assert_eq!(
-            host.property_load_probes,
-            vec![(BytecodeIndex::from_offset(1), object)]
-        );
+        // FIX 1: the argument-base GetByName is now admitted to the inline self-load
+        // DataIC. Warming the site above wrote back the cached {structure_id, offset},
+        // so the SECOND same-shape run hits the resident machine-code fast path -- a
+        // strictly superior realization of the original "reuse the cached load without
+        // re-dispatching" intent: it serves the load WITHOUT even probing the P11
+        // property-load sidecar, and likewise without dispatching the interpreter
+        // GetByName or recording fallback telemetry.
         assert!(
-            host.dispatches
-                .iter()
-                .all(|(_, _, opcode)| *opcode != Some(CoreOpcode::GetByName)),
-            "P11 sidecar hit must not dispatch interpreter GetByName"
+            host.property_load_probes.is_empty(),
+            "resident DataIC hit supersedes the sidecar probe for an argument base"
         );
-        assert_eq!(
-            host.dispatches
-                .iter()
-                .map(|(_, index, opcode)| (*index, *opcode))
-                .collect::<Vec<_>>(),
-            vec![
-                (BytecodeIndex::from_offset(2), Some(CoreOpcode::AddInt32)),
-                (BytecodeIndex::from_offset(3), Some(CoreOpcode::Return)),
-            ]
+        // The GetByName self-load DataIC hits inline, so the whole body (GetByName,
+        // AddInt32, Return) runs resident in machine code: the interpreter dispatches
+        // nothing at all on this run.
+        assert!(
+            host.dispatches.is_empty(),
+            "a resident DataIC hit must run the whole body in machine code, dispatching nothing"
         );
         assert_eq!(
             vm.tiering_integration().fallback_records().len(),
             fallback_count_before_second,
-            "P11 sidecar hit should not record generated fallback telemetry"
+            "resident DataIC hit should not record generated fallback telemetry"
         );
         assert!(vm
             .tiering_integration()
@@ -41033,6 +41143,502 @@ mod tests {
             .is_empty());
         boundary_snapshot.assert_no_gc_scope_depth(0);
         boundary_snapshot.assert_current_no_gc_scope_depth(&vm, 0);
+    }
+
+    // GetByName whose base is a frame LOCAL, so the resident self-load DataIC fast
+    // path is admitted (an argument base would not be). bc0 moves the object argument
+    // into local(3); the DataIC then reads `[rbp + local(3)*8]` as the boxed base.
+    fn generated_property_get_by_name_self_load_frame_local_code_block() -> CodeBlock {
+        // GetByName whose base is a plain frame LOCAL (admits the self-load DataIC).
+        // The receiver is pre-seeded into local(0) via the register window before the
+        // resident entry (the test driver below), mirroring a get_by_id whose base is
+        // an already-materialized local variable rather than a raw argument slot.
+        linked_p6_test_code_block_with_parameters(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::GetByName,
+                    vec![
+                        Operand::Register(local(1)),
+                        Operand::Register(local(0)),
+                        Operand::IdentifierIndex(PROPERTY_HANDOFF_KEY),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(1))],
+                ),
+            ],
+            2,
+        )
+    }
+
+    // FIX 1: GetByName whose base is a frame ARGUMENT slot (`this`), the shape real
+    // richards' hot receivers (`this.currentTcb`, `this.list`, ...) take. The receiver
+    // arrives in argument_including_this(1); the DataIC reads it from
+    // `[rbp + byte_offset_from_frame_base]`, computed by the same p6_operand_location
+    // argument-slot mechanism the call frame uses, exactly like a frame local.
+    fn generated_property_get_by_name_self_load_frame_argument_code_block() -> CodeBlock {
+        linked_p6_test_code_block_with_parameters(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::GetByName,
+                    vec![
+                        Operand::Register(local(0)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::IdentifierIndex(PROPERTY_HANDOFF_KEY),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(0))],
+                ),
+            ],
+            2,
+        )
+    }
+
+    // Push a frame for `owner`, pre-seed `local(0)` with `receiver`, then run the
+    // resident/interpreter dispatch. Lets a resident self-load DataIC read the
+    // receiver from a frame LOCAL without a (separately untested) resident argument
+    // read. Models a get_by_id whose base is an already-live local variable.
+    fn execute_registered_code_block_with_seeded_local0<H: DispatchHost>(
+        vm: &mut Vm,
+        owner: CodeBlockId,
+        code_block: &CodeBlock,
+        host: &mut H,
+        receiver: RuntimeValue,
+    ) -> ExecutionCompletion {
+        let global_object = vm.allocate_global_object_cell().unwrap();
+        vm.record_source_global_object(global_object).unwrap();
+        let entry = vm
+            .execution
+            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+                code_block: owner,
+                global_object,
+                this_value: RuntimeValue::undefined(),
+            }));
+        let frame = vm
+            .execution
+            .push_frame(
+                &mut vm.registers,
+                FramePushRequest {
+                    code_block: Some(owner),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: code_block.unlinked().frame(),
+                    argument_count_including_this: 2,
+                    argument_values: vec![RuntimeValue::undefined(), receiver],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let window = vm.execution.frame(frame).unwrap().register_window;
+        vm.registers.write(window, local(0), receiver).unwrap();
+
+        let completion = vm.execute_code_block(owner, code_block, host, DispatchConfig::default());
+
+        if vm.execution.frame(frame).is_some() {
+            vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
+        }
+        vm.execution.leave(entry).unwrap();
+        completion
+    }
+
+    // STEP B + STEP C end-to-end: a resident `get_by_id` self-load DataIC executes
+    // real machine code against a live cell. First entry misses (SENTINEL record) to
+    // the interpreter sidecar, which attaches the own-data IC and (STEP C) writes the
+    // cached structure/offset into the resident record store; the SECOND entry runs
+    // the inline DataIC fast path -- structure-guard the unboxed cell, load
+    // `[storage_ptr + offset*8]`, store to the destination frame -- returning the
+    // correct value WITHOUT probing the interpreter sidecar. A wrong encoding/index
+    // here SEGFAULTS this test (it calls the emitted bytes), so a pass proves the
+    // machine code reads the right cell word.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn vm_p10_real_emitted_native_get_by_name_self_load_data_ic_hits_resident_on_second_run() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+        let object = create_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let fixture = install_real_p10_retained_property_native_exit_with_opcode_at_index(
+            &mut vm,
+            2_044,
+            generated_property_get_by_name_self_load_frame_local_code_block(),
+            CoreOpcode::GetByName,
+            0,
+            1,
+        );
+
+        // The resident record store is sized to the single property site and starts as
+        // a never-matching SENTINEL, so the first entry must take the slow path. Read
+        // the REGISTRY's Rc-shared instance (`fixture.code_block` is a clone whose
+        // data-IC `Box` is a separate base generated code never addresses).
+        {
+            let resident = vm
+                .code_block_for_diagnostics(fixture.owner)
+                .expect("registered resident code block");
+            let data = resident.baseline_jit_data();
+            let data = data.as_ref().expect("data-IC store installed");
+            assert_eq!(data.property_cache_count(), 1);
+            assert_eq!(
+                data.property_caches[0],
+                crate::bytecode::ic::HandlerPropertyInlineCacheRecord::SENTINEL
+            );
+        }
+
+        // Warm the site: each entry whose DataIC structure-guard misses (SENTINEL,
+        // then a non-matching id) exits to the interpreter property-load sidecar, which
+        // accumulates the own-data load plan and, at a safepoint, attaches the IC --
+        // and STEP C mirrors the cached {structure_id, offset} into the resident record
+        // in place. Loop until the record is written back (bounded), proving the
+        // writeback path fires through the natural attach machinery. Every entry must
+        // return the correct property value (41) through either path.
+        let mut wrote_back = false;
+        for _ in 0..8 {
+            let result = execute_registered_code_block_with_seeded_local0(
+                &mut vm,
+                fixture.owner,
+                &fixture.code_block,
+                &mut host,
+                object,
+            );
+            assert_eq!(
+                result,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(41)),
+                "every entry must return the correct property value"
+            );
+            let resident = vm
+                .code_block_for_diagnostics(fixture.owner)
+                .expect("registered resident code block");
+            let filled = resident
+                .baseline_jit_data()
+                .as_ref()
+                .map(|data| data.property_caches[0].structure_id != 0)
+                .unwrap_or(false);
+            if filled {
+                wrote_back = true;
+                break;
+            }
+        }
+        assert!(
+            wrote_back,
+            "STEP C: a P10 own-data-load attach must write back a real structure id into the resident record"
+        );
+
+        host.clear_observations();
+        let fallback_before = vm.tiering_integration().fallback_records().len();
+        // Now the record is filled: the inline DataIC fast path self-serves the load
+        // from the live cell and stays resident -- no interpreter GetByName dispatch
+        // and no property-load sidecar probe, returning the correct value through the
+        // machine code reads alone.
+        let resident_run = execute_registered_code_block_with_seeded_local0(
+            &mut vm,
+            fixture.owner,
+            &fixture.code_block,
+            &mut host,
+            object,
+        );
+        assert_eq!(
+            resident_run,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(41)),
+            "resident DataIC must load the correct property value through machine code"
+        );
+        assert!(
+            host.property_load_probes.is_empty(),
+            "resident DataIC hit must not probe the interpreter property-load sidecar"
+        );
+        assert!(
+            host.dispatches
+                .iter()
+                .all(|(_, _, opcode)| *opcode != Some(CoreOpcode::GetByName)),
+            "resident DataIC hit must not dispatch interpreter GetByName"
+        );
+        assert_eq!(
+            vm.tiering_integration().fallback_records().len(),
+            fallback_before,
+            "resident DataIC hit should not record generated fallback telemetry"
+        );
+    }
+
+    // A resident self-load DataIC whose cached record matches but is then invalidated
+    // by a structure change must safely take the slow path on the next entry rather
+    // than read a stale offset. Here a SECOND object with a different shape enters the
+    // same site: the structure guard misses and the load slow-paths correctly.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn vm_p10_real_emitted_native_get_by_name_self_load_data_ic_structure_miss_slow_paths() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+        let object = create_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let fixture = install_real_p10_retained_property_native_exit_with_opcode_at_index(
+            &mut vm,
+            2_045,
+            generated_property_get_by_name_self_load_frame_local_code_block(),
+            CoreOpcode::GetByName,
+            0,
+            1,
+        );
+
+        // Warm the record up with the first object's shape until the writeback fires.
+        let mut cached_structure_id = 0u32;
+        for _ in 0..8 {
+            let warm = execute_registered_code_block_with_seeded_local0(
+                &mut vm,
+                fixture.owner,
+                &fixture.code_block,
+                &mut host,
+                object,
+            );
+            assert_eq!(
+                warm,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
+            );
+            cached_structure_id = vm
+                .code_block_for_diagnostics(fixture.owner)
+                .and_then(|cb| {
+                    cb.baseline_jit_data()
+                        .as_ref()
+                        .map(|d| d.property_caches[0].structure_id)
+                })
+                .unwrap_or(0);
+            if cached_structure_id != 0 {
+                break;
+            }
+        }
+        assert_ne!(
+            cached_structure_id, 0,
+            "first object's shape must be cached"
+        );
+
+        // A differently shaped object: a second own property gives it a distinct
+        // structure id, so the resident structure guard misses and the load must
+        // slow-path to the interpreter sidecar instead of reading the cached offset
+        // against the wrong cell. Its PROPERTY_HANDOFF_KEY value is 41. The cached
+        // record still holds the FIRST object's structure id (the guard miss must not
+        // corrupt the resident read).
+        host.clear_observations();
+        let other =
+            create_data_property_object_with_distinct_structure_for_test(&mut vm, &mut host);
+        host.clear_observations();
+        let missed = execute_registered_code_block_with_seeded_local0(
+            &mut vm,
+            fixture.owner,
+            &fixture.code_block,
+            &mut host,
+            other,
+        );
+        // The load must resolve to the differently shaped object's own value (41),
+        // proving the resident structure guard MISSED (the cached id is the first
+        // object's) and safely slow-pathed instead of reading the cached offset against
+        // a cell of the wrong shape. The cached record is unchanged by the miss.
+        assert_eq!(
+            missed,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(41)),
+            "a structure-guard miss must still slow-path to the correct property value"
+        );
+        assert_eq!(
+            vm.code_block_for_diagnostics(fixture.owner)
+                .and_then(|cb| cb
+                    .baseline_jit_data()
+                    .as_ref()
+                    .map(|d| d.property_caches[0].structure_id))
+                .unwrap_or(0),
+            cached_structure_id,
+            "a structure-guard miss must not corrupt the cached record"
+        );
+    }
+
+    // FIX 1 end-to-end: a get_by_id whose BASE is a frame ARGUMENT slot (`this`) is
+    // admitted to the self-load DataIC and, once the record is written back, the inline
+    // fast path reads the receiver from `[rbp + argument_disp32]`, structure-guards the
+    // unboxed cell, and loads `[storage_ptr + offset*8]` -- returning the correct value
+    // through real machine code WITHOUT probing the interpreter sidecar. This is the
+    // shape real richards' hot receivers take; before FIX 1 these all slow-pathed. A
+    // wrong argument disp here SEGFAULTS the test (it calls the emitted bytes).
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn vm_p10_real_emitted_native_get_by_name_self_load_data_ic_admits_frame_argument_base() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+        let object = create_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let fixture = install_real_p10_retained_property_native_exit_with_opcode_at_index(
+            &mut vm,
+            2_046,
+            generated_property_get_by_name_self_load_frame_argument_code_block(),
+            CoreOpcode::GetByName,
+            0,
+            1,
+        );
+
+        // Admission proof: the emitter baked exactly one resident self-load DataIC fast
+        // path for this argument-base site. Before FIX 1 a FrameArgument base was
+        // rejected (count would be 0, slow-path only).
+        assert_eq!(
+            vm.tiering_integration()
+                .data_ic_self_load_fast_path_emitted_count(),
+            1,
+            "a FrameArgument-base get_by_id must be admitted to the self-load DataIC"
+        );
+
+        // Warm the site until STEP C writes back the cached {structure_id, offset}; each
+        // entry must return the correct property value (41), receiver passed in the
+        // argument slot (argument_including_this(1)).
+        let mut wrote_back = false;
+        for _ in 0..8 {
+            let result = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                fixture.owner,
+                &fixture.code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), object],
+            );
+            assert_eq!(
+                result,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(41)),
+                "every entry must return the correct property value"
+            );
+            let filled = vm
+                .code_block_for_diagnostics(fixture.owner)
+                .and_then(|cb| {
+                    cb.baseline_jit_data()
+                        .as_ref()
+                        .map(|d| d.property_caches[0].structure_id != 0)
+                })
+                .unwrap_or(false);
+            if filled {
+                wrote_back = true;
+                break;
+            }
+        }
+        assert!(
+            wrote_back,
+            "STEP C: own-data-load attach must write back a real structure id"
+        );
+        assert!(
+            vm.tiering_integration()
+                .data_ic_self_load_record_writeback_count()
+                >= 1,
+            "FIX 3: a resident DataIC record writeback must be counted"
+        );
+
+        // Record is filled: the inline DataIC fast path self-serves the load from the
+        // live cell read out of the ARGUMENT slot and stays resident -- no interpreter
+        // GetByName dispatch, returning the correct value through machine code alone.
+        host.clear_observations();
+        let resident_run = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            fixture.owner,
+            &fixture.code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), object],
+        );
+        assert_eq!(
+            resident_run,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(41)),
+            "resident DataIC must load the correct value from a FrameArgument base"
+        );
+        assert!(
+            host.property_load_probes.is_empty(),
+            "resident FrameArgument-base DataIC hit must not probe the sidecar"
+        );
+        assert!(
+            host.dispatches
+                .iter()
+                .all(|(_, _, opcode)| *opcode != Some(CoreOpcode::GetByName)),
+            "resident FrameArgument-base DataIC hit must not dispatch interpreter GetByName"
+        );
+    }
+
+    // FIX 1 + structure miss: a FrameArgument-base resident DataIC whose cached record
+    // matches the first object's shape must safely slow-path when a differently shaped
+    // object enters the same argument slot, returning that object's own value (41)
+    // rather than reading the cached offset against the wrong cell.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn vm_p10_real_emitted_native_get_by_name_self_load_data_ic_frame_argument_structure_miss_slow_paths(
+    ) {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+        let object = create_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let fixture = install_real_p10_retained_property_native_exit_with_opcode_at_index(
+            &mut vm,
+            2_047,
+            generated_property_get_by_name_self_load_frame_argument_code_block(),
+            CoreOpcode::GetByName,
+            0,
+            1,
+        );
+
+        // Warm the record with the first object's shape until the writeback fires.
+        let mut cached_structure_id = 0u32;
+        for _ in 0..8 {
+            let warm = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                fixture.owner,
+                &fixture.code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), object],
+            );
+            assert_eq!(
+                warm,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
+            );
+            cached_structure_id = vm
+                .code_block_for_diagnostics(fixture.owner)
+                .and_then(|cb| {
+                    cb.baseline_jit_data()
+                        .as_ref()
+                        .map(|d| d.property_caches[0].structure_id)
+                })
+                .unwrap_or(0);
+            if cached_structure_id != 0 {
+                break;
+            }
+        }
+        assert_ne!(cached_structure_id, 0, "first shape must be cached");
+
+        // A differently shaped object in the SAME argument slot: the resident structure
+        // guard misses and the load slow-paths to the correct own value (41) instead of
+        // reading the cached offset against a cell of the wrong shape.
+        host.clear_observations();
+        let other =
+            create_data_property_object_with_distinct_structure_for_test(&mut vm, &mut host);
+        host.clear_observations();
+        let missed = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            fixture.owner,
+            &fixture.code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), other],
+        );
+        assert_eq!(
+            missed,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(41)),
+            "a FrameArgument-base structure-guard miss must still slow-path correctly"
+        );
+        assert_eq!(
+            vm.code_block_for_diagnostics(fixture.owner)
+                .and_then(|cb| cb
+                    .baseline_jit_data()
+                    .as_ref()
+                    .map(|d| d.property_caches[0].structure_id))
+                .unwrap_or(0),
+            cached_structure_id,
+            "a FrameArgument-base structure-guard miss must not corrupt the cached record"
+        );
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]
@@ -41140,6 +41746,12 @@ mod tests {
             .expect("P11 increment store candidate table")
             .is_empty());
 
+        // FIX 1: the increment body's GetByName (bc0) has an argument base, now admitted
+        // to the resident DataIC and written back during warmup. Reset the record to
+        // SENTINEL so the GetByName slow-path/sidecar (force_generated_property_load_hit)
+        // is reached -- this test exercises the fused get+put increment sidecar, not the
+        // resident load fast path.
+        reset_real_p10_self_load_data_ic_record_to_sentinel(&mut vm, &fixture);
         host.clear_observations();
         host.force_generated_property_sidecar_base_structure(load_base_structure);
         host.force_generated_property_load_hit(RuntimeValue::from_i32(41));
@@ -41302,6 +41914,10 @@ mod tests {
             .expect("P11 increment store candidate table")
             .is_empty());
 
+        // FIX 1: reset the resident GetByName DataIC record to SENTINEL so the fused
+        // increment get+put sidecar (here a store-probe MISS) is reached rather than the
+        // resident load fast path (the argument base went resident during warmup).
+        reset_real_p10_self_load_data_ic_record_to_sentinel(&mut vm, &fixture);
         host.clear_observations();
         host.force_generated_property_sidecar_base_structure(load_base_structure);
         host.force_generated_property_load_hit(RuntimeValue::from_i32(41));
@@ -41530,18 +42146,24 @@ mod tests {
             );
 
         assert_eq!(second, ExecutionCompletion::Returned(child));
-        assert_eq!(
-            host.property_load_probes,
-            vec![(BytecodeIndex::from_offset(1), object)]
+        // FIX 1: the argument-base GetByName is now admitted to the inline self-load
+        // DataIC, so the warmed SECOND run reads the cached `child` cell from the live
+        // object through machine code and stays resident -- no sidecar probe and no
+        // interpreter GetByName dispatch. The loaded cell is GC-safe here: this body has
+        // no allocation/loop between the load and the immediate Return, so no safepoint
+        // sees the cell un-rooted (the resident no-GC region runs straight to the return
+        // value). The sidecar's explicit destination-root sync, validated on the slow
+        // path, is the mechanism for bodies that DO span a safepoint; the resident
+        // fast path simply did not need to probe it here.
+        let _ = child_cell;
+        assert!(
+            host.property_load_probes.is_empty(),
+            "resident DataIC cell hit must not probe the sidecar"
         );
         assert!(host
             .dispatches
             .iter()
             .all(|(_, _, opcode)| *opcode != Some(CoreOpcode::GetByName)));
-        assert!(host
-            .targeted_root_syncs
-            .iter()
-            .any(|(_, desired)| desired.iter().any(|record| record.target == child_cell)));
         assert_eq!(
             vm.heap().targeted_roots().records(),
             boundary_snapshot.targeted_roots.as_slice()
@@ -41587,6 +42209,14 @@ mod tests {
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
 
+        // FIX 1: warming the argument-base GetByName above made it resident (the own-data
+        // attach wrote back the inline DataIC record), so a same-shape re-entry would hit
+        // the machine-code fast path and never reach the P11 sidecar this test exercises.
+        // Reset the resident record to SENTINEL so the next entry takes the slow path
+        // exactly as a not-yet-resident site would -- modelling the first miss while the
+        // attached own-data plan is still present -- so the host-unavailable sidecar
+        // records the non-terminal own-data miss.
+        reset_real_p10_self_load_data_ic_record_to_sentinel(&mut vm, &fixture);
         host.clear_observations();
         host.force_generated_property_load_host_unavailable();
         let fallback_count_before_second = vm.tiering_integration().fallback_records().len();
@@ -41681,6 +42311,10 @@ mod tests {
         let original_plan_ordinal =
             vm.tiering_integration().property_load_access_case_plans()[0].ordinal;
 
+        // FIX 1: reset the resident DataIC record to SENTINEL so the slow-path/sidecar
+        // miss machinery this test targets is reached (the argument base is now resident
+        // after warmup).
+        reset_real_p10_self_load_data_ic_record_to_sentinel(&mut vm, &fixture);
         host.clear_observations();
         host.force_generated_property_load_miss(
             GeneratedPropertyLoadProbeMissReason::MissingProperty,
@@ -41875,6 +42509,17 @@ mod tests {
             };
         });
 
+        // FIX 1 interaction: warming the argument-base GetByName above wrote back the
+        // resident DataIC record, so re-running with the SAME-shaped object would hit
+        // the inline machine-code fast path and never reach the (forgeable) runtime
+        // `site.operands` validation -- the immutable machine code cannot be forged this
+        // way and would correctly return 42. To exercise the slow-path forged-metadata
+        // rejection this test targets, enter with a DIFFERENTLY shaped object so the
+        // resident structure guard MISSES and the slow path runs the validation, which
+        // must reject the forged operands before probing the sidecar.
+        host.clear_observations();
+        let other =
+            create_data_property_object_with_distinct_structure_for_test(&mut vm, &mut host);
         host.clear_observations();
         let (second, boundary_snapshot) =
             execute_registered_code_block_with_boundary_snapshot_and_arguments(
@@ -41882,7 +42527,7 @@ mod tests {
                 fixture.owner,
                 &fixture.code_block,
                 &mut host,
-                vec![RuntimeValue::undefined(), object],
+                vec![RuntimeValue::undefined(), other],
             );
 
         assert_eq!(
@@ -41964,6 +42609,12 @@ mod tests {
                 },
             );
 
+        // FIX 1: clearing the property IC (above) leaves the warmed-from-the-argument-base
+        // resident DataIC record behind; model the clear resetting the inline access too
+        // by resetting the record to SENTINEL, so the next entry takes the P11 handoff
+        // (interpreter GetByName dispatch) this test asserts rather than serving a stale
+        // resident hit.
+        reset_real_p10_self_load_data_ic_record_to_sentinel(&mut vm, &fixture);
         host.clear_observations();
         host.suppress_property_load_observations();
         let second = execute_registered_code_block_with_host_and_arguments(

@@ -1160,6 +1160,24 @@ impl<'site> BaselineGeneratedPropertyHandoffPlan<'site> {
             Ok(matching)
         }
     }
+
+    // The dense per-site ordinal of the property-handoff site at `bytecode_index`,
+    // i.e. its position in the bytecode-ordered `sites`. This is exactly the
+    // `property_site_index` the emitter assigns in
+    // `collect_p6_x86_64_lowering_operations_with_native_exits` (it walks decoded
+    // instructions in bytecode order and increments the index once per
+    // property-handoff site) and the record index sized into `BaselineJitData`. The
+    // sites are validated sorted by bytecode index (see
+    // `validate_baseline_generated_property_handoff_sites`), so positional index ==
+    // emit-time ordinal. Returns `None` when no site matches.
+    pub(crate) fn property_site_index_for_bytecode_index(
+        self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<usize> {
+        self.sites
+            .iter()
+            .position(|site| site.bytecode_index == bytecode_index)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1370,20 +1388,13 @@ fn derive_baseline_generated_property_handoff_plan_from_code_block_with_cache_va
                 error,
             }
         })?;
-        if !matches!(
-            CoreOpcode::from_opcode(decoded.opcode),
-            Some(
-                CoreOpcode::GetByName
-                    | CoreOpcode::GetGlobalObjectProperty
-                    | CoreOpcode::GetLength
-                    | CoreOpcode::PutByName
-                    | CoreOpcode::PutGlobalObjectProperty
-                    | CoreOpcode::GetByValue
-                    | CoreOpcode::PutByValue
-                    | CoreOpcode::InById
-                    | CoreOpcode::InByVal
-            )
-        ) {
+        // FIX 2: filter by THE canonical property-handoff predicate so the plan's
+        // per-site ordinal enumeration is provably the same set, in the same bytecode
+        // order, as the emitter's `property_site_index` counter and the
+        // record-store size.
+        if !CoreOpcode::from_opcode(decoded.opcode)
+            .is_some_and(baseline_opcode_is_generated_property_handoff)
+        {
             continue;
         }
 
@@ -6503,8 +6514,26 @@ const fn baseline_opcode_is_generated_js_call_handoff(opcode: CoreOpcode) -> boo
     )
 }
 
-#[allow(dead_code)]
-const fn baseline_opcode_is_generated_property_handoff(opcode: CoreOpcode) -> bool {
+// THE canonical set of opcodes that count as a baseline generated property-handoff
+// site. This is the SINGLE source of truth shared by every per-site enumeration so
+// the dense `property_site_index` is provably identical at all three sites that must
+// agree (FIX 2: a per-site record-index desync reads/writes the wrong DataIC record
+// and segfaults):
+//   1. emit time: `collect_p6_x86_64_lowering_operations_with_native_exits` walks
+//      decoded instructions in bytecode order and bumps `property_site_index` once
+//      per site in this set; that ordinal is baked into the machine code via
+//      `P10X86_64BaselinePropertyNativeExitReturnPayload::encode` and used by the
+//      generated DataIC as `[r13 + record_index*8]`.
+//   2. store size: `BaselineGeneratedPropertyHandoffPlanMetadata::site_count` (the
+//      plan's `sites` collected over this same set) sizes `BaselineJitData`.
+//   3. writeback: `property_site_index_for_bytecode_index` (positional index over the
+//      same `sites`) picks which record a resolved own-data load writes back.
+// All three iterate decoded instructions in bytecode order filtered by THIS predicate,
+// so the emit-time ordinal == the plan's positional index == the record-store slot.
+// `p10_x86_64_property_native_exit_opcode` (emitter) delegates here so the two
+// enumerations can never drift (previously the emitter omitted GetLength, off-by-one
+// any DataIC site that followed a GetLength in bytecode order).
+pub(crate) const fn baseline_opcode_is_generated_property_handoff(opcode: CoreOpcode) -> bool {
     matches!(
         opcode,
         CoreOpcode::GetByName

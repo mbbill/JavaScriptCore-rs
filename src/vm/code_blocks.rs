@@ -34,6 +34,14 @@ use crate::vm::tiering::{
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CodeBlockRegistry {
     records: HashMap<CodeBlockId, CodeBlockRecord>,
+    // FIX 3: cumulative count of resident get_by_id self-load DataIC records the
+    // registry has actually written back in place (a resolved own-data-load miss that
+    // filled `records[record_index]`). The registry owns the resident store
+    // (`BaselineJitData`), so it naturally owns this count; the VM reads the delta
+    // after each attach and mirrors it into `VmTieringIntegration` (the telemetry
+    // surface) so DataIC residency is measurable without changing the attach result
+    // enum or threading tiering into the registry.
+    data_ic_self_load_record_writeback_count: usize,
 }
 
 impl CodeBlockRegistry {
@@ -289,9 +297,79 @@ impl CodeBlockRegistry {
             .code_block
             .attach_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
         {
-            Ok(outcome) => CodeBlockRegistryPropertyInlineCacheAttachment::Attached(outcome),
+            Ok(outcome) => {
+                // STEP C: a successful own-data-load attach just resolved the cached
+                // structure + base-relative offset for this `get_by_id` self-access
+                // site. Mirror it into the resident data-IC record store so the next
+                // entry to the generated self-load fast path hits. Only own-data loads
+                // have a base-relative offset usable by the simple self-load DataIC;
+                // prototype loads / negative lookups / stores keep SENTINEL and stay on
+                // the slow path. The write goes to this registry-held Rc-shared
+                // CodeBlock instance (the one whose store r13 addresses), never a clone.
+                if self.mirror_self_load_data_ic_record_for_attachment(owner, &outcome) {
+                    self.data_ic_self_load_record_writeback_count = self
+                        .data_ic_self_load_record_writeback_count
+                        .saturating_add(1);
+                }
+                CodeBlockRegistryPropertyInlineCacheAttachment::Attached(outcome)
+            }
             Err(error) => CodeBlockRegistryPropertyInlineCacheAttachment::Rejected(error),
         }
+    }
+
+    // Map a successful own-data-load attach to the dense per-site `property_site_index`
+    // (the emitter's record index) and write the cached structure/offset into the
+    // resident record store in place. The dense index is the position of this site in
+    // the property-handoff plan's sorted (bytecode-order) sites, identical to the
+    // `property_site_index` the emitter assigned in
+    // `collect_p6_x86_64_lowering_operations_with_native_exits`.
+    // Returns `true` iff a resident DataIC record was actually written in place
+    // (own-data load, offset known, plan-derivable, index in range, non-sentinel
+    // structure id), so the caller can count real writebacks (FIX 3).
+    fn mirror_self_load_data_ic_record_for_attachment(
+        &mut self,
+        owner: CodeBlockId,
+        outcome: &PropertyInlineCacheAttachmentOutcome,
+    ) -> bool {
+        use crate::bytecode::ic::PropertyInlineCacheAttachmentKind;
+        use crate::jit::plan::derive_baseline_generated_property_handoff_plan_from_current_code_block_metadata;
+
+        if outcome.attachment_kind != PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad {
+            return false;
+        }
+        let Some(offset) = outcome.offset else {
+            return false;
+        };
+        let Some(record) = self.records.get(&owner) else {
+            return false;
+        };
+        let code_block = &record.code_block;
+        // Derive the property-handoff plan from current metadata and find the dense
+        // index of this site by bytecode index. A snapshot/derivation failure or a
+        // missing site is a no-op: the fast path then keeps SENTINEL and slow-paths.
+        let Ok(derivation) =
+            derive_baseline_generated_property_handoff_plan_from_current_code_block_metadata(
+                code_block, owner,
+            )
+        else {
+            return false;
+        };
+        let Some(metadata) = derivation.metadata else {
+            return false;
+        };
+        let Some(record_index) = metadata
+            .borrowed_plan()
+            .property_site_index_for_bytecode_index(outcome.bytecode_index)
+        else {
+            return false;
+        };
+        code_block.mirror_self_load_data_ic_record(record_index, outcome.base_structure.0, offset.0)
+    }
+
+    // FIX 3: cumulative resident DataIC self-load record writebacks observed by the
+    // registry. The VM mirrors deltas into `VmTieringIntegration`.
+    pub(crate) fn data_ic_self_load_record_writeback_count(&self) -> usize {
+        self.data_ic_self_load_record_writeback_count
     }
 
     pub(crate) fn attach_call_link_inline_cache(
@@ -480,6 +558,7 @@ impl CodeBlockRegistry {
         owner: CodeBlockId,
         authority: CodeBlockMutationAuthority,
         slot: JitCodeSlot,
+        property_inline_cache_site_count: usize,
     ) -> Option<Result<(), CodeBlockMutationError>> {
         self.records.get_mut(&owner).map(|record| {
             let outcome = record.code_block.install_baseline_jit_slot(authority, slot);
@@ -489,16 +568,18 @@ impl CodeBlockRegistry {
             // in the same install step that adopts the baseline JIT code. We
             // mirror that here, right after adopting the baseline JIT slot.
             //
-            // FOUNDATION batch: this batch emits no `get_by_id` self-access ICs,
-            // so the unlinked property-IC count is 0 for all currently generated
-            // baseline code. The store is therefore allocated with 0 records (a
-            // stable empty `Box`); the entry seeds r13 from a dangling base that
-            // generated code never dereferences. The next batch that emits
-            // `get_by_id` will size this store by the count of emitted property
-            // IC sites, the faithful analogue of
-            // `jitCode->m_unlinkedPropertyInlineCaches.size()`.
+            // `property_inline_cache_site_count` is the dense per-site
+            // `property_site_index` total (the property-handoff plan's
+            // `site_count()`), the faithful analogue of
+            // `jitCode->m_unlinkedPropertyInlineCaches.size()`. Sizing the store to
+            // this count means `records[property_site_index]` is in-bounds for every
+            // emitted `get_by_id` self-load DataIC fast path, and the resident entry
+            // seeds r13 from this store's stable base. When the count is 0 the store
+            // is an empty `Box` whose dangling base generated code never dereferences.
             if outcome.is_ok() {
-                record.code_block.install_baseline_jit_data(0);
+                record
+                    .code_block
+                    .install_baseline_jit_data(property_inline_cache_site_count);
             }
             outcome
         })
@@ -1319,5 +1400,76 @@ mod tests {
                 &[guarded, store],
             )
             .is_empty());
+    }
+
+    // STEP A: the registry baseline-slot install sizes the resident
+    // `BaselineJitData` record store by the property IC site count, the analogue
+    // of `BaselineJITData::create(propertyCacheSize, ...)` with
+    // `propertyCacheSize == jitCode->m_unlinkedPropertyInlineCaches.size()`
+    // (CodeBlock.cpp:800-825). The store base seeded into r13 must be the
+    // registry's Rc-shared CodeBlock instance's store (not a clone), so the
+    // record store this test reads back is the same one generated code addresses.
+    #[test]
+    fn registry_install_baseline_jit_slot_sizes_resident_store_by_property_site_count() {
+        let owner = CodeBlockId(CellId(913));
+        let code_block = get_by_name_code_block(7);
+        let mut registry = CodeBlockRegistry::default();
+        registry.register(owner, code_block);
+
+        // No baseline store on the resident instance before install.
+        let resident = registry.get(owner).expect("registered").code_block();
+        assert!(resident.baseline_jit_data().is_none());
+        assert!(resident.baseline_jit_data_record_store_base().is_none());
+
+        let count = 3usize;
+        let outcome = registry.install_baseline_jit_slot(
+            owner,
+            CodeBlockMutationAuthority::VmMainThread,
+            JitCodeSlot(11),
+            count,
+        );
+        assert_eq!(outcome, Some(Ok(())));
+
+        // The resident Rc-shared instance now owns a store sized to `count` with
+        // a dereferenceable, stable record-store base (what r13 is seeded from).
+        let resident = registry.get(owner).expect("registered").code_block();
+        {
+            let data = resident.baseline_jit_data();
+            let data = data.as_ref().expect("store installed on resident instance");
+            assert_eq!(data.property_cache_count(), count);
+        }
+        let base = resident
+            .baseline_jit_data_record_store_base()
+            .expect("non-empty store exposes a dereferenceable base");
+        // Stable across reads: the Box is never reallocated.
+        assert_eq!(resident.baseline_jit_data_record_store_base(), Some(base));
+    }
+
+    // STEP A: a zero-site install still allocates the store (allocate-once
+    // contract) but exposes no dereferenceable base, mirroring a baseline
+    // CodeBlock with `m_unlinkedPropertyInlineCaches.size() == 0`. Generated code
+    // seeds r13 from a dangling pointer it never dereferences in that case.
+    #[test]
+    fn registry_install_baseline_jit_slot_zero_sites_has_no_dereferenceable_base() {
+        let owner = CodeBlockId(CellId(914));
+        let code_block = get_by_name_code_block(7);
+        let mut registry = CodeBlockRegistry::default();
+        registry.register(owner, code_block);
+
+        let outcome = registry.install_baseline_jit_slot(
+            owner,
+            CodeBlockMutationAuthority::VmMainThread,
+            JitCodeSlot(11),
+            0,
+        );
+        assert_eq!(outcome, Some(Ok(())));
+
+        let resident = registry.get(owner).expect("registered").code_block();
+        {
+            let data = resident.baseline_jit_data();
+            let data = data.as_ref().expect("zero-site store still installed");
+            assert_eq!(data.property_cache_count(), 0);
+        }
+        assert!(resident.baseline_jit_data_record_store_base().is_none());
     }
 }

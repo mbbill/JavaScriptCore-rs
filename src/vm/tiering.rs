@@ -196,6 +196,27 @@ pub struct VmTieringIntegration {
     generated_guarded_property_load_probe_misses:
         Vec<VmGeneratedGuardedPropertyLoadProbeMissRecord>,
     generated_guarded_property_load_probe_miss_count: usize,
+    // FIX 3: get_by_id self-load DataIC residency telemetry. These three counters
+    // make resident-vs-slow-path directly measurable for the inline
+    // `PropertyDataIcSelfLoadGetByNameWithExit` machine path:
+    //   - `..._fast_path_emitted_count`: how many self-load DataIC fast paths the
+    //     emitter baked into generated baseline code (one per admitted GetByName site).
+    //   - `..._record_writeback_count`: how many resident records were filled by a
+    //     resolved own-data-load miss (STEP C). After writeback the structure guard
+    //     hits and the site stays resident; a high writeback count relative to slow
+    //     exits means the DataIC is doing its job.
+    //   - `..._slow_path_exit_count`: how many times an admitted DataIC site took the
+    //     slow-path native exit at runtime (a runtime structure-guard MISS or an
+    //     unfilled SENTINEL record). Residency is observable as this count flattening
+    //     once the record is written.
+    // A true inline HIT counter would need a `inc [counter]` baked into the resident
+    // machine path (no Rust call happens on a hit); these counters instead bound HIT
+    // from below (emitted - slow exits after writeback) without touching the resident
+    // fast path. Mirrors how the existing generated-probe-miss counters surface
+    // generated-code behavior through `VmTieringIntegration`.
+    data_ic_self_load_fast_path_emitted_count: usize,
+    data_ic_self_load_record_writeback_count: usize,
+    data_ic_self_load_slow_path_exit_count: usize,
     diagnostics: Vec<ExecutionDiagnosticRecord>,
     baseline_entry_artifacts: Vec<BaselineEntryArtifact>,
     baseline_executable_materializations: Vec<BaselineExecutableMaterializationRecord>,
@@ -749,6 +770,37 @@ impl VmTieringIntegration {
         self.generated_guarded_property_load_probe_miss_count = self
             .generated_guarded_property_load_probe_miss_count
             .saturating_add(count);
+    }
+
+    // FIX 3: get_by_id self-load DataIC residency telemetry accessors + increments.
+    pub fn data_ic_self_load_fast_path_emitted_count(&self) -> usize {
+        self.data_ic_self_load_fast_path_emitted_count
+    }
+
+    pub fn data_ic_self_load_record_writeback_count(&self) -> usize {
+        self.data_ic_self_load_record_writeback_count
+    }
+
+    pub fn data_ic_self_load_slow_path_exit_count(&self) -> usize {
+        self.data_ic_self_load_slow_path_exit_count
+    }
+
+    pub(crate) fn record_data_ic_self_load_fast_path_emitted_count(&mut self, count: usize) {
+        self.data_ic_self_load_fast_path_emitted_count = self
+            .data_ic_self_load_fast_path_emitted_count
+            .saturating_add(count);
+    }
+
+    pub(crate) fn record_data_ic_self_load_record_writeback(&mut self) {
+        self.data_ic_self_load_record_writeback_count = self
+            .data_ic_self_load_record_writeback_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_data_ic_self_load_slow_path_exit(&mut self) {
+        self.data_ic_self_load_slow_path_exit_count = self
+            .data_ic_self_load_slow_path_exit_count
+            .saturating_add(1);
     }
 
     #[allow(dead_code)]

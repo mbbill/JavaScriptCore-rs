@@ -862,6 +862,67 @@ impl CodeBlock {
             .map(|data| data.record_store_base())
     }
 
+    // STEP C: mirror a freshly cached own-data-load structure/offset into the
+    // resident data-IC record store IN PLACE, so the next entry to the generated
+    // `get_by_id` self-load fast path hits instead of taking the slow-path exit.
+    //
+    // C++ JSC map: when a baseline `GetByIdSelf` IC misses and the slow path resolves
+    // a monomorphic own-data load, the IC's inline access fields are (re)written so the
+    // structure-guarded fast path now matches -- the inline structure id /
+    // PropertyOffset of `InlineAccess::generateSelfPropertyAccess`
+    // (bytecode/InlineAccess.cpp:188-204) updated through the `BaselineJITData`
+    // `HandlerPropertyInlineCache` (PropertyInlineCache.h:421-422). Here that is a
+    // single in-place write to `records[record_index]` (the `Box` base is never
+    // reallocated, so r13 still points at it; CodeBlock::Clone deep-copies the `Box`,
+    // but the resident path mutates the registry-held Rc-shared instance, never a
+    // clone). `record_index` is the dense per-site `property_site_index` the emitter
+    // assigned in bytecode order, which equals the position of this site in the
+    // property-handoff plan's sorted sites.
+    //
+    // Returns `true` when a record was written (store installed and index in range).
+    // Out-of-range or no-store cases are no-ops: the fast path then keeps SENTINEL and
+    // safely slow-paths, never reading a wrong record.
+    pub fn mirror_self_load_data_ic_record(
+        &self,
+        record_index: usize,
+        structure_id: u32,
+        offset: i32,
+    ) -> bool {
+        // structure_id == 0 is the never-matching SENTINEL; refuse to write it so a
+        // miss can never poison the record into a structure that aliases "no cache".
+        if structure_id == 0 {
+            return false;
+        }
+        let mut slot = self.baseline_jit_data.borrow_mut();
+        let Some(data) = slot.as_mut() else {
+            return false;
+        };
+        let Some(record) = data.property_caches.get_mut(record_index) else {
+            return false;
+        };
+        record.structure_id = structure_id;
+        record.offset = offset;
+        true
+    }
+
+    // Test-only: reset a resident self-load DataIC record back to the never-matching
+    // SENTINEL, modelling a not-yet-resident (or invalidated) site so the next entry
+    // takes the slow-path exit. Used by P11 sidecar tests that must exercise the
+    // slow/miss path even though FIX 1 admits their argument-base GetByName to the
+    // resident DataIC. Returns `true` when a record was reset.
+    #[cfg(test)]
+    pub fn reset_self_load_data_ic_record_to_sentinel(&self, record_index: usize) -> bool {
+        let mut slot = self.baseline_jit_data.borrow_mut();
+        let Some(data) = slot.as_mut() else {
+            return false;
+        };
+        let Some(record) = data.property_caches.get_mut(record_index) else {
+            return false;
+        };
+        *record = crate::bytecode::ic::HandlerPropertyInlineCacheRecord::SENTINEL;
+        true
+    }
+
     // C++ JSC divergence: value-profile sampling mutates `m_metadata` through the
     // shared `CodeBlock*` on the hot return path, with no per-call copy. Rust shares
     // one `Rc<CodeBlock>`, so this takes `&self` and writes through the

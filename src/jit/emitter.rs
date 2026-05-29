@@ -30,7 +30,8 @@ use crate::jit::emission::{
     BaselineMachineCodeEmitterKind,
 };
 use crate::jit::plan::{
-    bind_baseline_bytecode_proof_owner, validate_baseline_bytecode_proof_code_block_snapshot,
+    baseline_opcode_is_generated_property_handoff, bind_baseline_bytecode_proof_owner,
+    validate_baseline_bytecode_proof_code_block_snapshot,
     validate_baseline_generated_property_handoff_site_metadata, BaselineBytecodeEligibilityProof,
     BaselineBytecodeProofBindingError, BaselineBytecodeRange, BaselineBytecodeSnapshotFingerprint,
     BaselineExceptionMetadataPresence, BaselineGeneratedEffectContract,
@@ -69,7 +70,12 @@ const P6_X86_64_CALLABLE_PROLOGUE_BYTES: &[u8] = &[
     0x48, 0x89, 0xf5, // mov rbp, rsi
     0x49, 0x89, 0xff, // mov r15, rdi
     0x49, 0x89, 0xd1, // mov r9, rdx (Rust ABI callee JSValue carrier)
-    0x49, 0x89, 0xcb, // mov r13, rcx (GPRInfo::jitDataRegister = IC store base)
+    // FOUNDATION-BUG FIX: this was `0x49, 0x89, 0xcb` which decodes as `mov r11, rcx`
+    // (ModRM rm=011=r11), NOT `mov r13, rcx`. The IC store base never reached r13, so
+    // r13 held caller garbage; this was inert until the get_by_id self-load DataIC
+    // became the first reader of r13 (then `[r13+idx*8]` faulted). `mov r13, rcx` is
+    // ModRM mod=11 reg=001(rcx) rm=101(r13) = 0xcd under REX.WB (0x49).
+    0x49, 0x89, 0xcd, // mov r13, rcx (GPRInfo::jitDataRegister = IC store base)
 ];
 const P6_X86_64_CALLABLE_EPILOGUE_BYTES: &[u8] = &[
     0x41, 0x5d, // pop r13 (reverse of prologue push order: r13, then r12)
@@ -84,6 +90,19 @@ pub const P6_X86_64_BASELINE_SIDE_EXIT_RETURN_PAYLOAD_LOW_TAG: u8 = 0xff;
 pub const P6_X86_64_BASELINE_RUNTIME_HELPER_NATIVE_EXIT_PAYLOAD_INDEX_BASE: u32 = 0x8000_0000;
 pub const P9_X86_64_BASELINE_JS_CALL_NATIVE_EXIT_RETURN_PAYLOAD_LOW_TAG: u8 = 0xfe;
 pub const P10_X86_64_BASELINE_PROPERTY_NATIVE_EXIT_RETURN_PAYLOAD_LOW_TAG: u8 = 0xfd;
+// Cell ABI the resident `get_by_id` self-load DataIC addresses by absolute byte
+// layout, mirroring the interpreter's `CoreObjectCell` `#[repr(C)]` header
+// (src/interpreter/mod.rs:5455-5571, compile-time `offset_of!` asserted there):
+//   - structure id (u32) at byte 0  == JSCell::structureIDOffset() (runtime/JSCell.h:293),
+//   - storage pointer (8 bytes) at byte 8 == the JSObject Butterfly-pointer slot
+//     analog (runtime/JSObject.h:1572-1577), the base of out_of_line_storage.
+// These MUST match the interpreter constants `STRUCTURE_ID_OFFSET` / `STORAGE_PTR_DISP`;
+// the resident sidecar `generated_property_load_cell_data_property_at_offset` reads
+// the same `[storage_ptr + offset*8]` slot the DataIC loads. A divergence here would
+// make the DataIC read the wrong word and SEGFAULT or return a wrong value, so they
+// are pinned as named constants at the single codegen site.
+pub const P10_X86_64_BASELINE_CELL_STRUCTURE_ID_OFFSET: i32 = 0;
+pub const P10_X86_64_BASELINE_CELL_STORAGE_PTR_DISP: i32 = 8;
 pub const P14_X86_64_BASELINE_LOOP_BACKEDGE_RETURN_PAYLOAD_LOW_TAG: u8 = 0xfc;
 pub const P9_X86_64_BASELINE_JS_CALL_NATIVE_EXIT_MAX_ARGUMENT_REGISTERS: usize = 16;
 const P9_X86_64_BASELINE_OWNER_CALL_RESET_SP_NOOP_BYTE: u8 = 0x90;
@@ -461,6 +480,15 @@ pub enum P10X86_64BaselinePropertyNativeExitOperands {
     },
     GetGlobalObjectProperty {
         destination: VirtualRegister,
+    },
+    // op_get_length: `[dest, base, identifier]`, the same shape as GetByName. JSC
+    // baseline ICs it through the same GetById machinery (op_get_length lowers to a
+    // get_by_id of "length"). This batch keeps it on the slow-path native exit (binds
+    // no operand locations), but it still counts as a property-handoff site so the
+    // dense `property_site_index` is identical between emit and writeback (FIX 2).
+    GetLength {
+        destination: VirtualRegister,
+        base: VirtualRegister,
     },
     PutByName {
         base: VirtualRegister,
@@ -1038,6 +1066,41 @@ pub enum P6X86_64BaselineMachineInstruction {
     ReturnPropertyNativeExitPayload {
         encoded_payload: P10X86_64BaselinePropertyNativeExitReturnPayload,
     },
+    // Resident `get_by_id` self-load DataIC fast path, emitted INLINE just before
+    // the slow-path `ReturnPropertyNativeExitPayload` stub for an admitted
+    // monomorphic GetByName self-access site.
+    //
+    // C++ JSC map: this mirrors `InlineAccess::generateSelfPropertyAccess`
+    // (bytecode/InlineAccess.cpp:188-204) wired through a baseline `GetByIdSelf`
+    // DataIC (jit/JITInlineCacheGenerator.cpp:140-184): structure-guard the base,
+    // then load the value at the cached inline self offset. The cached structure
+    // id and offset live in the per-CodeBlock `BaselineJITData` record store
+    // addressed through r13 (`GPRInfo::jitDataRegister`), at `records[record_index]`
+    // = `[r13 + record_index*8]` (structure id at +0, PropertyOffset at +4) -- the
+    // Rust analogue of `HandlerPropertyInlineCache` (PropertyInlineCache.h:421-422).
+    //
+    // Rust ABI specifics the C++ self-access path does not carry: the base frame
+    // slot holds a BOXED RuntimeValue = `(CoreObjectCell_ptr << 8) | TAG_CELL`
+    // (value/repr.rs:507), so the fast path FIRST guards the base is a cell
+    // (low byte == cell_tag; non-cell -> slow path, mirroring a CheckTagEquals)
+    // THEN unboxes by `shr 8` to recover the raw cell pointer before reading
+    // `[cell + STRUCTURE_ID_OFFSET]` / `[cell + STORAGE_PTR_DISP]`. The byte
+    // emitter expands this into the complete fast path plus the slow-path return
+    // stub: any guard miss jumps to the slow-path stub (the existing P10 native
+    // exit) and a hit stores the value to the destination frame slot and jumps
+    // over the slow-path stub, staying resident. The slow path returns the same
+    // `encoded_payload` as a standalone `ReturnPropertyNativeExitPayload`, so the
+    // runtime native-exit dispatch (keyed on the returned payload, not byte
+    // offsets) is unchanged.
+    PropertyDataIcSelfLoadGetByNameWithExit {
+        record_index: u32,
+        base_frame_disp32: i32,
+        dest_frame_disp32: i32,
+        structure_id_offset: i32,
+        storage_ptr_disp: i32,
+        cell_tag: u64,
+        encoded_payload: P10X86_64BaselinePropertyNativeExitReturnPayload,
+    },
     Jump {
         target: P6X86_64BaselineControlFlowBranchContract,
     },
@@ -1542,6 +1605,12 @@ pub struct P6X86_64BaselineSemanticByteEmissionResult {
     pub source_image: AssemblerByteImage,
     pub linked_image: LinkedAssemblerByteImage,
     pub entry_offset: u32,
+    // FIX 3: number of resident get_by_id self-load DataIC fast paths
+    // (`PropertyDataIcSelfLoadGetByNameWithExit`) the emitter baked into this
+    // baseline image. The install path mirrors this into `VmTieringIntegration` so
+    // DataIC residency is measurable. Counted from the accepted selection, the
+    // authoritative source of which sites got the inline fast path.
+    pub data_ic_self_load_fast_path_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2683,6 +2752,7 @@ pub fn emit_p6_x86_64_baseline_semantic_bytes(
     validate_p6_x86_64_semantic_selection_effects(&selection)?;
     validate_p6_x86_64_non_callable_has_no_runtime_helper_native_exits(&selection)?;
     let terminal = validate_p6_x86_64_semantic_terminal_policy(&selection)?;
+    let data_ic_self_load_fast_path_count = p6_x86_64_data_ic_self_load_fast_path_count(&selection);
     let encoded = encode_p6_x86_64_semantic_selection(&contract, &selection, terminal)?;
     finish_p6_x86_64_semantic_byte_emission(
         &contract,
@@ -2692,6 +2762,7 @@ pub fn emit_p6_x86_64_baseline_semantic_bytes(
         p6_x86_64_semantic_source_buffer_id(&contract),
         p6_x86_64_semantic_source_image_id(&contract),
         0,
+        data_ic_self_load_fast_path_count,
     )
 }
 
@@ -2714,6 +2785,7 @@ pub(crate) fn emit_p6_x86_64_baseline_callable_semantic_bytes_with_owner_continu
         .map_err(|error| P6X86_64BaselineSemanticByteEmissionError::Selection { error })?;
     validate_p6_x86_64_semantic_selection_effects(&selection)?;
     let terminal = validate_p6_x86_64_semantic_terminal_policy(&selection)?;
+    let data_ic_self_load_fast_path_count = p6_x86_64_data_ic_self_load_fast_path_count(&selection);
     let encoded = encode_p6_x86_64_callable_semantic_selection(
         &contract,
         &selection,
@@ -2728,7 +2800,26 @@ pub(crate) fn emit_p6_x86_64_baseline_callable_semantic_bytes_with_owner_continu
         p6_x86_64_callable_semantic_source_buffer_id(&contract),
         p6_x86_64_callable_semantic_source_image_id(&contract),
         0,
+        data_ic_self_load_fast_path_count,
     )
+}
+
+// FIX 3: count the resident `PropertyDataIcSelfLoadGetByNameWithExit` fast paths in
+// an accepted selection (the authoritative set of sites that got the inline DataIC).
+fn p6_x86_64_data_ic_self_load_fast_path_count(
+    selection: &P6X86_64BaselineInstructionSelectionPlan,
+) -> usize {
+    selection
+        .instructions
+        .iter()
+        .flat_map(|instruction| instruction.machine_instructions.iter())
+        .filter(|machine_instruction| {
+            matches!(
+                machine_instruction,
+                P6X86_64BaselineMachineInstruction::PropertyDataIcSelfLoadGetByNameWithExit { .. }
+            )
+        })
+        .count()
 }
 
 fn finish_p6_x86_64_semantic_byte_emission(
@@ -2739,6 +2830,7 @@ fn finish_p6_x86_64_semantic_byte_emission(
     source_buffer_id: AssemblerBufferId,
     source_image_id: AssemblerByteImageId,
     entry_offset: u32,
+    data_ic_self_load_fast_path_count: usize,
 ) -> Result<P6X86_64BaselineSemanticByteEmissionResult, P6X86_64BaselineSemanticByteEmissionError> {
     let P6X86_64SemanticEncodedSelection {
         bytes,
@@ -2807,6 +2899,7 @@ fn finish_p6_x86_64_semantic_byte_emission(
         source_image,
         linked_image,
         entry_offset,
+        data_ic_self_load_fast_path_count,
     })
 }
 
@@ -6004,6 +6097,25 @@ fn emit_p6_x86_64_semantic_machine_instruction(
                 encoded_payload.raw_bits(),
             ))
         }
+        P6X86_64BaselineMachineInstruction::PropertyDataIcSelfLoadGetByNameWithExit {
+            record_index,
+            base_frame_disp32,
+            dest_frame_disp32,
+            structure_id_offset,
+            storage_ptr_disp,
+            cell_tag,
+            encoded_payload,
+        } => emit_p10_x86_64_property_data_ic_self_load_get_by_name_with_exit(
+            builder,
+            bytecode_index,
+            record_index,
+            base_frame_disp32,
+            dest_frame_disp32,
+            structure_id_offset,
+            storage_ptr_disp,
+            cell_tag,
+            encoded_payload,
+        ),
         P6X86_64BaselineMachineInstruction::Jump { target } => {
             if target.kind != P6X86_64BaselineBytecodeBranchKind::UnconditionalJump
                 || target.source_bytecode_index != bytecode_index
@@ -6594,6 +6706,106 @@ fn p9_x86_64_callable_js_call_native_exit_return_stub_bytes(return_value_bits: u
 
 fn p10_x86_64_callable_property_native_exit_return_stub_bytes(return_value_bits: u64) -> Vec<u8> {
     p6_x86_64_callable_payload_return_stub_bytes(return_value_bits)
+}
+
+// Emit the resident `get_by_id` self-load DataIC fast path immediately followed
+// by the slow-path native-exit return stub. Mirrors C++
+// `InlineAccess::generateSelfPropertyAccess` (bytecode/InlineAccess.cpp:188-204)
+// over a baseline `GetByIdSelf` DataIC (jit/JITInlineCacheGenerator.cpp:140-184):
+// structure-guard the base against the cached id, then load the inline self-offset
+// value. The cached `{structure_id:u32@+0, offset:i32@+4}` lives in the per-CodeBlock
+// `BaselineJITData` record store at `[r13 + record_index*8]` (r13 ==
+// `GPRInfo::jitDataRegister`).
+//
+// Rust ABI specifics not present in the C++ self-access path:
+//   - rbp == value frame base (P6 prologue `mov rbp, rsi`), so the base value and
+//     destination are `[rbp + disp32]` frame slots.
+//   - the base frame slot holds a BOXED RuntimeValue `(cell_ptr << 8) | TAG_CELL`
+//     (value/repr.rs:507); the fast path guards the low-byte cell tag, then `shr 8`
+//     to recover the raw `CoreObjectCell` pointer before reading the cell header.
+//
+// Register use (all caller-clobberable here; rbp/r12/r13/r15/r9 are preserved):
+//   rax = boxed base -> cell ptr -> loaded value; r10 = structure id / storage ptr;
+//   r11 = cached PropertyOffset.
+//
+// Any guard miss jumps to the slow-path stub (the existing P10 native exit, which
+// returns `encoded_payload`); a hit stores the value to the destination frame slot
+// and jumps over the slow-path stub, staying resident. SENTINEL records
+// (structure_id == 0) never match a real `StructureID`, so an unfilled site always
+// takes the slow path until the first miss writes back the cached id/offset.
+#[allow(clippy::too_many_arguments)]
+fn emit_p10_x86_64_property_data_ic_self_load_get_by_name_with_exit(
+    builder: &mut P6X86_64SemanticByteBuilder,
+    bytecode_index: crate::bytecode::BytecodeIndex,
+    record_index: u32,
+    base_frame_disp32: i32,
+    dest_frame_disp32: i32,
+    structure_id_offset: i32,
+    storage_ptr_disp: i32,
+    cell_tag: u64,
+    encoded_payload: P10X86_64BaselinePropertyNativeExitReturnPayload,
+) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    let cell_tag = p6_x86_64_semantic_u8_tag(bytecode_index, cell_tag)?;
+    // record_index*8 (structure id) and record_index*8 + 4 (offset) must fit a
+    // disp32 from r13. record_index is the dense property-site ordinal, which is
+    // tiny, but check rather than silently wrap into a wrong record read.
+    let record_byte_offset = (record_index as i64)
+        .checked_mul(8)
+        .filter(|&value| value <= i64::from(i32::MAX) - 4)
+        .ok_or(
+            P6X86_64BaselineSemanticByteEmissionError::FrameOffsetOutOfDisp32 {
+                bytecode_index,
+                location: P6X86_64BaselineOperandLocation::FrameLocal {
+                    local_index: record_index,
+                    slot_index: record_index,
+                    byte_offset: u64::from(record_index).saturating_mul(8),
+                },
+                byte_offset: u64::from(record_index).saturating_mul(8),
+            },
+        )? as i32;
+    let structure_id_record_disp32 = record_byte_offset;
+    let offset_record_disp32 = record_byte_offset + 4;
+
+    // mov rax, [rbp + base_frame_disp32]  (load boxed base value)
+    builder.emit(&[0x48, 0x8b, 0x85])?;
+    builder.emit_i32_le(base_frame_disp32)?;
+    // cmp al, cell_tag ; jne -> slow path (base is not a cell)
+    builder.emit(&[0x3c, cell_tag])?;
+    let not_cell = builder.emit_jne_rel32_internal()?;
+    // shr rax, 8  (unbox: recover the raw CoreObjectCell pointer)
+    builder.emit(&[0x48, 0xc1, 0xe8, 0x08])?;
+    // mov r10d, [rax + structure_id_offset]  (cell structure id)
+    builder.emit(&[0x44, 0x8b, 0x90])?;
+    builder.emit_i32_le(structure_id_offset)?;
+    // cmp r10d, [r13 + structure_id_record_disp32]  (cell id vs cached id)
+    builder.emit(&[0x45, 0x3b, 0x95])?;
+    builder.emit_i32_le(structure_id_record_disp32)?;
+    let structure_miss = builder.emit_jne_rel32_internal()?;
+    // mov r11d, [r13 + offset_record_disp32]  (cached PropertyOffset)
+    builder.emit(&[0x45, 0x8b, 0x9d])?;
+    builder.emit_i32_le(offset_record_disp32)?;
+    // mov r10, [rax + storage_ptr_disp]  (storage base pointer)
+    builder.emit(&[0x4c, 0x8b, 0x90])?;
+    builder.emit_i32_le(storage_ptr_disp)?;
+    // mov rax, [r10 + r11*8]  (value at storage_base + offset*8, scale-8 SIB)
+    builder.emit(&[0x4b, 0x8b, 0x04, 0xda])?;
+    // mov [rbp + dest_frame_disp32], rax  (store value to destination frame slot)
+    builder.emit(&[0x48, 0x89, 0x85])?;
+    builder.emit_i32_le(dest_frame_disp32)?;
+    // jmp -> done (resident fall-through, over the slow-path stub)
+    let resident_done = builder.emit_jmp_rel32_internal()?;
+
+    // slow path: same bytes a standalone `ReturnPropertyNativeExitPayload` emits.
+    let slow_path_offset = builder.offset()?;
+    builder.patch_internal_branch_to_target(not_cell, slow_path_offset)?;
+    builder.patch_internal_branch_to_target(structure_miss, slow_path_offset)?;
+    builder.emit(&p10_x86_64_callable_property_native_exit_return_stub_bytes(
+        encoded_payload.raw_bits(),
+    ))?;
+
+    // done: resident path rejoins here, past the slow-path stub.
+    builder.patch_internal_branch_to_current(resident_done)?;
+    Ok(())
 }
 
 fn p14_x86_64_callable_loop_backedge_return_stub_bytes(return_value_bits: u64) -> Vec<u8> {
@@ -7648,8 +7860,36 @@ fn p6_x86_64_baseline_backend_instruction_contract(
             });
         }
         P6X86_64BaselineLoweredOperation::RuntimeHelperNativeExit { .. }
-        | P6X86_64BaselineLoweredOperation::JsCallNativeExit { .. }
-        | P6X86_64BaselineLoweredOperation::PropertyNativeExit { .. } => {}
+        | P6X86_64BaselineLoweredOperation::JsCallNativeExit { .. } => {}
+        // Bind the destination + base frame slots for a GetByName self-load site so
+        // the backend can emit the inline DataIC fast path's frame-relative
+        // `mov rax, [rbp + base]` / `mov [rbp + dest], rax`. The base is read (not a
+        // destination) and the destination is written; both must be plain frame
+        // locals. Other property-handoff operand shapes (GetByValue, PutByName, ...)
+        // bind nothing and keep the slow-path-only native exit -- this batch only
+        // emits the self-load DataIC for GetByName.
+        P6X86_64BaselineLoweredOperation::PropertyNativeExit { operands, .. } => {
+            if let P10X86_64BaselinePropertyNativeExitOperands::GetByName { destination, base } =
+                operands
+            {
+                operand_locations.push(p6_operand_location_record(
+                    bytecode_index,
+                    P6X86_64BaselineOperandRole::Destination,
+                    destination,
+                    true,
+                    frame_layout,
+                    frame_local_count,
+                )?);
+                operand_locations.push(p6_operand_location_record(
+                    bytecode_index,
+                    P6X86_64BaselineOperandRole::Source,
+                    base,
+                    false,
+                    frame_layout,
+                    frame_local_count,
+                )?);
+            }
+        }
     }
 
     Ok(P6X86_64BaselineBackendInstructionContract {
@@ -8523,8 +8763,10 @@ fn p6_select_x86_64_instruction(
             encoded_payload, ..
         } => p9_select_js_call_native_exit(instruction, encoded_payload)?,
         P6X86_64BaselineLoweredOperation::PropertyNativeExit {
-            encoded_payload, ..
-        } => p10_select_property_native_exit(instruction, encoded_payload)?,
+            operands,
+            encoded_payload,
+            ..
+        } => p10_select_property_native_exit(contract, instruction, operands, encoded_payload)?,
     };
 
     Ok(P6X86_64BaselineSelectedInstruction {
@@ -8575,7 +8817,9 @@ fn p9_select_js_call_native_exit(
 }
 
 fn p10_select_property_native_exit(
+    contract: &P6X86_64BaselineBackendContractRecord,
     instruction: &P6X86_64BaselineBackendInstructionContract,
+    operands: P10X86_64BaselinePropertyNativeExitOperands,
     encoded_payload: P10X86_64BaselinePropertyNativeExitReturnPayload,
 ) -> Result<Vec<P6X86_64BaselineMachineInstruction>, P6X86_64BaselineInstructionSelectionError> {
     if let Some(actual) = instruction.arithmetic_exit_policy {
@@ -8586,10 +8830,130 @@ fn p10_select_property_native_exit(
             },
         );
     }
+
+    // Admission: only a GetByName self-access site with its destination + base both
+    // bound to plain frame locals (so the inline DataIC can `mov rax, [rbp+disp]` /
+    // `mov [rbp+disp], rax`) gets the resident self-load fast path. Every other
+    // property-handoff opcode -- and any GetByName whose operands do not resolve to
+    // frame locals -- binds no operand locations in the contract and keeps the
+    // slow-path-only native exit. The record store starts SENTINEL (structure_id ==
+    // 0), so an admitted-but-unfilled site always takes the slow path until the
+    // first P10 miss writes back the cached structure/offset (STEP C).
+    //
+    // C++ baseline emits the IC fast path for every get_by_id; we admit only the
+    // structurally simple self-load shape this batch can encode and fall back to the
+    // existing interpreter handoff for the rest, keeping the fallback fully intact.
+    if let P10X86_64BaselinePropertyNativeExitOperands::GetByName { .. } = operands {
+        if let Some((dest_frame_disp32, base_frame_disp32)) =
+            p10_self_load_frame_disp32_for_get_by_name(instruction)?
+        {
+            let record_index = encoded_payload.property_exit_index();
+            return Ok(vec![
+                P6X86_64BaselineMachineInstruction::PropertyDataIcSelfLoadGetByNameWithExit {
+                    record_index,
+                    base_frame_disp32,
+                    dest_frame_disp32,
+                    structure_id_offset: P10_X86_64_BASELINE_CELL_STRUCTURE_ID_OFFSET,
+                    storage_ptr_disp: P10_X86_64_BASELINE_CELL_STORAGE_PTR_DISP,
+                    cell_tag: contract.value_layout.cell_tag,
+                    encoded_payload,
+                },
+            ]);
+        }
+        // GetByName whose operands the contract bound but that did not resolve to the
+        // simple frame-local self-load shape (e.g. an argument base): keep the
+        // slow-path exit, but do not require empty operand locations -- the contract
+        // legitimately bound (Destination, Source) for every GetByName site.
+        return Ok(vec![
+            P6X86_64BaselineMachineInstruction::ReturnPropertyNativeExitPayload { encoded_payload },
+        ]);
+    }
+
     p6_exact_operand_locations(instruction, &[])?;
     Ok(vec![
         P6X86_64BaselineMachineInstruction::ReturnPropertyNativeExitPayload { encoded_payload },
     ])
+}
+
+// Resolve the (destination, base) frame displacements for a GetByName self-load
+// DataIC, or `None` when the contract bound no operands (the non-admitted shape) or
+// the operands are not an admissible self-load shape fitting a disp32.
+//
+// Both the destination slot and the base value are addressed from rbp (the P6
+// prologue's `mov rbp, rsi` value frame base), the same base the existing frame
+// `LoadQ`/`StoreQ` use. The destination must be a plain frame local (a get_by_id
+// destination is always a temp/local, never a callee argument slot). The BASE,
+// however, may be EITHER a frame local OR a frame ARGUMENT (FIX 1): real richards'
+// hot get_by_id receivers (`this.currentTcb`, `this.list`, ...) put `this` in a
+// frame ARGUMENT slot, so admitting only frame-local bases left 231 hot sites on the
+// slow path. A frame argument's rbp-relative byte offset is
+// `byte_offset_from_frame_base` -- computed by the same `p6_operand_location`
+// VirtualRegister->byte_offset mechanism the call frame uses for argument slots --
+// so the DataIC reads `mov rax, [rbp + argument_disp32]` exactly like a local
+// (`p6_x86_64_disp32_for_frame_local` already treats both as positive rbp-relative
+// displacements for LoadQ/StoreQ). Every other base shape (constant/computed) stays
+// on the slow path.
+fn p10_self_load_frame_disp32_for_get_by_name(
+    instruction: &P6X86_64BaselineBackendInstructionContract,
+) -> Result<Option<(i32, i32)>, P6X86_64BaselineInstructionSelectionError> {
+    let records = instruction.operand_locations.as_slice();
+    let [destination, base] = records else {
+        // No bound operands => non-admitted site; keep the slow-path exit.
+        return Ok(None);
+    };
+    if destination.role != P6X86_64BaselineOperandRole::Destination
+        || base.role != P6X86_64BaselineOperandRole::Source
+    {
+        return Err(
+            P6X86_64BaselineInstructionSelectionError::UnexpectedOperandRoles {
+                bytecode_index: instruction.lowered.bytecode_index,
+                expected: vec![
+                    P6X86_64BaselineOperandRole::Destination,
+                    P6X86_64BaselineOperandRole::Source,
+                ],
+                actual: vec![destination.role, base.role],
+            },
+        );
+    }
+    let (Some(dest_disp32), Some(base_disp32)) = (
+        // Destination: frame local only (the write target frame slot).
+        p10_frame_local_disp32(destination.location),
+        // Base: frame local OR frame argument, both rbp-relative (FIX 1).
+        p10_self_load_base_disp32(base.location),
+    ) else {
+        // A non-frame-resident operand (constant/computed dest, or a non-frame base)
+        // is not the simple self-load shape; keep the slow-path exit rather than
+        // encode an address we cannot.
+        return Ok(None);
+    };
+    Ok(Some((dest_disp32, base_disp32)))
+}
+
+fn p10_frame_local_disp32(location: P6X86_64BaselineOperandLocation) -> Option<i32> {
+    match location {
+        P6X86_64BaselineOperandLocation::FrameLocal { byte_offset, .. } => {
+            i32::try_from(byte_offset).ok()
+        }
+        _ => None,
+    }
+}
+
+// rbp-relative disp32 for a self-load BASE: a frame local (positive
+// `byte_offset`) or a frame argument (positive `byte_offset_from_frame_base`),
+// both addressed from rbp == the value frame base, identical to
+// `p6_x86_64_disp32_for_frame_local`'s frame-local/frame-argument handling for
+// LoadQ/StoreQ. Any other location (constant/computed) is not an admissible base.
+fn p10_self_load_base_disp32(location: P6X86_64BaselineOperandLocation) -> Option<i32> {
+    match location {
+        P6X86_64BaselineOperandLocation::FrameLocal { byte_offset, .. } => {
+            i32::try_from(byte_offset).ok()
+        }
+        P6X86_64BaselineOperandLocation::FrameArgument {
+            byte_offset_from_frame_base,
+            ..
+        } => i32::try_from(byte_offset_from_frame_base).ok(),
+        _ => None,
+    }
 }
 
 fn p6_select_jump(
@@ -10241,6 +10605,21 @@ fn collect_p6_x86_64_lowering_operations_with_native_exits(
                         opcode: instruction.opcode,
                         core_opcode: Some(opcode),
                     })?;
+                // FIX 2 reconciliation: the emit-time `property_site_index` baked into
+                // the DataIC machine code MUST equal the writeback's positional index
+                // over the plan's `sites` (`property_site_index_for_bytecode_index`).
+                // Both now filter decoded instructions in bytecode order by THE same
+                // canonical predicate, so they are provably the identical enumeration.
+                // Assert it here so any future predicate/order drift fails loudly in
+                // debug instead of reading/writing the wrong resident record.
+                debug_assert_eq!(
+                    property_native_exit_plan.and_then(|plan| plan
+                        .borrowed_plan()
+                        .property_site_index_for_bytecode_index(instruction.bytecode_index)),
+                    Some(property_site_index as usize),
+                    "emit-index != writeback-index for property-handoff site at {:?}",
+                    instruction.bytecode_index,
+                );
                 let lowered = lower_p10_x86_64_property_native_exit(
                     instruction,
                     opcode,
@@ -10737,18 +11116,14 @@ const fn p9_x86_64_js_call_native_exit_opcode(opcode: CoreOpcode) -> bool {
     )
 }
 
+// FIX 2: delegate to THE canonical property-handoff predicate so the emitter's
+// `property_site_index` counter enumerates the EXACT same set, in the same bytecode
+// order, as the plan's `sites` (record-store size + writeback positional index).
+// Previously this list omitted GetLength while the plan included it, so any DataIC
+// site that followed a GetLength in bytecode order baked record_index = i but the
+// writeback wrote records[i+1] -> wrong value / segfault.
 const fn p10_x86_64_property_native_exit_opcode(opcode: CoreOpcode) -> bool {
-    matches!(
-        opcode,
-        CoreOpcode::GetByName
-            | CoreOpcode::GetGlobalObjectProperty
-            | CoreOpcode::PutByName
-            | CoreOpcode::PutGlobalObjectProperty
-            | CoreOpcode::GetByValue
-            | CoreOpcode::PutByValue
-            | CoreOpcode::InById
-            | CoreOpcode::InByVal
-    )
+    baseline_opcode_is_generated_property_handoff(opcode)
 }
 
 fn validate_p10_x86_64_property_native_exit_operands(
@@ -10788,6 +11163,26 @@ fn validate_p10_x86_64_property_native_exit_operands(
                 });
             }
             P10X86_64BaselinePropertyNativeExitOperands::GetByName { destination, base }
+        }
+        CoreOpcode::GetLength => {
+            // Same `[dest, base, identifier]` shape as GetByName. Kept on the slow
+            // path (the contract binds no operand locations for GetLength), but it
+            // must be a valid p10 site so the canonical `property_site_index`
+            // enumeration matches the plan's (FIX 2).
+            let destination = p6_register_operand(instruction, opcode, 0)?;
+            let base = p6_register_operand(instruction, opcode, 1)?;
+            let identifier_index = p6_identifier_index_operand(instruction, opcode, 2)?;
+            let property_key = PropertyKey::from_identifier(Identifier::from_atom(
+                AtomId::from_table_slot(identifier_index),
+            ));
+            if site.property_key != PropertyCacheKey::Key(property_key) {
+                return Err(P6X86_64BaselineLoweringError::UnsupportedOpcode {
+                    bytecode_index: instruction.bytecode_index,
+                    opcode: instruction.opcode,
+                    core_opcode: Some(opcode),
+                });
+            }
+            P10X86_64BaselinePropertyNativeExitOperands::GetLength { destination, base }
         }
         CoreOpcode::GetGlobalObjectProperty => {
             let destination = p6_register_operand(instruction, opcode, 0)?;
@@ -11926,6 +12321,28 @@ mod tests {
                 ],
             ),
             typed_instruction(2, CoreOpcode::Return, vec![Operand::Register(local(1))]),
+        ])
+    }
+
+    // GetByName whose base is a plain frame LOCAL (not an argument), so the
+    // self-load DataIC fast path is admitted. Destination local(2), base local(1).
+    fn p10_get_by_name_self_load_frame_local_code_block() -> CodeBlock {
+        code_block_from_typed_instructions(vec![
+            typed_instruction(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(0)), Operand::SignedImmediate(7)],
+            ),
+            typed_instruction(
+                1,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(2)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            typed_instruction(2, CoreOpcode::Return, vec![Operand::Register(local(2))]),
         ])
     }
 
@@ -16194,7 +16611,7 @@ mod tests {
                 0x48, 0x89, 0xf5, // mov rbp, rsi
                 0x49, 0x89, 0xff, // mov r15, rdi
                 0x49, 0x89, 0xd1, // mov r9, rdx
-                0x49, 0x89, 0xcb, // mov r13, rcx (jitDataRegister = IC store base)
+                0x49, 0x89, 0xcd, // mov r13, rcx (jitDataRegister = IC store base)
             ]
         );
         assert_eq!(
@@ -17253,6 +17670,153 @@ mod tests {
             ),
             None
         );
+    }
+
+    // STEP B: a GetByName with a plain frame-local base emits the resident self-load
+    // DataIC fast path INLINE before the slow-path return stub. Pin the exact fast-path
+    // prologue bytes (rel32-independent) and confirm the slow-path stub (returning the
+    // P10 native-exit payload) is still present so a miss exits to the interpreter.
+    #[test]
+    fn p10_callable_emission_emits_inline_self_load_data_ic_for_frame_local_get_by_name() {
+        let code_block = p10_get_by_name_self_load_frame_local_code_block();
+        let result = p10_callable_semantic_emission_for_code_block(&code_block).unwrap();
+        assert_eq!(result.property_native_exit_stubs.len(), 1);
+        let property = &result.property_native_exit_stubs[0];
+        assert_eq!(property.site.opcode, CoreOpcode::GetByName);
+        assert_eq!(
+            property.operands,
+            P10X86_64BaselinePropertyNativeExitOperands::GetByName {
+                destination: local(2),
+                base: local(1),
+            }
+        );
+
+        // base local(1) -> [rbp + 8]; dest local(2) -> [rbp + 16]; record_index 0.
+        let bytes = &property.bytes;
+        // mov rax, [rbp+8]
+        assert_eq!(&bytes[0..7], &[0x48, 0x8b, 0x85, 0x08, 0x00, 0x00, 0x00]);
+        // cmp al, TAG_CELL(0x20)
+        assert_eq!(&bytes[7..9], &[0x3c, 0x20]);
+        // jne rel32 (slow path / not a cell)
+        assert_eq!(&bytes[9..11], &[0x0f, 0x85]);
+        // shr rax, 8  (unbox)
+        assert_eq!(&bytes[15..19], &[0x48, 0xc1, 0xe8, 0x08]);
+        // mov r10d, [rax+0]  (structure id)
+        assert_eq!(&bytes[19..26], &[0x44, 0x8b, 0x90, 0x00, 0x00, 0x00, 0x00]);
+        // cmp r10d, [r13+0]  (cached id)
+        assert_eq!(&bytes[26..33], &[0x45, 0x3b, 0x95, 0x00, 0x00, 0x00, 0x00]);
+        // jne rel32 (structure miss)
+        assert_eq!(&bytes[33..35], &[0x0f, 0x85]);
+        // mov r11d, [r13+4]  (cached offset)
+        assert_eq!(&bytes[39..46], &[0x45, 0x8b, 0x9d, 0x04, 0x00, 0x00, 0x00]);
+        // mov r10, [rax+8]  (storage ptr)
+        assert_eq!(&bytes[46..53], &[0x4c, 0x8b, 0x90, 0x08, 0x00, 0x00, 0x00]);
+        // mov rax, [r10+r11*8]  (value)
+        assert_eq!(&bytes[53..57], &[0x4b, 0x8b, 0x04, 0xda]);
+        // mov [rbp+16], rax  (store to dest)
+        assert_eq!(&bytes[57..64], &[0x48, 0x89, 0x85, 0x10, 0x00, 0x00, 0x00]);
+        // jmp rel32 (resident, over the slow-path stub)
+        assert_eq!(bytes[64], 0xe9);
+
+        // The slow-path return stub bytes must still appear (mov eax, payload + epilogue
+        // ending in ret) so a guard miss exits the same way a standalone P10 exit would.
+        let standalone_stub = p10_x86_64_callable_property_native_exit_return_stub_bytes(
+            property.encoded_payload.raw_bits(),
+        );
+        assert!(
+            bytes
+                .windows(standalone_stub.len())
+                .any(|window| window == standalone_stub.as_slice()),
+            "DataIC must embed the slow-path native-exit return stub"
+        );
+        assert_eq!(*bytes.last().unwrap(), 0xc3, "slow path ends in ret");
+    }
+
+    // FIX 2 reconciliation: the emit-time `property_exit_index()` baked into each
+    // property-handoff lowered op MUST equal the plan's positional
+    // `property_site_index_for_bytecode_index`. Both now filter decoded instructions in
+    // bytecode order by THE canonical `baseline_opcode_is_generated_property_handoff`
+    // predicate, so they are the identical enumeration. This block interleaves a
+    // GetLength (the opcode the emitter used to OMIT from its counter while the plan
+    // counted it, the exact off-by-one source) between two admitted GetByName self-load
+    // sites, so a regression desyncs the second GetByName's record index here. The
+    // lowering loop also debug_asserts this equality; this test pins it explicitly.
+    #[test]
+    fn p10_property_handoff_emit_index_equals_writeback_index_with_interleaved_get_length() {
+        let code_block = code_block_from_typed_instructions(vec![
+            typed_instruction(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(2)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            typed_instruction(
+                1,
+                CoreOpcode::GetLength,
+                vec![
+                    Operand::Register(local(3)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(12),
+                ],
+            ),
+            typed_instruction(
+                2,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(4)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(13),
+                ],
+            ),
+            typed_instruction(3, CoreOpcode::Return, vec![Operand::Register(local(4))]),
+        ]);
+
+        let property_plan =
+            crate::jit::plan::derive_baseline_generated_property_handoff_plan_from_code_block(
+                &code_block,
+                owner(),
+            )
+            .unwrap()
+            .metadata
+            .expect("property native-exit metadata");
+        // All three property-handoff opcodes count (GetByName, GetLength, GetByName).
+        assert_eq!(property_plan.site_count(), 3);
+
+        let proof = p9_mixed_lowering_proof(&code_block);
+        let lowering = plan_p6_x86_64_baseline_lowering_with_native_exits(
+            P6X86_64BaselineLoweringRequest::new(owner(), &code_block, proof),
+            None,
+            None,
+            Some(&property_plan),
+        )
+        .unwrap();
+
+        let plan = property_plan.borrowed_plan();
+        let mut admitted_sites = 0;
+        for op in &lowering.plan.operations {
+            if let P6X86_64BaselineLoweredOperation::PropertyNativeExit {
+                encoded_payload, ..
+            } = op.operation
+            {
+                let emit_index = encoded_payload.property_exit_index() as usize;
+                let writeback_index = plan
+                    .property_site_index_for_bytecode_index(op.bytecode_index)
+                    .expect("every property-handoff site has a plan index");
+                assert_eq!(
+                    emit_index, writeback_index,
+                    "emit-index != writeback-index at {:?}",
+                    op.bytecode_index
+                );
+                admitted_sites += 1;
+            }
+        }
+        // All three property-handoff sites lowered to PropertyNativeExit ops with
+        // matching indices (the GetLength in the middle does not skew the second
+        // GetByName's index).
+        assert_eq!(admitted_sites, 3);
     }
 
     #[test]
@@ -18473,6 +19037,7 @@ mod tests {
             P6X86_64BaselineSemanticByteEmissionAuthority::NonExecutableNonCallableSemanticBytesOnly,
             p6_x86_64_semantic_source_buffer_id(&contract),
             p6_x86_64_semantic_source_image_id(&contract),
+            0,
             0,
         )
         .unwrap();
