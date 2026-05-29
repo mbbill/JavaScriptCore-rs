@@ -9,3 +9,13 @@ publish = false
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+# Optimized profile for trustworthy perf comparison against local C++ JSC.
+# C++ JSC (JSCOnly Release) is built fully optimized + LTO, so a faithful
+# parity measurement requires the Rust engine to be comparably optimized.
+# `debug = 1` keeps line tables for profiler breakdowns of interpreter hot ops.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
