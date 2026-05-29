@@ -14,14 +14,20 @@ Legend:
 - [deferred] intentionally later than the current path
 
 ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
-  Phase 1 [wip]  Interpreter performance: make rooting C++-faithful (conservative
-                 scan at safepoints, no per-op register-root registry). Goal: 3-10x
-                 faster iteration + first non-zero climbing Octane score; also the
-                 safepoint foundation the GC needs.
-  Phase 2 [next] Octane feature completeness (perf-independent): everything needed to
-                 RUN all 15 benchmarks correctly -- eval (runtime parse+compile;
-                 unblocks code-load/earley-boyer/gbemu/mandreel/pdfjs), full Yarr
-                 (regexp), remaining runtime/stdlib gaps. Interpreter/baseline, either.
+  Phase 1 [mostly done] Interpreter performance for faster iteration. Cut 1: gate
+                 per-op register-root sync on cell-membership (3.6-4.9x; arith 20M
+                 245s->49s). Cut 2: drop per-register-write barrier (no C++
+                 counterpart for stack stores). Residual 2nd tier (HashMap props,
+                 CoreObjectCell, match dispatch, the sync itself on cell-churning
+                 code like richards) deferred to Phase 3; full safepoint rewrite is
+                 GC-coupled. Iteration is now fine for feature-dev (cargo test 0.8s).
+  Phase 2 [wip]  Octane feature completeness (perf-independent): RUN all benchmarks
+                 correctly. CORRECTED by ground-truth run-state (2026-05-29): the
+                 4 "eval-blocked" benchmarks were actually COMPILE-blocked by a
+                 store-to-unresolved-identifier bug -- FIXED (38ce3a4), now past
+                 prepare. Remaining: indirect eval (code-load + zlib runtime throw),
+                 the delta-blue regression, regexp/pdfjs hangs, splay(GC). eval is a
+                 defined binding; only its INVOCATION throws.
   Phase 3 [deferred] JIT as the perf path toward parity. NOTE: suite-SCORE parity is
                  structurally owned by the DEFERRED optimizing tiers (DFG/FTL/B3
                  ~283k LoC) + real GC; a baseline-only JIT asymptotes ~10-25%. Do NOT
@@ -33,56 +39,29 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] JetStreamDriver load order and shell globals
     [done] iteration, validation, scoring, and telemetry
     [done] benchmark/probe command surface for current investigations
-  [wip] Current proof path — core 4/6 pass (interpreter), full 4/15. Octane SCORE = 0.
-    [blocked] CONFIRMED CRITICAL GATE (3 measurements agree): richards' hot FUNCTIONS
-           never execute generated code -- only the top-level Program does; calls run
-           the callee in the INTERPRETER (generated_direct_call_transactions=0). So the
-           whole baseline get_by_id/call DataIC machine-code stack (self-load,
-           prototype-load, call-link admission) is emitted onto function bodies that
-           never run as machine code -> richards stays at ~1.6 bytecodes/generated-entry,
-           PROPERTY exit class 96, both FLAT across every DataIC batch. The real gate is
-           call-DISPATCH-INTO-generated-code, NOT opcode coverage. Per-opcode DataIC
-           grind is correct groundwork but cannot move any score until this is solved.
-           STRATEGIC REFRAME pending (2026-05-29).
-    [wip] Octane core (6 benchmarks)
-      [done] richards, navier-stokes, crypto, delta-blue (interpreter, scored)
-      [risk] raytrace render path CORRECT (validated: checkNumber guard reached,
-             monotonic w/ canvas size), but throughput-gated like the suite (30x30
-             render ~57s; official = 15x 100x100/iter) -> NOT a cheap win; same
-             generated-code throughput bottleneck as box2d
-      [risk] splay functionally expected pass but pathologically slow (48min+,
-             killed): it is the GC-stress benchmark and the engine runs no GC, so
-             it allocates unboundedly -> reinforces GC is needed for splay perf
-             (note: box2d RSS is flat, so box2d is NOT a GC problem -- different root)
-    [wip] Octane non-core (9 benchmarks)
-      [done] non-ASCII strings, replace-with-fn, .5 literals, String.match,
-             __defineGetter__/__defineSetter__, global Function, standard Math
-             (trig/round/sign/exp/hypot/...), apply/bind, isFinite/isNaN,
-             NaN/Infinity/parseFloat globals
-      [deferred] code-load, earley-boyer, gbemu, mandreel <= NO eval() support at all
-                 (typeof eval === undefined). Real eval = runtime parse+compile in
-                 caller scope + dynamic scope-chain resolution. Large subsystem, not
-                 a quick capture fix. Verified empirically 2026-05-27.
-      [blocked] box2d <= interpreter-COMPUTE-bound, NOT GC-bound (RSS flat ~1816kB
-                 across a 64s Step; one Step ~53-60s interpreter CPU). Baseline tier
-                 is currently a ~8.5x NET REGRESSION (MakeNewWorld 39s baseline vs
-                 4.6s interpreter): generated code runs only ~2 bytecodes/entry then
-                 exits+re-enters. Gate is generated-code RESIDENCY, capped by (1)
-                 property-IC attachment in hot b2ContactSolver blocks (sidecar returns
-                 None -> `Property` exit when no plan attached) and (2) user-JS `call`
-                 exits (R.Clamp/SynchronizeTransform always terminate residency; only
-                 native intrinsics stay resident). Non-cell property IC-hit resident
-                 path ALREADY exists; LoopHint-handoff widening was the WRONG lever
-                 (trigger already fires: 729 backedges/47 installs on MakeNewWorld;
-                 residency is the gate, not the trigger). `MakeNewWorld(); true`
-                 passes; `world.Step(1/60,10,3)` times out 120s. Next: measure
-                 exit-reason breakdown, then fix IC attachment and/or resident call.
-                 Object/BigInt bitwise and shift coercion remains a separate risk.
-      [blocked] regexp <= complex Yarr patterns throw (match works, exec/replace
-                 subset works; needs fuller Yarr execute)
-      [blocked] pdfjs <= non-ASCII fixed; likely needs eval too
-    [missing] full Octane correctness
-    [missing] Octane score parity with local C++ JSC
+  [wip] Current proof path. GROUND-TRUTH run-state (2026-05-29, interpreter, 60s budget):
+    [done] SCORES: crypto (0.604), navier-stokes (1.355); richards scores given time
+           (~79s/iter, 0.062). First real non-zero scores achieved.
+    [wip] PAST-PREPARE BUT SLOW/TIMEOUT (functional, perf-gated -> Phase 1/3, not feature):
+           richards, raytrace, splay (GC-stress), pdfjs, Box2D, typescript; regexp
+           (hangs in regexp.js top-level, does NOT throw -- not a Yarr-throw as old
+           tree claimed). delta-blue REGRESSED: old tree says scored, now times out
+           even at 180s/2-iter -- investigate (Phase 2 correctness).
+    [wip] RUNTIME THROW needing indirect eval: octane-code-load (indirect eval on a
+           whole program) and octane-zlib (asm.js blob invokes eval). eval EXISTS as
+           a binding; only invocation throws. Indirect-eval-as-global is the next
+           Phase 2 target (the whole Eval parse/bytecompile pipeline already exists;
+           one serial decision: native-call -> compile-pipeline re-entrancy).
+    [done] COMPILE-BLOCK on implicit-global store FIXED (38ce3a4): gbemu, earley-boyer,
+           mandreel now run past prepare; code-load now compiles (-> eval throw above).
+    [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
+           __defineGetter__/Setter__, global Function, Math, apply/bind, globals
+    [note] Phase 3 (JIT) context: richards' hot FUNCTIONS don't run generated code
+           (calls run callee in interpreter, generated_direct_call=0); the real JIT
+           gate is call-dispatch-into-generated-code, not opcode coverage. Deferred.
+    [missing] Octane score parity with local C++ JSC (needs optimizing tiers -- Phase 3)
+    [note] box2d/regexp/pdfjs/splay specifics are perf/throughput-gated (Phase 1/3) or
+           GC (splay); box2d Object/BigInt bitwise+shift coercion is a separate risk.
 
 [wip] C++ JSC structural fidelity
   [done] always-context rewrite contract in CLAUDE.md
