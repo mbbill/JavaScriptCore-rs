@@ -2825,6 +2825,13 @@ enum EmittedAssignmentTarget {
         object: VirtualRegister,
         key: VirtualRegister,
     },
+    // Assignment target is an UNRESOLVED identifier: C++ JSC lowers it to a
+    // put_to_scope resolving to the global object (sloppy: implicit global
+    // creation; strict: runtime ReferenceError), never a compile error. Mirrors
+    // the read path's unconditional global fallback.
+    GlobalObjectProperty {
+        name: ParserIdentifier,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4881,7 +4888,17 @@ impl AstBytecodeEmitter<'_, '_> {
                         self.emit_put_global_object_property(name.name, value);
                         self.declare_source_sloppy_global_property(name.name)?;
                     }
-                    None => return Err(BytecompilerEmissionError::UnboundIdentifier(name.name)),
+                    // C++ JSC lowers assignment to an UNRESOLVED identifier as
+                    // op_put_to_scope resolving to the global object (resolve type
+                    // GlobalProperty/Dynamic) -- it is NOT a compile error. In
+                    // sloppy mode the store creates the global property (the
+                    // Octane case: implicit globals assigned inside function
+                    // bodies); in strict mode it is a runtime ReferenceError.
+                    // Mirror the read path's unconditional global fallback
+                    // (emit_get_global_object_property). The strict-mode runtime
+                    // ReferenceError on an unresolved store is a known follow-up
+                    // divergence shared with the read path.
+                    None => self.emit_put_global_object_property(name.name, value),
                 }
                 Ok(value)
             }
@@ -4948,17 +4965,31 @@ impl AstBytecodeEmitter<'_, '_> {
     ) -> Result<EmittedAssignmentReference, BytecompilerEmissionError> {
         match self.arena.expression(target).cloned() {
             Some(Expr::Name(name)) if name.kind == NameKind::Resolve => {
-                let binding = self
-                    .resolve_binding(name.name)
-                    .ok_or(BytecompilerEmissionError::UnboundIdentifier(name.name))?;
-                let value = self.emit_read_resolved_binding(binding)?;
-                Ok(EmittedAssignmentReference {
-                    target: EmittedAssignmentTarget::Binding {
-                        name: name.name,
-                        target: binding,
-                    },
-                    value,
-                })
+                match self.resolve_binding(name.name) {
+                    Some(binding) => {
+                        let value = self.emit_read_resolved_binding(binding)?;
+                        Ok(EmittedAssignmentReference {
+                            target: EmittedAssignmentTarget::Binding {
+                                name: name.name,
+                                target: binding,
+                            },
+                            value,
+                        })
+                    }
+                    // Unresolved compound-assignment/update target (e.g. an
+                    // implicit global `x += 1` inside a function): read the
+                    // current value from and write back to the global object,
+                    // mirroring the plain-assignment global fallback above.
+                    None => {
+                        let value = self.emit_get_global_object_property(name.name)?;
+                        Ok(EmittedAssignmentReference {
+                            target: EmittedAssignmentTarget::GlobalObjectProperty {
+                                name: name.name,
+                            },
+                            value,
+                        })
+                    }
+                }
             }
             Some(Expr::Member(member)) => {
                 let object = self.emit_expression(member.base)?;
@@ -5002,6 +5033,9 @@ impl AstBytecodeEmitter<'_, '_> {
             EmittedAssignmentTarget::Bracket { object, key } => {
                 self.emit_put_by_value(object, key, value)
             }
+            EmittedAssignmentTarget::GlobalObjectProperty { name } => {
+                self.emit_put_global_object_property(name, value)
+            }
         }
     }
 
@@ -5012,10 +5046,13 @@ impl AstBytecodeEmitter<'_, '_> {
     ) -> Result<(), BytecompilerEmissionError> {
         match self.arena.expression(target).cloned() {
             Some(Expr::Name(name)) if name.kind == NameKind::Resolve => {
-                let target = self
-                    .resolve_binding(name.name)
-                    .ok_or(BytecompilerEmissionError::UnboundIdentifier(name.name))?;
-                self.emit_write_resolved_binding(name.name, target, value);
+                match self.resolve_binding(name.name) {
+                    // Unresolved destructuring target -> global object (implicit
+                    // global creation in sloppy mode), per the plain-assignment
+                    // global fallback above.
+                    Some(target) => self.emit_write_resolved_binding(name.name, target, value),
+                    None => self.emit_put_global_object_property(name.name, value),
+                }
                 Ok(())
             }
             Some(Expr::Member(member)) => {
