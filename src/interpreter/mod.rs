@@ -5387,10 +5387,37 @@ enum CorePrototypeIdentity {
     Cell(usize),
 }
 
-#[derive(Clone, Debug, Default)]
+// C++ JSC: a JSCell begins with m_structureID at structureIDOffset()==0
+// (runtime/JSCell.h:236,293) and a JSObject's Butterfly pointer lives in a fixed
+// header slot read at a constant displacement (runtime/JSObject.h:1572-1577). The
+// batch-3 machine-code GET_BY_ID must reach those by absolute byte layout, so this
+// cell is `#[repr(C)]` with a front-loaded, layout-asserted header:
+//   - structure_id FIRST  => STRUCTURE_ID_OFFSET == 0 (JSCell::m_structureID).
+//   - storage_ptr SECOND  => STORAGE_PTR_DISP == 8 (the JSObject Butterfly-pointer
+//     slot analog), a cached pointer into out_of_line_storage so the codegen can
+//     load [base + STORAGE_PTR_DISP] then [storage_ptr + offset*8] with no Vec
+//     bookkeeping. The header order is LOAD-BEARING and enforced by the
+//     const offset_of! asserts below.
+// DIVERGENCE: Clone is hand-written (see impl Clone) because storage_ptr is a raw
+// pointer into this cell's own out_of_line_storage and must be RECOMPUTED for a
+// clone, never copied (a copied ptr would dangle/alias into the source cell's Vec).
+// Default is likewise hand-written because *const has no derivable Default.
+#[derive(Debug)]
+#[repr(C)]
 struct CoreObjectCell {
-    cell_id: CellId,
+    // C++ JSC JSCell::m_structureID (runtime/JSCell.h:236) at structureIDOffset()==0.
+    // MUST stay the first declared field; STRUCTURE_ID_OFFSET asserts it is at 0.
     structure_id: StructureId,
+    // C++ JSC: the JSObject Butterfly pointer slot (runtime/JSObject.h:1572-1577).
+    // Rust butterfly-pointer analog: a cached `out_of_line_storage.as_ptr()` kept
+    // coherent by refresh_storage_ptr at every Vec mutation. MUST stay the second
+    // declared field; STORAGE_PTR_DISP asserts it is at byte 8 (after the 4-byte
+    // structure_id + 4-byte pad to pointer alignment). NEVER dereferenced without a
+    // prior matching structure guard: for an empty Vec this is a dangling-but-aligned
+    // pointer (Vec::as_ptr on a 0-capacity Vec), and a 0-slot shape has no valid
+    // offset to read, so the guard makes that pointer unreachable.
+    storage_ptr: *const RuntimeValue,
+    cell_id: CellId,
     kind: CoreObjectKind,
     prototype: Option<RuntimeValue>,
     function_index: Option<u32>,
@@ -5469,6 +5496,154 @@ struct CoreObjectCell {
     bound_target: Option<RuntimeValue>,
     bound_this: RuntimeValue,
     bound_args: Vec<RuntimeValue>,
+}
+
+// C++ JSC JSCell::structureIDOffset()==0 (runtime/JSCell.h:293): the StructureID
+// (a 4-byte id) is the first header word so a guard can `load32 [base+0]; cmp32`.
+// The batch-3 assembler takes structure_id_offset as a parameter; this const is the
+// value it must be given, and the assert pins the field at byte 0 so a silent
+// field-reorder cannot desynchronize the codegen from the layout.
+const STRUCTURE_ID_OFFSET: usize = std::mem::offset_of!(CoreObjectCell, structure_id);
+// C++ JSC: the JSObject Butterfly pointer slot (runtime/JSObject.h:1572-1577) read
+// at a constant displacement. STORAGE_PTR_DISP is the Rust analog displacement the
+// codegen uses to fetch the storage base before the offset-indexed property load.
+const STORAGE_PTR_DISP: usize = std::mem::offset_of!(CoreObjectCell, storage_ptr);
+
+// Compile-time layout guards. These fail the build if the #[repr(C)] header order
+// changes, if alignment padding shifts the storage pointer, or if RuntimeValue stops
+// being an 8-byte EncodedJsValue (the [storage_ptr + offset*8] stride assumption).
+const _: () = assert!(
+    STRUCTURE_ID_OFFSET == 0,
+    "CoreObjectCell::structure_id must be at offset 0 (JSCell::structureIDOffset()==0)"
+);
+const _: () = assert!(
+    STORAGE_PTR_DISP == 8,
+    "CoreObjectCell::storage_ptr must be at byte 8 (JSObject Butterfly-pointer slot analog)"
+);
+const _: () = assert!(
+    std::mem::size_of::<RuntimeValue>() == 8,
+    "RuntimeValue must be 8 bytes (EncodedJsValue) for the [storage_ptr + offset*8] stride"
+);
+
+impl Default for CoreObjectCell {
+    fn default() -> Self {
+        // Build with a dangling-but-aligned storage_ptr, then point it at this cell's
+        // own (empty) out_of_line_storage. C++ has no exact analog (a fresh JSObject's
+        // Butterfly is null until out-of-line storage is needed); the Rust mirror keeps
+        // storage_ptr always pointing into its own Vec so refresh_storage_ptr has a
+        // single invariant to maintain. The empty-Vec pointer is never read without a
+        // prior matching structure guard (a 0-slot shape has no valid offset).
+        let mut cell = Self {
+            structure_id: StructureId::default(),
+            storage_ptr: core::ptr::null(),
+            cell_id: CellId::default(),
+            kind: CoreObjectKind::default(),
+            prototype: None,
+            function_index: None,
+            native_function: None,
+            construct_ability: ConstructAbility::default(),
+            super_base: None,
+            super_constructor: None,
+            is_default_derived_constructor: false,
+            instance_fields: Vec::new(),
+            captures: Vec::new(),
+            binding_value: RuntimeValue::default(),
+            properties: HashMap::new(),
+            property_offsets: HashMap::new(),
+            next_property_offset: 0,
+            out_of_line_storage: Vec::new(),
+            deleted_offsets: Vec::new(),
+            property_order: Vec::new(),
+            elements: Vec::new(),
+            map_entries: Vec::new(),
+            set_values: Vec::new(),
+            regexp_source: String::new(),
+            regexp_flags: RegexFlags::default(),
+            regexp_flags_text: String::new(),
+            promise_state: PromiseState::default(),
+            promise_result: RuntimeValue::default(),
+            promise_reactions: Vec::new(),
+            promise_resolving_kind: None,
+            native_bound_promise: None,
+            native_bound_proxy: None,
+            primitive_value: None,
+            date_value: 0.0,
+            array_buffer_data: Vec::new(),
+            view_buffer: None,
+            view_byte_offset: 0,
+            view_byte_length: 0,
+            view_length: 0,
+            view_element_kind: TypedArrayElementKind::default(),
+            proxy_target: None,
+            proxy_handler: None,
+            bound_target: None,
+            bound_this: RuntimeValue::default(),
+            bound_args: Vec::new(),
+        };
+        cell.refresh_storage_ptr();
+        cell
+    }
+}
+
+impl Clone for CoreObjectCell {
+    fn clone(&self) -> Self {
+        // Clone every field normally, but RECOMPUTE storage_ptr from the CLONE's own
+        // out_of_line_storage. Copying self.storage_ptr would alias/dangle into the
+        // source cell's Vec (a different heap allocation), which the batch-3 codegen
+        // would then dereference. This is the one field that must NOT be a value copy.
+        // Vec's heap buffer pointer is stable across the subsequent move of this struct
+        // (into Box/Pin on the snapshot path), so computing from the new Vec here stays
+        // valid after the cell is re-pinned.
+        let mut cloned = Self {
+            structure_id: self.structure_id,
+            storage_ptr: core::ptr::null(),
+            cell_id: self.cell_id,
+            kind: self.kind,
+            prototype: self.prototype,
+            function_index: self.function_index,
+            native_function: self.native_function.clone(),
+            construct_ability: self.construct_ability,
+            super_base: self.super_base,
+            super_constructor: self.super_constructor,
+            is_default_derived_constructor: self.is_default_derived_constructor,
+            instance_fields: self.instance_fields.clone(),
+            captures: self.captures.clone(),
+            binding_value: self.binding_value,
+            properties: self.properties.clone(),
+            property_offsets: self.property_offsets.clone(),
+            next_property_offset: self.next_property_offset,
+            out_of_line_storage: self.out_of_line_storage.clone(),
+            deleted_offsets: self.deleted_offsets.clone(),
+            property_order: self.property_order.clone(),
+            elements: self.elements.clone(),
+            map_entries: self.map_entries.clone(),
+            set_values: self.set_values.clone(),
+            regexp_source: self.regexp_source.clone(),
+            regexp_flags: self.regexp_flags,
+            regexp_flags_text: self.regexp_flags_text.clone(),
+            promise_state: self.promise_state,
+            promise_result: self.promise_result,
+            promise_reactions: self.promise_reactions.clone(),
+            promise_resolving_kind: self.promise_resolving_kind,
+            native_bound_promise: self.native_bound_promise,
+            native_bound_proxy: self.native_bound_proxy,
+            primitive_value: self.primitive_value,
+            date_value: self.date_value,
+            array_buffer_data: self.array_buffer_data.clone(),
+            view_buffer: self.view_buffer,
+            view_byte_offset: self.view_byte_offset,
+            view_byte_length: self.view_byte_length,
+            view_length: self.view_length,
+            view_element_kind: self.view_element_kind,
+            proxy_target: self.proxy_target,
+            proxy_handler: self.proxy_handler,
+            bound_target: self.bound_target,
+            bound_this: self.bound_this,
+            bound_args: self.bound_args.clone(),
+        };
+        cloned.refresh_storage_ptr();
+        cloned
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -6317,6 +6492,18 @@ impl CorePropertyLookupRecord {
 }
 
 impl CoreObjectCell {
+    /// Re-point storage_ptr at the current out_of_line_storage buffer.
+    ///
+    /// C++ JSC keeps the JSObject Butterfly pointer (runtime/JSObject.h:1572-1577)
+    /// coherent whenever the Butterfly is (re)allocated. storage_ptr is the Rust
+    /// analog and MUST be refreshed after EVERY out_of_line_storage mutation that can
+    /// move the buffer (clear, resize/realloc); all such sites route through here.
+    /// Vec::as_ptr on an empty Vec yields a dangling-but-aligned pointer that is never
+    /// read without a prior matching structure guard (a 0-slot shape has no offset).
+    fn refresh_storage_ptr(&mut self) {
+        self.storage_ptr = self.out_of_line_storage.as_ptr();
+    }
+
     fn install_initial_shape_metadata(&mut self) {
         self.property_offsets.clear();
         self.next_property_offset = 0;
@@ -6326,6 +6513,10 @@ impl CoreObjectCell {
         // offset allocation here, so reset the out-of-line mirror too and re-fill it
         // in lockstep below (putDirectOffset analog).
         self.out_of_line_storage.clear();
+        // clear() can leave a non-coherent storage_ptr if the buffer was later moved;
+        // refresh now and again after the lockstep fill below so a cell with no data
+        // properties (no fill) still publishes a coherent pointer.
+        self.refresh_storage_ptr();
         self.deleted_offsets.clear();
 
         for key in self.property_order.clone() {
@@ -6408,6 +6599,10 @@ impl CoreObjectCell {
             if let Some(slot) = self.out_of_line_storage.get_mut(index) {
                 *slot = RuntimeValue::undefined();
             }
+            // In-place slot clear cannot realloc the Vec, so storage_ptr is already
+            // coherent here; refresh defensively so this mutation site obeys the same
+            // invariant as the growth paths (single rule: any Vec touch -> refresh).
+            self.refresh_storage_ptr();
             self.deleted_offsets.push(offset);
         }
     }
@@ -6429,6 +6624,10 @@ impl CoreObjectCell {
         if index >= self.out_of_line_storage.len() {
             self.out_of_line_storage
                 .resize(index + 1, RuntimeValue::undefined());
+            // resize can reallocate (move) the buffer, so the cached Butterfly-pointer
+            // analog must be refreshed; this is the centralized Vec-growth path that
+            // every out-of-line property add routes through.
+            self.refresh_storage_ptr();
         }
         self.out_of_line_storage[index] = value;
     }
@@ -8290,6 +8489,10 @@ impl CoreObjectStore {
 
     fn allocate_cell(&mut self, mut cell: CoreObjectCell) -> RuntimeValue {
         cell.install_initial_shape_metadata();
+        // install_initial_shape_metadata already refreshes storage_ptr; refresh once
+        // more so EVERY published cell is guaranteed to carry a coherent
+        // Butterfly-pointer analog regardless of how the cell was constructed.
+        cell.refresh_storage_ptr();
         if cell.structure_id == StructureId::INVALID {
             // C++ JSC: a fresh object adopts the shared empty Structure for its
             // class+prototype instead of a private one, so same-shape siblings can
