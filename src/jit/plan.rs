@@ -6511,6 +6511,14 @@ const fn baseline_opcode_is_function_or_constructor(opcode: CoreOpcode) -> bool 
             | CoreOpcode::LoadFunctionConstructor
             | CoreOpcode::LoadArrayBufferConstructor
             | CoreOpcode::LoadUint8ArrayConstructor
+            | CoreOpcode::LoadInt8ArrayConstructor
+            | CoreOpcode::LoadUint8ClampedArrayConstructor
+            | CoreOpcode::LoadInt16ArrayConstructor
+            | CoreOpcode::LoadUint16ArrayConstructor
+            | CoreOpcode::LoadInt32ArrayConstructor
+            | CoreOpcode::LoadUint32ArrayConstructor
+            | CoreOpcode::LoadFloat32ArrayConstructor
+            | CoreOpcode::LoadFloat64ArrayConstructor
             | CoreOpcode::LoadDataViewConstructor
             | CoreOpcode::LoadProxyConstructor
             | CoreOpcode::LoadStringConstructor
@@ -6548,6 +6556,14 @@ const fn baseline_opcode_is_allocation_or_object(opcode: CoreOpcode) -> bool {
             | CoreOpcode::LoadReflectObject
             | CoreOpcode::LoadArrayBufferConstructor
             | CoreOpcode::LoadUint8ArrayConstructor
+            | CoreOpcode::LoadInt8ArrayConstructor
+            | CoreOpcode::LoadUint8ClampedArrayConstructor
+            | CoreOpcode::LoadInt16ArrayConstructor
+            | CoreOpcode::LoadUint16ArrayConstructor
+            | CoreOpcode::LoadInt32ArrayConstructor
+            | CoreOpcode::LoadUint32ArrayConstructor
+            | CoreOpcode::LoadFloat32ArrayConstructor
+            | CoreOpcode::LoadFloat64ArrayConstructor
             | CoreOpcode::LoadDataViewConstructor
             | CoreOpcode::LoadProxyConstructor
             | CoreOpcode::LoadStringConstructor

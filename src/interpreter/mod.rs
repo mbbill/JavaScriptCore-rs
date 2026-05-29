@@ -60,6 +60,10 @@ use crate::object::{
     WatchpointState,
 };
 use crate::runtime::scope::{BindingAttributes, BindingError, BindingSlot, BindingWriteOutcome};
+use crate::runtime::typed_array::{
+    typed_array_element_size, typed_array_load_value_f64, typed_array_store_native_bytes,
+    TypedArrayElementKind,
+};
 use crate::runtime::{
     CallFrameId, CodeBlockId, CodeSpecializationKind, EntryFrameId, ExecutableId, GlobalObjectId,
     ObjectId, PromiseState, RuntimeValue, ScopeId, StackFrameId, VmEntryReason,
@@ -5123,9 +5127,110 @@ struct CoreObjectStore {
     bigint_prototype: Option<RuntimeValue>,
     symbol_prototype: Option<RuntimeValue>,
     array_buffer_prototype: Option<RuntimeValue>,
-    uint8_array_prototype: Option<RuntimeValue>,
+    // One prototype object per typed-array element kind, mirroring C++ JSC where
+    // each JSGenericTypedArrayView<Adaptor> has its own prototype (Int8Array.
+    // prototype, Int32Array.prototype, ...). Indexed by typed_array_kind_index;
+    // replaces the former single uint8_array_prototype field.
+    typed_array_prototypes: [Option<RuntimeValue>; TYPED_ARRAY_KIND_COUNT],
     data_view_prototype: Option<RuntimeValue>,
 }
+
+/// Number of typed-array element kinds tracked for per-kind prototype storage.
+/// Matches the wired Number-content constructor set plus a slot per kind in
+/// TypedArrayElementKind so indexing by discriminant is total.
+const TYPED_ARRAY_KIND_COUNT: usize = 12;
+
+/// Stable index for a typed-array element kind into per-kind prototype storage,
+/// mirroring the FOR_EACH_TYPED_ARRAY_TYPE ordering in C++ TypedArrayType.h.
+fn typed_array_kind_index(kind: TypedArrayElementKind) -> usize {
+    match kind {
+        TypedArrayElementKind::Int8 => 0,
+        TypedArrayElementKind::Uint8 => 1,
+        TypedArrayElementKind::Uint8Clamped => 2,
+        TypedArrayElementKind::Int16 => 3,
+        TypedArrayElementKind::Uint16 => 4,
+        TypedArrayElementKind::Int32 => 5,
+        TypedArrayElementKind::Uint32 => 6,
+        TypedArrayElementKind::Float16 => 7,
+        TypedArrayElementKind::Float32 => 8,
+        TypedArrayElementKind::Float64 => 9,
+        TypedArrayElementKind::BigInt64 => 10,
+        TypedArrayElementKind::BigUint64 => 11,
+    }
+}
+
+/// Class name of a typed-array element kind, mirroring C++ JSGenericTypedArrayView
+/// info().className (e.g. "Int8Array"). Used for Object.prototype.toString tags
+/// and the global binding name.
+fn typed_array_kind_name(kind: TypedArrayElementKind) -> &'static str {
+    match kind {
+        TypedArrayElementKind::Int8 => "Int8Array",
+        TypedArrayElementKind::Uint8 => "Uint8Array",
+        TypedArrayElementKind::Uint8Clamped => "Uint8ClampedArray",
+        TypedArrayElementKind::Int16 => "Int16Array",
+        TypedArrayElementKind::Uint16 => "Uint16Array",
+        TypedArrayElementKind::Int32 => "Int32Array",
+        TypedArrayElementKind::Uint32 => "Uint32Array",
+        TypedArrayElementKind::Float16 => "Float16Array",
+        TypedArrayElementKind::Float32 => "Float32Array",
+        TypedArrayElementKind::Float64 => "Float64Array",
+        TypedArrayElementKind::BigInt64 => "BigInt64Array",
+        TypedArrayElementKind::BigUint64 => "BigUint64Array",
+    }
+}
+
+/// The CoreNativeFunction constructor variant for a typed-array element kind.
+/// Float16/BigInt kinds are not wired (no Octane consumer); they fall back to
+/// the Uint8 constructor so the mapping stays total without inventing variants.
+fn typed_array_constructor_native_function(kind: TypedArrayElementKind) -> CoreNativeFunction {
+    match kind {
+        TypedArrayElementKind::Int8 => CoreNativeFunction::Int8ArrayConstructor,
+        TypedArrayElementKind::Uint8 => CoreNativeFunction::Uint8ArrayConstructor,
+        TypedArrayElementKind::Uint8Clamped => CoreNativeFunction::Uint8ClampedArrayConstructor,
+        TypedArrayElementKind::Int16 => CoreNativeFunction::Int16ArrayConstructor,
+        TypedArrayElementKind::Uint16 => CoreNativeFunction::Uint16ArrayConstructor,
+        TypedArrayElementKind::Int32 => CoreNativeFunction::Int32ArrayConstructor,
+        TypedArrayElementKind::Uint32 => CoreNativeFunction::Uint32ArrayConstructor,
+        TypedArrayElementKind::Float32 => CoreNativeFunction::Float32ArrayConstructor,
+        TypedArrayElementKind::Float64 => CoreNativeFunction::Float64ArrayConstructor,
+        TypedArrayElementKind::Float16
+        | TypedArrayElementKind::BigInt64
+        | TypedArrayElementKind::BigUint64 => CoreNativeFunction::Uint8ArrayConstructor,
+    }
+}
+
+/// Inverse of typed_array_constructor_native_function for the wired Number-content
+/// constructor variants. Returns None for non-typed-array native functions.
+fn typed_array_constructor_kind(function: CoreNativeFunction) -> Option<TypedArrayElementKind> {
+    match function {
+        CoreNativeFunction::Int8ArrayConstructor => Some(TypedArrayElementKind::Int8),
+        CoreNativeFunction::Uint8ArrayConstructor => Some(TypedArrayElementKind::Uint8),
+        CoreNativeFunction::Uint8ClampedArrayConstructor => {
+            Some(TypedArrayElementKind::Uint8Clamped)
+        }
+        CoreNativeFunction::Int16ArrayConstructor => Some(TypedArrayElementKind::Int16),
+        CoreNativeFunction::Uint16ArrayConstructor => Some(TypedArrayElementKind::Uint16),
+        CoreNativeFunction::Int32ArrayConstructor => Some(TypedArrayElementKind::Int32),
+        CoreNativeFunction::Uint32ArrayConstructor => Some(TypedArrayElementKind::Uint32),
+        CoreNativeFunction::Float32ArrayConstructor => Some(TypedArrayElementKind::Float32),
+        CoreNativeFunction::Float64ArrayConstructor => Some(TypedArrayElementKind::Float64),
+        _ => None,
+    }
+}
+
+/// The wired Number-content typed-array element kinds, in FOR_EACH_TYPED_ARRAY_TYPE
+/// order, that get a global constructor binding. Excludes Float16/BigInt kinds.
+const WIRED_TYPED_ARRAY_KINDS: [TypedArrayElementKind; 9] = [
+    TypedArrayElementKind::Int8,
+    TypedArrayElementKind::Uint8,
+    TypedArrayElementKind::Uint8Clamped,
+    TypedArrayElementKind::Int16,
+    TypedArrayElementKind::Uint16,
+    TypedArrayElementKind::Int32,
+    TypedArrayElementKind::Uint32,
+    TypedArrayElementKind::Float32,
+    TypedArrayElementKind::Float64,
+];
 
 impl Clone for CoreObjectStore {
     fn clone(&self) -> Self {
@@ -5158,7 +5263,7 @@ impl Clone for CoreObjectStore {
             bigint_prototype: self.bigint_prototype,
             symbol_prototype: self.symbol_prototype,
             array_buffer_prototype: self.array_buffer_prototype,
-            uint8_array_prototype: self.uint8_array_prototype,
+            typed_array_prototypes: self.typed_array_prototypes,
             data_view_prototype: self.data_view_prototype,
         };
         cloned.rebuild_object_indices();
@@ -5236,6 +5341,11 @@ struct CoreObjectCell {
     view_byte_offset: usize,
     view_byte_length: usize,
     view_length: usize,
+    // C++ JSC JSArrayBufferView is parameterized by one TypedArrayType; the Rust
+    // mirror keeps a single CoreObjectKind::Uint8Array view variant and carries
+    // the element kind here (size + store/load coercion). Only meaningful when
+    // kind == CoreObjectKind::Uint8Array; defaults to Int8 for other cells.
+    view_element_kind: TypedArrayElementKind,
     proxy_target: Option<RuntimeValue>,
     proxy_handler: Option<RuntimeValue>,
     /// C++ JSC JSBoundFunction: [[BoundTargetFunction]], [[BoundThis]], and
@@ -5419,6 +5529,19 @@ enum CoreNativeFunction {
     ArrayBufferByteLength,
     ArrayBufferSlice,
     Uint8ArrayConstructor,
+    // Number-content typed-array constructors. Each is a distinct C++
+    // JSGenericTypedArrayView<Adaptor> constructor; they share one Rust
+    // constructor body parameterized by element kind (native_typed_array_
+    // constructor). BigInt64/BigUint64/Float16 are not wired (no Octane consumer
+    // and they need ToBigInt / f16 narrowing not present on the value path).
+    Int8ArrayConstructor,
+    Uint8ClampedArrayConstructor,
+    Int16ArrayConstructor,
+    Uint16ArrayConstructor,
+    Int32ArrayConstructor,
+    Uint32ArrayConstructor,
+    Float32ArrayConstructor,
+    Float64ArrayConstructor,
     Uint8ArrayLength,
     Uint8ArrayByteLength,
     Uint8ArrayByteOffset,
@@ -5520,6 +5643,14 @@ impl CoreNativeFunction {
             | Self::DateConstructor
             | Self::ArrayBufferConstructor
             | Self::Uint8ArrayConstructor
+            | Self::Int8ArrayConstructor
+            | Self::Uint8ClampedArrayConstructor
+            | Self::Int16ArrayConstructor
+            | Self::Uint16ArrayConstructor
+            | Self::Int32ArrayConstructor
+            | Self::Uint32ArrayConstructor
+            | Self::Float32ArrayConstructor
+            | Self::Float64ArrayConstructor
             | Self::DataViewConstructor => ConstructAbility::CanConstruct,
             _ => ConstructAbility::CannotConstruct,
         }
@@ -6615,12 +6746,20 @@ impl CoreObjectStore {
         Ok(constructor)
     }
 
-    fn allocate_uint8_array_constructor_with_write_barrier(
+    /// Allocate the constructor for a typed-array element kind, mirroring C++ each
+    /// JSGenericTypedArrayView<Adaptor> constructor: a native function whose
+    /// `prototype` is the kind's view prototype and whose prototype's
+    /// `constructor` points back. (BYTES_PER_ELEMENT/length=3 own properties are
+    /// not modeled here; the existing Uint8Array constructor does not install them
+    /// either, so this stays a faithful mirror of the current Rust skeleton.)
+    fn allocate_typed_array_constructor_with_write_barrier(
         &mut self,
         heap: &mut Heap,
+        kind: TypedArrayElementKind,
     ) -> Result<RuntimeValue, ExecutionError> {
-        let constructor = self.allocate_native_function(CoreNativeFunction::Uint8ArrayConstructor);
-        let prototype = self.ensure_uint8_array_prototype();
+        let constructor =
+            self.allocate_native_function(typed_array_constructor_native_function(kind));
+        let prototype = self.ensure_typed_array_prototype(kind);
         self.install_constructor_prototype(constructor, prototype);
         self.install_prototype_constructor_with_write_barrier(heap, prototype, constructor)?;
         Ok(constructor)
@@ -6865,14 +7004,20 @@ impl CoreObjectStore {
             array_buffer,
             standard_attributes,
         )?;
-        let uint8_array = self.allocate_uint8_array_constructor_with_write_barrier(heap)?;
-        self.install_standard_global_data_property(
-            heap,
-            global_object,
-            "Uint8Array",
-            uint8_array,
-            standard_attributes,
-        )?;
+        // Install each wired Number-content typed-array constructor as a standard
+        // global data property (Int8Array, Uint8Array, Uint8ClampedArray, ...),
+        // mirroring C++ JSTypedArrayConstructors global installation.
+        for kind in WIRED_TYPED_ARRAY_KINDS {
+            let constructor =
+                self.allocate_typed_array_constructor_with_write_barrier(heap, kind)?;
+            self.install_standard_global_data_property(
+                heap,
+                global_object,
+                typed_array_kind_name(kind),
+                constructor,
+                standard_attributes,
+            )?;
+        }
         let data_view = self.allocate_data_view_constructor_with_write_barrier(heap)?;
         self.install_standard_global_data_property(
             heap,
@@ -7171,6 +7316,9 @@ impl CoreObjectStore {
         })
     }
 
+    // Test-only Uint8 convenience over allocate_typed_array_with_write_barrier;
+    // the production path uses the kind-parameterized allocator directly.
+    #[cfg(test)]
     fn allocate_uint8_array_with_write_barrier(
         &mut self,
         heap: &mut Heap,
@@ -7178,13 +7326,36 @@ impl CoreObjectStore {
         byte_offset: usize,
         length: usize,
     ) -> Result<RuntimeValue, ExecutionError> {
-        let prototype = self.ensure_uint8_array_prototype();
+        self.allocate_typed_array_with_write_barrier(
+            heap,
+            TypedArrayElementKind::Uint8,
+            buffer,
+            byte_offset,
+            length,
+        )
+    }
+
+    /// Allocate a typed-array view of `element_kind` over `buffer`, mirroring C++
+    /// `JSGenericTypedArrayView::create` for the buffer-backed form. `length` is
+    /// the element count; `view_byte_length` is `length * element_size`. The view
+    /// shares the buffer (no copy), and the element prototype is selected by kind.
+    fn allocate_typed_array_with_write_barrier(
+        &mut self,
+        heap: &mut Heap,
+        element_kind: TypedArrayElementKind,
+        buffer: RuntimeValue,
+        byte_offset: usize,
+        length: usize,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        let element_size = usize::from(typed_array_element_size(element_kind));
+        let prototype = self.ensure_typed_array_prototype(element_kind);
         let view = self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::Uint8Array,
             prototype: Some(prototype),
             view_byte_offset: byte_offset,
-            view_byte_length: length,
+            view_byte_length: length.saturating_mul(element_size),
             view_length: length,
+            view_element_kind: element_kind,
             ..CoreObjectCell::default()
         });
         self.apply_value_store_write_barrier(heap, view, buffer)?;
@@ -7636,13 +7807,20 @@ impl CoreObjectStore {
         prototype
     }
 
-    fn ensure_uint8_array_prototype(&mut self) -> RuntimeValue {
-        if let Some(prototype) = self.uint8_array_prototype {
+    /// Lazily allocate the prototype object for a typed-array element kind,
+    /// mirroring C++ where every JSGenericTypedArrayView<Adaptor> has a distinct
+    /// prototype off Object.prototype. The length/byteLength/byteOffset/buffer
+    /// getters and fill/set/subarray methods are shared across kinds because the
+    /// native implementations now read the element kind off the receiver cell
+    /// (the C++ prototype functions are likewise generic over TypedArrayType).
+    fn ensure_typed_array_prototype(&mut self, kind: TypedArrayElementKind) -> RuntimeValue {
+        let index = typed_array_kind_index(kind);
+        if let Some(prototype) = self.typed_array_prototypes[index] {
             return prototype;
         }
         let object_prototype = self.ensure_object_prototype();
         let prototype = self.allocate_with_prototype(Some(object_prototype));
-        self.uint8_array_prototype = Some(prototype);
+        self.typed_array_prototypes[index] = Some(prototype);
         for (name, native_function) in [
             ("length", CoreNativeFunction::Uint8ArrayLength),
             ("byteLength", CoreNativeFunction::Uint8ArrayByteLength),
@@ -8398,7 +8576,7 @@ impl CoreObjectStore {
         };
         if receiver_kind == CoreObjectKind::Uint8Array {
             if let Some(index) = key_array_index(key) {
-                self.write_uint8_element(object, index, number_to_uint8_lossy(value)?)?;
+                self.write_typed_element(object, index, typed_array_store_input_number(value)?)?;
                 return Ok(CorePropertyPut::Stored);
             }
         }
@@ -8480,9 +8658,9 @@ impl CoreObjectStore {
         }
         if object.kind == CoreObjectKind::Uint8Array {
             if let Some(index) = key_array_index(key) {
-                if let Some(value) = self.read_uint8_element(object_value, index)? {
+                if let Some(value) = self.read_typed_element(object_value, index)? {
                     return Ok(Some(CoreProperty {
-                        kind: CorePropertyKind::Data(RuntimeValue::from_i32(i32::from(value))),
+                        kind: CorePropertyKind::Data(value),
                         attributes: CorePropertyAttributes {
                             writable: true,
                             enumerable: true,
@@ -9337,6 +9515,21 @@ impl CoreObjectStore {
         Ok((buffer, object.view_byte_offset, object.view_length))
     }
 
+    /// Element kind of a typed-array view, mirroring C++ JSArrayBufferView's
+    /// TypedArrayType. Only valid for CoreObjectKind::Uint8Array view cells.
+    fn typed_array_element_kind(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<TypedArrayElementKind, ExecutionError> {
+        let Some(object) = self.find(value) else {
+            return Err(ExecutionError::ExpectedObject);
+        };
+        if object.kind != CoreObjectKind::Uint8Array {
+            return Err(ExecutionError::ExpectedObject);
+        }
+        Ok(object.view_element_kind)
+    }
+
     fn data_view_layout(
         &self,
         value: RuntimeValue,
@@ -9353,44 +9546,64 @@ impl CoreObjectStore {
         Ok((buffer, object.view_byte_offset, object.view_byte_length))
     }
 
-    fn read_uint8_element(
+    /// Read element `index` of a typed-array view, returning the JS Number per
+    /// C++ `Adaptor::toJSValue` (TypedArrayAdaptors.h). Scales the byte index by
+    /// the element size and reinterprets the native bytes. Returns Ok(None) when
+    /// out of bounds (mirrors C++ integer-indexed get returning undefined).
+    fn read_typed_element(
         &self,
         value: RuntimeValue,
         index: usize,
-    ) -> Result<Option<u8>, ExecutionError> {
+    ) -> Result<Option<RuntimeValue>, ExecutionError> {
         let (buffer, byte_offset, length) = self.uint8_array_layout(value)?;
         if index >= length {
             return Ok(None);
         }
+        let element_kind = self.typed_array_element_kind(value)?;
+        let element_size = usize::from(typed_array_element_size(element_kind));
         let Some(buffer) = self.find(buffer) else {
             return Err(ExecutionError::ExpectedObject);
         };
-        Ok(buffer
+        let start = byte_offset.saturating_add(index.saturating_mul(element_size));
+        let Some(bytes) = buffer
             .array_buffer_data
-            .get(byte_offset.saturating_add(index))
-            .copied())
+            .get(start..start.saturating_add(element_size))
+        else {
+            return Ok(None);
+        };
+        let number = typed_array_load_value_f64(element_kind, bytes);
+        Ok(Some(runtime_number_from_f64(number)))
     }
 
-    fn write_uint8_element(
+    /// Write the already-ToNumber-coerced `number` to element `index`, mirroring
+    /// C++ `Adaptor::toNativeFromDouble` + `setIndexQuicklyToNativeValue`
+    /// (JSGenericTypedArrayViewInlines.h). Scales by element size and serializes
+    /// the native bytes. Returns Ok(false) when out of bounds (the C++ integer-
+    /// indexed set silently drops out-of-bounds writes).
+    fn write_typed_element(
         &mut self,
         value: RuntimeValue,
         index: usize,
-        byte: u8,
+        number: f64,
     ) -> Result<bool, ExecutionError> {
         let (buffer, byte_offset, length) = self.uint8_array_layout(value)?;
         if index >= length {
             return Ok(false);
         }
+        let element_kind = self.typed_array_element_kind(value)?;
+        let element_size = usize::from(typed_array_element_size(element_kind));
+        let native = typed_array_store_native_bytes(element_kind, number);
         let Some(buffer) = self.find_mut(buffer) else {
             return Err(ExecutionError::ExpectedObject);
         };
+        let start = byte_offset.saturating_add(index.saturating_mul(element_size));
         let Some(slot) = buffer
             .array_buffer_data
-            .get_mut(byte_offset.saturating_add(index))
+            .get_mut(start..start.saturating_add(element_size))
         else {
             return Ok(false);
         };
-        *slot = byte;
+        slot.copy_from_slice(&native);
         Ok(true)
     }
 
@@ -9478,11 +9691,9 @@ impl CoreObjectStore {
     fn get_index(&self, object: RuntimeValue, index: i32) -> Result<RuntimeValue, ExecutionError> {
         let index = usize::try_from(index).map_err(|_| ExecutionError::ExpectedArrayIndex)?;
         if self.is_uint8_array(object) {
-            return self.read_uint8_element(object, index).map(|value| {
-                value.map_or_else(RuntimeValue::undefined, |value| {
-                    RuntimeValue::from_i32(i32::from(value))
-                })
-            });
+            return self
+                .read_typed_element(object, index)
+                .map(|value| value.unwrap_or_else(RuntimeValue::undefined));
         }
         self.get_index_from_prototype_chain(object, index)
     }
@@ -9506,7 +9717,7 @@ impl CoreObjectStore {
     ) -> Result<(), ExecutionError> {
         let index = usize::try_from(index).map_err(|_| ExecutionError::ExpectedArrayIndex)?;
         if self.is_uint8_array(object) {
-            self.write_uint8_element(object, index, number_to_uint8_lossy(value)?)?;
+            self.write_typed_element(object, index, typed_array_store_input_number(value)?)?;
             return Ok(());
         }
         self.put_array_element_with_write_barrier(heap, object, index, value)
@@ -10274,10 +10485,8 @@ impl CoreObjectStore {
             }
             if cell.kind == CoreObjectKind::Uint8Array {
                 if let Some(index) = key_array_index(key) {
-                    if let Some(value) = self.read_uint8_element(object, index)? {
-                        return Ok(CorePropertyGet::Data(RuntimeValue::from_i32(i32::from(
-                            value,
-                        ))));
+                    if let Some(value) = self.read_typed_element(object, index)? {
+                        return Ok(CorePropertyGet::Data(value));
                     }
                 }
             }
@@ -10388,8 +10597,7 @@ impl CoreObjectStore {
             }
             if cell.kind == CoreObjectKind::Uint8Array {
                 if let Some(index) = key_array_index(key) {
-                    if let Some(value) = self.read_uint8_element(current, index)? {
-                        let value = RuntimeValue::from_i32(i32::from(value));
+                    if let Some(value) = self.read_typed_element(current, index)? {
                         let mut record = CorePropertyLookupRecord::from_object_lookup(
                             site,
                             object,
@@ -10435,11 +10643,9 @@ impl CoreObjectStore {
                 return Err(ExecutionError::ExpectedObject);
             };
             if cell.kind == CoreObjectKind::Uint8Array {
-                return self.read_uint8_element(object, index).map(|value| {
-                    value.map_or_else(RuntimeValue::undefined, |value| {
-                        RuntimeValue::from_i32(i32::from(value))
-                    })
-                });
+                return self
+                    .read_typed_element(object, index)
+                    .map(|value| value.unwrap_or_else(RuntimeValue::undefined));
             }
             if let Some(Some(value)) = cell.elements.get(index).copied() {
                 return Ok(value);
@@ -10482,10 +10688,8 @@ impl CoreObjectStore {
 
             if cell.kind == CoreObjectKind::Uint8Array {
                 let value = self
-                    .read_uint8_element(current, index)?
-                    .map_or_else(RuntimeValue::undefined, |value| {
-                        RuntimeValue::from_i32(i32::from(value))
-                    });
+                    .read_typed_element(current, index)?
+                    .unwrap_or_else(RuntimeValue::undefined);
                 let mut record = CorePropertyLookupRecord::from_object_lookup(
                     site,
                     object,
@@ -12462,14 +12666,35 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 };
                 write_register(state, window, destination, function)
             }
-            CoreOpcode::LoadUint8ArrayConstructor => {
+            CoreOpcode::LoadUint8ArrayConstructor
+            | CoreOpcode::LoadInt8ArrayConstructor
+            | CoreOpcode::LoadUint8ClampedArrayConstructor
+            | CoreOpcode::LoadInt16ArrayConstructor
+            | CoreOpcode::LoadUint16ArrayConstructor
+            | CoreOpcode::LoadInt32ArrayConstructor
+            | CoreOpcode::LoadUint32ArrayConstructor
+            | CoreOpcode::LoadFloat32ArrayConstructor
+            | CoreOpcode::LoadFloat64ArrayConstructor => {
                 let destination = match register_operand(instruction, 0) {
                     Ok(register) => register,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                let kind = match opcode {
+                    CoreOpcode::LoadInt8ArrayConstructor => TypedArrayElementKind::Int8,
+                    CoreOpcode::LoadUint8ClampedArrayConstructor => {
+                        TypedArrayElementKind::Uint8Clamped
+                    }
+                    CoreOpcode::LoadInt16ArrayConstructor => TypedArrayElementKind::Int16,
+                    CoreOpcode::LoadUint16ArrayConstructor => TypedArrayElementKind::Uint16,
+                    CoreOpcode::LoadInt32ArrayConstructor => TypedArrayElementKind::Int32,
+                    CoreOpcode::LoadUint32ArrayConstructor => TypedArrayElementKind::Uint32,
+                    CoreOpcode::LoadFloat32ArrayConstructor => TypedArrayElementKind::Float32,
+                    CoreOpcode::LoadFloat64ArrayConstructor => TypedArrayElementKind::Float64,
+                    _ => TypedArrayElementKind::Uint8,
+                };
                 let function = match self
                     .objects
-                    .allocate_uint8_array_constructor_with_write_barrier(state.heap)
+                    .allocate_typed_array_constructor_with_write_barrier(state.heap, kind)
                 {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
@@ -16982,8 +17207,18 @@ impl CoreOpcodeDispatchHost {
                     CoreNativeFunction::ArrayBufferConstructor => {
                         self.native_array_buffer_constructor(&arguments)
                     }
-                    CoreNativeFunction::Uint8ArrayConstructor => {
-                        self.native_uint8_array_constructor(state.heap, &arguments)
+                    CoreNativeFunction::Uint8ArrayConstructor
+                    | CoreNativeFunction::Int8ArrayConstructor
+                    | CoreNativeFunction::Uint8ClampedArrayConstructor
+                    | CoreNativeFunction::Int16ArrayConstructor
+                    | CoreNativeFunction::Uint16ArrayConstructor
+                    | CoreNativeFunction::Int32ArrayConstructor
+                    | CoreNativeFunction::Uint32ArrayConstructor
+                    | CoreNativeFunction::Float32ArrayConstructor
+                    | CoreNativeFunction::Float64ArrayConstructor => {
+                        let kind = typed_array_constructor_kind(native)
+                            .unwrap_or(TypedArrayElementKind::Uint8);
+                        self.native_typed_array_constructor(state.heap, kind, &arguments)
                     }
                     CoreNativeFunction::DataViewConstructor => {
                         self.native_data_view_constructor(state.heap, &arguments)
@@ -18367,8 +18602,24 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::ArrayBufferSlice => {
                 self.native_array_buffer_slice(state.heap, this_value, arguments)
             }
-            CoreNativeFunction::Uint8ArrayConstructor => Err(self
-                .type_error_outcome_with_heap(state.heap, "Constructor Uint8Array requires 'new'")),
+            CoreNativeFunction::Uint8ArrayConstructor
+            | CoreNativeFunction::Int8ArrayConstructor
+            | CoreNativeFunction::Uint8ClampedArrayConstructor
+            | CoreNativeFunction::Int16ArrayConstructor
+            | CoreNativeFunction::Uint16ArrayConstructor
+            | CoreNativeFunction::Int32ArrayConstructor
+            | CoreNativeFunction::Uint32ArrayConstructor
+            | CoreNativeFunction::Float32ArrayConstructor
+            | CoreNativeFunction::Float64ArrayConstructor => {
+                // C++ callGenericTypedArrayViewImpl throws "cannot be called as a
+                // function" when a view constructor is invoked without `new`.
+                let name = typed_array_constructor_kind(native)
+                    .map_or("TypedArray", typed_array_kind_name);
+                Err(self.type_error_outcome_with_heap(
+                    state.heap,
+                    &format!("Constructor {name} requires 'new'"),
+                ))
+            }
             CoreNativeFunction::Uint8ArrayLength => {
                 self.native_uint8_array_length(state.heap, this_value)
             }
@@ -18621,6 +18872,13 @@ impl CoreOpcodeDispatchHost {
         if let Some(text) = self.primitive_to_string(value) {
             return text;
         }
+        if self.objects.is_uint8_array(value) {
+            // Per-kind class tag (e.g. "[object Int16Array]"), mirroring C++
+            // JSGenericTypedArrayView info().className.
+            if let Ok(kind) = self.objects.typed_array_element_kind(value) {
+                return format!("[object {}]", typed_array_kind_name(kind));
+            }
+        }
         if self.objects.is_array(value) {
             "[object Array]"
         } else if self.objects.is_map(value) {
@@ -18693,6 +18951,16 @@ impl CoreOpcodeDispatchHost {
         heap: &mut Heap,
         this_value: RuntimeValue,
     ) -> Result<RuntimeValue, DispatchOutcome> {
+        if self.objects.is_uint8_array(this_value) {
+            // Per-kind class tag (e.g. "[object Float32Array]"), mirroring C++
+            // JSGenericTypedArrayView info().className.
+            if let Ok(kind) = self.objects.typed_array_element_kind(this_value) {
+                return self
+                    .strings
+                    .allocate_with_heap(heap, &format!("[object {}]", typed_array_kind_name(kind)))
+                    .map_err(DispatchOutcome::Fail);
+            }
+        }
         let tag = if self.strings.text(this_value).is_some() {
             "String"
         } else if self.symbols.is_symbol(this_value) {
@@ -19203,73 +19471,156 @@ impl CoreOpcodeDispatchHost {
             .map_err(DispatchOutcome::Fail)
     }
 
-    fn native_uint8_array_constructor(
+    /// Faithful mirror of C++ constructGenericTypedArrayViewWithArguments
+    /// (runtime/JSGenericTypedArrayViewConstructorInlines.h:154-256) plus the
+    /// ArrayBuffer form (:120-152), parameterized by element kind. Branch order:
+    /// no-arg -> empty view; ArrayBuffer first arg -> Form C (buffer, byteOffset,
+    /// length); typed-array first arg -> copy with per-kind re-coercion; array-
+    /// like first arg -> copy; else -> Form A (length, zero-filled).
+    ///
+    /// DIVERGENCE: the @@iterator path, resizable/growable buffers, BigInt
+    /// content, and the FastTypedArray/Oversize allocation split are not ported
+    /// (no Octane consumer needs them); see runtime/typed_array.rs adaptors.
+    fn native_typed_array_constructor(
         &mut self,
         heap: &mut Heap,
+        kind: TypedArrayElementKind,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, DispatchOutcome> {
+        let element_size = usize::from(typed_array_element_size(kind));
         let Some(first) = arguments.first().copied() else {
             let buffer = self.objects.allocate_array_buffer(0);
             return self
                 .objects
-                .allocate_uint8_array_with_write_barrier(heap, buffer, 0, 0)
+                .allocate_typed_array_with_write_barrier(heap, kind, buffer, 0, 0)
                 .map_err(DispatchOutcome::Fail);
         };
         if self.objects.is_array_buffer(first) {
+            // Form C: new T(buffer[, byteOffset[, length]]). byteOffset and length
+            // are ToIndex-coerced; bounds and elementSize alignment are validated
+            // against the buffer byte length (C++ verifyByteOffsetAlignment /
+            // verifySubRangeLength, JSGenericTypedArrayViewInlines.h:106-136).
             let buffer_length = self
                 .objects
                 .array_buffer_byte_length(first)
                 .map_err(DispatchOutcome::Fail)?;
             let byte_offset = self.length_argument(arguments.get(1).copied(), 0)?;
-            if byte_offset > buffer_length {
+            if byte_offset > buffer_length || byte_offset % element_size != 0 {
                 return Err(DispatchOutcome::Fail(ExecutionError::ExpectedArrayIndex));
             }
             let length = if let Some(length) = arguments.get(2).copied() {
                 self.length_argument(Some(length), 0)?
             } else {
-                buffer_length.saturating_sub(byte_offset)
+                let remaining = buffer_length.saturating_sub(byte_offset);
+                if remaining % element_size != 0 {
+                    return Err(DispatchOutcome::Fail(ExecutionError::ExpectedArrayIndex));
+                }
+                remaining / element_size
             };
-            if byte_offset.saturating_add(length) > buffer_length {
+            if byte_offset.saturating_add(length.saturating_mul(element_size)) > buffer_length {
                 return Err(DispatchOutcome::Fail(ExecutionError::ExpectedArrayIndex));
             }
             return self
                 .objects
-                .allocate_uint8_array_with_write_barrier(heap, first, byte_offset, length)
+                .allocate_typed_array_with_write_barrier(heap, kind, first, byte_offset, length)
                 .map_err(DispatchOutcome::Fail);
         }
         if self.objects.is_uint8_array(first) {
-            let values = self.uint8_array_values(first)?;
-            let buffer = self.objects.allocate_array_buffer(values.len());
-            let view = self
-                .objects
-                .allocate_uint8_array_with_write_barrier(heap, buffer, 0, values.len())
-                .map_err(DispatchOutcome::Fail)?;
-            for (index, value) in values.iter().copied().enumerate() {
-                self.objects
-                    .write_uint8_element(view, index, value)
-                    .map_err(DispatchOutcome::Fail)?;
-            }
-            return Ok(view);
+            // Form B (typed-array source): element-by-element re-coercion to the
+            // destination kind (C++ setFromTypedArray; the slow per-element path
+            // is always taken here, which is observably equivalent).
+            let values = self.typed_array_source_values(first)?;
+            return self.allocate_typed_array_from_values(heap, kind, &values);
         }
         if self.objects.is_array(first) {
-            let values = self.array_like_uint8_values(first)?;
-            let buffer = self.objects.allocate_array_buffer(values.len());
-            let view = self
-                .objects
-                .allocate_uint8_array_with_write_barrier(heap, buffer, 0, values.len())
-                .map_err(DispatchOutcome::Fail)?;
-            for (index, value) in values.iter().copied().enumerate() {
-                self.objects
-                    .write_uint8_element(view, index, value)
-                    .map_err(DispatchOutcome::Fail)?;
-            }
-            return Ok(view);
+            // Form B (array-like source): read each element then ToNumber-coerce
+            // on store (C++ setFromArrayLike + setIndex).
+            let values = self.array_like_source_values(first)?;
+            return self.allocate_typed_array_from_values(heap, kind, &values);
         }
+        // Form A: new T(length) -> zero-filled view of `length` elements.
         let length = self.length_argument(Some(first), 0)?;
-        let buffer = self.objects.allocate_array_buffer(length);
+        let buffer = self
+            .objects
+            .allocate_array_buffer(length.saturating_mul(element_size));
         self.objects
-            .allocate_uint8_array_with_write_barrier(heap, buffer, 0, length)
+            .allocate_typed_array_with_write_barrier(heap, kind, buffer, 0, length)
             .map_err(DispatchOutcome::Fail)
+    }
+
+    /// Allocate a fresh view of `kind` over a new buffer and store the source
+    /// `values` (each ToNumber-coerced per the destination adaptor). Mirrors the
+    /// createUninitialized + setFrom* shape in C++ (no zero-fill needed since all
+    /// elements are overwritten).
+    fn allocate_typed_array_from_values(
+        &mut self,
+        heap: &mut Heap,
+        kind: TypedArrayElementKind,
+        values: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let element_size = usize::from(typed_array_element_size(kind));
+        let buffer = self
+            .objects
+            .allocate_array_buffer(values.len().saturating_mul(element_size));
+        let view = self
+            .objects
+            .allocate_typed_array_with_write_barrier(heap, kind, buffer, 0, values.len())
+            .map_err(DispatchOutcome::Fail)?;
+        for (index, value) in values.iter().copied().enumerate() {
+            let number = typed_array_store_input_number(value).map_err(DispatchOutcome::Fail)?;
+            self.objects
+                .write_typed_element(view, index, number)
+                .map_err(DispatchOutcome::Fail)?;
+        }
+        Ok(view)
+    }
+
+    /// Read every element of a typed-array source as a JS Number, mirroring the
+    /// element-by-element read in C++ setFromTypedArray's slow path.
+    fn typed_array_source_values(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<Vec<RuntimeValue>, DispatchOutcome> {
+        let (_, _, length) = self
+            .objects
+            .uint8_array_layout(value)
+            .map_err(DispatchOutcome::Fail)?;
+        let mut values = Vec::with_capacity(length);
+        for index in 0..length {
+            values.push(
+                self.objects
+                    .read_typed_element(value, index)
+                    .map_err(DispatchOutcome::Fail)?
+                    .unwrap_or_else(RuntimeValue::undefined),
+            );
+        }
+        Ok(values)
+    }
+
+    /// Read every element of an array-like source as a value, mirroring C++
+    /// setFromArrayLike (get(i) then store-coerce).
+    fn array_like_source_values(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<Vec<RuntimeValue>, DispatchOutcome> {
+        let Some(NumberValue::Int32(length)) = self
+            .objects
+            .array_length(value)
+            .map_err(DispatchOutcome::Fail)?
+            .and_then(RuntimeValue::as_number)
+        else {
+            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject));
+        };
+        let length = usize::try_from(length).unwrap_or(0);
+        let mut values = Vec::with_capacity(length);
+        for index in 0..length {
+            values.push(
+                self.objects
+                    .get_index(value, index.try_into().unwrap_or(i32::MAX))
+                    .map_err(DispatchOutcome::Fail)?,
+            );
+        }
+        Ok(values)
     }
 
     fn native_uint8_array_length(
@@ -19345,7 +19696,7 @@ impl CoreOpcodeDispatchHost {
         this_value: RuntimeValue,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, DispatchOutcome> {
-        let byte = self.runtime_value_to_uint8(
+        let number = self.runtime_value_to_store_number(
             arguments
                 .first()
                 .copied()
@@ -19361,7 +19712,7 @@ impl CoreOpcodeDispatchHost {
         let end = self.normalized_view_index(arguments.get(2).copied(), length, length)?;
         for index in start..end {
             self.objects
-                .write_uint8_element(this_value, index, byte)
+                .write_typed_element(this_value, index, number)
                 .map_err(DispatchOutcome::Fail)?;
         }
         Ok(this_value)
@@ -19384,9 +19735,9 @@ impl CoreOpcodeDispatchHost {
             )
         })?;
         let values = if self.objects.is_uint8_array(source) {
-            self.uint8_array_values(source)?
+            self.typed_array_source_values(source)?
         } else if self.objects.is_array(source) {
-            self.array_like_uint8_values(source)?
+            self.array_like_source_values(source)?
         } else {
             return Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject));
         };
@@ -19394,8 +19745,9 @@ impl CoreOpcodeDispatchHost {
             return Err(DispatchOutcome::Fail(ExecutionError::ExpectedArrayIndex));
         }
         for (index, value) in values.iter().copied().enumerate() {
+            let number = self.runtime_value_to_store_number(value)?;
             self.objects
-                .write_uint8_element(this_value, target_offset + index, value)
+                .write_typed_element(this_value, target_offset + index, number)
                 .map_err(DispatchOutcome::Fail)?;
         }
         Ok(RuntimeValue::undefined())
@@ -19414,14 +19766,27 @@ impl CoreOpcodeDispatchHost {
                     "Uint8Array method called on incompatible receiver",
                 )
             })?;
+        let element_kind = self
+            .objects
+            .typed_array_element_kind(this_value)
+            .map_err(|_| {
+                self.type_error_outcome_with_heap(
+                    heap,
+                    "Uint8Array method called on incompatible receiver",
+                )
+            })?;
+        let element_size = usize::from(typed_array_element_size(element_kind));
         let start = self.normalized_view_index(arguments.first().copied(), length, 0)?;
         let end = self.normalized_view_index(arguments.get(1).copied(), length, length)?;
         let length = end.saturating_sub(start);
+        // subarray shares the same buffer and element kind; the new view's byte
+        // offset advances by start * elementSize (C++ subarray uses elementSize).
         self.objects
-            .allocate_uint8_array_with_write_barrier(
+            .allocate_typed_array_with_write_barrier(
                 heap,
+                element_kind,
                 buffer,
-                byte_offset.saturating_add(start),
+                byte_offset.saturating_add(start.saturating_mul(element_size)),
                 length,
             )
             .map_err(DispatchOutcome::Fail)
@@ -19597,42 +19962,13 @@ impl CoreOpcodeDispatchHost {
         number_to_uint8_lossy(value).map_err(DispatchOutcome::Fail)
     }
 
-    fn uint8_array_values(&self, value: RuntimeValue) -> Result<Vec<u8>, DispatchOutcome> {
-        let (_, _, length) = self
-            .objects
-            .uint8_array_layout(value)
-            .map_err(DispatchOutcome::Fail)?;
-        let mut values = Vec::with_capacity(length);
-        for index in 0..length {
-            values.push(
-                self.objects
-                    .read_uint8_element(value, index)
-                    .map_err(DispatchOutcome::Fail)?
-                    .unwrap_or(0),
-            );
-        }
-        Ok(values)
-    }
-
-    fn array_like_uint8_values(&self, value: RuntimeValue) -> Result<Vec<u8>, DispatchOutcome> {
-        let Some(NumberValue::Int32(length)) = self
-            .objects
-            .array_length(value)
-            .map_err(DispatchOutcome::Fail)?
-            .and_then(RuntimeValue::as_number)
-        else {
-            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject));
-        };
-        let length = usize::try_from(length).unwrap_or(0);
-        let mut values = Vec::with_capacity(length);
-        for index in 0..length {
-            let value = self
-                .objects
-                .get_index(value, index.try_into().unwrap_or(i32::MAX))
-                .map_err(DispatchOutcome::Fail)?;
-            values.push(self.runtime_value_to_uint8(value)?);
-        }
-        Ok(values)
+    /// ToNumber a value to the f64 fed to the typed-array store adaptors, routing
+    /// primitives through number_constructor_value first (matching the legacy
+    /// runtime_value_to_uint8 path). The per-element narrowing happens in
+    /// write_typed_element via typed_array_store_native_bytes.
+    fn runtime_value_to_store_number(&self, value: RuntimeValue) -> Result<f64, DispatchOutcome> {
+        let value = self.number_constructor_value(value)?;
+        typed_array_store_input_number(value).map_err(DispatchOutcome::Fail)
     }
 
     fn native_symbol_constructor(
@@ -25575,6 +25911,18 @@ fn number_to_uint8_lossy(value: RuntimeValue) -> Result<u8, ExecutionError> {
     Ok(number_to_int32(number) as u8)
 }
 
+/// ToNumber a value to the f64 the typed-array store coercion operates on,
+/// mirroring the `value.toNumber(globalObject)` step in C++
+/// `toNativeFromValue` (ToNativeFromValue.h:43-58). The per-element narrowing
+/// (truncate/clamp/round) is then performed by `typed_array_store_native_bytes`.
+fn typed_array_store_input_number(value: RuntimeValue) -> Result<f64, ExecutionError> {
+    let value = to_number_value(value)?;
+    value
+        .as_number()
+        .map(number_to_f64)
+        .ok_or(ExecutionError::ExpectedInt32)
+}
+
 fn f64_to_int32(value: f64) -> i32 {
     if !value.is_finite() || value == 0.0 {
         return 0;
@@ -29633,7 +29981,7 @@ mod tests {
         let array = objects
             .allocate_uint8_array_with_write_barrier(&mut heap, buffer, 0, 1)
             .unwrap();
-        objects.write_uint8_element(array, 0, 123).unwrap();
+        objects.write_typed_element(array, 0, 123.0).unwrap();
         let key = CorePropertyKey::String("0".into());
 
         let (outcome, record) = objects
@@ -33507,7 +33855,7 @@ mod tests {
             .unwrap();
         let typed_array_structure = object_structure_id(&host.objects, typed_array);
         assert_eq!(
-            host.objects.write_uint8_element(typed_array, 0, 255),
+            host.objects.write_typed_element(typed_array, 0, 255.0),
             Ok(true)
         );
         assert_eq!(

@@ -116,7 +116,8 @@ Legend:
     [wip] simple Yarr executor subset
     [missing] full JSC Yarr parse/execute/Unicode semantics
     [missing] RegExp JIT and full String regex methods
-  [missing] typed arrays and ArrayBuffer breadth
+  [wip] typed arrays — 8 Number-content constructors ported (Int8..Float64,
+        faithful adaptor coercion); subarray, form edge cases, ArrayBuffer breadth pending
   [wip] Number autoboxing and prototype methods
     [done] Number.prototype.toString with radix (faithful C++ port)
     [done] Number.prototype.valueOf

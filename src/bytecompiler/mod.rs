@@ -226,6 +226,14 @@ pub const STANDARD_GLOBAL_BINDING_NAMES: &[&str] = &[
     "BigInt",
     "ArrayBuffer",
     "Uint8Array",
+    "Int8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float32Array",
+    "Float64Array",
     "DataView",
     "Proxy",
     "Symbol",
@@ -3426,6 +3434,17 @@ impl AstBytecodeEmitter<'_, '_> {
             ("BigInt", Self::emit_load_bigint_constructor),
             ("ArrayBuffer", Self::emit_load_array_buffer_constructor),
             ("Uint8Array", Self::emit_load_uint8_array_constructor),
+            ("Int8Array", Self::emit_load_int8_array_constructor),
+            (
+                "Uint8ClampedArray",
+                Self::emit_load_uint8_clamped_array_constructor,
+            ),
+            ("Int16Array", Self::emit_load_int16_array_constructor),
+            ("Uint16Array", Self::emit_load_uint16_array_constructor),
+            ("Int32Array", Self::emit_load_int32_array_constructor),
+            ("Uint32Array", Self::emit_load_uint32_array_constructor),
+            ("Float32Array", Self::emit_load_float32_array_constructor),
+            ("Float64Array", Self::emit_load_float64_array_constructor),
             ("DataView", Self::emit_load_data_view_constructor),
             ("Proxy", Self::emit_load_proxy_constructor),
             ("Symbol", Self::emit_load_symbol_constructor),
@@ -7103,12 +7122,69 @@ impl AstBytecodeEmitter<'_, '_> {
     fn emit_load_uint8_array_constructor(
         &mut self,
     ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        self.emit_load_typed_array_constructor(CoreOpcode::LoadUint8ArrayConstructor)
+    }
+
+    fn emit_load_int8_array_constructor(
+        &mut self,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        self.emit_load_typed_array_constructor(CoreOpcode::LoadInt8ArrayConstructor)
+    }
+
+    fn emit_load_uint8_clamped_array_constructor(
+        &mut self,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        self.emit_load_typed_array_constructor(CoreOpcode::LoadUint8ClampedArrayConstructor)
+    }
+
+    fn emit_load_int16_array_constructor(
+        &mut self,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        self.emit_load_typed_array_constructor(CoreOpcode::LoadInt16ArrayConstructor)
+    }
+
+    fn emit_load_uint16_array_constructor(
+        &mut self,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        self.emit_load_typed_array_constructor(CoreOpcode::LoadUint16ArrayConstructor)
+    }
+
+    fn emit_load_int32_array_constructor(
+        &mut self,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        self.emit_load_typed_array_constructor(CoreOpcode::LoadInt32ArrayConstructor)
+    }
+
+    fn emit_load_uint32_array_constructor(
+        &mut self,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        self.emit_load_typed_array_constructor(CoreOpcode::LoadUint32ArrayConstructor)
+    }
+
+    fn emit_load_float32_array_constructor(
+        &mut self,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        self.emit_load_typed_array_constructor(CoreOpcode::LoadFloat32ArrayConstructor)
+    }
+
+    fn emit_load_float64_array_constructor(
+        &mut self,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
+        self.emit_load_typed_array_constructor(CoreOpcode::LoadFloat64ArrayConstructor)
+    }
+
+    /// Shared emitter for the LoadXxxArrayConstructor opcodes: reserve a temp and
+    /// emit the single-operand load (mirrors the per-constructor intrinsic loads).
+    fn emit_load_typed_array_constructor(
+        &mut self,
+        opcode: CoreOpcode,
+    ) -> Result<VirtualRegister, BytecompilerEmissionError> {
         let destination = self
             .generator
             .registers_mut()
             .reserve_temporary(TemporaryLifetime::Expression);
         self.generator.instructions_mut().declare_instruction(
-            CoreOpcode::LoadUint8ArrayConstructor.opcode(),
+            opcode.opcode(),
             OperandWidth::Narrow,
             vec![Operand::Register(destination)],
         );

@@ -65048,6 +65048,53 @@ mod tests {
     }
 
     #[test]
+    fn vm_number_content_typed_array_constructors_store_per_cpp_adaptor() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        // Exercises the newly wired constructors with the C++ adaptor edge cases:
+        // Int8 signed readback, Int32 ToInt32 truncation, Float32 double->float
+        // rounding, Uint8Clamped clamp + round-half-to-even, a multi-byte buffer
+        // view sharing bytes with another view, per-kind class tags, and the
+        // call-without-new TypeError.
+        let completion = vm
+            .execute_source(source(
+                "let i8 = new Int8Array(2); i8[0] = -1; i8[1] = 257; \
+                 let i32 = new Int32Array(1); i32[0] = 4294967301; \
+                 let f32 = new Float32Array(1); f32[0] = 0.5; \
+                 let clamped = new Uint8ClampedArray(3); \
+                 clamped[0] = 257.9; clamped[1] = 2.5; clamped[2] = -5; \
+                 let fromArray = new Int16Array([1, 0x12345]); \
+                 let i32view = new Int32Array(2); \
+                 let u8over = new Uint8Array(i32view.buffer); \
+                 i32view[0] = 1; \
+                 let tagThrew = false; \
+                 try { Int8Array(1); } catch (error) { \
+                     tagThrew = error instanceof TypeError; \
+                 } \
+                 i8[0] === -1 \
+                     && i8[1] === 1 \
+                     && i32[0] === 5 \
+                     && f32[0] === 0.5 \
+                     && clamped[0] === 255 \
+                     && clamped[1] === 2 \
+                     && clamped[2] === 0 \
+                     && fromArray.length === 2 \
+                     && fromArray[1] === 0x2345 \
+                     && u8over.length === 8 \
+                     && u8over[0] === 1 \
+                     && Object.prototype.toString.call(i32) === \"[object Int32Array]\" \
+                     && Object.prototype.toString.call(f32) === \"[object Float32Array]\" \
+                     && tagThrew;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
     fn vm_symbol_constructor_creates_unique_symbols() {
         let mut vm = Vm::new(VmConfig::default());
 
