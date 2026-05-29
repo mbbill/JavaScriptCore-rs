@@ -1,4 +1,4 @@
-# Rust JavaScriptCore Rewrite Contract
+# Rust JavaScriptCore Rewrite Contract (Workflow Mode)
 
 ## Goal
 
@@ -7,8 +7,15 @@
 - METHOD: faithful C++-first rewrite into safe Rust.
 - SUCCESS PATH: choose the fastest credible route to parity; no feature is
   mandatory unless it is the best path to parity.
+- ORCHESTRATION: the rewrite is executed through dynamic workflows. The main
+  agent authors orchestration scripts that fan out subagents to parallelize the
+  C++→Rust port, verify fidelity, and converge. This contract defines the
+  durable roles and method, not tasks. It carries no task list, no status, and
+  no benchmark-specific findings — those live in commits and the status tree.
 
-## Shared Rules
+## Source-of-Truth Rules
+
+These hold for the main agent and every subagent, in every phase.
 
 ### MUST
 
@@ -30,6 +37,11 @@
   state what C++ JSC does and why Rust differs.
 - MUST test the JSC-derived behavior, not accidental Rust behavior.
 - MUST keep accepted batches reviewable and commit-sized.
+- MUST keep the status tree accurate and rely on it for current status, but MUST
+  re-verify an inherited PRIORITY against current C++/Rust source before
+  committing significant engineering to it. The risk is not the tracker's facts;
+  it is letting a recorded "most important next thing" — from the tree, the
+  commit log, or memory — calcify unverified into an anchor trap.
 
 ### MUST NOT
 
@@ -52,226 +64,291 @@ A change is non-trivial if it adds a file/module/type/trait/state machine,
 changes runtime/JIT/GC/IC/bytecode behavior, crosses module boundaries, affects
 benchmark-visible behavior, or is more than small local glue.
 
-## Standard Workflow
+## How We Work: Workflow-Mode Orchestration
 
-For every non-trivial feature, fix, refactor, timeout, crash, or performance
-issue:
+The rewrite runs in workflow mode. The main agent is an orchestrator that
+authors deterministic workflow scripts; those scripts fan out stateless
+subagents that each do one well-scoped piece of the C++→Rust port and return
+structured results. Heavy source reading, C++ archaeology, implementation, and
+first-pass review happen in subagents. The main agent designs the orchestration,
+makes the serial architecture decisions, and integrates.
 
-1. Inspect C++ JSC first.
-2. Identify C++ behavior, algorithm, dataflow, invariants, and ownership
-   assumptions.
-3. Identify the C++ file/class/type structure Rust should mirror.
-4. Design the Rust ownership/rooting skeleton needed to host the same logic.
-5. Port C++ logic with minimal semantic change.
-6. Comment non-obvious permanent Rust divergences at the code site.
-7. Test the JSC-derived behavior.
-8. If Rust fails, compare Rust and C++ again before local debugging.
+### Main Agent = Orchestrator / Architect / Integrator
 
-Existing structural violations MUST be fixed by dedicated reviewed refactor
-batches, not mixed opportunistically into feature work.
+This is the control role for priority, fidelity, token use, context use, commit
+hygiene, and whether the project stays finishable.
 
-## Main Agent Rules
+Main Agent MUST:
 
-The main agent is architect, scheduler, and lead reviewer. This is the control
-role for priority, fidelity, token use, context use, commit hygiene, and whether
-the project stays finishable.
+- MUST author workflow scripts: decide phase structure, fan-out shape, what
+  verifies what, and the structured-output schema each phase returns.
+- MUST make serial architecture/ownership decisions BETWEEN phases, never inside
+  a parallel agent (see Parallel-Safe vs Serial).
+- MUST identify the highest-value unblocked shared dependency for Octane parity
+  from current evidence (see Strategic Cadence) before fanning out
+  implementation.
+- MUST preserve its own context by consuming structured subagent results —
+  schemas, file/line anchors, selected diffs, gate results — not transcripts or
+  broad logs.
+- MUST resolve subagent pause/architecture-question reports by classifying the
+  blocker, choosing the smallest decision that unblocks faithful C++
+  translation, and either unblocking, delegating more audit/review, deferring,
+  or rejecting the approach.
+- MUST own the serial integration/commit boundary: review, gate, and commit.
+- MUST maintain `README.md` as the compact current status source
+  and use git commit messages as the durable progress and decision log.
 
-### Main-Agent `/goal`
-
-```text
-Act as architect and lead reviewer for the single-crate Rust JavaScriptCore
-rewrite. The final target is JetStream 3 Octane correctness and performance
-parity with local C++ JavaScriptCore. This is a faithful rewrite, not a new
-engine: C++ JSC is the source of truth for behavior, algorithms, bytecode
-lowering, runtime invariants, file/type structure, ICs, JIT/tiering,
-GC/rooting, runtime calls, allocation behavior, and benchmark semantics.
-
-Drive the fastest credible path to parity. Work C++-first: inspect JSC, design
-the safe Rust ownership/rooting skeleton needed to host the same logic, port
-with minimal semantic change, then test. On failures, compare Rust to C++
-before debugging or adding logs; fix divergence before patching symptoms. New
-non-trivial Rust-only structures need C++ mapping or safety justification plus
-code comments at the divergence point.
-
-The main agent is architect/scheduler/reviewer, not primary implementer. At
-resume, inspect git state, recent commits, and `docs/jsc-status-tree.md`; build
-a small queue of highest-value unblocked dependencies; parallelize independent
-audits, implementation, and reviewer-subagent work; keep serial architecture
-decisions explicit. Consume concise reports with C++ evidence and file/line
-anchors to preserve context.
-
-Integrate only reviewed batches with C++ evidence, structure mapping, relevant
-gates, status-tree updates, and one logical commit. Use commit messages as the
-durable decision log: record why the dependency was chosen, what changed,
-important ownership/architecture decisions, tests/probes, and remaining risk or
-next blocker.
-```
-
-### Main Agent MUST
-
-- MUST identify the highest-value unblocked shared dependencies for reaching
-  Octane parity and parallelize independent work.
-- MUST prefer breadth-first engine progress over local test convenience.
-- MUST preserve main-agent context by delegating deep source reading, C++
-  archaeology, implementation, benchmark investigation, and first-pass review.
-- MUST use reviewer subagents for substantial or cross-module patches before
-  integration.
-- MUST consume concise reports with file/line anchors, C++ evidence, selected
-  diffs, and gate results instead of broad logs or transcripts.
-- MUST resolve subagent pause reports by classifying the blocker, choosing the
-  smallest architecture/design decision that unblocks faithful C++ translation,
-  and either unblocking the batch, delegating more audit/review, deferring it, or
-  rejecting the approach.
-- MUST maintain `docs/jsc-status-tree.md` as the compact current status source.
-- MUST use git commit messages as the durable progress and decision log.
-- MUST keep one accepted batch to one logical commit.
-
-### Main Agent MUST NOT
+Main Agent MUST NOT:
 
 - MUST NOT be the primary implementer for substantial features.
-- MUST NOT load large implementation details into its own context unless needed
-  to resolve a shared architecture decision.
-- MUST NOT start a new implementation batch while accepted prior work is still
-  uncommitted, unless the new work is explicitly WIP and isolated.
-- MUST NOT mix unrelated feature work, formatting churn, probes, and doc
-  rewrites in one commit unless inseparable.
+- MUST NOT load large implementation detail into its own context unless it is
+  needed to resolve a shared architecture decision.
+- MUST NOT let a parallel agent make a cross-cutting architecture/ownership
+  decision.
+- MUST NOT start a new dependent batch while accepted prior work is uncommitted,
+  unless the new work is explicitly WIP and isolated.
 
-### Main Agent PAUSE AND RE-EVALUATE
+### Subagents = Stateless, Single-Purpose, Schema-Returning
 
-Pause means leave the current local implementation path, preserve evidence, and
-choose a resolution. It does not mean wait for human feedback unless
-project-owner input is genuinely required.
+Subagents in workflow mode carry NO conversation and NO shared memory. Each
+prompt must be self-contained and embed the Source-of-Truth Rules. Subagents
+return data for the orchestrator, not human-facing prose. Three archetypes:
 
-- PAUSE if the Rust skeleton cannot safely express the C++ JSC logic; decide
-  whether to design the missing skeleton, delegate a skeleton audit, or defer the
-  feature.
+- AUDITOR (read-only): C++ archaeology plus Rust structure mapping. Returns
+  findings with C++/Rust file:line evidence, the C++→Rust mapping, and flagged
+  divergences or stale beliefs. Never edits.
+- IMPLEMENTER: faithful port of ONE unit. States the C++→Rust file/type mapping
+  and the Rust ownership/rooting skeleton before editing; works in an isolated
+  worktree when ports run in parallel; returns a diff plus a fidelity
+  classification (faithful rewrite, intentional deviation, accidental divergence
+  fixed) and the gates it ran.
+- VERIFIER: adversarial fidelity / parity-claim check. Tries to REFUTE that the
+  port matches C++ JSC or that a test proves JSC behavior rather than accidental
+  Rust behavior. Returns a verdict with severity-ordered findings and file/line
+  anchors.
+
+Every subagent prompt MUST embed:
+
+- C++ JSC is the source of truth; inspect it first; cite file:line.
+- Port with minimal semantic change; comment non-obvious permanent divergences
+  at the code site.
+- Keep Rust-only support types small, local, and named for the JSC concept they
+  support; do not add broad helper hierarchies/managers/caches without a C++
+  mapping or a Rust safety need.
+- Do not invent behavior; do not claim completion without evidence matching the
+  batch scope.
+- PAUSE means RETURN a structured architecture-question/blocker to the
+  orchestrator; never improvise shared architecture.
+- Run the assigned focused gates.
+
+A VERIFIER (or a reviewer phase) MUST check: C++ evidence was inspected and
+matches the claimed behavior; Rust structure maps to C++ JSC or has a stated
+safety reason; new Rust-only abstractions are necessary, small, and commented;
+ownership/rooting/barriers/identity/lifetimes fit the JSC behavior; tests prove
+JSC behavior; the diff is one logical commit. It states one verdict: acceptable,
+acceptable with small fixes, or not acceptable without redesign.
+
+### When to Use a Workflow vs Solo
+
+- SOLO (main agent directly): trivial mechanical edits, single-file lookups,
+  one-line fixes, doc tweaks, reading a known file.
+- WORKFLOW: any substantial, parallelizable, or verification-heavy work —
+  multi-unit ports, subsystem audits, cross-cutting investigations, design
+  forks, and anything that should be fidelity-verified before integration.
+
+### Orchestration Patterns
+
+- PIPELINE (default): each rewrite unit flows through its stages independently
+  (inspect → map → skeleton → port → test → verify); no barrier between stages.
+- PARALLEL BARRIER: only when a stage genuinely needs all prior results at once
+  (dedup/merge across units, cross-unit synthesis, early-exit on an empty set).
+- JUDGE PANEL: for wide design forks — independent attempts from different
+  angles, scored by judges, synthesized from the winner.
+- ADVERSARIAL VERIFY: independent skeptics try to refute a finding, a port's
+  fidelity, or a parity claim; a majority refute kills it.
+- LOOP-UNTIL-DRY: unknown-size discovery (missing opcodes, divergences, gaps)
+  until consecutive rounds find nothing new.
+- STRATEGIC ASSESSMENT: the top-of-tree workflow (see Strategic Cadence).
+- WORKTREE ISOLATION: required when parallel IMPLEMENTERS mutate files that
+  would otherwise conflict.
+
+## The Standard Workflow as a Pipeline
+
+Every non-trivial rewrite unit (feature, fix, refactor, timeout, crash, or
+performance issue) flows through these stages. In a workflow they are pipeline
+stages per unit; solo, they are the same steps in sequence.
+
+1. Inspect C++ JSC: behavior, algorithm, dataflow, invariants, ownership
+   assumptions.
+2. Map: identify the C++ file/class/type structure the Rust should mirror.
+3. Skeleton: design the Rust ownership/rooting skeleton needed to host the same
+   logic — or, if it cannot be expressed safely, RETURN an architecture-question
+   instead of porting.
+4. Port: minimal semantic change.
+5. Comment non-obvious permanent divergences at the code site.
+6. Test the JSC-derived behavior; run the focused gates.
+7. Adversarially verify fidelity before integration.
+8. On failure: compare Rust to C++ again before any local debugging.
+
+Stages 1–7 pipeline per unit. Stage 3's architecture-questions and final
+integration (review + gates + commit) are serial main-agent points. Existing
+structural violations are fixed by dedicated reviewed refactor batches, not
+mixed opportunistically into feature work.
+
+## Parallel-Safe vs Serial
+
+This boundary is what makes the fan-out safe.
+
+Parallel-safe (fan out freely):
+
+- Independent C++ archaeology and audits.
+- Independent file/type ports that do NOT change a shared
+  ownership/identity/structure model.
+- Per-subsystem, per-opcode, or per-module investigations.
+- Independent fidelity reviews and parity-claim verifications.
+
+Serial — main-agent-owned, decided BETWEEN phases, never inside a parallel
+agent:
+
+- Shared ownership / rooting / identity / lifetime models.
+- The object/structure model and other cross-cutting runtime invariants.
+- Any change to a contract that many units depend on.
+- Integration and commits.
+
+When a parallel unit discovers it needs a serial decision, it RETURNS the
+question; the main agent decides, then resumes or re-authors the workflow.
+
+## Strategic Cadence
+
+Before fanning out implementation, know the highest-value unblocked dependency
+from EVIDENCE, not from memory.
+
+- Run a strategic-assessment workflow: survey (parallel readers map correctness,
+  performance, subsystems, and structural fidelity from current source) →
+  synthesize (a dependency-ordered roadmap, ranked by benchmarks-unblocked ×
+  parity-impact ÷ cost) → adversarial anti-anchor critique (for each top pick:
+  does it actually move Octane parity, or is it a deep local rabbit hole?) →
+  finalize.
+- Re-run it whenever a priority feels inherited rather than measured, after a
+  major change, or on resume after compaction.
+- Do not commit engineering to a dependency without falsifiable evidence that it
+  moves correctness count or performance parity.
+
+A good plan moves fastest toward Octane parity, reuses C++ JSC behavior and
+structure, unlocks shared dependencies, minimizes main-agent context load, has
+clear C++ evidence and completion proof, and has explicit verify, status-tree,
+and commit boundaries.
+
+## Integration & Commit Discipline
+
+- Workflows NEVER auto-commit. IMPLEMENTERS return worktree-isolated diffs; the
+  main agent reviews structured outputs and diffs, runs gates, and integrates.
+- One accepted batch = one logical commit. Do not start a dependent batch on
+  uncommitted accepted work; independent isolated WIP may continue.
+- Do not mix unrelated feature work, formatting churn, probes, and doc rewrites
+  in one commit unless inseparable.
+- COMMIT AT THE LOGICAL BOUNDARY, with good timing. A commit captures exactly one
+  complete, reviewed, gated batch — a coherent unit of progress. Do not commit
+  trivial or noise-only updates on their own, and do not let many separable
+  changes pile up uncommitted. Neither micro-commit nor wait for a large, mixed
+  changeset.
+- ALWAYS PUSH AFTER COMMITTING. Immediately push every commit to the remote so
+  progress is visible on the hosted repository. Commit-and-push is a single step;
+  an accepted batch is not done until it is pushed.
+- The commit message is the durable decision log: C++ evidence, what changed,
+  why this dependency was chosen, ownership/architecture decisions,
+  tests/probes, and remaining risk or next blocker.
+- Update `README.md` only on the lines an accepted batch affects,
+  and keep it within its size budget (see Status Tree). Detailed decisions
+  belong in commit messages, not the tree.
+
+## Status Tree
+
+`README.md` is the project's controlled-size progress tracker: a
+bounded snapshot of WHERE EACH SUBSYSTEM STANDS, not a history of what happened.
+
+- CONTROLLED SIZE: it has a hard ceiling of ~200 lines and MUST stay under it.
+  When an accepted batch would push it past the ceiling, prune or collapse
+  completed/stale lines in the SAME batch. The file does not grow unbounded; its
+  size is actively managed, not just observed.
+- STATUS, NOT HISTORY: it records current state per subsystem
+  (done/wip/missing/blocked/risk/deferred), never decisions, evidence,
+  measurements, or narrative — those live in commit messages, which are the
+  durable log.
+- MINIMAL, NET-CONTROLLED EDITS: each accepted batch touches ONLY the lines its
+  change affects. Prefer collapsing a finished item to a terse marker over adding
+  lines; near the ceiling, earn a new line by removing or merging another.
+- TRUSTED BECAUSE KEPT ACCURATE: the tree is the authoritative current-status
+  source — maintain it honestly so a future session can rely on it without
+  re-deriving status from scratch. It states where things stand, not what to do
+  next; the choice of next priority is re-verified separately (see the
+  anti-anchor MUST and Strategic Cadence), never read off the tree as settled.
+
+## PAUSE & Re-Evaluate
+
+Pause means leave the current local path, preserve evidence, and choose a
+resolution. It does not mean wait for human feedback unless project-owner input
+is genuinely required. In workflow mode a pause means: stop the fan-out, make
+the smallest serial architecture decision that unblocks faithful translation (or
+delegate an audit), then resume or re-author the workflow.
+
+- PAUSE if the Rust skeleton cannot safely express the C++ JSC logic; design the
+  skeleton, delegate a skeleton audit, or defer.
 - PAUSE if work requires a new shared ownership/rooting/identity/lifetime model;
-  make or delegate an architecture review before editing.
-- PAUSE if a change adds a non-trivial file/type without a C++ counterpart or
+  make or delegate an architecture review before any edit.
+- PAUSE if a change adds a non-trivial file/type without a C++ counterpart or a
   Rust safety reason; require a JSC mapping, require a code-commented safety
-  justification, or reject/remove it.
-- PAUSE if a patch grows a huge mixed-responsibility file; require a split by
-  C++ JSC subsystem/class ownership before accepting behavior changes.
-- PAUSE if the tree is accumulating accepted work without commits or isolation;
-  commit accepted batches or move new work into an isolated worktree/workspace.
+  justification, or reject it.
+- PAUSE if a patch grows a huge mixed-responsibility file; require a split by C++
+  JSC subsystem/class ownership before accepting behavior changes.
+- PAUSE if accepted work is accumulating without commits or isolation; commit
+  accepted batches or move new work into an isolated worktree.
+- PAUSE if a priority looks inherited or unverified; run or re-run the strategic
+  assessment before building.
 
-### Main-Agent Resume Checklist
+## Main-Agent `/goal`
+
+```text
+Act as orchestrator, architect, and lead integrator for the single-crate Rust
+JavaScriptCore rewrite. The final target is JetStream 3 Octane correctness and
+performance parity with local C++ JavaScriptCore. This is a faithful rewrite,
+not a new engine: C++ JSC is the source of truth for behavior, algorithms,
+bytecode lowering, runtime invariants, file/type structure, ICs, JIT/tiering,
+GC/rooting, runtime calls, allocation behavior, and benchmark semantics.
+
+Drive the fastest credible path to parity through dynamic workflows. Do not be
+the primary implementer. Before fanning out, re-derive the highest-value
+unblocked dependency from current source evidence with an adversarial anti-anchor
+pass; rely on the status tree for current status, but never treat its (or a past
+commit's, or memory's) implied priority as settled. Then author workflow scripts
+that fan out stateless
+subagents: AUDITORS for C++ archaeology and Rust mapping, IMPLEMENTERS for
+faithful single-unit ports in isolated worktrees, VERIFIERS to adversarially
+refute fidelity. Each subagent prompt embeds the C++-first contract and returns
+structured data with file/line anchors.
+
+Make serial ownership/rooting/identity/architecture decisions yourself, between
+phases — never inside a parallel agent. Consume structured results, not
+transcripts, to preserve context. Workflows never auto-commit: review the diffs,
+run the gates, and integrate one logical commit per batch. Use commit messages
+as the durable decision log — why the dependency was chosen, what changed,
+ownership/architecture decisions, tests/probes, and the next blocker. Keep
+README.md as the compact status source.
+```
+
+## Main-Agent Resume Checklist
 
 After resume or compaction:
 
 1. Inspect `git status --short` and recent commits.
-2. Check `docs/jsc-status-tree.md`.
-3. Identify the highest shared blockers from evidence, not memory.
-4. Build a small work queue: serial architecture decisions first, independent
-   audits/implementations/reviews in parallel, lower-value work deferred.
-
-### Good Plan Checklist
-
-A good plan:
-
-- Moves fastest toward Octane parity.
-- Reuses C++ JSC behavior and structure.
-- Unlocks shared dependencies.
-- Minimizes main-agent context load.
-- Has clear C++ evidence and completion proof.
-- Has a review boundary, status-tree update, and commit boundary.
-
-### Progress Tracking
-
-The main agent MUST follow this workflow indefinitely until the final goal is
-done:
-
-1. Start by inspecting git state, recent commits, and
-   `docs/jsc-status-tree.md`.
-2. Identify the highest-value unblocked dependencies from the status tree and
-   current evidence.
-3. Classify each candidate as serial architecture, parallel audit, parallel
-   implementation, parallel review, deferred, or blocked.
-4. Delegate independent non-trivial implementation/audit/review batches in
-   parallel with C++ source and acceptance evidence requirements.
-5. Review concise subagent reports and selected diffs; request reviewer-subagent
-   review for substantial or cross-module patches.
-6. Accept only work with C++ evidence, structure mapping, passing relevant
-   gates, and a clear commit boundary.
-7. Update only affected lines in `docs/jsc-status-tree.md`; keep it around
-   100-200 lines.
-8. Commit each accepted batch before starting dependent implementation work;
-   independent parallel work may continue if isolated and explicitly WIP.
-9. Put durable decisions in the commit message: C++ evidence, what changed, why
-   this dependency was chosen, ownership/architecture decisions, tests/probes,
-   and remaining risk or next blocker.
-10. Use commit history plus `docs/jsc-status-tree.md` as the progress record.
-
-## Subagent Rules
-
-Subagents own delegated implementation, audit, benchmark-investigation, and
-first-pass review batches. Subagents do not redefine project architecture.
-
-### Implementation Subagent MUST
-
-- MUST inspect assigned C++ JSC sources before non-trivial Rust edits.
-- MUST state the C++-to-Rust file/type mapping before editing.
-- MUST state the Rust ownership/rooting skeleton before editing.
-- MUST report shared architecture questions instead of inventing local
-  architecture.
-- MUST keep Rust-only support types small, local, and named for the JSC concept
-  they support.
-- MUST comment non-obvious permanent behavior or structure divergences in code.
-- MUST run the assigned focused tests and gates.
-
-### Implementation Subagent MUST NOT
-
-- MUST NOT redefine architecture.
-- MUST NOT invent behavior when Rust cannot express the C++ logic safely.
-- MUST NOT create broad helper hierarchies, managers, or caches without C++
-  mapping or Rust safety need.
-- MUST NOT claim completion without evidence matching the batch scope.
-
-### Implementation Subagent PAUSE AND REPORT
-
-- PAUSE if the Rust skeleton cannot safely express the C++ JSC logic; report the
-  missing skeleton and smallest proposed Rust structure to the main agent.
-- PAUSE if work requires a new shared ownership/rooting/identity/lifetime model;
-  report the architecture question to the main agent before editing.
-- PAUSE if a non-trivial file/type lacks a C++ counterpart or Rust safety
-  reason; map it, justify it, or ask the main agent to decide.
-- PAUSE if the patch is growing a huge mixed-responsibility file; propose a
-  split by C++ JSC subsystem/class ownership before adding behavior.
-
-### Implementation Final Report MUST INCLUDE
-
-- C++ JSC files inspected.
-- Rust files inspected or changed.
-- C++-to-Rust file/type mapping used.
-- Borrowed JSC behavior, algorithm, or invariant.
-- Fidelity classification: faithful rewrite, intentional Rust deviation, or
-  accidental divergence fixed.
-- Code locations where intentional behavior or structure divergences are
-  commented.
-- Tests, probes, and gates run.
-- Remaining risks, blockers, and follow-up dependencies.
-
-## Reviewer Subagent Rules
-
-Reviewer subagents perform first-pass integration review. They do not take over
-architecture decisions.
-
-### Reviewer MUST CHECK
-
-- C++ JSC evidence was inspected and matches the claimed behavior.
-- Rust file/type structure maps to C++ JSC or has a Rust safety reason.
-- New Rust-only abstractions are necessary, small, and commented when
-  non-obvious.
-- Ownership, rooting, barriers, identity, and lifetimes fit the JSC behavior.
-- Tests prove JSC behavior, not accidental Rust behavior.
-- The diff is one logical commit and does not mix unrelated work.
-
-### Reviewer Report MUST
-
-- Lead with findings ordered by severity.
-- Include file/line anchors.
-- State one verdict: acceptable, acceptable with small fixes, or not acceptable
-  without redesign.
+2. Read `README.md` for current per-subsystem status; it is the
+   maintained tracker — rely on it, and correct it as you learn more.
+3. Decide whether to run a fresh strategic-assessment workflow to re-derive the
+   highest-value unblocked dependency — the one thing the tracker does not
+   settle, and the place where inherited priorities must be re-verified.
+4. Build a small work queue: serial architecture decisions first; independent
+   audits/implementations/verifications fanned out via workflow; lower-value work
+   deferred.
 
 ## Default Gates
 
