@@ -1182,11 +1182,43 @@ pub struct RegisterFile {
     values: Vec<RuntimeValue>,
     windows: Vec<RegisterWindow>,
     barrier_handoffs: Vec<InterpreterWriteBarrierRecord>,
+    // C++ JSC divergence: C++ JSC does ZERO per-bytecode rooting. The LLInt
+    // dispatch macro just advances PC and jumps
+    // (llint/LowLevelInterpreter.asm dispatch); the JS register file is rooted
+    // by a single conservative span scan gathered ONLY in the GC marking phase
+    // (interpreter/CLoopStack.cpp gatherConservativeRoots,
+    // heap/Heap.cpp gatherStackRoots), so rooting cost is O(stack) once per GC,
+    // not per op.
+    //
+    // Rust instead maintains a precise targeted VM-register root registry that
+    // the dispatch loop reconciles. To approximate the C++ safepoint model
+    // (pay nothing on a pure-arith / cell-stable hot loop), this flag tracks
+    // whether the cell-membership of any register slot could have changed since
+    // the last reconcile. The targeted VM-register root set is a pure function
+    // of which slots hold cells and which cells those are
+    // (`targeted_register_roots_into` skips non-cell slots), so a write that
+    // neither stores a cell nor overwrites a cell cannot change the root set and
+    // need not trigger a recompute. The dispatch loop gates its per-op sync on
+    // this flag and clears it after a successful sync.
+    cell_root_dirty: bool,
 }
 
 impl RegisterFile {
     pub fn register_count(&self) -> usize {
         self.values.len()
+    }
+
+    /// Whether any register-slot cell-membership change may have occurred since
+    /// the last reconcile (see the `cell_root_dirty` field comment).
+    pub(crate) fn cell_root_dirty(&self) -> bool {
+        self.cell_root_dirty
+    }
+
+    /// Clears the cell-membership dirty signal. The dispatch loop calls this
+    /// after a successful targeted-root sync, and the pre-loop sync calls it
+    /// after establishing initial state.
+    pub(crate) fn clear_cell_root_dirty(&mut self) {
+        self.cell_root_dirty = false;
     }
 
     pub fn active_windows(&self) -> &[RegisterWindow] {
@@ -1329,6 +1361,17 @@ impl RegisterFile {
             this_offset: CallFrameSlotLayout::JSC_RUST.this_argument_offset,
         };
         self.windows.push(window);
+        // Conservative dirty signal: frame establishment writes argument values
+        // (which may be cells) into freshly grown slots without funneling
+        // through `write`. The interpreter dispatch loop is single-frame -- it
+        // exits the loop at every call/construct boundary (DispatchOutcome::
+        // OrdinaryBytecodeCall/Construct/FunctionValueCall/Return), and the
+        // nested `execute_code_block` runs its own UNCONDITIONAL pre-loop sync
+        // for the new window -- so this flag is not strictly required for
+        // correctness today. Setting it is cheap and keeps the dirty signal
+        // sound if a future path retains the same loop frame across an
+        // allocation. When in doubt, sync.
+        self.cell_root_dirty = true;
         Ok(window)
     }
 
@@ -1341,6 +1384,12 @@ impl RegisterFile {
             return Err(ExecutionError::RegisterWindowMismatch);
         }
         self.values.truncate(window.base);
+        // Conservative dirty signal: truncation drops the released window's
+        // slots (any cells they held) without funneling through `write`. As
+        // with `allocate_frame`, the dispatch loop exits at call/return/unwind
+        // boundaries so this is not strictly required today, but a sync here is
+        // cheap and keeps the signal sound. When in doubt, sync.
+        self.cell_root_dirty = true;
         Ok(())
     }
 
@@ -1399,6 +1448,16 @@ impl RegisterFile {
             return Err(ExecutionError::RegisterOutOfBounds);
         };
         let barrier = plan_interpreter_write_barrier(value)?;
+        // Mark the targeted register-root set as possibly stale only when this
+        // write changes the cell-membership of the slot: storing a cell adds a
+        // root, overwriting a cell removes or retargets one. A non-cell ->
+        // non-cell write (the pure-arithmetic hot-loop case) leaves the root set
+        // unchanged, so it does not set the flag and pays no per-op sync (see
+        // the `cell_root_dirty` field comment for the C++ JSC divergence).
+        let old = *target;
+        if old.as_cell().is_some() || value.as_cell().is_some() {
+            self.cell_root_dirty = true;
+        }
         *target = value;
         self.barrier_handoffs.push(InterpreterWriteBarrierRecord {
             frame: window.owner,
@@ -27941,6 +28000,11 @@ fn execute_code_block_with_resume<H: DispatchHost>(
         );
     }
 
+    // Pre-loop register-root sync stays UNCONDITIONAL: it establishes the
+    // initial targeted-root state for this frame (a fresh entry or a baseline
+    // re-entry resume, where generated code may have changed slot
+    // cell-membership outside this loop's `write` funnel). Clear the dirty flag
+    // immediately afterward so the first per-op gate sees a clean state.
     if let Err(error) = sync_targeted_register_roots_buffered(
         frame.id,
         execution.stack,
@@ -27957,6 +28021,7 @@ fn execute_code_block_with_resume<H: DispatchHost>(
             ExecutionCompletion::Failed(error),
         );
     }
+    execution.registers.clear_cell_root_dirty();
 
     loop {
         if let Some(reason) = execution.exceptions.termination() {
@@ -28011,21 +28076,41 @@ fn execute_code_block_with_resume<H: DispatchHost>(
             };
             host.dispatch_instruction(&mut state, instruction)
         };
-        if let Err(error) = sync_targeted_register_roots_buffered(
-            frame.id,
-            execution.stack,
-            execution.registers,
-            execution.heap,
-            host,
-            &mut active_targeted_register_roots,
-            &mut register_root_scratch,
-        ) {
-            return finish_with_targeted_root_cleanup(
+        // C++ JSC divergence: C++ JSC does ZERO per-bytecode rooting -- the
+        // LLInt dispatch macro only advances PC and jumps
+        // (llint/LowLevelInterpreter.asm), and the JS register file is rooted
+        // by one conservative span scan taken ONLY at a GC safepoint
+        // (interpreter/CLoopStack.cpp gatherConservativeRoots,
+        // heap/Heap.cpp gatherStackRoots), so rooting is O(stack) per GC, not
+        // per op. Rust keeps a precise targeted VM-register root registry, but
+        // recomputes it lazily: the per-op sync (a full window scan +
+        // TargetedRootSet build/validate + register/retarget/unregister) runs
+        // only when a write since the last reconcile may have changed a slot's
+        // cell-membership (`RegisterFile::cell_root_dirty`). The dispatched op
+        // is the only in-loop write source (`write_register` -> `write`), and
+        // call/construct/return/unwind all EXIT this single-frame loop (the
+        // `match outcome` below), so a clean flag here proves the root set is
+        // still in the correct state -- identical to syncing unconditionally,
+        // but a pure-arith / cell-stable hot loop pays nothing, approximating
+        // the C++ safepoint model. Clear the flag only after a successful sync.
+        if execution.registers.cell_root_dirty() {
+            if let Err(error) = sync_targeted_register_roots_buffered(
+                frame.id,
+                execution.stack,
+                execution.registers,
                 execution.heap,
+                host,
                 &mut active_targeted_register_roots,
-                &mut active_targeted_frame_roots,
-                ExecutionCompletion::Failed(error),
-            );
+                &mut register_root_scratch,
+            ) {
+                return finish_with_targeted_root_cleanup(
+                    execution.heap,
+                    &mut active_targeted_register_roots,
+                    &mut active_targeted_frame_roots,
+                    ExecutionCompletion::Failed(error),
+                );
+            }
+            execution.registers.clear_cell_root_dirty();
         }
 
         match outcome {
@@ -37750,9 +37835,22 @@ mod tests {
     #[test]
     fn targeted_register_roots_sync_alongside_known_frame_roots() {
         let register = VirtualRegister::local(0);
+        let mirror = VirtualRegister::local(1);
+        // NewObject installs a cell root for local0, then Move copies that cell
+        // into local1. The Move is a genuine cell-membership change (it sets the
+        // register-root dirty signal), so the sync after it runs with local0's
+        // register root already in `existing` -- exercising steady-state
+        // register/frame root coexistence without depending on a redundant
+        // recompute after a non-mutating op (the per-op tax this gating removes;
+        // see the dispatch-loop gate comment).
         let block = code_block(vec![
             core_typed(0, CoreOpcode::NewObject, vec![Operand::Register(register)]),
-            core_typed(1, CoreOpcode::Return, vec![Operand::Register(register)]),
+            core_typed(
+                1,
+                CoreOpcode::Move,
+                vec![Operand::Register(mirror), Operand::Register(register)],
+            ),
+            core_typed(2, CoreOpcode::Return, vec![Operand::Register(register)]),
         ]);
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
