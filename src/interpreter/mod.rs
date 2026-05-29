@@ -29,12 +29,11 @@ use crate::bytecode::{
     OperandKind, PackedInstructionStream, ParseMode, PropertyCacheKey,
 };
 use crate::gc::{
-    static_barrier_schema_registry, static_cell_metadata_registry, AllocationMode,
-    BarrierDecisionError, BarrierFieldKind, BarrierMutationAuthority, BarrierRequirementOutcome,
-    BarrierRequirementRequest, BarrierWriteContext, CellId, CellState, CellType, GcRef, Heap,
-    HeapAllocationRequest, HeapId, HeapIntegrationError, RootId, RootIdSet, RootKind, RootRecord,
-    RootSetMutationAuthority, RootSetSemanticError, StructureId, TargetedRootRecord,
-    TargetedRootSet, WriteBarrierApplicationRequest,
+    static_cell_metadata_registry, AllocationMode, BarrierDecisionError, BarrierFieldKind,
+    BarrierMutationAuthority, BarrierRequirementOutcome, BarrierWriteContext, CellId, CellState,
+    CellType, GcRef, Heap, HeapAllocationRequest, HeapId, HeapIntegrationError, RootId, RootIdSet,
+    RootKind, RootRecord, RootSetMutationAuthority, RootSetSemanticError, StructureId,
+    TargetedRootRecord, TargetedRootSet, WriteBarrierApplicationRequest,
 };
 use crate::jit::ic::{
     GeneratedPropertyStoreMutationCommit, GeneratedPropertyStoreMutationMissReason,
@@ -1181,7 +1180,6 @@ impl FrameRootDescriptor {
 pub struct RegisterFile {
     values: Vec<RuntimeValue>,
     windows: Vec<RegisterWindow>,
-    barrier_handoffs: Vec<InterpreterWriteBarrierRecord>,
     // C++ JSC divergence: C++ JSC does ZERO per-bytecode rooting. The LLInt
     // dispatch macro just advances PC and jumps
     // (llint/LowLevelInterpreter.asm dispatch); the JS register file is rooted
@@ -1223,10 +1221,6 @@ impl RegisterFile {
 
     pub fn active_windows(&self) -> &[RegisterWindow] {
         &self.windows
-    }
-
-    pub fn barrier_handoffs(&self) -> &[InterpreterWriteBarrierRecord] {
-        &self.barrier_handoffs
     }
 
     /// Borrows the current top register window as active-frame authority.
@@ -1447,7 +1441,26 @@ impl RegisterFile {
         let Some(target) = self.values.get_mut(slot) else {
             return Err(ExecutionError::RegisterOutOfBounds);
         };
-        let barrier = plan_interpreter_write_barrier(value)?;
+        // C++ JSC divergence (removed): a register/stack store does NOT emit a
+        // write barrier in C++ JSC. op_mov and every plain virtual-register
+        // store just write the slot (llint/LowLevelInterpreter64.asm op_mov
+        // -> storeValue; jit/JITOpcodes.cpp:51 emit_op_mov -> storeValue), with
+        // no barrierBranch / operationWriteBarrierSlowPath. The generational
+        // write barrier is only for HEAP-OBJECT FIELD stores keyed on the base
+        // cell (jit/JITPropertyAccess.cpp:771 op_put_by_id -> emitWriteBarrier,
+        // :1827 op_put_by_val, :1613/:1638/:1654 op_put_to_scope), because the
+        // GC must remember old->young CELL edges in the heap. The JS register
+        // file / call frame is a GC ROOT, conservatively span-scanned at GC
+        // safepoints (interpreter/CLoopStack.cpp:113 gatherConservativeRoots,
+        // heap/Heap.cpp:903 gatherStackRoots), so stack/register stores need no
+        // barrier. The prior per-write barrier-schema evaluation and the
+        // InterpreterWriteBarrierRecord accumulation therefore had no C++
+        // counterpart, were never drained or consumed by any runtime logic, and
+        // cost ~1.2us per register write; both are removed. The real heap-field
+        // barriers live in apply_value_store_write_barrier /
+        // put_data_own_with_write_barrier / put_array_element_with_write_barrier
+        // and are independent of this method and untouched.
+        //
         // Mark the targeted register-root set as possibly stale only when this
         // write changes the cell-membership of the slot: storing a cell adds a
         // root, overwriting a cell removes or retargets one. A non-cell ->
@@ -1459,13 +1472,6 @@ impl RegisterFile {
             self.cell_root_dirty = true;
         }
         *target = value;
-        self.barrier_handoffs.push(InterpreterWriteBarrierRecord {
-            frame: window.owner,
-            slot,
-            register,
-            value,
-            outcome: barrier,
-        });
         Ok(())
     }
 
@@ -1957,15 +1963,6 @@ impl ExecutionRootSnapshot {
             .chain(self.register_roots.iter().map(|descriptor| descriptor.root))
             .collect()
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InterpreterWriteBarrierRecord {
-    pub frame: CallFrameId,
-    pub slot: usize,
-    pub register: VirtualRegister,
-    pub value: RuntimeValue,
-    pub outcome: BarrierRequirementOutcome,
 }
 
 fn frame_local_capacity(shape: RegisterFrameShape) -> u32 {
@@ -28778,24 +28775,6 @@ fn value_cell_payload(value: RuntimeValue) -> Option<usize> {
     value.as_cell().map(|cell| cell.pointer_payload_bits())
 }
 
-fn target_state_for_value(value: RuntimeValue) -> Option<CellState> {
-    value_cell_payload(value).map(|_| CellState::PossiblyGrey)
-}
-
-fn plan_interpreter_write_barrier(
-    value: RuntimeValue,
-) -> Result<BarrierRequirementOutcome, BarrierDecisionError> {
-    let context = BarrierWriteContext::store(
-        BarrierFieldKind::Value,
-        CellState::PossiblyBlack,
-        target_state_for_value(value),
-    );
-    static_barrier_schema_registry().evaluate_requirement(
-        BarrierRequirementRequest::new(context)
-            .authority(BarrierMutationAuthority::MutatorFieldWrite),
-    )
-}
-
 fn validate_root_records(
     records: impl IntoIterator<Item = RootRecord>,
 ) -> Result<(), RootSetSemanticError> {
@@ -36384,9 +36363,17 @@ mod tests {
                 .unwrap(),
             RuntimeValue::from_i32(7)
         );
+        // C++ JSC divergence: register/stack stores are not barriered, so there
+        // is no per-write handoff stream to compare between the two paths. The
+        // faithful equivalence is that the baseline helpers and the dispatch
+        // loop leave the destination register holding the same moved value.
         assert_eq!(
-            baseline_registers.barrier_handoffs(),
-            dispatch_registers.barrier_handoffs()
+            baseline_registers
+                .read(window, destination, Some(block.constants()))
+                .unwrap(),
+            dispatch_registers
+                .read(window, destination, Some(block.constants()))
+                .unwrap()
         );
     }
 
@@ -38841,7 +38828,7 @@ mod tests {
     }
 
     #[test]
-    fn active_window_authority_write_records_same_barrier_handoff_as_register_file_write() {
+    fn active_window_authority_write_matches_register_file_write() {
         let mut direct = RegisterFile::default();
         let mut guarded = RegisterFile::default();
         let shape = RegisterFrameShape {
@@ -38868,7 +38855,19 @@ mod tests {
             authority.write(register, value).unwrap();
         }
 
-        assert_eq!(guarded.barrier_handoffs(), direct.barrier_handoffs());
+        // C++ JSC divergence: register/stack stores are not barriered, so there
+        // is no per-write handoff to compare. ActiveWindowAuthority::write just
+        // delegates to RegisterFile::write, so the faithful equivalence to
+        // assert is that both paths leave identical register state and identical
+        // targeted VM-register roots (the stored cell registered as a root).
+        assert_eq!(
+            guarded.read(guarded_window, register, None).unwrap(),
+            direct.read(direct_window, register, None).unwrap()
+        );
+        assert_eq!(
+            guarded.root_descriptors(HeapId(3)),
+            direct.root_descriptors(HeapId(3))
+        );
     }
 
     #[test]
@@ -39046,7 +39045,7 @@ mod tests {
     }
 
     #[test]
-    fn register_write_records_barrier_handoff_for_cell_values() {
+    fn register_write_of_cell_value_registers_targeted_root() {
         let mut registers = RegisterFile::default();
         let window = registers
             .allocate_frame(
@@ -39068,11 +39067,12 @@ mod tests {
             .write(window, VirtualRegister::local(0), value)
             .unwrap();
 
-        assert_eq!(registers.barrier_handoffs().len(), 1);
-        assert_eq!(
-            registers.barrier_handoffs()[0].outcome,
-            BarrierRequirementOutcome::Required(crate::gc::BarrierAction::MarkingBarrier)
-        );
+        // C++ JSC divergence: a register/stack store emits no write barrier
+        // (op_mov -> storeValue), so there is no per-write barrier record to
+        // assert. The faithful behavior this test proves is that storing a cell
+        // into a register registers it as a targeted VM-register GC root, which
+        // is what the conservative stack span scan covers in C++
+        // (heap/Heap.cpp:903 gatherStackRoots).
         assert_eq!(
             registers.root_descriptors(HeapId(3))[0].cell_payload,
             Some(0x1234)

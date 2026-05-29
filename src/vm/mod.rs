@@ -69,9 +69,9 @@ use crate::interpreter::{
     FunctionValuePropertyOperationCompletion, FunctionValuePropertyOperationOutcome,
     FunctionValuePropertyOperationResume, FunctionValueReturnTransform,
     GeneratedNativeIntrinsicCallRequest, GeneratedNativeIntrinsicCallResult,
-    InterpreterExecutionState, InterpreterFunctionCodeBlock, InterpreterWriteBarrierRecord,
-    OrdinaryBytecodeCallHandling, OrdinaryBytecodeCallRequest, OrdinaryBytecodeConstructRequest,
-    ProgramExecutionEntry, PropertyHasObservationDrainRequest, PropertyLoadObservationDrainRequest,
+    InterpreterExecutionState, InterpreterFunctionCodeBlock, OrdinaryBytecodeCallHandling,
+    OrdinaryBytecodeCallRequest, OrdinaryBytecodeConstructRequest, ProgramExecutionEntry,
+    PropertyHasObservationDrainRequest, PropertyLoadObservationDrainRequest,
     PropertyStoreObservationDescriptor, PropertyStoreObservationDrainRequest, RegisterFile,
     RegisterWindow, SingleDispatchOutcome, SingleDispatchRequest, StructureChainInvalidationEvent,
     StructureTransitionWatchpointRequest, StructureTransitionWatchpointSnapshot,
@@ -4157,10 +4157,6 @@ impl Vm {
     ) -> Result<ExecutionRootSnapshot, crate::gc::RootSetSemanticError> {
         self.execution
             .root_snapshot(self.heap.id(), &self.registers)
-    }
-
-    pub fn interpreter_write_barriers(&self) -> &[InterpreterWriteBarrierRecord] {
-        self.registers.barrier_handoffs()
     }
 
     pub fn heap_snapshot_hook(&self) -> VmHeapSnapshotHook {
@@ -33073,7 +33069,6 @@ mod tests {
             .unwrap();
         let boundary_snapshot = HeapMutationSnapshot::capture(&vm);
         boundary_snapshot.assert_no_gc_scope_depth(0);
-        let barrier_handoff_count = vm.registers.barrier_handoffs().len();
 
         let completion = vm.execute_code_block(
             owner,
@@ -33089,10 +33084,11 @@ mod tests {
         assert_no_gc_execution_depth_observed(&vm, VmNoGcExecutionPathForTest::GeneratedEntry, 1);
         boundary_snapshot.assert_heap_and_targeted_roots_unchanged(&vm);
         boundary_snapshot.assert_current_no_gc_scope_depth(&vm, 0);
-        assert!(
-            vm.registers.barrier_handoffs().len() > barrier_handoff_count,
-            "successful P6 generated writes still record register barrier handoffs"
-        );
+        // C++ JSC divergence (removed assertion): register/stack stores are not
+        // barriered in C++ (op_mov -> storeValue, no barrier), so there is no
+        // per-write handoff to accumulate. The faithful invariant this test now
+        // proves is that a successful generated entry mutates neither the heap
+        // nor the targeted root set (asserted above).
         if vm.execution.frame(frame).is_some() {
             vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
         }

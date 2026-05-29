@@ -14805,7 +14805,7 @@ mod tests {
             &block,
             BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitwiseRelationalJumps,
         );
-        let (result, stack, registers) = execute_generated(owner(), &block, &artifact);
+        let (result, stack, _registers) = execute_generated(owner(), &block, &artifact);
 
         assert_eq!(
             result,
@@ -14817,7 +14817,6 @@ mod tests {
             stack.top_frame().unwrap().bytecode_index,
             Some(BytecodeIndex::from_offset(0))
         );
-        assert!(registers.barrier_handoffs().is_empty());
     }
 
     #[test]
@@ -14835,7 +14834,7 @@ mod tests {
             &block,
             BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitwiseRelationalJumps,
         );
-        let (result, stack, registers) = execute_generated(owner(), &block, &artifact);
+        let (result, stack, _registers) = execute_generated(owner(), &block, &artifact);
         let frame = stack.top_frame().unwrap().id;
         let bytecode_index = BytecodeIndex::from_offset(0);
 
@@ -14859,7 +14858,6 @@ mod tests {
             stack.top_frame().unwrap().bytecode_index,
             Some(bytecode_index)
         );
-        assert!(registers.barrier_handoffs().is_empty());
     }
 
     #[test]
@@ -15314,13 +15312,12 @@ mod tests {
             ),
             core_typed(2, CoreOpcode::Return, vec![Operand::Register(local(1))]),
         ]);
-        let (result, _, registers) = execute_generated(owner(), &block, &artifact);
+        let (result, _, _registers) = execute_generated(owner(), &block, &artifact);
 
         assert!(matches!(
             result,
             Err(BaselineGeneratedExecutionError::CodeBlockSnapshotMismatch { .. })
         ));
-        assert!(registers.barrier_handoffs().is_empty());
     }
 
     #[test]
@@ -15502,13 +15499,12 @@ mod tests {
             core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
         ]);
 
-        let (result, _, registers) = execute_generated(owner(), &current, &artifact);
+        let (result, _, _registers) = execute_generated(owner(), &current, &artifact);
 
         assert!(matches!(
             result,
             Err(BaselineGeneratedExecutionError::CodeBlockSnapshotMismatch { .. })
         ));
-        assert!(registers.barrier_handoffs().is_empty());
     }
 
     #[test]
@@ -15531,13 +15527,12 @@ mod tests {
             core_typed(5, CoreOpcode::Return, vec![Operand::Register(local(0))]),
         ]);
 
-        let (result, _, registers) = execute_generated(owner(), &current, &artifact);
+        let (result, _, _registers) = execute_generated(owner(), &current, &artifact);
 
         assert!(matches!(
             result,
             Err(BaselineGeneratedExecutionError::CodeBlockSnapshotMismatch { .. })
         ));
-        assert!(registers.barrier_handoffs().is_empty());
     }
 
     #[test]
@@ -15552,7 +15547,7 @@ mod tests {
         ]);
         let artifact = artifact_for_block(owner(), &block);
 
-        let (owner_result, _, owner_registers) =
+        let (owner_result, _, _owner_registers) =
             execute_generated(other_owner(), &block, &artifact);
         assert_eq!(
             owner_result,
@@ -15561,11 +15556,10 @@ mod tests {
                 actual: other_owner(),
             })
         );
-        assert!(owner_registers.barrier_handoffs().is_empty());
 
         let mut invalid_artifact = artifact.clone();
         invalid_artifact.liveness = CodeLiveness::Unallocated;
-        let (artifact_result, _, artifact_registers) =
+        let (artifact_result, _, _artifact_registers) =
             execute_generated(owner(), &block, &invalid_artifact);
         assert_eq!(
             artifact_result,
@@ -15573,11 +15567,10 @@ mod tests {
                 JitCodeValidationError::BaselineGeneratedCodeNotLive
             ))
         );
-        assert!(artifact_registers.barrier_handoffs().is_empty());
 
         let mut invalid_effect_artifact = artifact.clone();
         invalid_effect_artifact.body.effect_contract = None;
-        let (effect_result, _, effect_registers) =
+        let (effect_result, _, _effect_registers) =
             execute_generated(owner(), &block, &invalid_effect_artifact);
         assert_eq!(
             effect_result,
@@ -15585,7 +15578,6 @@ mod tests {
                 JitCodeValidationError::BaselineGeneratedCodeEffectContractMismatch
             ))
         );
-        assert!(effect_registers.barrier_handoffs().is_empty());
 
         let mut code_block_stack = ExecutionContextStack::default();
         let mut code_block_registers = RegisterFile::default();
@@ -15619,7 +15611,6 @@ mod tests {
                 }
             ))
         );
-        assert!(code_block_registers.barrier_handoffs().is_empty());
 
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
@@ -15648,6 +15639,5 @@ mod tests {
                 }
             ))
         );
-        assert!(registers.barrier_handoffs().is_empty());
     }
 }
