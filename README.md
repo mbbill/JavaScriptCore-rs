@@ -18,7 +18,17 @@ Legend:
     [done] JetStreamDriver load order and shell globals
     [done] iteration, validation, scoring, and telemetry
     [done] benchmark/probe command surface for current investigations
-  [wip] Current proof path — core 4/6 pass, full 4/15
+  [wip] Current proof path — core 4/6 pass (interpreter), full 4/15. Octane SCORE = 0.
+    [blocked] CONFIRMED CRITICAL GATE (3 measurements agree): richards' hot FUNCTIONS
+           never execute generated code -- only the top-level Program does; calls run
+           the callee in the INTERPRETER (generated_direct_call_transactions=0). So the
+           whole baseline get_by_id/call DataIC machine-code stack (self-load,
+           prototype-load, call-link admission) is emitted onto function bodies that
+           never run as machine code -> richards stays at ~1.6 bytecodes/generated-entry,
+           PROPERTY exit class 96, both FLAT across every DataIC batch. The real gate is
+           call-DISPATCH-INTO-generated-code, NOT opcode coverage. Per-opcode DataIC
+           grind is correct groundwork but cannot move any score until this is solved.
+           STRATEGIC REFRAME pending (2026-05-29).
     [wip] Octane core (6 benchmarks)
       [done] richards, navier-stokes, crypto, delta-blue (interpreter, scored)
       [risk] raytrace render path CORRECT (validated: checkNumber guard reached,
@@ -100,10 +110,13 @@ Legend:
     [done] property load/store observation flow for current hot path
     [done] named has/in dormant metadata and narrow generated sidecar
     [wip] access-case evolution and megamorphic policy
-    [done] resident monomorphic self-load + prototype-chain (holder) load: receiver
-           guarded by STRUCTURE not identity (mirrors C++ AccessCase::Load
-           guardedByStructureCheckSkippingConstantIdentifierCheck), so same-structure
-           siblings share one plan; eliminated richards prototype-method-load exits 33->0
+    [done] resident monomorphic self-load + prototype-chain (holder) get_by_id DataIC
+           machine code emitted: receiver guarded by STRUCTURE not identity (mirrors C++
+           generateGetByIdInlineAccessBaselineDataIC Self/Prototype + AccessCase::Load
+           guardedByStructureCheckSkippingConstantIdentifierCheck); holder is a baked
+           pinned cell ptr validated by StructureTransition watchpoints. Machine-code
+           CORRECT (executes in tests), but see CRITICAL gate below: it does NOT move
+           richards -- the emitted code is on FUNCTION bodies that never run generated.
     [missing] full C++ Get/Put/In AccessCase taxonomy (multi-hop chains, Put/transition,
               megamorphic stubs)
     [missing] proxy/indexed in activation and call-link status
@@ -161,7 +174,9 @@ Legend:
          profiled self-time) and per-call deep clone
   [risk] baseline is still a Rust bytecode RE-INTERPRETER (~1.6x over interpreter,
          ~1.3M bytecodes/sec); top-level blocks get no generated execution. Parity
-         needs machine-code dispatch: no native get_by_id/put_by_id/call lowering yet
+         needs machine-code dispatch: get_by_id self+prototype DataIC machine code now
+         lands but is unreached on hot functions (see CONFIRMED CRITICAL GATE in proof
+         path: calls do not enter callee generated code, generated_direct_call=0)
   [wip] CRITICAL PATH to a real machine-code tier (in order): 1 StructureTransition
         Table [done] -> 2 fixed-offset Butterfly storage -> 3 inline mc GET/PUT_BY_ID
         -> 4 monomorphic call-link -> 5 per-opcode fast+slow slow-case rejoin ->
