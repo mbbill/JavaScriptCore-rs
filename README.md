@@ -39,29 +39,27 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] JetStreamDriver load order and shell globals
     [done] iteration, validation, scoring, and telemetry
     [done] benchmark/probe command surface for current investigations
-  [wip] Current proof path. GROUND-TRUTH run-state (2026-05-29, interpreter, 60s budget):
-    [done] SCORES: crypto (0.604), navier-stokes (1.355); richards scores given time
-           (~79s/iter, 0.062). First real non-zero scores achieved.
-    [wip] PAST-PREPARE BUT SLOW/TIMEOUT (functional, perf-gated -> Phase 1/3, not feature):
-           richards, raytrace, splay (GC-stress), pdfjs, Box2D, typescript; regexp
-           (hangs in regexp.js top-level, does NOT throw -- not a Yarr-throw as old
-           tree claimed). delta-blue REGRESSED: old tree says scored, now times out
-           even at 180s/2-iter -- investigate (Phase 2 correctness).
-    [wip] RUNTIME THROW needing indirect eval: octane-code-load (indirect eval on a
-           whole program) and octane-zlib (asm.js blob invokes eval). eval EXISTS as
-           a binding; only invocation throws. Indirect-eval-as-global is the next
-           Phase 2 target (the whole Eval parse/bytecompile pipeline already exists;
-           one serial decision: native-call -> compile-pipeline re-entrancy).
-    [done] COMPILE-BLOCK on implicit-global store FIXED (38ce3a4): gbemu, earley-boyer,
-           mandreel now run past prepare; code-load now compiles (-> eval throw above).
+  [wip] Current proof path. GROUND-TRUTH run-state (2026-05-30, interpreter, 30s/2-iter).
+        Suite geomean is None until ALL 15 Succeed (shell/octane.rs:1996); per-bench
+        score=5000/time_ms (:2693); the probe 30s timeout is a budget, not a scoring cutoff.
+    [done] SCORES (2): crypto (0.63), navier-stokes (1.38).
+    [wip] FUNCTIONAL-BUT-TIMEOUT (11; perf-gated -> Phase 1/3, not a feature gap): Box2D,
+           delta-blue, earley-boyer, gbemu, mandreel, pdfjs, raytrace, regexp, richards
+           (~73-77s/iter), splay (GC-stress), typescript. The monomorphic GET/PUT IC did
+           NOT move richards -- it is CALL + loop/dispatch-bound, not named-property-bound;
+           next interpreter lever is call-dispatch (~3M calls/iter at ~7us) + dispatch
+           overhead, not more property work.
+    [wip] THROW at runner (2; Phase 2): octane-code-load now Failed(ExpectedInt32) in the
+           jQuery AJAX/regex block (was ExpectedObject, 6f4c70e); octane-zlib loads all 4
+           sources then HANGS in its asm.js runner (perf/compute; URI byte path proven
+           correct). Indirect eval is NOT the blocker (landed b594d06).
+    [done] Phase-2 correctness landed: implicit-global store (38ce3a4), indirect/global eval
+           (b594d06), catchable TypeError + Array.prototype ToObject(this) (d750f2b, 6f4c70e),
+           putToPrimitive (212c8ee), RegExp.prototype getters (3b9b219), escape/URI globals
+           + read (ba5811e).
     [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
            __defineGetter__/Setter__, global Function, Math, apply/bind, globals
-    [note] Phase 3 (JIT) context: richards' hot FUNCTIONS don't run generated code
-           (calls run callee in interpreter, generated_direct_call=0); the real JIT
-           gate is call-dispatch-into-generated-code, not opcode coverage. Deferred.
     [missing] Octane score parity with local C++ JSC (needs optimizing tiers -- Phase 3)
-    [note] box2d/regexp/pdfjs/splay specifics are perf/throughput-gated (Phase 1/3) or
-           GC (splay); box2d Object/BigInt bitwise+shift coercion is a separate risk.
 
 [wip] C++ JSC structural fidelity
   [done] always-context rewrite contract in CLAUDE.md
