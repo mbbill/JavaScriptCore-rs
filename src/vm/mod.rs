@@ -31087,6 +31087,152 @@ mod tests {
         );
     }
 
+    // C++ JSC RegExpPrototype::finishCreation (runtime/RegExpPrototype.cpp:81-90)
+    // installs the RegExp.prototype accessor getters this engine previously
+    // omitted, so `/re/.source` returned undefined and jQuery/Sizzle's
+    // `new RegExp(o.match[r].source + ...)` threw on undefined.replace. These
+    // prove the JSC-derived getter behavior, not accidental Rust behavior.
+    #[test]
+    fn vm_regexp_prototype_source_getter_returns_pattern_string() {
+        // regExpProtoGetterSource (RegExpPrototype.cpp:459) returns the escaped
+        // pattern as a string for a RegExpObject receiver.
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("/abc/.source === \"abc\";"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("typeof /x/.source === \"string\";"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_regexp_prototype_boolean_getters_read_flag_bits() {
+        // regExpProtoGetterGlobal/IgnoreCase (RegExpPrototype.cpp:314/346) return
+        // the receiver's flag bit; absent flags read false.
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("/x/g.global === true && /x/.global === false;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("/x/i.ignoreCase === true;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_regexp_prototype_flags_getter_is_canonical_order() {
+        // regExpProtoGetterFlags (RegExpPrototype.cpp:443) reassembles the flag
+        // string in Yarr::flagsString canonical order (d,g,i,m,s,u,v,y), NOT the
+        // order the flags were written in the literal.
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("/x/gi.flags === \"gi\";"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("/x/ig.flags === \"gi\";"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_regexp_prototype_object_getters_use_special_case_values() {
+        // The %RegExp.prototype% receiver returns "(?:)" for source
+        // (RegExpPrototype.cpp:455), "" for flags, and undefined for the boolean
+        // getters (e.g. :310), rather than throwing.
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("RegExp.prototype.source === \"(?:)\";"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("RegExp.prototype.flags === \"\";"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("RegExp.prototype.global === undefined;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_regexp_prototype_getter_on_wrong_receiver_throws_type_error() {
+        // regExpProtoGetterSource (RegExpPrototype.cpp:456): a non-RegExp,
+        // non-%RegExp.prototype% receiver throws a catchable TypeError. The
+        // try/catch swallows it and the program completes normally with `true`.
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source(
+                "var t=false; \
+                 try { Object.getOwnPropertyDescriptor(RegExp.prototype,\"source\").get.call({}); } \
+                 catch (e) { t = (e instanceof TypeError); } \
+                 t;"
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_regexp_prototype_flags_getter_accepts_any_object() {
+        // regExpProtoGetterFlags (RegExpPrototype.cpp:437-440) does an
+        // isObject-only check, unlike source/boolean getters: a plain (non-RegExp)
+        // object receiver yields "" (every flag reads falsy), it does NOT throw.
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source(
+                "Object.getOwnPropertyDescriptor(RegExp.prototype,\"flags\").get.call({}) === \"\";"
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        // A non-object receiver still throws a catchable TypeError (:437-438).
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source(
+                "var t=false; \
+                 try { Object.getOwnPropertyDescriptor(RegExp.prototype,\"flags\").get.call(5); } \
+                 catch (e) { t = (e instanceof TypeError); } \
+                 t;"
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn vm_regexp_source_unblocks_sizzle_reconstruction() {
+        // jQuery 1.7.2 / Sizzle's `new RegExp(expr.source + suffix, flags)`
+        // pattern: reading `.source` off a RegExp and rebuilding. Previously
+        // `.source` was undefined and this threw.
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source(
+                "var r = /ab/g; var n = new RegExp(r.source + \"c\", \"i\"); \
+                 n.source === \"abc\" && n.flags === \"i\";"
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
     // C++ JSC globalFuncEval (runtime/JSGlobalObjectFunctions.cpp:450) ->
     // Interpreter::executeEval (interpreter/Interpreter.cpp:1436). INDIRECT
     // (global) eval. These prove JSC behavior: a string arg is compiled and its

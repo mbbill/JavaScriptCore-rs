@@ -84,6 +84,50 @@ use crate::yarr::{
 const FRAME_ROOT_ID_BASE: u64 = 1_000_000_000_000;
 const REGISTER_ROOT_ID_BASE: u64 = 2_000_000_000_000;
 
+/// Receiver classification shared by the RegExp.prototype accessor getters.
+/// Mirrors the `dynamicDowncast<RegExpObject>(thisValue)` /
+/// `thisValue == globalObject->regExpPrototype()` / TypeError branch structure
+/// repeated in every getter in runtime/RegExpPrototype.cpp:301-460.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegExpGetterReceiver {
+    RegExp,
+    Prototype,
+    Invalid,
+}
+
+/// Canonical RegExp flag string assembled from the flag booleans in the order
+/// fixed by yarr/YarrFlags.h:37-44 (d,g,i,m,s,u,v,y), matching Yarr::flagsString
+/// (yarr/YarrFlags.cpp:62) that backs regExpProtoGetterFlags. We reassemble from
+/// the booleans (not the stored user flags text) to match C++'s canonical order.
+fn regexp_canonical_flags_string(flags: RegexFlags) -> String {
+    let mut text = String::new();
+    if flags.has_indices {
+        text.push('d');
+    }
+    if flags.global {
+        text.push('g');
+    }
+    if flags.ignore_case {
+        text.push('i');
+    }
+    if flags.multiline {
+        text.push('m');
+    }
+    if flags.dot_all {
+        text.push('s');
+    }
+    if flags.unicode {
+        text.push('u');
+    }
+    if flags.unicode_sets {
+        text.push('v');
+    }
+    if flags.sticky {
+        text.push('y');
+    }
+    text
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct InterpreterStackId(pub u64);
 
@@ -6011,6 +6055,21 @@ enum CoreNativeFunction {
     RegExpTest,
     RegExpExec,
     RegExpPrototypeToString,
+    // RegExp.prototype accessor getters. C++ JSC installs each as a distinct
+    // native getter in RegExpPrototype::finishCreation (runtime/RegExpPrototype.cpp:81-90):
+    // regExpProtoGetterSource (:446), regExpProtoGetterFlags (:429), and the
+    // per-flag boolean getters regExpProtoGetterGlobal/HasIndices/IgnoreCase/
+    // Multiline/DotAll/Sticky/Unicode/UnicodeSets (:301-427).
+    RegExpProtoGetterSource,
+    RegExpProtoGetterFlags,
+    RegExpProtoGetterGlobal,
+    RegExpProtoGetterHasIndices,
+    RegExpProtoGetterIgnoreCase,
+    RegExpProtoGetterMultiline,
+    RegExpProtoGetterDotAll,
+    RegExpProtoGetterSticky,
+    RegExpProtoGetterUnicode,
+    RegExpProtoGetterUnicodeSets,
     PromiseConstructor,
     PromiseResolve,
     PromiseReject,
@@ -8453,6 +8512,35 @@ impl CoreObjectStore {
             ("toString", CoreNativeFunction::RegExpPrototypeToString),
         ] {
             self.install_native_method(prototype, name, native_function);
+        }
+        // RegExp.prototype accessor getters, mirroring the order and
+        // DontEnum|Accessor attributes of RegExpPrototype::finishCreation
+        // (runtime/RegExpPrototype.cpp:81-90). install_native_getter installs a
+        // DontEnum accessor with no setter, matching the native getter setup.
+        // C++ also installs `unicodeSets` (:88); RegExpFlags models that flag, so
+        // we install it too rather than deferring.
+        for (name, native_function) in [
+            ("global", CoreNativeFunction::RegExpProtoGetterGlobal),
+            ("dotAll", CoreNativeFunction::RegExpProtoGetterDotAll),
+            (
+                "hasIndices",
+                CoreNativeFunction::RegExpProtoGetterHasIndices,
+            ),
+            (
+                "ignoreCase",
+                CoreNativeFunction::RegExpProtoGetterIgnoreCase,
+            ),
+            ("multiline", CoreNativeFunction::RegExpProtoGetterMultiline),
+            ("sticky", CoreNativeFunction::RegExpProtoGetterSticky),
+            ("unicode", CoreNativeFunction::RegExpProtoGetterUnicode),
+            (
+                "unicodeSets",
+                CoreNativeFunction::RegExpProtoGetterUnicodeSets,
+            ),
+            ("source", CoreNativeFunction::RegExpProtoGetterSource),
+            ("flags", CoreNativeFunction::RegExpProtoGetterFlags),
+        ] {
+            self.install_native_getter(prototype, name, native_function);
         }
         prototype
     }
@@ -19839,6 +19927,37 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::RegExpPrototypeToString => {
                 self.native_regexp_prototype_to_string(state.heap, this_value)
             }
+            CoreNativeFunction::RegExpProtoGetterSource => {
+                self.native_regexp_proto_getter_source(state.heap, this_value)
+            }
+            CoreNativeFunction::RegExpProtoGetterFlags => {
+                self.native_regexp_proto_getter_flags(state.heap, this_value)
+            }
+            CoreNativeFunction::RegExpProtoGetterGlobal => {
+                self.native_regexp_proto_getter_flag(state.heap, this_value, |flags| flags.global)
+            }
+            CoreNativeFunction::RegExpProtoGetterHasIndices => self
+                .native_regexp_proto_getter_flag(state.heap, this_value, |flags| flags.has_indices),
+            CoreNativeFunction::RegExpProtoGetterIgnoreCase => self
+                .native_regexp_proto_getter_flag(state.heap, this_value, |flags| flags.ignore_case),
+            CoreNativeFunction::RegExpProtoGetterMultiline => {
+                self.native_regexp_proto_getter_flag(state.heap, this_value, |flags| {
+                    flags.multiline
+                })
+            }
+            CoreNativeFunction::RegExpProtoGetterDotAll => {
+                self.native_regexp_proto_getter_flag(state.heap, this_value, |flags| flags.dot_all)
+            }
+            CoreNativeFunction::RegExpProtoGetterSticky => {
+                self.native_regexp_proto_getter_flag(state.heap, this_value, |flags| flags.sticky)
+            }
+            CoreNativeFunction::RegExpProtoGetterUnicode => {
+                self.native_regexp_proto_getter_flag(state.heap, this_value, |flags| flags.unicode)
+            }
+            CoreNativeFunction::RegExpProtoGetterUnicodeSets => self
+                .native_regexp_proto_getter_flag(state.heap, this_value, |flags| {
+                    flags.unicode_sets
+                }),
             CoreNativeFunction::PromiseConstructor => {
                 Err(self
                     .type_error_outcome_with_heap(state.heap, "Constructor Promise requires 'new'"))
@@ -22384,6 +22503,112 @@ impl CoreOpcodeDispatchHost {
         self.strings
             .allocate_with_heap(heap, &format!("/{source}/{flags_text}"))
             .map_err(DispatchOutcome::Fail)
+    }
+
+    /// Three-way classification of a RegExp.prototype getter receiver, mirroring
+    /// the `dynamicDowncast<RegExpObject>(thisValue)` / `%RegExp.prototype%`
+    /// special-case / TypeError structure shared by every getter in
+    /// runtime/RegExpPrototype.cpp:301-460.
+    fn regexp_getter_receiver(&self, this_value: RuntimeValue) -> RegExpGetterReceiver {
+        if self.objects.is_regexp(this_value) {
+            RegExpGetterReceiver::RegExp
+        } else if Some(this_value) == self.objects.regexp_prototype {
+            RegExpGetterReceiver::Prototype
+        } else {
+            RegExpGetterReceiver::Invalid
+        }
+    }
+
+    /// `source` getter: regExpProtoGetterSource (runtime/RegExpPrototype.cpp:446).
+    /// A RegExpObject returns its escaped pattern; the %RegExp.prototype%
+    /// receiver returns "(?:)" (:455); any other receiver throws a TypeError (:456).
+    fn native_regexp_proto_getter_source(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        match self.regexp_getter_receiver(this_value) {
+            RegExpGetterReceiver::RegExp => {
+                let (source, _, _) = self.regexp_source_and_flags_or_throw(heap, this_value)?;
+                self.strings
+                    .allocate_with_heap(heap, &source)
+                    .map_err(DispatchOutcome::Fail)
+            }
+            RegExpGetterReceiver::Prototype => self
+                .strings
+                .allocate_with_heap(heap, "(?:)")
+                .map_err(DispatchOutcome::Fail),
+            RegExpGetterReceiver::Invalid => Err(self.type_error_outcome_with_heap(
+                heap,
+                "The RegExp.prototype.source getter can only be called on a RegExp object",
+            )),
+        }
+    }
+
+    /// `flags` getter: regExpProtoGetterFlags (runtime/RegExpPrototype.cpp:429).
+    /// Unlike `source` and the boolean getters (which dynamicDowncast to a
+    /// RegExpObject and throw otherwise), `flags` does an isObject-only check
+    /// (:437-438): ANY object receiver is accepted and the string is built by
+    /// reading each flag generically via flagsString (:249-267), so a non-RegExp
+    /// object yields "" (every flag read is falsy) rather than throwing. We
+    /// therefore do NOT reuse regexp_getter_receiver here. The canonical order is
+    /// Yarr::flagsString d,g,i,m,s,u,v,y (yarr/YarrFlags.h:37-44).
+    ///
+    /// DIVERGENCE (commented): C++ flagsString reads each flag through the
+    /// generic get() path, so a non-RegExp object carrying its own truthy
+    /// "global"/"sticky"/... data properties would contribute those letters.
+    /// We read the flag bits off a RegExpObject directly and treat every other
+    /// object as all-falsy ("") -- faithful for RegExp instances, RegExp.prototype,
+    /// and the plain-object receivers Octane exercises; the rare arbitrary-object-
+    /// with-flag-named-properties case is deferred.
+    fn native_regexp_proto_getter_flags(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        if !self.objects.is_object(this_value) {
+            // C++ RegExpPrototype.cpp:437-438: a non-object receiver throws.
+            return Err(self.type_error_outcome_with_heap(
+                heap,
+                "The RegExp.prototype.flags getter can only be called on an object",
+            ));
+        }
+        let flags = if self.objects.is_regexp(this_value) {
+            let (_, flags, _) = self.regexp_source_and_flags_or_throw(heap, this_value)?;
+            flags
+        } else {
+            // RegExp.prototype itself or any other object: every flag reads falsy.
+            RegexFlags::default()
+        };
+        let text = regexp_canonical_flags_string(flags);
+        self.strings
+            .allocate_with_heap(heap, &text)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    /// Per-flag boolean getter shared by regExpProtoGetterGlobal/HasIndices/
+    /// IgnoreCase/Multiline/DotAll/Sticky/Unicode/UnicodeSets
+    /// (runtime/RegExpPrototype.cpp:301-427). A RegExpObject returns the flag
+    /// bit; the %RegExp.prototype% receiver returns undefined; any other
+    /// receiver throws a TypeError. `select` picks the flag bit, matching each
+    /// C++ getter's `regexp->regExp()->global()` etc.
+    fn native_regexp_proto_getter_flag(
+        &mut self,
+        heap: &mut Heap,
+        this_value: RuntimeValue,
+        select: impl Fn(RegexFlags) -> bool,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        match self.regexp_getter_receiver(this_value) {
+            RegExpGetterReceiver::RegExp => {
+                let (_, flags, _) = self.regexp_source_and_flags_or_throw(heap, this_value)?;
+                Ok(RuntimeValue::from_bool(select(flags)))
+            }
+            RegExpGetterReceiver::Prototype => Ok(RuntimeValue::undefined()),
+            RegExpGetterReceiver::Invalid => Err(self.type_error_outcome_with_heap(
+                heap,
+                "The RegExp.prototype flag getter can only be called on a RegExp object",
+            )),
+        }
     }
 
     fn execute_regexp_match(
