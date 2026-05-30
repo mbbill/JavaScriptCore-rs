@@ -31019,6 +31019,74 @@ mod tests {
         );
     }
 
+    // C++ JSC JSValue::putToPrimitive (runtime/JSCJSValue.cpp:217): a property
+    // PUT on a primitive base is NOT fatal. In sloppy mode (Octane), with no
+    // prototype setter, it is a SILENT NO-OP — definePropertyOnReceiver
+    // (JSObject.cpp:983) cannot CreateDataProperty on a non-object receiver and
+    // returns false without storing. These prove JSC behavior (not accidental
+    // Rust behavior): the put does not throw, no property is created, and the
+    // assignment expression still evaluates to the RHS value.
+    #[test]
+    fn vm_put_to_primitive_number_base_is_sloppy_no_op() {
+        let mut vm = Vm::new(VmConfig::default());
+        // `(5).foo = 1` does not throw; the assignment expression evaluates to
+        // the RHS value 1 (putToPrimitive returns, the bytecode result is the
+        // stored value, not a property read).
+        assert_eq!(
+            vm.execute_source(source("(5).foo = 1;")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(1))
+        );
+        // Afterward `(5).foo` is undefined: nothing was stored on the primitive
+        // and Number.prototype has no `foo`.
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("(5).foo = 1; (5).foo;")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+    }
+
+    #[test]
+    fn vm_put_to_primitive_string_length_is_sloppy_no_op() {
+        let mut vm = Vm::new(VmConfig::default());
+        // gbemu's residual blocker: `s.length = 99` on a string. putToPrimitive
+        // (JSCJSValue.cpp:223) treats String length as read-only — a sloppy
+        // no-op — so it does not throw and `s.length` stays 1.
+        assert_eq!(
+            vm.execute_source(source("var s = \"x\"; s.length = 99; s.length;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(1))
+        );
+    }
+
+    #[test]
+    fn vm_put_to_primitive_string_and_boolean_bases_do_not_throw() {
+        // `"a".foo = 1` and `true.x = 1` are sloppy no-ops via String.prototype
+        // / Boolean.prototype synthesis, not fatal ExpectedObject failures. The
+        // assignment expression evaluates to the RHS value.
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("\"a\".foo = 1;")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(1))
+        );
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("true.x = 1;")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(1))
+        );
+    }
+
+    #[test]
+    fn vm_put_on_object_base_still_stores() {
+        // Object-base puts are unchanged by the put-to-primitive path: a normal
+        // own data property is created and reads back.
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("var o = {}; o.x = 3; o.x;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(3))
+        );
+    }
+
     // C++ JSC globalFuncEval (runtime/JSGlobalObjectFunctions.cpp:450) ->
     // Interpreter::executeEval (interpreter/Interpreter.cpp:1436). INDIRECT
     // (global) eval. These prove JSC behavior: a string arg is compiled and its

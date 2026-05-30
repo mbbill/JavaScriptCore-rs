@@ -6878,6 +6878,21 @@ enum CorePropertyPut {
     IgnoredReadOnly,
 }
 
+/// Result of a put on a primitive base, mirroring C++ JSC
+/// `JSValue::putToPrimitive` (runtime/JSCJSValue.cpp:217). The primitive's
+/// synthesized prototype chain is walked: a prototype accessor with a setter is
+/// invoked with the primitive as receiver (`Setter`); otherwise the assignment
+/// is a no-op (`NoOp`) — in sloppy mode `JSObject::definePropertyOnReceiver`
+/// (JSObject.cpp:973) returns false silently because the receiver is not an
+/// object, and a getter-only accessor or read-only data property on the chain
+/// likewise yields a sloppy no-op. Strict-mode TypeError is deferred (see the
+/// call site).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PutToPrimitiveOutcome {
+    Setter(RuntimeValue),
+    NoOp,
+}
+
 impl CoreObjectStore {
     fn allocate(&mut self) -> RuntimeValue {
         let prototype = self.ensure_object_prototype();
@@ -9477,6 +9492,50 @@ impl CoreObjectStore {
             CorePropertyAttributes::DATA_DEFAULT,
         )?;
         Ok(CorePropertyPut::Stored)
+    }
+
+    /// C++ JSC `JSValue::putToPrimitive` (runtime/JSCJSValue.cpp:217), the put
+    /// half of the autobox path that mirrors the get-side
+    /// `synthesizePrototype` lookup already used for `(42).toString()` and
+    /// `'x'.length`. `synthesized_prototype` is the primitive's
+    /// Number/String/Boolean/Symbol/BigInt `.prototype`; we walk its prototype
+    /// chain looking for a setter, exactly as `JSObject::putInlineSlow`
+    /// (JSObject.cpp:831) walks from `obj = this` upward. An accessor with a
+    /// setter is reported so the caller can invoke it with the primitive as
+    /// receiver (`slot.thisValue()`); a getter-only accessor or a read-only
+    /// data property, or reaching the end of the chain, is a no-op — in sloppy
+    /// mode `definePropertyOnReceiver` (JSObject.cpp:973) silently returns false
+    /// for a non-object receiver. We never store onto the prototype itself,
+    /// because the receiver is the primitive, not the prototype object.
+    fn find_setter_for_put_to_primitive(
+        &self,
+        synthesized_prototype: RuntimeValue,
+        key: &CorePropertyKey,
+    ) -> Result<PutToPrimitiveOutcome, ExecutionError> {
+        let mut current = Some(synthesized_prototype);
+        while let Some(object) = current {
+            let Some(cell) = self.find(object) else {
+                return Err(ExecutionError::ExpectedObject);
+            };
+            if let Some(property) = cell.properties.get(key).copied() {
+                return Ok(match property.kind {
+                    CorePropertyKind::Accessor {
+                        setter: Some(setter),
+                        ..
+                    } => PutToPrimitiveOutcome::Setter(setter),
+                    // Getter-only accessor or read-only data property: sloppy
+                    // no-op (strict TypeError deferred). Writable data property:
+                    // also a no-op here, since the receiver is the primitive and
+                    // `definePropertyOnReceiver` cannot create a data property on
+                    // a non-object receiver.
+                    CorePropertyKind::Accessor { setter: None, .. } | CorePropertyKind::Data(_) => {
+                        PutToPrimitiveOutcome::NoOp
+                    }
+                });
+            }
+            current = cell.prototype;
+        }
+        Ok(PutToPrimitiveOutcome::NoOp)
     }
 
     fn get_own_property(
@@ -15472,6 +15531,19 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 if matches!(object.kind(), ValueKind::Undefined | ValueKind::Null) {
                     return self.not_an_object_type_error(state.heap, object);
                 }
+                // C++ JSC: a primitive base routes through
+                // JSValue::putToPrimitiveByIndex (JSCJSValue.cpp:245) ->
+                // synthesizePrototype -> attemptToInterceptPutByIndexOnHoleForPrototype;
+                // the synthesized Number/String/Boolean/Symbol prototypes carry no
+                // indexed accessors, so this is a sloppy no-op (strict TypeError
+                // deferred), not the fatal ExpectedObject objects.put_index returns.
+                if self.is_primitive_put_base(object) {
+                    let key = array_index_property_key(index);
+                    return match self.put_to_primitive(state, object, &key, value, None) {
+                        Ok(_) => DispatchOutcome::Continue,
+                        Err(outcome) => outcome,
+                    };
+                }
                 self.put_index_with_store_observation(
                     state,
                     instruction.bytecode_index,
@@ -17117,6 +17189,80 @@ impl CoreOpcodeDispatchHost {
         }
     }
 
+    /// True for a put base that is a JS primitive (number/string/boolean/
+    /// symbol/bigint), i.e. not an object cell and not undefined/null. Mirrors
+    /// the cases `JSValue::synthesizePrototype` (JSCJSValue.cpp:188) handles
+    /// without throwing. This is only the predicate that gates the
+    /// `put_to_primitive` path (where the setter/no-op semantics are
+    /// documented); object bases return `false` so the caller falls through to
+    /// the normal `objects.put`, and undefined/null are excluded because they
+    /// are guarded (catchable TypeError) before this is reached.
+    fn is_primitive_put_base(&self, object: RuntimeValue) -> bool {
+        if matches!(object.kind(), ValueKind::Undefined | ValueKind::Null) {
+            return false;
+        }
+        self.strings.text(object).is_some()
+            || self.bigints.is_bigint(object)
+            || self.symbols.is_symbol(object)
+            || object.as_number().is_some()
+            || object.as_bool().is_some()
+    }
+
+    fn put_to_primitive(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        object: RuntimeValue,
+        key: &CorePropertyKey,
+        value: RuntimeValue,
+        completion_context: Option<FunctionValuePropertyOperationContext>,
+    ) -> Result<PropertyStoreObservationOutcome, DispatchOutcome> {
+        // Determine the synthesized prototype for the primitive base, matching
+        // JSValue::synthesizePrototype's dispatch order (string/bigint/symbol
+        // cells, then number, then boolean). Callers gate on
+        // is_primitive_put_base, so a non-primitive is unreachable here; treat
+        // it defensively as a no-op rather than mis-synthesizing a prototype.
+        let synthesized_prototype = if self.strings.text(object).is_some() {
+            // C++ JSValue::putToPrimitive: `isString() && key == "length"`
+            // returns typeError(ReadonlyPropertyWriteError) — a sloppy no-op,
+            // since String length is non-writable (JSCJSValue.cpp:223). We do
+            // not special-case it: `length` is not on String.prototype, so the
+            // chain walk reaches the end and yields NoOp, the same observable
+            // sloppy result (e.g. `s.length = 99` leaves `s.length === 1`).
+            self.objects.ensure_string_prototype()
+        } else if self.bigints.is_bigint(object) {
+            self.objects.ensure_bigint_prototype()
+        } else if self.symbols.is_symbol(object) {
+            self.objects.ensure_symbol_prototype()
+        } else if object.as_number().is_some() {
+            self.objects.ensure_number_prototype()
+        } else if object.as_bool().is_some() {
+            self.objects.ensure_boolean_prototype()
+        } else {
+            return Ok(PropertyStoreObservationOutcome::Ignored);
+        };
+        match self
+            .objects
+            .find_setter_for_put_to_primitive(synthesized_prototype, key)
+            .map_err(DispatchOutcome::Fail)?
+        {
+            PutToPrimitiveOutcome::Setter(setter) => {
+                let completion = completion_context
+                    .map(|context| context.completion(FunctionValuePropertyObservation::none()));
+                // Receiver is the primitive base (slot.thisValue()), per
+                // GetterSetter::callSetter (JSObject.cpp:879).
+                self.execute_function_value_with_completion(
+                    state,
+                    setter,
+                    object,
+                    &[value],
+                    completion,
+                )?;
+                Ok(PropertyStoreObservationOutcome::Setter)
+            }
+            PutToPrimitiveOutcome::NoOp => Ok(PropertyStoreObservationOutcome::Ignored),
+        }
+    }
+
     fn put_property_value_for_store_observation(
         &mut self,
         state: &mut DispatchState<'_>,
@@ -17149,11 +17295,15 @@ impl CoreOpcodeDispatchHost {
         // through JSValue::putToPrimitive -> synthesizePrototype (JSCJSValue.cpp:188,
         // 217), which throws a catchable TypeError via createNotAnObjectError. This is
         // the JS-observable store-observation entry (PutByName/PutByValue opcodes,
-        // which do not go through put_property_value_with_completion). Primitive bases
-        // are a separate put-to-primitive gap, left as the prior ExpectedObject
-        // failure from objects.put below.
+        // which do not go through put_property_value_with_completion).
         if matches!(object.kind(), ValueKind::Undefined | ValueKind::Null) {
             return Err(self.not_an_object_type_error(state.heap, object));
+        }
+        // C++ JSC: a primitive base (number/string/boolean/symbol/bigint) routes
+        // through JSValue::putToPrimitive (JSCJSValue.cpp:217) — a prototype-chain
+        // setter or a sloppy no-op — instead of objects.put's ExpectedObject.
+        if self.is_primitive_put_base(object) {
+            return self.put_to_primitive(state, object, key, value, completion_context);
         }
         match self
             .objects
@@ -17217,13 +17367,19 @@ impl CoreOpcodeDispatchHost {
         // C++ JSC put_by_id / put_by_val slow path: an undefined or null base goes
         // through JSValue::putToPrimitive -> synthesizePrototype (JSCJSValue.cpp:188,
         // 217) which throws a catchable TypeError via createNotAnObjectError. This is
-        // the JS-observable "Cannot set properties of undefined" case. (Primitive
-        // bases like numbers/strings route through Number/String.prototype in C++ and
-        // are a separate, pre-existing put-to-primitive gap left as the prior
-        // ExpectedObject failure below; only undefined/null become a catchable throw
-        // here.)
+        // the JS-observable "Cannot set properties of undefined" case.
         if matches!(object.kind(), ValueKind::Undefined | ValueKind::Null) {
             return Err(self.not_an_object_type_error(state.heap, object));
+        }
+        // C++ JSC: a primitive base (number/string/boolean/symbol/bigint) routes
+        // through JSValue::putToPrimitive (JSCJSValue.cpp:217), invoking a
+        // prototype-chain setter with the primitive as receiver or, in the common
+        // case (e.g. `(5).foo = 1`, `s.length = 99`), a sloppy no-op — not the
+        // fatal ExpectedObject objects.put would return. The assignment still
+        // evaluates to the RHS value; no property is stored.
+        if self.is_primitive_put_base(object) {
+            self.put_to_primitive(state, object, key, value, completion_context)?;
+            return Ok(());
         }
         match self
             .objects
