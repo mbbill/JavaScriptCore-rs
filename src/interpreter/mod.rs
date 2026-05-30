@@ -5995,6 +5995,16 @@ enum CoreNativeFunction {
     // functions. Both ToNumber the argument then test finiteness/NaN.
     GlobalIsFinite,
     GlobalIsNaN,
+    // C++ JSC globalFuncEscape / globalFuncUnescape / globalFuncDecodeURI /
+    // globalFuncDecodeURIComponent / globalFuncEncodeURI /
+    // globalFuncEncodeURIComponent (runtime/JSGlobalObjectFunctions.cpp:566-705).
+    // Installed on the global object with DontEnum (JSGlobalObject.cpp:699-704).
+    GlobalEscape,
+    GlobalUnescape,
+    GlobalDecodeURI,
+    GlobalDecodeURIComponent,
+    GlobalEncodeURI,
+    GlobalEncodeURIComponent,
     HostPerformanceNow,
     HostPrint,
     HostAlert,
@@ -7854,6 +7864,32 @@ impl CoreObjectStore {
             is_nan,
             standard_attributes,
         )?;
+        // C++ JSC JSGlobalObject::init installs the URI/escape global functions
+        // with DontEnum (runtime/JSGlobalObject.cpp:699-704). standard_attributes
+        // matches DontEnum (writable, configurable, not enumerable).
+        for (name, native) in [
+            ("escape", CoreNativeFunction::GlobalEscape),
+            ("unescape", CoreNativeFunction::GlobalUnescape),
+            ("decodeURI", CoreNativeFunction::GlobalDecodeURI),
+            (
+                "decodeURIComponent",
+                CoreNativeFunction::GlobalDecodeURIComponent,
+            ),
+            ("encodeURI", CoreNativeFunction::GlobalEncodeURI),
+            (
+                "encodeURIComponent",
+                CoreNativeFunction::GlobalEncodeURIComponent,
+            ),
+        ] {
+            let function = self.allocate_native_function(native);
+            self.install_standard_global_data_property(
+                heap,
+                global_object,
+                name,
+                function,
+                standard_attributes,
+            )?;
+        }
         // C++ JSC JSGlobalObject::init installs `NaN` and `Infinity` as value
         // properties with DontEnum | DontDelete | ReadOnly attributes
         // (not writable, not enumerable, not configurable).
@@ -7902,6 +7938,9 @@ impl CoreObjectStore {
                 "alert" => self.allocate_native_function(CoreNativeFunction::HostAlert),
                 "console" => self.allocate_host_console_object(),
                 "readFile" => self.allocate_native_function(CoreNativeFunction::HostReadFile),
+                // C++ JSC jsc shell binds `read` as a host-function alias of
+                // readFile (jsc.cpp:683 -> functionReadFile). Reuse HostReadFile.
+                "read" => self.allocate_native_function(CoreNativeFunction::HostReadFile),
                 "top" => self.allocate_host_top_object(),
                 _ => return Err(ExecutionError::UnknownHostGlobal),
             };
@@ -19788,6 +19827,20 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::ParseFloat => self.native_parse_float(arguments),
             CoreNativeFunction::GlobalIsFinite => self.native_global_is_finite(arguments),
             CoreNativeFunction::GlobalIsNaN => self.native_global_is_nan(arguments),
+            CoreNativeFunction::GlobalEscape => self.native_global_escape(state, arguments),
+            CoreNativeFunction::GlobalUnescape => self.native_global_unescape(state, arguments),
+            CoreNativeFunction::GlobalDecodeURI => {
+                self.native_global_decode_uri(state, arguments, DECODE_URI_RESERVED, true)
+            }
+            CoreNativeFunction::GlobalDecodeURIComponent => {
+                self.native_global_decode_uri(state, arguments, &[], true)
+            }
+            CoreNativeFunction::GlobalEncodeURI => {
+                self.native_global_encode_uri(state, arguments, ENCODE_URI_UNESCAPED)
+            }
+            CoreNativeFunction::GlobalEncodeURIComponent => {
+                self.native_global_encode_uri(state, arguments, ENCODE_URI_COMPONENT_UNESCAPED)
+            }
             CoreNativeFunction::HostPerformanceNow => Ok(self.native_host_performance_now()),
             CoreNativeFunction::HostPrint => {
                 Ok(self.native_host_output(CoreHostOutputSink::Print, arguments))
@@ -20581,6 +20634,103 @@ impl CoreOpcodeDispatchHost {
         let number = self.number_constructor_value(value)?;
         let number = number.as_number().map(number_to_f64).unwrap_or(f64::NAN);
         Ok(RuntimeValue::from_bool(number.is_nan()))
+    }
+
+    /// ToString the first argument, then return its UTF-16 code units.
+    ///
+    /// C++ JSC routes all six functions through toStringView (ToString the
+    /// argument once, then iterate span8/span16). coerce_to_string_value is the
+    /// engine's ToString (it calls toString/valueOf for objects); we then read
+    /// the flat text and expand to UTF-16 code units (str::encode_utf16),
+    /// matching the code-unit domain the C++ tables operate on.
+    fn uri_argument_code_units(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        arguments: &[RuntimeValue],
+    ) -> Result<Vec<u16>, DispatchOutcome> {
+        let value = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        let string_value = self.coerce_to_string_value(state, value)?;
+        let text = self
+            .strings
+            .text(string_value)
+            .ok_or(DispatchOutcome::Fail(ExecutionError::ExpectedObject))?;
+        Ok(text.encode_utf16().collect())
+    }
+
+    // C++ JSC throws a URIError on a malformed escape / illegal UTF-16 sequence
+    // (createURIError, JSGlobalObjectFunctions.cpp:67,199). This engine has no
+    // distinct URIError type yet, so we degrade to a catchable TypeError, the
+    // same pattern parseInt's RangeError case uses. The octane-zlib data path
+    // only decodes/encodes well-formed input, so this branch is not hit during
+    // the benchmark.
+    fn uri_error_outcome(&mut self, heap: &mut Heap) -> DispatchOutcome {
+        self.type_error_outcome_with_heap(heap, "URI error")
+    }
+
+    /// C++ JSC globalFuncEncodeURI / globalFuncEncodeURIComponent
+    /// (runtime/JSGlobalObjectFunctions.cpp:581-601).
+    fn native_global_encode_uri(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        arguments: &[RuntimeValue],
+        unescaped: &[u8],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let units = self.uri_argument_code_units(state, arguments)?;
+        let encoded = match uri_encode(&units, unescaped) {
+            Ok(encoded) => encoded,
+            Err(()) => return Err(self.uri_error_outcome(state.heap)),
+        };
+        self.strings
+            .allocate_with_heap(state.heap, &encoded)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    /// C++ JSC globalFuncDecodeURI / globalFuncDecodeURIComponent
+    /// (runtime/JSGlobalObjectFunctions.cpp:566-579).
+    fn native_global_decode_uri(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        arguments: &[RuntimeValue],
+        do_not_unescape: &[u8],
+        strict: bool,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let units = self.uri_argument_code_units(state, arguments)?;
+        let decoded = match uri_decode(&units, do_not_unescape, strict) {
+            Ok(decoded) => decoded,
+            Err(()) => return Err(self.uri_error_outcome(state.heap)),
+        };
+        self.strings
+            .allocate_with_heap(state.heap, &decoded)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    /// C++ JSC globalFuncEscape (runtime/JSGlobalObjectFunctions.cpp:603-641).
+    fn native_global_escape(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let units = self.uri_argument_code_units(state, arguments)?;
+        let escaped = uri_escape(&units);
+        self.strings
+            .allocate_with_heap(state.heap, &escaped)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    /// C++ JSC globalFuncUnescape (runtime/JSGlobalObjectFunctions.cpp:643-705).
+    fn native_global_unescape(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let units = self.uri_argument_code_units(state, arguments)?;
+        let unescaped = uri_unescape(&units);
+        self.strings
+            .allocate_with_heap(state.heap, &unescaped)
+            .map_err(DispatchOutcome::Fail)
     }
 
     fn native_date_constructor(
@@ -27290,6 +27440,301 @@ fn normalize_string_index(index: i32, length: i32) -> i32 {
     } else {
         index.min(length)
     }
+}
+
+// Faithful Rust port of the URI/escape global-function string transforms in
+// C++ JSC runtime/JSGlobalObjectFunctions.cpp. The C++ helpers operate on
+// UTF-16 code units (StringView::span8/span16) with WTF::BitSet<256>
+// do-not-escape / do-not-unescape tables; the Rust mirror operates on the
+// caller's UTF-16 code-unit vector (str::encode_utf16) and represents each
+// table as a byte-membership predicate over the same ASCII literal the C++
+// makeLatin1CharacterBitSet uses (WTF/wtf/text/ASCIIFastPath.h:49).
+//
+// Result of a decode/encode: Ok(String) on success, Err(()) signals the C++
+// "String contained an illegal UTF-16 sequence." / "URI error" URIError. The
+// caller maps Err(()) onto the engine's catchable error (URIError is not yet a
+// distinct error type in this engine; see the call sites).
+
+/// C++ JSC makeLatin1CharacterBitSet membership over a do-not-escape/unescape
+/// ASCII literal. `byte` is always < 256 at the call sites; non-ASCII code
+/// units are handled separately by the encode/decode/escape callers exactly as
+/// the C++ does (`character < doNotEscape.size()` / `u >= 128`).
+fn uri_char_in_set(set: &[u8], byte: u8) -> bool {
+    set.contains(&byte)
+}
+
+// doNotEscapeWhenEncodingURI (JSGlobalObjectFunctions.cpp:583-588): the URI
+// reserved + unreserved set preserved by encodeURI.
+const ENCODE_URI_UNESCAPED: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$&'()*+,-./:;=?@_~";
+
+// doNotEscapeWhenEncodingURIComponent (JSGlobalObjectFunctions.cpp:594-599):
+// the component-unreserved set preserved by encodeURIComponent (reserved chars
+// like ; , / ? : @ & = + $ # ! are escaped).
+const ENCODE_URI_COMPONENT_UNESCAPED: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!'()*-._~";
+
+// doNotUnescapeWhenDecodingURI (JSGlobalObjectFunctions.cpp:568-570): reserved
+// escapes that decodeURI leaves percent-encoded.
+const DECODE_URI_RESERVED: &[u8] = b"#$&+,/:;=?@";
+
+// doNotEscape set used by the legacy escape() (JSGlobalObjectFunctions.cpp:606-611).
+const ESCAPE_DO_NOT_ESCAPE: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789*+-./@_";
+
+fn uri_is_ascii_hex_digit(unit: u16) -> bool {
+    matches!(unit, 0x30..=0x39 | 0x41..=0x46 | 0x61..=0x66)
+}
+
+fn uri_hex_value(unit: u16) -> u32 {
+    match unit {
+        0x30..=0x39 => unit as u32 - 0x30,
+        0x41..=0x46 => unit as u32 - 0x41 + 10,
+        0x61..=0x66 => unit as u32 - 0x61 + 10,
+        _ => 0,
+    }
+}
+
+/// Lexer::convertHex (two ASCII hex digits -> byte).
+fn uri_convert_hex(high: u16, low: u16) -> u8 {
+    ((uri_hex_value(high) << 4) | uri_hex_value(low)) as u8
+}
+
+/// Lexer::convertUnicode (four ASCII hex digits -> UTF-16 code unit).
+fn uri_convert_unicode(a: u16, b: u16, c: u16, d: u16) -> u16 {
+    ((uri_hex_value(a) << 12)
+        | (uri_hex_value(b) << 8)
+        | (uri_hex_value(c) << 4)
+        | uri_hex_value(d)) as u16
+}
+
+fn uri_append_hex_byte(builder: &mut Vec<u16>, byte: u8) {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    builder.push(u16::from(b'%'));
+    builder.push(u16::from(DIGITS[(byte >> 4) as usize]));
+    builder.push(u16::from(DIGITS[(byte & 0xF) as usize]));
+}
+
+/// C++ JSC encode() (JSGlobalObjectFunctions.cpp:57-137). UTF-8-encodes each
+/// code point not in `unescaped` and emits one uppercase %XY per byte; throws
+/// (Err) on an unpaired surrogate.
+fn uri_encode(units: &[u16], unescaped: &[u8]) -> Result<String, ()> {
+    let mut builder: Vec<u16> = Vec::with_capacity(units.len());
+    let mut index = 0usize;
+    while index < units.len() {
+        let character = units[index];
+        // 4-c. If C is in unescapedSet, emit it verbatim.
+        if character < 256 && uri_char_in_set(unescaped, character as u8) {
+            builder.push(character);
+            index += 1;
+            continue;
+        }
+        // 4-d-i. A trailing surrogate that is not preceded by a lead is invalid.
+        if (0xDC00..=0xDFFF).contains(&character) {
+            return Err(());
+        }
+        let code_point: u32 = if !(0xD800..=0xDBFF).contains(&character) {
+            // 4-d-ii. BMP code unit.
+            u32::from(character)
+        } else {
+            // 4-d-iii. Lead surrogate: require a following trail surrogate.
+            index += 1;
+            if index >= units.len() {
+                return Err(());
+            }
+            let trail = units[index];
+            if !(0xDC00..=0xDFFF).contains(&trail) {
+                return Err(());
+            }
+            0x10000 + ((u32::from(character) - 0xD800) << 10) + (u32::from(trail) - 0xDC00)
+        };
+        // 4-d-iv..vi. UTF-8-encode V, then percent-encode each octet.
+        let mut buffer = [0u8; 4];
+        // code_point is a valid scalar value here (BMP non-surrogate or a
+        // value built from validated lead+trail), so char::from_u32 succeeds.
+        let scalar = char::from_u32(code_point).ok_or(())?;
+        let octets = scalar.encode_utf8(&mut buffer);
+        for byte in octets.as_bytes() {
+            uri_append_hex_byte(&mut builder, *byte);
+        }
+        index += 1;
+    }
+    Ok(String::from_utf16_lossy(&builder))
+}
+
+/// C++ JSC decode() (JSGlobalObjectFunctions.cpp:148-221). Reverses %XX UTF-8
+/// sequences; `do_not_unescape` (decodeURI's reserved set) leaves matching
+/// single-byte escapes encoded. `strict` (true for decodeURI*) throws on a
+/// malformed escape; when false (unescape uses its own path, not this one) the
+/// %uXXXX form is also recognized.
+fn uri_decode(units: &[u16], do_not_unescape: &[u8], strict: bool) -> Result<String, ()> {
+    let mut builder: Vec<u16> = Vec::with_capacity(units.len());
+    let length = units.len();
+    let mut k = 0usize;
+    while k < length {
+        let c = units[k];
+        if c == u16::from(b'%') {
+            let mut char_len = 0usize;
+            let mut u: u16 = 0;
+            // Pending lead surrogate emitted before a supplementary trail.
+            let mut pending_lead: Option<u16> = None;
+            if k + 3 <= length
+                && uri_is_ascii_hex_digit(units[k + 1])
+                && uri_is_ascii_hex_digit(units[k + 2])
+            {
+                let b0 = uri_convert_hex(units[k + 1], units[k + 2]);
+                let sequence_len = 1 + utf8_count_trail_bytes(b0);
+                if k + sequence_len * 3 <= length {
+                    char_len = sequence_len * 3;
+                    let mut sequence = [0u8; 4];
+                    sequence[0] = b0;
+                    for i in 1..sequence_len {
+                        let q = k + i * 3;
+                        if units[q] == u16::from(b'%')
+                            && uri_is_ascii_hex_digit(units[q + 1])
+                            && uri_is_ascii_hex_digit(units[q + 2])
+                        {
+                            sequence[i] = uri_convert_hex(units[q + 1], units[q + 2]);
+                        } else {
+                            char_len = 0;
+                            break;
+                        }
+                    }
+                    if char_len != 0 {
+                        match utf8_decode_next(&sequence[..sequence_len]) {
+                            None => char_len = 0,
+                            Some(code_point) if code_point > 0xFFFF => {
+                                // Supplementary: emit surrogate pair.
+                                let v = code_point - 0x10000;
+                                pending_lead = Some((0xD800 + (v >> 10)) as u16);
+                                u = (0xDC00 + (v & 0x3FF)) as u16;
+                            }
+                            Some(code_point) => u = code_point as u16,
+                        }
+                    }
+                }
+            }
+            if char_len == 0 {
+                if strict {
+                    return Err(());
+                }
+                // The non-strict path supports the WinIE "%uXXXX" form. (unescape
+                // has its own dedicated loop; this branch is retained for fidelity
+                // with the shared C++ decode().)
+                if k + 6 <= length
+                    && units[k + 1] == u16::from(b'u')
+                    && uri_is_ascii_hex_digit(units[k + 2])
+                    && uri_is_ascii_hex_digit(units[k + 3])
+                    && uri_is_ascii_hex_digit(units[k + 4])
+                    && uri_is_ascii_hex_digit(units[k + 5])
+                {
+                    char_len = 6;
+                    u = uri_convert_unicode(units[k + 2], units[k + 3], units[k + 4], units[k + 5]);
+                }
+            }
+            if char_len != 0 && (u >= 128 || !uri_char_in_set(do_not_unescape, u as u8)) {
+                if let Some(lead) = pending_lead {
+                    builder.push(lead);
+                }
+                builder.push(u);
+                k += char_len;
+                continue;
+            }
+        }
+        k += 1;
+        builder.push(c);
+    }
+    Ok(String::from_utf16_lossy(&builder))
+}
+
+/// ICU U8_COUNT_TRAIL_BYTES: number of UTF-8 trail bytes implied by a lead byte
+/// (0 for an invalid/continuation lead, matching the C++ U8_COUNT_TRAIL_BYTES
+/// used in decode()).
+fn utf8_count_trail_bytes(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 0,
+        0xC0..=0xDF => 1,
+        0xE0..=0xEF => 2,
+        0xF0..=0xF4 => 3,
+        _ => 0,
+    }
+}
+
+/// ICU U8_NEXT over a complete `sequence`: decode the single code point, or
+/// None on a malformed/over-long sequence (U_SENTINEL in the C++). std's
+/// from_utf8 is used in place of replicating U8_NEXT byte-by-byte; it is
+/// equivalent here because both reject the same ill-formed inputs strictly --
+/// overlong encodings, surrogate code points encoded as UTF-8, and truncated
+/// sequences all fail validation (adversarially verified), which is exactly the
+/// U_SENTINEL set decode() treats as an error.
+fn utf8_decode_next(sequence: &[u8]) -> Option<u32> {
+    std::str::from_utf8(sequence)
+        .ok()
+        .and_then(|text| text.chars().next())
+        .map(u32::from)
+}
+
+/// C++ JSC globalFuncEscape lambda (JSGlobalObjectFunctions.cpp:603-640).
+/// ASCII-range code units outside the do-not-escape set become %XX; code units
+/// >= 256 become %uXXXX; do-not-escape members pass through.
+fn uri_escape(units: &[u16]) -> String {
+    let mut builder: Vec<u16> = Vec::with_capacity(units.len());
+    for &character in units {
+        if character >= 256 {
+            builder.push(u16::from(b'%'));
+            builder.push(u16::from(b'u'));
+            const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+            for shift in [12u32, 8, 4, 0] {
+                builder.push(u16::from(DIGITS[((character >> shift) & 0xF) as usize]));
+            }
+        } else if uri_char_in_set(ESCAPE_DO_NOT_ESCAPE, character as u8) {
+            builder.push(character);
+        } else {
+            uri_append_hex_byte(&mut builder, character as u8);
+        }
+    }
+    String::from_utf16_lossy(&builder)
+}
+
+/// C++ JSC globalFuncUnescape lambda (JSGlobalObjectFunctions.cpp:643-696). The
+/// legacy %uXXXX / %XX form over UTF-16 code units; unrecognized `%` passes
+/// through. No do-not-unescape set and no strict error (matches C++).
+fn uri_unescape(units: &[u16]) -> String {
+    let mut builder: Vec<u16> = Vec::with_capacity(units.len());
+    let length = units.len();
+    let mut k = 0usize;
+    while k < length {
+        let c0 = units[k];
+        if c0 == u16::from(b'%')
+            && k + 6 <= length
+            && units[k + 1] == u16::from(b'u')
+            && uri_is_ascii_hex_digit(units[k + 2])
+            && uri_is_ascii_hex_digit(units[k + 3])
+            && uri_is_ascii_hex_digit(units[k + 4])
+            && uri_is_ascii_hex_digit(units[k + 5])
+        {
+            builder.push(uri_convert_unicode(
+                units[k + 2],
+                units[k + 3],
+                units[k + 4],
+                units[k + 5],
+            ));
+            k += 6;
+            continue;
+        }
+        if c0 == u16::from(b'%')
+            && k + 3 <= length
+            && uri_is_ascii_hex_digit(units[k + 1])
+            && uri_is_ascii_hex_digit(units[k + 2])
+        {
+            builder.push(u16::from(uri_convert_hex(units[k + 1], units[k + 2])));
+            k += 3;
+            continue;
+        }
+        builder.push(c0);
+        k += 1;
+    }
+    String::from_utf16_lossy(&builder)
 }
 
 fn string_code_unit_len(text: &str) -> usize {

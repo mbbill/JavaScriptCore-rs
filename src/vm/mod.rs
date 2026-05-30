@@ -947,6 +947,9 @@ pub const SOURCE_SESSION_SAFE_BENCHMARK_HOST_GLOBAL_NAMES: &[&str] = &[
     "alert",
     "console",
     "readFile",
+    // C++ JSC jsc shell binds `read` as an alias of readFile (jsc.cpp:683); the
+    // octane-zlib emscripten payload references `read` in its shell-env branch.
+    "read",
     "top",
 ];
 
@@ -64610,6 +64613,113 @@ mod tests {
                     text: "error".into(),
                 },
             ]
+        );
+    }
+
+    // C++ JSC URI/escape globals (runtime/JSGlobalObjectFunctions.cpp:566-705,
+    // installed at JSGlobalObject.cpp:699-704). These prove the JSC-derived
+    // encode/decode/escape/unescape behavior — the exact unescaped/reserved
+    // character sets and %XX / %uXXXX forms — via JS-side boolean compares, not
+    // accidental Rust behavior. octane-zlib's emscripten payload decodes its
+    // asm.js data with unescape(encodeURIComponent(...)).
+    fn returns_true(source_text: &str) -> bool {
+        let mut vm = Vm::new(VmConfig::default());
+        matches!(
+            vm.execute_source(source(source_text)).unwrap(),
+            ExecutionCompletion::Returned(value) if value == RuntimeValue::from_bool(true)
+        )
+    }
+
+    #[test]
+    fn vm_encode_uri_component_escapes_space_and_reserved() {
+        // encodeURIComponent escapes space to %20 (space is not unreserved).
+        assert!(returns_true("encodeURIComponent(\"a b\") === \"a%20b\";"));
+        // `!` IS in the component-unreserved set (JSGlobalObjectFunctions.cpp:598
+        // "!'()*-._~"), so it is NOT escaped: the C++ output is "a!b". Therefore
+        // comparing against the escaped "a%21b" must be FALSE.
+        assert!(returns_true(
+            "encodeURIComponent(\"a!b\") === \"a%21b\" === false;"
+        ));
+        // The component escapes the URI-reserved chars that encodeURI preserves.
+        assert!(returns_true(
+            "encodeURIComponent(\";,/?:@&=+$#\") === \"%3B%2C%2F%3F%3A%40%26%3D%2B%24%23\";"
+        ));
+    }
+
+    #[test]
+    fn vm_encode_uri_preserves_reserved_set() {
+        // encodeURI preserves the URI reserved+unreserved set
+        // (JSGlobalObjectFunctions.cpp:583-588), so these pass through unescaped.
+        assert!(returns_true(
+            "encodeURI(\";,/?:@&=+$#\") === \";,/?:@&=+$#\";"
+        ));
+        // Space is still escaped by encodeURI.
+        assert!(returns_true("encodeURI(\"a b\") === \"a%20b\";"));
+    }
+
+    #[test]
+    fn vm_decode_uri_component_and_decode_uri() {
+        // decodeURIComponent reverses %XX (JSGlobalObjectFunctions.cpp:575-579).
+        assert!(returns_true("decodeURIComponent(\"%20\") === \" \";"));
+        // decodeURI keeps the reserved escapes percent-encoded
+        // (doNotUnescapeWhenDecodingURI, JSGlobalObjectFunctions.cpp:568-570):
+        // %2F (/) stays encoded, but %20 (space, not reserved) decodes.
+        assert!(returns_true("decodeURI(\"%2F\") === \"%2F\";"));
+        assert!(returns_true("decodeURIComponent(\"%2F\") === \"/\";"));
+    }
+
+    #[test]
+    fn vm_escape_and_unescape_legacy_forms() {
+        // escape() escapes space to %20 (JSGlobalObjectFunctions.cpp:603-641).
+        assert!(returns_true("escape(\"a b\") === \"a%20b\";"));
+        // unescape() reverses %XX (JSGlobalObjectFunctions.cpp:643-705).
+        assert!(returns_true("unescape(\"%41\") === \"A\";"));
+        // unescape also recognizes the legacy %uXXXX form.
+        assert!(returns_true("unescape(\"%u0041\") === \"A\";"));
+    }
+
+    #[test]
+    fn vm_unescape_encode_uri_component_round_trips() {
+        // The octane-zlib idiom unescape(encodeURIComponent(x)) maps each char to
+        // its UTF-8 bytes as Latin-1 code units. It round-trips for ASCII, and a
+        // non-ASCII char (é, U+00E9 -> UTF-8 0xC3 0xA9) becomes a 2-char string.
+        assert!(returns_true(
+            "unescape(encodeURIComponent(\"A\")) === \"A\";"
+        ));
+        assert!(returns_true(
+            "unescape(encodeURIComponent(\"\\u00E9\")).length === 2;"
+        ));
+        // And decodeURIComponent(escape-then) reverses encodeURIComponent for the
+        // non-ASCII char: encodeURIComponent(é) === "%C3%A9".
+        assert!(returns_true(
+            "encodeURIComponent(\"\\u00E9\") === \"%C3%A9\";"
+        ));
+        assert!(returns_true(
+            "decodeURIComponent(\"%C3%A9\") === \"\\u00E9\";"
+        ));
+    }
+
+    // C++ JSC jsc shell binds `read` as a host-function alias of readFile
+    // (jsc.cpp:682-683: two separate addFunction calls to functionReadFile).
+    // octane-zlib's shell-env branch references `read`; without it the engine
+    // threw ReferenceError. Proves the alias is installed and is a function.
+    // Like C++, `read` and `readFile` are distinct function objects (two
+    // addFunction / two allocate_native_function calls), so they are NOT ===.
+    #[test]
+    fn vm_source_session_read_alias_is_installed() {
+        let mut vm = Vm::new(VmConfig::default());
+        let execution = vm
+            .execute_source_session_with_host_globals(
+                vec![source(
+                    "typeof read === 'function' && typeof readFile === 'function' \
+                     && (read === readFile) === false;",
+                )],
+                SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+            )
+            .unwrap();
+        assert_eq!(
+            execution.completions(),
+            &[ExecutionCompletion::Returned(RuntimeValue::from_bool(true))]
         );
     }
 
