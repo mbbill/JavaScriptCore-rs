@@ -14011,6 +14011,13 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(result) => {
                         write_register(state, window, destination, RuntimeValue::from_bool(result))
                     }
+                    // C++ JSC op_instanceof: a non-callable right-hand side throws a
+                    // catchable TypeError via createInvalidInstanceofParameterErrorNotFunction
+                    // ("<value> is not a function", JSObject.cpp:2661 /
+                    // ExceptionHelpers.cpp:298), not a fatal abort.
+                    Err(ExecutionError::ExpectedFunction) => {
+                        self.not_a_function_type_error(state.heap, constructor)
+                    }
                     Err(error) => DispatchOutcome::Fail(error),
                 }
             }
@@ -15176,6 +15183,12 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 };
                 self.last_property_lookup = None;
                 self.pending_property_lookup_site = None;
+                // C++ JSC get_by_val slow path: an undefined/null base coerces via
+                // toObject and throws a catchable TypeError (createNotAnObjectError)
+                // before any indexed/length fast path or the get_property funnel.
+                if matches!(object.kind(), ValueKind::Undefined | ValueKind::Null) {
+                    return self.not_an_object_type_error(state.heap, object);
+                }
                 if self.objects.is_array(object) {
                     if let Some(index) = self.value_array_index(key_value) {
                         let site = CorePropertyLookupSite {
@@ -15411,6 +15424,12 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 };
                 self.last_property_lookup = None;
                 self.pending_property_lookup_site = None;
+                // C++ JSC get_by_val slow path: an undefined/null base coerces via
+                // toObject and throws a catchable TypeError (createNotAnObjectError),
+                // rather than the object-store fatal ExpectedObject below.
+                if matches!(object.kind(), ValueKind::Undefined | ValueKind::Null) {
+                    return self.not_an_object_type_error(state.heap, object);
+                }
                 let site = CorePropertyLookupSite {
                     bytecode_index: Some(instruction.bytecode_index),
                     opcode: Some(CoreOpcode::GetByIndex),
@@ -15447,6 +15466,12 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                // C++ JSC put_by_val slow path: an undefined/null base routes through
+                // putToPrimitive -> synthesizePrototype and throws a catchable
+                // TypeError (createNotAnObjectError), not a fatal abort.
+                if matches!(object.kind(), ValueKind::Undefined | ValueKind::Null) {
+                    return self.not_an_object_type_error(state.heap, object);
+                }
                 self.put_index_with_store_observation(
                     state,
                     instruction.bytecode_index,
@@ -15484,6 +15509,12 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(context) => context,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                // C++ JSC get_length slow path: `(undefined).length` coerces the base
+                // via toObject and throws a catchable TypeError (createNotAnObjectError)
+                // before reaching the array/length read below.
+                if matches!(value.kind(), ValueKind::Undefined | ValueKind::Null) {
+                    return self.not_an_object_type_error(state.heap, value);
+                }
                 let length = if let Some(text) = self.strings.text(value) {
                     Ok(RuntimeValue::from_i32(string_code_unit_len_i32(text)))
                 } else {
@@ -15961,7 +15992,10 @@ impl CoreOpcodeDispatchHost {
                 return Ok(result);
             }
         }
-        Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject))
+        // C++ JSC JSObject::ordinaryToPrimitive (JSObject.cpp:2589): when neither
+        // toString nor valueOf yields a primitive, throw a catchable TypeError
+        // ("No default value") rather than aborting the VM.
+        Err(self.type_error_outcome_with_heap(state.heap, "No default value"))
     }
 
     fn is_callable_value(&self, value: RuntimeValue) -> bool {
@@ -16446,6 +16480,17 @@ impl CoreOpcodeDispatchHost {
             return result;
         }
 
+        // C++ JSC get_by_id / get_by_val slow path: the base goes through
+        // JSValue::toObject (LLIntSlowPaths.cpp:1212; CommonSlowPaths) which, for an
+        // undefined or null base, calls toObjectSlowCase -> createNotAnObjectError
+        // (JSCJSValue.cpp:154, ExceptionHelpers.cpp:318) and throws a catchable
+        // TypeError. Cells/primitives are handled by the typed branches above; only
+        // undefined/null reach here as a JS-observable "x is not an object" throw.
+        // (The objects.get_property fallthrough below would otherwise surface this
+        // as a fatal ExpectedObject failure, swallowing the catch.)
+        if matches!(object.kind(), ValueKind::Undefined | ValueKind::Null) {
+            return Err(self.not_an_object_type_error(state.heap, object));
+        }
         let (property, record) = match lookup_site {
             Some(site) => {
                 let (property, record) = self
@@ -17100,6 +17145,16 @@ impl CoreOpcodeDispatchHost {
             )?;
             return Ok(PropertyStoreObservationOutcome::Proxy);
         }
+        // C++ JSC put_by_id / put_by_val slow path: an undefined or null base routes
+        // through JSValue::putToPrimitive -> synthesizePrototype (JSCJSValue.cpp:188,
+        // 217), which throws a catchable TypeError via createNotAnObjectError. This is
+        // the JS-observable store-observation entry (PutByName/PutByValue opcodes,
+        // which do not go through put_property_value_with_completion). Primitive bases
+        // are a separate put-to-primitive gap, left as the prior ExpectedObject
+        // failure from objects.put below.
+        if matches!(object.kind(), ValueKind::Undefined | ValueKind::Null) {
+            return Err(self.not_an_object_type_error(state.heap, object));
+        }
         match self
             .objects
             .put(state.heap, object, key, value)
@@ -17158,6 +17213,17 @@ impl CoreOpcodeDispatchHost {
                 FunctionValuePropertyCallCompletion::none(completion_context),
             )?;
             return Ok(());
+        }
+        // C++ JSC put_by_id / put_by_val slow path: an undefined or null base goes
+        // through JSValue::putToPrimitive -> synthesizePrototype (JSCJSValue.cpp:188,
+        // 217) which throws a catchable TypeError via createNotAnObjectError. This is
+        // the JS-observable "Cannot set properties of undefined" case. (Primitive
+        // bases like numbers/strings route through Number/String.prototype in C++ and
+        // are a separate, pre-existing put-to-primitive gap left as the prior
+        // ExpectedObject failure below; only undefined/null become a catchable throw
+        // here.)
+        if matches!(object.kind(), ValueKind::Undefined | ValueKind::Null) {
+            return Err(self.not_an_object_type_error(state.heap, object));
         }
         match self
             .objects
@@ -17338,6 +17404,13 @@ impl CoreOpcodeDispatchHost {
                 completion,
             )?;
             return Ok(self.truthy(result));
+        }
+        // C++ JSC op_del_by_id / op_del_by_val: the base is coerced via toObject
+        // (CommonSlowPaths), so `delete (undefined).x` throws a catchable TypeError
+        // (createNotAnObjectError) rather than aborting. Other non-object delete
+        // targets are handled by delete_property below.
+        if matches!(object.kind(), ValueKind::Undefined | ValueKind::Null) {
+            return Err(self.not_an_object_type_error(state.heap, object));
         }
         self.objects
             .delete_property(object, key)
@@ -17847,6 +17920,13 @@ impl CoreOpcodeDispatchHost {
         let target = self.objects.function_call_target(callee);
         let (target_kind, may_call_js) = self.call_observation_target_kind(callee, target.as_ref());
         let outcome = match target {
+            // C++ JSC op_call slow path: a non-callable callee throws a catchable
+            // TypeError via createNotAFunctionError (ExceptionHelpers.cpp:313), not
+            // a fatal abort. ExpectedFunction is the JS-observable "x is not a
+            // function" case here.
+            Err(ExecutionError::ExpectedFunction) => {
+                self.not_a_function_type_error(state.heap, callee)
+            }
             Err(error) => DispatchOutcome::Fail(error),
             Ok(_) if self.objects.is_proxy(callee) => {
                 let arguments = match self.call_arguments_from_instruction(
@@ -18054,6 +18134,12 @@ impl CoreOpcodeDispatchHost {
         let target = self.objects.function_call_target(callee);
         let (target_kind, may_call_js) = self.call_observation_target_kind(callee, target.as_ref());
         let outcome = match target {
+            // C++ JSC op_call_with_this slow path: a non-callable callee throws a
+            // catchable TypeError (createNotAFunctionError, ExceptionHelpers.cpp:313)
+            // rather than aborting. This is the `({}).nope()` / method-call case.
+            Err(ExecutionError::ExpectedFunction) => {
+                self.not_a_function_type_error(state.heap, callee)
+            }
             Err(error) => DispatchOutcome::Fail(error),
             Ok(_) if self.objects.is_proxy(callee) => {
                 let arguments = match self.call_arguments_from_instruction(
@@ -18181,6 +18267,12 @@ impl CoreOpcodeDispatchHost {
         let (target_kind, may_call_js) = self.call_observation_target_kind(callee, target.as_ref());
         let target = match target {
             Ok(target) => target,
+            // INTERNAL INVARIANT (kept fatal): the JS-observable "not a constructor"
+            // TypeError is already thrown above by function_construct_ability (C++
+            // JSC op_construct slow path / Construct() in CallData.cpp). Reaching an
+            // ExpectedFunction here means the callee passed CanConstruct yet has no
+            // callable target — an inconsistent internal structure, not well-typed
+            // JS — so this stays a fatal failure.
             Err(error) => return DispatchOutcome::Fail(error),
         };
         let argument_count = match unsigned_immediate_operand(instruction, 2) {
@@ -24292,6 +24384,79 @@ impl CoreOpcodeDispatchHost {
             Ok(()) => DispatchOutcome::Throw(error),
             Err(outcome) => outcome,
         }
+    }
+
+    // C++ JSC errorDescriptionForValue (runtime/ExceptionHelpers.cpp:57): produce
+    // the short value description that prefixes "is not a function" / "is not an
+    // object" TypeError messages. We faithfully reproduce the common, cheap cases
+    // (undefined/null/boolean/number/string), and fall back to JSObject::
+    // calculatedClassName-style "object"/"function" for cells. JSC also quotes
+    // strings and resolves the precise source-text operand via the SourceAppender
+    // machinery (e.g. "f is not a function. (In 'f()' ...)"); extracting that
+    // operand name from bytecode here is expensive, so the first cut uses the
+    // base value description only (faithful prefix, abbreviated suffix).
+    fn error_description_for_value(&self, value: RuntimeValue) -> String {
+        match value.kind() {
+            ValueKind::Undefined => "undefined".to_owned(),
+            ValueKind::Null => "null".to_owned(),
+            ValueKind::Boolean => {
+                if value.as_bool().unwrap_or(false) {
+                    "true".to_owned()
+                } else {
+                    "false".to_owned()
+                }
+            }
+            ValueKind::Int32 | ValueKind::Double => self
+                .strings
+                .primitive_to_string(value)
+                .unwrap_or_else(|| "number".to_owned()),
+            ValueKind::Cell | ValueKind::Unknown => {
+                if let Some(text) = self.strings.text(value) {
+                    format!("\"{text}\"")
+                } else if self.symbols.is_symbol(value) {
+                    "Symbol".to_owned()
+                } else if self.objects.function_call_target_value(value).is_ok() {
+                    // C++ JSC: callable objects describe as "function".
+                    "function".to_owned()
+                } else {
+                    // C++ JSC: JSObject::calculatedClassName, abbreviated to "object".
+                    "object".to_owned()
+                }
+            }
+        }
+    }
+
+    // C++ JSC createNotAFunctionError (runtime/ExceptionHelpers.cpp:313): the
+    // op_call / op_tail_call / op_construct slow paths throw a catchable TypeError
+    // ("<value> is not a function") via throwException when the callee is not
+    // callable. This is a normal JS exception that unwinds to the nearest catch,
+    // never a fatal VM abort. Returns DispatchOutcome::Throw so the engine catches
+    // it exactly like an explicit `throw new TypeError(...)`.
+    fn not_a_function_type_error(
+        &mut self,
+        heap: &mut Heap,
+        callee: RuntimeValue,
+    ) -> DispatchOutcome {
+        let message = format!(
+            "{} is not a function",
+            self.error_description_for_value(callee)
+        );
+        self.type_error_outcome_with_heap(heap, &message)
+    }
+
+    // C++ JSC createNotAnObjectError (runtime/ExceptionHelpers.cpp:318), reached
+    // via JSValue::toObjectSlowCase / synthesizePrototype (runtime/JSCJSValue.cpp:
+    // 154,188) on the get_by_id / get_by_val / put_by_id / put_by_val slow paths
+    // when the base is undefined or null. Throws a catchable TypeError ("<value>
+    // is not an object"); this is the JS-observable "Cannot read/set properties of
+    // undefined" divergence the Rust port previously surfaced as a fatal
+    // ExpectedObject failure.
+    fn not_an_object_type_error(&mut self, heap: &mut Heap, base: RuntimeValue) -> DispatchOutcome {
+        let message = format!(
+            "{} is not an object",
+            self.error_description_for_value(base)
+        );
+        self.type_error_outcome_with_heap(heap, &message)
     }
 
     fn native_string_char_at(

@@ -64322,11 +64322,15 @@ mod tests {
             .execute_source_session_with_global_bindings(vec![source("print();")], globals)
             .unwrap();
 
-        assert_eq!(
-            execution.completions(),
-            &[ExecutionCompletion::Failed(
-                ExecutionError::ExpectedFunction
-            )]
+        // The host-global binding name `print` compiles and resolves to undefined
+        // (no runtime function installed). Calling undefined is a JS-observable
+        // TypeError: C++ JSC op_call throws createNotAFunctionError, a catchable
+        // exception that unwinds as a thrown completion -- not a fatal
+        // Failed(ExpectedFunction) VM abort (the prior accidental Rust divergence).
+        assert!(
+            matches!(execution.completions(), [ExecutionCompletion::Threw(_)]),
+            "expected a thrown TypeError completion, got {:?}",
+            execution.completions()
         );
     }
 
@@ -66507,6 +66511,118 @@ mod tests {
             completion,
             ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
         );
+    }
+
+    // C++ JSC op_call slow path: calling a non-callable value throws a catchable
+    // TypeError (createNotAFunctionError, ExceptionHelpers.cpp:313), not a fatal
+    // VM abort. Previously the Rust port surfaced this as Failed(ExpectedFunction)
+    // (a fatal completion the catch could never observe).
+    #[test]
+    fn vm_calling_undefined_throws_catchable_type_error() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var ok = false; \
+                 try { var f = undefined; f(); } \
+                 catch (e) { \
+                     ok = e instanceof TypeError \
+                         && e.message === \"undefined is not a function\"; \
+                 } \
+                 ok;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    // C++ JSC get_by_id slow path on an undefined base: JSValue::toObject ->
+    // createNotAnObjectError (JSCJSValue.cpp:154, ExceptionHelpers.cpp:318) throws
+    // a catchable TypeError. Previously Failed(ExpectedObject) (fatal).
+    #[test]
+    fn vm_property_get_on_undefined_throws_catchable_type_error() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var ok = false; \
+                 try { var o; o.foo; } \
+                 catch (e) { \
+                     ok = e instanceof TypeError \
+                         && e.message === \"undefined is not an object\"; \
+                 } \
+                 ok;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    // C++ JSC put_by_id slow path on an undefined base: JSValue::putToPrimitive ->
+    // synthesizePrototype -> createNotAnObjectError throws a catchable TypeError.
+    #[test]
+    fn vm_property_put_on_undefined_throws_catchable_type_error() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var threw = false; \
+                 try { var o; o.foo = 1; } \
+                 catch (e) { threw = e instanceof TypeError; } \
+                 threw;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    // C++ JSC op_call_with_this slow path: a missing method on an object resolves
+    // to undefined, and calling it throws a catchable TypeError
+    // (createNotAFunctionError). Covers `({}).nope()`.
+    #[test]
+    fn vm_calling_missing_method_throws_catchable_type_error() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var threw = false; \
+                 try { ({}).nope(); } \
+                 catch (e) { threw = e instanceof TypeError; } \
+                 threw;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    // C++ JSC: an uncaught non-function call produces a thrown (not fatal)
+    // completion that unwinds to the top, leaving a pending exception — never a
+    // fatal Failed(ExpectedFunction).
+    #[test]
+    fn vm_uncaught_non_function_call_throws_rather_than_aborting() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source("var f = undefined; f();"))
+            .unwrap();
+
+        assert!(
+            matches!(completion, ExecutionCompletion::Threw(_)),
+            "expected a thrown completion, got {completion:?}"
+        );
+        assert!(vm.exception_state().pending().is_some());
     }
 
     #[test]
