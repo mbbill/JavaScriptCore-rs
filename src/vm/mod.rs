@@ -66949,6 +66949,134 @@ mod tests {
         assert!(vm.exception_state().pending().is_some());
     }
 
+    // C++ JSC: every Array.prototype instance method opens with
+    // `thisValue.toThis(...).toObject(globalObject)` -- arrayProtoFuncSlice
+    // (runtime/ArrayPrototype.cpp:735). For an undefined `this`, toObjectSlowCase
+    // (runtime/JSCJSValue.cpp:169-171) throws a CATCHABLE TypeError
+    // (createNotAnObjectError "undefined is not an object"), not a fatal abort.
+    // This is jQuery/Sizzle's feature-detection idiom
+    // (Array.prototype.slice.call(undefined, 0)); previously the Rust port
+    // surfaced Failed(ExpectedObject), which the surrounding try/catch could not
+    // observe.
+    #[test]
+    fn vm_array_slice_call_undefined_this_throws_catchable_type_error() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var ok = false; \
+                 try { Array.prototype.slice.call(undefined, 0); } \
+                 catch (e) { ok = e instanceof TypeError; } \
+                 ok;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    // C++ JSC: a null `this` is also undefinedOrNull, so toObjectSlowCase throws
+    // the same catchable TypeError (runtime/JSCJSValue.cpp:169-171).
+    #[test]
+    fn vm_array_slice_call_null_this_throws_catchable_type_error() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var ok = false; \
+                 try { Array.prototype.slice.call(null, 0); } \
+                 catch (e) { ok = e instanceof TypeError; } \
+                 ok;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    // C++ JSC: arrayProtoFuncForEach (runtime/ArrayPrototype.cpp) opens with the
+    // same toObject(this); an undefined `this` throws a catchable TypeError. The
+    // ToObject(this) boundary is shared across slice/forEach/map/filter/etc.
+    #[test]
+    fn vm_array_for_each_call_undefined_this_throws_catchable_type_error() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var ok = false; \
+                 try { Array.prototype.forEach.call(undefined, function () {}); } \
+                 catch (e) { ok = e instanceof TypeError; } \
+                 ok;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    // C++ JSC: an UNCAUGHT toObject(this) failure unwinds to the top as a thrown
+    // (not fatal) completion -- never Failed(ExpectedObject) -- leaving a pending
+    // exception.
+    #[test]
+    fn vm_uncaught_array_slice_call_undefined_this_throws_rather_than_aborting() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source("Array.prototype.slice.call(undefined);"))
+            .unwrap();
+
+        assert!(
+            matches!(completion, ExecutionCompletion::Threw(_)),
+            "expected a thrown completion, got {completion:?}"
+        );
+        assert!(vm.exception_state().pending().is_some());
+    }
+
+    // C++ JSC: a normal array receiver takes the JSArray fast path and slices
+    // correctly -- the nullish-this guard must not affect a real array.
+    #[test]
+    fn vm_array_slice_on_real_array_still_works() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var r = [1, 2, 3].slice(1); \
+                 r.length === 2 && r[0] === 2 && r[1] === 3;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
+    // C++ JSC: an array-LIKE object receiver (non-null) passes toObject and is
+    // read generically via toLength/get -- arrayProtoFuncSlice
+    // (runtime/ArrayPrototype.cpp:739). The guard only narrows undefined/null.
+    #[test]
+    fn vm_array_slice_call_on_array_like_object_still_works() {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source(
+                "var r = Array.prototype.slice.call({ 0: 9, length: 1 }, 0); \
+                 r.length === 1 && r[0] === 9;",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+    }
+
     #[test]
     fn vm_error_prototype_to_string_uses_name_and_message_fields() {
         let mut vm = Vm::new(VmConfig::default());

@@ -6203,6 +6203,46 @@ enum CoreNativeFunction {
 }
 
 impl CoreNativeFunction {
+    // C++ JSC: every Array.prototype instance method begins with
+    // `callFrame->thisValue().toThis(globalObject, strict).toObject(globalObject)`
+    // -- e.g. arrayProtoFuncSlice (runtime/ArrayPrototype.cpp:735),
+    // arrayProtoFuncJoin (:444), arrayProtoFuncReverse (:597),
+    // arrayProtoFuncIndexOf (:1326), arrayProtoFuncPush (:566). For an
+    // undefined/null `this`, toObject -> toObjectSlowCase
+    // (runtime/JSCJSValue.cpp:169-171) throws a CATCHABLE TypeError via
+    // throwException(createNotAnObjectError(...)), NOT a VM abort. This
+    // predicate identifies the Array.prototype *instance* methods that funnel
+    // through ToObject(this); the static methods (ArrayConstructor/ArrayIsArray
+    // /ArrayFrom/ArrayOf) do not take `this` and are excluded.
+    const fn is_array_to_object_this(self) -> bool {
+        matches!(
+            self,
+            Self::ArrayPush
+                | Self::ArrayPop
+                | Self::ArrayShift
+                | Self::ArrayUnshift
+                | Self::ArrayJoin
+                | Self::ArrayPrototypeToString
+                | Self::ArraySlice
+                | Self::ArrayConcat
+                | Self::ArrayFill
+                | Self::ArrayReverse
+                | Self::ArraySort
+                | Self::ArraySplice
+                | Self::ArrayIndexOf
+                | Self::ArrayIncludes
+                | Self::ArrayForEach
+                | Self::ArrayMap
+                | Self::ArrayFilter
+                | Self::ArraySome
+                | Self::ArrayEvery
+                | Self::ArrayFind
+                | Self::ArrayFindIndex
+                | Self::ArrayReduce
+                | Self::ArrayReduceRight
+        )
+    }
+
     const fn intrinsic(self) -> Option<NativeIntrinsic> {
         match self {
             Self::StringCharCodeAt => Some(NativeIntrinsic::StringCharCodeAt),
@@ -20176,6 +20216,29 @@ impl CoreOpcodeDispatchHost {
         arguments: &[RuntimeValue],
         function_value_completion: Option<FunctionValueCallCompletion>,
     ) -> Result<RuntimeValue, DispatchOutcome> {
+        // C++ JSC: every Array.prototype instance method opens with
+        // `thisValue.toThis(...).toObject(globalObject)`. For an undefined/null
+        // `this`, toObjectSlowCase (runtime/JSCJSValue.cpp:169-171) throws a
+        // CATCHABLE TypeError ("X is not an object"), it does NOT abort the VM.
+        // The d750f2b batch converted the bytecode get/put/call/length sites but
+        // missed this ToObject(this) boundary inside the natives, so a nullish
+        // `this` (e.g. jQuery/Sizzle's `Array.prototype.slice.call(undefined, 0)`
+        // feature detection) fatally aborted with ExpectedObject and bypassed the
+        // surrounding try/catch. Route it through not_an_object_type_error so it
+        // becomes a normal JS exception that unwinds to the nearest catch.
+        //
+        // NOTE: a PRIMITIVE `this` (string/number/boolean) is NOT handled here.
+        // Faithful toObject (runtime/JSCJSValue.cpp:160-166) BOXES a primitive
+        // into its wrapper object and proceeds; only undefined/null throws. Boxing
+        // the receiver of an Array.prototype method is out of scope for this batch
+        // (undefined/null is the case code-load needs, and Octane does not exercise
+        // a primitive `this` here). A primitive `this` keeps its pre-existing
+        // behavior: find() misses on a non-cell, so array_length still yields the
+        // ExpectedObject path -- this guard only narrows undefined/null and does
+        // not change the primitive case. Deferred: box a primitive `this`.
+        if native.is_array_to_object_this() && is_nullish(this_value) {
+            return Err(self.not_an_object_type_error(state.heap, this_value));
+        }
         match native {
             CoreNativeFunction::ObjectConstructor => {
                 self.native_object_constructor(state.heap, arguments)
