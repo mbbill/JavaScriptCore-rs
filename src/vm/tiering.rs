@@ -13645,7 +13645,8 @@ impl CompletionDiagnostic {
             ExecutionCompletion::OrdinaryBytecodeCall(_)
             | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
             | ExecutionCompletion::BaselineLoopHandoff(_)
-            | ExecutionCompletion::FunctionValueCall(_) => Self::Failed,
+            | ExecutionCompletion::FunctionValueCall(_)
+            | ExecutionCompletion::EvalRequest(_) => Self::Failed,
             ExecutionCompletion::Terminated(_) => Self::Terminated,
             ExecutionCompletion::Suspended(_) => Self::Suspended,
             ExecutionCompletion::Failed(_) => Self::Failed,

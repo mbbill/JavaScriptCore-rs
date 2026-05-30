@@ -62,10 +62,11 @@ use crate::interpreter::{
     CallObservationDrainRequest, CallObservationOutcome, CallReturnContinuation,
     ConstructReturnContinuation, CoreGlobalLexicalDeclaration, CoreGlobalLexicalDeclarationKind,
     CoreHostOutputRecord, CoreHostResultRecord, CoreOpcodeDispatchHost, DispatchConfig,
-    DispatchHost, DispatchInstruction, DispatchOutcome, DispatchState, ExecutionCompletion,
-    ExecutionContextStack, ExecutionEntryRecord, ExecutionError, ExecutionRootSnapshot,
-    FramePushRequest, FunctionValueCallCompletion, FunctionValueCallHandling,
-    FunctionValueCallRequest, FunctionValueCallTailCompletion, FunctionValuePropertyObservation,
+    DispatchHost, DispatchInstruction, DispatchOutcome, DispatchState, EvalExecutionEntry,
+    EvalHostSymbolSnapshot, EvalRequest, ExecutionCompletion, ExecutionContextStack,
+    ExecutionEntryRecord, ExecutionError, ExecutionRootSnapshot, FramePushRequest,
+    FunctionValueCallCompletion, FunctionValueCallHandling, FunctionValueCallRequest,
+    FunctionValueCallTailCompletion, FunctionValuePropertyObservation,
     FunctionValuePropertyOperationCompletion, FunctionValuePropertyOperationOutcome,
     FunctionValuePropertyOperationResume, FunctionValueReturnTransform,
     GeneratedNativeIntrinsicCallRequest, GeneratedNativeIntrinsicCallResult,
@@ -194,10 +195,13 @@ use crate::platform::executable_memory_compartment::{
 };
 use crate::runtime::{
     ArityCheckMode, CallFrameId, CodeBlockId, CodeSpecializationKind, NativeCodeId, ObjectId,
-    RuntimeValue, ScriptExecutionStatus, StructureId,
+    RuntimeValue, ScopeId, ScriptExecutionStatus, StructureId,
 };
 use crate::strings::{AtomId, Identifier, PropertyKey};
-use crate::syntax::{AstBuilder, ParseMode, Parser, ParserArena, ParserError, SourceCode};
+use crate::syntax::{
+    AstBuilder, ParseMode, Parser, ParserArena, ParserError, SourceCode, SourceOrigin,
+    SourcePosition, SourceProvider, SourceSpan, SourceText,
+};
 use crate::value::EncodedJsValue;
 use code_blocks::{
     CodeBlockRegistry, CodeBlockRegistryAttachedCallLinkInlineCacheCandidate,
@@ -1047,6 +1051,33 @@ impl From<SourceCode> for SourceSessionSource {
     }
 }
 
+/// Build a `SourceCode` for an indirect-eval program string. Mirrors C++
+/// `makeSource(programSource, ...)` (JSGlobalObjectFunctions.cpp:517) and the
+/// `programSource.is8Bit()` Latin1/UTF-16 split (:503-508): a Latin1-only string
+/// stores as 8-bit, otherwise as UTF-16. The eval `SourceCode` spans the whole
+/// program text.
+fn make_eval_source_code(source: &str) -> SourceCode {
+    let text = if source.chars().all(|character| (character as u32) <= 0xFF) {
+        SourceText::Latin1(source.chars().map(|character| character as u8).collect())
+    } else {
+        SourceText::Utf16(source.encode_utf16().collect())
+    };
+    let unit_len = text.unit_len();
+    let provider = Arc::new(SourceProvider::new(SourceOrigin::default(), text));
+    SourceCode::new(
+        provider,
+        SourceSpan::new(SourcePosition(0), SourcePosition(unit_len)),
+    )
+}
+
+/// Map a Vm-owned eval compile/link failure to an `ExecutionError`. C++ JSC
+/// throws a JS SyntaxError when IndirectEvalExecutable::tryCreate fails
+/// (JSGlobalObjectFunctions.cpp:517-520); the first cut surfaces a Vm-level
+/// `EvalCompilationFailed` instead (see the `ExecutionError` variant comment).
+fn eval_source_execution_error(_error: SourceExecutionError) -> ExecutionError {
+    ExecutionError::EvalCompilationFailed
+}
+
 #[derive(Clone, Debug)]
 pub struct SourceSessionHandle {
     global_object: GlobalObjectId,
@@ -1116,6 +1147,36 @@ struct SourceSessionStableIds {
 }
 
 impl SourceSessionStableIds {
+    // Seed from the host's live identifier/string namespace so a Vm-owned eval
+    // compile reuses existing identifier indices and allocates fresh,
+    // non-colliding indices for new names. Eval bytecode resolves identifier
+    // indices through the host's shared map; a from-zero allocator would alias
+    // existing indices to different texts.
+    fn from_eval_host_snapshot(snapshot: EvalHostSymbolSnapshot) -> Self {
+        let EvalHostSymbolSnapshot {
+            identifier_texts,
+            string_literals,
+            prototype_property_key,
+        } = snapshot;
+        let text_to_identifier = identifier_texts
+            .iter()
+            .map(|(index, text)| (text.clone(), *index))
+            .collect();
+        let next_identifier_index = identifier_texts
+            .keys()
+            .copied()
+            .max()
+            .map(|index| index.saturating_add(1))
+            .unwrap_or(0);
+        Self {
+            next_identifier_index,
+            text_to_identifier,
+            identifier_texts,
+            string_literals,
+            prototype_property_key,
+        }
+    }
+
     fn map_source_identifiers(&mut self, mut identifiers: Vec<(u32, String)>) -> HashMap<u32, u32> {
         identifiers.sort_by_key(|(identifier, _)| *identifier);
         identifiers
@@ -4379,6 +4440,15 @@ impl Vm {
                     ),
                 ExecutionCompletion::FunctionValueCall(request) => self
                     .execute_function_value_call_request_in_current_region(
+                        *request,
+                        code_block_id,
+                        code_block,
+                        host,
+                        config,
+                    ),
+                // C++ JSC globalFuncEval -> executeEval (indirect/global eval).
+                ExecutionCompletion::EvalRequest(request) => self
+                    .execute_eval_request_in_current_region(
                         *request,
                         code_block_id,
                         code_block,
@@ -8760,6 +8830,11 @@ impl Vm {
             ExecutionCompletion::FunctionValueCall(_) => {
                 VmBaselineGeneratedExecutionOutcome::FunctionValueCall
             }
+            // An eval deferral never originates from baseline-generated code (eval
+            // is a native call routed through interpreter dispatch). If one ever
+            // surfaces here, fall back to the interpreter loop, which owns the
+            // `ExecutionCompletion::EvalRequest` handler.
+            ExecutionCompletion::EvalRequest(_) => VmBaselineGeneratedExecutionOutcome::Fallback,
             ExecutionCompletion::BaselineLoopHandoff(_) => {
                 VmBaselineGeneratedExecutionOutcome::Fallback
             }
@@ -10007,6 +10082,7 @@ impl Vm {
             SingleDispatchOutcome::OrdinaryBytecodeCall(_)
             | SingleDispatchOutcome::OrdinaryBytecodeConstruct(_)
             | SingleDispatchOutcome::FunctionValueCall(_)
+            | SingleDispatchOutcome::EvalRequest(_)
             | SingleDispatchOutcome::Suspended(_)
             | SingleDispatchOutcome::Failed(_) => CallObservationOutcome::FailedOrOpaque,
         }
@@ -10049,6 +10125,11 @@ impl Vm {
             }
             SingleDispatchOutcome::FunctionValueCall(_) => {
                 VmGeneratedDirectCallTransactionOutcome::FunctionValueCall
+            }
+            // An eval deferral never originates from a generated direct call; if
+            // one did, it is an unexpected outcome for this accounting path.
+            SingleDispatchOutcome::EvalRequest(_) => {
+                VmGeneratedDirectCallTransactionOutcome::Failed
             }
             SingleDispatchOutcome::Suspended(_) => {
                 VmGeneratedDirectCallTransactionOutcome::Suspended
@@ -12766,6 +12847,235 @@ impl Vm {
         )
     }
 
+    /// C++ JSC globalFuncEval -> Interpreter::executeEval (indirect/global eval).
+    ///
+    /// Owns the eval compile pipeline re-entry (Option A): suspend the active
+    /// no-GC region, sync the caller frame/register roots so the caller survives
+    /// the nested run, compile the source as an Eval CodeBlock in GLOBAL scope,
+    /// run it, then write the completion value into the call destination and
+    /// resume the caller through the same single-dispatch resume path used by
+    /// deferred function-value calls. This mirrors:
+    ///   globalFuncEval (JSGlobalObjectFunctions.cpp:517-522): build an
+    ///   IndirectEvalExecutable and run it via
+    ///   `executeEval(eval, globalThis, globalScope)`.
+    ///   executeEval (Interpreter.cpp:1436): enter the eval CodeBlock with one
+    ///   parameter `this` (:1488); global var/function declarations are hoisted
+    ///   to global bindings (:1513-1577).
+    ///
+    /// First cut: recompile per call (no DirectEvalCodeCache); INDIRECT only
+    /// (`direct: false`). Designed so a future `Function(string)` can reuse the
+    /// compile+link+run core (`build_and_run_eval_code_block`).
+    fn execute_eval_request_in_current_region<H: DispatchHost>(
+        &mut self,
+        request: EvalRequest,
+        caller_code_block_id: CodeBlockId,
+        caller_code_block: &CodeBlock,
+        host: &mut H,
+        config: DispatchConfig,
+    ) -> ExecutionCompletion {
+        let resume = Self::function_value_call_resume(&request.completion);
+        if resume.owner != caller_code_block_id {
+            return ExecutionCompletion::Failed(ExecutionError::CodeBlockMismatch {
+                expected: resume.owner,
+                actual: Some(caller_code_block_id),
+            });
+        }
+
+        let EvalRequest {
+            source,
+            completion,
+            global_this,
+        } = request;
+
+        let suspended = match self.suspend_no_gc_execution_region() {
+            Ok(suspended) => suspended,
+            Err(_) => return ExecutionCompletion::Failed(ExecutionError::GcBoundaryViolation),
+        };
+
+        let mut active_register_roots = Vec::new();
+        let mut active_frame_roots = Vec::new();
+        let prepared = sync_targeted_frame_roots(
+            resume.frame,
+            &self.execution,
+            &self.registers,
+            &mut self.heap,
+            &mut active_frame_roots,
+        )
+        .and_then(|()| {
+            sync_targeted_register_roots(
+                resume.frame,
+                &self.execution,
+                &self.registers,
+                &mut self.heap,
+                host,
+                &mut active_register_roots,
+            )
+        });
+
+        // Run the eval body (compile + link + enter) while roots are pinned. The
+        // eval-body `ExecutionCompletion` is then folded into the caller resume.
+        let eval_completion = match prepared {
+            Ok(()) => self.build_and_run_eval_code_block(source, global_this, host, config),
+            Err(error) => Err(error),
+        };
+
+        let cleanup = cleanup_targeted_root_sets(
+            &mut self.heap,
+            &mut active_register_roots,
+            &mut active_frame_roots,
+        );
+
+        // Translate the eval-body completion into the caller single-dispatch
+        // resume: a returned value is written into the call destination; a thrown
+        // exception propagates as a normal throw at the eval call site.
+        let outcome = match (eval_completion, cleanup) {
+            (Ok(ExecutionCompletion::Returned(value)), Ok(())) => {
+                self.finish_function_value_call_return(completion, value, caller_code_block, host)
+            }
+            (Ok(ExecutionCompletion::Threw(pending)), Ok(())) => {
+                match self.sync_exception_targeted_roots() {
+                    Ok(()) => self.finish_function_value_call_throw(
+                        completion,
+                        caller_code_block,
+                        pending,
+                        host,
+                    ),
+                    Err(error) => SingleDispatchOutcome::Failed(error.into()),
+                }
+            }
+            (Ok(ExecutionCompletion::Failed(error)), _) | (Err(error), _) => {
+                SingleDispatchOutcome::Failed(error)
+            }
+            // Eval bodies run to completion synchronously; suspension/handoff or a
+            // nested deferred call escaping the eval entry is unexpected here.
+            (Ok(_), Ok(())) => SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion),
+            (_, Err(error)) => SingleDispatchOutcome::Failed(error),
+        };
+
+        let outcome = self.resume_function_value_call_no_gc(suspended, outcome);
+        self.finish_single_dispatch_resume_in_current_region(
+            resume.owner,
+            resume.frame,
+            outcome,
+            caller_code_block,
+            host,
+            config,
+        )
+    }
+
+    /// Compile + link + enter an Eval CodeBlock in GLOBAL scope and run it to
+    /// completion. Must be called with the outer no-GC region suspended (compile
+    /// allocates). Shared core intended to also back a future `Function(string)`.
+    fn build_and_run_eval_code_block<H: DispatchHost>(
+        &mut self,
+        source: String,
+        global_this: RuntimeValue,
+        host: &mut H,
+        config: DispatchConfig,
+    ) -> Result<ExecutionCompletion, ExecutionError> {
+        let function_index_base = host
+            .eval_function_block_base()
+            .ok_or(ExecutionError::InvalidCallCompletion)?;
+        let visible_global_bindings = host
+            .eval_global_binding_set()
+            .ok_or(ExecutionError::InvalidCallCompletion)?;
+        let mut stable_ids =
+            SourceSessionStableIds::from_eval_host_snapshot(host.eval_symbol_namespace_snapshot());
+
+        let source_code = make_eval_source_code(&source);
+        let bytecompiler_session_id = self.next_source_bytecompiler_session_id;
+        let compiled = Self::compile_source_session_entry_with_mode(
+            SourceSessionSource::from(source_code),
+            ParseMode::Eval,
+            BytecompilerSessionId(bytecompiler_session_id),
+            function_index_base,
+            &mut stable_ids,
+            &visible_global_bindings,
+        )
+        .map_err(eval_source_execution_error)?;
+        self.next_source_bytecompiler_session_id = bytecompiler_session_id.saturating_add(1);
+
+        let linked = self
+            .link_source_session_compiled_entry_with_kind(compiled, ScriptExecutableKind::Eval)
+            .map_err(eval_source_execution_error)?;
+        host.append_eval_function_blocks(
+            linked.function_blocks,
+            stable_ids.string_literals.clone(),
+            stable_ids.identifier_texts.clone(),
+            stable_ids.prototype_property_key,
+        );
+
+        // Global var/function declarations of the eval body are hoisted via the
+        // emitted sloppy top-level global-assignment bytecode; lexical
+        // declarations become global lexical bindings now (executeEval global
+        // path, Interpreter.cpp:1513-1577).
+        host.install_eval_global_lexical_declarations(
+            Self::source_session_global_lexical_declarations(
+                &linked.executable_entry.declared_global_bindings,
+            ),
+        )?;
+
+        self.run_eval_executable_entry(&linked.executable_entry, global_this, host, config)
+    }
+
+    /// Push the Eval entry + frame (one parameter `this` = global object), run,
+    /// then pop. Mirrors `execute_source_session_entry`'s frame setup, but uses
+    /// `ExecutionEntryRecord::Eval` so global resolution sees `global_this`.
+    fn run_eval_executable_entry<H: DispatchHost>(
+        &mut self,
+        executable_entry: &SourceSessionExecutableEntry,
+        global_this: RuntimeValue,
+        host: &mut H,
+        config: DispatchConfig,
+    ) -> Result<ExecutionCompletion, ExecutionError> {
+        let vm_entry = self
+            .execution
+            .enter(ExecutionEntryRecord::Eval(EvalExecutionEntry {
+                code_block: executable_entry.code_block_id,
+                this_value: global_this,
+                // INDIRECT eval resolves globals through the global object, like
+                // program execution (no materialized global-scope cell); the
+                // `scope` field is bookkeeping. DEFERRED: direct eval would supply
+                // the caller scope chain here.
+                scope: ScopeId::default(),
+                // DEFERRED: direct eval (caller-scope visibility). Indirect only.
+                direct: false,
+            }));
+        let frame = self.execution.push_frame(
+            &mut self.registers,
+            FramePushRequest {
+                code_block: Some(executable_entry.code_block_id),
+                callee: None,
+                callee_value: None,
+                lexical_scope: None,
+                shape: executable_entry.code_block.unlinked().frame(),
+                argument_count_including_this: 1,
+                argument_values: vec![global_this],
+                start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                return_bytecode_index: None,
+            },
+        )?;
+        let completion = self.execute_code_block(
+            executable_entry.code_block_id,
+            &executable_entry.code_block,
+            host,
+            config,
+        );
+        let mut cleanup_error = None;
+        if self.execution.frame(frame).is_some() {
+            if let Err(error) = self.execution.pop_frame(&mut self.registers, frame) {
+                cleanup_error.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.execution.leave(vm_entry) {
+            cleanup_error.get_or_insert(error);
+        }
+        if let Some(error) = cleanup_error {
+            return Err(error);
+        }
+        Ok(completion)
+    }
+
     fn execute_function_value_call_request_as_single_dispatch_in_current_region<H: DispatchHost>(
         &mut self,
         request: FunctionValueCallRequest,
@@ -13160,6 +13470,7 @@ impl Vm {
             | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
             | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
+            | ExecutionCompletion::EvalRequest(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => self.finish_function_value_call_fail(
                 completion,
@@ -14200,6 +14511,7 @@ impl Vm {
             | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
             | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
+            | ExecutionCompletion::EvalRequest(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => {
                 DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion)
@@ -14271,6 +14583,9 @@ impl Vm {
             DispatchOutcome::FunctionValueCall(_) => {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
             }
+            DispatchOutcome::EvalRequest(_) => {
+                SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
+            }
             DispatchOutcome::BaselineLoopHandoff(_) => {
                 SingleDispatchOutcome::Failed(ExecutionError::BaselineGeneratedExecutionRejected)
             }
@@ -14320,6 +14635,9 @@ impl Vm {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
             }
             DispatchOutcome::FunctionValueCall(_) => {
+                SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
+            }
+            DispatchOutcome::EvalRequest(_) => {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
             }
             DispatchOutcome::BaselineLoopHandoff(_) => {
@@ -15935,6 +16253,9 @@ impl Vm {
             SingleDispatchOutcome::FunctionValueCall(_) => {
                 GeneratedExecutionControl::failed(ExecutionError::InvalidCallCompletion)
             }
+            SingleDispatchOutcome::EvalRequest(_) => {
+                GeneratedExecutionControl::failed(ExecutionError::InvalidCallCompletion)
+            }
             SingleDispatchOutcome::Suspended(record) => {
                 GeneratedExecutionControl::complete(ExecutionCompletion::Suspended(record))
             }
@@ -16074,6 +16395,9 @@ impl Vm {
                 ExecutionCompletion::Failed(ExecutionError::InvalidCallCompletion)
             }
             SingleDispatchOutcome::FunctionValueCall(_) => {
+                ExecutionCompletion::Failed(ExecutionError::InvalidCallCompletion)
+            }
+            SingleDispatchOutcome::EvalRequest(_) => {
                 ExecutionCompletion::Failed(ExecutionError::InvalidCallCompletion)
             }
             SingleDispatchOutcome::Suspended(record) => ExecutionCompletion::Suspended(record),
@@ -16446,12 +16770,36 @@ impl Vm {
         stable_ids: &mut SourceSessionStableIds,
         visible_global_bindings: &BytecompilerGlobalBindingSet,
     ) -> Result<SourceSessionCompiledEntry, SourceExecutionError> {
+        Self::compile_source_session_entry_with_mode(
+            source,
+            ParseMode::Program,
+            session,
+            function_index_base,
+            stable_ids,
+            visible_global_bindings,
+        )
+    }
+
+    // Parameterized over `ParseMode` so the Vm-owned indirect-eval handler can
+    // reuse the program compile pipeline with `ParseMode::Eval` (C++ JSC
+    // IndirectEvalExecutable, JSGlobalObjectFunctions.cpp:517). The bytecompiler
+    // already lowers `BytecompilerMode::Eval` with completion-value semantics
+    // (last expression statement is the eval result) and global var/function
+    // hoisting (sloppy top-level global assignment), matching executeEval.
+    fn compile_source_session_entry_with_mode(
+        source: SourceSessionSource,
+        parse_mode: ParseMode,
+        session: BytecompilerSessionId,
+        function_index_base: u32,
+        stable_ids: &mut SourceSessionStableIds,
+        visible_global_bindings: &BytecompilerGlobalBindingSet,
+    ) -> Result<SourceSessionCompiledEntry, SourceExecutionError> {
         let mut arena = ParserArena::new();
         let parsed = Parser::with_mode(
             &mut arena,
             AstBuilder::default(),
             source.source(),
-            ParseMode::Program,
+            parse_mode,
         )
         .parse()
         .map_err(SourceExecutionError::Parse)?;
@@ -16563,6 +16911,18 @@ impl Vm {
         &mut self,
         compiled: SourceSessionCompiledEntry,
     ) -> Result<SourceSessionLinkedEntry, SourceExecutionError> {
+        self.link_source_session_compiled_entry_with_kind(compiled, ScriptExecutableKind::Program)
+    }
+
+    // Parameterized over `ScriptExecutableKind` so the indirect-eval handler can
+    // register the eval CodeBlock as `ScriptExecutableKind::Eval` (C++ JSC
+    // EvalExecutable, not ProgramExecutable). Linking and registration are
+    // otherwise identical to the program path.
+    fn link_source_session_compiled_entry_with_kind(
+        &mut self,
+        compiled: SourceSessionCompiledEntry,
+        executable_kind: ScriptExecutableKind,
+    ) -> Result<SourceSessionLinkedEntry, SourceExecutionError> {
         let executable_id = self.allocate_executable_cell()?;
         let code_block_id = self.allocate_code_block_cell()?;
         let code_block = CodeBlock::from_shared_unlinked(
@@ -16580,11 +16940,7 @@ impl Vm {
         .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
         .with_root_map_owner(code_block_id);
         self.executables
-            .register_script(
-                executable_id,
-                ScriptExecutableKind::Program,
-                compiled.shared_unlinked,
-            )
+            .register_script(executable_id, executable_kind, compiled.shared_unlinked)
             .map_err(SourceExecutionError::ExecutableRegistration)?;
         self.code_blocks.register(code_block_id, code_block.clone());
         let install_record = self.executables.install_script_code(
@@ -30660,6 +31016,93 @@ mod tests {
         assert_eq!(
             vm.tiering_integration().diagnostics()[0].completion,
             CompletionDiagnostic::Returned
+        );
+    }
+
+    // C++ JSC globalFuncEval (runtime/JSGlobalObjectFunctions.cpp:450) ->
+    // Interpreter::executeEval (interpreter/Interpreter.cpp:1436). INDIRECT
+    // (global) eval. These prove JSC behavior: a string arg is compiled and its
+    // completion value returned; a non-string arg is returned unchanged; eval
+    // bound to a local and called still runs indirect eval; eval-body global var
+    // declarations become global bindings; a concatenated program string returns
+    // its completion value.
+    #[test]
+    fn vm_indirect_eval_compiles_and_returns_string_completion_value() {
+        let mut vm = Vm::new(VmConfig::default());
+        // globalFuncEval :458/:517 -> executeEval: "1+2" compiles to an Eval
+        // CodeBlock whose completion value is the last expression (3).
+        assert_eq!(
+            vm.execute_source(source("eval(\"1+2\");")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(3))
+        );
+    }
+
+    #[test]
+    fn vm_indirect_eval_returns_non_string_argument_unchanged() {
+        let mut vm = Vm::new(VmConfig::default());
+        // globalFuncEval :477-478: a non-string argument is returned unchanged
+        // (no compilation). `eval(o) === o` for an object `o`.
+        assert_eq!(
+            vm.execute_source(source("var o = {}; eval(o) === o;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(true))
+        );
+        // A number argument is likewise returned unchanged.
+        let mut vm = Vm::new(VmConfig::default());
+        assert_eq!(
+            vm.execute_source(source("eval(41);")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
+        );
+    }
+
+    #[test]
+    fn vm_indirect_eval_through_local_alias_runs_and_declares_global_var() {
+        let mut vm = Vm::new(VmConfig::default());
+        // `var e = eval; e("var x = 41; x + 1")` is INDIRECT eval (the callee is
+        // not the syntactic `eval` identifier). It runs at global scope, declares
+        // global `var x`, and returns the completion value 42 (executeEval global
+        // var hoisting, Interpreter.cpp:1513-1577).
+        assert_eq!(
+            vm.execute_source(source("var e = eval; e(\"var x = 41; x + 1\");"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn vm_indirect_eval_declared_global_var_is_visible_after_eval() {
+        let mut vm = Vm::new(VmConfig::default());
+        // The global `var gg` declared inside the eval body is a global binding;
+        // a subsequent top-level reference resolves it.
+        assert_eq!(
+            vm.execute_source(source("eval(\"var gg = 7;\"); gg + 1;"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(8))
+        );
+    }
+
+    #[test]
+    fn vm_indirect_eval_concatenated_program_returns_completion_value() {
+        let mut vm = Vm::new(VmConfig::default());
+        // A multi-statement program string: the last evaluated expression
+        // statement is the eval completion value (the IIFE result, 9).
+        assert_eq!(
+            vm.execute_source(source(
+                "eval(\"var a = 4; (function(){ return a + 5; })();\");"
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(9))
+        );
+    }
+
+    #[test]
+    fn vm_indirect_eval_empty_string_returns_undefined() {
+        let mut vm = Vm::new(VmConfig::default());
+        // An empty program has an undefined completion value (executeEval's
+        // initial completion register, emit_load_undefined for Eval mode).
+        assert_eq!(
+            vm.execute_source(source("eval(\"\");")).unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
         );
     }
 

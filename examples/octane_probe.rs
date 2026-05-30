@@ -1737,6 +1737,7 @@ fn completion_kind(completion: &ExecutionCompletion) -> &'static str {
         ExecutionCompletion::OrdinaryBytecodeConstruct(_) => "ordinary-bytecode-construct",
         ExecutionCompletion::BaselineLoopHandoff(_) => "baseline-loop-handoff",
         ExecutionCompletion::FunctionValueCall(_) => "function-value-call",
+        ExecutionCompletion::EvalRequest(_) => "eval-request",
         ExecutionCompletion::Terminated(_) => "terminated",
         ExecutionCompletion::Suspended(_) => "suspended",
         ExecutionCompletion::Failed(_) => "failed",

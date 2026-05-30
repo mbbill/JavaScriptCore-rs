@@ -2395,6 +2395,7 @@ fn classify_completion(
         | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
         | ExecutionCompletion::BaselineLoopHandoff(_)
         | ExecutionCompletion::FunctionValueCall(_)
+        | ExecutionCompletion::EvalRequest(_)
         | ExecutionCompletion::Terminated(_)
         | ExecutionCompletion::Suspended(_) => OctaneExecutionPhase::ExecuteRuntime,
     };

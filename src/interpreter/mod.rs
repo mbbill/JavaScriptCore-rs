@@ -28,6 +28,9 @@ use crate::bytecode::{
     ArrayProfile, BytecodeIndex, CodeKind, ConstructAbility, ConstructorKind, CoreOpcode,
     OperandKind, PackedInstructionStream, ParseMode, PropertyCacheKey,
 };
+// Indirect-eval host hooks expose the global binding set the Vm-owned eval
+// compile uses; the type lives in the bytecompiler (single-crate, no cycle).
+use crate::bytecompiler::BytecompilerGlobalBindingSet;
 use crate::gc::{
     static_cell_metadata_registry, AllocationMode, BarrierDecisionError, BarrierFieldKind,
     BarrierMutationAuthority, BarrierRequirementOutcome, BarrierWriteContext, CellId, CellState,
@@ -445,6 +448,45 @@ fn code_blocks_request_eq(left: &Rc<CodeBlock>, right: &Rc<CodeBlock>) -> bool {
         && left.link_context() == right.link_context()
         && left.entrypoints() == right.entrypoints()
         && left.lifecycle() == right.lifecycle()
+}
+
+/// Deferred INDIRECT (global) eval request.
+///
+/// C++ JSC globalFuncEval (runtime/JSGlobalObjectFunctions.cpp:450) compiles
+/// the program source as an IndirectEvalExecutable and runs it via
+/// `vm.interpreter.executeEval(eval, globalObject->globalThis(),
+/// globalObject->globalScope())` (:517-522). In Rust the native `eval` arm
+/// cannot compile inline: the compile pipeline lives on the Vm and mutates
+/// `&mut Vm` state (executable/code-block registries) that is not reachable
+/// while the per-instruction dispatch holds its `DispatchState` borrows. So the
+/// native arm extracts the source string and the call-site resume context, drops
+/// all borrows, and returns this request; the Vm handler
+/// (`execute_eval_request_in_current_region`) owns compile+link+run and writes
+/// the completion value back into the call destination via the same
+/// `FunctionValueCallCompletion` resume path used by deferred function-value
+/// calls.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvalRequest {
+    /// Program source text (the string `eval` was given). Mirrors C++
+    /// `programSource` (JSGlobalObjectFunctions.cpp:456).
+    pub(crate) source: String,
+    /// Call-site resume context: caller frame/window, owner code block, call +
+    /// resume bytecode indices, and the destination register the eval result is
+    /// written to. Reuses the deferred function-value-call completion machinery.
+    pub(crate) completion: FunctionValueCallCompletion,
+    /// Global object value, used as `this` for the eval CodeBlock's single
+    /// parameter (`globalObject->globalThis()`, Interpreter.cpp:1488).
+    pub(crate) global_this: RuntimeValue,
+}
+
+/// Snapshot of the host's identifier/string-literal namespace, used to seed the
+/// Vm-owned eval compile so newly compiled eval bytecode shares the host's
+/// identifier indices (see `DispatchHost::eval_symbol_namespace_snapshot`).
+#[derive(Clone, Debug, Default)]
+pub struct EvalHostSymbolSnapshot {
+    pub identifier_texts: HashMap<u32, String>,
+    pub string_literals: HashMap<u32, String>,
+    pub prototype_property_key: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1923,6 +1965,7 @@ pub(crate) fn finish_ordinary_js_call_return(
         | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
         | ExecutionCompletion::BaselineLoopHandoff(_)
         | ExecutionCompletion::FunctionValueCall(_)
+        | ExecutionCompletion::EvalRequest(_)
         | ExecutionCompletion::Terminated(_)
         | ExecutionCompletion::Suspended(_) => {
             if let Err(error) = discard_call_return_callee_if_present(state, continuation) {
@@ -2070,6 +2113,13 @@ pub enum ExecutionError {
     BaselineGeneratedCodeUnavailable,
     BaselineGeneratedExecutionRejected,
     GcBoundaryViolation,
+    // C++ JSC divergence (first cut): globalFuncEval throws a JS SyntaxError when
+    // the eval source fails to parse/compile (IndirectEvalExecutable::tryCreate
+    // returns null with an exception, JSGlobalObjectFunctions.cpp:517-520). The
+    // Vm-owned eval compile here surfaces a parse/compile failure as a Vm-level
+    // error instead of allocating a thrown SyntaxError object. Follow-up: turn
+    // this into a thrown SyntaxError at the eval call site.
+    EvalCompilationFailed,
 }
 
 impl From<BarrierDecisionError> for ExecutionError {
@@ -2499,6 +2549,51 @@ pub trait DispatchHost {
         } else {
             Err(DispatchOutcome::Fail(ExecutionError::ExpectedFunction))
         }
+    }
+
+    // --- Indirect-eval host hooks (C++ JSC globalFuncEval -> executeEval) ---
+    //
+    // The Vm owns the eval compile pipeline but the function-block table, source
+    // string/identifier maps, and global lexical environment live on the host
+    // (`CoreOpcodeDispatchHost`). These hooks let the Vm eval handler read the
+    // current function-block base (so newly compiled eval functions are indexed
+    // contiguously, matching `append_source_session_source`), append the eval's
+    // compiled function blocks/strings/identifiers, and install the eval body's
+    // top-level lexical (`let`/`const`) declarations as global lexical bindings.
+    // Defaults make eval unavailable on non-production hosts (test hosts), which
+    // never compile source. Only `CoreOpcodeDispatchHost` overrides them.
+    fn eval_function_block_base(&self) -> Option<u32> {
+        None
+    }
+
+    fn eval_global_binding_set(&self) -> Option<BytecompilerGlobalBindingSet> {
+        None
+    }
+
+    // Snapshot of the host's current identifier/string-literal namespace so the
+    // Vm-owned eval compile reuses existing identifier indices and allocates
+    // fresh, non-colliding indices for new names. Eval bytecode resolves
+    // identifier indices through the host's shared `identifier_texts` map, so a
+    // from-zero compile would corrupt resolution; this seeds the eval compile's
+    // stable-id allocator to continue the program's namespace.
+    fn eval_symbol_namespace_snapshot(&self) -> EvalHostSymbolSnapshot {
+        EvalHostSymbolSnapshot::default()
+    }
+
+    fn append_eval_function_blocks(
+        &mut self,
+        _function_blocks: Vec<InterpreterFunctionCodeBlock>,
+        _string_literals: HashMap<u32, String>,
+        _identifier_texts: HashMap<u32, String>,
+        _prototype_property_key: Option<u32>,
+    ) {
+    }
+
+    fn install_eval_global_lexical_declarations(
+        &mut self,
+        _declarations: Vec<CoreGlobalLexicalDeclaration>,
+    ) -> Result<(), ExecutionError> {
+        Ok(())
     }
 
     fn snapshot_structure_transition_watchpoints(
@@ -6019,6 +6114,12 @@ enum CoreNativeFunction {
     Keys,
     SetPrototypeOf,
     Values,
+    // C++ JSC globalFuncEval (runtime/JSGlobalObjectFunctions.cpp:450): the
+    // global `eval`. INDIRECT/global eval only. The native arm cannot compile
+    // here (it would re-enter the compile pipeline while DispatchState borrows
+    // are live); instead it returns `DispatchOutcome::EvalRequest`, deferring
+    // compile+run to the Vm, which owns the compile pipeline (Option A).
+    GlobalEval,
 }
 
 impl CoreNativeFunction {
@@ -7630,6 +7731,18 @@ impl CoreObjectStore {
             global_object,
             "Symbol",
             symbol,
+            standard_attributes,
+        )?;
+        // C++ JSC JSGlobalObject::init binds the global `eval` to globalFuncEval
+        // (runtime/JSGlobalObject.cpp / JSGlobalObjectFunctions.cpp:450) as a
+        // DontEnum data property. standard_attributes matches DontEnum (writable,
+        // configurable, not enumerable). Indirect/global eval only.
+        let eval = self.allocate_native_function(CoreNativeFunction::GlobalEval);
+        self.install_standard_global_data_property(
+            heap,
+            global_object,
+            "eval",
+            eval,
             standard_attributes,
         )?;
         let parse_int = self.allocate_native_function(CoreNativeFunction::ParseInt);
@@ -12832,6 +12945,69 @@ impl DispatchHost for CoreOpcodeDispatchHost {
         self.drain_call_observation_descriptor(heap, request)
     }
 
+    // --- Indirect-eval host hooks (see DispatchHost defaults) ---
+
+    fn eval_function_block_base(&self) -> Option<u32> {
+        // The eval source is compiled with this as `function_index_base`, so its
+        // function blocks are indexed contiguously after existing program/eval
+        // function blocks (mirrors `append_source_session_source`'s
+        // `session.function_count`).
+        u32::try_from(self.function_blocks.len()).ok()
+    }
+
+    fn eval_global_binding_set(&self) -> Option<BytecompilerGlobalBindingSet> {
+        // C++ JSC indirect eval resolves names against the global scope chain.
+        // The Rust bytecompiler resolves global `var`/property references
+        // dynamically (op ResolveGlobalObjectProperty) and only needs the binding
+        // set to distinguish global lexical (`let`/`const`) names. Standard
+        // globals are always visible; prior-program global lexicals are not yet
+        // threaded into the eval compile (first-cut: recompile per call, no
+        // DirectEvalCodeCache), which only affects eval bodies that read a
+        // prior global `let`/`const` by name.
+        Some(BytecompilerGlobalBindingSet::standard_globals())
+    }
+
+    fn eval_symbol_namespace_snapshot(&self) -> EvalHostSymbolSnapshot {
+        EvalHostSymbolSnapshot {
+            identifier_texts: self.identifier_texts.clone(),
+            string_literals: self.string_literals.clone(),
+            // Only an identifier-index prototype key is meaningful as a seed; the
+            // default string key is re-derived by the compile if "prototype" is
+            // referenced.
+            prototype_property_key: match &self.prototype_property_key {
+                Some(CorePropertyKey::Identifier(index)) => Some(*index),
+                _ => None,
+            },
+        }
+    }
+
+    fn append_eval_function_blocks(
+        &mut self,
+        function_blocks: Vec<InterpreterFunctionCodeBlock>,
+        string_literals: HashMap<u32, String>,
+        identifier_texts: HashMap<u32, String>,
+        prototype_property_key: Option<u32>,
+    ) {
+        self.append_function_code_blocks_strings_and_prototype_key(
+            function_blocks,
+            string_literals,
+            identifier_texts,
+            prototype_property_key,
+        );
+    }
+
+    fn install_eval_global_lexical_declarations(
+        &mut self,
+        declarations: Vec<CoreGlobalLexicalDeclaration>,
+    ) -> Result<(), ExecutionError> {
+        // C++ JSC executeEval (Interpreter.cpp:1513-1577) creates global bindings
+        // for the eval body's top-level declarations. Lexical (`let`/`const`)
+        // declarations become global lexical bindings here; `var`/function
+        // declarations become global object properties via the normal sloppy
+        // top-level assignment path emitted into the eval bytecode.
+        self.install_global_lexical_declarations(declarations)
+    }
+
     fn finalize_function_value_property_observation(
         &mut self,
         heap: &mut Heap,
@@ -17558,6 +17734,7 @@ impl CoreOpcodeDispatchHost {
             | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
             | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
+            | ExecutionCompletion::EvalRequest(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => {
                 Err(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))
@@ -17603,6 +17780,7 @@ impl CoreOpcodeDispatchHost {
             | DispatchOutcome::OrdinaryBytecodeCall(_)
             | DispatchOutcome::OrdinaryBytecodeConstruct(_)
             | DispatchOutcome::FunctionValueCall(_)
+            | DispatchOutcome::EvalRequest(_)
             | DispatchOutcome::Suspend(_)
             | DispatchOutcome::Fail(_) => CallObservationOutcome::FailedOrOpaque,
         }
@@ -18811,6 +18989,11 @@ impl CoreOpcodeDispatchHost {
                 | CoreNativeFunction::ReflectGet
                 | CoreNativeFunction::ReflectHas
                 | CoreNativeFunction::ReflectSet
+                // C++ JSC globalFuncEval: indirect eval must write its completion
+                // value into the call destination and resume the caller. We reuse
+                // the deferred-call resume completion so the Vm handler can write
+                // back through the same `finish_function_value_call_return` path.
+                | CoreNativeFunction::GlobalEval
         ) {
             self.function_value_tail_completion_for_current_call(
                 state,
@@ -19166,6 +19349,7 @@ impl CoreOpcodeDispatchHost {
             | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
             | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
+            | ExecutionCompletion::EvalRequest(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => {
                 DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion)
@@ -19218,6 +19402,9 @@ impl CoreOpcodeDispatchHost {
                     state.heap,
                     "Function constructor (dynamic compilation) is not supported",
                 ))
+            }
+            CoreNativeFunction::GlobalEval => {
+                self.native_global_eval(state, arguments, function_value_completion)
             }
             CoreNativeFunction::ArrayConstructor => {
                 self.native_array_constructor(state.heap, arguments)
@@ -19652,6 +19839,58 @@ impl CoreOpcodeDispatchHost {
             }
             CoreNativeFunction::Values => self.native_object_values(state, arguments),
         }
+    }
+
+    /// C++ JSC globalFuncEval (runtime/JSGlobalObjectFunctions.cpp:450).
+    ///
+    /// INDIRECT (global) eval only. Mirrors the C++ string-vs-non-string split:
+    /// - `x` is not a string -> return `x` unchanged (:477-478). A non-string
+    ///   argument is the eval result; no compilation happens.
+    /// - `x` is a string -> defer compile+run to the Vm by returning
+    ///   `DispatchOutcome::EvalRequest` carrying the source, the call-site resume
+    ///   context, and the global `this`. We CANNOT compile here: the compile
+    ///   pipeline mutates `&mut Vm` registries that are not reachable while the
+    ///   per-instruction `DispatchState` borrows are live. This arm extracts what
+    ///   the Vm needs and RETURNS, dropping all `DispatchState` borrows. The Vm
+    ///   handler (`execute_eval_request_in_current_region`) builds an
+    ///   IndirectEvalExecutable-equivalent EvalCodeBlock in GLOBAL scope and runs
+    ///   it via `executeEval(eval, globalThis, globalScope)` (:517-522).
+    ///
+    /// DEFERRED (out of scope): direct eval (`eval(...)` seeing caller locals).
+    /// That needs a caller scope-chain walk, StrictEvalActivation, and the
+    /// DirectEvalCodeCache; this path is always INDIRECT (`direct: false`).
+    fn native_global_eval(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        arguments: &[RuntimeValue],
+        completion: Option<FunctionValueCallCompletion>,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let argument = arguments
+            .first()
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        // C++ globalFuncEval :458/:477-478: only a string is compiled; any other
+        // value (including objects, with TrustedTypes disabled) is returned
+        // unchanged. Rust does not implement TrustedTypes, so the only compiled
+        // case is a primitive string.
+        let Some(source_text) = self.strings.text(argument).map(str::to_owned) else {
+            return Ok(argument);
+        };
+        // The completion is built by `function_value_tail_completion_for_native_call`
+        // only when the Vm owns re-entrancy (`DeferToVm`). The production Vm run
+        // loop is always `DeferToVm`; a missing completion means eval was invoked
+        // on a direct-interpreter path that cannot host the compile re-entry.
+        let Some(completion) = completion else {
+            return Err(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion));
+        };
+        let global_this = self
+            .active_global_object_value(state.stack)
+            .map_err(DispatchOutcome::Fail)?;
+        Err(DispatchOutcome::EvalRequest(Box::new(EvalRequest {
+            source: source_text,
+            completion,
+            global_this,
+        })))
     }
 
     fn native_host_performance_now(&mut self) -> RuntimeValue {
@@ -26899,6 +27138,7 @@ fn property_store_outcome_from_dispatch_error(
         | DispatchOutcome::OrdinaryBytecodeCall(_)
         | DispatchOutcome::OrdinaryBytecodeConstruct(_)
         | DispatchOutcome::FunctionValueCall(_)
+        | DispatchOutcome::EvalRequest(_)
         | DispatchOutcome::Suspend(_) => PropertyStoreObservationOutcome::Opaque,
     }
 }
@@ -27559,6 +27799,9 @@ pub enum DispatchOutcome {
     OrdinaryBytecodeCall(Box<OrdinaryBytecodeCallRequest>),
     OrdinaryBytecodeConstruct(Box<OrdinaryBytecodeConstructRequest>),
     FunctionValueCall(Box<FunctionValueCallRequest>),
+    // C++ JSC globalFuncEval -> executeEval re-entrancy. Like FunctionValueCall,
+    // this defers to the Vm, which owns the compile pipeline (see EvalRequest).
+    EvalRequest(Box<EvalRequest>),
     Suspend(SuspensionRecord),
     Fail(ExecutionError),
 }
@@ -27571,6 +27814,8 @@ pub enum ExecutionCompletion {
     OrdinaryBytecodeCall(Box<OrdinaryBytecodeCallRequest>),
     OrdinaryBytecodeConstruct(Box<OrdinaryBytecodeConstructRequest>),
     FunctionValueCall(Box<FunctionValueCallRequest>),
+    // C++ JSC globalFuncEval -> executeEval re-entrancy (see EvalRequest).
+    EvalRequest(Box<EvalRequest>),
     Terminated(TerminationReason),
     Suspended(SuspensionRecord),
     Failed(ExecutionError),
@@ -27596,6 +27841,8 @@ pub(crate) enum SingleDispatchOutcome {
     OrdinaryBytecodeCall(Box<OrdinaryBytecodeCallRequest>),
     OrdinaryBytecodeConstruct(Box<OrdinaryBytecodeConstructRequest>),
     FunctionValueCall(Box<FunctionValueCallRequest>),
+    // C++ JSC globalFuncEval -> executeEval re-entrancy (see EvalRequest).
+    EvalRequest(Box<EvalRequest>),
     Suspended(SuspensionRecord),
     Failed(ExecutionError),
 }
@@ -28193,6 +28440,14 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                     ExecutionCompletion::FunctionValueCall(request),
                 );
             }
+            DispatchOutcome::EvalRequest(request) => {
+                return finish_with_targeted_root_cleanup(
+                    execution.heap,
+                    &mut active_targeted_register_roots,
+                    &mut active_targeted_frame_roots,
+                    ExecutionCompletion::EvalRequest(request),
+                );
+            }
             DispatchOutcome::Suspend(record) => {
                 return finish_with_targeted_root_cleanup(
                     execution.heap,
@@ -28341,6 +28596,15 @@ fn map_single_dispatch_outcome(
         DispatchOutcome::FunctionValueCall(request) => {
             if call_handling.function_value_call == FunctionValueCallHandling::DeferToVm {
                 SingleDispatchOutcome::FunctionValueCall(request)
+            } else {
+                SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
+            }
+        }
+        DispatchOutcome::EvalRequest(request) => {
+            // Indirect eval defers to the Vm exactly like a function-value call;
+            // it is only valid where the Vm owns re-entrancy.
+            if call_handling.function_value_call == FunctionValueCallHandling::DeferToVm {
+                SingleDispatchOutcome::EvalRequest(request)
             } else {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
             }
