@@ -72538,4 +72538,122 @@ mod tests {
         assert_eq!(vm.execution_context_stack().frame_depth(), 0);
         assert_eq!(vm.register_file().register_count(), 0);
     }
+
+    // ---- LLInt monomorphic GetByName/PutByName inline-cache equivalence ----
+    // These run loops long enough (> LLINT_CACHE_WARMUP) to arm the per-site
+    // cache so the fast path is exercised, and assert the cache serves exactly
+    // what the slow path would (not accidental behavior).
+
+    fn eval_value(src: &str) -> RuntimeValue {
+        let mut vm = Vm::new(VmConfig::default());
+        match vm.execute_source(source(src)).unwrap() {
+            ExecutionCompletion::Returned(value) => value,
+            other => panic!("expected Returned, got {other:?}"),
+        }
+    }
+
+    fn eval_i32(src: &str) -> RuntimeValue {
+        eval_value(src)
+    }
+
+    fn eval_bool(src: &str) -> RuntimeValue {
+        eval_value(src)
+    }
+
+    #[test]
+    fn llint_ic_monomorphic_self_get_reads_back_after_warmup() {
+        // Cache arms after warmup; every later read returns the own data value.
+        assert_eq!(
+            eval_i32("var o={a:7,b:9}; var s=0; for (var i=0;i<50;i++){ s=o.a; } s"),
+            RuntimeValue::from_i32(7)
+        );
+    }
+
+    #[test]
+    fn llint_ic_replace_existing_put_updates_value() {
+        // Replace-existing PUT fast path must update the value the GET observes.
+        assert_eq!(
+            eval_i32("var o={a:1,b:2}; for (var i=0;i<50;i++){ o.a=i; } o.a"),
+            RuntimeValue::from_i32(49)
+        );
+    }
+
+    #[test]
+    fn llint_ic_second_object_same_shape_reads_its_own_value() {
+        // A second object of the SAME shape hits the cache (same structure id)
+        // but must read ITS OWN value, not the first object's.
+        assert_eq!(
+            eval_i32(
+                "var a={x:11,y:1}; var b={x:22,y:2}; var s=0; \
+                 for (var i=0;i<50;i++){ s=a.x; } \
+                 for (var i=0;i<50;i++){ s=b.x; } s"
+            ),
+            RuntimeValue::from_i32(22)
+        );
+    }
+
+    #[test]
+    fn llint_ic_prototype_inherited_property_not_misserved() {
+        // An inherited (prototype-chain) property must be read from the
+        // prototype, never cached/served as an own-data hit.
+        assert_eq!(
+            eval_i32(
+                "function P(){} P.prototype.v=5; var o=new P(); o.own=1; var s=0; \
+                 for (var i=0;i<50;i++){ s=o.v; } s"
+            ),
+            RuntimeValue::from_i32(5)
+        );
+    }
+
+    #[test]
+    fn llint_ic_accessor_property_still_invokes_getter() {
+        // An accessor (getter) must still invoke the getter, never be cached as
+        // an own data load.
+        assert_eq!(
+            eval_i32(
+                "var n=0; var o={ get a(){ n=n+1; return n; } }; var s=0; \
+                 for (var i=0;i<50;i++){ s=o.a; } s"
+            ),
+            RuntimeValue::from_i32(50)
+        );
+    }
+
+    #[test]
+    fn llint_ic_put_adding_new_property_creates_and_is_readable() {
+        // A PUT that ADDS a new property (transition) must not be fast-pathed as a
+        // replace; the property is created and readable. Each loop iteration uses a
+        // fresh object so the add case is hit repeatedly without being cached.
+        assert_eq!(
+            eval_i32("var last=0; for (var i=0;i<50;i++){ var o={}; o.n=i; last=o.n; } last"),
+            RuntimeValue::from_i32(49)
+        );
+    }
+
+    #[test]
+    fn llint_ic_polymorphic_get_site_returns_each_receivers_value() {
+        // A site that sees TWO shapes (different structures) is polymorphic; the
+        // cache must give up (megamorphic) and the slow path must return each
+        // receiver's correct value, summed.
+        assert_eq!(
+            eval_i32(
+                "var a={p:3}; var b={p:4,q:9}; var sum=0; \
+                 for (var i=0;i<50;i++){ var o = (i % 2 === 0) ? a : b; sum=sum+o.p; } sum"
+            ),
+            // 25 iterations hit a (p=3) and 25 hit b (p=4): 25*3 + 25*4 = 175.
+            RuntimeValue::from_i32(175)
+        );
+    }
+
+    #[test]
+    fn llint_ic_put_then_get_same_site_observe_new_value() {
+        // Replace-existing PUT updates BOTH stores so a subsequent GET (slow or
+        // fast) observes the new value; proves lockstep coherence.
+        assert_eq!(
+            eval_bool(
+                "var o={a:0}; var ok=true; \
+                 for (var i=0;i<50;i++){ o.a=i; if (o.a!==i) ok=false; } ok"
+            ),
+            RuntimeValue::from_bool(true)
+        );
+    }
 }

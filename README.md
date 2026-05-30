@@ -100,17 +100,17 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [missing] full C++ structure/watchpoint invalidation fidelity
     [missing] dictionary, override, and static-class-table predicates
   [wip] property access and inline caches
+    [done] interpreter LLInt monomorphic GetByName/PutByName IC (GetByIdModeMetadata
+           mirror): per-site {structure,offset,state} cache, own-data GET read +
+           replace-existing PUT from out_of_line_storage; warmup-gated so it does
+           not starve the observation pipeline; PUT ~5x, GET access ~2x on micro
     [done] generated property handoff groundwork
     [done] property load/store observation flow for current hot path
     [done] named has/in dormant metadata and narrow generated sidecar
     [wip] access-case evolution and megamorphic policy
     [done] resident monomorphic self-load + prototype-chain (holder) get_by_id DataIC
-           machine code emitted: receiver guarded by STRUCTURE not identity (mirrors C++
-           generateGetByIdInlineAccessBaselineDataIC Self/Prototype + AccessCase::Load
-           guardedByStructureCheckSkippingConstantIdentifierCheck); holder is a baked
-           pinned cell ptr validated by StructureTransition watchpoints. Machine-code
-           CORRECT (executes in tests), but see CRITICAL gate below: it does NOT move
-           richards -- the emitted code is on FUNCTION bodies that never run generated.
+           machine code (structure-guarded, watchpoint-validated holder ptr); CORRECT
+           but does NOT move richards -- emitted on FUNCTION bodies that never run generated
     [missing] full C++ Get/Put/In AccessCase taxonomy (multi-hop chains, Put/transition,
               megamorphic stubs)
     [missing] proxy/indexed in activation and call-link status

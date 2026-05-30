@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
 };
 
@@ -690,6 +690,64 @@ impl CodeBlock {
             .array_profiles
             .iter()
             .find(|profile| profile.bytecode_index == bytecode_index)
+    }
+
+    /// Read the monomorphic GET inline cache for a GetByName site, if filled.
+    ///
+    /// Mirrors loading `OpGetById::Metadata::m_modeMetadata` before
+    /// `performGetByIDHelper` runs (LowLevelInterpreter64.asm:1676). Returns the
+    /// `Copy` record so the caller does not hold the `RefCell` borrow across the
+    /// fast path (and across the slow path's `&mut self` reentry).
+    pub fn llint_get_by_id_cache(&self, bytecode_index: BytecodeIndex) -> LLIntGetByIdCache {
+        self.side_tables
+            .llint_get_by_id_caches
+            .borrow()
+            .get(&bytecode_index)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Install/overwrite the monomorphic GET cache for a GetByName site,
+    /// mirroring the `metadata.defaultMode.*` writes in `performLLIntGetByID`
+    /// (LLIntSlowPaths.cpp:945). Interior-mutable through `&self`.
+    pub fn set_llint_get_by_id_cache(
+        &self,
+        bytecode_index: BytecodeIndex,
+        metadata: LLIntGetByIdCache,
+    ) {
+        self.side_tables
+            .llint_get_by_id_caches
+            .borrow_mut()
+            .insert(bytecode_index, metadata);
+    }
+
+    /// Read the monomorphic PUT (replace-existing) inline cache for a PutByName
+    /// site, if filled. Mirrors loading `OpPutById::Metadata` before the LLInt
+    /// put fast path (LowLevelInterpreter64.asm op_put_by_id). Returns a clone:
+    /// the record carries a non-`Copy` cached key (O(1) for the common
+    /// `Identifier` key).
+    pub fn llint_put_by_id_cache(&self, bytecode_index: BytecodeIndex) -> LLIntPutByIdCache {
+        self.side_tables
+            .llint_put_by_id_caches
+            .borrow()
+            .get(&bytecode_index)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Install/overwrite the monomorphic PUT cache for a PutByName site,
+    /// mirroring the `metadata.m_oldStructureID`/`m_offset` writes in
+    /// `slow_path_put_by_id` (LLIntSlowPaths.cpp:1436). Interior-mutable through
+    /// `&self`.
+    pub fn set_llint_put_by_id_cache(
+        &self,
+        bytecode_index: BytecodeIndex,
+        metadata: LLIntPutByIdCache,
+    ) {
+        self.side_tables
+            .llint_put_by_id_caches
+            .borrow_mut()
+            .insert(bytecode_index, metadata);
     }
 
     pub fn tier_state(&self) -> &CodeBlockTierState {
@@ -3657,6 +3715,95 @@ pub struct UnlinkedSideTables {
     pub root_maps: Vec<BytecodeRootMap>,
 }
 
+/// Per-bytecode-site monomorphic LLInt inline-cache mode, mirroring C++ JSC
+/// `GetByIdMode` (bytecode/GetByIdMetadata.h:34).
+///
+/// C++ has four modes (ProtoLoad/Default/Unset/ArrayLength). This first
+/// interpreter cut implements only `Default` (the structureID+cachedOffset
+/// own-data hit that `performGetByIDHelper`'s `.opGetByIdDefault` arm serves,
+/// LowLevelInterpreter64.asm:1639) plus a `Megamorphic` give-up state with no
+/// C++ enum counterpart: C++ instead falls back to the inline-cache repatch /
+/// megamorphic IC machinery, which the deferred JIT path owns. The
+/// prototype-load (ProtoLoad), unset (Unset), and array-length (ArrayLength)
+/// modes are deliberately deferred — they need the prototype-chain watchpoint
+/// and indexing-header machinery — so an inherited/unset/length site simply
+/// stays `Uninitialized`/`Megamorphic` and always takes the slow path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GetByIdCacheMode {
+    /// No cache filled yet; the next slow path may fill it. Mirrors a freshly
+    /// constructed `LLIntGetByIdCache` (mode == Default, structureID == 0).
+    #[default]
+    Uninitialized,
+    /// C++ `GetByIdMode::Default`: a monomorphic own-data hit. The stored
+    /// structure id + offset are valid for the fast path.
+    Monomorphic,
+    /// Site gave up after exceeding the miss budget (saw a second structure on
+    /// an already-monomorphic site). No C++ enum value; mirrors C++ abandoning
+    /// LLInt caching for a polymorphic/megamorphic site. The fast path is never
+    /// attempted again for this site.
+    Megamorphic,
+}
+
+/// Per-bytecode-site monomorphic GET inline cache, the Rust mirror of C++ JSC
+/// `LLIntGetByIdCache` in its `Default` mode (bytecode/GetByIdMetadata.h:41,
+/// the `defaultMode.structureID`/`defaultMode.cachedOffset` pair read by
+/// `performGetByIDHelper`, LowLevelInterpreter64.asm:1639). One record per
+/// `op_get_by_id`-equivalent (GetByName) site, keyed by `BytecodeIndex` in the
+/// `LinkedSideTables::llint_get_by_id_caches` map.
+///
+/// `cached_offset` is C++ `PropertyOffset` (an `int`); the interpreter resolves
+/// it through `offset_storage_index`.
+///
+/// `warmup` mirrors C++ `hitCountForLLIntCaching` (GetByIdMetadata.h:71): the
+/// number of slow-path passes still required before the cache arms. In C++ this
+/// gates the PROTOTYPE cache (default 2); here it serves a Rust-specific
+/// coordination DIVERGENCE: the interpreter slow path also feeds the Rust
+/// access-case-plan observation pipeline (a baseline-JIT-tiering input C++ does
+/// NOT have in the LLInt), which needs a couple of slow-path passes to form its
+/// plan. Arming the own-data cache on the very first pass (as C++ Default mode
+/// does) would starve that pipeline, so the own-data cache waits `warmup` slow
+/// passes too. Once armed and then missed on a second structure, the site goes
+/// `Megamorphic` and stops fast-pathing (the polymorphic give-up).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LLIntGetByIdCache {
+    pub mode: GetByIdCacheMode,
+    pub cached_structure_id: StructureId,
+    pub cached_offset: i32,
+    pub warmup: u8,
+}
+
+/// Per-bytecode-site monomorphic PUT (replace-existing) inline cache, the Rust
+/// mirror of the C++ JSC `OpPutById::Metadata` LLInt cache in its
+/// replace-existing shape (`m_oldStructureID`/`m_offset` with
+/// `m_newStructureID == m_oldStructureID`, filled by `slow_path_put_by_id`,
+/// LLIntSlowPaths.cpp:1436). C++ also caches the property-add TRANSITION case
+/// (`m_newStructureID != m_oldStructureID` + `m_structureChain`); this cut
+/// caches ONLY replace-existing and leaves adds uncached (see the dispatch-site
+/// comment) because the add case touches the shared structure-transition graph.
+///
+/// DIVERGENCE: this carries the resolved property KEY (`cached_key`), which the
+/// C++ metadata does not (C++'s store target is the Butterfly slot, the sole
+/// source of truth). The Rust interpreter keeps a `properties` HashMap as the
+/// value-authoritative store with `out_of_line_storage` as the lockstep mirror
+/// (see CoreObjectCell), so the PUT fast path must update BOTH; the cached key
+/// lets it do the `properties.get_mut` with NO per-iteration key rebuild/String
+/// allocation (the key is built once at fill). This is exactly the identifier
+/// the bytecode operand binds the site to, so caching it is faithful. The key
+/// makes the record non-`Copy`; callers clone it (O(1) for the common
+/// `Identifier` variant).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LLIntPutByIdCache {
+    pub mode: GetByIdCacheMode,
+    pub cached_structure_id: StructureId,
+    pub cached_offset: i32,
+    // Slow-path warmup gate; see LLIntGetByIdCache::warmup.
+    pub warmup: u8,
+    // `CorePropertyKey` is a `pub(crate)` interpreter type; this field matches its
+    // visibility (the cache is a crate-internal interpreter concept, never public
+    // API).
+    pub(crate) cached_key: Option<crate::interpreter::CorePropertyKey>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LinkedSideTables {
     pub handlers: Vec<HandlerInfo>,
@@ -3681,6 +3828,19 @@ pub struct LinkedSideTables {
     pub root_maps: Vec<BytecodeRootMap>,
     pub direct_eval_cache: Option<DirectEvalCacheRef>,
     pub catch_liveness: Vec<CatchLivenessRecord>,
+    // C++ JSC: each `op_get_by_id`/`op_put_by_id` carries its monomorphic LLInt
+    // cache (`LLIntGetByIdCache` / `OpPutById::Metadata`) inline in the
+    // CodeBlock metadata, mutated in place through `CodeBlock*` on the slow path.
+    // The Rust interpreter has no per-site metadata slab for GetByName/PutByName
+    // (the existing `inline_caches` table feeds the DEFERRED JIT codegen, not
+    // interpreter dispatch), so these two `BytecodeIndex`-keyed maps are the
+    // minimal per-site `LLIntGetByIdCache` store. Interior-mutable for the same
+    // reason as `inline_caches`/`value_profiles`: the runtime feedback path mutates
+    // through the shared `Rc<CodeBlock>` (`&self`), never `&mut`. Entries are
+    // created lazily on first slow-path fill (no link-time pre-seed), so unrelated
+    // code blocks pay nothing.
+    pub llint_get_by_id_caches: RefCell<HashMap<BytecodeIndex, LLIntGetByIdCache>>,
+    pub llint_put_by_id_caches: RefCell<HashMap<BytecodeIndex, LLIntPutByIdCache>>,
 }
 
 // `RefCell` is neither `Eq` nor `PartialEq`; compare through a short borrow so the
@@ -3699,6 +3859,8 @@ impl PartialEq for LinkedSideTables {
             && self.root_maps == other.root_maps
             && self.direct_eval_cache == other.direct_eval_cache
             && self.catch_liveness == other.catch_liveness
+            && *self.llint_get_by_id_caches.borrow() == *other.llint_get_by_id_caches.borrow()
+            && *self.llint_put_by_id_caches.borrow() == *other.llint_put_by_id_caches.borrow()
     }
 }
 

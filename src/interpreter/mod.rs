@@ -15,7 +15,8 @@ use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bytecode::code_block::{
-    CodeBlock, ConstantValue, HandlerRange, HandlerTarget, LinkedConstantPool,
+    CodeBlock, ConstantValue, GetByIdCacheMode, HandlerRange, HandlerTarget, LLIntGetByIdCache,
+    LLIntPutByIdCache, LinkedConstantPool,
 };
 use crate::bytecode::instruction::{
     InstructionDeclaration, Operand, OperandAccessError, TypedInstruction,
@@ -2807,6 +2808,16 @@ pub struct CoreHostOutputRecord {
 }
 
 const CORE_HOST_OUTPUT_RECORD_LIMIT: usize = 1024;
+
+/// Slow-path passes a GetByName/PutByName site must take before its monomorphic
+/// LLInt inline cache arms. See `LLIntGetByIdCache::warmup`: C++ Default-mode
+/// own-data caching arms on the first pass, but the Rust interpreter slow path
+/// also feeds the access-case-plan observation pipeline (a baseline-JIT-tiering
+/// input that does not exist in the C++ LLInt), which needs a few slow-path
+/// passes to form its plan / let a generated sidecar take over. The own-data
+/// cache waits this many passes so it never starves that pipeline; hot
+/// interpreter-only loops still amortize it away after the warmup.
+const LLINT_CACHE_WARMUP: u8 = 4;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CoreHostResultRecord {
@@ -11903,6 +11914,137 @@ impl CoreObjectStore {
         Some(object)
     }
 
+    /// LLInt monomorphic GET fast path read, mirroring `performGetByIDHelper`'s
+    /// `.opGetByIdDefault` arm (LowLevelInterpreter64.asm:1639): structure guard,
+    /// then `loadPropertyAtVariableOffset` from out-of-line storage.
+    ///
+    /// C++ FAST PATH: `loadi JSCell::m_structureID[t3]` -> compare to the cached
+    /// `defaultMode.structureID` -> `loadPropertyAtVariableOffset` from the
+    /// Butterfly. The Rust mirror reuses the SAME cell layout: `structure_id` and
+    /// `out_of_line_storage` are exactly what the slow path maintains in lockstep,
+    /// so a structure match implies the cached offset is valid (invariant b) and
+    /// the slot value equals what the slow path would return (invariant c).
+    ///
+    /// This deliberately resolves the cell through `object_indices_by_payload` (an
+    /// integer-keyed probe) as the SOUNDNESS GATE before dereferencing: a payload
+    /// from a non-object cell (string/symbol/bigint, allocated in a different
+    /// `Pin<Box<T>>` store with a different layout) must never be read as a
+    /// `CoreObjectCell`, and the structure-id compare alone cannot prove the
+    /// pointer's type. DIVERGENCE from the frozen "deref the Pin<Box> directly"
+    /// note: the integer-keyed membership probe is kept as the type/liveness gate
+    /// for memory safety; it is far cheaper than the slow path it replaces (no
+    /// `CorePropertyKey` String allocation, no `properties`/`property_offsets`
+    /// key-hash lookups, no proxy/symbol/primitive guards, no observation /
+    /// completion-context build). Returns `None` on any miss so the caller falls
+    /// to the unchanged slow path and refills.
+    fn llint_get_by_id_fast(
+        &self,
+        receiver: RuntimeValue,
+        cached_structure_id: StructureId,
+        cached_offset: PropertyOffset,
+    ) -> Option<RuntimeValue> {
+        let payload = receiver.as_cell()?.pointer_payload_bits();
+        let index = self.object_indices_by_payload.get(&payload).copied()?;
+        let cell = self.objects.get(index)?.as_ref().get_ref();
+        if cell.structure_id != cached_structure_id {
+            return None;
+        }
+        // Structure match => same (kind, prototype, shape) => the cached offset is
+        // a live own-data slot (invariant a/b). Read it directly from the
+        // out-of-line storage mirror with NO key comparison or HashMap scan.
+        cell.read_data_property_offset_slot(cached_offset)
+    }
+
+    /// LLInt monomorphic PUT replace-existing fast path, mirroring the
+    /// `storePropertyAtVariableOffset` store after a structure guard
+    /// (LowLevelInterpreter64.asm:1581). ONLY the replace-existing case: the
+    /// structure is UNCHANGED by the write (no transition), so the cached offset
+    /// stays valid. Returns `true` if it stored on the fast path, `false` on any
+    /// miss (caller takes the unchanged slow put + refills).
+    ///
+    /// Same soundness gate as `llint_get_by_id_fast`. The structure guard proves
+    /// `cached_key` is the live OWN DATA property at `cached_offset`; writing it
+    /// does not change `structure_id` (a replace, not an add — invariant a), so
+    /// the cache stays valid for the next iteration.
+    ///
+    /// Updates BOTH the value-authoritative `properties` HashMap (via the cached
+    /// key — one hash lookup, NO allocation) and the `out_of_line_storage` mirror
+    /// (invariant c), so a later slow-path read sees the new value. Refuses
+    /// (returns false) if the guarded property is not actually a writable own
+    /// data property at the cached offset — a defensive re-check that keeps the
+    /// fast path from serving a write the slow path would reject (read-only) or
+    /// mis-target (accessor / shape drift).
+    fn llint_put_by_id_replace_fast(
+        &mut self,
+        heap: &mut Heap,
+        receiver: RuntimeValue,
+        cached_structure_id: StructureId,
+        cached_offset: PropertyOffset,
+        cached_key: &CorePropertyKey,
+        value: RuntimeValue,
+    ) -> Result<bool, ExecutionError> {
+        let Some(payload) = receiver.as_cell().map(|cell| cell.pointer_payload_bits()) else {
+            return Ok(false);
+        };
+        let Some(index) = self.object_indices_by_payload.get(&payload).copied() else {
+            return Ok(false);
+        };
+        // Read-only structure/writability checks first (immutable borrow), so a
+        // miss bails BEFORE touching the GC write barrier.
+        {
+            let Some(cell) = self.objects.get(index) else {
+                return Ok(false);
+            };
+            let cell = cell.as_ref().get_ref();
+            if cell.structure_id != cached_structure_id {
+                return Ok(false);
+            }
+            // The structure match guarantees the cached_key is an own data property
+            // at cached_offset. Re-confirm data-kind + writability before storing:
+            // the structure invariant already implies this, but the explicit check
+            // guards a read-only/accessor target (which the slow put would leave
+            // untouched / route to a setter) and keeps the fast path from diverging
+            // from slow-path semantics. One HashMap probe on the already-built key,
+            // no allocation.
+            match cell.properties.get(cached_key) {
+                Some(property)
+                    if property.attributes.writable
+                        && matches!(property.kind, CorePropertyKind::Data(_)) => {}
+                _ => return Ok(false),
+            }
+        }
+        // GC write barrier, identical to the slow store's
+        // set_data_own_with_write_barrier -> apply_value_store_write_barrier. MUST
+        // run on the fast path too: storing a heap value into an object field is a
+        // barriered mutator field write regardless of whether an IC served it.
+        self.apply_value_store_write_barrier(heap, receiver, value)?;
+        let Some(cell) = self.objects.get_mut(index) else {
+            return Ok(false);
+        };
+        let cell = cell.as_mut().get_mut();
+        // Re-validate after the barrier (the barrier path does not mutate this
+        // cell's shape, but the re-fetch keeps the store self-contained).
+        if cell.structure_id != cached_structure_id {
+            return Ok(false);
+        }
+        let Some(property) = cell.properties.get_mut(cached_key) else {
+            return Ok(false);
+        };
+        let CorePropertyKind::Data(slot) = &mut property.kind else {
+            return Ok(false);
+        };
+        *slot = value;
+        // Lockstep mirror update (invariant c): write the same value into
+        // out_of_line_storage at the cached offset. The slot already exists (the
+        // structure match proves the shape), so this never grows the Vec and the
+        // cached storage_ptr stays coherent.
+        let storage_index = offset_storage_index(cached_offset);
+        if let Some(mirror) = cell.out_of_line_storage.get_mut(storage_index) {
+            *mirror = value;
+        }
+        Ok(true)
+    }
+
     fn find_by_object_id(&self, object_id: ObjectId) -> Option<&CoreObjectCell> {
         if object_id == ObjectId::default() {
             return None;
@@ -15233,6 +15375,25 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(key) => key,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                // LLInt monomorphic GET fast path, mirroring `op_get_by_id` +
+                // `performGetByIDHelper`'s `.opGetByIdDefault` arm
+                // (LowLevelInterpreter64.asm:1639): if the per-site cache is
+                // Monomorphic and the receiver's structure matches, read the value
+                // straight from out-of-line storage and skip the String-key build,
+                // the proxy/symbol/primitive guards, the property HashMaps, and the
+                // observation/completion-context machinery the slow path runs.
+                let get_cache = state
+                    .code_block
+                    .llint_get_by_id_cache(instruction.bytecode_index);
+                if get_cache.mode == GetByIdCacheMode::Monomorphic {
+                    if let Some(value) = self.objects.llint_get_by_id_fast(
+                        object,
+                        get_cache.cached_structure_id,
+                        PropertyOffset::new(get_cache.cached_offset),
+                    ) {
+                        return write_register(state, window, destination, value);
+                    }
+                }
                 let key = self.identifier_property_key(key_index);
                 let site = CorePropertyLookupSite {
                     bytecode_index: Some(instruction.bytecode_index),
@@ -15260,6 +15421,15 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(outcome) => return outcome,
                 };
+                // Slow path ran; refill/transition the per-site cache from the
+                // recorded lookup result (mirrors `performLLIntGetByID`'s cache
+                // fill, LLIntSlowPaths.cpp:940). Cacheability predicates inside.
+                self.refill_get_by_id_cache(
+                    state.code_block,
+                    instruction.bytecode_index,
+                    object,
+                    &get_cache,
+                );
                 write_register(state, window, destination, value)
             }
             CoreOpcode::PutByName => {
@@ -15271,7 +15441,7 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let key = match identifier_index_operand(instruction, 1) {
+                let key_index = match identifier_index_operand(instruction, 1) {
                     Ok(key) => key,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
@@ -15283,7 +15453,35 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let key = self.identifier_property_key(key);
+                // LLInt monomorphic PUT replace-existing fast path, mirroring the
+                // `op_put_by_id` replace IC (LLIntSlowPaths.cpp:1436 fills it,
+                // storePropertyAtVariableOffset stores it): if the per-site cache is
+                // Monomorphic and the receiver's structure matches, write the value
+                // straight into the existing own-data slot (both the authoritative
+                // HashMap and the out-of-line mirror) and skip the proxy/primitive
+                // guards plus the store-observation build. Only the replace-existing
+                // shape is cached; the property-add transition stays on the slow
+                // path (see refill).
+                let put_cache = state
+                    .code_block
+                    .llint_put_by_id_cache(instruction.bytecode_index);
+                if put_cache.mode == GetByIdCacheMode::Monomorphic {
+                    if let Some(cached_key) = put_cache.cached_key.as_ref() {
+                        match self.objects.llint_put_by_id_replace_fast(
+                            state.heap,
+                            object,
+                            put_cache.cached_structure_id,
+                            PropertyOffset::new(put_cache.cached_offset),
+                            cached_key,
+                            value,
+                        ) {
+                            Ok(true) => return DispatchOutcome::Continue,
+                            Ok(false) => {}
+                            Err(error) => return DispatchOutcome::Fail(error),
+                        }
+                    }
+                }
+                let key = self.identifier_property_key(key_index);
                 let completion_context = match self
                     .function_value_property_operation_context_for_current_instruction(
                         state,
@@ -15294,14 +15492,28 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(context) => context,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                self.put_by_name_property_value_with_observation(
+                let outcome = self.put_by_name_property_value_with_observation(
                     state,
                     instruction.bytecode_index,
                     object,
                     &key,
                     value,
                     completion_context,
-                )
+                );
+                // Refill/transition the per-site PUT cache from the recorded store
+                // result (mirrors `slow_path_put_by_id`'s cache fill). Only the
+                // replace-existing case is cached; adds/setters/read-only stay
+                // uncached. Cacheability predicates live in refill_put_by_id_cache.
+                if matches!(outcome, DispatchOutcome::Continue) {
+                    self.refill_put_by_id_cache(
+                        state.code_block,
+                        instruction.bytecode_index,
+                        object,
+                        &key,
+                        &put_cache,
+                    );
+                }
+                outcome
             }
             CoreOpcode::DeleteByName => {
                 let destination = match register_operand(instruction, 0) {
@@ -17144,6 +17356,229 @@ impl CoreOpcodeDispatchHost {
                 Ok(RuntimeValue::undefined())
             }
         }
+    }
+
+    /// Refill/transition the per-site GET cache after a GetByName slow path,
+    /// mirroring the cacheability predicates of `performLLIntGetByID`
+    /// (LLIntSlowPaths.cpp:910-961).
+    ///
+    /// FILL only when the recorded lookup was an OWN DATA property
+    /// (`classification == OwnData`, `prototype_depth == 0`) with a concrete
+    /// structure id + offset — the Rust analog of C++ `slot.isCacheable() &&
+    /// !slot.isUnset() && slot.isValue() && slot.slotBase() == baseValue` plus
+    /// `structure->propertyAccessesAreCacheable()`. Accessors (own or inherited),
+    /// prototype-chain data (ProtoLoad — deferred), missing (Unset — deferred),
+    /// indexed/array-length, and proxy/opaque lookups are left UNCACHEABLE so the
+    /// site always takes the slow path.
+    ///
+    /// MEGAMORPHIC: a miss on an already-`Monomorphic` site (the receiver now has
+    /// a different structure than cached, or resolved to a non-own-data result)
+    /// parks the site `Megamorphic` and stops fast-pathing — the Rust analog of
+    /// C++ giving up LLInt caching for a polymorphic/megamorphic site. The miss
+    /// budget is 1 (a single different structure parks it), matching the LLInt
+    /// monomorphic-only cache (the DFG/FTL own polymorphic ICs).
+    fn refill_get_by_id_cache(
+        &self,
+        code_block: &CodeBlock,
+        bytecode_index: BytecodeIndex,
+        receiver: RuntimeValue,
+        previous: &LLIntGetByIdCache,
+    ) {
+        let record = match self.last_property_lookup.as_ref() {
+            Some(record) => record,
+            None => return,
+        };
+        // Only own-data hits are cacheable; verify the record matches this site.
+        let cacheable = record.bytecode_index == Some(bytecode_index)
+            && record.opcode == Some(CoreOpcode::GetByName)
+            && record.lookup_mode == PropertyLookupMode::Get
+            && record.classification == CorePropertyLookupClassification::OwnData
+            && record.prototype_depth == 0;
+        let (structure, offset) = match (cacheable, record.base_structure, record.offset) {
+            (true, Some(structure), Some(offset))
+                if structure != StructureId::INVALID && offset.raw() >= 0 =>
+            {
+                (structure, offset)
+            }
+            _ => {
+                // Not an own-data property (accessor/inherited/missing/indexed/
+                // opaque). If the site had been monomorphic, give up (megamorphic);
+                // otherwise just leave it uninitialized so it keeps taking the slow
+                // path without ever fast-pathing a non-cacheable shape.
+                if previous.mode == GetByIdCacheMode::Monomorphic {
+                    code_block.set_llint_get_by_id_cache(
+                        bytecode_index,
+                        LLIntGetByIdCache {
+                            mode: GetByIdCacheMode::Megamorphic,
+                            ..Default::default()
+                        },
+                    );
+                }
+                return;
+            }
+        };
+        // Megamorphic give-up: an already-monomorphic site that now resolves on a
+        // DIFFERENT structure is polymorphic; stop caching it.
+        if previous.mode == GetByIdCacheMode::Monomorphic
+            && previous.cached_structure_id != structure
+        {
+            code_block.set_llint_get_by_id_cache(
+                bytecode_index,
+                LLIntGetByIdCache {
+                    mode: GetByIdCacheMode::Megamorphic,
+                    ..Default::default()
+                },
+            );
+            return;
+        }
+        if previous.mode == GetByIdCacheMode::Megamorphic {
+            // Site already gave up; never re-arm (mirrors C++ not re-caching a
+            // megamorphic site from the LLInt slow path).
+            return;
+        }
+        // Defensive: only cache for a plain object receiver (a string/number/etc.
+        // base routes through autobox prototypes and must never be served by the
+        // own-data fast path). The fast path's payload->object-cell membership
+        // probe also re-checks this, but refuse to arm the cache for a non-object.
+        if self.objects.find(receiver).is_none() {
+            return;
+        }
+        // Warmup gate (see LLIntGetByIdCache::warmup): let the access-case-plan
+        // observation pipeline collect its slow-path passes before the own-data
+        // cache arms. Record structure/offset while warming so the eventual arm is
+        // for the settled shape; only flip to Monomorphic once warmup is exhausted.
+        let next_warmup = previous.warmup.saturating_add(1);
+        if next_warmup < LLINT_CACHE_WARMUP {
+            code_block.set_llint_get_by_id_cache(
+                bytecode_index,
+                LLIntGetByIdCache {
+                    mode: GetByIdCacheMode::Uninitialized,
+                    cached_structure_id: structure,
+                    cached_offset: offset.raw(),
+                    warmup: next_warmup,
+                },
+            );
+            return;
+        }
+        code_block.set_llint_get_by_id_cache(
+            bytecode_index,
+            LLIntGetByIdCache {
+                mode: GetByIdCacheMode::Monomorphic,
+                cached_structure_id: structure,
+                cached_offset: offset.raw(),
+                warmup: next_warmup,
+            },
+        );
+    }
+
+    /// Refill/transition the per-site PUT cache after a PutByName slow path,
+    /// mirroring `slow_path_put_by_id`'s cacheability predicates
+    /// (LLIntSlowPaths.cpp:1434-1470).
+    ///
+    /// FILL only the REPLACE-EXISTING case: the recorded store was an
+    /// `OwnDataStore` (own data property updated in place) with the structure
+    /// UNCHANGED across the write (`base_structure_before == base_structure_after`
+    /// — no transition) and a valid offset. This is the C++ analog of
+    /// `slot.isCacheablePut()` with `slot.type() == ExistingProperty`
+    /// (`m_newStructureID == m_oldStructureID`).
+    ///
+    /// DELIBERATE DEFERRAL: the property-add TRANSITION case
+    /// (`CreatedProperty`, `m_newStructureID != m_oldStructureID` +
+    /// `m_structureChain` in C++) is NOT cached. C++ caches it via the transition
+    /// watchpoint; we leave adds on the slow path because caching a transition
+    /// store touches the shared structure-transition graph (and the chain
+    /// watchpoint), which is out of scope for this batch. The site simply stays
+    /// uncached for adds.
+    ///
+    /// MEGAMORPHIC: same give-up rule as GET — a structure mismatch on an
+    /// already-`Monomorphic` site parks it `Megamorphic`.
+    fn refill_put_by_id_cache(
+        &self,
+        code_block: &CodeBlock,
+        bytecode_index: BytecodeIndex,
+        receiver: RuntimeValue,
+        key: &CorePropertyKey,
+        previous: &LLIntPutByIdCache,
+    ) {
+        let record = match self.last_property_store.as_ref() {
+            Some(record) => record,
+            None => return,
+        };
+        let replace_existing = record.bytecode_index == Some(bytecode_index)
+            && record.opcode == Some(CoreOpcode::PutByName)
+            && record.outcome == PropertyStoreObservationOutcome::OwnDataStore
+            && record.base_structure_before == record.base_structure_after;
+        let (structure, offset) = match (
+            replace_existing,
+            record.base_structure_after,
+            record.offset_after,
+        ) {
+            (true, Some(structure), Some(offset))
+                if structure != StructureId::INVALID && offset.raw() >= 0 =>
+            {
+                (structure, offset)
+            }
+            _ => {
+                // Add/transition (CreatedProperty), setter, read-only, indexed, or
+                // opaque store: not a cacheable replace. Give up an already-monomorphic
+                // site (the add changed the structure out from under the cache);
+                // otherwise leave it uninitialized for the slow path.
+                if previous.mode == GetByIdCacheMode::Monomorphic {
+                    code_block.set_llint_put_by_id_cache(
+                        bytecode_index,
+                        LLIntPutByIdCache {
+                            mode: GetByIdCacheMode::Megamorphic,
+                            ..Default::default()
+                        },
+                    );
+                }
+                return;
+            }
+        };
+        if previous.mode == GetByIdCacheMode::Monomorphic
+            && previous.cached_structure_id != structure
+        {
+            code_block.set_llint_put_by_id_cache(
+                bytecode_index,
+                LLIntPutByIdCache {
+                    mode: GetByIdCacheMode::Megamorphic,
+                    ..Default::default()
+                },
+            );
+            return;
+        }
+        if previous.mode == GetByIdCacheMode::Megamorphic {
+            return;
+        }
+        if self.objects.find(receiver).is_none() {
+            return;
+        }
+        // Warmup gate, mirroring the GET cache: let the store access-case-plan
+        // observation pipeline collect its slow-path passes before arming.
+        let next_warmup = previous.warmup.saturating_add(1);
+        if next_warmup < LLINT_CACHE_WARMUP {
+            code_block.set_llint_put_by_id_cache(
+                bytecode_index,
+                LLIntPutByIdCache {
+                    mode: GetByIdCacheMode::Uninitialized,
+                    cached_structure_id: structure,
+                    cached_offset: offset.raw(),
+                    warmup: next_warmup,
+                    cached_key: Some(key.clone()),
+                },
+            );
+            return;
+        }
+        code_block.set_llint_put_by_id_cache(
+            bytecode_index,
+            LLIntPutByIdCache {
+                mode: GetByIdCacheMode::Monomorphic,
+                cached_structure_id: structure,
+                cached_offset: offset.raw(),
+                warmup: next_warmup,
+                cached_key: Some(key.clone()),
+            },
+        );
     }
 
     fn put_by_name_property_value_with_observation(
