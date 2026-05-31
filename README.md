@@ -13,6 +13,7 @@ Legend:
 - [risk] exists but needs fidelity or structure review
 - [deferred] intentionally later than the current path
 
+```text
 ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   Phase 1 [wip]  Interpreter performance. Landed: per-op root sync gated on cell-membership
                  (3.6-4.9x); dropped per-register-write barrier; monomorphic GetByName/
@@ -184,3 +185,4 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   [missing] local C++ JSC comparison harness for parity claims
   [missing] standard subagent reviewer flow for every substantial patch
   [missing] one logical commit per accepted batch going forward
+```
