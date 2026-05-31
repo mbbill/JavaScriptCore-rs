@@ -14196,10 +14196,32 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                // C++ JSC slow_path_negate / slow_path_bitnot and
+                // JSValue::toNumeric coerce an object operand to a primitive
+                // FIRST (toPrimitive PreferNumber => valueOf then toString)
+                // before the Number/BigInt branch. LogicalNot/TypeOf/Void
+                // operate on the value directly and must NOT primitivize. As on
+                // the binary path, only a non-primitive object operand pays the
+                // ToPrimitive cost (which may throw a catchable TypeError).
+                let numeric_source = match opcode {
+                    CoreOpcode::ToNumber | CoreOpcode::NegateNumber | CoreOpcode::BitNotInt32
+                        if !self.is_primitive_value(source) =>
+                    {
+                        match self.object_to_number_hint_primitive(state, source) {
+                            Ok(primitive) => primitive,
+                            Err(outcome) => return outcome,
+                        }
+                    }
+                    _ => source,
+                };
                 let value = match opcode {
-                    CoreOpcode::ToNumber => self.to_number_with_string(source),
-                    CoreOpcode::NegateNumber => self.negate_numeric_value(state.heap, source),
-                    CoreOpcode::BitNotInt32 => self.bit_not_numeric_value(state.heap, source),
+                    CoreOpcode::ToNumber => self.to_number_with_string(numeric_source),
+                    CoreOpcode::NegateNumber => {
+                        self.negate_numeric_value(state.heap, numeric_source)
+                    }
+                    CoreOpcode::BitNotInt32 => {
+                        self.bit_not_numeric_value(state.heap, numeric_source)
+                    }
                     CoreOpcode::LogicalNot => Ok(RuntimeValue::from_bool(!self.truthy(source))),
                     CoreOpcode::TypeOf => self
                         .strings
@@ -14244,42 +14266,15 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let result = if opcode == CoreOpcode::AddInt32
-                    && (self.strings.text(left).is_some() || self.strings.text(right).is_some())
-                {
-                    self.concat_primitives(state.heap, left, right)
-                } else if self.bigints.is_bigint(left) || self.bigints.is_bigint(right) {
-                    self.bigint_binary_result(state.heap, left, right, opcode)
-                } else {
-                    let left = match self.non_bigint_number_operand(left) {
-                        Ok(value) => value,
-                        Err(error) => return DispatchOutcome::Fail(error),
-                    };
-                    let right = match self.non_bigint_number_operand(right) {
-                        Ok(value) => value,
-                        Err(error) => return DispatchOutcome::Fail(error),
-                    };
-                    match opcode {
-                        CoreOpcode::AddInt32
-                        | CoreOpcode::SubInt32
-                        | CoreOpcode::MulInt32
-                        | CoreOpcode::DivNumber
-                        | CoreOpcode::ModNumber
-                        | CoreOpcode::PowNumber => numeric_binary_result(left, right, opcode),
-                        CoreOpcode::BitOrInt32
-                        | CoreOpcode::BitXorInt32
-                        | CoreOpcode::BitAndInt32
-                        | CoreOpcode::LeftShiftInt32
-                        | CoreOpcode::RightShiftInt32
-                        | CoreOpcode::UnsignedRightShiftInt32 => {
-                            bitwise_binary_result(left, right, opcode)
-                        }
-                        _ => Err(ExecutionError::ExpectedInt32),
-                    }
-                };
-                match result {
+                // C++ JSC jsAddSlowCase / arithmeticBinaryOp primitivize object
+                // operands (valueOf then toString) BEFORE the string/BigInt/
+                // Number branch. arithmetic_binary_result mirrors that and only
+                // pays the ToPrimitive cost when an operand is a non-primitive
+                // object; number/number, string/string, int/int stay on the
+                // existing fast path.
+                match self.arithmetic_binary_result(state, left, right, opcode) {
                     Ok(result) => write_register(state, window, destination, result),
-                    Err(error) => DispatchOutcome::Fail(error),
+                    Err(outcome) => outcome,
                 }
             }
             CoreOpcode::LessThanInt32
@@ -16474,7 +16469,12 @@ impl CoreOpcodeDispatchHost {
         if let Some(value) = self.bigints.value(value) {
             return self.bigints.allocate(heap, value.neg());
         }
-        negate_number_value(value)
+        // C++ JSC slow_path_negate computes -primValue.toNumber(globalObject):
+        // after the BigInt check the primitive (object operands are already
+        // ToPrimitive'd by the caller) is reduced via ToNumber, which parses
+        // string primitives. Use the string-aware ToNumber, not the free
+        // to_number_value, so e.g. -"5" (and -[5] -> -"5") yields -5.
+        negate_number_value(self.to_number_with_string(value)?)
     }
 
     fn bit_not_numeric_value(
@@ -16485,7 +16485,10 @@ impl CoreOpcodeDispatchHost {
         if let Some(value) = self.bigints.value(value) {
             return self.bigints.allocate(heap, value.bit_not());
         }
-        bit_not_value(value)
+        // C++ JSC slow_path_bitnot uses toBigIntOrInt32 -> ToInt32, which after
+        // the BigInt check reduces the primitive via ToNumber (parsing string
+        // primitives) before truncation. Mirror the string-aware ToNumber.
+        bit_not_value(self.to_number_with_string(value)?)
     }
 
     fn bigint_binary_result(
@@ -16520,6 +16523,69 @@ impl CoreOpcodeDispatchHost {
             Some(value) => self.bigints.allocate(heap, value),
             None => Err(ExecutionError::Int32ArithmeticOverflow),
         }
+    }
+
+    // C++ JSC jsAddSlowCase (Operations.cpp:35) and arithmeticBinaryOp
+    // (OperationsInlines.h:571) coerce object operands to primitives FIRST
+    // (toPrimitive / toNumeric, both PreferNumber for ordinary objects =>
+    // valueOf then toString) and only then choose the string-concat, BigInt,
+    // or Number branch. This helper mirrors that for AddInt32 / Sub / Mul /
+    // Div / Mod / Pow and the bitwise/shift ops: it primitivizes non-primitive
+    // operands and then re-runs the existing primitive branch logic.
+    //
+    // Hot-path note: the common primitive operands (number/number, string/
+    // string, int/int) are already primitives, so the ToPrimitive step below
+    // is skipped entirely and they pay no new cost. Only a non-primitive
+    // object/array operand enters object_to_number_hint_primitive, which may
+    // call user valueOf/toString (re-entrant) and may THROW a catchable
+    // TypeError ("No default value", JSObject.cpp:2589) or a user throw, both
+    // propagated as a catchable DispatchOutcome, never a fatal abort.
+    fn arithmetic_binary_result(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        left: RuntimeValue,
+        right: RuntimeValue,
+        opcode: CoreOpcode,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let left = if self.is_primitive_value(left) {
+            left
+        } else {
+            self.object_to_number_hint_primitive(state, left)?
+        };
+        let right = if self.is_primitive_value(right) {
+            right
+        } else {
+            self.object_to_number_hint_primitive(state, right)?
+        };
+        let result = if opcode == CoreOpcode::AddInt32
+            && (self.strings.text(left).is_some() || self.strings.text(right).is_some())
+        {
+            self.concat_primitives(state.heap, left, right)
+        } else if self.bigints.is_bigint(left) || self.bigints.is_bigint(right) {
+            self.bigint_binary_result(state.heap, left, right, opcode)
+        } else {
+            self.non_bigint_number_operand(left).and_then(|left| {
+                self.non_bigint_number_operand(right)
+                    .and_then(|right| match opcode {
+                        CoreOpcode::AddInt32
+                        | CoreOpcode::SubInt32
+                        | CoreOpcode::MulInt32
+                        | CoreOpcode::DivNumber
+                        | CoreOpcode::ModNumber
+                        | CoreOpcode::PowNumber => numeric_binary_result(left, right, opcode),
+                        CoreOpcode::BitOrInt32
+                        | CoreOpcode::BitXorInt32
+                        | CoreOpcode::BitAndInt32
+                        | CoreOpcode::LeftShiftInt32
+                        | CoreOpcode::RightShiftInt32
+                        | CoreOpcode::UnsignedRightShiftInt32 => {
+                            bitwise_binary_result(left, right, opcode)
+                        }
+                        _ => Err(ExecutionError::ExpectedInt32),
+                    })
+            })
+        };
+        result.map_err(DispatchOutcome::Fail)
     }
 
     fn numeric_compare(
@@ -16622,9 +16688,11 @@ impl CoreOpcodeDispatchHost {
     ) -> Result<NumberValue, ExecutionError> {
         // C++ JSC's arithmeticBinaryOp applies JSValue::toNumeric before its
         // Number branch, while bitwise helpers apply toBigIntOrInt32 before
-        // ToInt32. For the current non-BigInt primitive slice both routes go
-        // through ToNumber; object ToPrimitive remains handled only where the
-        // existing Rust skeleton can express it safely.
+        // ToInt32. Both first ToPrimitive object operands (handled by the
+        // callers via arithmetic_binary_result / the unary numeric_source step,
+        // mirroring jsAddSlowCase) and then reduce the resulting PRIMITIVE to a
+        // number here. For the non-BigInt primitive slice both routes go
+        // through ToNumber.
         self.to_number_with_string(value)?
             .as_number()
             .ok_or(ExecutionError::ExpectedInt32)

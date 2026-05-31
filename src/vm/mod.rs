@@ -64699,6 +64699,58 @@ mod tests {
         ));
     }
 
+    // C++ JSC jsAddSlowCase (Operations.cpp:35) / arithmeticBinaryOp
+    // (OperationsInlines.h:571) / slow_path_negate / slow_path_bitnot
+    // (CommonSlowPaths.cpp:424,673) ToPrimitive object operands BEFORE the
+    // string-concat / BigInt / Number branch. Before this fix the interpreter
+    // never primitivized object operands, so jQuery 1.7.2's `bW=["*/"]+["*"]`
+    // (code-first-load.js:1212) fatally aborted instead of evaluating to the
+    // string "*/*". These tests assert the JSC-derived behavior via JS-side
+    // === / instanceof so they prove engine semantics, not a Rust value shape.
+    #[test]
+    fn vm_object_operands_are_primitivized_before_arithmetic() {
+        // jsAddSlowCase: ["*/"].valueOf is the array (non-primitive) so toString
+        // ("*/") is used -> concat "*/*". Same for ["a"]+["b"] -> "ab".
+        assert!(returns_true("([\"*/\"]+[\"*\"]) === \"*/*\";"));
+        assert!(returns_true("([\"a\"]+[\"b\"]) === \"ab\";"));
+        // valueOf returning a primitive number wins, so the + is numeric add.
+        assert!(returns_true("({valueOf:function(){return 5}})+3 === 8;"));
+        // Bitwise / shift toBigIntOrInt32 -> ToInt32 path: [4].toString()="4".
+        assert!(returns_true("([4]|0) === 4;"));
+        // Unary negate / bitnot ToPrimitive then ToNumber on the "5" string.
+        assert!(returns_true("(-[5]) === -5;"));
+        assert!(returns_true("(~[5]) === -6;"));
+        // Subtraction primitivizes both sides; "1" parses to 1 -> 3 - 1 = 2.
+        assert!(returns_true("(3-[\"1\"]) === 2;"));
+    }
+
+    #[test]
+    fn vm_object_arithmetic_to_primitive_throw_is_catchable() {
+        // ToPrimitive may call user valueOf/toString, which may throw. C++ JSC
+        // propagates that as a normal (catchable) exception via the throw scope,
+        // never a fatal abort. A try/catch around the + must observe the throw.
+        assert!(returns_true(
+            "var c=0; try { ({valueOf:function(){throw 42}})+1 } catch(e) { c=e } c === 42;"
+        ));
+        // When neither valueOf nor toString yields a primitive, JSObject::
+        // ordinaryToPrimitive (JSObject.cpp:2589) throws a catchable TypeError
+        // ("No default value"), again caught by try/catch.
+        assert!(returns_true(
+            "var o={valueOf:function(){return {}},toString:function(){return {}}}; \
+             var c=false; try { o+1 } catch(e) { c=(e instanceof TypeError) } c;"
+        ));
+    }
+
+    #[test]
+    fn vm_primitive_arithmetic_hot_path_is_unchanged() {
+        // The common primitive operands must not change behavior (and stay on
+        // the fast path with no ToPrimitive cost): number+number, string+string,
+        // number-number.
+        assert!(returns_true("1+2 === 3;"));
+        assert!(returns_true("\"a\"+\"b\" === \"ab\";"));
+        assert!(returns_true("5-2 === 3;"));
+    }
+
     // C++ JSC jsc shell binds `read` as a host-function alias of readFile
     // (jsc.cpp:682-683: two separate addFunction calls to functionReadFile).
     // octane-zlib's shell-env branch references `read`; without it the engine
