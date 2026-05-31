@@ -943,6 +943,35 @@ impl ExecutionContextStack {
         Ok(())
     }
 
+    /// Range-narrowed form of `register_root_snapshot_for_frame_into`: fill
+    /// `register_roots` (cleared first) with the per-frame register-root
+    /// descriptors for `owner_frame` whose absolute slot index lies in
+    /// `lo..=hi`. Produces exactly the in-range subset the full-window form
+    /// would produce; used by the dispatch-loop per-op sync when only a
+    /// coalesced slot span is dirty (`CellRootDirty::Slots`).
+    fn register_root_snapshot_for_frame_range_into(
+        &self,
+        heap: &Heap,
+        registers: &RegisterFile,
+        owner_frame: CallFrameId,
+        lo: usize,
+        hi: usize,
+        register_roots: &mut Vec<RegisterRootDescriptor>,
+    ) -> Result<(), RootSetSemanticError> {
+        register_roots.clear();
+        for frame in self.frames.iter().filter(|frame| frame.id == owner_frame) {
+            registers.root_descriptors_for_window_range_into(
+                heap.id(),
+                frame.register_window,
+                lo,
+                hi,
+                register_roots,
+            );
+        }
+        validate_root_records(register_roots.iter().map(|descriptor| descriptor.root))?;
+        Ok(())
+    }
+
     fn nonlocal_frame_root_snapshot_for_heap(
         &self,
         heap: &Heap,
@@ -1263,6 +1292,64 @@ impl FrameRootDescriptor {
     }
 }
 
+/// Coalesced cell-membership dirty signal for the per-instruction register-root
+/// sync.
+///
+/// C++ JSC has no per-op rooting at all (the LLInt dispatch macro just advances
+/// PC; the JS register file is conservatively span-scanned once per GC at a
+/// safepoint -- interpreter/CLoopStack.cpp gatherConservativeRoots,
+/// heap/Heap.cpp:903 gatherStackRoots), so this whole signal is a Rust-only
+/// device to approximate that lazy model while keeping a precise targeted root
+/// registry exact for the future Phase-3 safepoint collector.
+///
+/// The prior signal was a single bool ("something changed; rescan the whole
+/// callee window"). On wide richards frames a full-window rescan
+/// (`root_descriptors_for_window_into` over every local + every argument slot)
+/// dominated the in-loop cost. This enum coalesces the per-slot write
+/// information the `write` funnel already has so the in-loop sync can patch only
+/// the slots that actually changed:
+///
+/// - `Clean`: no cell-membership change since the last reconcile; sync skipped.
+/// - `Slots { lo, hi }`: an inclusive span of ABSOLUTE register-file slot
+///   indices (the same index `RegisterFile::write` resolves and the same index
+///   `register_root_id` keys on) whose cell-membership may have changed. The
+///   in-loop sync patches the registry for exactly slots `lo..=hi`.
+/// - `FullWindow`: a whole-span mutation happened outside the per-slot funnel
+///   (`allocate_frame`/`release_frame`); the in-loop sync must rescan the full
+///   window, exactly like the prior bool.
+///
+/// Coalescing widens the span monotonically: two writes to different slots
+/// between syncs produce a `Slots` span covering both, so both are patched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CellRootDirty {
+    Clean,
+    Slots { lo: usize, hi: usize },
+    FullWindow,
+}
+
+impl Default for CellRootDirty {
+    fn default() -> Self {
+        CellRootDirty::Clean
+    }
+}
+
+impl CellRootDirty {
+    /// Widen the dirty signal to include the single absolute slot index `slot`.
+    /// `Clean` becomes a one-slot span; `Slots` grows to cover `slot`;
+    /// `FullWindow` stays `FullWindow` (already maximal). Used by the `write`
+    /// funnel, the only per-slot mutation site.
+    fn widen_slot(&mut self, slot: usize) {
+        *self = match *self {
+            CellRootDirty::Clean => CellRootDirty::Slots { lo: slot, hi: slot },
+            CellRootDirty::Slots { lo, hi } => CellRootDirty::Slots {
+                lo: lo.min(slot),
+                hi: hi.max(slot),
+            },
+            CellRootDirty::FullWindow => CellRootDirty::FullWindow,
+        };
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RegisterFile {
     values: Vec<RuntimeValue>,
@@ -1277,15 +1364,17 @@ pub struct RegisterFile {
     //
     // Rust instead maintains a precise targeted VM-register root registry that
     // the dispatch loop reconciles. To approximate the C++ safepoint model
-    // (pay nothing on a pure-arith / cell-stable hot loop), this flag tracks
-    // whether the cell-membership of any register slot could have changed since
-    // the last reconcile. The targeted VM-register root set is a pure function
-    // of which slots hold cells and which cells those are
+    // (pay nothing on a pure-arith / cell-stable hot loop), this signal tracks
+    // whether -- and now WHICH SLOTS' -- cell-membership could have changed
+    // since the last reconcile. The targeted VM-register root set is a pure
+    // function of which slots hold cells and which cells those are
     // (`targeted_register_roots_into` skips non-cell slots), so a write that
     // neither stores a cell nor overwrites a cell cannot change the root set and
     // need not trigger a recompute. The dispatch loop gates its per-op sync on
-    // this flag and clears it after a successful sync.
-    cell_root_dirty: bool,
+    // this signal and clears it after a successful sync. The signal coalesces a
+    // dirty SLOT RANGE (see `CellRootDirty`) so the in-loop sync can patch only
+    // the changed slots instead of rescanning the whole callee window.
+    cell_root_dirty: CellRootDirty,
 }
 
 impl RegisterFile {
@@ -1293,17 +1382,18 @@ impl RegisterFile {
         self.values.len()
     }
 
-    /// Whether any register-slot cell-membership change may have occurred since
-    /// the last reconcile (see the `cell_root_dirty` field comment).
-    pub(crate) fn cell_root_dirty(&self) -> bool {
+    /// The coalesced cell-membership dirty signal accumulated since the last
+    /// reconcile (see the `cell_root_dirty` field comment and `CellRootDirty`).
+    /// `Clean` means the dispatch loop can skip the per-op sync entirely.
+    pub(crate) fn cell_root_dirty(&self) -> CellRootDirty {
         self.cell_root_dirty
     }
 
-    /// Clears the cell-membership dirty signal. The dispatch loop calls this
-    /// after a successful targeted-root sync, and the pre-loop sync calls it
-    /// after establishing initial state.
+    /// Clears the cell-membership dirty signal to `Clean`. The dispatch loop
+    /// calls this after a successful targeted-root sync, and the pre-loop sync
+    /// calls it after establishing initial state.
     pub(crate) fn clear_cell_root_dirty(&mut self) {
-        self.cell_root_dirty = false;
+        self.cell_root_dirty = CellRootDirty::Clean;
     }
 
     pub fn active_windows(&self) -> &[RegisterWindow] {
@@ -1408,6 +1498,50 @@ impl RegisterFile {
         }
     }
 
+    /// Append the register-root descriptors for `window` whose ABSOLUTE slot
+    /// index lies in the inclusive range `lo..=hi` onto `out`, in the same
+    /// (locals-then-arguments) order as `root_descriptors_for_window_into`.
+    ///
+    /// This is the range-narrowed counterpart of
+    /// `root_descriptors_for_window_into`, used by the dispatch-loop per-op sync
+    /// when only a coalesced slot span (`CellRootDirty::Slots`) is dirty: it
+    /// produces exactly the descriptors the full-window scan would have produced
+    /// for the in-range slots, and emits NOTHING for out-of-range slots (whose
+    /// roots must be left untouched). Slots in `lo..=hi` that fall outside this
+    /// window (locals/arguments) simply contribute nothing, matching the
+    /// full-window scan which only ever visits in-window slots.
+    fn root_descriptors_for_window_range_into(
+        &self,
+        heap: HeapId,
+        window: RegisterWindow,
+        lo: usize,
+        hi: usize,
+        out: &mut Vec<RegisterRootDescriptor>,
+    ) {
+        for offset in 0..window.local_count {
+            let slot = window.base.saturating_add(offset);
+            if slot < lo || slot > hi {
+                continue;
+            }
+            if let Some(descriptor) =
+                self.register_root_descriptor(heap, window, slot, RegisterSlotKind::Local)
+            {
+                out.push(descriptor);
+            }
+        }
+        for offset in 0..window.argument_count {
+            let slot = window.argument_base.saturating_add(offset);
+            if slot < lo || slot > hi {
+                continue;
+            }
+            if let Some(descriptor) =
+                self.register_root_descriptor(heap, window, slot, RegisterSlotKind::Argument)
+            {
+                out.push(descriptor);
+            }
+        }
+    }
+
     pub fn allocate_frame(
         &mut self,
         owner: CallFrameId,
@@ -1444,15 +1578,20 @@ impl RegisterFile {
         self.windows.push(window);
         // Conservative dirty signal: frame establishment writes argument values
         // (which may be cells) into freshly grown slots without funneling
-        // through `write`. The interpreter dispatch loop is single-frame -- it
+        // through `write` -- a whole-span mutation outside the per-slot funnel.
+        // It therefore forces a FULL-WINDOW rescan (the `FullWindow` sentinel)
+        // rather than a per-slot patch: the affected slots are an entire window
+        // span, not a single resolved index, so coalescing them as a range
+        // would be both wasteful and (because new slots are appended at the
+        // tail) fragile. The interpreter dispatch loop is single-frame -- it
         // exits the loop at every call/construct boundary (DispatchOutcome::
         // OrdinaryBytecodeCall/Construct/FunctionValueCall/Return), and the
         // nested `execute_code_block` runs its own UNCONDITIONAL pre-loop sync
-        // for the new window -- so this flag is not strictly required for
+        // for the new window -- so this signal is not strictly required for
         // correctness today. Setting it is cheap and keeps the dirty signal
         // sound if a future path retains the same loop frame across an
-        // allocation. When in doubt, sync.
-        self.cell_root_dirty = true;
+        // allocation. When in doubt, full-rescan.
+        self.cell_root_dirty = CellRootDirty::FullWindow;
         Ok(window)
     }
 
@@ -1466,11 +1605,13 @@ impl RegisterFile {
         }
         self.values.truncate(window.base);
         // Conservative dirty signal: truncation drops the released window's
-        // slots (any cells they held) without funneling through `write`. As
+        // slots (any cells they held) without funneling through `write` -- again
+        // a whole-span mutation outside the per-slot funnel, so it forces a
+        // FULL-WINDOW rescan (`FullWindow`) rather than a per-slot patch. As
         // with `allocate_frame`, the dispatch loop exits at call/return/unwind
-        // boundaries so this is not strictly required today, but a sync here is
-        // cheap and keeps the signal sound. When in doubt, sync.
-        self.cell_root_dirty = true;
+        // boundaries so this is not strictly required today, but a full rescan
+        // here is cheap and keeps the signal sound. When in doubt, full-rescan.
+        self.cell_root_dirty = CellRootDirty::FullWindow;
         Ok(())
     }
 
@@ -1552,11 +1693,18 @@ impl RegisterFile {
         // write changes the cell-membership of the slot: storing a cell adds a
         // root, overwriting a cell removes or retargets one. A non-cell ->
         // non-cell write (the pure-arithmetic hot-loop case) leaves the root set
-        // unchanged, so it does not set the flag and pays no per-op sync (see
-        // the `cell_root_dirty` field comment for the C++ JSC divergence).
+        // unchanged, so it does not touch the signal and pays no per-op sync
+        // (see the `cell_root_dirty` field comment for the C++ JSC divergence).
+        //
+        // This is the per-slot mutation funnel: it knows the exact absolute slot
+        // index, so it COALESCES that index into the dirty SLOT RANGE rather than
+        // forcing a full-window rescan. The in-loop sync then patches only the
+        // changed slots. Both the cell->non-cell (unregister) and non-cell->cell
+        // (register) and cell->cell (retarget) transitions widen the same range,
+        // so the range covers every slot whose desired root may have changed.
         let old = *target;
         if old.as_cell().is_some() || value.as_cell().is_some() {
-            self.cell_root_dirty = true;
+            self.cell_root_dirty.widen_slot(slot);
         }
         *target = value;
         Ok(())
@@ -29884,18 +30032,26 @@ fn execute_code_block_with_resume<H: DispatchHost>(
         // (interpreter/CLoopStack.cpp gatherConservativeRoots,
         // heap/Heap.cpp gatherStackRoots), so rooting is O(stack) per GC, not
         // per op. Rust keeps a precise targeted VM-register root registry, but
-        // recomputes it lazily: the per-op sync (a full window scan +
-        // TargetedRootSet build/validate + register/retarget/unregister) runs
-        // only when a write since the last reconcile may have changed a slot's
-        // cell-membership (`RegisterFile::cell_root_dirty`). The dispatched op
-        // is the only in-loop write source (`write_register` -> `write`), and
+        // recomputes it lazily: the per-op sync runs only when a write since the
+        // last reconcile may have changed a slot's cell-membership
+        // (`RegisterFile::cell_root_dirty`). The dispatched op is the only
+        // in-loop write source (`write_register` -> `write`), and
         // call/construct/return/unwind all EXIT this single-frame loop (the
-        // `match outcome` below), so a clean flag here proves the root set is
+        // `match outcome` below), so a clean signal here proves the root set is
         // still in the correct state -- identical to syncing unconditionally,
         // but a pure-arith / cell-stable hot loop pays nothing, approximating
-        // the C++ safepoint model. Clear the flag only after a successful sync.
-        if execution.registers.cell_root_dirty() {
-            if let Err(error) = sync_targeted_register_roots_buffered(
+        // the C++ safepoint model.
+        //
+        // The dirty signal is coalesced (see `CellRootDirty`): on `Clean` skip;
+        // on `Slots(lo,hi)` PATCH only the changed slot span (the common case,
+        // ~21% of richards ops, which previously rescanned the whole wide callee
+        // window); on `FullWindow` (frame allocate/release touched whole spans
+        // outside the per-slot `write` funnel) do the original full-window
+        // rescan. The post-state is identical to an unconditional full-window
+        // sync in every case. Clear to `Clean` only after a successful sync.
+        let sync_result = match execution.registers.cell_root_dirty() {
+            CellRootDirty::Clean => Ok(()),
+            CellRootDirty::Slots { lo, hi } => sync_targeted_register_roots_range_buffered(
                 frame.id,
                 execution.stack,
                 execution.registers,
@@ -29903,7 +30059,24 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                 host,
                 &mut active_targeted_register_roots,
                 &mut register_root_scratch,
-            ) {
+                lo,
+                hi,
+            ),
+            CellRootDirty::FullWindow => sync_targeted_register_roots_buffered(
+                frame.id,
+                execution.stack,
+                execution.registers,
+                execution.heap,
+                host,
+                &mut active_targeted_register_roots,
+                &mut register_root_scratch,
+            ),
+        };
+        match sync_result {
+            Ok(()) => {
+                execution.registers.clear_cell_root_dirty();
+            }
+            Err(error) => {
                 return finish_with_targeted_root_cleanup(
                     execution.heap,
                     &mut active_targeted_register_roots,
@@ -29911,7 +30084,6 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                     ExecutionCompletion::Failed(error),
                 );
             }
-            execution.registers.clear_cell_root_dirty();
         }
 
         match outcome {
@@ -30311,6 +30483,119 @@ pub(crate) fn sync_targeted_register_roots_buffered<H: DispatchHost>(
     sync_targeted_vm_roots_buffered(heap, active_roots, scratch)
 }
 
+/// Range-narrowed per-instruction register-root sync: reconcile the targeted
+/// VM-register roots for ONLY the slots in the inclusive absolute-slot range
+/// `lo..=hi`, leaving out-of-range active roots exactly as-is.
+///
+/// This is the `CellRootDirty::Slots` fast path of the dispatch loop. The
+/// full-window form (`sync_targeted_register_roots_buffered`) rebuilds the
+/// desired set over the WHOLE callee window and then unregisters every active
+/// root absent from it; doing that with a range-only desired set would wrongly
+/// unregister every live OUT-OF-RANGE root. So this variant instead PATCHES the
+/// registry for the dirty range only:
+///
+///   - It resolves the desired roots for the in-range slots
+///     (`register_root_snapshot_for_frame_range_into` -> `targeted_register_roots_into`).
+///   - It registers/retargets each in-range desired root.
+///   - It unregisters only those currently-active roots whose SLOT IS IN RANGE
+///     and that are absent from the in-range desired set (a cell->non-cell write
+///     in the range). Out-of-range active roots are never considered stale.
+///
+/// The post-state for the in-range slots is byte-identical to what the
+/// unconditional full-window sync would have produced (the verifier invariant);
+/// out-of-range slots did not change, so leaving their roots untouched is also
+/// identical to a full sync (which would re-register them with the same record).
+pub(crate) fn sync_targeted_register_roots_range_buffered<H: DispatchHost>(
+    owner_frame: CallFrameId,
+    stack: &ExecutionContextStack,
+    registers: &RegisterFile,
+    heap: &mut Heap,
+    host: &mut H,
+    active_roots: &mut Vec<RootRecord>,
+    scratch: &mut RegisterRootSyncScratch,
+    lo: usize,
+    hi: usize,
+) -> Result<(), ExecutionError> {
+    // 1. Fill the in-range register-root snapshot into the reused buffer.
+    stack.register_root_snapshot_for_frame_range_into(
+        heap,
+        registers,
+        owner_frame,
+        lo,
+        hi,
+        &mut scratch.snapshot_registers,
+    )?;
+    let snapshot = ExecutionRootSnapshot {
+        frame_roots: Vec::new(),
+        register_roots: std::mem::take(&mut scratch.snapshot_registers),
+    };
+    // 2. Resolve targeted records for the in-range descriptors into the reused
+    //    buffer (same resolution the full-window path uses).
+    let targeted_result =
+        host.targeted_register_roots_into(heap, &snapshot, &mut scratch.targeted_records);
+    scratch.snapshot_registers = snapshot.register_roots;
+    targeted_result?;
+
+    sync_targeted_vm_roots_range_buffered(heap, active_roots, scratch, lo, hi)
+}
+
+/// Range-scoped core of the VM-register-root patch. Mirrors
+/// `sync_targeted_vm_roots_buffered`, but the stale set is restricted to active
+/// roots whose slot is IN the dirty range `lo..=hi`: an out-of-range active root
+/// absent from the (range-only) desired set is NOT stale -- its slot did not
+/// change, so its root must be left alone.
+fn sync_targeted_vm_roots_range_buffered(
+    heap: &mut Heap,
+    active_roots: &mut Vec<RootRecord>,
+    scratch: &mut RegisterRootSyncScratch,
+    lo: usize,
+    hi: usize,
+) -> Result<(), ExecutionError> {
+    let heap_id = heap.id();
+    scratch.desired_set.refill_from_records(
+        heap_id,
+        scratch
+            .targeted_records
+            .iter()
+            .copied()
+            .filter(|record| record.root.kind == RootKind::VMRegister),
+    )?;
+
+    scratch.desired_root_ids.clear();
+    scratch
+        .desired_root_ids
+        .extend(scratch.desired_set.records().iter().map(|r| r.root.id));
+
+    // Stale = active roots whose SLOT lies in [lo, hi] and that the in-range
+    // desired set does not keep. `register_root_slot` is the exact inverse of
+    // `register_root_id` over register-root ids; the register-root active set
+    // contains only such ids, so this in-range test is exact. Out-of-range
+    // active roots are deliberately excluded -- they correspond to slots that
+    // did not change and whose roots a full-window sync would have left
+    // identical.
+    scratch.stale_roots.clear();
+    scratch
+        .stale_roots
+        .extend(
+            active_roots
+                .iter()
+                .copied()
+                .filter(|root| match register_root_slot(root.id) {
+                    Some(slot) => {
+                        slot >= lo && slot <= hi && !scratch.desired_root_ids.contains(&root.id)
+                    }
+                    None => false,
+                }),
+        );
+
+    apply_desired_vm_roots(
+        heap,
+        active_roots,
+        &scratch.desired_set,
+        &scratch.stale_roots,
+    )
+}
+
 pub(crate) fn sync_targeted_nonlocal_frame_roots(
     owner_frame: CallFrameId,
     stack: &ExecutionContextStack,
@@ -30590,6 +30875,19 @@ fn register_root_id(slot: usize) -> RootId {
             .saturating_add(slot as u64)
             .saturating_add(1),
     )
+}
+
+/// Exact inverse of `register_root_id` over the register-root id namespace:
+/// recovers the absolute slot index a register root keys on, or `None` if the
+/// id is not a register-root id. Used by the range-scoped per-op root sync to
+/// decide which active roots fall inside the dirty slot span (and are therefore
+/// eligible to be unregistered as stale). Frame-root ids live in a separate
+/// reserved namespace (`FRAME_ROOT_ID_BASE`) below `REGISTER_ROOT_ID_BASE`, so
+/// they map to `None` and are never treated as in-range register slots.
+fn register_root_slot(id: RootId) -> Option<usize> {
+    id.0.checked_sub(REGISTER_ROOT_ID_BASE)
+        .and_then(|offset| offset.checked_sub(1))
+        .map(|slot| slot as usize)
 }
 
 fn value_cell_payload(value: RuntimeValue) -> Option<usize> {
@@ -40898,5 +41196,366 @@ mod tests {
             registers.root_descriptors(HeapId(3))[0].cell_payload,
             Some(0x1234)
         );
+    }
+
+    // ----- in-loop dirty-range narrowing: differential + targeted invariants -----
+
+    /// One parallel-state harness for the dirty-range narrowing differential.
+    /// Each instance owns its own heap/register-file/host/active-root set/scratch
+    /// so two harnesses can replay an identical mutation sequence and have their
+    /// final `heap.targeted_roots()` compared. (`Heap::new()` uses a constant
+    /// default `HeapId`, and both heaps allocate cells in the same order, so the
+    /// produced root records and cell targets are directly comparable.)
+    struct RootSyncHarness {
+        stack: ExecutionContextStack,
+        registers: RegisterFile,
+        heap: Heap,
+        host: CoreOpcodeDispatchHost,
+        frame: CallFrameId,
+        window: RegisterWindow,
+        active_roots: Vec<RootRecord>,
+        scratch: RegisterRootSyncScratch,
+    }
+
+    impl RootSyncHarness {
+        fn new(shape: RegisterFrameShape) -> Self {
+            let block = code_block_with_frame(vec![typed(0)], shape);
+            let mut stack = ExecutionContextStack::default();
+            let mut registers = RegisterFile::default();
+            let mut heap = Heap::new();
+            let code_block_id = allocate_test_code_block_id(&mut heap);
+            enter_program_frame(
+                &mut stack,
+                &mut registers,
+                code_block_id,
+                &block,
+                Vec::new(),
+            );
+            let frame = stack.top_frame().unwrap().id;
+            let window = *registers.active_windows().last().unwrap();
+            // Pre-loop sync establishes a clean baseline (mirrors the
+            // unconditional pre-loop sync in the dispatch loop).
+            let mut active_roots = Vec::new();
+            let mut scratch = RegisterRootSyncScratch::new();
+            sync_targeted_register_roots_buffered(
+                frame,
+                &stack,
+                &registers,
+                &mut heap,
+                &mut CoreOpcodeDispatchHost::new(),
+                &mut active_roots,
+                &mut scratch,
+            )
+            .unwrap();
+            registers.clear_cell_root_dirty();
+            Self {
+                stack,
+                registers,
+                heap,
+                host: CoreOpcodeDispatchHost::new(),
+                frame,
+                window,
+                active_roots,
+                scratch,
+            }
+        }
+
+        /// Allocate a fresh object cell value (resolvable by the host) on this
+        /// harness's object store.
+        fn fresh_cell(&mut self) -> RuntimeValue {
+            self.host.objects.allocate()
+        }
+
+        fn write_local(&mut self, index: u32, value: RuntimeValue) {
+            self.registers
+                .write(self.window, VirtualRegister::local(index), value)
+                .unwrap();
+        }
+
+        /// Reconcile using the FULL-WINDOW buffered sync (the `FullWindow` path),
+        /// then clear the dirty signal -- the reference behavior.
+        fn sync_full(&mut self) {
+            sync_targeted_register_roots_buffered(
+                self.frame,
+                &self.stack,
+                &self.registers,
+                &mut self.heap,
+                &mut self.host,
+                &mut self.active_roots,
+                &mut self.scratch,
+            )
+            .unwrap();
+            self.registers.clear_cell_root_dirty();
+        }
+
+        /// Reconcile exactly as the dispatch loop now does: dispatch on the
+        /// coalesced `CellRootDirty`, taking the range-narrowed path for `Slots`.
+        fn sync_narrowed(&mut self) {
+            match self.registers.cell_root_dirty() {
+                CellRootDirty::Clean => {}
+                CellRootDirty::Slots { lo, hi } => sync_targeted_register_roots_range_buffered(
+                    self.frame,
+                    &self.stack,
+                    &self.registers,
+                    &mut self.heap,
+                    &mut self.host,
+                    &mut self.active_roots,
+                    &mut self.scratch,
+                    lo,
+                    hi,
+                )
+                .unwrap(),
+                CellRootDirty::FullWindow => sync_targeted_register_roots_buffered(
+                    self.frame,
+                    &self.stack,
+                    &self.registers,
+                    &mut self.heap,
+                    &mut self.host,
+                    &mut self.active_roots,
+                    &mut self.scratch,
+                )
+                .unwrap(),
+            }
+            self.registers.clear_cell_root_dirty();
+        }
+
+        fn sorted_targeted_records(&self) -> Vec<TargetedRootRecord> {
+            let mut records = self.heap.targeted_roots().records().to_vec();
+            records.sort_by_key(|record| (record.root.id.0, record.target.0));
+            records
+        }
+
+        fn sorted_active_roots(&self) -> Vec<RootRecord> {
+            let mut roots = self.active_roots.clone();
+            roots.sort_by_key(|root| root.id.0);
+            roots
+        }
+    }
+
+    fn churn_shape() -> RegisterFrameShape {
+        RegisterFrameShape {
+            num_parameters_including_this: 1,
+            num_vars: 4,
+            num_callee_locals: 0,
+            num_temporaries: 4,
+            special: Default::default(),
+        }
+    }
+
+    /// Replay an identical cell-churning mutation sequence against two parallel
+    /// harnesses, reconciling one with the full-window sync and the other with
+    /// the range-narrowed sync after every step. The host-visible observations
+    /// (the resolved cell targets per slot) and the final
+    /// `heap.targeted_roots()` and active-root sets MUST be byte-identical.
+    /// This is the core fidelity check for the narrowing.
+    #[test]
+    fn dirty_range_narrowing_matches_full_window_over_cell_churn() {
+        let mut full = RootSyncHarness::new(churn_shape());
+        let mut narrowed = RootSyncHarness::new(churn_shape());
+
+        // A churning script: each step is a batch of writes (possibly to several
+        // slots, exercising coalescing) followed by one reconcile. We mirror the
+        // exact same writes into both harnesses, allocating cells in lock-step so
+        // both heaps bind the same CellIds.
+        // Step 1: store cells into two different locals (coalesced two-slot span).
+        let (a0, n0) = (full.fresh_cell(), narrowed.fresh_cell());
+        let (a1, n1) = (full.fresh_cell(), narrowed.fresh_cell());
+        full.write_local(0, a0);
+        full.write_local(2, a1);
+        narrowed.write_local(0, n0);
+        narrowed.write_local(2, n1);
+        full.sync_full();
+        narrowed.sync_narrowed();
+        assert_eq!(
+            full.sorted_targeted_records(),
+            narrowed.sorted_targeted_records()
+        );
+        assert_eq!(full.sorted_active_roots(), narrowed.sorted_active_roots());
+
+        // Step 2: retarget local0 to a new cell, leave local2 untouched.
+        let (a2, n2) = (full.fresh_cell(), narrowed.fresh_cell());
+        full.write_local(0, a2);
+        narrowed.write_local(0, n2);
+        full.sync_full();
+        narrowed.sync_narrowed();
+        assert_eq!(
+            full.sorted_targeted_records(),
+            narrowed.sorted_targeted_records()
+        );
+        assert_eq!(full.sorted_active_roots(), narrowed.sorted_active_roots());
+
+        // Step 3: cell -> non-cell write at local2 (must unregister local2's root)
+        // while local0 stays live and out of this write's range.
+        full.write_local(2, RuntimeValue::from_i32(7));
+        narrowed.write_local(2, RuntimeValue::from_i32(7));
+        full.sync_full();
+        narrowed.sync_narrowed();
+        assert_eq!(
+            full.sorted_targeted_records(),
+            narrowed.sorted_targeted_records()
+        );
+        assert_eq!(full.sorted_active_roots(), narrowed.sorted_active_roots());
+
+        // Step 4: store a cell into a third local; local0 still untouched/live.
+        let (a3, n3) = (full.fresh_cell(), narrowed.fresh_cell());
+        full.write_local(5, a3);
+        narrowed.write_local(5, n3);
+        full.sync_full();
+        narrowed.sync_narrowed();
+        assert_eq!(
+            full.sorted_targeted_records(),
+            narrowed.sorted_targeted_records()
+        );
+        assert_eq!(full.sorted_active_roots(), narrowed.sorted_active_roots());
+
+        // The narrowed run must have actually rooted something (guards against a
+        // vacuously-equal "both empty" pass).
+        assert!(!narrowed.heap.targeted_roots().records().is_empty());
+    }
+
+    /// A cell -> non-cell write at a slot must UNREGISTER that slot's targeted
+    /// root under the range-narrowed sync (the slot is in-range).
+    #[test]
+    fn dirty_range_narrowing_cell_to_noncell_write_unregisters_slot() {
+        let mut h = RootSyncHarness::new(churn_shape());
+        let cell = h.fresh_cell();
+        h.write_local(1, cell);
+        h.sync_narrowed();
+        assert!(h
+            .heap
+            .targeted_roots()
+            .records()
+            .iter()
+            .any(|record| record.root.id == register_root_id(h.window.base + 1)));
+
+        // Overwrite the cell with an immediate; the range-narrowed sync must drop
+        // that slot's root and leave the active set empty.
+        h.write_local(1, RuntimeValue::from_i32(99));
+        h.sync_narrowed();
+        assert!(h.heap.targeted_roots().records().is_empty());
+        assert!(h.active_roots.is_empty());
+    }
+
+    /// Two writes to DIFFERENT slots between syncs must BOTH be covered by the
+    /// coalesced range -- both slots end up rooted after a single narrowed sync.
+    #[test]
+    fn dirty_range_narrowing_two_slot_writes_both_covered() {
+        let mut h = RootSyncHarness::new(churn_shape());
+        let c0 = h.fresh_cell();
+        let c1 = h.fresh_cell();
+        // Write the low slot then a higher slot; the coalesced Slots span must
+        // include both, so a single narrowed sync roots both.
+        h.write_local(0, c0);
+        h.write_local(6, c1);
+        match h.registers.cell_root_dirty() {
+            CellRootDirty::Slots { lo, hi } => {
+                assert_eq!(lo, h.window.base);
+                assert_eq!(hi, h.window.base + 6);
+            }
+            other => panic!("expected coalesced Slots span, got {other:?}"),
+        }
+        h.sync_narrowed();
+        assert!(h
+            .heap
+            .targeted_roots()
+            .records()
+            .iter()
+            .any(|record| record.root.id == register_root_id(h.window.base)));
+        assert!(h
+            .heap
+            .targeted_roots()
+            .records()
+            .iter()
+            .any(|record| record.root.id == register_root_id(h.window.base + 6)));
+        assert_eq!(h.active_roots.len(), 2);
+    }
+
+    /// An out-of-range write must NOT disturb a live root for an out-of-range
+    /// slot. This is the sharp edge: the narrowed reconcile must patch only the
+    /// dirty range, never unregister live roots whose slots did not change.
+    #[test]
+    fn dirty_range_narrowing_leaves_out_of_range_roots_untouched() {
+        let mut h = RootSyncHarness::new(churn_shape());
+        // Root local0 with a cell.
+        let kept = h.fresh_cell();
+        h.write_local(0, kept);
+        h.sync_narrowed();
+        let kept_cell = heap_cell_for_value(&h.heap, kept);
+        assert!(h
+            .heap
+            .targeted_roots()
+            .records()
+            .iter()
+            .any(|record| record.target == kept_cell));
+
+        // Now churn a DIFFERENT slot (local3) cell-on/cell-off without ever
+        // touching local0. local0's root must survive every narrowed sync.
+        let other = h.fresh_cell();
+        h.write_local(3, other);
+        h.sync_narrowed();
+        assert!(
+            h.heap
+                .targeted_roots()
+                .records()
+                .iter()
+                .any(|record| record.target == kept_cell),
+            "out-of-range live root was wrongly unregistered when local3 changed"
+        );
+
+        h.write_local(3, RuntimeValue::from_i32(0));
+        h.sync_narrowed();
+        assert!(
+            h.heap
+                .targeted_roots()
+                .records()
+                .iter()
+                .any(|record| record.target == kept_cell),
+            "out-of-range live root was wrongly unregistered on cell->non-cell at local3"
+        );
+        // local0's root is the only survivor.
+        assert_eq!(h.active_roots.len(), 1);
+        assert_eq!(h.active_roots[0].id, register_root_id(h.window.base));
+    }
+
+    /// `allocate_frame` and `release_frame` must force a FULL-WINDOW rescan via
+    /// the `FullWindow` sentinel, never a per-slot range.
+    #[test]
+    fn dirty_range_narrowing_frame_boundaries_force_full_window() {
+        let mut registers = RegisterFile::default();
+        let shape = churn_shape();
+        let window = registers
+            .allocate_frame(CallFrameId(1), shape, 1, &[])
+            .unwrap();
+        assert_eq!(registers.cell_root_dirty(), CellRootDirty::FullWindow);
+        registers.clear_cell_root_dirty();
+
+        // A per-slot write coalesces into a Slots span...
+        let cell = RuntimeValue::from_encoded(EncodedJsValue((0xABCD << 8) | 0x20));
+        registers
+            .write(window, VirtualRegister::local(0), cell)
+            .unwrap();
+        assert!(matches!(
+            registers.cell_root_dirty(),
+            CellRootDirty::Slots { .. }
+        ));
+
+        // ...but releasing the frame escalates back to FullWindow (whole-span
+        // mutation outside the per-slot funnel).
+        registers.release_frame(window).unwrap();
+        assert_eq!(registers.cell_root_dirty(), CellRootDirty::FullWindow);
+    }
+
+    /// `register_root_slot` is the exact inverse of `register_root_id` over the
+    /// register-root id namespace and rejects frame-root ids. The range-scoped
+    /// stale computation depends on this.
+    #[test]
+    fn register_root_slot_inverts_register_root_id_and_rejects_frame_ids() {
+        for slot in [0usize, 1, 7, 4096, 1_000_000] {
+            assert_eq!(register_root_slot(register_root_id(slot)), Some(slot));
+        }
+        // A frame-root id lives below REGISTER_ROOT_ID_BASE and must not be read
+        // as an in-range register slot.
+        let frame_id = frame_root_id(CallFrameId(3), FrameRootSource::CodeBlock);
+        assert_eq!(register_root_slot(frame_id), None);
     }
 }
