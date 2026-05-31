@@ -4351,10 +4351,23 @@ impl Vm {
                 );
             }
         }
-        let boundary = self.fallback_boundary_snapshot();
+        // C++ setUpCall does no per-call root work (llint/LLIntSlowPaths.cpp
+        // :2106); the boundary snapshot is consumed only on the
+        // FallbackToInterpreter branch inside commit_interpreter_entry_decision.
+        // Defer the O(stack-depth x frame-width) root scan into a thunk over
+        // disjoint field borrows so it runs lazily at the same stack/root state
+        // (no mutation happens between here and the decision) and only when a
+        // fallback actually records it; ordinary entries discard it unused.
+        let heap = &self.heap;
+        let execution = &self.execution;
+        let registers = &self.registers;
+        let gc_execution = &self.gc_execution;
+        let entry = &self.entry;
         let entry_decision = self
             .tiering
-            .commit_interpreter_entry_decision(entry_selection, boundary);
+            .commit_interpreter_entry_decision(entry_selection, || {
+                compute_fallback_boundary_snapshot(heap, execution, registers, gc_execution, entry)
+            });
         self.record_baseline_native_entry_launch_descriptor_if_ready(
             code_block_id,
             code_block,
@@ -5118,10 +5131,19 @@ impl Vm {
             ));
         }
 
-        let boundary = self.fallback_boundary_snapshot();
+        // Same lazy boundary as execute_code_block_with_entry_kind: defer the
+        // root scan into a thunk so it runs only on the FallbackToInterpreter
+        // branch that consumes it, at the identical stack/root state.
+        let heap = &self.heap;
+        let execution = &self.execution;
+        let registers = &self.registers;
+        let gc_execution = &self.gc_execution;
+        let entry = &self.entry;
         let entry_decision = self
             .tiering
-            .commit_interpreter_entry_decision(selection, boundary);
+            .commit_interpreter_entry_decision(selection, || {
+                compute_fallback_boundary_snapshot(heap, execution, registers, gc_execution, entry)
+            });
         self.record_baseline_native_entry_launch_descriptor_if_ready(
             owner,
             code_block,
@@ -17652,16 +17674,41 @@ impl Vm {
     }
 
     fn fallback_boundary_snapshot(&self) -> FallbackBoundarySnapshot {
-        FallbackBoundarySnapshot::from_roots(
-            self.heap.id(),
-            self.execution_root_snapshot()
-                .map(|snapshot| snapshot.precise_root_records()),
-            self.gc_execution.no_gc_scope_depth(),
-            self.entry.entry_depth(),
-            self.execution.frame_depth(),
+        compute_fallback_boundary_snapshot(
+            &self.heap,
+            &self.execution,
+            &self.registers,
+            &self.gc_execution,
+            &self.entry,
         )
     }
+}
 
+// Free-standing form of `Vm::fallback_boundary_snapshot` over disjoint field
+// borrows so a lazy snapshot thunk can capture only the roots/state inputs
+// without aliasing `Vm::tiering` (which the entry-decision call borrows
+// mutably). It computes the IDENTICAL boundary the eager method did: same
+// heap id, the same execution_root_snapshot().precise_root_records() over the
+// same register file, no-GC scope depth, entry depth, and frame depth.
+fn compute_fallback_boundary_snapshot(
+    heap: &Heap,
+    execution: &ExecutionContextStack,
+    registers: &RegisterFile,
+    gc_execution: &VmGcExecutionState,
+    entry: &VmEntryState,
+) -> FallbackBoundarySnapshot {
+    FallbackBoundarySnapshot::from_roots(
+        heap.id(),
+        execution
+            .root_snapshot(heap.id(), registers)
+            .map(|snapshot| snapshot.precise_root_records()),
+        gc_execution.no_gc_scope_depth(),
+        entry.entry_depth(),
+        execution.frame_depth(),
+    )
+}
+
+impl Vm {
     fn record_metadata_only_call_link_boundary_validation_for_observation(
         &mut self,
         observation_ordinal: u64,

@@ -2663,7 +2663,7 @@ impl VmTieringIntegration {
     pub fn observe_interpreter_entry(
         &mut self,
         request: TierEntryRequest,
-        boundary: FallbackBoundarySnapshot,
+        boundary: impl FnOnce() -> FallbackBoundarySnapshot,
     ) -> TierEntryDecisionRecord {
         let selection = self.select_interpreter_entry_plan(request);
         self.commit_interpreter_entry_decision(selection, boundary)
@@ -2710,10 +2710,19 @@ impl VmTieringIntegration {
         }
     }
 
+    // C++ fidelity: setUpCall (llint/LLIntSlowPaths.cpp:2106) performs ZERO
+    // per-call root work; conservative stack roots are gathered only at a GC
+    // safepoint under worldIsStopped() (heap/Heap.cpp gatherStackRoots:901,
+    // called from :3022). The FallbackBoundarySnapshot's precise_root_records()
+    // scan is therefore only meaningful when a fallback actually records it.
+    // `boundary` is a thunk so the O(stack-depth x frame-width) root scan runs
+    // lazily, exactly on the TierEntryDecision::FallbackToInterpreter branch
+    // that consumes it (the sole consumer), instead of eagerly on every entry
+    // where the result is discarded unused.
     pub(crate) fn commit_interpreter_entry_decision(
         &mut self,
         selection: TierEntryPlanSelection,
-        boundary: FallbackBoundarySnapshot,
+        boundary: impl FnOnce() -> FallbackBoundarySnapshot,
     ) -> TierEntryDecisionRecord {
         let request = selection.request;
         let policy = request.policy;
@@ -2763,7 +2772,8 @@ impl VmTieringIntegration {
                     entry_kind: request.entry_kind,
                     generated_baseline: None,
                 },
-                boundary,
+                // Run the deferred root snapshot only here, the sole consumer.
+                boundary(),
             );
             record.fallback_record_index = Some(fallback.ordinal);
         }
@@ -19900,7 +19910,7 @@ mod tests {
                 inline_cache_count: 0,
                 policy: TieringPolicy::BaselineAllowed,
             },
-            boundary(),
+            boundary,
         )
     }
 
@@ -32194,7 +32204,7 @@ mod tests {
                 inline_cache_count: 0,
                 policy: TieringPolicy::OptimizingAllowed,
             },
-            boundary(),
+            boundary,
         );
 
         assert_eq!(
@@ -32460,7 +32470,7 @@ mod tests {
                 inline_cache_count: 0,
                 policy: TieringPolicy::BaselineAllowed,
             },
-            boundary(),
+            boundary,
         );
 
         assert_eq!(
@@ -32505,7 +32515,7 @@ mod tests {
                 inline_cache_count: 0,
                 policy: TieringPolicy::BaselineAllowed,
             },
-            boundary(),
+            boundary,
         );
 
         assert_eq!(
@@ -32651,7 +32661,7 @@ mod tests {
                 inline_cache_count: 0,
                 policy: TieringPolicy::BaselineAllowed,
             },
-            boundary(),
+            boundary,
         );
 
         assert_eq!(
@@ -32893,7 +32903,7 @@ mod tests {
                 inline_cache_count: 0,
                 policy: TieringPolicy::BaselineAllowed,
             },
-            boundary(),
+            boundary,
         );
 
         assert_eq!(
@@ -32936,7 +32946,7 @@ mod tests {
                     inline_cache_count: 0,
                     policy,
                 },
-                boundary(),
+                boundary,
             );
 
             assert_eq!(
@@ -34162,7 +34172,7 @@ mod tests {
                 inline_cache_count: 0,
                 policy: TieringPolicy::BaselineAllowed,
             },
-            boundary(),
+            boundary,
         );
         assert_eq!(
             installed_entry
@@ -34215,7 +34225,7 @@ mod tests {
                 inline_cache_count: 0,
                 policy: TieringPolicy::BaselineAllowed,
             },
-            boundary(),
+            boundary,
         );
         assert_eq!(
             deferred_entry
