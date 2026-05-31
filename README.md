@@ -14,20 +14,20 @@ Legend:
 - [deferred] intentionally later than the current path
 
 ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
-  Phase 1 [mostly done] Interpreter performance for faster iteration. Cut 1: gate
-                 per-op register-root sync on cell-membership (3.6-4.9x; arith 20M
-                 245s->49s). Cut 2: drop per-register-write barrier (no C++
-                 counterpart for stack stores). Residual 2nd tier (HashMap props,
-                 CoreObjectCell, match dispatch, the sync itself on cell-churning
-                 code like richards) deferred to Phase 3; full safepoint rewrite is
-                 GC-coupled. Iteration is now fine for feature-dev (cargo test 0.8s).
-  Phase 2 [wip]  Octane feature completeness (perf-independent): RUN all benchmarks
-                 correctly. CORRECTED by ground-truth run-state (2026-05-29): the
-                 4 "eval-blocked" benchmarks were actually COMPILE-blocked by a
-                 store-to-unresolved-identifier bug -- FIXED (38ce3a4), now past
-                 prepare. Remaining: indirect eval (code-load + zlib runtime throw),
-                 the delta-blue regression, regexp/pdfjs hangs, splay(GC). eval is a
-                 defined binding; only its INVOCATION throws.
+  Phase 1 [wip]  Interpreter performance. Landed: per-op root sync gated on cell-membership
+                 (3.6-4.9x); dropped per-register-write barrier; monomorphic GetByName/
+                 PutByName inline cache (PUT 5.35x micro, 7dd0659). KEY FINDING (2026-05-30):
+                 the IC did NOT move richards and zlib is perf-bound -- the DOMINANT cost is
+                 per-CALL driver re-entry (~7.3us/call vs C++ LLInt commonCallOp). The big
+                 remaining lever is cheap call dispatch (stay in one interpreter loop +
+                 call-link IC) + safepoint rooting; a serial architecture change (see memory
+                 project-call-dispatch-lever).
+  Phase 2 [done] Octane feature completeness: all 15 benchmarks RUN correctly. Ground-truth
+                 2026-05-30: ZERO throwers/aborts -- 3 score, 12 functional-but-slow
+                 (perf-gated, Phase 1). Landed: implicit-global store, indirect eval, catchable
+                 TypeError + Array.prototype ToObject, putToPrimitive, RegExp getters, escape/
+                 URI globals, ToPrimitive on object arithmetic. Deferred (not blocking any run):
+                 @@Symbol.toPrimitive, BigInt+Number-mix TypeError, Yarr.
   Phase 3 [deferred] JIT as the perf path toward parity. NOTE: suite-SCORE parity is
                  structurally owned by the DEFERRED optimizing tiers (DFG/FTL/B3
                  ~283k LoC) + real GC; a baseline-only JIT asymptotes ~10-25%. Do NOT
@@ -39,27 +39,18 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] JetStreamDriver load order and shell globals
     [done] iteration, validation, scoring, and telemetry
     [done] benchmark/probe command surface for current investigations
-  [wip] Current proof path. GROUND-TRUTH run-state (2026-05-30, interpreter, 30s/2-iter).
-        Suite geomean is None until ALL 15 Succeed (shell/octane.rs:1996); per-bench
-        score=5000/time_ms (:2693); the probe 30s timeout is a budget, not a scoring cutoff.
-    [done] SCORES (2): crypto (0.63), navier-stokes (1.38).
-    [wip] FUNCTIONAL-BUT-TIMEOUT (11; perf-gated -> Phase 1/3, not a feature gap): Box2D,
-           delta-blue, earley-boyer, gbemu, mandreel, pdfjs, raytrace, regexp, richards
-           (~73-77s/iter), splay (GC-stress), typescript. The monomorphic GET/PUT IC did
-           NOT move richards -- it is CALL + loop/dispatch-bound, not named-property-bound;
-           next interpreter lever is call-dispatch (~3M calls/iter at ~7us) + dispatch
-           overhead, not more property work.
-    [wip] THROW at runner (2; Phase 2): octane-code-load now Failed(ExpectedInt32) in the
-           jQuery AJAX/regex block (was ExpectedObject, 6f4c70e); octane-zlib loads all 4
-           sources then HANGS in its asm.js runner (perf/compute; URI byte path proven
-           correct). Indirect eval is NOT the blocker (landed b594d06).
-    [done] Phase-2 correctness landed: implicit-global store (38ce3a4), indirect/global eval
-           (b594d06), catchable TypeError + Array.prototype ToObject(this) (d750f2b, 6f4c70e),
-           putToPrimitive (212c8ee), RegExp.prototype getters (3b9b219), escape/URI globals
-           + read (ba5811e).
+  [wip] Current proof path. GROUND-TRUTH run-state (2026-05-30, interpreter, 30s/2-iter):
+        ZERO throwers/aborts across all 15. Suite geomean is None until ALL 15 Succeed
+        (shell/octane.rs:1996); per-bench score=5000/time_ms (:2693); the 30s probe timeout
+        is a budget, not a scoring cutoff.
+    [done] SCORES (3): octane-code-load (7.6), crypto (0.63), navier-stokes (1.37).
+    [wip] FUNCTIONAL-BUT-SLOW (12; perf-gated -> Phase 1, not a feature gap): Box2D, delta-blue,
+           earley-boyer, gbemu, mandreel, pdfjs, raytrace, regexp, richards (~73-77s/iter),
+           splay (GC-stress), typescript, octane-zlib (asm.js, ~18-60M calls/iter). The gate to
+           all 15 Succeeding (hence any suite geomean) is cheap call dispatch, not features.
     [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
            __defineGetter__/Setter__, global Function, Math, apply/bind, globals
-    [missing] Octane score parity with local C++ JSC (needs optimizing tiers -- Phase 3)
+    [missing] Octane score parity with local C++ JSC (needs call-dispatch + optimizing tiers)
 
 [wip] C++ JSC structural fidelity
   [done] always-context rewrite contract in CLAUDE.md
