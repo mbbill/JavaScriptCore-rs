@@ -16,13 +16,14 @@ Legend:
 ```text
 ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   Phase 1 [wip]  Interpreter performance. Landed: per-op root sync gated on cell-membership
-                 (3.6-4.9x); dropped per-register-write barrier; monomorphic GetByName/
-                 PutByName inline cache (PUT 5.35x micro, 7dd0659). KEY FINDING (2026-05-30):
-                 the IC did NOT move richards and zlib is perf-bound -- the DOMINANT cost is
-                 per-CALL driver re-entry (~7.3us/call vs C++ LLInt commonCallOp). The big
-                 remaining lever is cheap call dispatch (stay in one interpreter loop +
-                 call-link IC) + safepoint rooting; a serial architecture change (see memory
-                 project-call-dispatch-lever).
+                 (3.6-4.9x); dropped per-register-write barrier; monomorphic GetByName/PutByName
+                 IC (7dd0659). A wall profile (2026-05-30) corrected the cost model: the dominant
+                 per-call cost is ROOTING + a wasted eager root snapshot, NOT IC safepoint passes
+                 (~0 wall). Landed since: skip idempotent passes (e50f685, 90091ab), lazy
+                 fallback-boundary-snapshot (3ff6095), in-loop root-sync narrowed to the dirtied
+                 slot range (6ebfe66) -- richards 140s->112s, crypto/navier/code-load +30-60%.
+                 Remaining lever: the unconditional PRE-LOOP root sync (~28s; a VM-owned-all-
+                 windows rooting-model change = serial). See memory project-call-dispatch-lever.
   Phase 2 [done] Octane feature completeness: all 15 benchmarks RUN correctly. Ground-truth
                  2026-05-30: ZERO throwers/aborts -- 3 score, 12 functional-but-slow
                  (perf-gated, Phase 1). Landed: implicit-global store, indirect eval, catchable
@@ -44,11 +45,14 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
         ZERO throwers/aborts across all 15. Suite geomean is None until ALL 15 Succeed
         (shell/octane.rs:1996); per-bench score=5000/time_ms (:2693); the 30s probe timeout
         is a budget, not a scoring cutoff.
-    [done] SCORES (3): octane-code-load (7.6), crypto (0.63), navier-stokes (1.37).
+    [done] SCORES (3): octane-code-load (10.0), crypto (0.88), navier-stokes (2.20) -- up
+           ~30-60% from the call-perf batches (lazy snapshot + in-loop root-sync narrowing,
+           confirmed 2026-05-30; the full-window root rescan was a broad per-op tax).
     [wip] FUNCTIONAL-BUT-SLOW (12; perf-gated -> Phase 1, not a feature gap): Box2D, delta-blue,
-           earley-boyer, gbemu, mandreel, pdfjs, raytrace, regexp, richards (~73-77s/iter),
+           earley-boyer, gbemu, mandreel, pdfjs, raytrace, regexp, richards (~56s/iter),
            splay (GC-stress), typescript, octane-zlib (asm.js, ~18-60M calls/iter). The gate to
-           all 15 Succeeding (hence any suite geomean) is cheap call dispatch, not features.
+           all 15 Succeeding (hence any suite geomean) is interpreter throughput -- next the
+           pre-loop root sync (~28s) then likely the JIT.
     [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
            __defineGetter__/Setter__, global Function, Math, apply/bind, globals
     [missing] Octane score parity with local C++ JSC (needs call-dispatch + optimizing tiers)
