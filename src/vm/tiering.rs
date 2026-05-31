@@ -528,6 +528,63 @@ impl VmTieringIntegration {
         &self.call_link_attachment_plan_records
     }
 
+    // Batch 1 of the call-dispatch constant-factor plan. Cheap presence check:
+    // returns false IFF `owner` has NO entries in ANY of the owner-keyed tables
+    // that the five idempotent IC/tiering safepoint passes
+    // (materialize_and_attach_guarded_property_load_inline_caches_at_safepoint,
+    // attach_metadata_only_non_guarded_property_inline_cache_cases_at_safepoint,
+    // reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint,
+    // clear_stale_metadata_only_call_link_inline_caches_at_safepoint,
+    // recheck_metadata_only_call_link_attachment_plans_at_safepoint) consult.
+    //
+    // Each of those passes filters `owner == this-owner` FIRST and yields an
+    // empty work set when the owner has no plans/candidates, so skipping them on
+    // a false result is observably identical to running them. The guard caller
+    // ALSO keeps the cheap soundness drain unconditional, so any host-queued
+    // invalidation is still serviced regardless of this predicate.
+    //
+    // Tables consulted, with the pass that reads each:
+    //   - property_load_guard_plans              (pass 1; the watchpoint
+    //     materialization table is reachable only via a guard plan whose owner
+    //     is filtered in `vm_property_load_guarded_candidate_outcome`, so an
+    //     empty owner slice here means pass 1's guarded arm is empty too)
+    //   - property_load_access_case_plans        (pass 1 self-load arm + pass 2)
+    //   - property_store_access_case_plans       (pass 2)
+    //   - property_inline_cache_attachment_records (pass 1 prototype-arm + pass 3
+    //     structure-stub reservation, both filter attachment.owner == owner)
+    //   - call_link_inline_cache_attachment_records (pass 4)
+    //   - call_link_attachment_plan_records      (pass 5)
+    //
+    // C++ JSC does this IC/call-link work per-LINK (llint_default_call ->
+    // linkFor, LLIntSlowPaths.cpp:613-627; setUpCall, LLIntSlowPaths.cpp:2106),
+    // NOT once per call. Our driver re-ran all five passes per nested call; this
+    // predicate restores the C++ "no work when nothing is registered" behavior.
+    pub(crate) fn owner_has_any_safepoint_plan_work(&self, owner: CodeBlockId) -> bool {
+        self.property_load_guard_plans
+            .iter()
+            .any(|record| record.owner == owner)
+            || self
+                .property_load_access_case_plans
+                .iter()
+                .any(|record| record.owner == owner)
+            || self
+                .property_store_access_case_plans
+                .iter()
+                .any(|record| record.owner == owner)
+            || self
+                .property_inline_cache_attachment_records
+                .iter()
+                .any(|record| record.owner == owner)
+            || self
+                .call_link_inline_cache_attachment_records
+                .iter()
+                .any(|record| record.owner == owner)
+            || self
+                .call_link_attachment_plan_records
+                .iter()
+                .any(|record| record.owner == owner)
+    }
+
     pub fn call_link_attachment_install_rechecks(
         &self,
     ) -> &[VmCallLinkAttachmentInstallRecheckRecord] {

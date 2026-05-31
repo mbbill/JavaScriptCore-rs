@@ -486,6 +486,16 @@ fn dump_vm_code_block(vm: &Vm, raw_cell_id: u32) {
 }
 
 fn print_tiering_summary(vm: &Vm) {
+    // Batch 1 (call-dispatch constant-factor): cumulative full-branch (non-
+    // skipped) invocations of the five idempotent IC/tiering safepoint passes.
+    // On a hot JS call path whose callees have no registered plans this should
+    // stay tiny relative to call count (the per-call prologue/epilogue safepoints
+    // skip the five passes); a high value means the guard kept taking the full
+    // path (work was registered or the drain reported pending invalidations).
+    println!(
+        "safepoint-passes full_branch_invocations={}",
+        vm.safepoint_pass_full_branch_invocations(),
+    );
     let tiering = vm.tiering_integration();
     // FIX 3 get_by_id self-load DataIC residency telemetry: how many inline
     // self-load fast paths the emitter baked, how many of those records were

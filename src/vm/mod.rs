@@ -871,6 +871,14 @@ pub struct Vm {
     next_source_bytecompiler_session_id: u64,
     next_p15_auto_baseline_native_entry_id: u32,
     next_p15_auto_baseline_generated_code_id: u32,
+    // Batch 1 call-dispatch measurement: cumulative count of how many times the
+    // five skippable IC/tiering safepoint passes were actually INVOKED (a single
+    // increment per prologue/epilogue/resume safepoint that took the full
+    // branch, i.e. when owner_has_any_safepoint_plan_work was true OR the drain
+    // returned pending work). Lets a probe observe per-call pass invocations drop
+    // to ~0 on a hot call path with no registered plans. Plain counter (one
+    // usize) so the release octane_probe can read it; not behind cfg(test).
+    safepoint_pass_full_branch_invocations: u64,
     #[cfg(test)]
     no_gc_execution_depth_observations_for_test: Vec<VmNoGcExecutionDepthObservationForTest>,
 }
@@ -1859,6 +1867,7 @@ impl Vm {
             next_source_bytecompiler_session_id: 1,
             next_p15_auto_baseline_native_entry_id: 0,
             next_p15_auto_baseline_generated_code_id: 0,
+            safepoint_pass_full_branch_invocations: 0,
             #[cfg(test)]
             no_gc_execution_depth_observations_for_test: Vec::new(),
         }
@@ -4278,28 +4287,10 @@ impl Vm {
         entry_kind: crate::interpreter::ExecutionEntryKind,
     ) -> ExecutionCompletion {
         let mut region = self.enter_no_gc_execution_region();
-        self.drain_pending_property_load_runtime_invalidations(host);
-        self.materialize_and_attach_guarded_property_load_inline_caches_at_safepoint(
-            code_block_id,
-            code_block,
-            host,
-        );
-        self.attach_metadata_only_non_guarded_property_inline_cache_cases_at_safepoint(
-            code_block_id,
-            code_block,
-        );
-        self.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
-            code_block_id,
-            code_block,
-        );
-        self.clear_stale_metadata_only_call_link_inline_caches_at_safepoint(
-            code_block_id,
-            code_block,
-        );
-        self.recheck_metadata_only_call_link_attachment_plans_at_safepoint(
-            code_block_id,
-            code_block,
-        );
+        // Batch 1: drain runs unconditionally inside run_ic_tiering_safepoint;
+        // the five idempotent passes are skipped when this owner has no
+        // registered plans and the drain reported no pending work.
+        self.run_ic_tiering_safepoint(code_block_id, code_block, host);
         let top_frame = self.execution.top_frame().cloned();
         let entry_selection = self
             .tiering
@@ -4501,28 +4492,8 @@ impl Vm {
             host,
         );
         host.discard_property_store_observations();
-        self.drain_pending_property_load_runtime_invalidations(host);
-        self.materialize_and_attach_guarded_property_load_inline_caches_at_safepoint(
-            code_block_id,
-            code_block,
-            host,
-        );
-        self.attach_metadata_only_non_guarded_property_inline_cache_cases_at_safepoint(
-            code_block_id,
-            code_block,
-        );
-        self.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
-            code_block_id,
-            code_block,
-        );
-        self.clear_stale_metadata_only_call_link_inline_caches_at_safepoint(
-            code_block_id,
-            code_block,
-        );
-        self.recheck_metadata_only_call_link_attachment_plans_at_safepoint(
-            code_block_id,
-            code_block,
-        );
+        // Batch 1: symmetric epilogue safepoint -- same guard as the prologue.
+        self.run_ic_tiering_safepoint(code_block_id, code_block, host);
         let completion = self.leave_no_gc_region_with_completion(region, completion);
         self.tiering.record_execution_completion(
             code_block_id,
@@ -4553,6 +4524,85 @@ impl Vm {
             TierEntryExecutionPath::Interpreter,
         );
         completion
+    }
+
+    // Batch 1 of the call-dispatch constant-factor plan. The IC/tiering
+    // safepoint that runs in the execute_code_block prologue, the symmetric
+    // epilogue, and the generated-resume refresh. The cheap soundness drain runs
+    // UNCONDITIONALLY (it pulls from the global host invalidation/watchpoint
+    // queues -- drain_pending_property_load_structure_chain_invalidations /
+    // drain_pending_property_load_guard_watchpoint_events -- which are not
+    // owner-scoped, so they must always be serviced). The other five passes are
+    // idempotent and each filters owner==this-owner FIRST, so when the owner has
+    // NO registered plans/candidates they do filtering work and find nothing.
+    //
+    // C++ JSC does this IC/call-link materialization per-LINK (llint_default_call
+    // -> linkFor, LLIntSlowPaths.cpp:613-627; setUpCall, LLIntSlowPaths.cpp:2106),
+    // NOT once per call. The Rust driver re-entered this safepoint on every
+    // nested call, paying twelve filter passes (six prologue + six epilogue) per
+    // call for the overwhelmingly common callee with no plans. We restore the
+    // C++ "no work when nothing is registered" behavior by skipping the five
+    // idempotent passes when owner_has_any_safepoint_plan_work is false AND the
+    // always-on drain reported no pending work. If the drain returns non-empty,
+    // we take the full path regardless of the predicate (pending invalidation may
+    // have just retired/queued plan work this entry must service). This is a pure
+    // presence-check guard around already-idempotent work: no shared mutable
+    // state, no epoch/memo, no change to control flow, no-GC nesting, or counters.
+    //
+    // SOUNDNESS NOTE on `pending`: drain_pending_property_load_runtime_invalidations
+    // returns ONLY the watchpoint-event Vec; the structure-chain drain it also runs
+    // has its result discarded. That is sound here because the structure-chain drain's
+    // only effect is aging the global megamorphic property-load cache, and NONE of the
+    // five skippable passes read that cache -- so a discarded structure-chain result
+    // can never imply pass work the skip would miss. The watchpoint drain, by contrast,
+    // clears affected ICs inline and its non-empty result is exactly when new pass work
+    // can exist, which is why `pending.is_empty()` is the correct gate.
+    fn run_ic_tiering_safepoint<H: DispatchHost>(
+        &mut self,
+        code_block_id: CodeBlockId,
+        code_block: &CodeBlock,
+        host: &mut H,
+    ) {
+        let pending = self.drain_pending_property_load_runtime_invalidations(host);
+        if !self
+            .tiering
+            .owner_has_any_safepoint_plan_work(code_block_id)
+            && pending.is_empty()
+        {
+            return;
+        }
+        self.safepoint_pass_full_branch_invocations = self
+            .safepoint_pass_full_branch_invocations
+            .saturating_add(1);
+        self.materialize_and_attach_guarded_property_load_inline_caches_at_safepoint(
+            code_block_id,
+            code_block,
+            host,
+        );
+        self.attach_metadata_only_non_guarded_property_inline_cache_cases_at_safepoint(
+            code_block_id,
+            code_block,
+        );
+        self.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
+            code_block_id,
+            code_block,
+        );
+        self.clear_stale_metadata_only_call_link_inline_caches_at_safepoint(
+            code_block_id,
+            code_block,
+        );
+        self.recheck_metadata_only_call_link_attachment_plans_at_safepoint(
+            code_block_id,
+            code_block,
+        );
+    }
+
+    // Batch 1 measurement accessor: cumulative full-branch (non-skipped)
+    // invocations of the five idempotent IC/tiering safepoint passes. Read by the
+    // octane_probe to show per-call pass invocations collapse to ~0 on a hot call
+    // path whose callees have no registered plans.
+    pub fn safepoint_pass_full_branch_invocations(&self) -> u64 {
+        self.safepoint_pass_full_branch_invocations
     }
 
     #[cfg(test)]
@@ -16355,18 +16405,12 @@ impl Vm {
         code_block: &CodeBlock,
         host: &mut H,
     ) {
-        self.drain_pending_property_load_runtime_invalidations(host);
-        self.materialize_and_attach_guarded_property_load_inline_caches_at_safepoint(
-            owner, code_block, host,
-        );
-        self.attach_metadata_only_non_guarded_property_inline_cache_cases_at_safepoint(
-            owner, code_block,
-        );
-        self.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
-            owner, code_block,
-        );
-        self.clear_stale_metadata_only_call_link_inline_caches_at_safepoint(owner, code_block);
-        self.recheck_metadata_only_call_link_attachment_plans_at_safepoint(owner, code_block);
+        // Batch 1: the generated-resume IC refresh runs the SAME owner-scoped
+        // drain + five idempotent passes as the execute_code_block
+        // prologue/epilogue, with the identical owner-first-filter invariant
+        // (every pass filters owner == this owner first). Apply the same presence
+        // guard for consistency; the drain stays unconditional inside the helper.
+        self.run_ic_tiering_safepoint(owner, code_block, host);
     }
 
     fn finish_single_dispatch_resume_in_current_region<H: DispatchHost>(
@@ -46355,6 +46399,116 @@ mod tests {
                 .len(),
             clear_count_before + 1,
             "accepted clear records should suppress repeated stale clears until lifecycle retirement lands"
+        );
+    }
+
+    // Batch 1 (call-dispatch constant-factor): a callee/owner with NO registered
+    // plans must SKIP the five idempotent IC/tiering safepoint passes in both the
+    // prologue and epilogue, and produce an identical result. We observe the skip
+    // through the full-branch invocation counter (it stays 0 across a full
+    // execute_code_block) and the presence predicate (false for this owner).
+    #[test]
+    fn vm_safepoint_passes_skipped_for_owner_with_no_registered_plans() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+
+        let code_block = p6_int32_return_42_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+
+        // No plans/candidates registered for this owner -> predicate is false.
+        assert!(
+            !vm.tiering_integration()
+                .owner_has_any_safepoint_plan_work(owner),
+            "fresh owner with no registered plans must report no safepoint work"
+        );
+        assert_eq!(vm.safepoint_pass_full_branch_invocations(), 0);
+
+        let (completion, _) = execute_registered_code_block_with_boundary_snapshot_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined()],
+        );
+
+        // Result is correct (observably identical to running the passes)...
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        // ...and BOTH the prologue and epilogue safepoints skipped the five
+        // passes: the full-branch counter never advanced.
+        assert_eq!(
+            vm.safepoint_pass_full_branch_invocations(),
+            0,
+            "prologue + epilogue safepoints must skip the five passes when the owner has no plans"
+        );
+    }
+
+    // Batch 1: a callee/owner WITH a registered plan (here a live call-link IC
+    // attachment record) must take the FULL safepoint path. After the first run
+    // attaches a call-link IC, the presence predicate flips to true and a second
+    // execute_code_block advances the full-branch counter by exactly 2 (prologue
+    // + epilogue), proving the guard does NOT skip when work is registered.
+    #[test]
+    fn vm_safepoint_passes_run_full_path_for_owner_with_registered_plan() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let function_unlinked = js_call_return_41_function_code_block().unlinked().clone();
+        let function_blocks = vm
+            .install_source_function_blocks(vec![function_unlinked])
+            .expect("owned function executable call code");
+        let mut host = RecordingCoreHost::with_function_code_blocks(function_blocks);
+        let callee = load_function_value_for_test(&mut vm, &mut host, 0);
+        host.clear_observations();
+
+        let code_block = generated_js_call_return_consumed_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        install_typed_baseline_for_test(&mut vm, owner, 1322);
+
+        let (completion, _) = execute_registered_code_block_with_boundary_snapshot_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), callee],
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+
+        // The first run attached a call-link IC for this owner, so the predicate
+        // must now report registered work.
+        assert!(
+            !vm.tiering_integration()
+                .call_link_inline_cache_attachment_records()
+                .is_empty(),
+            "first run must attach a call-link IC for the owner"
+        );
+        assert!(
+            vm.tiering_integration()
+                .owner_has_any_safepoint_plan_work(owner),
+            "owner with a registered call-link IC attachment must report safepoint work"
+        );
+
+        // A second execution must take the FULL path on BOTH the prologue and
+        // epilogue safepoints: counter advances by exactly 2.
+        let before = vm.safepoint_pass_full_branch_invocations();
+        let (completion, _) = execute_registered_code_block_with_boundary_snapshot_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), callee],
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        assert_eq!(
+            vm.safepoint_pass_full_branch_invocations() - before,
+            2,
+            "owner with registered plans must run the full safepoint path in prologue + epilogue"
         );
     }
 
