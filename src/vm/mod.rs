@@ -879,6 +879,19 @@ pub struct Vm {
     // to ~0 on a hot call path with no registered plans. Plain counter (one
     // usize) so the release octane_probe can read it; not behind cfg(test).
     safepoint_pass_full_branch_invocations: u64,
+    // Batch 2 call-dispatch steady-state memo. Owner-keyed cache of the
+    // (fingerprint, plan_generation) under which the five idempotent IC/tiering
+    // safepoint passes last ran to completion for that owner. In
+    // `run_ic_tiering_safepoint`, an owner that HAS plans but whose CodeBlock
+    // fingerprint AND the global plan_generation both still match its recorded
+    // memo is in steady state, so re-running the (post-hoist) idempotent passes
+    // is observably a no-op and is skipped. A bytecode change bumps the
+    // fingerprint; any six-table plan mutation (for any owner) bumps
+    // plan_generation; either mismatch forces the full path next safepoint. This
+    // is the Rust analogue of C++ JSC materializing ICs/call links per-LINK
+    // (LLIntSlowPaths.cpp setUpCall/linkFor), not once per call: once a link is
+    // materialized and nothing has changed, the per-call work is gone.
+    ic_tiering_safepoint_memo: HashMap<CodeBlockId, (BaselineBytecodeSnapshotFingerprint, u64)>,
     #[cfg(test)]
     no_gc_execution_depth_observations_for_test: Vec<VmNoGcExecutionDepthObservationForTest>,
 }
@@ -1868,6 +1881,7 @@ impl Vm {
             next_p15_auto_baseline_native_entry_id: 0,
             next_p15_auto_baseline_generated_code_id: 0,
             safepoint_pass_full_branch_invocations: 0,
+            ic_tiering_safepoint_memo: HashMap::new(),
             #[cfg(test)]
             no_gc_execution_depth_observations_for_test: Vec::new(),
         }
@@ -4557,6 +4571,22 @@ impl Vm {
     // can never imply pass work the skip would miss. The watchpoint drain, by contrast,
     // clears affected ICs inline and its non-empty result is exactly when new pass work
     // can exist, which is why `pending.is_empty()` is the correct gate.
+    //
+    // Batch 2 of the call-dispatch constant-factor plan extends Batch 1's
+    // no-plans skip to a STEADY-STATE skip. An owner that HAS plans but has had
+    // ZERO six-table plan mutations since its last full pass (richards: 57
+    // call-link ICs are created during warmup, then nothing changes across ~6M
+    // entries) was still re-running the five idempotent passes every call -- pure
+    // waste, since each pass filters owner-first and early-returns when already
+    // attached/materialized. Batch 2 keys an owner memo on
+    // (CodeBlock snapshot fingerprint, global plan_generation): if both still
+    // match the value under which the passes last completed for this owner, the
+    // passes are skipped. Two correctness preconditions hold:
+    //   (1) The hoisted prototype-load DataIC re-arm below runs UNCONDITIONALLY
+    //       before any skip, so the only work the memo gates is idempotent.
+    //   (2) plan_generation bumps on EVERY six-table mutation (any owner) and the
+    //       fingerprint bumps on any CodeBlock bytecode change, so a memo hit is
+    //       observably identical to re-running the (idempotent) passes.
     fn run_ic_tiering_safepoint<H: DispatchHost>(
         &mut self,
         code_block_id: CodeBlockId,
@@ -4564,13 +4594,79 @@ impl Vm {
         host: &mut H,
     ) {
         let pending = self.drain_pending_property_load_runtime_invalidations(host);
-        if !self
+
+        // Compute the CodeBlock snapshot fingerprint ONCE (the hoisted re-arm and
+        // the memo both need it). `None` on a decode failure: the re-arm is
+        // skipped (it would have early-returned on the same Err inside the pass),
+        // and the memo is neither consulted nor recorded, so the full path is
+        // taken whenever there is any plan work -- the safe default.
+        let fingerprint =
+            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(code_block).ok();
+
+        // STEP 2 (Batch 2): HOISTED prototype-load DataIC re-arm. Runs
+        // UNCONDITIONALLY, before the skip decision. This re-resolves and
+        // re-writes holder cell pointers every entry an attachment is live -- a
+        // genuine per-call side effect that the memo must never skip. It is cheap
+        // and a no-op for owners with no armed depth-1 prototype-load DataICs (it
+        // early-returns on an empty guarded candidate table).
+        if let Some(fingerprint) = fingerprint {
+            self.arm_resident_prototype_load_data_ic_records_at_safepoint(
+                code_block_id,
+                fingerprint,
+                host,
+            );
+        }
+
+        let has_plan_work = self
             .tiering
-            .owner_has_any_safepoint_plan_work(code_block_id)
-            && pending.is_empty()
-        {
+            .owner_has_any_safepoint_plan_work(code_block_id);
+
+        // Batch 1 skip: owner has NO plans AND the drain reported nothing. There
+        // is no idempotent pass work and no memo to consult.
+        if !has_plan_work && pending.is_empty() {
             return;
         }
+
+        // Batch 2 steady-state skip: when the drain was empty (so no host event
+        // can have queued new pass work) and the owner HAS plans, consult the
+        // memo. A drain-non-empty entry never consults the memo and always takes
+        // the full path (pending invalidation may have just retired/queued plan
+        // work this entry must service) -- this preserves Batch 1's gate exactly.
+        //
+        // IDEMPOTENCY ASSUMPTION (load-bearing): a memo hit is sound only because
+        // the five skipped passes are idempotent given (fingerprint, plan_generation)
+        // -- they re-derive nothing once attached/materialized. There is ONE pass
+        // whose work also depends on RUNTIME HEAP LIVENESS, not on the six plan
+        // tables or the fingerprint: clear_stale_metadata_only_call_link_inline_caches_at_safepoint
+        // tests call_link_executable_cell_is_live (heap allocation_records), which
+        // can flip live->dead WITHOUT any six-table mutation or fingerprint change.
+        // This is benign TODAY because no production path destroys a published
+        // executable cell during an interpreter run (invalidate_cell has only
+        // test/fixture callers; there is no GC sweep mid-run). C++ JSC clears dead
+        // call links eagerly via GC finalizeUnconditionally/visitWeak, not per-call
+        // polling. WHEN a real GC-driven call-link finalization is added, it MUST
+        // route the retire through the clear recorders (record_call_link_inline_cache_clear
+        // / retire_call_link_inline_cache_metadata_for_clear), which bump
+        // plan_generation -- otherwise this memo would skip the stale-clear and a
+        // dead link would stay live. Do not add a mid-run executable-cell destroyer
+        // without that epoch bump.
+        if pending.is_empty() {
+            if let Some(fingerprint) = fingerprint {
+                if let Some(&(memo_fingerprint, memo_generation)) =
+                    self.ic_tiering_safepoint_memo.get(&code_block_id)
+                {
+                    if memo_fingerprint == fingerprint
+                        && memo_generation == self.tiering.plan_generation()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
+        // FULL path: the five idempotent passes. The full-branch counter is
+        // incremented ONLY here (as in Batch 1) so the probe sees per-call pass
+        // invocations collapse on a steady-state hot call path.
         self.safepoint_pass_full_branch_invocations = self
             .safepoint_pass_full_branch_invocations
             .saturating_add(1);
@@ -4595,6 +4691,17 @@ impl Vm {
             code_block_id,
             code_block,
         );
+
+        // Record the memo under the POST-pass plan_generation: the passes above
+        // may have inserted/transitioned plan entries (e.g. attaching this
+        // owner's first IC), which bumped plan_generation; recording the value
+        // after they run is what lets a subsequent unchanged entry hit and skip.
+        // The fingerprint cannot change here (the passes hold a shared &CodeBlock
+        // and never call invalidate_snapshot_fingerprint).
+        if let Some(fingerprint) = fingerprint {
+            self.ic_tiering_safepoint_memo
+                .insert(code_block_id, (fingerprint, self.tiering.plan_generation()));
+        }
     }
 
     // Batch 1 measurement accessor: cumulative full-branch (non-skipped)
@@ -4603,6 +4710,36 @@ impl Vm {
     // path whose callees have no registered plans.
     pub fn safepoint_pass_full_branch_invocations(&self) -> u64 {
         self.safepoint_pass_full_branch_invocations
+    }
+
+    // Batch 2 test hook: overwrite the stored fingerprint half of an owner's
+    // safepoint memo with a deterministically different value so the NEXT
+    // safepoint sees a fingerprint mismatch and is forced onto the full path --
+    // exercising the "CodeBlock bytecode change -> memo miss" transition. Returns
+    // true iff a memo entry existed to corrupt. A registered CodeBlock's snapshot
+    // fingerprint is immutable in practice (no `&mut` accessor survives
+    // registration), so this is the only deterministic way a test can drive the
+    // fingerprint-mismatch branch with an entry still present.
+    #[cfg(test)]
+    fn corrupt_ic_tiering_safepoint_memo_fingerprint_for_test(
+        &mut self,
+        owner: CodeBlockId,
+        replacement_fingerprint: BaselineBytecodeSnapshotFingerprint,
+    ) -> bool {
+        if let Some(entry) = self.ic_tiering_safepoint_memo.get_mut(&owner) {
+            assert_ne!(
+                entry.0, replacement_fingerprint,
+                "test must supply a fingerprint distinct from the memoized one"
+            );
+            entry.0 = replacement_fingerprint;
+            return true;
+        }
+        false
+    }
+
+    #[cfg(test)]
+    fn ic_tiering_safepoint_memo_contains_for_test(&self, owner: CodeBlockId) -> bool {
+        self.ic_tiering_safepoint_memo.contains_key(&owner)
     }
 
     #[cfg(test)]
@@ -18294,11 +18431,14 @@ impl Vm {
         }
 
         self.attach_metadata_only_guarded_property_inline_cache_cases(owner, bytecode_snapshot);
-        self.arm_resident_prototype_load_data_ic_records_at_safepoint(
-            owner,
-            bytecode_snapshot,
-            host,
-        );
+        // Batch 2: the prototype-load DataIC re-arm was HOISTED out of this pass
+        // into `run_ic_tiering_safepoint`, where it now runs UNCONDITIONALLY
+        // (alongside the always-on drain) BEFORE the steady-state skip decision.
+        // Reason: the re-arm re-resolves and re-writes the holder cell pointer on
+        // EVERY entry an attachment is live -- a genuine per-call side effect, NOT
+        // idempotent-skippable -- so it must not sit behind the memo. With it
+        // hoisted, the five passes under the memo are all idempotent, which is
+        // what makes a memo HIT observably identical to running them.
     }
 
     // Arm the resident prototype-chain (holder) data-IC records for sites whose
@@ -43434,6 +43574,128 @@ mod tests {
         );
     }
 
+    // Batch 2 (re-arm hoist correctness): an owner with an armed depth-1
+    // prototype-load DataIC keeps re-arming the holder pointer EVERY entry and
+    // keeps serving the correct prototype value (42) even once the safepoint memo
+    // engages and SKIPS the five idempotent passes. The re-arm was hoisted out of
+    // the (now-skippable) guarded-load pass into run_ic_tiering_safepoint, where
+    // it runs unconditionally before the skip decision; this test refutes the
+    // hypothesis that the memo could swallow the per-call holder re-resolution.
+    // Mirrors C++ CacheType::GetByIdPrototype re-filling offsetOfInlineHolder on
+    // the resident path (jit/JITInlineCacheGenerator.cpp:154-161).
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn vm_p10_resident_prototype_load_rearm_survives_steady_state_safepoint_memo_skip() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+        let (object, _prototype) =
+            create_prototype_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let fixture = install_real_p10_retained_property_native_exit(
+            &mut vm,
+            2_082,
+            generated_property_get_by_name_return_consumed_code_block(),
+        );
+
+        // Warm until the resident prototype record is armed (holder_ptr != 0).
+        let armed_holder = |vm: &Vm| -> u64 {
+            vm.code_block_for_diagnostics(fixture.owner)
+                .and_then(|cb| {
+                    cb.baseline_jit_data()
+                        .as_ref()
+                        .map(|d| d.property_caches[0].holder_ptr)
+                })
+                .unwrap_or(0)
+        };
+        let mut armed = false;
+        for _ in 0..8 {
+            let result = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                fixture.owner,
+                &fixture.code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), object],
+            );
+            assert_eq!(
+                result,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+            );
+            if armed_holder(&vm) != 0 {
+                armed = true;
+                break;
+            }
+        }
+        assert!(
+            armed,
+            "the resident prototype record must arm a holder pointer"
+        );
+
+        // The owner HAS plans (a prototype guard plan), so once it stabilizes the
+        // memo must engage and freeze the full-branch counter. Run several more
+        // entries; capture the counter once it stops advancing across a step.
+        let mut prev = vm.safepoint_pass_full_branch_invocations();
+        let mut steady = false;
+        for _ in 0..8 {
+            let result = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                fixture.owner,
+                &fixture.code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), object],
+            );
+            assert_eq!(
+                result,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+            );
+            let now = vm.safepoint_pass_full_branch_invocations();
+            if now == prev {
+                steady = true;
+                break;
+            }
+            prev = now;
+        }
+        assert!(
+            steady,
+            "an owner with a stabilized prototype guard plan must reach the steady-state memo skip"
+        );
+        assert!(
+            vm.ic_tiering_safepoint_memo_contains_for_test(fixture.owner),
+            "the owner must have a recorded safepoint memo in steady state"
+        );
+
+        // Now in steady state: the memo skips the five idempotent passes. Run many
+        // more entries and assert (i) the holder stays armed (the hoisted re-arm
+        // keeps writing it every entry), (ii) the value served is still 42, and
+        // (iii) the full-branch counter does NOT advance (the passes are skipped).
+        let frozen = vm.safepoint_pass_full_branch_invocations();
+        for _ in 0..16 {
+            host.clear_observations();
+            let result = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                fixture.owner,
+                &fixture.code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), object],
+            );
+            assert_eq!(
+                result,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+                "the re-arm must keep serving the correct prototype value while the memo skips the idempotent passes"
+            );
+            assert_ne!(
+                armed_holder(&vm),
+                0,
+                "the hoisted re-arm must keep the holder pointer armed every entry, even when the memo skips"
+            );
+        }
+        assert_eq!(
+            vm.safepoint_pass_full_branch_invocations(),
+            frozen,
+            "the steady-state memo must keep skipping the five idempotent passes across these entries"
+        );
+    }
+
     // Receiver-structure miss: once the resident prototype record is armed, an entry
     // whose RECEIVER has a DIFFERENT structure than the cached one fails the in-emit
     // structure guard (jne -> slow path) and slow-paths to the sidecar/interpreter
@@ -46445,11 +46707,16 @@ mod tests {
         );
     }
 
-    // Batch 1: a callee/owner WITH a registered plan (here a live call-link IC
-    // attachment record) must take the FULL safepoint path. After the first run
-    // attaches a call-link IC, the presence predicate flips to true and a second
-    // execute_code_block advances the full-branch counter by exactly 2 (prologue
-    // + epilogue), proving the guard does NOT skip when work is registered.
+    // Batch 1 + Batch 2: a callee/owner WITH a registered plan (here a live
+    // call-link IC attachment record) takes the FULL safepoint path while it is
+    // still attaching/transitioning that work. Batch 1 alone re-ran the five
+    // idempotent passes on EVERY subsequent call; Batch 2's memo collapses the
+    // steady state to a skip. This test pins both halves of the invariant: the
+    // FIRST encounter of registered work runs the full path (the counter
+    // advances), and a forced plan mutation re-arms the full path (the guard does
+    // NOT skip when there is genuinely new plan work). The pure steady-state skip
+    // and the fingerprint-change resume are pinned by
+    // vm_safepoint_passes_skipped_in_steady_state_and_resume_on_mutation.
     #[test]
     fn vm_safepoint_passes_run_full_path_for_owner_with_registered_plan() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
@@ -46465,6 +46732,7 @@ mod tests {
         let owner = register_test_code_block(&mut vm, code_block.clone());
         install_typed_baseline_for_test(&mut vm, owner, 1322);
 
+        let before_first = vm.safepoint_pass_full_branch_invocations();
         let (completion, _) = execute_registered_code_block_with_boundary_snapshot_and_arguments(
             &mut vm,
             owner,
@@ -46478,7 +46746,8 @@ mod tests {
         );
 
         // The first run attached a call-link IC for this owner, so the predicate
-        // must now report registered work.
+        // must now report registered work, and the attaching run took the full
+        // safepoint path (the counter advanced while the IC was materialized).
         assert!(
             !vm.tiering_integration()
                 .call_link_inline_cache_attachment_records()
@@ -46490,9 +46759,48 @@ mod tests {
                 .owner_has_any_safepoint_plan_work(owner),
             "owner with a registered call-link IC attachment must report safepoint work"
         );
+        assert!(
+            vm.safepoint_pass_full_branch_invocations() > before_first,
+            "the first encounter of registered plan work must run the full safepoint path"
+        );
 
-        // A second execution must take the FULL path on BOTH the prologue and
-        // epilogue safepoints: counter advances by exactly 2.
+        // Drive to steady state so the memo engages (counter freezes across a
+        // step), then force a genuine plan mutation: the next run must RESUME the
+        // full path -- the guard must not skip when new plan work is registered.
+        let mut prev = vm.safepoint_pass_full_branch_invocations();
+        for _ in 0..8 {
+            let (completion, _) =
+                execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                    &mut vm,
+                    owner,
+                    &code_block,
+                    &mut host,
+                    vec![RuntimeValue::undefined(), callee],
+                );
+            assert_eq!(
+                completion,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+            );
+            let now = vm.safepoint_pass_full_branch_invocations();
+            if now == prev {
+                break;
+            }
+            prev = now;
+        }
+
+        let bytecode_snapshot =
+            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(&code_block)
+                .expect("owner code block fingerprint");
+        vm.tiering_integration_mut()
+            .record_call_link_attachment_plan(VmCallLinkAttachmentPlanRequest {
+                boundary_validation_ordinal: 0,
+                owner,
+                frame: Some(CallFrameId(1)),
+                bytecode_index: BytecodeIndex::from_offset(0),
+                opcode: CoreOpcode::Call,
+                bytecode_snapshot,
+                slot: InlineCacheSlotId(9),
+            });
         let before = vm.safepoint_pass_full_branch_invocations();
         let (completion, _) = execute_registered_code_block_with_boundary_snapshot_and_arguments(
             &mut vm,
@@ -46505,10 +46813,134 @@ mod tests {
             completion,
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
+        assert!(
+            vm.safepoint_pass_full_branch_invocations() > before,
+            "a forced plan mutation must re-arm the full safepoint path for an owner with registered plans"
+        );
+    }
+
+    // Batch 2 (call-dispatch constant-factor): an owner that HAS plans but is in
+    // STEADY STATE (no six-table plan mutation and an unchanged CodeBlock
+    // fingerprint since its last full pass) must SKIP the five idempotent passes
+    // via the safepoint memo -- the full-branch counter stops advancing across
+    // further calls. It must RESUME advancing after (a) a forced plan mutation
+    // (plan_generation bump) or (b) a CodeBlock fingerprint change (memo-key
+    // mismatch). This is the Rust analogue of C++ JSC materializing call links
+    // per-LINK (LLIntSlowPaths.cpp setUpCall/linkFor): once a link is
+    // materialized and nothing changes, the per-call work disappears.
+    #[test]
+    fn vm_safepoint_passes_skipped_in_steady_state_and_resume_on_mutation() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let function_unlinked = js_call_return_41_function_code_block().unlinked().clone();
+        let function_blocks = vm
+            .install_source_function_blocks(vec![function_unlinked])
+            .expect("owned function executable call code");
+        let mut host = RecordingCoreHost::with_function_code_blocks(function_blocks);
+        let callee = load_function_value_for_test(&mut vm, &mut host, 0);
+        host.clear_observations();
+
+        let code_block = generated_js_call_return_consumed_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        install_typed_baseline_for_test(&mut vm, owner, 1322);
+
+        // Run 1: attaches the owner's call-link IC and records the memo. This is
+        // a full path (the attachment is this owner's first plan).
+        let run = |vm: &mut Vm, host: &mut RecordingCoreHost| {
+            let (completion, _) =
+                execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                    vm,
+                    owner,
+                    &code_block,
+                    host,
+                    vec![RuntimeValue::undefined(), callee],
+                );
+            assert_eq!(
+                completion,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+            );
+        };
+        run(&mut vm, &mut host);
+        assert!(
+            vm.tiering_integration()
+                .owner_has_any_safepoint_plan_work(owner),
+            "first run must attach a call-link IC for the owner"
+        );
+        assert!(
+            vm.ic_tiering_safepoint_memo_contains_for_test(owner),
+            "the full path must record a memo for the owner"
+        );
+
+        // Run 2: still warming (the second run can take the full path while the
+        // attachment lifecycle settles). After it, the owner is in steady state.
+        run(&mut vm, &mut host);
+
+        // STEADY STATE: a further run must SKIP both safepoints -> counter frozen.
+        let steady = vm.safepoint_pass_full_branch_invocations();
+        run(&mut vm, &mut host);
+        run(&mut vm, &mut host);
         assert_eq!(
-            vm.safepoint_pass_full_branch_invocations() - before,
-            2,
-            "owner with registered plans must run the full safepoint path in prologue + epilogue"
+            vm.safepoint_pass_full_branch_invocations(),
+            steady,
+            "steady-state runs with no plan mutation and unchanged fingerprint must skip the five passes"
+        );
+
+        // RESUME on a forced PLAN MUTATION: a genuine six-table mutation bumps the
+        // global plan_generation, so every memo (including this owner's) mismatches
+        // and the next safepoint takes the full path. Use a call-link attachment
+        // plan record (boundary_validation_ordinal 0 has no match -> a Rejected
+        // record is still pushed, which still bumps the epoch -- exactly the
+        // omission-proof behavior the coverage test asserts).
+        let bytecode_snapshot =
+            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(&code_block)
+                .expect("owner code block fingerprint");
+        let generation_before = vm.tiering_integration().plan_generation();
+        vm.tiering_integration_mut()
+            .record_call_link_attachment_plan(VmCallLinkAttachmentPlanRequest {
+                boundary_validation_ordinal: 0,
+                owner,
+                frame: Some(CallFrameId(1)),
+                bytecode_index: BytecodeIndex::from_offset(0),
+                opcode: CoreOpcode::Call,
+                bytecode_snapshot,
+                slot: InlineCacheSlotId(7),
+            });
+        assert!(
+            vm.tiering_integration().plan_generation() > generation_before,
+            "the forced plan mutation must bump plan_generation"
+        );
+        let before_mutation_resume = vm.safepoint_pass_full_branch_invocations();
+        run(&mut vm, &mut host);
+        assert!(
+            vm.safepoint_pass_full_branch_invocations() > before_mutation_resume,
+            "a plan-generation bump must force the full safepoint path on the next run"
+        );
+
+        // Back to steady state (the resume run re-recorded the memo at the new
+        // plan_generation): confirm the counter freezes again before the next case.
+        let steady_again = vm.safepoint_pass_full_branch_invocations();
+        run(&mut vm, &mut host);
+        assert_eq!(
+            vm.safepoint_pass_full_branch_invocations(),
+            steady_again,
+            "after re-recording the memo the owner must return to the steady-state skip"
+        );
+
+        // RESUME on a FINGERPRINT CHANGE: poke the memo's stored fingerprint to a
+        // structurally distinct value so the memo key mismatches even though
+        // plan_generation is unchanged. The next safepoint must take the full path.
+        let distinct = generated_native_call_return_object_code_block();
+        let distinct_fingerprint =
+            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(&distinct)
+                .expect("distinct code block fingerprint");
+        assert!(
+            vm.corrupt_ic_tiering_safepoint_memo_fingerprint_for_test(owner, distinct_fingerprint),
+            "owner must have a memo entry to corrupt"
+        );
+        let before_fingerprint_resume = vm.safepoint_pass_full_branch_invocations();
+        run(&mut vm, &mut host);
+        assert!(
+            vm.safepoint_pass_full_branch_invocations() > before_fingerprint_resume,
+            "a CodeBlock fingerprint change must force the full safepoint path on the next run"
         );
     }
 

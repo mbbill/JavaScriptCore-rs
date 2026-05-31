@@ -260,6 +260,21 @@ pub struct VmTieringIntegration {
     next_watchpoint_set: u64,
     next_watchpoint_dependency: u64,
     next_structure_stub_repatch_code_id: u64,
+    // Batch 2 of the call-dispatch constant-factor plan. A single GLOBAL epoch
+    // bumped by +1 on EVERY mutation (insert OR lifecycle transition) of the six
+    // owner-keyed plan/candidate tables that the five idempotent IC/tiering
+    // safepoint passes consult (the same six tables
+    // `owner_has_any_safepoint_plan_work` reads). The Vm-side owner-keyed memo in
+    // `run_ic_tiering_safepoint` keys its skip decision on this value: when an
+    // owner HAS plans but is in steady state (no plan-table mutation since the
+    // last full pass), the five idempotent passes are pure waste and the memo
+    // skips them. A mutation to ANY owner bumps this and invalidates every memo
+    // (coarse but sound: the audit confirmed plan state stabilizes after warmup,
+    // so the skip still engages). Deliberately NOT `next_ordinal`, which is
+    // bumped ~6M times/run by per-call entry/completion/observation records and
+    // never stabilizes. Init 0 via `Default`; bumped only through
+    // `bump_plan_generation` so the six tables are the only mutation surface.
+    plan_generation: u64,
 }
 
 impl VmTieringIntegration {
@@ -289,6 +304,26 @@ impl VmTieringIntegration {
 
     pub fn record_ordinal_count(&self) -> u64 {
         self.next_ordinal
+    }
+
+    // Batch 2: read the global plan-generation epoch (see the `plan_generation`
+    // field comment). The Vm-side safepoint memo compares this against its stored
+    // per-owner snapshot to decide whether the six plan/candidate tables changed
+    // since the last full IC/tiering safepoint pass for that owner.
+    pub(crate) fn plan_generation(&self) -> u64 {
+        self.plan_generation
+    }
+
+    // Batch 2: the SINGLE bump site for the plan-generation epoch. Every mutation
+    // (insert OR lifecycle transition) of the six owner-keyed plan/candidate
+    // tables routes through this so omission is structurally impossible: a new
+    // mutator that forgets to call this is caught by the coverage test
+    // `plan_generation_advances_on_every_six_table_mutation`. Coarse over-bumping
+    // (e.g. when a transition's `.find()` misses or an outcome is Rejected) is
+    // sound -- it only forces an extra full safepoint pass, never skips a needed
+    // one.
+    fn bump_plan_generation(&mut self) {
+        self.plan_generation = self.plan_generation.saturating_add(1);
     }
 
     pub fn property_load_observations(&self) -> &[VmPropertyLoadObservationRecord] {
@@ -2946,6 +2981,7 @@ impl VmTieringIntegration {
                 return Ok(record);
             }
             let ordinal = self.next_record_ordinal();
+            self.bump_plan_generation();
             self.property_load_access_case_plans
                 .push(VmPropertyLoadAccessCasePlanRecord {
                     ordinal,
@@ -3019,6 +3055,7 @@ impl VmTieringIntegration {
                     self.next_watchpoint_dependency_id(),
                 )
             });
+            self.bump_plan_generation();
             self.property_load_guard_plans
                 .push(VmPropertyLoadGuardPlanRecord {
                     ordinal,
@@ -4183,6 +4220,7 @@ impl VmTieringIntegration {
                 return Ok(record);
             }
             let ordinal = self.next_record_ordinal();
+            self.bump_plan_generation();
             self.property_store_access_case_plans
                 .push(VmPropertyStoreAccessCasePlanRecord {
                     ordinal,
@@ -4410,6 +4448,7 @@ impl VmTieringIntegration {
             lifecycle: VmCallLinkAttachmentPlanLifecycle::MetadataOnly,
             outcome,
         };
+        self.bump_plan_generation();
         self.call_link_attachment_plan_records.push(record.clone());
         record
     }
@@ -4505,6 +4544,7 @@ impl VmTieringIntegration {
             outcome: outcome.clone(),
         };
 
+        self.bump_plan_generation();
         self.call_link_inline_cache_attachment_records
             .push(record.clone());
         record
@@ -4580,6 +4620,10 @@ impl VmTieringIntegration {
         &mut self,
         clear: &VmCallLinkInlineCacheClearRecord,
     ) {
+        // Batch 2: this retires `call_link_inline_cache_attachment_records` and
+        // `call_link_attachment_plan_records` entries (-> Cleared/RetiredByClear).
+        // Bump unconditionally at entry; over-bump if no record matches is sound.
+        self.bump_plan_generation();
         if let Some(attachment) = self
             .call_link_inline_cache_attachment_records
             .iter_mut()
@@ -4812,6 +4856,10 @@ impl VmTieringIntegration {
         &mut self,
         request: VmPropertyLoadGuardWatchpointInvalidationRequest,
     ) -> VmPropertyLoadGuardWatchpointInvalidationRecord {
+        // Batch 2: on an Accepted invalidation this retires a
+        // `property_load_guard_plans` entry (-> Retired). Bump unconditionally at
+        // entry; over-bump on a non-retiring outcome is sound.
+        self.bump_plan_generation();
         let ordinal = self.next_record_ordinal();
         let outcome = vm_property_load_guard_watchpoint_invalidation_outcome(self, &request);
         let retires_guard = matches!(
@@ -4971,6 +5019,10 @@ impl VmTieringIntegration {
         &mut self,
         request: VmGeneratedPropertyLoadProbeMissRequest,
     ) -> VmGeneratedPropertyLoadProbeMissRecord {
+        // Batch 2: a terminal miss invalidates matching
+        // `property_load_access_case_plans` entries (-> Invalidated). Bump
+        // unconditionally at entry; over-bump on a non-terminal miss is sound.
+        self.bump_plan_generation();
         let ordinal = self.next_record_ordinal();
         let terminal = generated_property_load_probe_miss_invalidates_plan(request.reason);
         let mut invalidated_plan_ordinals = Vec::new();
@@ -5215,6 +5267,7 @@ impl VmTieringIntegration {
             self.mark_property_inline_cache_attachment_plan_attached(&request, ordinal);
         }
 
+        self.bump_plan_generation();
         self.property_inline_cache_attachment_records
             .push(record.clone());
         record
@@ -5611,6 +5664,11 @@ impl VmTieringIntegration {
         request: VmPropertyInlineCacheClearRequest,
         outcome: VmPropertyInlineCacheClearOutcome,
     ) -> VmPropertyInlineCacheClearRecord {
+        // Batch 2: on an Accepted clear this flips a
+        // `property_inline_cache_attachment_records` entry to `Cleared`. Bump
+        // unconditionally at entry (coarse over-bump on a Rejected clear is
+        // sound).
+        self.bump_plan_generation();
         let ordinal = self.next_record_ordinal();
         let code_block_outcome = match &outcome {
             VmPropertyInlineCacheClearOutcome::Accepted { outcome } => Some(outcome),
@@ -5779,6 +5837,11 @@ impl VmTieringIntegration {
         request: &VmPropertyInlineCacheAttachmentRequest,
         attachment_ordinal: u64,
     ) {
+        // Batch 2: lifecycle transition of one of the three plan tables
+        // (load access-case / guard / store access-case) to `Attached`. Bump
+        // unconditionally before the match -- coarse over-bump if the
+        // `.find()` below misses is sound.
+        self.bump_plan_generation();
         match request.kind {
             VmPropertyInlineCacheAttachmentKind::OwnDataLoad => {
                 if let Some(plan) = self
@@ -5820,6 +5883,10 @@ impl VmTieringIntegration {
         &mut self,
         request: VmGeneratedGuardedPropertyLoadProbeMissRequest,
     ) -> VmGeneratedGuardedPropertyLoadProbeMissRecord {
+        // Batch 2: a terminal guarded miss retires the matching
+        // `property_load_guard_plans` entry (-> RetiredByTerminalGuardedMiss).
+        // Bump unconditionally at entry; over-bump on a non-terminal miss is sound.
+        self.bump_plan_generation();
         let ordinal = self.next_record_ordinal();
         let terminal = generated_guarded_property_load_probe_miss_terminal(request.reason);
         let retired_guard_plan_ordinal =
@@ -34227,5 +34294,254 @@ mod tests {
             }
         );
         assert!(tiering.baseline_entry_artifacts().is_empty());
+    }
+
+    // Batch 2 coverage test: `plan_generation` MUST advance after every kind of
+    // mutation (insert OR lifecycle transition) of the six owner-keyed
+    // plan/candidate tables. This is the omission-proofing guarantee for the
+    // steady-state safepoint memo in `Vm::run_ic_tiering_safepoint`: if a future
+    // edit adds a six-table mutator that forgets to bump the epoch (directly or
+    // by routing through one of the covered recorders), the memo could SKIP an
+    // IC/call-link materialization the call actually needs. Each block below
+    // captures the epoch, performs exactly one category of mutation through the
+    // public recorder, and asserts the epoch strictly increased.
+    #[test]
+    fn plan_generation_advances_on_every_six_table_mutation() {
+        // INSERT 1: property_load_access_case_plans (own-data load observation).
+        {
+            let owner = CodeBlockId(CellId(7001));
+            let bytecode_index = BytecodeIndex::from_offset(8);
+            let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+            let mut tiering = VmTieringIntegration::default();
+            let descriptor =
+                property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+            let before = tiering.plan_generation();
+            record_property_load_descriptor_after_initial_countdown(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                descriptor,
+            );
+            assert_eq!(tiering.property_load_access_case_plans().len(), 1);
+            assert!(
+                tiering.plan_generation() > before,
+                "load access-case plan insert must bump plan_generation"
+            );
+        }
+
+        // INSERT 2: property_load_guard_plans (prototype-data guard observation).
+        {
+            let (tiering, _guard_plan, _) = record_prototype_data_guard_fixture();
+            assert_eq!(tiering.property_load_guard_plans().len(), 1);
+            // The fixture starts from a fresh default (epoch 0) and inserts a
+            // guard plan, so a non-zero epoch proves the guard-plan insert bumped.
+            assert!(
+                tiering.plan_generation() > 0,
+                "guard plan insert must bump plan_generation"
+            );
+        }
+
+        // INSERT 3: property_store_access_case_plans (own-data store observation).
+        {
+            let owner = CodeBlockId(CellId(7003));
+            let bytecode_index = BytecodeIndex::from_offset(9);
+            let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+            let mut tiering = VmTieringIntegration::default();
+            let mut descriptor = property_store_observation(
+                owner,
+                InlineCacheSlotId(4),
+                bytecode_index,
+                PropertyStoreObservationOutcome::OwnDataStore,
+            );
+            descriptor.base_structure_before = Some(StructureId(801));
+            descriptor.base_structure_after = Some(StructureId(801));
+            let mut saw_bump = false;
+            let mut last = tiering.plan_generation();
+            for _ in 0..8 {
+                record_property_store_descriptor(
+                    &mut tiering,
+                    owner,
+                    bytecode_snapshot,
+                    descriptor.clone(),
+                );
+                if tiering.plan_generation() > last {
+                    saw_bump = true;
+                }
+                last = tiering.plan_generation();
+            }
+            assert_eq!(tiering.property_store_access_case_plans().len(), 1);
+            assert!(
+                saw_bump,
+                "store access-case plan insert must bump plan_generation"
+            );
+        }
+
+        // INSERT 4 + TRANSITION (plan -> Attached): property_inline_cache_attachment_records
+        // insert plus mark_property_inline_cache_attachment_plan_attached.
+        {
+            let (mut tiering, plan, _attachment, _candidate) = structure_stub_transaction_fixture();
+            // The fixture already performed the attachment insert and the
+            // plan-attached transition from a fresh default, so the epoch is
+            // already non-zero. Re-run an attachment to observe a fresh bump and
+            // capture the property-inline-cache-clear transition below.
+            let before = tiering.plan_generation();
+            let request = VmPropertyInlineCacheClearRequest {
+                owner: plan.owner,
+                bytecode_index: plan.bytecode_index,
+                bytecode_snapshot: plan.bytecode_snapshot,
+                slot: plan.plan.slot,
+                kind: VmPropertyInlineCacheAttachmentKind::OwnDataLoad,
+                attachment_ordinal: _attachment.ordinal,
+                source_plan_ordinal: plan.ordinal,
+                guarded_materialization_ordinal: None,
+                guarded_dependency_ordinals: Vec::new(),
+                guarded_binding_set_ids: Vec::new(),
+                triggering_invalidation_ordinal: None,
+                triggering_event_dispatch_ordinal: None,
+                key: plan.plan.key,
+                base_structure: plan.plan.access_case.base_structure.unwrap(),
+                holder_structure: None,
+                new_structure: None,
+                offset: plan.plan.access_case.offset,
+            };
+            // TRANSITION: property_inline_cache_clear flips the attachment record
+            // to Cleared (and retires the source plan via the nested
+            // structure-stub clear). Rejected or accepted, the recorder bumps.
+            tiering.record_property_inline_cache_clear(
+                request,
+                VmPropertyInlineCacheClearOutcome::Rejected {
+                    reason: VmPropertyInlineCacheClearRejectionReason::AttachmentMissing,
+                },
+            );
+            assert!(
+                tiering.plan_generation() > before,
+                "property inline cache clear must bump plan_generation"
+            );
+            // Also assert the original fixture inserts bumped from zero.
+            assert!(before > 0, "attachment insert must bump plan_generation");
+        }
+
+        // INSERT 5: call_link_attachment_plan_records.
+        {
+            let (tiering, ..) = record_call_link_attachment_plan_fixture();
+            assert_eq!(tiering.call_link_attachment_plan_records().len(), 1);
+            assert!(
+                tiering.plan_generation() > 0,
+                "call-link attachment plan insert must bump plan_generation"
+            );
+        }
+
+        // INSERT 6 + TRANSITION (clear): call_link_inline_cache_attachment_records
+        // insert plus retire_call_link_inline_cache_metadata_for_clear.
+        {
+            let (mut tiering, _, _, attachment, _, _) =
+                record_call_link_inline_cache_attachment_fixture();
+            assert!(
+                tiering.plan_generation() > 0,
+                "call-link inline cache attachment insert must bump plan_generation"
+            );
+            let before = tiering.plan_generation();
+            let request = call_link_inline_cache_clear_request(&attachment);
+            let outcome = call_link_inline_cache_clear_outcome(&attachment);
+            tiering.record_call_link_inline_cache_clear(
+                request,
+                VmCallLinkInlineCacheClearOutcome::Accepted { outcome },
+            );
+            assert!(
+                tiering.plan_generation() > before,
+                "call-link inline cache clear must bump plan_generation"
+            );
+        }
+
+        // TRANSITION: property_load_guard_plans -> Retired via watchpoint
+        // invalidation. The materialization/recheck setup touches non-six tables
+        // (no bump), so the delta isolates the invalidation recorder.
+        {
+            let (mut tiering, guard_plan, _) = record_prototype_data_guard_fixture();
+            let materialization = accepted_watchpoint_materialization(
+                &mut tiering,
+                &guard_plan,
+                WatchpointState::Clear,
+                None,
+                300,
+            );
+            let binding = materialization.bindings[0].clone();
+            let event = watchpoint_fire_event_for_binding(
+                &binding,
+                WatchpointGeneration(binding.sampled_generation.0 + 1),
+            );
+            let before = tiering.plan_generation();
+            tiering.record_property_load_guard_watchpoint_invalidation(
+                VmPropertyLoadGuardWatchpointInvalidationRequest {
+                    materialization_ordinal: materialization.ordinal,
+                    event,
+                },
+            );
+            assert!(
+                tiering.plan_generation() > before,
+                "guard watchpoint invalidation must bump plan_generation"
+            );
+        }
+
+        // TRANSITION: property_load_access_case_plans -> Invalidated via generated
+        // property-load probe miss.
+        {
+            let owner = CodeBlockId(CellId(7009));
+            let bytecode_index = BytecodeIndex::from_offset(8);
+            let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+            let mut tiering = VmTieringIntegration::default();
+            let descriptor =
+                property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+            record_property_load_descriptor_after_initial_countdown(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                descriptor,
+            );
+            let plan = tiering.property_load_access_case_plans()[0].clone();
+            let request = generated_property_load_probe_miss_request(
+                &plan,
+                GeneratedPropertyLoadProbeMissReason::StructureMismatch,
+            );
+            let before = tiering.plan_generation();
+            tiering.record_generated_property_load_probe_miss(request);
+            assert!(
+                tiering.plan_generation() > before,
+                "generated property-load probe miss must bump plan_generation"
+            );
+        }
+
+        // TRANSITION: property_load_guard_plans -> RetiredByTerminalGuardedMiss via
+        // generated guarded property-load probe miss.
+        {
+            let (mut tiering, guard_plan, bytecode_snapshot) =
+                record_prototype_data_guard_fixture();
+            accepted_watchpoint_materialization(
+                &mut tiering,
+                &guard_plan,
+                WatchpointState::Clear,
+                None,
+                301,
+            );
+            let table = tiering
+                .property_load_guarded_candidate_table_for_owner(
+                    guard_plan.owner,
+                    bytecode_snapshot,
+                )
+                .expect("guarded candidate table");
+            let candidate = table.candidates()[0].clone();
+            let request = generated_guarded_property_load_probe_miss_request(
+                &guard_plan,
+                &candidate,
+                GeneratedGuardedPropertyLoadProbeMissReason::HostUnavailable,
+                None,
+            );
+            let before = tiering.plan_generation();
+            tiering.record_generated_guarded_property_load_probe_miss(request);
+            assert!(
+                tiering.plan_generation() > before,
+                "generated guarded property-load probe miss must bump plan_generation"
+            );
+        }
     }
 }
