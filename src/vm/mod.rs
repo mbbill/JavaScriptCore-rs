@@ -2166,6 +2166,15 @@ impl Vm {
         &self.config
     }
 
+    fn can_execute_p6_x86_64_emitted_native_entry(&self) -> bool {
+        // C++ JSC selects a CPU-specific MacroAssembler/JIT backend before
+        // publishing callable JIT code. Rust currently has only the P6 x86_64
+        // emitted C-ABI entry; on arm64 macOS we may still keep its metadata
+        // records for fidelity tests, but executing those bytes is not a valid
+        // substitute for JSC's ARM64 backend.
+        self.config.host_capabilities.can_use_jit && cfg!(all(unix, target_arch = "x86_64"))
+    }
+
     pub fn heap(&self) -> &Heap {
         &self.heap
     }
@@ -4800,6 +4809,17 @@ impl Vm {
                         == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
                 })
                 .unwrap_or(false)
+                && !self.can_execute_p6_x86_64_emitted_native_entry()
+            {
+                return;
+            }
+            if readiness
+                .callable
+                .map(|callable| {
+                    callable.kind()
+                        == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
+                })
+                .unwrap_or(false)
                 && self
                     .platform_residency_index_for_native_entry(&readiness, &descriptor)
                     .is_none()
@@ -5262,6 +5282,11 @@ impl Vm {
         let Some(callable) = readiness.callable else {
             return None;
         };
+        if callable.kind() == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
+            && !self.can_execute_p6_x86_64_emitted_native_entry()
+        {
+            return None;
+        }
         let Some(descriptor) = readiness.descriptor else {
             return None;
         };
@@ -5451,6 +5476,9 @@ impl Vm {
                 ))
             }
         };
+        if !self.can_execute_p6_x86_64_emitted_native_entry() {
+            return fallback(self, host);
+        }
 
         let vm = NonNull::from(&mut *self).cast::<c_void>();
         let mut invocation = initial_invocation;
@@ -7680,6 +7708,9 @@ impl Vm {
             .callable
             .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
         if callable.kind() != BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry {
+            return Ok(None);
+        }
+        if !self.can_execute_p6_x86_64_emitted_native_entry() {
             return Ok(None);
         }
         let descriptor = readiness
@@ -10492,6 +10523,9 @@ impl Vm {
         if callable.kind() != BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry {
             return Err(VmGeneratedDirectCallRootlessRejectionReason::EffectContract);
         }
+        if !self.can_execute_p6_x86_64_emitted_native_entry() {
+            return Err(VmGeneratedDirectCallRootlessRejectionReason::InvalidGeneratedArtifact);
+        }
         let descriptor = readiness
             .descriptor
             .ok_or(VmGeneratedDirectCallRootlessRejectionReason::InvalidGeneratedArtifact)?;
@@ -10699,7 +10733,13 @@ impl Vm {
         let readiness = self
             .tiering
             .baseline_native_entry_readiness_for_gate(&gate)?;
-        readiness.callable.map(|callable| callable.kind())
+        let kind = readiness.callable.map(|callable| callable.kind())?;
+        if kind == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
+            && !self.can_execute_p6_x86_64_emitted_native_entry()
+        {
+            return None;
+        }
+        Some(kind)
     }
 
     fn validate_rootless_emitted_native_entry_body(
@@ -20286,6 +20326,27 @@ mod tests {
     use std::pin::Pin;
     use std::ptr::NonNull;
     use std::sync::Arc;
+
+    fn assert_host_supported_baseline_source_execution_path(
+        vm: &Vm,
+        execution_path: TierEntryExecutionPath,
+    ) {
+        if vm.can_execute_p6_x86_64_emitted_native_entry() {
+            assert_eq!(
+                execution_path,
+                TierEntryExecutionPath::NativeCode(JitType::Baseline)
+            );
+        } else {
+            assert!(
+                matches!(
+                    execution_path,
+                    TierEntryExecutionPath::Interpreter
+                        | TierEntryExecutionPath::NativeCode(JitType::Baseline)
+                ),
+                "unsupported x86_64 emitted entries should either stay on the interpreter path or use a platform-independent native shim, got {execution_path:?}"
+            );
+        }
+    }
 
     fn source(text: &str) -> SourceCode {
         let provider = Arc::new(SourceProvider::new(
@@ -31750,9 +31811,9 @@ mod tests {
         assert_ne!(global_allocation.response.cell, diagnostic_owner.0);
 
         assert!(vm.tiering_integration().fallback_records().is_empty());
-        assert_eq!(
+        assert_host_supported_baseline_source_execution_path(
+            &vm,
             vm.tiering_integration().diagnostics()[0].execution_path,
-            TierEntryExecutionPath::NativeCode(JitType::Baseline)
         );
     }
 
@@ -35425,13 +35486,22 @@ mod tests {
             completion,
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
-        assert_eq!(
-            host.dispatches
-                .iter()
-                .map(|(_, index, opcode)| (*index, *opcode))
-                .collect::<Vec<_>>(),
-            vec![(BytecodeIndex::from_offset(1), Some(CoreOpcode::Call))]
-        );
+        let dispatches = host
+            .dispatches
+            .iter()
+            .map(|(_, index, opcode)| (*index, *opcode))
+            .collect::<Vec<_>>();
+        if vm.can_execute_p6_x86_64_emitted_native_entry() {
+            assert_eq!(
+                dispatches,
+                vec![(BytecodeIndex::from_offset(1), Some(CoreOpcode::Call))]
+            );
+        } else {
+            assert_eq!(
+                dispatches.first().copied(),
+                Some((BytecodeIndex::from_offset(1), Some(CoreOpcode::Call)))
+            );
+        }
         assert!(host.dispatch_roots[0]
             .iter()
             .any(|record| record.target == callee_cell));
@@ -36261,15 +36331,19 @@ mod tests {
             second_completion,
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
-        assert_eq!(
-            host.dispatches
-                .iter()
-                .map(|(_, index, opcode)| (*index, *opcode))
-                .collect::<Vec<_>>(),
-            vec![],
-            "monomorphic user-JS CallWithThis must enter the callee through the resident direct call \
-             and resume the owner in generated code without an interpreter exit"
-        );
+        let dispatches = host
+            .dispatches
+            .iter()
+            .map(|(_, index, opcode)| (*index, *opcode))
+            .collect::<Vec<_>>();
+        if vm.can_execute_p6_x86_64_emitted_native_entry() {
+            assert_eq!(
+                dispatches,
+                vec![],
+                "monomorphic user-JS CallWithThis must enter the callee through the resident direct call \
+                 and resume the owner in generated code without an interpreter exit"
+            );
+        }
         assert_eq!(
             vm.tiering_integration()
                 .generated_call_link_probe_misses()
@@ -36403,14 +36477,18 @@ mod tests {
                 "the relinked site must keep executing callee B (-> 7, +1 -> 8)"
             );
         }
-        assert_eq!(
-            host.dispatches
-                .iter()
-                .map(|(_, index, opcode)| (*index, *opcode))
-                .collect::<Vec<_>>(),
-            vec![],
-            "after relinking to B, the call site must be resident again (no interpreter exit)"
-        );
+        let dispatches = host
+            .dispatches
+            .iter()
+            .map(|(_, index, opcode)| (*index, *opcode))
+            .collect::<Vec<_>>();
+        if vm.can_execute_p6_x86_64_emitted_native_entry() {
+            assert_eq!(
+                dispatches,
+                vec![],
+                "after relinking to B, the call site must be resident again (no interpreter exit)"
+            );
+        }
 
         // Switching back to A must again execute A (42), proving the identity guard distinguishes
         // both linked callees and never confuses their bodies.
@@ -47730,16 +47808,28 @@ mod tests {
             );
 
         assert_eq!(completion, ExecutionCompletion::Returned(this_value));
-        assert_eq!(
-            host.dispatches
-                .iter()
-                .map(|(_, index, opcode)| (*index, *opcode))
-                .collect::<Vec<_>>(),
-            vec![(
-                BytecodeIndex::from_offset(1),
-                Some(CoreOpcode::CallWithThis)
-            )]
-        );
+        let dispatches = host
+            .dispatches
+            .iter()
+            .map(|(_, index, opcode)| (*index, *opcode))
+            .collect::<Vec<_>>();
+        if vm.can_execute_p6_x86_64_emitted_native_entry() {
+            assert_eq!(
+                dispatches,
+                vec![(
+                    BytecodeIndex::from_offset(1),
+                    Some(CoreOpcode::CallWithThis)
+                )]
+            );
+        } else {
+            assert_eq!(
+                dispatches.first().copied(),
+                Some((
+                    BytecodeIndex::from_offset(1),
+                    Some(CoreOpcode::CallWithThis)
+                ))
+            );
+        }
         assert!(host.dispatch_roots[0]
             .iter()
             .any(|record| record.target == callee_cell));
@@ -66021,13 +66111,13 @@ mod tests {
                 tier: JitType::Baseline
             }
         );
-        assert_eq!(
+        assert_host_supported_baseline_source_execution_path(
+            &baseline_vm,
             baseline_decision.execution_path,
-            TierEntryExecutionPath::NativeCode(JitType::Baseline)
         );
-        assert_eq!(
+        assert_host_supported_baseline_source_execution_path(
+            &baseline_vm,
             baseline_vm.tiering_integration().diagnostics()[0].execution_path,
-            TierEntryExecutionPath::NativeCode(JitType::Baseline)
         );
         assert!(baseline_vm
             .tiering_integration()

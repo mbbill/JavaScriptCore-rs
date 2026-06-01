@@ -94,7 +94,7 @@ non-trivial Rust-only structures need C++ mapping or safety justification plus
 code comments at the divergence point.
 
 The main agent is architect/scheduler/reviewer, not primary implementer. At
-resume, inspect git state, recent commits, and `docs/jsc-status-tree.md`; build
+resume, inspect git state, recent commits, and `README.md`; build
 a small queue of highest-value unblocked dependencies; parallelize independent
 audits, implementation, and reviewer-subagent work; keep serial architecture
 decisions explicit. Consume concise reports with C++ evidence and file/line
@@ -122,7 +122,7 @@ next blocker.
   smallest architecture/design decision that unblocks faithful C++ translation,
   and either unblocking the batch, delegating more audit/review, deferring it, or
   rejecting the approach.
-- MUST maintain `docs/jsc-status-tree.md` as the compact current status source.
+- MUST maintain `README.md` as the compact current status source.
 - MUST use git commit messages as the durable progress and decision log.
 - MUST keep one accepted batch to one logical commit.
 
@@ -160,7 +160,7 @@ project-owner input is genuinely required.
 After resume or compaction:
 
 1. Inspect `git status --short` and recent commits.
-2. Check `docs/jsc-status-tree.md`.
+2. Check `README.md`.
 3. Identify the highest shared blockers from evidence, not memory.
 4. Build a small work queue: serial architecture decisions first, independent
    audits/implementations/reviews in parallel, lower-value work deferred.
@@ -182,7 +182,7 @@ The main agent MUST follow this workflow indefinitely until the final goal is
 done:
 
 1. Start by inspecting git state, recent commits, and
-   `docs/jsc-status-tree.md`.
+   `README.md`.
 2. Identify the highest-value unblocked dependencies from the status tree and
    current evidence.
 3. Classify each candidate as serial architecture, parallel audit, parallel
@@ -193,14 +193,14 @@ done:
    review for substantial or cross-module patches.
 6. Accept only work with C++ evidence, structure mapping, passing relevant
    gates, and a clear commit boundary.
-7. Update only affected lines in `docs/jsc-status-tree.md`; keep it around
+7. Update only affected lines in `README.md`; keep the embedded status tree around
    100-200 lines.
 8. Commit each accepted batch before starting dependent implementation work;
    independent parallel work may continue if isolated and explicitly WIP.
 9. Put durable decisions in the commit message: C++ evidence, what changed, why
    this dependency was chosen, ownership/architecture decisions, tests/probes,
    and remaining risk or next blocker.
-10. Use commit history plus `docs/jsc-status-tree.md` as the progress record.
+10. Use commit history plus `README.md` as the progress record.
 
 ## Subagent Rules
 

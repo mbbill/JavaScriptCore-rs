@@ -185,6 +185,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
 
 [wip] Verification and integration discipline
   [done] focused Rust gates for current accepted slices
+  [done] macOS arm64 bring-up gate: x86_64 P6 emitted native entries are guarded
+         as non-callable on arm64, while generated/interpreter fallbacks keep tests green
   [wip] release octane_probe evidence for active bottlenecks
   [missing] local C++ JSC comparison harness for parity claims
   [missing] standard subagent reviewer flow for every substantial patch

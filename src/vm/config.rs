@@ -24,6 +24,10 @@ impl VmConfig {
         Self {
             execution_mode: VmExecutionMode::BaselineAllowed,
             enable_jit_compatibility_fields: true,
+            host_capabilities: HostCapabilities {
+                can_use_jit: cfg!(all(unix, target_arch = "x86_64")),
+                ..HostCapabilities::default()
+            },
             ..Self::default()
         }
     }
