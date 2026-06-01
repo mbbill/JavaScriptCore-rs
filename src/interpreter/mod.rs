@@ -1315,8 +1315,9 @@ impl FrameRootDescriptor {
 ///   `register_root_id` keys on) whose cell-membership may have changed. The
 ///   in-loop sync patches the registry for exactly slots `lo..=hi`.
 /// - `FullWindow`: a whole-span mutation happened outside the per-slot funnel
-///   (`allocate_frame`/`release_frame`); the in-loop sync must rescan the full
-///   window, exactly like the prior bool.
+///   (`allocate_frame`); the in-loop sync must rescan the full window, exactly
+///   like the prior bool. Releasing the top frame is handled by the root owner
+///   cleaning that frame's window and does not dirty the surviving caller.
 ///
 /// Coalescing widens the span monotonically: two writes to different slots
 /// between syncs produce a `Slots` span covering both, so both are patched.
@@ -1586,11 +1587,11 @@ impl RegisterFile {
         // tail) fragile. The interpreter dispatch loop is single-frame -- it
         // exits the loop at every call/construct boundary (DispatchOutcome::
         // OrdinaryBytecodeCall/Construct/FunctionValueCall/Return), and the
-        // nested `execute_code_block` runs its own UNCONDITIONAL pre-loop sync
-        // for the new window -- so this signal is not strictly required for
-        // correctness today. Setting it is cheap and keeps the dirty signal
-        // sound if a future path retains the same loop frame across an
-        // allocation. When in doubt, full-rescan.
+        // nested `execute_code_block` performs a fresh-frame full sync for the
+        // new window -- so this signal is not strictly required for correctness
+        // today. Setting it is cheap and keeps the dirty signal sound if a
+        // future path retains the same loop frame across an allocation. When in
+        // doubt, full-rescan.
         self.cell_root_dirty = CellRootDirty::FullWindow;
         Ok(window)
     }
@@ -1604,14 +1605,12 @@ impl RegisterFile {
             return Err(ExecutionError::RegisterWindowMismatch);
         }
         self.values.truncate(window.base);
-        // Conservative dirty signal: truncation drops the released window's
-        // slots (any cells they held) without funneling through `write` -- again
-        // a whole-span mutation outside the per-slot funnel, so it forces a
-        // FULL-WINDOW rescan (`FullWindow`) rather than a per-slot patch. As
-        // with `allocate_frame`, the dispatch loop exits at call/return/unwind
-        // boundaries so this is not strictly required today, but a full rescan
-        // here is cheap and keeps the signal sound. When in doubt, full-rescan.
-        self.cell_root_dirty = CellRootDirty::FullWindow;
+        // C++ JSC scans the live call-frame span at a GC safepoint; popping the
+        // top frame does not make the surviving caller frame dirty. Rust's
+        // precise targeted-root bridge therefore cleans the popped frame through
+        // the frame/root owner, not by forcing the next caller entry to rescan a
+        // full surviving window. A returned cell still dirties the caller
+        // through `write`, below, because that is an actual caller-slot change.
         Ok(())
     }
 
@@ -29652,6 +29651,7 @@ pub fn execute_code_block<H: DispatchHost>(
     host: &mut H,
     config: DispatchConfig,
 ) -> ExecutionCompletion {
+    let mut root_scope = InterpreterRootSyncScope::new();
     execute_code_block_with_resume(
         execution,
         code_block_id,
@@ -29660,6 +29660,8 @@ pub fn execute_code_block<H: DispatchHost>(
         config,
         None,
         InterpreterCallHandling::direct_interpreter(),
+        &mut root_scope,
+        InterpreterRootScopeMode::ScopedDispatch,
     )
 }
 
@@ -29671,6 +29673,7 @@ pub(crate) fn execute_baseline_fallback<H: DispatchHost>(
     host: &mut H,
     config: DispatchConfig,
 ) -> ExecutionCompletion {
+    let mut root_scope = InterpreterRootSyncScope::new();
     execute_code_block_with_resume(
         execution,
         request.code_block,
@@ -29679,15 +29682,18 @@ pub(crate) fn execute_baseline_fallback<H: DispatchHost>(
         config,
         Some(request),
         InterpreterCallHandling::direct_interpreter(),
+        &mut root_scope,
+        InterpreterRootScopeMode::ScopedDispatch,
     )
 }
 
-pub(crate) fn execute_code_block_deferring_ordinary_calls<H: DispatchHost>(
+pub(crate) fn execute_code_block_deferring_ordinary_calls_with_root_scope<H: DispatchHost>(
     execution: InterpreterExecutionState<'_>,
     code_block_id: CodeBlockId,
     code_block: &CodeBlock,
     host: &mut H,
     config: DispatchConfig,
+    root_scope: &mut InterpreterRootSyncScope,
 ) -> ExecutionCompletion {
     execute_code_block_with_resume(
         execution,
@@ -29697,15 +29703,21 @@ pub(crate) fn execute_code_block_deferring_ordinary_calls<H: DispatchHost>(
         config,
         None,
         InterpreterCallHandling::defer_to_vm(),
+        root_scope,
+        InterpreterRootScopeMode::VmStack,
     )
 }
 
-pub(crate) fn execute_baseline_fallback_deferring_ordinary_calls<H: DispatchHost>(
+pub(crate) fn execute_baseline_fallback_deferring_ordinary_calls_with_root_scope<
+    H: DispatchHost,
+>(
     execution: InterpreterExecutionState<'_>,
     request: BaselineFallbackRequest,
     code_block: &CodeBlock,
     host: &mut H,
     config: DispatchConfig,
+    root_scope: &mut InterpreterRootSyncScope,
+    root_scope_mode: InterpreterRootScopeMode,
 ) -> ExecutionCompletion {
     execute_code_block_with_resume(
         execution,
@@ -29715,7 +29727,15 @@ pub(crate) fn execute_baseline_fallback_deferring_ordinary_calls<H: DispatchHost
         config,
         Some(request),
         InterpreterCallHandling::defer_to_vm(),
+        root_scope,
+        root_scope_mode,
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InterpreterRootScopeMode {
+    ScopedDispatch,
+    VmStack,
 }
 
 #[allow(dead_code)]
@@ -29901,8 +29921,11 @@ fn execute_code_block_with_resume<H: DispatchHost>(
     config: DispatchConfig,
     resume: Option<BaselineFallbackRequest>,
     call_handling: InterpreterCallHandling,
+    root_scope: &mut InterpreterRootSyncScope,
+    root_scope_mode: InterpreterRootScopeMode,
 ) -> ExecutionCompletion {
     let cursor = InstructionCursor::new(code_block.unlinked().instructions());
+    let force_pre_loop_register_sync = resume.is_some();
     let (frame, mut pc) = match resume {
         Some(request) => match validate_baseline_fallback_request(
             execution.stack,
@@ -29927,46 +29950,46 @@ fn execute_code_block_with_resume<H: DispatchHost>(
         }
     };
     let mut steps = 0usize;
-    let mut active_targeted_register_roots = Vec::new();
-    let mut active_targeted_frame_roots = Vec::new();
-    // One scratch buffer set owned across all loop iterations so the
-    // per-instruction register-root sync reuses its working collections instead
-    // of allocating them every bytecode (see RegisterRootSyncScratch).
-    let mut register_root_scratch = RegisterRootSyncScratch::new();
 
-    if let Err(error) = sync_targeted_frame_roots(
+    if let Err(error) = sync_targeted_frame_roots_for_dispatch_entry(
         frame.id,
         execution.stack,
         execution.registers,
         execution.heap,
-        &mut active_targeted_frame_roots,
+        root_scope,
     ) {
-        return finish_with_targeted_root_cleanup(
+        return finish_with_root_scope_cleanup(
             execution.heap,
-            &mut active_targeted_register_roots,
-            &mut active_targeted_frame_roots,
+            root_scope,
+            root_scope_mode,
+            frame.id,
+            frame.register_window,
             ExecutionCompletion::Failed(error),
         );
     }
 
-    // Pre-loop register-root sync stays UNCONDITIONAL: it establishes the
-    // initial targeted-root state for this frame (a fresh entry or a baseline
-    // re-entry resume, where generated code may have changed slot
-    // cell-membership outside this loop's `write` funnel). Clear the dirty flag
-    // immediately afterward so the first per-op gate sees a clean state.
-    if let Err(error) = sync_targeted_register_roots_buffered(
+    // A fresh frame or baseline resume still needs a full register-window
+    // sync, but a VM-owned root scope can keep a caller frame's roots active
+    // across nested calls. C++ JSC keeps the caller slots in the same stack span
+    // and scans that span only at GC; this mirrors that lifetime while retaining
+    // Rust's precise targeted-root registry. Baseline fallback resumes are
+    // forced full because generated code may have changed slots outside this
+    // loop's `write` funnel.
+    if let Err(error) = sync_targeted_register_roots_for_dispatch_entry(
         frame.id,
         execution.stack,
         execution.registers,
         execution.heap,
         host,
-        &mut active_targeted_register_roots,
-        &mut register_root_scratch,
+        root_scope,
+        force_pre_loop_register_sync,
     ) {
-        return finish_with_targeted_root_cleanup(
+        return finish_with_root_scope_cleanup(
             execution.heap,
-            &mut active_targeted_register_roots,
-            &mut active_targeted_frame_roots,
+            root_scope,
+            root_scope_mode,
+            frame.id,
+            frame.register_window,
             ExecutionCompletion::Failed(error),
         );
     }
@@ -29974,18 +29997,22 @@ fn execute_code_block_with_resume<H: DispatchHost>(
 
     loop {
         if let Some(reason) = execution.exceptions.termination() {
-            return finish_with_targeted_root_cleanup(
+            return finish_with_root_scope_cleanup(
                 execution.heap,
-                &mut active_targeted_register_roots,
-                &mut active_targeted_frame_roots,
+                root_scope,
+                root_scope_mode,
+                frame.id,
+                frame.register_window,
                 ExecutionCompletion::Terminated(reason),
             );
         }
         if steps >= config.max_steps {
-            return finish_with_targeted_root_cleanup(
+            return finish_with_root_scope_cleanup(
                 execution.heap,
-                &mut active_targeted_register_roots,
-                &mut active_targeted_frame_roots,
+                root_scope,
+                root_scope_mode,
+                frame.id,
+                frame.register_window,
                 ExecutionCompletion::Failed(ExecutionError::DispatchStepLimitExceeded),
             );
         }
@@ -29993,10 +30020,12 @@ fn execute_code_block_with_resume<H: DispatchHost>(
 
         let index = pc.offset() as usize;
         let Some(view) = cursor.get(index) else {
-            return finish_with_targeted_root_cleanup(
+            return finish_with_root_scope_cleanup(
                 execution.heap,
-                &mut active_targeted_register_roots,
-                &mut active_targeted_frame_roots,
+                root_scope,
+                root_scope_mode,
+                frame.id,
+                frame.register_window,
                 ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(pc)),
             );
         };
@@ -30045,10 +30074,10 @@ fn execute_code_block_with_resume<H: DispatchHost>(
         // The dirty signal is coalesced (see `CellRootDirty`): on `Clean` skip;
         // on `Slots(lo,hi)` PATCH only the changed slot span (the common case,
         // ~21% of richards ops, which previously rescanned the whole wide callee
-        // window); on `FullWindow` (frame allocate/release touched whole spans
-        // outside the per-slot `write` funnel) do the original full-window
-        // rescan. The post-state is identical to an unconditional full-window
-        // sync in every case. Clear to `Clean` only after a successful sync.
+        // window); on `FullWindow` (frame allocation touched whole spans outside
+        // the per-slot `write` funnel) do the original full-window rescan. The
+        // post-state is identical to an unconditional full-window sync in every
+        // case. Clear to `Clean` only after a successful sync.
         let sync_result = match execution.registers.cell_root_dirty() {
             CellRootDirty::Clean => Ok(()),
             CellRootDirty::Slots { lo, hi } => sync_targeted_register_roots_range_buffered(
@@ -30057,19 +30086,19 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                 execution.registers,
                 execution.heap,
                 host,
-                &mut active_targeted_register_roots,
-                &mut register_root_scratch,
+                &mut root_scope.active_targeted_register_roots,
+                &mut root_scope.register_root_scratch,
                 lo,
                 hi,
             ),
-            CellRootDirty::FullWindow => sync_targeted_register_roots_buffered(
+            CellRootDirty::FullWindow => sync_targeted_register_roots_buffered_scoped(
                 frame.id,
                 execution.stack,
                 execution.registers,
                 execution.heap,
                 host,
-                &mut active_targeted_register_roots,
-                &mut register_root_scratch,
+                &mut root_scope.active_targeted_register_roots,
+                &mut root_scope.register_root_scratch,
             ),
         };
         match sync_result {
@@ -30077,10 +30106,12 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                 execution.registers.clear_cell_root_dirty();
             }
             Err(error) => {
-                return finish_with_targeted_root_cleanup(
+                return finish_with_root_scope_cleanup(
                     execution.heap,
-                    &mut active_targeted_register_roots,
-                    &mut active_targeted_frame_roots,
+                    root_scope,
+                    root_scope_mode,
+                    frame.id,
+                    frame.register_window,
                     ExecutionCompletion::Failed(error),
                 );
             }
@@ -30090,10 +30121,12 @@ fn execute_code_block_with_resume<H: DispatchHost>(
             DispatchOutcome::Continue => {
                 let next = index.saturating_add(1);
                 if next >= cursor.len() {
-                    return finish_with_targeted_root_cleanup(
+                    return finish_with_root_scope_cleanup(
                         execution.heap,
-                        &mut active_targeted_register_roots,
-                        &mut active_targeted_frame_roots,
+                        root_scope,
+                        root_scope_mode,
+                        frame.id,
+                        frame.register_window,
                         ExecutionCompletion::Returned(RuntimeValue::undefined()),
                     );
                 }
@@ -30101,18 +30134,22 @@ fn execute_code_block_with_resume<H: DispatchHost>(
             }
             DispatchOutcome::ContinueTo(target) => {
                 let Some(target) = target else {
-                    return finish_with_targeted_root_cleanup(
+                    return finish_with_root_scope_cleanup(
                         execution.heap,
-                        &mut active_targeted_register_roots,
-                        &mut active_targeted_frame_roots,
+                        root_scope,
+                        root_scope_mode,
+                        frame.id,
+                        frame.register_window,
                         ExecutionCompletion::Returned(RuntimeValue::undefined()),
                     );
                 };
                 if cursor.get(target.offset() as usize).is_none() {
-                    return finish_with_targeted_root_cleanup(
+                    return finish_with_root_scope_cleanup(
                         execution.heap,
-                        &mut active_targeted_register_roots,
-                        &mut active_targeted_frame_roots,
+                        root_scope,
+                        root_scope_mode,
+                        frame.id,
+                        frame.register_window,
                         ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(target)),
                     );
                 }
@@ -30120,76 +30157,94 @@ fn execute_code_block_with_resume<H: DispatchHost>(
             }
             DispatchOutcome::Jump(target) => {
                 if cursor.get(target.offset() as usize).is_none() {
-                    return finish_with_targeted_root_cleanup(
+                    return finish_with_root_scope_cleanup(
                         execution.heap,
-                        &mut active_targeted_register_roots,
-                        &mut active_targeted_frame_roots,
+                        root_scope,
+                        root_scope_mode,
+                        frame.id,
+                        frame.register_window,
                         ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(target)),
                     );
                 }
                 pc = target;
             }
             DispatchOutcome::Return(value) => {
-                return finish_with_targeted_root_cleanup(
+                return finish_with_root_scope_cleanup(
                     execution.heap,
-                    &mut active_targeted_register_roots,
-                    &mut active_targeted_frame_roots,
+                    root_scope,
+                    root_scope_mode,
+                    frame.id,
+                    frame.register_window,
                     ExecutionCompletion::Returned(value),
                 );
             }
             DispatchOutcome::BaselineLoopHandoff(request) => {
-                return finish_with_targeted_root_cleanup(
+                return finish_with_root_scope_cleanup(
                     execution.heap,
-                    &mut active_targeted_register_roots,
-                    &mut active_targeted_frame_roots,
+                    root_scope,
+                    root_scope_mode,
+                    frame.id,
+                    frame.register_window,
                     ExecutionCompletion::BaselineLoopHandoff(request),
                 );
             }
             DispatchOutcome::OrdinaryBytecodeCall(request) => {
-                return finish_with_targeted_root_cleanup(
+                return finish_with_root_scope_cleanup(
                     execution.heap,
-                    &mut active_targeted_register_roots,
-                    &mut active_targeted_frame_roots,
+                    root_scope,
+                    root_scope_mode,
+                    frame.id,
+                    frame.register_window,
                     ExecutionCompletion::OrdinaryBytecodeCall(request),
                 );
             }
             DispatchOutcome::OrdinaryBytecodeConstruct(request) => {
-                return finish_with_targeted_root_cleanup(
+                return finish_with_root_scope_cleanup(
                     execution.heap,
-                    &mut active_targeted_register_roots,
-                    &mut active_targeted_frame_roots,
+                    root_scope,
+                    root_scope_mode,
+                    frame.id,
+                    frame.register_window,
                     ExecutionCompletion::OrdinaryBytecodeConstruct(request),
                 );
             }
             DispatchOutcome::FunctionValueCall(request) => {
-                return finish_with_targeted_root_cleanup(
+                return finish_with_root_scope_cleanup(
                     execution.heap,
-                    &mut active_targeted_register_roots,
-                    &mut active_targeted_frame_roots,
+                    root_scope,
+                    root_scope_mode,
+                    frame.id,
+                    frame.register_window,
                     ExecutionCompletion::FunctionValueCall(request),
                 );
             }
             DispatchOutcome::EvalRequest(request) => {
-                return finish_with_targeted_root_cleanup(
+                return finish_with_root_scope_cleanup(
                     execution.heap,
-                    &mut active_targeted_register_roots,
-                    &mut active_targeted_frame_roots,
+                    root_scope,
+                    root_scope_mode,
+                    frame.id,
+                    frame.register_window,
                     ExecutionCompletion::EvalRequest(request),
                 );
             }
             DispatchOutcome::Suspend(record) => {
-                return finish_with_targeted_root_cleanup(
+                return finish_with_root_scope_cleanup(
                     execution.heap,
-                    &mut active_targeted_register_roots,
-                    &mut active_targeted_frame_roots,
+                    root_scope,
+                    root_scope_mode,
+                    frame.id,
+                    frame.register_window,
                     ExecutionCompletion::Suspended(record),
                 );
             }
             DispatchOutcome::Fail(error) => {
-                return finish_with_targeted_root_cleanup(
+                return finish_with_root_scope_cleanup(
                     execution.heap,
-                    &mut active_targeted_register_roots,
-                    &mut active_targeted_frame_roots,
+                    root_scope,
+                    root_scope_mode,
+                    frame.id,
+                    frame.register_window,
                     ExecutionCompletion::Failed(error),
                 );
             }
@@ -30212,10 +30267,12 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                         &mut unwind,
                     );
                     execution.exceptions.replace_unwind(unwind);
-                    return finish_with_targeted_root_cleanup(
+                    return finish_with_root_scope_cleanup(
                         execution.heap,
-                        &mut active_targeted_register_roots,
-                        &mut active_targeted_frame_roots,
+                        root_scope,
+                        root_scope_mode,
+                        frame.id,
+                        frame.register_window,
                         ExecutionCompletion::Threw(pending),
                     );
                 }
@@ -30658,7 +30715,7 @@ fn sync_targeted_vm_roots(
 /// optimization with no C++ JSC counterpart; the produced roots and the order in
 /// which they are registered/retargeted/unregistered are identical to the
 /// allocating path.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct RegisterRootSyncScratch {
     snapshot_registers: Vec<RegisterRootDescriptor>,
     targeted_records: Vec<TargetedRootRecord>,
@@ -30674,6 +30731,73 @@ pub(crate) struct RegisterRootSyncScratch {
 impl RegisterRootSyncScratch {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+}
+
+/// VM-owned interpreter root state for live call frames.
+///
+/// C++ JSC does not create per-dispatch root scopes: VM registers live in one
+/// call-frame stack and `Heap::gatherStackRoots` scans that live span only at a
+/// GC safepoint. Rust still exposes a precise targeted-root registry for the
+/// future collector, so this scope is the Rust ownership skeleton that lets the
+/// registry mirror C++'s stack lifetime: caller roots stay active while a callee
+/// runs, and only the popped/finished frame is cleaned.
+#[derive(Debug, Default)]
+pub(crate) struct InterpreterRootSyncScope {
+    active_targeted_register_roots: Vec<RootRecord>,
+    active_targeted_frame_roots: Vec<RootRecord>,
+    register_root_scratch: RegisterRootSyncScratch,
+    synced_register_frames: HashSet<CallFrameId>,
+    synced_frame_roots: HashSet<CallFrameId>,
+}
+
+impl InterpreterRootSyncScope {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn cleanup_all(&mut self, heap: &mut Heap) -> Result<(), ExecutionError> {
+        let register_cleanup =
+            cleanup_targeted_vm_roots(heap, &mut self.active_targeted_register_roots);
+        let frame_cleanup = cleanup_targeted_vm_roots(heap, &mut self.active_targeted_frame_roots);
+        self.synced_register_frames.clear();
+        self.synced_frame_roots.clear();
+        register_cleanup.and(frame_cleanup)
+    }
+
+    fn cleanup_frame(
+        &mut self,
+        heap: &mut Heap,
+        frame: CallFrameId,
+        window: RegisterWindow,
+    ) -> Result<(), ExecutionError> {
+        let register_roots = self
+            .active_targeted_register_roots
+            .iter()
+            .copied()
+            .filter(|root| root_is_register_root_for_window(*root, window))
+            .collect::<Vec<_>>();
+        let register_cleanup = cleanup_selected_targeted_vm_roots(
+            heap,
+            &mut self.active_targeted_register_roots,
+            &register_roots,
+        );
+
+        let frame_roots = self
+            .active_targeted_frame_roots
+            .iter()
+            .copied()
+            .filter(|root| root_is_frame_root_for_frame(*root, frame))
+            .collect::<Vec<_>>();
+        let frame_cleanup = cleanup_selected_targeted_vm_roots(
+            heap,
+            &mut self.active_targeted_frame_roots,
+            &frame_roots,
+        );
+
+        self.synced_register_frames.remove(&frame);
+        self.synced_frame_roots.remove(&frame);
+        register_cleanup.and(frame_cleanup)
     }
 }
 
@@ -30719,6 +30843,192 @@ fn sync_targeted_vm_roots_buffered(
     )
 }
 
+fn sync_targeted_frame_roots_scoped(
+    owner_frame: CallFrameId,
+    stack: &ExecutionContextStack,
+    _registers: &RegisterFile,
+    heap: &mut Heap,
+    active_roots: &mut Vec<RootRecord>,
+) -> Result<(), ExecutionError> {
+    let snapshot = stack.frame_root_snapshot_for_heap(heap, owner_frame)?;
+    let targeted = TargetedFrameRootPlan::resolve(heap, &snapshot)?;
+    sync_targeted_vm_roots_scoped(heap, active_roots, targeted.into_records(), |root| {
+        root_is_frame_root_for_frame(root, owner_frame)
+    })
+}
+
+fn sync_targeted_register_roots_buffered_scoped<H: DispatchHost>(
+    owner_frame: CallFrameId,
+    stack: &ExecutionContextStack,
+    registers: &RegisterFile,
+    heap: &mut Heap,
+    host: &mut H,
+    active_roots: &mut Vec<RootRecord>,
+    scratch: &mut RegisterRootSyncScratch,
+) -> Result<(), ExecutionError> {
+    let window = stack
+        .frame(owner_frame)
+        .map(|frame| frame.register_window)
+        .ok_or(ExecutionError::FrameMismatch {
+            expected: owner_frame,
+            actual: stack.top_frame().map(|frame| frame.id),
+        })?;
+    stack.register_root_snapshot_for_frame_into(
+        heap,
+        registers,
+        owner_frame,
+        &mut scratch.snapshot_registers,
+    )?;
+    let snapshot = ExecutionRootSnapshot {
+        frame_roots: Vec::new(),
+        register_roots: std::mem::take(&mut scratch.snapshot_registers),
+    };
+    let targeted_result =
+        host.targeted_register_roots_into(heap, &snapshot, &mut scratch.targeted_records);
+    scratch.snapshot_registers = snapshot.register_roots;
+    targeted_result?;
+
+    sync_targeted_vm_roots_window_buffered(heap, active_roots, scratch, window)
+}
+
+fn sync_targeted_register_roots_for_dispatch_entry<H: DispatchHost>(
+    owner_frame: CallFrameId,
+    stack: &ExecutionContextStack,
+    registers: &RegisterFile,
+    heap: &mut Heap,
+    host: &mut H,
+    root_scope: &mut InterpreterRootSyncScope,
+    force_full_window: bool,
+) -> Result<(), ExecutionError> {
+    let result = if force_full_window || !root_scope.synced_register_frames.contains(&owner_frame) {
+        sync_targeted_register_roots_buffered_scoped(
+            owner_frame,
+            stack,
+            registers,
+            heap,
+            host,
+            &mut root_scope.active_targeted_register_roots,
+            &mut root_scope.register_root_scratch,
+        )
+    } else {
+        match registers.cell_root_dirty() {
+            CellRootDirty::Clean => Ok(()),
+            CellRootDirty::Slots { lo, hi } => sync_targeted_register_roots_range_buffered(
+                owner_frame,
+                stack,
+                registers,
+                heap,
+                host,
+                &mut root_scope.active_targeted_register_roots,
+                &mut root_scope.register_root_scratch,
+                lo,
+                hi,
+            ),
+            CellRootDirty::FullWindow => sync_targeted_register_roots_buffered_scoped(
+                owner_frame,
+                stack,
+                registers,
+                heap,
+                host,
+                &mut root_scope.active_targeted_register_roots,
+                &mut root_scope.register_root_scratch,
+            ),
+        }
+    };
+    if result.is_ok() {
+        root_scope.synced_register_frames.insert(owner_frame);
+    }
+    result
+}
+
+fn sync_targeted_frame_roots_for_dispatch_entry(
+    owner_frame: CallFrameId,
+    stack: &ExecutionContextStack,
+    registers: &RegisterFile,
+    heap: &mut Heap,
+    root_scope: &mut InterpreterRootSyncScope,
+) -> Result<(), ExecutionError> {
+    if root_scope.synced_frame_roots.contains(&owner_frame) {
+        return Ok(());
+    }
+    let result = sync_targeted_frame_roots_scoped(
+        owner_frame,
+        stack,
+        registers,
+        heap,
+        &mut root_scope.active_targeted_frame_roots,
+    );
+    if result.is_ok() {
+        root_scope.synced_frame_roots.insert(owner_frame);
+    }
+    result
+}
+
+fn sync_targeted_vm_roots_window_buffered(
+    heap: &mut Heap,
+    active_roots: &mut Vec<RootRecord>,
+    scratch: &mut RegisterRootSyncScratch,
+    window: RegisterWindow,
+) -> Result<(), ExecutionError> {
+    let heap_id = heap.id();
+    scratch.desired_set.refill_from_records(
+        heap_id,
+        scratch
+            .targeted_records
+            .iter()
+            .copied()
+            .filter(|record| record.root.kind == RootKind::VMRegister),
+    )?;
+
+    scratch.desired_root_ids.clear();
+    scratch
+        .desired_root_ids
+        .extend(scratch.desired_set.records().iter().map(|r| r.root.id));
+
+    scratch.stale_roots.clear();
+    scratch
+        .stale_roots
+        .extend(active_roots.iter().copied().filter(|root| {
+            root_is_register_root_for_window(*root, window)
+                && !scratch.desired_root_ids.contains(&root.id)
+        }));
+
+    apply_desired_vm_roots(
+        heap,
+        active_roots,
+        &scratch.desired_set,
+        &scratch.stale_roots,
+    )
+}
+
+fn sync_targeted_vm_roots_scoped<F>(
+    heap: &mut Heap,
+    active_roots: &mut Vec<RootRecord>,
+    desired_records: Vec<TargetedRootRecord>,
+    mut stale_scope: F,
+) -> Result<(), ExecutionError>
+where
+    F: FnMut(RootRecord) -> bool,
+{
+    let desired_records = desired_records
+        .into_iter()
+        .filter(|record| record.root.kind == RootKind::VMRegister)
+        .collect::<Vec<_>>();
+    let desired = TargetedRootSet::from_records(heap.id(), desired_records)?;
+    let desired_root_ids = desired
+        .records()
+        .iter()
+        .map(|record| record.root.id)
+        .collect::<HashSet<_>>();
+    let stale_roots = active_roots
+        .iter()
+        .copied()
+        .filter(|root| stale_scope(*root) && !desired_root_ids.contains(&root.id))
+        .collect::<Vec<_>>();
+
+    apply_desired_vm_roots(heap, active_roots, &desired, &stale_roots)
+}
+
 /// Shared core of the VM-register-root sync, used by both the allocating
 /// (`sync_targeted_vm_roots`) and the buffered per-instruction
 /// (`sync_targeted_register_roots_buffered`) entry points. `desired` is the
@@ -30744,30 +31054,27 @@ fn apply_desired_vm_roots(
         // O(1) lookup of the existing record by root identity instead of a linear
         // scan of the live targeted-root set per desired record.
         let existing = heap.targeted_roots().record_for_root(record.root).copied();
+        let scope_already_owns_root = active_roots
+            .iter()
+            .any(|active| active.id == record.root.id);
         match existing {
             Some(existing) if existing == *record => {
-                if !active_roots
-                    .iter()
-                    .any(|active| active.id == record.root.id)
-                {
-                    active_roots.push(record.root);
-                }
+                // If this active scope already owns the root, keep tracking it.
+                // If another overlapping scope owns the same VM-register root,
+                // leave ownership with that scope; otherwise this temporary scope
+                // would unregister a caller root it did not create. C++ JSC has
+                // one stack-root lifetime, so overlapping Rust scopes must not
+                // steal roots from each other.
             }
             Some(_) => {
                 heap.retarget_targeted_root(*record, RootSetMutationAuthority::VmRegisterFile)?;
-                if !active_roots
-                    .iter()
-                    .any(|active| active.id == record.root.id)
-                {
-                    active_roots.push(record.root);
+                if !scope_already_owns_root {
+                    continue;
                 }
             }
             None => {
                 heap.register_targeted_root(*record, RootSetMutationAuthority::VmRegisterFile)?;
-                if !active_roots
-                    .iter()
-                    .any(|active| active.id == record.root.id)
-                {
+                if !scope_already_owns_root {
                     active_roots.push(record.root);
                 }
             }
@@ -30777,16 +31084,37 @@ fn apply_desired_vm_roots(
     Ok(())
 }
 
-fn finish_with_targeted_root_cleanup(
+fn finish_with_root_scope_cleanup(
     heap: &mut Heap,
-    active_register_roots: &mut Vec<RootRecord>,
-    active_frame_roots: &mut Vec<RootRecord>,
+    root_scope: &mut InterpreterRootSyncScope,
+    mode: InterpreterRootScopeMode,
+    frame: CallFrameId,
+    window: RegisterWindow,
     completion: ExecutionCompletion,
 ) -> ExecutionCompletion {
-    match cleanup_targeted_root_sets(heap, active_register_roots, active_frame_roots) {
+    let cleanup = match mode {
+        InterpreterRootScopeMode::ScopedDispatch => root_scope.cleanup_all(heap),
+        InterpreterRootScopeMode::VmStack if completion_retains_current_frame(&completion) => {
+            Ok(())
+        }
+        InterpreterRootScopeMode::VmStack => root_scope.cleanup_frame(heap, frame, window),
+    };
+    match cleanup {
         Ok(()) => completion,
         Err(error) => ExecutionCompletion::Failed(error),
     }
+}
+
+fn completion_retains_current_frame(completion: &ExecutionCompletion) -> bool {
+    matches!(
+        completion,
+        ExecutionCompletion::OrdinaryBytecodeCall(_)
+            | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
+            | ExecutionCompletion::BaselineLoopHandoff(_)
+            | ExecutionCompletion::FunctionValueCall(_)
+            | ExecutionCompletion::EvalRequest(_)
+            | ExecutionCompletion::Suspended(_)
+    )
 }
 
 fn finish_single_dispatch_with_targeted_root_cleanup(
@@ -30824,6 +31152,21 @@ fn cleanup_targeted_vm_roots(
         {
             heap.unregister_targeted_root(root, RootSetMutationAuthority::VmRegisterFile)?;
         }
+    }
+    Ok(())
+}
+
+fn cleanup_selected_targeted_vm_roots(
+    heap: &mut Heap,
+    active_roots: &mut Vec<RootRecord>,
+    selected_roots: &[RootRecord],
+) -> Result<(), ExecutionError> {
+    for root in selected_roots {
+        let root = *root;
+        if heap.targeted_roots().contains_root(root) {
+            heap.unregister_targeted_root(root, RootSetMutationAuthority::VmRegisterFile)?;
+        }
+        active_roots.retain(|active| active.id != root.id);
     }
     Ok(())
 }
@@ -30888,6 +31231,32 @@ fn register_root_slot(id: RootId) -> Option<usize> {
     id.0.checked_sub(REGISTER_ROOT_ID_BASE)
         .and_then(|offset| offset.checked_sub(1))
         .map(|slot| slot as usize)
+}
+
+fn register_window_contains_slot(window: RegisterWindow, slot: usize) -> bool {
+    let local_end = window.base.saturating_add(window.local_count);
+    let argument_end = window.argument_base.saturating_add(window.argument_count);
+    (slot >= window.base && slot < local_end)
+        || (slot >= window.argument_base && slot < argument_end)
+}
+
+fn root_is_register_root_for_window(root: RootRecord, window: RegisterWindow) -> bool {
+    if root.kind != RootKind::VMRegister {
+        return false;
+    }
+    match register_root_slot(root.id) {
+        Some(slot) => register_window_contains_slot(window, slot),
+        None => false,
+    }
+}
+
+fn root_is_frame_root_for_frame(root: RootRecord, frame: CallFrameId) -> bool {
+    if root.kind != RootKind::VMRegister {
+        return false;
+    }
+    root.id == frame_root_id(frame, FrameRootSource::CodeBlock)
+        || root.id == frame_root_id(frame, FrameRootSource::Callee)
+        || root.id == frame_root_id(frame, FrameRootSource::LexicalScope)
 }
 
 fn value_cell_payload(value: RuntimeValue) -> Option<usize> {
@@ -41517,10 +41886,128 @@ mod tests {
         assert_eq!(h.active_roots[0].id, register_root_id(h.window.base));
     }
 
-    /// `allocate_frame` and `release_frame` must force a FULL-WINDOW rescan via
-    /// the `FullWindow` sentinel, never a per-slot range.
+    /// VM-owned root scopes mirror C++ JSC's live call-frame stack: syncing a
+    /// callee frame must not consider the caller frame's roots stale, and
+    /// cleaning the callee must leave caller roots in place until the caller
+    /// itself finishes.
     #[test]
-    fn dirty_range_narrowing_frame_boundaries_force_full_window() {
+    fn vm_stack_root_scope_keeps_caller_roots_across_callee_sync_and_cleanup() {
+        let block = code_block_with_frame(vec![typed(0)], churn_shape());
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut heap = Heap::new();
+        let mut host = CoreOpcodeDispatchHost::new();
+        let caller_owner = allocate_test_code_block_id(&mut heap);
+        enter_program_frame(&mut stack, &mut registers, caller_owner, &block, Vec::new());
+        let caller_frame = stack.top_frame().unwrap().id;
+        let caller_window = stack.top_frame().unwrap().register_window;
+        let caller_cell_value = host.objects.allocate();
+        registers
+            .write(caller_window, VirtualRegister::local(0), caller_cell_value)
+            .unwrap();
+
+        let mut root_scope = InterpreterRootSyncScope::new();
+        sync_targeted_frame_roots_for_dispatch_entry(
+            caller_frame,
+            &stack,
+            &registers,
+            &mut heap,
+            &mut root_scope,
+        )
+        .unwrap();
+        sync_targeted_register_roots_for_dispatch_entry(
+            caller_frame,
+            &stack,
+            &registers,
+            &mut heap,
+            &mut host,
+            &mut root_scope,
+            false,
+        )
+        .unwrap();
+        registers.clear_cell_root_dirty();
+
+        let caller_root = RootRecord {
+            id: register_root_id(caller_window.base),
+            kind: RootKind::VMRegister,
+            heap: heap.id(),
+        };
+        let caller_target = heap_cell_for_value(&heap, caller_cell_value);
+        assert!(heap
+            .targeted_roots()
+            .records()
+            .iter()
+            .any(|record| record.root == caller_root && record.target == caller_target));
+
+        let callee_owner = allocate_test_code_block_id(&mut heap);
+        let callee_frame = stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(callee_owner),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: vec![RuntimeValue::undefined()],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let callee_window = stack.frame(callee_frame).unwrap().register_window;
+
+        sync_targeted_frame_roots_for_dispatch_entry(
+            callee_frame,
+            &stack,
+            &registers,
+            &mut heap,
+            &mut root_scope,
+        )
+        .unwrap();
+        sync_targeted_register_roots_for_dispatch_entry(
+            callee_frame,
+            &stack,
+            &registers,
+            &mut heap,
+            &mut host,
+            &mut root_scope,
+            false,
+        )
+        .unwrap();
+
+        assert!(heap
+            .targeted_roots()
+            .records()
+            .iter()
+            .any(|record| record.root == caller_root && record.target == caller_target));
+
+        root_scope
+            .cleanup_frame(&mut heap, callee_frame, callee_window)
+            .unwrap();
+        stack.pop_frame(&mut registers, callee_frame).unwrap();
+        assert!(heap
+            .targeted_roots()
+            .records()
+            .iter()
+            .any(|record| record.root == caller_root && record.target == caller_target));
+
+        root_scope
+            .cleanup_frame(&mut heap, caller_frame, caller_window)
+            .unwrap();
+        assert!(!heap
+            .targeted_roots()
+            .records()
+            .iter()
+            .any(|record| record.root == caller_root));
+    }
+
+    /// `allocate_frame` must force a FULL-WINDOW rescan via the `FullWindow`
+    /// sentinel. `release_frame` pops the top window and leaves the surviving
+    /// frame's dirty state alone; the root owner cleans the popped frame.
+    #[test]
+    fn dirty_range_narrowing_frame_allocation_forces_full_window_release_does_not_escalate() {
         let mut registers = RegisterFile::default();
         let shape = churn_shape();
         let window = registers
@@ -41539,10 +42026,15 @@ mod tests {
             CellRootDirty::Slots { .. }
         ));
 
-        // ...but releasing the frame escalates back to FullWindow (whole-span
-        // mutation outside the per-slot funnel).
+        // ...and releasing the top frame does not make a surviving caller window
+        // dirty. In this standalone register-file test there is no caller, so the
+        // pre-existing slot dirty signal is simply preserved rather than
+        // escalated to FullWindow.
         registers.release_frame(window).unwrap();
-        assert_eq!(registers.cell_root_dirty(), CellRootDirty::FullWindow);
+        assert!(matches!(
+            registers.cell_root_dirty(),
+            CellRootDirty::Slots { .. }
+        ));
     }
 
     /// `register_root_slot` is the exact inverse of `register_root_id` over the

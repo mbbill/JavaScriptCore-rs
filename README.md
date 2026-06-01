@@ -21,9 +21,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
                  per-call cost is ROOTING + a wasted eager root snapshot, NOT IC safepoint passes
                  (~0 wall). Landed since: skip idempotent passes (e50f685, 90091ab), lazy
                  fallback-boundary-snapshot (3ff6095), in-loop root-sync narrowed to the dirtied
-                 slot range (6ebfe66) -- richards 140s->112s, crypto/navier/code-load +30-60%.
-                 Remaining lever: the unconditional PRE-LOOP root sync (~28s; a VM-owned-all-
-                 windows rooting-model change = serial). See memory project-call-dispatch-lever.
+                 slot range (6ebfe66) -- richards 140s->112s, crypto/navier/code-load +30-60%;
+                 VM-owned interpreter root scope keeps caller roots live across nested calls.
+                 macOS arm64 richards after VM-root-scope: interpreter score=0.1219, baseline
+                 score=0.1113, zero generated direct-call entries. Remaining lever is JIT residency.
   Phase 2 [done] Octane feature completeness: all 15 benchmarks RUN correctly. Ground-truth
                  2026-05-30: ZERO throwers/aborts -- 3 score, 12 functional-but-slow
                  (perf-gated, Phase 1). Landed: implicit-global store, indirect eval, catchable
@@ -51,14 +52,14 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [wip] FUNCTIONAL-BUT-SLOW (12; perf-gated -> Phase 1, not a feature gap): Box2D, delta-blue,
            earley-boyer, gbemu, mandreel, pdfjs, raytrace, regexp, richards (~56s/iter),
            splay (GC-stress), typescript, octane-zlib (asm.js, ~18-60M calls/iter). The gate to
-           all 15 Succeeding (hence any suite geomean) is interpreter throughput -- next the
-           pre-loop root sync (~28s) then likely the JIT.
+           all 15 Succeeding (hence any suite geomean) is throughput; after the VM-stack root
+           scope, richards is correctness-clean but still generated/JIT-residency-bound.
     [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
            __defineGetter__/Setter__, global Function, Math, apply/bind, globals
     [missing] Octane score parity with local C++ JSC (needs call-dispatch + optimizing tiers)
 
 [wip] C++ JSC structural fidelity
-  [done] always-context rewrite contract in CLAUDE.md
+  [done] always-context rewrite contract in AGENTS.md
   [done] compact status tree is current status source
   [risk] pre-contract dirty tree needs logical commits or isolation
   [risk] existing Rust-only files/types need dedicated structure review
@@ -162,8 +163,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          JS-call/P6 reentry), increment sidecar, LoopHint handoff skeleton. ALL on the
          re-interpreter shim path; CORRECT but unreached on hot functions.
   [risk] baseline is a Rust bytecode RE-INTERPRETER (no register allocation); the real
-         gate is call-dispatch-into-generated-code (generated_direct_call=0), then real
-         reg-alloc. Score is owned by the absent optimizing tiers.
+         gate is call-dispatch-into-generated-code (macOS richards baseline still has
+         generated_direct_call=0), then real reg-alloc. Score is owned by the absent
+         optimizing tiers.
   [missing] CRITICAL PATH (deferred, in order): call-dispatch-into-generated -> mc
          put_by_id/call/construct/get_by_val -> slow-case rejoin -> inline alloc ->
          real reg-alloc; then DFG/FTL/B3-equivalent optimizing tier (where parity lives)
@@ -173,9 +175,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   [done] targeted-root sync now gated on register cell-membership (Phase 1 cut 1):
          non-cell hot loops skip the per-op recompute (3.6-4.9x); register/stack
          stores no longer barriered (cut 2, faithful: C++ barriers only heap fields)
+  [done] VM-owned interpreter root scope mirrors C++ live call-frame stack lifetime:
+         caller roots survive nested calls, and frame pop cleans only the popped window
   [risk] still a per-op targeted-root registry (vs C++ conservative-scan-at-safepoint);
-         full safepoint rewrite is GC-coupled -> Phase 3. Cell-churning code (richards)
-         still pays the sync when it runs.
+         full safepoint rewrite is GC-coupled -> Phase 3. Cell-churning code still pays
+         dirty-slot syncs when cell membership changes.
   [wip] targeted roots around helper exits
   [wip] write-barrier evidence for current property stores
   [missing] no GC collection runs during execution (unbounded heap growth)
@@ -187,7 +191,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   [done] focused Rust gates for current accepted slices
   [done] macOS arm64 bring-up gate: x86_64 P6 emitted native entries are guarded
          as non-callable on arm64, while generated/interpreter fallbacks keep tests green
-  [wip] release octane_probe evidence for active bottlenecks
+  [done] release octane_probe evidence for VM-stack rooting on macOS arm64: nested-call eval
+         works with zero fallbacks; richards via ../WebKit/PerformanceTests/JetStream3 returns
+         score=0.1219 avg=0.1059 with zero fallbacks
+  [done] baseline-mode richards evidence: score=0.1113, fallbacks=4, baseline_installs=35,
+         generated_artifacts=5, generated_direct_call_entries=0
   [missing] local C++ JSC comparison harness for parity claims
   [missing] standard subagent reviewer flow for every substantial patch
   [missing] one logical commit per accepted batch going forward

@@ -51,9 +51,9 @@ use crate::gc::{
     RootSetMutationAuthority, TargetedRootRecord, TargetedRootSet,
 };
 use crate::interpreter::{
-    cleanup_targeted_root_sets, execute_baseline_fallback_deferring_ordinary_calls,
+    cleanup_targeted_root_sets, execute_baseline_fallback_deferring_ordinary_calls_with_root_scope,
     execute_code_block as execute_interpreter_code_block,
-    execute_code_block_deferring_ordinary_calls, execute_single_dispatch,
+    execute_code_block_deferring_ordinary_calls_with_root_scope, execute_single_dispatch,
     execute_single_dispatch_deferring_ordinary_calls, find_handler, finish_ordinary_js_call_return,
     pop_call_return_callee, sync_targeted_frame_roots, sync_targeted_nonlocal_frame_roots,
     sync_targeted_nonlocal_register_roots, sync_targeted_register_roots,
@@ -70,12 +70,13 @@ use crate::interpreter::{
     FunctionValuePropertyOperationCompletion, FunctionValuePropertyOperationOutcome,
     FunctionValuePropertyOperationResume, FunctionValueReturnTransform,
     GeneratedNativeIntrinsicCallRequest, GeneratedNativeIntrinsicCallResult,
-    InterpreterExecutionState, InterpreterFunctionCodeBlock, OrdinaryBytecodeCallHandling,
-    OrdinaryBytecodeCallRequest, OrdinaryBytecodeConstructRequest, ProgramExecutionEntry,
-    PropertyHasObservationDrainRequest, PropertyLoadObservationDrainRequest,
-    PropertyStoreObservationDescriptor, PropertyStoreObservationDrainRequest, RegisterFile,
-    RegisterWindow, SingleDispatchOutcome, SingleDispatchRequest, StructureChainInvalidationEvent,
-    StructureTransitionWatchpointRequest, StructureTransitionWatchpointSnapshot,
+    InterpreterExecutionState, InterpreterFunctionCodeBlock, InterpreterRootScopeMode,
+    InterpreterRootSyncScope, OrdinaryBytecodeCallHandling, OrdinaryBytecodeCallRequest,
+    OrdinaryBytecodeConstructRequest, ProgramExecutionEntry, PropertyHasObservationDrainRequest,
+    PropertyLoadObservationDrainRequest, PropertyStoreObservationDescriptor,
+    PropertyStoreObservationDrainRequest, RegisterFile, RegisterWindow, SingleDispatchOutcome,
+    SingleDispatchRequest, StructureChainInvalidationEvent, StructureTransitionWatchpointRequest,
+    StructureTransitionWatchpointSnapshot,
 };
 use crate::jit::baseline::{
     baseline_generated_js_call_handoff, baseline_generated_property_handoff,
@@ -858,6 +859,7 @@ pub struct Vm {
     services: VmServices,
     execution: ExecutionContextStack,
     registers: RegisterFile,
+    interpreter_root_scope: InterpreterRootSyncScope,
     gc_execution: VmGcExecutionState,
     tiering: VmTieringIntegration,
     generated_call_link_candidate_table_cache:
@@ -1868,6 +1870,7 @@ impl Vm {
             services: VmServices::default(),
             execution: ExecutionContextStack::default(),
             registers: RegisterFile::default(),
+            interpreter_root_scope: InterpreterRootSyncScope::new(),
             gc_execution: VmGcExecutionState::default(),
             tiering: VmTieringIntegration::default(),
             generated_call_link_candidate_table_cache: RefCell::new(Vec::new()),
@@ -5020,7 +5023,7 @@ impl Vm {
             code_block_id,
             self.config.tiering_policy(),
         );
-        execute_code_block_deferring_ordinary_calls(
+        execute_code_block_deferring_ordinary_calls_with_root_scope(
             InterpreterExecutionState {
                 stack: &mut self.execution,
                 registers: &mut self.registers,
@@ -5031,6 +5034,7 @@ impl Vm {
             code_block,
             &mut host,
             config,
+            &mut self.interpreter_root_scope,
         )
     }
 
@@ -16793,7 +16797,7 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> ExecutionCompletion {
-        execute_baseline_fallback_deferring_ordinary_calls(
+        execute_baseline_fallback_deferring_ordinary_calls_with_root_scope(
             InterpreterExecutionState {
                 stack: &mut self.execution,
                 registers: &mut self.registers,
@@ -16804,6 +16808,8 @@ impl Vm {
             code_block,
             host,
             config,
+            &mut self.interpreter_root_scope,
+            InterpreterRootScopeMode::VmStack,
         )
     }
 
