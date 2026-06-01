@@ -23,8 +23,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
                  fallback-boundary-snapshot (3ff6095), in-loop root-sync narrowed to the dirtied
                  slot range (6ebfe66) -- richards 140s->112s, crypto/navier/code-load +30-60%;
                  VM-owned interpreter root scope keeps caller roots live across nested calls.
-                 macOS arm64 richards after VM-root-scope: interpreter score=0.1219, baseline
-                 score=0.1113, zero generated direct-call entries. Remaining lever is JIT residency.
+                 macOS arm64 richards after VM-root-scope: interpreter score=0.1219. Baseline
+                 call-link telemetry now shows ~4.05M authorized direct-call transactions, all
+                 NestedInterpreterFallback; remaining lever is generated/native callee residency.
   Phase 2 [done] Octane feature completeness: all 15 benchmarks RUN correctly. Ground-truth
                  2026-05-30: ZERO throwers/aborts -- 3 score, 12 functional-but-slow
                  (perf-gated, Phase 1). Landed: implicit-global store, indirect eval, catchable
@@ -53,7 +54,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            earley-boyer, gbemu, mandreel, pdfjs, raytrace, regexp, richards (~56s/iter),
            splay (GC-stress), typescript, octane-zlib (asm.js, ~18-60M calls/iter). The gate to
            all 15 Succeeding (hence any suite geomean) is throughput; after the VM-stack root
-           scope, richards is correctness-clean but still generated/JIT-residency-bound.
+           scope and call-link telemetry, richards is correctness-clean but still
+           generated/native-callee-residency-bound.
     [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
            __defineGetter__/Setter__, global Function, Math, apply/bind, globals
     [missing] Octane score parity with local C++ JSC (needs call-dispatch + optimizing tiers)
@@ -162,10 +164,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          prototype-chain DataIC (structure-guarded), retained exits (helper/property/
          JS-call/P6 reentry), increment sidecar, LoopHint handoff skeleton. ALL on the
          re-interpreter shim path; CORRECT but unreached on hot functions.
-  [risk] baseline is a Rust bytecode RE-INTERPRETER (no register allocation); the real
-         gate is call-dispatch-into-generated-code (macOS richards baseline still has
-         generated_direct_call=0), then real reg-alloc. Score is owned by the absent
-         optimizing tiers.
+  [risk] baseline is a Rust bytecode RE-INTERPRETER (no register allocation); macOS richards now
+         proves call-link admission (~4.05M direct-call transactions), but every transaction routes
+         to NestedInterpreterFallback because hot callees lack generated/native residency. Then
+         real reg-alloc and the absent optimizing tiers own score parity.
   [missing] CRITICAL PATH (deferred, in order): call-dispatch-into-generated -> mc
          put_by_id/call/construct/get_by_val -> slow-case rejoin -> inline alloc ->
          real reg-alloc; then DFG/FTL/B3-equivalent optimizing tier (where parity lives)
@@ -194,8 +196,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   [done] release octane_probe evidence for VM-stack rooting on macOS arm64: nested-call eval
          works with zero fallbacks; richards via ../WebKit/PerformanceTests/JetStream3 returns
          score=0.1219 avg=0.1059 with zero fallbacks
-  [done] baseline-mode richards evidence: score=0.1113, fallbacks=4, baseline_installs=35,
-         generated_artifacts=5, generated_direct_call_entries=0
+  [done] baseline-mode richards evidence: score=0.1121, fallbacks=4, baseline_installs=35,
+         generated_artifacts=5, generated_direct_call_transactions=4,046,563, all
+         NestedInterpreterFallback
   [missing] local C++ JSC comparison harness for parity claims
   [missing] standard subagent reviewer flow for every substantial patch
   [missing] one logical commit per accepted batch going forward

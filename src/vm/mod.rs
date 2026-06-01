@@ -12599,6 +12599,7 @@ impl Vm {
                 return self
                     .execute_ordinary_bytecode_call_link_direct_dispatch_as_single_dispatch(
                         request,
+                        direct_call,
                         caller_code_block,
                         target_code_block,
                         host,
@@ -13968,6 +13969,7 @@ impl Vm {
     fn execute_ordinary_bytecode_call_link_direct_dispatch_as_single_dispatch<H: DispatchHost>(
         &mut self,
         request: OrdinaryBytecodeCallRequest,
+        direct_call: BaselineGeneratedJsDirectCall,
         caller_code_block: &CodeBlock,
         // Shared `Rc<CodeBlock>` from validation (refcount bump; used only as
         // `&target_code_block`, deref-coerced to `&CodeBlock`). See divergence note
@@ -14025,6 +14027,7 @@ impl Vm {
 
         let outcome = self.execute_ordinary_bytecode_call_link_direct_dispatch_body(
             request,
+            direct_call,
             caller_code_block,
             &target_code_block,
             host,
@@ -14052,6 +14055,7 @@ impl Vm {
     fn execute_ordinary_bytecode_call_link_direct_dispatch_body<H: DispatchHost>(
         &mut self,
         request: OrdinaryBytecodeCallRequest,
+        direct_call: BaselineGeneratedJsDirectCall,
         caller_code_block: &CodeBlock,
         target_code_block: &CodeBlock,
         host: &mut H,
@@ -14079,7 +14083,16 @@ impl Vm {
             },
         ) {
             Ok(frame) => frame,
-            Err(error) => return SingleDispatchOutcome::Failed(error),
+            Err(error) => {
+                self.record_generated_direct_call_transaction(
+                    continuation,
+                    target_code_block_id,
+                    argument_count_including_this,
+                    VmGeneratedDirectCallTransactionRoute::FrameSetupFailed,
+                    VmGeneratedDirectCallTransactionOutcome::Failed,
+                );
+                return SingleDispatchOutcome::Failed(error);
+            }
         };
         let continuation = match self
             .execution
@@ -14088,12 +14101,32 @@ impl Vm {
             Ok(continuation) => continuation,
             Err(error) => {
                 if let Err(cleanup_error) = self.execution.pop_frame(&mut self.registers, frame) {
+                    self.record_generated_direct_call_transaction(
+                        continuation,
+                        target_code_block_id,
+                        argument_count_including_this,
+                        VmGeneratedDirectCallTransactionRoute::ContinuationAttachFailed,
+                        VmGeneratedDirectCallTransactionOutcome::Failed,
+                    );
                     return SingleDispatchOutcome::Failed(cleanup_error);
                 }
+                self.record_generated_direct_call_transaction(
+                    continuation,
+                    target_code_block_id,
+                    argument_count_including_this,
+                    VmGeneratedDirectCallTransactionRoute::ContinuationAttachFailed,
+                    VmGeneratedDirectCallTransactionOutcome::Failed,
+                );
                 return SingleDispatchOutcome::Failed(error);
             }
         };
 
+        // C++ LLInt/Baseline enters a monomorphic callee through the linked
+        // CallLinkInfo fast path after linkFor/linkMonomorphicCall updates the
+        // call metadata. Rust still routes the frame setup through VM-owned
+        // code for rooting, but this is the same baseline CallLinkInfo fast
+        // path, so publish it through the generated-direct-call transaction
+        // telemetry used by generated call-link sidecars.
         let callee_execution = self.execute_generated_direct_call_callee_code_block(
             target_code_block_id,
             target_code_block,
@@ -14103,6 +14136,20 @@ impl Vm {
             host,
             config,
         );
+        let route = callee_execution.route;
+        if matches!(
+            route,
+            VmGeneratedDirectCallTransactionRoute::GeneratedEntry
+                | VmGeneratedDirectCallTransactionRoute::NativeEntry
+        ) {
+            self.install_generated_direct_call_hot_slot(
+                continuation.owner,
+                continuation.kind.opcode(),
+                continuation.call_bytecode_index,
+                &direct_call,
+                route,
+            );
+        }
         let completion = callee_execution.completion;
         let thrown = match &completion {
             ExecutionCompletion::Threw(pending) => Some(*pending),
@@ -14127,13 +14174,21 @@ impl Vm {
             finish_ordinary_js_call_return(&mut state, continuation, completion)
         };
 
-        self.ordinary_bytecode_call_single_dispatch_outcome(
+        let outcome = self.ordinary_bytecode_call_single_dispatch_outcome(
             continuation.caller_frame,
             continuation.call_bytecode_index,
             caller_code_block,
             dispatch_outcome,
             thrown,
-        )
+        );
+        self.record_generated_direct_call_transaction(
+            continuation,
+            target_code_block_id,
+            argument_count_including_this,
+            route,
+            Self::generated_direct_call_transaction_outcome(&outcome),
+        );
+        outcome
     }
 
     fn record_ordinary_js_call_result_value_profile_sample(
@@ -36226,6 +36281,10 @@ mod tests {
             .tiering_integration()
             .generated_call_link_probe_blocked_records()
             .len();
+        let direct_call_transaction_count_after_first = vm
+            .tiering_integration()
+            .generated_direct_call_transaction_records()
+            .len();
 
         let (second_completion, boundary_snapshot) =
             execute_registered_code_block_with_boundary_snapshot_and_arguments(
@@ -36264,6 +36323,21 @@ mod tests {
         assert_eq!(
             vm.tiering_integration().fallback_records().len(),
             fallback_count_before
+        );
+        let direct_call_transactions = vm
+            .tiering_integration()
+            .generated_direct_call_transaction_records();
+        assert_eq!(
+            direct_call_transactions.len(),
+            direct_call_transaction_count_after_first + 1,
+            "ordinary CallLinkInfo fast path should publish one direct-call transaction"
+        );
+        let direct_call_transaction = direct_call_transactions.last().unwrap();
+        assert_eq!(direct_call_transaction.caller, owner);
+        assert_eq!(
+            direct_call_transaction.route,
+            VmGeneratedDirectCallTransactionRoute::NestedInterpreterFallback,
+            "callee has no generated/native entry in this fixture, so only admission is proven"
         );
         assert!(
             !host.core.has_call_observation_record(),
