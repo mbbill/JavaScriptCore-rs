@@ -7617,6 +7617,7 @@ pub(crate) struct BaselineEntryAutoMaterializationRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BaselineEntryAutoNativeMaterializationOutcome {
     Installed,
+    SkippedDisabledNativeEntry,
     Failed {
         reason: BaselineEntryAutoNativeMaterializationFailure,
         generated_fallback_allowed: bool,
