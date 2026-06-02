@@ -1657,6 +1657,36 @@ fn print_benchmark_tiering_summary(benchmark: &OctaneBenchmarkExecutionReport) {
                 .then_with(|| format!("{:?}", left.route).cmp(&format!("{:?}", right.route)))
         },
     );
+    print_top_records(
+        &mut stderr,
+        "generated-direct-call-callee-fallback-summary",
+        &summary.generated_direct_call_callee_fallback_summaries,
+        tail_limit,
+        record_filter.as_deref(),
+        |left, right| {
+            right
+                .fallback_count
+                .cmp(&left.fallback_count)
+                .then_with(|| format!("{:?}", left.caller).cmp(&format!("{:?}", right.caller)))
+                .then_with(|| {
+                    left.call_bytecode_index
+                        .as_bits()
+                        .cmp(&right.call_bytecode_index.as_bits())
+                })
+                .then_with(|| {
+                    format!("{:?}", left.target_code_block)
+                        .cmp(&format!("{:?}", right.target_code_block))
+                })
+                .then_with(|| {
+                    format!("{:?}", left.generated_entry_miss)
+                        .cmp(&format!("{:?}", right.generated_entry_miss))
+                })
+                .then_with(|| {
+                    format!("{:?}", left.native_entry_miss)
+                        .cmp(&format!("{:?}", right.native_entry_miss))
+                })
+        },
+    );
     let _ = stderr.flush();
 }
 

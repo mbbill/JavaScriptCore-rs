@@ -269,7 +269,10 @@ pub use tiering::{
     VmCallLinkInlineCacheClearLifecycle, VmCallLinkInlineCacheClearOutcome,
     VmCallLinkInlineCacheClearRecord, VmCallLinkInlineCacheClearRejectionReason,
     VmCallLinkReadinessRecord, VmCallLinkTargetValidation, VmCallLinkTargetValidationRejection,
-    VmCallObservationRecord, VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
+    VmCallObservationRecord, VmGeneratedDirectCallCalleeFallbackRecord,
+    VmGeneratedDirectCallCalleeFallbackSummary, VmGeneratedDirectCallGeneratedEntryMissReason,
+    VmGeneratedDirectCallNativeEntryMissReason,
+    VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
     VmGeneratedDirectCallRootlessRejectionCounts,
     VmGeneratedDirectCallRootlessRetainedSideExitCount,
     VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount, VmGeneratedDirectCallTransactionRoute,
@@ -300,9 +303,10 @@ use tiering::{
     VmCallLinkBoundaryValidationRequest, VmCallLinkInlineCacheAttachmentRequest,
     VmCallLinkInlineCacheClearRequest, VmCallObservationRequest,
     VmGeneratedCallLinkProbeBlockedRequest, VmGeneratedCallLinkProbeMissRequest,
-    VmGeneratedDirectCallRootlessRejectionReason, VmGeneratedDirectCallTransactionOutcome,
-    VmGeneratedDirectCallTransactionRequest, VmGeneratedGuardedPropertyLoadProbeMissRequest,
-    VmGeneratedPropertyLoadProbeMissRequest, VmGeneratedPropertyStoreMutationReadinessOutcome,
+    VmGeneratedDirectCallCalleeFallbackRequest, VmGeneratedDirectCallRootlessRejectionReason,
+    VmGeneratedDirectCallTransactionOutcome, VmGeneratedDirectCallTransactionRequest,
+    VmGeneratedGuardedPropertyLoadProbeMissRequest, VmGeneratedPropertyLoadProbeMissRequest,
+    VmGeneratedPropertyStoreMutationReadinessOutcome,
     VmGeneratedPropertyStoreMutationReadinessRequest,
     VmGeneratedPropertyStoreMutationRejectionRequest, VmGeneratedPropertyStoreProbeMissRequest,
     VmOwnedCallTargetValidationRequest, VmPropertyHasObservationRequest,
@@ -10433,6 +10437,153 @@ impl Vm {
         );
     }
 
+    fn record_generated_direct_call_callee_fallback(
+        &mut self,
+        continuation: CallReturnContinuation,
+        target_code_block: CodeBlockId,
+        argument_count_including_this: u32,
+        preferred_route: Option<VmGeneratedDirectCallTransactionRoute>,
+        generated_entry_miss: VmGeneratedDirectCallGeneratedEntryMissReason,
+        native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason,
+    ) {
+        self.tiering.record_generated_direct_call_callee_fallback(
+            VmGeneratedDirectCallCalleeFallbackRequest {
+                caller: continuation.owner,
+                call_bytecode_index: continuation.call_bytecode_index,
+                callee: continuation.callee_object,
+                target_code_block,
+                argument_count_including_this,
+                preferred_route,
+                generated_entry_miss,
+                native_entry_miss,
+            },
+        );
+    }
+
+    fn generated_direct_call_generated_entry_miss_reason(
+        &self,
+        code_block_id: CodeBlockId,
+        code_block: &CodeBlock,
+        expected_frame: CallFrameId,
+    ) -> VmGeneratedDirectCallGeneratedEntryMissReason {
+        let Some(artifact) = self
+            .tiering
+            .baseline_generated_code_artifact_ref_for(code_block_id)
+        else {
+            return VmGeneratedDirectCallGeneratedEntryMissReason::MissingArtifact;
+        };
+        if artifact.validate().is_err() {
+            return VmGeneratedDirectCallGeneratedEntryMissReason::InvalidArtifact;
+        }
+        if artifact.owner != code_block_id {
+            return VmGeneratedDirectCallGeneratedEntryMissReason::OwnerMismatch;
+        }
+        let expected_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
+        let Ok(actual_snapshot) =
+            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(code_block)
+        else {
+            return VmGeneratedDirectCallGeneratedEntryMissReason::SnapshotMismatch;
+        };
+        if actual_snapshot != expected_snapshot {
+            return VmGeneratedDirectCallGeneratedEntryMissReason::SnapshotMismatch;
+        }
+        let Some(active_frame) = self.execution.top_frame() else {
+            return VmGeneratedDirectCallGeneratedEntryMissReason::FrameMismatch;
+        };
+        if active_frame.id != expected_frame || active_frame.code_block != Some(code_block_id) {
+            return VmGeneratedDirectCallGeneratedEntryMissReason::FrameMismatch;
+        }
+        VmGeneratedDirectCallGeneratedEntryMissReason::Ready
+    }
+
+    fn generated_direct_call_native_entry_miss_reason(
+        &self,
+        code_block_id: CodeBlockId,
+        code_block: &CodeBlock,
+        expected_frame: CallFrameId,
+    ) -> VmGeneratedDirectCallNativeEntryMissReason {
+        let Some(gate) = self
+            .tiering
+            .baseline_native_entry_gate_for_owner(code_block_id)
+        else {
+            return VmGeneratedDirectCallNativeEntryMissReason::MissingGate;
+        };
+        if gate.outcome != BaselineEntryGateOutcome::NativeEntryReady {
+            return VmGeneratedDirectCallNativeEntryMissReason::GateNotReady {
+                outcome: gate.outcome,
+            };
+        }
+        let Some(readiness) = self.tiering.baseline_native_entry_readiness_for_gate(&gate) else {
+            return VmGeneratedDirectCallNativeEntryMissReason::MissingReadiness;
+        };
+        if readiness.execution_policy != BaselineNativeEntryExecutionPolicy::Enabled
+            || readiness.outcome != BaselineNativeEntryReadinessOutcome::Ready
+        {
+            return VmGeneratedDirectCallNativeEntryMissReason::ReadinessNotReady;
+        }
+        let Some(callable) = readiness.callable else {
+            return VmGeneratedDirectCallNativeEntryMissReason::MissingCallable;
+        };
+        if callable.kind() == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
+            && !self.can_execute_p6_x86_64_emitted_native_entry()
+        {
+            return VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64;
+        }
+        let Some(descriptor) = readiness.descriptor else {
+            return VmGeneratedDirectCallNativeEntryMissReason::MissingDescriptor;
+        };
+        let Some(artifact) = gate.native_artifact else {
+            return VmGeneratedDirectCallNativeEntryMissReason::MissingNativeArtifact;
+        };
+        if artifact.owner != code_block_id
+            || descriptor.owner != code_block_id
+            || descriptor.artifact_id != artifact.id
+            || descriptor.native_symbol != artifact.native_code
+            || descriptor.machine_code != artifact.machine_code
+            || descriptor.machine_range != artifact.machine_code.range
+            || descriptor.entrypoint != artifact.entrypoint
+            || descriptor.baseline_abi_proof != artifact.baseline_abi_proof
+            || callable.validate_for_descriptor(&descriptor).is_err()
+        {
+            return VmGeneratedDirectCallNativeEntryMissReason::MetadataMismatch;
+        }
+        let Some(readiness_snapshot) = readiness.bytecode_snapshot else {
+            return VmGeneratedDirectCallNativeEntryMissReason::SnapshotMissing;
+        };
+        let Ok(actual_snapshot) =
+            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(code_block)
+        else {
+            return VmGeneratedDirectCallNativeEntryMissReason::SnapshotMismatch;
+        };
+        if actual_snapshot != readiness_snapshot {
+            return VmGeneratedDirectCallNativeEntryMissReason::SnapshotMismatch;
+        }
+        let Some(active_frame) = self.execution.top_frame() else {
+            return VmGeneratedDirectCallNativeEntryMissReason::FrameMismatch;
+        };
+        if active_frame.id != expected_frame || active_frame.code_block != Some(code_block_id) {
+            return VmGeneratedDirectCallNativeEntryMissReason::FrameMismatch;
+        }
+        let Some((scope, call_frame)) = self.baseline_native_entry_launch_metadata(
+            code_block_id,
+            code_block,
+            crate::interpreter::ExecutionEntryKind::Function,
+        ) else {
+            return VmGeneratedDirectCallNativeEntryMissReason::MissingLaunchMetadata;
+        };
+        let Ok(launch_descriptor) =
+            VmEntryLaunchDescriptor::baseline_native_entry(scope, call_frame, gate, readiness)
+        else {
+            return VmGeneratedDirectCallNativeEntryMissReason::InvalidLaunchDescriptor;
+        };
+        match launch_descriptor.dispatch {
+            VmEntryDispatchSelection::BaselineNative(
+                BaselineNativeDispatchTokenSelection::NormalEntry { token },
+            ) if token == callable.token() => VmGeneratedDirectCallNativeEntryMissReason::Ready,
+            _ => VmGeneratedDirectCallNativeEntryMissReason::DispatchSelectionMismatch,
+        }
+    }
+
     fn generated_direct_call_transaction_outcome(
         outcome: &SingleDispatchOutcome,
     ) -> VmGeneratedDirectCallTransactionOutcome {
@@ -11991,9 +12142,11 @@ impl Vm {
         };
 
         let callee_execution = self.execute_generated_direct_call_callee_code_block(
+            continuation,
             target_code_block_id,
             &target_code_block,
             frame,
+            argument_count_including_this,
             preferred_route,
             route_policy,
             host,
@@ -12152,9 +12305,11 @@ impl Vm {
 
     fn execute_generated_direct_call_callee_code_block<H: DispatchHost>(
         &mut self,
+        continuation: CallReturnContinuation,
         code_block_id: CodeBlockId,
         code_block: &CodeBlock,
         expected_frame: CallFrameId,
+        argument_count_including_this: u32,
         preferred_route: Option<VmGeneratedDirectCallTransactionRoute>,
         route_policy: GeneratedDirectCallCalleeRoutePolicy,
         host: &mut H,
@@ -12240,14 +12395,34 @@ impl Vm {
             config,
             true,
         )
-        .unwrap_or_else(|| GeneratedDirectCallCalleeExecution {
-            completion: self.execute_nested_callee_code_block(
+        .unwrap_or_else(|| {
+            let generated_entry_miss = self.generated_direct_call_generated_entry_miss_reason(
                 code_block_id,
                 code_block,
-                host,
-                config,
-            ),
-            route: VmGeneratedDirectCallTransactionRoute::NestedInterpreterFallback,
+                expected_frame,
+            );
+            let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
+                code_block_id,
+                code_block,
+                expected_frame,
+            );
+            self.record_generated_direct_call_callee_fallback(
+                continuation,
+                code_block_id,
+                argument_count_including_this,
+                preferred_route,
+                generated_entry_miss,
+                native_entry_miss,
+            );
+            GeneratedDirectCallCalleeExecution {
+                completion: self.execute_nested_callee_code_block(
+                    code_block_id,
+                    code_block,
+                    host,
+                    config,
+                ),
+                route: VmGeneratedDirectCallTransactionRoute::NestedInterpreterFallback,
+            }
         })
     }
 
@@ -14205,9 +14380,11 @@ impl Vm {
         // path, so publish it through the generated-direct-call transaction
         // telemetry used by generated call-link sidecars.
         let callee_execution = self.execute_generated_direct_call_callee_code_block(
+            continuation,
             target_code_block_id,
             target_code_block,
             frame,
+            argument_count_including_this,
             None,
             GeneratedDirectCallCalleeRoutePolicy::AnyAvailable,
             host,
@@ -46918,6 +47095,31 @@ mod tests {
                 .last()
                 .map(|record| record.route),
             Some(VmGeneratedDirectCallTransactionRoute::NestedInterpreterFallback)
+        );
+        let fallback_record = vm
+            .tiering_integration()
+            .generated_direct_call_callee_fallback_records()
+            .last()
+            .expect("nested interpreter fallback should record callee route miss evidence");
+        assert_eq!(fallback_record.caller, owner);
+        assert_eq!(
+            fallback_record.call_bytecode_index,
+            BytecodeIndex::from_offset(1)
+        );
+        assert_eq!(
+            fallback_record.generated_entry_miss,
+            VmGeneratedDirectCallGeneratedEntryMissReason::MissingArtifact
+        );
+        assert_eq!(
+            fallback_record.native_entry_miss,
+            VmGeneratedDirectCallNativeEntryMissReason::MissingGate
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_callee_fallback_summaries()
+                .last()
+                .map(|summary| summary.fallback_count),
+            Some(1)
         );
         assert_latest_generated_entry_evidence(&vm, owner, artifact.clone());
     }

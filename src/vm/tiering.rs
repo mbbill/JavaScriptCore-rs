@@ -231,6 +231,9 @@ pub struct VmTieringIntegration {
     baseline_generated_executed_bytecode_count: u64,
     generated_direct_call_transaction_records: Vec<VmGeneratedDirectCallTransactionRecord>,
     generated_direct_call_transaction_summaries: Vec<VmGeneratedDirectCallTransactionSummary>,
+    generated_direct_call_callee_fallback_records: Vec<VmGeneratedDirectCallCalleeFallbackRecord>,
+    generated_direct_call_callee_fallback_summaries:
+        Vec<VmGeneratedDirectCallCalleeFallbackSummary>,
     generated_direct_call_transaction_count: usize,
     generated_direct_call_generated_entry_count: usize,
     generated_direct_call_native_entry_count: usize,
@@ -1767,6 +1770,18 @@ impl VmTieringIntegration {
         &self.generated_direct_call_transaction_summaries
     }
 
+    pub fn generated_direct_call_callee_fallback_records(
+        &self,
+    ) -> &[VmGeneratedDirectCallCalleeFallbackRecord] {
+        &self.generated_direct_call_callee_fallback_records
+    }
+
+    pub fn generated_direct_call_callee_fallback_summaries(
+        &self,
+    ) -> &[VmGeneratedDirectCallCalleeFallbackSummary] {
+        &self.generated_direct_call_callee_fallback_summaries
+    }
+
     pub fn generated_direct_call_transaction_count(&self) -> usize {
         self.generated_direct_call_transaction_count
     }
@@ -2539,6 +2554,59 @@ impl VmTieringIntegration {
         if self.generated_direct_call_transaction_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
         {
             self.generated_direct_call_transaction_records.push(record);
+        }
+        record
+    }
+
+    pub(crate) fn record_generated_direct_call_callee_fallback(
+        &mut self,
+        request: VmGeneratedDirectCallCalleeFallbackRequest,
+    ) -> VmGeneratedDirectCallCalleeFallbackRecord {
+        let record = VmGeneratedDirectCallCalleeFallbackRecord {
+            ordinal: self.next_record_ordinal(),
+            caller: request.caller,
+            call_bytecode_index: request.call_bytecode_index,
+            callee: request.callee,
+            target_code_block: request.target_code_block,
+            argument_count_including_this: request.argument_count_including_this,
+            preferred_route: request.preferred_route,
+            generated_entry_miss: request.generated_entry_miss,
+            native_entry_miss: request.native_entry_miss,
+        };
+        if let Some(summary) = self
+            .generated_direct_call_callee_fallback_summaries
+            .iter_mut()
+            .find(|summary| {
+                summary.caller == request.caller
+                    && summary.call_bytecode_index == request.call_bytecode_index
+                    && summary.target_code_block == request.target_code_block
+                    && summary.argument_count_including_this
+                        == request.argument_count_including_this
+                    && summary.preferred_route == request.preferred_route
+                    && summary.generated_entry_miss == request.generated_entry_miss
+                    && summary.native_entry_miss == request.native_entry_miss
+            })
+        {
+            summary.record();
+        } else {
+            let mut summary = VmGeneratedDirectCallCalleeFallbackSummary::new(
+                request.caller,
+                request.call_bytecode_index,
+                request.target_code_block,
+                request.argument_count_including_this,
+                request.preferred_route,
+                request.generated_entry_miss,
+                request.native_entry_miss,
+            );
+            summary.record();
+            self.generated_direct_call_callee_fallback_summaries
+                .push(summary);
+        }
+        if self.generated_direct_call_callee_fallback_records.len()
+            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        {
+            self.generated_direct_call_callee_fallback_records
+                .push(record);
         }
         record
     }
@@ -7191,6 +7259,100 @@ pub enum VmGeneratedDirectCallTransactionOutcome {
     FunctionValueCall,
     Suspended,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmGeneratedDirectCallGeneratedEntryMissReason {
+    MissingArtifact,
+    InvalidArtifact,
+    OwnerMismatch,
+    SnapshotMismatch,
+    FrameMismatch,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmGeneratedDirectCallNativeEntryMissReason {
+    MissingGate,
+    GateNotReady { outcome: BaselineEntryGateOutcome },
+    MissingReadiness,
+    ReadinessNotReady,
+    MissingCallable,
+    HostBlockedX86_64,
+    MissingDescriptor,
+    MissingNativeArtifact,
+    MetadataMismatch,
+    SnapshotMissing,
+    SnapshotMismatch,
+    FrameMismatch,
+    MissingLaunchMetadata,
+    InvalidLaunchDescriptor,
+    DispatchSelectionMismatch,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VmGeneratedDirectCallCalleeFallbackRequest {
+    pub caller: CodeBlockId,
+    pub call_bytecode_index: BytecodeIndex,
+    pub callee: Option<ObjectId>,
+    pub target_code_block: CodeBlockId,
+    pub argument_count_including_this: u32,
+    pub preferred_route: Option<VmGeneratedDirectCallTransactionRoute>,
+    pub generated_entry_miss: VmGeneratedDirectCallGeneratedEntryMissReason,
+    pub native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGeneratedDirectCallCalleeFallbackRecord {
+    pub ordinal: u64,
+    pub caller: CodeBlockId,
+    pub call_bytecode_index: BytecodeIndex,
+    pub callee: Option<ObjectId>,
+    pub target_code_block: CodeBlockId,
+    pub argument_count_including_this: u32,
+    pub preferred_route: Option<VmGeneratedDirectCallTransactionRoute>,
+    pub generated_entry_miss: VmGeneratedDirectCallGeneratedEntryMissReason,
+    pub native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGeneratedDirectCallCalleeFallbackSummary {
+    pub caller: CodeBlockId,
+    pub call_bytecode_index: BytecodeIndex,
+    pub target_code_block: CodeBlockId,
+    pub argument_count_including_this: u32,
+    pub preferred_route: Option<VmGeneratedDirectCallTransactionRoute>,
+    pub generated_entry_miss: VmGeneratedDirectCallGeneratedEntryMissReason,
+    pub native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason,
+    pub fallback_count: usize,
+}
+
+impl VmGeneratedDirectCallCalleeFallbackSummary {
+    const fn new(
+        caller: CodeBlockId,
+        call_bytecode_index: BytecodeIndex,
+        target_code_block: CodeBlockId,
+        argument_count_including_this: u32,
+        preferred_route: Option<VmGeneratedDirectCallTransactionRoute>,
+        generated_entry_miss: VmGeneratedDirectCallGeneratedEntryMissReason,
+        native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason,
+    ) -> Self {
+        Self {
+            caller,
+            call_bytecode_index,
+            target_code_block,
+            argument_count_including_this,
+            preferred_route,
+            generated_entry_miss,
+            native_entry_miss,
+            fallback_count: 0,
+        }
+    }
+
+    fn record(&mut self) {
+        self.fallback_count = self.fallback_count.saturating_add(1);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

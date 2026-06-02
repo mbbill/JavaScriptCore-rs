@@ -120,6 +120,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            generated baseline residency when the generated subset can represent the callee
     [done] host-noncallable P6 x86_64 auto-installs also materialize generated
            residency on arm64; richards top direct calls now route to GeneratedEntry
+    [done] direct-call callee fallback telemetry: remaining richards 110@80 -> 146
+           fallback is MissingArtifact plus HostBlockedX86_64, so next batch is callee
+           generated auto-materialization before JS-to-JS call ABI work
     [wip] rootless direct-call admission
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
@@ -215,6 +218,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          generated_artifacts=40, generated_direct_call_generated_entries=3,389,270,
          nested_interpreter_fallbacks=657,293, hot_slot_hits=2,731,836, but score regresses to
          0.0458 because generated baseline is still the re-interpreter shim
+  [done] direct-call fallback evidence: top remaining richards nested fallback is
+         caller=110@80 target=146 count=657,293 with generated_entry_miss=MissingArtifact and
+         native_entry_miss=HostBlockedX86_64
   [missing] local C++ JSC comparison harness for parity claims
   [done] subagent reviewer flow used for current substantial patch
   [done] one logical commit boundary restored for current accepted batch
