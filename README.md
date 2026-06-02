@@ -123,6 +123,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] direct-call callee fallback telemetry: remaining richards 110@80 -> 146
            fallback is MissingArtifact plus HostBlockedX86_64, so next batch is callee
            generated auto-materialization before JS-to-JS call ABI work
+    [done] direct-call callee host-blocked preparation path: mirrors C++ linkFor()
+           prepareForExecution for supported callees and records failed generated install once
+    [missing] richards target 146 generated artifact eligibility: callee prep attempts once,
+              then 110@80 -> 146 stays MissingArtifact plus HostBlockedX86_64
     [wip] rootless direct-call admission
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
@@ -221,6 +225,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   [done] direct-call fallback evidence: top remaining richards nested fallback is
          caller=110@80 target=146 count=657,293 with generated_entry_miss=MissingArtifact and
          native_entry_miss=HostBlockedX86_64
+  [done] direct-call callee auto-materialization evidence: focused arm64 test proves
+         supported host-blocked native callees publish a generated entry; richards confirms
+         retry guard (baseline_entry_auto_materializations=41) but target 146 still lacks a
+         generated artifact, score=0.0460, nested_interpreter_fallbacks=657,293
   [missing] local C++ JSC comparison harness for parity claims
   [done] subagent reviewer flow used for current substantial patch
   [done] one logical commit boundary restored for current accepted batch

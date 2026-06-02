@@ -7780,6 +7780,7 @@ pub(crate) struct BaselineEntryAutoMaterializationRequest {
 pub enum BaselineEntryAutoNativeMaterializationOutcome {
     Installed,
     SkippedDisabledNativeEntry,
+    SkippedHostBlockedX86_64NativeEntry,
     Failed {
         reason: BaselineEntryAutoNativeMaterializationFailure,
         generated_fallback_allowed: bool,
