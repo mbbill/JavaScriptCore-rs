@@ -130,9 +130,13 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] generated property-handoff current-metadata validation: warmed bytecode ICs
            no longer make generated install apply cold PropertyHandoffPlan cache checks;
            focused tests cover bytecode-0 host-blocked callee auto-materialization
-    [missing] richards post-handoff release evidence: macOS arm64 probe reaches the
-              runner but does not produce a tiering summary before manual timeout;
-              next batch must profile the generated execution path against C++ JSC
+    [done] generated executor per-invocation dispatch cap: Rust-only diagnostic guard
+           makes the bytecode re-interpreter shim honor DispatchConfig for one generated
+           invocation while default helper callers stay unbounded
+    [missing] richards post-handoff source-run dispatch evidence: 50k capped macOS arm64
+              probe still stays in the runner because repeated generated resumes reset the
+              per-invocation guard; next batch needs source-run budget or the generated
+              sidecar/entrypoint perf fix
     [wip] rootless direct-call admission
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
@@ -237,9 +241,12 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   [done] generated property-handoff current-metadata evidence: C++ baseline JIT creates
          fresh property IC slots from profiled CodeBlock metadata; Rust install now derives
          from current metadata and focused tests cover warmed bytecode-0 and bytecode-1 ICs
-  [risk] richards post-fix release probe: unbounded macOS arm64 run reached runner and was
-         killed after no summary at >8 CPU minutes; 2M and 50k dispatch-step capped probes
-         also remained in runner until killed, so benchmark progress is not claimed
+  [done] generated dispatch-budget evidence: focused tests prove a capped generated infinite
+         loop returns DispatchStepLimitExceeded and default generated execution remains unbounded
+  [risk] richards post-dispatch-guard release probe: unbounded macOS arm64 run reached runner
+         and was killed after no summary at >8 CPU minutes; a 50k dispatch-step probe after the
+         per-invocation generated cap still remained in runner until killed, so benchmark
+         progress is not claimed
   [missing] local C++ JSC comparison harness for parity claims
   [done] subagent reviewer flow used for current substantial patch
   [done] one logical commit boundary restored for current accepted batch

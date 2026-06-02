@@ -80,12 +80,12 @@ use crate::interpreter::{
 };
 use crate::jit::baseline::{
     baseline_generated_js_call_handoff, baseline_generated_property_handoff,
-    execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation,
-    execute_baseline_generated_code_with_metrics_and_validation,
-    execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation,
-    execute_baseline_generated_code_with_runtime_helpers,
-    execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation,
-    execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation,
+    execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation_and_dispatch_config,
+    execute_baseline_generated_code_with_metrics_and_validation_and_dispatch_config,
+    execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation_and_dispatch_config,
+    execute_baseline_generated_code_with_runtime_helpers_and_dispatch_config,
+    execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation_and_dispatch_config,
+    execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_config,
     execute_baseline_generated_property_has_sidecar_probe,
     execute_baseline_generated_property_load_or_increment_sidecar_probe,
     execute_baseline_generated_property_load_sidecar_probe,
@@ -8527,7 +8527,7 @@ impl Vm {
                     ));
                     let mut metrics = BaselineGeneratedExecutionMetrics::default();
                     let result =
-                        execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation(
+                        execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_config(
                             BaselineGeneratedExecutionRequest {
                                 artifact: &artifact,
                                 owner: code_block_id,
@@ -8545,6 +8545,7 @@ impl Vm {
                             None,
                             &mut metrics,
                             validation,
+                            config,
                         );
                     (
                         result,
@@ -8650,7 +8651,7 @@ impl Vm {
                         );
                     let mut metrics = BaselineGeneratedExecutionMetrics::default();
                     let result =
-                        execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation(
+                        execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_config(
                             BaselineGeneratedExecutionRequest {
                                 artifact: &artifact,
                                 owner: code_block_id,
@@ -8668,6 +8669,7 @@ impl Vm {
                             Some(&mut sidecar),
                             &mut metrics,
                             validation,
+                            config,
                         );
                     (
                         result,
@@ -8710,7 +8712,7 @@ impl Vm {
 
             let mut metrics = BaselineGeneratedExecutionMetrics::default();
             let result =
-                execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation(
+                execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation_and_dispatch_config(
                     BaselineGeneratedExecutionRequest {
                         artifact: &artifact,
                         owner: code_block_id,
@@ -8726,6 +8728,7 @@ impl Vm {
                     runtime_helper_plan,
                     &mut metrics,
                     validation,
+                    config,
                 );
             let outcome = Self::baseline_generated_execution_with_runtime_helpers_outcome(&result);
             self.record_baseline_generated_execution_metrics(
@@ -8920,7 +8923,7 @@ impl Vm {
                         &megamorphic_has_candidate_table,
                     ));
                     let mut metrics = BaselineGeneratedExecutionMetrics::default();
-                    let result = execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation(
+                    let result = execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation_and_dispatch_config(
                         BaselineGeneratedExecutionRequest {
                             artifact: &artifact,
                             owner: code_block_id,
@@ -8936,6 +8939,7 @@ impl Vm {
                         &mut sidecars,
                         &mut metrics,
                         validation,
+                        config,
                     );
                     (
                         result,
@@ -9051,7 +9055,7 @@ impl Vm {
                         );
                     let mut metrics = BaselineGeneratedExecutionMetrics::default();
                     let result =
-                        execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation(
+                        execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation_and_dispatch_config(
                             BaselineGeneratedExecutionRequest {
                                 artifact: &artifact,
                                 owner: code_block_id,
@@ -9067,6 +9071,7 @@ impl Vm {
                             &mut sidecar,
                             &mut metrics,
                             validation,
+                            config,
                         );
                     (
                         result,
@@ -9106,22 +9111,24 @@ impl Vm {
                 );
             }
             let mut metrics = BaselineGeneratedExecutionMetrics::default();
-            let result = execute_baseline_generated_code_with_metrics_and_validation(
-                BaselineGeneratedExecutionRequest {
-                    artifact: &artifact,
-                    owner: code_block_id,
-                    code_block,
-                    expected_frame,
-                    execution: InterpreterExecutionState {
-                        stack: &mut self.execution,
-                        registers: &mut self.registers,
-                        exceptions: &mut self.exceptions,
-                        heap: &mut self.heap,
+            let result =
+                execute_baseline_generated_code_with_metrics_and_validation_and_dispatch_config(
+                    BaselineGeneratedExecutionRequest {
+                        artifact: &artifact,
+                        owner: code_block_id,
+                        code_block,
+                        expected_frame,
+                        execution: InterpreterExecutionState {
+                            stack: &mut self.execution,
+                            registers: &mut self.registers,
+                            exceptions: &mut self.exceptions,
+                            heap: &mut self.heap,
+                        },
                     },
-                },
-                &mut metrics,
-                validation,
-            );
+                    &mut metrics,
+                    validation,
+                    config,
+                );
             let outcome = Self::baseline_generated_execution_outcome(&result);
             self.record_baseline_generated_execution_metrics(
                 code_block_id,
@@ -9813,7 +9820,7 @@ impl Vm {
             runtime_helper_plan,
         } = request;
 
-        match execute_baseline_generated_code_with_runtime_helpers(
+        match execute_baseline_generated_code_with_runtime_helpers_and_dispatch_config(
             BaselineGeneratedExecutionRequest {
                 artifact,
                 owner,
@@ -9827,6 +9834,7 @@ impl Vm {
                 },
             },
             runtime_helper_plan,
+            config,
         ) {
             Ok(BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion)) => {
                 completion
@@ -59312,6 +59320,80 @@ mod tests {
             .iter()
             .skip(profile_count_before)
             .all(|record| record.event != TierProfileEvent::LoopBackedge));
+    }
+
+    #[test]
+    fn vm_generated_baseline_dispatch_budget_stops_infinite_reexecutor_loop() {
+        let code_block = p14_backward_jump_infinite_code_block();
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        install_typed_baseline_for_test(&mut vm, owner, 2_208);
+        let mut host = InterpreterDispatchMustNotRun;
+
+        let completion = execute_registered_code_block_with_host_config(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            DispatchConfig::new(2),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Failed(ExecutionError::DispatchStepLimitExceeded)
+        );
+        assert_no_gc_execution_depth_observed(&vm, VmNoGcExecutionPathForTest::GeneratedEntry, 1);
+        let record = vm
+            .tiering_integration()
+            .baseline_generated_execution_records()
+            .iter()
+            .rev()
+            .find(|record| record.owner == owner)
+            .expect("generated execution record for capped infinite loop");
+        assert_eq!(record.executed_bytecode_count, 2);
+        assert_eq!(record.outcome, VmBaselineGeneratedExecutionOutcome::Failed);
+        assert_eq!(
+            vm.tiering_integration()
+                .baseline_generated_executed_bytecode_count(),
+            2
+        );
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+        assert_eq!(vm.exception_state().pending(), None);
+        assert!(exception_targeted_roots(&vm).is_empty());
+    }
+
+    #[test]
+    fn vm_generated_baseline_default_dispatch_budget_remains_unbounded() {
+        let code_block = p14_backward_jump_finite_code_block();
+        let expected = execute_interpreter_registered_code_block(&code_block, Vec::new());
+        assert_eq!(
+            expected,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        install_typed_baseline_for_test(&mut vm, owner, 2_209);
+        let mut host = InterpreterDispatchMustNotRun;
+
+        let completion =
+            execute_registered_code_block_with_host(&mut vm, owner, &code_block, &mut host);
+
+        assert_eq!(completion, expected);
+        assert_no_gc_execution_depth_observed(&vm, VmNoGcExecutionPathForTest::GeneratedEntry, 1);
+        let record = vm
+            .tiering_integration()
+            .baseline_generated_execution_records()
+            .iter()
+            .rev()
+            .find(|record| record.owner == owner)
+            .expect("generated execution record for default finite loop");
+        assert!(record.executed_bytecode_count > 0);
+        assert_eq!(
+            record.outcome,
+            VmBaselineGeneratedExecutionOutcome::Returned
+        );
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]
