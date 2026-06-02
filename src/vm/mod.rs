@@ -135,13 +135,12 @@ use crate::jit::plan::{
     baseline_generated_runtime_helper_plan_is_native_exit_eligible,
     derive_baseline_generated_js_call_native_exit_plan_from_code_block,
     derive_baseline_generated_owner_continuation_map_from_code_block,
-    derive_baseline_generated_property_handoff_plan_from_code_block,
     derive_baseline_generated_property_handoff_plan_from_current_code_block_metadata,
     derive_baseline_generated_runtime_helper_plan_from_code_block,
     validate_baseline_generated_js_call_native_exit_site_against_code_block,
     validate_baseline_generated_js_call_native_exit_site_metadata,
     validate_baseline_generated_owner_continuation_site_metadata,
-    validate_baseline_generated_property_handoff_plan_against_code_block,
+    validate_baseline_generated_property_handoff_plan_against_current_code_block,
     validate_baseline_generated_property_handoff_site_against_code_block,
     validate_baseline_generated_property_handoff_site_against_current_code_block,
     validate_baseline_generated_property_handoff_site_metadata,
@@ -4237,14 +4236,22 @@ impl Vm {
             metadata: derived_property_handoff_plan,
         } = match property_handoff_plan.as_ref() {
             Some(property_handoff_plan) => {
-                validate_baseline_generated_property_handoff_plan_against_code_block(
+                validate_baseline_generated_property_handoff_plan_against_current_code_block(
                     code_block,
                     owner,
                     property_handoff_plan,
                 )
             }
             None => {
-                derive_baseline_generated_property_handoff_plan_from_code_block(code_block, owner)
+                // C++ JSC's Baseline JIT creates fresh baseline property IC slots
+                // from the profiled CodeBlock's current metadata
+                // (`JIT::addUnlinkedPropertyInlineCache` ->
+                // `CodeBlock::setupWithUnlinkedBaselineCode`), so generated
+                // install must not reject a valid site just because an existing
+                // bytecode IC already warmed.
+                derive_baseline_generated_property_handoff_plan_from_current_code_block_metadata(
+                    code_block, owner,
+                )
             }
         }
         .map_err(|error| BaselineGeneratedCodeInstallError::Eligibility {
@@ -20690,8 +20697,8 @@ mod tests {
     use crate::bytecode::register::{RegisterFrameShape, ThisArgumentOffset, VirtualRegister};
     use crate::bytecode::{
         BytecodeIndex, BytecodeRootMap, BytecodeRootMapId, BytecodeRootSlotDescriptor,
-        BytecodeRootSlotKind, GetByIdMode, PropertyInlineCacheDispatch,
-        StructureStubAccessCaseLinkError, ValueProfileBucketKind,
+        BytecodeRootSlotKind, GetByIdMode, InlineCacheMutationAuthority, InlineCacheState,
+        PropertyInlineCacheDispatch, StructureStubAccessCaseLinkError, ValueProfileBucketKind,
     };
     use crate::gc::{
         CellId, CellType, CellZapReason, GcRef, HeapCellInvalidationRequest, HeapIntegrationError,
@@ -38095,6 +38102,120 @@ mod tests {
         assert_latest_generated_entry_evidence(&vm, owner, caller_artifact);
     }
 
+    #[cfg(all(unix, not(target_arch = "x86_64")))]
+    #[test]
+    fn vm_generated_direct_call_host_blocked_warmed_property_callee_materializes_generated_entry() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let function_unlinked =
+            generated_property_get_by_name_self_load_frame_argument_code_block()
+                .unlinked()
+                .clone();
+        let function_blocks = vm
+            .install_source_function_blocks(vec![function_unlinked])
+            .expect("owned host-blocked property callee code");
+        let callee_owner = function_blocks[0].id;
+        let mut host = RecordingCoreHost::with_function_code_blocks(function_blocks);
+        let object = create_data_property_object_for_test(&mut vm, &mut host);
+        let callee = load_function_value_for_test(&mut vm, &mut host, 0);
+        host.clear_observations();
+        vm.install_p6_x86_64_callable_semantic_baseline_native_entry(p6_semantic_install_request(
+            callee_owner,
+            2_278,
+        ))
+        .expect("manual host-blocked x86_64 property callee install");
+        assert_eq!(
+            vm.generated_direct_call_native_entry_miss_reason(
+                callee_owner,
+                vm.code_blocks
+                    .get(callee_owner)
+                    .expect("registered property callee")
+                    .code_block(),
+                CallFrameId(0),
+            ),
+            VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64
+        );
+
+        let code_block = generated_js_call_one_arg_return_result_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let caller_artifact = install_typed_baseline_for_test(&mut vm, owner, 2_279);
+
+        let first = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), callee, object],
+        );
+        assert_eq!(
+            first,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
+        );
+        assert!(vm
+            .tiering_integration()
+            .baseline_generated_code_artifact_for(callee_owner)
+            .is_none());
+        {
+            let callee_code_block = vm
+                .code_blocks
+                .get(callee_owner)
+                .expect("registered property callee")
+                .code_block();
+            let mut inline_caches = callee_code_block.side_tables().inline_caches_mut();
+            let cache = inline_caches
+                .property_accesses
+                .iter_mut()
+                .find(|cache| cache.bytecode_index == BytecodeIndex::from_offset(0))
+                .expect("bytecode-0 GetByName property IC");
+            cache.dispatch = PropertyInlineCacheDispatch::Handler;
+            cache.mutation_authority = InlineCacheMutationAuthority::BaselineJit;
+        }
+
+        let auto_count_before = vm
+            .tiering_integration()
+            .baseline_entry_auto_materializations()
+            .len();
+        host.clear_observations();
+        let second = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), callee, object],
+        );
+
+        assert_eq!(
+            second,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
+        );
+        let callee_auto_record = vm
+            .tiering_integration()
+            .baseline_entry_auto_materializations()[auto_count_before..]
+            .iter()
+            .find(|record| record.owner == callee_owner)
+            .expect("host-blocked property callee generated materialization");
+        assert_eq!(
+            callee_auto_record.native,
+            BaselineEntryAutoNativeMaterializationOutcome::SkippedHostBlockedX86_64NativeEntry
+        );
+        assert_eq!(
+            callee_auto_record.generated,
+            Some(BaselineEntryAutoGeneratedMaterializationOutcome::Installed)
+        );
+        assert_eq!(callee_auto_record.generated_detail, None);
+        let callee_artifact = vm
+            .tiering_integration()
+            .baseline_generated_code_artifact_for(callee_owner)
+            .expect("generated property callee artifact");
+        let property_plan = callee_artifact
+            .property_handoff_plan()
+            .expect("property callee handoff plan");
+        assert!(property_plan
+            .site_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("unique bytecode-0 lookup")
+            .is_some());
+        assert_latest_generated_entry_evidence(&vm, owner, caller_artifact);
+    }
+
     #[cfg(all(unix, target_arch = "x86_64"))]
     #[test]
     fn vm_generated_direct_call_rootless_emitted_native_side_exit_publishes_nonlocal_roots() {
@@ -54238,6 +54359,48 @@ mod tests {
             .tiering_integration()
             .baseline_generated_code_artifacts()
             .is_empty());
+    }
+
+    #[test]
+    fn vm_generated_property_handoff_install_accepts_warmed_current_metadata_before_dispatch() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let code_block = generated_property_get_by_name_return_consumed_code_block();
+        let side_tables = code_block.side_tables().clone();
+        {
+            let mut inline_caches = side_tables.inline_caches_mut();
+            let cache = inline_caches
+                .property_accesses
+                .iter_mut()
+                .find(|cache| cache.bytecode_index == BytecodeIndex::from_offset(1))
+                .expect("GetByName property IC");
+            cache.state = InlineCacheState::Monomorphic;
+            cache.dispatch = PropertyInlineCacheDispatch::Handler;
+            cache.mutation_authority = InlineCacheMutationAuthority::BaselineJit;
+        }
+        let code_block = code_block.with_side_tables(side_tables);
+        let owner = register_test_code_block(&mut vm, code_block);
+
+        let artifact = vm
+            .install_baseline_generated_code_artifact(
+                owner,
+                JitCodeId(1028),
+                BaselineGeneratedCodeBodyId(1128),
+                BaselineInstallDependencyPolicy::Allow,
+            )
+            .unwrap();
+        let property_plan = artifact
+            .property_handoff_plan()
+            .expect("property handoff plan");
+
+        assert_eq!(property_plan.site_count(), 1);
+        assert_eq!(
+            property_plan
+                .site_for_bytecode_index(BytecodeIndex::from_offset(1))
+                .expect("unique lookup")
+                .expect("GetByName site")
+                .owner,
+            owner
+        );
     }
 
     #[test]

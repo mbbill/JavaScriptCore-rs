@@ -1572,6 +1572,7 @@ pub(crate) fn validate_baseline_generated_js_call_native_exit_site_against_code_
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn validate_baseline_generated_property_handoff_plan_against_code_block(
     code_block: &CodeBlock,
     owner: CodeBlockId,
@@ -1579,6 +1580,25 @@ pub(crate) fn validate_baseline_generated_property_handoff_plan_against_code_blo
 ) -> Result<BaselineGeneratedPropertyHandoffPlanDerivation, JitPlanValidationError> {
     let derivation =
         derive_baseline_generated_property_handoff_plan_from_code_block(code_block, owner)?;
+    if derivation.metadata.as_ref() != Some(property_handoff_plan) {
+        return Err(baseline_generated_property_handoff_plan_mismatch_error(
+            code_block,
+            derivation.metadata.as_ref(),
+            property_handoff_plan,
+        ));
+    }
+    Ok(derivation)
+}
+
+pub(crate) fn validate_baseline_generated_property_handoff_plan_against_current_code_block(
+    code_block: &CodeBlock,
+    owner: CodeBlockId,
+    property_handoff_plan: &BaselineGeneratedPropertyHandoffPlanMetadata,
+) -> Result<BaselineGeneratedPropertyHandoffPlanDerivation, JitPlanValidationError> {
+    let derivation =
+        derive_baseline_generated_property_handoff_plan_from_current_code_block_metadata(
+            code_block, owner,
+        )?;
     if derivation.metadata.as_ref() != Some(property_handoff_plan) {
         return Err(baseline_generated_property_handoff_plan_mismatch_error(
             code_block,

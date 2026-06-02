@@ -127,9 +127,12 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            prepareForExecution for supported callees and records failed generated install once
     [done] generated auto-materialization telemetry preserves install stage and
            validator detail through Octane benchmark summaries
-    [missing] richards target 146 property-handoff cache fidelity: callee prep fails
-              generated install with PropertyHandoffPlan malformed bytecode cache at bytecode 0,
-              then 110@80 -> 146 stays MissingArtifact plus HostBlockedX86_64
+    [done] generated property-handoff current-metadata validation: warmed bytecode ICs
+           no longer make generated install apply cold PropertyHandoffPlan cache checks;
+           focused tests cover bytecode-0 host-blocked callee auto-materialization
+    [missing] richards post-handoff release evidence: macOS arm64 probe reaches the
+              runner but does not produce a tiering summary before manual timeout;
+              next batch must profile the generated execution path against C++ JSC
     [wip] rootless direct-call admission
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
@@ -229,11 +232,14 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          caller=110@80 target=146 count=657,293 with generated_entry_miss=MissingArtifact and
          native_entry_miss=HostBlockedX86_64
   [done] direct-call callee auto-materialization evidence: focused arm64 test proves
-         supported host-blocked native callees publish a generated entry; richards confirms
-         retry guard (baseline_entry_auto_materializations=41) but target 146 generated install
-         fails once: generated_detail=PropertyHandoffPlan /
-         BaselineGeneratedPropertyHandoffPlanMalformedBytecodeCache at bytecode 0;
-         score=0.0460, nested_interpreter_fallbacks=657,293
+         supported host-blocked native callees publish a generated entry; earlier richards
+         probe showed target 146 blocked by PropertyHandoffPlan malformed bytecode cache
+  [done] generated property-handoff current-metadata evidence: C++ baseline JIT creates
+         fresh property IC slots from profiled CodeBlock metadata; Rust install now derives
+         from current metadata and focused tests cover warmed bytecode-0 and bytecode-1 ICs
+  [risk] richards post-fix release probe: unbounded macOS arm64 run reached runner and was
+         killed after no summary at >8 CPU minutes; 2M and 50k dispatch-step capped probes
+         also remained in runner until killed, so benchmark progress is not claimed
   [missing] local C++ JSC comparison harness for parity claims
   [done] subagent reviewer flow used for current substantial patch
   [done] one logical commit boundary restored for current accepted batch
