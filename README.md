@@ -24,9 +24,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
                  slot range (6ebfe66) -- richards 140s->112s, crypto/navier/code-load +30-60%;
                  VM-owned interpreter root scope keeps caller roots live across nested calls.
                  macOS arm64 richards after VM-root-scope: interpreter score=0.1219. Baseline
-                 call-link telemetry now shows ~4.05M authorized direct-call transactions, all
-                 NestedInterpreterFallback; disabled-native fallback is handled, so remaining
-                 lever is generated/native callee residency or eligibility for hot callees.
+                 call-link telemetry now shows ~4.05M authorized direct-call transactions.
+                 Host-callability fallback moves ~3.39M to GeneratedEntry, exposing the next
+                 blocker: generated baseline is still a Rust bytecode re-interpreter and is slower
+                 than the optimized interpreter on richards.
   Phase 2 [done] Octane feature completeness: all 15 benchmarks RUN correctly. Ground-truth
                  2026-05-30: ZERO throwers/aborts -- 3 score, 12 functional-but-slow
                  (perf-gated, Phase 1). Landed: implicit-global store, indirect eval, catchable
@@ -55,8 +56,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            earley-boyer, gbemu, mandreel, pdfjs, raytrace, regexp, richards (~56s/iter),
            splay (GC-stress), typescript, octane-zlib (asm.js, ~18-60M calls/iter). The gate to
            all 15 Succeeding (hence any suite geomean) is throughput; after the VM-stack root
-           scope and call-link telemetry, richards is correctness-clean but still
-           direct-call generated/native-callee-residency-bound.
+           scope and call-link telemetry, richards is correctness-clean; generated direct-call
+           residency now works for most hot calls but regresses score until generated execution
+           stops re-interpreting bytecode.
     [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
            __defineGetter__/Setter__, global Function, Math, apply/bind, globals
     [missing] Octane score parity with local C++ JSC (needs call-dispatch + optimizing tiers)
@@ -116,6 +118,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [wip] direct-call and generated-call paths
     [done] disabled native-entry metadata on macOS arm64 no longer blocks portable
            generated baseline residency when the generated subset can represent the callee
+    [done] host-noncallable P6 x86_64 auto-installs also materialize generated
+           residency on arm64; richards top direct calls now route to GeneratedEntry
     [wip] rootless direct-call admission
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
@@ -168,10 +172,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          JS-call/P6 reentry), increment sidecar, LoopHint handoff skeleton. ALL on the
          re-interpreter shim path; CORRECT but unreached on hot functions.
   [risk] baseline is a Rust bytecode RE-INTERPRETER (no register allocation); macOS richards now
-         proves call-link admission (~4.05M direct-call transactions), but every transaction routes
-         to NestedInterpreterFallback because hot callees still lack generated/native residency;
-         disabled-native fallback is not the richards blocker. Then real reg-alloc and the absent
-         optimizing tiers own score parity.
+         proves call-link admission (~4.05M direct-call transactions) and generated callee
+         residency (~3.39M GeneratedEntry, ~0.66M NestedInterpreterFallback), but score regresses
+         to ~0.0458 because generated execution still re-dispatches bytecode. Real reg-alloc and
+         the absent optimizing tiers own score parity.
   [missing] CRITICAL PATH (deferred, in order): call-dispatch-into-generated -> mc
          put_by_id/call/construct/get_by_val -> slow-case rejoin -> inline alloc ->
          real reg-alloc; then DFG/FTL/B3-equivalent optimizing tier (where parity lives)
@@ -207,6 +211,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          ReadyButExecutionDisabled native artifact auto-materializes generated baseline code and
          ordinary CallLinkInfo can route to GeneratedEntry, but richards stays score=0.1119 with
          ~4.05M NestedInterpreterFallback direct-call transactions
+  [done] macOS arm64 host-callability fallback evidence: richards baseline now records
+         generated_artifacts=40, generated_direct_call_generated_entries=3,389,270,
+         nested_interpreter_fallbacks=657,293, hot_slot_hits=2,731,836, but score regresses to
+         0.0458 because generated baseline is still the re-interpreter shim
   [missing] local C++ JSC comparison harness for parity claims
   [done] subagent reviewer flow used for current substantial patch
   [done] one logical commit boundary restored for current accepted batch
