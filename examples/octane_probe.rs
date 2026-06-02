@@ -1687,6 +1687,13 @@ fn print_benchmark_tiering_summary(benchmark: &OctaneBenchmarkExecutionReport) {
                 })
         },
     );
+    print_tail_records(
+        &mut stderr,
+        "baseline-entry-auto-materialization",
+        &summary.baseline_entry_auto_materialization_records,
+        tail_limit,
+        record_filter.as_deref(),
+    );
     let _ = stderr.flush();
 }
 

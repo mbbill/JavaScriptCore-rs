@@ -125,7 +125,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            generated auto-materialization before JS-to-JS call ABI work
     [done] direct-call callee host-blocked preparation path: mirrors C++ linkFor()
            prepareForExecution for supported callees and records failed generated install once
-    [missing] richards target 146 generated artifact eligibility: callee prep attempts once,
+    [done] generated auto-materialization telemetry preserves install stage and
+           validator detail through Octane benchmark summaries
+    [missing] richards target 146 property-handoff cache fidelity: callee prep fails
+              generated install with PropertyHandoffPlan malformed bytecode cache at bytecode 0,
               then 110@80 -> 146 stays MissingArtifact plus HostBlockedX86_64
     [wip] rootless direct-call admission
     [missing] full CallLinkInfo/function executable fidelity
@@ -227,8 +230,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          native_entry_miss=HostBlockedX86_64
   [done] direct-call callee auto-materialization evidence: focused arm64 test proves
          supported host-blocked native callees publish a generated entry; richards confirms
-         retry guard (baseline_entry_auto_materializations=41) but target 146 still lacks a
-         generated artifact, score=0.0460, nested_interpreter_fallbacks=657,293
+         retry guard (baseline_entry_auto_materializations=41) but target 146 generated install
+         fails once: generated_detail=PropertyHandoffPlan /
+         BaselineGeneratedPropertyHandoffPlanMalformedBytecodeCache at bytecode 0;
+         score=0.0460, nested_interpreter_fallbacks=657,293
   [missing] local C++ JSC comparison harness for parity claims
   [done] subagent reviewer flow used for current substantial patch
   [done] one logical commit boundary restored for current accepted batch
