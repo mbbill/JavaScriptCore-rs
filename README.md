@@ -130,13 +130,18 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] generated property-handoff current-metadata validation: warmed bytecode ICs
            no longer make generated install apply cold PropertyHandoffPlan cache checks;
            focused tests cover bytecode-0 host-blocked callee auto-materialization
+    [done] generated property sidecar projection cache: property load/store/has tables are
+           retained per owner/snapshot under CodeBlock-registry, plan-generation, and
+           megamorphic-projection epochs, avoiding per-generated-entry rebuilds while preserving
+           stale metadata invalidation
     [done] generated executor per-invocation dispatch cap: Rust-only diagnostic guard
            makes the bytecode re-interpreter shim honor DispatchConfig for one generated
            invocation while default helper callers stay unbounded
     [missing] richards post-handoff source-run dispatch evidence: 50k capped macOS arm64
               probe still stays in the runner because repeated generated resumes reset the
-              per-invocation guard; next batch needs source-run budget or the generated
-              sidecar/entrypoint perf fix
+              per-invocation guard; property sidecar projection rebuild is removed from the hot
+              entry path, but no benchmark progress is claimed until a source-run/entrypoint probe
+              proves it
     [wip] rootless direct-call admission
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit

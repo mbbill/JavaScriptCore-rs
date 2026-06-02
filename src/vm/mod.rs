@@ -128,8 +128,11 @@ use crate::jit::executable::{
     record_link_buffer_copy_link_with_linked_image, LinkBufferLinkedCopyLinkRequest,
 };
 use crate::jit::ic::{
-    GeneratedCallLinkDirectCall, GeneratedPropertyStoreMutationRequest,
-    GeneratedPropertyStoreMutationResult,
+    GeneratedCallLinkDirectCall, GeneratedPropertyHasMegamorphicCandidateTable,
+    GeneratedPropertyLoadMegamorphicCandidateTable,
+    GeneratedPropertyStoreMegamorphicCandidateTable, GeneratedPropertyStoreMutationRequest,
+    GeneratedPropertyStoreMutationResult, PropertyLoadAccessCasePlanTable,
+    PropertyLoadGuardedCandidateTable, PropertyStoreMutationCandidateTable,
 };
 use crate::jit::plan::{
     baseline_generated_runtime_helper_plan_is_native_exit_eligible,
@@ -797,6 +800,7 @@ fn vm_record_sequence_epoch<T>(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GeneratedCallLinkProjectionEpoch {
+    code_block_registry_revision: u64,
     call_observations: VmRecordSequenceEpoch,
     call_link_readiness_records: VmRecordSequenceEpoch,
     call_link_descriptor_records: VmRecordSequenceEpoch,
@@ -813,6 +817,31 @@ struct GeneratedCallLinkCandidateTableCacheEntry {
     bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
     epoch: GeneratedCallLinkProjectionEpoch,
     table: GeneratedCallLinkCandidateTable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GeneratedPropertySidecarProjectionEpoch {
+    code_block_registry_revision: u64,
+    plan_generation: u64,
+    megamorphic_projection_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GeneratedPropertySidecarProjection {
+    property_load_plan_table: PropertyLoadAccessCasePlanTable,
+    guarded_candidate_table: PropertyLoadGuardedCandidateTable,
+    megamorphic_load_candidate_table: GeneratedPropertyLoadMegamorphicCandidateTable,
+    store_candidate_table: PropertyStoreMutationCandidateTable,
+    megamorphic_store_candidate_table: GeneratedPropertyStoreMegamorphicCandidateTable,
+    megamorphic_has_candidate_table: GeneratedPropertyHasMegamorphicCandidateTable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GeneratedPropertySidecarProjectionCacheEntry {
+    owner: CodeBlockId,
+    bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    epoch: GeneratedPropertySidecarProjectionEpoch,
+    projection: GeneratedPropertySidecarProjection,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -870,6 +899,8 @@ pub struct Vm {
     tiering: VmTieringIntegration,
     generated_call_link_candidate_table_cache:
         RefCell<Vec<GeneratedCallLinkCandidateTableCacheEntry>>,
+    generated_property_sidecar_projection_cache:
+        RefCell<Vec<GeneratedPropertySidecarProjectionCacheEntry>>,
     generated_direct_call_hot_slots: RefCell<Vec<GeneratedDirectCallHotSlot>>,
     baseline_platform_executable_residencies: Vec<ExecutableMemoryPlatformResidency>,
     p6_x86_64_callable_retained_return_tables: Vec<P6X86_64CallableRetainedReturnTable>,
@@ -1886,6 +1917,7 @@ impl Vm {
             gc_execution: VmGcExecutionState::default(),
             tiering: VmTieringIntegration::default(),
             generated_call_link_candidate_table_cache: RefCell::new(Vec::new()),
+            generated_property_sidecar_projection_cache: RefCell::new(Vec::new()),
             generated_direct_call_hot_slots: RefCell::new(Vec::new()),
             baseline_platform_executable_residencies: Vec::new(),
             p6_x86_64_callable_retained_return_tables: Vec::new(),
@@ -1904,6 +1936,7 @@ impl Vm {
 
     fn generated_call_link_projection_epoch(&self) -> GeneratedCallLinkProjectionEpoch {
         GeneratedCallLinkProjectionEpoch {
+            code_block_registry_revision: self.code_blocks.revision(),
             call_observations: vm_record_sequence_epoch(
                 self.tiering.call_observations(),
                 |record| record.ordinal,
@@ -1936,6 +1969,18 @@ impl Vm {
                 self.tiering.call_link_inline_cache_clear_records(),
                 |record| record.ordinal,
             ),
+        }
+    }
+
+    fn generated_property_sidecar_projection_epoch(
+        &self,
+    ) -> GeneratedPropertySidecarProjectionEpoch {
+        GeneratedPropertySidecarProjectionEpoch {
+            code_block_registry_revision: self.code_blocks.revision(),
+            plan_generation: self.tiering.plan_generation(),
+            megamorphic_projection_generation: self
+                .tiering
+                .property_megamorphic_projection_generation(),
         }
     }
 
@@ -2013,12 +2058,123 @@ impl Vm {
         Ok(table)
     }
 
+    fn generated_property_sidecar_projection_for_owner_cached(
+        &self,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+    ) -> Result<GeneratedPropertySidecarProjection, ExecutionError> {
+        let epoch = self.generated_property_sidecar_projection_epoch();
+        {
+            let mut cache = self
+                .generated_property_sidecar_projection_cache
+                .borrow_mut();
+            cache.retain(|entry| entry.epoch == epoch);
+            if let Some(entry) = cache
+                .iter()
+                .find(|entry| entry.owner == owner && entry.bytecode_snapshot == bytecode_snapshot)
+            {
+                return Ok(entry.projection.clone());
+            }
+        }
+
+        // C++ JSC retains PropertyInlineCache AccessCases/stubs and mutates the
+        // VM megamorphic cache arrays in place. Rust's generated executor
+        // consumes immutable projected sidecar tables instead, so this cache is a
+        // Rust ownership/perf adaptation keyed by the mutation generations that
+        // make those projections stale.
+        let attached_property_ic_candidates = self
+            .code_blocks
+            .attached_property_inline_cache_candidates_for_owner(
+                owner,
+                bytecode_snapshot,
+                self.tiering.property_inline_cache_attachment_records(),
+            );
+        let structure_stub_property_ic_candidates = self
+            .code_blocks
+            .structure_stub_property_inline_cache_candidates_for_owner(
+                owner,
+                bytecode_snapshot,
+                self.tiering.property_inline_cache_attachment_records(),
+            );
+        let property_load_plan_table = self
+            .tiering
+            .property_load_access_case_plan_table_for_owner_with_attached_and_structure_stubs(
+                owner,
+                bytecode_snapshot,
+                &attached_property_ic_candidates,
+                &structure_stub_property_ic_candidates,
+            )
+            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+        let guarded_candidate_table = self
+            .tiering
+            .property_load_guarded_candidate_table_for_owner_with_attached(
+                owner,
+                bytecode_snapshot,
+                &attached_property_ic_candidates,
+            )
+            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+        let megamorphic_load_candidate_table = self
+            .tiering
+            .generated_property_load_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+        let store_candidate_table = self
+            .tiering
+            .property_store_mutation_candidate_table_for_owner_with_attached(
+                owner,
+                bytecode_snapshot,
+                &attached_property_ic_candidates,
+            )
+            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+        let megamorphic_store_candidate_table = self
+            .tiering
+            .generated_property_store_megamorphic_candidate_table_for_owner(
+                owner,
+                bytecode_snapshot,
+            )
+            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+        let megamorphic_has_candidate_table = self
+            .tiering
+            .generated_property_has_megamorphic_candidate_table_for_owner(owner, bytecode_snapshot)
+            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+
+        let projection = GeneratedPropertySidecarProjection {
+            property_load_plan_table,
+            guarded_candidate_table,
+            megamorphic_load_candidate_table,
+            store_candidate_table,
+            megamorphic_store_candidate_table,
+            megamorphic_has_candidate_table,
+        };
+
+        self.generated_property_sidecar_projection_cache
+            .borrow_mut()
+            .push(GeneratedPropertySidecarProjectionCacheEntry {
+                owner,
+                bytecode_snapshot,
+                epoch,
+                projection: projection.clone(),
+            });
+        Ok(projection)
+    }
+
     #[cfg(test)]
     fn generated_call_link_candidate_table_cache_entries_for_current_epoch_for_test(
         &self,
     ) -> usize {
         let epoch = self.generated_call_link_projection_epoch();
         self.generated_call_link_candidate_table_cache
+            .borrow()
+            .iter()
+            .filter(|entry| entry.epoch == epoch)
+            .count()
+    }
+
+    #[cfg(test)]
+    fn generated_property_sidecar_projection_cache_entries_for_current_epoch_for_test(
+        &self,
+    ) -> usize {
+        let epoch = self.generated_property_sidecar_projection_epoch();
+        self.generated_property_sidecar_projection_cache
             .borrow()
             .iter()
             .filter(|entry| entry.epoch == epoch)
@@ -8349,120 +8505,18 @@ impl Vm {
                     )
                 }
             };
-            // The property/candidate sidecar tables below are rebuilt on every
-            // region entry. Unlike the call-link candidate table above (cached
-            // via the record-sequence-epoch pattern), they are intentionally NOT
-            // cached: their inputs include state that is mutated IN PLACE on
-            // existing records without a guaranteed append to any epoch-tracked
-            // log, so a (len, last_ordinal) record-sequence epoch cannot observe
-            // the change and a cache would silently serve stale tables.
-            // Specifically:
-            //   - megamorphic load/store/has tables read the megamorphic cache's
-            //     fixed-size primary/secondary arrays, overwritten in place by
-            //     insert_hit/insert_miss/... (tiering.rs ~12230-12303) with no
-            //     bump of property_megamorphic_cache_epoch on a fill;
-            //   - the property-load access-case / guarded tables read
-            //     property_load_guard_plans[..].lifecycle and
-            //     property_inline_cache_evolution_states[..].terminal, which are
-            //     retired/flipped in place (e.g. guard-plan watchpoint retirement
-            //     at tiering.rs ~4750) whose only unconditional append is to a Vec
-            //     the proof epoch does not track.
-            // Caching these faithfully would require a new per-Vec
-            // revision-counter invalidation scheme rather than the established
-            // record-sequence pattern, so it is deferred. The call-link cache is
-            // sound only because its in-place lifecycle flips are always preceded
-            // by an append to call_link_inline_cache_clear_records, which the
-            // epoch does track.
-            let attached_property_ic_candidates = self
-                .code_blocks
-                .attached_property_inline_cache_candidates_for_owner(
-                    code_block_id,
-                    bytecode_snapshot,
-                    self.tiering.property_inline_cache_attachment_records(),
-                );
-            let structure_stub_property_ic_candidates = self
-                .code_blocks
-                .structure_stub_property_inline_cache_candidates_for_owner(
-                    code_block_id,
-                    bytecode_snapshot,
-                    self.tiering.property_inline_cache_attachment_records(),
-                );
-            let property_load_plan_table = match self
-                .tiering
-                .property_load_access_case_plan_table_for_owner_with_attached_and_structure_stubs(
-                    code_block_id,
-                    bytecode_snapshot,
-                    &attached_property_ic_candidates,
-                    &structure_stub_property_ic_candidates,
-                ) {
-                Ok(table) => table,
-                Err(_) => {
-                    return GeneratedExecutionControl::failed(
-                        ExecutionError::BaselineGeneratedExecutionRejected,
-                    )
-                }
-            };
-            let guarded_candidate_table = match self
-                .tiering
-                .property_load_guarded_candidate_table_for_owner_with_attached(
-                    code_block_id,
-                    bytecode_snapshot,
-                    &attached_property_ic_candidates,
-                ) {
-                Ok(table) => table,
-                Err(_) => {
-                    return GeneratedExecutionControl::failed(
-                        ExecutionError::BaselineGeneratedExecutionRejected,
-                    )
-                }
-            };
-            let megamorphic_load_candidate_table = match self
-                .tiering
-                .generated_property_load_megamorphic_candidate_table_for_owner(
-                    code_block_id,
-                    bytecode_snapshot,
-                ) {
-                Ok(table) => table,
-                Err(_) => {
-                    return GeneratedExecutionControl::failed(
-                        ExecutionError::BaselineGeneratedExecutionRejected,
-                    )
-                }
-            };
-            let store_candidate_table = match self
-                .tiering
-                .property_store_mutation_candidate_table_for_owner_with_attached(
-                    code_block_id,
-                    bytecode_snapshot,
-                    &attached_property_ic_candidates,
-                ) {
-                Ok(table) => table,
-                Err(_) => {
-                    return GeneratedExecutionControl::failed(
-                        ExecutionError::BaselineGeneratedExecutionRejected,
-                    )
-                }
-            };
-            let megamorphic_store_candidate_table = match self
-                .tiering
-                .generated_property_store_megamorphic_candidate_table_for_owner(
-                    code_block_id,
-                    bytecode_snapshot,
-                ) {
-                Ok(table) => table,
-                Err(_) => {
-                    return GeneratedExecutionControl::failed(
-                        ExecutionError::BaselineGeneratedExecutionRejected,
-                    )
-                }
-            };
-            let megamorphic_has_candidate_table = match self
-                .tiering
-                .generated_property_has_megamorphic_candidate_table_for_owner(
-                    code_block_id,
-                    bytecode_snapshot,
-                ) {
-                Ok(table) => table,
+            let GeneratedPropertySidecarProjection {
+                property_load_plan_table,
+                guarded_candidate_table,
+                megamorphic_load_candidate_table,
+                store_candidate_table,
+                megamorphic_store_candidate_table,
+                megamorphic_has_candidate_table,
+            } = match self.generated_property_sidecar_projection_for_owner_cached(
+                code_block_id,
+                bytecode_snapshot,
+            ) {
+                Ok(projection) => projection,
                 Err(_) => {
                     return GeneratedExecutionControl::failed(
                         ExecutionError::BaselineGeneratedExecutionRejected,
@@ -8762,104 +8816,18 @@ impl Vm {
                     )
                 }
             };
-            // See the matching note in the runtime-helper-plan branch above: the
-            // property/candidate sidecar tables below are intentionally NOT cached
-            // because their inputs are mutated in place (megamorphic cache arrays;
-            // property_load_guard_plans/evolution_states lifecycle+terminal) in a
-            // way the record-sequence epoch cannot observe, so caching them would
-            // serve stale tables. Deferred until a per-Vec revision-counter scheme
-            // exists; the call-link cache above is sound only because its in-place
-            // flips are always preceded by a tracked clear-record append.
-            let attached_property_ic_candidates = self
-                .code_blocks
-                .attached_property_inline_cache_candidates_for_owner(
-                    code_block_id,
-                    bytecode_snapshot,
-                    self.tiering.property_inline_cache_attachment_records(),
-                );
-            let structure_stub_property_ic_candidates = self
-                .code_blocks
-                .structure_stub_property_inline_cache_candidates_for_owner(
-                    code_block_id,
-                    bytecode_snapshot,
-                    self.tiering.property_inline_cache_attachment_records(),
-                );
-            let property_load_plan_table = match self
-                .tiering
-                .property_load_access_case_plan_table_for_owner_with_attached_and_structure_stubs(
-                    code_block_id,
-                    bytecode_snapshot,
-                    &attached_property_ic_candidates,
-                    &structure_stub_property_ic_candidates,
-                ) {
-                Ok(table) => table,
-                Err(_) => {
-                    return GeneratedExecutionControl::failed(
-                        ExecutionError::BaselineGeneratedExecutionRejected,
-                    )
-                }
-            };
-            let guarded_candidate_table = match self
-                .tiering
-                .property_load_guarded_candidate_table_for_owner_with_attached(
-                    code_block_id,
-                    bytecode_snapshot,
-                    &attached_property_ic_candidates,
-                ) {
-                Ok(table) => table,
-                Err(_) => {
-                    return GeneratedExecutionControl::failed(
-                        ExecutionError::BaselineGeneratedExecutionRejected,
-                    )
-                }
-            };
-            let megamorphic_load_candidate_table = match self
-                .tiering
-                .generated_property_load_megamorphic_candidate_table_for_owner(
-                    code_block_id,
-                    bytecode_snapshot,
-                ) {
-                Ok(table) => table,
-                Err(_) => {
-                    return GeneratedExecutionControl::failed(
-                        ExecutionError::BaselineGeneratedExecutionRejected,
-                    )
-                }
-            };
-            let store_candidate_table = match self
-                .tiering
-                .property_store_mutation_candidate_table_for_owner_with_attached(
-                    code_block_id,
-                    bytecode_snapshot,
-                    &attached_property_ic_candidates,
-                ) {
-                Ok(table) => table,
-                Err(_) => {
-                    return GeneratedExecutionControl::failed(
-                        ExecutionError::BaselineGeneratedExecutionRejected,
-                    )
-                }
-            };
-            let megamorphic_store_candidate_table = match self
-                .tiering
-                .generated_property_store_megamorphic_candidate_table_for_owner(
-                    code_block_id,
-                    bytecode_snapshot,
-                ) {
-                Ok(table) => table,
-                Err(_) => {
-                    return GeneratedExecutionControl::failed(
-                        ExecutionError::BaselineGeneratedExecutionRejected,
-                    )
-                }
-            };
-            let megamorphic_has_candidate_table = match self
-                .tiering
-                .generated_property_has_megamorphic_candidate_table_for_owner(
-                    code_block_id,
-                    bytecode_snapshot,
-                ) {
-                Ok(table) => table,
+            let GeneratedPropertySidecarProjection {
+                property_load_plan_table,
+                guarded_candidate_table,
+                megamorphic_load_candidate_table,
+                store_candidate_table,
+                megamorphic_store_candidate_table,
+                megamorphic_has_candidate_table,
+            } = match self.generated_property_sidecar_projection_for_owner_cached(
+                code_block_id,
+                bytecode_snapshot,
+            ) {
+                Ok(projection) => projection,
                 Err(_) => {
                     return GeneratedExecutionControl::failed(
                         ExecutionError::BaselineGeneratedExecutionRejected,
@@ -51807,6 +51775,150 @@ mod tests {
             .iter()
             .any(|(_, _, opcode)| *opcode == Some(CoreOpcode::GetByName)));
         assert_latest_generated_entry_evidence(&vm, owner, artifact);
+    }
+
+    #[test]
+    fn vm_generated_property_sidecar_projection_cache_reuses_current_epoch_projection() {
+        let vm = Vm::new(VmConfig::baseline_allowed());
+        let code_block = generated_property_get_by_name_return_consumed_code_block();
+        let owner = CodeBlockId(CellId(16_900));
+        let bytecode_snapshot =
+            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(&code_block)
+                .expect("bytecode snapshot");
+
+        assert_eq!(
+            vm.generated_property_sidecar_projection_cache_entries_for_current_epoch_for_test(),
+            0
+        );
+        let first = vm
+            .generated_property_sidecar_projection_for_owner_cached(owner, bytecode_snapshot)
+            .expect("first property sidecar projection");
+        assert!(first.property_load_plan_table.is_empty());
+        assert!(first.guarded_candidate_table.is_empty());
+        assert!(first.megamorphic_load_candidate_table.is_empty());
+        assert!(first.store_candidate_table.is_empty());
+        assert!(first.megamorphic_store_candidate_table.is_empty());
+        assert!(first.megamorphic_has_candidate_table.is_empty());
+        assert_eq!(
+            vm.generated_property_sidecar_projection_cache_entries_for_current_epoch_for_test(),
+            1
+        );
+
+        let second = vm
+            .generated_property_sidecar_projection_for_owner_cached(owner, bytecode_snapshot)
+            .expect("second property sidecar projection");
+        assert_eq!(first, second);
+        assert_eq!(
+            vm.generated_property_sidecar_projection_cache_entries_for_current_epoch_for_test(),
+            1
+        );
+    }
+
+    #[test]
+    fn vm_generated_property_sidecar_projection_cache_invalidates_on_plan_and_megamorphic_generation(
+    ) {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+        let object = create_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let code_block = generated_property_get_by_name_return_consumed_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let _artifact = install_typed_baseline_for_test(&mut vm, owner, 1169);
+        let bytecode_snapshot =
+            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(&code_block)
+                .expect("bytecode snapshot");
+        let first_epoch = vm.generated_property_sidecar_projection_epoch();
+
+        let empty_projection = vm
+            .generated_property_sidecar_projection_for_owner_cached(owner, bytecode_snapshot)
+            .expect("empty property sidecar projection");
+        assert!(empty_projection.property_load_plan_table.is_empty());
+        assert_eq!(
+            vm.generated_property_sidecar_projection_cache_entries_for_current_epoch_for_test(),
+            1
+        );
+
+        let warmup = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), object],
+        );
+        assert_eq!(
+            warmup,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        assert!(vm
+            .tiering_integration()
+            .property_load_access_case_plans()
+            .is_empty());
+
+        host.clear_observations();
+        let first_plan_run = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), object],
+        );
+        assert_eq!(
+            first_plan_run,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .property_load_access_case_plans()
+                .len(),
+            1
+        );
+        assert!(
+            vm.generated_property_sidecar_projection_epoch()
+                .plan_generation
+                > first_epoch.plan_generation
+        );
+        let projected_plan = vm
+            .generated_property_sidecar_projection_for_owner_cached(owner, bytecode_snapshot)
+            .expect("property sidecar projection after plan generation");
+        assert!(!projected_plan.property_load_plan_table.is_empty());
+        assert!(
+            vm.generated_property_sidecar_projection_cache
+                .borrow()
+                .iter()
+                .all(|entry| entry.epoch != first_epoch),
+            "plan-generation bump must retire the old empty projection before serving current tables"
+        );
+        assert_eq!(
+            vm.generated_property_sidecar_projection_cache_entries_for_current_epoch_for_test(),
+            1
+        );
+
+        let before_megamorphic_generation = vm.generated_property_sidecar_projection_epoch();
+        vm.tiering
+            .record_property_load_megamorphic_cache_collection_completion(
+                crate::gc::CollectionKind::Eden,
+            )
+            .expect("megamorphic cache aging record");
+        assert!(
+            vm.generated_property_sidecar_projection_epoch()
+                .megamorphic_projection_generation
+                > before_megamorphic_generation.megamorphic_projection_generation
+        );
+        assert_eq!(
+            vm.generated_property_sidecar_projection_cache_entries_for_current_epoch_for_test(),
+            0,
+            "megamorphic projection-generation bump must retire projected tables"
+        );
+
+        let after_megamorphic_age = vm
+            .generated_property_sidecar_projection_for_owner_cached(owner, bytecode_snapshot)
+            .expect("property sidecar projection after megamorphic age");
+        assert!(!after_megamorphic_age.property_load_plan_table.is_empty());
+        assert_eq!(
+            vm.generated_property_sidecar_projection_cache_entries_for_current_epoch_for_test(),
+            1
+        );
     }
 
     #[test]

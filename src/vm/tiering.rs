@@ -181,6 +181,11 @@ pub struct VmTieringIntegration {
     property_inline_cache_attachment_records: Vec<VmPropertyInlineCacheAttachmentRecord>,
     property_inline_cache_clear_records: Vec<VmPropertyInlineCacheClearRecord>,
     property_megamorphic_cache_epoch: VmMegamorphicCacheEpoch,
+    // C++ JSC's VM-owned MegamorphicCache is a set of fixed arrays mutated in
+    // place. Rust projects those arrays plus the per-site lists into immutable
+    // generated-side tables, so this generation is the cache invalidation epoch
+    // for those projections; it is not JS-visible state.
+    property_megamorphic_projection_generation: u64,
     property_load_megamorphic_sites: Vec<VmPropertyLoadMegamorphicSiteRecord>,
     property_load_megamorphic_cache: VmPropertyLoadMegamorphicCache,
     property_load_megamorphic_cache_records: Vec<VmPropertyLoadMegamorphicCacheRecord>,
@@ -317,6 +322,10 @@ impl VmTieringIntegration {
         self.plan_generation
     }
 
+    pub(crate) fn property_megamorphic_projection_generation(&self) -> u64 {
+        self.property_megamorphic_projection_generation
+    }
+
     // Batch 2: the SINGLE bump site for the plan-generation epoch. Every mutation
     // (insert OR lifecycle transition) of the six owner-keyed plan/candidate
     // tables routes through this so omission is structurally impossible: a new
@@ -327,6 +336,12 @@ impl VmTieringIntegration {
     // one.
     fn bump_plan_generation(&mut self) {
         self.plan_generation = self.plan_generation.saturating_add(1);
+    }
+
+    fn bump_property_megamorphic_projection_generation(&mut self) {
+        self.property_megamorphic_projection_generation = self
+            .property_megamorphic_projection_generation
+            .saturating_add(1);
     }
 
     pub fn property_load_observations(&self) -> &[VmPropertyLoadObservationRecord] {
@@ -3396,6 +3411,7 @@ impl VmTieringIntegration {
         ) else {
             return;
         };
+        self.bump_property_megamorphic_projection_generation();
 
         if self
             .property_load_megamorphic_cache_records
@@ -3459,6 +3475,7 @@ impl VmTieringIntegration {
         ) else {
             return;
         };
+        self.bump_property_megamorphic_projection_generation();
 
         if self
             .property_load_megamorphic_cache_records
@@ -3532,6 +3549,7 @@ impl VmTieringIntegration {
         ) else {
             return;
         };
+        self.bump_property_megamorphic_projection_generation();
 
         if self
             .property_load_megamorphic_cache_records
@@ -3633,6 +3651,7 @@ impl VmTieringIntegration {
         ) else {
             return;
         };
+        self.bump_property_megamorphic_projection_generation();
 
         if self
             .property_load_megamorphic_cache_records
@@ -3721,6 +3740,7 @@ impl VmTieringIntegration {
             self.property_has_megamorphic_cache.invalidate_entries();
         }
         let epoch_after = self.property_megamorphic_cache_epoch.current();
+        self.bump_property_megamorphic_projection_generation();
         let record = VmPropertyLoadMegamorphicCacheAgingRecord {
             sequence,
             trigger,
@@ -3812,6 +3832,7 @@ impl VmTieringIntegration {
                 slot,
                 key,
             });
+        self.bump_property_megamorphic_projection_generation();
     }
 
     fn record_property_store_megamorphic_cache_entry(
@@ -3848,6 +3869,7 @@ impl VmTieringIntegration {
                 ) else {
                     return;
                 };
+                self.bump_property_megamorphic_projection_generation();
                 (old_structure, insert)
             }
             PropertyStoreAccessCasePlanKind::DataOnlyTransition => {
@@ -3864,6 +3886,7 @@ impl VmTieringIntegration {
                 ) else {
                     return;
                 };
+                self.bump_property_megamorphic_projection_generation();
                 (new_structure, insert)
             }
             PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore
@@ -3939,6 +3962,7 @@ impl VmTieringIntegration {
                 slot,
                 key,
             });
+        self.bump_property_megamorphic_projection_generation();
     }
 
     #[allow(dead_code)]
@@ -3966,6 +3990,7 @@ impl VmTieringIntegration {
                 request.base_structure,
             )
         }?;
+        self.bump_property_megamorphic_projection_generation();
 
         if self
             .property_has_megamorphic_cache_records
@@ -4031,6 +4056,7 @@ impl VmTieringIntegration {
                 slot: request.slot,
                 key: request.key,
             });
+        self.bump_property_megamorphic_projection_generation();
     }
 
     fn property_load_access_case_replaced_by_existing_handler_case(
@@ -21192,6 +21218,59 @@ mod tests {
                 structure
             ),
             GeneratedPropertyHasMegamorphicLookup::NoSite
+        );
+    }
+
+    #[test]
+    fn property_megamorphic_projection_generation_advances_for_site_array_and_age_mutations() {
+        let owner = CodeBlockId(CellId(913));
+        let bytecode_index = BytecodeIndex::from_offset(19);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(5);
+        let key = CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+            AtomId::from_table_slot(38),
+        )));
+        let structure = StructureId(9303);
+        let mut tiering = VmTieringIntegration::default();
+        let request = VmPropertyHasMegamorphicCacheEntryRequest {
+            observation_ordinal: 201,
+            evolution_ordinal: 202,
+            owner,
+            frame: None,
+            bytecode_index,
+            bytecode_snapshot,
+            slot,
+            key,
+            base_structure: structure,
+            result: true,
+        };
+
+        let before_first = tiering.property_megamorphic_projection_generation();
+        tiering
+            .record_property_has_megamorphic_cache_entry(request)
+            .expect("first has cache record");
+        assert!(
+            tiering.property_megamorphic_projection_generation() > before_first,
+            "new megamorphic site/cache entry must invalidate projected generated tables"
+        );
+
+        let before_duplicate = tiering.property_megamorphic_projection_generation();
+        assert_eq!(
+            tiering.record_property_has_megamorphic_cache_entry(request),
+            None
+        );
+        assert!(
+            tiering.property_megamorphic_projection_generation() > before_duplicate,
+            "duplicate record suppression still follows an in-place megamorphic array insert"
+        );
+
+        let before_age = tiering.property_megamorphic_projection_generation();
+        tiering
+            .record_property_load_megamorphic_cache_collection_completion(CollectionKind::Eden)
+            .expect("eden completion ages megamorphic cache");
+        assert!(
+            tiering.property_megamorphic_projection_generation() > before_age,
+            "megamorphic cache aging changes the epoch carried by generated table projections"
         );
     }
 

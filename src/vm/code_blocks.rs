@@ -34,6 +34,11 @@ use crate::vm::tiering::{
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CodeBlockRegistry {
     records: HashMap<CodeBlockId, CodeBlockRecord>,
+    // C++ keeps a stable CodeBlock* with IC side tables owned by that object.
+    // Rust tests and install paths can replace the registered Rc<CodeBlock>, so
+    // generated projection caches key on this coarse revision to avoid serving
+    // side-table candidates from an old registry instance.
+    revision: u64,
     // FIX 3: cumulative count of resident get_by_id self-load DataIC records the
     // registry has actually written back in place (a resolved own-data-load miss that
     // filled `records[record_index]`). The registry owns the resident store
@@ -66,6 +71,15 @@ impl CodeBlockRegistry {
             code_block_mut.stamp_root_map_owner(owner);
         }
         self.records.insert(owner, CodeBlockRecord::new(code_block));
+        self.bump_revision();
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.saturating_add(1);
     }
 
     #[allow(dead_code)]
@@ -88,6 +102,9 @@ impl CodeBlockRegistry {
     // Tests mutate the block before sharing it, so this holds.
     #[cfg(test)]
     pub(crate) fn code_block_mut_for_test(&mut self, owner: CodeBlockId) -> Option<&mut CodeBlock> {
+        if self.records.contains_key(&owner) {
+            self.bump_revision();
+        }
         self.records
             .get_mut(&owner)
             .and_then(|record| Rc::get_mut(&mut record.code_block))
@@ -311,6 +328,7 @@ impl CodeBlockRegistry {
                         .data_ic_self_load_record_writeback_count
                         .saturating_add(1);
                 }
+                self.bump_revision();
                 CodeBlockRegistryPropertyInlineCacheAttachment::Attached(outcome)
             }
             Err(error) => CodeBlockRegistryPropertyInlineCacheAttachment::Rejected(error),
@@ -385,7 +403,10 @@ impl CodeBlockRegistry {
             .code_block
             .attach_call_link_inline_cache(CodeBlockMutationAuthority::VmMainThread, request)
         {
-            Ok(outcome) => CodeBlockRegistryCallLinkInlineCacheAttachment::Attached(outcome),
+            Ok(outcome) => {
+                self.bump_revision();
+                CodeBlockRegistryCallLinkInlineCacheAttachment::Attached(outcome)
+            }
             Err(error) => CodeBlockRegistryCallLinkInlineCacheAttachment::Rejected(error),
         }
     }
@@ -403,7 +424,10 @@ impl CodeBlockRegistry {
             .code_block
             .clear_call_link_inline_cache(CodeBlockMutationAuthority::VmMainThread, request)
         {
-            Ok(outcome) => CodeBlockRegistryCallLinkInlineCacheClear::Cleared(outcome),
+            Ok(outcome) => {
+                self.bump_revision();
+                CodeBlockRegistryCallLinkInlineCacheClear::Cleared(outcome)
+            }
             Err(error) => CodeBlockRegistryCallLinkInlineCacheClear::Rejected(error),
         }
     }
@@ -528,7 +552,10 @@ impl CodeBlockRegistry {
             .code_block
             .clear_property_inline_cache_case(CodeBlockMutationAuthority::VmMainThread, request)
         {
-            Ok(outcome) => CodeBlockRegistryPropertyInlineCacheClear::Cleared(outcome),
+            Ok(outcome) => {
+                self.bump_revision();
+                CodeBlockRegistryPropertyInlineCacheClear::Cleared(outcome)
+            }
             Err(error) => CodeBlockRegistryPropertyInlineCacheClear::Rejected(error),
         }
     }
@@ -547,7 +574,10 @@ impl CodeBlockRegistry {
             .code_block
             .link_structure_stub_access_case(CodeBlockMutationAuthority::VmMainThread, request)
         {
-            Ok(outcome) => CodeBlockRegistryStructureStubAccessCaseLink::Attached(outcome),
+            Ok(outcome) => {
+                self.bump_revision();
+                CodeBlockRegistryStructureStubAccessCaseLink::Attached(outcome)
+            }
             Err(error) => CodeBlockRegistryStructureStubAccessCaseLink::Rejected(error),
         }
     }
