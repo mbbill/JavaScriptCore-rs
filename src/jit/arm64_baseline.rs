@@ -18,18 +18,20 @@ use crate::jit::emitter::{
     finish_p6_x86_64_semantic_byte_emission, p6_x86_64_checked_byte_len,
     p6_x86_64_semantic_source_buffer_id, validate_p6_x86_64_semantic_selection_effects,
     validate_p6_x86_64_semantic_terminal_policy, validate_p6_x86_64_semantic_value_layout,
-    P6X86_64BaselineBackendContractRecord, P6X86_64BaselineCallableEpilogueRecord,
-    P6X86_64BaselineCallablePrologueRecord, P6X86_64BaselineInstructionByteRecord,
-    P6X86_64BaselineInstructionSelectionPlan, P6X86_64BaselineLoweredOperation,
-    P6X86_64BaselineOperandLocation, P6X86_64BaselineOperandRole,
+    P6X86_64BaselineBackendContractRecord, P6X86_64BaselineBytecodeBranchKind,
+    P6X86_64BaselineCallableEpilogueRecord, P6X86_64BaselineCallablePrologueRecord,
+    P6X86_64BaselineControlFlowBranchContract, P6X86_64BaselineImmediateOperand,
+    P6X86_64BaselineInstructionByteRecord, P6X86_64BaselineInstructionSelectionPlan,
+    P6X86_64BaselineLoweredOperation, P6X86_64BaselineOperandLocation, P6X86_64BaselineOperandRole,
     P6X86_64BaselinePhysicalRegisterBinding, P6X86_64BaselinePhysicalRegisterMap,
-    P6X86_64BaselineSelectedInstruction, P6X86_64BaselineSemanticByteEmissionAuthority,
-    P6X86_64BaselineSemanticByteEmissionError, P6X86_64BaselineSemanticByteEmissionResult,
-    P6X86_64BaselineSemanticByteEmissionShape, P6X86_64BaselineSemanticOperandRejectionReason,
-    P6X86_64BaselineSideExitReturnPayload, P6X86_64BaselineSymbolicRegister,
-    P6X86_64BaselineTerminalPolicy, P6X86_64BaselineTerminalPolicyRecord,
-    P6X86_64BaselineValueLayoutContract, P6X86_64SemanticEncodedSelection,
-    P6X86_64SemanticTerminalSelection,
+    P6X86_64BaselineSelectedInstruction, P6X86_64BaselineSelectedSideExitReason,
+    P6X86_64BaselineSemanticByteEmissionAuthority, P6X86_64BaselineSemanticByteEmissionError,
+    P6X86_64BaselineSemanticByteEmissionResult, P6X86_64BaselineSemanticByteEmissionShape,
+    P6X86_64BaselineSemanticOperandRejectionReason, P6X86_64BaselineSideExitDestinationEffect,
+    P6X86_64BaselineSideExitLabel, P6X86_64BaselineSideExitReturnPayload,
+    P6X86_64BaselineSymbolicRegister, P6X86_64BaselineTerminalPolicy,
+    P6X86_64BaselineTerminalPolicyRecord, P6X86_64BaselineValueLayoutContract,
+    P6X86_64SemanticEncodedSelection, P6X86_64SemanticTerminalSelection,
 };
 
 // ARM64 JSC map: GPRInfo::callFrameRegister is fp/x29 and returnValueGPR is
@@ -438,6 +440,271 @@ fn encode_p6_arm64_callable_return_seed_selection(
         js_call_owner_post_call_reentry_stubs: Vec::new(),
         property_native_exit_stubs: Vec::new(),
     })
+}
+
+// C++ JSC `emit_op_jfalse` records target jumps with `addJump`, and `op_ret`
+// jumps through ReturnFromBaseline after loading returnValueJSR. This private
+// ARM64 skeleton is dormant: it keeps public branch-aware admission rejected and
+// uses one local C-ABI epilogue until VM/native-entry payload decode is ported.
+#[allow(dead_code)]
+fn encode_p6_arm64_dormant_branch_aware_callable_selection(
+    value_layout: P6X86_64BaselineValueLayoutContract,
+    instructions: &[P6X86_64BaselineSelectedInstruction],
+) -> Result<P6X86_64SemanticEncodedSelection, P6X86_64BaselineSemanticByteEmissionError> {
+    validate_p6_x86_64_semantic_value_layout(value_layout)?;
+    let return_instruction_indices: Vec<usize> = instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            matches!(
+                instruction.lowered.operation,
+                P6X86_64BaselineLoweredOperation::Return { .. }
+            )
+            .then_some(index)
+        })
+        .collect();
+    let Some(&final_return_instruction_index) = return_instruction_indices.last() else {
+        return Err(P6X86_64BaselineSemanticByteEmissionError::MissingReturn);
+    };
+    let return_bytecode_index = instructions[final_return_instruction_index].bytecode_index;
+    if final_return_instruction_index != instructions.len().saturating_sub(1) {
+        let next_bytecode_index = instructions[final_return_instruction_index + 1].bytecode_index;
+        return Err(P6X86_64BaselineSemanticByteEmissionError::NonFinalReturn {
+            bytecode_index: return_bytecode_index,
+            next_bytecode_index,
+        });
+    }
+
+    let mut builder = control_flow::P6Arm64SemanticByteBuilder::default();
+    let callable_prologue = p6_arm64_builder_emit_callable_prologue(&mut builder)?;
+    let mut instruction_bytes = Vec::with_capacity(instructions.len());
+    let mut pending_return_branches = Vec::new();
+    let mut normal_epilogue = None;
+    let mut saw_jump_if_false = false;
+
+    for (index, instruction) in instructions.iter().enumerate() {
+        let start_offset = builder.offset()?;
+        match instruction.lowered.operation {
+            P6X86_64BaselineLoweredOperation::LoadUndefined { .. }
+            | P6X86_64BaselineLoweredOperation::LoadNull { .. }
+            | P6X86_64BaselineLoweredOperation::LoadBool { .. }
+            | P6X86_64BaselineLoweredOperation::LoadInt32 { .. }
+            | P6X86_64BaselineLoweredOperation::LoadCallee { .. }
+            | P6X86_64BaselineLoweredOperation::Move { .. } => {
+                p6_arm64_builder_emit_materialized_frame_write(
+                    &mut builder,
+                    value_layout,
+                    instruction,
+                )?;
+            }
+            P6X86_64BaselineLoweredOperation::JumpIfFalse { target, .. } => {
+                if target <= instruction.bytecode_index {
+                    return Err(p6_arm64_seed_unsupported_operation(instruction));
+                }
+                let source = p6_arm64_seed_source_location(instruction)?;
+                p6_arm64_seed_validate_branch_target_operand(instruction, target)?;
+                let target = P6X86_64BaselineControlFlowBranchContract {
+                    kind: P6X86_64BaselineBytecodeBranchKind::JumpIfFalseTaken,
+                    source_bytecode_index: instruction.bytecode_index,
+                    target_bytecode_index: target,
+                };
+                builder.emit_branch_if_false_primitive(
+                    instruction.bytecode_index,
+                    source,
+                    value_layout,
+                    p6_arm64_unsupported_truthiness_side_exit_label(instruction.bytecode_index),
+                    target,
+                )?;
+                saw_jump_if_false = true;
+            }
+            P6X86_64BaselineLoweredOperation::Return { .. } => {
+                let value = p6_arm64_seed_return_frame_value(instruction)
+                    .ok_or_else(|| p6_arm64_seed_unsupported_operation(instruction))?;
+                p6_arm64_builder_emit_return_value(
+                    &mut builder,
+                    instruction.bytecode_index,
+                    value,
+                )?;
+                if !return_instruction_indices.contains(&index) {
+                    return Err(p6_arm64_seed_unsupported_operation(instruction));
+                }
+                if index != final_return_instruction_index {
+                    pending_return_branches.push(builder.emit_unconditional_internal_branch()?);
+                } else {
+                    let epilogue = p6_arm64_builder_emit_callable_epilogue(&mut builder)?;
+                    for branch in pending_return_branches.drain(..) {
+                        builder.patch_internal_branch_to_target(branch, epilogue.start_offset)?;
+                    }
+                    normal_epilogue = Some(epilogue);
+                }
+            }
+            P6X86_64BaselineLoweredOperation::Jump { .. }
+            | P6X86_64BaselineLoweredOperation::JumpIfNotNullish { .. } => {
+                return Err(p6_arm64_seed_unsupported_operation(instruction));
+            }
+            _ => return Err(p6_arm64_seed_unsupported_operation(instruction)),
+        }
+
+        let end_offset = builder.offset()?;
+        instruction_bytes.push(P6X86_64BaselineInstructionByteRecord {
+            bytecode_index: instruction.bytecode_index,
+            start_offset,
+            end_offset,
+            byte_len: end_offset.checked_sub(start_offset).ok_or(
+                P6X86_64BaselineSemanticByteEmissionError::ImageLengthExceedsU32 {
+                    actual: builder.bytes().len(),
+                },
+            )?,
+            machine_instruction_count: instruction.machine_instructions.len() as u32,
+            bytes: p6_arm64_bytes_for_range(builder.bytes(), start_offset, end_offset)?,
+        });
+    }
+
+    if !saw_jump_if_false {
+        return Err(P6X86_64BaselineSemanticByteEmissionError::MissingReturn);
+    }
+    let normal_epilogue =
+        normal_epilogue.ok_or(P6X86_64BaselineSemanticByteEmissionError::MissingReturn)?;
+    let normal_path_end_offset = builder.offset()?;
+    let bytecode_branches = builder.finish_bytecode_branches(&instruction_bytes)?;
+    let side_exit_return_stubs = builder.finish_side_exit_return_stubs()?;
+    for record in &mut instruction_bytes {
+        record.bytes =
+            p6_arm64_bytes_for_range(builder.bytes(), record.start_offset, record.end_offset)?;
+    }
+
+    Ok(P6X86_64SemanticEncodedSelection {
+        bytes: builder.bytes().to_vec(),
+        terminal_policy: P6X86_64BaselineTerminalPolicyRecord {
+            policy: P6X86_64BaselineTerminalPolicy::CallableCAbiPrologueBytecodeBranchesSharedNormalEpilogueThenInlinePayloadStubs,
+            return_bytecode_index,
+            ret_offset: normal_epilogue.ret_offset,
+            normal_path_end_offset,
+        },
+        callable_prologue: Some(callable_prologue),
+        callable_normal_epilogue: Some(normal_epilogue),
+        instruction_bytes,
+        bytecode_branches,
+        side_exit_placeholders: Vec::new(),
+        side_exit_return_stubs,
+        loop_backedge_safepoint_stubs: Vec::new(),
+        runtime_helper_native_exit_stubs: Vec::new(),
+        js_call_native_exit_stubs: Vec::new(),
+        js_call_owner_post_call_stubs: Vec::new(),
+        js_call_owner_post_call_reentry_stubs: Vec::new(),
+        property_native_exit_stubs: Vec::new(),
+    })
+}
+
+fn p6_arm64_builder_emit_callable_prologue(
+    builder: &mut control_flow::P6Arm64SemanticByteBuilder,
+) -> Result<P6X86_64BaselineCallablePrologueRecord, P6X86_64BaselineSemanticByteEmissionError> {
+    let start_offset = builder.offset()?;
+    builder.emit_bytes(P6_ARM64_CALLABLE_PROLOGUE_BYTES)?;
+    let end_offset = builder.offset()?;
+    Ok(P6X86_64BaselineCallablePrologueRecord {
+        start_offset,
+        end_offset,
+        byte_len: end_offset.checked_sub(start_offset).ok_or(
+            P6X86_64BaselineSemanticByteEmissionError::ImageLengthExceedsU32 {
+                actual: builder.bytes().len(),
+            },
+        )?,
+        bytes: p6_arm64_bytes_for_range(builder.bytes(), start_offset, end_offset)?,
+    })
+}
+
+fn p6_arm64_builder_emit_callable_epilogue(
+    builder: &mut control_flow::P6Arm64SemanticByteBuilder,
+) -> Result<P6X86_64BaselineCallableEpilogueRecord, P6X86_64BaselineSemanticByteEmissionError> {
+    let start_offset = builder.offset()?;
+    builder.emit_bytes(P6_ARM64_CALLABLE_EPILOGUE_BYTES)?;
+    let end_offset = builder.offset()?;
+    Ok(P6X86_64BaselineCallableEpilogueRecord {
+        start_offset,
+        ret_offset: end_offset.checked_sub(4).ok_or(
+            P6X86_64BaselineSemanticByteEmissionError::ImageLengthExceedsU32 {
+                actual: builder.bytes().len(),
+            },
+        )?,
+        end_offset,
+        byte_len: end_offset.checked_sub(start_offset).ok_or(
+            P6X86_64BaselineSemanticByteEmissionError::ImageLengthExceedsU32 {
+                actual: builder.bytes().len(),
+            },
+        )?,
+        bytes: p6_arm64_bytes_for_range(builder.bytes(), start_offset, end_offset)?,
+    })
+}
+
+fn p6_arm64_builder_emit_materialized_frame_write(
+    builder: &mut control_flow::P6Arm64SemanticByteBuilder,
+    value_layout: P6X86_64BaselineValueLayoutContract,
+    instruction: &P6X86_64BaselineSelectedInstruction,
+) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    let mut bytes = Vec::new();
+    let mut known_values = Vec::new();
+    p6_arm64_emit_materialize_seed_frame_write(
+        &mut bytes,
+        value_layout,
+        &mut known_values,
+        instruction,
+    )?;
+    builder.emit_bytes(&bytes)
+}
+
+fn p6_arm64_builder_emit_return_value(
+    builder: &mut control_flow::P6Arm64SemanticByteBuilder,
+    bytecode_index: BytecodeIndex,
+    value: P6Arm64ReturnSeedValue,
+) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    let mut bytes = Vec::new();
+    p6_arm64_emit_return_value(&mut bytes, bytecode_index, value)?;
+    builder.emit_bytes(&bytes)
+}
+
+fn p6_arm64_seed_source_location(
+    instruction: &P6X86_64BaselineSelectedInstruction,
+) -> Result<P6X86_64BaselineOperandLocation, P6X86_64BaselineSemanticByteEmissionError> {
+    instruction
+        .operand_locations
+        .iter()
+        .find(|record| record.role == P6X86_64BaselineOperandRole::Source)
+        .map(|record| record.location)
+        .ok_or_else(|| p6_arm64_seed_unsupported_operation(instruction))
+}
+
+fn p6_arm64_seed_validate_branch_target_operand(
+    instruction: &P6X86_64BaselineSelectedInstruction,
+    target: BytecodeIndex,
+) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    let Some(record) = instruction
+        .operand_locations
+        .iter()
+        .find(|record| record.role == P6X86_64BaselineOperandRole::BranchTarget)
+    else {
+        return Err(p6_arm64_seed_unsupported_operation(instruction));
+    };
+    match record.location {
+        P6X86_64BaselineOperandLocation::Immediate(
+            P6X86_64BaselineImmediateOperand::BytecodeIndex(actual),
+        ) if actual == target => Ok(()),
+        _ => Err(p6_arm64_seed_unsupported_operation(instruction)),
+    }
+}
+
+fn p6_arm64_unsupported_truthiness_side_exit_label(
+    bytecode_index: BytecodeIndex,
+) -> P6X86_64BaselineSideExitLabel {
+    P6X86_64BaselineSideExitLabel {
+        reason: P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand,
+        retained_bytecode_index: bytecode_index,
+        destination: P6X86_64BaselineSideExitDestinationEffect::DestinationUnchanged,
+        may_throw: false,
+        runtime_call: false,
+        heap_allocation: false,
+        touches_gc_roots: false,
+    }
 }
 
 fn p6_arm64_seed_set_value(
@@ -1519,6 +1786,26 @@ mod tests {
         }
     }
 
+    fn return_value_location_record(
+        location: P6X86_64BaselineOperandLocation,
+    ) -> P6X86_64BaselineOperandLocationRecord {
+        P6X86_64BaselineOperandLocationRecord {
+            role: P6X86_64BaselineOperandRole::ReturnValue,
+            location,
+        }
+    }
+
+    fn branch_target_location_record(
+        target: BytecodeIndex,
+    ) -> P6X86_64BaselineOperandLocationRecord {
+        P6X86_64BaselineOperandLocationRecord {
+            role: P6X86_64BaselineOperandRole::BranchTarget,
+            location: P6X86_64BaselineOperandLocation::Immediate(
+                P6X86_64BaselineImmediateOperand::BytecodeIndex(target),
+            ),
+        }
+    }
+
     fn rust_low_byte_value_layout() -> P6X86_64BaselineValueLayoutContract {
         P6X86_64BaselineValueLayoutContract {
             layout_name: "rust-low-byte-tagged",
@@ -1763,6 +2050,211 @@ mod tests {
             )
         );
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn arm64_dormant_branch_aware_callable_encodes_forward_jump_if_false_shared_epilogue() {
+        let value_layout = rust_low_byte_value_layout();
+        let instructions = vec![
+            selected_instruction(
+                0,
+                P6X86_64BaselineLoweredOperation::LoadBool {
+                    destination: VirtualRegister::local(0),
+                    raw_immediate: 0,
+                    value: false,
+                },
+                vec![destination_location_record(frame_local_location(0))],
+            ),
+            selected_instruction(
+                1,
+                P6X86_64BaselineLoweredOperation::JumpIfFalse {
+                    source: VirtualRegister::local(0),
+                    target: bci(4),
+                },
+                vec![
+                    source_location_record(frame_local_location(0)),
+                    branch_target_location_record(bci(4)),
+                ],
+            ),
+            selected_instruction(
+                2,
+                P6X86_64BaselineLoweredOperation::LoadInt32 {
+                    destination: VirtualRegister::local(1),
+                    value: 11,
+                },
+                vec![destination_location_record(frame_local_location(8))],
+            ),
+            selected_instruction(
+                3,
+                P6X86_64BaselineLoweredOperation::Return {
+                    source: VirtualRegister::local(1),
+                },
+                vec![return_value_location_record(frame_local_location(8))],
+            ),
+            selected_instruction(
+                4,
+                P6X86_64BaselineLoweredOperation::LoadInt32 {
+                    destination: VirtualRegister::local(1),
+                    value: 42,
+                },
+                vec![destination_location_record(frame_local_location(8))],
+            ),
+            selected_instruction(
+                5,
+                P6X86_64BaselineLoweredOperation::Return {
+                    source: VirtualRegister::local(1),
+                },
+                vec![return_value_location_record(frame_local_location(8))],
+            ),
+        ];
+        let encoded =
+            encode_p6_arm64_dormant_branch_aware_callable_selection(value_layout, &instructions)
+                .unwrap();
+        let prologue = encoded.callable_prologue.as_ref().unwrap();
+        let epilogue = encoded.callable_normal_epilogue.as_ref().unwrap();
+
+        assert_eq!(
+            encoded.terminal_policy.policy,
+            P6X86_64BaselineTerminalPolicy::CallableCAbiPrologueBytecodeBranchesSharedNormalEpilogueThenInlinePayloadStubs
+        );
+        assert_eq!(encoded.terminal_policy.return_bytecode_index, bci(5));
+        assert_eq!(prologue.start_offset, 0);
+        assert_eq!(prologue.end_offset, 8);
+        assert_eq!(prologue.bytes, P6_ARM64_CALLABLE_PROLOGUE_BYTES);
+        assert_eq!(epilogue.start_offset, 100);
+        assert_eq!(epilogue.ret_offset, 104);
+        assert_eq!(epilogue.end_offset, 108);
+        assert_eq!(epilogue.bytes, P6_ARM64_CALLABLE_EPILOGUE_BYTES);
+        assert_eq!(encoded.terminal_policy.ret_offset, epilogue.ret_offset);
+        assert_eq!(
+            encoded.terminal_policy.normal_path_end_offset,
+            epilogue.end_offset
+        );
+        assert_eq!(encoded.instruction_bytes.len(), instructions.len());
+        assert_eq!(encoded.instruction_bytes[4].bytecode_index, bci(4));
+        assert_eq!(encoded.instruction_bytes[4].start_offset, 88);
+
+        assert_eq!(encoded.bytecode_branches.len(), 4);
+        for (record, expected_offset) in encoded.bytecode_branches.iter().zip([28_u32, 36, 44, 68])
+        {
+            assert_eq!(record.bytecode_index, bci(1));
+            assert_eq!(
+                record.kind,
+                P6X86_64BaselineBytecodeBranchKind::JumpIfFalseTaken
+            );
+            assert_eq!(record.branch_offset, expected_offset);
+            assert_eq!(record.rel32_offset, expected_offset);
+            assert_eq!(record.branch_end_offset, expected_offset + 4);
+            assert_eq!(record.target_bytecode_index, bci(4));
+            assert_eq!(record.target_offset, 88);
+            assert_eq!(
+                arm64_word(&encoded.bytes, expected_offset),
+                link_conditional_branch(Arm64Condition::Eq, expected_offset, 88)
+                    .unwrap()
+                    .instruction_word
+            );
+        }
+
+        assert_eq!(
+            arm64_word(&encoded.bytes, 84),
+            link_unconditional_branch(84, epilogue.start_offset)
+                .unwrap()
+                .instruction_word
+        );
+        assert_eq!(encoded.side_exit_return_stubs.len(), 1);
+        let side_exit = &encoded.side_exit_return_stubs[0];
+        assert_eq!(side_exit.bytecode_index, bci(1));
+        assert_eq!(
+            side_exit.reason,
+            P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand
+        );
+        assert_eq!(side_exit.branch_offset, 60);
+        assert_eq!(side_exit.branch_end_offset, 64);
+        assert_eq!(side_exit.target_offset, epilogue.end_offset);
+        assert_eq!(side_exit.resume_bytecode_index, None);
+        assert_eq!(side_exit.resume_entry_offset, None);
+        assert_eq!(
+            arm64_word(&encoded.bytes, side_exit.branch_offset),
+            link_conditional_branch(
+                Arm64Condition::Ne,
+                side_exit.branch_offset,
+                epilogue.end_offset
+            )
+            .unwrap()
+            .instruction_word
+        );
+        assert_eq!(
+            side_exit.bytes,
+            p6_arm64_callable_side_exit_payload_return_stub_bytes(side_exit.encoded_payload)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn arm64_dormant_branch_aware_callable_rejects_unsupported_branch_operations() {
+        for operation in [
+            P6X86_64BaselineLoweredOperation::Jump { target: bci(2) },
+            P6X86_64BaselineLoweredOperation::JumpIfNotNullish {
+                source: VirtualRegister::local(0),
+                target: bci(2),
+            },
+        ] {
+            let branch = selected_instruction(1, operation, Vec::new());
+            let ret = selected_instruction(
+                2,
+                P6X86_64BaselineLoweredOperation::Return {
+                    source: VirtualRegister::local(0),
+                },
+                vec![return_value_location_record(frame_local_location(0))],
+            );
+            assert_eq!(
+                encode_p6_arm64_dormant_branch_aware_callable_selection(
+                    rust_low_byte_value_layout(),
+                    &[branch.clone(), ret],
+                ),
+                Err(p6_arm64_seed_unsupported_operation(&branch))
+            );
+        }
+    }
+
+    #[test]
+    fn arm64_dormant_branch_aware_callable_rejects_backward_jump_if_false_and_missing_source() {
+        let backward = selected_instruction(
+            1,
+            P6X86_64BaselineLoweredOperation::JumpIfFalse {
+                source: VirtualRegister::local(0),
+                target: bci(0),
+            },
+            vec![
+                source_location_record(frame_local_location(0)),
+                branch_target_location_record(bci(0)),
+            ],
+        );
+        let missing_source = selected_instruction(
+            1,
+            P6X86_64BaselineLoweredOperation::JumpIfFalse {
+                source: VirtualRegister::local(0),
+                target: bci(2),
+            },
+            vec![branch_target_location_record(bci(2))],
+        );
+        let ret = selected_instruction(
+            2,
+            P6X86_64BaselineLoweredOperation::Return {
+                source: VirtualRegister::local(0),
+            },
+            vec![return_value_location_record(frame_local_location(0))],
+        );
+
+        for branch in [backward, missing_source] {
+            assert_eq!(
+                encode_p6_arm64_dormant_branch_aware_callable_selection(
+                    rust_low_byte_value_layout(),
+                    &[branch.clone(), ret.clone()],
+                ),
+                Err(p6_arm64_seed_unsupported_operation(&branch))
+            );
+        }
     }
 
     #[test]

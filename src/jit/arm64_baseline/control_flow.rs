@@ -647,7 +647,7 @@ struct P6Arm64PendingSideExitBranch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct P6Arm64PendingInternalBranch {
+pub(super) struct P6Arm64PendingInternalBranch {
     kind: Arm64DirectBranchKind,
     branch_offset: u32,
     branch_end_offset: u32,
@@ -669,7 +669,7 @@ impl P6Arm64SemanticByteBuilder {
         &self.bytes
     }
 
-    fn emit_bytes(
+    pub(super) fn emit_bytes(
         &mut self,
         bytes: &[u8],
     ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
@@ -700,6 +700,19 @@ impl P6Arm64SemanticByteBuilder {
         self.emit_direct_bytecode_branch(source, Arm64DirectBranchKind::Conditional { condition })
     }
 
+    pub(super) fn emit_unconditional_internal_branch(
+        &mut self,
+    ) -> Result<P6Arm64PendingInternalBranch, P6X86_64BaselineSemanticByteEmissionError> {
+        let kind = Arm64DirectBranchKind::Unconditional;
+        let branch_offset = self.emit_word(kind.placeholder_word())?;
+        let branch_end_offset = self.offset()?;
+        Ok(P6Arm64PendingInternalBranch {
+            kind,
+            branch_offset,
+            branch_end_offset,
+        })
+    }
+
     fn emit_conditional_internal_branch(
         &mut self,
         condition: Arm64Condition,
@@ -719,6 +732,14 @@ impl P6Arm64SemanticByteBuilder {
         branch: P6Arm64PendingInternalBranch,
     ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
         let target_offset = self.offset()?;
+        self.patch_internal_branch_to_target(branch, target_offset)
+    }
+
+    pub(super) fn patch_internal_branch_to_target(
+        &mut self,
+        branch: P6Arm64PendingInternalBranch,
+        target_offset: u32,
+    ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
         let linked = Arm64DirectBranchPatch {
             kind: branch.kind,
             source_instruction_offset: branch.branch_offset,
