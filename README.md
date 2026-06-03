@@ -131,11 +131,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            continuation PC metadata remains deferred
     [done] host-noncallable P6 x86_64 auto-installs also materialize generated
            residency on arm64; richards top direct calls now route to GeneratedEntry
-    [done] direct-call callee fallback telemetry: remaining richards 110@80 -> 146
-           fallback is MissingArtifact plus HostBlockedX86_64, so next batch is callee
-           generated auto-materialization before JS-to-JS call ABI work
-    [done] direct-call callee host-blocked preparation path: mirrors C++ linkFor()
-           prepareForExecution for supported callees and records failed generated install once
+    [done] direct-call callee preparation path: mirrors C++ linkFor()
+           prepareForExecution for host-blocked and missing-native-gate callees; the 50k
+           richards probe now routes the former 110@80 -> 146 MissingArtifact fallback through
+           GeneratedEntry, with unsupported generated callees recording one failed install
     [done] generated auto-materialization telemetry preserves install stage and
            validator detail through Octane benchmark summaries
     [done] generated property-handoff current-metadata validation: warmed bytecode ICs

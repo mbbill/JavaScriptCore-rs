@@ -7813,6 +7813,7 @@ pub enum BaselineEntryAutoNativeMaterializationOutcome {
     Installed,
     SkippedDisabledNativeEntry,
     SkippedHostBlockedX86_64NativeEntry,
+    SkippedMissingNativeEntryGate,
     Failed {
         reason: BaselineEntryAutoNativeMaterializationFailure,
         generated_fallback_allowed: bool,
