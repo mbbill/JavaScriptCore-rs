@@ -5935,9 +5935,24 @@ impl Vm {
         let Ok(result) = call_result else {
             return fallback(self, host);
         };
-        BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Returned(
-            RuntimeValue::from_encoded(EncodedJsValue(result.encoded_js_value_bits)),
-        ))
+        match p6_arm64_emitted_semantic_native_raw_return(result.encoded_js_value_bits) {
+            Ok(P6Arm64EmittedSemanticNativeRawReturn::RuntimeValue(value)) => {
+                BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Returned(value))
+            }
+            Ok(P6Arm64EmittedSemanticNativeRawReturn::RetainedP6SideExit(payload)) => {
+                // ARM64 shares the retained P6 payload ABI tag with the x86_64
+                // callable bridge so the VM can reuse the same fallback/rooting
+                // table decode, but ARM64 has no native reentry ABI yet.
+                p6_arm64_reject_side_exit_reentry_execution(
+                    self.execute_p6_x86_64_callable_retained_native_exit_payload_in_current_region(
+                        code_block, &dispatch, payload, host, config,
+                    ),
+                )
+            }
+            Err(error) => {
+                BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(error))
+            }
+        }
     }
 
     fn execute_p6_x86_64_emitted_semantic_native_entry_in_current_region<H: DispatchHost>(
@@ -17290,6 +17305,12 @@ enum P6P9P10P14X86_64CallableNativeReturnPayload {
     P14(P14X86_64BaselineLoopBackedgeReturnPayload),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum P6Arm64EmittedSemanticNativeRawReturn {
+    RuntimeValue(RuntimeValue),
+    RetainedP6SideExit(P6X86_64BaselineSideExitReturnPayload),
+}
+
 fn p6_p9_p10_p14_x86_64_callable_native_return_payload(
     raw_bits: u64,
 ) -> Result<Option<P6P9P10P14X86_64CallableNativeReturnPayload>, ExecutionError> {
@@ -17323,6 +17344,37 @@ fn p6_p9_p10_p14_x86_64_callable_native_return_payload(
             )))
         }
         _ => Ok(None),
+    }
+}
+
+fn p6_arm64_emitted_semantic_native_raw_return(
+    raw_bits: u64,
+) -> Result<P6Arm64EmittedSemanticNativeRawReturn, ExecutionError> {
+    match p6_p9_p10_p14_x86_64_callable_native_return_payload(raw_bits)? {
+        Some(P6P9P10P14X86_64CallableNativeReturnPayload::P6(payload)) => Ok(
+            P6Arm64EmittedSemanticNativeRawReturn::RetainedP6SideExit(payload),
+        ),
+        Some(
+            P6P9P10P14X86_64CallableNativeReturnPayload::P9(_)
+            | P6P9P10P14X86_64CallableNativeReturnPayload::P10(_)
+            | P6P9P10P14X86_64CallableNativeReturnPayload::P14(_),
+        ) => Err(ExecutionError::BaselineGeneratedExecutionRejected),
+        None => Ok(P6Arm64EmittedSemanticNativeRawReturn::RuntimeValue(
+            RuntimeValue::from_encoded(EncodedJsValue(raw_bits)),
+        )),
+    }
+}
+
+fn p6_arm64_reject_side_exit_reentry_execution(
+    execution: BaselineNativeEntryVmExecution,
+) -> BaselineNativeEntryVmExecution {
+    match execution {
+        BaselineNativeEntryVmExecution::P6SideExitReentry(_) => {
+            BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(
+                ExecutionError::BaselineGeneratedExecutionRejected,
+            ))
+        }
+        execution => execution,
     }
 }
 
@@ -38951,6 +39003,65 @@ mod tests {
             p6_p9_p10_p14_x86_64_callable_native_return_payload(malformed_p10),
             Err(ExecutionError::BaselineGeneratedExecutionRejected)
         );
+    }
+
+    #[test]
+    fn vm_p6_arm64_raw_return_classifier_keeps_values_and_retained_p6_payloads_distinct() {
+        let int32 = RuntimeValue::from_i32(42);
+        let undefined = RuntimeValue::undefined();
+        let raw_non_payload = 0x1234_5678_90ab_cd00;
+        let p6 = P6X86_64BaselineSideExitReturnPayload::encode(7);
+
+        assert_eq!(
+            p6_arm64_emitted_semantic_native_raw_return(int32.encoded().0).unwrap(),
+            P6Arm64EmittedSemanticNativeRawReturn::RuntimeValue(int32)
+        );
+        assert_eq!(
+            p6_arm64_emitted_semantic_native_raw_return(undefined.encoded().0).unwrap(),
+            P6Arm64EmittedSemanticNativeRawReturn::RuntimeValue(undefined)
+        );
+        assert_eq!(
+            p6_arm64_emitted_semantic_native_raw_return(raw_non_payload).unwrap(),
+            P6Arm64EmittedSemanticNativeRawReturn::RuntimeValue(RuntimeValue::from_encoded(
+                EncodedJsValue(raw_non_payload)
+            ))
+        );
+        assert_eq!(
+            p6_arm64_emitted_semantic_native_raw_return(p6.raw_bits()).unwrap(),
+            P6Arm64EmittedSemanticNativeRawReturn::RetainedP6SideExit(p6)
+        );
+    }
+
+    #[test]
+    fn vm_p6_arm64_raw_return_classifier_rejects_non_p6_payload_tags_and_malformed_payloads() {
+        let p9 = P9X86_64BaselineJsCallNativeExitReturnPayload::encode(3);
+        let p10 = P10X86_64BaselinePropertyNativeExitReturnPayload::encode(3);
+        let p14 = P14X86_64BaselineLoopBackedgeReturnPayload::encode(3);
+        let malformed_p6 = ((u64::from(u32::MAX) + 1) << 8)
+            | u64::from(P6_X86_64_BASELINE_SIDE_EXIT_RETURN_PAYLOAD_LOW_TAG);
+
+        for raw_bits in [p9.raw_bits(), p10.raw_bits(), p14.raw_bits(), malformed_p6] {
+            assert_eq!(
+                p6_arm64_emitted_semantic_native_raw_return(raw_bits),
+                Err(ExecutionError::BaselineGeneratedExecutionRejected)
+            );
+        }
+    }
+
+    #[test]
+    fn vm_p6_arm64_side_exit_reentry_result_is_defensively_rejected() {
+        let execution = p6_arm64_reject_side_exit_reentry_execution(
+            BaselineNativeEntryVmExecution::P6SideExitReentry(
+                P6X86_64CallableNativeInvocation::Entry { entry_offset: 123 },
+            ),
+        );
+
+        match execution {
+            BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(
+                ExecutionError::BaselineGeneratedExecutionRejected,
+            )) => {}
+            _ => panic!("expected ARM64 retained P6 native reentry rejection"),
+        }
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]

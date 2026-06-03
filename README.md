@@ -99,9 +99,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            private JumpIfFalse branch-aware callable encoder skeleton added to
            src/jit/arm64_baseline.rs (public branch-aware callable emission
            remains disabled)
-    [done] JIT ARM64 callable side-exit payload return stub helper added to
-           src/jit/arm64_baseline.rs (Rust native-entry ABI/rooting bridge only;
-           C++ jfalse truthiness remains valueIsFalsey/LLInt slow-path work)
+    [done] JIT/VM ARM64 callable side-exit payload bridge added: ARM64 stubs return
+           retained P6 payloads and the VM decodes them before JSValue wrapping
+           (Rust native-entry ABI/rooting bridge only; C++ jfalse truthiness remains
+           valueIsFalsey/LLInt slow-path work)
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
