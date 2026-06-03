@@ -77,6 +77,181 @@ enum P6Arm64ReturnSeedValue {
 }
 
 #[allow(dead_code)]
+pub(crate) mod register_contract {
+    // C++ JSC map: `GPRInfo` names the ARM64 baseline register identity,
+    // `JSRInfo` aliases the JSValue return register, and `AssemblyHelpers`/`JIT`
+    // materialize tag and metadata registers before opcode bodies use them.
+    // This Rust module is metadata only; it records the dormant contract the
+    // future ARM64 baseline emitter must satisfy and emits no instructions.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64Gpr {
+        pub(crate) name: &'static str,
+        pub(crate) index: u8,
+    }
+
+    impl Arm64Gpr {
+        const fn new(name: &'static str, index: u8) -> Self {
+            Self { name, index }
+        }
+    }
+
+    pub(crate) const X0: Arm64Gpr = Arm64Gpr::new("x0", 0);
+    pub(crate) const X1: Arm64Gpr = Arm64Gpr::new("x1", 1);
+    pub(crate) const X2: Arm64Gpr = Arm64Gpr::new("x2", 2);
+    pub(crate) const X3: Arm64Gpr = Arm64Gpr::new("x3", 3);
+    pub(crate) const X4: Arm64Gpr = Arm64Gpr::new("x4", 4);
+    pub(crate) const X5: Arm64Gpr = Arm64Gpr::new("x5", 5);
+    pub(crate) const X6: Arm64Gpr = Arm64Gpr::new("x6", 6);
+    pub(crate) const X7: Arm64Gpr = Arm64Gpr::new("x7", 7);
+    pub(crate) const X8: Arm64Gpr = Arm64Gpr::new("x8", 8);
+    pub(crate) const X9: Arm64Gpr = Arm64Gpr::new("x9", 9);
+    pub(crate) const X10: Arm64Gpr = Arm64Gpr::new("x10", 10);
+    pub(crate) const X11: Arm64Gpr = Arm64Gpr::new("x11", 11);
+    pub(crate) const X12: Arm64Gpr = Arm64Gpr::new("x12", 12);
+    pub(crate) const X13: Arm64Gpr = Arm64Gpr::new("x13", 13);
+    pub(crate) const X14: Arm64Gpr = Arm64Gpr::new("x14", 14);
+    pub(crate) const X15: Arm64Gpr = Arm64Gpr::new("x15", 15);
+    pub(crate) const X25: Arm64Gpr = Arm64Gpr::new("x25", 25);
+    pub(crate) const X26: Arm64Gpr = Arm64Gpr::new("x26", 26);
+    pub(crate) const X27: Arm64Gpr = Arm64Gpr::new("x27", 27);
+    pub(crate) const X28: Arm64Gpr = Arm64Gpr::new("x28", 28);
+    pub(crate) const X29: Arm64Gpr = Arm64Gpr::new("x29", 29);
+
+    pub(crate) const REG_T0: Arm64Gpr = X0;
+    pub(crate) const REG_T1: Arm64Gpr = X1;
+    pub(crate) const REG_T2: Arm64Gpr = X2;
+    pub(crate) const REG_T3: Arm64Gpr = X3;
+    pub(crate) const REG_T4: Arm64Gpr = X4;
+    pub(crate) const REG_T5: Arm64Gpr = X5;
+    pub(crate) const REG_T6: Arm64Gpr = X6;
+    pub(crate) const REG_T7: Arm64Gpr = X7;
+    pub(crate) const REG_T8: Arm64Gpr = X8;
+    pub(crate) const REG_T9: Arm64Gpr = X9;
+    pub(crate) const REG_T10: Arm64Gpr = X10;
+    pub(crate) const REG_T11: Arm64Gpr = X11;
+    pub(crate) const REG_T12: Arm64Gpr = X12;
+    pub(crate) const REG_T13: Arm64Gpr = X13;
+    pub(crate) const REG_T14: Arm64Gpr = X14;
+    pub(crate) const REG_T15: Arm64Gpr = X15;
+    pub(crate) const TEMPORARY_GPRS: [Arm64Gpr; 16] = [
+        REG_T0, REG_T1, REG_T2, REG_T3, REG_T4, REG_T5, REG_T6, REG_T7, REG_T8, REG_T9, REG_T10,
+        REG_T11, REG_T12, REG_T13, REG_T14, REG_T15,
+    ];
+
+    pub(crate) const ARGUMENT_GPR0: Arm64Gpr = X0;
+    pub(crate) const ARGUMENT_GPR1: Arm64Gpr = X1;
+    pub(crate) const ARGUMENT_GPR2: Arm64Gpr = X2;
+    pub(crate) const ARGUMENT_GPR3: Arm64Gpr = X3;
+    pub(crate) const ARGUMENT_GPR4: Arm64Gpr = X4;
+    pub(crate) const ARGUMENT_GPR5: Arm64Gpr = X5;
+    pub(crate) const ARGUMENT_GPR6: Arm64Gpr = X6;
+    pub(crate) const ARGUMENT_GPR7: Arm64Gpr = X7;
+    pub(crate) const ARGUMENT_GPRS: [Arm64Gpr; 8] = [
+        ARGUMENT_GPR0,
+        ARGUMENT_GPR1,
+        ARGUMENT_GPR2,
+        ARGUMENT_GPR3,
+        ARGUMENT_GPR4,
+        ARGUMENT_GPR5,
+        ARGUMENT_GPR6,
+        ARGUMENT_GPR7,
+    ];
+
+    pub(crate) const CALL_FRAME_REGISTER: Arm64Gpr = X29;
+    pub(crate) const CALL_FRAME_REGISTER_NAME: &str = "fp/x29";
+    pub(crate) const RETURN_VALUE_GPR: Arm64Gpr = REG_T0;
+    pub(crate) const RETURN_VALUE_GPR2: Arm64Gpr = REG_T1;
+    pub(crate) const JIT_DATA_REGISTER: Arm64Gpr = X26;
+    pub(crate) const METADATA_TABLE_REGISTER: Arm64Gpr = X25;
+    pub(crate) const NUMBER_TAG_REGISTER: Arm64Gpr = X27;
+    pub(crate) const NOT_CELL_MASK_REGISTER: Arm64Gpr = X28;
+    pub(crate) const REG_CS6: Arm64Gpr = METADATA_TABLE_REGISTER;
+    pub(crate) const REG_CS7: Arm64Gpr = JIT_DATA_REGISTER;
+    pub(crate) const REG_CS8: Arm64Gpr = NUMBER_TAG_REGISTER;
+    pub(crate) const REG_CS9: Arm64Gpr = NOT_CELL_MASK_REGISTER;
+    pub(crate) const BASELINE_RESERVED_CALLEE_SAVE_GPRS: [Arm64Gpr; 4] =
+        [REG_CS6, REG_CS7, REG_CS8, REG_CS9];
+
+    pub(crate) const PINNED_CALL_FRAME_BASE_PHYSICAL: &str = CALL_FRAME_REGISTER_NAME;
+    pub(crate) const PROPERTY_BASE_RESERVED_PHYSICAL: &str = "x0 (reserved)";
+    pub(crate) const PINNED_VM_RETURN_SEED_PHYSICAL: &str = "x0 (C ABI arg, unused by seed)";
+    pub(crate) const METADATA_TABLE_BASE_RESERVED_PHYSICAL: &str = "x25 (reserved)";
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64JSValueRegs {
+        pub(crate) gpr: Arm64Gpr,
+    }
+
+    pub(crate) const RETURN_VALUE_JSR: Arm64JSValueRegs = Arm64JSValueRegs {
+        gpr: RETURN_VALUE_GPR,
+    };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Arm64BaselineTagConstant {
+        NumberTag,
+        NotCellMask,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Arm64BaselineMaterializedState {
+        TagConstant(Arm64BaselineTagConstant),
+        JitDataFromCodeBlockJitData,
+        MetadataTableFromCodeBlockMetadataTable,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Arm64BaselineMaterializationSource {
+        AssemblyHelpersTagCheckRegisters,
+        CodeBlockJitDataAndMetadataTable,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Arm64BaselineMaterializationEmission {
+        DormantMetadataOnlyNoInstructions,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64BaselineMaterializationRequirement {
+        pub(crate) register: Arm64Gpr,
+        pub(crate) required_state: Arm64BaselineMaterializedState,
+        pub(crate) source: Arm64BaselineMaterializationSource,
+        pub(crate) emission: Arm64BaselineMaterializationEmission,
+    }
+
+    pub(crate) const REQUIRED_MATERIALIZED_REGISTER_STATES:
+        [Arm64BaselineMaterializationRequirement; 4] = [
+        Arm64BaselineMaterializationRequirement {
+            register: NUMBER_TAG_REGISTER,
+            required_state: Arm64BaselineMaterializedState::TagConstant(
+                Arm64BaselineTagConstant::NumberTag,
+            ),
+            source: Arm64BaselineMaterializationSource::AssemblyHelpersTagCheckRegisters,
+            emission: Arm64BaselineMaterializationEmission::DormantMetadataOnlyNoInstructions,
+        },
+        Arm64BaselineMaterializationRequirement {
+            register: NOT_CELL_MASK_REGISTER,
+            required_state: Arm64BaselineMaterializedState::TagConstant(
+                Arm64BaselineTagConstant::NotCellMask,
+            ),
+            source: Arm64BaselineMaterializationSource::AssemblyHelpersTagCheckRegisters,
+            emission: Arm64BaselineMaterializationEmission::DormantMetadataOnlyNoInstructions,
+        },
+        Arm64BaselineMaterializationRequirement {
+            register: JIT_DATA_REGISTER,
+            required_state: Arm64BaselineMaterializedState::JitDataFromCodeBlockJitData,
+            source: Arm64BaselineMaterializationSource::CodeBlockJitDataAndMetadataTable,
+            emission: Arm64BaselineMaterializationEmission::DormantMetadataOnlyNoInstructions,
+        },
+        Arm64BaselineMaterializationRequirement {
+            register: METADATA_TABLE_REGISTER,
+            required_state: Arm64BaselineMaterializedState::MetadataTableFromCodeBlockMetadataTable,
+            source: Arm64BaselineMaterializationSource::CodeBlockJitDataAndMetadataTable,
+            emission: Arm64BaselineMaterializationEmission::DormantMetadataOnlyNoInstructions,
+        },
+    ];
+}
+
+#[allow(dead_code)]
 pub(crate) mod control_flow {
     use super::BytecodeIndex;
 
@@ -766,39 +941,43 @@ fn p6_arm64_semantic_physical_register_map() -> P6X86_64BaselinePhysicalRegister
         bindings: [
             P6X86_64BaselinePhysicalRegisterBinding {
                 symbolic: P6X86_64BaselineSymbolicRegister::ReturnGpr,
-                physical: "x0",
+                physical: register_contract::RETURN_VALUE_GPR.name,
             },
             P6X86_64BaselinePhysicalRegisterBinding {
                 symbolic: P6X86_64BaselineSymbolicRegister::Scratch0,
-                physical: "x9",
+                physical: register_contract::X9.name,
             },
             P6X86_64BaselinePhysicalRegisterBinding {
                 symbolic: P6X86_64BaselineSymbolicRegister::Scratch1,
-                physical: "x10",
+                physical: register_contract::X10.name,
             },
             P6X86_64BaselinePhysicalRegisterBinding {
                 symbolic: P6X86_64BaselineSymbolicRegister::Scratch2,
-                physical: "x11",
+                physical: register_contract::X11.name,
             },
             P6X86_64BaselinePhysicalRegisterBinding {
                 symbolic: P6X86_64BaselineSymbolicRegister::PropertyBase,
-                physical: "x0 (reserved)",
+                physical: register_contract::PROPERTY_BASE_RESERVED_PHYSICAL,
             },
             P6X86_64BaselinePhysicalRegisterBinding {
                 symbolic: P6X86_64BaselineSymbolicRegister::PinnedCalleeValue,
-                physical: "x2",
+                physical: register_contract::X2.name,
             },
             P6X86_64BaselinePhysicalRegisterBinding {
                 symbolic: P6X86_64BaselineSymbolicRegister::PinnedCallFrameBase,
-                physical: "fp/x29",
+                physical: register_contract::PINNED_CALL_FRAME_BASE_PHYSICAL,
             },
             P6X86_64BaselinePhysicalRegisterBinding {
                 symbolic: P6X86_64BaselineSymbolicRegister::PinnedVm,
-                physical: "x0 (C ABI arg, unused by seed)",
+                physical: register_contract::PINNED_VM_RETURN_SEED_PHYSICAL,
             },
+            // C++ ARM64 baseline has GPRInfo::jitDataRegister in x26/regCS7.
+            // The shared return-seed map has no jitData symbolic register yet,
+            // so x26 stays recorded in the local dormant contract instead of
+            // widening cross-module emitter state in this metadata-only batch.
             P6X86_64BaselinePhysicalRegisterBinding {
                 symbolic: P6X86_64BaselineSymbolicRegister::MetadataTableBase,
-                physical: "x25 (reserved)",
+                physical: register_contract::METADATA_TABLE_BASE_RESERVED_PHYSICAL,
             },
         ],
     }
@@ -832,6 +1011,190 @@ mod tests {
             source_offset,
             end_offset,
         }
+    }
+
+    fn physical_binding(symbolic: P6X86_64BaselineSymbolicRegister) -> &'static str {
+        let map = p6_arm64_semantic_physical_register_map();
+        map.bindings
+            .iter()
+            .find(|binding| binding.symbolic == symbolic)
+            .unwrap()
+            .physical
+    }
+
+    fn materialization_for(
+        register: register_contract::Arm64Gpr,
+    ) -> register_contract::Arm64BaselineMaterializationRequirement {
+        register_contract::REQUIRED_MATERIALIZED_REGISTER_STATES
+            .iter()
+            .copied()
+            .find(|requirement| requirement.register == register)
+            .unwrap()
+    }
+
+    #[test]
+    fn arm64_baseline_register_contract_matches_gprinfo_jsrinfo_identity() {
+        assert_eq!(
+            register_contract::RETURN_VALUE_JSR.gpr,
+            register_contract::X0
+        );
+        assert_eq!(
+            register_contract::RETURN_VALUE_JSR.gpr,
+            register_contract::REG_T0
+        );
+        assert_eq!(
+            register_contract::RETURN_VALUE_GPR,
+            register_contract::REG_T0
+        );
+        assert_eq!(
+            register_contract::RETURN_VALUE_GPR2,
+            register_contract::REG_T1
+        );
+        assert_eq!(
+            register_contract::CALL_FRAME_REGISTER,
+            register_contract::X29
+        );
+        assert_eq!(register_contract::CALL_FRAME_REGISTER.index, 29);
+        assert_eq!(register_contract::CALL_FRAME_REGISTER_NAME, "fp/x29");
+        assert_eq!(
+            register_contract::ARGUMENT_GPRS,
+            [
+                register_contract::X0,
+                register_contract::X1,
+                register_contract::X2,
+                register_contract::X3,
+                register_contract::X4,
+                register_contract::X5,
+                register_contract::X6,
+                register_contract::X7,
+            ]
+        );
+        assert_eq!(register_contract::TEMPORARY_GPRS[0], register_contract::X0);
+        assert_eq!(
+            register_contract::TEMPORARY_GPRS[15],
+            register_contract::X15
+        );
+    }
+
+    #[test]
+    fn arm64_baseline_metadata_tag_and_callee_save_registers_match_gprinfo() {
+        assert_eq!(
+            register_contract::METADATA_TABLE_REGISTER,
+            register_contract::X25
+        );
+        assert_eq!(register_contract::JIT_DATA_REGISTER, register_contract::X26);
+        assert_eq!(
+            register_contract::NUMBER_TAG_REGISTER,
+            register_contract::X27
+        );
+        assert_eq!(
+            register_contract::NOT_CELL_MASK_REGISTER,
+            register_contract::X28
+        );
+        assert_eq!(
+            register_contract::REG_CS6,
+            register_contract::METADATA_TABLE_REGISTER
+        );
+        assert_eq!(
+            register_contract::REG_CS7,
+            register_contract::JIT_DATA_REGISTER
+        );
+        assert_eq!(
+            register_contract::REG_CS8,
+            register_contract::NUMBER_TAG_REGISTER
+        );
+        assert_eq!(
+            register_contract::REG_CS9,
+            register_contract::NOT_CELL_MASK_REGISTER
+        );
+        assert_eq!(
+            register_contract::BASELINE_RESERVED_CALLEE_SAVE_GPRS,
+            [
+                register_contract::X25,
+                register_contract::X26,
+                register_contract::X27,
+                register_contract::X28,
+            ]
+        );
+    }
+
+    #[test]
+    fn arm64_baseline_materialization_contract_is_metadata_only() {
+        use register_contract::{
+            Arm64BaselineMaterializationEmission as Emission,
+            Arm64BaselineMaterializationSource as Source, Arm64BaselineMaterializedState as State,
+            Arm64BaselineTagConstant as TagConstant,
+        };
+
+        let number_tag = materialization_for(register_contract::NUMBER_TAG_REGISTER);
+        let not_cell_mask = materialization_for(register_contract::NOT_CELL_MASK_REGISTER);
+        let jit_data = materialization_for(register_contract::JIT_DATA_REGISTER);
+        let metadata_table = materialization_for(register_contract::METADATA_TABLE_REGISTER);
+
+        assert_eq!(
+            number_tag.required_state,
+            State::TagConstant(TagConstant::NumberTag)
+        );
+        assert_eq!(
+            not_cell_mask.required_state,
+            State::TagConstant(TagConstant::NotCellMask)
+        );
+        assert_ne!(number_tag.required_state, not_cell_mask.required_state);
+        assert_eq!(jit_data.required_state, State::JitDataFromCodeBlockJitData);
+        assert_eq!(
+            metadata_table.required_state,
+            State::MetadataTableFromCodeBlockMetadataTable
+        );
+        assert_eq!(number_tag.source, Source::AssemblyHelpersTagCheckRegisters);
+        assert_eq!(
+            not_cell_mask.source,
+            Source::AssemblyHelpersTagCheckRegisters
+        );
+        assert_eq!(jit_data.source, Source::CodeBlockJitDataAndMetadataTable);
+        assert_eq!(
+            metadata_table.source,
+            Source::CodeBlockJitDataAndMetadataTable
+        );
+        for requirement in register_contract::REQUIRED_MATERIALIZED_REGISTER_STATES {
+            assert_eq!(
+                requirement.emission,
+                Emission::DormantMetadataOnlyNoInstructions
+            );
+        }
+    }
+
+    #[test]
+    fn arm64_return_seed_c_abi_map_is_narrower_than_full_baseline_contract() {
+        let map = p6_arm64_semantic_physical_register_map();
+        let exact_physical_registers: Vec<_> = map
+            .bindings
+            .iter()
+            .map(|binding| binding.physical)
+            .collect();
+
+        assert_eq!(
+            physical_binding(P6X86_64BaselineSymbolicRegister::ReturnGpr),
+            register_contract::RETURN_VALUE_GPR.name
+        );
+        assert_eq!(
+            physical_binding(P6X86_64BaselineSymbolicRegister::MetadataTableBase),
+            register_contract::METADATA_TABLE_BASE_RESERVED_PHYSICAL
+        );
+        assert_eq!(
+            physical_binding(P6X86_64BaselineSymbolicRegister::PinnedVm),
+            register_contract::PINNED_VM_RETURN_SEED_PHYSICAL
+        );
+        assert!(register_contract::REQUIRED_MATERIALIZED_REGISTER_STATES
+            .iter()
+            .any(|requirement| requirement.register == register_contract::JIT_DATA_REGISTER));
+        assert!(!exact_physical_registers.contains(&register_contract::JIT_DATA_REGISTER.name));
+        assert!(!exact_physical_registers.contains(&register_contract::NUMBER_TAG_REGISTER.name));
+        assert!(!exact_physical_registers.contains(&register_contract::NOT_CELL_MASK_REGISTER.name));
+        assert!(
+            map.bindings.len()
+                < register_contract::TEMPORARY_GPRS.len()
+                    + register_contract::BASELINE_RESERVED_CALLEE_SAVE_GPRS.len()
+        );
     }
 
     #[test]

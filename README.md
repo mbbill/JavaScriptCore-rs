@@ -91,6 +91,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] JIT ARM64 baseline control-flow/slow-case metadata skeleton added to
            src/jit/arm64_baseline.rs (maps to C++ Jump/JumpList/JumpTable/SlowCaseEntry;
            no side-exit or opcode-emission behavior expansion)
+    [done] JIT ARM64 GPRInfo/JSRInfo/AssemblyHelpers register materialization
+           contract skeleton added to src/jit/arm64_baseline.rs (metadata only)
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
