@@ -588,6 +588,275 @@ pub(crate) mod control_flow {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) mod direct_branch {
+    const ARM64_INSTRUCTION_SIZE_BYTES: u32 = 4;
+    const UNCONDITIONAL_BRANCH_BASE: u32 = 0x1400_0000;
+    const CONDITIONAL_BRANCH_BASE: u32 = 0x5400_0000;
+    const UNCONDITIONAL_BRANCH_IMM26_MASK: u32 = 0x03ff_ffff;
+    const CONDITIONAL_BRANCH_IMM19_MASK: u32 = 0x0007_ffff;
+    const UNCONDITIONAL_BRANCH_SIGNED_WORD_BITS: u8 = 26;
+    const CONDITIONAL_BRANCH_SIGNED_WORD_BITS: u8 = 19;
+
+    // C++ JSC map: `MacroAssemblerARM64::jump()` records the label before
+    // `ARM64Assembler::b()`, while conditional helpers return
+    // `Jump(makeBranch(cond))` after `ARM64Assembler::b_cond(cond)`.
+    // `ARM64Assembler::linkJumpOrCall()` and `linkConditionalBranch()` compute
+    // PC-relative immediates in instruction words from `fromInstruction`. For
+    // non-fixed conditional jumps, C++ stores the public `Jump` label after
+    // `b.cond` and normalizes it by subtracting one instruction in
+    // `ARM64Assembler::link()` before patching; this Rust record stores the
+    // already-normalized branch-instruction offset. This Rust module is dormant
+    // encoding metadata only: it emits no executable control flow and exists to
+    // keep the future ARM64 baseline emitter's patch records shaped like the JSC
+    // assembler layer.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64DirectBranchPatch {
+        pub(crate) kind: Arm64DirectBranchKind,
+        pub(crate) source_instruction_offset: u32,
+    }
+
+    impl Arm64DirectBranchPatch {
+        pub(crate) fn unconditional(source_instruction_offset: u32) -> Self {
+            Self {
+                kind: Arm64DirectBranchKind::Unconditional,
+                source_instruction_offset,
+            }
+        }
+
+        pub(crate) fn conditional(
+            source_instruction_offset: u32,
+            condition: Arm64Condition,
+        ) -> Self {
+            Self {
+                kind: Arm64DirectBranchKind::Conditional { condition },
+                source_instruction_offset,
+            }
+        }
+
+        pub(crate) fn placeholder_word(self) -> u32 {
+            self.kind.placeholder_word()
+        }
+
+        pub(crate) fn link_to(
+            self,
+            target_offset: u32,
+        ) -> Result<Arm64LinkedDirectBranch, Arm64DirectBranchLinkError> {
+            link_direct_branch(self.kind, self.source_instruction_offset, target_offset)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Arm64DirectBranchKind {
+        Unconditional,
+        Conditional { condition: Arm64Condition },
+    }
+
+    impl Arm64DirectBranchKind {
+        pub(crate) fn placeholder_word(self) -> u32 {
+            match self {
+                Self::Unconditional => encode_unconditional_branch_word(0),
+                Self::Conditional { condition } => encode_conditional_branch_word(0, condition),
+            }
+        }
+
+        fn signed_word_bits(self) -> u8 {
+            match self {
+                Self::Unconditional => UNCONDITIONAL_BRANCH_SIGNED_WORD_BITS,
+                Self::Conditional { .. } => CONDITIONAL_BRANCH_SIGNED_WORD_BITS,
+            }
+        }
+    }
+
+    #[repr(u8)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Arm64Condition {
+        Eq = 0,
+        Ne = 1,
+        Hs = 2,
+        Lo = 3,
+        Mi = 4,
+        Pl = 5,
+        Vs = 6,
+        Vc = 7,
+        Hi = 8,
+        Ls = 9,
+        Ge = 10,
+        Lt = 11,
+        Gt = 12,
+        Le = 13,
+        Al = 14,
+        Invalid = 15,
+    }
+
+    impl Arm64Condition {
+        pub(crate) fn from_code(code: u8) -> Option<Self> {
+            match code {
+                0 => Some(Self::Eq),
+                1 => Some(Self::Ne),
+                2 => Some(Self::Hs),
+                3 => Some(Self::Lo),
+                4 => Some(Self::Mi),
+                5 => Some(Self::Pl),
+                6 => Some(Self::Vs),
+                7 => Some(Self::Vc),
+                8 => Some(Self::Hi),
+                9 => Some(Self::Ls),
+                10 => Some(Self::Ge),
+                11 => Some(Self::Lt),
+                12 => Some(Self::Gt),
+                13 => Some(Self::Le),
+                14 => Some(Self::Al),
+                15 => Some(Self::Invalid),
+                _ => None,
+            }
+        }
+
+        pub(crate) fn code(self) -> u8 {
+            self as u8
+        }
+    }
+
+    pub(crate) const ARM64_CONDITION_CS: Arm64Condition = Arm64Condition::Hs;
+    pub(crate) const ARM64_CONDITION_CC: Arm64Condition = Arm64Condition::Lo;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Arm64DirectBranchOffsetRole {
+        SourceInstruction,
+        Target,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Arm64DirectBranchLinkError {
+        UnalignedOffset {
+            role: Arm64DirectBranchOffsetRole,
+            offset: u32,
+        },
+        OutOfRange {
+            kind: Arm64DirectBranchKind,
+            source_instruction_offset: u32,
+            target_offset: u32,
+            word_offset: i64,
+            signed_word_bits: u8,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64LinkedDirectBranch {
+        pub(crate) kind: Arm64DirectBranchKind,
+        pub(crate) source_instruction_offset: u32,
+        pub(crate) target_offset: u32,
+        pub(crate) byte_delta_from_source_instruction: i64,
+        pub(crate) word_offset: i64,
+        pub(crate) instruction_word: u32,
+    }
+
+    pub(crate) fn unconditional_branch_placeholder_word() -> u32 {
+        Arm64DirectBranchKind::Unconditional.placeholder_word()
+    }
+
+    pub(crate) fn conditional_branch_placeholder_word(condition: Arm64Condition) -> u32 {
+        Arm64DirectBranchKind::Conditional { condition }.placeholder_word()
+    }
+
+    pub(crate) fn link_unconditional_branch(
+        source_instruction_offset: u32,
+        target_offset: u32,
+    ) -> Result<Arm64LinkedDirectBranch, Arm64DirectBranchLinkError> {
+        link_direct_branch(
+            Arm64DirectBranchKind::Unconditional,
+            source_instruction_offset,
+            target_offset,
+        )
+    }
+
+    pub(crate) fn link_conditional_branch(
+        condition: Arm64Condition,
+        source_instruction_offset: u32,
+        target_offset: u32,
+    ) -> Result<Arm64LinkedDirectBranch, Arm64DirectBranchLinkError> {
+        link_direct_branch(
+            Arm64DirectBranchKind::Conditional { condition },
+            source_instruction_offset,
+            target_offset,
+        )
+    }
+
+    fn link_direct_branch(
+        kind: Arm64DirectBranchKind,
+        source_instruction_offset: u32,
+        target_offset: u32,
+    ) -> Result<Arm64LinkedDirectBranch, Arm64DirectBranchLinkError> {
+        validate_offset_alignment(
+            Arm64DirectBranchOffsetRole::SourceInstruction,
+            source_instruction_offset,
+        )?;
+        validate_offset_alignment(Arm64DirectBranchOffsetRole::Target, target_offset)?;
+
+        let byte_delta_from_source_instruction =
+            target_offset as i64 - source_instruction_offset as i64;
+        let word_offset = byte_delta_from_source_instruction / ARM64_INSTRUCTION_SIZE_BYTES as i64;
+        let signed_word_bits = kind.signed_word_bits();
+        if !is_signed_n_bit_word_offset(word_offset, signed_word_bits) {
+            // C++ `ARM64Assembler::linkConditionalBranch()` can fall back to an
+            // inverted conditional branch plus direct unconditional branch pair
+            // when the target is out of the direct b.cond range. This dormant
+            // Rust skeleton records/rejects out-of-range direct branches until
+            // full executable branch-pair emission is ported.
+            return Err(Arm64DirectBranchLinkError::OutOfRange {
+                kind,
+                source_instruction_offset,
+                target_offset,
+                word_offset,
+                signed_word_bits,
+            });
+        }
+
+        let instruction_word = match kind {
+            Arm64DirectBranchKind::Unconditional => encode_unconditional_branch_word(word_offset),
+            Arm64DirectBranchKind::Conditional { condition } => {
+                encode_conditional_branch_word(word_offset, condition)
+            }
+        };
+
+        Ok(Arm64LinkedDirectBranch {
+            kind,
+            source_instruction_offset,
+            target_offset,
+            byte_delta_from_source_instruction,
+            word_offset,
+            instruction_word,
+        })
+    }
+
+    fn validate_offset_alignment(
+        role: Arm64DirectBranchOffsetRole,
+        offset: u32,
+    ) -> Result<(), Arm64DirectBranchLinkError> {
+        if offset % ARM64_INSTRUCTION_SIZE_BYTES == 0 {
+            Ok(())
+        } else {
+            Err(Arm64DirectBranchLinkError::UnalignedOffset { role, offset })
+        }
+    }
+
+    fn is_signed_n_bit_word_offset(word_offset: i64, bits: u8) -> bool {
+        let min = -(1_i64 << (bits - 1));
+        let max = (1_i64 << (bits - 1)) - 1;
+        (min..=max).contains(&word_offset)
+    }
+
+    fn encode_unconditional_branch_word(word_offset: i64) -> u32 {
+        UNCONDITIONAL_BRANCH_BASE | ((word_offset as u32) & UNCONDITIONAL_BRANCH_IMM26_MASK)
+    }
+
+    fn encode_conditional_branch_word(word_offset: i64, condition: Arm64Condition) -> u32 {
+        CONDITIONAL_BRANCH_BASE
+            | (((word_offset as u32) & CONDITIONAL_BRANCH_IMM19_MASK) << 5)
+            | condition.code() as u32
+    }
+}
+
 fn encode_p6_arm64_callable_return_seed_selection(
     contract: &P6X86_64BaselineBackendContractRecord,
     selection: &P6X86_64BaselineInstructionSelectionPlan,
@@ -1000,6 +1269,7 @@ fn p6_arm64_callable_semantic_source_image_id(
 #[cfg(test)]
 mod tests {
     use super::control_flow::*;
+    use super::direct_branch::*;
     use super::*;
 
     fn bci(offset: u32) -> BytecodeIndex {
@@ -1011,6 +1281,25 @@ mod tests {
             source_offset,
             end_offset,
         }
+    }
+
+    fn assert_linked_direct_branch(
+        linked: Arm64LinkedDirectBranch,
+        kind: Arm64DirectBranchKind,
+        source_instruction_offset: u32,
+        target_offset: u32,
+        word_offset: i64,
+        instruction_word: u32,
+    ) {
+        assert_eq!(linked.kind, kind);
+        assert_eq!(linked.source_instruction_offset, source_instruction_offset);
+        assert_eq!(linked.target_offset, target_offset);
+        assert_eq!(
+            linked.byte_delta_from_source_instruction,
+            target_offset as i64 - source_instruction_offset as i64
+        );
+        assert_eq!(linked.word_offset, word_offset);
+        assert_eq!(linked.instruction_word, instruction_word);
     }
 
     fn physical_binding(symbolic: P6X86_64BaselineSymbolicRegister) -> &'static str {
@@ -1373,5 +1662,154 @@ mod tests {
         assert!(empty.jumps().is_empty());
         empty.push(jump(0x40, 0x44));
         assert_eq!(empty.jumps(), &[jump(0x40, 0x44)]);
+    }
+
+    #[test]
+    fn arm64_baseline_direct_branch_placeholders_match_arm64_b_and_b_cond() {
+        assert_eq!(unconditional_branch_placeholder_word(), 0x1400_0000);
+        assert_eq!(
+            Arm64DirectBranchPatch::unconditional(0x20).placeholder_word(),
+            0x1400_0000
+        );
+        assert_eq!(
+            conditional_branch_placeholder_word(Arm64Condition::Eq),
+            0x5400_0000
+        );
+        assert_eq!(
+            conditional_branch_placeholder_word(Arm64Condition::Ne),
+            0x5400_0001
+        );
+        assert_eq!(
+            Arm64DirectBranchPatch::conditional(0x24, Arm64Condition::Le).placeholder_word(),
+            0x5400_000d
+        );
+        assert_eq!(
+            conditional_branch_placeholder_word(Arm64Condition::Invalid),
+            0x5400_000f
+        );
+
+        for code in 0..=15 {
+            assert_eq!(Arm64Condition::from_code(code).unwrap().code(), code);
+        }
+        assert_eq!(Arm64Condition::from_code(16), None);
+        assert_eq!(ARM64_CONDITION_CS, Arm64Condition::Hs);
+        assert_eq!(ARM64_CONDITION_CC, Arm64Condition::Lo);
+    }
+
+    #[test]
+    fn arm64_baseline_direct_unconditional_links_forward_and_backward() {
+        let forward = link_unconditional_branch(0x100, 0x110).unwrap();
+        assert_linked_direct_branch(
+            forward,
+            Arm64DirectBranchKind::Unconditional,
+            0x100,
+            0x110,
+            4,
+            0x1400_0004,
+        );
+
+        let backward = Arm64DirectBranchPatch::unconditional(0x110)
+            .link_to(0x100)
+            .unwrap();
+        assert_linked_direct_branch(
+            backward,
+            Arm64DirectBranchKind::Unconditional,
+            0x110,
+            0x100,
+            -4,
+            0x17ff_fffc,
+        );
+    }
+
+    #[test]
+    fn arm64_baseline_direct_conditional_links_forward_and_backward() {
+        let kind = Arm64DirectBranchKind::Conditional {
+            condition: Arm64Condition::Ne,
+        };
+        let forward = link_conditional_branch(Arm64Condition::Ne, 0x100, 0x110).unwrap();
+        assert_linked_direct_branch(forward, kind, 0x100, 0x110, 4, 0x5400_0081);
+
+        let backward = Arm64DirectBranchPatch::conditional(0x110, Arm64Condition::Ne)
+            .link_to(0x100)
+            .unwrap();
+        assert_linked_direct_branch(backward, kind, 0x110, 0x100, -4, 0x54ff_ff81);
+    }
+
+    #[test]
+    fn arm64_baseline_direct_branch_linking_accepts_signed_immediate_boundaries() {
+        let unconditional_max = ((1_u32 << 25) - 1) * 4;
+        assert_eq!(
+            link_unconditional_branch(0, unconditional_max)
+                .unwrap()
+                .instruction_word,
+            0x15ff_ffff
+        );
+        assert_eq!(
+            link_unconditional_branch(unconditional_max + 4, 0)
+                .unwrap()
+                .instruction_word,
+            0x1600_0000
+        );
+
+        let conditional_max = ((1_u32 << 18) - 1) * 4;
+        assert_eq!(
+            link_conditional_branch(Arm64Condition::Eq, 0, conditional_max)
+                .unwrap()
+                .instruction_word,
+            0x547f_ffe0
+        );
+        assert_eq!(
+            link_conditional_branch(Arm64Condition::Ne, conditional_max + 4, 0)
+                .unwrap()
+                .instruction_word,
+            0x5480_0001
+        );
+    }
+
+    #[test]
+    fn arm64_baseline_direct_branch_linking_rejects_unaligned_offsets() {
+        assert_eq!(
+            link_unconditional_branch(0x101, 0x104),
+            Err(Arm64DirectBranchLinkError::UnalignedOffset {
+                role: Arm64DirectBranchOffsetRole::SourceInstruction,
+                offset: 0x101,
+            })
+        );
+        assert_eq!(
+            link_conditional_branch(Arm64Condition::Eq, 0x100, 0x103),
+            Err(Arm64DirectBranchLinkError::UnalignedOffset {
+                role: Arm64DirectBranchOffsetRole::Target,
+                offset: 0x103,
+            })
+        );
+    }
+
+    #[test]
+    fn arm64_baseline_direct_branch_linking_rejects_out_of_range_offsets() {
+        let unconditional_target = (1_u32 << 25) * 4;
+        assert_eq!(
+            link_unconditional_branch(0, unconditional_target),
+            Err(Arm64DirectBranchLinkError::OutOfRange {
+                kind: Arm64DirectBranchKind::Unconditional,
+                source_instruction_offset: 0,
+                target_offset: unconditional_target,
+                word_offset: 1_i64 << 25,
+                signed_word_bits: 26,
+            })
+        );
+
+        let conditional_target = (1_u32 << 18) * 4;
+        assert_eq!(
+            link_conditional_branch(Arm64Condition::Eq, 0, conditional_target),
+            Err(Arm64DirectBranchLinkError::OutOfRange {
+                kind: Arm64DirectBranchKind::Conditional {
+                    condition: Arm64Condition::Eq,
+                },
+                source_instruction_offset: 0,
+                target_offset: conditional_target,
+                word_offset: 1_i64 << 18,
+                signed_word_bits: 19,
+            })
+        );
     }
 }

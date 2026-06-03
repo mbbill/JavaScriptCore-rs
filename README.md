@@ -93,6 +93,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            no side-exit or opcode-emission behavior expansion)
     [done] JIT ARM64 GPRInfo/JSRInfo/AssemblyHelpers register materialization
            contract skeleton added to src/jit/arm64_baseline.rs (metadata only)
+    [done] JIT ARM64 direct branch/link encoding skeleton added to
+           src/jit/arm64_baseline.rs (maps to MacroAssemblerARM64::jump/makeBranch,
+           ARM64Assembler::b/b_cond/linkJumpOrCall/linkConditionalBranch; dormant direct-only)
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
