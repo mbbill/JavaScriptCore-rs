@@ -176,6 +176,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] generated direct-call route-opportunity telemetry: generated-entry successes now
            report the selected/preferred route and native-entry miss reason per site/target,
            exposing macOS arm64 native blockers without changing route selection
+    [done] generated direct-call MissingGate preparation: the CallLinkInfo/linkFor-style
+           slow path now attempts native baseline entry materialization before publishing
+           a generated callee fallback, so route telemetry reports concrete native failures
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
   [wip] arrays and indexed storage

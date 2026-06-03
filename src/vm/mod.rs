@@ -9636,6 +9636,33 @@ impl Vm {
             .tiering
             .baseline_native_entry_gate_for_owner(code_block_id)
         else {
+            // Oversized-file exception: generated direct-call telemetry lives in
+            // the VM core today. C++ linkFor() prepares the callee executable
+            // before publishing an entrypoint; after Rust attempts that
+            // preparation, a generated fallback should report the concrete
+            // native materialization failure rather than the pre-attempt
+            // MissingGate state.
+            if let Some(reason) = self
+                .tiering
+                .baseline_entry_auto_materializations()
+                .iter()
+                .rev()
+                .find(|record| record.owner == code_block_id)
+                .and_then(|record| match record.native {
+                    BaselineEntryAutoNativeMaterializationOutcome::Failed {
+                        reason,
+                        generated_fallback_allowed,
+                    } => Some(
+                        VmGeneratedDirectCallNativeEntryMissReason::NativeMaterializationFailed {
+                            reason,
+                            generated_fallback_allowed,
+                        },
+                    ),
+                    _ => None,
+                })
+            {
+                return reason;
+            }
             return VmGeneratedDirectCallNativeEntryMissReason::MissingGate;
         };
         if gate.outcome != BaselineEntryGateOutcome::NativeEntryReady {
@@ -45366,7 +45393,10 @@ mod tests {
             .expect("missing native gate callee should prepare generated entry");
         assert_eq!(
             callee_auto_record.native,
-            BaselineEntryAutoNativeMaterializationOutcome::SkippedMissingNativeEntryGate
+            BaselineEntryAutoNativeMaterializationOutcome::Failed {
+                reason: BaselineEntryAutoNativeMaterializationFailure::EligibilityProof,
+                generated_fallback_allowed: true,
+            }
         );
         assert_eq!(
             callee_auto_record.generated,
@@ -45397,7 +45427,10 @@ mod tests {
         );
         assert_eq!(
             fallback_record.native_entry_miss,
-            VmGeneratedDirectCallNativeEntryMissReason::MissingGate
+            VmGeneratedDirectCallNativeEntryMissReason::NativeMaterializationFailed {
+                reason: BaselineEntryAutoNativeMaterializationFailure::EligibilityProof,
+                generated_fallback_allowed: true,
+            }
         );
         assert_eq!(
             vm.tiering_integration()

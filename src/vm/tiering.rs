@@ -7483,7 +7483,13 @@ pub enum VmGeneratedDirectCallGeneratedEntryMissReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VmGeneratedDirectCallNativeEntryMissReason {
     MissingGate,
-    GateNotReady { outcome: BaselineEntryGateOutcome },
+    NativeMaterializationFailed {
+        reason: BaselineEntryAutoNativeMaterializationFailure,
+        generated_fallback_allowed: bool,
+    },
+    GateNotReady {
+        outcome: BaselineEntryGateOutcome,
+    },
     MissingReadiness,
     ReadinessNotReady,
     MissingCallable,

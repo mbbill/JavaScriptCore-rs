@@ -789,18 +789,19 @@ impl Vm {
             );
             return execution;
         }
-        let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
-            code_block_id,
-            code_block,
-            expected_frame,
-        );
         if let Some(execution) = self.try_prepare_missing_generated_direct_call_callee_entry(
             code_block_id,
             code_block,
             expected_frame,
+            route_policy,
             host,
             config,
         ) {
+            let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
+                code_block_id,
+                code_block,
+                expected_frame,
+            );
             self.record_generated_direct_call_route_opportunity(
                 continuation,
                 code_block_id,
@@ -901,6 +902,7 @@ impl Vm {
         code_block_id: CodeBlockId,
         code_block: &CodeBlock,
         expected_frame: CallFrameId,
+        route_policy: GeneratedDirectCallCalleeRoutePolicy,
         host: &mut H,
         config: DispatchConfig,
     ) -> Option<GeneratedDirectCallCalleeExecution> {
@@ -911,6 +913,10 @@ impl Vm {
         ) != VmGeneratedDirectCallGeneratedEntryMissReason::MissingArtifact
             || !self
                 .selected_entry_code_block_matches_registered_code_block(code_block_id, code_block)
+            || !matches!(
+                self.config.tiering_policy(),
+                TieringPolicy::BaselineAllowed | TieringPolicy::OptimizingAllowed
+            )
         {
             return None;
         }
@@ -919,38 +925,99 @@ impl Vm {
             code_block,
             expected_frame,
         );
-        let native = match native_entry_miss {
+        let (native, native_detail, generated, generated_detail) = match native_entry_miss {
             VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64
                 if self.p15_host_blocked_native_generated_install_should_retry(code_block_id) =>
             {
-                BaselineEntryAutoNativeMaterializationOutcome::SkippedHostBlockedX86_64NativeEntry
+                let (generated, generated_detail) =
+                    self.p15_auto_install_generated_baseline_artifact(code_block_id);
+                (
+                    BaselineEntryAutoNativeMaterializationOutcome::SkippedHostBlockedX86_64NativeEntry,
+                    None,
+                    Some(generated),
+                    generated_detail,
+                )
             }
             VmGeneratedDirectCallNativeEntryMissReason::MissingGate
                 if self.p15_missing_native_gate_generated_install_should_retry(code_block_id) =>
             {
-                BaselineEntryAutoNativeMaterializationOutcome::SkippedMissingNativeEntryGate
+                let request =
+                    self.next_p15_auto_baseline_native_entry_install_request(code_block_id);
+                match self.install_p6_x86_64_callable_semantic_baseline_native_entry(request) {
+                    Ok(record) => {
+                        let (generated, generated_detail) = if self
+                            .p15_native_auto_install_requires_generated_host_fallback(&record)
+                            || route_policy
+                                == GeneratedDirectCallCalleeRoutePolicy::GeneratedEntryOnly
+                        {
+                            // C++ JSC's linkFor() calls prepareForExecution() before
+                            // entrypointFor() publishes the callee target. Rust may
+                            // retain a non-host-native audit callable, but direct-call
+                            // generated-only requests still need the portable generated
+                            // artifact as their executable callee entry.
+                            let (generated, generated_detail) =
+                                self.p15_auto_install_generated_baseline_artifact(code_block_id);
+                            (Some(generated), generated_detail)
+                        } else {
+                            (None, None)
+                        };
+                        (
+                            BaselineEntryAutoNativeMaterializationOutcome::Installed,
+                            None,
+                            generated,
+                            generated_detail,
+                        )
+                    }
+                    Err(error) => {
+                        let generated_fallback_allowed =
+                            Self::p15_native_auto_install_failure_allows_generated_fallback(&error);
+                        let native = BaselineEntryAutoNativeMaterializationOutcome::Failed {
+                            reason: Self::p15_auto_native_install_failure_reason(&error),
+                            generated_fallback_allowed,
+                        };
+                        let native_detail = Self::p15_auto_native_install_failure_detail(&error);
+                        let (generated, generated_detail) = if generated_fallback_allowed {
+                            let (generated, generated_detail) =
+                                self.p15_auto_install_generated_baseline_artifact(code_block_id);
+                            (Some(generated), generated_detail)
+                        } else {
+                            (None, None)
+                        };
+                        (native, native_detail, generated, generated_detail)
+                    }
+                }
             }
             _ => return None,
         };
 
-        // C++ JSC's linkFor() prepares the JS callee executable before
-        // returning the linked entrypoint (RepatchInlines.h:191). Rust keeps
-        // any native audit artifact/gate state intact, but when no native route
-        // can run on this host, the rooted slow path publishes the portable
-        // generated baseline body as the executable callee entry.
-        let (generated, generated_detail) =
-            self.p15_auto_install_generated_baseline_artifact(code_block_id);
         let request = BaselineEntryAutoMaterializationRequest {
             owner: code_block_id,
             requested_tier: JitType::Baseline,
             native,
-            native_detail: None,
-            generated: Some(generated),
+            native_detail,
+            generated,
             generated_detail,
         };
         self.tiering
             .record_baseline_entry_auto_materialization(request);
 
+        if route_policy != GeneratedDirectCallCalleeRoutePolicy::GeneratedEntryOnly {
+            if let Some(execution) = self
+                .try_execute_generated_direct_call_callee_with_native_entry(
+                    code_block_id,
+                    code_block,
+                    expected_frame,
+                    host,
+                    config,
+                    route_policy != GeneratedDirectCallCalleeRoutePolicy::NativeEntryOnly,
+                )
+            {
+                return Some(execution);
+            }
+        }
+        if route_policy == GeneratedDirectCallCalleeRoutePolicy::NativeEntryOnly {
+            return None;
+        }
         self.try_execute_generated_direct_call_callee_with_generated_entry(
             code_block_id,
             code_block,
@@ -968,8 +1035,11 @@ impl Vm {
             .rev()
             .any(|record| {
                 record.owner == owner
-                    && record.native
-                        == BaselineEntryAutoNativeMaterializationOutcome::SkippedMissingNativeEntryGate
+                    && matches!(
+                        record.native,
+                        BaselineEntryAutoNativeMaterializationOutcome::SkippedMissingNativeEntryGate
+                            | BaselineEntryAutoNativeMaterializationOutcome::Failed { .. }
+                    )
                     && !matches!(
                         record.generated,
                         Some(BaselineEntryAutoGeneratedMaterializationOutcome::Installed)
@@ -2222,28 +2292,52 @@ mod tests {
             execution.completion,
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
-        assert_eq!(
-            execution.route,
-            VmGeneratedDirectCallTransactionRoute::GeneratedEntry
-        );
         let callee_auto_record = vm
             .tiering_integration()
             .baseline_entry_auto_materializations()[auto_count_before..]
             .iter()
             .find(|record| record.owner == callee_owner)
-            .expect("missing native gate callee generated materialization");
-        assert_eq!(
-            callee_auto_record.native,
-            BaselineEntryAutoNativeMaterializationOutcome::SkippedMissingNativeEntryGate
-        );
-        assert_eq!(
-            callee_auto_record.generated,
-            Some(BaselineEntryAutoGeneratedMaterializationOutcome::Installed)
-        );
-        assert!(vm
-            .tiering_integration()
-            .baseline_generated_code_artifact_for(callee_owner)
-            .is_some());
+            .expect("missing native gate callee materialization");
+        match execution.route {
+            VmGeneratedDirectCallTransactionRoute::NativeEntry => {
+                assert_eq!(
+                    callee_auto_record.native,
+                    BaselineEntryAutoNativeMaterializationOutcome::Installed
+                );
+                assert_eq!(callee_auto_record.generated, None);
+                assert_eq!(
+                    vm.generated_direct_call_native_entry_miss_reason(
+                        callee_owner,
+                        &callee_code_block,
+                        callee_frame,
+                    ),
+                    VmGeneratedDirectCallNativeEntryMissReason::Ready
+                );
+            }
+            VmGeneratedDirectCallTransactionRoute::GeneratedEntry => {
+                assert!(
+                    matches!(
+                        callee_auto_record.native,
+                        BaselineEntryAutoNativeMaterializationOutcome::Installed
+                            | BaselineEntryAutoNativeMaterializationOutcome::Failed {
+                                generated_fallback_allowed: true,
+                                ..
+                            }
+                    ),
+                    "generated fallback should follow a concrete native attempt, got {:?}",
+                    callee_auto_record.native
+                );
+                assert_eq!(
+                    callee_auto_record.generated,
+                    Some(BaselineEntryAutoGeneratedMaterializationOutcome::Installed)
+                );
+                assert!(vm
+                    .tiering_integration()
+                    .baseline_generated_code_artifact_for(callee_owner)
+                    .is_some());
+            }
+            route => unreachable!("unexpected prepared callee route {route:?}"),
+        }
         assert_eq!(
             vm.tiering_integration()
                 .generated_direct_call_callee_fallback_records()
