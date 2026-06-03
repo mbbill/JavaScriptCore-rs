@@ -25,7 +25,13 @@ impl VmConfig {
             execution_mode: VmExecutionMode::BaselineAllowed,
             enable_jit_compatibility_fields: true,
             host_capabilities: HostCapabilities {
-                can_use_jit: cfg!(all(unix, target_arch = "x86_64")),
+                // C++ JSC gates callable JIT code on the host backend selected for
+                // the process. Rust currently has executable native-entry backends
+                // for Unix x86_64 and the narrow Unix aarch64 return seed.
+                can_use_jit: cfg!(all(
+                    unix,
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )),
                 ..HostCapabilities::default()
             },
             ..Self::default()

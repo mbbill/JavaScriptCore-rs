@@ -156,21 +156,23 @@ use crate::jit::plan::{
     BaselineGeneratedRuntimeHelperPlanDerivation, BaselineGeneratedRuntimeHelperPlanMetadata,
 };
 use crate::jit::{
+    emit_p6_arm64_baseline_callable_semantic_bytes,
     emit_p6_x86_64_baseline_callable_semantic_bytes_with_owner_continuation_map,
     emit_p6_x86_64_baseline_semantic_bytes, finalize_link_buffer, plan_p6_x86_64_baseline_lowering,
-    record_baseline_machine_code_emission, record_p6_x86_64_baseline_backend_contract_from_plan,
-    select_p6_x86_64_baseline_instructions, AbiValue, AccessCaseKind,
-    BaselineBytecodeEligibilityProof, BaselineBytecodeEligibilityRecord,
+    record_baseline_machine_code_emission, record_p6_arm64_baseline_backend_contract_from_plan,
+    record_p6_x86_64_baseline_backend_contract_from_plan, select_p6_x86_64_baseline_instructions,
+    AbiValue, AccessCaseKind, BaselineBytecodeEligibilityProof, BaselineBytecodeEligibilityRecord,
     BaselineGeneratedCodeArtifact, BaselineGeneratedCodeBody, BaselineGeneratedCodeBodyId,
     BaselineMachineCodeEmissionRecord, BaselineMachineCodeEmissionRequest,
-    BaselineMachineCodeEmissionValidationError, BaselineNativeEntryCallableAuthority,
-    BaselineNativeEntryCallableKind, BaselineNativeEntryDescriptor, BaselineSupportedOpcodeSubset,
-    CacheKey, CallBoundaryId, CallBoundaryMetadata, CallLinkMode, CallLinkReadinessBlocker,
-    CodeFinalizationAuthority, CodeLiveness, CodeOrigin, CodeOriginKind, CodeOwnership,
-    CompilerSafepointId, EntryAbi, Entrypoint, EntrypointKind, ExecutableAllocationId,
-    ExecutableAllocationLifecycle, ExecutableAllocationRecord, ExecutableAllocationRequest,
-    ExecutableLedgerValidationError, ExecutableMemoryProtection, ExecutableMutationAuthority,
-    GeneratedCallLinkCandidate, GeneratedCallLinkCandidateTable, GeneratedCallLinkDirectCallStatus,
+    BaselineMachineCodeEmissionValidationError, BaselineMachineCodeEmitterKind,
+    BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableKind,
+    BaselineNativeEntryDescriptor, BaselineSupportedOpcodeSubset, CacheKey, CallBoundaryId,
+    CallBoundaryMetadata, CallLinkMode, CallLinkReadinessBlocker, CodeFinalizationAuthority,
+    CodeLiveness, CodeOrigin, CodeOriginKind, CodeOwnership, CompilerSafepointId, EntryAbi,
+    Entrypoint, EntrypointKind, ExecutableAllocationId, ExecutableAllocationLifecycle,
+    ExecutableAllocationRecord, ExecutableAllocationRequest, ExecutableLedgerValidationError,
+    ExecutableMemoryProtection, ExecutableMutationAuthority, GeneratedCallLinkCandidate,
+    GeneratedCallLinkCandidateTable, GeneratedCallLinkDirectCallStatus,
     GeneratedCallLinkProbeMissReason, GeneratedCallLinkProbeRequest, GeneratedCallLinkProbeResult,
     GeneratedGuardedPropertyLoadProbeRequest, GeneratedGuardedPropertyLoadProbeResult,
     GeneratedPropertyLoadMegamorphicHolderProbeRequest, GeneratedPropertyLoadProbeRequest,
@@ -2349,6 +2351,29 @@ impl Vm {
         self.config.host_capabilities.can_use_jit && cfg!(all(unix, target_arch = "x86_64"))
     }
 
+    fn can_execute_p6_arm64_emitted_native_entry(&self) -> bool {
+        // C++ JSC's ARM64 baseline lane uses fp/x29 as the CallFrame register
+        // and x0 as the JSValue return carrier. This Rust seed is executable
+        // only on native Unix aarch64 hosts; other hosts may retain metadata but
+        // must not call the bytes.
+        self.config.host_capabilities.can_use_jit && cfg!(all(unix, target_arch = "aarch64"))
+    }
+
+    fn can_execute_baseline_native_entry_kind(
+        &self,
+        kind: BaselineNativeEntryCallableKind,
+    ) -> bool {
+        match kind {
+            BaselineNativeEntryCallableKind::P6PureBaselineNativeEntryShim => true,
+            BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry => {
+                self.can_execute_p6_x86_64_emitted_native_entry()
+            }
+            BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry => {
+                self.can_execute_p6_arm64_emitted_native_entry()
+            }
+        }
+    }
+
     pub fn heap(&self) -> &Heap {
         &self.heap
     }
@@ -2963,16 +2988,12 @@ impl Vm {
         &self,
         record: &P6X86_64SemanticBaselineNativeEntryInstallRecord,
     ) -> bool {
-        !self.can_execute_p6_x86_64_emitted_native_entry()
-            && record
-                .enabled_readiness
-                .as_ref()
-                .and_then(|readiness| readiness.callable)
-                .map(|callable| {
-                    callable.kind()
-                        == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
-                })
-                .unwrap_or(false)
+        record
+            .enabled_readiness
+            .as_ref()
+            .and_then(|readiness| readiness.callable)
+            .map(|callable| !self.can_execute_baseline_native_entry_kind(callable.kind()))
+            .unwrap_or(false)
     }
 
     fn try_p15_auto_install_selected_baseline_entry(
@@ -3451,14 +3472,10 @@ impl Vm {
             plan_p6_x86_64_baseline_lowering(lowering_request)
         }
         .map_err(|error| P6X86_64SemanticBaselineNativeEntryInstallError::Lowering { error })?;
-        let backend_contract = record_p6_x86_64_baseline_backend_contract_from_plan(&lowering.plan)
-            .map_err(
-                |error| P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract { error },
-            )?;
-        let selection =
-            select_p6_x86_64_baseline_instructions(&backend_contract).map_err(|error| {
-                P6X86_64SemanticBaselineNativeEntryInstallError::InstructionSelection { error }
-            })?;
+        let use_arm64_callable = matches!(
+            readiness_mode,
+            P6X86_64SemanticBaselineNativeEntryReadinessMode::EnabledCallable
+        ) && cfg!(all(unix, target_arch = "aarch64"));
         let owner_continuation_map_for_emission = if matches!(
             readiness_mode,
             P6X86_64SemanticBaselineNativeEntryReadinessMode::EnabledCallable
@@ -3485,9 +3502,87 @@ impl Vm {
         };
         let semantic_emission = match readiness_mode {
             P6X86_64SemanticBaselineNativeEntryReadinessMode::DisabledOnly => {
+                let backend_contract =
+                    record_p6_x86_64_baseline_backend_contract_from_plan(&lowering.plan).map_err(
+                        |error| {
+                            P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
+                                error,
+                            }
+                        },
+                    )?;
+                let selection = select_p6_x86_64_baseline_instructions(&backend_contract)
+                    .map_err(|error| {
+                        P6X86_64SemanticBaselineNativeEntryInstallError::InstructionSelection {
+                            error,
+                        }
+                    })?;
                 emit_p6_x86_64_baseline_semantic_bytes(backend_contract, selection)
             }
+            P6X86_64SemanticBaselineNativeEntryReadinessMode::EnabledCallable
+                if use_arm64_callable =>
+            {
+                let backend_contract =
+                    record_p6_arm64_baseline_backend_contract_from_plan(&lowering.plan).map_err(
+                        |error| {
+                            P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
+                                error,
+                            }
+                        },
+                    )?;
+                let selection = select_p6_x86_64_baseline_instructions(&backend_contract)
+                    .map_err(|error| {
+                        P6X86_64SemanticBaselineNativeEntryInstallError::InstructionSelection {
+                            error,
+                        }
+                    })?;
+                match emit_p6_arm64_baseline_callable_semantic_bytes(backend_contract, selection) {
+                    Ok(semantic_emission) => Ok(semantic_emission),
+                    Err(
+                        P6X86_64BaselineSemanticByteEmissionError::UnsupportedArm64SeedLoweredOperation {
+                            ..
+                        },
+                    ) => {
+                        // C++ JSC has a complete architecture-specific Baseline JIT backend.
+                        // This Rust ARM64 lane is only the no-call/no-heap return seed, so
+                        // valid P6 bodies outside that seed keep the existing x86_64 semantic
+                        // artifact route until the full ARM64 backend is ported.
+                        let backend_contract =
+                            record_p6_x86_64_baseline_backend_contract_from_plan(&lowering.plan)
+                                .map_err(|error| {
+                                    P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
+                                        error,
+                                    }
+                                })?;
+                        let selection = select_p6_x86_64_baseline_instructions(&backend_contract)
+                            .map_err(|error| {
+                                P6X86_64SemanticBaselineNativeEntryInstallError::InstructionSelection {
+                                    error,
+                                }
+                            })?;
+                        emit_p6_x86_64_baseline_callable_semantic_bytes_with_owner_continuation_map(
+                            backend_contract,
+                            selection,
+                            owner_continuation_map_for_emission.as_ref(),
+                        )
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             P6X86_64SemanticBaselineNativeEntryReadinessMode::EnabledCallable => {
+                let backend_contract =
+                    record_p6_x86_64_baseline_backend_contract_from_plan(&lowering.plan).map_err(
+                        |error| {
+                            P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
+                                error,
+                            }
+                        },
+                    )?;
+                let selection = select_p6_x86_64_baseline_instructions(&backend_contract)
+                    .map_err(|error| {
+                        P6X86_64SemanticBaselineNativeEntryInstallError::InstructionSelection {
+                            error,
+                        }
+                    })?;
                 emit_p6_x86_64_baseline_callable_semantic_bytes_with_owner_continuation_map(
                     backend_contract,
                     selection,
@@ -3538,7 +3633,16 @@ impl Vm {
                 P6X86_64SemanticBaselineNativeEntryInstallError::CodeBlockNotRegistered { owner },
             )?
             .code_block();
-        let owner_continuation_native_binding =
+        let owner_continuation_native_binding = if semantic_emission.emitter_kind
+            == BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset
+        {
+            // C++ JSC's Baseline JIT publishes complete native PC metadata. This ARM64
+            // seed intentionally fuses no-call/no-heap operations into the terminal
+            // return and cannot yet provide a full bytecode-index range map, so direct
+            // native-call continuation binding remains disabled until the full ARM64
+            // backend is ported.
+            None
+        } else {
             derive_baseline_generated_owner_continuation_map_from_code_block(
                 current_code_block,
                 owner,
@@ -3558,7 +3662,8 @@ impl Vm {
                 P6X86_64SemanticBaselineNativeEntryInstallError::OwnerContinuationNativeBinding {
                     error,
                 }
-            })?;
+            })?
+        };
 
         let artifact_size = semantic_emission.linked_image.output_size_bytes;
         #[cfg(test)]
@@ -3787,17 +3892,26 @@ impl Vm {
                     .map_err(|error| {
                         P6X86_64SemanticBaselineNativeEntryInstallError::ArtifactInvalid { error }
                     })?;
+                let callable_authority = match semantic_emission.emitter_kind {
+                    BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset => {
+                        BaselineNativeEntryCallableAuthority::new_p6_arm64_emitted_semantic_c_abi_entry(
+                            descriptor,
+                        )
+                    }
+                    _ => {
+                        BaselineNativeEntryCallableAuthority::new_p6_x86_64_emitted_semantic_c_abi_entry(
+                            descriptor,
+                        )
+                    }
+                };
+                let expected_callable_kind = callable_authority.kind();
                 let readiness = self.tiering.record_baseline_native_entry_readiness(
                     BaselineNativeEntryReadinessRequest {
                         owner,
                         materialization: &materialization,
                         install: &install,
                         execution_policy: BaselineNativeEntryExecutionPolicy::Enabled,
-                        callable: Some(
-                            BaselineNativeEntryCallableAuthority::new_p6_x86_64_emitted_semantic_c_abi_entry(
-                                descriptor,
-                            ),
-                        ),
+                        callable: Some(callable_authority),
                     },
                 );
                 if readiness.execution_policy != BaselineNativeEntryExecutionPolicy::Enabled
@@ -3814,10 +3928,7 @@ impl Vm {
                 }
                 if !readiness
                     .callable
-                    .map(|callable| {
-                        callable.kind()
-                            == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
-                    })
+                    .map(|callable| callable.kind() == expected_callable_kind)
                     .unwrap_or(false)
                 {
                     return Err(
@@ -5157,29 +5268,20 @@ impl Vm {
             return;
         };
         if let Some(descriptor) = readiness.descriptor {
-            if readiness
-                .callable
-                .map(|callable| {
-                    callable.kind()
-                        == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
-                })
-                .unwrap_or(false)
-                && !self.can_execute_p6_x86_64_emitted_native_entry()
-            {
-                return;
-            }
-            if readiness
-                .callable
-                .map(|callable| {
-                    callable.kind()
-                        == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
-                })
-                .unwrap_or(false)
-                && self
+            if let Some(callable) = readiness.callable {
+                if !self.can_execute_baseline_native_entry_kind(callable.kind()) {
+                    return;
+                }
+                if matches!(
+                    callable.kind(),
+                    BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
+                        | BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry
+                ) && self
                     .platform_residency_index_for_native_entry(&readiness, &descriptor)
                     .is_none()
-            {
-                return;
+                {
+                    return;
+                }
             }
         }
         match gate.outcome {
@@ -5643,9 +5745,7 @@ impl Vm {
         let Some(callable) = readiness.callable else {
             return None;
         };
-        if callable.kind() == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
-            && !self.can_execute_p6_x86_64_emitted_native_entry()
-        {
+        if !self.can_execute_baseline_native_entry_kind(callable.kind()) {
             return None;
         }
         let Some(descriptor) = readiness.descriptor else {
@@ -5731,6 +5831,22 @@ impl Vm {
                     host,
                     config,
                 ),
+            BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry => self
+                .execute_p6_arm64_emitted_semantic_native_entry_in_current_region(
+                    code_block,
+                    P6EmittedNativeDispatch {
+                        code_block_id,
+                        expected_frame,
+                        entry_kind,
+                        current_tier,
+                        bytecode_snapshot: actual_snapshot,
+                        readiness: &readiness,
+                        descriptor: &descriptor,
+                        allow_interpreter_fallback,
+                    },
+                    host,
+                    config,
+                ),
         })
     }
 
@@ -5792,6 +5908,91 @@ impl Vm {
                 ExecutionError::BaselineGeneratedExecutionRejected,
             )),
         }
+    }
+
+    fn execute_p6_arm64_emitted_semantic_native_entry_in_current_region<H: DispatchHost>(
+        &mut self,
+        code_block: &CodeBlock,
+        dispatch: P6EmittedNativeDispatch<'_>,
+        host: &mut H,
+        config: DispatchConfig,
+    ) -> BaselineNativeEntryVmExecution {
+        let fallback = |vm: &mut Self, host: &mut H| {
+            if dispatch.allow_interpreter_fallback {
+                BaselineNativeEntryVmExecution::InterpreterFallback(
+                    vm.execute_interpreter_code_block_in_current_region(
+                        dispatch.code_block_id,
+                        code_block,
+                        host,
+                        config,
+                    ),
+                )
+            } else {
+                BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(
+                    ExecutionError::BaselineGeneratedExecutionRejected,
+                ))
+            }
+        };
+        if !self.can_execute_p6_arm64_emitted_native_entry() {
+            return fallback(self, host);
+        }
+        if let Some(reason) = self.exceptions.termination() {
+            return BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Terminated(reason));
+        }
+        let Some(active_frame) = self.execution.top_frame() else {
+            return fallback(self, host);
+        };
+        let active_frame_id = active_frame.id;
+        let active_frame_code_block = active_frame.code_block;
+        let active_callee_value = active_frame.callee_value;
+        let active_register_window = active_frame.register_window;
+        if active_frame_id != dispatch.expected_frame
+            || active_frame_code_block != Some(dispatch.code_block_id)
+        {
+            return fallback(self, host);
+        }
+        if p6_code_block_uses_load_callee(code_block) && active_callee_value.is_none() {
+            return fallback(self, host);
+        }
+        let callee_value_bits = active_callee_value
+            .unwrap_or_else(RuntimeValue::undefined)
+            .encoded()
+            .0;
+        let Some(platform_residency_index) =
+            self.platform_residency_index_for_native_entry(dispatch.readiness, dispatch.descriptor)
+        else {
+            return fallback(self, host);
+        };
+        let vm = NonNull::from(&mut *self).cast::<c_void>();
+        let Ok(frame_base) = self
+            .registers
+            .borrow_active_frame_base_for_raw_native_entry(active_register_window)
+        else {
+            return fallback(self, host);
+        };
+        let ic_store_base = self
+            .code_blocks
+            .get(dispatch.code_block_id)
+            .map(|registered| registered.code_block())
+            .and_then(|resident| resident.baseline_jit_data_record_store_base())
+            .and_then(|base| NonNull::new(base as *mut c_void))
+            .unwrap_or_else(NonNull::<c_void>::dangling);
+        let call_result = self.baseline_platform_executable_residencies[platform_residency_index]
+            .evidence
+            .compartment
+            .call_p6_arm64_entry(ExecutableMemoryP6CallRequest::new(
+                dispatch.descriptor.machine_range.start_offset,
+                vm,
+                frame_base.as_non_null(),
+                callee_value_bits,
+                ic_store_base,
+            ));
+        let Ok(result) = call_result else {
+            return fallback(self, host);
+        };
+        BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Returned(
+            RuntimeValue::from_encoded(EncodedJsValue(result.encoded_js_value_bits)),
+        ))
     }
 
     fn execute_p6_x86_64_emitted_semantic_native_entry_in_current_region<H: DispatchHost>(
@@ -10655,9 +10856,11 @@ impl Vm {
         let Some(callable) = readiness.callable else {
             return VmGeneratedDirectCallNativeEntryMissReason::MissingCallable;
         };
-        if callable.kind() == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
-            && !self.can_execute_p6_x86_64_emitted_native_entry()
-        {
+        if !self.can_execute_baseline_native_entry_kind(callable.kind()) {
+            // Historical telemetry name: this path was introduced for x86_64
+            // semantic bytes on arm64. It now gates any non-executable native
+            // callable kind, while ARM64 direct-call continuation binding stays
+            // disabled until the full PC-metadata backend is ported.
             return VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64;
         }
         let Some(descriptor) = readiness.descriptor else {
@@ -11107,9 +11310,7 @@ impl Vm {
             .tiering
             .baseline_native_entry_readiness_for_gate(&gate)?;
         let kind = readiness.callable.map(|callable| callable.kind())?;
-        if kind == BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
-            && !self.can_execute_p6_x86_64_emitted_native_entry()
-        {
+        if !self.can_execute_baseline_native_entry_kind(kind) {
             return None;
         }
         Some(kind)
@@ -21644,6 +21845,21 @@ mod tests {
         }
     }
 
+    fn baseline_native_entry_callable_kind_for_owner(
+        vm: &Vm,
+        owner: CodeBlockId,
+    ) -> Option<BaselineNativeEntryCallableKind> {
+        let gate = vm.tiering.baseline_native_entry_gate_for_owner(owner)?;
+        let readiness = vm.tiering.baseline_native_entry_readiness_for_gate(&gate)?;
+        readiness.callable.map(|callable| callable.kind())
+    }
+
+    fn baseline_native_entry_for_owner_is_host_callable(vm: &Vm, owner: CodeBlockId) -> bool {
+        baseline_native_entry_callable_kind_for_owner(vm, owner)
+            .map(|kind| vm.can_execute_baseline_native_entry_kind(kind))
+            .unwrap_or(false)
+    }
+
     fn assert_p6_semantic_install_rejected_without_side_effects(
         vm: &Vm,
         owner: CodeBlockId,
@@ -21678,7 +21894,7 @@ mod tests {
         enabled_readiness.ordinal
     }
 
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn assert_latest_p6_callable_native_completion(
         vm: &Vm,
         owner: CodeBlockId,
@@ -36506,7 +36722,7 @@ mod tests {
         );
         let new_generated_artifacts =
             &generated_artifacts_after[generated_artifacts_before.len()..];
-        if vm.can_execute_p6_x86_64_emitted_native_entry() {
+        if baseline_native_entry_for_owner_is_host_callable(&vm, expected_target_code_block) {
             assert_eq!(new_generated_artifacts.len(), 0);
         } else {
             assert_eq!(new_generated_artifacts.len(), 1);
@@ -36709,6 +36925,7 @@ mod tests {
         let function_blocks = vm
             .install_source_function_blocks(vec![function_unlinked])
             .expect("owned function executable call code");
+        let callee_owner = function_blocks[0].id;
         let mut host = RecordingCoreHost::with_function_code_blocks(function_blocks);
         let callee = load_function_value_for_test(&mut vm, &mut host, 0);
         let first_this = create_empty_object_for_test(&mut vm, &mut host);
@@ -36830,15 +37047,24 @@ mod tests {
         );
         let direct_call_transaction = direct_call_transactions.last().unwrap();
         assert_eq!(direct_call_transaction.caller, owner);
-        let expected_route = if vm.can_execute_p6_x86_64_emitted_native_entry() {
-            VmGeneratedDirectCallTransactionRoute::NestedInterpreterFallback
-        } else {
-            VmGeneratedDirectCallTransactionRoute::GeneratedEntry
+        let expected_route = match baseline_native_entry_callable_kind_for_owner(&vm, callee_owner)
+        {
+            Some(BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry)
+                if vm.can_execute_p6_arm64_emitted_native_entry() =>
+            {
+                VmGeneratedDirectCallTransactionRoute::NativeEntry
+            }
+            Some(BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry)
+                if vm.can_execute_p6_x86_64_emitted_native_entry() =>
+            {
+                VmGeneratedDirectCallTransactionRoute::NestedInterpreterFallback
+            }
+            _ => VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
         };
         assert_eq!(
             direct_call_transaction.route,
             expected_route,
-            "host-callable x86_64 metadata keeps this fixture admission-only; host-blocked metadata now materializes generated fallback residency"
+            "host-callable x86_64 metadata keeps this fixture admission-only, host-blocked metadata materializes generated fallback residency, and the ARM64 return seed can call the callee native entry"
         );
         assert!(
             !host.core.has_call_observation_record(),
@@ -38032,11 +38258,36 @@ mod tests {
         let mut host = RecordingCoreHost::with_function_code_blocks(function_blocks);
         let callee = load_function_value_for_test(&mut vm, &mut host, 0);
         host.clear_observations();
-        vm.install_p6_x86_64_callable_semantic_baseline_native_entry(p6_semantic_install_request(
-            callee_owner,
-            2_276,
-        ))
-        .expect("manual host-blocked x86_64 callee install");
+        let disabled_native = vm
+            .install_p6_x86_64_semantic_baseline_native_entry(p6_semantic_install_request(
+                callee_owner,
+                2_276,
+            ))
+            .expect("manual host-blocked x86_64 callee install");
+        let descriptor = disabled_native
+            .install
+            .artifact
+            .clone()
+            .expect("installed host-blocked callee descriptor")
+            .validate_native_entry_descriptor()
+            .expect("valid host-blocked callee descriptor");
+        let readiness =
+            vm.tiering
+                .record_baseline_native_entry_readiness(BaselineNativeEntryReadinessRequest {
+                    owner: callee_owner,
+                    materialization: &disabled_native.materialization,
+                    install: &disabled_native.install,
+                    execution_policy: BaselineNativeEntryExecutionPolicy::Enabled,
+                    callable: Some(
+                        BaselineNativeEntryCallableAuthority::new_p6_x86_64_emitted_semantic_c_abi_entry(
+                            descriptor,
+                        ),
+                    ),
+                });
+        assert_eq!(
+            readiness.outcome,
+            BaselineNativeEntryReadinessOutcome::Ready
+        );
         assert_eq!(
             vm.generated_direct_call_native_entry_miss_reason(
                 callee_owner,
@@ -49333,7 +49584,8 @@ mod tests {
                 assert!(new_entry_artifacts
                     .iter()
                     .any(|artifact| artifact.owner == expected_target_code_block));
-                if vm.can_execute_p6_x86_64_emitted_native_entry() {
+                if baseline_native_entry_for_owner_is_host_callable(&vm, expected_target_code_block)
+                {
                     assert_eq!(nested_auto_record.generated, None);
                     assert_eq!(new_generated_artifacts.len(), 0);
                 } else {
@@ -58158,6 +58410,388 @@ mod tests {
                 readiness: before.readiness + 2,
                 provenance: before.provenance + 1,
             }
+        );
+    }
+
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn vm_p6_arm64_callable_return_seed_enters_native_path_without_generated_executor() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let code_block = p6_int32_return_42_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let request = p6_semantic_install_request(owner, 734);
+
+        let record = vm
+            .install_p6_x86_64_callable_semantic_baseline_native_entry(request)
+            .expect("accepted ARM64 return-seed callable install");
+        let enabled_readiness = record
+            .enabled_readiness
+            .as_ref()
+            .expect("callable install records enabled readiness");
+
+        assert_eq!(
+            record.semantic_emission.emitter_kind,
+            BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset
+        );
+        assert_eq!(
+            enabled_readiness.callable.map(|callable| callable.kind()),
+            Some(BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry)
+        );
+        assert_eq!(
+            enabled_readiness.outcome,
+            BaselineNativeEntryReadinessOutcome::Ready
+        );
+        let fallback_count_before = vm.tiering_integration().fallback_records().len();
+        let generated_record_count_before = vm
+            .tiering_integration()
+            .baseline_generated_execution_records()
+            .len();
+        let launch_descriptor_count_before = vm.entry_state().launch_descriptors().len();
+        let mut host = InterpreterDispatchMustNotRun;
+
+        let completion =
+            execute_registered_code_block_with_host(&mut vm, owner, &code_block, &mut host);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        assert_eq!(
+            vm.tiering_integration().fallback_records().len(),
+            fallback_count_before
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .baseline_generated_execution_records()
+                .len(),
+            generated_record_count_before
+        );
+        let entry_decision = vm
+            .tiering_integration()
+            .entry_decisions()
+            .last()
+            .expect("ARM64 native entry decision");
+        assert_eq!(
+            entry_decision.decision,
+            TierEntryDecision::EnterNative {
+                tier: JitType::Baseline
+            }
+        );
+        assert_eq!(
+            entry_decision.execution_path,
+            TierEntryExecutionPath::NativeCode(JitType::Baseline)
+        );
+        assert_eq!(
+            entry_decision
+                .baseline_entry_gate
+                .as_ref()
+                .map(|gate| gate.outcome),
+            Some(BaselineEntryGateOutcome::NativeEntryReady)
+        );
+        assert_eq!(
+            entry_decision
+                .baseline_entry_gate
+                .as_ref()
+                .and_then(|gate| gate.native_entry_readiness_ordinal),
+            Some(enabled_readiness.ordinal)
+        );
+        assert_eq!(
+            vm.entry_state().launch_descriptors().len(),
+            launch_descriptor_count_before + 1
+        );
+    }
+
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    fn install_p6_arm64_return_seed_for_test(vm: &mut Vm, owner: CodeBlockId, id: u64) -> u64 {
+        let record = vm
+            .install_p6_x86_64_callable_semantic_baseline_native_entry(p6_semantic_install_request(
+                owner, id,
+            ))
+            .expect("accepted ARM64 return-seed callable install");
+        let enabled_readiness = record
+            .enabled_readiness
+            .as_ref()
+            .expect("ARM64 return seed records enabled readiness");
+        assert_eq!(
+            record.semantic_emission.emitter_kind,
+            BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset
+        );
+        assert_eq!(
+            enabled_readiness.callable.map(|callable| callable.kind()),
+            Some(BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry)
+        );
+        assert_eq!(
+            enabled_readiness.outcome,
+            BaselineNativeEntryReadinessOutcome::Ready
+        );
+        enabled_readiness.ordinal
+    }
+
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn vm_p6_arm64_callable_return_seed_covers_constants_moves_and_frame_values() {
+        struct Arm64SeedCase {
+            name: &'static str,
+            code_block: CodeBlock,
+            arguments: Vec<RuntimeValue>,
+            expected: RuntimeValue,
+        }
+
+        let cases = vec![
+            Arm64SeedCase {
+                name: "undefined return",
+                code_block: linked_p6_test_code_block(vec![
+                    typed_core_instruction_with_operands(
+                        0,
+                        CoreOpcode::LoadUndefined,
+                        vec![Operand::Register(local(0))],
+                    ),
+                    typed_core_instruction_with_operands(
+                        1,
+                        CoreOpcode::Return,
+                        vec![Operand::Register(local(0))],
+                    ),
+                ]),
+                arguments: Vec::new(),
+                expected: RuntimeValue::undefined(),
+            },
+            Arm64SeedCase {
+                name: "null return",
+                code_block: linked_p6_test_code_block(vec![
+                    typed_core_instruction_with_operands(
+                        0,
+                        CoreOpcode::LoadNull,
+                        vec![Operand::Register(local(0))],
+                    ),
+                    typed_core_instruction_with_operands(
+                        1,
+                        CoreOpcode::Return,
+                        vec![Operand::Register(local(0))],
+                    ),
+                ]),
+                arguments: Vec::new(),
+                expected: RuntimeValue::null(),
+            },
+            Arm64SeedCase {
+                name: "bool return",
+                code_block: linked_p6_test_code_block(vec![
+                    typed_core_instruction_with_operands(
+                        0,
+                        CoreOpcode::LoadBool,
+                        vec![Operand::Register(local(0)), Operand::UnsignedImmediate(1)],
+                    ),
+                    typed_core_instruction_with_operands(
+                        1,
+                        CoreOpcode::Return,
+                        vec![Operand::Register(local(0))],
+                    ),
+                ]),
+                arguments: Vec::new(),
+                expected: RuntimeValue::from_bool(true),
+            },
+            Arm64SeedCase {
+                name: "move return",
+                code_block: linked_p6_test_code_block(vec![
+                    typed_core_instruction_with_operands(
+                        0,
+                        CoreOpcode::LoadInt32,
+                        vec![Operand::Register(local(0)), Operand::SignedImmediate(17)],
+                    ),
+                    typed_core_instruction_with_operands(
+                        1,
+                        CoreOpcode::Move,
+                        vec![Operand::Register(local(1)), Operand::Register(local(0))],
+                    ),
+                    typed_core_instruction_with_operands(
+                        2,
+                        CoreOpcode::Return,
+                        vec![Operand::Register(local(1))],
+                    ),
+                ]),
+                arguments: Vec::new(),
+                expected: RuntimeValue::from_i32(17),
+            },
+            Arm64SeedCase {
+                name: "argument frame return",
+                code_block: linked_p6_test_code_block_with_parameters(
+                    vec![typed_core_instruction_with_operands(
+                        0,
+                        CoreOpcode::Return,
+                        vec![Operand::Register(argument_including_this(1))],
+                    )],
+                    2,
+                ),
+                arguments: vec![RuntimeValue::undefined(), RuntimeValue::from_i32(91)],
+                expected: RuntimeValue::from_i32(91),
+            },
+        ];
+
+        for (case_index, case) in cases.into_iter().enumerate() {
+            let mut vm = Vm::new(VmConfig::baseline_allowed());
+            let owner = register_test_code_block(&mut vm, case.code_block.clone());
+            let readiness_ordinal =
+                install_p6_arm64_return_seed_for_test(&mut vm, owner, 735 + case_index as u64);
+            let fallback_count_before = vm.tiering_integration().fallback_records().len();
+            let generated_record_count_before = vm
+                .tiering_integration()
+                .baseline_generated_execution_records()
+                .len();
+            let launch_descriptor_count_before = vm.entry_state().launch_descriptors().len();
+            let mut host = InterpreterDispatchMustNotRun;
+
+            let completion = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                owner,
+                &case.code_block,
+                &mut host,
+                case.arguments,
+            );
+
+            assert_eq!(
+                completion,
+                ExecutionCompletion::Returned(case.expected),
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                vm.tiering_integration().fallback_records().len(),
+                fallback_count_before,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                vm.tiering_integration()
+                    .baseline_generated_execution_records()
+                    .len(),
+                generated_record_count_before,
+                "{}",
+                case.name
+            );
+            assert_latest_p6_callable_native_completion(
+                &vm,
+                owner,
+                readiness_ordinal,
+                launch_descriptor_count_before,
+            );
+        }
+    }
+
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn vm_p6_arm64_callable_return_seed_load_callee_returns_active_frame_callee() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let code_block = linked_p6_test_code_block(vec![
+            typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::LoadCallee,
+                vec![Operand::Register(local(0))],
+            ),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::Return,
+                vec![Operand::Register(local(0))],
+            ),
+        ]);
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let readiness_ordinal = install_p6_arm64_return_seed_for_test(&mut vm, owner, 741);
+        let callee = RuntimeValue::from_encoded(EncodedJsValue((0x1234_u64 << 8) | 0x20));
+        let global_object = vm.allocate_global_object_cell().unwrap();
+        vm.record_source_global_object(global_object).unwrap();
+        let entry = vm
+            .execution
+            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+                code_block: owner,
+                global_object,
+                this_value: RuntimeValue::undefined(),
+            }));
+        let frame = vm
+            .execution
+            .push_frame(
+                &mut vm.registers,
+                FramePushRequest {
+                    code_block: Some(owner),
+                    callee: None,
+                    callee_value: Some(callee),
+                    lexical_scope: None,
+                    shape: code_block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: Vec::new(),
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let fallback_count_before = vm.tiering_integration().fallback_records().len();
+        let generated_record_count_before = vm
+            .tiering_integration()
+            .baseline_generated_execution_records()
+            .len();
+        let launch_descriptor_count_before = vm.entry_state().launch_descriptors().len();
+        let mut host = InterpreterDispatchMustNotRun;
+
+        let completion =
+            vm.execute_code_block(owner, &code_block, &mut host, DispatchConfig::default());
+
+        if vm.execution.frame(frame).is_some() {
+            vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
+        }
+        vm.execution.leave(entry).unwrap();
+
+        assert_eq!(completion, ExecutionCompletion::Returned(callee));
+        assert_eq!(
+            vm.tiering_integration().fallback_records().len(),
+            fallback_count_before
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .baseline_generated_execution_records()
+                .len(),
+            generated_record_count_before
+        );
+        assert_latest_p6_callable_native_completion(
+            &vm,
+            owner,
+            readiness_ordinal,
+            launch_descriptor_count_before,
+        );
+    }
+
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn vm_p6_arm64_callable_arithmetic_uses_existing_x86_semantic_fallback_artifact() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let code_block = p6_int32_arithmetic_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+
+        let record = vm
+            .install_p6_x86_64_callable_semantic_baseline_native_entry(p6_semantic_install_request(
+                owner, 742,
+            ))
+            .expect("accepted P6 arithmetic callable install");
+        let enabled_readiness = record
+            .enabled_readiness
+            .as_ref()
+            .expect("callable install records enabled readiness");
+
+        assert_ne!(
+            record.semantic_emission.emitter_kind,
+            BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset
+        );
+        assert_eq!(
+            enabled_readiness.callable.map(|callable| callable.kind()),
+            Some(BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry)
+        );
+        assert!(!vm.can_execute_baseline_native_entry_kind(
+            BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
+        ));
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        let completion =
+            execute_registered_code_block_with_host(&mut vm, owner, &code_block, &mut host);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
     }
 

@@ -197,6 +197,41 @@ impl ExecutableMemoryMapping {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn call_p6_arm64_entry(
+        &self,
+        entry_offset: usize,
+        vm: NonNull<c_void>,
+        frame_base: NonNull<c_void>,
+        callee_value_bits: u64,
+        ic_store_base: NonNull<c_void>,
+    ) -> Result<u64, ExecutableMemoryPlatformError> {
+        let ptr = self
+            .ptr
+            .ok_or(ExecutableMemoryPlatformError::AlreadyReleased)?;
+        let entry_end = entry_offset
+            .checked_add(1)
+            .ok_or(ExecutableMemoryPlatformError::RangeOutOfBounds)?;
+        if entry_end > self.byte_len {
+            return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
+        }
+
+        // SAFETY: the safe compartment wrapper requires RX protection and a
+        // linked executable lifecycle before reaching this backend. The checked
+        // offset above ensures the private entry address lies inside the live
+        // mapping. The ARM64 seed uses the same C shape as x86_64:
+        // `extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> u64`.
+        unsafe {
+            call_p6_arm64_entry(
+                ptr.as_ptr().add(entry_offset).cast_const(),
+                vm,
+                frame_base,
+                callee_value_bits,
+                ic_store_base,
+            )
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     pub(super) fn call_p9_x86_64_owner_post_call_reentry(
         &self,
@@ -329,6 +364,37 @@ unsafe fn call_p6_x86_64_entry(
     // the VM-owned call boundary. `ic_store_base` is the IC record store base
     // (or a dangling pointer when there are zero IC sites, which the entry never
     // dereferences); generated code only seeds it into the callee-saved r13.
+    Ok(unsafe {
+        entry(
+            vm.as_ptr(),
+            frame_base.as_ptr(),
+            callee_value_bits,
+            ic_store_base.as_ptr(),
+        )
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn call_p6_arm64_entry(
+    entry: *const u8,
+    vm: NonNull<c_void>,
+    frame_base: NonNull<c_void>,
+    callee_value_bits: u64,
+    ic_store_base: NonNull<c_void>,
+) -> Result<u64, ExecutableMemoryPlatformError> {
+    type P6Entry = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> u64;
+
+    if entry.is_null() {
+        return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
+    }
+
+    // SAFETY: callers pass a non-null address inside a live RX mapping and the
+    // P6 ARM64 seed contract says the bytes at this address implement the C ABI
+    // entry shape represented by `P6Entry`.
+    let entry: P6Entry = unsafe { std::mem::transmute(entry) };
+    // SAFETY: the checked RX function pointer receives VM/frame opaque pointers
+    // plus raw JSValue bits. The current ARM64 seed reads only the frame/callee
+    // carrier for no-call/no-heap returns and never dereferences `ic_store_base`.
     Ok(unsafe {
         entry(
             vm.as_ptr(),

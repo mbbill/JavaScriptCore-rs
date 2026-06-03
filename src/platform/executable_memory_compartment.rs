@@ -42,7 +42,7 @@ pub struct ExecutableMemoryCompartmentRequest {
     pub mutation_authority: ExecutableMutationAuthority,
 }
 
-/// Request to invoke a sealed P6 x86_64 C-ABI entry inside an RX compartment.
+/// Request to invoke a sealed P6 C-ABI entry inside an RX compartment.
 ///
 /// `entry_offset` is an allocation-relative offset. The opaque VM and frame-base
 /// pointers are passed through to generated code without exposing the
@@ -472,6 +472,46 @@ impl ExecutableMemoryCompartment {
         }
     }
 
+    /// Invoke a sealed P6 ARM64 C-ABI entry inside an already RX compartment.
+    ///
+    /// The executable address and function pointer remain private to the
+    /// platform backend. This wrapper only accepts opaque VM/frame-base
+    /// pointers and returns raw EncodedJsValue bits.
+    pub fn call_p6_arm64_entry(
+        &self,
+        request: ExecutableMemoryP6CallRequest,
+    ) -> Result<ExecutableMemoryP6CallResult, ExecutableMemoryCompartmentError> {
+        self.require_executable_lifecycle()?;
+        self.validate_entry_offset(request.entry_offset)?;
+
+        #[cfg(all(unix, target_arch = "aarch64"))]
+        {
+            let mapping = self
+                .mapping
+                .as_ref()
+                .ok_or(ExecutableMemoryCompartmentError::AlreadyReleased)?;
+            let encoded_js_value_bits = mapping
+                .call_p6_arm64_entry(
+                    request.entry_offset as usize,
+                    request.vm,
+                    request.frame_base,
+                    request.callee_value_bits,
+                    request.ic_store_base,
+                )
+                .map_err(|error| {
+                    map_call_platform_error(error, ExecutableMemoryPlatformOperation::CallP6Entry)
+                })?;
+            Ok(ExecutableMemoryP6CallResult {
+                encoded_js_value_bits,
+            })
+        }
+        #[cfg(any(not(unix), not(target_arch = "aarch64")))]
+        {
+            let _ = request;
+            Err(ExecutableMemoryCompartmentError::UnsupportedPlatform)
+        }
+    }
+
     pub fn call_p9_x86_64_owner_post_call_reentry(
         &self,
         request: ExecutableMemoryP9PostCallReentryRequest,
@@ -690,7 +730,7 @@ fn map_platform_error(
     }
 }
 
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn map_call_platform_error(
     error: unix_executable_memory::ExecutableMemoryPlatformError,
     operation: ExecutableMemoryPlatformOperation,

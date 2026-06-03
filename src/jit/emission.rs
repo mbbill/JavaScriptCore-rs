@@ -29,6 +29,7 @@ use crate::runtime::{CodeBlockId, NativeCodeId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BaselineMachineCodeEmitterKind {
+    P6Arm64NoCallNoHeapReturnSeedSubset,
     P6X86_64NoCallNoHeapSubset,
     P8aX86_64NoCallNoHeapBranchSubset,
     P8bX86_64NoCallNoHeapBranchTruthinessSubset,
@@ -56,6 +57,7 @@ pub enum BaselineMachineCodeEmitterKind {
 impl BaselineMachineCodeEmitterKind {
     pub const fn expected_architecture(self) -> AssemblerArchitecture {
         match self {
+            Self::P6Arm64NoCallNoHeapReturnSeedSubset => AssemblerArchitecture::Arm64,
             Self::P6X86_64NoCallNoHeapSubset
             | Self::P8aX86_64NoCallNoHeapBranchSubset
             | Self::P8bX86_64NoCallNoHeapBranchTruthinessSubset
@@ -85,6 +87,14 @@ impl BaselineMachineCodeEmitterKind {
 
     pub const fn supported_opcode_subset(self) -> BaselineSupportedOpcodeSubset {
         match self {
+            Self::P6Arm64NoCallNoHeapReturnSeedSubset => {
+                // The ARM64 seed reuses the existing P6 lowering/proof envelope
+                // so unsupported arithmetic bodies can fall back through the
+                // current generated/x86_64-semantic path. The bytes emitted by
+                // this backend are narrower: constants, moves, callee/frame
+                // loads, and terminal returns only.
+                BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic
+            }
             Self::P6X86_64NoCallNoHeapSubset => {
                 BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic
             }
@@ -1102,8 +1112,26 @@ mod tests {
         image: &'a AssemblerByteImage,
         linked: Option<&'a LinkedAssemblerByteImage>,
     ) -> BaselineMachineCodeEmissionRequest<'a> {
+        request_with_emitter(
+            BaselineMachineCodeEmitterKind::P6X86_64NoCallNoHeapSubset,
+            entry_artifact,
+            eligibility_proof,
+            buffer,
+            image,
+            linked,
+        )
+    }
+
+    fn request_with_emitter<'a>(
+        emitter_kind: BaselineMachineCodeEmitterKind,
+        entry_artifact: &'a BaselineEntryArtifact,
+        eligibility_proof: &'a crate::jit::BaselineBytecodeEligibilityProof,
+        buffer: &'a AssemblerBufferDescriptor,
+        image: &'a AssemblerByteImage,
+        linked: Option<&'a LinkedAssemblerByteImage>,
+    ) -> BaselineMachineCodeEmissionRequest<'a> {
         BaselineMachineCodeEmissionRequest {
-            emitter_kind: BaselineMachineCodeEmitterKind::P6X86_64NoCallNoHeapSubset,
+            emitter_kind,
             entry_artifact,
             eligibility_proof,
             source_buffer: buffer,
@@ -1367,6 +1395,50 @@ mod tests {
                 BaselineMachineCodeEmissionValidationError::SourceArchitectureMismatch {
                     expected: AssemblerArchitecture::X86_64,
                     actual: Some(AssemblerArchitecture::Arm64),
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn arm64_emitter_accepts_only_arm64_source_architecture() {
+        let entry_artifact = entry_artifact();
+        let proof = proof();
+        let arm_buffer = frozen_buffer(AssemblerArchitecture::Arm64);
+        let arm_image = source_image(&arm_buffer);
+        let arm_linked = linked_image(&arm_buffer, &arm_image);
+
+        let record = record_baseline_machine_code_emission(request_with_emitter(
+            BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset,
+            &entry_artifact,
+            &proof,
+            &arm_buffer,
+            &arm_image,
+            Some(&arm_linked),
+        ))
+        .expect("ARM64 emitter accepts ARM64 source bytes");
+        assert_eq!(
+            record.emitter_kind,
+            BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset
+        );
+        assert_eq!(record.source_architecture, AssemblerArchitecture::Arm64);
+
+        let x86_buffer = frozen_buffer(AssemblerArchitecture::X86_64);
+        let x86_image = source_image(&x86_buffer);
+        let x86_linked = linked_image(&x86_buffer, &x86_image);
+        assert_eq!(
+            record_baseline_machine_code_emission(request_with_emitter(
+                BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset,
+                &entry_artifact,
+                &proof,
+                &x86_buffer,
+                &x86_image,
+                Some(&x86_linked),
+            )),
+            Err(
+                BaselineMachineCodeEmissionValidationError::SourceArchitectureMismatch {
+                    expected: AssemblerArchitecture::Arm64,
+                    actual: Some(AssemblerArchitecture::X86_64),
                 },
             )
         );

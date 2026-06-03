@@ -118,6 +118,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [wip] direct-call and generated-call paths
     [done] disabled native-entry metadata on macOS arm64 no longer blocks portable
            generated baseline residency when the generated subset can represent the callee
+    [done] macOS arm64 P6 return-seed native entry: no-call/no-heap callable return shapes
+           install real ARM64 C-ABI bytes; arithmetic/unsupported bodies keep the existing
+           x86_64 semantic artifact or generated/interpreter fallback path, and direct-call
+           continuation PC metadata remains deferred
     [done] host-noncallable P6 x86_64 auto-installs also materialize generated
            residency on arm64; richards top direct calls now route to GeneratedEntry
     [done] direct-call callee fallback telemetry: remaining richards 110@80 -> 146
@@ -258,6 +262,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          hot-slot proof after monomorphic linking; focused test proves the second generated-entry
          direct call skips entry root sync, and 50k richards rootless rejections drop 212->31
          with hot_slot_miss 192->0 and only missing_generated_artifact remaining
+  [done] macOS arm64 return-seed native evidence: focused tests prove constants, moves,
+         frame/argument, and callee returns enter real ARM64 native entry without generated
+         execution; arithmetic fallback keeps the existing x86_64 semantic artifact path
   [missing] local C++ JSC comparison harness for parity claims
   [done] subagent reviewer flow used for current substantial patch
   [done] one logical commit boundary restored for current accepted batch

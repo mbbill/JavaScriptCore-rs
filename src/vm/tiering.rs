@@ -68,16 +68,16 @@ use crate::jit::{
     JitPlanValidationError, JitType, LinkBufferFinalizationOutcome, LinkBufferFinalizationRecord,
     LinkedCallKind, MachineCodeHandle, MachineCodeOwnership, MachineCodeRange,
     MachineCodeValidationError, OsrState, P6X86_64BaselineBranchTargetRejectionReason,
-    P6X86_64BaselineLoweringError, P6X86_64BaselineLoweringRequirement,
-    P6X86_64BaselineLoweringValidationShape, P6X86_64BaselineMachineInstruction,
-    P6X86_64BaselineOperandLocation, P6X86_64BaselineSelectedInstructionEffects,
-    P6X86_64BaselineSelectedSideExitReason, P6X86_64BaselineSemanticByteEmissionError,
-    P6X86_64BaselineSemanticOperandRejectionReason, P6X86_64BaselineSymbolicRegister,
-    PatchWriteBarrier, PatchpointDescriptor, PatchpointKind, PropertyHasObservationDescriptor,
-    PropertyLoadAccessCasePlan, PropertyLoadAccessCasePlanKind, PropertyLoadAccessCasePlanTable,
-    PropertyLoadBaseNormalization, PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome,
-    PropertyLoadGuardPlan, PropertyLoadGuardRequirement,
-    PropertyLoadGuardedCandidate as JitPropertyLoadGuardedCandidate,
+    P6X86_64BaselineLoweredOperation, P6X86_64BaselineLoweringError,
+    P6X86_64BaselineLoweringRequirement, P6X86_64BaselineLoweringValidationShape,
+    P6X86_64BaselineMachineInstruction, P6X86_64BaselineOperandLocation,
+    P6X86_64BaselineSelectedInstructionEffects, P6X86_64BaselineSelectedSideExitReason,
+    P6X86_64BaselineSemanticByteEmissionError, P6X86_64BaselineSemanticOperandRejectionReason,
+    P6X86_64BaselineSymbolicRegister, PatchWriteBarrier, PatchpointDescriptor, PatchpointKind,
+    PropertyHasObservationDescriptor, PropertyLoadAccessCasePlan, PropertyLoadAccessCasePlanKind,
+    PropertyLoadAccessCasePlanTable, PropertyLoadBaseNormalization,
+    PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome, PropertyLoadGuardPlan,
+    PropertyLoadGuardRequirement, PropertyLoadGuardedCandidate as JitPropertyLoadGuardedCandidate,
     PropertyLoadGuardedCandidateKind as JitPropertyLoadGuardedCandidateKind,
     PropertyLoadGuardedCandidateTable, PropertyLoadObservationDescriptor,
     PropertyLoadObservationReadiness, PropertyStoreAccessCasePlan,
@@ -7519,7 +7519,10 @@ impl VmGeneratedDirectCallRootlessPreferredNativeEntryCounts {
             Some(BaselineNativeEntryCallableKind::P6PureBaselineNativeEntryShim) => {
                 self.pure_baseline_shim = self.pure_baseline_shim.saturating_add(1);
             }
-            Some(BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry) => {
+            Some(
+                BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
+                | BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
+            ) => {
                 self.emitted_semantic_c_abi_entry =
                     self.emitted_semantic_c_abi_entry.saturating_add(1);
             }
@@ -8055,6 +8058,10 @@ pub enum BaselineNativeSemanticByteEmissionFailureDetail {
         bytecode_index: BytecodeIndex,
         instruction: P6X86_64BaselineMachineInstruction,
     },
+    UnsupportedArm64SeedLoweredOperation {
+        bytecode_index: BytecodeIndex,
+        operation: P6X86_64BaselineLoweredOperation,
+    },
     UnsupportedImmediateTag {
         bytecode_index: BytecodeIndex,
         tag: u64,
@@ -8173,6 +8180,13 @@ impl BaselineNativeSemanticByteEmissionFailureDetail {
             } => Self::UnsupportedMachineInstruction {
                 bytecode_index: *bytecode_index,
                 instruction: *instruction,
+            },
+            P6X86_64BaselineSemanticByteEmissionError::UnsupportedArm64SeedLoweredOperation {
+                bytecode_index,
+                operation,
+            } => Self::UnsupportedArm64SeedLoweredOperation {
+                bytecode_index: *bytecode_index,
+                operation: *operation,
             },
             P6X86_64BaselineSemanticByteEmissionError::UnsupportedImmediateTag {
                 bytecode_index,

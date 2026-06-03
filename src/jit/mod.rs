@@ -49,8 +49,10 @@ pub use emission::{
     BaselineMachineCodeEmissionValidationError, BaselineMachineCodeEmitterKind,
 };
 pub use emitter::{
+    emit_p6_arm64_baseline_callable_semantic_bytes,
     emit_p6_x86_64_baseline_callable_semantic_bytes, emit_p6_x86_64_baseline_semantic_bytes,
     emit_p6_x86_64_non_callable_return_stub, plan_p6_x86_64_baseline_lowering,
+    record_p6_arm64_baseline_backend_contract_from_plan,
     record_p6_x86_64_baseline_backend_contract,
     record_p6_x86_64_baseline_backend_contract_from_plan, select_p6_x86_64_baseline_instructions,
     BaselineMachineCodeByteGenerationAuthority, BaselineMachineCodeByteGenerationError,

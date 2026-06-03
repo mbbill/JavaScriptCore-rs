@@ -276,6 +276,7 @@ pub enum BaselineArityCheckUnavailableReason {
 pub enum BaselineNativeEntryCallableKind {
     P6PureBaselineNativeEntryShim,
     P6X86_64EmittedSemanticCAbiEntry,
+    P6Arm64EmittedSemanticCAbiEntry,
 }
 
 impl BaselineNativeEntryCallableKind {
@@ -286,6 +287,14 @@ impl BaselineNativeEntryCallableKind {
             }
             Self::P6X86_64EmittedSemanticCAbiEntry => {
                 BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullishFalse
+            }
+            Self::P6Arm64EmittedSemanticCAbiEntry => {
+                // This reports the shared P6 lowering/proof envelope used at
+                // install time. The current ARM64 callable is a narrower return
+                // seed; arithmetic in this envelope is intentionally rejected by
+                // the ARM64 encoder and falls back to the existing generated
+                // baseline/x86_64-semantic artifact path.
+                BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic
             }
         }
     }
@@ -350,7 +359,7 @@ struct BaselineNativeEntryCallableSeal {
 /// Opaque authority for crossing the native-entry boundary.
 ///
 /// This authority can represent either a Rust shim or an emitted semantic
-/// x86_64 C-ABI entry. Public native-entry descriptor/token metadata can
+/// x86_64/ARM64 C-ABI entry. Public native-entry descriptor/token metadata can
 /// describe a symbolic entrypoint, but VM enabled execution additionally
 /// requires this sealed value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,6 +388,17 @@ impl BaselineNativeEntryCallableAuthority {
     ) -> Self {
         Self::from_descriptor_and_token(
             BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry,
+            descriptor,
+            descriptor.normal_entry,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn new_p6_arm64_emitted_semantic_c_abi_entry(
+        descriptor: BaselineNativeEntryDescriptor,
+    ) -> Self {
+        Self::from_descriptor_and_token(
+            BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
             descriptor,
             descriptor.normal_entry,
         )
@@ -1400,33 +1420,45 @@ mod tests {
                 .supported_opcode_subset(),
             BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullishFalse
         );
+        assert_eq!(
+            BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry
+                .supported_opcode_subset(),
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic
+        );
     }
 
     #[test]
-    fn p6_x86_64_emitted_semantic_c_abi_callable_constructor_seals_descriptor() {
+    fn p6_emitted_semantic_c_abi_callable_constructors_seal_descriptor() {
         let descriptor = baseline_native_entry_descriptor(owner());
 
         let shim = BaselineNativeEntryCallableAuthority::new_p6_pure_baseline_native_entry_shim(
             descriptor,
         );
-        let emitted =
-            BaselineNativeEntryCallableAuthority::new_p6_x86_64_emitted_semantic_c_abi_entry(
-                descriptor,
-            );
-
-        assert_eq!(
-            emitted.kind(),
-            BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
-        );
-        assert_eq!(emitted.descriptor(), descriptor);
-        assert_eq!(emitted.token(), descriptor.normal_entry);
-        assert_eq!(emitted.seal, shim.seal);
-        assert_eq!(emitted.seal.owner, descriptor.owner);
-        assert_eq!(emitted.seal.artifact_id, descriptor.artifact_id);
-        assert_eq!(emitted.seal.native_symbol, descriptor.native_symbol);
-        assert_eq!(emitted.seal.machine_code, descriptor.machine_code);
-        assert_eq!(emitted.seal.entrypoint, descriptor.entrypoint);
-        assert_eq!(emitted.validate_for_descriptor(&descriptor), Ok(()));
+        for (emitted, expected_kind) in [
+            (
+                BaselineNativeEntryCallableAuthority::new_p6_x86_64_emitted_semantic_c_abi_entry(
+                    descriptor,
+                ),
+                BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry,
+            ),
+            (
+                BaselineNativeEntryCallableAuthority::new_p6_arm64_emitted_semantic_c_abi_entry(
+                    descriptor,
+                ),
+                BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
+            ),
+        ] {
+            assert_eq!(emitted.kind(), expected_kind);
+            assert_eq!(emitted.descriptor(), descriptor);
+            assert_eq!(emitted.token(), descriptor.normal_entry);
+            assert_eq!(emitted.seal, shim.seal);
+            assert_eq!(emitted.seal.owner, descriptor.owner);
+            assert_eq!(emitted.seal.artifact_id, descriptor.artifact_id);
+            assert_eq!(emitted.seal.native_symbol, descriptor.native_symbol);
+            assert_eq!(emitted.seal.machine_code, descriptor.machine_code);
+            assert_eq!(emitted.seal.entrypoint, descriptor.entrypoint);
+            assert_eq!(emitted.validate_for_descriptor(&descriptor), Ok(()));
+        }
     }
 
     #[test]
