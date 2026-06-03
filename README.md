@@ -100,7 +100,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            src/jit/arm64_baseline.rs (Rust native-entry ABI/rooting bridge only;
            C++ jfalse truthiness remains valueIsFalsey/LLInt slow-path work)
     [done] JIT ARM64 dormant callable byte-builder finalizes direct bytecode branch
-           records and retained side-exit return-stub records; still no opcode emission
+           records and retained side-exit return-stub records, plus a dormant primitive
+           JumpIfFalse low-byte false/null/undefined/int32-zero byte slice; still no
+           public opcode wiring or full valueIsFalsey parity
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler

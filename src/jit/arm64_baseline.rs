@@ -18,10 +18,11 @@ use crate::jit::emitter::{
     finish_p6_x86_64_semantic_byte_emission, p6_x86_64_checked_byte_len,
     p6_x86_64_semantic_source_buffer_id, validate_p6_x86_64_semantic_selection_effects,
     validate_p6_x86_64_semantic_terminal_policy, validate_p6_x86_64_semantic_value_layout,
-    P6X86_64BaselineBackendContractRecord, P6X86_64BaselineBytecodeBranchRecord,
-    P6X86_64BaselineCallableEpilogueRecord, P6X86_64BaselineCallablePrologueRecord,
-    P6X86_64BaselineControlFlowBranchContract, P6X86_64BaselineInstructionByteRecord,
-    P6X86_64BaselineInstructionSelectionPlan, P6X86_64BaselineLoweredOperation,
+    P6X86_64BaselineBackendContractRecord, P6X86_64BaselineBytecodeBranchKind,
+    P6X86_64BaselineBytecodeBranchRecord, P6X86_64BaselineCallableEpilogueRecord,
+    P6X86_64BaselineCallablePrologueRecord, P6X86_64BaselineControlFlowBranchContract,
+    P6X86_64BaselineInstructionByteRecord, P6X86_64BaselineInstructionSelectionPlan,
+    P6X86_64BaselineLoweredOperation, P6X86_64BaselineMachineInstruction,
     P6X86_64BaselineOperandLocation, P6X86_64BaselineOperandRole,
     P6X86_64BaselinePhysicalRegisterBinding, P6X86_64BaselinePhysicalRegisterMap,
     P6X86_64BaselineSelectedInstruction, P6X86_64BaselineSemanticByteEmissionAuthority,
@@ -30,8 +31,8 @@ use crate::jit::emitter::{
     P6X86_64BaselineSideExitDestinationEffect, P6X86_64BaselineSideExitLabel,
     P6X86_64BaselineSideExitReturnPayload, P6X86_64BaselineSideExitReturnStubRecord,
     P6X86_64BaselineSymbolicRegister, P6X86_64BaselineTerminalPolicy,
-    P6X86_64BaselineTerminalPolicyRecord, P6X86_64SemanticEncodedSelection,
-    P6X86_64SemanticTerminalSelection,
+    P6X86_64BaselineTerminalPolicyRecord, P6X86_64BaselineValueLayoutContract,
+    P6X86_64SemanticEncodedSelection, P6X86_64SemanticTerminalSelection,
 };
 
 // ARM64 JSC map: GPRInfo::callFrameRegister is fp/x29 and returnValueGPR is
@@ -876,6 +877,13 @@ struct P6Arm64PendingSideExitBranch {
     branch_end_offset: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct P6Arm64PendingInternalBranch {
+    kind: direct_branch::Arm64DirectBranchKind,
+    branch_offset: u32,
+    branch_end_offset: u32,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct P6Arm64SemanticByteBuilder {
@@ -928,6 +936,41 @@ impl P6Arm64SemanticByteBuilder {
         )
     }
 
+    fn emit_conditional_internal_branch(
+        &mut self,
+        condition: direct_branch::Arm64Condition,
+    ) -> Result<P6Arm64PendingInternalBranch, P6X86_64BaselineSemanticByteEmissionError> {
+        let kind = direct_branch::Arm64DirectBranchKind::Conditional { condition };
+        let branch_offset = self.emit_word(kind.placeholder_word())?;
+        let branch_end_offset = self.offset()?;
+        Ok(P6Arm64PendingInternalBranch {
+            kind,
+            branch_offset,
+            branch_end_offset,
+        })
+    }
+
+    fn patch_internal_branch_to_current(
+        &mut self,
+        branch: P6Arm64PendingInternalBranch,
+    ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+        let target_offset = self.offset()?;
+        let linked = direct_branch::Arm64DirectBranchPatch {
+            kind: branch.kind,
+            source_instruction_offset: branch.branch_offset,
+        }
+        .link_to(target_offset)
+        .map_err(|error| {
+            p6_arm64_direct_branch_link_error(
+                error,
+                branch.branch_offset,
+                branch.branch_end_offset,
+                target_offset,
+            )
+        })?;
+        self.patch_direct_branch_word(branch.branch_offset, linked.instruction_word)
+    }
+
     fn emit_direct_bytecode_branch(
         &mut self,
         source: P6X86_64BaselineControlFlowBranchContract,
@@ -961,6 +1004,79 @@ impl P6Arm64SemanticByteBuilder {
             branch_end_offset,
         });
         Ok(())
+    }
+
+    fn emit_branch_if_false_primitive(
+        &mut self,
+        bytecode_index: BytecodeIndex,
+        source: P6X86_64BaselineOperandLocation,
+        value_layout: P6X86_64BaselineValueLayoutContract,
+        unsupported_exit: P6X86_64BaselineSideExitLabel,
+        target: P6X86_64BaselineControlFlowBranchContract,
+    ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+        validate_p6_x86_64_semantic_value_layout(value_layout)?;
+        let machine_instruction = P6X86_64BaselineMachineInstruction::BranchIfFalsePrimitive {
+            value: P6X86_64BaselineSymbolicRegister::Scratch0,
+            undefined_tag: value_layout.immediate_undefined_tag,
+            null_tag: value_layout.immediate_null_tag,
+            false_tag: value_layout.immediate_false_tag,
+            true_tag: value_layout.immediate_true_tag,
+            int32_tag: value_layout.immediate_int32_tag,
+            unsupported_exit,
+            target,
+        };
+        if target.kind != P6X86_64BaselineBytecodeBranchKind::JumpIfFalseTaken
+            || target.source_bytecode_index != bytecode_index
+        {
+            return Err(
+                P6X86_64BaselineSemanticByteEmissionError::UnsupportedMachineInstruction {
+                    bytecode_index,
+                    instruction: machine_instruction,
+                },
+            );
+        }
+
+        let undefined_tag =
+            p6_arm64_semantic_u8_tag(bytecode_index, value_layout.immediate_undefined_tag)?;
+        let null_tag = p6_arm64_semantic_u8_tag(bytecode_index, value_layout.immediate_null_tag)?;
+        let false_tag = p6_arm64_semantic_u8_tag(bytecode_index, value_layout.immediate_false_tag)?;
+        let true_tag = p6_arm64_semantic_u8_tag(bytecode_index, value_layout.immediate_true_tag)?;
+        let int32_tag = p6_arm64_semantic_u8_tag(bytecode_index, value_layout.immediate_int32_tag)?;
+
+        p6_arm64_emit_ldr_x9_from_frame_location(&mut self.bytes, bytecode_index, source)?;
+        self.emit_word(p6_arm64_encode_and_x10_x9_low_byte_tag_mask())?;
+
+        // C++ JSC `emit_op_jfalse` first handles JSValue64 booleans/int32/Other
+        // with `branchIfNotBoolean`, `branchIfNotInt32`, and `branchIfOther`,
+        // then calls `valueIsFalseyGenerator` for full truthiness. This dormant
+        // Rust ARM64 slice is intentionally narrower: Rust values currently use
+        // a low-byte tag + payload-shift layout, so it masks the low byte and
+        // only recognizes false, null, undefined, int32(0), true, and nonzero
+        // int32. Double/cell/unknown tags branch to the retained side-exit
+        // payload stub instead of claiming C++ `valueIsFalsey`/ToBoolean parity.
+        self.emit_word(p6_arm64_encode_cmp_imm64(
+            register_contract::X10,
+            undefined_tag,
+        ))?;
+        self.emit_conditional_bytecode_branch(target, direct_branch::Arm64Condition::Eq)?;
+        self.emit_word(p6_arm64_encode_cmp_imm64(register_contract::X10, null_tag))?;
+        self.emit_conditional_bytecode_branch(target, direct_branch::Arm64Condition::Eq)?;
+        self.emit_word(p6_arm64_encode_cmp_imm64(register_contract::X10, false_tag))?;
+        self.emit_conditional_bytecode_branch(target, direct_branch::Arm64Condition::Eq)?;
+        self.emit_word(p6_arm64_encode_cmp_imm64(register_contract::X10, true_tag))?;
+        let true_fallthrough =
+            self.emit_conditional_internal_branch(direct_branch::Arm64Condition::Eq)?;
+        self.emit_word(p6_arm64_encode_cmp_imm64(register_contract::X10, int32_tag))?;
+        self.emit_retained_side_exit_direct_branch(
+            bytecode_index,
+            unsupported_exit,
+            direct_branch::Arm64DirectBranchKind::Conditional {
+                condition: direct_branch::Arm64Condition::Ne,
+            },
+        )?;
+        self.emit_word(p6_arm64_encode_cmp_imm64(register_contract::X9, int32_tag))?;
+        self.emit_conditional_bytecode_branch(target, direct_branch::Arm64Condition::Eq)?;
+        self.patch_internal_branch_to_current(true_fallthrough)
     }
 
     fn finish_bytecode_branches(
@@ -1147,6 +1263,22 @@ fn p6_arm64_direct_branch_link_error(
                 target_offset,
             }
         }
+    }
+}
+
+fn p6_arm64_semantic_u8_tag(
+    bytecode_index: BytecodeIndex,
+    tag: u64,
+) -> Result<u8, P6X86_64BaselineSemanticByteEmissionError> {
+    if tag <= u64::from(u8::MAX) {
+        Ok(tag as u8)
+    } else {
+        Err(
+            P6X86_64BaselineSemanticByteEmissionError::UnsupportedImmediateTag {
+                bytecode_index,
+                tag,
+            },
+        )
     }
 }
 
@@ -1421,6 +1553,42 @@ fn p6_arm64_emit_ldr_x0_from_frame_location(
     bytecode_index: BytecodeIndex,
     location: P6X86_64BaselineOperandLocation,
 ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    p6_arm64_emit_ldr_xd_from_frame_location(bytes, bytecode_index, location, register_contract::X0)
+}
+
+fn p6_arm64_emit_ldr_x9_from_frame_location(
+    bytes: &mut Vec<u8>,
+    bytecode_index: BytecodeIndex,
+    location: P6X86_64BaselineOperandLocation,
+) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    p6_arm64_emit_ldr_xd_from_frame_location(bytes, bytecode_index, location, register_contract::X9)
+}
+
+fn p6_arm64_emit_ldr_xd_from_frame_location(
+    bytes: &mut Vec<u8>,
+    bytecode_index: BytecodeIndex,
+    location: P6X86_64BaselineOperandLocation,
+    dest: register_contract::Arm64Gpr,
+) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    let byte_offset = p6_arm64_frame_location_byte_offset(bytecode_index, location)?;
+    let Some(instruction) =
+        p6_arm64_encode_ldr_unsigned_64(dest, register_contract::CALL_FRAME_REGISTER, byte_offset)
+    else {
+        return Err(
+            P6X86_64BaselineSemanticByteEmissionError::FrameOffsetOutOfDisp32 {
+                bytecode_index,
+                location,
+                byte_offset,
+            },
+        );
+    };
+    p6_arm64_emit_word(bytes, instruction)
+}
+
+fn p6_arm64_frame_location_byte_offset(
+    bytecode_index: BytecodeIndex,
+    location: P6X86_64BaselineOperandLocation,
+) -> Result<u64, P6X86_64BaselineSemanticByteEmissionError> {
     let byte_offset = match location {
         P6X86_64BaselineOperandLocation::FrameLocal { byte_offset, .. } => byte_offset,
         P6X86_64BaselineOperandLocation::FrameArgument {
@@ -1438,18 +1606,50 @@ fn p6_arm64_emit_ldr_x0_from_frame_location(
             );
         }
     };
-    if !byte_offset.is_multiple_of(8) || byte_offset / 8 > 0x0fff {
-        return Err(
+    if byte_offset.is_multiple_of(8) && byte_offset / 8 <= 0x0fff {
+        Ok(byte_offset)
+    } else {
+        Err(
             P6X86_64BaselineSemanticByteEmissionError::FrameOffsetOutOfDisp32 {
                 bytecode_index,
                 location,
                 byte_offset,
             },
-        );
+        )
+    }
+}
+
+fn p6_arm64_encode_ldr_unsigned_64(
+    dest: register_contract::Arm64Gpr,
+    base: register_contract::Arm64Gpr,
+    byte_offset: u64,
+) -> Option<u32> {
+    if !byte_offset.is_multiple_of(8) || byte_offset / 8 > 0x0fff {
+        return None;
     }
     let imm12 = (byte_offset / 8) as u32;
-    let instruction = 0xf940_0000_u32 | (imm12 << 10) | (29 << 5);
-    p6_arm64_emit_word(bytes, instruction)
+    Some(0xf940_0000_u32 | (imm12 << 10) | (u32::from(base.index) << 5) | u32::from(dest.index))
+}
+
+fn p6_arm64_encode_and_x10_x9_low_byte_tag_mask() -> u32 {
+    // ARM64Assembler::and_<64>(x10, x9, LogicalImmediate::create64(0xff)).
+    p6_arm64_encode_and_imm64(register_contract::X10, register_contract::X9, 0x1007)
+}
+
+fn p6_arm64_encode_and_imm64(
+    dest: register_contract::Arm64Gpr,
+    source: register_contract::Arm64Gpr,
+    logical_immediate_13: u16,
+) -> u32 {
+    0x9200_0000_u32
+        | (u32::from(logical_immediate_13) << 10)
+        | (u32::from(source.index) << 5)
+        | u32::from(dest.index)
+}
+
+fn p6_arm64_encode_cmp_imm64(source: register_contract::Arm64Gpr, imm12: u8) -> u32 {
+    // ARM64Assembler::cmp<64>(rn, UInt12(imm)) lowers to subs xzr, rn, #imm.
+    0xf100_001f_u32 | (u32::from(imm12) << 10) | (u32::from(source.index) << 5)
 }
 
 fn p6_arm64_emit_mov_x0_u64(
@@ -2136,6 +2336,154 @@ mod tests {
             heap_allocation: false,
             touches_gc_roots: false,
         }
+    }
+
+    fn frame_local_location(byte_offset: u64) -> P6X86_64BaselineOperandLocation {
+        P6X86_64BaselineOperandLocation::FrameLocal {
+            local_index: 0,
+            slot_index: (byte_offset / 8) as u32,
+            byte_offset,
+        }
+    }
+
+    fn rust_low_byte_value_layout() -> P6X86_64BaselineValueLayoutContract {
+        P6X86_64BaselineValueLayoutContract {
+            layout_name: "rust-low-byte-tagged",
+            storage_bits: 64,
+            slot_width_bytes: 8,
+            tag_mask: 0xff,
+            payload_shift: 8,
+            immediate_undefined_tag: 0x01,
+            immediate_null_tag: 0x02,
+            immediate_false_tag: 0x03,
+            immediate_true_tag: 0x04,
+            immediate_int32_tag: 0x10,
+            immediate_double_tag: 0x30,
+            cell_tag: 0x20,
+            double_tag: 0x30,
+        }
+    }
+
+    #[test]
+    fn arm64_branch_if_false_primitive_words_match_macro_assembler_arm64_fast_path() {
+        assert_eq!(
+            p6_arm64_encode_ldr_unsigned_64(
+                register_contract::X9,
+                register_contract::CALL_FRAME_REGISTER,
+                0
+            ),
+            Some(0xf940_03a9)
+        );
+        assert_eq!(
+            p6_arm64_encode_ldr_unsigned_64(
+                register_contract::X9,
+                register_contract::CALL_FRAME_REGISTER,
+                16
+            ),
+            Some(0xf940_0ba9)
+        );
+        assert_eq!(p6_arm64_encode_and_x10_x9_low_byte_tag_mask(), 0x9240_1d2a);
+        assert_eq!(
+            p6_arm64_encode_cmp_imm64(register_contract::X10, 0x03),
+            0xf100_0d5f
+        );
+        assert_eq!(
+            p6_arm64_encode_cmp_imm64(register_contract::X10, 0x10),
+            0xf100_415f
+        );
+        assert_eq!(
+            p6_arm64_encode_cmp_imm64(register_contract::X9, 0x10),
+            0xf100_413f
+        );
+    }
+
+    #[test]
+    fn arm64_semantic_builder_emits_primitive_jump_if_false_fast_path_and_side_exit_stub() {
+        let mut builder = P6Arm64SemanticByteBuilder::default();
+        let bytecode_index = bci(4);
+        let target = branch_contract(P6X86_64BaselineBytecodeBranchKind::JumpIfFalseTaken, 4, 12);
+        let unsupported_exit = side_exit_label(
+            4,
+            P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand,
+        );
+
+        builder
+            .emit_branch_if_false_primitive(
+                bytecode_index,
+                frame_local_location(16),
+                rust_low_byte_value_layout(),
+                unsupported_exit,
+                target,
+            )
+            .unwrap();
+        let fallthrough_offset = builder.offset().unwrap();
+        builder.emit_word(0xd503_201f).unwrap();
+        let target_offset = builder.emit_word(0xd503_201f).unwrap();
+        let branch_records = builder
+            .finish_bytecode_branches(&[instruction_record(12, target_offset)])
+            .unwrap();
+        let side_exit_records = builder.finish_side_exit_return_stubs().unwrap();
+
+        assert_eq!(fallthrough_offset, 56);
+        assert_eq!(target_offset, 60);
+        assert_eq!(branch_records.len(), 4);
+        assert_eq!(side_exit_records.len(), 1);
+
+        let expected_branch_offsets = [12, 20, 28, 52];
+        for (record, expected_branch_offset) in branch_records.iter().zip(expected_branch_offsets) {
+            assert_eq!(record.bytecode_index, bytecode_index);
+            assert_eq!(
+                record.kind,
+                P6X86_64BaselineBytecodeBranchKind::JumpIfFalseTaken
+            );
+            assert_eq!(record.branch_offset, expected_branch_offset);
+            assert_eq!(record.branch_end_offset, expected_branch_offset + 4);
+            assert_eq!(record.target_bytecode_index, bci(12));
+            assert_eq!(record.target_offset, target_offset);
+            assert_eq!(
+                arm64_word(builder.bytes(), expected_branch_offset),
+                link_conditional_branch(Arm64Condition::Eq, expected_branch_offset, target_offset)
+                    .unwrap()
+                    .instruction_word
+            );
+        }
+
+        assert_eq!(arm64_word(builder.bytes(), 0), 0xf940_0ba9);
+        assert_eq!(arm64_word(builder.bytes(), 4), 0x9240_1d2a);
+        assert_eq!(arm64_word(builder.bytes(), 8), 0xf100_055f);
+        assert_eq!(arm64_word(builder.bytes(), 16), 0xf100_095f);
+        assert_eq!(arm64_word(builder.bytes(), 24), 0xf100_0d5f);
+        assert_eq!(arm64_word(builder.bytes(), 32), 0xf100_115f);
+        assert_eq!(arm64_word(builder.bytes(), 36), 0x5400_00a0);
+        assert_eq!(arm64_word(builder.bytes(), 40), 0xf100_415f);
+        assert_eq!(arm64_word(builder.bytes(), 48), 0xf100_413f);
+        assert_eq!(arm64_word(builder.bytes(), 52), 0x5400_0040);
+        assert_eq!(arm64_word(builder.bytes(), fallthrough_offset), 0xd503_201f);
+        assert_eq!(arm64_word(builder.bytes(), target_offset), 0xd503_201f);
+
+        let side_exit = &side_exit_records[0];
+        assert_eq!(side_exit.bytecode_index, bytecode_index);
+        assert_eq!(
+            side_exit.reason,
+            P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand
+        );
+        assert_eq!(side_exit.branch_offset, 44);
+        assert_eq!(side_exit.branch_end_offset, 48);
+        assert_eq!(side_exit.target_offset, 64);
+        assert_eq!(side_exit.resume_bytecode_index, None);
+        assert_eq!(side_exit.resume_entry_offset, None);
+        assert_eq!(
+            arm64_word(builder.bytes(), side_exit.branch_offset),
+            link_conditional_branch(Arm64Condition::Ne, side_exit.branch_offset, 64)
+                .unwrap()
+                .instruction_word
+        );
+        assert_eq!(
+            side_exit.bytes,
+            p6_arm64_callable_side_exit_payload_return_stub_bytes(side_exit.encoded_payload)
+                .unwrap()
+        );
+        assert_eq!(side_exit.encoded_payload.side_exit_index(), 0);
     }
 
     #[test]
