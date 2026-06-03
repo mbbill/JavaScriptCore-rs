@@ -51560,6 +51560,10 @@ mod tests {
             .tiering_integration()
             .generated_property_load_probe_misses()
             .len();
+        let generated_invalidation_count_before_second = vm
+            .tiering_integration()
+            .baseline_generated_code_invalidations()
+            .len();
         let second = execute_registered_code_block_with_host_and_arguments(
             &mut vm,
             owner,
@@ -51657,6 +51661,13 @@ mod tests {
             .property_load_guarded_candidate_table_for_owner(owner, bytecode_snapshot)
             .expect("retired guarded candidate table")
             .is_empty());
+        assert_eq!(
+            vm.tiering_integration()
+                .baseline_generated_code_invalidations()
+                .len(),
+            generated_invalidation_count_before_second,
+            "terminal guarded sidecar miss resets the guarded IC projection without invalidating generated code"
+        );
 
         host.clear_observations();
         host.use_core_generated_guarded_property_load_probe();
@@ -51696,7 +51707,13 @@ mod tests {
             vm.tiering_integration().property_load_guard_plans()[0].lifecycle,
             retired
         );
-        assert_latest_generated_entry_invalidated(&vm, owner, artifact);
+        assert_eq!(
+            vm.tiering_integration()
+                .baseline_generated_code_invalidations()
+                .len(),
+            generated_invalidation_count_before_second
+        );
+        assert_latest_generated_entry_evidence(&vm, owner, artifact);
     }
 
     #[test]

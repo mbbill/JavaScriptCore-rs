@@ -6023,20 +6023,12 @@ impl VmTieringIntegration {
             } else {
                 None
             };
-        if retired_guard_plan_ordinal.is_some() {
-            self.record_baseline_generated_code_invalidation(
-                BaselineGeneratedCodeInvalidationRequest {
-                    owner: request.owner,
-                    artifact_id: None,
-                    // C++ JSC retires the property IC by owner/cache reset and keeps
-                    // on-stack stub code alive separately; Rust IC snapshots are mutable
-                    // metadata, so dependency misses invalidate the latest owner artifact.
-                    bytecode_snapshot: None,
-                    reason: CodeInvalidationReason::GeneratedInlineCacheDependencyInvalidated,
-                    source: BaselineGeneratedCodeInvalidationSource::GuardedPropertyLoadProbeMiss,
-                },
-            );
-        }
+        // C++ JSC clears/repatches the PropertyInlineCache handler/stub, not the
+        // owning CodeBlock's JITCode, for this kind of guarded IC miss. Rust's
+        // generated sidecar tables are immutable projections rather than
+        // mutable InlineCacheHandler nodes, so retiring the guard plan and
+        // bumping `plan_generation` is the Rust ownership boundary that makes
+        // the next generated invocation re-project without this stale candidate.
         let record = VmGeneratedGuardedPropertyLoadProbeMissRecord {
             ordinal,
             owner: request.owner,
@@ -28147,7 +28139,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_guarded_property_load_probe_miss_feeds_generated_artifact_invalidation_only_when_terminal(
+    fn generated_guarded_property_load_terminal_probe_miss_retires_plan_without_generated_artifact_invalidation(
     ) {
         let (mut tiering, guard_plan, bytecode_snapshot) = record_prototype_data_guard_fixture();
         let owner = guard_plan.owner;
@@ -28191,11 +28183,6 @@ mod tests {
             Some(0),
         );
         let terminal = tiering.record_generated_guarded_property_load_probe_miss(terminal_request);
-        let generated_invalidation = tiering
-            .baseline_generated_code_invalidations()
-            .last()
-            .copied()
-            .expect("terminal guarded property-load generated invalidation");
         let entry = observe_baseline_entry(&mut tiering, owner, 242);
 
         assert!(terminal.terminal);
@@ -28203,36 +28190,37 @@ mod tests {
             terminal.retired_guard_plan_ordinal,
             Some(guard_plan.ordinal)
         );
+        assert!(tiering.baseline_generated_code_invalidations().is_empty());
         assert_eq!(
-            generated_invalidation.outcome,
-            BaselineGeneratedCodeInvalidationOutcome::Accepted
-        );
-        assert_eq!(
-            generated_invalidation.source,
-            BaselineGeneratedCodeInvalidationSource::GuardedPropertyLoadProbeMiss
-        );
-        assert_eq!(
-            generated_invalidation.reason,
-            CodeInvalidationReason::GeneratedInlineCacheDependencyInvalidated
-        );
-        assert_eq!(
-            generated_invalidation.artifact_id,
-            Some(generated_artifact.id)
-        );
-        assert_eq!(
-            generated_invalidation.bytecode_snapshot,
-            Some(bytecode_snapshot)
+            tiering.baseline_generated_code_artifact_for(owner),
+            Some(generated_artifact.clone())
         );
         assert_eq!(
             entry.baseline_entry_gate.as_ref().map(|gate| gate.outcome),
-            Some(BaselineEntryGateOutcome::InvalidatedGeneratedArtifact)
+            Some(BaselineEntryGateOutcome::Eligible)
         );
-        assert_eq!(entry.execution_path, TierEntryExecutionPath::Interpreter);
+        assert_eq!(
+            entry
+                .baseline_entry_gate
+                .as_ref()
+                .and_then(|gate| gate.generated_artifact.as_ref())
+                .map(|artifact| artifact.id),
+            Some(generated_artifact.id)
+        );
+        assert_eq!(
+            entry.decision,
+            TierEntryDecision::EnterOptimized {
+                tier: JitType::Baseline
+            }
+        );
+        assert_eq!(
+            entry.execution_path,
+            TierEntryExecutionPath::GeneratedCode(JitType::Baseline)
+        );
     }
 
     #[test]
-    fn generated_guarded_property_load_probe_miss_targets_generated_artifact_when_ic_snapshot_differs(
-    ) {
+    fn generated_guarded_property_load_terminal_probe_miss_ignores_generated_artifact_snapshot() {
         let (mut tiering, guard_plan, ic_snapshot) = record_prototype_data_guard_fixture();
         let owner = guard_plan.owner;
         let generated_artifact = tiering
@@ -28270,38 +28258,25 @@ mod tests {
         );
         assert_eq!(terminal_request.bytecode_snapshot, ic_snapshot);
         let terminal = tiering.record_generated_guarded_property_load_probe_miss(terminal_request);
-        let generated_invalidation = tiering
-            .baseline_generated_code_invalidations()
-            .last()
-            .copied()
-            .expect(
-                "terminal guarded property-load generated invalidation with mismatched IC snapshot",
-            );
 
         assert!(terminal.terminal);
         assert_eq!(
             terminal.retired_guard_plan_ordinal,
             Some(guard_plan.ordinal)
         );
+        assert!(tiering.baseline_generated_code_invalidations().is_empty());
         assert_eq!(
-            generated_invalidation.outcome,
-            BaselineGeneratedCodeInvalidationOutcome::Accepted
-        );
-        assert_eq!(
-            generated_invalidation.source,
-            BaselineGeneratedCodeInvalidationSource::GuardedPropertyLoadProbeMiss
-        );
-        assert_eq!(
-            generated_invalidation.artifact_id,
+            tiering
+                .baseline_generated_code_artifact_for(owner)
+                .map(|artifact| artifact.id),
             Some(generated_artifact.id)
         );
         assert_eq!(
-            generated_invalidation.bytecode_snapshot,
+            tiering
+                .baseline_generated_code_artifact_for(owner)
+                .map(|artifact| artifact.eligibility_proof.bytecode_snapshot_fingerprint()),
             Some(artifact_snapshot)
         );
-        assert!(tiering
-            .baseline_generated_code_artifact_for(owner)
-            .is_none());
     }
 
     #[test]

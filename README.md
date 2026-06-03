@@ -146,8 +146,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            callee auto-materialization and invalidated GetByName slow-path dispatch
     [done] generated property sidecar projection cache: property load/store/has tables are
            retained per owner/snapshot under CodeBlock-registry, plan-generation, and
-           megamorphic-projection epochs, avoiding per-generated-entry rebuilds while preserving
-           stale metadata invalidation
+           megamorphic-projection epochs; terminal guarded misses now retire only the guarded
+           candidate and refresh projection without jettisoning the generated owner artifact
     [done] generated executor per-invocation dispatch cap: Rust-only diagnostic guard
            makes the bytecode re-interpreter shim honor DispatchConfig for one generated
            invocation while default helper callers stay unbounded
@@ -268,12 +268,12 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          and a source-run fixture spends one budget across generated-entry fallback/resume
   [done] richards bounded dispatch-guard release probe: 50k macOS arm64 baseline probe reaches
          the runner then fails at DispatchStepLimitExceeded with tiering summary after the
-         invalidated property-exit fix; unbounded richards throughput remains a performance
-         blocker, so benchmark progress is not claimed
+         guarded-IC terminal miss reset; generated-code invalidations=0, but unbounded richards
+         throughput remains a performance blocker, so benchmark progress is not claimed
   [done] rootless direct-call hot-slot gate evidence: C++ CallLinkInfo fast path has no second
          hot-slot proof after monomorphic linking; focused test proves the second generated-entry
-         direct call skips entry root sync, and 50k richards rootless rejections drop 212->31
-         with hot_slot_miss 192->0 and only missing_generated_artifact remaining
+         direct call skips entry root sync, and 50k richards rootless rejections drop 212->31->0
+         after guarded IC reset while hot_slot_miss stays 0
   [done] macOS arm64 return-seed native evidence: focused tests prove constants, moves,
          frame/argument, and callee returns enter real ARM64 native entry without generated
          execution; arithmetic fallback keeps the existing x86_64 semantic artifact path
