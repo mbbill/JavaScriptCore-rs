@@ -141,9 +141,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            is shared across generated-entry interpreter fallbacks and generated resumes; 50k
            capped richards runner now returns DispatchStepLimitExceeded instead of staying
            in the runner
-    [wip] rootless direct-call admission: full validated monomorphic generated-entry
+    [done] rootless direct-call admission: full validated monomorphic generated-entry
           handoffs no longer require an extra Rust hot-slot hit before rootless dispatch;
-          bounded richards rootless rejections now collapse to missing generated artifacts
+          missing generated artifacts stay on the rooted CallLinkInfo::linkFor-style slow path
+          and become rootless only after that path prepares the callee artifact
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
   [wip] arrays and indexed storage

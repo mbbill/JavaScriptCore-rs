@@ -10796,6 +10796,11 @@ impl Vm {
             .tiering
             .baseline_generated_code_artifact_ref_for(validation.target_code_block_id)
         else {
+            // C++ CallLinkInfo::linkFor() prepares a missing JS callee
+            // executable from the rooted call slow path before returning the
+            // entrypoint. Rootless dispatch is only the already-prepared fast
+            // path, so absence of the generated artifact must fall through to
+            // Rust's rooted direct-call slow path rather than generating here.
             return Err(VmGeneratedDirectCallRootlessRejectionReason::MissingGeneratedArtifact);
         };
         if artifact.validate().is_err() || artifact.owner != validation.target_code_block_id {
@@ -38087,6 +38092,9 @@ mod tests {
             .tiering_integration()
             .generated_direct_call_transaction_records()
             .len();
+        let rootless_rejections_before = vm
+            .tiering_integration()
+            .generated_direct_call_rootless_rejection_counts();
         host.clear_observations();
 
         let (second, boundary_snapshot) =
@@ -38138,6 +38146,20 @@ mod tests {
                 .len(),
             transaction_count_before + 1
         );
+        let rootless_rejections_after_second = vm
+            .tiering_integration()
+            .generated_direct_call_rootless_rejection_counts();
+        assert_eq!(
+            rootless_rejections_after_second.missing_generated_artifact,
+            rootless_rejections_before.missing_generated_artifact + 1,
+            "missing generated artifacts should be rejected by the rootless fast path and prepared by the rooted direct-call slow path"
+        );
+        assert_eq!(
+            rootless_rejections_after_second
+                .saturating_sub(rootless_rejections_before)
+                .total(),
+            1
+        );
         assert_eq!(direct_call_transaction.caller, owner);
         assert_eq!(direct_call_transaction.target_code_block, callee_owner);
         assert_eq!(
@@ -38153,6 +38175,78 @@ mod tests {
         assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
         assert_eq!(vm.heap().no_gc_scope_depth(), 0);
         assert_latest_generated_entry_evidence(&vm, owner, caller_artifact);
+
+        let rootless_count_before_third = vm
+            .tiering_integration()
+            .generated_direct_call_rootless_generated_entry_count();
+        let transaction_count_before_third = vm
+            .tiering_integration()
+            .generated_direct_call_transaction_records()
+            .len();
+        let rootless_rejections_before_third = vm
+            .tiering_integration()
+            .generated_direct_call_rootless_rejection_counts();
+        let proof_count_before_third = vm
+            .generated_direct_call_hot_slot_rootless_generated_entry_proof_count_for_current_epoch_for_test();
+        host.clear_observations();
+
+        let (third, third_boundary_snapshot) =
+            execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                &mut vm,
+                owner,
+                &code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), callee],
+            );
+
+        assert_eq!(
+            third,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(43))
+        );
+        assert!(
+            host.targeted_root_syncs.is_empty(),
+            "once the rooted slow path has prepared the callee artifact, the next generated-entry direct call should stay rootless"
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_rootless_generated_entry_count(),
+            rootless_count_before_third + 1
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_rootless_rejection_counts(),
+            rootless_rejections_before_third,
+            "prepared callee artifacts should not keep producing missing-artifact rootless rejections"
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_transaction_records()
+                .len(),
+            transaction_count_before_third + 1
+        );
+        let rootless_direct_call = vm
+            .tiering_integration()
+            .generated_direct_call_transaction_records()
+            .last()
+            .expect("rootless host-blocked generated direct-call transaction");
+        assert_eq!(rootless_direct_call.caller, owner);
+        assert_eq!(rootless_direct_call.target_code_block, callee_owner);
+        assert_eq!(
+            rootless_direct_call.route,
+            VmGeneratedDirectCallTransactionRoute::GeneratedEntry
+        );
+        assert_eq!(
+            rootless_direct_call.outcome,
+            VmGeneratedDirectCallTransactionOutcome::Continue
+        );
+        assert_eq!(
+            vm.generated_direct_call_hot_slot_rootless_generated_entry_proof_count_for_current_epoch_for_test(),
+            proof_count_before_third + 1
+        );
+        third_boundary_snapshot.assert_no_gc_scope_depth(0);
+        third_boundary_snapshot.assert_current_no_gc_scope_depth(&vm, 0);
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
     }
 
     #[cfg(all(unix, not(target_arch = "x86_64")))]
