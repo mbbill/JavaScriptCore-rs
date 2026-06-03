@@ -21,6 +21,7 @@ use crate::interpreter::{
     GeneratedNativeIntrinsicCallRequest, GeneratedNativeIntrinsicCallResult,
     InterpreterExecutionState, RegisterWindow,
 };
+pub(crate) use crate::jit::generated_metrics::BaselineGeneratedExecutionMetrics;
 use crate::jit::ic::{
     GeneratedCallLinkDirectCall, GeneratedPropertyStoreMutationCommit,
     GeneratedPropertyStoreMutationMissReason, GeneratedPropertyStoreMutationRequest,
@@ -81,41 +82,6 @@ pub(crate) enum BaselineGeneratedExecutionWithRuntimeHelpersResult {
     JsCall(BaselineGeneratedJsCallHandoff),
     Property(BaselineGeneratedPropertyHandoff),
     RuntimeHelper(BaselineGeneratedRuntimeHelperHandoff),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BaselineGeneratedLoopHintObservation {
-    pub(crate) bytecode_index: BytecodeIndex,
-    pub(crate) count: u64,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct BaselineGeneratedExecutionMetrics {
-    pub(crate) executed_bytecode_count: u64,
-    loop_hint_observations: Vec<BaselineGeneratedLoopHintObservation>,
-}
-
-impl BaselineGeneratedExecutionMetrics {
-    fn record_loop_hint(&mut self, bytecode_index: BytecodeIndex) {
-        if let Some(observation) = self
-            .loop_hint_observations
-            .iter_mut()
-            .find(|observation| observation.bytecode_index == bytecode_index)
-        {
-            observation.count = observation.count.saturating_add(1);
-            return;
-        }
-
-        self.loop_hint_observations
-            .push(BaselineGeneratedLoopHintObservation {
-                bytecode_index,
-                count: 1,
-            });
-    }
-
-    pub(crate) fn loop_hint_observations(&self) -> &[BaselineGeneratedLoopHintObservation] {
-        &self.loop_hint_observations
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2341,10 +2307,10 @@ fn execute_baseline_generated_code_internal(
         }
         execution.stack.mark_top_bytecode_index(bytecode_index);
         if let Some(metrics) = metrics.as_deref_mut() {
-            metrics.executed_bytecode_count = metrics.executed_bytecode_count.saturating_add(1);
-            if CoreOpcode::from_opcode(instruction.opcode) == Some(CoreOpcode::LoopHint) {
-                metrics.record_loop_hint(bytecode_index);
-            }
+            metrics.record_dispatched_instruction(
+                bytecode_index,
+                CoreOpcode::from_opcode(instruction.opcode),
+            );
         }
 
         let outcome = match execute_instruction(
@@ -2387,9 +2353,7 @@ fn execute_baseline_generated_code_internal(
                 }
                 if let Some(metrics) = metrics.as_deref_mut() {
                     let skipped = target_ordinal.saturating_sub(ordinal.saturating_add(1));
-                    metrics.executed_bytecode_count = metrics
-                        .executed_bytecode_count
-                        .saturating_add(skipped as u64);
+                    metrics.record_skipped_bytecodes(skipped as u64);
                 }
                 pc = target;
             }

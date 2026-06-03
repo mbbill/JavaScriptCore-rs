@@ -19,7 +19,8 @@ use crate::interpreter::{
 use crate::syntax::source::SourceText;
 use crate::vm::{
     BaselineEntryAutoMaterializationRecord, SourceExecutionError, SourceSessionHandle,
-    SourceSessionHostGlobalConfig, SourceSessionSource, Vm, VmBaselineGeneratedExecutionSummary,
+    SourceSessionHostGlobalConfig, SourceSessionSource, Vm,
+    VmBaselineGeneratedDispatchedOpcodeCount, VmBaselineGeneratedExecutionSummary,
     VmBaselineGeneratedInvalidationSummary, VmConfig, VmGeneratedDirectCallCalleeFallbackSummary,
     VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
     VmGeneratedDirectCallRootlessRejectionCounts,
@@ -387,6 +388,7 @@ pub struct OctaneTieringSummary {
     pub baseline_native_semantic_byte_emission_failures: usize,
     pub baseline_native_entry_readiness: usize,
     pub baseline_generated_execution_summaries: Vec<VmBaselineGeneratedExecutionSummary>,
+    pub baseline_generated_dispatched_opcode_counts: Vec<VmBaselineGeneratedDispatchedOpcodeCount>,
     pub generated_direct_call_transactions: usize,
     pub generated_direct_call_generated_entries: usize,
     pub generated_direct_call_native_entries: usize,
@@ -560,6 +562,9 @@ impl OctaneTieringSummary {
             baseline_generated_execution_summaries: tiering
                 .baseline_generated_execution_summaries()
                 .to_vec(),
+            baseline_generated_dispatched_opcode_counts: tiering
+                .baseline_generated_dispatched_opcode_counts()
+                .to_vec(),
             generated_direct_call_transactions: tiering.generated_direct_call_transaction_count(),
             generated_direct_call_generated_entries: tiering
                 .generated_direct_call_generated_entry_count(),
@@ -643,6 +648,11 @@ impl OctaneTieringSummary {
                 &self.baseline_generated_execution_summaries,
                 &start.baseline_generated_execution_summaries,
             );
+        let baseline_generated_dispatched_opcode_counts =
+            octane_baseline_generated_dispatched_opcode_count_delta(
+                &self.baseline_generated_dispatched_opcode_counts,
+                &start.baseline_generated_dispatched_opcode_counts,
+            );
         let generated_direct_call_rootless_unsupported_body_opcode_counts =
             octane_rootless_unsupported_body_opcode_count_delta(
                 &self.generated_direct_call_rootless_unsupported_body_opcode_counts,
@@ -722,6 +732,7 @@ impl OctaneTieringSummary {
                 .baseline_native_entry_readiness
                 .saturating_sub(start.baseline_native_entry_readiness),
             baseline_generated_execution_summaries,
+            baseline_generated_dispatched_opcode_counts,
             generated_direct_call_transactions: self
                 .generated_direct_call_transactions
                 .saturating_sub(start.generated_direct_call_transactions),
@@ -1024,6 +1035,31 @@ fn octane_baseline_generated_execution_summary_has_activity(
         || summary.property_count > 0
         || summary.runtime_helper_count > 0
         || summary.rejected_count > 0
+}
+
+fn octane_baseline_generated_dispatched_opcode_count_delta(
+    current: &[VmBaselineGeneratedDispatchedOpcodeCount],
+    start: &[VmBaselineGeneratedDispatchedOpcodeCount],
+) -> Vec<VmBaselineGeneratedDispatchedOpcodeCount> {
+    current
+        .iter()
+        .filter_map(|current_count| {
+            let start_count = start
+                .iter()
+                .find(|start_count| {
+                    start_count.owner == current_count.owner
+                        && start_count.opcode == current_count.opcode
+                })
+                .map(|start_count| start_count.count)
+                .unwrap_or(0);
+            let count = current_count.count.saturating_sub(start_count);
+            (count > 0).then_some(VmBaselineGeneratedDispatchedOpcodeCount {
+                owner: current_count.owner,
+                opcode: current_count.opcode,
+                count,
+            })
+        })
+        .collect()
 }
 
 fn octane_generated_direct_call_transaction_summary_delta(
@@ -3680,6 +3716,18 @@ Benchmark.prototype.validate = function() {
                 runtime_helper_count: 0,
                 rejected_count: 0,
             }],
+            baseline_generated_dispatched_opcode_counts: vec![
+                VmBaselineGeneratedDispatchedOpcodeCount {
+                    owner,
+                    opcode: CoreOpcode::Call,
+                    count: 4,
+                },
+                VmBaselineGeneratedDispatchedOpcodeCount {
+                    owner,
+                    opcode: CoreOpcode::LoadInt32,
+                    count: 2,
+                },
+            ],
             generated_direct_call_transaction_summaries: vec![
                 VmGeneratedDirectCallTransactionSummary {
                     caller,
@@ -3830,6 +3878,23 @@ Benchmark.prototype.validate = function() {
                     property_count: 0,
                     runtime_helper_count: 0,
                     rejected_count: 0,
+                },
+            ],
+            baseline_generated_dispatched_opcode_counts: vec![
+                VmBaselineGeneratedDispatchedOpcodeCount {
+                    owner,
+                    opcode: CoreOpcode::Call,
+                    count: 11,
+                },
+                VmBaselineGeneratedDispatchedOpcodeCount {
+                    owner,
+                    opcode: CoreOpcode::AddInt32,
+                    count: 3,
+                },
+                VmBaselineGeneratedDispatchedOpcodeCount {
+                    owner: second_owner,
+                    opcode: CoreOpcode::LoopHint,
+                    count: 1,
                 },
             ],
             generated_direct_call_transaction_summaries: vec![
@@ -4046,6 +4111,26 @@ Benchmark.prototype.validate = function() {
                 runtime_helper_count: 0,
                 rejected_count: 0,
             }
+        );
+        assert_eq!(
+            delta.baseline_generated_dispatched_opcode_counts,
+            vec![
+                VmBaselineGeneratedDispatchedOpcodeCount {
+                    owner,
+                    opcode: CoreOpcode::Call,
+                    count: 7,
+                },
+                VmBaselineGeneratedDispatchedOpcodeCount {
+                    owner,
+                    opcode: CoreOpcode::AddInt32,
+                    count: 3,
+                },
+                VmBaselineGeneratedDispatchedOpcodeCount {
+                    owner: second_owner,
+                    opcode: CoreOpcode::LoopHint,
+                    count: 1,
+                },
+            ]
         );
         assert_eq!(delta.generated_direct_call_transaction_summaries.len(), 2);
         assert_eq!(

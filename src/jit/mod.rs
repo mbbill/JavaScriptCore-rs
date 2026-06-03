@@ -13,6 +13,7 @@ pub(crate) mod disassembly;
 pub(crate) mod emission;
 pub(crate) mod emitter;
 pub(crate) mod executable;
+pub(crate) mod generated_metrics;
 pub(crate) mod ic;
 pub(crate) mod integration;
 pub(crate) mod machine;

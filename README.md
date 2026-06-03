@@ -28,7 +28,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
                  Host-callability fallback moves ~3.39M to GeneratedEntry; ready sealed native
                  direct-call callees now outrank GeneratedEntry when both artifacts exist, but the
                  broad blocker remains: generated baseline is still a Rust bytecode re-interpreter
-                 and is slower than the optimized interpreter on richards.
+                 and is slower than the optimized interpreter on richards. Capped telemetry now
+                 shows generated dispatch heat dominated by GetByName, JumpIfFalse, PutByName,
+                 and CallWithThis in the hot generated owners.
   Phase 2 [done] Octane feature completeness: all 15 benchmarks RUN correctly. Ground-truth
                  2026-05-30: ZERO throwers/aborts -- 3 score, 12 functional-but-slow
                  (perf-gated, Phase 1). Landed: implicit-global store, indirect eval, catchable
@@ -214,7 +216,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          residency (~3.39M GeneratedEntry, ~0.66M NestedInterpreterFallback); a narrow native
          entrypoint preference now bypasses the generated callee re-interpreter when sealed native
          readiness exists, but score regresses to ~0.0458 because general generated execution still
-         re-dispatches bytecode. Real reg-alloc and the absent optimizing tiers own score parity.
+         re-dispatches bytecode. A 500k capped probe reports top generated opcode heat as owner
+         110 GetByName=47,408, then owner 146/185 GetByName, JumpIfFalse, PutByName, and
+         CallWithThis. Real reg-alloc and the absent optimizing tiers own score parity.
   [missing] CRITICAL PATH (deferred, in order): call-dispatch-into-generated -> mc
          put_by_id/call/construct/get_by_val -> slow-case rejoin -> inline alloc ->
          real reg-alloc; then DFG/FTL/B3-equivalent optimizing tier (where parity lives)
@@ -274,6 +278,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          hot-slot proof after monomorphic linking; focused test proves the second generated-entry
          direct call skips entry root sync, and 50k richards rootless rejections drop 212->31->0
          after guarded IC reset while hot_slot_miss stays 0
+  [done] generated opcode-heat evidence: 500k capped richards baseline probe still fails at
+         DispatchStepLimitExceeded with generated-code invalidations=0 and rootless rejections=0,
+         but now reports baseline-generated-dispatched-opcode heat for the next C++ JIT::emit_op_*
+         selection (owner 110 GetByName=47,408; then owner 146/185 GetByName, JumpIfFalse,
+         PutByName, CallWithThis)
   [done] macOS arm64 return-seed native evidence: focused tests prove constants, moves,
          frame/argument, and callee returns enter real ARM64 native entry without generated
          execution; arithmetic fallback keeps the existing x86_64 semantic artifact path

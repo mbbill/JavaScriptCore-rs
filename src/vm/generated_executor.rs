@@ -786,6 +786,7 @@ impl Vm {
                 entry_kind,
                 current_tier,
                 executed_bytecode_count: metrics.executed_bytecode_count,
+                dispatched_opcode_counts: metrics.dispatched_opcode_counts().to_vec(),
                 outcome,
             });
     }

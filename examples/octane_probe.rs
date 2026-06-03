@@ -525,6 +525,8 @@ fn print_tiering_summary(vm: &Vm) {
         tiering.baseline_generated_code_invalidation_summary();
     let baseline_generated_executions = tiering.baseline_generated_execution_records();
     let baseline_generated_execution_summaries = tiering.baseline_generated_execution_summaries();
+    let baseline_generated_dispatched_opcode_counts =
+        tiering.baseline_generated_dispatched_opcode_counts();
     let baseline_generated_execution_count = tiering.baseline_generated_execution_count();
     let baseline_generated_executed_bytecodes =
         tiering.baseline_generated_executed_bytecode_count();
@@ -843,6 +845,20 @@ fn print_tiering_summary(vm: &Vm) {
                 .cmp(&left.executed_bytecode_count)
                 .then_with(|| right.execution_count.cmp(&left.execution_count))
                 .then_with(|| format!("{:?}", left.owner).cmp(&format!("{:?}", right.owner)))
+        },
+    );
+    print_top_records(
+        &mut stderr,
+        "baseline-generated-dispatched-opcode",
+        baseline_generated_dispatched_opcode_counts,
+        tail_limit,
+        record_filter.as_deref(),
+        |left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| format!("{:?}", left.owner).cmp(&format!("{:?}", right.owner)))
+                .then_with(|| format!("{:?}", left.opcode).cmp(&format!("{:?}", right.opcode)))
         },
     );
     print_top_records(
@@ -1664,6 +1680,20 @@ fn print_benchmark_tiering_summary(benchmark: &OctaneBenchmarkExecutionReport) {
                 .cmp(&left.executed_bytecode_count)
                 .then_with(|| right.execution_count.cmp(&left.execution_count))
                 .then_with(|| format!("{:?}", left.owner).cmp(&format!("{:?}", right.owner)))
+        },
+    );
+    print_top_records(
+        &mut stderr,
+        "baseline-generated-dispatched-opcode",
+        &summary.baseline_generated_dispatched_opcode_counts,
+        tail_limit,
+        record_filter.as_deref(),
+        |left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| format!("{:?}", left.owner).cmp(&format!("{:?}", right.owner)))
+                .then_with(|| format!("{:?}", left.opcode).cmp(&format!("{:?}", right.opcode)))
         },
     );
     print_top_records(
