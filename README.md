@@ -76,6 +76,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] VM generated property IC exit/handoff cluster extracted to
            src/vm/property_handoff.rs (maps to C++ JITPropertyAccess/
            JITOperations/PropertyInlineCache)
+    [done] VM generated CodeBlock entry executor extracted to
+           src/vm/generated_executor.rs (maps to C++ ScriptExecutable/CodeBlock/JITCode entry)
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
