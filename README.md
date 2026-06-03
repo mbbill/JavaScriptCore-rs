@@ -137,11 +137,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] generated executor per-invocation dispatch cap: Rust-only diagnostic guard
            makes the bytecode re-interpreter shim honor DispatchConfig for one generated
            invocation while default helper callers stay unbounded
-    [missing] richards post-handoff source-run dispatch evidence: 50k capped macOS arm64
-              probe still stays in the runner because repeated generated resumes reset the
-              per-invocation guard; property sidecar projection rebuild is removed from the hot
-              entry path, but no benchmark progress is claimed until a source-run/entrypoint probe
-              proves it
+    [done] generated executor source-entry dispatch budget: VM/source-entry scoped budget
+           is shared across generated-entry interpreter fallbacks and generated resumes; 50k
+           capped richards runner now returns DispatchStepLimitExceeded instead of staying
+           in the runner
     [wip] rootless direct-call admission
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
@@ -247,11 +246,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          fresh property IC slots from profiled CodeBlock metadata; Rust install now derives
          from current metadata and focused tests cover warmed bytecode-0 and bytecode-1 ICs
   [done] generated dispatch-budget evidence: focused tests prove a capped generated infinite
-         loop returns DispatchStepLimitExceeded and default generated execution remains unbounded
-  [risk] richards post-dispatch-guard release probe: unbounded macOS arm64 run reached runner
-         and was killed after no summary at >8 CPU minutes; a 50k dispatch-step probe after the
-         per-invocation generated cap still remained in runner until killed, so benchmark
-         progress is not claimed
+         loop returns DispatchStepLimitExceeded, default generated execution remains unbounded,
+         and a source-run fixture spends one budget across generated-entry fallback/resume
+  [done] richards bounded dispatch-guard release probe: 50k macOS arm64 baseline probe reaches
+         the runner then fails at DispatchStepLimitExceeded with tiering summary; unbounded
+         richards throughput remains a performance blocker, so benchmark progress is not claimed
   [missing] local C++ JSC comparison harness for parity claims
   [done] subagent reviewer flow used for current substantial patch
   [done] one logical commit boundary restored for current accepted batch

@@ -51,41 +51,42 @@ use crate::gc::{
     RootSetMutationAuthority, TargetedRootRecord, TargetedRootSet,
 };
 use crate::interpreter::{
-    cleanup_targeted_root_sets, execute_baseline_fallback_deferring_ordinary_calls_with_root_scope,
+    cleanup_targeted_root_sets,
+    execute_baseline_fallback_deferring_ordinary_calls_with_root_scope_and_dispatch_budget,
     execute_code_block as execute_interpreter_code_block,
-    execute_code_block_deferring_ordinary_calls_with_root_scope, execute_single_dispatch,
-    execute_single_dispatch_deferring_ordinary_calls, find_handler, finish_ordinary_js_call_return,
-    pop_call_return_callee, sync_targeted_frame_roots, sync_targeted_nonlocal_frame_roots,
-    sync_targeted_nonlocal_register_roots, sync_targeted_register_roots,
-    validate_call_return_continuation, validate_construct_return_continuation,
-    BaselineFallbackRequest, BaselineLoopHandoffRequest, CallObservationDescriptor,
-    CallObservationDrainRequest, CallObservationOutcome, CallReturnContinuation,
-    ConstructReturnContinuation, CoreGlobalLexicalDeclaration, CoreGlobalLexicalDeclarationKind,
-    CoreHostOutputRecord, CoreHostResultRecord, CoreOpcodeDispatchHost, DispatchConfig,
-    DispatchHost, DispatchInstruction, DispatchOutcome, DispatchState, EvalExecutionEntry,
-    EvalHostSymbolSnapshot, EvalRequest, ExecutionCompletion, ExecutionContextStack,
-    ExecutionEntryRecord, ExecutionError, ExecutionRootSnapshot, FramePushRequest,
-    FunctionValueCallCompletion, FunctionValueCallHandling, FunctionValueCallRequest,
-    FunctionValueCallTailCompletion, FunctionValuePropertyObservation,
-    FunctionValuePropertyOperationCompletion, FunctionValuePropertyOperationOutcome,
-    FunctionValuePropertyOperationResume, FunctionValueReturnTransform,
-    GeneratedNativeIntrinsicCallRequest, GeneratedNativeIntrinsicCallResult,
-    InterpreterExecutionState, InterpreterFunctionCodeBlock, InterpreterRootScopeMode,
-    InterpreterRootSyncScope, OrdinaryBytecodeCallHandling, OrdinaryBytecodeCallRequest,
-    OrdinaryBytecodeConstructRequest, ProgramExecutionEntry, PropertyHasObservationDrainRequest,
-    PropertyLoadObservationDrainRequest, PropertyStoreObservationDescriptor,
-    PropertyStoreObservationDrainRequest, RegisterFile, RegisterWindow, SingleDispatchOutcome,
-    SingleDispatchRequest, StructureChainInvalidationEvent, StructureTransitionWatchpointRequest,
-    StructureTransitionWatchpointSnapshot,
+    execute_code_block_deferring_ordinary_calls_with_root_scope_and_dispatch_budget,
+    execute_single_dispatch, execute_single_dispatch_deferring_ordinary_calls, find_handler,
+    finish_ordinary_js_call_return, pop_call_return_callee, sync_targeted_frame_roots,
+    sync_targeted_nonlocal_frame_roots, sync_targeted_nonlocal_register_roots,
+    sync_targeted_register_roots, validate_call_return_continuation,
+    validate_construct_return_continuation, BaselineFallbackRequest, BaselineLoopHandoffRequest,
+    CallObservationDescriptor, CallObservationDrainRequest, CallObservationOutcome,
+    CallReturnContinuation, ConstructReturnContinuation, CoreGlobalLexicalDeclaration,
+    CoreGlobalLexicalDeclarationKind, CoreHostOutputRecord, CoreHostResultRecord,
+    CoreOpcodeDispatchHost, DispatchBudget, DispatchConfig, DispatchHost, DispatchInstruction,
+    DispatchOutcome, DispatchState, EvalExecutionEntry, EvalHostSymbolSnapshot, EvalRequest,
+    ExecutionCompletion, ExecutionContextStack, ExecutionEntryRecord, ExecutionError,
+    ExecutionRootSnapshot, FramePushRequest, FunctionValueCallCompletion,
+    FunctionValueCallHandling, FunctionValueCallRequest, FunctionValueCallTailCompletion,
+    FunctionValuePropertyObservation, FunctionValuePropertyOperationCompletion,
+    FunctionValuePropertyOperationOutcome, FunctionValuePropertyOperationResume,
+    FunctionValueReturnTransform, GeneratedNativeIntrinsicCallRequest,
+    GeneratedNativeIntrinsicCallResult, InterpreterExecutionState, InterpreterFunctionCodeBlock,
+    InterpreterRootScopeMode, InterpreterRootSyncScope, OrdinaryBytecodeCallHandling,
+    OrdinaryBytecodeCallRequest, OrdinaryBytecodeConstructRequest, ProgramExecutionEntry,
+    PropertyHasObservationDrainRequest, PropertyLoadObservationDrainRequest,
+    PropertyStoreObservationDescriptor, PropertyStoreObservationDrainRequest, RegisterFile,
+    RegisterWindow, SingleDispatchOutcome, SingleDispatchRequest, StructureChainInvalidationEvent,
+    StructureTransitionWatchpointRequest, StructureTransitionWatchpointSnapshot,
 };
 use crate::jit::baseline::{
     baseline_generated_js_call_handoff, baseline_generated_property_handoff,
-    execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation_and_dispatch_config,
-    execute_baseline_generated_code_with_metrics_and_validation_and_dispatch_config,
-    execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation_and_dispatch_config,
-    execute_baseline_generated_code_with_runtime_helpers_and_dispatch_config,
-    execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation_and_dispatch_config,
-    execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_config,
+    execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation_and_dispatch_budget,
+    execute_baseline_generated_code_with_metrics_and_validation_and_dispatch_budget,
+    execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation_and_dispatch_budget,
+    execute_baseline_generated_code_with_runtime_helpers_and_dispatch_budget,
+    execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation_and_dispatch_budget,
+    execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_budget,
     execute_baseline_generated_property_has_sidecar_probe,
     execute_baseline_generated_property_load_or_increment_sidecar_probe,
     execute_baseline_generated_property_load_sidecar_probe,
@@ -895,6 +896,7 @@ pub struct Vm {
     execution: ExecutionContextStack,
     registers: RegisterFile,
     interpreter_root_scope: InterpreterRootSyncScope,
+    active_dispatch_budget: Option<DispatchBudget>,
     gc_execution: VmGcExecutionState,
     tiering: VmTieringIntegration,
     generated_call_link_candidate_table_cache:
@@ -1914,6 +1916,7 @@ impl Vm {
             execution: ExecutionContextStack::default(),
             registers: RegisterFile::default(),
             interpreter_root_scope: InterpreterRootSyncScope::new(),
+            active_dispatch_budget: None,
             gc_execution: VmGcExecutionState::default(),
             tiering: VmTieringIntegration::default(),
             generated_call_link_candidate_table_cache: RefCell::new(Vec::new()),
@@ -4626,7 +4629,31 @@ impl Vm {
             .active_entry()
             .map(|entry| entry.record.kind())
             .unwrap_or(crate::interpreter::ExecutionEntryKind::Program);
-        self.execute_code_block_with_entry_kind(code_block_id, code_block, host, config, entry_kind)
+        if self.active_dispatch_budget.is_some() {
+            return self.execute_code_block_with_entry_kind(
+                code_block_id,
+                code_block,
+                host,
+                config,
+                entry_kind,
+            );
+        }
+
+        // C++ enters JS through VMEntryScope and keeps watchdog/trap state on
+        // the VM for the active execution stack. Rust's dispatch-step cap is a
+        // diagnostic probe guard for the bytecode interpreter and generated
+        // re-interpreter shim, so the mutable budget is installed only at the
+        // outer VM entry and nested calls/generated resumes spend from it.
+        self.active_dispatch_budget = Some(DispatchBudget::from_config(config));
+        let completion = self.execute_code_block_with_entry_kind(
+            code_block_id,
+            code_block,
+            host,
+            config,
+            entry_kind,
+        );
+        self.active_dispatch_budget = None;
+        completion
     }
 
     fn execute_code_block_with_entry_kind<H: DispatchHost>(
@@ -5348,7 +5375,12 @@ impl Vm {
             code_block_id,
             self.config.tiering_policy(),
         );
-        execute_code_block_deferring_ordinary_calls_with_root_scope(
+        let mut local_dispatch_budget = DispatchBudget::from_config(config);
+        let dispatch_budget = self
+            .active_dispatch_budget
+            .as_mut()
+            .unwrap_or(&mut local_dispatch_budget);
+        execute_code_block_deferring_ordinary_calls_with_root_scope_and_dispatch_budget(
             InterpreterExecutionState {
                 stack: &mut self.execution,
                 registers: &mut self.registers,
@@ -5358,7 +5390,7 @@ impl Vm {
             code_block_id,
             code_block,
             &mut host,
-            config,
+            dispatch_budget,
             &mut self.interpreter_root_scope,
         )
     }
@@ -8580,8 +8612,13 @@ impl Vm {
                         &megamorphic_has_candidate_table,
                     ));
                     let mut metrics = BaselineGeneratedExecutionMetrics::default();
+                    let mut local_dispatch_budget = DispatchBudget::from_config(config);
+                    let dispatch_budget = self
+                        .active_dispatch_budget
+                        .as_mut()
+                        .unwrap_or(&mut local_dispatch_budget);
                     let result =
-                        execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_config(
+                        execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_budget(
                             BaselineGeneratedExecutionRequest {
                                 artifact: &artifact,
                                 owner: code_block_id,
@@ -8599,7 +8636,7 @@ impl Vm {
                             None,
                             &mut metrics,
                             validation,
-                            config,
+                            dispatch_budget,
                         );
                     (
                         result,
@@ -8704,8 +8741,13 @@ impl Vm {
                             host,
                         );
                     let mut metrics = BaselineGeneratedExecutionMetrics::default();
+                    let mut local_dispatch_budget = DispatchBudget::from_config(config);
+                    let dispatch_budget = self
+                        .active_dispatch_budget
+                        .as_mut()
+                        .unwrap_or(&mut local_dispatch_budget);
                     let result =
-                        execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_config(
+                        execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_budget(
                             BaselineGeneratedExecutionRequest {
                                 artifact: &artifact,
                                 owner: code_block_id,
@@ -8723,7 +8765,7 @@ impl Vm {
                             Some(&mut sidecar),
                             &mut metrics,
                             validation,
-                            config,
+                            dispatch_budget,
                         );
                     (
                         result,
@@ -8765,8 +8807,13 @@ impl Vm {
             }
 
             let mut metrics = BaselineGeneratedExecutionMetrics::default();
+            let mut local_dispatch_budget = DispatchBudget::from_config(config);
+            let dispatch_budget = self
+                .active_dispatch_budget
+                .as_mut()
+                .unwrap_or(&mut local_dispatch_budget);
             let result =
-                execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation_and_dispatch_config(
+                execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation_and_dispatch_budget(
                     BaselineGeneratedExecutionRequest {
                         artifact: &artifact,
                         owner: code_block_id,
@@ -8782,7 +8829,7 @@ impl Vm {
                     runtime_helper_plan,
                     &mut metrics,
                     validation,
-                    config,
+                    dispatch_budget,
                 );
             let outcome = Self::baseline_generated_execution_with_runtime_helpers_outcome(&result);
             self.record_baseline_generated_execution_metrics(
@@ -8891,7 +8938,12 @@ impl Vm {
                         &megamorphic_has_candidate_table,
                     ));
                     let mut metrics = BaselineGeneratedExecutionMetrics::default();
-                    let result = execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation_and_dispatch_config(
+                    let mut local_dispatch_budget = DispatchBudget::from_config(config);
+                    let dispatch_budget = self
+                        .active_dispatch_budget
+                        .as_mut()
+                        .unwrap_or(&mut local_dispatch_budget);
+                    let result = execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation_and_dispatch_budget(
                         BaselineGeneratedExecutionRequest {
                             artifact: &artifact,
                             owner: code_block_id,
@@ -8907,7 +8959,7 @@ impl Vm {
                         &mut sidecars,
                         &mut metrics,
                         validation,
-                        config,
+                        dispatch_budget,
                     );
                     (
                         result,
@@ -9022,8 +9074,13 @@ impl Vm {
                             host,
                         );
                     let mut metrics = BaselineGeneratedExecutionMetrics::default();
+                    let mut local_dispatch_budget = DispatchBudget::from_config(config);
+                    let dispatch_budget = self
+                        .active_dispatch_budget
+                        .as_mut()
+                        .unwrap_or(&mut local_dispatch_budget);
                     let result =
-                        execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation_and_dispatch_config(
+                        execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation_and_dispatch_budget(
                             BaselineGeneratedExecutionRequest {
                                 artifact: &artifact,
                                 owner: code_block_id,
@@ -9039,7 +9096,7 @@ impl Vm {
                             &mut sidecar,
                             &mut metrics,
                             validation,
-                            config,
+                            dispatch_budget,
                         );
                     (
                         result,
@@ -9079,8 +9136,13 @@ impl Vm {
                 );
             }
             let mut metrics = BaselineGeneratedExecutionMetrics::default();
+            let mut local_dispatch_budget = DispatchBudget::from_config(config);
+            let dispatch_budget = self
+                .active_dispatch_budget
+                .as_mut()
+                .unwrap_or(&mut local_dispatch_budget);
             let result =
-                execute_baseline_generated_code_with_metrics_and_validation_and_dispatch_config(
+                execute_baseline_generated_code_with_metrics_and_validation_and_dispatch_budget(
                     BaselineGeneratedExecutionRequest {
                         artifact: &artifact,
                         owner: code_block_id,
@@ -9095,7 +9157,7 @@ impl Vm {
                     },
                     &mut metrics,
                     validation,
-                    config,
+                    dispatch_budget,
                 );
             let outcome = Self::baseline_generated_execution_outcome(&result);
             self.record_baseline_generated_execution_metrics(
@@ -9788,7 +9850,12 @@ impl Vm {
             runtime_helper_plan,
         } = request;
 
-        match execute_baseline_generated_code_with_runtime_helpers_and_dispatch_config(
+        let mut local_dispatch_budget = DispatchBudget::from_config(config);
+        let dispatch_budget = self
+            .active_dispatch_budget
+            .as_mut()
+            .unwrap_or(&mut local_dispatch_budget);
+        match execute_baseline_generated_code_with_runtime_helpers_and_dispatch_budget(
             BaselineGeneratedExecutionRequest {
                 artifact,
                 owner,
@@ -9802,7 +9869,7 @@ impl Vm {
                 },
             },
             runtime_helper_plan,
-            config,
+            dispatch_budget,
         ) {
             Ok(BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion)) => {
                 completion
@@ -17232,7 +17299,12 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> ExecutionCompletion {
-        execute_baseline_fallback_deferring_ordinary_calls_with_root_scope(
+        let mut local_dispatch_budget = DispatchBudget::from_config(config);
+        let dispatch_budget = self
+            .active_dispatch_budget
+            .as_mut()
+            .unwrap_or(&mut local_dispatch_budget);
+        execute_baseline_fallback_deferring_ordinary_calls_with_root_scope_and_dispatch_budget(
             InterpreterExecutionState {
                 stack: &mut self.execution,
                 registers: &mut self.registers,
@@ -17242,7 +17314,7 @@ impl Vm {
             request,
             code_block,
             host,
-            config,
+            dispatch_budget,
             &mut self.interpreter_root_scope,
             InterpreterRootScopeMode::VmStack,
         )
@@ -59469,6 +59541,57 @@ mod tests {
             vm.tiering_integration()
                 .baseline_generated_executed_bytecode_count(),
             2
+        );
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+        assert_eq!(vm.exception_state().pending(), None);
+        assert!(exception_targeted_roots(&vm).is_empty());
+    }
+
+    #[test]
+    fn vm_generated_baseline_dispatch_budget_is_shared_across_generated_resumes() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut session = vm
+            .open_source_session_with_host_globals_and_dispatch_config(
+                SourceSessionHostGlobalConfig::safe_benchmark_host_globals(),
+                DispatchConfig::new(4),
+            )
+            .unwrap();
+
+        let completion = vm
+            .append_source_session_source(
+                &mut session,
+                source("let f = function() { return 41; }; f();"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Failed(ExecutionError::DispatchStepLimitExceeded)
+        );
+        assert!(
+            vm.tiering_integration()
+                .fallback_records()
+                .iter()
+                .any(|record| {
+                    matches!(
+                        record.generated_baseline,
+                        Some(GeneratedBaselineFallbackRecord {
+                            opcode: GeneratedBaselineFallbackOpcode::Core(
+                                CoreOpcode::GetGlobalLexical
+                            ),
+                            cause: GeneratedBaselineFallbackCause::UnsupportedOpcode,
+                            ..
+                        })
+                    )
+                }),
+            "first generated invocation should single-dispatch the GetGlobalLexical fallback"
+        );
+        assert!(
+            vm.tiering_integration()
+                .call_observations()
+                .is_empty(),
+            "shared budget should be exhausted before the resumed generated invocation reaches Call"
         );
         assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
         assert_eq!(vm.heap().no_gc_scope_depth(), 0);

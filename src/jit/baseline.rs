@@ -16,9 +16,10 @@ use crate::gc::StructureId;
 use crate::interpreter::{
     baseline_active_frame, baseline_read_register, baseline_return_register,
     baseline_write_register, create_call_return_continuation, BaselineFallbackRequest,
-    CallReturnContinuation, CallReturnContinuationRequest, CallReturnKind, DispatchConfig,
-    DispatchHost, ExecutionCompletion, ExecutionError, GeneratedNativeIntrinsicCallRequest,
-    GeneratedNativeIntrinsicCallResult, InterpreterExecutionState, RegisterWindow,
+    CallReturnContinuation, CallReturnContinuationRequest, CallReturnKind, DispatchBudget,
+    DispatchConfig, DispatchHost, ExecutionCompletion, ExecutionError,
+    GeneratedNativeIntrinsicCallRequest, GeneratedNativeIntrinsicCallResult,
+    InterpreterExecutionState, RegisterWindow,
 };
 use crate::jit::ic::{
     GeneratedCallLinkDirectCall, GeneratedPropertyStoreMutationCommit,
@@ -1628,13 +1629,14 @@ pub(crate) fn execute_baseline_p6_native_entry_shim(
 pub(crate) fn execute_baseline_generated_code(
     request: BaselineGeneratedExecutionRequest<'_, '_>,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::unbounded();
     match execute_baseline_generated_code_internal(
         request,
         None,
         None,
         None,
         None,
-        DispatchConfig::unbounded(),
+        &mut dispatch_budget,
         BaselineGeneratedExecutionValidation::Full,
     )? {
         BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
@@ -1686,13 +1688,28 @@ pub(crate) fn execute_baseline_generated_code_with_metrics_and_validation_and_di
     validation: BaselineGeneratedExecutionValidation,
     dispatch_config: DispatchConfig,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::from_config(dispatch_config);
+    execute_baseline_generated_code_with_metrics_and_validation_and_dispatch_budget(
+        request,
+        metrics,
+        validation,
+        &mut dispatch_budget,
+    )
+}
+
+pub(crate) fn execute_baseline_generated_code_with_metrics_and_validation_and_dispatch_budget(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+    validation: BaselineGeneratedExecutionValidation,
+    dispatch_budget: &mut DispatchBudget,
+) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
     match execute_baseline_generated_code_internal(
         request,
         None,
         None,
         None,
         Some(metrics),
-        dispatch_config,
+        dispatch_budget,
         validation,
     )? {
         BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
@@ -1742,13 +1759,14 @@ pub(crate) fn execute_baseline_generated_code_with_generated_call_link_sidecar(
     request: BaselineGeneratedExecutionRequest<'_, '_>,
     sidecar: &mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::unbounded();
     match execute_baseline_generated_code_internal(
         request,
         None,
         None,
         Some(sidecar),
         None,
-        DispatchConfig::unbounded(),
+        &mut dispatch_budget,
         BaselineGeneratedExecutionValidation::Full,
     )? {
         BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
@@ -1805,13 +1823,30 @@ pub(crate) fn execute_baseline_generated_code_with_generated_call_link_sidecar_a
     validation: BaselineGeneratedExecutionValidation,
     dispatch_config: DispatchConfig,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::from_config(dispatch_config);
+    execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation_and_dispatch_budget(
+        request,
+        sidecar,
+        metrics,
+        validation,
+        &mut dispatch_budget,
+    )
+}
+
+pub(crate) fn execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation_and_dispatch_budget(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    sidecar: &mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+    validation: BaselineGeneratedExecutionValidation,
+    dispatch_budget: &mut DispatchBudget,
+) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
     match execute_baseline_generated_code_internal(
         request,
         None,
         None,
         Some(sidecar),
         Some(metrics),
-        dispatch_config,
+        dispatch_budget,
         validation,
     )? {
         BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
@@ -1861,13 +1896,14 @@ pub(crate) fn execute_baseline_generated_code_with_property_sidecars(
     request: BaselineGeneratedExecutionRequest<'_, '_>,
     property_sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::unbounded();
     match execute_baseline_generated_code_internal(
         request,
         None,
         Some(property_sidecars),
         None,
         None,
-        DispatchConfig::unbounded(),
+        &mut dispatch_budget,
         BaselineGeneratedExecutionValidation::Full,
     )? {
         BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
@@ -1924,13 +1960,30 @@ pub(crate) fn execute_baseline_generated_code_with_property_sidecars_and_metrics
     validation: BaselineGeneratedExecutionValidation,
     dispatch_config: DispatchConfig,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::from_config(dispatch_config);
+    execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation_and_dispatch_budget(
+        request,
+        property_sidecars,
+        metrics,
+        validation,
+        &mut dispatch_budget,
+    )
+}
+
+pub(crate) fn execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation_and_dispatch_budget(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    property_sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+    validation: BaselineGeneratedExecutionValidation,
+    dispatch_budget: &mut DispatchBudget,
+) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
     match execute_baseline_generated_code_internal(
         request,
         None,
         Some(property_sidecars),
         None,
         Some(metrics),
-        dispatch_config,
+        dispatch_budget,
         validation,
     )? {
         BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
@@ -1957,13 +2010,14 @@ pub(crate) fn execute_baseline_generated_code_with_property_and_call_link_sideca
     property_sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
     generated_call_link_sidecar: &mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::unbounded();
     match execute_baseline_generated_code_internal(
         request,
         None,
         Some(property_sidecars),
         Some(generated_call_link_sidecar),
         None,
-        DispatchConfig::unbounded(),
+        &mut dispatch_budget,
         BaselineGeneratedExecutionValidation::Full,
     )? {
         BaselineGeneratedExecutionWithRuntimeHelpersResult::Completed(completion) => {
@@ -1989,21 +2043,36 @@ pub(crate) fn execute_baseline_generated_code_with_runtime_helpers<'proof>(
     request: BaselineGeneratedExecutionRequest<'_, '_>,
     runtime_helper_plan: BaselineGeneratedRuntimeHelperPlan<'proof>,
 ) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::unbounded();
     execute_baseline_generated_code_internal(
         request,
         Some(runtime_helper_plan),
         None,
         None,
         None,
-        DispatchConfig::unbounded(),
+        &mut dispatch_budget,
         BaselineGeneratedExecutionValidation::Full,
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_dispatch_config<'proof>(
     request: BaselineGeneratedExecutionRequest<'_, '_>,
     runtime_helper_plan: BaselineGeneratedRuntimeHelperPlan<'proof>,
     dispatch_config: DispatchConfig,
+) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::from_config(dispatch_config);
+    execute_baseline_generated_code_with_runtime_helpers_and_dispatch_budget(
+        request,
+        runtime_helper_plan,
+        &mut dispatch_budget,
+    )
+}
+
+pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_dispatch_budget<'proof>(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    runtime_helper_plan: BaselineGeneratedRuntimeHelperPlan<'proof>,
+    dispatch_budget: &mut DispatchBudget,
 ) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
     execute_baseline_generated_code_internal(
         request,
@@ -2011,7 +2080,7 @@ pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_dispatch_
         None,
         None,
         None,
-        dispatch_config,
+        dispatch_budget,
         BaselineGeneratedExecutionValidation::Full,
     )
 }
@@ -2056,13 +2125,32 @@ pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_metrics_a
     validation: BaselineGeneratedExecutionValidation,
     dispatch_config: DispatchConfig,
 ) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::from_config(dispatch_config);
+    execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation_and_dispatch_budget(
+        request,
+        runtime_helper_plan,
+        metrics,
+        validation,
+        &mut dispatch_budget,
+    )
+}
+
+pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation_and_dispatch_budget<
+    'proof,
+>(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    runtime_helper_plan: BaselineGeneratedRuntimeHelperPlan<'proof>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+    validation: BaselineGeneratedExecutionValidation,
+    dispatch_budget: &mut DispatchBudget,
+) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
     execute_baseline_generated_code_internal(
         request,
         Some(runtime_helper_plan),
         None,
         None,
         Some(metrics),
-        dispatch_config,
+        dispatch_budget,
         validation,
     )
 }
@@ -2074,13 +2162,14 @@ pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_sidecars<
     property_sidecars: Option<&mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>>,
     generated_call_link_sidecar: Option<&mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>>,
 ) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::unbounded();
     execute_baseline_generated_code_internal(
         request,
         Some(runtime_helper_plan),
         property_sidecars,
         generated_call_link_sidecar,
         None,
-        DispatchConfig::unbounded(),
+        &mut dispatch_budget,
         BaselineGeneratedExecutionValidation::Full,
     )
 }
@@ -2137,13 +2226,36 @@ pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_sidecars_
     validation: BaselineGeneratedExecutionValidation,
     dispatch_config: DispatchConfig,
 ) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    let mut dispatch_budget = DispatchBudget::from_config(dispatch_config);
+    execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_budget(
+        request,
+        runtime_helper_plan,
+        property_sidecars,
+        generated_call_link_sidecar,
+        metrics,
+        validation,
+        &mut dispatch_budget,
+    )
+}
+
+pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_budget<
+    'proof,
+>(
+    request: BaselineGeneratedExecutionRequest<'_, '_>,
+    runtime_helper_plan: BaselineGeneratedRuntimeHelperPlan<'proof>,
+    property_sidecars: Option<&mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>>,
+    generated_call_link_sidecar: Option<&mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>>,
+    metrics: &mut BaselineGeneratedExecutionMetrics,
+    validation: BaselineGeneratedExecutionValidation,
+    dispatch_budget: &mut DispatchBudget,
+) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
     execute_baseline_generated_code_internal(
         request,
         Some(runtime_helper_plan),
         property_sidecars,
         generated_call_link_sidecar,
         Some(metrics),
-        dispatch_config,
+        dispatch_budget,
         validation,
     )
 }
@@ -2154,7 +2266,7 @@ fn execute_baseline_generated_code_internal(
     mut property_sidecars: Option<&mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>>,
     mut generated_call_link_sidecar: Option<&mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>>,
     mut metrics: Option<&mut BaselineGeneratedExecutionMetrics>,
-    dispatch_config: DispatchConfig,
+    dispatch_budget: &mut DispatchBudget,
     validation: BaselineGeneratedExecutionValidation,
 ) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
     let BaselineGeneratedExecutionRequest {
@@ -2202,18 +2314,15 @@ fn execute_baseline_generated_code_internal(
     let mut pc = frame
         .bytecode_index
         .unwrap_or_else(|| BytecodeIndex::from_offset(0));
-    let mut steps = 0usize;
     loop {
         // C++ Baseline JIT emits native code for each bytecode in
         // JIT::privateCompileMainPass and uses op_loop_hint's executeCounter for
         // tiering/fuzzing, not a dispatch-loop cap. This Rust-only guard exists
         // because the current "generated" executor is still a bytecode
-        // re-interpreter, so octane_probe --dispatch-steps must bound each
-        // generated executor invocation too.
-        if steps >= dispatch_config.max_steps {
-            return Err(ExecutionError::DispatchStepLimitExceeded.into());
-        }
-        steps = steps.saturating_add(1);
+        // re-interpreter. It spends the VM/source-entry DispatchBudget instead
+        // of resetting per generated resume, matching C++'s outer VMEntryScope
+        // watchdog/trap shape rather than changing JS-visible semantics.
+        dispatch_budget.spend_step()?;
 
         let ordinal = pc.offset() as usize;
         if ordinal >= instruction_count {

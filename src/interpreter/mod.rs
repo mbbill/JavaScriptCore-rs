@@ -29574,6 +29574,35 @@ impl Default for DispatchConfig {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DispatchBudget {
+    remaining_steps: usize,
+}
+
+impl DispatchBudget {
+    pub(crate) const fn from_config(config: DispatchConfig) -> Self {
+        Self {
+            remaining_steps: config.max_steps,
+        }
+    }
+
+    pub(crate) const fn unbounded() -> Self {
+        Self {
+            remaining_steps: usize::MAX,
+        }
+    }
+
+    pub(crate) fn spend_step(&mut self) -> Result<(), ExecutionError> {
+        if self.remaining_steps == 0 {
+            return Err(ExecutionError::DispatchStepLimitExceeded);
+        }
+        if self.remaining_steps != usize::MAX {
+            self.remaining_steps = self.remaining_steps.saturating_sub(1);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InstructionView<'a> {
     Typed(&'a TypedInstruction),
@@ -29652,12 +29681,13 @@ pub fn execute_code_block<H: DispatchHost>(
     config: DispatchConfig,
 ) -> ExecutionCompletion {
     let mut root_scope = InterpreterRootSyncScope::new();
+    let mut dispatch_budget = DispatchBudget::from_config(config);
     execute_code_block_with_resume(
         execution,
         code_block_id,
         code_block,
         host,
-        config,
+        &mut dispatch_budget,
         None,
         InterpreterCallHandling::direct_interpreter(),
         &mut root_scope,
@@ -29674,12 +29704,13 @@ pub(crate) fn execute_baseline_fallback<H: DispatchHost>(
     config: DispatchConfig,
 ) -> ExecutionCompletion {
     let mut root_scope = InterpreterRootSyncScope::new();
+    let mut dispatch_budget = DispatchBudget::from_config(config);
     execute_code_block_with_resume(
         execution,
         request.code_block,
         code_block,
         host,
-        config,
+        &mut dispatch_budget,
         Some(request),
         InterpreterCallHandling::direct_interpreter(),
         &mut root_scope,
@@ -29687,6 +29718,7 @@ pub(crate) fn execute_baseline_fallback<H: DispatchHost>(
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn execute_code_block_deferring_ordinary_calls_with_root_scope<H: DispatchHost>(
     execution: InterpreterExecutionState<'_>,
     code_block_id: CodeBlockId,
@@ -29695,12 +29727,33 @@ pub(crate) fn execute_code_block_deferring_ordinary_calls_with_root_scope<H: Dis
     config: DispatchConfig,
     root_scope: &mut InterpreterRootSyncScope,
 ) -> ExecutionCompletion {
+    let mut dispatch_budget = DispatchBudget::from_config(config);
+    execute_code_block_deferring_ordinary_calls_with_root_scope_and_dispatch_budget(
+        execution,
+        code_block_id,
+        code_block,
+        host,
+        &mut dispatch_budget,
+        root_scope,
+    )
+}
+
+pub(crate) fn execute_code_block_deferring_ordinary_calls_with_root_scope_and_dispatch_budget<
+    H: DispatchHost,
+>(
+    execution: InterpreterExecutionState<'_>,
+    code_block_id: CodeBlockId,
+    code_block: &CodeBlock,
+    host: &mut H,
+    dispatch_budget: &mut DispatchBudget,
+    root_scope: &mut InterpreterRootSyncScope,
+) -> ExecutionCompletion {
     execute_code_block_with_resume(
         execution,
         code_block_id,
         code_block,
         host,
-        config,
+        dispatch_budget,
         None,
         InterpreterCallHandling::defer_to_vm(),
         root_scope,
@@ -29708,6 +29761,7 @@ pub(crate) fn execute_code_block_deferring_ordinary_calls_with_root_scope<H: Dis
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn execute_baseline_fallback_deferring_ordinary_calls_with_root_scope<
     H: DispatchHost,
 >(
@@ -29719,12 +29773,35 @@ pub(crate) fn execute_baseline_fallback_deferring_ordinary_calls_with_root_scope
     root_scope: &mut InterpreterRootSyncScope,
     root_scope_mode: InterpreterRootScopeMode,
 ) -> ExecutionCompletion {
+    let mut dispatch_budget = DispatchBudget::from_config(config);
+    execute_baseline_fallback_deferring_ordinary_calls_with_root_scope_and_dispatch_budget(
+        execution,
+        request,
+        code_block,
+        host,
+        &mut dispatch_budget,
+        root_scope,
+        root_scope_mode,
+    )
+}
+
+pub(crate) fn execute_baseline_fallback_deferring_ordinary_calls_with_root_scope_and_dispatch_budget<
+    H: DispatchHost,
+>(
+    execution: InterpreterExecutionState<'_>,
+    request: BaselineFallbackRequest,
+    code_block: &CodeBlock,
+    host: &mut H,
+    dispatch_budget: &mut DispatchBudget,
+    root_scope: &mut InterpreterRootSyncScope,
+    root_scope_mode: InterpreterRootScopeMode,
+) -> ExecutionCompletion {
     execute_code_block_with_resume(
         execution,
         request.code_block,
         code_block,
         host,
-        config,
+        dispatch_budget,
         Some(request),
         InterpreterCallHandling::defer_to_vm(),
         root_scope,
@@ -29918,7 +29995,7 @@ fn execute_code_block_with_resume<H: DispatchHost>(
     code_block_id: CodeBlockId,
     code_block: &CodeBlock,
     host: &mut H,
-    config: DispatchConfig,
+    dispatch_budget: &mut DispatchBudget,
     resume: Option<BaselineFallbackRequest>,
     call_handling: InterpreterCallHandling,
     root_scope: &mut InterpreterRootSyncScope,
@@ -29949,7 +30026,6 @@ fn execute_code_block_with_resume<H: DispatchHost>(
             (frame, pc)
         }
     };
-    let mut steps = 0usize;
 
     if let Err(error) = sync_targeted_frame_roots_for_dispatch_entry(
         frame.id,
@@ -30006,17 +30082,21 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                 ExecutionCompletion::Terminated(reason),
             );
         }
-        if steps >= config.max_steps {
+        // C++ JSC executes a VM entry under VMEntryScope and services watchdog
+        // timeouts through VM traps; it does not maintain a bytecode dispatch
+        // counter. Rust's diagnostic `octane_probe --dispatch-steps` guard must
+        // therefore be VM/source-entry scoped, not reset for each fallback or
+        // generated shim that re-enters this interpreter loop.
+        if let Err(error) = dispatch_budget.spend_step() {
             return finish_with_root_scope_cleanup(
                 execution.heap,
                 root_scope,
                 root_scope_mode,
                 frame.id,
                 frame.register_window,
-                ExecutionCompletion::Failed(ExecutionError::DispatchStepLimitExceeded),
+                ExecutionCompletion::Failed(error),
             );
         }
-        steps = steps.saturating_add(1);
 
         let index = pc.offset() as usize;
         let Some(view) = cursor.get(index) else {
