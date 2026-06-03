@@ -24,10 +24,10 @@
 - MUST keep Rust files, modules, types, traits, and ownership boundaries
   recognizably mapped to C++ JSC files, classes, structs, enums, and subsystem
   boundaries.
-- MUST keep oversized Rust files shrinking: any non-trivial behavior that would
-  land in a source file over 3,000 lines or already mixing multiple C++ JSC
-  subsystems must use a JSC-mapped extraction boundary or a documented minimal
-  emergency exception.
+- MUST keep oversized Rust files shrinking: any non-trivial change that would
+  make a source file exceed 3,000 lines, grow one already over 3,000 lines, or
+  further mix unrelated C++ JSC subsystems must use a JSC-mapped extraction
+  boundary or a documented minimal emergency exception.
 - MUST map any new non-trivial Rust file/type/state machine/cache/manager to a
   C++ JSC counterpart or to a Rust ownership/rooting/safety requirement.
 - MUST comment every non-obvious permanent Rust divergence at the code site:
@@ -157,11 +157,10 @@ project-owner input is genuinely required.
 - PAUSE if a change adds a non-trivial file/type without a C++ counterpart or
   Rust safety reason; require a JSC mapping, require a code-commented safety
   justification, or reject/remove it.
-- PAUSE if a patch grows a huge mixed-responsibility file; require a split by
-  C++ JSC subsystem/class ownership before accepting behavior changes.
-- PAUSE if a non-trivial patch adds behavior to an oversized
-  mixed-responsibility file without an extraction boundary or emergency
-  exception rationale.
+- PAUSE if a patch would make a file oversized, grow an oversized file with
+  behavior, or further mix unrelated C++ JSC subsystem ownership; require a
+  JSC-mapped extraction boundary before accepting behavior changes, unless it is
+  minimal documented emergency glue.
 - PAUSE if the tree is accumulating accepted work without commits or isolation;
   commit accepted batches or move new work into an isolated worktree/workspace.
 
@@ -245,8 +244,9 @@ first-pass review batches. Subagents do not redefine project architecture.
   report the architecture question to the main agent before editing.
 - PAUSE if a non-trivial file/type lacks a C++ counterpart or Rust safety
   reason; map it, justify it, or ask the main agent to decide.
-- PAUSE if the patch is growing a huge mixed-responsibility file; propose a
-  split by C++ JSC subsystem/class ownership before adding behavior.
+- PAUSE if the patch would make a file oversized, grow an oversized file with
+  behavior, or further mix unrelated C++ JSC subsystem ownership; propose a
+  JSC-mapped extraction boundary before adding behavior.
 
 ### Implementation Final Report MUST INCLUDE
 
