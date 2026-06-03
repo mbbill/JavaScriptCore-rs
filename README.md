@@ -34,6 +34,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
                  GuardedPrototypeData loads now use the C++ GetByIdPrototype-shaped
                  receiver-structure + holder/offset fast path, with the 500k richards cap
                  still showing owner 110@32/76 heat and zero generated invalidations.
+                 Generated Call/CallWithThis sidecars now carry same-dispatch setup payloads
+                 into VM direct-call validation, avoiding duplicate argument register reads
+                 while preserving the generated re-interpreter as the broad blocker.
   Phase 2 [done] Octane feature completeness: all 15 benchmarks RUN correctly. Ground-truth
                  2026-05-30: ZERO throwers/aborts -- 3 score, 12 functional-but-slow
                  (perf-gated, Phase 1). Landed: implicit-global store, indirect eval, catchable
@@ -167,6 +170,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
           handoffs no longer require an extra Rust hot-slot hit before rootless dispatch;
           missing generated artifacts stay on the rooted CallLinkInfo::linkFor-style slow path
           and become rootless only after that path prepares the callee artifact
+    [done] generated Call/CallWithThis setup payload: sidecars carry the C++ JITCall.cpp-shaped
+           same-dispatch this+argument frame setup snapshot into VM CallLinkInfo validation;
+           malformed payloads fall back, and plain Call preserves implicit undefined this
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
   [wip] arrays and indexed storage
@@ -289,6 +295,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          but now reports owner/opcode plus owner/site/opcode/readiness heat for the next C++
          JIT::emit_op_* selection (owner 110 GetByName=47,408; first surfaced GetByName site
          owner 110@32 GuardedPrototypeData=7,611)
+  [done] generated call-link setup-payload evidence: reviewer accepted extraction + payload
+         after the plain-Call implicit-this guard; focused payload/hot-slot/rootless tests and
+         full gates pass; 500k capped richards still exits at DispatchStepLimitExceeded with
+         invalidations=0, rootless_rejections=0, sidecar_hot_slot_hits=28,548, and owner
+         110@36 CallWithThis heat=7,612
   [done] macOS arm64 return-seed native evidence: focused tests prove constants, moves,
          frame/argument, and callee returns enter real ARM64 native entry without generated
          execution; arithmetic fallback keeps the existing x86_64 semantic artifact path

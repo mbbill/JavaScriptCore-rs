@@ -17,9 +17,8 @@ use crate::interpreter::{
     baseline_active_frame, baseline_read_register, baseline_return_register,
     baseline_write_register, create_call_return_continuation, BaselineFallbackRequest,
     CallReturnContinuation, CallReturnContinuationRequest, CallReturnKind, DispatchBudget,
-    DispatchConfig, DispatchHost, ExecutionCompletion, ExecutionError,
-    GeneratedNativeIntrinsicCallRequest, GeneratedNativeIntrinsicCallResult,
-    InterpreterExecutionState, RegisterWindow,
+    DispatchConfig, DispatchHost, ExecutionCompletion, ExecutionError, InterpreterExecutionState,
+    RegisterWindow,
 };
 pub(crate) use crate::jit::generated_metrics::BaselineGeneratedExecutionMetrics;
 use crate::jit::ic::{
@@ -46,17 +45,16 @@ use crate::jit::{
     BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableValidationError,
     BaselineSupportedOpcodeSubset, CacheKey, CallBoundaryId, GeneratedCallLinkCandidate,
     GeneratedCallLinkCandidateTable, GeneratedCallLinkDirectCallStatus,
-    GeneratedCallLinkProbeMissReason, GeneratedCallLinkProbeRequest, GeneratedCallLinkProbeResult,
-    GeneratedGuardedPropertyLoadProbeMissReason, GeneratedPropertyHasMegamorphicCandidateTable,
-    GeneratedPropertyHasMegamorphicLookup, GeneratedPropertyLoadMegamorphicCandidateTable,
-    GeneratedPropertyLoadProbeMissReason, GeneratedPropertyStoreMegamorphicCandidateTable,
-    GeneratedPropertyStoreMegamorphicLookup, GeneratedPropertyStoreProbeMissReason,
-    GeneratedPropertyStoreProbeRequest, GeneratedPropertyStoreProbeResult,
-    InlineCacheFallbackSemantics, InlineCacheKind, InlineCacheSlotId, JitCodeValidationError,
-    JitPlanValidationError, PropertyLoadAccessCasePlanTable, PropertyLoadGuardChainOutcome,
-    PropertyLoadGuardRequirement, PropertyLoadGuardedCandidateKind,
-    PropertyLoadGuardedCandidateTable, PropertyStoreAccessCasePlan,
-    PropertyStoreAccessCasePlanKind, PropertyStoreMutationCandidate,
+    GeneratedCallLinkProbeMissReason, GeneratedGuardedPropertyLoadProbeMissReason,
+    GeneratedPropertyHasMegamorphicCandidateTable, GeneratedPropertyHasMegamorphicLookup,
+    GeneratedPropertyLoadMegamorphicCandidateTable, GeneratedPropertyLoadProbeMissReason,
+    GeneratedPropertyStoreMegamorphicCandidateTable, GeneratedPropertyStoreMegamorphicLookup,
+    GeneratedPropertyStoreProbeMissReason, GeneratedPropertyStoreProbeRequest,
+    GeneratedPropertyStoreProbeResult, InlineCacheFallbackSemantics, InlineCacheKind,
+    InlineCacheSlotId, JitCodeValidationError, JitPlanValidationError,
+    PropertyLoadAccessCasePlanTable, PropertyLoadGuardChainOutcome, PropertyLoadGuardRequirement,
+    PropertyLoadGuardedCandidateKind, PropertyLoadGuardedCandidateTable,
+    PropertyStoreAccessCasePlan, PropertyStoreAccessCasePlanKind, PropertyStoreMutationCandidate,
     PropertyStoreMutationCandidateTable, WatchpointSetId,
 };
 use crate::object::PropertyOffset;
@@ -64,9 +62,17 @@ use crate::runtime::{CallFrameId, CodeBlockId, ExecutableId, ObjectId, RuntimeVa
 use crate::strings::{PropertyIndex, PropertyKey};
 use crate::value::{NumberValue, ValueKind};
 
+mod generated_call_link;
 mod generated_property_load;
 mod generated_readiness;
 
+#[cfg(test)]
+use generated_call_link::execute_generated_call_link_sidecar_probe_with_host;
+use generated_call_link::{
+    execute_generated_call_link_property_sidecar_probe, execute_generated_call_link_sidecar_probe,
+    execute_generated_native_intrinsic_call_property_sidecar_probe,
+    execute_generated_native_intrinsic_call_sidecar_probe, GeneratedCallLinkSidecarAttempt,
+};
 use generated_property_load::execute_property_load_sidecar_candidate;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -952,6 +958,22 @@ pub(crate) struct BaselineGeneratedJsDirectCall {
     pub(crate) this_value: RuntimeValue,
     pub(crate) this_object: Option<ObjectId>,
     pub(crate) argument_count_including_this: u32,
+    // Rust-only same-dispatch setup payload: C++ Baseline JIT has already
+    // materialized the callee frame slots before CallLinkInfo::emitFastPath()
+    // branches to the monomorphic destination. The Rust generated sidecar reads
+    // the equivalent values while executing the call opcode and carries them to
+    // VM direct-call validation so the VM does not re-decode and re-read the
+    // caller registers. VM validation remains the authority for the target,
+    // route, artifact, continuation, and rooting checks before these values can
+    // seed a direct call.
+    pub(crate) setup_payload: Option<BaselineGeneratedJsDirectCallSetupPayload>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BaselineGeneratedJsDirectCallSetupPayload {
+    pub(crate) this_value: RuntimeValue,
+    pub(crate) this_object: Option<ObjectId>,
+    pub(crate) argument_values_including_this: Vec<RuntimeValue>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3201,477 +3223,12 @@ fn execute_native_entry_shim_instruction(
     execute_instruction(context, window, execution, instruction, None, None)
 }
 
-struct GeneratedCallLinkSidecarAttempt<'code, 'instruction> {
-    window: RegisterWindow,
-    code_block: &'code CodeBlock,
-    fallback: BaselineGeneratedFallbackSite,
-    owner: CodeBlockId,
-    opcode: CoreOpcode,
-    instruction: DecodedInstruction<'instruction>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GeneratedCallLinkSidecarOperands {
-    argument_count_including_this: u32,
-    callee_value: RuntimeValue,
-    callee_value_kind: ValueKind,
-    callee_object: Option<ObjectId>,
-    this_value: RuntimeValue,
-    this_value_kind: ValueKind,
-    this_object: Option<ObjectId>,
-}
-
-fn execute_generated_native_intrinsic_call_sidecar_probe(
-    sidecar: &mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>,
-    execution: &mut InterpreterExecutionState<'_>,
-    attempt: GeneratedCallLinkSidecarAttempt<'_, '_>,
-) -> Result<Option<BaselineInstructionOutcome>, BaselineInstructionAbort> {
-    let BaselineGeneratedCallLinkExecutionSidecar { dispatch_host, .. } = sidecar;
-    execute_generated_native_intrinsic_call_probe_with_host(
-        &mut **dispatch_host,
-        execution,
-        attempt,
-    )
-}
-
-fn execute_generated_native_intrinsic_call_property_sidecar_probe(
-    sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
-    execution: &mut InterpreterExecutionState<'_>,
-    attempt: GeneratedCallLinkSidecarAttempt<'_, '_>,
-) -> Result<Option<BaselineInstructionOutcome>, BaselineInstructionAbort> {
-    let BaselineGeneratedPropertyExecutionSidecars { dispatch_host, .. } = sidecars;
-    execute_generated_native_intrinsic_call_probe_with_host(
-        &mut **dispatch_host,
-        execution,
-        attempt,
-    )
-}
-
-fn execute_generated_native_intrinsic_call_probe_with_host(
-    dispatch_host: &mut dyn DispatchHost,
-    execution: &mut InterpreterExecutionState<'_>,
-    attempt: GeneratedCallLinkSidecarAttempt<'_, '_>,
-) -> Result<Option<BaselineInstructionOutcome>, BaselineInstructionAbort> {
-    let GeneratedCallLinkSidecarAttempt {
-        window,
-        code_block,
-        fallback,
-        owner,
-        opcode,
-        instruction,
-    } = attempt;
-    let destination = register_operand_or_fallback(instruction, 0, fallback)?;
-    let callee_register = register_operand_or_fallback(instruction, 1, fallback)?;
-    let callee_value =
-        read_register_or_outcome(execution, code_block, window, callee_register, fallback)?;
-    let (this_value, provided_argument_count, first_argument_operand) = match opcode {
-        CoreOpcode::CallWithThis => {
-            let this_register = register_operand_or_fallback(instruction, 2, fallback)?;
-            let this_value =
-                read_register_or_outcome(execution, code_block, window, this_register, fallback)?;
-            let argument_count = unsigned_immediate_operand_or_fallback(instruction, 3, fallback)?;
-            (this_value, argument_count, 4)
-        }
-        CoreOpcode::Call => {
-            let argument_count = unsigned_immediate_operand_or_fallback(instruction, 2, fallback)?;
-            (RuntimeValue::undefined(), argument_count, 3)
-        }
-        _ => return Ok(None),
-    };
-    let first_argument = if provided_argument_count == 0 {
-        None
-    } else {
-        let argument_register =
-            register_operand_or_fallback(instruction, first_argument_operand, fallback)?;
-        Some(read_register_or_outcome(
-            execution,
-            code_block,
-            window,
-            argument_register,
-            fallback,
-        )?)
-    };
-    let second_argument = if provided_argument_count <= 1 {
-        None
-    } else {
-        let second_argument_operand = first_argument_operand.saturating_add(1);
-        let argument_register =
-            register_operand_or_fallback(instruction, second_argument_operand, fallback)?;
-        Some(read_register_or_outcome(
-            execution,
-            code_block,
-            window,
-            argument_register,
-            fallback,
-        )?)
-    };
-    let request = GeneratedNativeIntrinsicCallRequest {
-        owner,
-        bytecode_index: instruction.bytecode_index,
-        opcode,
-        callee_value,
-        this_value,
-        provided_argument_count,
-        first_argument,
-        second_argument,
-    };
-    match DispatchHost::dispatch_generated_native_intrinsic_call(
-        dispatch_host,
-        execution.heap,
-        request,
-    ) {
-        GeneratedNativeIntrinsicCallResult::Hit(hit) => {
-            write_register_or_outcome(execution, window, destination, hit.value, fallback).map(Some)
-        }
-        GeneratedNativeIntrinsicCallResult::Miss(_) => Ok(None),
-    }
-}
-
-fn execute_generated_call_link_sidecar_probe(
-    sidecar: &mut BaselineGeneratedCallLinkExecutionSidecar<'_, '_>,
-    execution: &mut InterpreterExecutionState<'_>,
-    attempt: GeneratedCallLinkSidecarAttempt<'_, '_>,
-) -> Result<Option<BaselineGeneratedJsDirectCall>, BaselineInstructionAbort> {
-    let BaselineGeneratedCallLinkExecutionSidecar {
-        candidate_table,
-        direct_call_hot_slots,
-        dispatch_host,
-        probe_miss_records,
-        probe_blocked_records,
-        direct_call_hot_slot_hits,
-    } = sidecar;
-    execute_generated_call_link_sidecar_probe_with_host(
-        candidate_table,
-        direct_call_hot_slots,
-        &mut **dispatch_host,
-        probe_miss_records,
-        probe_blocked_records,
-        direct_call_hot_slot_hits,
-        execution,
-        attempt,
-    )
-}
-
-fn execute_generated_call_link_property_sidecar_probe(
-    sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
-    execution: &mut InterpreterExecutionState<'_>,
-    attempt: GeneratedCallLinkSidecarAttempt<'_, '_>,
-) -> Result<Option<BaselineGeneratedJsDirectCall>, BaselineInstructionAbort> {
-    let BaselineGeneratedPropertyExecutionSidecars {
-        generated_call_link_candidate_table,
-        generated_direct_call_hot_slots,
-        dispatch_host,
-        generated_call_link_probe_miss_records,
-        generated_call_link_probe_blocked_records,
-        generated_direct_call_hot_slot_hits,
-        ..
-    } = sidecars;
-    let Some(candidate_table) = *generated_call_link_candidate_table else {
-        return Ok(None);
-    };
-    execute_generated_call_link_sidecar_probe_with_host(
-        candidate_table,
-        generated_direct_call_hot_slots,
-        &mut **dispatch_host,
-        generated_call_link_probe_miss_records,
-        generated_call_link_probe_blocked_records,
-        generated_direct_call_hot_slot_hits,
-        execution,
-        attempt,
-    )
-}
-
-fn execute_generated_call_link_sidecar_probe_with_host(
-    candidate_table: &GeneratedCallLinkCandidateTable,
-    direct_call_hot_slots: &[BaselineGeneratedJsDirectCallHotSlot],
-    dispatch_host: &mut dyn DispatchHost,
-    probe_miss_records: &mut Vec<BaselineGeneratedCallLinkProbeMissRecord>,
-    probe_blocked_records: &mut Vec<BaselineGeneratedCallLinkProbeBlockedRecord>,
-    direct_call_hot_slot_hits: &mut usize,
-    execution: &mut InterpreterExecutionState<'_>,
-    attempt: GeneratedCallLinkSidecarAttempt<'_, '_>,
-) -> Result<Option<BaselineGeneratedJsDirectCall>, BaselineInstructionAbort> {
-    let GeneratedCallLinkSidecarAttempt {
-        window,
-        code_block,
-        fallback,
-        owner,
-        opcode,
-        instruction,
-    } = attempt;
-    let bytecode_index = instruction.bytecode_index;
-    if candidate_table.owner() != owner {
-        return Ok(None);
-    }
-
-    let candidates = candidate_table
-        .candidates_for_bytecode_index(bytecode_index.offset())
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        probe_miss_records.push(call_link_probe_miss_record(
-            owner,
-            bytecode_index,
-            None,
-            GeneratedCallLinkProbeMissReason::CandidateNotFound,
-        ));
-        return Ok(None);
-    }
-
-    let operands =
-        generated_call_link_sidecar_operands(execution, code_block, window, instruction, fallback)?;
-    if let Some(direct_call) = generated_call_link_hot_slot_direct_call(
-        direct_call_hot_slots,
-        &candidates,
-        owner,
-        opcode,
-        bytecode_index,
-        operands,
-    ) {
-        *direct_call_hot_slot_hits = direct_call_hot_slot_hits.saturating_add(1);
-        return Ok(Some(direct_call));
-    }
-
-    let candidates_to_probe = match operands.callee_object {
-        Some(callee_object) => {
-            let matching = candidates
-                .iter()
-                .copied()
-                .filter(|candidate| candidate.target.callee == callee_object)
-                .collect::<Vec<_>>();
-            if matching.is_empty() {
-                probe_miss_records.push(call_link_probe_miss_record(
-                    owner,
-                    bytecode_index,
-                    candidates.first().copied(),
-                    GeneratedCallLinkProbeMissReason::CalleeMismatch,
-                ));
-                return Ok(None);
-            }
-            matching
-        }
-        None => candidates,
-    };
-    for candidate in candidates_to_probe {
-        let request = GeneratedCallLinkProbeRequest::new(
-            candidate,
-            owner,
-            opcode,
-            bytecode_index.offset(),
-            operands.argument_count_including_this,
-            operands.callee_value,
-            operands.callee_value_kind,
-            operands.callee_object,
-            operands.this_value,
-            operands.this_value_kind,
-            operands.this_object,
-        );
-        match DispatchHost::probe_generated_call_link(dispatch_host, execution.heap, request) {
-            GeneratedCallLinkProbeResult::DirectCall(authorization) => {
-                let Some(callee_object) = operands.callee_object else {
-                    probe_miss_records.push(call_link_probe_miss_record(
-                        owner,
-                        bytecode_index,
-                        Some(candidate),
-                        GeneratedCallLinkProbeMissReason::MissingCalleeIdentity,
-                    ));
-                    continue;
-                };
-                return Ok(Some(BaselineGeneratedJsDirectCall {
-                    candidate: candidate.clone(),
-                    authorization,
-                    callee_value: operands.callee_value,
-                    callee_object,
-                    this_value: operands.this_value,
-                    this_object: operands.this_object,
-                    argument_count_including_this: operands.argument_count_including_this,
-                }));
-            }
-            GeneratedCallLinkProbeResult::Blocked(blocked) => {
-                probe_blocked_records
-                    .push(call_link_probe_blocked_record(candidate, blocked.reason));
-            }
-            GeneratedCallLinkProbeResult::Miss(miss) => {
-                probe_miss_records.push(call_link_probe_miss_record(
-                    owner,
-                    bytecode_index,
-                    Some(candidate),
-                    miss.reason,
-                ));
-            }
-        }
-    }
-
-    Ok(None)
-}
-
-fn generated_call_link_hot_slot_direct_call(
-    hot_slots: &[BaselineGeneratedJsDirectCallHotSlot],
-    current_candidates: &[&GeneratedCallLinkCandidate],
-    owner: CodeBlockId,
-    opcode: CoreOpcode,
-    bytecode_index: BytecodeIndex,
-    operands: GeneratedCallLinkSidecarOperands,
-) -> Option<BaselineGeneratedJsDirectCall> {
-    let callee_object = operands.callee_object?;
-    hot_slots
-        .iter()
-        .find(|slot| {
-            slot.candidate.owner == owner
-                && slot.candidate.opcode == opcode
-                && slot.candidate.bytecode_index == bytecode_index.offset()
-                && slot.candidate.direct_call_status
-                    == GeneratedCallLinkDirectCallStatus::Authorized
-                && current_candidates
-                    .iter()
-                    .any(|candidate| *candidate == &slot.candidate)
-                && slot.candidate.target.callee == callee_object
-                && slot.callee_object == callee_object
-                && slot.argument_count_including_this == operands.argument_count_including_this
-        })
-        .map(|slot| BaselineGeneratedJsDirectCall {
-            candidate: slot.candidate.clone(),
-            authorization: slot.authorization,
-            callee_value: operands.callee_value,
-            callee_object,
-            this_value: operands.this_value,
-            this_object: operands.this_object,
-            argument_count_including_this: operands.argument_count_including_this,
-        })
-}
-
-fn generated_call_link_sidecar_operands(
-    execution: &mut InterpreterExecutionState<'_>,
-    code_block: &CodeBlock,
-    window: RegisterWindow,
-    instruction: DecodedInstruction<'_>,
-    fallback: BaselineGeneratedFallbackSite,
-) -> Result<GeneratedCallLinkSidecarOperands, BaselineInstructionAbort> {
-    let opcode = CoreOpcode::from_opcode(instruction.opcode);
-    let _destination = register_operand_or_fallback(instruction, 0, fallback)?;
-    let callee_register = register_operand_or_fallback(instruction, 1, fallback)?;
-    let callee_value =
-        read_register_or_outcome(execution, code_block, window, callee_register, fallback)?;
-    let callee_value_kind = callee_value.kind();
-    let callee_object = object_id_for_runtime_value(execution, callee_value);
-
-    let (this_value, provided_argument_count) = match opcode {
-        Some(CoreOpcode::CallWithThis) => {
-            let this_register = register_operand_or_fallback(instruction, 2, fallback)?;
-            let this_value =
-                read_register_or_outcome(execution, code_block, window, this_register, fallback)?;
-            let argument_count = unsigned_immediate_operand_or_fallback(instruction, 3, fallback)?;
-            (this_value, argument_count)
-        }
-        _ => {
-            let argument_count = unsigned_immediate_operand_or_fallback(instruction, 2, fallback)?;
-            (RuntimeValue::undefined(), argument_count)
-        }
-    };
-    let this_value_kind = this_value.kind();
-    let this_object = object_id_for_runtime_value(execution, this_value);
-
-    Ok(GeneratedCallLinkSidecarOperands {
-        argument_count_including_this: provided_argument_count.saturating_add(1),
-        callee_value,
-        callee_value_kind,
-        callee_object,
-        this_value,
-        this_value_kind,
-        this_object,
-    })
-}
-
 fn object_id_for_runtime_value(
     execution: &InterpreterExecutionState<'_>,
     value: RuntimeValue,
 ) -> Option<ObjectId> {
     let payload = value.as_cell()?.pointer_payload_bits();
     execution.heap.cell_for_payload(payload).map(ObjectId)
-}
-
-fn call_link_probe_miss_record(
-    owner: CodeBlockId,
-    bytecode_index: BytecodeIndex,
-    candidate: Option<&GeneratedCallLinkCandidate>,
-    reason: GeneratedCallLinkProbeMissReason,
-) -> BaselineGeneratedCallLinkProbeMissRecord {
-    let (
-        slot,
-        attachment_ordinal,
-        attachment_plan_ordinal,
-        install_recheck_ordinal,
-        boundary_validation_ordinal,
-        descriptor_ordinal,
-        observation_ordinal,
-        readiness_ordinal,
-        target_executable,
-        target_callee,
-        target_code_block,
-        target_boundary,
-        direct_call_status,
-    ) = match candidate {
-        Some(candidate) => (
-            Some(candidate.slot),
-            Some(candidate.attachment_ordinal),
-            Some(candidate.attachment_plan_ordinal),
-            Some(candidate.install_recheck_ordinal),
-            candidate.boundary_validation_ordinal,
-            candidate.descriptor_ordinal,
-            candidate.observation_ordinal,
-            candidate.readiness_ordinal,
-            Some(candidate.target.executable),
-            Some(candidate.target.callee),
-            Some(candidate.target.target_code_block),
-            Some(candidate.boundary.id),
-            Some(candidate.direct_call_status),
-        ),
-        None => (
-            None, None, None, None, None, None, None, None, None, None, None, None, None,
-        ),
-    };
-
-    BaselineGeneratedCallLinkProbeMissRecord {
-        owner,
-        bytecode_index,
-        slot,
-        attachment_ordinal,
-        attachment_plan_ordinal,
-        install_recheck_ordinal,
-        boundary_validation_ordinal,
-        descriptor_ordinal,
-        observation_ordinal,
-        readiness_ordinal,
-        target_executable,
-        target_callee,
-        target_code_block,
-        target_boundary,
-        direct_call_status,
-        reason,
-    }
-}
-
-fn call_link_probe_blocked_record(
-    candidate: &GeneratedCallLinkCandidate,
-    reason: GeneratedCallLinkProbeMissReason,
-) -> BaselineGeneratedCallLinkProbeBlockedRecord {
-    BaselineGeneratedCallLinkProbeBlockedRecord {
-        owner: candidate.owner,
-        bytecode_index: BytecodeIndex::from_offset(candidate.bytecode_index),
-        slot: candidate.slot,
-        attachment_ordinal: candidate.attachment_ordinal,
-        attachment_plan_ordinal: candidate.attachment_plan_ordinal,
-        install_recheck_ordinal: candidate.install_recheck_ordinal,
-        boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-        descriptor_ordinal: candidate.descriptor_ordinal,
-        observation_ordinal: candidate.observation_ordinal,
-        readiness_ordinal: candidate.readiness_ordinal,
-        target_executable: candidate.target.executable,
-        target_callee: candidate.target.callee,
-        target_code_block: candidate.target.target_code_block,
-        target_boundary: candidate.boundary.id,
-        direct_call_status: candidate.direct_call_status,
-        reason,
-    }
 }
 
 struct PropertyLoadSidecarAttempt<'code, 'instruction, 'site> {
@@ -7702,11 +7259,13 @@ mod tests {
             ),
             core_typed(
                 1,
-                CoreOpcode::Call,
+                CoreOpcode::CallWithThis,
                 vec![
                     Operand::Register(local(1)),
                     Operand::Register(local(2)),
-                    Operand::UnsignedImmediate(0),
+                    Operand::Register(local(3)),
+                    Operand::UnsignedImmediate(1),
+                    Operand::Register(local(4)),
                 ],
             ),
             core_typed(2, CoreOpcode::Return, vec![Operand::Register(local(1))]),
@@ -7719,7 +7278,7 @@ mod tests {
         let mut heap = Heap::new();
         let matching_cell = allocate_test_object_cell(&mut heap, matching_payload);
         let mut candidate = generated_call_link_candidate_for_target(
-            CoreOpcode::Call,
+            CoreOpcode::CallWithThis,
             InlineCacheSlotId(77),
             bytecode_index,
             ExecutableId(CellId(87)),
@@ -7742,12 +7301,16 @@ mod tests {
             candidate: candidate.clone(),
             authorization,
             callee_object: ObjectId(matching_cell),
-            argument_count_including_this: 1,
+            argument_count_including_this: 2,
         }];
         let table = generated_call_link_candidate_table(owner(), vec![candidate.clone()]);
         let frame = enter_program_frame(&mut stack, &mut registers, owner(), &block);
         let window = stack.top_frame().unwrap().register_window;
+        let this_value = RuntimeValue::from_i32(88);
+        let argument_value = RuntimeValue::from_i32(13);
         registers.write(window, local(2), matching_value).unwrap();
+        registers.write(window, local(3), this_value).unwrap();
+        registers.write(window, local(4), argument_value).unwrap();
         let instruction = block.decoded_instruction_at(bytecode_index).unwrap();
         let fallback = fallback_site(owner(), frame, instruction);
         let mut miss_records = Vec::new();
@@ -7773,7 +7336,7 @@ mod tests {
                 code_block: &block,
                 fallback,
                 owner: owner(),
-                opcode: CoreOpcode::Call,
+                opcode: CoreOpcode::CallWithThis,
                 instruction,
             },
         )
@@ -7784,8 +7347,16 @@ mod tests {
         assert_eq!(direct_call.authorization, authorization);
         assert_eq!(direct_call.callee_value, matching_value);
         assert_eq!(direct_call.callee_object, ObjectId(matching_cell));
-        assert_eq!(direct_call.this_value, RuntimeValue::undefined());
-        assert_eq!(direct_call.argument_count_including_this, 1);
+        assert_eq!(direct_call.this_value, this_value);
+        assert_eq!(direct_call.argument_count_including_this, 2);
+        assert_eq!(
+            direct_call.setup_payload,
+            Some(BaselineGeneratedJsDirectCallSetupPayload {
+                this_value,
+                this_object: None,
+                argument_values_including_this: vec![this_value, argument_value],
+            })
+        );
         assert_eq!(hot_slot_hits, 1);
         assert!(
             host.requests.is_empty(),

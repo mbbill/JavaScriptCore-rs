@@ -7811,6 +7811,7 @@ impl Vm {
                         this_value,
                         this_object,
                         argument_count_including_this,
+                        setup_payload: None,
                     });
                 }
                 GeneratedCallLinkProbeResult::Blocked(blocked) => {
@@ -11331,6 +11332,7 @@ impl Vm {
                 this_value,
                 this_object,
                 argument_count_including_this,
+                setup_payload: None,
             });
         }
 
@@ -11650,6 +11652,7 @@ impl Vm {
                 this_value,
                 this_object,
                 argument_count_including_this,
+                setup_payload: None,
             });
         }
 
@@ -36128,6 +36131,7 @@ mod tests {
             this_value: RuntimeValue::undefined(),
             this_object: None,
             argument_count_including_this: 1,
+            setup_payload: None,
         };
         vm.install_generated_direct_call_hot_slot(
             owner,
@@ -36757,6 +36761,7 @@ mod tests {
             this_value: RuntimeValue::undefined(),
             this_object: None,
             argument_count_including_this: 1,
+            setup_payload: None,
         };
         vm.install_generated_direct_call_hot_slot(
             owner,
@@ -36907,6 +36912,7 @@ mod tests {
             this_value: RuntimeValue::undefined(),
             this_object: None,
             argument_count_including_this: 2,
+            setup_payload: None,
         };
         vm.install_generated_direct_call_hot_slot(
             owner,
@@ -37106,6 +37112,7 @@ mod tests {
             this_value: RuntimeValue::undefined(),
             this_object: None,
             argument_count_including_this: 2,
+            setup_payload: None,
         };
         vm.install_generated_direct_call_hot_slot(
             caller_owner,
@@ -37315,6 +37322,7 @@ mod tests {
             this_value: RuntimeValue::undefined(),
             this_object: None,
             argument_count_including_this: 2,
+            setup_payload: None,
         };
         vm.install_generated_direct_call_hot_slot(
             caller_owner,
@@ -37504,6 +37512,7 @@ mod tests {
             this_value: RuntimeValue::undefined(),
             this_object: None,
             argument_count_including_this: 1,
+            setup_payload: None,
         };
         vm.install_generated_direct_call_hot_slot(
             owner,
@@ -37648,6 +37657,7 @@ mod tests {
             this_value: RuntimeValue::undefined(),
             this_object: None,
             argument_count_including_this: 2,
+            setup_payload: None,
         };
         vm.install_generated_direct_call_hot_slot(
             owner,
@@ -45186,6 +45196,7 @@ mod tests {
             this_value: RuntimeValue::undefined(),
             this_object: None,
             argument_count_including_this: 1,
+            setup_payload: None,
         };
 
         let mut forged_authorization = direct_call.clone();

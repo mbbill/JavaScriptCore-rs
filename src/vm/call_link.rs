@@ -1140,6 +1140,19 @@ impl Vm {
         direct: &BaselineGeneratedJsDirectCall,
         target_code_block: &CodeBlock,
     ) -> Result<Vec<RuntimeValue>, ExecutionError> {
+        if direct.setup_payload.is_some() {
+            if let Some(argument_values) = self
+                .generated_js_direct_call_argument_values_from_setup_payload(
+                    handoff,
+                    call_continuation,
+                    direct,
+                    target_code_block,
+                )?
+            {
+                return Ok(argument_values);
+            }
+        }
+
         let instruction = code_block
             .decoded_instruction_at(handoff.resume.bytecode_index)
             .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
@@ -1199,6 +1212,63 @@ impl Vm {
         }
 
         Ok(argument_values)
+    }
+
+    fn generated_js_direct_call_argument_values_from_setup_payload(
+        &self,
+        handoff: &BaselineGeneratedJsCallHandoff,
+        call_continuation: &CallReturnContinuation,
+        direct: &BaselineGeneratedJsDirectCall,
+        target_code_block: &CodeBlock,
+    ) -> Result<Option<Vec<RuntimeValue>>, ExecutionError> {
+        match handoff.resume.opcode {
+            CoreOpcode::Call | CoreOpcode::CallWithThis => {}
+            _ => return Err(ExecutionError::BaselineGeneratedExecutionRejected),
+        }
+        let Some(payload) = direct.setup_payload.as_ref() else {
+            return Ok(None);
+        };
+        if handoff.resume.opcode == CoreOpcode::Call {
+            let implicit_this = RuntimeValue::undefined();
+            if direct.this_value != implicit_this
+                || payload.this_value != implicit_this
+                || direct.this_object.is_some()
+                || payload.this_object.is_some()
+            {
+                return Ok(None);
+            }
+        }
+        let _caller_window =
+            validate_call_return_continuation(&self.execution, &self.registers, call_continuation)
+                .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+        let expected_provided_len = usize::try_from(direct.argument_count_including_this)
+            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
+        if payload.this_value != direct.this_value
+            || payload.this_object != direct.this_object
+            || payload.argument_values_including_this.len() != expected_provided_len
+            || payload.argument_values_including_this.first().copied() != Some(direct.this_value)
+        {
+            return Ok(None);
+        }
+
+        // The generated sidecar read these values while executing this call
+        // opcode, matching the frame setup that C++ JITCall.cpp performs before
+        // CallLinkInfo::emitFastPath(). Re-reading the same caller registers here
+        // would recreate the duplicate setup cost this sidecar payload removes;
+        // malformed or mismatched payloads fall back to the register path above.
+        let mut argument_values = payload.argument_values_including_this.clone();
+        let formal_parameter_count = target_code_block
+            .unlinked()
+            .frame()
+            .num_parameters_including_this
+            .saturating_sub(1);
+        while argument_values.len()
+            < usize::try_from(formal_parameter_count.saturating_add(1)).unwrap_or(usize::MAX)
+        {
+            argument_values.push(RuntimeValue::undefined());
+        }
+
+        Ok(Some(argument_values))
     }
 
     fn validate_generated_js_direct_call_handoff(
@@ -1379,6 +1449,14 @@ mod tests {
     use crate::bytecode::opcode::OperandWidth;
     use crate::bytecode::register::{RegisterFrameShape, ThisArgumentOffset};
     use crate::interpreter::CallReturnKind;
+    use crate::jit::baseline::{
+        BaselineGeneratedJsCallHandoffContinuation, BaselineGeneratedJsCallResume,
+        BaselineGeneratedJsDirectCallSetupPayload,
+    };
+    use crate::jit::{
+        CallLinkAttachmentTargetDescriptor, CallLinkInfoDescriptor, CallLinkReadinessBlockers,
+    };
+    use crate::runtime::{CellId, ExecutableId};
 
     fn typed_core_instruction_with_operands(
         offset: u32,
@@ -1403,13 +1481,20 @@ mod tests {
     }
 
     fn linked_p6_test_code_block(instructions: Vec<TypedInstruction>) -> CodeBlock {
+        linked_p6_test_code_block_with_params(instructions, 1)
+    }
+
+    fn linked_p6_test_code_block_with_params(
+        instructions: Vec<TypedInstruction>,
+        num_parameters_including_this: u32,
+    ) -> CodeBlock {
         CodeBlock::from_unlinked(
             UnlinkedCodeBlock::new(
                 CodeKind::Program,
                 PackedInstructionStream::from_typed_placeholder(instructions),
             )
             .with_frame(RegisterFrameShape {
-                num_parameters_including_this: 1,
+                num_parameters_including_this,
                 num_vars: 8,
                 num_callee_locals: 0,
                 num_temporaries: 0,
@@ -1476,6 +1561,421 @@ mod tests {
         let owner = vm.allocate_code_block_cell().unwrap();
         vm.code_blocks.register(owner, code_block);
         owner
+    }
+
+    fn generated_call_link_candidate_for_payload_test(
+        owner: CodeBlockId,
+        callee: ObjectId,
+        target_code_block: CodeBlockId,
+        argument_count_including_this: u8,
+        opcode: CoreOpcode,
+    ) -> GeneratedCallLinkCandidate {
+        let executable = ExecutableId(CellId(9001));
+        let boundary = CallBoundaryId(9002);
+        GeneratedCallLinkCandidate {
+            owner,
+            opcode,
+            slot: InlineCacheSlotId(9003),
+            bytecode_index: 0,
+            descriptor: CallLinkInfoDescriptor {
+                mode: CallLinkMode::Monomorphic,
+                call_kind: LinkedCallKind::Call,
+                owner: Some(owner),
+                executable: Some(executable),
+                callee: Some(callee),
+                target_code_block: Some(target_code_block),
+                boundary: Some(boundary),
+                slow_path_count: 0,
+                max_argument_count_including_this: argument_count_including_this,
+            },
+            target: CallLinkAttachmentTargetDescriptor {
+                executable,
+                target_code_block,
+                callee,
+                specialization: CodeSpecialization::Call,
+            },
+            boundary: CallBoundaryMetadata {
+                id: boundary,
+                owner: Some(owner),
+                abi: EntryAbi::LlIntCompatible,
+                entry_kind: EntrypointKind::InterpreterThunk,
+                native_symbol: None,
+                arguments: vec![AbiValue::JsValue; usize::from(argument_count_including_this)],
+                returns: vec![AbiValue::JsValue],
+                registers: Vec::new(),
+                frame_slots: Vec::new(),
+                requires_vm_entry_scope: true,
+                may_call_js: true,
+                may_throw: true,
+            },
+            attachment_ordinal: 9004,
+            attachment_plan_ordinal: 9005,
+            install_recheck_ordinal: 9006,
+            boundary_validation_ordinal: Some(9007),
+            descriptor_ordinal: Some(9008),
+            observation_ordinal: Some(9009),
+            readiness_ordinal: Some(9010),
+            remaining_blockers: CallLinkReadinessBlockers::from_blocker(
+                CallLinkReadinessBlocker::MayCallJsBoundary,
+            ),
+            direct_call_status: GeneratedCallLinkDirectCallStatus::Authorized,
+        }
+    }
+
+    #[test]
+    fn generated_direct_call_argument_values_use_matching_setup_payload() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let caller_code_block =
+            linked_p6_test_code_block(vec![typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::CallWithThis,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(2)),
+                    Operand::UnsignedImmediate(1),
+                    Operand::Register(local(3)),
+                ],
+            )]);
+        let caller_owner = register_test_code_block(&mut vm, caller_code_block.clone());
+        let target_code_block = linked_p6_test_code_block_with_params(
+            vec![typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::Return,
+                vec![Operand::Register(argument_including_this(0))],
+            )],
+            3,
+        );
+        let target_owner = register_test_code_block(&mut vm, target_code_block.clone());
+        let global_object = vm.allocate_global_object_cell().unwrap();
+        vm.record_source_global_object(global_object).unwrap();
+        let _entry = vm
+            .execution
+            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+                code_block: caller_owner,
+                global_object,
+                this_value: RuntimeValue::undefined(),
+            }));
+        let caller_frame = vm
+            .execution
+            .push_frame(
+                &mut vm.registers,
+                FramePushRequest {
+                    code_block: Some(caller_owner),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: caller_code_block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: vec![RuntimeValue::undefined()],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let window = vm.execution.top_frame().unwrap().register_window;
+        vm.registers
+            .write(window, local(2), RuntimeValue::from_i32(111))
+            .unwrap();
+        vm.registers
+            .write(window, local(3), RuntimeValue::from_i32(222))
+            .unwrap();
+
+        let continuation = CallReturnContinuation {
+            caller_frame,
+            callee_frame: None,
+            owner: caller_owner,
+            call_bytecode_index: BytecodeIndex::from_offset(0),
+            resume_bytecode_index: None,
+            destination: local(0),
+            argument_count_including_this: 2,
+            callee_value: None,
+            callee_object: None,
+            kind: CallReturnKind::Call,
+        };
+        let payload_this = RuntimeValue::from_i32(7);
+        let payload_argument = RuntimeValue::from_i32(8);
+        let candidate = generated_call_link_candidate_for_payload_test(
+            caller_owner,
+            ObjectId(CellId(9011)),
+            target_owner,
+            2,
+            CoreOpcode::CallWithThis,
+        );
+        let direct = BaselineGeneratedJsDirectCall {
+            candidate: candidate.clone(),
+            authorization: GeneratedCallLinkDirectCall::from_candidate(&candidate),
+            callee_value: RuntimeValue::undefined(),
+            callee_object: candidate.target.callee,
+            this_value: payload_this,
+            this_object: None,
+            argument_count_including_this: 2,
+            setup_payload: Some(BaselineGeneratedJsDirectCallSetupPayload {
+                this_value: payload_this,
+                this_object: None,
+                argument_values_including_this: vec![payload_this, payload_argument],
+            }),
+        };
+        let handoff = BaselineGeneratedJsCallHandoff {
+            resume: BaselineGeneratedJsCallResume {
+                owner: caller_owner,
+                frame: caller_frame,
+                bytecode_index: BytecodeIndex::from_offset(0),
+                opcode: CoreOpcode::CallWithThis,
+            },
+            continuation: BaselineGeneratedJsCallHandoffContinuation::Call(continuation),
+            owner_continuation: None,
+            direct_call: Some(Box::new(direct.clone())),
+            requires_no_gc_exit_reentry: true,
+            may_throw: true,
+        };
+
+        assert_eq!(
+            vm.generated_js_direct_call_argument_values(
+                &handoff,
+                &caller_code_block,
+                &continuation,
+                &direct,
+                &target_code_block,
+            )
+            .unwrap(),
+            vec![payload_this, payload_argument, RuntimeValue::undefined()]
+        );
+    }
+
+    #[test]
+    fn generated_direct_call_argument_values_fall_back_for_mismatched_setup_payload() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let caller_code_block =
+            linked_p6_test_code_block(vec![typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::CallWithThis,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::Register(local(2)),
+                    Operand::UnsignedImmediate(1),
+                    Operand::Register(local(3)),
+                ],
+            )]);
+        let caller_owner = register_test_code_block(&mut vm, caller_code_block.clone());
+        let target_code_block = linked_p6_test_code_block_with_params(
+            vec![typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::Return,
+                vec![Operand::Register(argument_including_this(0))],
+            )],
+            2,
+        );
+        let target_owner = register_test_code_block(&mut vm, target_code_block.clone());
+        let global_object = vm.allocate_global_object_cell().unwrap();
+        vm.record_source_global_object(global_object).unwrap();
+        let _entry = vm
+            .execution
+            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+                code_block: caller_owner,
+                global_object,
+                this_value: RuntimeValue::undefined(),
+            }));
+        let caller_frame = vm
+            .execution
+            .push_frame(
+                &mut vm.registers,
+                FramePushRequest {
+                    code_block: Some(caller_owner),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: caller_code_block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: vec![RuntimeValue::undefined()],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let window = vm.execution.top_frame().unwrap().register_window;
+        let register_this = RuntimeValue::from_i32(31);
+        let register_argument = RuntimeValue::from_i32(32);
+        vm.registers.write(window, local(2), register_this).unwrap();
+        vm.registers
+            .write(window, local(3), register_argument)
+            .unwrap();
+
+        let continuation = CallReturnContinuation {
+            caller_frame,
+            callee_frame: None,
+            owner: caller_owner,
+            call_bytecode_index: BytecodeIndex::from_offset(0),
+            resume_bytecode_index: None,
+            destination: local(0),
+            argument_count_including_this: 2,
+            callee_value: None,
+            callee_object: None,
+            kind: CallReturnKind::Call,
+        };
+        let candidate = generated_call_link_candidate_for_payload_test(
+            caller_owner,
+            ObjectId(CellId(9021)),
+            target_owner,
+            2,
+            CoreOpcode::CallWithThis,
+        );
+        let direct = BaselineGeneratedJsDirectCall {
+            candidate: candidate.clone(),
+            authorization: GeneratedCallLinkDirectCall::from_candidate(&candidate),
+            callee_value: RuntimeValue::undefined(),
+            callee_object: candidate.target.callee,
+            this_value: register_this,
+            this_object: None,
+            argument_count_including_this: 2,
+            setup_payload: Some(BaselineGeneratedJsDirectCallSetupPayload {
+                this_value: register_this,
+                this_object: None,
+                argument_values_including_this: vec![RuntimeValue::from_i32(99), register_argument],
+            }),
+        };
+        let handoff = BaselineGeneratedJsCallHandoff {
+            resume: BaselineGeneratedJsCallResume {
+                owner: caller_owner,
+                frame: caller_frame,
+                bytecode_index: BytecodeIndex::from_offset(0),
+                opcode: CoreOpcode::CallWithThis,
+            },
+            continuation: BaselineGeneratedJsCallHandoffContinuation::Call(continuation),
+            owner_continuation: None,
+            direct_call: Some(Box::new(direct.clone())),
+            requires_no_gc_exit_reentry: true,
+            may_throw: true,
+        };
+
+        assert_eq!(
+            vm.generated_js_direct_call_argument_values(
+                &handoff,
+                &caller_code_block,
+                &continuation,
+                &direct,
+                &target_code_block,
+            )
+            .unwrap(),
+            vec![register_this, register_argument]
+        );
+    }
+
+    #[test]
+    fn generated_direct_call_argument_values_reject_call_payload_with_explicit_this() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let caller_code_block =
+            linked_p6_test_code_block(vec![typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::Call,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::UnsignedImmediate(1),
+                    Operand::Register(local(2)),
+                ],
+            )]);
+        let caller_owner = register_test_code_block(&mut vm, caller_code_block.clone());
+        let target_code_block = linked_p6_test_code_block_with_params(
+            vec![typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::Return,
+                vec![Operand::Register(argument_including_this(0))],
+            )],
+            2,
+        );
+        let target_owner = register_test_code_block(&mut vm, target_code_block.clone());
+        let global_object = vm.allocate_global_object_cell().unwrap();
+        vm.record_source_global_object(global_object).unwrap();
+        let _entry = vm
+            .execution
+            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+                code_block: caller_owner,
+                global_object,
+                this_value: RuntimeValue::undefined(),
+            }));
+        let caller_frame = vm
+            .execution
+            .push_frame(
+                &mut vm.registers,
+                FramePushRequest {
+                    code_block: Some(caller_owner),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: caller_code_block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: vec![RuntimeValue::undefined()],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        let window = vm.execution.top_frame().unwrap().register_window;
+        let register_argument = RuntimeValue::from_i32(41);
+        vm.registers
+            .write(window, local(2), register_argument)
+            .unwrap();
+
+        let continuation = CallReturnContinuation {
+            caller_frame,
+            callee_frame: None,
+            owner: caller_owner,
+            call_bytecode_index: BytecodeIndex::from_offset(0),
+            resume_bytecode_index: None,
+            destination: local(0),
+            argument_count_including_this: 2,
+            callee_value: None,
+            callee_object: None,
+            kind: CallReturnKind::Call,
+        };
+        let forged_this = RuntimeValue::from_i32(77);
+        let candidate = generated_call_link_candidate_for_payload_test(
+            caller_owner,
+            ObjectId(CellId(9031)),
+            target_owner,
+            2,
+            CoreOpcode::Call,
+        );
+        let direct = BaselineGeneratedJsDirectCall {
+            candidate: candidate.clone(),
+            authorization: GeneratedCallLinkDirectCall::from_candidate(&candidate),
+            callee_value: RuntimeValue::undefined(),
+            callee_object: candidate.target.callee,
+            this_value: forged_this,
+            this_object: None,
+            argument_count_including_this: 2,
+            setup_payload: Some(BaselineGeneratedJsDirectCallSetupPayload {
+                this_value: forged_this,
+                this_object: None,
+                argument_values_including_this: vec![forged_this, RuntimeValue::from_i32(88)],
+            }),
+        };
+        let handoff = BaselineGeneratedJsCallHandoff {
+            resume: BaselineGeneratedJsCallResume {
+                owner: caller_owner,
+                frame: caller_frame,
+                bytecode_index: BytecodeIndex::from_offset(0),
+                opcode: CoreOpcode::Call,
+            },
+            continuation: BaselineGeneratedJsCallHandoffContinuation::Call(continuation),
+            owner_continuation: None,
+            direct_call: Some(Box::new(direct.clone())),
+            requires_no_gc_exit_reentry: true,
+            may_throw: true,
+        };
+
+        assert_eq!(
+            vm.generated_js_direct_call_argument_values(
+                &handoff,
+                &caller_code_block,
+                &continuation,
+                &direct,
+                &target_code_block,
+            ),
+            Err(ExecutionError::BaselineGeneratedExecutionRejected)
+        );
     }
 
     #[test]
