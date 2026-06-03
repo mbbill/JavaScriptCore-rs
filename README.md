@@ -25,9 +25,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
                  VM-owned interpreter root scope keeps caller roots live across nested calls.
                  macOS arm64 richards after VM-root-scope: interpreter score=0.1219. Baseline
                  call-link telemetry now shows ~4.05M authorized direct-call transactions.
-                 Host-callability fallback moves ~3.39M to GeneratedEntry, exposing the next
-                 blocker: generated baseline is still a Rust bytecode re-interpreter and is slower
-                 than the optimized interpreter on richards.
+                 Host-callability fallback moves ~3.39M to GeneratedEntry; ready sealed native
+                 direct-call callees now outrank GeneratedEntry when both artifacts exist, but the
+                 broad blocker remains: generated baseline is still a Rust bytecode re-interpreter
+                 and is slower than the optimized interpreter on richards.
   Phase 2 [done] Octane feature completeness: all 15 benchmarks RUN correctly. Ground-truth
                  2026-05-30: ZERO throwers/aborts -- 3 score, 12 functional-but-slow
                  (perf-gated, Phase 1). Landed: implicit-global store, indirect eval, catchable
@@ -201,9 +202,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          re-interpreter shim path; CORRECT but unreached on hot functions.
   [risk] baseline is a Rust bytecode RE-INTERPRETER (no register allocation); macOS richards now
          proves call-link admission (~4.05M direct-call transactions) and generated callee
-         residency (~3.39M GeneratedEntry, ~0.66M NestedInterpreterFallback), but score regresses
-         to ~0.0458 because generated execution still re-dispatches bytecode. Real reg-alloc and
-         the absent optimizing tiers own score parity.
+         residency (~3.39M GeneratedEntry, ~0.66M NestedInterpreterFallback); a narrow native
+         entrypoint preference now bypasses the generated callee re-interpreter when sealed native
+         readiness exists, but score regresses to ~0.0458 because general generated execution still
+         re-dispatches bytecode. Real reg-alloc and the absent optimizing tiers own score parity.
   [missing] CRITICAL PATH (deferred, in order): call-dispatch-into-generated -> mc
          put_by_id/call/construct/get_by_val -> slow-case rejoin -> inline alloc ->
          real reg-alloc; then DFG/FTL/B3-equivalent optimizing tier (where parity lives)

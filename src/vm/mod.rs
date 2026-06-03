@@ -10954,6 +10954,21 @@ impl Vm {
         GeneratedDirectCallRootlessGeneratedEntryProof,
         VmGeneratedDirectCallRootlessRejectionReason,
     > {
+        if validation.preferred_route != Some(VmGeneratedDirectCallTransactionRoute::NativeEntry) {
+            if let Some(kind) =
+                self.generated_direct_call_native_entry_kind(validation.target_code_block_id)
+            {
+                // C++ CallLinkInfo's fast path jumps to the prepared target
+                // entrypoint. Once Rust has a sealed callable native entry, the
+                // generated re-interpreter artifact is not the faithful
+                // equivalent of that target entrypoint.
+                return Err(
+                    VmGeneratedDirectCallRootlessRejectionReason::PreferredRouteNotGeneratedEntry {
+                        native_entry_kind: Some(kind),
+                    },
+                );
+            }
+        }
         if validation.hot_slot_hit
             && validation.preferred_route
                 != Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry)
@@ -12495,13 +12510,15 @@ impl Vm {
             config,
         );
         let route = callee_execution.route;
-        if !hot_slot_hit
-            && matches!(
-                route,
-                VmGeneratedDirectCallTransactionRoute::GeneratedEntry
-                    | VmGeneratedDirectCallTransactionRoute::NativeEntry
-            )
+        if matches!(
+            route,
+            VmGeneratedDirectCallTransactionRoute::GeneratedEntry
+                | VmGeneratedDirectCallTransactionRoute::NativeEntry
+        ) && (!hot_slot_hit || preferred_route != Some(route))
         {
+            // C++ CallLinkInfo keeps the linked target entrypoint mutable; when
+            // Rust's validated direct-call route changes, refresh the VM-owned
+            // hot slot instead of preserving a stale GeneratedEntry preference.
             self.install_generated_direct_call_hot_slot(
                 owner,
                 opcode,
@@ -12657,35 +12674,23 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> GeneratedDirectCallCalleeExecution {
-        if let Some(preferred_route) = preferred_route {
-            let preferred = match preferred_route {
-                VmGeneratedDirectCallTransactionRoute::GeneratedEntry => self
-                    .try_execute_generated_direct_call_callee_with_generated_entry(
-                        code_block_id,
-                        code_block,
-                        expected_frame,
-                        host,
-                        config,
-                    ),
-                VmGeneratedDirectCallTransactionRoute::NativeEntry
-                    if matches!(
-                        route_policy,
-                        GeneratedDirectCallCalleeRoutePolicy::AnyAvailable
-                            | GeneratedDirectCallCalleeRoutePolicy::NativeEntryOnly
-                    ) =>
-                {
-                    self.try_execute_generated_direct_call_callee_with_native_entry(
-                        code_block_id,
-                        code_block,
-                        expected_frame,
-                        host,
-                        config,
-                        route_policy != GeneratedDirectCallCalleeRoutePolicy::NativeEntryOnly,
-                    )
-                }
-                _ => None,
-            };
-            if let Some(execution) = preferred {
+        if preferred_route == Some(VmGeneratedDirectCallTransactionRoute::NativeEntry)
+            && matches!(
+                route_policy,
+                GeneratedDirectCallCalleeRoutePolicy::AnyAvailable
+                    | GeneratedDirectCallCalleeRoutePolicy::NativeEntryOnly
+            )
+        {
+            if let Some(execution) = self
+                .try_execute_generated_direct_call_callee_with_native_entry(
+                    code_block_id,
+                    code_block,
+                    expected_frame,
+                    host,
+                    config,
+                    route_policy != GeneratedDirectCallCalleeRoutePolicy::NativeEntryOnly,
+                )
+            {
                 self.tiering
                     .record_generated_direct_call_preferred_route_hit();
                 return execution;
@@ -12708,6 +12713,43 @@ impl Vm {
                     ),
                     route: VmGeneratedDirectCallTransactionRoute::NativeEntry,
                 });
+        }
+
+        if route_policy == GeneratedDirectCallCalleeRoutePolicy::AnyAvailable {
+            // C++ Baseline CallLinkInfo calls the entrypoint that linkFor()
+            // prepared for the callee (JITCall.cpp compileOpCall ->
+            // CallLinkInfo.cpp emitFastPathImpl). When Rust has both a sealed
+            // native callable entry and a diagnostic generated artifact, the
+            // native entry is the faithful target; the generated artifact still
+            // exists as fallback/residency evidence.
+            if let Some(execution) = self
+                .try_execute_generated_direct_call_callee_with_native_entry(
+                    code_block_id,
+                    code_block,
+                    expected_frame,
+                    host,
+                    config,
+                    true,
+                )
+            {
+                return execution;
+            }
+        }
+
+        if preferred_route == Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry) {
+            if let Some(execution) = self
+                .try_execute_generated_direct_call_callee_with_generated_entry(
+                    code_block_id,
+                    code_block,
+                    expected_frame,
+                    host,
+                    config,
+                )
+            {
+                self.tiering
+                    .record_generated_direct_call_preferred_route_hit();
+                return execution;
+            }
         }
 
         let generated = self.try_execute_generated_direct_call_callee_with_generated_entry(
@@ -38244,6 +38286,324 @@ mod tests {
                         .and_then(|gate| gate.generated_artifact.clone())
                         == Some(caller_artifact.clone())
             }));
+    }
+
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn vm_generated_direct_call_prefers_ready_arm64_native_entry_over_generated_callee_entry() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let function_unlinked = p6_int32_return_42_code_block().unlinked().clone();
+        let function_blocks = vm
+            .install_source_function_blocks(vec![function_unlinked])
+            .expect("owned ARM64 direct-call callee code");
+        let callee_owner = function_blocks[0].id;
+        let mut host = RecordingCoreHost::with_function_code_blocks(function_blocks);
+        let callee = load_function_value_for_test(&mut vm, &mut host, 0);
+        host.clear_observations();
+
+        let _callee_artifact = install_typed_baseline_for_test(&mut vm, callee_owner, 2_280);
+        install_p6_arm64_return_seed_for_test(&mut vm, callee_owner, 2_281);
+        assert_eq!(
+            vm.generated_direct_call_native_entry_miss_reason(
+                callee_owner,
+                vm.code_blocks
+                    .get(callee_owner)
+                    .expect("registered ARM64 direct-call callee")
+                    .code_block(),
+                CallFrameId(0),
+            ),
+            VmGeneratedDirectCallNativeEntryMissReason::FrameMismatch,
+            "native readiness exists before the callee frame is pushed"
+        );
+
+        let code_block = generated_js_call_return_consumed_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let caller_artifact = install_typed_baseline_for_test(&mut vm, owner, 2_282);
+
+        let first = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), callee],
+        );
+        assert_eq!(
+            first,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(43))
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .call_link_inline_cache_attachment_records()
+                .len(),
+            1,
+            "first call should link the monomorphic JS callee before generated direct dispatch"
+        );
+        assert!(vm
+            .tiering_integration()
+            .baseline_generated_code_artifact_for(callee_owner)
+            .is_some());
+        assert!(vm
+            .tiering_integration()
+            .baseline_native_entry_gate_for_owner(callee_owner)
+            .is_some_and(|gate| gate.outcome == BaselineEntryGateOutcome::NativeEntryReady));
+
+        let callee_generated_record_count_before = vm
+            .tiering_integration()
+            .baseline_generated_execution_records()
+            .iter()
+            .filter(|record| record.owner == callee_owner)
+            .count();
+        let callee_generated_bytecodes_before: u64 = vm
+            .tiering_integration()
+            .baseline_generated_execution_records()
+            .iter()
+            .filter(|record| record.owner == callee_owner)
+            .map(|record| record.executed_bytecode_count)
+            .sum();
+        let transaction_count_before = vm
+            .tiering_integration()
+            .generated_direct_call_transaction_records()
+            .len();
+        let preferred_route_hits_before = vm
+            .tiering_integration()
+            .generated_direct_call_preferred_route_hit_count();
+        host.clear_observations();
+
+        let (second, boundary_snapshot) =
+            execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                &mut vm,
+                owner,
+                &code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), callee],
+            );
+
+        assert_eq!(
+            second,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(43))
+        );
+        let direct_call_transaction = vm
+            .tiering_integration()
+            .generated_direct_call_transaction_records()
+            .last()
+            .expect("ARM64 native direct-call transaction");
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_transaction_records()
+                .len(),
+            transaction_count_before + 1
+        );
+        assert_eq!(direct_call_transaction.caller, owner);
+        assert_eq!(direct_call_transaction.target_code_block, callee_owner);
+        assert_eq!(
+            direct_call_transaction.route,
+            VmGeneratedDirectCallTransactionRoute::NativeEntry
+        );
+        assert_eq!(
+            direct_call_transaction.outcome,
+            VmGeneratedDirectCallTransactionOutcome::Continue
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .baseline_generated_execution_records()
+                .iter()
+                .filter(|record| record.owner == callee_owner)
+                .count(),
+            callee_generated_record_count_before,
+            "ready native direct calls must not execute the generated callee re-interpreter"
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .baseline_generated_execution_records()
+                .iter()
+                .filter(|record| record.owner == callee_owner)
+                .map(|record| record.executed_bytecode_count)
+                .sum::<u64>(),
+            callee_generated_bytecodes_before,
+            "ready native direct calls must not add generated bytecode metrics for the callee"
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_preferred_route_hit_count(),
+            preferred_route_hits_before,
+            "cold AnyAvailable native preference is entrypoint selection, not a cached hot-slot hit"
+        );
+        assert_eq!(
+            vm.generated_direct_call_hot_slot_count_for_current_epoch_for_test(),
+            1,
+            "the native route should install a monomorphic hot slot for later calls"
+        );
+        boundary_snapshot.assert_no_gc_scope_depth(0);
+        boundary_snapshot.assert_current_no_gc_scope_depth(&vm, 0);
+        assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
+        assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+        assert_latest_generated_entry_evidence(&vm, owner, caller_artifact);
+    }
+
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn vm_generated_direct_call_upgrades_stale_generated_hot_slot_to_ready_arm64_native_entry() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let function_unlinked = p6_int32_return_42_code_block().unlinked().clone();
+        let function_blocks = vm
+            .install_source_function_blocks(vec![function_unlinked])
+            .expect("owned stale-slot callee code");
+        let callee_owner = function_blocks[0].id;
+        let mut host = RecordingCoreHost::with_function_code_blocks(function_blocks);
+        let callee = load_function_value_for_test(&mut vm, &mut host, 0);
+        host.clear_observations();
+
+        install_typed_baseline_for_test(&mut vm, callee_owner, 2_283);
+        let code_block = generated_js_call_return_consumed_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let caller_artifact = install_typed_baseline_for_test(&mut vm, owner, 2_284);
+
+        let first = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), callee],
+        );
+        assert_eq!(
+            first,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(43))
+        );
+
+        host.clear_observations();
+        let second = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), callee],
+        );
+        assert_eq!(
+            second,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(43))
+        );
+        let generated_route = vm
+            .tiering_integration()
+            .generated_direct_call_transaction_records()
+            .last()
+            .expect("generated-entry direct-call transaction before native readiness");
+        assert_eq!(generated_route.caller, owner);
+        assert_eq!(generated_route.target_code_block, callee_owner);
+        assert_eq!(
+            generated_route.route,
+            VmGeneratedDirectCallTransactionRoute::GeneratedEntry
+        );
+        assert_eq!(
+            vm.generated_direct_call_hot_slot_count_for_current_epoch_for_test(),
+            1
+        );
+
+        install_p6_arm64_return_seed_for_test(&mut vm, callee_owner, 2_285);
+        let callee_generated_record_count_before = vm
+            .tiering_integration()
+            .baseline_generated_execution_records()
+            .iter()
+            .filter(|record| record.owner == callee_owner)
+            .count();
+        let transaction_count_before_native = vm
+            .tiering_integration()
+            .generated_direct_call_transaction_records()
+            .len();
+        let preferred_route_hits_before_native = vm
+            .tiering_integration()
+            .generated_direct_call_preferred_route_hit_count();
+        host.clear_observations();
+
+        let (third, boundary_snapshot) =
+            execute_registered_code_block_with_boundary_snapshot_and_arguments(
+                &mut vm,
+                owner,
+                &code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), callee],
+            );
+
+        assert_eq!(
+            third,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(43))
+        );
+        let native_route = vm
+            .tiering_integration()
+            .generated_direct_call_transaction_records()
+            .last()
+            .expect("native route after publishing readiness");
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_transaction_records()
+                .len(),
+            transaction_count_before_native + 1
+        );
+        assert_eq!(native_route.caller, owner);
+        assert_eq!(native_route.target_code_block, callee_owner);
+        assert_eq!(
+            native_route.route,
+            VmGeneratedDirectCallTransactionRoute::NativeEntry,
+            "ready native entry should replace the stale GeneratedEntry hot-slot route"
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .baseline_generated_execution_records()
+                .iter()
+                .filter(|record| record.owner == callee_owner)
+                .count(),
+            callee_generated_record_count_before,
+            "native route upgrade must not keep executing the generated callee"
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_preferred_route_hit_count(),
+            preferred_route_hits_before_native,
+            "the first native reroute refreshes the stale slot but is not itself a preferred-route hit"
+        );
+        boundary_snapshot.assert_no_gc_scope_depth(0);
+        boundary_snapshot.assert_current_no_gc_scope_depth(&vm, 0);
+
+        let preferred_route_hits_before_hot = vm
+            .tiering_integration()
+            .generated_direct_call_preferred_route_hit_count();
+        let transaction_count_before_hot = vm
+            .tiering_integration()
+            .generated_direct_call_transaction_records()
+            .len();
+        host.clear_observations();
+
+        let fourth = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), callee],
+        );
+        assert_eq!(
+            fourth,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(43))
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_transaction_records()
+                .len(),
+            transaction_count_before_hot + 1
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_transaction_records()
+                .last()
+                .expect("updated hot-slot native direct-call transaction")
+                .route,
+            VmGeneratedDirectCallTransactionRoute::NativeEntry
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_preferred_route_hit_count(),
+            preferred_route_hits_before_hot + 1,
+            "the refreshed hot slot should cache NativeEntry for later calls"
+        );
+        assert_latest_generated_entry_evidence(&vm, owner, caller_artifact);
     }
 
     #[cfg(all(unix, not(target_arch = "x86_64")))]
