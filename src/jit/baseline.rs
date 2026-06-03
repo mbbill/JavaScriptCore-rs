@@ -47,19 +47,16 @@ use crate::jit::{
     BaselineSupportedOpcodeSubset, CacheKey, CallBoundaryId, GeneratedCallLinkCandidate,
     GeneratedCallLinkCandidateTable, GeneratedCallLinkDirectCallStatus,
     GeneratedCallLinkProbeMissReason, GeneratedCallLinkProbeRequest, GeneratedCallLinkProbeResult,
-    GeneratedGuardedPropertyLoadProbeMissReason, GeneratedGuardedPropertyLoadProbeRequest,
-    GeneratedGuardedPropertyLoadProbeResult, GeneratedPropertyHasMegamorphicCandidateTable,
+    GeneratedGuardedPropertyLoadProbeMissReason, GeneratedPropertyHasMegamorphicCandidateTable,
     GeneratedPropertyHasMegamorphicLookup, GeneratedPropertyLoadMegamorphicCandidateTable,
-    GeneratedPropertyLoadMegamorphicHolderProbeRequest, GeneratedPropertyLoadMegamorphicLookup,
-    GeneratedPropertyLoadProbeMissReason, GeneratedPropertyLoadProbeRequest,
-    GeneratedPropertyLoadProbeResult, GeneratedPropertyStoreMegamorphicCandidateTable,
+    GeneratedPropertyLoadProbeMissReason, GeneratedPropertyStoreMegamorphicCandidateTable,
     GeneratedPropertyStoreMegamorphicLookup, GeneratedPropertyStoreProbeMissReason,
     GeneratedPropertyStoreProbeRequest, GeneratedPropertyStoreProbeResult,
     InlineCacheFallbackSemantics, InlineCacheKind, InlineCacheSlotId, JitCodeValidationError,
-    JitPlanValidationError, PropertyLoadAccessCasePlan, PropertyLoadAccessCasePlanKind,
-    PropertyLoadAccessCasePlanTable, PropertyLoadGuardChainOutcome, PropertyLoadGuardRequirement,
-    PropertyLoadGuardedCandidateKind, PropertyLoadGuardedCandidateTable,
-    PropertyStoreAccessCasePlan, PropertyStoreAccessCasePlanKind, PropertyStoreMutationCandidate,
+    JitPlanValidationError, PropertyLoadAccessCasePlanTable, PropertyLoadGuardChainOutcome,
+    PropertyLoadGuardRequirement, PropertyLoadGuardedCandidateKind,
+    PropertyLoadGuardedCandidateTable, PropertyStoreAccessCasePlan,
+    PropertyStoreAccessCasePlanKind, PropertyStoreMutationCandidate,
     PropertyStoreMutationCandidateTable, WatchpointSetId,
 };
 use crate::object::PropertyOffset;
@@ -67,7 +64,10 @@ use crate::runtime::{CallFrameId, CodeBlockId, ExecutableId, ObjectId, RuntimeVa
 use crate::strings::{PropertyIndex, PropertyKey};
 use crate::value::{NumberValue, ValueKind};
 
+mod generated_property_load;
 mod generated_readiness;
+
+use generated_property_load::execute_property_load_sidecar_candidate;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BaselineGeneratedExecutionResult {
@@ -3954,407 +3954,6 @@ fn element_sidecar_cache_key_from_runtime_value(value: RuntimeValue) -> Option<C
     Some(CacheKey::Property(PropertyKey::from_index(
         PropertyIndex::from_canonical_index(index),
     )))
-}
-
-fn execute_property_load_sidecar_candidate(
-    sidecars: &mut BaselineGeneratedPropertyExecutionSidecars<'_, '_>,
-    execution: &mut InterpreterExecutionState<'_>,
-    attempt: PropertyLoadSidecarAttempt<'_, '_, '_>,
-) -> Result<Option<BaselineInstructionOutcome>, BaselineInstructionAbort> {
-    let PropertyLoadSidecarAttempt {
-        window,
-        code_block,
-        fallback,
-        frame,
-        instruction,
-        site,
-    } = attempt;
-
-    let mut operands = None;
-    let BaselineGeneratedPropertyExecutionSidecars {
-        property_load_plan_table,
-        property_load_guarded_candidate_table,
-        property_load_megamorphic_candidate_table,
-        dispatch_host,
-        destination_root_sync_requests,
-        property_load_probe_miss_records,
-        guarded_property_load_probe_miss_records,
-        ..
-    } = sidecars;
-
-    let mut current_base_structure = None;
-    if let Some(megamorphic_table) = *property_load_megamorphic_candidate_table {
-        if megamorphic_table.owner() == site.owner && site.opcode == CoreOpcode::GetByName {
-            let Some(site_key) = named_property_sidecar_cache_key(site) else {
-                return Ok(None);
-            };
-            if megamorphic_table.contains_site(site.slot, site.bytecode_index.offset(), site_key) {
-                if dispatch_host.has_pending_structure_chain_invalidation_events() {
-                    return Ok(None);
-                }
-                let (destination, base, _) = property_load_sidecar_operands(
-                    &mut operands,
-                    execution,
-                    code_block,
-                    window,
-                    instruction,
-                    fallback,
-                )?;
-                let actual_structure = *current_base_structure.get_or_insert_with(|| {
-                    dispatch_host.generated_property_sidecar_base_structure(base)
-                });
-                let lookup = match actual_structure {
-                    Some(actual_structure) => megamorphic_table.lookup(
-                        site.slot,
-                        site.bytecode_index.offset(),
-                        site_key,
-                        actual_structure,
-                    ),
-                    None => return Ok(None),
-                };
-                match lookup {
-                    GeneratedPropertyLoadMegamorphicLookup::NoSite => {}
-                    GeneratedPropertyLoadMegamorphicLookup::Miss => return Ok(None),
-                    GeneratedPropertyLoadMegamorphicLookup::Missing => {
-                        let outcome = write_register_or_outcome(
-                            execution,
-                            window,
-                            destination,
-                            RuntimeValue::undefined(),
-                            fallback,
-                        )?;
-                        return Ok(Some(outcome));
-                    }
-                    GeneratedPropertyLoadMegamorphicLookup::PrototypeData {
-                        key,
-                        base_structure,
-                        holder,
-                        offset,
-                    } => {
-                        let result = dispatch_host
-                            .probe_generated_property_load_megamorphic_holder(
-                                GeneratedPropertyLoadMegamorphicHolderProbeRequest {
-                                    key,
-                                    base_structure,
-                                    holder,
-                                    offset,
-                                },
-                            );
-                        let hit = match result {
-                            GeneratedPropertyLoadProbeResult::Hit(hit) => hit,
-                            GeneratedPropertyLoadProbeResult::Miss(miss) => {
-                                property_load_probe_miss_records.push(
-                                    BaselineGeneratedPropertyLoadProbeMissRecord {
-                                        owner: site.owner,
-                                        bytecode_index: site.bytecode_index,
-                                        key,
-                                        base_structure: Some(base_structure),
-                                        offset: Some(offset),
-                                        reason: miss.reason,
-                                    },
-                                );
-                                return Ok(None);
-                            }
-                        };
-
-                        let outcome = write_register_or_outcome(
-                            execution,
-                            window,
-                            destination,
-                            hit.value,
-                            fallback,
-                        )?;
-                        if hit.destination_root_sync.requires_targeted_register_sync() {
-                            destination_root_sync_requests.push(
-                                BaselineGeneratedPropertyLoadDestinationRootSyncRequest {
-                                    frame,
-                                    bytecode_index: site.bytecode_index,
-                                    destination,
-                                },
-                            );
-                        }
-                        return Ok(Some(outcome));
-                    }
-                    GeneratedPropertyLoadMegamorphicLookup::Hit(plan) => {
-                        let result = dispatch_host.probe_generated_property_load(
-                            GeneratedPropertyLoadProbeRequest { plan: &plan, base },
-                        );
-                        let hit = match result {
-                            GeneratedPropertyLoadProbeResult::Hit(hit) => hit,
-                            GeneratedPropertyLoadProbeResult::Miss(miss) => {
-                                property_load_probe_miss_records.push(
-                                    BaselineGeneratedPropertyLoadProbeMissRecord {
-                                        owner: plan.owner,
-                                        bytecode_index: BytecodeIndex::from_offset(
-                                            plan.bytecode_index,
-                                        ),
-                                        key: plan.key,
-                                        base_structure: plan.access_case.base_structure,
-                                        offset: plan.access_case.offset,
-                                        reason: miss.reason,
-                                    },
-                                );
-                                return Ok(None);
-                            }
-                        };
-
-                        let outcome = write_register_or_outcome(
-                            execution,
-                            window,
-                            destination,
-                            hit.value,
-                            fallback,
-                        )?;
-                        if hit.destination_root_sync.requires_targeted_register_sync() {
-                            destination_root_sync_requests.push(
-                                BaselineGeneratedPropertyLoadDestinationRootSyncRequest {
-                                    frame,
-                                    bytecode_index: site.bytecode_index,
-                                    destination,
-                                },
-                            );
-                        }
-                        return Ok(Some(outcome));
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(plan_table) = *property_load_plan_table {
-        if plan_table.owner() == site.owner {
-            for plan in
-                plan_table.candidates_for_bytecode_index_newest_first(site.bytecode_index.offset())
-            {
-                let (destination, base, runtime_key) = property_load_sidecar_operands(
-                    &mut operands,
-                    execution,
-                    code_block,
-                    window,
-                    instruction,
-                    fallback,
-                )?;
-                let probe_plan;
-                let plan = match site.opcode {
-                    CoreOpcode::GetByName
-                    | CoreOpcode::GetGlobalObjectProperty
-                    | CoreOpcode::GetLength => {
-                        let Some(site_key) = named_property_sidecar_cache_key(site) else {
-                            return Ok(None);
-                        };
-                        if plan.plan_kind != PropertyLoadAccessCasePlanKind::DataOnlyOwnLoad
-                            || plan.key != site_key
-                        {
-                            continue;
-                        }
-                        plan
-                    }
-                    CoreOpcode::GetByValue => {
-                        if plan.plan_kind != PropertyLoadAccessCasePlanKind::DataOnlyIndexedLoad {
-                            continue;
-                        }
-                        let Some(runtime_key) = runtime_key else {
-                            return Ok(None);
-                        };
-                        probe_plan = property_load_plan_with_runtime_key(plan, runtime_key);
-                        &probe_plan
-                    }
-                    _ => return Ok(None),
-                };
-
-                if property_load_sidecar_structure_guard_misses(
-                    &mut **dispatch_host,
-                    &mut current_base_structure,
-                    base,
-                    plan,
-                ) {
-                    continue;
-                }
-
-                let result = dispatch_host.probe_generated_property_load(
-                    GeneratedPropertyLoadProbeRequest { plan, base },
-                );
-                let hit = match result {
-                    GeneratedPropertyLoadProbeResult::Hit(hit) => hit,
-                    GeneratedPropertyLoadProbeResult::Miss(miss) => {
-                        property_load_probe_miss_records.push(
-                            BaselineGeneratedPropertyLoadProbeMissRecord {
-                                owner: plan.owner,
-                                bytecode_index: BytecodeIndex::from_offset(plan.bytecode_index),
-                                key: plan.key,
-                                base_structure: plan.access_case.base_structure,
-                                offset: plan.access_case.offset,
-                                reason: miss.reason,
-                            },
-                        );
-                        continue;
-                    }
-                };
-
-                let outcome =
-                    write_register_or_outcome(execution, window, destination, hit.value, fallback)?;
-                if hit.destination_root_sync.requires_targeted_register_sync() {
-                    destination_root_sync_requests.push(
-                        BaselineGeneratedPropertyLoadDestinationRootSyncRequest {
-                            frame,
-                            bytecode_index: site.bytecode_index,
-                            destination,
-                        },
-                    );
-                }
-                return Ok(Some(outcome));
-            }
-        }
-    }
-
-    if let Some(guarded_candidate_table) = *property_load_guarded_candidate_table {
-        if guarded_candidate_table.owner() == site.owner {
-            for candidate in
-                guarded_candidate_table.candidates_for_bytecode_index(site.bytecode_index.offset())
-            {
-                if !matches!(site.opcode, CoreOpcode::GetByName | CoreOpcode::GetLength) {
-                    continue;
-                }
-                let Some(site_key) = named_property_sidecar_cache_key(site) else {
-                    return Ok(None);
-                };
-                let plan = &candidate.plan;
-                if plan.descriptor.key != site_key {
-                    continue;
-                }
-
-                let (destination, base, _) = property_load_sidecar_operands(
-                    &mut operands,
-                    execution,
-                    code_block,
-                    window,
-                    instruction,
-                    fallback,
-                )?;
-
-                let result = dispatch_host.probe_generated_guarded_property_load(
-                    GeneratedGuardedPropertyLoadProbeRequest::new(plan, base),
-                );
-                let hit = match result {
-                    GeneratedGuardedPropertyLoadProbeResult::Hit(hit) => hit,
-                    GeneratedGuardedPropertyLoadProbeResult::Miss(miss) => {
-                        guarded_property_load_probe_miss_records.push(
-                            BaselineGeneratedGuardedPropertyLoadProbeMissRecord {
-                                owner: plan.owner,
-                                bytecode_index: BytecodeIndex::from_offset(plan.bytecode_index),
-                                slot: plan.slot,
-                                guard_plan_ordinal: candidate.guard_plan_ordinal,
-                                materialization_ordinal: candidate.materialization_ordinal,
-                                dependency_ordinals: candidate.dependency_ordinals.clone(),
-                                binding_set_ids: candidate.binding_set_ids.clone(),
-                                candidate_kind: candidate.candidate_kind,
-                                base_structure: plan.descriptor.base_structure,
-                                reason: miss.reason,
-                                requirement: miss.requirement,
-                                key: miss.key,
-                                prototype_depth: miss.prototype_depth,
-                                chain_index: miss.chain_index,
-                                outcome: miss.outcome,
-                            },
-                        );
-                        continue;
-                    }
-                };
-
-                let outcome =
-                    write_register_or_outcome(execution, window, destination, hit.value, fallback)?;
-                if hit.destination_root_sync.requires_targeted_register_sync() {
-                    destination_root_sync_requests.push(
-                        BaselineGeneratedPropertyLoadDestinationRootSyncRequest {
-                            frame,
-                            bytecode_index: site.bytecode_index,
-                            destination,
-                        },
-                    );
-                }
-                return Ok(Some(outcome));
-            }
-        }
-    }
-
-    Ok(None)
-}
-
-fn property_load_sidecar_structure_guard_misses(
-    dispatch_host: &mut dyn DispatchHost,
-    current_base_structure: &mut Option<Option<StructureId>>,
-    base: RuntimeValue,
-    plan: &PropertyLoadAccessCasePlan,
-) -> bool {
-    if plan.plan_kind != PropertyLoadAccessCasePlanKind::DataOnlyOwnLoad {
-        return false;
-    }
-    let Some(expected_structure) = plan.access_case.base_structure else {
-        return false;
-    };
-    if expected_structure == StructureId::INVALID {
-        return false;
-    }
-    let actual_structure = *current_base_structure
-        .get_or_insert_with(|| dispatch_host.generated_property_sidecar_base_structure(base));
-    matches!(actual_structure, Some(actual_structure) if actual_structure != expected_structure)
-}
-
-fn property_load_plan_with_runtime_key(
-    plan: &crate::jit::PropertyLoadAccessCasePlan,
-    runtime_key: CacheKey,
-) -> crate::jit::PropertyLoadAccessCasePlan {
-    let mut plan = plan.clone();
-    plan.key = runtime_key;
-    plan.access_case.key = runtime_key;
-    plan
-}
-
-fn property_load_sidecar_operands(
-    operands: &mut Option<(VirtualRegister, RuntimeValue, Option<CacheKey>)>,
-    execution: &mut InterpreterExecutionState<'_>,
-    code_block: &CodeBlock,
-    window: RegisterWindow,
-    instruction: DecodedInstruction<'_>,
-    fallback: BaselineGeneratedFallbackSite,
-) -> Result<(VirtualRegister, RuntimeValue, Option<CacheKey>), BaselineInstructionAbort> {
-    if let Some(operands) = *operands {
-        return Ok(operands);
-    }
-
-    let destination = register_operand_or_fallback(instruction, 0, fallback)?;
-    let opcode = CoreOpcode::from_opcode(instruction.opcode);
-    let (base, runtime_key) = match opcode {
-        Some(CoreOpcode::GetGlobalObjectProperty) => (
-            execution
-                .stack
-                .active_global_this_value()
-                .map_err(execution_error_abort)?,
-            None,
-        ),
-        Some(CoreOpcode::GetByValue) => {
-            let base_register = register_operand_or_fallback(instruction, 1, fallback)?;
-            let base =
-                read_register_or_outcome(execution, code_block, window, base_register, fallback)?;
-            let key_register = register_operand_or_fallback(instruction, 2, fallback)?;
-            let key_value =
-                read_register_or_outcome(execution, code_block, window, key_register, fallback)?;
-            (
-                base,
-                element_sidecar_cache_key_from_runtime_value(key_value),
-            )
-        }
-        _ => {
-            let base_register = register_operand_or_fallback(instruction, 1, fallback)?;
-            (
-                read_register_or_outcome(execution, code_block, window, base_register, fallback)?,
-                None,
-            )
-        }
-    };
-    let decoded_operands = (destination, base, runtime_key);
-    *operands = Some(decoded_operands);
-    Ok(decoded_operands)
 }
 
 fn next_baseline_generated_bytecode_index(
@@ -11288,6 +10887,378 @@ mod tests {
     }
 
     #[test]
+    fn generated_guarded_prototype_data_fast_path_uses_holder_probe_without_guarded_probe() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let plan_table = property_load_plan_table(owner(), Vec::new());
+        let candidate =
+            prototype_data_guarded_candidate(owner(), BytecodeIndex::from_offset(0), 11, 1);
+        let guarded_table = property_load_guarded_candidate_table(owner(), vec![candidate.clone()]);
+        let base = cell_runtime_value();
+        let loaded = RuntimeValue::from_encoded(
+            static_value_representation_layout()
+                .encode_cell_payload(0x5678)
+                .unwrap(),
+        );
+        let mut host = SequencedPropertyLoadProbeHost::new_guarded(vec![
+            GeneratedGuardedPropertyLoadProbeResult::hit(RuntimeValue::from_i32(404)),
+        ]);
+        host.sidecar_base_structure = Some(candidate.plan.descriptor.base_structure);
+        host.holder_results = vec![GeneratedPropertyLoadProbeResult::hit(loaded)];
+
+        let (result, stack, _, root_sync_requests, probe_miss_records, guarded_miss_records) =
+            execute_generated_with_property_load_sidecar_tables(
+                owner(),
+                &block,
+                &artifact,
+                &plan_table,
+                &guarded_table,
+                &mut host,
+                &[(local(1), base)],
+            );
+        let frame = stack.top_frame().unwrap();
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(loaded)
+            ))
+        );
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert!(host.probed_plan_keys.is_empty());
+        assert!(host.guarded_probed_plan_keys.is_empty());
+        assert_eq!(
+            host.holder_requests,
+            vec![GeneratedPropertyLoadMegamorphicHolderProbeRequest {
+                key: property_cache_key(11),
+                base_structure: candidate.plan.descriptor.base_structure,
+                holder: candidate.plan.descriptor.holder_object.unwrap(),
+                offset: candidate.plan.descriptor.offset.unwrap(),
+            }]
+        );
+        assert_eq!(
+            root_sync_requests,
+            vec![BaselineGeneratedPropertyLoadDestinationRootSyncRequest {
+                frame: frame.id,
+                bytecode_index: BytecodeIndex::from_offset(0),
+                destination: local(0),
+            }]
+        );
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_miss_records.is_empty());
+    }
+
+    #[test]
+    fn generated_guarded_prototype_data_fast_path_preserves_megamorphic_priority() {
+        use crate::jit::{
+            GeneratedPropertyLoadMegamorphicCacheEntry,
+            GeneratedPropertyLoadMegamorphicCacheEntryKind, GeneratedPropertyLoadMegamorphicSite,
+        };
+
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let plan_table = property_load_plan_table(owner(), Vec::new());
+        let candidate =
+            prototype_data_guarded_candidate(owner(), BytecodeIndex::from_offset(0), 11, 1);
+        let guarded_table = property_load_guarded_candidate_table(owner(), vec![candidate.clone()]);
+        let key = property_cache_key(11);
+        let megamorphic_table =
+            GeneratedPropertyLoadMegamorphicCandidateTable::test_with_primary_entry(
+                owner(),
+                1,
+                GeneratedPropertyLoadMegamorphicSite {
+                    owner: owner(),
+                    slot: InlineCacheSlotId(0),
+                    bytecode_index: 0,
+                    key,
+                },
+                GeneratedPropertyLoadMegamorphicCacheEntry {
+                    key,
+                    base_structure: candidate.plan.descriptor.base_structure,
+                    epoch: 1,
+                    kind: GeneratedPropertyLoadMegamorphicCacheEntryKind::OwnData {
+                        offset: PropertyOffset::new(7),
+                    },
+                },
+            );
+        let base = cell_runtime_value();
+        let megamorphic_value = RuntimeValue::from_i32(42);
+        let mut host =
+            SequencedPropertyLoadProbeHost::new(vec![GeneratedPropertyLoadProbeResult::hit(
+                megamorphic_value,
+            )]);
+        host.sidecar_base_structure = Some(candidate.plan.descriptor.base_structure);
+        host.holder_results = vec![GeneratedPropertyLoadProbeResult::hit(
+            RuntimeValue::from_i32(91),
+        )];
+        host.guarded_results = vec![GeneratedGuardedPropertyLoadProbeResult::hit(
+            RuntimeValue::from_i32(404),
+        )];
+
+        let (result, _, _, root_sync_requests, probe_miss_records, guarded_miss_records) =
+            execute_generated_with_property_load_sidecar_tables_and_megamorphic_table(
+                owner(),
+                &block,
+                &artifact,
+                &plan_table,
+                &guarded_table,
+                &megamorphic_table,
+                &mut host,
+                &[(local(1), base)],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(megamorphic_value)
+            ))
+        );
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert_eq!(host.probed_plan_keys, vec![key]);
+        assert!(host.holder_requests.is_empty());
+        assert!(host.guarded_probed_plan_keys.is_empty());
+        assert!(root_sync_requests.is_empty());
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_miss_records.is_empty());
+    }
+
+    #[test]
+    fn generated_guarded_prototype_data_fast_path_skips_pending_structure_chain_invalidation() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let plan_table = property_load_plan_table(owner(), Vec::new());
+        let candidate =
+            prototype_data_guarded_candidate(owner(), BytecodeIndex::from_offset(0), 11, 1);
+        let guarded_table = property_load_guarded_candidate_table(owner(), vec![candidate.clone()]);
+        let guarded_value = RuntimeValue::from_i32(37);
+        let mut host = SequencedPropertyLoadProbeHost::new_guarded(vec![
+            GeneratedGuardedPropertyLoadProbeResult::hit(guarded_value),
+        ]);
+        host.sidecar_base_structure = Some(candidate.plan.descriptor.base_structure);
+        host.holder_results = vec![GeneratedPropertyLoadProbeResult::hit(
+            RuntimeValue::from_i32(91),
+        )];
+        host.pending_structure_chain_invalidations = true;
+
+        let (result, _, _, root_sync_requests, probe_miss_records, guarded_miss_records) =
+            execute_generated_with_property_load_sidecar_tables(
+                owner(),
+                &block,
+                &artifact,
+                &plan_table,
+                &guarded_table,
+                &mut host,
+                &[(local(1), cell_runtime_value())],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(guarded_value)
+            ))
+        );
+        assert!(host.sidecar_base_structure_queries.is_empty());
+        assert!(host.holder_requests.is_empty());
+        assert_eq!(host.guarded_probed_plan_keys, vec![property_cache_key(11)]);
+        assert!(root_sync_requests.is_empty());
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_miss_records.is_empty());
+    }
+
+    #[test]
+    fn generated_guarded_prototype_data_fast_path_holder_miss_uses_guarded_probe() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let plan_table = property_load_plan_table(owner(), Vec::new());
+        let candidate =
+            prototype_data_guarded_candidate(owner(), BytecodeIndex::from_offset(0), 11, 1);
+        let guarded_table = property_load_guarded_candidate_table(owner(), vec![candidate.clone()]);
+        let guarded_value = RuntimeValue::from_i32(37);
+        let mut host = SequencedPropertyLoadProbeHost::new_guarded(vec![
+            GeneratedGuardedPropertyLoadProbeResult::hit(guarded_value),
+        ]);
+        host.sidecar_base_structure = Some(candidate.plan.descriptor.base_structure);
+        host.holder_results = vec![GeneratedPropertyLoadProbeResult::miss(
+            GeneratedPropertyLoadProbeMissReason::HostUnavailable,
+        )];
+
+        let (result, _, _, root_sync_requests, probe_miss_records, guarded_miss_records) =
+            execute_generated_with_property_load_sidecar_tables(
+                owner(),
+                &block,
+                &artifact,
+                &plan_table,
+                &guarded_table,
+                &mut host,
+                &[(local(1), cell_runtime_value())],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(guarded_value)
+            ))
+        );
+        assert_eq!(host.sidecar_base_structure_queries.len(), 1);
+        assert_eq!(host.holder_requests.len(), 1);
+        assert_eq!(host.guarded_probed_plan_keys, vec![property_cache_key(11)]);
+        assert!(root_sync_requests.is_empty());
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_miss_records.is_empty());
+    }
+
+    #[test]
+    fn generated_guarded_prototype_data_fast_path_structure_mismatch_uses_guarded_probe() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let plan_table = property_load_plan_table(owner(), Vec::new());
+        let candidate =
+            prototype_data_guarded_candidate(owner(), BytecodeIndex::from_offset(0), 11, 1);
+        let guarded_table = property_load_guarded_candidate_table(owner(), vec![candidate]);
+        let base = cell_runtime_value();
+        let guarded_value = RuntimeValue::from_i32(37);
+        let mut host = SequencedPropertyLoadProbeHost::new_guarded(vec![
+            GeneratedGuardedPropertyLoadProbeResult::hit(guarded_value),
+        ]);
+        host.sidecar_base_structure = Some(StructureId::new(999));
+        host.holder_results = vec![GeneratedPropertyLoadProbeResult::hit(
+            RuntimeValue::from_i32(91),
+        )];
+
+        let (result, _, _, root_sync_requests, probe_miss_records, guarded_miss_records) =
+            execute_generated_with_property_load_sidecar_tables(
+                owner(),
+                &block,
+                &artifact,
+                &plan_table,
+                &guarded_table,
+                &mut host,
+                &[(local(1), base)],
+            );
+
+        assert_eq!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Completed(
+                ExecutionCompletion::Returned(guarded_value)
+            ))
+        );
+        assert_eq!(host.sidecar_base_structure_queries, vec![base]);
+        assert!(host.holder_requests.is_empty());
+        assert!(host.probed_plan_keys.is_empty());
+        assert_eq!(host.guarded_probed_plan_keys, vec![property_cache_key(11)]);
+        assert!(root_sync_requests.is_empty());
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_miss_records.is_empty());
+    }
+
+    #[test]
+    fn generated_guarded_prototype_data_fast_path_wrong_key_preserves_existing_skip() {
+        let block = code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(0))]),
+        ]);
+        let artifact = mixed_artifact_for_block(owner(), &block);
+        let plan_table = property_load_plan_table(owner(), Vec::new());
+        let wrong_key_candidate =
+            prototype_data_guarded_candidate(owner(), BytecodeIndex::from_offset(0), 12, 1);
+        let guarded_table =
+            property_load_guarded_candidate_table(owner(), vec![wrong_key_candidate.clone()]);
+        let mut host = SequencedPropertyLoadProbeHost::new_guarded(vec![
+            GeneratedGuardedPropertyLoadProbeResult::hit(RuntimeValue::from_i32(37)),
+        ]);
+        host.sidecar_base_structure = Some(wrong_key_candidate.plan.descriptor.base_structure);
+        host.holder_results = vec![GeneratedPropertyLoadProbeResult::hit(
+            RuntimeValue::from_i32(91),
+        )];
+
+        let (result, _, _, root_sync_requests, probe_miss_records, guarded_miss_records) =
+            execute_generated_with_property_load_sidecar_tables(
+                owner(),
+                &block,
+                &artifact,
+                &plan_table,
+                &guarded_table,
+                &mut host,
+                &[(local(1), cell_runtime_value())],
+            );
+
+        assert!(matches!(
+            result,
+            Ok(BaselineGeneratedExecutionResult::Property(_))
+        ));
+        assert!(host.sidecar_base_structure_queries.is_empty());
+        assert!(host.holder_requests.is_empty());
+        assert!(host.probed_plan_keys.is_empty());
+        assert!(host.guarded_probed_plan_keys.is_empty());
+        assert!(root_sync_requests.is_empty());
+        assert!(probe_miss_records.is_empty());
+        assert!(guarded_miss_records.is_empty());
+    }
+
+    #[test]
     fn generated_guarded_property_load_negative_lookup_hit_writes_undefined() {
         let block = code_block(vec![
             core_typed(
@@ -11329,6 +11300,7 @@ mod tests {
         );
         assert!(host.probed_plan_keys.is_empty());
         assert_eq!(host.guarded_probed_plan_keys, vec![property_cache_key(11)]);
+        assert!(host.holder_requests.is_empty());
         assert!(root_sync_requests.is_empty());
         assert!(probe_miss_records.is_empty());
         assert!(guarded_miss_records.is_empty());
@@ -11875,6 +11847,28 @@ mod tests {
     ) -> PropertyLoadSidecarTablesExecutionResult {
         let plan_table = property_load_plan_table(owner, Vec::new());
         let guarded_candidate_table = empty_property_load_guarded_candidate_table(owner);
+        execute_generated_with_property_load_sidecar_tables_and_megamorphic_table(
+            owner,
+            code_block,
+            artifact,
+            &plan_table,
+            &guarded_candidate_table,
+            megamorphic_table,
+            host,
+            initial_locals,
+        )
+    }
+
+    fn execute_generated_with_property_load_sidecar_tables_and_megamorphic_table(
+        owner: CodeBlockId,
+        code_block: &CodeBlock,
+        artifact: &BaselineGeneratedCodeArtifact,
+        plan_table: &PropertyLoadAccessCasePlanTable,
+        guarded_candidate_table: &PropertyLoadGuardedCandidateTable,
+        megamorphic_table: &GeneratedPropertyLoadMegamorphicCandidateTable,
+        host: &mut dyn DispatchHost,
+        initial_locals: &[(VirtualRegister, RuntimeValue)],
+    ) -> PropertyLoadSidecarTablesExecutionResult {
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
         let mut exceptions = ExceptionState::default();
@@ -11892,7 +11886,7 @@ mod tests {
         {
             let mut sidecars = BaselineGeneratedPropertyExecutionSidecars::new(
                 host,
-                Some((&plan_table, &guarded_candidate_table)),
+                Some((plan_table, guarded_candidate_table)),
                 None,
             )
             .with_property_load_megamorphic_candidate_table(Some(megamorphic_table));

@@ -30,8 +30,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
                  broad blocker remains: generated baseline is still a Rust bytecode re-interpreter
                  and is slower than the optimized interpreter on richards. Capped telemetry now
                  shows generated dispatch heat dominated by GetByName, JumpIfFalse, PutByName,
-                 and CallWithThis in the hot generated owners; site telemetry first identifies
-                 owner 110@32 GetByName as GuardedPrototypeData-ready under the 500k cap.
+                 and CallWithThis in the hot generated owners; generated-entry depth-1
+                 GuardedPrototypeData loads now use the C++ GetByIdPrototype-shaped
+                 receiver-structure + holder/offset fast path, with the 500k richards cap
+                 still showing owner 110@32/76 heat and zero generated invalidations.
   Phase 2 [done] Octane feature completeness: all 15 benchmarks RUN correctly. Ground-truth
                  2026-05-30: ZERO throwers/aborts -- 3 score, 12 functional-but-slow
                  (perf-gated, Phase 1). Landed: implicit-global store, indirect eval, catchable
@@ -118,6 +120,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            not starve the observation pipeline; PUT ~5x, GET access ~2x on micro
     [done] generated property handoff groundwork
     [done] property load/store observation flow for current hot path
+    [done] generated-entry depth-1 GuardedPrototypeData holder loads: receiver
+           structure guard + holder/offset read mirrors C++ GetByIdPrototype DataIC
+           while preserving Rust sidecar priority and pending-invalidation fallback
     [done] named has/in dormant metadata and narrow generated sidecar
     [wip] access-case evolution and megamorphic policy
     [done] resident monomorphic self-load + prototype-chain (holder) get_by_id DataIC
