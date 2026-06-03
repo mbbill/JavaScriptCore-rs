@@ -24,6 +24,10 @@
 - MUST keep Rust files, modules, types, traits, and ownership boundaries
   recognizably mapped to C++ JSC files, classes, structs, enums, and subsystem
   boundaries.
+- MUST keep oversized Rust files shrinking: any non-trivial behavior that would
+  land in a source file over 3,000 lines or already mixing multiple C++ JSC
+  subsystems must use a JSC-mapped extraction boundary or a documented minimal
+  emergency exception.
 - MUST map any new non-trivial Rust file/type/state machine/cache/manager to a
   C++ JSC counterpart or to a Rust ownership/rooting/safety requirement.
 - MUST comment every non-obvious permanent Rust divergence at the code site:
@@ -38,6 +42,9 @@
   symptom patching before comparing Rust against C++ JSC.
 - MUST NOT use benchmark source hacks, fake JS behavior, tiny-path shortcuts,
   panic placeholders, or broad `Rc<RefCell<_>>` designs to move a metric.
+- MUST NOT add new non-trivial engine behavior, state machines, caches, managers,
+  or subsystem ownership to an oversized mixed-responsibility file except as
+  extraction glue or a documented minimal emergency fix.
 - MUST NOT create non-trivial Rust-only file/type hierarchies when an existing
   JSC concept should be ported.
 - MUST NOT put unrelated engine subsystems into one huge file.
@@ -152,6 +159,9 @@ project-owner input is genuinely required.
   justification, or reject/remove it.
 - PAUSE if a patch grows a huge mixed-responsibility file; require a split by
   C++ JSC subsystem/class ownership before accepting behavior changes.
+- PAUSE if a non-trivial patch adds behavior to an oversized
+  mixed-responsibility file without an extraction boundary or emergency
+  exception rationale.
 - PAUSE if the tree is accumulating accepted work without commits or isolation;
   commit accepted batches or move new work into an isolated worktree/workspace.
 
@@ -265,6 +275,9 @@ architecture decisions.
 - Ownership, rooting, barriers, identity, and lifetimes fit the JSC behavior.
 - Tests prove JSC behavior, not accidental Rust behavior.
 - The diff is one logical commit and does not mix unrelated work.
+- Oversized files do not grow with new subsystem behavior, and no source file is
+  newly pushed over the oversized threshold without an extraction/migration
+  rationale.
 
 ### Reviewer Report MUST
 
