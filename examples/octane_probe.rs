@@ -539,6 +539,8 @@ fn print_tiering_summary(vm: &Vm) {
     let generated_direct_call_transactions = tiering.generated_direct_call_transaction_records();
     let generated_direct_call_transaction_summaries =
         tiering.generated_direct_call_transaction_summaries();
+    let generated_direct_call_route_opportunity_summaries =
+        tiering.generated_direct_call_route_opportunity_summaries();
     let generated_direct_call_transaction_count = tiering.generated_direct_call_transaction_count();
     let generated_direct_call_generated_entries =
         tiering.generated_direct_call_generated_entry_count();
@@ -907,6 +909,39 @@ fn print_tiering_summary(vm: &Vm) {
                         .cmp(&format!("{:?}", right.target_code_block))
                 })
                 .then_with(|| format!("{:?}", left.route).cmp(&format!("{:?}", right.route)))
+        },
+    );
+    print_top_records(
+        &mut stderr,
+        "generated-direct-call-route-opportunity-summary",
+        generated_direct_call_route_opportunity_summaries,
+        tail_limit,
+        record_filter.as_deref(),
+        |left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| format!("{:?}", left.caller).cmp(&format!("{:?}", right.caller)))
+                .then_with(|| {
+                    left.call_bytecode_index
+                        .as_bits()
+                        .cmp(&right.call_bytecode_index.as_bits())
+                })
+                .then_with(|| {
+                    format!("{:?}", left.target_code_block)
+                        .cmp(&format!("{:?}", right.target_code_block))
+                })
+                .then_with(|| {
+                    format!("{:?}", left.selected_route).cmp(&format!("{:?}", right.selected_route))
+                })
+                .then_with(|| {
+                    format!("{:?}", left.preferred_route)
+                        .cmp(&format!("{:?}", right.preferred_route))
+                })
+                .then_with(|| {
+                    format!("{:?}", left.native_entry_miss)
+                        .cmp(&format!("{:?}", right.native_entry_miss))
+                })
         },
     );
     print_tail_records(
@@ -1790,6 +1825,39 @@ fn print_benchmark_tiering_summary(benchmark: &OctaneBenchmarkExecutionReport) {
                 .then_with(|| {
                     format!("{:?}", left.generated_entry_miss)
                         .cmp(&format!("{:?}", right.generated_entry_miss))
+                })
+                .then_with(|| {
+                    format!("{:?}", left.native_entry_miss)
+                        .cmp(&format!("{:?}", right.native_entry_miss))
+                })
+        },
+    );
+    print_top_records(
+        &mut stderr,
+        "generated-direct-call-route-opportunity-summary",
+        &summary.generated_direct_call_route_opportunity_summaries,
+        tail_limit,
+        record_filter.as_deref(),
+        |left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| format!("{:?}", left.caller).cmp(&format!("{:?}", right.caller)))
+                .then_with(|| {
+                    left.call_bytecode_index
+                        .as_bits()
+                        .cmp(&right.call_bytecode_index.as_bits())
+                })
+                .then_with(|| {
+                    format!("{:?}", left.target_code_block)
+                        .cmp(&format!("{:?}", right.target_code_block))
+                })
+                .then_with(|| {
+                    format!("{:?}", left.selected_route).cmp(&format!("{:?}", right.selected_route))
+                })
+                .then_with(|| {
+                    format!("{:?}", left.preferred_route)
+                        .cmp(&format!("{:?}", right.preferred_route))
                 })
                 .then_with(|| {
                     format!("{:?}", left.native_entry_miss)

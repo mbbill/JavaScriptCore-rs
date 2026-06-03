@@ -630,6 +630,11 @@ impl Vm {
                     | GeneratedDirectCallCalleeRoutePolicy::NativeEntryOnly
             )
         {
+            let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
+                code_block_id,
+                code_block,
+                expected_frame,
+            );
             if let Some(execution) = self
                 .try_execute_generated_direct_call_callee_with_native_entry(
                     code_block_id,
@@ -642,11 +647,24 @@ impl Vm {
             {
                 self.tiering
                     .record_generated_direct_call_preferred_route_hit();
+                self.record_generated_direct_call_route_opportunity(
+                    continuation,
+                    code_block_id,
+                    argument_count_including_this,
+                    execution.route,
+                    preferred_route,
+                    native_entry_miss,
+                );
                 return execution;
             }
         }
 
         if route_policy == GeneratedDirectCallCalleeRoutePolicy::NativeEntryOnly {
+            let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
+                code_block_id,
+                code_block,
+                expected_frame,
+            );
             return self
                 .try_execute_generated_direct_call_callee_with_native_entry(
                     code_block_id,
@@ -656,11 +674,32 @@ impl Vm {
                     config,
                     false,
                 )
-                .unwrap_or_else(|| GeneratedDirectCallCalleeExecution {
-                    completion: ExecutionCompletion::Failed(
-                        ExecutionError::BaselineGeneratedExecutionRejected,
-                    ),
-                    route: VmGeneratedDirectCallTransactionRoute::NativeEntry,
+                .map(|execution| {
+                    self.record_generated_direct_call_route_opportunity(
+                        continuation,
+                        code_block_id,
+                        argument_count_including_this,
+                        execution.route,
+                        preferred_route,
+                        native_entry_miss,
+                    );
+                    execution
+                })
+                .unwrap_or_else(|| {
+                    self.record_generated_direct_call_route_opportunity(
+                        continuation,
+                        code_block_id,
+                        argument_count_including_this,
+                        VmGeneratedDirectCallTransactionRoute::NativeEntry,
+                        preferred_route,
+                        native_entry_miss,
+                    );
+                    GeneratedDirectCallCalleeExecution {
+                        completion: ExecutionCompletion::Failed(
+                            ExecutionError::BaselineGeneratedExecutionRejected,
+                        ),
+                        route: VmGeneratedDirectCallTransactionRoute::NativeEntry,
+                    }
                 });
         }
 
@@ -671,6 +710,11 @@ impl Vm {
             // native callable entry and a diagnostic generated artifact, the
             // native entry is the faithful target; the generated artifact still
             // exists as fallback/residency evidence.
+            let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
+                code_block_id,
+                code_block,
+                expected_frame,
+            );
             if let Some(execution) = self
                 .try_execute_generated_direct_call_callee_with_native_entry(
                     code_block_id,
@@ -681,11 +725,24 @@ impl Vm {
                     true,
                 )
             {
+                self.record_generated_direct_call_route_opportunity(
+                    continuation,
+                    code_block_id,
+                    argument_count_including_this,
+                    execution.route,
+                    preferred_route,
+                    native_entry_miss,
+                );
                 return execution;
             }
         }
 
         if preferred_route == Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry) {
+            let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
+                code_block_id,
+                code_block,
+                expected_frame,
+            );
             if let Some(execution) = self
                 .try_execute_generated_direct_call_callee_with_generated_entry(
                     code_block_id,
@@ -697,10 +754,23 @@ impl Vm {
             {
                 self.tiering
                     .record_generated_direct_call_preferred_route_hit();
+                self.record_generated_direct_call_route_opportunity(
+                    continuation,
+                    code_block_id,
+                    argument_count_including_this,
+                    execution.route,
+                    preferred_route,
+                    native_entry_miss,
+                );
                 return execution;
             }
         }
 
+        let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
+            code_block_id,
+            code_block,
+            expected_frame,
+        );
         let generated = self.try_execute_generated_direct_call_callee_with_generated_entry(
             code_block_id,
             code_block,
@@ -709,8 +779,21 @@ impl Vm {
             config,
         );
         if let Some(execution) = generated {
+            self.record_generated_direct_call_route_opportunity(
+                continuation,
+                code_block_id,
+                argument_count_including_this,
+                execution.route,
+                preferred_route,
+                native_entry_miss,
+            );
             return execution;
         }
+        let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
+            code_block_id,
+            code_block,
+            expected_frame,
+        );
         if let Some(execution) = self.try_prepare_missing_generated_direct_call_callee_entry(
             code_block_id,
             code_block,
@@ -718,9 +801,30 @@ impl Vm {
             host,
             config,
         ) {
+            self.record_generated_direct_call_route_opportunity(
+                continuation,
+                code_block_id,
+                argument_count_including_this,
+                execution.route,
+                preferred_route,
+                native_entry_miss,
+            );
             return execution;
         }
         if route_policy == GeneratedDirectCallCalleeRoutePolicy::GeneratedEntryOnly {
+            let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
+                code_block_id,
+                code_block,
+                expected_frame,
+            );
+            self.record_generated_direct_call_route_opportunity(
+                continuation,
+                code_block_id,
+                argument_count_including_this,
+                VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
+                preferred_route,
+                native_entry_miss,
+            );
             return GeneratedDirectCallCalleeExecution {
                 completion: ExecutionCompletion::Failed(
                     ExecutionError::BaselineGeneratedExecutionRejected,
@@ -729,6 +833,11 @@ impl Vm {
             };
         }
 
+        let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
+            code_block_id,
+            code_block,
+            expected_frame,
+        );
         self.try_execute_generated_direct_call_callee_with_native_entry(
             code_block_id,
             code_block,
@@ -737,6 +846,17 @@ impl Vm {
             config,
             true,
         )
+        .map(|execution| {
+            self.record_generated_direct_call_route_opportunity(
+                continuation,
+                code_block_id,
+                argument_count_including_this,
+                execution.route,
+                preferred_route,
+                native_entry_miss,
+            );
+            execution
+        })
         .unwrap_or_else(|| {
             let generated_entry_miss = self.generated_direct_call_generated_entry_miss_reason(
                 code_block_id,
@@ -754,6 +874,14 @@ impl Vm {
                 argument_count_including_this,
                 preferred_route,
                 generated_entry_miss,
+                native_entry_miss,
+            );
+            self.record_generated_direct_call_route_opportunity(
+                continuation,
+                code_block_id,
+                argument_count_including_this,
+                VmGeneratedDirectCallTransactionRoute::NestedInterpreterFallback,
+                preferred_route,
                 native_entry_miss,
             );
             GeneratedDirectCallCalleeExecution {

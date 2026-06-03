@@ -250,6 +250,10 @@ pub struct VmTieringIntegration {
     generated_direct_call_callee_fallback_records: Vec<VmGeneratedDirectCallCalleeFallbackRecord>,
     generated_direct_call_callee_fallback_summaries:
         Vec<VmGeneratedDirectCallCalleeFallbackSummary>,
+    generated_direct_call_route_opportunity_records:
+        Vec<VmGeneratedDirectCallRouteOpportunityRecord>,
+    generated_direct_call_route_opportunity_summaries:
+        Vec<VmGeneratedDirectCallRouteOpportunitySummary>,
     generated_direct_call_transaction_count: usize,
     generated_direct_call_generated_entry_count: usize,
     generated_direct_call_native_entry_count: usize,
@@ -1820,6 +1824,18 @@ impl VmTieringIntegration {
         &self.generated_direct_call_callee_fallback_summaries
     }
 
+    pub fn generated_direct_call_route_opportunity_records(
+        &self,
+    ) -> &[VmGeneratedDirectCallRouteOpportunityRecord] {
+        &self.generated_direct_call_route_opportunity_records
+    }
+
+    pub fn generated_direct_call_route_opportunity_summaries(
+        &self,
+    ) -> &[VmGeneratedDirectCallRouteOpportunitySummary] {
+        &self.generated_direct_call_route_opportunity_summaries
+    }
+
     pub fn generated_direct_call_transaction_count(&self) -> usize {
         self.generated_direct_call_transaction_count
     }
@@ -2664,6 +2680,59 @@ impl VmTieringIntegration {
             < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
         {
             self.generated_direct_call_callee_fallback_records
+                .push(record);
+        }
+        record
+    }
+
+    pub(crate) fn record_generated_direct_call_route_opportunity(
+        &mut self,
+        request: VmGeneratedDirectCallRouteOpportunityRequest,
+    ) -> VmGeneratedDirectCallRouteOpportunityRecord {
+        let record = VmGeneratedDirectCallRouteOpportunityRecord {
+            ordinal: self.next_record_ordinal(),
+            caller: request.caller,
+            call_bytecode_index: request.call_bytecode_index,
+            callee: request.callee,
+            target_code_block: request.target_code_block,
+            argument_count_including_this: request.argument_count_including_this,
+            selected_route: request.selected_route,
+            preferred_route: request.preferred_route,
+            native_entry_miss: request.native_entry_miss,
+        };
+        if let Some(summary) = self
+            .generated_direct_call_route_opportunity_summaries
+            .iter_mut()
+            .find(|summary| {
+                summary.caller == request.caller
+                    && summary.call_bytecode_index == request.call_bytecode_index
+                    && summary.target_code_block == request.target_code_block
+                    && summary.argument_count_including_this
+                        == request.argument_count_including_this
+                    && summary.selected_route == request.selected_route
+                    && summary.preferred_route == request.preferred_route
+                    && summary.native_entry_miss == request.native_entry_miss
+            })
+        {
+            summary.record();
+        } else {
+            let mut summary = VmGeneratedDirectCallRouteOpportunitySummary::new(
+                request.caller,
+                request.call_bytecode_index,
+                request.target_code_block,
+                request.argument_count_including_this,
+                request.selected_route,
+                request.preferred_route,
+                request.native_entry_miss,
+            );
+            summary.record();
+            self.generated_direct_call_route_opportunity_summaries
+                .push(summary);
+        }
+        if self.generated_direct_call_route_opportunity_records.len()
+            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        {
+            self.generated_direct_call_route_opportunity_records
                 .push(record);
         }
         record
@@ -7492,6 +7561,77 @@ impl VmGeneratedDirectCallCalleeFallbackSummary {
 
     fn record(&mut self) {
         self.fallback_count = self.fallback_count.saturating_add(1);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VmGeneratedDirectCallRouteOpportunityRequest {
+    pub caller: CodeBlockId,
+    pub call_bytecode_index: BytecodeIndex,
+    pub callee: Option<ObjectId>,
+    pub target_code_block: CodeBlockId,
+    pub argument_count_including_this: u32,
+    pub selected_route: VmGeneratedDirectCallTransactionRoute,
+    pub preferred_route: Option<VmGeneratedDirectCallTransactionRoute>,
+    pub native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGeneratedDirectCallRouteOpportunityRecord {
+    pub ordinal: u64,
+    pub caller: CodeBlockId,
+    pub call_bytecode_index: BytecodeIndex,
+    pub callee: Option<ObjectId>,
+    pub target_code_block: CodeBlockId,
+    pub argument_count_including_this: u32,
+    pub selected_route: VmGeneratedDirectCallTransactionRoute,
+    pub preferred_route: Option<VmGeneratedDirectCallTransactionRoute>,
+    pub native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason,
+}
+
+// Diagnostic mirror of C++ JSC CallLinkInfo/DirectCallLinkInfo target
+// selection: C++ records a selected call target once addressForCall() is
+// available (CallLinkInfo.cpp DirectCallLinkInfo::retrieveCodePtr and
+// setCallTarget). Rust keeps this small summary so generated-entry success can
+// still explain which native-entry availability check blocked that target.
+// Oversized-file exception: this stays beside the existing generated direct-call
+// summaries until the dedicated VmTieringIntegration telemetry extraction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGeneratedDirectCallRouteOpportunitySummary {
+    pub caller: CodeBlockId,
+    pub call_bytecode_index: BytecodeIndex,
+    pub target_code_block: CodeBlockId,
+    pub argument_count_including_this: u32,
+    pub selected_route: VmGeneratedDirectCallTransactionRoute,
+    pub preferred_route: Option<VmGeneratedDirectCallTransactionRoute>,
+    pub native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason,
+    pub count: usize,
+}
+
+impl VmGeneratedDirectCallRouteOpportunitySummary {
+    const fn new(
+        caller: CodeBlockId,
+        call_bytecode_index: BytecodeIndex,
+        target_code_block: CodeBlockId,
+        argument_count_including_this: u32,
+        selected_route: VmGeneratedDirectCallTransactionRoute,
+        preferred_route: Option<VmGeneratedDirectCallTransactionRoute>,
+        native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason,
+    ) -> Self {
+        Self {
+            caller,
+            call_bytecode_index,
+            target_code_block,
+            argument_count_including_this,
+            selected_route,
+            preferred_route,
+            native_entry_miss,
+            count: 0,
+        }
+    }
+
+    fn record(&mut self) {
+        self.count = self.count.saturating_add(1);
     }
 }
 
@@ -19542,6 +19682,71 @@ mod tests {
     use crate::runtime::{ExecutableId, NativeCodeId, WatchpointGeneration};
     use crate::strings::{AtomId, Identifier, PropertyIndex, PropertyKey};
     use crate::value::ValueKind;
+
+    #[test]
+    fn generated_direct_call_route_opportunity_summary_tracks_generated_entry_native_blocker() {
+        let mut tiering = VmTieringIntegration::default();
+        let caller = CodeBlockId(CellId(10));
+        let target = CodeBlockId(CellId(20));
+        let call_bytecode_index = BytecodeIndex::from_offset(32);
+        let request = VmGeneratedDirectCallRouteOpportunityRequest {
+            caller,
+            call_bytecode_index,
+            callee: Some(ObjectId(CellId(30))),
+            target_code_block: target,
+            argument_count_including_this: 3,
+            selected_route: VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
+            preferred_route: Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry),
+            native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64,
+        };
+
+        let first = tiering.record_generated_direct_call_route_opportunity(request);
+        let second = tiering.record_generated_direct_call_route_opportunity(request);
+
+        assert_eq!(second.ordinal, first.ordinal + 1);
+        assert_eq!(
+            tiering.generated_direct_call_route_opportunity_records(),
+            &[
+                VmGeneratedDirectCallRouteOpportunityRecord {
+                    ordinal: first.ordinal,
+                    caller,
+                    call_bytecode_index,
+                    callee: Some(ObjectId(CellId(30))),
+                    target_code_block: target,
+                    argument_count_including_this: 3,
+                    selected_route: VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
+                    preferred_route: Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry),
+                    native_entry_miss:
+                        VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64,
+                },
+                VmGeneratedDirectCallRouteOpportunityRecord {
+                    ordinal: second.ordinal,
+                    caller,
+                    call_bytecode_index,
+                    callee: Some(ObjectId(CellId(30))),
+                    target_code_block: target,
+                    argument_count_including_this: 3,
+                    selected_route: VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
+                    preferred_route: Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry),
+                    native_entry_miss:
+                        VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64,
+                },
+            ]
+        );
+        assert_eq!(
+            tiering.generated_direct_call_route_opportunity_summaries(),
+            &[VmGeneratedDirectCallRouteOpportunitySummary {
+                caller,
+                call_bytecode_index,
+                target_code_block: target,
+                argument_count_including_this: 3,
+                selected_route: VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
+                preferred_route: Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry),
+                native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64,
+                count: 2,
+            }]
+        );
+    }
 
     fn boundary() -> FallbackBoundarySnapshot {
         FallbackBoundarySnapshot::from_roots(

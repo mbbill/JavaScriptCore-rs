@@ -27,8 +27,8 @@ use crate::vm::{
     VmGeneratedDirectCallRootlessRejectionCounts,
     VmGeneratedDirectCallRootlessRetainedSideExitCount,
     VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount,
-    VmGeneratedDirectCallTransactionSummary, VmPropertyInlineCacheEvolutionDecision,
-    VmPropertyInlineCacheEvolutionTerminalState,
+    VmGeneratedDirectCallRouteOpportunitySummary, VmGeneratedDirectCallTransactionSummary,
+    VmPropertyInlineCacheEvolutionDecision, VmPropertyInlineCacheEvolutionTerminalState,
 };
 
 pub const OCTANE_DEFAULT_ITERATION_COUNT: usize = 120;
@@ -417,6 +417,8 @@ pub struct OctaneTieringSummary {
     pub generated_direct_call_transaction_summaries: Vec<VmGeneratedDirectCallTransactionSummary>,
     pub generated_direct_call_callee_fallback_summaries:
         Vec<VmGeneratedDirectCallCalleeFallbackSummary>,
+    pub generated_direct_call_route_opportunity_summaries:
+        Vec<VmGeneratedDirectCallRouteOpportunitySummary>,
     pub launch_descriptors: usize,
     pub call_observations: usize,
     pub call_link_boundary_validations: usize,
@@ -612,6 +614,9 @@ impl OctaneTieringSummary {
             generated_direct_call_callee_fallback_summaries: tiering
                 .generated_direct_call_callee_fallback_summaries()
                 .to_vec(),
+            generated_direct_call_route_opportunity_summaries: tiering
+                .generated_direct_call_route_opportunity_summaries()
+                .to_vec(),
             launch_descriptors: vm.entry_state().launch_descriptors().len(),
             call_observations: tiering.call_observations().len(),
             call_link_boundary_validations: tiering.call_link_boundary_validation_records().len(),
@@ -693,6 +698,11 @@ impl OctaneTieringSummary {
             octane_generated_direct_call_callee_fallback_summary_delta(
                 &self.generated_direct_call_callee_fallback_summaries,
                 &start.generated_direct_call_callee_fallback_summaries,
+            );
+        let generated_direct_call_route_opportunity_summaries =
+            octane_generated_direct_call_route_opportunity_summary_delta(
+                &self.generated_direct_call_route_opportunity_summaries,
+                &start.generated_direct_call_route_opportunity_summaries,
             );
         let baseline_entry_auto_materialization_records = self
             .baseline_entry_auto_materialization_records
@@ -792,6 +802,7 @@ impl OctaneTieringSummary {
             generated_direct_call_rootless_preferred_native_entry_counts,
             generated_direct_call_transaction_summaries,
             generated_direct_call_callee_fallback_summaries,
+            generated_direct_call_route_opportunity_summaries,
             launch_descriptors: self
                 .launch_descriptors
                 .saturating_sub(start.launch_descriptors),
@@ -1234,6 +1245,42 @@ fn octane_generated_direct_call_callee_fallback_summary_delta(
                 ),
             };
             (delta.fallback_count > 0).then_some(delta)
+        })
+        .collect()
+}
+
+fn octane_generated_direct_call_route_opportunity_summary_delta(
+    current: &[VmGeneratedDirectCallRouteOpportunitySummary],
+    start: &[VmGeneratedDirectCallRouteOpportunitySummary],
+) -> Vec<VmGeneratedDirectCallRouteOpportunitySummary> {
+    current
+        .iter()
+        .filter_map(|current_summary| {
+            let start_summary = start.iter().find(|start_summary| {
+                start_summary.caller == current_summary.caller
+                    && start_summary.call_bytecode_index == current_summary.call_bytecode_index
+                    && start_summary.target_code_block == current_summary.target_code_block
+                    && start_summary.argument_count_including_this
+                        == current_summary.argument_count_including_this
+                    && start_summary.selected_route == current_summary.selected_route
+                    && start_summary.preferred_route == current_summary.preferred_route
+                    && start_summary.native_entry_miss == current_summary.native_entry_miss
+            });
+            let delta = VmGeneratedDirectCallRouteOpportunitySummary {
+                caller: current_summary.caller,
+                call_bytecode_index: current_summary.call_bytecode_index,
+                target_code_block: current_summary.target_code_block,
+                argument_count_including_this: current_summary.argument_count_including_this,
+                selected_route: current_summary.selected_route,
+                preferred_route: current_summary.preferred_route,
+                native_entry_miss: current_summary.native_entry_miss,
+                count: current_summary.count.saturating_sub(
+                    start_summary
+                        .map(|start_summary| start_summary.count)
+                        .unwrap_or(0),
+                ),
+            };
+            (delta.count > 0).then_some(delta)
         })
         .collect()
 }
@@ -3823,6 +3870,19 @@ Benchmark.prototype.validate = function() {
                     fallback_count: 2,
                 },
             ],
+            generated_direct_call_route_opportunity_summaries: vec![
+                VmGeneratedDirectCallRouteOpportunitySummary {
+                    caller,
+                    call_bytecode_index,
+                    target_code_block: target,
+                    argument_count_including_this: 2,
+                    selected_route: VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
+                    preferred_route: Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry),
+                    native_entry_miss:
+                        VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64,
+                    count: 2,
+                },
+            ],
             baseline_entry_auto_materializations: 1,
             baseline_entry_auto_materialization_records: vec![start_auto_record.clone()],
             property_inline_cache_evolution_records: 7,
@@ -4045,6 +4105,29 @@ Benchmark.prototype.validate = function() {
                     native_entry_miss:
                         VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64,
                     fallback_count: 1,
+                },
+            ],
+            generated_direct_call_route_opportunity_summaries: vec![
+                VmGeneratedDirectCallRouteOpportunitySummary {
+                    caller,
+                    call_bytecode_index,
+                    target_code_block: target,
+                    argument_count_including_this: 2,
+                    selected_route: VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
+                    preferred_route: Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry),
+                    native_entry_miss:
+                        VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64,
+                    count: 6,
+                },
+                VmGeneratedDirectCallRouteOpportunitySummary {
+                    caller,
+                    call_bytecode_index,
+                    target_code_block: target,
+                    argument_count_including_this: 2,
+                    selected_route: VmGeneratedDirectCallTransactionRoute::NativeEntry,
+                    preferred_route: Some(VmGeneratedDirectCallTransactionRoute::NativeEntry),
+                    native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason::Ready,
+                    count: 1,
                 },
             ],
             baseline_entry_auto_materializations: 2,
@@ -4308,6 +4391,32 @@ Benchmark.prototype.validate = function() {
                     native_entry_miss:
                         VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64,
                     fallback_count: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            delta.generated_direct_call_route_opportunity_summaries,
+            vec![
+                VmGeneratedDirectCallRouteOpportunitySummary {
+                    caller,
+                    call_bytecode_index,
+                    target_code_block: target,
+                    argument_count_including_this: 2,
+                    selected_route: VmGeneratedDirectCallTransactionRoute::GeneratedEntry,
+                    preferred_route: Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry),
+                    native_entry_miss:
+                        VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64,
+                    count: 4,
+                },
+                VmGeneratedDirectCallRouteOpportunitySummary {
+                    caller,
+                    call_bytecode_index,
+                    target_code_block: target,
+                    argument_count_including_this: 2,
+                    selected_route: VmGeneratedDirectCallTransactionRoute::NativeEntry,
+                    preferred_route: Some(VmGeneratedDirectCallTransactionRoute::NativeEntry),
+                    native_entry_miss: VmGeneratedDirectCallNativeEntryMissReason::Ready,
+                    count: 1,
                 },
             ]
         );

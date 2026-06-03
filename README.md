@@ -173,6 +173,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] generated Call/CallWithThis setup payload: sidecars carry the C++ JITCall.cpp-shaped
            same-dispatch this+argument frame setup snapshot into VM CallLinkInfo validation;
            malformed payloads fall back, and plain Call preserves implicit undefined this
+    [done] generated direct-call route-opportunity telemetry: generated-entry successes now
+           report the selected/preferred route and native-entry miss reason per site/target,
+           exposing macOS arm64 native blockers without changing route selection
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
   [wip] arrays and indexed storage
