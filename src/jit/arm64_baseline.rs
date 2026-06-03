@@ -26,9 +26,9 @@ use crate::jit::emitter::{
     P6X86_64BaselineSelectedInstruction, P6X86_64BaselineSemanticByteEmissionAuthority,
     P6X86_64BaselineSemanticByteEmissionError, P6X86_64BaselineSemanticByteEmissionResult,
     P6X86_64BaselineSemanticByteEmissionShape, P6X86_64BaselineSemanticOperandRejectionReason,
-    P6X86_64BaselineSymbolicRegister, P6X86_64BaselineTerminalPolicy,
-    P6X86_64BaselineTerminalPolicyRecord, P6X86_64SemanticEncodedSelection,
-    P6X86_64SemanticTerminalSelection,
+    P6X86_64BaselineSideExitReturnPayload, P6X86_64BaselineSymbolicRegister,
+    P6X86_64BaselineTerminalPolicy, P6X86_64BaselineTerminalPolicyRecord,
+    P6X86_64SemanticEncodedSelection, P6X86_64SemanticTerminalSelection,
 };
 
 // ARM64 JSC map: GPRInfo::callFrameRegister is fp/x29 and returnValueGPR is
@@ -1101,6 +1101,28 @@ fn p6_arm64_emit_return_value(
     }
 }
 
+#[allow(dead_code)]
+fn p6_arm64_callable_payload_return_stub_bytes(
+    return_value_bits: u64,
+) -> Result<Vec<u8>, P6X86_64BaselineSemanticByteEmissionError> {
+    let mut bytes = Vec::new();
+    p6_arm64_emit_mov_x0_u64(&mut bytes, return_value_bits)?;
+    p6_arm64_emit_bytes(&mut bytes, P6_ARM64_CALLABLE_EPILOGUE_BYTES)?;
+    Ok(bytes)
+}
+
+#[allow(dead_code)]
+fn p6_arm64_callable_side_exit_payload_return_stub_bytes(
+    encoded_payload: P6X86_64BaselineSideExitReturnPayload,
+) -> Result<Vec<u8>, P6X86_64BaselineSemanticByteEmissionError> {
+    // C++ Baseline JIT handles `jfalse` fallback through
+    // `JITOpcodes.cpp::valueIsFalseyGenerator` and LLInt's
+    // `slow_path_jfalse`. This Rust-only native-entry stub does not implement
+    // truthiness; it returns the encoded payload through x0 so the VM can
+    // leave and reenter through the current rooting/fallback tables.
+    p6_arm64_callable_payload_return_stub_bytes(encoded_payload.raw_bits())
+}
+
 fn p6_arm64_emit_ldr_x0_from_frame_location(
     bytes: &mut Vec<u8>,
     bytecode_index: BytecodeIndex,
@@ -1321,6 +1343,40 @@ mod tests {
             .unwrap()
     }
 
+    fn assert_no_x86_ud2_bytes(bytes: &[u8]) {
+        assert!(!bytes.windows(2).any(|window| window == [0x0f, 0x0b]));
+    }
+
+    fn decode_mov_x0_u64_sequence(bytes: &[u8]) -> u64 {
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes.len() % 4, 0);
+
+        let mut value = 0_u64;
+        let mut saw_movz = false;
+        for chunk in bytes.chunks_exact(4) {
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let halfword = ((word >> 21) & 0x3) as u64;
+            let imm16 = ((word >> 5) & 0xffff) as u64;
+            let shift = halfword * 16;
+
+            match word & 0xff80_001f {
+                0xd280_0000 => {
+                    assert!(!saw_movz, "payload materialization has multiple movz");
+                    saw_movz = true;
+                    value = imm16 << shift;
+                }
+                0xf280_0000 => {
+                    assert!(saw_movz, "payload materialization starts with movk");
+                    value &= !(0xffff_u64 << shift);
+                    value |= imm16 << shift;
+                }
+                _ => panic!("unexpected ARM64 x0 materialization word 0x{word:08x}"),
+            }
+        }
+        assert!(saw_movz, "payload materialization is missing movz");
+        value
+    }
+
     #[test]
     fn arm64_baseline_register_contract_matches_gprinfo_jsrinfo_identity() {
         assert_eq!(
@@ -1363,6 +1419,45 @@ mod tests {
             register_contract::TEMPORARY_GPRS[15],
             register_contract::X15
         );
+    }
+
+    #[test]
+    fn arm64_callable_payload_return_stub_materializes_x0_payload_then_epilogue() {
+        let cases = [
+            (0_u64, 4_usize),
+            (0x1234_5678_u64, 8_usize),
+            (0xfedc_ba98_7654_3210_u64, 16_usize),
+        ];
+
+        for (payload, expected_mov_byte_len) in cases {
+            let stub = p6_arm64_callable_payload_return_stub_bytes(payload).unwrap();
+            let mov_byte_len = stub.len() - P6_ARM64_CALLABLE_EPILOGUE_BYTES.len();
+
+            assert_eq!(mov_byte_len, expected_mov_byte_len);
+            assert_eq!(&stub[mov_byte_len..], P6_ARM64_CALLABLE_EPILOGUE_BYTES);
+            assert_eq!(decode_mov_x0_u64_sequence(&stub[..mov_byte_len]), payload);
+            assert_no_x86_ud2_bytes(&stub);
+        }
+    }
+
+    #[test]
+    fn arm64_callable_side_exit_payload_return_stub_preserves_p6_payload_identity() {
+        for side_exit_index in [0_u32, 1, u32::MAX] {
+            let encoded_payload = P6X86_64BaselineSideExitReturnPayload::encode(side_exit_index);
+            let stub =
+                p6_arm64_callable_side_exit_payload_return_stub_bytes(encoded_payload).unwrap();
+            let mov_byte_len = stub.len() - P6_ARM64_CALLABLE_EPILOGUE_BYTES.len();
+            let decoded_bits = decode_mov_x0_u64_sequence(&stub[..mov_byte_len]);
+
+            assert_eq!(&stub[mov_byte_len..], P6_ARM64_CALLABLE_EPILOGUE_BYTES);
+            assert_eq!(decoded_bits, encoded_payload.raw_bits());
+            assert_eq!(
+                P6X86_64BaselineSideExitReturnPayload::decode(decoded_bits),
+                Some(encoded_payload)
+            );
+            assert_eq!(encoded_payload.side_exit_index(), side_exit_index);
+            assert_no_x86_ud2_bytes(&stub);
+        }
     }
 
     #[test]

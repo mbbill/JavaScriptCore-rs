@@ -96,6 +96,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] JIT ARM64 direct branch/link encoding skeleton added to
            src/jit/arm64_baseline.rs (maps to MacroAssemblerARM64::jump/makeBranch,
            ARM64Assembler::b/b_cond/linkJumpOrCall/linkConditionalBranch; dormant direct-only)
+    [done] JIT ARM64 callable side-exit payload return stub helper added to
+           src/jit/arm64_baseline.rs (Rust native-entry ABI/rooting bridge only;
+           C++ jfalse truthiness remains valueIsFalsey/LLInt slow-path work)
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
