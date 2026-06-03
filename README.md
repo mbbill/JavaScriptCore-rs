@@ -179,6 +179,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] generated direct-call MissingGate preparation: the CallLinkInfo/linkFor-style
            slow path now attempts native baseline entry materialization before publishing
            a generated callee fallback, so route telemetry reports concrete native failures
+    [done] generated direct-call backend-contract detail: native auto-materialization telemetry
+           now preserves backend contract variants; capped richards confirms hot failures are
+           ARM64 return-seed UnsupportedOpcodeSubset, not an undifferentiated native gate
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
   [wip] arrays and indexed storage

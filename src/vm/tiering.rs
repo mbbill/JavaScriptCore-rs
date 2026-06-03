@@ -6,7 +6,8 @@
 
 use super::code_blocks::CodeBlockRegistryAttachedCallLinkInlineCacheCandidate;
 use crate::assembler::{
-    AssemblerByteImageDigest, AssemblerByteImageId, LinkBufferProfile, LinkBufferState,
+    AssemblerArchitecture, AssemblerByteImageDigest, AssemblerByteImageId, LinkBufferProfile,
+    LinkBufferState,
 };
 use crate::bytecode::code_block::CodeBlockMutationError;
 use crate::bytecode::ic::{
@@ -48,51 +49,54 @@ use crate::jit::plan::BaselineBytecodeSnapshotFingerprint;
 use crate::jit::{
     derive_property_load_guard_dependencies, plan_property_load_access_case_from_observation,
     plan_property_load_guard_plan_from_observation, select_tier_plan, AbiValue,
-    AccessCaseDescriptor, AccessCaseKind, BaselineBytecodeEligibilityProof, BaselineBytecodeRange,
-    BaselineGeneratedEffectContract, BaselineMachineCodeEmissionRecord,
-    BaselineMachineCodeEmissionValidationError, BaselineMachineCodeEmitterKind,
-    BaselineSupportedOpcodeSubset, CacheKey, CallBoundaryId, CallBoundaryMetadata,
-    CallLinkAttachmentPlan, CallLinkAttachmentPlanTable, CallLinkAttachmentTargetDescriptor,
-    CallLinkInfoDescriptor, CallLinkMode, CallLinkReadinessBlocker, CallLinkReadinessBlockers,
-    CodeFinalizationAuthority, CodeInvalidationReason, CodeLiveness, CodeOrigin, CodeOriginKind,
-    CodeOwnership, CodePatchPlan, CodePatchRecord, CodePatchState, DependencyStrength, EntryAbi,
-    Entrypoint, EntrypointKind, ExecutableAllocationId, ExecutableAllocationLifecycle,
-    ExecutableLedgerValidationError, ExecutableMemoryProtection, GeneratedCallLinkCandidate,
-    GeneratedCallLinkCandidateTable, GeneratedCallLinkDirectCallStatus,
-    GeneratedCallLinkProbeMissReason, GeneratedGuardedPropertyLoadProbeMissReason,
-    GeneratedPropertyHasMegamorphicCacheEntry, GeneratedPropertyHasMegamorphicCandidateTable,
-    GeneratedPropertyHasMegamorphicSite, GeneratedPropertyLoadMegamorphicCacheEntry,
-    GeneratedPropertyLoadMegamorphicCacheEntryKind, GeneratedPropertyLoadMegamorphicCandidateTable,
-    GeneratedPropertyLoadMegamorphicSite, GeneratedPropertyLoadProbeMissReason,
-    GeneratedPropertyStoreMegamorphicCacheEntry, GeneratedPropertyStoreMegamorphicCandidateTable,
-    GeneratedPropertyStoreMegamorphicSite, GeneratedPropertyStoreProbeMissReason, InlineCacheKind,
-    InlineCacheSlotId, InlineCacheStub, InlineCacheStubId, InlineCacheStubKind,
-    InlineCacheValidationError, JitCodeArtifact, JitCodeId, JitCodeValidationError,
-    JitPlanValidationError, JitType, LinkBufferFinalizationOutcome, LinkBufferFinalizationRecord,
-    LinkedCallKind, MachineCodeHandle, MachineCodeOwnership, MachineCodeRange,
-    MachineCodeValidationError, OsrState, P6X86_64BaselineBranchTargetRejectionReason,
-    P6X86_64BaselineLoweredOperation, P6X86_64BaselineLoweringError,
-    P6X86_64BaselineLoweringRequirement, P6X86_64BaselineLoweringValidationShape,
-    P6X86_64BaselineMachineInstruction, P6X86_64BaselineOperandLocation,
-    P6X86_64BaselineSelectedInstructionEffects, P6X86_64BaselineSelectedSideExitReason,
-    P6X86_64BaselineSemanticByteEmissionError, P6X86_64BaselineSemanticOperandRejectionReason,
-    P6X86_64BaselineSymbolicRegister, PatchWriteBarrier, PatchpointDescriptor, PatchpointKind,
-    PropertyHasObservationDescriptor, PropertyLoadAccessCasePlan, PropertyLoadAccessCasePlanKind,
-    PropertyLoadAccessCasePlanTable, PropertyLoadBaseNormalization,
-    PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome, PropertyLoadGuardPlan,
-    PropertyLoadGuardRequirement, PropertyLoadGuardedCandidate as JitPropertyLoadGuardedCandidate,
+    AccessCaseDescriptor, AccessCaseKind, BaselineAbiValidationError,
+    BaselineBytecodeEligibilityProof, BaselineBytecodeRange, BaselineGeneratedEffectContract,
+    BaselineMachineCodeEmissionRecord, BaselineMachineCodeEmissionValidationError,
+    BaselineMachineCodeEmitterKind, BaselineSupportedOpcodeSubset, CacheKey, CallBoundaryId,
+    CallBoundaryMetadata, CallLinkAttachmentPlan, CallLinkAttachmentPlanTable,
+    CallLinkAttachmentTargetDescriptor, CallLinkInfoDescriptor, CallLinkMode,
+    CallLinkReadinessBlocker, CallLinkReadinessBlockers, CodeFinalizationAuthority,
+    CodeInvalidationReason, CodeLiveness, CodeOrigin, CodeOriginKind, CodeOwnership, CodePatchPlan,
+    CodePatchRecord, CodePatchState, DependencyStrength, EntryAbi, Entrypoint, EntrypointKind,
+    ExecutableAllocationId, ExecutableAllocationLifecycle, ExecutableLedgerValidationError,
+    ExecutableMemoryProtection, GeneratedCallLinkCandidate, GeneratedCallLinkCandidateTable,
+    GeneratedCallLinkDirectCallStatus, GeneratedCallLinkProbeMissReason,
+    GeneratedGuardedPropertyLoadProbeMissReason, GeneratedPropertyHasMegamorphicCacheEntry,
+    GeneratedPropertyHasMegamorphicCandidateTable, GeneratedPropertyHasMegamorphicSite,
+    GeneratedPropertyLoadMegamorphicCacheEntry, GeneratedPropertyLoadMegamorphicCacheEntryKind,
+    GeneratedPropertyLoadMegamorphicCandidateTable, GeneratedPropertyLoadMegamorphicSite,
+    GeneratedPropertyLoadProbeMissReason, GeneratedPropertyStoreMegamorphicCacheEntry,
+    GeneratedPropertyStoreMegamorphicCandidateTable, GeneratedPropertyStoreMegamorphicSite,
+    GeneratedPropertyStoreProbeMissReason, InlineCacheKind, InlineCacheSlotId, InlineCacheStub,
+    InlineCacheStubId, InlineCacheStubKind, InlineCacheValidationError, JitCodeArtifact, JitCodeId,
+    JitCodeValidationError, JitPlanValidationError, JitType, LinkBufferFinalizationOutcome,
+    LinkBufferFinalizationRecord, LinkedCallKind, MachineCodeHandle, MachineCodeOwnership,
+    MachineCodeRange, MachineCodeValidationError, OsrState, P6X86_64BaselineBackendContractError,
+    P6X86_64BaselineBranchTargetRejectionReason, P6X86_64BaselineLoweredOperation,
+    P6X86_64BaselineLoweringByteEmission, P6X86_64BaselineLoweringCallableAuthority,
+    P6X86_64BaselineLoweringError, P6X86_64BaselineLoweringRequirement,
+    P6X86_64BaselineLoweringValidationShape, P6X86_64BaselineMachineInstruction,
+    P6X86_64BaselineOperandLocation, P6X86_64BaselineOperandLocationError,
+    P6X86_64BaselineOperandRole, P6X86_64BaselineSelectedInstructionEffects,
+    P6X86_64BaselineSelectedSideExitReason, P6X86_64BaselineSemanticByteEmissionError,
+    P6X86_64BaselineSemanticOperandRejectionReason, P6X86_64BaselineSymbolicRegister,
+    PatchWriteBarrier, PatchpointDescriptor, PatchpointKind, PropertyHasObservationDescriptor,
+    PropertyLoadAccessCasePlan, PropertyLoadAccessCasePlanKind, PropertyLoadAccessCasePlanTable,
+    PropertyLoadBaseNormalization, PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome,
+    PropertyLoadGuardPlan, PropertyLoadGuardRequirement,
+    PropertyLoadGuardedCandidate as JitPropertyLoadGuardedCandidate,
     PropertyLoadGuardedCandidateKind as JitPropertyLoadGuardedCandidateKind,
     PropertyLoadGuardedCandidateTable, PropertyLoadObservationDescriptor,
     PropertyLoadObservationReadiness, PropertyStoreAccessCasePlan,
     PropertyStoreAccessCasePlanContract, PropertyStoreAccessCasePlanKind,
     PropertyStoreAccessCasePlanTable, PropertyStoreBarrierEffect,
     PropertyStoreMutationBarrierEvidence, PropertyStoreMutationCandidate,
-    PropertyStoreMutationCandidateTable, RelocationKind, TierCounters, TierFallbackReason,
-    TierFallbackResultRecord, TierFallbackSemantics, TierFallbackTarget, TierPlanDescriptor,
-    TierPlanKind, TierThresholds, TieringPolicy, TieringSnapshot, TieringState, TieringTrigger,
-    TieringValidationError, WatchpointDependency, WatchpointDependencyId, WatchpointFireEvent,
-    WatchpointFirePolicy, WatchpointOwner, WatchpointSetDescriptor, WatchpointSetId,
-    WatchpointSetState, WatchpointTarget, TIER_DESCRIPTOR_TABLE,
+    PropertyStoreMutationCandidateTable, RegisterRole, RelocationKind, TierCounters,
+    TierFallbackReason, TierFallbackResultRecord, TierFallbackSemantics, TierFallbackTarget,
+    TierPlanDescriptor, TierPlanKind, TierThresholds, TieringPolicy, TieringSnapshot, TieringState,
+    TieringTrigger, TieringValidationError, WatchpointDependency, WatchpointDependencyId,
+    WatchpointFireEvent, WatchpointFirePolicy, WatchpointOwner, WatchpointSetDescriptor,
+    WatchpointSetId, WatchpointSetState, WatchpointTarget, TIER_DESCRIPTOR_TABLE,
 };
 use crate::object::{PropertyCacheability, PropertyOffset, WatchpointKind, WatchpointState};
 use crate::platform::executable_memory::{
@@ -103,7 +107,7 @@ use crate::runtime::{
     WatchpointGeneration,
 };
 use crate::strings::PropertyKey;
-use crate::value::ValueKind;
+use crate::value::{ImmediateKind, ValueKind, ValueRepresentationValidationError};
 use crate::vm::generated_metrics::{
     record_vm_baseline_generated_dispatched_opcode_counts,
     record_vm_baseline_generated_dispatched_site_opcode_counts,
@@ -8113,7 +8117,187 @@ pub enum BaselineEntryAutoNativeMaterializationFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BaselineEntryAutoNativeMaterializationDetail {
     Lowering(BaselineNativeLoweringFailureDetail),
+    BackendContract(BaselineNativeBackendContractFailureDetail),
     SemanticByteEmission(BaselineNativeSemanticByteEmissionFailureDetail),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaselineNativeBackendContractFailureDetail {
+    UnexpectedEmitterKind {
+        expected: BaselineMachineCodeEmitterKind,
+        actual: BaselineMachineCodeEmitterKind,
+    },
+    UnexpectedByteEmission {
+        actual: P6X86_64BaselineLoweringByteEmission,
+    },
+    UnexpectedCallableAuthority {
+        actual: P6X86_64BaselineLoweringCallableAuthority,
+    },
+    UnexpectedArchitecture {
+        expected: AssemblerArchitecture,
+        actual: AssemblerArchitecture,
+    },
+    UnsupportedOpcodeSubset {
+        emitter: BaselineMachineCodeEmitterKind,
+        expected: BaselineSupportedOpcodeSubset,
+        actual: BaselineSupportedOpcodeSubset,
+    },
+    UnsupportedEffectContract {
+        emitter: BaselineMachineCodeEmitterKind,
+        expected: BaselineGeneratedEffectContract,
+        actual: BaselineGeneratedEffectContract,
+    },
+    ValueLayoutInvalid {
+        error: ValueRepresentationValidationError,
+    },
+    UnsupportedValueLayout {
+        layout_name: &'static str,
+        storage_bits: u8,
+        slot_width_bytes: u8,
+        tag_mask: u64,
+        payload_shift: u8,
+    },
+    MissingImmediateTag {
+        canonical_name: &'static str,
+    },
+    UnexpectedImmediateTagKind {
+        canonical_name: &'static str,
+        expected: ImmediateKind,
+        actual: ImmediateKind,
+    },
+    DoubleImmediateTagMismatch {
+        immediate_double_tag: u64,
+        double_tag: u64,
+    },
+    AbiDescriptorInvalid {
+        error: BaselineAbiValidationError,
+    },
+    MissingPinnedRegister {
+        role: RegisterRole,
+    },
+    MissingReturnConvention,
+    UnsupportedReturnCarrier,
+    UnexpectedReturnValue {
+        expected: AbiValue,
+        actual: AbiValue,
+    },
+    OperandLocation {
+        bytecode_index: BytecodeIndex,
+        role: P6X86_64BaselineOperandRole,
+        register: VirtualRegister,
+        error: P6X86_64BaselineOperandLocationError,
+    },
+}
+
+impl BaselineNativeBackendContractFailureDetail {
+    pub(crate) fn from_backend_contract_error(
+        error: &P6X86_64BaselineBackendContractError,
+    ) -> Self {
+        match error {
+            P6X86_64BaselineBackendContractError::UnexpectedEmitterKind { expected, actual } => {
+                Self::UnexpectedEmitterKind {
+                    expected: *expected,
+                    actual: *actual,
+                }
+            }
+            P6X86_64BaselineBackendContractError::UnexpectedByteEmission { actual } => {
+                Self::UnexpectedByteEmission { actual: *actual }
+            }
+            P6X86_64BaselineBackendContractError::UnexpectedCallableAuthority { actual } => {
+                Self::UnexpectedCallableAuthority { actual: *actual }
+            }
+            P6X86_64BaselineBackendContractError::UnexpectedArchitecture { expected, actual } => {
+                Self::UnexpectedArchitecture {
+                    expected: *expected,
+                    actual: *actual,
+                }
+            }
+            P6X86_64BaselineBackendContractError::UnsupportedOpcodeSubset {
+                emitter,
+                expected,
+                actual,
+            } => Self::UnsupportedOpcodeSubset {
+                emitter: *emitter,
+                expected: *expected,
+                actual: *actual,
+            },
+            P6X86_64BaselineBackendContractError::UnsupportedEffectContract {
+                emitter,
+                expected,
+                actual,
+            } => Self::UnsupportedEffectContract {
+                emitter: *emitter,
+                expected: *expected,
+                actual: *actual,
+            },
+            P6X86_64BaselineBackendContractError::ValueLayoutInvalid { error } => {
+                Self::ValueLayoutInvalid { error: *error }
+            }
+            P6X86_64BaselineBackendContractError::UnsupportedValueLayout {
+                layout_name,
+                storage_bits,
+                slot_width_bytes,
+                tag_mask,
+                payload_shift,
+            } => Self::UnsupportedValueLayout {
+                layout_name: *layout_name,
+                storage_bits: *storage_bits,
+                slot_width_bytes: *slot_width_bytes,
+                tag_mask: *tag_mask,
+                payload_shift: *payload_shift,
+            },
+            P6X86_64BaselineBackendContractError::MissingImmediateTag { canonical_name } => {
+                Self::MissingImmediateTag {
+                    canonical_name: *canonical_name,
+                }
+            }
+            P6X86_64BaselineBackendContractError::UnexpectedImmediateTagKind {
+                canonical_name,
+                expected,
+                actual,
+            } => Self::UnexpectedImmediateTagKind {
+                canonical_name: *canonical_name,
+                expected: *expected,
+                actual: *actual,
+            },
+            P6X86_64BaselineBackendContractError::DoubleImmediateTagMismatch {
+                immediate_double_tag,
+                double_tag,
+            } => Self::DoubleImmediateTagMismatch {
+                immediate_double_tag: *immediate_double_tag,
+                double_tag: *double_tag,
+            },
+            P6X86_64BaselineBackendContractError::AbiDescriptorInvalid { error } => {
+                Self::AbiDescriptorInvalid { error: *error }
+            }
+            P6X86_64BaselineBackendContractError::MissingPinnedRegister { role } => {
+                Self::MissingPinnedRegister { role: *role }
+            }
+            P6X86_64BaselineBackendContractError::MissingReturnConvention => {
+                Self::MissingReturnConvention
+            }
+            P6X86_64BaselineBackendContractError::UnsupportedReturnCarrier => {
+                Self::UnsupportedReturnCarrier
+            }
+            P6X86_64BaselineBackendContractError::UnexpectedReturnValue { expected, actual } => {
+                Self::UnexpectedReturnValue {
+                    expected: *expected,
+                    actual: *actual,
+                }
+            }
+            P6X86_64BaselineBackendContractError::OperandLocation {
+                bytecode_index,
+                role,
+                register,
+                error,
+            } => Self::OperandLocation {
+                bytecode_index: *bytecode_index,
+                role: *role,
+                register: *register,
+                error: *error,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

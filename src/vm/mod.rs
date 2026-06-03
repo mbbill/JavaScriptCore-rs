@@ -266,32 +266,32 @@ pub use tiering::{
     BaselineMachineCodeEmissionLinkedByteEvidence,
     BaselineMachineCodeEmissionLinkedByteEvidenceSource,
     BaselineMachineCodeEmissionProvenanceOutcome, BaselineMachineCodeEmissionProvenanceRecord,
-    BaselineMachineCodeEmissionProvenanceRejection, BaselineNativeEntryExecutionPolicy,
-    BaselineNativeEntryReadinessOutcome, BaselineNativeEntryReadinessRecord,
-    BaselineNativeEntryReadinessRejection, BaselineNativeLoweringFailureDetail,
-    BaselineNativeSemanticByteEmissionFailureDetail, CompletionDiagnostic,
-    ExecutionDiagnosticRecord, FallbackBoundarySnapshot, GeneratedBaselineFallbackCause,
-    GeneratedBaselineFallbackOpcode, GeneratedBaselineFallbackRecord,
-    GeneratedBaselineRegisterFallbackCause, OptimizedCallFallbackRequest, OptimizedFallbackRecord,
-    OsrBoundaryKind, OsrBoundaryRecord, OsrBoundaryRequest, RuntimeTierState, TierEntryDecision,
-    TierEntryDecisionRecord, TierEntryExecutionPath, TierEntryFallbackReason,
-    TierEntryInterpretReason, TierEntryRequest, TierExecutionProfile, TierProfileEvent,
-    TierProfileRecord, VmBaselineGeneratedExecutionSummary, VmBaselineGeneratedInvalidationSummary,
-    VmCallLinkAttachmentAcceptedEvidenceSummary, VmCallLinkAttachmentInstallRecheckOutcome,
-    VmCallLinkAttachmentInstallRecheckRecord, VmCallLinkAttachmentInstallRecheckRejectionReason,
-    VmCallLinkAttachmentPlanLifecycle, VmCallLinkAttachmentPlanOutcome,
-    VmCallLinkAttachmentPlanRecord, VmCallLinkAttachmentPlanRejectionReason,
-    VmCallLinkBoundaryEvidenceSummary, VmCallLinkBoundaryValidationOutcome,
-    VmCallLinkBoundaryValidationRecord, VmCallLinkBoundaryValidationRejection,
-    VmCallLinkDescriptorLifecycle, VmCallLinkDescriptorRecord,
-    VmCallLinkInlineCacheAttachmentLifecycle, VmCallLinkInlineCacheAttachmentOutcome,
-    VmCallLinkInlineCacheAttachmentRecord, VmCallLinkInlineCacheAttachmentRejectionReason,
-    VmCallLinkInlineCacheClearLifecycle, VmCallLinkInlineCacheClearOutcome,
-    VmCallLinkInlineCacheClearRecord, VmCallLinkInlineCacheClearRejectionReason,
-    VmCallLinkReadinessRecord, VmCallLinkTargetValidation, VmCallLinkTargetValidationRejection,
-    VmCallObservationRecord, VmGeneratedDirectCallCalleeFallbackRecord,
-    VmGeneratedDirectCallCalleeFallbackSummary, VmGeneratedDirectCallGeneratedEntryMissReason,
-    VmGeneratedDirectCallNativeEntryMissReason,
+    BaselineMachineCodeEmissionProvenanceRejection, BaselineNativeBackendContractFailureDetail,
+    BaselineNativeEntryExecutionPolicy, BaselineNativeEntryReadinessOutcome,
+    BaselineNativeEntryReadinessRecord, BaselineNativeEntryReadinessRejection,
+    BaselineNativeLoweringFailureDetail, BaselineNativeSemanticByteEmissionFailureDetail,
+    CompletionDiagnostic, ExecutionDiagnosticRecord, FallbackBoundarySnapshot,
+    GeneratedBaselineFallbackCause, GeneratedBaselineFallbackOpcode,
+    GeneratedBaselineFallbackRecord, GeneratedBaselineRegisterFallbackCause,
+    OptimizedCallFallbackRequest, OptimizedFallbackRecord, OsrBoundaryKind, OsrBoundaryRecord,
+    OsrBoundaryRequest, RuntimeTierState, TierEntryDecision, TierEntryDecisionRecord,
+    TierEntryExecutionPath, TierEntryFallbackReason, TierEntryInterpretReason, TierEntryRequest,
+    TierExecutionProfile, TierProfileEvent, TierProfileRecord, VmBaselineGeneratedExecutionSummary,
+    VmBaselineGeneratedInvalidationSummary, VmCallLinkAttachmentAcceptedEvidenceSummary,
+    VmCallLinkAttachmentInstallRecheckOutcome, VmCallLinkAttachmentInstallRecheckRecord,
+    VmCallLinkAttachmentInstallRecheckRejectionReason, VmCallLinkAttachmentPlanLifecycle,
+    VmCallLinkAttachmentPlanOutcome, VmCallLinkAttachmentPlanRecord,
+    VmCallLinkAttachmentPlanRejectionReason, VmCallLinkBoundaryEvidenceSummary,
+    VmCallLinkBoundaryValidationOutcome, VmCallLinkBoundaryValidationRecord,
+    VmCallLinkBoundaryValidationRejection, VmCallLinkDescriptorLifecycle,
+    VmCallLinkDescriptorRecord, VmCallLinkInlineCacheAttachmentLifecycle,
+    VmCallLinkInlineCacheAttachmentOutcome, VmCallLinkInlineCacheAttachmentRecord,
+    VmCallLinkInlineCacheAttachmentRejectionReason, VmCallLinkInlineCacheClearLifecycle,
+    VmCallLinkInlineCacheClearOutcome, VmCallLinkInlineCacheClearRecord,
+    VmCallLinkInlineCacheClearRejectionReason, VmCallLinkReadinessRecord,
+    VmCallLinkTargetValidation, VmCallLinkTargetValidationRejection, VmCallObservationRecord,
+    VmGeneratedDirectCallCalleeFallbackRecord, VmGeneratedDirectCallCalleeFallbackSummary,
+    VmGeneratedDirectCallGeneratedEntryMissReason, VmGeneratedDirectCallNativeEntryMissReason,
     VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
     VmGeneratedDirectCallRootlessRejectionCounts,
     VmGeneratedDirectCallRootlessRetainedSideExitCount,
@@ -2793,6 +2793,17 @@ impl Vm {
             P6X86_64SemanticBaselineNativeEntryInstallError::Lowering { error } => {
                 Some(BaselineEntryAutoNativeMaterializationDetail::Lowering(
                     BaselineNativeLoweringFailureDetail::from_lowering_error(error),
+                ))
+            }
+            P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract { error } => {
+                // Rust-only diagnostic scaffolding: C++ JSC's linkFor()/entrypointFor()
+                // observes prepared, finalized JIT code, while this incomplete Rust backend can
+                // reject a generated native contract before materialization. Keep the collapsed
+                // failure reason stable and expose the contract detail for parity triage only.
+                // Oversized-file exception: this narrow mapper belongs beside the existing
+                // auto-materialization telemetry until the VM/tiering extraction batch owns it.
+                Some(BaselineEntryAutoNativeMaterializationDetail::BackendContract(
+                    BaselineNativeBackendContractFailureDetail::from_backend_contract_error(error),
                 ))
             }
             P6X86_64SemanticBaselineNativeEntryInstallError::SemanticByteEmission { error } => {
@@ -60348,6 +60359,85 @@ mod tests {
                     bytecode_index: BytecodeIndex::from_offset(11),
                 },
             ))
+        );
+    }
+
+    #[test]
+    fn vm_p15_auto_native_install_failure_detail_preserves_backend_opcode_subset() {
+        let error = P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
+            error: P6X86_64BaselineBackendContractError::UnsupportedOpcodeSubset {
+                emitter: BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset,
+                expected: BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic,
+                actual:
+                    BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr,
+            },
+        };
+
+        assert_eq!(
+            Vm::p15_auto_native_install_failure_reason(&error),
+            BaselineEntryAutoNativeMaterializationFailure::BackendContract
+        );
+        assert_eq!(
+            Vm::p15_auto_native_install_failure_detail(&error),
+            Some(BaselineEntryAutoNativeMaterializationDetail::BackendContract(
+                BaselineNativeBackendContractFailureDetail::UnsupportedOpcodeSubset {
+                    emitter: BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset,
+                    expected: BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic,
+                    actual:
+                        BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr,
+                },
+            ))
+        );
+    }
+
+    #[test]
+    fn vm_p15_auto_native_install_failure_detail_preserves_backend_effect_contract() {
+        let expected = BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic
+            .generated_effect_contract();
+        let actual = BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr
+            .generated_effect_contract();
+        let error = P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
+            error: P6X86_64BaselineBackendContractError::UnsupportedEffectContract {
+                emitter: BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset,
+                expected,
+                actual,
+            },
+        };
+
+        assert_eq!(
+            Vm::p15_auto_native_install_failure_detail(&error),
+            Some(
+                BaselineEntryAutoNativeMaterializationDetail::BackendContract(
+                    BaselineNativeBackendContractFailureDetail::UnsupportedEffectContract {
+                        emitter:
+                            BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset,
+                        expected,
+                        actual,
+                    },
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn vm_p15_auto_native_install_failure_detail_preserves_backend_unexpected_architecture() {
+        let error = P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
+            error: P6X86_64BaselineBackendContractError::UnexpectedArchitecture {
+                expected: AssemblerArchitecture::Arm64,
+                actual: AssemblerArchitecture::X86_64,
+            },
+        };
+
+        assert_eq!(
+            Vm::p15_auto_native_install_failure_detail(&error),
+            Some(
+                BaselineEntryAutoNativeMaterializationDetail::BackendContract(
+                    BaselineNativeBackendContractFailureDetail::UnexpectedArchitecture {
+                        expected: AssemblerArchitecture::Arm64,
+                        actual: AssemblerArchitecture::X86_64,
+                    },
+                )
+            )
         );
     }
 
