@@ -66,10 +66,13 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
 
 [wip] C++ JSC structural fidelity
   [done] always-context rewrite contract in AGENTS.md
+  [done] oversized-file guardrail in AGENTS.md
   [done] compact status tree is current status source
   [risk] pre-contract dirty tree needs logical commits or isolation
   [risk] existing Rust-only files/types need dedicated structure review
-  [missing] dedicated C++-to-Rust structure audit batches
+  [wip] dedicated C++-to-Rust structure audit/extraction batches
+    [done] VM CallLinkInfo/generated direct-call execution cluster extracted to
+           src/vm/call_link.rs (maps to C++ CallLinkInfo/LLIntSlowPaths/JITCall)
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
