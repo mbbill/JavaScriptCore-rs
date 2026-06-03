@@ -40,7 +40,9 @@ use crate::jit::code::{
     BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableKind,
     BaselineNativeEntryCallableValidationError, BaselineNativeEntryDescriptor,
 };
-use crate::jit::generated_metrics::BaselineGeneratedDispatchedOpcodeCount;
+use crate::jit::generated_metrics::{
+    BaselineGeneratedDispatchedOpcodeCount, BaselineGeneratedDispatchedSiteOpcodeCount,
+};
 use crate::jit::ic::GeneratedPropertyStoreMutationMissReason;
 use crate::jit::plan::BaselineBytecodeSnapshotFingerprint;
 use crate::jit::{
@@ -103,7 +105,9 @@ use crate::runtime::{
 use crate::strings::PropertyKey;
 use crate::value::ValueKind;
 use crate::vm::generated_metrics::{
-    record_vm_baseline_generated_dispatched_opcode_counts, VmBaselineGeneratedDispatchedOpcodeCount,
+    record_vm_baseline_generated_dispatched_opcode_counts,
+    record_vm_baseline_generated_dispatched_site_opcode_counts,
+    VmBaselineGeneratedDispatchedOpcodeCount, VmBaselineGeneratedDispatchedSiteOpcodeCount,
 };
 
 const STRUCTURE_STUB_REPATCH_CODE_ID_BASE: u64 = 1 << 48;
@@ -237,6 +241,8 @@ pub struct VmTieringIntegration {
     baseline_generated_execution_records: Vec<VmBaselineGeneratedExecutionRecord>,
     baseline_generated_execution_summaries: Vec<VmBaselineGeneratedExecutionSummary>,
     baseline_generated_dispatched_opcode_counts: Vec<VmBaselineGeneratedDispatchedOpcodeCount>,
+    baseline_generated_dispatched_site_opcode_counts:
+        Vec<VmBaselineGeneratedDispatchedSiteOpcodeCount>,
     baseline_generated_execution_count: usize,
     baseline_generated_executed_bytecode_count: u64,
     generated_direct_call_transaction_records: Vec<VmGeneratedDirectCallTransactionRecord>,
@@ -1776,6 +1782,12 @@ impl VmTieringIntegration {
         &self.baseline_generated_dispatched_opcode_counts
     }
 
+    pub fn baseline_generated_dispatched_site_opcode_counts(
+        &self,
+    ) -> &[VmBaselineGeneratedDispatchedSiteOpcodeCount] {
+        &self.baseline_generated_dispatched_site_opcode_counts
+    }
+
     pub fn baseline_generated_execution_count(&self) -> usize {
         self.baseline_generated_execution_count
     }
@@ -2519,6 +2531,11 @@ impl VmTieringIntegration {
             &mut self.baseline_generated_dispatched_opcode_counts,
             request.owner,
             &request.dispatched_opcode_counts,
+        );
+        record_vm_baseline_generated_dispatched_site_opcode_counts(
+            &mut self.baseline_generated_dispatched_site_opcode_counts,
+            request.owner,
+            &request.dispatched_site_opcode_counts,
         );
         if self.baseline_generated_execution_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
             self.baseline_generated_execution_records.push(record);
@@ -7209,6 +7226,7 @@ pub(crate) struct VmBaselineGeneratedExecutionRequest {
     pub current_tier: JitType,
     pub executed_bytecode_count: u64,
     pub dispatched_opcode_counts: Vec<BaselineGeneratedDispatchedOpcodeCount>,
+    pub dispatched_site_opcode_counts: Vec<BaselineGeneratedDispatchedSiteOpcodeCount>,
     pub outcome: VmBaselineGeneratedExecutionOutcome,
 }
 

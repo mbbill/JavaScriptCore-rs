@@ -527,6 +527,8 @@ fn print_tiering_summary(vm: &Vm) {
     let baseline_generated_execution_summaries = tiering.baseline_generated_execution_summaries();
     let baseline_generated_dispatched_opcode_counts =
         tiering.baseline_generated_dispatched_opcode_counts();
+    let baseline_generated_dispatched_site_opcode_counts =
+        tiering.baseline_generated_dispatched_site_opcode_counts();
     let baseline_generated_execution_count = tiering.baseline_generated_execution_count();
     let baseline_generated_executed_bytecodes =
         tiering.baseline_generated_executed_bytecode_count();
@@ -859,6 +861,29 @@ fn print_tiering_summary(vm: &Vm) {
                 .cmp(&left.count)
                 .then_with(|| format!("{:?}", left.owner).cmp(&format!("{:?}", right.owner)))
                 .then_with(|| format!("{:?}", left.opcode).cmp(&format!("{:?}", right.opcode)))
+        },
+    );
+    print_top_records(
+        &mut stderr,
+        "baseline-generated-dispatched-site-opcode",
+        baseline_generated_dispatched_site_opcode_counts,
+        tail_limit,
+        record_filter.as_deref(),
+        |left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| format!("{:?}", left.owner).cmp(&format!("{:?}", right.owner)))
+                .then_with(|| {
+                    left.bytecode_index
+                        .offset()
+                        .cmp(&right.bytecode_index.offset())
+                })
+                .then_with(|| format!("{:?}", left.opcode).cmp(&format!("{:?}", right.opcode)))
+                .then_with(|| {
+                    format!("{:?}", left.property_load_sidecar_readiness)
+                        .cmp(&format!("{:?}", right.property_load_sidecar_readiness))
+                })
         },
     );
     print_top_records(
@@ -1694,6 +1719,29 @@ fn print_benchmark_tiering_summary(benchmark: &OctaneBenchmarkExecutionReport) {
                 .cmp(&left.count)
                 .then_with(|| format!("{:?}", left.owner).cmp(&format!("{:?}", right.owner)))
                 .then_with(|| format!("{:?}", left.opcode).cmp(&format!("{:?}", right.opcode)))
+        },
+    );
+    print_top_records(
+        &mut stderr,
+        "baseline-generated-dispatched-site-opcode",
+        &summary.baseline_generated_dispatched_site_opcode_counts,
+        tail_limit,
+        record_filter.as_deref(),
+        |left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| format!("{:?}", left.owner).cmp(&format!("{:?}", right.owner)))
+                .then_with(|| {
+                    left.bytecode_index
+                        .offset()
+                        .cmp(&right.bytecode_index.offset())
+                })
+                .then_with(|| format!("{:?}", left.opcode).cmp(&format!("{:?}", right.opcode)))
+                .then_with(|| {
+                    format!("{:?}", left.property_load_sidecar_readiness)
+                        .cmp(&format!("{:?}", right.property_load_sidecar_readiness))
+                })
         },
     );
     print_top_records(

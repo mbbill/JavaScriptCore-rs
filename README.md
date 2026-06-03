@@ -30,7 +30,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
                  broad blocker remains: generated baseline is still a Rust bytecode re-interpreter
                  and is slower than the optimized interpreter on richards. Capped telemetry now
                  shows generated dispatch heat dominated by GetByName, JumpIfFalse, PutByName,
-                 and CallWithThis in the hot generated owners.
+                 and CallWithThis in the hot generated owners; site telemetry first identifies
+                 owner 110@32 GetByName as GuardedPrototypeData-ready under the 500k cap.
   Phase 2 [done] Octane feature completeness: all 15 benchmarks RUN correctly. Ground-truth
                  2026-05-30: ZERO throwers/aborts -- 3 score, 12 functional-but-slow
                  (perf-gated, Phase 1). Landed: implicit-global store, indirect eval, catchable
@@ -280,9 +281,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          after guarded IC reset while hot_slot_miss stays 0
   [done] generated opcode-heat evidence: 500k capped richards baseline probe still fails at
          DispatchStepLimitExceeded with generated-code invalidations=0 and rootless rejections=0,
-         but now reports baseline-generated-dispatched-opcode heat for the next C++ JIT::emit_op_*
-         selection (owner 110 GetByName=47,408; then owner 146/185 GetByName, JumpIfFalse,
-         PutByName, CallWithThis)
+         but now reports owner/opcode plus owner/site/opcode/readiness heat for the next C++
+         JIT::emit_op_* selection (owner 110 GetByName=47,408; first surfaced GetByName site
+         owner 110@32 GuardedPrototypeData=7,611)
   [done] macOS arm64 return-seed native evidence: focused tests prove constants, moves,
          frame/argument, and callee returns enter real ARM64 native entry without generated
          execution; arithmetic fallback keeps the existing x86_64 semantic artifact path

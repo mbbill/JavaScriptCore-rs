@@ -20,8 +20,9 @@ use crate::syntax::source::SourceText;
 use crate::vm::{
     BaselineEntryAutoMaterializationRecord, SourceExecutionError, SourceSessionHandle,
     SourceSessionHostGlobalConfig, SourceSessionSource, Vm,
-    VmBaselineGeneratedDispatchedOpcodeCount, VmBaselineGeneratedExecutionSummary,
-    VmBaselineGeneratedInvalidationSummary, VmConfig, VmGeneratedDirectCallCalleeFallbackSummary,
+    VmBaselineGeneratedDispatchedOpcodeCount, VmBaselineGeneratedDispatchedSiteOpcodeCount,
+    VmBaselineGeneratedExecutionSummary, VmBaselineGeneratedInvalidationSummary, VmConfig,
+    VmGeneratedDirectCallCalleeFallbackSummary,
     VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
     VmGeneratedDirectCallRootlessRejectionCounts,
     VmGeneratedDirectCallRootlessRetainedSideExitCount,
@@ -389,6 +390,8 @@ pub struct OctaneTieringSummary {
     pub baseline_native_entry_readiness: usize,
     pub baseline_generated_execution_summaries: Vec<VmBaselineGeneratedExecutionSummary>,
     pub baseline_generated_dispatched_opcode_counts: Vec<VmBaselineGeneratedDispatchedOpcodeCount>,
+    pub baseline_generated_dispatched_site_opcode_counts:
+        Vec<VmBaselineGeneratedDispatchedSiteOpcodeCount>,
     pub generated_direct_call_transactions: usize,
     pub generated_direct_call_generated_entries: usize,
     pub generated_direct_call_native_entries: usize,
@@ -565,6 +568,9 @@ impl OctaneTieringSummary {
             baseline_generated_dispatched_opcode_counts: tiering
                 .baseline_generated_dispatched_opcode_counts()
                 .to_vec(),
+            baseline_generated_dispatched_site_opcode_counts: tiering
+                .baseline_generated_dispatched_site_opcode_counts()
+                .to_vec(),
             generated_direct_call_transactions: tiering.generated_direct_call_transaction_count(),
             generated_direct_call_generated_entries: tiering
                 .generated_direct_call_generated_entry_count(),
@@ -653,6 +659,11 @@ impl OctaneTieringSummary {
                 &self.baseline_generated_dispatched_opcode_counts,
                 &start.baseline_generated_dispatched_opcode_counts,
             );
+        let baseline_generated_dispatched_site_opcode_counts =
+            octane_baseline_generated_dispatched_site_opcode_count_delta(
+                &self.baseline_generated_dispatched_site_opcode_counts,
+                &start.baseline_generated_dispatched_site_opcode_counts,
+            );
         let generated_direct_call_rootless_unsupported_body_opcode_counts =
             octane_rootless_unsupported_body_opcode_count_delta(
                 &self.generated_direct_call_rootless_unsupported_body_opcode_counts,
@@ -733,6 +744,7 @@ impl OctaneTieringSummary {
                 .saturating_sub(start.baseline_native_entry_readiness),
             baseline_generated_execution_summaries,
             baseline_generated_dispatched_opcode_counts,
+            baseline_generated_dispatched_site_opcode_counts,
             generated_direct_call_transactions: self
                 .generated_direct_call_transactions
                 .saturating_sub(start.generated_direct_call_transactions),
@@ -1056,6 +1068,36 @@ fn octane_baseline_generated_dispatched_opcode_count_delta(
             (count > 0).then_some(VmBaselineGeneratedDispatchedOpcodeCount {
                 owner: current_count.owner,
                 opcode: current_count.opcode,
+                count,
+            })
+        })
+        .collect()
+}
+
+fn octane_baseline_generated_dispatched_site_opcode_count_delta(
+    current: &[VmBaselineGeneratedDispatchedSiteOpcodeCount],
+    start: &[VmBaselineGeneratedDispatchedSiteOpcodeCount],
+) -> Vec<VmBaselineGeneratedDispatchedSiteOpcodeCount> {
+    current
+        .iter()
+        .filter_map(|current_count| {
+            let start_count = start
+                .iter()
+                .find(|start_count| {
+                    start_count.owner == current_count.owner
+                        && start_count.bytecode_index == current_count.bytecode_index
+                        && start_count.opcode == current_count.opcode
+                        && start_count.property_load_sidecar_readiness
+                            == current_count.property_load_sidecar_readiness
+                })
+                .map(|start_count| start_count.count)
+                .unwrap_or(0);
+            let count = current_count.count.saturating_sub(start_count);
+            (count > 0).then_some(VmBaselineGeneratedDispatchedSiteOpcodeCount {
+                owner: current_count.owner,
+                bytecode_index: current_count.bytecode_index,
+                opcode: current_count.opcode,
+                property_load_sidecar_readiness: current_count.property_load_sidecar_readiness,
                 count,
             })
         })
@@ -2820,7 +2862,10 @@ mod tests {
     use super::*;
     use crate::bytecode::{BytecodeIndex, CoreOpcode};
     use crate::gc::CellId;
-    use crate::jit::{JitPlanValidationError, JitType, P6X86_64BaselineSelectedSideExitReason};
+    use crate::jit::{
+        BaselineGeneratedPropertyLoadSidecarReadiness, JitPlanValidationError, JitType,
+        P6X86_64BaselineSelectedSideExitReason,
+    };
     use crate::runtime::CodeBlockId;
     use crate::vm::{
         BaselineEntryAutoGeneratedMaterializationDetail,
@@ -3728,6 +3773,24 @@ Benchmark.prototype.validate = function() {
                     count: 2,
                 },
             ],
+            baseline_generated_dispatched_site_opcode_counts: vec![
+                VmBaselineGeneratedDispatchedSiteOpcodeCount {
+                    owner,
+                    bytecode_index: BytecodeIndex::from_offset(36),
+                    opcode: CoreOpcode::GetByName,
+                    property_load_sidecar_readiness:
+                        BaselineGeneratedPropertyLoadSidecarReadiness::OwnDataPlan,
+                    count: 5,
+                },
+                VmBaselineGeneratedDispatchedSiteOpcodeCount {
+                    owner,
+                    bytecode_index: BytecodeIndex::from_offset(44),
+                    opcode: CoreOpcode::GetByName,
+                    property_load_sidecar_readiness:
+                        BaselineGeneratedPropertyLoadSidecarReadiness::NoLoadPlan,
+                    count: 1,
+                },
+            ],
             generated_direct_call_transaction_summaries: vec![
                 VmGeneratedDirectCallTransactionSummary {
                     caller,
@@ -3895,6 +3958,32 @@ Benchmark.prototype.validate = function() {
                     owner: second_owner,
                     opcode: CoreOpcode::LoopHint,
                     count: 1,
+                },
+            ],
+            baseline_generated_dispatched_site_opcode_counts: vec![
+                VmBaselineGeneratedDispatchedSiteOpcodeCount {
+                    owner,
+                    bytecode_index: BytecodeIndex::from_offset(36),
+                    opcode: CoreOpcode::GetByName,
+                    property_load_sidecar_readiness:
+                        BaselineGeneratedPropertyLoadSidecarReadiness::OwnDataPlan,
+                    count: 13,
+                },
+                VmBaselineGeneratedDispatchedSiteOpcodeCount {
+                    owner,
+                    bytecode_index: BytecodeIndex::from_offset(44),
+                    opcode: CoreOpcode::GetByName,
+                    property_load_sidecar_readiness:
+                        BaselineGeneratedPropertyLoadSidecarReadiness::NoLoadPlan,
+                    count: 1,
+                },
+                VmBaselineGeneratedDispatchedSiteOpcodeCount {
+                    owner,
+                    bytecode_index: BytecodeIndex::from_offset(44),
+                    opcode: CoreOpcode::GetByName,
+                    property_load_sidecar_readiness:
+                        BaselineGeneratedPropertyLoadSidecarReadiness::GuardedPrototypeData,
+                    count: 3,
                 },
             ],
             generated_direct_call_transaction_summaries: vec![
@@ -4129,6 +4218,27 @@ Benchmark.prototype.validate = function() {
                     owner: second_owner,
                     opcode: CoreOpcode::LoopHint,
                     count: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            delta.baseline_generated_dispatched_site_opcode_counts,
+            vec![
+                VmBaselineGeneratedDispatchedSiteOpcodeCount {
+                    owner,
+                    bytecode_index: BytecodeIndex::from_offset(36),
+                    opcode: CoreOpcode::GetByName,
+                    property_load_sidecar_readiness:
+                        BaselineGeneratedPropertyLoadSidecarReadiness::OwnDataPlan,
+                    count: 8,
+                },
+                VmBaselineGeneratedDispatchedSiteOpcodeCount {
+                    owner,
+                    bytecode_index: BytecodeIndex::from_offset(44),
+                    opcode: CoreOpcode::GetByName,
+                    property_load_sidecar_readiness:
+                        BaselineGeneratedPropertyLoadSidecarReadiness::GuardedPrototypeData,
+                    count: 3,
                 },
             ]
         );

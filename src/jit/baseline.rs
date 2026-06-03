@@ -67,6 +67,8 @@ use crate::runtime::{CallFrameId, CodeBlockId, ExecutableId, ObjectId, RuntimeVa
 use crate::strings::{PropertyIndex, PropertyKey};
 use crate::value::{NumberValue, ValueKind};
 
+mod generated_readiness;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BaselineGeneratedExecutionResult {
     Completed(ExecutionCompletion),
@@ -2306,10 +2308,23 @@ fn execute_baseline_generated_code_internal(
             return Err(ExecutionError::InvalidBytecodeIndex(bytecode_index).into());
         }
         execution.stack.mark_top_bytecode_index(bytecode_index);
+        let opcode = CoreOpcode::from_opcode(instruction.opcode);
         if let Some(metrics) = metrics.as_deref_mut() {
+            let property_sidecars_for_metrics =
+                property_sidecars.as_ref().map(|sidecars| &**sidecars);
+            let property_load_sidecar_readiness =
+                generated_readiness::property_load_sidecar_readiness_for_instruction(
+                    owner,
+                    code_block,
+                    instruction,
+                    property_handoff_plan,
+                    property_sidecars_for_metrics,
+                    opcode,
+                );
             metrics.record_dispatched_instruction(
                 bytecode_index,
-                CoreOpcode::from_opcode(instruction.opcode),
+                opcode,
+                property_load_sidecar_readiness,
             );
         }
 

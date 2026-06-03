@@ -116,6 +116,7 @@ pub use executable::{
     LinkBufferCopyLinkOutcome, LinkBufferCopyLinkRecord, LinkBufferCopyLinkRequest,
     LinkBufferFinalizationOutcome, LinkBufferFinalizationRecord, LinkBufferFinalizationRequest,
 };
+pub use generated_metrics::BaselineGeneratedPropertyLoadSidecarReadiness;
 pub use ic::{
     classify_inline_cache_semantics, classify_inline_cache_slot,
     derive_property_load_guard_dependencies, plan_property_load_access_case_from_observation,
