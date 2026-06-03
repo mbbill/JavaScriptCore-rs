@@ -88,6 +88,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            src/vm/generated_executor.rs (maps to C++ ScriptExecutable/CodeBlock/JITCode entry)
     [done] JIT ARM64 return-seed emitter extracted to src/jit/arm64_baseline.rs
            (maps to C++ JIT/MacroAssemblerARM64; behavior unchanged)
+    [done] JIT ARM64 baseline control-flow/slow-case metadata skeleton added to
+           src/jit/arm64_baseline.rs (maps to C++ Jump/JumpList/JumpTable/SlowCaseEntry;
+           no side-exit or opcode-emission behavior expansion)
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler

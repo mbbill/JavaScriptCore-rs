@@ -76,6 +76,343 @@ enum P6Arm64ReturnSeedValue {
     CalleeValue,
 }
 
+#[allow(dead_code)]
+pub(crate) mod control_flow {
+    use super::BytecodeIndex;
+
+    // C++ JSC map: `AbstractMacroAssembler::Jump`/`JumpList`, `JIT::JumpTable`,
+    // and `JIT::SlowCaseEntry` are control-flow records linked to labels after the
+    // hot path has been emitted. ARM64 `returnValueJSR` is x0; `JITCall.cpp`
+    // `op_ret` loads the normal JSValue return into x0 and jumps ReturnFromBaseline.
+    // Rust must not treat x0 as a fallback discriminator. Slow/fallback edges are
+    // represented here only as metadata until the out-of-line ARM64 baseline slow
+    // path machinery is ported.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64BaselineBytecodeLabel {
+        pub(crate) bytecode_index: BytecodeIndex,
+        pub(crate) code_offset: u32,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64BaselineJumpRecord {
+        pub(crate) source_offset: u32,
+        pub(crate) end_offset: u32,
+    }
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    pub(crate) struct Arm64BaselineJumpList {
+        jumps: Vec<Arm64BaselineJumpRecord>,
+    }
+
+    impl Arm64BaselineJumpList {
+        pub(crate) fn new() -> Self {
+            Self { jumps: Vec::new() }
+        }
+
+        pub(crate) fn from_jump(jump: Arm64BaselineJumpRecord) -> Self {
+            Self { jumps: vec![jump] }
+        }
+
+        pub(crate) fn push(&mut self, jump: Arm64BaselineJumpRecord) {
+            self.jumps.push(jump);
+        }
+
+        pub(crate) fn jumps(&self) -> &[Arm64BaselineJumpRecord] {
+            &self.jumps
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64BaselineJumpTableEntry {
+        pub(crate) jump: Arm64BaselineJumpRecord,
+        pub(crate) target_bytecode_index: BytecodeIndex,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64BaselineLinkedJumpRecord {
+        pub(crate) jump: Arm64BaselineJumpRecord,
+        pub(crate) target_offset: u32,
+        pub(crate) byte_displacement_from_source: i64,
+        pub(crate) byte_displacement_from_end: i64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64BaselineLinkedJumpTableEntry {
+        pub(crate) jump: Arm64BaselineJumpRecord,
+        pub(crate) target_bytecode_index: BytecodeIndex,
+        pub(crate) target_offset: u32,
+        pub(crate) byte_displacement_from_source: i64,
+        pub(crate) byte_displacement_from_end: i64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64BaselineSlowCaseEntry {
+        pub(crate) jump: Option<Arm64BaselineJumpRecord>,
+        pub(crate) bytecode_index: BytecodeIndex,
+        pub(crate) fast_path_resume_offset: Option<u32>,
+        pub(crate) slow_path_offset: Option<u32>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64BaselineLinkedSlowCaseEntry {
+        pub(crate) entry: Arm64BaselineSlowCaseEntry,
+        pub(crate) linked_jump: Option<Arm64BaselineLinkedJumpRecord>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Arm64BaselineNormalReturnValueRecord {
+        pub(crate) bytecode_index: BytecodeIndex,
+        pub(crate) return_value_gpr: &'static str,
+        pub(crate) return_value_jsr: &'static str,
+        pub(crate) value_offset: u32,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Arm64BaselineControlEdgeRecord {
+        NormalReturnValueJSR(Arm64BaselineNormalReturnValueRecord),
+        SlowCaseControlEdge(Arm64BaselineSlowCaseEntry),
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Arm64BaselineControlFlowLinkError {
+        InvalidBytecodeIndex {
+            bytecode_index: BytecodeIndex,
+        },
+        DuplicateLabel {
+            bytecode_index: BytecodeIndex,
+            existing_offset: u32,
+            duplicate_offset: u32,
+        },
+        MissingLabel {
+            bytecode_index: BytecodeIndex,
+        },
+        InvalidJumpRange {
+            source_offset: u32,
+            end_offset: u32,
+        },
+        SlowCaseOutOfOrder {
+            previous: BytecodeIndex,
+            current: BytecodeIndex,
+        },
+    }
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    pub(crate) struct Arm64BaselineControlFlowBuilder {
+        labels: Vec<Arm64BaselineBytecodeLabel>,
+        jump_table: Vec<Arm64BaselineJumpTableEntry>,
+        slow_cases: Vec<Arm64BaselineSlowCaseEntry>,
+        next_slow_case_to_link: usize,
+    }
+
+    impl Arm64BaselineControlFlowBuilder {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        pub(crate) fn record_label(
+            &mut self,
+            bytecode_index: BytecodeIndex,
+            code_offset: u32,
+        ) -> Result<Arm64BaselineBytecodeLabel, Arm64BaselineControlFlowLinkError> {
+            validate_arm64_baseline_bytecode_index(bytecode_index)?;
+            if let Some(existing) = self
+                .labels
+                .iter()
+                .find(|label| label.bytecode_index == bytecode_index)
+            {
+                return Err(Arm64BaselineControlFlowLinkError::DuplicateLabel {
+                    bytecode_index,
+                    existing_offset: existing.code_offset,
+                    duplicate_offset: code_offset,
+                });
+            }
+            let label = Arm64BaselineBytecodeLabel {
+                bytecode_index,
+                code_offset,
+            };
+            self.labels.push(label);
+            Ok(label)
+        }
+
+        pub(crate) fn labels_in_bytecode_order(&self) -> Vec<Arm64BaselineBytecodeLabel> {
+            let mut labels = self.labels.clone();
+            labels.sort_by_key(|label| label.bytecode_index);
+            labels
+        }
+
+        pub(crate) fn record_pending_jump(
+            &mut self,
+            jump: Arm64BaselineJumpRecord,
+            target_bytecode_index: BytecodeIndex,
+        ) -> Result<Arm64BaselineJumpTableEntry, Arm64BaselineControlFlowLinkError> {
+            validate_arm64_baseline_jump(jump)?;
+            validate_arm64_baseline_bytecode_index(target_bytecode_index)?;
+            let entry = Arm64BaselineJumpTableEntry {
+                jump,
+                target_bytecode_index,
+            };
+            self.jump_table.push(entry);
+            Ok(entry)
+        }
+
+        pub(crate) fn record_pending_jump_list(
+            &mut self,
+            jumps: &Arm64BaselineJumpList,
+            target_bytecode_index: BytecodeIndex,
+        ) -> Result<Vec<Arm64BaselineJumpTableEntry>, Arm64BaselineControlFlowLinkError> {
+            jumps
+                .jumps()
+                .iter()
+                .copied()
+                .map(|jump| self.record_pending_jump(jump, target_bytecode_index))
+                .collect()
+        }
+
+        pub(crate) fn link_pending_jumps(
+            &self,
+        ) -> Result<Vec<Arm64BaselineLinkedJumpTableEntry>, Arm64BaselineControlFlowLinkError>
+        {
+            self.jump_table
+                .iter()
+                .copied()
+                .map(|entry| {
+                    let target_offset = self.label_offset(entry.target_bytecode_index)?;
+                    let linked = resolve_arm64_baseline_jump(entry.jump, target_offset)?;
+                    Ok(Arm64BaselineLinkedJumpTableEntry {
+                        jump: entry.jump,
+                        target_bytecode_index: entry.target_bytecode_index,
+                        target_offset,
+                        byte_displacement_from_source: linked.byte_displacement_from_source,
+                        byte_displacement_from_end: linked.byte_displacement_from_end,
+                    })
+                })
+                .collect()
+        }
+
+        pub(crate) fn record_slow_case(
+            &mut self,
+            entry: Arm64BaselineSlowCaseEntry,
+        ) -> Result<Arm64BaselineSlowCaseEntry, Arm64BaselineControlFlowLinkError> {
+            validate_arm64_baseline_bytecode_index(entry.bytecode_index)?;
+            if let Some(jump) = entry.jump {
+                validate_arm64_baseline_jump(jump)?;
+            }
+            if let Some(previous) = self.slow_cases.last() {
+                if previous.bytecode_index > entry.bytecode_index {
+                    return Err(Arm64BaselineControlFlowLinkError::SlowCaseOutOfOrder {
+                        previous: previous.bytecode_index,
+                        current: entry.bytecode_index,
+                    });
+                }
+            }
+            self.slow_cases.push(entry);
+            Ok(entry)
+        }
+
+        pub(crate) fn record_slow_case_jump(
+            &mut self,
+            bytecode_index: BytecodeIndex,
+            jump: Arm64BaselineJumpRecord,
+            fast_path_resume_offset: Option<u32>,
+        ) -> Result<Arm64BaselineSlowCaseEntry, Arm64BaselineControlFlowLinkError> {
+            self.record_slow_case(Arm64BaselineSlowCaseEntry {
+                jump: Some(jump),
+                bytecode_index,
+                fast_path_resume_offset,
+                slow_path_offset: None,
+            })
+        }
+
+        pub(crate) fn link_all_slow_cases_up_to_bytecode_index(
+            &mut self,
+            bytecode_index: BytecodeIndex,
+            slow_path_offset: u32,
+        ) -> Result<Vec<Arm64BaselineLinkedSlowCaseEntry>, Arm64BaselineControlFlowLinkError>
+        {
+            validate_arm64_baseline_bytecode_index(bytecode_index)?;
+            let mut linked = Vec::new();
+            while let Some(entry) = self.slow_cases.get(self.next_slow_case_to_link).copied() {
+                if entry.bytecode_index > bytecode_index {
+                    break;
+                }
+                let entry = Arm64BaselineSlowCaseEntry {
+                    slow_path_offset: Some(slow_path_offset),
+                    ..entry
+                };
+                let linked_jump = entry
+                    .jump
+                    .map(|jump| resolve_arm64_baseline_jump(jump, slow_path_offset))
+                    .transpose()?;
+                linked.push(Arm64BaselineLinkedSlowCaseEntry { entry, linked_jump });
+                self.next_slow_case_to_link += 1;
+            }
+            Ok(linked)
+        }
+
+        pub(crate) fn normal_return_value_jsr(
+            bytecode_index: BytecodeIndex,
+            value_offset: u32,
+        ) -> Result<Arm64BaselineControlEdgeRecord, Arm64BaselineControlFlowLinkError> {
+            validate_arm64_baseline_bytecode_index(bytecode_index)?;
+            Ok(Arm64BaselineControlEdgeRecord::NormalReturnValueJSR(
+                Arm64BaselineNormalReturnValueRecord {
+                    bytecode_index,
+                    return_value_gpr: "x0",
+                    return_value_jsr: "returnValueJSR",
+                    value_offset,
+                },
+            ))
+        }
+
+        fn label_offset(
+            &self,
+            bytecode_index: BytecodeIndex,
+        ) -> Result<u32, Arm64BaselineControlFlowLinkError> {
+            self.labels
+                .iter()
+                .find(|label| label.bytecode_index == bytecode_index)
+                .map(|label| label.code_offset)
+                .ok_or(Arm64BaselineControlFlowLinkError::MissingLabel { bytecode_index })
+        }
+    }
+
+    fn validate_arm64_baseline_bytecode_index(
+        bytecode_index: BytecodeIndex,
+    ) -> Result<(), Arm64BaselineControlFlowLinkError> {
+        if bytecode_index.is_valid() {
+            Ok(())
+        } else {
+            Err(Arm64BaselineControlFlowLinkError::InvalidBytecodeIndex { bytecode_index })
+        }
+    }
+
+    fn validate_arm64_baseline_jump(
+        jump: Arm64BaselineJumpRecord,
+    ) -> Result<(), Arm64BaselineControlFlowLinkError> {
+        if jump.source_offset <= jump.end_offset {
+            Ok(())
+        } else {
+            Err(Arm64BaselineControlFlowLinkError::InvalidJumpRange {
+                source_offset: jump.source_offset,
+                end_offset: jump.end_offset,
+            })
+        }
+    }
+
+    fn resolve_arm64_baseline_jump(
+        jump: Arm64BaselineJumpRecord,
+        target_offset: u32,
+    ) -> Result<Arm64BaselineLinkedJumpRecord, Arm64BaselineControlFlowLinkError> {
+        validate_arm64_baseline_jump(jump)?;
+        Ok(Arm64BaselineLinkedJumpRecord {
+            jump,
+            target_offset,
+            byte_displacement_from_source: target_offset as i64 - jump.source_offset as i64,
+            byte_displacement_from_end: target_offset as i64 - jump.end_offset as i64,
+        })
+    }
+}
+
 fn encode_p6_arm64_callable_return_seed_selection(
     contract: &P6X86_64BaselineBackendContractRecord,
     selection: &P6X86_64BaselineInstructionSelectionPlan,
@@ -479,4 +816,199 @@ fn p6_arm64_callable_semantic_source_image_id(
 ) -> AssemblerByteImageId {
     let raw_id = p6_arm64_callable_semantic_source_buffer_id(contract).0 ^ 0x1f00_0000_a64c_ab1e;
     AssemblerByteImageId(if raw_id == 0 { 1 } else { raw_id })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::control_flow::*;
+    use super::*;
+
+    fn bci(offset: u32) -> BytecodeIndex {
+        BytecodeIndex::from_offset(offset)
+    }
+
+    fn jump(source_offset: u32, end_offset: u32) -> Arm64BaselineJumpRecord {
+        Arm64BaselineJumpRecord {
+            source_offset,
+            end_offset,
+        }
+    }
+
+    #[test]
+    fn arm64_baseline_bytecode_labels_resolve_and_pending_jumps_keep_append_order() {
+        let mut builder = Arm64BaselineControlFlowBuilder::new();
+        builder.record_label(bci(8), 0x80).unwrap();
+        builder.record_label(bci(0), 0x10).unwrap();
+        builder.record_label(bci(4), 0x44).unwrap();
+
+        let mut jump_list = Arm64BaselineJumpList::from_jump(jump(0x20, 0x24));
+        jump_list.push(jump(0x30, 0x34));
+        builder
+            .record_pending_jump(jump(0x10, 0x14), bci(8))
+            .unwrap();
+        builder
+            .record_pending_jump_list(&jump_list, bci(4))
+            .unwrap();
+
+        let labels = builder.labels_in_bytecode_order();
+        assert_eq!(
+            labels,
+            vec![
+                Arm64BaselineBytecodeLabel {
+                    bytecode_index: bci(0),
+                    code_offset: 0x10,
+                },
+                Arm64BaselineBytecodeLabel {
+                    bytecode_index: bci(4),
+                    code_offset: 0x44,
+                },
+                Arm64BaselineBytecodeLabel {
+                    bytecode_index: bci(8),
+                    code_offset: 0x80,
+                },
+            ]
+        );
+
+        let linked = builder.link_pending_jumps().unwrap();
+        assert_eq!(linked.len(), 3);
+        assert_eq!(linked[0].target_bytecode_index, bci(8));
+        assert_eq!(linked[0].target_offset, 0x80);
+        assert_eq!(linked[0].byte_displacement_from_source, 0x70);
+        assert_eq!(linked[0].byte_displacement_from_end, 0x6c);
+        assert_eq!(linked[1].target_bytecode_index, bci(4));
+        assert_eq!(linked[1].target_offset, 0x44);
+        assert_eq!(linked[1].byte_displacement_from_source, 0x24);
+        assert_eq!(linked[1].byte_displacement_from_end, 0x20);
+        assert_eq!(linked[2].target_bytecode_index, bci(4));
+        assert_eq!(linked[2].target_offset, 0x44);
+    }
+
+    #[test]
+    fn arm64_baseline_bytecode_label_resolution_rejects_missing_and_duplicate_targets() {
+        let mut missing = Arm64BaselineControlFlowBuilder::new();
+        missing.record_label(bci(0), 0x10).unwrap();
+        missing
+            .record_pending_jump(jump(0x20, 0x24), bci(4))
+            .unwrap();
+        assert_eq!(
+            missing.link_pending_jumps(),
+            Err(Arm64BaselineControlFlowLinkError::MissingLabel {
+                bytecode_index: bci(4),
+            })
+        );
+
+        let mut duplicate = Arm64BaselineControlFlowBuilder::new();
+        duplicate.record_label(bci(2), 0x20).unwrap();
+        assert_eq!(
+            duplicate.record_label(bci(2), 0x28),
+            Err(Arm64BaselineControlFlowLinkError::DuplicateLabel {
+                bytecode_index: bci(2),
+                existing_offset: 0x20,
+                duplicate_offset: 0x28,
+            })
+        );
+    }
+
+    #[test]
+    fn arm64_baseline_slow_cases_link_by_bytecode_index_order() {
+        let mut builder = Arm64BaselineControlFlowBuilder::new();
+        builder
+            .record_slow_case_jump(bci(1), jump(0x10, 0x14), Some(0x18))
+            .unwrap();
+        builder
+            .record_slow_case_jump(bci(1), jump(0x20, 0x24), Some(0x28))
+            .unwrap();
+        builder
+            .record_slow_case(Arm64BaselineSlowCaseEntry {
+                jump: None,
+                bytecode_index: bci(3),
+                fast_path_resume_offset: None,
+                slow_path_offset: None,
+            })
+            .unwrap();
+
+        let linked_at_one = builder
+            .link_all_slow_cases_up_to_bytecode_index(bci(1), 0x90)
+            .unwrap();
+        assert_eq!(linked_at_one.len(), 2);
+        assert_eq!(linked_at_one[0].entry.bytecode_index, bci(1));
+        assert_eq!(linked_at_one[0].entry.fast_path_resume_offset, Some(0x18));
+        assert_eq!(linked_at_one[0].entry.slow_path_offset, Some(0x90));
+        assert_eq!(
+            linked_at_one[0].linked_jump.unwrap(),
+            Arm64BaselineLinkedJumpRecord {
+                jump: jump(0x10, 0x14),
+                target_offset: 0x90,
+                byte_displacement_from_source: 0x80,
+                byte_displacement_from_end: 0x7c,
+            }
+        );
+        assert_eq!(linked_at_one[1].entry.bytecode_index, bci(1));
+
+        let linked_at_two = builder
+            .link_all_slow_cases_up_to_bytecode_index(bci(2), 0xa0)
+            .unwrap();
+        assert!(linked_at_two.is_empty());
+
+        let linked_at_three = builder
+            .link_all_slow_cases_up_to_bytecode_index(bci(3), 0xb0)
+            .unwrap();
+        assert_eq!(linked_at_three.len(), 1);
+        assert_eq!(linked_at_three[0].entry.bytecode_index, bci(3));
+        assert_eq!(linked_at_three[0].entry.slow_path_offset, Some(0xb0));
+        assert_eq!(linked_at_three[0].linked_jump, None);
+    }
+
+    #[test]
+    fn arm64_baseline_slow_cases_reject_out_of_order_entries() {
+        let mut builder = Arm64BaselineControlFlowBuilder::new();
+        builder
+            .record_slow_case_jump(bci(4), jump(0x20, 0x24), None)
+            .unwrap();
+        assert_eq!(
+            builder.record_slow_case_jump(bci(2), jump(0x30, 0x34), None),
+            Err(Arm64BaselineControlFlowLinkError::SlowCaseOutOfOrder {
+                previous: bci(4),
+                current: bci(2),
+            })
+        );
+    }
+
+    #[test]
+    fn arm64_baseline_x0_jsvalue_return_is_distinct_from_slow_case_control_edge() {
+        let normal =
+            Arm64BaselineControlFlowBuilder::normal_return_value_jsr(bci(9), 0x70).unwrap();
+        let slow_entry = Arm64BaselineSlowCaseEntry {
+            jump: Some(jump(0x70, 0x74)),
+            bytecode_index: bci(9),
+            fast_path_resume_offset: Some(0x78),
+            slow_path_offset: None,
+        };
+        let slow = Arm64BaselineControlEdgeRecord::SlowCaseControlEdge(slow_entry);
+
+        assert_eq!(
+            normal,
+            Arm64BaselineControlEdgeRecord::NormalReturnValueJSR(
+                Arm64BaselineNormalReturnValueRecord {
+                    bytecode_index: bci(9),
+                    return_value_gpr: "x0",
+                    return_value_jsr: "returnValueJSR",
+                    value_offset: 0x70,
+                }
+            )
+        );
+        assert!(matches!(
+            slow,
+            Arm64BaselineControlEdgeRecord::SlowCaseControlEdge(_)
+        ));
+        assert_ne!(normal, slow);
+    }
+
+    #[test]
+    fn arm64_baseline_jump_list_records_empty_and_appended_jumps() {
+        let mut empty = Arm64BaselineJumpList::new();
+        assert!(empty.jumps().is_empty());
+        empty.push(jump(0x40, 0x44));
+        assert_eq!(empty.jumps(), &[jump(0x40, 0x44)]);
+    }
 }
