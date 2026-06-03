@@ -154,9 +154,10 @@ use crate::jit::plan::{
     validate_baseline_generated_runtime_helper_plan_against_code_block,
     BaselineBytecodeSnapshotFingerprint, BaselineGeneratedJsCallNativeExitPlanMetadata,
     BaselineGeneratedJsCallNativeExitSite, BaselineGeneratedOwnerContinuationKind,
-    BaselineGeneratedPropertyHandoffPlanDerivation, BaselineGeneratedPropertyHandoffPlanMetadata,
-    BaselineGeneratedPropertyHandoffSite, BaselineGeneratedRuntimeBoundaryProof,
-    BaselineGeneratedRuntimeHelperPlanDerivation, BaselineGeneratedRuntimeHelperPlanMetadata,
+    BaselineGeneratedOwnerContinuationMapMetadata, BaselineGeneratedPropertyHandoffPlanDerivation,
+    BaselineGeneratedPropertyHandoffPlanMetadata, BaselineGeneratedPropertyHandoffSite,
+    BaselineGeneratedRuntimeBoundaryProof, BaselineGeneratedRuntimeHelperPlanDerivation,
+    BaselineGeneratedRuntimeHelperPlanMetadata,
 };
 use crate::jit::{
     emit_p6_arm64_baseline_callable_semantic_bytes,
@@ -186,7 +187,7 @@ use crate::jit::{
     MachineCodeOwnership, MachineCodeRange, P14X86_64BaselineBackedgeSafepointAuthority,
     P14X86_64BaselineLoopBackedgeReturnPayload, P6X86_64BaselineBackendContractError,
     P6X86_64BaselineBytecodeBranchKind, P6X86_64BaselineInstructionSelectionError,
-    P6X86_64BaselineLoweringError, P6X86_64BaselineLoweringRequest,
+    P6X86_64BaselineLoweringError, P6X86_64BaselineLoweringPlan, P6X86_64BaselineLoweringRequest,
     P6X86_64BaselineSelectedSideExitReason, P6X86_64BaselineSemanticByteEmissionError,
     P6X86_64BaselineSemanticByteEmissionResult, P6X86_64BaselineSideExitReturnPayload,
     PropertyHasObservationDescriptor, PropertyLoadAccessCasePlanKind,
@@ -2817,6 +2818,51 @@ impl Vm {
         }
     }
 
+    fn p15_arm64_return_seed_backend_contract_allows_x86_semantic_fallback(
+        error: &P6X86_64BaselineBackendContractError,
+    ) -> bool {
+        matches!(
+            error,
+            P6X86_64BaselineBackendContractError::UnsupportedOpcodeSubset {
+                emitter: BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset,
+                expected: BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic,
+                ..
+            }
+        )
+    }
+
+    fn emit_p6_x86_64_callable_semantic_from_lowering_plan(
+        plan: &P6X86_64BaselineLoweringPlan,
+        owner_continuation_map: Option<&BaselineGeneratedOwnerContinuationMapMetadata>,
+    ) -> Result<
+        P6X86_64BaselineSemanticByteEmissionResult,
+        P6X86_64SemanticBaselineNativeEntryInstallError,
+    > {
+        // C++ JSC's linkFor()/prepareForExecution() prepares the callee and then
+        // entrypointFor() publishes the current platform entry. This x86_64 semantic
+        // path is the native callable path on x86_64 and the fallback artifact path for
+        // Rust's return-seed-only ARM64 callable backend until the full ARM64 backend is
+        // ported.
+        // Oversized-file exception: this narrow policy helper stays beside the current
+        // VM install path until the JSC-mapped backend extraction owns both branches.
+        let backend_contract =
+            record_p6_x86_64_baseline_backend_contract_from_plan(plan).map_err(|error| {
+                P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract { error }
+            })?;
+        let selection =
+            select_p6_x86_64_baseline_instructions(&backend_contract).map_err(|error| {
+                P6X86_64SemanticBaselineNativeEntryInstallError::InstructionSelection { error }
+            })?;
+        emit_p6_x86_64_baseline_callable_semantic_bytes_with_owner_continuation_map(
+            backend_contract,
+            selection,
+            owner_continuation_map,
+        )
+        .map_err(|error| {
+            P6X86_64SemanticBaselineNativeEntryInstallError::SemanticByteEmission { error }
+        })
+    }
+
     fn p15_native_auto_install_failure_allows_generated_fallback(
         error: &P6X86_64SemanticBaselineNativeEntryInstallError,
     ) -> bool {
@@ -3419,97 +3465,79 @@ impl Vm {
         };
         let semantic_emission = match readiness_mode {
             P6X86_64SemanticBaselineNativeEntryReadinessMode::DisabledOnly => {
-                let backend_contract =
-                    record_p6_x86_64_baseline_backend_contract_from_plan(&lowering.plan).map_err(
-                        |error| {
-                            P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
-                                error,
-                            }
-                        },
-                    )?;
-                let selection = select_p6_x86_64_baseline_instructions(&backend_contract)
-                    .map_err(|error| {
+                let backend_contract = record_p6_x86_64_baseline_backend_contract_from_plan(
+                    &lowering.plan,
+                )
+                .map_err(|error| {
+                    P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract { error }
+                })?;
+                let selection =
+                    select_p6_x86_64_baseline_instructions(&backend_contract).map_err(|error| {
                         P6X86_64SemanticBaselineNativeEntryInstallError::InstructionSelection {
                             error,
                         }
                     })?;
-                emit_p6_x86_64_baseline_semantic_bytes(backend_contract, selection)
+                emit_p6_x86_64_baseline_semantic_bytes(backend_contract, selection).map_err(
+                    |error| P6X86_64SemanticBaselineNativeEntryInstallError::SemanticByteEmission {
+                        error,
+                    },
+                )
             }
             P6X86_64SemanticBaselineNativeEntryReadinessMode::EnabledCallable
                 if use_arm64_callable =>
             {
-                let backend_contract =
-                    record_p6_arm64_baseline_backend_contract_from_plan(&lowering.plan).map_err(
-                        |error| {
-                            P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
-                                error,
-                            }
-                        },
-                    )?;
-                let selection = select_p6_x86_64_baseline_instructions(&backend_contract)
-                    .map_err(|error| {
-                        P6X86_64SemanticBaselineNativeEntryInstallError::InstructionSelection {
-                            error,
-                        }
-                    })?;
-                match emit_p6_arm64_baseline_callable_semantic_bytes(backend_contract, selection) {
-                    Ok(semantic_emission) => Ok(semantic_emission),
-                    Err(
-                        P6X86_64BaselineSemanticByteEmissionError::UnsupportedArm64SeedLoweredOperation {
-                            ..
-                        },
-                    ) => {
-                        // C++ JSC has a complete architecture-specific Baseline JIT backend.
-                        // This Rust ARM64 lane is only the no-call/no-heap return seed, so
-                        // valid P6 bodies outside that seed keep the existing x86_64 semantic
-                        // artifact route until the full ARM64 backend is ported.
-                        let backend_contract =
-                            record_p6_x86_64_baseline_backend_contract_from_plan(&lowering.plan)
-                                .map_err(|error| {
-                                    P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
-                                        error,
-                                    }
-                                })?;
+                match record_p6_arm64_baseline_backend_contract_from_plan(&lowering.plan) {
+                    Ok(backend_contract) => {
                         let selection = select_p6_x86_64_baseline_instructions(&backend_contract)
                             .map_err(|error| {
                                 P6X86_64SemanticBaselineNativeEntryInstallError::InstructionSelection {
                                     error,
                                 }
                             })?;
-                        emit_p6_x86_64_baseline_callable_semantic_bytes_with_owner_continuation_map(
+                        match emit_p6_arm64_baseline_callable_semantic_bytes(
                             backend_contract,
                             selection,
+                        ) {
+                            Ok(semantic_emission) => Ok(semantic_emission),
+                            Err(
+                                P6X86_64BaselineSemanticByteEmissionError::UnsupportedArm64SeedLoweredOperation {
+                                    ..
+                                },
+                            ) => Self::emit_p6_x86_64_callable_semantic_from_lowering_plan(
+                                &lowering.plan,
+                                owner_continuation_map_for_emission.as_ref(),
+                            ),
+                            Err(error) => Err(
+                                P6X86_64SemanticBaselineNativeEntryInstallError::SemanticByteEmission {
+                                    error,
+                                },
+                            ),
+                        }
+                    }
+                    Err(error)
+                        if Self::p15_arm64_return_seed_backend_contract_allows_x86_semantic_fallback(
+                            &error,
+                        ) =>
+                    {
+                        Self::emit_p6_x86_64_callable_semantic_from_lowering_plan(
+                            &lowering.plan,
                             owner_continuation_map_for_emission.as_ref(),
                         )
                     }
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        Err(P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
+                            error,
+                        })
+                    }
                 }
             }
             P6X86_64SemanticBaselineNativeEntryReadinessMode::EnabledCallable => {
-                let backend_contract =
-                    record_p6_x86_64_baseline_backend_contract_from_plan(&lowering.plan).map_err(
-                        |error| {
-                            P6X86_64SemanticBaselineNativeEntryInstallError::BackendContract {
-                                error,
-                            }
-                        },
-                    )?;
-                let selection = select_p6_x86_64_baseline_instructions(&backend_contract)
-                    .map_err(|error| {
-                        P6X86_64SemanticBaselineNativeEntryInstallError::InstructionSelection {
-                            error,
-                        }
-                    })?;
-                emit_p6_x86_64_baseline_callable_semantic_bytes_with_owner_continuation_map(
-                    backend_contract,
-                    selection,
+                Self::emit_p6_x86_64_callable_semantic_from_lowering_plan(
+                    &lowering.plan,
                     owner_continuation_map_for_emission.as_ref(),
                 )
             }
-        }
-        .map_err(|error| {
-            P6X86_64SemanticBaselineNativeEntryInstallError::SemanticByteEmission { error }
-        })?;
+        }?;
 
         #[cfg(test)]
         if let P6X86_64SemanticBaselineNativeEntryInstallMode::ReplaceCurrentCodeBlockBeforeMaterializationForTest(replacement) =
@@ -56413,6 +56441,74 @@ mod tests {
         );
     }
 
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn vm_p6_arm64_callable_broader_subset_uses_x86_semantic_fallback_artifact() {
+        let code_block = linked_p6_test_code_block(vec![
+            typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(0)), Operand::SignedImmediate(14)],
+            ),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(local(1)), Operand::SignedImmediate(11)],
+            ),
+            typed_core_instruction_with_operands(
+                2,
+                CoreOpcode::BitAndInt32,
+                vec![
+                    Operand::Register(local(2)),
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                3,
+                CoreOpcode::Return,
+                vec![Operand::Register(local(2))],
+            ),
+        ]);
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+
+        let record = vm
+            .install_p6_x86_64_callable_semantic_baseline_native_entry(p6_semantic_install_request(
+                owner, 743,
+            ))
+            .expect("ARM64 seed subset rejection should use x86 semantic callable fallback");
+        let enabled_readiness = record
+            .enabled_readiness
+            .as_ref()
+            .expect("callable install records enabled readiness");
+
+        assert_eq!(
+            record.eligibility_proof.opcode_subset(),
+            BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr
+        );
+        assert_ne!(
+            record.semantic_emission.emitter_kind,
+            BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset
+        );
+        assert_eq!(
+            enabled_readiness.callable.map(|callable| callable.kind()),
+            Some(BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry)
+        );
+        assert!(!vm.can_execute_baseline_native_entry_kind(
+            BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
+        ));
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        let completion =
+            execute_registered_code_block_with_host(&mut vm, owner, &code_block, &mut host);
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(10))
+        );
+    }
+
     #[cfg(all(unix, target_arch = "x86_64"))]
     #[test]
     fn vm_p6_semantic_callable_native_ready_subset_matches_interpreter_matrix() {
@@ -60387,6 +60483,41 @@ mod tests {
                         BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr,
                 },
             ))
+        );
+    }
+
+    #[test]
+    fn vm_p15_arm64_return_seed_backend_contract_fallback_policy_is_opcode_subset_only() {
+        let supported_seed_gap = P6X86_64BaselineBackendContractError::UnsupportedOpcodeSubset {
+            emitter: BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset,
+            expected: BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic,
+            actual: BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr,
+        };
+        assert!(
+            Vm::p15_arm64_return_seed_backend_contract_allows_x86_semantic_fallback(
+                &supported_seed_gap
+            )
+        );
+
+        let wrong_emitter = P6X86_64BaselineBackendContractError::UnsupportedOpcodeSubset {
+            emitter: BaselineMachineCodeEmitterKind::P6X86_64NoCallNoHeapSubset,
+            expected: BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32ArithmeticBitAndOr,
+            actual: BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic,
+        };
+        assert!(
+            !Vm::p15_arm64_return_seed_backend_contract_allows_x86_semantic_fallback(
+                &wrong_emitter
+            )
+        );
+
+        let non_subset_contract = P6X86_64BaselineBackendContractError::UnexpectedArchitecture {
+            expected: AssemblerArchitecture::Arm64,
+            actual: AssemblerArchitecture::X86_64,
+        };
+        assert!(
+            !Vm::p15_arm64_return_seed_backend_contract_allows_x86_semantic_fallback(
+                &non_subset_contract
+            )
         );
     }
 
