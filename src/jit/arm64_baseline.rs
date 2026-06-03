@@ -18,17 +18,20 @@ use crate::jit::emitter::{
     finish_p6_x86_64_semantic_byte_emission, p6_x86_64_checked_byte_len,
     p6_x86_64_semantic_source_buffer_id, validate_p6_x86_64_semantic_selection_effects,
     validate_p6_x86_64_semantic_terminal_policy, validate_p6_x86_64_semantic_value_layout,
-    P6X86_64BaselineBackendContractRecord, P6X86_64BaselineCallableEpilogueRecord,
-    P6X86_64BaselineCallablePrologueRecord, P6X86_64BaselineInstructionByteRecord,
+    P6X86_64BaselineBackendContractRecord, P6X86_64BaselineBytecodeBranchRecord,
+    P6X86_64BaselineCallableEpilogueRecord, P6X86_64BaselineCallablePrologueRecord,
+    P6X86_64BaselineControlFlowBranchContract, P6X86_64BaselineInstructionByteRecord,
     P6X86_64BaselineInstructionSelectionPlan, P6X86_64BaselineLoweredOperation,
     P6X86_64BaselineOperandLocation, P6X86_64BaselineOperandRole,
     P6X86_64BaselinePhysicalRegisterBinding, P6X86_64BaselinePhysicalRegisterMap,
     P6X86_64BaselineSelectedInstruction, P6X86_64BaselineSemanticByteEmissionAuthority,
     P6X86_64BaselineSemanticByteEmissionError, P6X86_64BaselineSemanticByteEmissionResult,
     P6X86_64BaselineSemanticByteEmissionShape, P6X86_64BaselineSemanticOperandRejectionReason,
-    P6X86_64BaselineSideExitReturnPayload, P6X86_64BaselineSymbolicRegister,
-    P6X86_64BaselineTerminalPolicy, P6X86_64BaselineTerminalPolicyRecord,
-    P6X86_64SemanticEncodedSelection, P6X86_64SemanticTerminalSelection,
+    P6X86_64BaselineSideExitDestinationEffect, P6X86_64BaselineSideExitLabel,
+    P6X86_64BaselineSideExitReturnPayload, P6X86_64BaselineSideExitReturnStubRecord,
+    P6X86_64BaselineSymbolicRegister, P6X86_64BaselineTerminalPolicy,
+    P6X86_64BaselineTerminalPolicyRecord, P6X86_64SemanticEncodedSelection,
+    P6X86_64SemanticTerminalSelection,
 };
 
 // ARM64 JSC map: GPRInfo::callFrameRegister is fp/x29 and returnValueGPR is
@@ -857,6 +860,296 @@ pub(crate) mod direct_branch {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct P6Arm64PendingBytecodeBranch {
+    source: P6X86_64BaselineControlFlowBranchContract,
+    kind: direct_branch::Arm64DirectBranchKind,
+    source_instruction_offset: u32,
+    branch_end_offset: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct P6Arm64PendingSideExitBranch {
+    label: P6X86_64BaselineSideExitLabel,
+    kind: direct_branch::Arm64DirectBranchKind,
+    branch_offset: u32,
+    branch_end_offset: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct P6Arm64SemanticByteBuilder {
+    bytes: Vec<u8>,
+    pending_bytecode_branches: Vec<P6Arm64PendingBytecodeBranch>,
+    pending_side_exits: Vec<P6Arm64PendingSideExitBranch>,
+}
+
+#[allow(dead_code)]
+impl P6Arm64SemanticByteBuilder {
+    fn offset(&self) -> Result<u32, P6X86_64BaselineSemanticByteEmissionError> {
+        p6_x86_64_checked_byte_len(self.bytes.len())
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn emit_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+        p6_arm64_emit_bytes(&mut self.bytes, bytes)
+    }
+
+    fn emit_word(&mut self, word: u32) -> Result<u32, P6X86_64BaselineSemanticByteEmissionError> {
+        let offset = self.offset()?;
+        p6_arm64_emit_word(&mut self.bytes, word)?;
+        Ok(offset)
+    }
+
+    fn emit_unconditional_bytecode_branch(
+        &mut self,
+        source: P6X86_64BaselineControlFlowBranchContract,
+    ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+        self.emit_direct_bytecode_branch(
+            source,
+            direct_branch::Arm64DirectBranchKind::Unconditional,
+        )
+    }
+
+    fn emit_conditional_bytecode_branch(
+        &mut self,
+        source: P6X86_64BaselineControlFlowBranchContract,
+        condition: direct_branch::Arm64Condition,
+    ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+        self.emit_direct_bytecode_branch(
+            source,
+            direct_branch::Arm64DirectBranchKind::Conditional { condition },
+        )
+    }
+
+    fn emit_direct_bytecode_branch(
+        &mut self,
+        source: P6X86_64BaselineControlFlowBranchContract,
+        kind: direct_branch::Arm64DirectBranchKind,
+    ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+        let source_instruction_offset = self.emit_word(kind.placeholder_word())?;
+        let branch_end_offset = self.offset()?;
+        self.pending_bytecode_branches
+            .push(P6Arm64PendingBytecodeBranch {
+                source,
+                kind,
+                source_instruction_offset,
+                branch_end_offset,
+            });
+        Ok(())
+    }
+
+    fn emit_retained_side_exit_direct_branch(
+        &mut self,
+        bytecode_index: BytecodeIndex,
+        label: P6X86_64BaselineSideExitLabel,
+        kind: direct_branch::Arm64DirectBranchKind,
+    ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+        validate_p6_arm64_semantic_side_exit_label(bytecode_index, label)?;
+        let branch_offset = self.emit_word(kind.placeholder_word())?;
+        let branch_end_offset = self.offset()?;
+        self.pending_side_exits.push(P6Arm64PendingSideExitBranch {
+            label,
+            kind,
+            branch_offset,
+            branch_end_offset,
+        });
+        Ok(())
+    }
+
+    fn finish_bytecode_branches(
+        &mut self,
+        instruction_bytes: &[P6X86_64BaselineInstructionByteRecord],
+    ) -> Result<Vec<P6X86_64BaselineBytecodeBranchRecord>, P6X86_64BaselineSemanticByteEmissionError>
+    {
+        let pending = self.pending_bytecode_branches.clone();
+        let mut records = Vec::with_capacity(pending.len());
+        for branch in pending {
+            let target = instruction_bytes
+                .iter()
+                .find(|record| record.bytecode_index == branch.source.target_bytecode_index)
+                .ok_or(
+                    P6X86_64BaselineSemanticByteEmissionError::BranchTargetMissing {
+                        bytecode_index: branch.source.source_bytecode_index,
+                        target: branch.source.target_bytecode_index,
+                    },
+                )?;
+            let target_offset = target.start_offset;
+            let linked = direct_branch::Arm64DirectBranchPatch {
+                kind: branch.kind,
+                source_instruction_offset: branch.source_instruction_offset,
+            }
+            .link_to(target_offset)
+            .map_err(|error| {
+                p6_arm64_direct_branch_link_error(
+                    error,
+                    branch.source_instruction_offset,
+                    branch.branch_end_offset,
+                    target_offset,
+                )
+            })?;
+            self.patch_direct_branch_word(
+                branch.source_instruction_offset,
+                linked.instruction_word,
+            )?;
+            records.push(P6X86_64BaselineBytecodeBranchRecord {
+                bytecode_index: branch.source.source_bytecode_index,
+                kind: branch.source.kind,
+                branch_offset: branch.source_instruction_offset,
+                // Shared P6 branch records are still x86-named. For ARM64 this
+                // field stores the branch instruction word patch offset until a
+                // cross-backend branch-patch record replaces `rel32_offset`.
+                rel32_offset: branch.source_instruction_offset,
+                branch_end_offset: branch.branch_end_offset,
+                target_bytecode_index: branch.source.target_bytecode_index,
+                target_offset,
+            });
+        }
+        self.pending_bytecode_branches.clear();
+        Ok(records)
+    }
+
+    fn finish_side_exit_return_stubs(
+        &mut self,
+    ) -> Result<
+        Vec<P6X86_64BaselineSideExitReturnStubRecord>,
+        P6X86_64BaselineSemanticByteEmissionError,
+    > {
+        let pending = self.pending_side_exits.clone();
+        let mut records = Vec::with_capacity(pending.len());
+        for (side_exit_index, branch) in pending.into_iter().enumerate() {
+            let side_exit_index = p6_arm64_checked_side_exit_index(side_exit_index)?;
+            let encoded_payload = P6X86_64BaselineSideExitReturnPayload::encode(side_exit_index);
+            let stub_bytes =
+                p6_arm64_callable_side_exit_payload_return_stub_bytes(encoded_payload)?;
+            let target_offset = self.offset()?;
+            self.emit_bytes(&stub_bytes)?;
+            let stub_end_offset = self.offset()?;
+            let linked = direct_branch::Arm64DirectBranchPatch {
+                kind: branch.kind,
+                source_instruction_offset: branch.branch_offset,
+            }
+            .link_to(target_offset)
+            .map_err(|error| {
+                p6_arm64_direct_branch_link_error(
+                    error,
+                    branch.branch_offset,
+                    branch.branch_end_offset,
+                    target_offset,
+                )
+            })?;
+            self.patch_direct_branch_word(branch.branch_offset, linked.instruction_word)?;
+            records.push(P6X86_64BaselineSideExitReturnStubRecord {
+                bytecode_index: branch.label.retained_bytecode_index,
+                reason: branch.label.reason,
+                side_exit_index,
+                branch_offset: branch.branch_offset,
+                branch_end_offset: branch.branch_end_offset,
+                target_offset,
+                stub_end_offset,
+                byte_len: stub_end_offset.checked_sub(target_offset).ok_or(
+                    P6X86_64BaselineSemanticByteEmissionError::ImageLengthExceedsU32 {
+                        actual: self.bytes.len(),
+                    },
+                )?,
+                // C++ `jfalse` fallback branches to `valueIsFalsey`/slow path.
+                // This dormant ARM64 native-entry bridge only returns retained
+                // payloads for the current Rust fallback ABI; reentry offsets stay
+                // empty until executable ARM64 branch bodies are ported.
+                resume_bytecode_index: None,
+                resume_entry_offset: None,
+                encoded_payload,
+                bytes: p6_arm64_bytes_for_range(&self.bytes, target_offset, stub_end_offset)?,
+            });
+        }
+        self.pending_side_exits.clear();
+        Ok(records)
+    }
+
+    fn patch_direct_branch_word(
+        &mut self,
+        branch_offset: u32,
+        instruction_word: u32,
+    ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+        let start = branch_offset as usize;
+        let Some(end) = start.checked_add(4) else {
+            return Err(
+                P6X86_64BaselineSemanticByteEmissionError::BranchPatchOutOfRange { branch_offset },
+            );
+        };
+        let Some(slot) = self.bytes.get_mut(start..end) else {
+            return Err(
+                P6X86_64BaselineSemanticByteEmissionError::BranchPatchOutOfRange { branch_offset },
+            );
+        };
+        slot.copy_from_slice(&instruction_word.to_le_bytes());
+        Ok(())
+    }
+}
+
+fn validate_p6_arm64_semantic_side_exit_label(
+    bytecode_index: BytecodeIndex,
+    label: P6X86_64BaselineSideExitLabel,
+) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    if label.retained_bytecode_index != bytecode_index
+        || label.destination != P6X86_64BaselineSideExitDestinationEffect::DestinationUnchanged
+        || label.may_throw
+        || label.runtime_call
+        || label.heap_allocation
+        || label.touches_gc_roots
+    {
+        return Err(
+            P6X86_64BaselineSemanticByteEmissionError::UnexpectedSideExitEffects {
+                bytecode_index,
+                reason: label.reason,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn p6_arm64_checked_side_exit_index(
+    side_exit_index: usize,
+) -> Result<u32, P6X86_64BaselineSemanticByteEmissionError> {
+    if side_exit_index <= u32::MAX as usize {
+        Ok(side_exit_index as u32)
+    } else {
+        Err(
+            P6X86_64BaselineSemanticByteEmissionError::SideExitIndexExceedsPayloadCapacity {
+                side_exit_index,
+            },
+        )
+    }
+}
+
+fn p6_arm64_direct_branch_link_error(
+    error: direct_branch::Arm64DirectBranchLinkError,
+    branch_offset: u32,
+    branch_end_offset: u32,
+    target_offset: u32,
+) -> P6X86_64BaselineSemanticByteEmissionError {
+    match error {
+        direct_branch::Arm64DirectBranchLinkError::UnalignedOffset { offset, .. } => {
+            P6X86_64BaselineSemanticByteEmissionError::BranchPatchOutOfRange {
+                branch_offset: offset,
+            }
+        }
+        direct_branch::Arm64DirectBranchLinkError::OutOfRange { .. } => {
+            P6X86_64BaselineSemanticByteEmissionError::BranchDisplacementOutOfRange {
+                branch_offset,
+                branch_end_offset,
+                target_offset,
+            }
+        }
+    }
+}
+
 fn encode_p6_arm64_callable_return_seed_selection(
     contract: &P6X86_64BaselineBackendContractRecord,
     selection: &P6X86_64BaselineInstructionSelectionPlan,
@@ -1293,6 +1586,9 @@ mod tests {
     use super::control_flow::*;
     use super::direct_branch::*;
     use super::*;
+    use crate::jit::emitter::{
+        P6X86_64BaselineBytecodeBranchKind, P6X86_64BaselineSelectedSideExitReason,
+    };
 
     fn bci(offset: u32) -> BytecodeIndex {
         BytecodeIndex::from_offset(offset)
@@ -1789,6 +2085,205 @@ mod tests {
         assert_eq!(Arm64Condition::from_code(16), None);
         assert_eq!(ARM64_CONDITION_CS, Arm64Condition::Hs);
         assert_eq!(ARM64_CONDITION_CC, Arm64Condition::Lo);
+    }
+
+    fn arm64_word(bytes: &[u8], offset: u32) -> u32 {
+        let start = offset as usize;
+        u32::from_le_bytes([
+            bytes[start],
+            bytes[start + 1],
+            bytes[start + 2],
+            bytes[start + 3],
+        ])
+    }
+
+    fn instruction_record(
+        bytecode_offset: u32,
+        start_offset: u32,
+    ) -> P6X86_64BaselineInstructionByteRecord {
+        P6X86_64BaselineInstructionByteRecord {
+            bytecode_index: bci(bytecode_offset),
+            start_offset,
+            end_offset: start_offset + 4,
+            byte_len: 4,
+            machine_instruction_count: 1,
+            bytes: vec![0x1f, 0x20, 0x03, 0xd5],
+        }
+    }
+
+    fn branch_contract(
+        kind: P6X86_64BaselineBytecodeBranchKind,
+        source_bytecode_offset: u32,
+        target_bytecode_offset: u32,
+    ) -> P6X86_64BaselineControlFlowBranchContract {
+        P6X86_64BaselineControlFlowBranchContract {
+            kind,
+            source_bytecode_index: bci(source_bytecode_offset),
+            target_bytecode_index: bci(target_bytecode_offset),
+        }
+    }
+
+    fn side_exit_label(
+        bytecode_offset: u32,
+        reason: P6X86_64BaselineSelectedSideExitReason,
+    ) -> P6X86_64BaselineSideExitLabel {
+        P6X86_64BaselineSideExitLabel {
+            reason,
+            retained_bytecode_index: bci(bytecode_offset),
+            destination: P6X86_64BaselineSideExitDestinationEffect::DestinationUnchanged,
+            may_throw: false,
+            runtime_call: false,
+            heap_allocation: false,
+            touches_gc_roots: false,
+        }
+    }
+
+    #[test]
+    fn arm64_semantic_builder_patches_forward_unconditional_bytecode_branch() {
+        let mut builder = P6Arm64SemanticByteBuilder::default();
+        let source = branch_contract(P6X86_64BaselineBytecodeBranchKind::UnconditionalJump, 0, 8);
+
+        builder.emit_unconditional_bytecode_branch(source).unwrap();
+        builder.emit_word(0xd503_201f).unwrap();
+        let target_offset = builder.emit_word(0xd503_201f).unwrap();
+        let records = builder
+            .finish_bytecode_branches(&[instruction_record(8, target_offset)])
+            .unwrap();
+        let expected = link_unconditional_branch(0, target_offset)
+            .unwrap()
+            .instruction_word;
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].bytecode_index, bci(0));
+        assert_eq!(
+            records[0].kind,
+            P6X86_64BaselineBytecodeBranchKind::UnconditionalJump
+        );
+        assert_eq!(records[0].branch_offset, 0);
+        assert_eq!(records[0].rel32_offset, 0);
+        assert_eq!(records[0].branch_end_offset, 4);
+        assert_eq!(records[0].target_bytecode_index, bci(8));
+        assert_eq!(records[0].target_offset, target_offset);
+        assert_eq!(arm64_word(builder.bytes(), 0), expected);
+    }
+
+    #[test]
+    fn arm64_semantic_builder_patches_forward_conditional_bytecode_branch() {
+        let mut builder = P6Arm64SemanticByteBuilder::default();
+        let source = branch_contract(P6X86_64BaselineBytecodeBranchKind::JumpIfFalseTaken, 4, 12);
+
+        builder.emit_word(0xd503_201f).unwrap();
+        builder
+            .emit_conditional_bytecode_branch(source, Arm64Condition::Eq)
+            .unwrap();
+        let target_offset = builder.emit_word(0xd503_201f).unwrap();
+        let records = builder
+            .finish_bytecode_branches(&[instruction_record(12, target_offset)])
+            .unwrap();
+        let expected = link_conditional_branch(Arm64Condition::Eq, 4, target_offset)
+            .unwrap()
+            .instruction_word;
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].bytecode_index, bci(4));
+        assert_eq!(
+            records[0].kind,
+            P6X86_64BaselineBytecodeBranchKind::JumpIfFalseTaken
+        );
+        assert_eq!(records[0].branch_offset, 4);
+        assert_eq!(records[0].rel32_offset, 4);
+        assert_eq!(records[0].branch_end_offset, 8);
+        assert_eq!(records[0].target_bytecode_index, bci(12));
+        assert_eq!(records[0].target_offset, target_offset);
+        assert_eq!(arm64_word(builder.bytes(), 4), expected);
+    }
+
+    #[test]
+    fn arm64_semantic_builder_reports_missing_bytecode_branch_target() {
+        let mut builder = P6Arm64SemanticByteBuilder::default();
+        let source = branch_contract(P6X86_64BaselineBytecodeBranchKind::UnconditionalJump, 0, 44);
+
+        builder.emit_unconditional_bytecode_branch(source).unwrap();
+        assert_eq!(
+            builder.finish_bytecode_branches(&[]),
+            Err(
+                P6X86_64BaselineSemanticByteEmissionError::BranchTargetMissing {
+                    bytecode_index: bci(0),
+                    target: bci(44),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn arm64_semantic_builder_appends_side_exit_payload_return_stubs_in_order() {
+        let mut builder = P6Arm64SemanticByteBuilder::default();
+        let first_label = side_exit_label(
+            20,
+            P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand,
+        );
+        let second_label =
+            side_exit_label(24, P6X86_64BaselineSelectedSideExitReason::NonInt32Operand);
+
+        builder.emit_word(0xd503_201f).unwrap();
+        builder
+            .emit_retained_side_exit_direct_branch(
+                bci(20),
+                first_label,
+                Arm64DirectBranchKind::Unconditional,
+            )
+            .unwrap();
+        builder.emit_word(0xd503_201f).unwrap();
+        builder
+            .emit_retained_side_exit_direct_branch(
+                bci(24),
+                second_label,
+                Arm64DirectBranchKind::Unconditional,
+            )
+            .unwrap();
+        let normal_path_end = builder.offset().unwrap();
+        let records = builder.finish_side_exit_return_stubs().unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].bytecode_index, bci(20));
+        assert_eq!(records[0].side_exit_index, 0);
+        assert_eq!(records[0].target_offset, normal_path_end);
+        assert_eq!(records[0].resume_bytecode_index, None);
+        assert_eq!(records[0].resume_entry_offset, None);
+        assert_eq!(records[1].bytecode_index, bci(24));
+        assert_eq!(records[1].side_exit_index, 1);
+        assert_eq!(records[1].target_offset, records[0].stub_end_offset);
+        assert_eq!(records[1].resume_bytecode_index, None);
+        assert_eq!(records[1].resume_entry_offset, None);
+
+        for record in &records {
+            let expected_stub =
+                p6_arm64_callable_side_exit_payload_return_stub_bytes(record.encoded_payload)
+                    .unwrap();
+            let expected_branch =
+                link_unconditional_branch(record.branch_offset, record.target_offset)
+                    .unwrap()
+                    .instruction_word;
+
+            assert_eq!(record.bytes, expected_stub);
+            assert_eq!(record.byte_len as usize, expected_stub.len());
+            assert_eq!(
+                record.stub_end_offset,
+                record.target_offset + record.byte_len
+            );
+            assert_eq!(
+                P6X86_64BaselineSideExitReturnPayload::decode(record.encoded_payload.raw_bits()),
+                Some(record.encoded_payload)
+            );
+            assert_eq!(
+                record.encoded_payload.side_exit_index(),
+                record.side_exit_index
+            );
+            assert_eq!(
+                arm64_word(builder.bytes(), record.branch_offset),
+                expected_branch
+            );
+        }
     }
 
     #[test]
