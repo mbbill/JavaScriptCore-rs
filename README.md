@@ -95,6 +95,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            linking plus JIT Jump/JumpList/JumpTable/SlowCaseEntry; behavior unchanged)
     [done] JIT ARM64 GPRInfo/JSRInfo/AssemblyHelpers register materialization
            contract skeleton added to src/jit/arm64_baseline.rs (metadata only)
+    [done] JIT ARM64 dormant virtual-register frame materialization helpers
+           added to src/jit/arm64_baseline.rs (store/load/callee/immediate bytes;
+           branch-aware callable emission remains disabled)
     [done] JIT ARM64 callable side-exit payload return stub helper added to
            src/jit/arm64_baseline.rs (Rust native-entry ABI/rooting bridge only;
            C++ jfalse truthiness remains valueIsFalsey/LLInt slow-path work)

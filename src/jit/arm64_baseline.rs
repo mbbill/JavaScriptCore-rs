@@ -28,7 +28,8 @@ use crate::jit::emitter::{
     P6X86_64BaselineSemanticByteEmissionShape, P6X86_64BaselineSemanticOperandRejectionReason,
     P6X86_64BaselineSideExitReturnPayload, P6X86_64BaselineSymbolicRegister,
     P6X86_64BaselineTerminalPolicy, P6X86_64BaselineTerminalPolicyRecord,
-    P6X86_64SemanticEncodedSelection, P6X86_64SemanticTerminalSelection,
+    P6X86_64BaselineValueLayoutContract, P6X86_64SemanticEncodedSelection,
+    P6X86_64SemanticTerminalSelection,
 };
 
 // ARM64 JSC map: GPRInfo::callFrameRegister is fp/x29 and returnValueGPR is
@@ -467,10 +468,24 @@ fn p6_arm64_seed_known_value(
 fn p6_arm64_seed_return_frame_value(
     instruction: &P6X86_64BaselineSelectedInstruction,
 ) -> Option<P6Arm64ReturnSeedValue> {
+    p6_arm64_seed_frame_value_for_role(instruction, P6X86_64BaselineOperandRole::ReturnValue)
+}
+
+#[allow(dead_code)]
+fn p6_arm64_seed_source_frame_value(
+    instruction: &P6X86_64BaselineSelectedInstruction,
+) -> Option<P6Arm64ReturnSeedValue> {
+    p6_arm64_seed_frame_value_for_role(instruction, P6X86_64BaselineOperandRole::Source)
+}
+
+fn p6_arm64_seed_frame_value_for_role(
+    instruction: &P6X86_64BaselineSelectedInstruction,
+    role: P6X86_64BaselineOperandRole,
+) -> Option<P6Arm64ReturnSeedValue> {
     let location = instruction
         .operand_locations
         .iter()
-        .find(|record| record.role == P6X86_64BaselineOperandRole::ReturnValue)
+        .find(|record| record.role == role)
         .map(|record| record.location)?;
     match location {
         P6X86_64BaselineOperandLocation::FrameLocal { .. }
@@ -479,6 +494,118 @@ fn p6_arm64_seed_return_frame_value(
         }
         _ => None,
     }
+}
+
+#[allow(dead_code)]
+fn p6_arm64_seed_destination_frame_location(
+    instruction: &P6X86_64BaselineSelectedInstruction,
+) -> Result<P6X86_64BaselineOperandLocation, P6X86_64BaselineSemanticByteEmissionError> {
+    instruction
+        .operand_locations
+        .iter()
+        .find(|record| record.role == P6X86_64BaselineOperandRole::Destination)
+        .map(|record| record.location)
+        .ok_or_else(|| p6_arm64_seed_unsupported_operation(instruction))
+}
+
+#[allow(dead_code)]
+fn p6_arm64_emit_materialize_value_to_frame_location(
+    bytes: &mut Vec<u8>,
+    bytecode_index: BytecodeIndex,
+    value: P6Arm64ReturnSeedValue,
+    destination: P6X86_64BaselineOperandLocation,
+) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    // C++ JSC emits opcode results with `emitPutVirtualRegister`, which
+    // stores the JSValue into `addressFor(dst)`. The current Rust ARM64
+    // return seed still rejects public branch-aware returns, so this is dormant
+    // frame-write glue for the later branch-aware byte builder.
+    match value {
+        P6Arm64ReturnSeedValue::Immediate(bits) => {
+            p6_arm64_emit_mov_xd_u64(bytes, register_contract::X9, bits)?;
+            p6_arm64_emit_str_xd_to_frame_location(
+                bytes,
+                bytecode_index,
+                register_contract::X9,
+                destination,
+            )
+        }
+        P6Arm64ReturnSeedValue::Frame(source) => {
+            p6_arm64_emit_ldr_xd_from_frame_location(
+                bytes,
+                bytecode_index,
+                source,
+                register_contract::X9,
+            )?;
+            p6_arm64_emit_str_xd_to_frame_location(
+                bytes,
+                bytecode_index,
+                register_contract::X9,
+                destination,
+            )
+        }
+        P6Arm64ReturnSeedValue::CalleeValue => p6_arm64_emit_str_xd_to_frame_location(
+            bytes,
+            bytecode_index,
+            register_contract::X2,
+            destination,
+        ),
+    }
+}
+
+#[allow(dead_code)]
+fn p6_arm64_emit_materialize_seed_frame_write(
+    bytes: &mut Vec<u8>,
+    value_layout: P6X86_64BaselineValueLayoutContract,
+    known_values: &mut Vec<(VirtualRegister, P6Arm64ReturnSeedValue)>,
+    instruction: &P6X86_64BaselineSelectedInstruction,
+) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    let bytecode_index = instruction.bytecode_index;
+    let (destination_register, value) = match instruction.lowered.operation {
+        P6X86_64BaselineLoweredOperation::LoadUndefined { destination } => (
+            destination,
+            P6Arm64ReturnSeedValue::Immediate(value_layout.immediate_undefined_tag),
+        ),
+        P6X86_64BaselineLoweredOperation::LoadNull { destination } => (
+            destination,
+            P6Arm64ReturnSeedValue::Immediate(value_layout.immediate_null_tag),
+        ),
+        P6X86_64BaselineLoweredOperation::LoadBool {
+            destination, value, ..
+        } => {
+            let bits = if value {
+                value_layout.immediate_true_tag
+            } else {
+                value_layout.immediate_false_tag
+            };
+            (destination, P6Arm64ReturnSeedValue::Immediate(bits))
+        }
+        P6X86_64BaselineLoweredOperation::LoadInt32 { destination, value } => {
+            let bits = ((value as u32 as u64) << value_layout.payload_shift)
+                | value_layout.immediate_int32_tag;
+            (destination, P6Arm64ReturnSeedValue::Immediate(bits))
+        }
+        P6X86_64BaselineLoweredOperation::LoadCallee { destination } => {
+            (destination, P6Arm64ReturnSeedValue::CalleeValue)
+        }
+        P6X86_64BaselineLoweredOperation::Move {
+            destination,
+            source,
+        } => {
+            let value = p6_arm64_seed_known_value(known_values, source)
+                .or_else(|| p6_arm64_seed_source_frame_value(instruction))
+                .ok_or_else(|| p6_arm64_seed_unsupported_operation(instruction))?;
+            (destination, value)
+        }
+        _ => return Err(p6_arm64_seed_unsupported_operation(instruction)),
+    };
+    let destination = p6_arm64_seed_destination_frame_location(instruction)?;
+    p6_arm64_emit_materialize_value_to_frame_location(bytes, bytecode_index, value, destination)?;
+    let known_value = match value {
+        P6Arm64ReturnSeedValue::Frame(_) => P6Arm64ReturnSeedValue::Frame(destination),
+        value => value,
+    };
+    p6_arm64_seed_set_value(known_values, destination_register, known_value);
+    Ok(())
 }
 
 fn p6_arm64_emit_return_value(
@@ -548,6 +675,29 @@ fn p6_arm64_emit_ldr_xd_from_frame_location(
     p6_arm64_emit_word(bytes, instruction)
 }
 
+fn p6_arm64_emit_str_xd_to_frame_location(
+    bytes: &mut Vec<u8>,
+    bytecode_index: BytecodeIndex,
+    source: register_contract::Arm64Gpr,
+    location: P6X86_64BaselineOperandLocation,
+) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    let byte_offset = p6_arm64_frame_location_byte_offset(bytecode_index, location)?;
+    let Some(instruction) = p6_arm64_encode_str_unsigned_64(
+        source,
+        register_contract::CALL_FRAME_REGISTER,
+        byte_offset,
+    ) else {
+        return Err(
+            P6X86_64BaselineSemanticByteEmissionError::FrameOffsetOutOfDisp32 {
+                bytecode_index,
+                location,
+                byte_offset,
+            },
+        );
+    };
+    p6_arm64_emit_word(bytes, instruction)
+}
+
 fn p6_arm64_frame_location_byte_offset(
     bytecode_index: BytecodeIndex,
     location: P6X86_64BaselineOperandLocation,
@@ -594,8 +744,28 @@ fn p6_arm64_encode_ldr_unsigned_64(
     Some(0xf940_0000_u32 | (imm12 << 10) | (u32::from(base.index) << 5) | u32::from(dest.index))
 }
 
+fn p6_arm64_encode_str_unsigned_64(
+    source: register_contract::Arm64Gpr,
+    base: register_contract::Arm64Gpr,
+    byte_offset: u64,
+) -> Option<u32> {
+    if !byte_offset.is_multiple_of(8) || byte_offset / 8 > 0x0fff {
+        return None;
+    }
+    let imm12 = (byte_offset / 8) as u32;
+    Some(0xf900_0000_u32 | (imm12 << 10) | (u32::from(base.index) << 5) | u32::from(source.index))
+}
+
 fn p6_arm64_emit_mov_x0_u64(
     bytes: &mut Vec<u8>,
+    value: u64,
+) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+    p6_arm64_emit_mov_xd_u64(bytes, register_contract::X0, value)
+}
+
+fn p6_arm64_emit_mov_xd_u64(
+    bytes: &mut Vec<u8>,
+    dest: register_contract::Arm64Gpr,
     value: u64,
 ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
     let mut emitted_movz = false;
@@ -605,14 +775,20 @@ fn p6_arm64_emit_mov_x0_u64(
             if chunk == 0 && halfword != 3 && value != 0 {
                 continue;
             }
-            p6_arm64_emit_word(bytes, 0xd280_0000_u32 | (halfword << 21) | (chunk << 5))?;
+            p6_arm64_emit_word(
+                bytes,
+                0xd280_0000_u32 | (halfword << 21) | (chunk << 5) | u32::from(dest.index),
+            )?;
             emitted_movz = true;
         } else if chunk != 0 {
-            p6_arm64_emit_word(bytes, 0xf280_0000_u32 | (halfword << 21) | (chunk << 5))?;
+            p6_arm64_emit_word(
+                bytes,
+                0xf280_0000_u32 | (halfword << 21) | (chunk << 5) | u32::from(dest.index),
+            )?;
         }
     }
     if !emitted_movz {
-        p6_arm64_emit_word(bytes, 0xd280_0000)?;
+        p6_arm64_emit_word(bytes, 0xd280_0000 | u32::from(dest.index))?;
     }
     Ok(())
 }
@@ -729,8 +905,10 @@ mod tests {
     use super::*;
     use crate::jit::emitter::{
         P6X86_64BaselineBytecodeBranchKind, P6X86_64BaselineControlFlowBranchContract,
-        P6X86_64BaselineSelectedSideExitReason, P6X86_64BaselineSideExitDestinationEffect,
-        P6X86_64BaselineSideExitLabel, P6X86_64BaselineValueLayoutContract,
+        P6X86_64BaselineLoweredInstruction, P6X86_64BaselineOperandLocationRecord,
+        P6X86_64BaselineSelectedInstructionEffects, P6X86_64BaselineSelectedSideExitReason,
+        P6X86_64BaselineSideExitDestinationEffect, P6X86_64BaselineSideExitLabel,
+        P6X86_64BaselineValueLayoutContract,
     };
 
     fn bci(offset: u32) -> BytecodeIndex {
@@ -1289,6 +1467,58 @@ mod tests {
         }
     }
 
+    fn frame_argument_location(
+        byte_offset_from_frame_base: u64,
+    ) -> P6X86_64BaselineOperandLocation {
+        P6X86_64BaselineOperandLocation::FrameArgument {
+            argument_index_including_this: 0,
+            raw_virtual_register: 5,
+            byte_offset_from_argument_base: 0,
+            byte_offset_from_frame_base,
+        }
+    }
+
+    fn selected_instruction(
+        bytecode_offset: u32,
+        operation: P6X86_64BaselineLoweredOperation,
+        operand_locations: Vec<P6X86_64BaselineOperandLocationRecord>,
+    ) -> P6X86_64BaselineSelectedInstruction {
+        P6X86_64BaselineSelectedInstruction {
+            bytecode_index: bci(bytecode_offset),
+            lowered: P6X86_64BaselineLoweredInstruction {
+                bytecode_index: bci(bytecode_offset),
+                width: crate::bytecode::OperandWidth::Narrow,
+                operation,
+            },
+            operand_locations,
+            effects: P6X86_64BaselineSelectedInstructionEffects {
+                may_throw: false,
+                runtime_call: false,
+                heap_allocation: false,
+                touches_gc_roots: false,
+            },
+            machine_instructions: Vec::new(),
+        }
+    }
+
+    fn destination_location_record(
+        location: P6X86_64BaselineOperandLocation,
+    ) -> P6X86_64BaselineOperandLocationRecord {
+        P6X86_64BaselineOperandLocationRecord {
+            role: P6X86_64BaselineOperandRole::Destination,
+            location,
+        }
+    }
+
+    fn source_location_record(
+        location: P6X86_64BaselineOperandLocation,
+    ) -> P6X86_64BaselineOperandLocationRecord {
+        P6X86_64BaselineOperandLocationRecord {
+            role: P6X86_64BaselineOperandRole::Source,
+            location,
+        }
+    }
+
     fn rust_low_byte_value_layout() -> P6X86_64BaselineValueLayoutContract {
         P6X86_64BaselineValueLayoutContract {
             layout_name: "rust-low-byte-tagged",
@@ -1338,6 +1568,201 @@ mod tests {
             p6_arm64_encode_cmp_imm64(register_contract::X9, 0x10),
             0xf100_413f
         );
+    }
+
+    #[test]
+    fn arm64_frame_store_words_match_macro_assembler_arm64_unsigned_immediate_form() {
+        assert_eq!(
+            p6_arm64_encode_str_unsigned_64(
+                register_contract::X9,
+                register_contract::CALL_FRAME_REGISTER,
+                0
+            ),
+            Some(0xf900_03a9)
+        );
+        assert_eq!(
+            p6_arm64_encode_str_unsigned_64(
+                register_contract::X9,
+                register_contract::CALL_FRAME_REGISTER,
+                16
+            ),
+            Some(0xf900_0ba9)
+        );
+        assert_eq!(
+            p6_arm64_encode_str_unsigned_64(
+                register_contract::X2,
+                register_contract::CALL_FRAME_REGISTER,
+                24
+            ),
+            Some(0xf900_0fa2)
+        );
+        assert_eq!(
+            p6_arm64_encode_str_unsigned_64(
+                register_contract::X9,
+                register_contract::CALL_FRAME_REGISTER,
+                4095 * 8
+            ),
+            Some(0xf93f_ffa9)
+        );
+        assert_eq!(
+            p6_arm64_encode_str_unsigned_64(
+                register_contract::X9,
+                register_contract::CALL_FRAME_REGISTER,
+                4
+            ),
+            None
+        );
+        assert_eq!(
+            p6_arm64_encode_str_unsigned_64(
+                register_contract::X9,
+                register_contract::CALL_FRAME_REGISTER,
+                4096 * 8
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn arm64_materializes_immediate_jsvalue_bits_to_frame_local_with_scratch_store() {
+        let mut bytes = Vec::new();
+
+        p6_arm64_emit_materialize_value_to_frame_location(
+            &mut bytes,
+            bci(2),
+            P6Arm64ReturnSeedValue::Immediate(0x1234_5678),
+            frame_local_location(16),
+        )
+        .unwrap();
+
+        assert_eq!(arm64_word(&bytes, 0), 0xd28a_cf09);
+        assert_eq!(arm64_word(&bytes, 4), 0xf2a2_4689);
+        assert_eq!(arm64_word(&bytes, 8), 0xf900_0ba9);
+    }
+
+    #[test]
+    fn arm64_materializes_callee_value_to_frame_argument_slot() {
+        let mut bytes = Vec::new();
+
+        p6_arm64_emit_materialize_value_to_frame_location(
+            &mut bytes,
+            bci(3),
+            P6Arm64ReturnSeedValue::CalleeValue,
+            frame_argument_location(24),
+        )
+        .unwrap();
+
+        assert_eq!(bytes.len(), 4);
+        assert_eq!(arm64_word(&bytes, 0), 0xf900_0fa2);
+    }
+
+    #[test]
+    fn arm64_materializes_frame_to_frame_move_through_scratch_load_store() {
+        let mut bytes = Vec::new();
+
+        p6_arm64_emit_materialize_value_to_frame_location(
+            &mut bytes,
+            bci(4),
+            P6Arm64ReturnSeedValue::Frame(frame_local_location(8)),
+            frame_local_location(16),
+        )
+        .unwrap();
+
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(arm64_word(&bytes, 0), 0xf940_07a9);
+        assert_eq!(arm64_word(&bytes, 4), 0xf900_0ba9);
+    }
+
+    #[test]
+    fn arm64_seed_frame_write_helper_materializes_load_and_move_selected_instructions() {
+        let value_layout = rust_low_byte_value_layout();
+        let load = selected_instruction(
+            0,
+            P6X86_64BaselineLoweredOperation::LoadInt32 {
+                destination: VirtualRegister::local(0),
+                value: 7,
+            },
+            vec![destination_location_record(frame_local_location(0))],
+        );
+        let move_from_known = selected_instruction(
+            1,
+            P6X86_64BaselineLoweredOperation::Move {
+                destination: VirtualRegister::local(1),
+                source: VirtualRegister::local(0),
+            },
+            vec![
+                destination_location_record(frame_local_location(8)),
+                source_location_record(frame_local_location(0)),
+            ],
+        );
+        let move_from_frame = selected_instruction(
+            2,
+            P6X86_64BaselineLoweredOperation::Move {
+                destination: VirtualRegister::local(0),
+                source: VirtualRegister::local(1),
+            },
+            vec![
+                destination_location_record(frame_local_location(0)),
+                source_location_record(frame_local_location(8)),
+            ],
+        );
+        let mut known_values = Vec::new();
+        let mut bytes = Vec::new();
+
+        p6_arm64_emit_materialize_seed_frame_write(
+            &mut bytes,
+            value_layout,
+            &mut known_values,
+            &load,
+        )
+        .unwrap();
+        p6_arm64_emit_materialize_seed_frame_write(
+            &mut bytes,
+            value_layout,
+            &mut known_values,
+            &move_from_known,
+        )
+        .unwrap();
+        known_values.clear();
+        p6_arm64_emit_materialize_seed_frame_write(
+            &mut bytes,
+            value_layout,
+            &mut known_values,
+            &move_from_frame,
+        )
+        .unwrap();
+
+        assert_eq!(arm64_word(&bytes, 0), 0xd280_e209);
+        assert_eq!(arm64_word(&bytes, 4), 0xf900_03a9);
+        assert_eq!(arm64_word(&bytes, 8), 0xd280_e209);
+        assert_eq!(arm64_word(&bytes, 12), 0xf900_07a9);
+        assert_eq!(arm64_word(&bytes, 16), 0xf940_07a9);
+        assert_eq!(arm64_word(&bytes, 20), 0xf900_03a9);
+    }
+
+    #[test]
+    fn arm64_materialization_rejects_non_frame_destination_with_existing_semantic_error() {
+        let mut bytes = Vec::new();
+        let location = P6X86_64BaselineOperandLocation::Immediate(
+            crate::jit::emitter::P6X86_64BaselineImmediateOperand::Null,
+        );
+
+        assert_eq!(
+            p6_arm64_emit_materialize_value_to_frame_location(
+                &mut bytes,
+                bci(9),
+                P6Arm64ReturnSeedValue::CalleeValue,
+                location,
+            ),
+            Err(
+                P6X86_64BaselineSemanticByteEmissionError::UnsupportedOperandLocation {
+                    bytecode_index: bci(9),
+                    location,
+                    reason:
+                        P6X86_64BaselineSemanticOperandRejectionReason::ExpectedFrameLocalMemory,
+                }
+            )
+        );
+        assert!(bytes.is_empty());
     }
 
     #[test]
