@@ -73,6 +73,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   [wip] dedicated C++-to-Rust structure audit/extraction batches
     [done] VM CallLinkInfo/generated direct-call execution cluster extracted to
            src/vm/call_link.rs (maps to C++ CallLinkInfo/LLIntSlowPaths/JITCall)
+    [done] VM generated property IC exit/handoff cluster extracted to
+           src/vm/property_handoff.rs (maps to C++ JITPropertyAccess/
+           JITOperations/PropertyInlineCache)
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
