@@ -88,21 +88,16 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            src/vm/generated_executor.rs (maps to C++ ScriptExecutable/CodeBlock/JITCode entry)
     [done] JIT ARM64 return-seed emitter extracted to src/jit/arm64_baseline.rs
            (maps to C++ JIT/MacroAssemblerARM64; behavior unchanged)
-    [done] JIT ARM64 baseline control-flow/slow-case metadata skeleton added to
-           src/jit/arm64_baseline.rs (maps to C++ Jump/JumpList/JumpTable/SlowCaseEntry;
-           no side-exit or opcode-emission behavior expansion)
+    [done] JIT ARM64 control-flow/direct-branch/semantic-byte-builder cluster
+           extracted to src/jit/arm64_baseline/control_flow.rs (includes dormant
+           direct branches, retained side-exit stubs, and primitive JumpIfFalse
+           byte slice; maps to C++ MacroAssemblerARM64/ARM64Assembler branch
+           linking plus JIT Jump/JumpList/JumpTable/SlowCaseEntry; behavior unchanged)
     [done] JIT ARM64 GPRInfo/JSRInfo/AssemblyHelpers register materialization
            contract skeleton added to src/jit/arm64_baseline.rs (metadata only)
-    [done] JIT ARM64 direct branch/link encoding skeleton added to
-           src/jit/arm64_baseline.rs (maps to MacroAssemblerARM64::jump/makeBranch,
-           ARM64Assembler::b/b_cond/linkJumpOrCall/linkConditionalBranch; dormant direct-only)
     [done] JIT ARM64 callable side-exit payload return stub helper added to
            src/jit/arm64_baseline.rs (Rust native-entry ABI/rooting bridge only;
            C++ jfalse truthiness remains valueIsFalsey/LLInt slow-path work)
-    [done] JIT ARM64 dormant callable byte-builder finalizes direct bytecode branch
-           records and retained side-exit return-stub records, plus a dormant primitive
-           JumpIfFalse low-byte false/null/undefined/int32-zero byte slice; still no
-           public opcode wiring or full valueIsFalsey parity
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
