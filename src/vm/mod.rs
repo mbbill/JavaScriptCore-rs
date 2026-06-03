@@ -10751,10 +10751,9 @@ impl Vm {
         GeneratedDirectCallRootlessGeneratedEntryProof,
         VmGeneratedDirectCallRootlessRejectionReason,
     > {
-        if !validation.hot_slot_hit {
-            return Err(VmGeneratedDirectCallRootlessRejectionReason::HotSlotMiss);
-        }
-        if validation.preferred_route != Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry)
+        if validation.hot_slot_hit
+            && validation.preferred_route
+                != Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry)
         {
             return Err(
                 VmGeneratedDirectCallRootlessRejectionReason::PreferredRouteNotGeneratedEntry {
@@ -10763,6 +10762,12 @@ impl Vm {
                 },
             );
         }
+        // C++ Baseline CallLinkInfo's monomorphic fast path calls the linked
+        // target entry after linkFor() has prepared the callee; it does not
+        // require a second VM-owned hot-slot hit. A full Rust sidecar handoff is
+        // already a validated monomorphic call-link observation, so the
+        // generated artifact/snapshot/effect checks below are the rootless
+        // admission proof when no cached hot slot exists yet.
         if let Some(cache) = validation.rootless_generated_entry_proof {
             if cache.epoch == self.generated_direct_call_rootless_proof_epoch()
                 && cache.target_code_block_id == validation.target_code_block_id
@@ -39975,8 +39980,11 @@ mod tests {
             ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
         );
 
+        let rootless_count_before_second = vm
+            .tiering_integration()
+            .generated_direct_call_rootless_generated_entry_count();
         host.clear_observations();
-        let (second_completion, _) =
+        let (second_completion, second_boundary_snapshot) =
             execute_registered_code_block_with_boundary_snapshot_and_arguments(
                 &mut vm,
                 owner,
@@ -39991,6 +39999,15 @@ mod tests {
         assert_eq!(
             second_completion,
             ExecutionCompletion::Returned(RuntimeValue::from_i32(41))
+        );
+        assert!(
+            host.targeted_root_syncs.is_empty(),
+            "validated monomorphic CallLinkInfo handoffs should not wait for a Rust hot-slot hit before rootless generated-entry dispatch"
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_rootless_generated_entry_count(),
+            rootless_count_before_second + 1
         );
         let installed_direct_call = vm
             .tiering_integration()
@@ -40011,6 +40028,8 @@ mod tests {
             vm.generated_direct_call_hot_slot_rootless_generated_entry_proof_count_for_current_epoch_for_test(),
             0
         );
+        second_boundary_snapshot.assert_no_gc_scope_depth(0);
+        second_boundary_snapshot.assert_current_no_gc_scope_depth(&vm, 0);
 
         let rootless_count_before = vm
             .tiering_integration()

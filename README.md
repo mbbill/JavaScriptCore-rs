@@ -141,7 +141,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            is shared across generated-entry interpreter fallbacks and generated resumes; 50k
            capped richards runner now returns DispatchStepLimitExceeded instead of staying
            in the runner
-    [wip] rootless direct-call admission
+    [wip] rootless direct-call admission: full validated monomorphic generated-entry
+          handoffs no longer require an extra Rust hot-slot hit before rootless dispatch;
+          bounded richards rootless rejections now collapse to missing generated artifacts
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
   [wip] arrays and indexed storage
@@ -251,6 +253,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   [done] richards bounded dispatch-guard release probe: 50k macOS arm64 baseline probe reaches
          the runner then fails at DispatchStepLimitExceeded with tiering summary; unbounded
          richards throughput remains a performance blocker, so benchmark progress is not claimed
+  [done] rootless direct-call hot-slot gate evidence: C++ CallLinkInfo fast path has no second
+         hot-slot proof after monomorphic linking; focused test proves the second generated-entry
+         direct call skips entry root sync, and 50k richards rootless rejections drop 212->31
+         with hot_slot_miss 192->0 and only missing_generated_artifact remaining
   [missing] local C++ JSC comparison harness for parity claims
   [done] subagent reviewer flow used for current substantial patch
   [done] one logical commit boundary restored for current accepted batch
