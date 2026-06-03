@@ -146,7 +146,6 @@ use crate::jit::plan::{
     validate_baseline_generated_js_call_native_exit_site_metadata,
     validate_baseline_generated_owner_continuation_site_metadata,
     validate_baseline_generated_property_handoff_plan_against_current_code_block,
-    validate_baseline_generated_property_handoff_site_against_code_block,
     validate_baseline_generated_property_handoff_site_against_current_code_block,
     validate_baseline_generated_property_handoff_site_metadata,
     validate_baseline_generated_runtime_helper_plan_against_code_block,
@@ -8292,49 +8291,6 @@ impl Vm {
         }
     }
 
-    fn p10_x86_64_callable_property_native_exit_site_matches_retained_artifact(
-        &self,
-        owner: CodeBlockId,
-        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
-        site: &BaselineGeneratedPropertyHandoffSite,
-    ) -> bool {
-        self.p6_x86_64_callable_retained_return_tables
-            .iter()
-            .rev()
-            .any(|table| {
-                if table.owner != owner || table.bytecode_snapshot != bytecode_snapshot {
-                    return false;
-                }
-                let Ok(entry_artifact) = table.artifact.validate_baseline_entry_artifact(owner)
-                else {
-                    return false;
-                };
-                let Ok(descriptor) = entry_artifact.validate_native_entry_descriptor() else {
-                    return false;
-                };
-                let Some(readiness) = self
-                    .tiering
-                    .baseline_native_entry_readiness_by_ordinal(table.readiness_ordinal)
-                else {
-                    return false;
-                };
-                readiness.owner == owner
-                    && readiness.materialization_ordinal == table.materialization_ordinal
-                    && readiness.install_ordinal == table.install_ordinal
-                    && readiness.artifact_id == Some(entry_artifact.id)
-                    && readiness.native_code == Some(entry_artifact.native_code)
-                    && readiness.machine_code == Some(entry_artifact.machine_code)
-                    && readiness.machine_range == Some(entry_artifact.machine_code.range)
-                    && readiness.bytecode_snapshot == Some(bytecode_snapshot)
-                    && readiness.descriptor == Some(table.descriptor)
-                    && descriptor == table.descriptor
-                    && table
-                        .property_exit_sites
-                        .iter()
-                        .any(|retained| retained.site == *site)
-            })
-    }
-
     fn p14_x86_64_callable_loop_backedge_return_site_for_payload(
         &self,
         dispatch: &P6EmittedNativeDispatch<'_>,
@@ -14986,7 +14942,7 @@ impl Vm {
             return Err(ExecutionError::BaselineGeneratedExecutionRejected);
         }
 
-        let validated_against_artifact = if let Some(artifact) = self
+        if let Some(artifact) = self
             .tiering
             .baseline_generated_code_artifact_for(handoff.resume.owner)
         {
@@ -15009,33 +14965,22 @@ impl Vm {
             if *artifact_site != handoff.site {
                 return Err(ExecutionError::BaselineGeneratedExecutionRejected);
             }
-            true
-        } else {
-            false
-        };
-
-        let validated_against_artifact_backed_exit = validated_against_artifact
-            || self.p10_x86_64_callable_property_native_exit_site_matches_retained_artifact(
-                handoff.resume.owner,
-                current_snapshot,
-                &handoff.site,
-            );
-
-        if validated_against_artifact_backed_exit {
-            validate_baseline_generated_property_handoff_site_against_current_code_block(
-                code_block,
-                handoff.resume.owner,
-                &handoff.site,
-            )
-            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
-        } else {
-            validate_baseline_generated_property_handoff_site_against_code_block(
-                code_block,
-                handoff.resume.owner,
-                &handoff.site,
-            )
-            .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
         }
+
+        // C++ JSC baseline property ICs run their slow operation and may
+        // repatch the cache on a miss/stale stub (`JIT::emitSlow_op_get_by_id`
+        // -> `operationGetByIdOptimize` -> `repatchGetBy`). They do not reject
+        // the whole baseline execution because the bytecode IC has already
+        // warmed past the cold install shape. Rust still keeps artifact-backed
+        // exits exact above, but an invalidated/missing artifact can safely run
+        // the existing single-dispatch slow path once the handoff matches the
+        // current CodeBlock metadata.
+        validate_baseline_generated_property_handoff_site_against_current_code_block(
+            code_block,
+            handoff.resume.owner,
+            &handoff.site,
+        )
+        .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
 
         Ok(GeneratedPropertyExitValidation {
             bytecode_snapshot: current_snapshot,
@@ -19653,6 +19598,9 @@ mod tests {
         VmStructureStubRepatchTransactionLifecycle, VmStructureStubRepatchTransactionOutcome,
         VmStructureStubRepatchTransactionRecord,
     };
+    use super::tiering::{
+        BaselineGeneratedCodeInvalidationRequest, BaselineGeneratedCodeInvalidationSource,
+    };
     use super::*;
     use crate::api::{
         ApiContextGroup, ApiOpaqueHandle, ApiProtectionCount, ApiProtectionOwner,
@@ -19721,8 +19669,8 @@ mod tests {
         BaselineBytecodeEligibilityProof, BaselineGeneratedCodeBodyId,
         BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableKind,
         BaselineOpcodeRejectionReason, CallBoundaryId, CallLinkInfoDescriptor, CallLinkMode,
-        CallLinkReadinessBlocker, CodeFinalizationAuthority, CodeLiveness, CodeOrigin,
-        CodeOriginKind, CodeOwnership, CodePatchState, CompilerSafepointDescriptor,
+        CallLinkReadinessBlocker, CodeFinalizationAuthority, CodeInvalidationReason, CodeLiveness,
+        CodeOrigin, CodeOriginKind, CodeOwnership, CodePatchState, CompilerSafepointDescriptor,
         CompilerSafepointId, CompilerSafepointKind, EntryAbi, Entrypoint, EntrypointKind,
         ExecutableAllocationId, ExecutableAllocationLifecycle, ExecutableAllocationRecord,
         ExecutableAllocationRequest, ExecutableMemoryProtection, ExecutableMutationAuthority,
@@ -44618,7 +44566,7 @@ mod tests {
             .property_exit_sites[0]
             .site;
         assert!(
-            validate_baseline_generated_property_handoff_site_against_code_block(
+            crate::jit::plan::validate_baseline_generated_property_handoff_site_against_code_block(
                 &registered_code_block,
                 fixture.owner,
                 &retained_site,
@@ -53996,6 +53944,102 @@ mod tests {
                 .owner,
             owner
         );
+    }
+
+    #[test]
+    fn vm_generated_property_handoff_runs_invalidated_artifact_exit_against_current_metadata() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+        let object = create_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let code_block = generated_property_get_by_name_return_consumed_code_block();
+        let side_tables = code_block.side_tables().clone();
+        {
+            let mut inline_caches = side_tables.inline_caches_mut();
+            let cache = inline_caches
+                .property_accesses
+                .iter_mut()
+                .find(|cache| cache.bytecode_index == BytecodeIndex::from_offset(1))
+                .expect("GetByName property IC");
+            cache.state = InlineCacheState::Monomorphic;
+            cache.dispatch = PropertyInlineCacheDispatch::Handler;
+            cache.mutation_authority = InlineCacheMutationAuthority::BaselineJit;
+        }
+        let code_block = code_block.with_side_tables(side_tables);
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let artifact = install_typed_baseline_for_test(&mut vm, owner, 1029);
+        let bytecode_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
+        let site = *artifact
+            .property_handoff_plan()
+            .expect("property handoff plan")
+            .site_for_bytecode_index(BytecodeIndex::from_offset(1))
+            .expect("valid property site lookup")
+            .expect("GetByName property site");
+        let invalidation = vm
+            .tiering_integration_mut()
+            .record_baseline_generated_code_invalidation(
+                BaselineGeneratedCodeInvalidationRequest {
+                    owner,
+                    artifact_id: Some(artifact.id),
+                    bytecode_snapshot: Some(bytecode_snapshot),
+                    reason: CodeInvalidationReason::GeneratedInlineCacheDependencyInvalidated,
+                    source: BaselineGeneratedCodeInvalidationSource::Explicit,
+                },
+            );
+        assert_eq!(invalidation.artifact_id, Some(artifact.id));
+        assert!(vm
+            .tiering_integration()
+            .baseline_generated_code_artifact_for(owner)
+            .is_none());
+
+        let (entry, frame) = enter_runtime_helper_program_frame_with_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            vec![RuntimeValue::undefined(), object],
+        );
+        let instruction = code_block
+            .decoded_instruction_at(BytecodeIndex::from_offset(1))
+            .expect("GetByName instruction");
+        let handoff = baseline_generated_property_handoff(owner, frame, instruction, &site)
+            .expect("generated property handoff");
+        let boundary_snapshot = HeapMutationSnapshot::capture(&vm);
+        let region = vm.enter_no_gc_execution_region();
+
+        let outcome = vm.dispatch_generated_property_handoff_in_current_region(
+            handoff,
+            &code_block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            outcome,
+            SingleDispatchOutcome::Continue(Some(BytecodeIndex::from_offset(2)))
+        );
+        assert_eq!(
+            host.dispatches
+                .iter()
+                .map(|(_, index, opcode)| (*index, *opcode))
+                .collect::<Vec<_>>(),
+            vec![(BytecodeIndex::from_offset(1), Some(CoreOpcode::GetByName))]
+        );
+        let observations = vm.tiering_integration().property_load_observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].owner, owner);
+        assert_eq!(observations[0].frame, Some(frame));
+        assert_eq!(
+            observations[0].bytecode_index,
+            BytecodeIndex::from_offset(1)
+        );
+        assert_vm_and_heap_no_gc_scope_depth(&vm, 1);
+        vm.leave_no_gc_execution_region(region).unwrap();
+        boundary_snapshot.assert_current_no_gc_scope_depth(&vm, 0);
+        if vm.execution.frame(frame).is_some() {
+            vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
+        }
+        vm.execution.leave(entry).unwrap();
     }
 
     #[test]

@@ -136,8 +136,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] generated auto-materialization telemetry preserves install stage and
            validator detail through Octane benchmark summaries
     [done] generated property-handoff current-metadata validation: warmed bytecode ICs
-           no longer make generated install apply cold PropertyHandoffPlan cache checks;
-           focused tests cover bytecode-0 host-blocked callee auto-materialization
+           no longer make generated install or invalidated-artifact exits apply cold
+           PropertyHandoffPlan cache checks; focused tests cover bytecode-0 host-blocked
+           callee auto-materialization and invalidated GetByName slow-path dispatch
     [done] generated property sidecar projection cache: property load/store/has tables are
            retained per owner/snapshot under CodeBlock-registry, plan-generation, and
            megamorphic-projection epochs, avoiding per-generated-entry rebuilds while preserving
@@ -261,8 +262,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
          loop returns DispatchStepLimitExceeded, default generated execution remains unbounded,
          and a source-run fixture spends one budget across generated-entry fallback/resume
   [done] richards bounded dispatch-guard release probe: 50k macOS arm64 baseline probe reaches
-         the runner then fails at DispatchStepLimitExceeded with tiering summary; unbounded
-         richards throughput remains a performance blocker, so benchmark progress is not claimed
+         the runner then fails at DispatchStepLimitExceeded with tiering summary after the
+         invalidated property-exit fix; unbounded richards throughput remains a performance
+         blocker, so benchmark progress is not claimed
   [done] rootless direct-call hot-slot gate evidence: C++ CallLinkInfo fast path has no second
          hot-slot proof after monomorphic linking; focused test proves the second generated-entry
          direct call skips entry root sync, and 50k richards rootless rejections drop 212->31

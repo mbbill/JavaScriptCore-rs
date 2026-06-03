@@ -1609,6 +1609,7 @@ pub(crate) fn validate_baseline_generated_property_handoff_plan_against_current_
     Ok(derivation)
 }
 
+#[allow(dead_code)]
 pub(crate) fn validate_baseline_generated_property_handoff_site_against_code_block(
     code_block: &CodeBlock,
     owner: CodeBlockId,
@@ -1941,6 +1942,7 @@ fn baseline_generated_runtime_helper_plan_mismatch_error(
     }
 }
 
+#[allow(dead_code)]
 fn derive_baseline_generated_property_handoff_site(
     code_block: &CodeBlock,
     owner: CodeBlockId,
