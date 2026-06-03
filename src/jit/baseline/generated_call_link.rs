@@ -235,10 +235,8 @@ pub(super) fn execute_generated_call_link_sidecar_probe_with_host(
         return Ok(None);
     }
 
-    let candidates = candidate_table
-        .candidates_for_bytecode_index(bytecode_index.offset())
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
+    let mut candidates = candidate_table.candidates_for_bytecode_index(bytecode_index.offset());
+    let Some(first_candidate) = candidates.next() else {
         probe_miss_records.push(call_link_probe_miss_record(
             owner,
             bytecode_index,
@@ -246,13 +244,13 @@ pub(super) fn execute_generated_call_link_sidecar_probe_with_host(
             GeneratedCallLinkProbeMissReason::CandidateNotFound,
         ));
         return Ok(None);
-    }
+    };
 
     let operands =
         generated_call_link_sidecar_operands(execution, code_block, window, instruction, fallback)?;
     if let Some(direct_call) = generated_call_link_hot_slot_direct_call(
+        candidate_table,
         direct_call_hot_slots,
-        &candidates,
         owner,
         opcode,
         bytecode_index,
@@ -262,27 +260,15 @@ pub(super) fn execute_generated_call_link_sidecar_probe_with_host(
         return Ok(Some(direct_call));
     }
 
-    let candidates_to_probe = match operands.callee_object {
-        Some(callee_object) => {
-            let matching = candidates
-                .iter()
-                .copied()
-                .filter(|candidate| candidate.target.callee == callee_object)
-                .collect::<Vec<_>>();
-            if matching.is_empty() {
-                probe_miss_records.push(call_link_probe_miss_record(
-                    owner,
-                    bytecode_index,
-                    candidates.first().copied(),
-                    GeneratedCallLinkProbeMissReason::CalleeMismatch,
-                ));
-                return Ok(None);
-            }
-            matching
-        }
-        None => candidates,
-    };
-    for candidate in candidates_to_probe {
+    let mut probed_matching_candidate = false;
+    for candidate in std::iter::once(first_candidate)
+        .chain(candidates)
+        .filter(|candidate| match operands.callee_object {
+            Some(callee_object) => candidate.target.callee == callee_object,
+            None => true,
+        })
+    {
+        probed_matching_candidate = true;
         let request = GeneratedCallLinkProbeRequest::new(
             candidate,
             owner,
@@ -332,13 +318,21 @@ pub(super) fn execute_generated_call_link_sidecar_probe_with_host(
             }
         }
     }
+    if !probed_matching_candidate && operands.callee_object.is_some() {
+        probe_miss_records.push(call_link_probe_miss_record(
+            owner,
+            bytecode_index,
+            Some(first_candidate),
+            GeneratedCallLinkProbeMissReason::CalleeMismatch,
+        ));
+    }
 
     Ok(None)
 }
 
 fn generated_call_link_hot_slot_direct_call(
+    candidate_table: &GeneratedCallLinkCandidateTable,
     hot_slots: &[BaselineGeneratedJsDirectCallHotSlot],
-    current_candidates: &[&GeneratedCallLinkCandidate],
     owner: CodeBlockId,
     opcode: CoreOpcode,
     bytecode_index: BytecodeIndex,
@@ -353,9 +347,9 @@ fn generated_call_link_hot_slot_direct_call(
                 && slot.candidate.bytecode_index == bytecode_index.offset()
                 && slot.candidate.direct_call_status
                     == GeneratedCallLinkDirectCallStatus::Authorized
-                && current_candidates
-                    .iter()
-                    .any(|candidate| *candidate == &slot.candidate)
+                && candidate_table
+                    .candidates_for_bytecode_index(bytecode_index.offset())
+                    .any(|candidate| candidate == &slot.candidate)
                 && slot.candidate.target.callee == callee_object
                 && slot.callee_object == callee_object
                 && slot.argument_count_including_this == operands.argument_count_including_this
