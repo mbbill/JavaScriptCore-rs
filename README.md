@@ -86,6 +86,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            JITOperations/PropertyInlineCache)
     [done] VM generated CodeBlock entry executor extracted to
            src/vm/generated_executor.rs (maps to C++ ScriptExecutable/CodeBlock/JITCode entry)
+    [done] JIT ARM64 return-seed emitter extracted to src/jit/arm64_baseline.rs
+           (maps to C++ JIT/MacroAssemblerARM64; behavior unchanged)
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
