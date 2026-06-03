@@ -4396,25 +4396,13 @@ impl CoreOpcodeDispatchHost {
             return GeneratedPropertyLoadProbeResult::miss(Miss::StructureMismatch);
         }
 
-        let Some((stored_key, property)) = cell
-            .properties
-            .iter()
-            .find(|(stored_key, _)| key.matches(stored_key))
-            .map(|(stored_key, property)| (stored_key, *property))
+        let Some(value) =
+            generated_property_load_cell_data_property_at_offset(cell, key, expected_offset)
         else {
-            return GeneratedPropertyLoadProbeResult::miss(Miss::MissingProperty);
+            return GeneratedPropertyLoadProbeResult::miss(
+                generated_property_load_offset_miss_reason(cell, key, expected_offset),
+            );
         };
-
-        let CorePropertyKind::Data(value) = property.kind else {
-            return GeneratedPropertyLoadProbeResult::miss(Miss::NonDataProperty);
-        };
-
-        let Some(actual_offset) = cell.property_offset(stored_key) else {
-            return GeneratedPropertyLoadProbeResult::miss(Miss::MissingOrInvalidOffset);
-        };
-        if actual_offset != expected_offset {
-            return GeneratedPropertyLoadProbeResult::miss(Miss::KeyOffsetMismatch);
-        }
 
         GeneratedPropertyLoadProbeResult::hit(value)
     }
@@ -4446,22 +4434,13 @@ impl CoreOpcodeDispatchHost {
             return GeneratedPropertyLoadProbeResult::miss(Miss::OpaqueObject);
         }
 
-        let Some((stored_key, property)) = holder
-            .properties
-            .iter()
-            .find(|(stored_key, _)| key.matches(stored_key))
+        let Some(value) =
+            generated_property_load_cell_data_property_at_offset(holder, key, request.offset)
         else {
-            return GeneratedPropertyLoadProbeResult::miss(Miss::MissingProperty);
+            return GeneratedPropertyLoadProbeResult::miss(
+                generated_property_load_offset_miss_reason(holder, key, request.offset),
+            );
         };
-        let CorePropertyKind::Data(value) = property.kind else {
-            return GeneratedPropertyLoadProbeResult::miss(Miss::NonDataProperty);
-        };
-        let Some(actual_offset) = holder.property_offset(stored_key) else {
-            return GeneratedPropertyLoadProbeResult::miss(Miss::MissingOrInvalidOffset);
-        };
-        if actual_offset != request.offset {
-            return GeneratedPropertyLoadProbeResult::miss(Miss::KeyOffsetMismatch);
-        }
 
         GeneratedPropertyLoadProbeResult::hit(value)
     }
@@ -6539,17 +6518,38 @@ fn generated_property_load_cell_data_property_at_offset(
     // the value is read directly at the structure-assigned offset with NO key
     // comparison or HashMap scan. This is exactly the offset-indexed load batch 3 will
     // emit as `mov reg <- [storage_base + offset*8]` from out_of_line_storage.
-    //
     // The is-Data check is kept cheap and structure-keyed: property_offsets only ever
     // holds live DATA-property offsets (accessor installs and deletions call
     // remove_property_offset, which drops the entry and clears the slot), so confirming
     // the guarded key still maps to expected_offset proves the slot is a live data
-    // property without scanning `properties` for the value. The Vec read then replaces
-    // the former O(n) properties scan.
+    // property without scanning `properties` for the value.
     if !key.cell_named_data_offset_matches(cell, expected_offset) {
         return None;
     }
     cell.read_data_property_offset_slot(expected_offset)
+}
+
+fn generated_property_load_offset_miss_reason(
+    cell: &CoreObjectCell,
+    key: GeneratedPropertyLoadCoreKey<'_>,
+    expected_offset: PropertyOffset,
+) -> GeneratedPropertyLoadProbeMissReason {
+    use GeneratedPropertyLoadProbeMissReason as Miss;
+
+    let Some((stored_key, property)) = cell
+        .properties
+        .iter()
+        .find(|(stored_key, _)| key.matches(stored_key))
+    else {
+        return Miss::MissingProperty;
+    };
+    if !matches!(property.kind, CorePropertyKind::Data(_)) {
+        return Miss::NonDataProperty;
+    }
+    match cell.property_offset(stored_key) {
+        Some(actual_offset) if actual_offset != expected_offset => Miss::KeyOffsetMismatch,
+        _ => Miss::MissingOrInvalidOffset,
+    }
 }
 
 fn core_property_key_supports_named_property_offset(key: &CorePropertyKey) -> bool {

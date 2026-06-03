@@ -106,8 +106,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            siblings share one structure_id (mirrors C++ Structure transitions),
            so structure-keyed ICs hit cross-instance incl. the new-Foo() path
     [done] offset-indexed Butterfly storage (out_of_line_storage Vec, getDirect/
-           locationForOffset) written lockstep w/ the authoritative HashMap; hot
-           load reads by offset (batch-3 machine-code mov target). INLINE_CAPACITY=0
+           locationForOffset) written lockstep w/ the authoritative HashMap; interpreter
+           and generated hot data loads read by offset (machine-code mov target). INLINE_CAPACITY=0
     [missing] full C++ structure/watchpoint invalidation fidelity
     [missing] dictionary, override, and static-class-table predicates
   [wip] property access and inline caches
