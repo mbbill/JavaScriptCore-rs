@@ -20,7 +20,7 @@ use crate::syntax::source::SourceText;
 use crate::vm::{
     BaselineEntryAutoMaterializationRecord, SourceExecutionError, SourceSessionHandle,
     SourceSessionHostGlobalConfig, SourceSessionSource, Vm, VmBaselineGeneratedExecutionSummary,
-    VmConfig, VmGeneratedDirectCallCalleeFallbackSummary,
+    VmBaselineGeneratedInvalidationSummary, VmConfig, VmGeneratedDirectCallCalleeFallbackSummary,
     VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
     VmGeneratedDirectCallRootlessRejectionCounts,
     VmGeneratedDirectCallRootlessRetainedSideExitCount,
@@ -377,6 +377,8 @@ pub struct OctaneTieringSummary {
     pub baseline_entry_artifacts: usize,
     pub baseline_materializations: usize,
     pub baseline_generated_code_artifacts: usize,
+    pub baseline_generated_code_invalidations: usize,
+    pub baseline_generated_code_invalidation_summary: VmBaselineGeneratedInvalidationSummary,
     pub baseline_generated_executions: usize,
     pub baseline_generated_executed_bytecodes: u64,
     pub baseline_entry_auto_materializations: usize,
@@ -535,6 +537,11 @@ impl OctaneTieringSummary {
             baseline_entry_artifacts: tiering.baseline_entry_artifacts().len(),
             baseline_materializations: tiering.baseline_executable_materializations().len(),
             baseline_generated_code_artifacts: tiering.baseline_generated_code_artifacts().len(),
+            baseline_generated_code_invalidations: tiering
+                .baseline_generated_code_invalidations()
+                .len(),
+            baseline_generated_code_invalidation_summary: tiering
+                .baseline_generated_code_invalidation_summary(),
             baseline_generated_executions: tiering.baseline_generated_execution_count(),
             baseline_generated_executed_bytecodes: tiering
                 .baseline_generated_executed_bytecode_count(),
@@ -689,6 +696,12 @@ impl OctaneTieringSummary {
             baseline_generated_code_artifacts: self
                 .baseline_generated_code_artifacts
                 .saturating_sub(start.baseline_generated_code_artifacts),
+            baseline_generated_code_invalidations: self
+                .baseline_generated_code_invalidations
+                .saturating_sub(start.baseline_generated_code_invalidations),
+            baseline_generated_code_invalidation_summary: self
+                .baseline_generated_code_invalidation_summary
+                .saturating_sub(start.baseline_generated_code_invalidation_summary),
             baseline_generated_executions: self
                 .baseline_generated_executions
                 .saturating_sub(start.baseline_generated_executions),
@@ -3598,6 +3611,15 @@ Benchmark.prototype.validate = function() {
         };
 
         let start = OctaneTieringSummary {
+            baseline_generated_code_invalidations: 5,
+            baseline_generated_code_invalidation_summary: VmBaselineGeneratedInvalidationSummary {
+                total: 5,
+                accepted: 3,
+                no_matching_artifact: 1,
+                property_load_probe_miss: 2,
+                guarded_property_load_probe_miss: 1,
+                ..VmBaselineGeneratedInvalidationSummary::default()
+            },
             generated_direct_call_rootless_rejections:
                 VmGeneratedDirectCallRootlessRejectionCounts {
                     hot_slot_miss: 2,
@@ -3711,6 +3733,17 @@ Benchmark.prototype.validate = function() {
             ..OctaneTieringSummary::default()
         };
         let current = OctaneTieringSummary {
+            baseline_generated_code_invalidations: 13,
+            baseline_generated_code_invalidation_summary: VmBaselineGeneratedInvalidationSummary {
+                total: 13,
+                accepted: 9,
+                no_matching_artifact: 2,
+                bytecode_snapshot_mismatch: 1,
+                property_load_probe_miss: 7,
+                guarded_property_load_probe_miss: 3,
+                property_load_guard_watchpoint_invalidation: 2,
+                ..VmBaselineGeneratedInvalidationSummary::default()
+            },
             generated_direct_call_rootless_rejections:
                 VmGeneratedDirectCallRootlessRejectionCounts {
                     hot_slot_miss: 5,
@@ -3886,6 +3919,20 @@ Benchmark.prototype.validate = function() {
 
         let delta = current.delta_since(start);
 
+        assert_eq!(delta.baseline_generated_code_invalidations, 8);
+        assert_eq!(
+            delta.baseline_generated_code_invalidation_summary,
+            VmBaselineGeneratedInvalidationSummary {
+                total: 8,
+                accepted: 6,
+                no_matching_artifact: 1,
+                bytecode_snapshot_mismatch: 1,
+                property_load_probe_miss: 5,
+                guarded_property_load_probe_miss: 2,
+                property_load_guard_watchpoint_invalidation: 2,
+                ..VmBaselineGeneratedInvalidationSummary::default()
+            }
+        );
         assert_eq!(
             delta
                 .generated_direct_call_rootless_rejections

@@ -1914,6 +1914,16 @@ impl VmTieringIntegration {
         &self.baseline_generated_code_invalidations
     }
 
+    pub fn baseline_generated_code_invalidation_summary(
+        &self,
+    ) -> VmBaselineGeneratedInvalidationSummary {
+        let mut summary = VmBaselineGeneratedInvalidationSummary::default();
+        for record in &self.baseline_generated_code_invalidations {
+            summary.record(record);
+        }
+        summary
+    }
+
     pub fn baseline_install_records(&self) -> &[BaselineInstallRecord] {
         &self.baseline_install_records
     }
@@ -7092,6 +7102,82 @@ pub(crate) struct BaselineGeneratedCodeInvalidationRecord {
     pub reason: CodeInvalidationReason,
     pub source: BaselineGeneratedCodeInvalidationSource,
     pub outcome: BaselineGeneratedCodeInvalidationOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VmBaselineGeneratedInvalidationSummary {
+    pub total: usize,
+    pub accepted: usize,
+    pub no_matching_artifact: usize,
+    pub bytecode_snapshot_mismatch: usize,
+    pub already_invalidated: usize,
+    pub explicit: usize,
+    pub property_load_probe_miss: usize,
+    pub guarded_property_load_probe_miss: usize,
+    pub property_load_guard_watchpoint_invalidation: usize,
+}
+
+impl VmBaselineGeneratedInvalidationSummary {
+    fn record(&mut self, record: &BaselineGeneratedCodeInvalidationRecord) {
+        self.total = self.total.saturating_add(1);
+        match record.outcome {
+            BaselineGeneratedCodeInvalidationOutcome::Accepted => {
+                self.accepted = self.accepted.saturating_add(1);
+            }
+            BaselineGeneratedCodeInvalidationOutcome::NoMatchingArtifact => {
+                self.no_matching_artifact = self.no_matching_artifact.saturating_add(1);
+            }
+            BaselineGeneratedCodeInvalidationOutcome::BytecodeSnapshotMismatch { .. } => {
+                self.bytecode_snapshot_mismatch = self.bytecode_snapshot_mismatch.saturating_add(1);
+            }
+            BaselineGeneratedCodeInvalidationOutcome::AlreadyInvalidated { .. } => {
+                self.already_invalidated = self.already_invalidated.saturating_add(1);
+            }
+        }
+        match record.source {
+            BaselineGeneratedCodeInvalidationSource::Explicit => {
+                self.explicit = self.explicit.saturating_add(1);
+            }
+            BaselineGeneratedCodeInvalidationSource::PropertyLoadProbeMiss => {
+                self.property_load_probe_miss = self.property_load_probe_miss.saturating_add(1);
+            }
+            BaselineGeneratedCodeInvalidationSource::GuardedPropertyLoadProbeMiss => {
+                self.guarded_property_load_probe_miss =
+                    self.guarded_property_load_probe_miss.saturating_add(1);
+            }
+            BaselineGeneratedCodeInvalidationSource::PropertyLoadGuardWatchpointInvalidation => {
+                self.property_load_guard_watchpoint_invalidation = self
+                    .property_load_guard_watchpoint_invalidation
+                    .saturating_add(1);
+            }
+        }
+    }
+
+    pub fn saturating_sub(self, start: Self) -> Self {
+        Self {
+            total: self.total.saturating_sub(start.total),
+            accepted: self.accepted.saturating_sub(start.accepted),
+            no_matching_artifact: self
+                .no_matching_artifact
+                .saturating_sub(start.no_matching_artifact),
+            bytecode_snapshot_mismatch: self
+                .bytecode_snapshot_mismatch
+                .saturating_sub(start.bytecode_snapshot_mismatch),
+            already_invalidated: self
+                .already_invalidated
+                .saturating_sub(start.already_invalidated),
+            explicit: self.explicit.saturating_sub(start.explicit),
+            property_load_probe_miss: self
+                .property_load_probe_miss
+                .saturating_sub(start.property_load_probe_miss),
+            guarded_property_load_probe_miss: self
+                .guarded_property_load_probe_miss
+                .saturating_sub(start.guarded_property_load_probe_miss),
+            property_load_guard_watchpoint_invalidation: self
+                .property_load_guard_watchpoint_invalidation
+                .saturating_sub(start.property_load_guard_watchpoint_invalidation),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -272,7 +272,7 @@ pub use tiering::{
     OsrBoundaryKind, OsrBoundaryRecord, OsrBoundaryRequest, RuntimeTierState, TierEntryDecision,
     TierEntryDecisionRecord, TierEntryExecutionPath, TierEntryFallbackReason,
     TierEntryInterpretReason, TierEntryRequest, TierExecutionProfile, TierProfileEvent,
-    TierProfileRecord, VmBaselineGeneratedExecutionSummary,
+    TierProfileRecord, VmBaselineGeneratedExecutionSummary, VmBaselineGeneratedInvalidationSummary,
     VmCallLinkAttachmentAcceptedEvidenceSummary, VmCallLinkAttachmentInstallRecheckOutcome,
     VmCallLinkAttachmentInstallRecheckRecord, VmCallLinkAttachmentInstallRecheckRejectionReason,
     VmCallLinkAttachmentPlanLifecycle, VmCallLinkAttachmentPlanOutcome,

@@ -137,8 +137,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            prepareForExecution for host-blocked and missing-native-gate callees; the 50k
            richards probe now routes the former 110@80 -> 146 MissingArtifact fallback through
            GeneratedEntry, with unsupported generated callees recording one failed install
-    [done] generated auto-materialization telemetry preserves install stage and
-           validator detail through Octane benchmark summaries
+    [done] generated auto-materialization/invalidation telemetry preserves install
+           stage, validator detail, and generated-code invalidation source/outcome
+           through Octane benchmark summaries
     [done] generated property-handoff current-metadata validation: warmed bytecode ICs
            no longer make generated install or invalidated-artifact exits apply cold
            PropertyHandoffPlan cache checks; focused tests cover bytecode-0 host-blocked
