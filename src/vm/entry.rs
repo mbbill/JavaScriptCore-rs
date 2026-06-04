@@ -47,6 +47,8 @@ pub struct VmEntryState {
     records: Vec<VmEntryRecord>,
     exits: Vec<VmExitRecord>,
     launch_descriptors: Vec<VmEntryLaunchDescriptor>,
+    native_call_frame_publications: Vec<VmNativeCallFramePublicationRecord>,
+    native_call_frame_publication_exits: Vec<VmNativeCallFramePublicationExitRecord>,
     next_ordinal: u64,
 }
 
@@ -79,8 +81,83 @@ impl VmEntryState {
         &self.launch_descriptors
     }
 
+    pub fn native_call_frame_publications(&self) -> &[VmNativeCallFramePublicationRecord] {
+        &self.native_call_frame_publications
+    }
+
+    pub fn native_call_frame_publication_exits(&self) -> &[VmNativeCallFramePublicationExitRecord] {
+        &self.native_call_frame_publication_exits
+    }
+
     pub(crate) fn record_launch_descriptor(&mut self, descriptor: VmEntryLaunchDescriptor) {
         self.launch_descriptors.push(descriptor);
+    }
+
+    pub fn publish_native_call_frame(
+        &mut self,
+        request: VmNativeCallFramePublicationRequest,
+    ) -> Result<VmNativeCallFramePublicationGuard<'_>, VmNativeCallFramePublicationError> {
+        if self.entry_depth == 0 {
+            return Err(VmNativeCallFramePublicationError::NotInsideVmEntry);
+        }
+        let current_entry_frame = self
+            .entry_frame
+            .ok_or(VmNativeCallFramePublicationError::CurrentEntryFrameMissing)?;
+        let previous_top_frame = self
+            .top_frame
+            .ok_or(VmNativeCallFramePublicationError::CurrentTopFrameMissing)?;
+        let active_entry_frame = request
+            .scope
+            .active_entry_frame
+            .ok_or(VmNativeCallFramePublicationError::LaunchActiveEntryMissing)?;
+        let active_top_call_frame = request
+            .scope
+            .active_top_call_frame
+            .ok_or(VmNativeCallFramePublicationError::LaunchActiveTopFrameMissing)?;
+        if request.call_frame.entry_frame != Some(active_entry_frame) {
+            return Err(VmNativeCallFramePublicationError::EntryFrameMismatch {
+                expected: active_entry_frame,
+                actual: request.call_frame.entry_frame,
+            });
+        }
+        if request.call_frame.frame != active_top_call_frame {
+            return Err(VmNativeCallFramePublicationError::TopFrameMismatch {
+                expected: active_top_call_frame,
+                actual: request.call_frame.frame,
+            });
+        }
+
+        self.next_ordinal = self.next_ordinal.saturating_add(1);
+        let ordinal = self.next_ordinal;
+        let record = VmNativeCallFramePublicationRecord {
+            ordinal,
+            entry_depth: self.entry_depth,
+            reason: request.reason,
+            owner: request.owner,
+            code_block: request.code_block,
+            current_entry_frame,
+            previous_top_frame: Some(previous_top_frame),
+            published_top_frame: request.published_top_frame,
+            active_entry_frame,
+            previous_entry_frame: request.scope.previous_entry_frame,
+            saved_top_call_frame: request.scope.saved_top_call_frame,
+            active_top_call_frame,
+            call_frame: request.call_frame,
+        };
+
+        // C++ writes the raw CallFrame* into VM::topCallFrame. Rust launch
+        // metadata currently names frames symbolically with CallFrameId while
+        // VmEntryState stores FrameAddress, so this guard validates the
+        // symbolic pair and publishes the explicit active FrameAddress.
+        self.top_frame = Some(request.published_top_frame);
+        self.native_call_frame_publications.push(record);
+
+        Ok(VmNativeCallFramePublicationGuard {
+            state: self,
+            record,
+            previous_top_frame: Some(previous_top_frame),
+            _borrow: PhantomData,
+        })
     }
 
     pub fn enter(&mut self, top_frame: Option<FrameAddress>, kind: EntryKind) -> VmEntryGuard<'_> {
@@ -150,6 +227,120 @@ impl VmEntryState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmNativeCallFramePublicationRequest {
+    pub reason: VmNativeCallFramePublicationReason,
+    pub owner: CodeBlockId,
+    pub code_block: CodeBlockId,
+    pub scope: VmEntryLaunchScope,
+    pub call_frame: VmEntryCallFrameMetadata,
+    pub published_top_frame: FrameAddress,
+}
+
+impl VmNativeCallFramePublicationRequest {
+    pub fn baseline_native_entry(
+        descriptor: &VmEntryLaunchDescriptor,
+        published_top_frame: FrameAddress,
+    ) -> Self {
+        Self {
+            reason: VmNativeCallFramePublicationReason::BaselineNativeEntry,
+            owner: descriptor.owner,
+            code_block: descriptor.code_block,
+            scope: descriptor.scope,
+            call_frame: descriptor.call_frame,
+            published_top_frame,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmNativeCallFramePublicationReason {
+    BaselineNativeEntry,
+    BaselineNativeSideExitReentry,
+    BaselineNativeSlowPathHandoff,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmNativeCallFramePublicationRecord {
+    pub ordinal: u64,
+    pub entry_depth: usize,
+    pub reason: VmNativeCallFramePublicationReason,
+    pub owner: CodeBlockId,
+    pub code_block: CodeBlockId,
+    pub current_entry_frame: FrameAddress,
+    pub previous_top_frame: Option<FrameAddress>,
+    pub published_top_frame: FrameAddress,
+    pub active_entry_frame: EntryFrameId,
+    pub previous_entry_frame: Option<EntryFrameId>,
+    pub saved_top_call_frame: Option<CallFrameId>,
+    pub active_top_call_frame: CallFrameId,
+    pub call_frame: VmEntryCallFrameMetadata,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmNativeCallFramePublicationExitRecord {
+    pub ordinal: u64,
+    pub depth_before_exit: usize,
+    pub restored_top_frame: Option<FrameAddress>,
+    pub closed_publication: VmNativeCallFramePublicationRecord,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmNativeCallFramePublicationError {
+    NotInsideVmEntry,
+    CurrentEntryFrameMissing,
+    CurrentTopFrameMissing,
+    LaunchActiveEntryMissing,
+    LaunchActiveTopFrameMissing,
+    EntryFrameMismatch {
+        expected: EntryFrameId,
+        actual: Option<EntryFrameId>,
+    },
+    TopFrameMismatch {
+        expected: CallFrameId,
+        actual: CallFrameId,
+    },
+}
+
+pub struct VmNativeCallFramePublicationGuard<'vm> {
+    state: &'vm mut VmEntryState,
+    record: VmNativeCallFramePublicationRecord,
+    previous_top_frame: Option<FrameAddress>,
+    _borrow: PhantomData<&'vm mut VmEntryState>,
+}
+
+impl<'vm> VmNativeCallFramePublicationGuard<'vm> {
+    pub fn record(&self) -> VmNativeCallFramePublicationRecord {
+        self.record
+    }
+
+    pub fn top_frame(&self) -> Option<FrameAddress> {
+        self.state.top_frame
+    }
+
+    pub fn publish_native_call_frame(
+        &mut self,
+        request: VmNativeCallFramePublicationRequest,
+    ) -> Result<VmNativeCallFramePublicationGuard<'_>, VmNativeCallFramePublicationError> {
+        self.state.publish_native_call_frame(request)
+    }
+}
+
+impl Drop for VmNativeCallFramePublicationGuard<'_> {
+    fn drop(&mut self) {
+        let depth_before_exit = self.state.entry_depth;
+        self.state.top_frame = self.previous_top_frame;
+        self.state.native_call_frame_publication_exits.push(
+            VmNativeCallFramePublicationExitRecord {
+                ordinal: self.record.ordinal,
+                depth_before_exit,
+                restored_top_frame: self.state.top_frame,
+                closed_publication: self.record,
+            },
+        );
+    }
+}
+
 /// Scoped VM entry guard.
 ///
 /// The raw pointer is an ABI-boundary placeholder for future interpreter/JIT
@@ -162,6 +353,19 @@ pub struct VmEntryGuard<'vm> {
     previous_kind: Option<EntryKind>,
     previous_disallow: bool,
     _borrow: PhantomData<&'vm mut VmEntryState>,
+}
+
+impl VmEntryGuard<'_> {
+    pub fn top_frame(&self) -> Option<FrameAddress> {
+        self.state.top_frame
+    }
+
+    pub fn publish_native_call_frame(
+        &mut self,
+        request: VmNativeCallFramePublicationRequest,
+    ) -> Result<VmNativeCallFramePublicationGuard<'_>, VmNativeCallFramePublicationError> {
+        self.state.publish_native_call_frame(request)
+    }
 }
 
 impl Drop for VmEntryGuard<'_> {
@@ -703,6 +907,202 @@ mod tests {
     }
 
     #[test]
+    fn native_call_frame_publication_records_and_restores_top_frame() {
+        let owner = CodeBlockId(CellId(14));
+        let mut state = VmEntryState::default();
+        {
+            let mut entry =
+                state.enter_rooted(Some(FrameAddress(10)), EntryKind::Script, HeapId(8));
+            {
+                let publication = entry
+                    .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+                    .expect("native call-frame publication");
+                assert_eq!(publication.top_frame(), Some(FrameAddress(20)));
+
+                let record = publication.record();
+                assert_eq!(
+                    record.reason,
+                    VmNativeCallFramePublicationReason::BaselineNativeEntry
+                );
+                assert_eq!(record.owner, owner);
+                assert_eq!(record.code_block, owner);
+                assert_eq!(record.current_entry_frame, FrameAddress(10));
+                assert_eq!(record.previous_top_frame, Some(FrameAddress(10)));
+                assert_eq!(record.published_top_frame, FrameAddress(20));
+                assert_eq!(record.active_entry_frame, EntryFrameId(1));
+                assert_eq!(record.active_top_call_frame, CallFrameId(2));
+            }
+            assert_eq!(entry.top_frame(), Some(FrameAddress(10)));
+        }
+
+        assert_eq!(state.native_call_frame_publications().len(), 1);
+        assert_eq!(state.native_call_frame_publication_exits().len(), 1);
+        assert_eq!(
+            state.native_call_frame_publication_exits()[0].restored_top_frame,
+            Some(FrameAddress(10))
+        );
+    }
+
+    #[test]
+    fn nested_native_call_frame_publication_restores_inner_then_outer_frame() {
+        let owner = CodeBlockId(CellId(15));
+        let mut state = VmEntryState::default();
+        {
+            let mut entry =
+                state.enter_rooted(Some(FrameAddress(10)), EntryKind::Script, HeapId(8));
+            {
+                let mut outer = entry
+                    .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+                    .expect("outer native call-frame publication");
+                assert_eq!(outer.top_frame(), Some(FrameAddress(20)));
+                {
+                    let inner = outer
+                        .publish_native_call_frame(native_publication_request(
+                            owner,
+                            FrameAddress(30),
+                        ))
+                        .expect("inner native call-frame publication");
+                    assert_eq!(inner.record().previous_top_frame, Some(FrameAddress(20)));
+                    assert_eq!(inner.top_frame(), Some(FrameAddress(30)));
+                }
+                assert_eq!(outer.top_frame(), Some(FrameAddress(20)));
+            }
+            assert_eq!(entry.top_frame(), Some(FrameAddress(10)));
+        }
+
+        assert_eq!(state.native_call_frame_publications().len(), 2);
+        assert_eq!(state.native_call_frame_publication_exits().len(), 2);
+        assert_eq!(
+            state.native_call_frame_publication_exits()[0].restored_top_frame,
+            Some(FrameAddress(20))
+        );
+        assert_eq!(
+            state.native_call_frame_publication_exits()[1].restored_top_frame,
+            Some(FrameAddress(10))
+        );
+    }
+
+    #[test]
+    fn native_call_frame_publication_rejects_missing_active_vm_entry() {
+        let owner = CodeBlockId(CellId(16));
+        let mut state = VmEntryState::default();
+        let error = state
+            .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+            .err()
+            .expect("publication rejection");
+
+        assert_eq!(error, VmNativeCallFramePublicationError::NotInsideVmEntry);
+        assert!(state.native_call_frame_publications().is_empty());
+    }
+
+    #[test]
+    fn native_call_frame_publication_rejects_missing_current_entry_or_top_frame() {
+        let owner = CodeBlockId(CellId(17));
+        let mut missing_entry_frame = active_native_entry_state(None, Some(FrameAddress(10)));
+        let entry_error = missing_entry_frame
+            .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+            .err()
+            .expect("entry-frame rejection");
+        assert_eq!(
+            entry_error,
+            VmNativeCallFramePublicationError::CurrentEntryFrameMissing
+        );
+
+        let mut missing_top_frame = active_native_entry_state(Some(FrameAddress(10)), None);
+        let top_error = missing_top_frame
+            .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+            .err()
+            .expect("top-frame rejection");
+        assert_eq!(
+            top_error,
+            VmNativeCallFramePublicationError::CurrentTopFrameMissing
+        );
+    }
+
+    #[test]
+    fn native_call_frame_publication_rejects_missing_launch_entry_or_top_frame() {
+        let owner = CodeBlockId(CellId(18));
+        let mut missing_launch_entry = native_publication_request(owner, FrameAddress(20));
+        missing_launch_entry.scope.active_entry_frame = None;
+        let entry_error = active_native_entry_state(Some(FrameAddress(10)), Some(FrameAddress(10)))
+            .publish_native_call_frame(missing_launch_entry)
+            .err()
+            .expect("launch entry-frame rejection");
+        assert_eq!(
+            entry_error,
+            VmNativeCallFramePublicationError::LaunchActiveEntryMissing
+        );
+
+        let mut missing_launch_top = native_publication_request(owner, FrameAddress(20));
+        missing_launch_top.scope.active_top_call_frame = None;
+        let top_error = active_native_entry_state(Some(FrameAddress(10)), Some(FrameAddress(10)))
+            .publish_native_call_frame(missing_launch_top)
+            .err()
+            .expect("launch top-frame rejection");
+        assert_eq!(
+            top_error,
+            VmNativeCallFramePublicationError::LaunchActiveTopFrameMissing
+        );
+    }
+
+    #[test]
+    fn native_call_frame_publication_rejects_symbolic_entry_or_top_mismatch() {
+        let owner = CodeBlockId(CellId(19));
+        let mut entry_mismatch = native_publication_request(owner, FrameAddress(20));
+        entry_mismatch.call_frame.entry_frame = Some(EntryFrameId(9));
+        let entry_error = active_native_entry_state(Some(FrameAddress(10)), Some(FrameAddress(10)))
+            .publish_native_call_frame(entry_mismatch)
+            .err()
+            .expect("symbolic entry-frame rejection");
+        assert_eq!(
+            entry_error,
+            VmNativeCallFramePublicationError::EntryFrameMismatch {
+                expected: EntryFrameId(1),
+                actual: Some(EntryFrameId(9))
+            }
+        );
+
+        let mut top_mismatch = native_publication_request(owner, FrameAddress(20));
+        top_mismatch.call_frame.frame = CallFrameId(9);
+        let top_error = active_native_entry_state(Some(FrameAddress(10)), Some(FrameAddress(10)))
+            .publish_native_call_frame(top_mismatch)
+            .err()
+            .expect("symbolic top-frame rejection");
+        assert_eq!(
+            top_error,
+            VmNativeCallFramePublicationError::TopFrameMismatch {
+                expected: CallFrameId(2),
+                actual: CallFrameId(9)
+            }
+        );
+    }
+
+    #[test]
+    fn native_call_frame_publication_exit_closes_matching_record_on_drop() {
+        let owner = CodeBlockId(CellId(21));
+        let mut state = VmEntryState::default();
+        let publication_ordinal;
+        {
+            let mut entry =
+                state.enter_rooted(Some(FrameAddress(10)), EntryKind::Script, HeapId(8));
+            {
+                let publication = entry
+                    .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+                    .expect("native call-frame publication");
+                publication_ordinal = publication.record().ordinal;
+            }
+        }
+
+        let exits = state.native_call_frame_publication_exits();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].ordinal, publication_ordinal);
+        assert_eq!(
+            exits[0].closed_publication,
+            state.native_call_frame_publications()[0]
+        );
+    }
+
+    #[test]
     fn function_entry_descriptor_copies_proto_call_frame_metadata_and_pads_args() {
         let owner = CodeBlockId(CellId(10));
         let function = ObjectId(CellId(11));
@@ -888,6 +1288,33 @@ mod tests {
             padded_argument_count: 1,
             specialization: CodeSpecializationKind::Call,
             arity_mode: ArityCheckMode::AlreadyChecked,
+        }
+    }
+
+    fn native_publication_request(
+        owner: CodeBlockId,
+        published_top_frame: FrameAddress,
+    ) -> VmNativeCallFramePublicationRequest {
+        VmNativeCallFramePublicationRequest {
+            reason: VmNativeCallFramePublicationReason::BaselineNativeEntry,
+            owner,
+            code_block: owner,
+            scope: launch_scope(owner),
+            call_frame: launch_call_frame(owner),
+            published_top_frame,
+        }
+    }
+
+    fn active_native_entry_state(
+        entry_frame: Option<FrameAddress>,
+        top_frame: Option<FrameAddress>,
+    ) -> VmEntryState {
+        VmEntryState {
+            entry_depth: 1,
+            entry_frame,
+            top_frame,
+            kind: Some(EntryKind::Script),
+            ..VmEntryState::default()
         }
     }
 

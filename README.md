@@ -110,6 +110,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            native through exact two-label metadata, retained ARM64 fallback can
            privately reenter a resolved P6 target, and public ARM64 branch-aware
            callable admission still rejects to the existing x86 semantic artifact.
+    [done] VM native call-frame publication skeleton added to src/vm/entry.rs:
+           C++ TopCallFrameSetter/NativeCallFrameTracer-shaped publish/restore
+           records for future public ARM64 admission; native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
