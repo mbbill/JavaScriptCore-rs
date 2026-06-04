@@ -17,6 +17,7 @@ use crate::runtime::{
 };
 
 use super::call_frame_storage::VmPublishedTopCallFrame;
+use super::entry_frame_storage::VmPublishedEntryFrame;
 use super::tiering::{
     BaselineEntryGateOutcome, BaselineEntryGateRecord, BaselineNativeEntryExecutionPolicy,
     BaselineNativeEntryReadinessOutcome, BaselineNativeEntryReadinessRecord,
@@ -38,6 +39,12 @@ pub enum EntryKind {
 }
 
 /// Active entry-frame and top-frame bookkeeping.
+///
+/// `enter_rooted` remains the legacy abstract interpreter path: current Rust
+/// interpreter entry has no JSC `EntryFrame*` storage, so it may seed the
+/// entry-frame slot from the same abstract address as the top call frame. The
+/// dormant `enter_storage_backed` path below mirrors JSC's distinct
+/// `VM::topCallFrame` / `VM::topEntryFrame` pair for future native entry.
 #[derive(Clone, Debug, Default)]
 pub struct VmEntryState {
     entry_depth: usize,
@@ -50,6 +57,8 @@ pub struct VmEntryState {
     launch_descriptors: Vec<VmEntryLaunchDescriptor>,
     native_call_frame_publications: Vec<VmNativeCallFramePublicationRecord>,
     native_call_frame_publication_exits: Vec<VmNativeCallFramePublicationExitRecord>,
+    storage_backed_entries: Vec<VmStorageBackedEntryRecord>,
+    storage_backed_entry_exits: Vec<VmStorageBackedEntryExitRecord>,
     next_ordinal: u64,
 }
 
@@ -60,6 +69,10 @@ impl VmEntryState {
 
     pub fn top_frame(&self) -> Option<FrameAddress> {
         self.top_frame
+    }
+
+    pub fn entry_frame(&self) -> Option<FrameAddress> {
+        self.entry_frame
     }
 
     pub fn kind(&self) -> Option<EntryKind> {
@@ -88,6 +101,16 @@ impl VmEntryState {
 
     pub fn native_call_frame_publication_exits(&self) -> &[VmNativeCallFramePublicationExitRecord] {
         &self.native_call_frame_publication_exits
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn storage_backed_entries(&self) -> &[VmStorageBackedEntryRecord] {
+        &self.storage_backed_entries
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn storage_backed_entry_exits(&self) -> &[VmStorageBackedEntryExitRecord] {
+        &self.storage_backed_entry_exits
     }
 
     pub(crate) fn record_launch_descriptor(&mut self, descriptor: VmEntryLaunchDescriptor) {
@@ -237,16 +260,207 @@ impl VmEntryState {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn enter_storage_backed<'storage>(
+        &mut self,
+        top_call_frame: FrameAddress,
+        published_entry_frame: VmPublishedEntryFrame<'storage>,
+        kind: EntryKind,
+        heap: HeapId,
+    ) -> Result<VmStorageBackedEntryGuard<'_, 'storage>, VmStorageBackedEntryError> {
+        let previous_top_call_frame = self.top_frame;
+        let previous_top_entry_frame = self.entry_frame;
+        if published_entry_frame.previous_top_call_frame() != previous_top_call_frame {
+            return Err(VmStorageBackedEntryError::PreviousTopCallFrameMismatch {
+                expected: previous_top_call_frame,
+                actual: published_entry_frame.previous_top_call_frame(),
+            });
+        }
+        if published_entry_frame.previous_top_entry_frame() != previous_top_entry_frame {
+            return Err(VmStorageBackedEntryError::PreviousTopEntryFrameMismatch {
+                expected: previous_top_entry_frame,
+                actual: published_entry_frame.previous_top_entry_frame(),
+            });
+        }
+
+        let previous_kind = self.kind;
+        let previous_disallow = self.disallow_user_observable_work;
+        self.entry_depth += 1;
+        self.next_ordinal = self.next_ordinal.saturating_add(1);
+        let ordinal = self.next_ordinal;
+        let top_entry_frame = published_entry_frame.address();
+        self.top_frame = Some(top_call_frame);
+        // C++ LLInt publishes `(sp, cfr)` into the adjacent
+        // VM::topCallFrame / VM::topEntryFrame pair. Rust keeps the existing
+        // abstract entry guard for interpreter execution, but this dormant path
+        // requires the entry-frame address to come from VM entry-frame storage.
+        self.entry_frame = Some(top_entry_frame);
+        self.kind = Some(kind);
+        self.disallow_user_observable_work = matches!(kind, EntryKind::VmInquiry);
+        let root_scope = VmEntryRootScope {
+            root: RootRecord {
+                id: RootId(4_000_000_u64.saturating_add(ordinal)),
+                kind: RootKind::Host,
+                heap,
+            },
+            ordinal,
+            kind,
+            heap,
+        };
+        let record = VmStorageBackedEntryRecord {
+            ordinal,
+            depth: self.entry_depth,
+            previous_top_call_frame,
+            previous_top_entry_frame,
+            top_call_frame,
+            top_entry_frame,
+            entry: published_entry_frame.entry(),
+            previous_entry_frame: published_entry_frame.previous_entry_frame(),
+            saved_top_call_frame: published_entry_frame.saved_top_call_frame(),
+            kind,
+            root_scope,
+        };
+        self.storage_backed_entries.push(record);
+
+        Ok(VmStorageBackedEntryGuard {
+            state: self,
+            record,
+            root_scope,
+            previous_top_call_frame,
+            previous_top_entry_frame,
+            previous_kind,
+            previous_disallow,
+            published_entry_frame,
+            _borrow: PhantomData,
+        })
+    }
+
     pub fn root_scopes(&self) -> impl Iterator<Item = VmEntryRootScope> + '_ {
-        self.records
+        let legacy_scopes =
+            self.records
+                .iter()
+                .map(|record| record.root_scope)
+                .filter(move |scope| {
+                    !self
+                        .exits
+                        .iter()
+                        .any(|exit| exit.closed_root_scope.ordinal == scope.ordinal)
+                });
+        let storage_scopes = self
+            .storage_backed_entries
             .iter()
             .map(|record| record.root_scope)
             .filter(move |scope| {
                 !self
-                    .exits
+                    .storage_backed_entry_exits
                     .iter()
                     .any(|exit| exit.closed_root_scope.ordinal == scope.ordinal)
-            })
+            });
+        legacy_scopes.chain(storage_scopes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VmStorageBackedEntryRecord {
+    pub ordinal: u64,
+    pub depth: usize,
+    pub previous_top_call_frame: Option<FrameAddress>,
+    pub previous_top_entry_frame: Option<FrameAddress>,
+    pub top_call_frame: FrameAddress,
+    pub top_entry_frame: FrameAddress,
+    pub entry: EntryFrameId,
+    pub previous_entry_frame: Option<EntryFrameId>,
+    pub saved_top_call_frame: Option<CallFrameId>,
+    pub kind: EntryKind,
+    pub root_scope: VmEntryRootScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VmStorageBackedEntryExitRecord {
+    pub ordinal: u64,
+    pub depth_before_exit: usize,
+    pub restored_top_call_frame: Option<FrameAddress>,
+    pub restored_top_entry_frame: Option<FrameAddress>,
+    pub restored_kind: Option<EntryKind>,
+    pub closed_entry: VmStorageBackedEntryRecord,
+    pub closed_root_scope: VmEntryRootScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum VmStorageBackedEntryError {
+    PreviousTopCallFrameMismatch {
+        expected: Option<FrameAddress>,
+        actual: Option<FrameAddress>,
+    },
+    PreviousTopEntryFrameMismatch {
+        expected: Option<FrameAddress>,
+        actual: Option<FrameAddress>,
+    },
+}
+
+#[allow(dead_code)]
+pub(crate) struct VmStorageBackedEntryGuard<'vm, 'storage> {
+    state: &'vm mut VmEntryState,
+    record: VmStorageBackedEntryRecord,
+    root_scope: VmEntryRootScope,
+    previous_top_call_frame: Option<FrameAddress>,
+    previous_top_entry_frame: Option<FrameAddress>,
+    previous_kind: Option<EntryKind>,
+    previous_disallow: bool,
+    published_entry_frame: VmPublishedEntryFrame<'storage>,
+    _borrow: PhantomData<&'vm mut VmEntryState>,
+}
+
+#[allow(dead_code)]
+impl<'storage> VmStorageBackedEntryGuard<'_, 'storage> {
+    pub(crate) fn record(&self) -> VmStorageBackedEntryRecord {
+        self.record
+    }
+
+    pub(crate) fn top_call_frame(&self) -> Option<FrameAddress> {
+        self.state.top_frame
+    }
+
+    pub(crate) fn top_entry_frame(&self) -> Option<FrameAddress> {
+        self.state.entry_frame
+    }
+
+    pub(crate) fn published_entry_frame(&self) -> VmPublishedEntryFrame<'storage> {
+        self.published_entry_frame
+    }
+
+    pub(crate) fn enter_storage_backed<'nested>(
+        &mut self,
+        top_call_frame: FrameAddress,
+        published_entry_frame: VmPublishedEntryFrame<'nested>,
+        kind: EntryKind,
+        heap: HeapId,
+    ) -> Result<VmStorageBackedEntryGuard<'_, 'nested>, VmStorageBackedEntryError> {
+        self.state
+            .enter_storage_backed(top_call_frame, published_entry_frame, kind, heap)
+    }
+}
+
+impl Drop for VmStorageBackedEntryGuard<'_, '_> {
+    fn drop(&mut self) {
+        let depth_before_exit = self.state.entry_depth;
+        self.state.entry_depth = self.state.entry_depth.saturating_sub(1);
+        self.state.top_frame = self.previous_top_call_frame;
+        self.state.entry_frame = self.previous_top_entry_frame;
+        self.state.kind = self.previous_kind;
+        self.state.disallow_user_observable_work = self.previous_disallow;
+        self.state
+            .storage_backed_entry_exits
+            .push(VmStorageBackedEntryExitRecord {
+                ordinal: self.record.ordinal,
+                depth_before_exit,
+                restored_top_call_frame: self.state.top_frame,
+                restored_top_entry_frame: self.state.entry_frame,
+                restored_kind: self.state.kind,
+                closed_entry: self.record,
+                closed_root_scope: self.root_scope,
+            });
     }
 }
 
@@ -925,6 +1139,7 @@ fn validate_owner(
 #[cfg(test)]
 mod tests {
     use super::super::call_frame_storage::JscCallFrameStorage;
+    use super::super::entry_frame_storage::{JscEntryFrameRegistration, JscEntryFrameStorage};
     use super::*;
     use crate::bytecode::register::CallFrameSlotLayout;
     use crate::gc::CellId;
@@ -939,7 +1154,7 @@ mod tests {
     };
 
     #[test]
-    fn entry_guard_records_entry_and_exit_restoration() {
+    fn legacy_entry_guard_records_abstract_entry_and_exit_restoration() {
         let mut state = VmEntryState::default();
         {
             let _outer = state.enter_rooted(Some(FrameAddress(10)), EntryKind::Script, HeapId(8));
@@ -948,10 +1163,264 @@ mod tests {
         assert_eq!(state.entry_depth(), 0);
         assert_eq!(state.records().len(), 1);
         assert_eq!(state.exits().len(), 1);
+        // Legacy Rust interpreter entry has not yet been moved onto JSC-shaped
+        // EntryFrame storage, so outer entry_frame still mirrors top_frame.
+        assert_eq!(state.records()[0].entry_frame, Some(FrameAddress(10)));
         assert_eq!(state.records()[0].top_frame, Some(FrameAddress(10)));
         assert_eq!(state.records()[0].root_scope.heap, HeapId(8));
         assert_eq!(state.exits()[0].restored_top_frame, None);
         assert_eq!(state.root_scopes().count(), 0);
+    }
+
+    #[test]
+    fn storage_backed_entry_records_distinct_top_call_and_entry_frames_and_restores_both() {
+        let mut storage = JscEntryFrameStorage::default();
+        let published_entry_frame =
+            published_entry_frame(&mut storage, EntryFrameId(1), None, None, None, None);
+        let top_entry_frame = published_entry_frame.address();
+        let top_call_frame = distinct_top_call_frame(top_entry_frame, 1);
+        let mut state = VmEntryState::default();
+        {
+            let guard = state
+                .enter_storage_backed(
+                    top_call_frame,
+                    published_entry_frame,
+                    EntryKind::Script,
+                    HeapId(9),
+                )
+                .expect("storage-backed VM entry");
+
+            assert_eq!(guard.top_call_frame(), Some(top_call_frame));
+            assert_eq!(guard.top_entry_frame(), Some(top_entry_frame));
+            assert_ne!(guard.top_call_frame(), guard.top_entry_frame());
+            assert_eq!(guard.published_entry_frame(), published_entry_frame);
+            let record = guard.record();
+            assert_eq!(record.previous_top_call_frame, None);
+            assert_eq!(record.previous_top_entry_frame, None);
+            assert_eq!(record.top_call_frame, top_call_frame);
+            assert_eq!(record.top_entry_frame, top_entry_frame);
+            assert_eq!(record.entry, EntryFrameId(1));
+            assert_eq!(record.root_scope.heap, HeapId(9));
+        }
+
+        assert_eq!(state.entry_depth(), 0);
+        assert_eq!(state.top_frame(), None);
+        assert_eq!(state.entry_frame(), None);
+        assert_eq!(state.storage_backed_entries().len(), 1);
+        assert_eq!(state.storage_backed_entry_exits().len(), 1);
+        assert_eq!(
+            state.storage_backed_entry_exits()[0].restored_top_call_frame,
+            None
+        );
+        assert_eq!(
+            state.storage_backed_entry_exits()[0].restored_top_entry_frame,
+            None
+        );
+        assert_eq!(state.root_scopes().count(), 0);
+    }
+
+    #[test]
+    fn nested_storage_backed_entries_restore_inner_then_outer_top_pair() {
+        let mut storage = JscEntryFrameStorage::default();
+        let outer_handle = storage.register_entry_frame(entry_registration(
+            EntryFrameId(1),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let outer_top_entry_frame = storage
+            .entry_frame_address(outer_handle)
+            .expect("outer entry-frame address");
+        let outer_top_call_frame = distinct_top_call_frame(outer_top_entry_frame, 2);
+        let inner_handle = storage.register_entry_frame(entry_registration(
+            EntryFrameId(2),
+            Some(EntryFrameId(1)),
+            Some(CallFrameId(7)),
+            Some(outer_top_call_frame),
+            Some(outer_top_entry_frame),
+        ));
+        let outer_entry_frame = storage
+            .published_entry_frame(outer_handle)
+            .expect("outer published entry frame");
+        let inner_entry_frame = storage
+            .published_entry_frame(inner_handle)
+            .expect("inner published entry frame");
+        let inner_top_entry_frame = inner_entry_frame.address();
+        let inner_top_call_frame = distinct_top_call_frame(inner_top_entry_frame, 3);
+        let mut state = VmEntryState::default();
+
+        {
+            let mut outer = state
+                .enter_storage_backed(
+                    outer_top_call_frame,
+                    outer_entry_frame,
+                    EntryKind::Script,
+                    HeapId(10),
+                )
+                .expect("outer storage-backed VM entry");
+            assert_eq!(outer.top_call_frame(), Some(outer_top_call_frame));
+            assert_eq!(outer.top_entry_frame(), Some(outer_top_entry_frame));
+            {
+                let inner = outer
+                    .enter_storage_backed(
+                        inner_top_call_frame,
+                        inner_entry_frame,
+                        EntryKind::HostCall,
+                        HeapId(11),
+                    )
+                    .expect("inner storage-backed VM entry");
+                assert_eq!(inner.top_call_frame(), Some(inner_top_call_frame));
+                assert_eq!(inner.top_entry_frame(), Some(inner_top_entry_frame));
+                assert_eq!(
+                    inner.record().previous_top_call_frame,
+                    Some(outer_top_call_frame)
+                );
+                assert_eq!(
+                    inner.record().previous_top_entry_frame,
+                    Some(outer_top_entry_frame)
+                );
+            }
+            assert_eq!(outer.top_call_frame(), Some(outer_top_call_frame));
+            assert_eq!(outer.top_entry_frame(), Some(outer_top_entry_frame));
+        }
+
+        assert_eq!(state.top_frame(), None);
+        assert_eq!(state.entry_frame(), None);
+        assert_eq!(state.storage_backed_entries().len(), 2);
+        assert_eq!(state.storage_backed_entry_exits().len(), 2);
+        assert_eq!(
+            state.storage_backed_entry_exits()[0].restored_top_call_frame,
+            Some(outer_top_call_frame)
+        );
+        assert_eq!(
+            state.storage_backed_entry_exits()[0].restored_top_entry_frame,
+            Some(outer_top_entry_frame)
+        );
+        assert_eq!(
+            state.storage_backed_entry_exits()[1].restored_top_call_frame,
+            None
+        );
+        assert_eq!(
+            state.storage_backed_entry_exits()[1].restored_top_entry_frame,
+            None
+        );
+    }
+
+    #[test]
+    fn storage_backed_entry_rejects_previous_top_call_frame_mismatch_without_mutation() {
+        let previous_top_call_frame = FrameAddress(0x1100);
+        let previous_top_entry_frame = FrameAddress(0x2200);
+        let mut storage = JscEntryFrameStorage::default();
+        let published_entry_frame = published_entry_frame(
+            &mut storage,
+            EntryFrameId(3),
+            None,
+            None,
+            Some(FrameAddress(0x1110)),
+            Some(previous_top_entry_frame),
+        );
+        let mut state = active_storage_entry_state(
+            Some(previous_top_entry_frame),
+            Some(previous_top_call_frame),
+        );
+
+        let error = state
+            .enter_storage_backed(
+                distinct_top_call_frame(published_entry_frame.address(), 4),
+                published_entry_frame,
+                EntryKind::Script,
+                HeapId(12),
+            )
+            .err()
+            .expect("previous top-call-frame rejection");
+
+        assert_eq!(
+            error,
+            VmStorageBackedEntryError::PreviousTopCallFrameMismatch {
+                expected: Some(previous_top_call_frame),
+                actual: Some(FrameAddress(0x1110))
+            }
+        );
+        assert_unmutated_storage_entry_state(
+            &state,
+            Some(previous_top_entry_frame),
+            Some(previous_top_call_frame),
+        );
+    }
+
+    #[test]
+    fn storage_backed_entry_rejects_previous_top_entry_frame_mismatch_without_mutation() {
+        let previous_top_call_frame = FrameAddress(0x3300);
+        let previous_top_entry_frame = FrameAddress(0x4400);
+        let mut storage = JscEntryFrameStorage::default();
+        let published_entry_frame = published_entry_frame(
+            &mut storage,
+            EntryFrameId(4),
+            None,
+            None,
+            Some(previous_top_call_frame),
+            Some(FrameAddress(0x4410)),
+        );
+        let mut state = active_storage_entry_state(
+            Some(previous_top_entry_frame),
+            Some(previous_top_call_frame),
+        );
+
+        let error = state
+            .enter_storage_backed(
+                distinct_top_call_frame(published_entry_frame.address(), 5),
+                published_entry_frame,
+                EntryKind::Script,
+                HeapId(13),
+            )
+            .err()
+            .expect("previous top-entry-frame rejection");
+
+        assert_eq!(
+            error,
+            VmStorageBackedEntryError::PreviousTopEntryFrameMismatch {
+                expected: Some(previous_top_entry_frame),
+                actual: Some(FrameAddress(0x4410))
+            }
+        );
+        assert_unmutated_storage_entry_state(
+            &state,
+            Some(previous_top_entry_frame),
+            Some(previous_top_call_frame),
+        );
+    }
+
+    #[test]
+    fn storage_backed_entry_guard_retains_published_entry_frame_proof() {
+        let mut storage = JscEntryFrameStorage::default();
+        let handle = storage.register_entry_frame(entry_registration(
+            EntryFrameId(5),
+            None,
+            None,
+            None,
+            None,
+        ));
+        {
+            let published_entry_frame = storage
+                .published_entry_frame(handle)
+                .expect("published entry-frame proof");
+            let top_call_frame = distinct_top_call_frame(published_entry_frame.address(), 6);
+            let mut state = VmEntryState::default();
+            {
+                let guard = state
+                    .enter_storage_backed(
+                        top_call_frame,
+                        published_entry_frame,
+                        EntryKind::Script,
+                        HeapId(14),
+                    )
+                    .expect("storage-backed VM entry");
+                assert_eq!(guard.published_entry_frame(), published_entry_frame);
+            }
+        }
+
+        assert!(storage.retire(handle));
     }
 
     #[test]
@@ -1480,6 +1949,46 @@ mod tests {
         }
     }
 
+    fn published_entry_frame<'storage>(
+        storage: &'storage mut JscEntryFrameStorage,
+        entry: EntryFrameId,
+        previous_entry_frame: Option<EntryFrameId>,
+        saved_top_call_frame: Option<CallFrameId>,
+        previous_top_call_frame: Option<FrameAddress>,
+        previous_top_entry_frame: Option<FrameAddress>,
+    ) -> VmPublishedEntryFrame<'storage> {
+        let handle = storage.register_entry_frame(entry_registration(
+            entry,
+            previous_entry_frame,
+            saved_top_call_frame,
+            previous_top_call_frame,
+            previous_top_entry_frame,
+        ));
+        storage
+            .published_entry_frame(handle)
+            .expect("storage-derived published entry frame")
+    }
+
+    fn entry_registration(
+        entry: EntryFrameId,
+        previous_entry_frame: Option<EntryFrameId>,
+        saved_top_call_frame: Option<CallFrameId>,
+        previous_top_call_frame: Option<FrameAddress>,
+        previous_top_entry_frame: Option<FrameAddress>,
+    ) -> JscEntryFrameRegistration {
+        JscEntryFrameRegistration {
+            entry,
+            previous_entry_frame,
+            saved_top_call_frame,
+            previous_top_call_frame,
+            previous_top_entry_frame,
+        }
+    }
+
+    fn distinct_top_call_frame(top_entry_frame: FrameAddress, salt: usize) -> FrameAddress {
+        FrameAddress(top_entry_frame.0 ^ 0x55aa_55aa_usize.wrapping_add(salt))
+    }
+
     fn published_top_call_frame<'storage>(
         storage: &'storage mut JscCallFrameStorage,
         owner: CodeBlockId,
@@ -1523,6 +2032,34 @@ mod tests {
             },
             state: FrameState::Executing,
         }
+    }
+
+    fn active_storage_entry_state(
+        entry_frame: Option<FrameAddress>,
+        top_frame: Option<FrameAddress>,
+    ) -> VmEntryState {
+        VmEntryState {
+            entry_depth: 1,
+            entry_frame,
+            top_frame,
+            kind: Some(EntryKind::Script),
+            disallow_user_observable_work: false,
+            ..VmEntryState::default()
+        }
+    }
+
+    fn assert_unmutated_storage_entry_state(
+        state: &VmEntryState,
+        entry_frame: Option<FrameAddress>,
+        top_frame: Option<FrameAddress>,
+    ) {
+        assert_eq!(state.entry_depth(), 1);
+        assert_eq!(state.entry_frame(), entry_frame);
+        assert_eq!(state.top_frame(), top_frame);
+        assert_eq!(state.kind(), Some(EntryKind::Script));
+        assert!(!state.disallows_user_observable_work());
+        assert!(state.storage_backed_entries().is_empty());
+        assert!(state.storage_backed_entry_exits().is_empty());
     }
 
     fn active_native_entry_state(
