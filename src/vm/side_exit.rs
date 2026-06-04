@@ -29,6 +29,12 @@ pub(super) struct P6CallableSideExitNativeReentryInvocation {
     pub(super) entry_offset: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct P6JumpIfFalseTruthinessSideExitResumeShape {
+    pub(super) taken_target: P6BaselineNativeReentryTargetRecord,
+    pub(super) fallthrough_target: P6BaselineNativeReentryTargetRecord,
+}
+
 pub(super) fn p6_side_exit_native_reentry_target_for_single_dispatch_outcome(
     side_exit: &P6X86_64CallableSideExitReturnSite,
     opcode: Option<CoreOpcode>,
@@ -71,6 +77,13 @@ pub(super) fn p6_jump_if_false_truthiness_side_exit_single_dispatch_native_resum
     code_block: &CodeBlock,
     side_exit: &P6X86_64CallableSideExitReturnSite,
 ) -> bool {
+    p6_jump_if_false_truthiness_side_exit_resume_shape(code_block, side_exit).is_some()
+}
+
+pub(super) fn p6_jump_if_false_truthiness_side_exit_resume_shape(
+    code_block: &CodeBlock,
+    side_exit: &P6X86_64CallableSideExitReturnSite,
+) -> Option<P6JumpIfFalseTruthinessSideExitResumeShape> {
     // C++ `jfalse` can resume from `valueIsFalsey` at either the taken target or
     // the next bytecode. Rust admits x86 private native reentry only when the
     // retained side-exit metadata published both labels and left the legacy
@@ -79,41 +92,55 @@ pub(super) fn p6_jump_if_false_truthiness_side_exit_single_dispatch_native_resum
         || side_exit.resume_entry_offset.is_some()
         || side_exit.native_reentry_targets.len() != 2
     {
-        return false;
+        return None;
     }
     let Ok(instruction) = code_block.decoded_instruction_at(side_exit.bytecode_index) else {
-        return false;
+        return None;
     };
     if !p6_jump_if_false_truthiness_side_exit_site_allowed_with_instruction(
         code_block,
         side_exit,
         &instruction,
     ) {
-        return false;
+        return None;
     }
     let Ok(taken_target) = instruction.bytecode_index_operand(1) else {
-        return false;
+        return None;
     };
     let Some(fallthrough_target) =
         p6_next_decoded_bytecode_index_after(code_block, side_exit.bytecode_index)
     else {
-        return false;
+        return None;
     };
     if taken_target == fallthrough_target
         || code_block
             .decoded_instruction_at(fallthrough_target)
             .is_err()
     {
-        return false;
+        return None;
     }
-    [taken_target, fallthrough_target]
-        .into_iter()
-        .all(|resume_bytecode_index| {
-            side_exit
-                .native_reentry_targets
-                .iter()
-                .any(|target| target.resume_bytecode_index == resume_bytecode_index)
-        })
+    let taken_target = p6_unique_native_reentry_target(side_exit, taken_target)?;
+    let fallthrough_target = p6_unique_native_reentry_target(side_exit, fallthrough_target)?;
+    Some(P6JumpIfFalseTruthinessSideExitResumeShape {
+        taken_target,
+        fallthrough_target,
+    })
+}
+
+fn p6_unique_native_reentry_target(
+    side_exit: &P6X86_64CallableSideExitReturnSite,
+    resume_bytecode_index: BytecodeIndex,
+) -> Option<P6BaselineNativeReentryTargetRecord> {
+    let mut targets = side_exit
+        .native_reentry_targets
+        .iter()
+        .copied()
+        .filter(|target| target.resume_bytecode_index == resume_bytecode_index);
+    let target = targets.next()?;
+    if targets.next().is_some() {
+        return None;
+    }
+    Some(target)
 }
 
 fn p6_jump_if_false_truthiness_side_exit_site_allowed_with_instruction(
@@ -405,6 +432,13 @@ mod tests {
                 &code_block,
                 &valid
             )
+        );
+        assert_eq!(
+            p6_jump_if_false_truthiness_side_exit_resume_shape(&code_block, &valid),
+            Some(P6JumpIfFalseTruthinessSideExitResumeShape {
+                taken_target: record(bci(4), 44),
+                fallthrough_target: record(bci(2), 22),
+            })
         );
 
         let mut legacy_single_target_shape = valid.clone();

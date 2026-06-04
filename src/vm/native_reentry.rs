@@ -11,7 +11,7 @@
 use core::ffi::c_void;
 use std::{convert::Infallible, ptr::NonNull};
 
-use crate::bytecode::{BytecodeIndex, CoreOpcode};
+use crate::bytecode::{BytecodeIndex, CodeBlock, CoreOpcode};
 use crate::interpreter::{ExecutionCompletion, ExecutionError};
 use crate::jit::emitter::{
     P10X86_64BaselinePropertyNativeExitReturnPayload,
@@ -30,7 +30,8 @@ use crate::runtime::RuntimeValue;
 use crate::value::EncodedJsValue;
 
 use super::side_exit::{
-    P6CallableSideExitNativeReentryInvocation, P6X86_64CallableSideExitReturnSite,
+    p6_jump_if_false_truthiness_side_exit_resume_shape, P6CallableSideExitNativeReentryInvocation,
+    P6X86_64CallableSideExitReturnSite,
 };
 use super::BaselineNativeEntryVmExecution;
 
@@ -145,16 +146,17 @@ pub(super) struct P6Arm64BranchAwareCallableMetadataProof {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct P6Arm64BranchAwareCallableSideExitProof<'a> {
     pub(super) site: &'a P6X86_64CallableSideExitReturnSite,
+    pub(super) code_block: &'a CodeBlock,
     pub(super) opcode: Option<CoreOpcode>,
     pub(super) target_bytecode_index: BytecodeIndex,
     pub(super) fallthrough_bytecode_index: BytecodeIndex,
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct P6Arm64BranchAwareCallableAdmissionProofRequest<'a> {
     pub(super) callable_kind: BaselineNativeEntryCallableKind,
     pub(super) terminal_policy: Option<P6X86_64BaselineTerminalPolicy>,
@@ -341,23 +343,35 @@ fn validate_p6_arm64_branch_aware_callable_side_exit_proof(
         );
     }
 
-    for resume_bytecode_index in [
-        proof.target_bytecode_index,
-        proof.fallthrough_bytecode_index,
-    ] {
-        let Some(target) = proof
-            .site
-            .native_reentry_targets
-            .iter()
-            .find(|target| target.resume_bytecode_index == resume_bytecode_index)
-        else {
-            return Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::MissingNativeReentryTarget {
-                    side_exit_index: proof.site.side_exit_index,
-                    resume_bytecode_index,
-                },
-            );
-        };
+    let Some(shape) =
+        p6_jump_if_false_truthiness_side_exit_resume_shape(proof.code_block, proof.site)
+    else {
+        return Err(
+            P6Arm64BranchAwareCallableAdmissionRejection::UnexpectedSideExit {
+                side_exit_index: proof.site.side_exit_index,
+                reason: proof.site.reason,
+                opcode: proof.opcode,
+            },
+        );
+    };
+    if proof.target_bytecode_index != shape.taken_target.resume_bytecode_index {
+        return Err(
+            P6Arm64BranchAwareCallableAdmissionRejection::MissingNativeReentryTarget {
+                side_exit_index: proof.site.side_exit_index,
+                resume_bytecode_index: proof.target_bytecode_index,
+            },
+        );
+    }
+    if proof.fallthrough_bytecode_index != shape.fallthrough_target.resume_bytecode_index {
+        return Err(
+            P6Arm64BranchAwareCallableAdmissionRejection::MissingNativeReentryTarget {
+                side_exit_index: proof.site.side_exit_index,
+                resume_bytecode_index: proof.fallthrough_bytecode_index,
+            },
+        );
+    }
+
+    for target in [shape.taken_target, shape.fallthrough_target] {
         if !p6_arm64_image_entry_offset_points_inside_descriptor_range(
             target.resume_entry_offset,
             range,
@@ -365,7 +379,7 @@ fn validate_p6_arm64_branch_aware_callable_side_exit_proof(
             return Err(
                 P6Arm64BranchAwareCallableAdmissionRejection::NativeReentryTargetOutsideDescriptorRange {
                     side_exit_index: proof.site.side_exit_index,
-                    resume_bytecode_index,
+                    resume_bytecode_index: target.resume_bytecode_index,
                     resume_entry_offset: target.resume_entry_offset,
                     range,
                 },
@@ -432,6 +446,13 @@ impl P6NativeSideExitReentryCallBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+
+    use crate::bytecode::{
+        CodeBlockEntrypoints, CodeBlockLifecycleState, CodeKind, InterpreterEntrySlot, LinkContext,
+        Operand, OperandWidth, PackedInstructionStream, RegisterFrameShape, TypedInstruction,
+        UnlinkedCodeBlock, VirtualRegister,
+    };
     use crate::jit::{ExecutableAllocationId, P6BaselineNativeReentryTargetRecord};
 
     fn bci(offset: u32) -> BytecodeIndex {
@@ -456,6 +477,94 @@ mod tests {
         }
     }
 
+    fn local(index: u32) -> VirtualRegister {
+        VirtualRegister::local(index)
+    }
+
+    fn typed_core_instruction_with_operands(
+        offset: u32,
+        opcode: CoreOpcode,
+        operands: Vec<Operand>,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: opcode.opcode(),
+            width: OperandWidth::Narrow,
+            operands,
+            schema: None,
+            bytecode_index: Some(bci(offset)),
+        }
+    }
+
+    fn code_block_from_instructions(instructions: Vec<TypedInstruction>) -> CodeBlock {
+        CodeBlock::from_unlinked(
+            UnlinkedCodeBlock::new(
+                CodeKind::Program,
+                PackedInstructionStream::from_typed_placeholder(instructions),
+            )
+            .with_frame(RegisterFrameShape {
+                num_parameters_including_this: 1,
+                num_vars: 1,
+                num_callee_locals: 0,
+                num_temporaries: 0,
+                special: Default::default(),
+            }),
+            LinkContext::default(),
+        )
+        .with_entrypoints(CodeBlockEntrypoints {
+            interpreter: Some(InterpreterEntrySlot(0)),
+            ..CodeBlockEntrypoints::default()
+        })
+        .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    fn jump_if_false_code_block(taken_target: u32) -> CodeBlock {
+        code_block_from_instructions(vec![
+            typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::LoadBool,
+                vec![Operand::Register(local(0)), Operand::UnsignedImmediate(0)],
+            ),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::JumpIfFalse,
+                vec![
+                    Operand::Register(local(0)),
+                    Operand::BytecodeIndex(bci(taken_target)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                2,
+                CoreOpcode::Return,
+                vec![Operand::Register(local(0))],
+            ),
+            typed_core_instruction_with_operands(
+                3,
+                CoreOpcode::LoadBool,
+                vec![Operand::Register(local(0)), Operand::UnsignedImmediate(1)],
+            ),
+            typed_core_instruction_with_operands(
+                4,
+                CoreOpcode::Return,
+                vec![Operand::Register(local(0))],
+            ),
+        ])
+    }
+
+    fn terminal_jump_if_false_code_block() -> CodeBlock {
+        code_block_from_instructions(vec![
+            typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::LoadBool,
+                vec![Operand::Register(local(0)), Operand::UnsignedImmediate(0)],
+            ),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::JumpIfFalse,
+                vec![Operand::Register(local(0)), Operand::BytecodeIndex(bci(0))],
+            ),
+        ])
+    }
+
     fn jump_if_false_site() -> P6X86_64CallableSideExitReturnSite {
         P6X86_64CallableSideExitReturnSite {
             bytecode_index: bci(1),
@@ -465,6 +574,35 @@ mod tests {
             resume_entry_offset: None,
             native_reentry_targets: vec![target(bci(4), 12), target(bci(2), 28)],
             encoded_payload: P6X86_64BaselineSideExitReturnPayload::encode(0),
+        }
+    }
+
+    fn branch_aware_side_exit_proof<'a>(
+        code_block: &'a CodeBlock,
+        site: &'a P6X86_64CallableSideExitReturnSite,
+    ) -> P6Arm64BranchAwareCallableSideExitProof<'a> {
+        branch_aware_side_exit_proof_with_labels(
+            code_block,
+            site,
+            Some(CoreOpcode::JumpIfFalse),
+            bci(4),
+            bci(2),
+        )
+    }
+
+    fn branch_aware_side_exit_proof_with_labels<'a>(
+        code_block: &'a CodeBlock,
+        site: &'a P6X86_64CallableSideExitReturnSite,
+        opcode: Option<CoreOpcode>,
+        target_bytecode_index: BytecodeIndex,
+        fallthrough_bytecode_index: BytecodeIndex,
+    ) -> P6Arm64BranchAwareCallableSideExitProof<'a> {
+        P6Arm64BranchAwareCallableSideExitProof {
+            site,
+            code_block,
+            opcode,
+            target_bytecode_index,
+            fallthrough_bytecode_index,
         }
     }
 
@@ -494,15 +632,42 @@ mod tests {
         }
     }
 
+    fn admission_for_site(
+        code_block: &CodeBlock,
+        site: &P6X86_64CallableSideExitReturnSite,
+    ) -> Result<Infallible, P6Arm64BranchAwareCallableAdmissionRejection> {
+        admission_for_site_with_labels(
+            code_block,
+            site,
+            Some(CoreOpcode::JumpIfFalse),
+            bci(4),
+            bci(2),
+        )
+    }
+
+    fn admission_for_site_with_labels(
+        code_block: &CodeBlock,
+        site: &P6X86_64CallableSideExitReturnSite,
+        opcode: Option<CoreOpcode>,
+        target_bytecode_index: BytecodeIndex,
+        fallthrough_bytecode_index: BytecodeIndex,
+    ) -> Result<Infallible, P6Arm64BranchAwareCallableAdmissionRejection> {
+        let side_exits = [branch_aware_side_exit_proof_with_labels(
+            code_block,
+            site,
+            opcode,
+            target_bytecode_index,
+            fallthrough_bytecode_index,
+        )];
+        let request = valid_request(&side_exits);
+        p6_arm64_public_branch_aware_callable_admission_proof(&request)
+    }
+
     #[test]
     fn public_arm64_branch_aware_admission_rejects_missing_fallback_rooting_proof() {
+        let code_block = jump_if_false_code_block(4);
         let site = jump_if_false_site();
-        let side_exits = [P6Arm64BranchAwareCallableSideExitProof {
-            site: &site,
-            opcode: Some(CoreOpcode::JumpIfFalse),
-            target_bytecode_index: bci(4),
-            fallthrough_bytecode_index: bci(2),
-        }];
+        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
         let request = valid_request(&side_exits);
 
         assert_eq!(
@@ -517,13 +682,9 @@ mod tests {
 
     #[test]
     fn public_arm64_branch_aware_admission_rejects_x86_callable_kind() {
+        let code_block = jump_if_false_code_block(4);
         let site = jump_if_false_site();
-        let side_exits = [P6Arm64BranchAwareCallableSideExitProof {
-            site: &site,
-            opcode: Some(CoreOpcode::JumpIfFalse),
-            target_bytecode_index: bci(4),
-            fallthrough_bytecode_index: bci(2),
-        }];
+        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
         let mut request = valid_request(&side_exits);
         request.callable_kind = BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry;
 
@@ -539,13 +700,9 @@ mod tests {
 
     #[test]
     fn public_arm64_branch_aware_admission_rejects_non_branch_aware_terminal_policy() {
+        let code_block = jump_if_false_code_block(4);
         let site = jump_if_false_site();
-        let side_exits = [P6Arm64BranchAwareCallableSideExitProof {
-            site: &site,
-            opcode: Some(CoreOpcode::JumpIfFalse),
-            target_bytecode_index: bci(4),
-            fallthrough_bytecode_index: bci(2),
-        }];
+        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
         let mut request = valid_request(&side_exits);
         request.terminal_policy = Some(
             P6X86_64BaselineTerminalPolicy::CallableCAbiPrologueSingleFinalEpilogueThenInlinePayloadSideExitStubs,
@@ -563,14 +720,10 @@ mod tests {
 
     #[test]
     fn public_arm64_branch_aware_admission_requires_target_and_fallthrough_reentry_ranges() {
+        let code_block = jump_if_false_code_block(4);
         let mut site = jump_if_false_site();
         site.native_reentry_targets = vec![target(bci(4), 12), target(bci(2), 64)];
-        let side_exits = [P6Arm64BranchAwareCallableSideExitProof {
-            site: &site,
-            opcode: Some(CoreOpcode::JumpIfFalse),
-            target_bytecode_index: bci(4),
-            fallthrough_bytecode_index: bci(2),
-        }];
+        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
         let request = valid_request(&side_exits);
 
         assert_eq!(
@@ -581,6 +734,187 @@ mod tests {
                     resume_bytecode_index: bci(2),
                     resume_entry_offset: 64,
                     range: range(),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn public_arm64_branch_aware_admission_rejects_legacy_single_target_shape() {
+        let code_block = jump_if_false_code_block(4);
+        let mut site = jump_if_false_site();
+        site.resume_bytecode_index = Some(bci(2));
+        site.resume_entry_offset = Some(28);
+
+        assert_eq!(
+            admission_for_site(&code_block, &site),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::UnexpectedSideExit {
+                    side_exit_index: 0,
+                    reason: P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand,
+                    opcode: Some(CoreOpcode::JumpIfFalse),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn public_arm64_branch_aware_admission_rejects_missing_extra_or_duplicate_reentry_labels() {
+        let code_block = jump_if_false_code_block(4);
+
+        for native_reentry_targets in [
+            vec![target(bci(4), 12)],
+            vec![target(bci(4), 12), target(bci(2), 28), target(bci(8), 36)],
+            vec![target(bci(4), 12), target(bci(4), 36)],
+            vec![target(bci(4), 12), target(bci(8), 36)],
+        ] {
+            let mut site = jump_if_false_site();
+            site.native_reentry_targets = native_reentry_targets;
+
+            assert_eq!(
+                admission_for_site(&code_block, &site),
+                Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::UnexpectedSideExit {
+                        side_exit_index: 0,
+                        reason:
+                            P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand,
+                        opcode: Some(CoreOpcode::JumpIfFalse),
+                    }
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn public_arm64_branch_aware_admission_rejects_degenerate_or_invalid_decoded_labels() {
+        let degenerate_code_block = jump_if_false_code_block(2);
+        let mut degenerate_site = jump_if_false_site();
+        degenerate_site.native_reentry_targets = vec![target(bci(2), 28), target(bci(2), 36)];
+
+        assert_eq!(
+            admission_for_site(&degenerate_code_block, &degenerate_site),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::UnexpectedSideExit {
+                    side_exit_index: 0,
+                    reason: P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand,
+                    opcode: Some(CoreOpcode::JumpIfFalse),
+                }
+            )
+        );
+
+        let invalid_target_code_block = jump_if_false_code_block(99);
+        let mut invalid_target_site = jump_if_false_site();
+        invalid_target_site.native_reentry_targets = vec![target(bci(99), 12), target(bci(2), 28)];
+
+        assert_eq!(
+            admission_for_site_with_labels(
+                &invalid_target_code_block,
+                &invalid_target_site,
+                Some(CoreOpcode::JumpIfFalse),
+                bci(99),
+                bci(2),
+            ),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::UnexpectedSideExit {
+                    side_exit_index: 0,
+                    reason: P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand,
+                    opcode: Some(CoreOpcode::JumpIfFalse),
+                }
+            )
+        );
+
+        let terminal_code_block = terminal_jump_if_false_code_block();
+        let mut missing_fallthrough_site = jump_if_false_site();
+        missing_fallthrough_site.native_reentry_targets =
+            vec![target(bci(0), 12), target(bci(2), 28)];
+
+        assert_eq!(
+            admission_for_site_with_labels(
+                &terminal_code_block,
+                &missing_fallthrough_site,
+                Some(CoreOpcode::JumpIfFalse),
+                bci(0),
+                bci(2),
+            ),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::UnexpectedSideExit {
+                    side_exit_index: 0,
+                    reason: P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand,
+                    opcode: Some(CoreOpcode::JumpIfFalse),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn public_arm64_branch_aware_admission_rejects_wrong_reason_or_opcode() {
+        let code_block = jump_if_false_code_block(4);
+        let mut wrong_reason = jump_if_false_site();
+        wrong_reason.reason = P6X86_64BaselineSelectedSideExitReason::NonInt32Operand;
+
+        assert_eq!(
+            admission_for_site(&code_block, &wrong_reason),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::UnexpectedSideExit {
+                    side_exit_index: 0,
+                    reason: P6X86_64BaselineSelectedSideExitReason::NonInt32Operand,
+                    opcode: Some(CoreOpcode::JumpIfFalse),
+                }
+            )
+        );
+
+        let site = jump_if_false_site();
+        assert_eq!(
+            admission_for_site_with_labels(
+                &code_block,
+                &site,
+                Some(CoreOpcode::AddInt32),
+                bci(4),
+                bci(2),
+            ),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::UnexpectedSideExit {
+                    side_exit_index: 0,
+                    reason: P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand,
+                    opcode: Some(CoreOpcode::AddInt32),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn public_arm64_branch_aware_admission_rejects_proof_label_mismatches() {
+        let code_block = jump_if_false_code_block(4);
+        let site = jump_if_false_site();
+
+        assert_eq!(
+            admission_for_site_with_labels(
+                &code_block,
+                &site,
+                Some(CoreOpcode::JumpIfFalse),
+                bci(8),
+                bci(2),
+            ),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingNativeReentryTarget {
+                    side_exit_index: 0,
+                    resume_bytecode_index: bci(8),
+                }
+            )
+        );
+
+        assert_eq!(
+            admission_for_site_with_labels(
+                &code_block,
+                &site,
+                Some(CoreOpcode::JumpIfFalse),
+                bci(4),
+                bci(8),
+            ),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingNativeReentryTarget {
+                    side_exit_index: 0,
+                    resume_bytecode_index: bci(8),
                 }
             )
         );

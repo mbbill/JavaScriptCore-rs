@@ -107,9 +107,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            src/vm/side_exit.rs resolver metadata, and src/vm/native_reentry.rs
            request bridge preserve JumpIfFalse taken/fallthrough native reentry
            targets; x86/private truthiness exits now single-dispatch and resume
-           native through exact two-label metadata, retained ARM64 fallback can
-           privately reenter a resolved P6 target, and public ARM64 branch-aware
-           callable admission still rejects to the existing x86 semantic artifact.
+           native through exact two-label metadata, dormant public ARM64 proof
+           now reuses the decoded JumpIfFalse shape before descriptor-range
+           checks, retained ARM64 fallback can privately reenter a resolved P6
+           target, and public ARM64 callable admission still rejects to the
+           existing x86 semantic artifact.
     [done] VM native call-frame publication skeleton added to src/vm/entry.rs:
            C++ TopCallFrameSetter/NativeCallFrameTracer-shaped publish/restore
            records for future public ARM64 admission; native execution unchanged.

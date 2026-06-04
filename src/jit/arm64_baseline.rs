@@ -2313,6 +2313,7 @@ mod tests {
     fn arm64_semantic_builder_emits_primitive_jump_if_false_fast_path_and_side_exit_stub() {
         let mut builder = P6Arm64SemanticByteBuilder::default();
         let bytecode_index = bci(4);
+        let value_layout = rust_low_byte_value_layout();
         let target = branch_contract(P6X86_64BaselineBytecodeBranchKind::JumpIfFalseTaken, 4, 12);
         let unsupported_exit = side_exit_label(
             4,
@@ -2323,7 +2324,7 @@ mod tests {
             .emit_branch_if_false_primitive(
                 bytecode_index,
                 frame_local_location(16),
-                rust_low_byte_value_layout(),
+                value_layout,
                 unsupported_exit,
                 target,
                 &[bci(12), bci(8)],
@@ -2368,6 +2369,55 @@ mod tests {
 
         assert_eq!(arm64_word(builder.bytes(), 0), 0xf940_0ba9);
         assert_eq!(arm64_word(builder.bytes(), 4), 0x9240_1d2a);
+        for (tag, cmp_offset, branch_offset) in [
+            (value_layout.immediate_undefined_tag, 8, 12),
+            (value_layout.immediate_null_tag, 16, 20),
+            (value_layout.immediate_false_tag, 24, 28),
+        ] {
+            assert_eq!(
+                arm64_word(builder.bytes(), cmp_offset),
+                p6_arm64_encode_cmp_imm64(register_contract::X10, tag as u8)
+            );
+            assert_eq!(
+                arm64_word(builder.bytes(), branch_offset),
+                link_conditional_branch(Arm64Condition::Eq, branch_offset, target_offset)
+                    .unwrap()
+                    .instruction_word
+            );
+        }
+        assert_eq!(
+            arm64_word(builder.bytes(), 32),
+            p6_arm64_encode_cmp_imm64(
+                register_contract::X10,
+                value_layout.immediate_true_tag as u8
+            )
+        );
+        assert_eq!(
+            arm64_word(builder.bytes(), 36),
+            link_conditional_branch(Arm64Condition::Eq, 36, fallthrough_offset)
+                .unwrap()
+                .instruction_word
+        );
+        assert_eq!(
+            arm64_word(builder.bytes(), 40),
+            p6_arm64_encode_cmp_imm64(
+                register_contract::X10,
+                value_layout.immediate_int32_tag as u8
+            )
+        );
+        assert_eq!(
+            arm64_word(builder.bytes(), 48),
+            p6_arm64_encode_cmp_imm64(
+                register_contract::X9,
+                value_layout.immediate_int32_tag as u8
+            )
+        );
+        assert_eq!(
+            arm64_word(builder.bytes(), 52),
+            link_conditional_branch(Arm64Condition::Eq, 52, target_offset)
+                .unwrap()
+                .instruction_word
+        );
         assert_eq!(arm64_word(builder.bytes(), 8), 0xf100_055f);
         assert_eq!(arm64_word(builder.bytes(), 16), 0xf100_095f);
         assert_eq!(arm64_word(builder.bytes(), 24), 0xf100_0d5f);
