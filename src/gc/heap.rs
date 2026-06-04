@@ -11,9 +11,9 @@ use crate::gc::{
     AllocationMode, AllocationProfile, AllocationSchemaRegistry, BarrierDecisionError,
     BarrierMutationAuthority, BarrierRequirementOutcome, BarrierRequirementRequest,
     BarrierWriteContext, CellDestructionState, CellId, CellLifecycleRecord, CellMetadata,
-    CellZapReason, CollectionRequest, ConservativeRoots, FinalizerKind, FinalizerPlan,
-    FinalizerPlanningError, FinalizerPlanningRecord, FinalizerRecord, FinalizerState,
-    FinalizerStateTransitionError, FinalizerTransitionRequest, FxIntBuildHasher,
+    CellZapReason, CollectionRequest, ConservativeRootCell, ConservativeRoots, FinalizerKind,
+    FinalizerPlan, FinalizerPlanningError, FinalizerPlanningRecord, FinalizerRecord,
+    FinalizerState, FinalizerStateTransitionError, FinalizerTransitionRequest, FxIntBuildHasher,
     GcActivityCallbackState, GcConductor, GcPhase, GcRef, HeapFinalizerCallback,
     HeapFinalizerCallbackId, HeapMutationAuthority, HeapSemanticError, HeapSemanticOperation,
     HeapSnapshotBuilder, HeapSnapshotCellRecord, HeapSnapshotEdge, HeapSnapshotId,
@@ -305,6 +305,7 @@ pub enum HeapIntegrationError {
     SnapshotAlreadyFinalized(HeapSnapshotId),
     Root(RootSetSemanticError),
     ConservativeRoot(RootPlanningError),
+    InvalidConservativeRootCell(ConservativeRootCell),
     StaleMachineStackConservativeRootingProof {
         expected: HeapEpoch,
         actual: HeapEpoch,
@@ -511,6 +512,31 @@ impl Heap {
         self.payload_to_cell.get(&payload).copied()
     }
 
+    pub fn validate_conservative_root_candidate_exact_payload(
+        &self,
+        candidate_address: usize,
+    ) -> Option<ConservativeRootCell> {
+        if candidate_address == 0 {
+            return None;
+        }
+
+        let cell = self.cell_for_payload(candidate_address)?;
+        let record = self
+            .allocations
+            .iter()
+            .find(|record| record.response.cell == cell)?;
+        if !record.published
+            || record.lifecycle.destruction_state != CellDestructionState::NotPending
+        {
+            return None;
+        }
+
+        Some(ConservativeRootCell {
+            candidate_address,
+            cell,
+        })
+    }
+
     pub fn payload_for_cell(&self, cell: CellId) -> Option<usize> {
         self.cell_to_payload.get(&cell).copied()
     }
@@ -685,6 +711,7 @@ impl Heap {
             precise_roots: self.roots.records.clone(),
             targeted_roots: self.targeted_roots.records.clone(),
             conservative_spans: self.conservative_roots.spans().to_vec(),
+            conservative_cells: self.conservative_roots.validated_cells().to_vec(),
             source: crate::gc::ConservativeRootSource::MachineStack,
         }
     }
@@ -892,15 +919,62 @@ impl Heap {
         &mut self,
         roots: ConservativeRoots,
     ) -> Result<(), HeapIntegrationError> {
+        for root in roots.validated_cells() {
+            if self.validate_conservative_root_candidate_exact_payload(root.candidate_address)
+                != Some(*root)
+            {
+                return Err(HeapIntegrationError::InvalidConservativeRootCell(*root));
+            }
+        }
+
         let plan = RootMarkingPlan {
             precise_roots: Vec::new(),
             targeted_roots: Vec::new(),
             conservative_spans: roots.spans().to_vec(),
+            conservative_cells: roots.validated_cells().to_vec(),
             source: crate::gc::ConservativeRootSource::MachineStack,
         };
         plan.validate()?;
         self.conservative_roots.extend(roots);
         Ok(())
+    }
+
+    fn add_exact_payload_conservative_cells_from_machine_stack_spans(
+        &self,
+        roots: &mut ConservativeRoots,
+    ) {
+        let spans = roots.spans().to_vec();
+        let pointer_width = core::mem::size_of::<usize>();
+        for span in spans {
+            let mut address = span.begin;
+            while address < span.end {
+                // C++ `ConservativeRoots::genericAddPointer` walks
+                // MarkedBlock/PreciseAllocation geometry, accepts interior and
+                // butterfly cases, and runs JIT stub hooks. This Rust proof
+                // batch intentionally accepts only exact published payload
+                // addresses through the heap identity map until those JSC
+                // allocation geometries and hooks are ported.
+                //
+                // SAFETY: this helper is called only while consuming a
+                // `JscMachineStackConservativeRootingProof`. The marker
+                // validated pointer-width alignment and keeps the current
+                // register/stack span evidence lexical for this call, matching
+                // C++ current-thread conservative stack scanning.
+                let candidate = unsafe { (address as *const usize).read() };
+                if let Some(root) =
+                    self.validate_conservative_root_candidate_exact_payload(candidate)
+                {
+                    roots.add_validated_cell(root);
+                }
+                address += pointer_width;
+            }
+        }
+
+        for candidate in roots.candidate_addresses().to_vec() {
+            if let Some(root) = self.validate_conservative_root_candidate_exact_payload(candidate) {
+                roots.add_validated_cell(root);
+            }
+        }
     }
 
     // Dormant MachineStackMarker bridge; future GC/native-entry plumbing should
@@ -966,7 +1040,9 @@ impl Heap {
             );
         }
 
-        self.ingest_conservative_roots(proof.into_conservative_roots())
+        let mut roots = proof.into_conservative_roots();
+        self.add_exact_payload_conservative_cells_from_machine_stack_spans(&mut roots);
+        self.ingest_conservative_roots(roots)
     }
 
     pub fn begin_heap_snapshot(&mut self, kind: HeapSnapshotKind) -> HeapSnapshotId {

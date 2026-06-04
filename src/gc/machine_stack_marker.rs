@@ -457,7 +457,8 @@ fn validate_current_thread_gather_order(
 mod tests {
     use super::*;
     use crate::gc::{
-        GcConductor, Heap, HeapEpoch, HeapId, HeapIntegrationError, HeapSemanticError,
+        AllocationMode, CellId, CellMetadata, ConservativeRootCell, GcConductor, Heap,
+        HeapAllocationRequest, HeapEpoch, HeapId, HeapIntegrationError, HeapSemanticError,
         HeapSemanticOperation, RootPlanStep,
     };
 
@@ -475,6 +476,14 @@ mod tests {
         }
     }
 
+    fn span_for_words(words: &[usize]) -> ConservativeRootSpan {
+        let begin = words.as_ptr() as usize;
+        ConservativeRootSpan {
+            begin,
+            end: begin + core::mem::size_of_val(words),
+        }
+    }
+
     fn collecting_heap() -> Heap {
         let mut heap = Heap::new();
         heap.enter_phase(
@@ -483,6 +492,19 @@ mod tests {
             GcConductor::Collector,
         );
         heap
+    }
+
+    fn allocate_test_cell(heap: &mut Heap) -> CellId {
+        heap.allocate_record(HeapAllocationRequest {
+            heap: heap.id(),
+            subspace: "object",
+            metadata: CellMetadata::default(),
+            byte_size: 64,
+            mode: AllocationMode::Normal,
+            may_trigger_collection: false,
+        })
+        .map(|response| response.cell)
+        .expect("test allocation")
     }
 
     fn forged_proof(
@@ -786,13 +808,15 @@ mod tests {
     fn heap_ingests_synthetic_roots_inside_marker_closure_for_testing() {
         let marker = JscMachineStackMarker::new();
         let mut heap = collecting_heap();
+        let stack_words = [0usize; 2];
+        let stack_span = span_for_words(&stack_words);
 
         marker
             .with_synthetic_current_thread_conservative_roots_for_testing(
                 heap.id(),
                 heap.epoch(),
                 heap.state_descriptor(),
-                stack_span(),
+                stack_span,
                 |proof| heap.ingest_machine_stack_conservative_roots(proof),
             )
             .expect("marker")
@@ -814,9 +838,76 @@ mod tests {
         assert_eq!(
             steps[1],
             RootPlanStep::Conservative {
-                span: stack_span(),
+                span: stack_span,
                 source: crate::gc::ConservativeRootSource::MachineStack
             }
+        );
+    }
+
+    #[test]
+    fn machine_stack_scan_validates_exact_payload_roots_in_register_before_stack_order() {
+        let marker = JscMachineStackMarker::new();
+        let mut heap = Heap::new();
+        let register_cell = allocate_test_cell(&mut heap);
+        let stack_cell = allocate_test_cell(&mut heap);
+        let register_payload = 0x1000;
+        let stack_payload = 0x2000;
+        heap.bind_cell_payload(register_cell, register_payload)
+            .expect("bind register payload");
+        heap.bind_cell_payload(stack_cell, stack_payload)
+            .expect("bind stack payload");
+        heap.publish_cell(register_cell)
+            .expect("publish register cell");
+        heap.publish_cell(stack_cell).expect("publish stack cell");
+        heap.enter_phase(
+            GcPhase::Fixpoint,
+            MutatorState::Collecting,
+            GcConductor::Collector,
+        );
+
+        let register_state = JscArm64RegisterState {
+            x19: register_payload as u64,
+            ..JscArm64RegisterState::default()
+        };
+        let stack_words = [0usize, stack_payload, 0x3000];
+        let stack_span = span_for_words(&stack_words);
+        let state = JscCurrentThreadState {
+            stack_origin: stack_span.end,
+            stack_top: stack_span.begin,
+            register_state: Some(&register_state),
+        };
+
+        marker
+            .with_current_thread_conservative_roots_from_state(
+                heap.id(),
+                heap.epoch(),
+                heap.state_descriptor(),
+                &state,
+                |proof| heap.ingest_machine_stack_conservative_roots(proof),
+            )
+            .expect("marker")
+            .expect("heap ingest");
+
+        let steps = heap.root_marking_plan().planned_steps().expect("root plan");
+        let conservative_cells: Vec<_> = steps
+            .iter()
+            .filter_map(|step| match step {
+                RootPlanStep::ConservativeCell { root, .. } => Some(*root),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            conservative_cells,
+            vec![
+                ConservativeRootCell {
+                    candidate_address: register_payload,
+                    cell: register_cell
+                },
+                ConservativeRootCell {
+                    candidate_address: stack_payload,
+                    cell: stack_cell
+                }
+            ]
         );
     }
 

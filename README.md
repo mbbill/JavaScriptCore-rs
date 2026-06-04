@@ -137,7 +137,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            src/gc/heap/run_current_phase.rs adds the dormant
            Heap::runCurrentPhase / collectInMutatorThread NeedCurrentThreadState
            handshake that reruns mutator Fixpoint with the exact captured
-           CurrentThreadState; native execution unchanged.
+           CurrentThreadState; src/gc/conservative_roots.rs adds the dormant
+           ConservativeRoots descriptor with exact published-payload validation
+           only; native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler

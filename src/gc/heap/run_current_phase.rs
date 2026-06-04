@@ -164,6 +164,14 @@ mod tests {
         }
     }
 
+    fn span_for_words(words: &[usize]) -> ConservativeRootSpan {
+        let begin = words.as_ptr() as usize;
+        ConservativeRootSpan {
+            begin,
+            end: begin + core::mem::size_of_val(words),
+        }
+    }
+
     #[test]
     fn mutator_fixpoint_without_current_thread_state_requests_state() {
         let marker = JscMachineStackMarker::new();
@@ -257,8 +265,10 @@ mod tests {
     fn mutator_rerun_with_synthetic_state_ingests_registers_before_stack() {
         let marker = JscMachineStackMarker::new();
         let mut heap = fixpoint_heap(GcConductor::Mutator);
+        let stack_words = [0usize; 2];
+        let stack_span = span_for_words(&stack_words);
 
-        let result = marker.synthetic_current_thread_state_for_testing(stack_span(), |state| {
+        let result = marker.synthetic_current_thread_state_for_testing(stack_span, |state| {
             heap.run_current_phase_descriptor(GcConductor::Mutator, &marker, Some(state))
         });
 
@@ -275,7 +285,7 @@ mod tests {
         assert_eq!(
             steps[1],
             RootPlanStep::Conservative {
-                span: stack_span(),
+                span: stack_span,
                 source: ConservativeRootSource::MachineStack
             }
         );

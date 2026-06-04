@@ -17,6 +17,7 @@
 
 mod barrier;
 mod cell;
+mod conservative_roots;
 mod fast_hash;
 mod heap;
 mod machine_stack_marker;
@@ -47,6 +48,7 @@ pub use cell::{
     TypeInfoDescriptor, STATIC_CELL_METADATA_DESCRIPTORS, STATIC_CELL_METADATA_REGISTRY,
     STATIC_TYPE_INFO_DESCRIPTORS,
 };
+pub use conservative_roots::{ConservativeRootCell, ConservativeRoots};
 pub use fast_hash::{FxIntBuildHasher, FxIntHasher};
 pub use heap::{
     static_heap_schema_descriptor, AllocationPlan, CellArena, CellInit, ConservativeRootSpan,
@@ -107,11 +109,11 @@ pub use trace::{
     MarkingPlanGraphError, MarkingPlanStep, Trace, Tracer,
 };
 pub use visitor::{
-    root_mark_reason_for_kind, ConservativeRootSource, ConservativeRoots, DrainMode, DrainResult,
-    MarkDependency, MarkStackTransfer, MarkStackTransferKind, MarkWorkItem, MarkWorklistDescriptor,
-    MarkWorklistId, MarkWorklistKind, MarkWorklistStats, OpaqueRootId, OpaqueRootRecord,
-    ReferrerToken, ReferrerTokenKind, RootMarkReason, RootMarkingPlan, RootPlanStep,
-    RootPlanningError, SlotVisitorDescriptor,
+    root_mark_reason_for_kind, ConservativeRootSource, DrainMode, DrainResult, MarkDependency,
+    MarkStackTransfer, MarkStackTransferKind, MarkWorkItem, MarkWorklistDescriptor, MarkWorklistId,
+    MarkWorklistKind, MarkWorklistStats, OpaqueRootId, OpaqueRootRecord, ReferrerToken,
+    ReferrerTokenKind, RootMarkReason, RootMarkingPlan, RootPlanStep, RootPlanningError,
+    SlotVisitorDescriptor,
 };
 pub use weak::{
     FinalizerKind, FinalizerPlan, FinalizerPlanEntry, FinalizerPlanningError,

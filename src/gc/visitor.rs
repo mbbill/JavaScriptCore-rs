@@ -157,53 +157,6 @@ pub enum ConservativeRootSource {
     Host,
 }
 
-/// Conservative roots found in raw stack or register spans.
-///
-/// Candidate addresses are untrusted until the heap validates them. They are
-/// observations, not roots or heap-cell identities.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ConservativeRoots {
-    spans: Vec<ConservativeRootSpan>,
-    candidate_addresses: Vec<usize>,
-    opaque_roots: Vec<OpaqueRootRecord>,
-}
-
-impl ConservativeRoots {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn add_span(&mut self, span: ConservativeRootSpan) {
-        self.spans.push(span);
-    }
-
-    pub fn add_candidate_address(&mut self, address: usize) {
-        self.candidate_addresses.push(address);
-    }
-
-    pub fn add_opaque_root(&mut self, root: OpaqueRootRecord) {
-        self.opaque_roots.push(root);
-    }
-
-    pub fn extend(&mut self, other: Self) {
-        self.spans.extend(other.spans);
-        self.candidate_addresses.extend(other.candidate_addresses);
-        self.opaque_roots.extend(other.opaque_roots);
-    }
-
-    pub fn spans(&self) -> &[ConservativeRootSpan] {
-        &self.spans
-    }
-
-    pub fn candidate_addresses(&self) -> &[usize] {
-        &self.candidate_addresses
-    }
-
-    pub fn opaque_roots(&self) -> &[OpaqueRootRecord] {
-        &self.opaque_roots
-    }
-}
-
 /// Opaque root tracked outside ordinary cell fields.
 ///
 /// Opaque root IDs belong to VM/host registries and must not be converted into
@@ -292,6 +245,7 @@ pub struct RootMarkingPlan {
     pub precise_roots: Vec<RootRecord>,
     pub targeted_roots: Vec<TargetedRootRecord>,
     pub conservative_spans: Vec<ConservativeRootSpan>,
+    pub conservative_cells: Vec<crate::gc::ConservativeRootCell>,
     pub source: ConservativeRootSource,
 }
 
@@ -328,13 +282,22 @@ impl RootMarkingPlan {
             }
         }
 
+        for root in &self.conservative_cells {
+            if root.candidate_address == 0 || root.cell == CellId::default() {
+                return Err(RootPlanningError::InvalidConservativeRootCell(*root));
+            }
+        }
+
         Ok(())
     }
 
     pub fn planned_steps(&self) -> Result<Vec<RootPlanStep>, RootPlanningError> {
         self.validate()?;
         let mut steps = Vec::with_capacity(
-            self.precise_roots.len() + self.targeted_roots.len() + self.conservative_spans.len(),
+            self.precise_roots.len()
+                + self.targeted_roots.len()
+                + self.conservative_spans.len()
+                + self.conservative_cells.len(),
         );
 
         for root in &self.precise_roots {
@@ -359,6 +322,13 @@ impl RootMarkingPlan {
             });
         }
 
+        for root in &self.conservative_cells {
+            steps.push(RootPlanStep::ConservativeCell {
+                root: *root,
+                source: self.source,
+            });
+        }
+
         Ok(steps)
     }
 }
@@ -378,6 +348,10 @@ pub enum RootPlanStep {
         span: ConservativeRootSpan,
         source: ConservativeRootSource,
     },
+    ConservativeCell {
+        root: crate::gc::ConservativeRootCell,
+        source: ConservativeRootSource,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -388,6 +362,7 @@ pub enum RootPlanningError {
         target: CellId,
     },
     InvalidConservativeSpan(ConservativeRootSpan),
+    InvalidConservativeRootCell(crate::gc::ConservativeRootCell),
 }
 
 pub fn root_mark_reason_for_kind(kind: crate::gc::RootKind) -> RootMarkReason {
@@ -419,6 +394,7 @@ mod tests {
                 begin: 0x1000,
                 end: 0x1010,
             }],
+            conservative_cells: Vec::new(),
             source: ConservativeRootSource::MachineStack,
         };
 
@@ -453,6 +429,7 @@ mod tests {
                 begin: 0x1000,
                 end: 0x1000,
             }],
+            conservative_cells: Vec::new(),
             source: ConservativeRootSource::Host,
         };
 
