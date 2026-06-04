@@ -239,8 +239,11 @@ use executables::{
 #[cfg(test)]
 use self::native_reentry::p6_x86_64_callable_side_exit_payload_has_reserved_tag;
 use self::native_reentry::{
-    p6_arm64_emitted_semantic_native_raw_return, p6_arm64_reject_side_exit_reentry_execution,
-    p6_p9_p10_p14_x86_64_callable_native_return_payload, P6Arm64EmittedSemanticNativeRawReturn,
+    p6_arm64_emitted_semantic_native_raw_return,
+    p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate,
+    p6_arm64_reject_side_exit_reentry_execution,
+    p6_p9_p10_p14_x86_64_callable_native_return_payload,
+    P6Arm64BranchAwareCallableAdmissionRejection, P6Arm64EmittedSemanticNativeRawReturn,
     P6NativeSideExitReentryCallBridge, P6P9P10P14X86_64CallableNativeReturnPayload,
 };
 pub use self::runtime::{
@@ -3516,10 +3519,18 @@ impl Vm {
                                 P6X86_64BaselineSemanticByteEmissionError::UnsupportedArm64SeedLoweredOperation {
                                     ..
                                 },
-                            ) => Self::emit_p6_x86_64_callable_semantic_from_lowering_plan(
-                                &lowering.plan,
-                                owner_continuation_map_for_emission.as_ref(),
-                            ),
+                            ) => {
+                                let admission_rejection =
+                                    p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate();
+                                debug_assert_eq!(
+                                    admission_rejection,
+                                    P6Arm64BranchAwareCallableAdmissionRejection::MissingBranchAwareSemanticEmission
+                                );
+                                Self::emit_p6_x86_64_callable_semantic_from_lowering_plan(
+                                    &lowering.plan,
+                                    owner_continuation_map_for_emission.as_ref(),
+                                )
+                            }
                             Err(error) => Err(
                                 P6X86_64SemanticBaselineNativeEntryInstallError::SemanticByteEmission {
                                     error,
@@ -56767,6 +56778,12 @@ mod tests {
     #[cfg(all(unix, target_arch = "aarch64"))]
     #[test]
     fn vm_p6_arm64_public_branch_aware_jump_if_false_uses_x86_semantic_fallback_artifact() {
+        assert_eq!(
+            p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate(
+            ),
+            P6Arm64BranchAwareCallableAdmissionRejection::MissingBranchAwareSemanticEmission
+        );
+
         let code_block = p8b_jump_if_false_code_block(P8bTruthinessSource::Bool(false));
         let mut vm = Vm::new(VmConfig::baseline_allowed());
         let owner = register_test_code_block(&mut vm, code_block);

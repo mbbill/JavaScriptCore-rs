@@ -108,7 +108,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            request bridge preserve dormant JumpIfFalse taken/fallthrough native
            reentry targets; retained ARM64 fallback can privately reenter a
            resolved P6 target, while public ARM64 branch-aware callable
-           admission still falls back to the existing x86 semantic artifact.
+           admission has an explicit rejecting proof skeleton and still falls
+           back to the existing x86 semantic artifact.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
