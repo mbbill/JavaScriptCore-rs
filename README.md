@@ -121,7 +121,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            caller-slot address is the future FrameAddress source, with
            VM-owned active/retired storage handles and storage-derived native
            publication proofs while the raw native ABI frame-base stays
-           separate; native execution unchanged.
+           separate; src/vm/entry_frame_storage.rs adds the dormant
+           EntryFrame.h/VMEntryRecord.h-shaped previous-top-pair storage/proof
+           skeleton for future topEntryFrame publication; native execution
+           unchanged.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler

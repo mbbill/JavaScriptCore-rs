@@ -18,6 +18,7 @@ mod call_link;
 mod code_blocks;
 mod config;
 mod entry;
+mod entry_frame_storage;
 mod exceptions;
 mod executables;
 mod generated_executor;
@@ -238,6 +239,7 @@ use executables::{
 };
 
 use self::call_frame_storage::JscCallFrameStorage;
+use self::entry_frame_storage::JscEntryFrameStorage;
 #[cfg(test)]
 use self::native_reentry::p6_x86_64_callable_side_exit_payload_has_reserved_tag;
 use self::native_reentry::{
@@ -880,6 +882,8 @@ pub struct Vm {
     entry: VmEntryState,
     #[allow(dead_code)]
     call_frame_storage: JscCallFrameStorage,
+    #[allow(dead_code)]
+    entry_frame_storage: JscEntryFrameStorage,
     exceptions: ExceptionState,
     structures: RuntimeStructures,
     caches: RuntimeCaches,
@@ -1839,6 +1843,7 @@ impl Vm {
             api_protections,
             entry: VmEntryState::default(),
             call_frame_storage: JscCallFrameStorage::default(),
+            entry_frame_storage: JscEntryFrameStorage::default(),
             exceptions: ExceptionState::default(),
             structures: RuntimeStructures::default(),
             caches: RuntimeCaches::default(),
