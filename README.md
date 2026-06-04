@@ -129,11 +129,12 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            native call-frame publication; src/vm/native_reentry.rs now derives
            the publication proof from those storage-backed entry/call-frame
            guards before rejecting at the conservative-root blocker;
-           src/gc/machine_stack_marker.rs adds the dormant
-           MachineStackMarker/RegisterState-shaped crate-internal,
-           heap/epoch-bound current-thread gather+ingest closure without
-           treating boxed VM frame storage as machine-stack evidence; native
-           execution unchanged.
+           src/gc/machine_stack_marker.rs and src/wtf/stack_bounds.rs add the
+           dormant MachineStackMarker/RegisterState/WTF StackBounds-shaped
+           crate-internal, heap/epoch-bound current-thread gather+ingest
+           closure with real macOS/aarch64 stack-bounds and x19-x28 capture,
+           without treating boxed VM frame storage as machine-stack evidence;
+           native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler

@@ -7,6 +7,10 @@
 //! WTF contracts describe infrastructure ownership only. They must not mint or
 //! reinterpret JavaScript heap-cell identity; that remains `gc::CellId`.
 
+mod stack_bounds;
+
+pub(crate) use stack_bounds::{WtfStackBounds, WtfStackBoundsError};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WtfDependencyKind {
     Vector,

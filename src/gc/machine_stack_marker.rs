@@ -6,9 +6,12 @@
 
 use core::marker::PhantomData;
 
-use crate::gc::{
-    ConservativeRootSpan, ConservativeRoots, GcPhase, HeapEpoch, HeapId, HeapIntegrationError,
-    HeapStateDescriptor, MutatorState,
+use crate::{
+    gc::{
+        ConservativeRootSpan, ConservativeRoots, GcPhase, HeapEpoch, HeapId, HeapIntegrationError,
+        HeapStateDescriptor, MutatorState,
+    },
+    wtf::{WtfStackBounds, WtfStackBoundsError},
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -26,35 +29,54 @@ pub(crate) struct JscArm64RegisterState {
     pub x28: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::gc) struct JscCurrentThreadStateSnapshot {
-    stack_origin: usize,
-    stack_top: usize,
-    register_state: JscArm64RegisterState,
-}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+macro_rules! capture_current_macos_aarch64_register_state {
+    ($register_state:expr) => {{
+        let register_state_ptr = &mut $register_state as *mut JscArm64RegisterState;
 
-impl JscCurrentThreadStateSnapshot {
-    pub(in crate::gc) const fn new(
-        stack_top: usize,
-        stack_origin: usize,
-        register_state: JscArm64RegisterState,
-    ) -> Self {
-        Self {
-            stack_origin,
-            stack_top,
-            register_state,
+        // SAFETY: `register_state_ptr` points to writable stack-local
+        // `JscArm64RegisterState` storage in the current-thread capture function.
+        // This macro expands at the capture site, matching C++ JSC's
+        // `ALLOCATE_AND_GET_REGISTER_STATE`: no Rust helper-call prologue can
+        // move caller callee-saves out of the scanned stack span before the asm
+        // stores x19..x28. The asm uses caller-scratch x9 as the base register
+        // and intentionally does not claim `nomem` because it writes through
+        // `register_state_ptr`.
+        unsafe {
+            core::arch::asm!(
+                "str x19, [x9, #0]",
+                "str x20, [x9, #8]",
+                "str x21, [x9, #16]",
+                "str x22, [x9, #24]",
+                "str x23, [x9, #32]",
+                "str x24, [x9, #40]",
+                "str x25, [x9, #48]",
+                "str x26, [x9, #56]",
+                "str x27, [x9, #64]",
+                "str x28, [x9, #72]",
+                in("x9") register_state_ptr,
+                options(preserves_flags),
+            );
         }
-    }
+    }};
 }
 
 #[derive(Debug)]
-pub(in crate::gc) struct JscCurrentThreadState {
+pub(in crate::gc) struct JscCurrentThreadState<'registers> {
     stack_origin: usize,
     stack_top: usize,
-    register_state: JscArm64RegisterState,
+    register_state: Option<&'registers JscArm64RegisterState>,
 }
 
-impl JscCurrentThreadState {
+impl<'registers> JscCurrentThreadState<'registers> {
+    pub(in crate::gc) fn stack_origin_address(&self) -> usize {
+        self.stack_origin
+    }
+
+    pub(in crate::gc) fn stack_top_address(&self) -> usize {
+        self.stack_top
+    }
+
     pub(in crate::gc) fn stack_span(&self) -> ConservativeRootSpan {
         normalize_span(ConservativeRootSpan {
             begin: self.stack_top,
@@ -62,19 +84,20 @@ impl JscCurrentThreadState {
         })
     }
 
-    pub(in crate::gc) fn register_state(&self) -> &JscArm64RegisterState {
-        &self.register_state
+    pub(in crate::gc) fn register_state(&self) -> Option<&JscArm64RegisterState> {
+        self.register_state
     }
 
-    pub(in crate::gc) fn register_state_span(&self) -> ConservativeRootSpan {
-        let begin = self.register_state() as *const JscArm64RegisterState as usize;
-        ConservativeRootSpan {
+    pub(in crate::gc) fn register_state_span(&self) -> Option<ConservativeRootSpan> {
+        let register_state = self.register_state()?;
+        let begin = register_state as *const JscArm64RegisterState as usize;
+        Some(ConservativeRootSpan {
             begin,
             end: round_up_to_multiple(
                 begin + core::mem::size_of::<JscArm64RegisterState>(),
                 core::mem::size_of::<usize>(),
             ),
-        }
+        })
     }
 }
 
@@ -92,6 +115,16 @@ pub(crate) struct JscMachineStackRootSpan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JscMachineStackMarkerError {
+    CurrentThreadCaptureUnsupported {
+        target_os: &'static str,
+        target_arch: &'static str,
+    },
+    StackBounds(WtfStackBoundsError),
+    StackTopOutsideBounds {
+        stack_top: usize,
+        stack_origin: usize,
+        stack_bound: usize,
+    },
     CollectionPhaseRequired {
         phase: GcPhase,
     },
@@ -102,6 +135,7 @@ pub(crate) enum JscMachineStackMarkerError {
         kind: JscMachineStackRootSpanKind,
         span: ConservativeRootSpan,
     },
+    MissingRegisterState,
     UnalignedSpan {
         kind: JscMachineStackRootSpanKind,
         span: ConservativeRootSpan,
@@ -116,6 +150,12 @@ pub(crate) enum JscMachineStackMarkerError {
 pub(in crate::gc) enum JscMachineStackRootingIngestError {
     Marker(JscMachineStackMarkerError),
     Heap(HeapIntegrationError),
+}
+
+impl From<WtfStackBoundsError> for JscMachineStackMarkerError {
+    fn from(error: WtfStackBoundsError) -> Self {
+        Self::StackBounds(error)
+    }
 }
 
 impl From<JscMachineStackMarkerError> for JscMachineStackRootingIngestError {
@@ -138,7 +178,7 @@ pub(crate) struct JscMachineStackConservativeRootingProof<'state> {
     mutator_state: MutatorState,
     roots: ConservativeRoots,
     spans: [JscMachineStackRootSpan; 2],
-    _state: PhantomData<&'state JscCurrentThreadState>,
+    _state: PhantomData<&'state JscCurrentThreadState<'state>>,
 }
 
 impl<'state> JscMachineStackConservativeRootingProof<'state> {
@@ -183,22 +223,9 @@ impl JscMachineStackMarker {
 
     pub(in crate::gc) fn call_with_current_thread_state<R>(
         &self,
-        snapshot: &JscCurrentThreadStateSnapshot,
-        lambda: impl for<'state> FnOnce(&'state JscCurrentThreadState) -> R,
-    ) -> R {
-        // C++ `DECLARE_AND_COMPUTE_CURRENT_THREAD_STATE` captures a live stack
-        // local plus real callee-save registers. This dormant Rust skeleton
-        // still takes explicit test stack bounds and synthetic register values,
-        // but the register span is derived from this lexical register storage,
-        // not from caller-supplied addresses. Accepting boxed VM/call-frame
-        // addresses here would not prove that native machine stack words are
-        // conservatively visible to GC.
-        let state = JscCurrentThreadState {
-            stack_origin: snapshot.stack_origin,
-            stack_top: snapshot.stack_top,
-            register_state: snapshot.register_state,
-        };
-        lambda(&state)
+        lambda: impl for<'state> FnOnce(&'state JscCurrentThreadState<'state>) -> R,
+    ) -> Result<R, JscMachineStackMarkerError> {
+        self.capture_current_thread_state(lambda)
     }
 
     pub(in crate::gc) fn with_current_thread_conservative_roots<R>(
@@ -206,10 +233,90 @@ impl JscMachineStackMarker {
         heap: HeapId,
         epoch: HeapEpoch,
         heap_state: HeapStateDescriptor,
-        snapshot: &JscCurrentThreadStateSnapshot,
         lambda: impl for<'state> FnOnce(JscMachineStackConservativeRootingProof<'state>) -> R,
     ) -> Result<R, JscMachineStackMarkerError> {
-        self.call_with_current_thread_state(snapshot, |state| {
+        validate_collection_state(heap_state)?;
+        self.call_with_current_thread_state(|state| {
+            self.gather_from_current_thread_state(heap, epoch, heap_state, state)
+                .map(lambda)
+        })?
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn capture_current_thread_state<R>(
+        &self,
+        lambda: impl for<'state> FnOnce(&'state JscCurrentThreadState<'state>) -> R,
+    ) -> Result<R, JscMachineStackMarkerError> {
+        let stack_bounds = WtfStackBounds::current_thread_stack_bounds()?;
+        let mut state = JscCurrentThreadState {
+            stack_origin: stack_bounds.origin_address(),
+            stack_top: 0,
+            register_state: None,
+        };
+
+        // C++ `DECLARE_AND_COMPUTE_CURRENT_THREAD_STATE` uses the address of the
+        // `CurrentThreadState` stack local as `stackTop`, then records Darwin
+        // stack origin and expands `ALLOCATE_AND_GET_REGISTER_STATE` in place.
+        // Rust keeps that structure: `register_state` is separate lexical
+        // storage, `state` points at it, and the proof borrows `state` inside the
+        // marker closure. C++ applies red-zone adjustment only when copying
+        // suspended other-thread stacks, not in current-thread gather. Boxed
+        // VM/call-frame storage is still not machine-stack evidence and cannot
+        // enter this production path.
+        state.stack_top = &state as *const _ as usize;
+        if !stack_bounds.contains_address(state.stack_top) {
+            return Err(JscMachineStackMarkerError::StackTopOutsideBounds {
+                stack_top: state.stack_top,
+                stack_origin: stack_bounds.origin_address(),
+                stack_bound: stack_bounds.bound_address(),
+            });
+        }
+        let mut register_state = JscArm64RegisterState::default();
+        capture_current_macos_aarch64_register_state!(register_state);
+        state.register_state = Some(&register_state);
+
+        Ok(lambda(&state))
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    fn capture_current_thread_state<R>(
+        &self,
+        _lambda: impl for<'state> FnOnce(&'state JscCurrentThreadState<'state>) -> R,
+    ) -> Result<R, JscMachineStackMarkerError> {
+        Err(
+            JscMachineStackMarkerError::CurrentThreadCaptureUnsupported {
+                target_os: std::env::consts::OS,
+                target_arch: std::env::consts::ARCH,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn synthetic_current_thread_state_for_testing<R>(
+        &self,
+        stack_span: ConservativeRootSpan,
+        lambda: impl for<'state> FnOnce(&'state JscCurrentThreadState<'state>) -> R,
+    ) -> R {
+        let register_state = JscArm64RegisterState::default();
+        let state = JscCurrentThreadState {
+            stack_origin: stack_span.end,
+            stack_top: stack_span.begin,
+            register_state: Some(&register_state),
+        };
+        lambda(&state)
+    }
+
+    #[cfg(test)]
+    fn with_synthetic_current_thread_conservative_roots_for_testing<R>(
+        &self,
+        heap: HeapId,
+        epoch: HeapEpoch,
+        heap_state: HeapStateDescriptor,
+        stack_span: ConservativeRootSpan,
+        lambda: impl for<'state> FnOnce(JscMachineStackConservativeRootingProof<'state>) -> R,
+    ) -> Result<R, JscMachineStackMarkerError> {
+        validate_collection_state(heap_state)?;
+        self.synthetic_current_thread_state_for_testing(stack_span, |state| {
             self.gather_from_current_thread_state(heap, epoch, heap_state, state)
                 .map(lambda)
         })
@@ -220,13 +327,16 @@ impl JscMachineStackMarker {
         heap: HeapId,
         epoch: HeapEpoch,
         heap_state: HeapStateDescriptor,
-        state: &'state JscCurrentThreadState,
+        state: &'state JscCurrentThreadState<'state>,
     ) -> Result<JscMachineStackConservativeRootingProof<'state>, JscMachineStackMarkerError> {
         validate_collection_state(heap_state)?;
 
+        let register_state_span = state
+            .register_state_span()
+            .ok_or(JscMachineStackMarkerError::MissingRegisterState)?;
         let register_span = validate_span(
             JscMachineStackRootSpanKind::RegisterState,
-            state.register_state_span(),
+            register_state_span,
         )?;
         let stack_span = validate_span(JscMachineStackRootSpanKind::Stack, state.stack_span())?;
 
@@ -350,14 +460,6 @@ mod tests {
         }
     }
 
-    fn snapshot(stack_span: ConservativeRootSpan) -> JscCurrentThreadStateSnapshot {
-        JscCurrentThreadStateSnapshot::new(
-            stack_span.begin,
-            stack_span.end,
-            JscArm64RegisterState::default(),
-        )
-    }
-
     fn collecting_heap() -> Heap {
         let mut heap = Heap::new();
         heap.enter_phase(
@@ -409,7 +511,6 @@ mod tests {
                 heap.id(),
                 heap.epoch(),
                 heap.state_descriptor(),
-                &snapshot(stack_span()),
                 |_| ()
             ),
             Err(JscMachineStackMarkerError::CollectionPhaseRequired {
@@ -424,10 +525,7 @@ mod tests {
         let mut heap = Heap::new();
 
         assert_eq!(
-            heap.ingest_current_thread_machine_stack_conservative_roots(
-                &marker,
-                &snapshot(stack_span())
-            ),
+            heap.ingest_current_thread_machine_stack_conservative_roots(&marker),
             Err(JscMachineStackRootingIngestError::Marker(
                 JscMachineStackMarkerError::CollectionPhaseRequired {
                     phase: GcPhase::NotRunning
@@ -451,7 +549,6 @@ mod tests {
                 heap.id(),
                 heap.epoch(),
                 heap.state_descriptor(),
-                &snapshot(stack_span()),
                 |_| ()
             ),
             Err(JscMachineStackMarkerError::MutatorMustBeCollecting {
@@ -471,10 +568,7 @@ mod tests {
         );
 
         assert_eq!(
-            heap.ingest_current_thread_machine_stack_conservative_roots(
-                &marker,
-                &snapshot(stack_span())
-            ),
+            heap.ingest_current_thread_machine_stack_conservative_roots(&marker),
             Err(JscMachineStackRootingIngestError::Marker(
                 JscMachineStackMarkerError::MutatorMustBeCollecting {
                     mutator_state: MutatorState::Running
@@ -493,40 +587,17 @@ mod tests {
         };
 
         assert_eq!(
-            marker.with_current_thread_conservative_roots(
+            marker.with_synthetic_current_thread_conservative_roots_for_testing(
                 heap.id(),
                 heap.epoch(),
                 heap.state_descriptor(),
-                &snapshot(empty_stack),
+                empty_stack,
                 |_| ()
             ),
             Err(JscMachineStackMarkerError::EmptySpan {
                 kind: JscMachineStackRootSpanKind::Stack,
                 span: empty_stack
             })
-        );
-    }
-
-    #[test]
-    fn heap_current_thread_ingest_rejects_empty_stack_span() {
-        let marker = JscMachineStackMarker::new();
-        let mut heap = collecting_heap();
-        let empty_stack = ConservativeRootSpan {
-            begin: 0x2000,
-            end: 0x2000,
-        };
-
-        assert_eq!(
-            heap.ingest_current_thread_machine_stack_conservative_roots(
-                &marker,
-                &snapshot(empty_stack)
-            ),
-            Err(JscMachineStackRootingIngestError::Marker(
-                JscMachineStackMarkerError::EmptySpan {
-                    kind: JscMachineStackRootSpanKind::Stack,
-                    span: empty_stack
-                }
-            ))
         );
     }
 
@@ -540,11 +611,11 @@ mod tests {
         };
 
         assert_eq!(
-            marker.with_current_thread_conservative_roots(
+            marker.with_synthetic_current_thread_conservative_roots_for_testing(
                 heap.id(),
                 heap.epoch(),
                 heap.state_descriptor(),
-                &snapshot(unaligned_stack),
+                unaligned_stack,
                 |_| ()
             ),
             Err(JscMachineStackMarkerError::UnalignedSpan {
@@ -556,39 +627,15 @@ mod tests {
     }
 
     #[test]
-    fn heap_current_thread_ingest_rejects_unaligned_stack_span() {
-        let marker = JscMachineStackMarker::new();
-        let mut heap = collecting_heap();
-        let unaligned_stack = ConservativeRootSpan {
-            begin: 0x2000,
-            end: 0x3001,
-        };
-
-        assert_eq!(
-            heap.ingest_current_thread_machine_stack_conservative_roots(
-                &marker,
-                &snapshot(unaligned_stack)
-            ),
-            Err(JscMachineStackRootingIngestError::Marker(
-                JscMachineStackMarkerError::UnalignedSpan {
-                    kind: JscMachineStackRootSpanKind::Stack,
-                    span: unaligned_stack,
-                    pointer_width: core::mem::size_of::<usize>()
-                }
-            ))
-        );
-    }
-
-    #[test]
-    fn records_register_span_before_stack_span() {
+    fn synthetic_gather_records_register_span_before_stack_span_for_testing() {
         let marker = JscMachineStackMarker::new();
         let heap = collecting_heap();
         let (spans, root_spans) = marker
-            .with_current_thread_conservative_roots(
+            .with_synthetic_current_thread_conservative_roots_for_testing(
                 heap.id(),
                 heap.epoch(),
                 heap.state_descriptor(),
-                &snapshot(stack_span()),
+                stack_span(),
                 |proof| {
                     (
                         [proof.spans()[0], proof.spans()[1]],
@@ -611,34 +658,130 @@ mod tests {
     }
 
     #[test]
-    fn register_span_is_derived_from_lexical_register_storage() {
+    fn synthetic_register_span_is_derived_from_lexical_register_storage_for_testing() {
         let marker = JscMachineStackMarker::new();
-        let observed = marker.call_with_current_thread_state(&snapshot(stack_span()), |state| {
-            let register_address = state.register_state() as *const JscArm64RegisterState as usize;
-            let span = state.register_state_span();
-            (register_address, span)
+        let observed = marker.synthetic_current_thread_state_for_testing(stack_span(), |state| {
+            let state_begin = state as *const _ as usize;
+            let state_end = state_begin + core::mem::size_of_val(state);
+            let register_address = state.register_state().expect("register state")
+                as *const JscArm64RegisterState as usize;
+            let span = state.register_state_span().expect("register state span");
+            (state_begin, state_end, register_address, span)
         });
 
-        assert_eq!(observed.1.begin, observed.0);
+        assert!(observed.2 < observed.0 || observed.2 >= observed.1);
+        assert_eq!(observed.3.begin, observed.2);
         assert_eq!(
-            observed.1.end,
+            observed.3.end,
             round_up_to_multiple(
-                observed.0 + core::mem::size_of::<JscArm64RegisterState>(),
+                observed.2 + core::mem::size_of::<JscArm64RegisterState>(),
                 core::mem::size_of::<usize>(),
             )
         );
     }
 
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     #[test]
-    fn heap_ingests_current_thread_roots_inside_marker_closure() {
+    fn current_thread_capture_reports_unsupported_on_other_targets() {
+        let marker = JscMachineStackMarker::new();
+
+        assert_eq!(
+            marker.call_with_current_thread_state(|_| ()),
+            Err(
+                JscMachineStackMarkerError::CurrentThreadCaptureUnsupported {
+                    target_os: std::env::consts::OS,
+                    target_arch: std::env::consts::ARCH,
+                }
+            )
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn captured_stack_top_is_inside_wtf_stack_bounds() {
+        let marker = JscMachineStackMarker::new();
+        let (bounds, stack_top, stack_span) = marker
+            .call_with_current_thread_state(|state| {
+                (
+                    WtfStackBounds::current_thread_stack_bounds().expect("stack bounds"),
+                    state.stack_top_address(),
+                    state.stack_span(),
+                )
+            })
+            .expect("current-thread state");
+
+        assert!(bounds.contains_address(stack_top));
+        assert_eq!(stack_span.end, bounds.origin_address());
+        assert!(stack_span.begin < stack_span.end);
+        assert_eq!(stack_span.begin % core::mem::size_of::<usize>(), 0);
+        assert_eq!(stack_span.end % core::mem::size_of::<usize>(), 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn captured_register_span_is_lexical_and_pointer_sized() {
+        let marker = JscMachineStackMarker::new();
+        let (state_begin, state_end, register_address, register_span) = marker
+            .call_with_current_thread_state(|state| {
+                let state_begin = state as *const _ as usize;
+                (
+                    state_begin,
+                    state_begin + core::mem::size_of_val(state),
+                    state.register_state().expect("register state") as *const JscArm64RegisterState
+                        as usize,
+                    state.register_state_span().expect("register state span"),
+                )
+            })
+            .expect("current-thread state");
+
+        assert!(register_address < state_begin || register_address >= state_end);
+        assert_eq!(register_span.begin, register_address);
+        assert_eq!(
+            register_span.end - register_span.begin,
+            core::mem::size_of::<JscArm64RegisterState>()
+        );
+        assert_eq!(register_span.begin % core::mem::size_of::<usize>(), 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn captured_current_thread_gather_records_register_span_before_stack_span() {
+        let marker = JscMachineStackMarker::new();
+        let heap = collecting_heap();
+        let (spans, root_spans) = marker
+            .with_current_thread_conservative_roots(
+                heap.id(),
+                heap.epoch(),
+                heap.state_descriptor(),
+                |proof| {
+                    (
+                        [proof.spans()[0], proof.spans()[1]],
+                        proof.conservative_roots().spans().to_vec(),
+                    )
+                },
+            )
+            .expect("machine-stack proof");
+
+        assert_eq!(spans[0].kind, JscMachineStackRootSpanKind::RegisterState);
+        assert_eq!(spans[1].kind, JscMachineStackRootSpanKind::Stack);
+        assert_eq!(root_spans, vec![spans[0].span, spans[1].span]);
+    }
+
+    #[test]
+    fn heap_ingests_synthetic_roots_inside_marker_closure_for_testing() {
         let marker = JscMachineStackMarker::new();
         let mut heap = collecting_heap();
 
-        heap.ingest_current_thread_machine_stack_conservative_roots(
-            &marker,
-            &snapshot(stack_span()),
-        )
-        .expect("proof-minted ingest");
+        marker
+            .with_synthetic_current_thread_conservative_roots_for_testing(
+                heap.id(),
+                heap.epoch(),
+                heap.state_descriptor(),
+                stack_span(),
+                |proof| heap.ingest_machine_stack_conservative_roots(proof),
+            )
+            .expect("marker")
+            .expect("proof-minted ingest");
 
         let steps = heap.root_marking_plan().planned_steps().expect("root plan");
         assert_eq!(steps.len(), 2);
@@ -660,6 +803,37 @@ mod tests {
                 source: crate::gc::ConservativeRootSource::MachineStack
             }
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn heap_ingests_current_thread_roots_inside_marker_closure() {
+        let marker = JscMachineStackMarker::new();
+        let mut heap = collecting_heap();
+
+        heap.ingest_current_thread_machine_stack_conservative_roots(&marker)
+            .expect("proof-minted ingest");
+
+        let steps = heap.root_marking_plan().planned_steps().expect("root plan");
+        assert_eq!(steps.len(), 2);
+        let RootPlanStep::Conservative {
+            span: register_span,
+            source: crate::gc::ConservativeRootSource::MachineStack,
+        } = steps[0]
+        else {
+            panic!("register span should be a conservative root step");
+        };
+        assert_eq!(
+            register_span.end - register_span.begin,
+            core::mem::size_of::<JscArm64RegisterState>()
+        );
+        assert!(matches!(
+            steps[1],
+            RootPlanStep::Conservative {
+                source: crate::gc::ConservativeRootSource::MachineStack,
+                ..
+            }
+        ));
     }
 
     #[test]
