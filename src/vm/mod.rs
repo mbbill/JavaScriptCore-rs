@@ -23,6 +23,7 @@ mod generated_executor;
 mod generated_metrics;
 mod property_handoff;
 mod runtime;
+mod side_exit;
 mod tiering;
 
 use crate::api::{
@@ -159,6 +160,8 @@ use crate::jit::plan::{
     BaselineGeneratedRuntimeBoundaryProof, BaselineGeneratedRuntimeHelperPlanDerivation,
     BaselineGeneratedRuntimeHelperPlanMetadata,
 };
+#[cfg(test)]
+use crate::jit::P6BaselineNativeReentryTargetRecord;
 use crate::jit::{
     emit_p6_arm64_baseline_callable_semantic_bytes,
     emit_p6_x86_64_baseline_callable_semantic_bytes_with_owner_continuation_map,
@@ -185,10 +188,9 @@ use crate::jit::{
     JitCodeValidationError, JitPlanValidationError, JitType, LinkBufferCopyLinkRecord,
     LinkBufferFinalizationRecord, LinkBufferFinalizationRequest, LinkedCallKind, MachineCodeHandle,
     MachineCodeOwnership, MachineCodeRange, P14X86_64BaselineBackedgeSafepointAuthority,
-    P14X86_64BaselineLoopBackedgeReturnPayload, P6BaselineNativeReentryTargetRecord,
-    P6X86_64BaselineBackendContractError, P6X86_64BaselineBytecodeBranchKind,
-    P6X86_64BaselineInstructionSelectionError, P6X86_64BaselineLoweringError,
-    P6X86_64BaselineLoweringPlan, P6X86_64BaselineLoweringRequest,
+    P14X86_64BaselineLoopBackedgeReturnPayload, P6X86_64BaselineBackendContractError,
+    P6X86_64BaselineBytecodeBranchKind, P6X86_64BaselineInstructionSelectionError,
+    P6X86_64BaselineLoweringError, P6X86_64BaselineLoweringPlan, P6X86_64BaselineLoweringRequest,
     P6X86_64BaselineSelectedSideExitReason, P6X86_64BaselineSemanticByteEmissionError,
     P6X86_64BaselineSemanticByteEmissionResult, P6X86_64BaselineSideExitReturnPayload,
     PropertyHasObservationDescriptor, PropertyLoadAccessCasePlanKind,
@@ -240,6 +242,10 @@ pub use self::runtime::{
     RuntimeStructures, VmDescriptorOwner, VmDescriptorProvenance, VmLifecycleState,
     VmMutationAuthority, VmServiceDescriptor, VmServiceKind, VmServices, VmStaticDescriptorTables,
     VmStaticDescriptorTablesBuilder, VmStaticDescriptorValidationError, VmStructureTableDescriptor,
+};
+use self::side_exit::{
+    p6_side_exit_native_reentry_target_for_single_dispatch_outcome,
+    P6X86_64CallableSideExitReturnSite,
 };
 pub use config::{HeapPolicy, HostCapabilities, VmConfig, VmExecutionMode};
 pub use entry::{
@@ -618,22 +624,6 @@ struct P6EmittedNativeDispatch<'a> {
     readiness: &'a BaselineNativeEntryReadinessRecord,
     descriptor: &'a BaselineNativeEntryDescriptor,
     allow_interpreter_fallback: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct P6X86_64CallableSideExitReturnSite {
-    bytecode_index: BytecodeIndex,
-    reason: P6X86_64BaselineSelectedSideExitReason,
-    side_exit_index: u32,
-    resume_bytecode_index: Option<BytecodeIndex>,
-    resume_entry_offset: Option<u32>,
-    // C++ JSC publishes bytecode->native labels through
-    // `fastPathResumePoint`/`JITCodeMapBuilder`. This minimal VM-table
-    // extension keeps the dormant Rust stand-in with the retained payload
-    // owner instead of creating a separate metadata owner before ARM64
-    // side-exit reentry/rooting exists.
-    native_reentry_targets: Vec<P6BaselineNativeReentryTargetRecord>,
-    encoded_payload: P6X86_64BaselineSideExitReturnPayload,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6337,13 +6327,12 @@ impl Vm {
         side_exit: &P6X86_64CallableSideExitReturnSite,
         outcome: &SingleDispatchOutcome,
     ) -> Result<Option<P6X86_64CallableNativeInvocation>, ExecutionError> {
-        let SingleDispatchOutcome::Continue(Some(resume_bytecode_index)) = outcome else {
-            return Ok(None);
-        };
-        if side_exit.resume_bytecode_index != Some(*resume_bytecode_index) {
-            return Ok(None);
-        }
-        let Some(resume_entry_offset) = side_exit.resume_entry_offset else {
+        let opcode = p6_core_opcode_at_bytecode_index(code_block, side_exit.bytecode_index);
+        let Some(native_reentry_target) =
+            p6_side_exit_native_reentry_target_for_single_dispatch_outcome(
+                side_exit, opcode, outcome,
+            )
+        else {
             return Ok(None);
         };
         let bytecode_snapshot =
@@ -6353,11 +6342,11 @@ impl Vm {
             return Err(ExecutionError::BaselineGeneratedExecutionRejected);
         }
         code_block
-            .decoded_instruction_at(*resume_bytecode_index)
+            .decoded_instruction_at(native_reentry_target.resume_bytecode_index)
             .map_err(|_| ExecutionError::BaselineGeneratedExecutionRejected)?;
         let entry_offset = p6_allocation_relative_entry_offset_for_side_exit_resume(
             dispatch,
-            resume_entry_offset,
+            native_reentry_target.resume_entry_offset,
         )?;
         Ok(Some(P6X86_64CallableNativeInvocation::Entry {
             entry_offset,
