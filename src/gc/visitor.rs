@@ -1,8 +1,8 @@
 //! Marking worklists, slot visitors, and conservative root scan descriptors.
 
 use crate::gc::{
-    CellId, ConservativeRootSpan, GcRef, HeapEpoch, HeapId, JsCell, MarkReason, RootRecord,
-    TargetedRootRecord,
+    CellId, ConservativeRootCell, ConservativeRootSpan, ConservativeRoots, GcRef, HeapEpoch,
+    HeapId, JsCell, MarkReason, RootRecord, TargetedRootRecord,
 };
 
 /// C++ `RootMarkReason` values that annotate a visitor's current root context.
@@ -100,6 +100,52 @@ pub struct MarkWorkItem {
     pub reason: MarkReason,
     pub dependency: MarkDependency,
     pub referrer: Option<ReferrerToken>,
+}
+
+/// Descriptor for C++ `SlotVisitor::append(const ConservativeRoots&)`.
+///
+/// Records are validated cell identities, not borrowed JSCell storage. The
+/// visitor metadata names the collector context that would own the mark-stack
+/// mutation in C++.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlotVisitorConservativeRootAppendPlan {
+    pub heap: HeapId,
+    pub marking_epoch: HeapEpoch,
+    pub worklist: MarkWorklistId,
+    pub root_mark_reason: RootMarkReason,
+    pub dependency: MarkDependency,
+    pub referrer: Option<ReferrerToken>,
+    pub records: Vec<SlotVisitorConservativeRootAppendRecord>,
+}
+
+/// One ordered conservative root append descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlotVisitorConservativeRootAppendRecord {
+    pub order: usize,
+    pub root: ConservativeRootCell,
+    pub cell: CellId,
+    pub heap: HeapId,
+    pub marking_epoch: HeapEpoch,
+    pub worklist: MarkWorklistId,
+    pub root_mark_reason: RootMarkReason,
+    pub dependency: MarkDependency,
+    pub referrer: Option<ReferrerToken>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotVisitorConservativeRootAppendError {
+    HeapMismatch {
+        visitor: HeapId,
+        roots: HeapId,
+    },
+    MarkingEpochMismatch {
+        visitor: HeapEpoch,
+        roots: HeapEpoch,
+    },
+    InvalidRootMarkReason {
+        actual: RootMarkReason,
+    },
+    InvalidConservativeRootCell(ConservativeRootCell),
 }
 
 /// Descriptor for stack balancing between mutator, collector, and helper worklists.
@@ -236,6 +282,73 @@ impl SlotVisitorDescriptor {
             dependency: MarkDependency::Weak,
             referrer: self.current_referrer,
         }
+    }
+
+    pub fn append_conservative_roots_descriptor(
+        &self,
+        roots: &ConservativeRoots,
+        roots_heap: HeapId,
+        roots_marking_epoch: HeapEpoch,
+    ) -> Result<SlotVisitorConservativeRootAppendPlan, SlotVisitorConservativeRootAppendError> {
+        if roots_heap != self.heap {
+            return Err(SlotVisitorConservativeRootAppendError::HeapMismatch {
+                visitor: self.heap,
+                roots: roots_heap,
+            });
+        }
+
+        if roots_marking_epoch != self.marking_epoch {
+            return Err(
+                SlotVisitorConservativeRootAppendError::MarkingEpochMismatch {
+                    visitor: self.marking_epoch,
+                    roots: roots_marking_epoch,
+                },
+            );
+        }
+
+        if self.root_mark_reason != RootMarkReason::ConservativeScan {
+            return Err(
+                SlotVisitorConservativeRootAppendError::InvalidRootMarkReason {
+                    actual: self.root_mark_reason,
+                },
+            );
+        }
+
+        let mut records = Vec::with_capacity(roots.size());
+        for (order, root) in roots.roots().iter().copied().enumerate() {
+            if root.candidate_address == 0 || root.cell == CellId::default() {
+                return Err(
+                    SlotVisitorConservativeRootAppendError::InvalidConservativeRootCell(root),
+                );
+            }
+
+            // C++ `appendJSCellOrAuxiliary` validates JSCell structure, runs
+            // `testAndSetMarked`, greys JSCells, appends them to the mark
+            // stack, and notes Auxiliary cells. Rust only emits descriptor
+            // records until real heap cell storage, mark bits, JSCell versus
+            // Auxiliary classification, and mark-stack mutation are ported.
+            records.push(SlotVisitorConservativeRootAppendRecord {
+                order,
+                root,
+                cell: root.cell,
+                heap: self.heap,
+                marking_epoch: self.marking_epoch,
+                worklist: self.worklist,
+                root_mark_reason: self.root_mark_reason,
+                dependency: MarkDependency::Conservative,
+                referrer: self.current_referrer,
+            });
+        }
+
+        Ok(SlotVisitorConservativeRootAppendPlan {
+            heap: self.heap,
+            marking_epoch: self.marking_epoch,
+            worklist: self.worklist,
+            root_mark_reason: self.root_mark_reason,
+            dependency: MarkDependency::Conservative,
+            referrer: self.current_referrer,
+            records,
+        })
     }
 }
 
@@ -381,6 +494,29 @@ mod tests {
     use super::*;
     use crate::gc::{HeapId, RootId, RootKind};
 
+    fn conservative_scan_visitor(heap: HeapId, epoch: HeapEpoch) -> SlotVisitorDescriptor {
+        let mut visitor = SlotVisitorDescriptor::new(heap, "slot-visitor-test", epoch);
+        visitor.worklist = MarkWorklistId(19);
+        visitor.current_referrer = Some(ReferrerToken {
+            kind: ReferrerTokenKind::RootMarkReason,
+            address: 0,
+            root_mark_reason: RootMarkReason::ConservativeScan,
+        });
+        visitor.root_mark_reason = RootMarkReason::ConservativeScan;
+        visitor
+    }
+
+    fn conservative_roots(cells: &[(usize, CellId)]) -> ConservativeRoots {
+        let mut roots = ConservativeRoots::new();
+        for (candidate_address, cell) in cells {
+            roots.add_validated_cell(ConservativeRootCell {
+                candidate_address: *candidate_address,
+                cell: *cell,
+            });
+        }
+        roots
+    }
+
     #[test]
     fn root_plan_orders_precise_roots_before_conservative_spans() {
         let plan = RootMarkingPlan {
@@ -441,6 +577,154 @@ mod tests {
                     end: 0x1000
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn slot_visitor_append_conservative_roots_preserves_order_and_reason() {
+        let heap = HeapId(7);
+        let epoch = HeapEpoch(11);
+        let visitor = conservative_scan_visitor(heap, epoch);
+        let roots = conservative_roots(&[(0x1000, CellId(1)), (0x2000, CellId(2))]);
+
+        let plan = visitor
+            .append_conservative_roots_descriptor(&roots, heap, epoch)
+            .expect("append descriptor");
+
+        assert_eq!(plan.heap, heap);
+        assert_eq!(plan.marking_epoch, epoch);
+        assert_eq!(plan.worklist, MarkWorklistId(19));
+        assert_eq!(plan.root_mark_reason, RootMarkReason::ConservativeScan);
+        assert_eq!(plan.dependency, MarkDependency::Conservative);
+        assert_eq!(plan.referrer, visitor.current_referrer);
+        assert_eq!(
+            plan.records,
+            vec![
+                SlotVisitorConservativeRootAppendRecord {
+                    order: 0,
+                    root: ConservativeRootCell {
+                        candidate_address: 0x1000,
+                        cell: CellId(1)
+                    },
+                    cell: CellId(1),
+                    heap,
+                    marking_epoch: epoch,
+                    worklist: MarkWorklistId(19),
+                    root_mark_reason: RootMarkReason::ConservativeScan,
+                    dependency: MarkDependency::Conservative,
+                    referrer: visitor.current_referrer
+                },
+                SlotVisitorConservativeRootAppendRecord {
+                    order: 1,
+                    root: ConservativeRootCell {
+                        candidate_address: 0x2000,
+                        cell: CellId(2)
+                    },
+                    cell: CellId(2),
+                    heap,
+                    marking_epoch: epoch,
+                    worklist: MarkWorklistId(19),
+                    root_mark_reason: RootMarkReason::ConservativeScan,
+                    dependency: MarkDependency::Conservative,
+                    referrer: visitor.current_referrer
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn slot_visitor_append_conservative_roots_accepts_empty_roots() {
+        let heap = HeapId(7);
+        let epoch = HeapEpoch(11);
+        let visitor = conservative_scan_visitor(heap, epoch);
+
+        let plan = visitor
+            .append_conservative_roots_descriptor(&ConservativeRoots::new(), heap, epoch)
+            .expect("append descriptor");
+
+        assert!(plan.records.is_empty());
+        assert_eq!(plan.root_mark_reason, RootMarkReason::ConservativeScan);
+        assert_eq!(plan.dependency, MarkDependency::Conservative);
+    }
+
+    #[test]
+    fn slot_visitor_append_conservative_roots_rejects_mismatch_or_wrong_reason() {
+        let heap = HeapId(7);
+        let epoch = HeapEpoch(11);
+        let visitor = conservative_scan_visitor(heap, epoch);
+        let roots = conservative_roots(&[(0x1000, CellId(1))]);
+
+        assert_eq!(
+            visitor.append_conservative_roots_descriptor(&roots, HeapId(8), epoch),
+            Err(SlotVisitorConservativeRootAppendError::HeapMismatch {
+                visitor: heap,
+                roots: HeapId(8)
+            })
+        );
+        assert_eq!(
+            visitor.append_conservative_roots_descriptor(&roots, heap, HeapEpoch(12)),
+            Err(
+                SlotVisitorConservativeRootAppendError::MarkingEpochMismatch {
+                    visitor: epoch,
+                    roots: HeapEpoch(12)
+                }
+            )
+        );
+
+        let wrong_reason = SlotVisitorDescriptor::new(heap, "slot-visitor-test", epoch);
+        assert_eq!(
+            wrong_reason.append_conservative_roots_descriptor(&roots, heap, epoch),
+            Err(
+                SlotVisitorConservativeRootAppendError::InvalidRootMarkReason {
+                    actual: RootMarkReason::None
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn slot_visitor_conservative_cells_stay_distinct_from_precise_roots() {
+        let heap = HeapId(7);
+        let epoch = HeapEpoch(11);
+        let visitor = conservative_scan_visitor(heap, epoch);
+        let conservative_root = ConservativeRootCell {
+            candidate_address: 0x3000,
+            cell: CellId(9),
+        };
+        let roots =
+            conservative_roots(&[(conservative_root.candidate_address, conservative_root.cell)]);
+
+        let append_plan = visitor
+            .append_conservative_roots_descriptor(&roots, heap, epoch)
+            .expect("append descriptor");
+        assert_eq!(append_plan.records[0].root, conservative_root);
+        assert_eq!(append_plan.records[0].cell, CellId(9));
+
+        let precise_root = RootRecord {
+            id: RootId(1),
+            kind: RootKind::Handle,
+            heap,
+        };
+        let plan = RootMarkingPlan {
+            precise_roots: vec![precise_root],
+            targeted_roots: Vec::new(),
+            conservative_spans: Vec::new(),
+            conservative_cells: vec![conservative_root],
+            source: ConservativeRootSource::MachineStack,
+        };
+
+        assert_eq!(
+            plan.planned_steps(),
+            Ok(vec![
+                RootPlanStep::Precise {
+                    root: precise_root,
+                    reason: RootMarkReason::StrongHandles
+                },
+                RootPlanStep::ConservativeCell {
+                    root: conservative_root,
+                    source: ConservativeRootSource::MachineStack
+                }
+            ])
         );
     }
 }

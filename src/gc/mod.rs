@@ -113,7 +113,8 @@ pub use visitor::{
     MarkStackTransfer, MarkStackTransferKind, MarkWorkItem, MarkWorklistDescriptor, MarkWorklistId,
     MarkWorklistKind, MarkWorklistStats, OpaqueRootId, OpaqueRootRecord, ReferrerToken,
     ReferrerTokenKind, RootMarkReason, RootMarkingPlan, RootPlanStep, RootPlanningError,
-    SlotVisitorDescriptor,
+    SlotVisitorConservativeRootAppendError, SlotVisitorConservativeRootAppendPlan,
+    SlotVisitorConservativeRootAppendRecord, SlotVisitorDescriptor,
 };
 pub use weak::{
     FinalizerKind, FinalizerPlan, FinalizerPlanEntry, FinalizerPlanningError,
