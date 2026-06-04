@@ -126,7 +126,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            skeleton, and src/vm/entry.rs now has a dormant storage-backed
            VM-entry guard that validates/restores the distinct topCallFrame /
            topEntryFrame pair and is the only reachable entry-guard path for
-           native call-frame publication; native execution unchanged.
+           native call-frame publication; src/vm/native_reentry.rs now derives
+           the publication proof from those storage-backed entry/call-frame
+           guards before rejecting at the conservative-root blocker; native
+           execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler

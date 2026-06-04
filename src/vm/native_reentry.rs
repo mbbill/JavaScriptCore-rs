@@ -480,21 +480,27 @@ mod tests {
     use super::*;
     use std::convert::Infallible;
 
+    use crate::bytecode::register::CallFrameSlotLayout;
     use crate::bytecode::{
         CodeBlockEntrypoints, CodeBlockLifecycleState, CodeKind, InterpreterEntrySlot, LinkContext,
         Operand, OperandWidth, PackedInstructionStream, RegisterFrameShape, TypedInstruction,
         UnlinkedCodeBlock, VirtualRegister,
     };
+    use crate::gc::HeapId;
+    use crate::interpreter::{FrameState, InstalledCallFrame, RegisterWindow};
     use crate::jit::{ExecutableAllocationId, P6BaselineNativeReentryTargetRecord};
     use crate::runtime::{
         ArityCheckMode, CallFrameId, CellId, CodeBlockId, CodeSpecializationKind, EntryFrameId,
         RuntimeValue,
     };
 
+    use super::super::call_frame_storage::JscCallFrameStorage;
     use super::super::entry::{
-        FrameAddress, VmEntryCallFrameMetadata, VmEntryLaunchArgumentValue,
-        VmNativeCallFramePublicationReason, VmNativeCallFramePublicationRecord,
+        EntryKind, FrameAddress, VmEntryCallFrameMetadata, VmEntryLaunchArgumentValue,
+        VmEntryLaunchScope, VmEntryState, VmNativeCallFramePublicationReason,
+        VmNativeCallFramePublicationRecord, VmNativeCallFramePublicationRequest,
     };
+    use super::super::entry_frame_storage::{JscEntryFrameRegistration, JscEntryFrameStorage};
 
     fn bci(offset: u32) -> BytecodeIndex {
         BytecodeIndex::from_offset(offset)
@@ -674,39 +680,118 @@ mod tests {
     }
 
     fn top_call_frame_publication_record() -> VmNativeCallFramePublicationRecord {
+        let mut entry_state = VmEntryState::default();
+        let mut entry_storage = JscEntryFrameStorage::default();
+        let mut call_frame_storage = JscCallFrameStorage::default();
+
         let code_block = CodeBlockId(CellId(41));
-        VmNativeCallFramePublicationRecord {
-            ordinal: 1,
-            entry_depth: 1,
-            reason: VmNativeCallFramePublicationReason::BaselineNativeEntry,
-            owner: code_block,
-            code_block,
-            current_entry_frame: FrameAddress(0x1000),
-            previous_top_frame: Some(FrameAddress(0x1000)),
-            published_top_frame: FrameAddress(0x2000),
-            active_entry_frame: EntryFrameId(1),
+        let entry = EntryFrameId(1);
+        let frame = CallFrameId(2);
+        let entry_handle = entry_storage.register_entry_frame(JscEntryFrameRegistration {
+            entry,
             previous_entry_frame: None,
             saved_top_call_frame: None,
-            active_top_call_frame: CallFrameId(2),
-            call_frame: VmEntryCallFrameMetadata {
-                frame: CallFrameId(2),
-                entry_frame: Some(EntryFrameId(1)),
-                caller_frame: None,
-                code_block: Some(code_block),
-                callee: None,
-                callee_value: None,
-                context: None,
-                global_object: None,
-                entry_value: VmEntryLaunchArgumentValue::This(RuntimeValue::undefined()),
-                argument_count_including_this: 1,
-                provided_argument_count: 0,
-                padded_argument_count: 1,
-                specialization: CodeSpecializationKind::Call,
-                arity_mode: ArityCheckMode::AlreadyChecked,
-            },
-        }
+            previous_top_call_frame: None,
+            previous_top_entry_frame: None,
+        });
+        let published_entry_frame = entry_storage
+            .published_entry_frame(entry_handle)
+            .expect("storage-derived published entry frame");
+        let entry_top_call_frame =
+            FrameAddress(published_entry_frame.address().0 ^ 0x55aa_55aa_usize);
+        let installed_frame = installed_call_frame(frame, Some(entry), None, code_block, 64);
+        let call_frame_handle = call_frame_storage.register_installed_frame(&installed_frame);
+        let published_top_frame_address = call_frame_storage
+            .frame_address(call_frame_handle)
+            .expect("storage-derived top call-frame address");
+        let published_top_frame = call_frame_storage
+            .published_top_call_frame(call_frame_handle)
+            .expect("storage-derived published top call frame");
+        let mut entry_guard = entry_state
+            .enter_storage_backed(
+                entry_top_call_frame,
+                published_entry_frame,
+                EntryKind::Script,
+                HeapId::default(),
+            )
+            .expect("storage-backed entry guard");
+        let entry_record = entry_guard.record();
+        let call_frame = VmEntryCallFrameMetadata {
+            frame,
+            entry_frame: Some(entry),
+            caller_frame: None,
+            code_block: Some(code_block),
+            callee: None,
+            callee_value: None,
+            context: None,
+            global_object: None,
+            entry_value: VmEntryLaunchArgumentValue::This(RuntimeValue::undefined()),
+            argument_count_including_this: 1,
+            provided_argument_count: 0,
+            padded_argument_count: 1,
+            specialization: CodeSpecializationKind::Call,
+            arity_mode: ArityCheckMode::AlreadyChecked,
+        };
+        let publication = entry_guard
+            .publish_native_call_frame(VmNativeCallFramePublicationRequest {
+                reason: VmNativeCallFramePublicationReason::BaselineNativeEntry,
+                owner: code_block,
+                code_block,
+                scope: VmEntryLaunchScope {
+                    owner: code_block,
+                    entry_code_block: Some(code_block),
+                    active_entry_frame: Some(entry),
+                    previous_entry_frame: None,
+                    saved_top_call_frame: None,
+                    active_top_call_frame: Some(frame),
+                },
+                call_frame,
+                published_top_frame,
+            })
+            .expect("storage-backed native call-frame publication");
+        let record = publication.record();
+
+        assert_eq!(record.entry_depth, entry_record.depth);
+        assert_eq!(record.current_entry_frame, entry_record.top_entry_frame);
+        assert_eq!(record.previous_top_frame, Some(entry_record.top_call_frame));
+        assert_eq!(record.published_top_frame, published_top_frame_address);
+        assert_eq!(record.active_entry_frame, entry);
+        assert_eq!(record.active_top_call_frame, frame);
+        assert_eq!(record.call_frame, call_frame);
+
+        record
     }
 
+    fn installed_call_frame(
+        id: CallFrameId,
+        entry: Option<EntryFrameId>,
+        caller: Option<CallFrameId>,
+        code_block: CodeBlockId,
+        base: usize,
+    ) -> InstalledCallFrame {
+        InstalledCallFrame {
+            id,
+            entry,
+            caller,
+            code_block: Some(code_block),
+            callee: None,
+            callee_value: None,
+            lexical_scope: None,
+            bytecode_index: None,
+            return_address: None,
+            return_continuation: None,
+            argument_count_including_this: 1,
+            register_window: RegisterWindow {
+                owner: id,
+                base,
+                local_count: 4,
+                argument_base: base + 4,
+                argument_count: 1,
+                this_offset: CallFrameSlotLayout::JSC_RUST.this_argument_offset,
+            },
+            state: FrameState::Executing,
+        }
+    }
     fn admission_for_site(
         code_block: &CodeBlock,
         site: &P6X86_64CallableSideExitReturnSite,
