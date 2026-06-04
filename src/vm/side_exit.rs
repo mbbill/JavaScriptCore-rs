@@ -20,6 +20,15 @@ pub(super) struct P6X86_64CallableSideExitReturnSite {
     pub(super) encoded_payload: P6X86_64BaselineSideExitReturnPayload,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct P6CallableSideExitNativeReentryInvocation {
+    // C++ JSC maps bytecode labels to native PCs through
+    // `fastPathResumePoint`/`JITCodeMapBuilder`. This carries the resolved
+    // allocation-relative native-PC metadata after a P6 side-exit fallback; it
+    // is not authority for ARM64 or any other backend to execute native reentry.
+    pub(super) entry_offset: u32,
+}
+
 pub(super) fn p6_side_exit_native_reentry_target_for_single_dispatch_outcome(
     side_exit: &P6X86_64CallableSideExitReturnSite,
     opcode: Option<CoreOpcode>,

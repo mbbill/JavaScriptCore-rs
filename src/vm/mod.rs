@@ -245,7 +245,7 @@ pub use self::runtime::{
 };
 use self::side_exit::{
     p6_side_exit_native_reentry_target_for_single_dispatch_outcome,
-    P6X86_64CallableSideExitReturnSite,
+    P6CallableSideExitNativeReentryInvocation, P6X86_64CallableSideExitReturnSite,
 };
 pub use config::{HeapPolicy, HostCapabilities, VmConfig, VmExecutionMode};
 pub use entry::{
@@ -549,7 +549,7 @@ enum BaselineNativeEntryVmExecution {
         completion: ExecutionCompletion,
         roots: BaselineNativeEntryDeferredRoots,
     },
-    P6SideExitReentry(P6X86_64CallableNativeInvocation),
+    P6SideExitReentry(P6CallableSideExitNativeReentryInvocation),
     P9OwnerPostCallReentry(P9OwnerPostCallReentryInvocation),
 }
 
@@ -6110,7 +6110,9 @@ impl Vm {
                             code_block, &dispatch, payload, host, config,
                         ) {
                         BaselineNativeEntryVmExecution::P6SideExitReentry(reentry) => {
-                            invocation = reentry;
+                            invocation = P6X86_64CallableNativeInvocation::Entry {
+                                entry_offset: reentry.entry_offset,
+                            };
                             continue;
                         }
                         execution => return execution,
@@ -6326,7 +6328,7 @@ impl Vm {
         dispatch: &P6EmittedNativeDispatch<'_>,
         side_exit: &P6X86_64CallableSideExitReturnSite,
         outcome: &SingleDispatchOutcome,
-    ) -> Result<Option<P6X86_64CallableNativeInvocation>, ExecutionError> {
+    ) -> Result<Option<P6CallableSideExitNativeReentryInvocation>, ExecutionError> {
         let opcode = p6_core_opcode_at_bytecode_index(code_block, side_exit.bytecode_index);
         let Some(native_reentry_target) =
             p6_side_exit_native_reentry_target_for_single_dispatch_outcome(
@@ -6348,7 +6350,7 @@ impl Vm {
             dispatch,
             native_reentry_target.resume_entry_offset,
         )?;
-        Ok(Some(P6X86_64CallableNativeInvocation::Entry {
+        Ok(Some(P6CallableSideExitNativeReentryInvocation {
             entry_offset,
         }))
     }
@@ -39185,11 +39187,17 @@ mod tests {
     }
 
     #[test]
-    fn vm_p6_arm64_side_exit_reentry_result_is_defensively_rejected() {
+    fn vm_p6_side_exit_reentry_result_uses_backend_neutral_invocation_and_arm64_rejects() {
+        let reentry = P6CallableSideExitNativeReentryInvocation { entry_offset: 123 };
+        let BaselineNativeEntryVmExecution::P6SideExitReentry(native_reentry) =
+            BaselineNativeEntryVmExecution::P6SideExitReentry(reentry)
+        else {
+            panic!("expected P6 side-exit reentry result");
+        };
+        assert_eq!(native_reentry, reentry);
+
         let execution = p6_arm64_reject_side_exit_reentry_execution(
-            BaselineNativeEntryVmExecution::P6SideExitReentry(
-                P6X86_64CallableNativeInvocation::Entry { entry_offset: 123 },
-            ),
+            BaselineNativeEntryVmExecution::P6SideExitReentry(native_reentry),
         );
 
         match execution {
@@ -56956,7 +56964,7 @@ mod tests {
 
         let rejected = p6_arm64_reject_side_exit_reentry_execution(
             BaselineNativeEntryVmExecution::P6SideExitReentry(
-                P6X86_64CallableNativeInvocation::Entry {
+                P6CallableSideExitNativeReentryInvocation {
                     entry_offset: site.native_reentry_targets[0].resume_entry_offset,
                 },
             ),
