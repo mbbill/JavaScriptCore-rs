@@ -185,9 +185,10 @@ use crate::jit::{
     JitCodeValidationError, JitPlanValidationError, JitType, LinkBufferCopyLinkRecord,
     LinkBufferFinalizationRecord, LinkBufferFinalizationRequest, LinkedCallKind, MachineCodeHandle,
     MachineCodeOwnership, MachineCodeRange, P14X86_64BaselineBackedgeSafepointAuthority,
-    P14X86_64BaselineLoopBackedgeReturnPayload, P6X86_64BaselineBackendContractError,
-    P6X86_64BaselineBytecodeBranchKind, P6X86_64BaselineInstructionSelectionError,
-    P6X86_64BaselineLoweringError, P6X86_64BaselineLoweringPlan, P6X86_64BaselineLoweringRequest,
+    P14X86_64BaselineLoopBackedgeReturnPayload, P6BaselineNativeReentryTargetRecord,
+    P6X86_64BaselineBackendContractError, P6X86_64BaselineBytecodeBranchKind,
+    P6X86_64BaselineInstructionSelectionError, P6X86_64BaselineLoweringError,
+    P6X86_64BaselineLoweringPlan, P6X86_64BaselineLoweringRequest,
     P6X86_64BaselineSelectedSideExitReason, P6X86_64BaselineSemanticByteEmissionError,
     P6X86_64BaselineSemanticByteEmissionResult, P6X86_64BaselineSideExitReturnPayload,
     PropertyHasObservationDescriptor, PropertyLoadAccessCasePlanKind,
@@ -619,13 +620,19 @@ struct P6EmittedNativeDispatch<'a> {
     allow_interpreter_fallback: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct P6X86_64CallableSideExitReturnSite {
     bytecode_index: BytecodeIndex,
     reason: P6X86_64BaselineSelectedSideExitReason,
     side_exit_index: u32,
     resume_bytecode_index: Option<BytecodeIndex>,
     resume_entry_offset: Option<u32>,
+    // C++ JSC publishes bytecode->native labels through
+    // `fastPathResumePoint`/`JITCodeMapBuilder`. This minimal VM-table
+    // extension keeps the dormant Rust stand-in with the retained payload
+    // owner instead of creating a separate metadata owner before ARM64
+    // side-exit reentry/rooting exists.
+    native_reentry_targets: Vec<P6BaselineNativeReentryTargetRecord>,
     encoded_payload: P6X86_64BaselineSideExitReturnPayload,
 }
 
@@ -3957,6 +3964,7 @@ impl Vm {
                 side_exit_index: stub.side_exit_index,
                 resume_bytecode_index: stub.resume_bytecode_index,
                 resume_entry_offset: stub.resume_entry_offset,
+                native_reentry_targets: stub.native_reentry_targets.clone(),
                 encoded_payload: stub.encoded_payload,
             })
             .collect();
@@ -6201,7 +6209,7 @@ impl Vm {
                     config,
                 ),
             (None, Some(side_exit)) => {
-                self.record_p6_x86_64_callable_side_exit_fallback(dispatch, side_exit, code_block);
+                self.record_p6_x86_64_callable_side_exit_fallback(dispatch, &side_exit, code_block);
                 self.execute_p6_x86_64_callable_side_exit_fallback_in_current_region(
                     code_block, dispatch, side_exit, host, config,
                 )
@@ -6238,7 +6246,7 @@ impl Vm {
             ));
         }
         let completion = if Self::p6_x86_64_callable_side_exit_single_dispatch_resume_allowed(
-            code_block, side_exit,
+            code_block, &side_exit,
         ) {
             let outcome = execute_single_dispatch(
                 InterpreterExecutionState {
@@ -6256,7 +6264,7 @@ impl Vm {
                 host,
             );
             let native_reentry = match self.p6_x86_64_callable_side_exit_native_reentry_invocation(
-                code_block, dispatch, side_exit, &outcome,
+                code_block, dispatch, &side_exit, &outcome,
             ) {
                 Ok(native_reentry) => native_reentry,
                 Err(error) => {
@@ -6326,7 +6334,7 @@ impl Vm {
         &self,
         code_block: &CodeBlock,
         dispatch: &P6EmittedNativeDispatch<'_>,
-        side_exit: P6X86_64CallableSideExitReturnSite,
+        side_exit: &P6X86_64CallableSideExitReturnSite,
         outcome: &SingleDispatchOutcome,
     ) -> Result<Option<P6X86_64CallableNativeInvocation>, ExecutionError> {
         let SingleDispatchOutcome::Continue(Some(resume_bytecode_index)) = outcome else {
@@ -6358,7 +6366,7 @@ impl Vm {
 
     fn p6_x86_64_callable_side_exit_single_dispatch_resume_allowed(
         code_block: &CodeBlock,
-        side_exit: P6X86_64CallableSideExitReturnSite,
+        side_exit: &P6X86_64CallableSideExitReturnSite,
     ) -> bool {
         let Some(opcode) = p6_core_opcode_at_bytecode_index(code_block, side_exit.bytecode_index)
         else {
@@ -7940,7 +7948,7 @@ impl Vm {
                     .side_exit_sites
                     .iter()
                     .find(|site| site.encoded_payload == payload)
-                    .copied()
+                    .cloned()
             })
     }
 
@@ -8397,7 +8405,7 @@ impl Vm {
     fn record_p6_x86_64_callable_side_exit_fallback(
         &mut self,
         dispatch: &P6EmittedNativeDispatch<'_>,
-        side_exit: P6X86_64CallableSideExitReturnSite,
+        side_exit: &P6X86_64CallableSideExitReturnSite,
         code_block: &CodeBlock,
     ) {
         let generated_baseline = self.p6_x86_64_callable_side_exit_generated_fallback_record(
@@ -8423,7 +8431,7 @@ impl Vm {
     fn p6_x86_64_callable_side_exit_generated_fallback_record(
         &self,
         dispatch: &P6EmittedNativeDispatch<'_>,
-        side_exit: P6X86_64CallableSideExitReturnSite,
+        side_exit: &P6X86_64CallableSideExitReturnSite,
         code_block: &CodeBlock,
     ) -> Option<GeneratedBaselineFallbackRecord> {
         let opcode = p6_core_opcode_at_bytecode_index(code_block, side_exit.bytecode_index)?;
@@ -36365,6 +36373,7 @@ mod tests {
             side_exit_index: 0,
             resume_bytecode_index: None,
             resume_entry_offset: None,
+            native_reentry_targets: Vec::new(),
             encoded_payload: P6X86_64BaselineSideExitReturnPayload::encode(0),
         };
         assert!(
@@ -36381,7 +36390,7 @@ mod tests {
             )
         );
 
-        let mut wrong_payload = valid_site;
+        let mut wrong_payload = valid_site.clone();
         wrong_payload.encoded_payload = P6X86_64BaselineSideExitReturnPayload::encode(1);
         assert!(
             !Vm::rootless_emitted_native_entry_retained_side_exit_site_allowed(
@@ -36398,7 +36407,7 @@ mod tests {
             )
         );
 
-        let mut wrong_reason = valid_site;
+        let mut wrong_reason = valid_site.clone();
         wrong_reason.reason = P6X86_64BaselineSelectedSideExitReason::Overflow;
         assert!(
             !Vm::rootless_emitted_native_entry_truthiness_side_exit_site_allowed(
@@ -36414,7 +36423,7 @@ mod tests {
             )
         );
 
-        let mut wrong_opcode = valid_site;
+        let mut wrong_opcode = valid_site.clone();
         wrong_opcode.bytecode_index = BytecodeIndex::from_offset(0);
         assert!(
             !Vm::rootless_emitted_native_entry_truthiness_side_exit_site_allowed(
@@ -36485,6 +36494,7 @@ mod tests {
             side_exit_index: 0,
             resume_bytecode_index: None,
             resume_entry_offset: None,
+            native_reentry_targets: Vec::new(),
             encoded_payload: P6X86_64BaselineSideExitReturnPayload::encode(0),
         };
         assert!(
@@ -36501,6 +36511,7 @@ mod tests {
             side_exit_index: 0,
             resume_bytecode_index: None,
             resume_entry_offset: None,
+            native_reentry_targets: Vec::new(),
             encoded_payload: P6X86_64BaselineSideExitReturnPayload::encode(0),
         };
         assert!(
@@ -36568,12 +36579,13 @@ mod tests {
             side_exit_index: 0,
             resume_bytecode_index: Some(BytecodeIndex::from_offset(2)),
             resume_entry_offset: Some(12),
+            native_reentry_targets: Vec::new(),
             encoded_payload: P6X86_64BaselineSideExitReturnPayload::encode(0),
         };
         assert!(
             Vm::p6_x86_64_callable_side_exit_single_dispatch_resume_allowed(
                 &to_number_code_block,
-                to_number_site
+                &to_number_site
             )
         );
         assert!(
@@ -36612,6 +36624,7 @@ mod tests {
             side_exit_index: 0,
             resume_bytecode_index: None,
             resume_entry_offset: None,
+            native_reentry_targets: Vec::new(),
             encoded_payload: P6X86_64BaselineSideExitReturnPayload::encode(0),
         };
         assert!(
@@ -36628,6 +36641,7 @@ mod tests {
             side_exit_index: 0,
             resume_bytecode_index: None,
             resume_entry_offset: None,
+            native_reentry_targets: Vec::new(),
             encoded_payload: P6X86_64BaselineSideExitReturnPayload::encode(0),
         };
         assert!(
@@ -36638,7 +36652,7 @@ mod tests {
             )
         );
 
-        let mut wrong_non_int32_opcode = non_int32_site;
+        let mut wrong_non_int32_opcode = non_int32_site.clone();
         wrong_non_int32_opcode.bytecode_index = BytecodeIndex::from_offset(0);
         assert!(
             !Vm::rootless_emitted_native_entry_retained_side_exit_site_allowed(
@@ -56797,6 +56811,173 @@ mod tests {
         assert!(!vm.can_execute_baseline_native_entry_kind(
             BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vm_retained_return_table_preserves_x86_single_native_reentry_target_metadata() {
+        let code_block = linked_p6_test_code_block_with_parameters(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(0)), Operand::SignedImmediate(99)],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::ToNumber,
+                    vec![
+                        Operand::Register(local(0)),
+                        Operand::Register(argument_including_this(1)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(0))],
+                ),
+            ],
+            2,
+        );
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block);
+        let record = vm
+            .install_p6_x86_64_callable_semantic_baseline_native_entry(p6_semantic_install_request(
+                owner, 745,
+            ))
+            .expect("accepted x86 callable side-exit install");
+        let readiness = record
+            .enabled_readiness
+            .as_ref()
+            .expect("callable install records enabled readiness");
+        let stub = record
+            .semantic_emission
+            .side_exit_return_stubs
+            .iter()
+            .find(|stub| {
+                stub.bytecode_index == BytecodeIndex::from_offset(1)
+                    && stub.reason
+                        == P6X86_64BaselineSelectedSideExitReason::UnsupportedToNumberOperand
+            })
+            .expect("x86 single-resume side-exit stub");
+        assert_eq!(
+            stub.resume_bytecode_index,
+            Some(BytecodeIndex::from_offset(2))
+        );
+        assert!(stub.resume_entry_offset.is_some());
+        assert_eq!(
+            stub.native_reentry_targets,
+            vec![P6BaselineNativeReentryTargetRecord {
+                resume_bytecode_index: stub.resume_bytecode_index.unwrap(),
+                resume_entry_offset: stub.resume_entry_offset.unwrap(),
+            }]
+        );
+
+        let table = vm
+            .p6_x86_64_callable_retained_return_tables
+            .iter()
+            .find(|table| table.owner == owner && table.readiness_ordinal == readiness.ordinal)
+            .expect("retained x86 side-exit table");
+        let site = table
+            .side_exit_sites
+            .iter()
+            .find(|site| site.encoded_payload == stub.encoded_payload)
+            .expect("retained x86 side-exit site");
+        assert_eq!(site.resume_bytecode_index, stub.resume_bytecode_index);
+        assert_eq!(site.resume_entry_offset, stub.resume_entry_offset);
+        assert_eq!(site.native_reentry_targets, stub.native_reentry_targets);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vm_retained_return_table_preserves_arm64_dormant_jump_if_false_native_reentry_targets() {
+        let code_block = p8b_jump_if_false_code_block(P8bTruthinessSource::Bool(false));
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let record = vm
+            .install_p6_x86_64_callable_semantic_baseline_native_entry(p6_semantic_install_request(
+                owner, 746,
+            ))
+            .expect("accepted callable install for retained table shell");
+        let readiness = record
+            .enabled_readiness
+            .as_ref()
+            .expect("callable install records enabled readiness");
+        let backedge_safepoints = p14_x86_64_backedge_safepoint_authorities_for_code_block(
+            owner,
+            record.eligibility_proof.bytecode_snapshot_fingerprint(),
+            &code_block,
+        );
+        let lowering = plan_p6_x86_64_baseline_lowering(
+            P6X86_64BaselineLoweringRequest::new_with_backedge_safepoints(
+                owner,
+                &code_block,
+                record.eligibility_proof.clone(),
+                &backedge_safepoints,
+            ),
+        )
+        .expect("JumpIfFalse lowering for dormant ARM64 metadata");
+        let backend_contract = record_p6_x86_64_baseline_backend_contract_from_plan(&lowering.plan)
+            .expect("x86 semantic contract for dormant ARM64 metadata stand-in");
+        let selection = select_p6_x86_64_baseline_instructions(&backend_contract)
+            .expect("dormant ARM64 branch-aware selection");
+        let arm64_semantic =
+            crate::jit::arm64_baseline::emit_p6_arm64_dormant_branch_aware_callable_semantic_bytes_for_test(
+                backend_contract,
+                selection,
+            )
+            .expect("dormant ARM64 branch-aware semantic emission");
+        assert_eq!(arm64_semantic.side_exit_return_stubs.len(), 1);
+        let stub = &arm64_semantic.side_exit_return_stubs[0];
+        assert_eq!(stub.bytecode_index, BytecodeIndex::from_offset(1));
+        assert_eq!(
+            stub.reason,
+            P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand
+        );
+        assert_eq!(stub.resume_bytecode_index, None);
+        assert_eq!(stub.resume_entry_offset, None);
+        assert_eq!(
+            stub.native_reentry_targets
+                .iter()
+                .map(|target| target.resume_bytecode_index)
+                .collect::<Vec<_>>(),
+            vec![BytecodeIndex::from_offset(4), BytecodeIndex::from_offset(2)]
+        );
+
+        vm.retain_p6_x86_64_callable_retained_return_table(
+            owner,
+            &record.artifact,
+            &arm64_semantic,
+            None,
+            &record.materialization,
+            &record.install,
+            readiness,
+        );
+        let table = vm
+            .p6_x86_64_callable_retained_return_tables
+            .iter()
+            .rev()
+            .find(|table| table.owner == owner && table.readiness_ordinal == readiness.ordinal)
+            .expect("retained ARM64 dormant side-exit table");
+        assert_eq!(table.side_exit_sites.len(), 1);
+        let site = &table.side_exit_sites[0];
+        assert_eq!(site.resume_bytecode_index, None);
+        assert_eq!(site.resume_entry_offset, None);
+        assert_eq!(site.native_reentry_targets, stub.native_reentry_targets);
+
+        let rejected = p6_arm64_reject_side_exit_reentry_execution(
+            BaselineNativeEntryVmExecution::P6SideExitReentry(
+                P6X86_64CallableNativeInvocation::Entry {
+                    entry_offset: site.native_reentry_targets[0].resume_entry_offset,
+                },
+            ),
+        );
+        match rejected {
+            BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(
+                ExecutionError::BaselineGeneratedExecutionRejected,
+            )) => {}
+            _ => panic!("ARM64 side-exit reentry must remain rejected"),
+        }
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]

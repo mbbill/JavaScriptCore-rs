@@ -72,6 +72,34 @@ pub fn emit_p6_arm64_baseline_callable_semantic_bytes(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn emit_p6_arm64_dormant_branch_aware_callable_semantic_bytes_for_test(
+    contract: P6X86_64BaselineBackendContractRecord,
+    selection: P6X86_64BaselineInstructionSelectionPlan,
+) -> Result<P6X86_64BaselineSemanticByteEmissionResult, P6X86_64BaselineSemanticByteEmissionError> {
+    selection
+        .validate_against(&contract)
+        .map_err(|error| P6X86_64BaselineSemanticByteEmissionError::Selection { error })?;
+    validate_p6_x86_64_semantic_selection_effects(&selection)?;
+    validate_p6_x86_64_semantic_terminal_policy(&selection)?;
+    let encoded = encode_p6_arm64_dormant_branch_aware_callable_selection(
+        contract.value_layout,
+        &selection.instructions,
+    )?;
+    finish_p6_x86_64_semantic_byte_emission(
+        &contract,
+        encoded,
+        P6X86_64BaselineSemanticByteEmissionShape::P3cCallableCAbiSemanticArm64ReturnSeedFromAcceptedP6Selection,
+        P6X86_64BaselineSemanticByteEmissionAuthority::NonExecutableCallableSemanticBytesOnlyNoVmOrPlatformAuthority,
+        p6_arm64_callable_semantic_source_buffer_id(&contract),
+        p6_arm64_callable_semantic_source_image_id(&contract),
+        0,
+        AssemblerArchitecture::Arm64,
+        p6_arm64_semantic_physical_register_map(),
+        0,
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum P6Arm64ReturnSeedValue {
     Immediate(u64),
