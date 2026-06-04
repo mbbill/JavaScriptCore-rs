@@ -678,12 +678,12 @@ mod tests {
     use super::*;
     use crate::gc::CellId;
     use crate::jit::code::BaselineEntryArtifact;
-    use crate::jit::BaselineNativeEntryCallableAuthority;
     use crate::jit::{
-        CodeFinalizationAuthority, CodeLiveness, CodeOrigin, CodeOriginKind, CodeOwnership,
-        EntryAbi, Entrypoint, EntrypointKind, ExecutableAllocationId,
-        ExecutableAllocationLifecycle, ExecutableMemoryProtection, ExecutableMutationAuthority,
-        JitCodeArtifact, MachineCodeOwnership,
+        BaselineGeneratedCodeBodyCapability, BaselineNativeEntryCallableAuthority,
+        BaselineSupportedOpcodeSubset, CodeFinalizationAuthority, CodeLiveness, CodeOrigin,
+        CodeOriginKind, CodeOwnership, EntryAbi, Entrypoint, EntrypointKind,
+        ExecutableAllocationId, ExecutableAllocationLifecycle, ExecutableMemoryProtection,
+        ExecutableMutationAuthority, JitCodeArtifact, MachineCodeOwnership,
     };
 
     #[test]
@@ -936,6 +936,7 @@ mod tests {
             machine_code: Some(artifact.machine_code),
             machine_range: Some(artifact.machine_code.range),
             bytecode_snapshot: None,
+            body_capability: None,
             execution_policy: BaselineNativeEntryExecutionPolicy::Disabled,
             descriptor: Some(
                 artifact
@@ -965,6 +966,11 @@ mod tests {
             machine_code: Some(artifact.machine_code),
             machine_range: Some(artifact.machine_code.range),
             bytecode_snapshot: None,
+            body_capability: Some(
+                BaselineGeneratedCodeBodyCapability::from_supported_opcode_subset(
+                    BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic,
+                ),
+            ),
             execution_policy: BaselineNativeEntryExecutionPolicy::Enabled,
             descriptor: Some(descriptor),
             callable: Some(

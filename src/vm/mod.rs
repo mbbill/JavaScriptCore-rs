@@ -10032,9 +10032,13 @@ impl Vm {
             return Err(VmGeneratedDirectCallRootlessRejectionReason::InvalidGeneratedArtifact);
         }
 
-        let opcode_subset = callable.kind().supported_opcode_subset();
-        let contract = opcode_subset.generated_effect_contract();
-        if !contract.permits_no_heap_allocation_no_runtime_call()
+        let body_capability = readiness
+            .body_capability
+            .ok_or(VmGeneratedDirectCallRootlessRejectionReason::EffectContract)?;
+        let opcode_subset = body_capability.supported_opcode_subset;
+        let contract = body_capability.effect_contract;
+        if contract.opcode_subset != opcode_subset
+            || !contract.permits_no_heap_allocation_no_runtime_call()
             || contract.summary.may_throw
             || contract.summary.writes_heap
             || contract.touches_gc_roots
@@ -18250,15 +18254,16 @@ mod tests {
     };
     use crate::jit::{
         finalize_link_buffer, record_link_buffer_copy_link, AccessCaseKind,
-        BaselineBytecodeEligibilityProof, BaselineGeneratedCodeBodyId,
-        BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableKind,
-        BaselineOpcodeRejectionReason, CallBoundaryId, CallLinkInfoDescriptor, CallLinkMode,
-        CallLinkReadinessBlocker, CodeFinalizationAuthority, CodeInvalidationReason, CodeLiveness,
-        CodeOrigin, CodeOriginKind, CodeOwnership, CodePatchState, CompilerSafepointDescriptor,
-        CompilerSafepointId, CompilerSafepointKind, EntryAbi, Entrypoint, EntrypointKind,
-        ExecutableAllocationId, ExecutableAllocationLifecycle, ExecutableAllocationRecord,
-        ExecutableAllocationRequest, ExecutableMemoryProtection, ExecutableMutationAuthority,
-        GeneratedCallLinkCandidate, GeneratedCallLinkProbeRequest, GeneratedCallLinkProbeResult,
+        BaselineBytecodeEligibilityProof, BaselineGeneratedCodeBodyCapability,
+        BaselineGeneratedCodeBodyId, BaselineNativeEntryCallableAuthority,
+        BaselineNativeEntryCallableKind, BaselineOpcodeRejectionReason, CallBoundaryId,
+        CallLinkInfoDescriptor, CallLinkMode, CallLinkReadinessBlocker, CodeFinalizationAuthority,
+        CodeInvalidationReason, CodeLiveness, CodeOrigin, CodeOriginKind, CodeOwnership,
+        CodePatchState, CompilerSafepointDescriptor, CompilerSafepointId, CompilerSafepointKind,
+        EntryAbi, Entrypoint, EntrypointKind, ExecutableAllocationId,
+        ExecutableAllocationLifecycle, ExecutableAllocationRecord, ExecutableAllocationRequest,
+        ExecutableMemoryProtection, ExecutableMutationAuthority, GeneratedCallLinkCandidate,
+        GeneratedCallLinkProbeRequest, GeneratedCallLinkProbeResult,
         GeneratedGuardedPropertyLoadProbeMissReason, GeneratedGuardedPropertyLoadProbeRequest,
         GeneratedGuardedPropertyLoadProbeResult, GeneratedPropertyLoadProbeMissReason,
         GeneratedPropertyLoadProbeRequest, GeneratedPropertyLoadProbeResult,
@@ -37722,6 +37727,134 @@ mod tests {
 
     #[cfg(all(unix, target_arch = "x86_64"))]
     #[test]
+    fn vm_generated_direct_call_rootless_emitted_native_uses_readiness_body_capability() {
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let callee_code_block = p8b_jump_if_false_code_block(P8bTruthinessSource::Bool(false));
+        let function_blocks = vm
+            .install_source_function_blocks(vec![callee_code_block.unlinked().clone()])
+            .expect("owned P8b truthiness function code");
+        let callee_owner = function_blocks[0].id;
+        let mut host = RecordingCoreHost::with_function_code_blocks(function_blocks);
+        let callee = load_function_value_for_test(&mut vm, &mut host, 0);
+        let callee_object = ObjectId(heap_cell_for_value(&vm, callee));
+        host.clear_observations();
+        let install =
+            vm.install_p6_x86_64_callable_semantic_baseline_native_entry(
+                p6_semantic_install_request(callee_owner, 2_477),
+            )
+            .expect("manual emitted native P8b callee install");
+        assert_eq!(
+            install.eligibility_proof.opcode_subset(),
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBranchNullishFalse
+        );
+        let readiness = vm
+            .tiering
+            .baseline_native_entry_readiness_records
+            .iter_mut()
+            .rev()
+            .find(|record| {
+                record.owner == callee_owner
+                    && record.execution_policy == BaselineNativeEntryExecutionPolicy::Enabled
+            })
+            .expect("enabled P8b native readiness");
+        assert_eq!(
+            readiness
+                .body_capability
+                .expect("P8b body capability")
+                .supported_opcode_subset,
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBranchNullishFalse
+        );
+        assert_eq!(
+            readiness
+                .callable
+                .expect("P8b callable")
+                .kind()
+                .supported_opcode_subset(),
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBitAndOrNoCallLooseEqualityRelationalPrimitiveToNumberBranchNullishFalse
+        );
+        readiness.body_capability = Some(
+            BaselineGeneratedCodeBodyCapability::from_supported_opcode_subset(
+                BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic,
+            ),
+        );
+
+        let code_block = generated_js_call_return_consumed_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        let caller_artifact = install_typed_baseline_for_test(&mut vm, owner, 2_478);
+        let arguments = || vec![RuntimeValue::undefined(), callee];
+
+        let first = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            arguments(),
+        );
+        assert_eq!(
+            first,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(43))
+        );
+        let candidate = generated_direct_call_candidate_for_test(
+            &vm,
+            owner,
+            caller_artifact
+                .eligibility_proof
+                .bytecode_snapshot_fingerprint(),
+        );
+        let direct_call = BaselineGeneratedJsDirectCall {
+            authorization: GeneratedCallLinkDirectCall::from_candidate(&candidate),
+            candidate,
+            callee_value: callee,
+            callee_object,
+            this_value: RuntimeValue::undefined(),
+            this_object: None,
+            argument_count_including_this: 1,
+            setup_payload: None,
+        };
+        vm.install_generated_direct_call_hot_slot(
+            owner,
+            CoreOpcode::Call,
+            BytecodeIndex::from_offset(1),
+            &direct_call,
+            VmGeneratedDirectCallTransactionRoute::NativeEntry,
+        );
+
+        let rootless_native_entries_before = vm
+            .tiering_integration()
+            .generated_direct_call_rootless_native_entry_count();
+        let native_rejections_before = vm
+            .tiering_integration()
+            .generated_direct_call_rootless_native_entry_rejection_counts();
+        host.clear_observations();
+        let second = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            arguments(),
+        );
+
+        assert_eq!(
+            second,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(43))
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_rootless_native_entry_count(),
+            rootless_native_entries_before,
+            "forged body capability must not enter rootless native code"
+        );
+        assert_eq!(
+            vm.tiering_integration()
+                .generated_direct_call_rootless_native_entry_rejection_counts()
+                .unsupported_body_opcode,
+            native_rejections_before.unsupported_body_opcode + 1,
+            "native admission must reject against readiness body coverage"
+        );
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
     fn vm_generated_direct_call_rootless_emitted_native_js_call_exit_admitted_and_publishes_on_nested_dispatch(
     ) {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
@@ -56067,6 +56200,12 @@ mod tests {
         assert_eq!(
             install_proof.opcode_subset(),
             BaselineSupportedOpcodeSubset::P6ConstantsMovesReturnInt32Arithmetic
+        );
+        assert_eq!(
+            enabled_readiness.body_capability,
+            Some(BaselineGeneratedCodeBodyCapability::from_eligibility_proof(
+                install_proof
+            ))
         );
         assert_eq!(
             record

@@ -199,6 +199,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] generated direct-call backend-contract detail: native auto-materialization telemetry
            now preserves backend contract variants; capped richards confirms hot failures are
            ARM64 return-seed UnsupportedOpcodeSubset, not an undifferentiated native gate
+    [done] native-entry readiness body-capability metadata: enabled readiness now records
+           install-proof-derived subset/effect evidence, and rootless native admission consumes
+           that body evidence instead of callable-kind coverage diagnostics
     [done] ARM64 return-seed subset fallback policy: seed UnsupportedOpcodeSubset now keeps
            the existing prepared x86 semantic/generated artifact path; capped richards moves
            hot native misses to HostBlockedX86_64, making broader ARM64 backend coverage next

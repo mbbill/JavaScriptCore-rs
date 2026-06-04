@@ -31,14 +31,14 @@ pub use abi::{
 pub use arm64_baseline::emit_p6_arm64_baseline_callable_semantic_bytes;
 pub use code::{
     BaselineArityCheckNativeEntry, BaselineArityCheckUnavailableReason,
-    BaselineGeneratedCodeArtifact, BaselineGeneratedCodeBody, BaselineGeneratedCodeBodyId,
-    BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableKind,
-    BaselineNativeEntryCallableValidationError, BaselineNativeEntryDescriptor,
-    BaselineNativeEntryToken, BaselineNativeEntryTokenKind, CodeBlockJitSlots,
-    CodeFinalizationAuthority, CodeInstallBarrier, CodeInvalidationReason, CodeInvalidationState,
-    CodeLiveness, CodeOrigin, CodeOriginKind, CodeOwnership, CodeReplacement, CodeRetentionPolicy,
-    JitCodeArtifact, JitCodeId, JitCodeRef, JitCodeValidationError, JitOpaqueByproductId, JitType,
-    OpaqueByproductDescriptor,
+    BaselineGeneratedCodeArtifact, BaselineGeneratedCodeBody, BaselineGeneratedCodeBodyCapability,
+    BaselineGeneratedCodeBodyId, BaselineNativeEntryCallableAuthority,
+    BaselineNativeEntryCallableKind, BaselineNativeEntryCallableValidationError,
+    BaselineNativeEntryDescriptor, BaselineNativeEntryToken, BaselineNativeEntryTokenKind,
+    CodeBlockJitSlots, CodeFinalizationAuthority, CodeInstallBarrier, CodeInvalidationReason,
+    CodeInvalidationState, CodeLiveness, CodeOrigin, CodeOriginKind, CodeOwnership,
+    CodeReplacement, CodeRetentionPolicy, JitCodeArtifact, JitCodeId, JitCodeRef,
+    JitCodeValidationError, JitOpaqueByproductId, JitType, OpaqueByproductDescriptor,
 };
 pub use disassembly::{
     DisassemblyAnnotation, DisassemblyExecutionAnnotation, DisassemblyExecutionKind,

@@ -540,6 +540,52 @@ impl BaselineGeneratedCodeBody {
     }
 }
 
+/// Copyable coverage/effect evidence for a compiled baseline body.
+///
+/// C++ JSC publishes a `BaselineJITCode` object whose finalized `CodeRef` owns
+/// the executable body and entrypoints. Rust keeps this proof projection
+/// separate from native-entry callable kind so readiness/admission can validate
+/// body coverage without treating a callable-kind table as generated-code proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BaselineGeneratedCodeBodyCapability {
+    pub supported_opcode_subset: BaselineSupportedOpcodeSubset,
+    pub effect_contract: BaselineGeneratedEffectContract,
+}
+
+impl BaselineGeneratedCodeBodyCapability {
+    pub const fn from_supported_opcode_subset(
+        supported_opcode_subset: BaselineSupportedOpcodeSubset,
+    ) -> Self {
+        Self {
+            supported_opcode_subset,
+            effect_contract: supported_opcode_subset.generated_effect_contract(),
+        }
+    }
+
+    pub fn from_eligibility_proof(proof: &BaselineBytecodeEligibilityProof) -> Self {
+        Self {
+            supported_opcode_subset: proof.opcode_subset(),
+            effect_contract: proof.generated_effect_contract(),
+        }
+    }
+
+    pub fn from_body(body: &BaselineGeneratedCodeBody) -> Option<Self> {
+        let supported_opcode_subset = body.supported_opcode_subset?;
+        let effect_contract = body.effect_contract?;
+        if effect_contract != supported_opcode_subset.generated_effect_contract() {
+            return None;
+        }
+        Some(Self {
+            supported_opcode_subset,
+            effect_contract,
+        })
+    }
+
+    pub fn matches_eligibility_proof(self, proof: &BaselineBytecodeEligibilityProof) -> bool {
+        self == Self::from_eligibility_proof(proof)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaselineGeneratedCodeArtifact {
     pub id: JitCodeId,

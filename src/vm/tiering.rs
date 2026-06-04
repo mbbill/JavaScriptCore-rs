@@ -38,8 +38,9 @@ use crate::interpreter::{
 };
 use crate::jit::code::{
     BaselineAbiProof, BaselineEntryArtifact, BaselineGeneratedCodeArtifact,
-    BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableKind,
-    BaselineNativeEntryCallableValidationError, BaselineNativeEntryDescriptor,
+    BaselineGeneratedCodeBodyCapability, BaselineNativeEntryCallableAuthority,
+    BaselineNativeEntryCallableKind, BaselineNativeEntryCallableValidationError,
+    BaselineNativeEntryDescriptor,
 };
 use crate::jit::generated_metrics::{
     BaselineGeneratedDispatchedOpcodeCount, BaselineGeneratedDispatchedSiteOpcodeCount,
@@ -2137,6 +2138,11 @@ impl VmTieringIntegration {
             .as_ref()
             .map(BaselineBytecodeEligibilityProof::bytecode_snapshot_fingerprint)
             .or(request.materialization.bytecode_snapshot);
+        let body_capability = request
+            .install
+            .eligibility_proof
+            .as_ref()
+            .map(BaselineGeneratedCodeBodyCapability::from_eligibility_proof);
         let execution_policy = request.execution_policy;
         let callable = request.callable;
 
@@ -2168,6 +2174,7 @@ impl VmTieringIntegration {
             machine_code,
             machine_range,
             bytecode_snapshot,
+            body_capability,
             execution_policy,
             descriptor,
             callable,
@@ -7052,6 +7059,7 @@ pub struct BaselineNativeEntryReadinessRecord {
     pub machine_code: Option<MachineCodeHandle>,
     pub machine_range: Option<MachineCodeRange>,
     pub(crate) bytecode_snapshot: Option<BaselineBytecodeSnapshotFingerprint>,
+    pub body_capability: Option<BaselineGeneratedCodeBodyCapability>,
     pub execution_policy: BaselineNativeEntryExecutionPolicy,
     pub descriptor: Option<BaselineNativeEntryDescriptor>,
     pub(crate) callable: Option<BaselineNativeEntryCallableAuthority>,
@@ -7077,6 +7085,7 @@ pub enum BaselineNativeEntryReadinessOutcome {
 pub enum BaselineNativeEntryReadinessRejection {
     ExecutionPolicyEnabled,
     EnabledBytecodeSnapshotMissing,
+    EnabledBodyCapabilityMissing,
     CallableAuthorityMissing,
     CallableAuthorityMismatch {
         reason: Box<BaselineNativeEntryCallableValidationError>,
@@ -14864,6 +14873,9 @@ fn validate_baseline_native_entry_readiness(
         {
             return Err(BaselineNativeEntryReadinessRejection::EnabledBytecodeSnapshotMissing);
         }
+        if request.install.eligibility_proof.is_none() {
+            return Err(BaselineNativeEntryReadinessRejection::EnabledBodyCapabilityMissing);
+        }
         let callable = request
             .callable
             .ok_or(BaselineNativeEntryReadinessRejection::CallableAuthorityMissing)?;
@@ -15329,6 +15341,7 @@ fn baseline_native_entry_readiness_is_ready_enabled(
         && matches!(record.outcome, BaselineNativeEntryReadinessOutcome::Ready)
         && record.descriptor.is_some()
         && record.callable.is_some()
+        && record.body_capability.is_some()
 }
 
 fn baseline_native_entry_readiness_is_ready(record: &BaselineNativeEntryReadinessRecord) -> bool {
@@ -19836,7 +19849,8 @@ mod tests {
         finalize_link_buffer, install_barriers_for_request, record_baseline_machine_code_emission,
         record_link_buffer_copy_link, AbiValue, AccessCaseKind, BaselineBytecodeEligibilityRecord,
         BaselineBytecodeInstruction, BaselineBytecodeRange, BaselineExceptionMetadataPresence,
-        BaselineGeneratedCodeArtifact, BaselineGeneratedCodeBody, BaselineGeneratedCodeBodyId,
+        BaselineGeneratedCodeArtifact, BaselineGeneratedCodeBody,
+        BaselineGeneratedCodeBodyCapability, BaselineGeneratedCodeBodyId,
         BaselineMachineCodeEmissionRecord, BaselineMachineCodeEmissionRequest,
         BaselineMachineCodeEmitterKind, BaselineNativeEntryCallableAuthority,
         BaselineNativeEntryCallableValidationError, BaselineRootMapRequirements,
@@ -33306,6 +33320,16 @@ mod tests {
             .baseline_native_entry_readiness_records()
             .last()
             .expect("native entry readiness record");
+        let install_proof = install
+            .eligibility_proof
+            .as_ref()
+            .expect("installed readiness keeps eligibility proof");
+        assert_eq!(
+            readiness.body_capability,
+            Some(BaselineGeneratedCodeBodyCapability::from_eligibility_proof(
+                install_proof
+            ))
+        );
         assert_eq!(
             readiness.outcome,
             BaselineNativeEntryReadinessOutcome::ReadyButExecutionDisabled
@@ -34445,6 +34469,48 @@ mod tests {
     }
 
     #[test]
+    fn baseline_native_entry_readiness_enabled_requires_install_body_capability() {
+        let owner = CodeBlockId(CellId(438));
+        let artifact = baseline_artifact(owner, 438);
+        let mut tiering = VmTieringIntegration::default();
+        let materialization =
+            accepted_byte_evidence_materialization(&mut tiering, owner, &artifact);
+        let install = installed_native_entry(&mut tiering, owner, &artifact, &materialization);
+        let descriptor = install
+            .artifact
+            .expect("installed native artifact")
+            .validate_native_entry_descriptor()
+            .expect("native entry descriptor");
+        let mut missing_body_capability = install.clone();
+        missing_body_capability.ordinal += 1_000;
+        missing_body_capability.eligibility_proof = None;
+        tiering
+            .baseline_install_records
+            .push(missing_body_capability.clone());
+
+        let readiness =
+            tiering.record_baseline_native_entry_readiness(BaselineNativeEntryReadinessRequest {
+                owner,
+                materialization: &materialization,
+                install: &missing_body_capability,
+                execution_policy: BaselineNativeEntryExecutionPolicy::Enabled,
+                callable: Some(
+                    BaselineNativeEntryCallableAuthority::new_p6_pure_baseline_native_entry_shim(
+                        descriptor,
+                    ),
+                ),
+            });
+
+        assert_eq!(
+            readiness.outcome,
+            BaselineNativeEntryReadinessOutcome::Rejected {
+                reason: BaselineNativeEntryReadinessRejection::EnabledBodyCapabilityMissing
+            }
+        );
+        assert!(readiness.body_capability.is_none());
+    }
+
+    #[test]
     fn baseline_native_entry_readiness_enabled_requires_sealed_callable_authority() {
         let owner = CodeBlockId(CellId(338));
         let artifact = baseline_artifact(owner, 338);
@@ -34637,6 +34703,25 @@ mod tests {
             });
         assert_eq!(accepted.outcome, BaselineNativeEntryReadinessOutcome::Ready);
         assert!(accepted.callable.is_some());
+        let install_proof = install
+            .eligibility_proof
+            .as_ref()
+            .expect("enabled native readiness keeps install proof");
+        let body_capability = accepted
+            .body_capability
+            .expect("enabled native readiness records body capability");
+        assert_eq!(
+            body_capability,
+            BaselineGeneratedCodeBodyCapability::from_eligibility_proof(install_proof)
+        );
+        assert_ne!(
+            body_capability.supported_opcode_subset,
+            accepted
+                .callable
+                .expect("enabled callable")
+                .kind()
+                .supported_opcode_subset()
+        );
     }
 
     #[test]
