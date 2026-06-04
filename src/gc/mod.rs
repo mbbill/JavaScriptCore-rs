@@ -19,6 +19,7 @@ mod barrier;
 mod cell;
 mod fast_hash;
 mod heap;
+mod machine_stack_marker;
 mod phase;
 mod refs;
 mod snapshot;
@@ -59,6 +60,9 @@ pub use heap::{
     TargetedRootRecord, TargetedRootSet, WeakId, WeakProcessingPhase,
     WeakProcessingTransitionRecord, WeakRegistrationRecord, WeakRegistry,
     WriteBarrierApplicationRecord, WriteBarrierApplicationRequest, STATIC_HEAP_SCHEMA_DESCRIPTOR,
+};
+pub(crate) use machine_stack_marker::{
+    JscMachineStackConservativeRootingProof, JscMachineStackMarker,
 };
 pub use phase::{
     evaluate_heap_semantics, CollectionCompletionCallbackId, CollectionKind, CollectionRequest,

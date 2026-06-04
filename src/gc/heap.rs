@@ -3,6 +3,9 @@
 use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet};
 
+use super::machine_stack_marker::{
+    JscCurrentThreadStateSnapshot, JscMachineStackRootingIngestError,
+};
 use crate::gc::{
     evaluate_heap_semantics, static_allocation_schema_registry, static_barrier_schema_registry,
     AllocationMode, AllocationProfile, AllocationSchemaRegistry, BarrierDecisionError,
@@ -15,10 +18,11 @@ use crate::gc::{
     HeapFinalizerCallbackId, HeapMutationAuthority, HeapSemanticError, HeapSemanticOperation,
     HeapSnapshotBuilder, HeapSnapshotCellRecord, HeapSnapshotEdge, HeapSnapshotId,
     HeapSnapshotKind, HeapSnapshotNodeId, HeapSnapshotRecord, HeapSnapshotValidationError,
-    HeapStateDescriptor, HeapStatistics, MarkedSpaceDescriptor, MutatorState, RootMarkingPlan,
-    RootPlanningError, SlotVisitorDescriptor, SubspaceDescriptor, SubspaceKind, TraceCell,
-    WeakEdgeKind, WeakHandleOwnerContract, WeakHandleOwnerId, WeakSetDescriptor, WeakSetId,
-    WeakSlotState, WeakSlotTransitionOutcome, WeakSlotTransitionRequest, WeakStateTransitionError,
+    HeapStateDescriptor, HeapStatistics, JscMachineStackConservativeRootingProof,
+    JscMachineStackMarker, MarkedSpaceDescriptor, MutatorState, RootMarkingPlan, RootPlanningError,
+    SlotVisitorDescriptor, SubspaceDescriptor, SubspaceKind, TraceCell, WeakEdgeKind,
+    WeakHandleOwnerContract, WeakHandleOwnerId, WeakSetDescriptor, WeakSetId, WeakSlotState,
+    WeakSlotTransitionOutcome, WeakSlotTransitionRequest, WeakStateTransitionError,
 };
 
 /// Opaque identity for one VM-owned heap.
@@ -301,6 +305,16 @@ pub enum HeapIntegrationError {
     SnapshotAlreadyFinalized(HeapSnapshotId),
     Root(RootSetSemanticError),
     ConservativeRoot(RootPlanningError),
+    StaleMachineStackConservativeRootingProof {
+        expected: HeapEpoch,
+        actual: HeapEpoch,
+    },
+    MachineStackConservativeRootingProofStateMismatch {
+        expected_phase: GcPhase,
+        actual_phase: GcPhase,
+        expected_mutator_state: MutatorState,
+        actual_mutator_state: MutatorState,
+    },
 }
 
 impl From<HeapSemanticError> for HeapIntegrationError {
@@ -887,6 +901,73 @@ impl Heap {
         plan.validate()?;
         self.conservative_roots.extend(roots);
         Ok(())
+    }
+
+    // Dormant MachineStackMarker bridge; future GC/native-entry plumbing should
+    // call this so lexical register spans are gathered and ingested in one scope.
+    #[allow(dead_code)]
+    pub(in crate::gc) fn ingest_current_thread_machine_stack_conservative_roots(
+        &mut self,
+        marker: &JscMachineStackMarker,
+        snapshot: &JscCurrentThreadStateSnapshot,
+    ) -> Result<(), JscMachineStackRootingIngestError> {
+        let heap = self.id;
+        let epoch = self.epoch;
+        let state = self.state_descriptor();
+        marker
+            .with_current_thread_conservative_roots(heap, epoch, state, snapshot, |proof| {
+                self.ingest_machine_stack_conservative_roots(proof)
+            })?
+            .map_err(JscMachineStackRootingIngestError::from)
+    }
+
+    // Dormant proof-consumption hook kept separate for tests and future
+    // native_reentry proof plumbing; live heap state is rechecked before ingest.
+    #[allow(dead_code)]
+    pub(crate) fn ingest_machine_stack_conservative_roots(
+        &mut self,
+        proof: JscMachineStackConservativeRootingProof<'_>,
+    ) -> Result<(), HeapIntegrationError> {
+        self.require_heap(proof.heap())?;
+
+        if proof.epoch() != self.epoch {
+            return Err(
+                HeapIntegrationError::StaleMachineStackConservativeRootingProof {
+                    expected: self.epoch,
+                    actual: proof.epoch(),
+                },
+            );
+        }
+
+        let state = self.state_descriptor();
+        if state.phase == GcPhase::NotRunning {
+            return Err(HeapIntegrationError::HeapSemantic(
+                HeapSemanticError::WrongPhase {
+                    operation: HeapSemanticOperation::TraceRoots,
+                    phase: state.phase,
+                },
+            ));
+        }
+        if state.mutator_state != MutatorState::Collecting {
+            return Err(HeapIntegrationError::HeapSemantic(
+                HeapSemanticError::MutatorMustBeStopped {
+                    operation: HeapSemanticOperation::TraceRoots,
+                    mutator_state: state.mutator_state,
+                },
+            ));
+        }
+        if proof.phase() != state.phase || proof.mutator_state() != state.mutator_state {
+            return Err(
+                HeapIntegrationError::MachineStackConservativeRootingProofStateMismatch {
+                    expected_phase: state.phase,
+                    actual_phase: proof.phase(),
+                    expected_mutator_state: state.mutator_state,
+                    actual_mutator_state: proof.mutator_state(),
+                },
+            );
+        }
+
+        self.ingest_conservative_roots(proof.into_conservative_roots())
     }
 
     pub fn begin_heap_snapshot(&mut self, kind: HeapSnapshotKind) -> HeapSnapshotId {

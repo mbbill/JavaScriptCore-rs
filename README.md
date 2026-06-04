@@ -128,7 +128,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            topEntryFrame pair and is the only reachable entry-guard path for
            native call-frame publication; src/vm/native_reentry.rs now derives
            the publication proof from those storage-backed entry/call-frame
-           guards before rejecting at the conservative-root blocker; native
+           guards before rejecting at the conservative-root blocker;
+           src/gc/machine_stack_marker.rs adds the dormant
+           MachineStackMarker/RegisterState-shaped crate-internal,
+           heap/epoch-bound current-thread gather+ingest closure without
+           treating boxed VM frame storage as machine-stack evidence; native
            execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
