@@ -1767,6 +1767,14 @@ impl VmTieringIntegration {
         &self.baseline_native_entry_readiness_records
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn baseline_native_entry_readiness_records_mut_for_test(
+        &mut self,
+    ) -> &mut [BaselineNativeEntryReadinessRecord] {
+        &mut self.baseline_native_entry_readiness_records
+    }
+
     pub fn baseline_machine_code_emission_provenance_records(
         &self,
     ) -> &[BaselineMachineCodeEmissionProvenanceRecord] {

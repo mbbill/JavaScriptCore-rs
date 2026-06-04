@@ -4420,15 +4420,14 @@ impl P6X86_64SemanticByteBuilder {
                 target_offset,
             )?;
             self.patch_rel32(branch.rel32_offset, branch.branch_offset, displacement)?;
-            let resume_bytecode_index = side_exit_resume_targets
+            let native_reentry_targets = side_exit_resume_targets
                 .iter()
-                .find(|target| {
+                .filter(|target| {
                     target.side_exit_bytecode_index == branch.label.retained_bytecode_index
                 })
-                .map(|target| target.resume_bytecode_index);
-            let resume_entry_offset = resume_bytecode_index
-                .map(|resume_bytecode_index| {
-                    callable_reentry_offsets
+                .map(|target| {
+                    let resume_bytecode_index = target.resume_bytecode_index;
+                    let resume_entry_offset = callable_reentry_offsets
                         .iter()
                         .find(|(bytecode_index, _)| *bytecode_index == resume_bytecode_index)
                         .map(|(_, offset)| *offset)
@@ -4437,18 +4436,21 @@ impl P6X86_64SemanticByteBuilder {
                                 bytecode_index: branch.label.retained_bytecode_index,
                                 target: resume_bytecode_index,
                             },
-                        )
-                })
-                .transpose()?;
-            let native_reentry_targets = match (resume_bytecode_index, resume_entry_offset) {
-                (Some(resume_bytecode_index), Some(resume_entry_offset)) => {
-                    vec![P6BaselineNativeReentryTargetRecord {
+                        )?;
+                    Ok(P6BaselineNativeReentryTargetRecord {
                         resume_bytecode_index,
                         resume_entry_offset,
-                    }]
-                }
-                _ => Vec::new(),
-            };
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (resume_bytecode_index, resume_entry_offset) =
+                match native_reentry_targets.as_slice() {
+                    [target] => (
+                        Some(target.resume_bytecode_index),
+                        Some(target.resume_entry_offset),
+                    ),
+                    _ => (None, None),
+                };
             records.push(P6X86_64BaselineSideExitReturnStubRecord {
                 bytecode_index: branch.label.retained_bytecode_index,
                 reason: branch.label.reason,
@@ -4749,6 +4751,9 @@ fn p14_x86_64_callable_loop_backedge_targets(
 fn p6_x86_64_callable_side_exit_resume_targets(
     selection: &P6X86_64BaselineInstructionSelectionPlan,
 ) -> Vec<P6X86_64CallableSideExitResumeTarget> {
+    // Oversized-file exception: this narrow `JIT::emit_op_jfalse` metadata glue
+    // stays beside the existing x86 semantic emitter until the JSC-mapped x86
+    // baseline extraction owns retained side-exit target publication.
     let mut targets = Vec::new();
     for (index, instruction) in selection.instructions.iter().enumerate() {
         if !p6_x86_64_selected_instruction_needs_side_exit_reentry(instruction) {
@@ -4757,20 +4762,49 @@ fn p6_x86_64_callable_side_exit_resume_targets(
         let Some(next_instruction) = selection.instructions.get(index.saturating_add(1)) else {
             continue;
         };
-        if targets
-            .iter()
-            .any(|target: &P6X86_64CallableSideExitResumeTarget| {
-                target.side_exit_bytecode_index == instruction.bytecode_index
-            })
+        if let P6X86_64BaselineLoweredOperation::JumpIfFalse { target, .. } =
+            instruction.lowered.operation
         {
+            // C++ `emit_op_jfalse` resumes after `valueIsFalsey` at either the
+            // taken target or the fallthrough fast-path label. Rust keeps the
+            // legacy single-target fields empty for this multi-target shape and
+            // publishes both reentry bytecode labels explicitly.
+            p6_x86_64_push_callable_side_exit_resume_target(
+                &mut targets,
+                instruction.bytecode_index,
+                target,
+            );
+            p6_x86_64_push_callable_side_exit_resume_target(
+                &mut targets,
+                instruction.bytecode_index,
+                next_instruction.bytecode_index,
+            );
             continue;
         }
-        targets.push(P6X86_64CallableSideExitResumeTarget {
-            side_exit_bytecode_index: instruction.bytecode_index,
-            resume_bytecode_index: next_instruction.bytecode_index,
-        });
+        p6_x86_64_push_callable_side_exit_resume_target(
+            &mut targets,
+            instruction.bytecode_index,
+            next_instruction.bytecode_index,
+        );
     }
     targets
+}
+
+fn p6_x86_64_push_callable_side_exit_resume_target(
+    targets: &mut Vec<P6X86_64CallableSideExitResumeTarget>,
+    side_exit_bytecode_index: crate::bytecode::BytecodeIndex,
+    resume_bytecode_index: crate::bytecode::BytecodeIndex,
+) {
+    if targets.iter().any(|target| {
+        target.side_exit_bytecode_index == side_exit_bytecode_index
+            && target.resume_bytecode_index == resume_bytecode_index
+    }) {
+        return;
+    }
+    targets.push(P6X86_64CallableSideExitResumeTarget {
+        side_exit_bytecode_index,
+        resume_bytecode_index,
+    });
 }
 
 fn p6_x86_64_selected_instruction_needs_side_exit_reentry(
@@ -4782,6 +4816,7 @@ fn p6_x86_64_selected_instruction_needs_side_exit_reentry(
             | P6X86_64BaselineLoweredOperation::SubInt32 { .. }
             | P6X86_64BaselineLoweredOperation::MulInt32 { .. }
             | P6X86_64BaselineLoweredOperation::ToNumberPrimitive { .. }
+            | P6X86_64BaselineLoweredOperation::JumpIfFalse { .. }
     );
     eligible_opcode
         && instruction
@@ -4800,6 +4835,7 @@ fn p6_x86_64_machine_instruction_has_retained_side_exit(
             | P6X86_64BaselineMachineInstruction::Int32OrNumberArithmetic { .. }
             | P6X86_64BaselineMachineInstruction::PrimitiveToNumber { .. }
             | P6X86_64BaselineMachineInstruction::CheckMulNegativeZero { .. }
+            | P6X86_64BaselineMachineInstruction::BranchIfFalsePrimitive { .. }
     )
 }
 
@@ -18736,6 +18772,20 @@ mod tests {
             P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand
         );
         assert_eq!(side_exit.bytecode_index, BytecodeIndex::from_offset(1));
+        assert_eq!(side_exit.resume_bytecode_index, None);
+        assert_eq!(side_exit.resume_entry_offset, None);
+        assert_eq!(
+            side_exit
+                .native_reentry_targets
+                .iter()
+                .map(|target| target.resume_bytecode_index)
+                .collect::<Vec<_>>(),
+            vec![BytecodeIndex::from_offset(4), BytecodeIndex::from_offset(2)]
+        );
+        assert!(side_exit
+            .native_reentry_targets
+            .iter()
+            .all(|target| target.resume_entry_offset > 0));
         assert!(side_exit.target_offset >= result.terminal_policy.normal_path_end_offset);
         assert_ne!(side_exit.target_offset, branch.target_offset);
         assert_eq!(

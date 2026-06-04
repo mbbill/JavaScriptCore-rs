@@ -256,6 +256,7 @@ pub use self::runtime::{
     VmStaticDescriptorTablesBuilder, VmStaticDescriptorValidationError, VmStructureTableDescriptor,
 };
 use self::side_exit::{
+    p6_jump_if_false_truthiness_side_exit_single_dispatch_native_resume_allowed,
     p6_side_exit_native_reentry_target_for_single_dispatch_outcome,
     P6CallableSideExitNativeReentryInvocation, P6X86_64CallableSideExitReturnSite,
 };
@@ -6436,7 +6437,7 @@ impl Vm {
         else {
             return false;
         };
-        matches!(
+        if matches!(
             (side_exit.reason, opcode),
             (
                 P6X86_64BaselineSelectedSideExitReason::NonInt32Operand
@@ -6449,6 +6450,17 @@ impl Vm {
                 P6X86_64BaselineSelectedSideExitReason::UnsupportedToNumberOperand,
                 CoreOpcode::ToNumber
             )
+        ) {
+            return true;
+        }
+
+        if side_exit.reason != P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand
+            || opcode != CoreOpcode::JumpIfFalse
+        {
+            return false;
+        }
+        p6_jump_if_false_truthiness_side_exit_single_dispatch_native_resume_allowed(
+            code_block, side_exit,
         )
     }
 
@@ -37741,7 +37753,7 @@ mod tests {
         );
         let readiness = vm
             .tiering
-            .baseline_native_entry_readiness_records
+            .baseline_native_entry_readiness_records_mut_for_test()
             .iter_mut()
             .rev()
             .find(|record| {
@@ -57543,6 +57555,7 @@ mod tests {
             name: &'static str,
             value: SideExitValue,
             expected: ExecutionCompletion,
+            expected_native_resume_bytecode_index: BytecodeIndex,
             generated_cause: GeneratedBaselineFallbackCause,
         }
 
@@ -57551,6 +57564,7 @@ mod tests {
                 name: "cell side-exits then falls through in interpreter",
                 value: SideExitValue::Cell,
                 expected: ExecutionCompletion::Returned(RuntimeValue::from_i32(11)),
+                expected_native_resume_bytecode_index: BytecodeIndex::from_offset(1),
                 generated_cause: GeneratedBaselineFallbackCause::UnsupportedTruthinessOperand {
                     operand_index: 0,
                     register: local(0),
@@ -57561,6 +57575,7 @@ mod tests {
                 name: "unknown side-exits then branches in interpreter",
                 value: SideExitValue::Unknown,
                 expected: ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+                expected_native_resume_bytecode_index: BytecodeIndex::from_offset(3),
                 generated_cause: GeneratedBaselineFallbackCause::UnsupportedTruthinessOperand {
                     operand_index: 0,
                     register: local(0),
@@ -57571,6 +57586,7 @@ mod tests {
                 name: "double side-exits to interpreter truthiness",
                 value: SideExitValue::DoubleNegativeZero,
                 expected: ExecutionCompletion::Returned(RuntimeValue::from_i32(42)),
+                expected_native_resume_bytecode_index: BytecodeIndex::from_offset(3),
                 generated_cause: GeneratedBaselineFallbackCause::UnsupportedTruthinessOperand {
                     operand_index: 0,
                     register: local(0),
@@ -57604,6 +57620,7 @@ mod tests {
                 .enabled_readiness
                 .clone()
                 .expect("P8b callable readiness");
+            let readiness_ordinal = readiness.ordinal;
             let descriptor = readiness.descriptor.expect("P8b callable descriptor");
             let (entry, frame) = enter_runtime_helper_program_frame(&mut vm, owner, &code_block);
             let window = vm
@@ -57615,6 +57632,7 @@ mod tests {
                 .write(window, local(0), value)
                 .expect("write P8b condition local");
             let fallback_count_before = vm.tiering_integration().fallback_records().len();
+            let launch_descriptor_count_before = vm.entry_state().launch_descriptors().len();
             let dispatch = P6EmittedNativeDispatch {
                 code_block_id: owner,
                 expected_frame: frame,
@@ -57626,7 +57644,7 @@ mod tests {
                 allow_interpreter_fallback: true,
             };
             let region = vm.enter_no_gc_execution_region();
-            let mut host = CoreOpcodeDispatchHost::new();
+            let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
 
             let completion = match vm
                 .execute_p6_x86_64_emitted_semantic_native_entry_in_current_region(
@@ -57650,6 +57668,24 @@ mod tests {
             };
 
             assert_eq!(completion, case.expected, "{}", case.name);
+            assert_eq!(
+                host.dispatches
+                    .iter()
+                    .map(|(_, index, opcode)| (*index, *opcode))
+                    .collect::<Vec<_>>(),
+                vec![(BytecodeIndex::from_offset(0), Some(CoreOpcode::JumpIfFalse))],
+                "{} should dispatch exactly the side-exit JumpIfFalse before native reentry",
+                case.name
+            );
+            assert!(
+                !host
+                    .dispatches
+                    .iter()
+                    .any(|(_, index, _)| *index == case.expected_native_resume_bytecode_index),
+                "{} should resume at bytecode {:?} in native code, not interpreter replay",
+                case.name,
+                case.expected_native_resume_bytecode_index
+            );
             assert_latest_p6_callable_side_exit_fallback(
                 &vm,
                 owner,
@@ -57657,6 +57693,13 @@ mod tests {
                 BytecodeIndex::from_offset(0),
                 CoreOpcode::JumpIfFalse,
                 Some(case.generated_cause),
+            );
+            assert_latest_p6_callable_side_exit_decision(
+                &vm,
+                owner,
+                readiness_ordinal,
+                launch_descriptor_count_before,
+                TierEntryExecutionPath::NativeCode(JitType::Baseline),
             );
             vm.leave_no_gc_execution_region(region).unwrap();
             if vm.execution.frame(frame).is_some() {
