@@ -501,6 +501,10 @@ fn encode_p6_arm64_dormant_branch_aware_callable_selection(
                 if target <= instruction.bytecode_index {
                     return Err(p6_arm64_seed_unsupported_operation(instruction));
                 }
+                let Some(fallthrough_instruction) = instructions.get(index.saturating_add(1))
+                else {
+                    return Err(p6_arm64_seed_unsupported_operation(instruction));
+                };
                 let source = p6_arm64_seed_source_location(instruction)?;
                 p6_arm64_seed_validate_branch_target_operand(instruction, target)?;
                 let target = P6X86_64BaselineControlFlowBranchContract {
@@ -508,12 +512,17 @@ fn encode_p6_arm64_dormant_branch_aware_callable_selection(
                     source_bytecode_index: instruction.bytecode_index,
                     target_bytecode_index: target,
                 };
+                let side_exit_native_reentry_targets = [
+                    target.target_bytecode_index,
+                    fallthrough_instruction.bytecode_index,
+                ];
                 builder.emit_branch_if_false_primitive(
                     instruction.bytecode_index,
                     source,
                     value_layout,
                     p6_arm64_unsupported_truthiness_side_exit_label(instruction.bytecode_index),
                     target,
+                    &side_exit_native_reentry_targets,
                 )?;
                 saw_jump_if_false = true;
             }
@@ -567,7 +576,7 @@ fn encode_p6_arm64_dormant_branch_aware_callable_selection(
         normal_epilogue.ok_or(P6X86_64BaselineSemanticByteEmissionError::MissingReturn)?;
     let normal_path_end_offset = builder.offset()?;
     let bytecode_branches = builder.finish_bytecode_branches(&instruction_bytes)?;
-    let side_exit_return_stubs = builder.finish_side_exit_return_stubs()?;
+    let side_exit_return_stubs = builder.finish_side_exit_return_stubs(&instruction_bytes)?;
     for record in &mut instruction_bytes {
         record.bytes =
             p6_arm64_bytes_for_range(builder.bytes(), record.start_offset, record.end_offset)?;
@@ -1171,11 +1180,11 @@ mod tests {
     use super::control_flow::*;
     use super::*;
     use crate::jit::emitter::{
-        P6X86_64BaselineBytecodeBranchKind, P6X86_64BaselineControlFlowBranchContract,
-        P6X86_64BaselineLoweredInstruction, P6X86_64BaselineOperandLocationRecord,
-        P6X86_64BaselineSelectedInstructionEffects, P6X86_64BaselineSelectedSideExitReason,
-        P6X86_64BaselineSideExitDestinationEffect, P6X86_64BaselineSideExitLabel,
-        P6X86_64BaselineValueLayoutContract,
+        P6BaselineNativeReentryTargetRecord, P6X86_64BaselineBytecodeBranchKind,
+        P6X86_64BaselineControlFlowBranchContract, P6X86_64BaselineLoweredInstruction,
+        P6X86_64BaselineOperandLocationRecord, P6X86_64BaselineSelectedInstructionEffects,
+        P6X86_64BaselineSelectedSideExitReason, P6X86_64BaselineSideExitDestinationEffect,
+        P6X86_64BaselineSideExitLabel, P6X86_64BaselineValueLayoutContract,
     };
 
     fn bci(offset: u32) -> BytecodeIndex {
@@ -2163,6 +2172,8 @@ mod tests {
         );
         assert_eq!(encoded.side_exit_return_stubs.len(), 1);
         let side_exit = &encoded.side_exit_return_stubs[0];
+        let taken_reentry = &encoded.instruction_bytes[4];
+        let fallthrough_reentry = &encoded.instruction_bytes[2];
         assert_eq!(side_exit.bytecode_index, bci(1));
         assert_eq!(
             side_exit.reason,
@@ -2173,6 +2184,19 @@ mod tests {
         assert_eq!(side_exit.target_offset, epilogue.end_offset);
         assert_eq!(side_exit.resume_bytecode_index, None);
         assert_eq!(side_exit.resume_entry_offset, None);
+        assert_eq!(
+            side_exit.native_reentry_targets,
+            vec![
+                P6BaselineNativeReentryTargetRecord {
+                    resume_bytecode_index: bci(4),
+                    resume_entry_offset: taken_reentry.start_offset,
+                },
+                P6BaselineNativeReentryTargetRecord {
+                    resume_bytecode_index: bci(2),
+                    resume_entry_offset: fallthrough_reentry.start_offset,
+                },
+            ]
+        );
         assert_eq!(
             arm64_word(&encoded.bytes, side_exit.branch_offset),
             link_conditional_branch(
@@ -2274,6 +2298,7 @@ mod tests {
                 rust_low_byte_value_layout(),
                 unsupported_exit,
                 target,
+                &[bci(12), bci(8)],
             )
             .unwrap();
         let fallthrough_offset = builder.offset().unwrap();
@@ -2282,7 +2307,12 @@ mod tests {
         let branch_records = builder
             .finish_bytecode_branches(&[instruction_record(12, target_offset)])
             .unwrap();
-        let side_exit_records = builder.finish_side_exit_return_stubs().unwrap();
+        let side_exit_records = builder
+            .finish_side_exit_return_stubs(&[
+                instruction_record(8, fallthrough_offset),
+                instruction_record(12, target_offset),
+            ])
+            .unwrap();
 
         assert_eq!(fallthrough_offset, 56);
         assert_eq!(target_offset, 60);
@@ -2332,6 +2362,19 @@ mod tests {
         assert_eq!(side_exit.target_offset, 64);
         assert_eq!(side_exit.resume_bytecode_index, None);
         assert_eq!(side_exit.resume_entry_offset, None);
+        assert_eq!(
+            side_exit.native_reentry_targets,
+            vec![
+                P6BaselineNativeReentryTargetRecord {
+                    resume_bytecode_index: bci(12),
+                    resume_entry_offset: target_offset,
+                },
+                P6BaselineNativeReentryTargetRecord {
+                    resume_bytecode_index: bci(8),
+                    resume_entry_offset: fallthrough_offset,
+                },
+            ]
+        );
         assert_eq!(
             arm64_word(builder.bytes(), side_exit.branch_offset),
             link_conditional_branch(Arm64Condition::Ne, side_exit.branch_offset, 64)
@@ -2450,7 +2493,7 @@ mod tests {
             )
             .unwrap();
         let normal_path_end = builder.offset().unwrap();
-        let records = builder.finish_side_exit_return_stubs().unwrap();
+        let records = builder.finish_side_exit_return_stubs(&[]).unwrap();
 
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].bytecode_index, bci(20));
@@ -2458,11 +2501,13 @@ mod tests {
         assert_eq!(records[0].target_offset, normal_path_end);
         assert_eq!(records[0].resume_bytecode_index, None);
         assert_eq!(records[0].resume_entry_offset, None);
+        assert!(records[0].native_reentry_targets.is_empty());
         assert_eq!(records[1].bytecode_index, bci(24));
         assert_eq!(records[1].side_exit_index, 1);
         assert_eq!(records[1].target_offset, records[0].stub_end_offset);
         assert_eq!(records[1].resume_bytecode_index, None);
         assert_eq!(records[1].resume_entry_offset, None);
+        assert!(records[1].native_reentry_targets.is_empty());
 
         for record in &records {
             let expected_stub =

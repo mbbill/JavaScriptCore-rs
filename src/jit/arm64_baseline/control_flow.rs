@@ -22,13 +22,13 @@ use super::{
 use crate::bytecode::BytecodeIndex;
 use crate::jit::emitter::{
     p6_x86_64_checked_byte_len, validate_p6_x86_64_semantic_value_layout,
-    P6X86_64BaselineBytecodeBranchKind, P6X86_64BaselineBytecodeBranchRecord,
-    P6X86_64BaselineControlFlowBranchContract, P6X86_64BaselineInstructionByteRecord,
-    P6X86_64BaselineMachineInstruction, P6X86_64BaselineOperandLocation,
-    P6X86_64BaselineSemanticByteEmissionError, P6X86_64BaselineSideExitDestinationEffect,
-    P6X86_64BaselineSideExitLabel, P6X86_64BaselineSideExitReturnPayload,
-    P6X86_64BaselineSideExitReturnStubRecord, P6X86_64BaselineSymbolicRegister,
-    P6X86_64BaselineValueLayoutContract,
+    P6BaselineNativeReentryTargetRecord, P6X86_64BaselineBytecodeBranchKind,
+    P6X86_64BaselineBytecodeBranchRecord, P6X86_64BaselineControlFlowBranchContract,
+    P6X86_64BaselineInstructionByteRecord, P6X86_64BaselineMachineInstruction,
+    P6X86_64BaselineOperandLocation, P6X86_64BaselineSemanticByteEmissionError,
+    P6X86_64BaselineSideExitDestinationEffect, P6X86_64BaselineSideExitLabel,
+    P6X86_64BaselineSideExitReturnPayload, P6X86_64BaselineSideExitReturnStubRecord,
+    P6X86_64BaselineSymbolicRegister, P6X86_64BaselineValueLayoutContract,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -638,12 +638,13 @@ struct P6Arm64PendingBytecodeBranch {
     branch_end_offset: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct P6Arm64PendingSideExitBranch {
     label: P6X86_64BaselineSideExitLabel,
     kind: Arm64DirectBranchKind,
     branch_offset: u32,
     branch_end_offset: u32,
+    native_reentry_target_bytecode_indices: Vec<BytecodeIndex>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -779,6 +780,21 @@ impl P6Arm64SemanticByteBuilder {
         label: P6X86_64BaselineSideExitLabel,
         kind: Arm64DirectBranchKind,
     ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
+        self.emit_retained_side_exit_direct_branch_with_native_reentry_targets(
+            bytecode_index,
+            label,
+            kind,
+            &[],
+        )
+    }
+
+    fn emit_retained_side_exit_direct_branch_with_native_reentry_targets(
+        &mut self,
+        bytecode_index: BytecodeIndex,
+        label: P6X86_64BaselineSideExitLabel,
+        kind: Arm64DirectBranchKind,
+        native_reentry_target_bytecode_indices: &[BytecodeIndex],
+    ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
         validate_p6_arm64_semantic_side_exit_label(bytecode_index, label)?;
         let branch_offset = self.emit_word(kind.placeholder_word())?;
         let branch_end_offset = self.offset()?;
@@ -787,6 +803,9 @@ impl P6Arm64SemanticByteBuilder {
             kind,
             branch_offset,
             branch_end_offset,
+            native_reentry_target_bytecode_indices: p6_arm64_unique_reentry_target_bytecode_indices(
+                native_reentry_target_bytecode_indices,
+            ),
         });
         Ok(())
     }
@@ -798,6 +817,7 @@ impl P6Arm64SemanticByteBuilder {
         value_layout: P6X86_64BaselineValueLayoutContract,
         unsupported_exit: P6X86_64BaselineSideExitLabel,
         target: P6X86_64BaselineControlFlowBranchContract,
+        unsupported_exit_native_reentry_targets: &[BytecodeIndex],
     ) -> Result<(), P6X86_64BaselineSemanticByteEmissionError> {
         validate_p6_x86_64_semantic_value_layout(value_layout)?;
         let machine_instruction = P6X86_64BaselineMachineInstruction::BranchIfFalsePrimitive {
@@ -851,12 +871,13 @@ impl P6Arm64SemanticByteBuilder {
         self.emit_word(p6_arm64_encode_cmp_imm64(register_contract::X10, true_tag))?;
         let true_fallthrough = self.emit_conditional_internal_branch(Arm64Condition::Eq)?;
         self.emit_word(p6_arm64_encode_cmp_imm64(register_contract::X10, int32_tag))?;
-        self.emit_retained_side_exit_direct_branch(
+        self.emit_retained_side_exit_direct_branch_with_native_reentry_targets(
             bytecode_index,
             unsupported_exit,
             Arm64DirectBranchKind::Conditional {
                 condition: Arm64Condition::Ne,
             },
+            unsupported_exit_native_reentry_targets,
         )?;
         self.emit_word(p6_arm64_encode_cmp_imm64(register_contract::X9, int32_tag))?;
         self.emit_conditional_bytecode_branch(target, Arm64Condition::Eq)?;
@@ -917,6 +938,7 @@ impl P6Arm64SemanticByteBuilder {
 
     pub(super) fn finish_side_exit_return_stubs(
         &mut self,
+        instruction_bytes: &[P6X86_64BaselineInstructionByteRecord],
     ) -> Result<
         Vec<P6X86_64BaselineSideExitReturnStubRecord>,
         P6X86_64BaselineSemanticByteEmissionError,
@@ -945,6 +967,25 @@ impl P6Arm64SemanticByteBuilder {
                 )
             })?;
             self.patch_direct_branch_word(branch.branch_offset, linked.instruction_word)?;
+            let native_reentry_targets = branch
+                .native_reentry_target_bytecode_indices
+                .iter()
+                .map(|resume_bytecode_index| {
+                    let resume_instruction = instruction_bytes
+                        .iter()
+                        .find(|record| record.bytecode_index == *resume_bytecode_index)
+                        .ok_or(
+                            P6X86_64BaselineSemanticByteEmissionError::BranchTargetMissing {
+                                bytecode_index: branch.label.retained_bytecode_index,
+                                target: *resume_bytecode_index,
+                            },
+                        )?;
+                    Ok(P6BaselineNativeReentryTargetRecord {
+                        resume_bytecode_index: *resume_bytecode_index,
+                        resume_entry_offset: resume_instruction.start_offset,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             records.push(P6X86_64BaselineSideExitReturnStubRecord {
                 bytecode_index: branch.label.retained_bytecode_index,
                 reason: branch.label.reason,
@@ -959,11 +1000,13 @@ impl P6Arm64SemanticByteBuilder {
                     },
                 )?,
                 // C++ `jfalse` fallback branches to `valueIsFalsey`/slow path.
-                // This dormant ARM64 native-entry bridge only returns retained
-                // payloads for the current Rust fallback ABI; reentry offsets stay
-                // empty until executable ARM64 branch bodies are ported.
+                // This dormant ARM64 native-entry bridge records the possible
+                // native labels in `native_reentry_targets`, but it keeps the
+                // legacy single-target fields empty because JumpIfFalse fallback
+                // can resume at either the taken target or the fallthrough.
                 resume_bytecode_index: None,
                 resume_entry_offset: None,
+                native_reentry_targets,
                 encoded_payload,
                 bytes: p6_arm64_bytes_for_range(&self.bytes, target_offset, stub_end_offset)?,
             });
@@ -1026,6 +1069,18 @@ fn p6_arm64_checked_side_exit_index(
             },
         )
     }
+}
+
+fn p6_arm64_unique_reentry_target_bytecode_indices(
+    targets: &[BytecodeIndex],
+) -> Vec<BytecodeIndex> {
+    let mut unique = Vec::new();
+    for target in targets {
+        if !unique.contains(target) {
+            unique.push(*target);
+        }
+    }
+    unique
 }
 
 fn p6_arm64_direct_branch_link_error(

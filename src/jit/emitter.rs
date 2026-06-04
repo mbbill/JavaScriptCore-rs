@@ -1701,6 +1701,15 @@ pub struct P6X86_64BaselineSideExitPlaceholderRecord {
     pub placeholder_bytes: [u8; 2],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct P6BaselineNativeReentryTargetRecord {
+    // Metadata-only mirror of C++ JIT bytecode-label/PC publication
+    // (fastPathResumePoint/JITCodeMapBuilder); it does not authorize native
+    // side-exit reentry without a backend-specific VM/rooting bridge.
+    pub resume_bytecode_index: crate::bytecode::BytecodeIndex,
+    pub resume_entry_offset: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct P6X86_64BaselineSideExitReturnStubRecord {
     pub bytecode_index: crate::bytecode::BytecodeIndex,
@@ -1713,6 +1722,7 @@ pub struct P6X86_64BaselineSideExitReturnStubRecord {
     pub byte_len: u32,
     pub resume_bytecode_index: Option<crate::bytecode::BytecodeIndex>,
     pub resume_entry_offset: Option<u32>,
+    pub native_reentry_targets: Vec<P6BaselineNativeReentryTargetRecord>,
     pub encoded_payload: P6X86_64BaselineSideExitReturnPayload,
     pub bytes: Vec<u8>,
 }
@@ -4430,6 +4440,15 @@ impl P6X86_64SemanticByteBuilder {
                         )
                 })
                 .transpose()?;
+            let native_reentry_targets = match (resume_bytecode_index, resume_entry_offset) {
+                (Some(resume_bytecode_index), Some(resume_entry_offset)) => {
+                    vec![P6BaselineNativeReentryTargetRecord {
+                        resume_bytecode_index,
+                        resume_entry_offset,
+                    }]
+                }
+                _ => Vec::new(),
+            };
             records.push(P6X86_64BaselineSideExitReturnStubRecord {
                 bytecode_index: branch.label.retained_bytecode_index,
                 reason: branch.label.reason,
@@ -4445,6 +4464,7 @@ impl P6X86_64SemanticByteBuilder {
                 )?,
                 resume_bytecode_index,
                 resume_entry_offset,
+                native_reentry_targets,
                 encoded_payload,
                 bytes: self.bytes_for_range(target_offset, stub_end_offset)?,
             });
@@ -18498,6 +18518,13 @@ mod tests {
             let resume_entry_offset = stub
                 .resume_entry_offset
                 .expect("side exit resume entry offset");
+            assert_eq!(
+                stub.native_reentry_targets,
+                vec![P6BaselineNativeReentryTargetRecord {
+                    resume_bytecode_index: expected_resume_bytecode,
+                    resume_entry_offset,
+                }]
+            );
             assert!(resume_entry_offset > resume_instruction.start_offset);
             assert!(resume_entry_offset < resume_instruction.end_offset);
             let resume_entry_end_offset =

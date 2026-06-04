@@ -56759,6 +56759,46 @@ mod tests {
         );
     }
 
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn vm_p6_arm64_public_branch_aware_jump_if_false_uses_x86_semantic_fallback_artifact() {
+        let code_block = p8b_jump_if_false_code_block(P8bTruthinessSource::Bool(false));
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let owner = register_test_code_block(&mut vm, code_block);
+
+        let record = vm
+            .install_p6_x86_64_callable_semantic_baseline_native_entry(p6_semantic_install_request(
+                owner, 744,
+            ))
+            .expect("public ARM64 branch-aware callable admission should fall back to x86 semantic artifact");
+        let enabled_readiness = record
+            .enabled_readiness
+            .as_ref()
+            .expect("callable install records enabled readiness");
+
+        assert_eq!(
+            record.eligibility_proof.opcode_subset(),
+            BaselineSupportedOpcodeSubset::P8bConstantsMovesReturnInt32ArithmeticBranchNullishFalse
+        );
+        assert_ne!(
+            record.semantic_emission.emitter_kind,
+            BaselineMachineCodeEmitterKind::P6Arm64NoCallNoHeapReturnSeedSubset
+        );
+        assert_eq!(
+            record.semantic_emission.emitter_kind,
+            BaselineMachineCodeEmitterKind::P8bX86_64NoCallNoHeapBranchTruthinessSubset
+        );
+        assert_eq!(record.semantic_emission.bytecode_branches.len(), 1);
+        assert_eq!(record.semantic_emission.side_exit_return_stubs.len(), 1);
+        assert_eq!(
+            enabled_readiness.callable.map(|callable| callable.kind()),
+            Some(BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry)
+        );
+        assert!(!vm.can_execute_baseline_native_entry_kind(
+            BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry
+        ));
+    }
+
     #[cfg(all(unix, target_arch = "x86_64"))]
     #[test]
     fn vm_p6_semantic_callable_native_ready_subset_matches_interpreter_matrix() {

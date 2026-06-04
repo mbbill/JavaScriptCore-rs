@@ -103,6 +103,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            retained P6 payloads and the VM decodes them before JSValue wrapping
            (Rust native-entry ABI/rooting bridge only; C++ jfalse truthiness remains
            valueIsFalsey/LLInt slow-path work)
+    [done] JIT ARM64 retained side-exit records carry dormant native reentry target
+           metadata for JumpIfFalse taken/fallthrough outcomes; public ARM64
+           branch-aware callable admission still falls back to the existing x86
+           semantic artifact until ARM64 native reentry/rooting is designed.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
