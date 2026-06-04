@@ -3,6 +3,7 @@
 use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet};
 
+mod conservative_scan;
 mod run_current_phase;
 
 use super::machine_stack_marker::JscMachineStackRootingIngestError;

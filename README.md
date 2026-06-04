@@ -139,9 +139,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            handshake that reruns mutator Fixpoint with the exact captured
            CurrentThreadState; src/gc/conservative_roots.rs adds the dormant
            ConservativeRoots descriptor with exact published-payload validation
-           only, and src/gc/visitor.rs adds the descriptor-only
-           SlotVisitor::append(ConservativeRoots) boundary; native execution
-           unchanged.
+           only, src/gc/visitor.rs adds the descriptor-only
+           SlotVisitor::append(ConservativeRoots) boundary, and
+           src/gc/heap/conservative_scan.rs adds the heap conservative-scan
+           append receipt that scopes the visitor reason locally; native
+           execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
