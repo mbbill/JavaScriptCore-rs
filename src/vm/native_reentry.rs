@@ -29,6 +29,7 @@ use crate::platform::executable_memory_compartment::ExecutableMemoryP6CallReques
 use crate::runtime::RuntimeValue;
 use crate::value::EncodedJsValue;
 
+use super::entry::VmNativeCallFramePublicationRecord;
 use super::side_exit::{
     p6_jump_if_false_truthiness_side_exit_resume_shape, P6CallableSideExitNativeReentryInvocation,
     P6X86_64CallableSideExitReturnSite,
@@ -123,8 +124,30 @@ pub(super) fn p6_arm64_reject_side_exit_reentry_execution(
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct P6Arm64BranchAwareCallableTopCallFramePublicationProof {
+    // C++ JSC stores a raw CallFrame* in VM::topCallFrame; this Rust evidence
+    // is tied to the symbolic publication record from `entry.rs`, so it proves
+    // top-frame metadata exists but not that conservative machine-stack roots
+    // can see generated ARM64 state.
+    pub(super) publication: VmNativeCallFramePublicationRecord,
+}
+
+impl P6Arm64BranchAwareCallableTopCallFramePublicationProof {
+    #[allow(dead_code)]
+    pub(super) const fn from_publication_record(
+        publication: VmNativeCallFramePublicationRecord,
+    ) -> Self {
+        Self { publication }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum P6Arm64BranchAwareCallableFallbackRootingProof {
-    MissingJscStyleFrameAndMachineStackRoots,
+    MissingTopCallFramePublication,
+    TopCallFramePublicationWithoutConservativeRoots(
+        P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+    ),
 }
 
 #[allow(dead_code)]
@@ -214,8 +237,9 @@ pub(super) enum P6Arm64BranchAwareCallableAdmissionRejection {
     ReadinessBytecodeSnapshotMismatch,
     MaterializationInstallMismatch,
     RetainedTableMaterializationMismatch,
-    MissingFallbackRootingProof {
-        proof: P6Arm64BranchAwareCallableFallbackRootingProof,
+    MissingTopCallFramePublicationProof,
+    MissingMachineStackAndConservativeRootingProof {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
     },
 }
 
@@ -312,18 +336,26 @@ pub(super) fn p6_arm64_public_branch_aware_callable_admission_proof(
         );
     }
 
-    // C++ JSC publishes branch targets in finalized baseline code
-    // (JITCodeMapBuilder) and keeps CallFrame/topCallFrame visible to
-    // FrameTracers, StackVisitor, and conservative stack roots. Rust currently
-    // diverges intentionally: the ARM64 branch-aware encoder and retained
-    // reentry records are metadata-only, and no public machine-stack/rooting
-    // proof exists. The `Infallible` success type keeps this boundary rejected
-    // until that proof is designed explicitly.
-    Err(
-        P6Arm64BranchAwareCallableAdmissionRejection::MissingFallbackRootingProof {
-            proof: request.fallback_rooting_proof,
-        },
-    )
+    // C++ JSC publishes an actual CallFrame* into VM::topCallFrame via
+    // TopCallFrameSetter/NativeCallFrameTracer/prepareCallOperation, and
+    // StackVisitor plus conservative roots consume that machine-stack fact.
+    // Rust intentionally diverges here: VmNativeCallFramePublicationRecord is
+    // symbolic VM-entry metadata, not a proof that generated ARM64 state is
+    // visible to conservative stack/root scanning. The `Infallible` success
+    // type keeps public ARM64 admission rejected after distinguishing these
+    // two missing pieces.
+    match request.fallback_rooting_proof {
+        P6Arm64BranchAwareCallableFallbackRootingProof::MissingTopCallFramePublication => {
+            Err(P6Arm64BranchAwareCallableAdmissionRejection::MissingTopCallFramePublicationProof)
+        }
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithoutConservativeRoots(
+            top_call_frame_publication,
+        ) => Err(
+            P6Arm64BranchAwareCallableAdmissionRejection::MissingMachineStackAndConservativeRootingProof {
+                top_call_frame_publication,
+            },
+        ),
+    }
 }
 
 #[allow(dead_code)]
@@ -454,6 +486,15 @@ mod tests {
         UnlinkedCodeBlock, VirtualRegister,
     };
     use crate::jit::{ExecutableAllocationId, P6BaselineNativeReentryTargetRecord};
+    use crate::runtime::{
+        ArityCheckMode, CallFrameId, CellId, CodeBlockId, CodeSpecializationKind, EntryFrameId,
+        RuntimeValue,
+    };
+
+    use super::super::entry::{
+        FrameAddress, VmEntryCallFrameMetadata, VmEntryLaunchArgumentValue,
+        VmNativeCallFramePublicationReason, VmNativeCallFramePublicationRecord,
+    };
 
     fn bci(offset: u32) -> BytecodeIndex {
         BytecodeIndex::from_offset(offset)
@@ -628,7 +669,41 @@ mod tests {
             exit_counts: P6Arm64BranchAwareCallableExitCounts::default(),
             metadata: valid_metadata(),
             fallback_rooting_proof:
-                P6Arm64BranchAwareCallableFallbackRootingProof::MissingJscStyleFrameAndMachineStackRoots,
+                P6Arm64BranchAwareCallableFallbackRootingProof::MissingTopCallFramePublication,
+        }
+    }
+
+    fn top_call_frame_publication_record() -> VmNativeCallFramePublicationRecord {
+        let code_block = CodeBlockId(CellId(41));
+        VmNativeCallFramePublicationRecord {
+            ordinal: 1,
+            entry_depth: 1,
+            reason: VmNativeCallFramePublicationReason::BaselineNativeEntry,
+            owner: code_block,
+            code_block,
+            current_entry_frame: FrameAddress(0x1000),
+            previous_top_frame: Some(FrameAddress(0x1000)),
+            published_top_frame: FrameAddress(0x2000),
+            active_entry_frame: EntryFrameId(1),
+            previous_entry_frame: None,
+            saved_top_call_frame: None,
+            active_top_call_frame: CallFrameId(2),
+            call_frame: VmEntryCallFrameMetadata {
+                frame: CallFrameId(2),
+                entry_frame: Some(EntryFrameId(1)),
+                caller_frame: None,
+                code_block: Some(code_block),
+                callee: None,
+                callee_value: None,
+                context: None,
+                global_object: None,
+                entry_value: VmEntryLaunchArgumentValue::This(RuntimeValue::undefined()),
+                argument_count_including_this: 1,
+                provided_argument_count: 0,
+                padded_argument_count: 1,
+                specialization: CodeSpecializationKind::Call,
+                arity_mode: ArityCheckMode::AlreadyChecked,
+            },
         }
     }
 
@@ -664,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn public_arm64_branch_aware_admission_rejects_missing_fallback_rooting_proof() {
+    fn public_arm64_branch_aware_admission_rejects_missing_top_call_frame_publication_proof() {
         let code_block = jump_if_false_code_block(4);
         let site = jump_if_false_site();
         let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
@@ -672,9 +747,30 @@ mod tests {
 
         assert_eq!(
             p6_arm64_public_branch_aware_callable_admission_proof(&request),
+            Err(P6Arm64BranchAwareCallableAdmissionRejection::MissingTopCallFramePublicationProof)
+        );
+    }
+
+    #[test]
+    fn public_arm64_branch_aware_admission_rejects_missing_machine_roots_after_publication() {
+        let code_block = jump_if_false_code_block(4);
+        let site = jump_if_false_site();
+        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
+        let mut request = valid_request(&side_exits);
+        let top_call_frame_publication =
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof::from_publication_record(
+                top_call_frame_publication_record(),
+            );
+        request.fallback_rooting_proof =
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithoutConservativeRoots(
+                top_call_frame_publication,
+            );
+
+        assert_eq!(
+            p6_arm64_public_branch_aware_callable_admission_proof(&request),
             Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::MissingFallbackRootingProof {
-                    proof: P6Arm64BranchAwareCallableFallbackRootingProof::MissingJscStyleFrameAndMachineStackRoots,
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingMachineStackAndConservativeRootingProof {
+                    top_call_frame_publication,
                 }
             )
         );

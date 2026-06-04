@@ -114,7 +114,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            existing x86 semantic artifact.
     [done] VM native call-frame publication skeleton added to src/vm/entry.rs:
            C++ TopCallFrameSetter/NativeCallFrameTracer-shaped publish/restore
-           records for future public ARM64 admission; native execution unchanged.
+           records for future public ARM64 admission; src/vm/native_reentry.rs
+           now separates missing top-call-frame publication from symbolic
+           publication-without-conservative-root proof; native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
