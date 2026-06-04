@@ -125,7 +125,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            EntryFrame.h/VMEntryRecord.h-shaped previous-top-pair storage/proof
            skeleton, and src/vm/entry.rs now has a dormant storage-backed
            VM-entry guard that validates/restores the distinct topCallFrame /
-           topEntryFrame pair for future publication; native execution unchanged.
+           topEntryFrame pair and is the only reachable entry-guard path for
+           native call-frame publication; native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
