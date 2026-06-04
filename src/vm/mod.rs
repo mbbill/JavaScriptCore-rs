@@ -237,6 +237,7 @@ use executables::{
     ExecutableRegistryEntryPublication, ExecutableRegistryError,
 };
 
+use self::call_frame_storage::JscCallFrameStorage;
 #[cfg(test)]
 use self::native_reentry::p6_x86_64_callable_side_exit_payload_has_reserved_tag;
 use self::native_reentry::{
@@ -877,6 +878,8 @@ pub struct Vm {
     heap: Heap,
     api_protections: ApiProtectionRegistry,
     entry: VmEntryState,
+    #[allow(dead_code)]
+    call_frame_storage: JscCallFrameStorage,
     exceptions: ExceptionState,
     structures: RuntimeStructures,
     caches: RuntimeCaches,
@@ -1835,6 +1838,7 @@ impl Vm {
             heap,
             api_protections,
             entry: VmEntryState::default(),
+            call_frame_storage: JscCallFrameStorage::default(),
             exceptions: ExceptionState::default(),
             structures: RuntimeStructures::default(),
             caches: RuntimeCaches::default(),

@@ -16,6 +16,7 @@ use crate::runtime::{
     NativeCodeId, ObjectId, ProtoCallFrame, RuntimeValue,
 };
 
+use super::call_frame_storage::VmPublishedTopCallFrame;
 use super::tiering::{
     BaselineEntryGateOutcome, BaselineEntryGateRecord, BaselineNativeEntryExecutionPolicy,
     BaselineNativeEntryReadinessOutcome, BaselineNativeEntryReadinessRecord,
@@ -93,10 +94,12 @@ impl VmEntryState {
         self.launch_descriptors.push(descriptor);
     }
 
-    pub fn publish_native_call_frame(
+    #[allow(dead_code)]
+    pub(crate) fn publish_native_call_frame<'storage>(
         &mut self,
-        request: VmNativeCallFramePublicationRequest,
-    ) -> Result<VmNativeCallFramePublicationGuard<'_>, VmNativeCallFramePublicationError> {
+        request: VmNativeCallFramePublicationRequest<'storage>,
+    ) -> Result<VmNativeCallFramePublicationGuard<'_, 'storage>, VmNativeCallFramePublicationError>
+    {
         if self.entry_depth == 0 {
             return Err(VmNativeCallFramePublicationError::NotInsideVmEntry);
         }
@@ -126,9 +129,27 @@ impl VmEntryState {
                 actual: request.call_frame.frame,
             });
         }
+        if request.published_top_frame.entry_frame() != Some(active_entry_frame) {
+            return Err(
+                VmNativeCallFramePublicationError::PublishedEntryFrameMismatch {
+                    expected: active_entry_frame,
+                    actual: request.published_top_frame.entry_frame(),
+                },
+            );
+        }
+        if request.published_top_frame.frame() != active_top_call_frame {
+            return Err(
+                VmNativeCallFramePublicationError::PublishedTopFrameMismatch {
+                    expected: active_top_call_frame,
+                    actual: request.published_top_frame.frame(),
+                },
+            );
+        }
 
         self.next_ordinal = self.next_ordinal.saturating_add(1);
         let ordinal = self.next_ordinal;
+        let published_top_frame_proof = request.published_top_frame;
+        let published_top_frame = request.published_top_frame.address();
         let record = VmNativeCallFramePublicationRecord {
             ordinal,
             entry_depth: self.entry_depth,
@@ -137,7 +158,7 @@ impl VmEntryState {
             code_block: request.code_block,
             current_entry_frame,
             previous_top_frame: Some(previous_top_frame),
-            published_top_frame: request.published_top_frame,
+            published_top_frame,
             active_entry_frame,
             previous_entry_frame: request.scope.previous_entry_frame,
             saved_top_call_frame: request.scope.saved_top_call_frame,
@@ -146,16 +167,18 @@ impl VmEntryState {
         };
 
         // C++ writes the raw CallFrame* into VM::topCallFrame. Rust launch
-        // metadata currently names frames symbolically with CallFrameId while
-        // VmEntryState stores FrameAddress, so this guard validates the
-        // symbolic pair and publishes the explicit active FrameAddress.
-        self.top_frame = Some(request.published_top_frame);
+        // metadata currently names frames symbolically with CallFrameId, so this
+        // guard also requires a VM-owned JSC-shaped storage proof before
+        // publishing the underlying FrameAddress. This is not yet a conservative
+        // root proof or real native-execution publication.
+        self.top_frame = Some(published_top_frame);
         self.native_call_frame_publications.push(record);
 
         Ok(VmNativeCallFramePublicationGuard {
             state: self,
             record,
             previous_top_frame: Some(previous_top_frame),
+            published_top_frame: published_top_frame_proof,
             _borrow: PhantomData,
         })
     }
@@ -228,19 +251,21 @@ impl VmEntryState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VmNativeCallFramePublicationRequest {
-    pub reason: VmNativeCallFramePublicationReason,
-    pub owner: CodeBlockId,
-    pub code_block: CodeBlockId,
-    pub scope: VmEntryLaunchScope,
-    pub call_frame: VmEntryCallFrameMetadata,
-    pub published_top_frame: FrameAddress,
+#[allow(dead_code)]
+pub(crate) struct VmNativeCallFramePublicationRequest<'frame> {
+    pub(crate) reason: VmNativeCallFramePublicationReason,
+    pub(crate) owner: CodeBlockId,
+    pub(crate) code_block: CodeBlockId,
+    pub(crate) scope: VmEntryLaunchScope,
+    pub(crate) call_frame: VmEntryCallFrameMetadata,
+    pub(crate) published_top_frame: VmPublishedTopCallFrame<'frame>,
 }
 
-impl VmNativeCallFramePublicationRequest {
-    pub fn baseline_native_entry(
+#[allow(dead_code)]
+impl<'frame> VmNativeCallFramePublicationRequest<'frame> {
+    pub(crate) fn baseline_native_entry(
         descriptor: &VmEntryLaunchDescriptor,
-        published_top_frame: FrameAddress,
+        published_top_frame: VmPublishedTopCallFrame<'frame>,
     ) -> Self {
         Self {
             reason: VmNativeCallFramePublicationReason::BaselineNativeEntry,
@@ -286,6 +311,7 @@ pub struct VmNativeCallFramePublicationExitRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub enum VmNativeCallFramePublicationError {
     NotInsideVmEntry,
     CurrentEntryFrameMissing,
@@ -300,16 +326,27 @@ pub enum VmNativeCallFramePublicationError {
         expected: CallFrameId,
         actual: CallFrameId,
     },
+    PublishedEntryFrameMismatch {
+        expected: EntryFrameId,
+        actual: Option<EntryFrameId>,
+    },
+    PublishedTopFrameMismatch {
+        expected: CallFrameId,
+        actual: CallFrameId,
+    },
 }
 
-pub struct VmNativeCallFramePublicationGuard<'vm> {
+#[allow(dead_code)]
+pub struct VmNativeCallFramePublicationGuard<'vm, 'storage> {
     state: &'vm mut VmEntryState,
     record: VmNativeCallFramePublicationRecord,
     previous_top_frame: Option<FrameAddress>,
+    published_top_frame: VmPublishedTopCallFrame<'storage>,
     _borrow: PhantomData<&'vm mut VmEntryState>,
 }
 
-impl<'vm> VmNativeCallFramePublicationGuard<'vm> {
+#[allow(dead_code)]
+impl<'vm, 'storage> VmNativeCallFramePublicationGuard<'vm, 'storage> {
     pub fn record(&self) -> VmNativeCallFramePublicationRecord {
         self.record
     }
@@ -318,15 +355,21 @@ impl<'vm> VmNativeCallFramePublicationGuard<'vm> {
         self.state.top_frame
     }
 
-    pub fn publish_native_call_frame(
+    pub(crate) fn published_top_frame(&self) -> VmPublishedTopCallFrame<'storage> {
+        self.published_top_frame
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn publish_native_call_frame<'nested>(
         &mut self,
-        request: VmNativeCallFramePublicationRequest,
-    ) -> Result<VmNativeCallFramePublicationGuard<'_>, VmNativeCallFramePublicationError> {
+        request: VmNativeCallFramePublicationRequest<'nested>,
+    ) -> Result<VmNativeCallFramePublicationGuard<'_, 'nested>, VmNativeCallFramePublicationError>
+    {
         self.state.publish_native_call_frame(request)
     }
 }
 
-impl Drop for VmNativeCallFramePublicationGuard<'_> {
+impl Drop for VmNativeCallFramePublicationGuard<'_, '_> {
     fn drop(&mut self) {
         let depth_before_exit = self.state.entry_depth;
         self.state.top_frame = self.previous_top_frame;
@@ -360,10 +403,12 @@ impl VmEntryGuard<'_> {
         self.state.top_frame
     }
 
-    pub fn publish_native_call_frame(
+    #[allow(dead_code)]
+    pub(crate) fn publish_native_call_frame<'storage>(
         &mut self,
-        request: VmNativeCallFramePublicationRequest,
-    ) -> Result<VmNativeCallFramePublicationGuard<'_>, VmNativeCallFramePublicationError> {
+        request: VmNativeCallFramePublicationRequest<'storage>,
+    ) -> Result<VmNativeCallFramePublicationGuard<'_, 'storage>, VmNativeCallFramePublicationError>
+    {
         self.state.publish_native_call_frame(request)
     }
 }
@@ -879,8 +924,11 @@ fn validate_owner(
 
 #[cfg(test)]
 mod tests {
+    use super::super::call_frame_storage::JscCallFrameStorage;
     use super::*;
+    use crate::bytecode::register::CallFrameSlotLayout;
     use crate::gc::CellId;
+    use crate::interpreter::{FrameState, InstalledCallFrame, RegisterWindow};
     use crate::jit::code::BaselineEntryArtifact;
     use crate::jit::{
         BaselineGeneratedCodeBodyCapability, BaselineNativeEntryCallableAuthority,
@@ -909,15 +957,32 @@ mod tests {
     #[test]
     fn native_call_frame_publication_records_and_restores_top_frame() {
         let owner = CodeBlockId(CellId(14));
+        let mut storage = JscCallFrameStorage::default();
+        let published_top_frame = published_top_call_frame(
+            &mut storage,
+            owner,
+            CallFrameId(2),
+            Some(EntryFrameId(1)),
+            20,
+        );
+        let published_address = published_top_frame.address();
         let mut state = VmEntryState::default();
         {
             let mut entry =
                 state.enter_rooted(Some(FrameAddress(10)), EntryKind::Script, HeapId(8));
             {
                 let publication = entry
-                    .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+                    .publish_native_call_frame(native_publication_request(
+                        owner,
+                        published_top_frame,
+                    ))
                     .expect("native call-frame publication");
-                assert_eq!(publication.top_frame(), Some(FrameAddress(20)));
+                assert_eq!(publication.top_frame(), Some(published_address));
+                // The publication guard retains this storage-derived proof for
+                // the same scope that `VmEntryState::top_frame` carries the
+                // underlying address. A mutable retire of `storage` here would
+                // conflict with that live storage lease.
+                assert_eq!(publication.published_top_frame(), published_top_frame);
 
                 let record = publication.record();
                 assert_eq!(
@@ -928,7 +993,7 @@ mod tests {
                 assert_eq!(record.code_block, owner);
                 assert_eq!(record.current_entry_frame, FrameAddress(10));
                 assert_eq!(record.previous_top_frame, Some(FrameAddress(10)));
-                assert_eq!(record.published_top_frame, FrameAddress(20));
+                assert_eq!(record.published_top_frame, published_address);
                 assert_eq!(record.active_entry_frame, EntryFrameId(1));
                 assert_eq!(record.active_top_call_frame, CallFrameId(2));
             }
@@ -946,26 +1011,49 @@ mod tests {
     #[test]
     fn nested_native_call_frame_publication_restores_inner_then_outer_frame() {
         let owner = CodeBlockId(CellId(15));
+        let mut storage = JscCallFrameStorage::default();
+        let outer_handle = storage.register_installed_frame(&installed_frame(
+            CallFrameId(2),
+            Some(EntryFrameId(1)),
+            None,
+            owner,
+            20,
+        ));
+        let inner_handle = storage.register_installed_frame(&installed_frame(
+            CallFrameId(2),
+            Some(EntryFrameId(1)),
+            None,
+            owner,
+            30,
+        ));
+        let outer_top_frame = storage
+            .published_top_call_frame(outer_handle)
+            .expect("outer published top frame");
+        let inner_top_frame = storage
+            .published_top_call_frame(inner_handle)
+            .expect("inner published top frame");
+        let outer_address = outer_top_frame.address();
+        let inner_address = inner_top_frame.address();
         let mut state = VmEntryState::default();
         {
             let mut entry =
                 state.enter_rooted(Some(FrameAddress(10)), EntryKind::Script, HeapId(8));
             {
                 let mut outer = entry
-                    .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+                    .publish_native_call_frame(native_publication_request(owner, outer_top_frame))
                     .expect("outer native call-frame publication");
-                assert_eq!(outer.top_frame(), Some(FrameAddress(20)));
+                assert_eq!(outer.top_frame(), Some(outer_address));
                 {
                     let inner = outer
                         .publish_native_call_frame(native_publication_request(
                             owner,
-                            FrameAddress(30),
+                            inner_top_frame,
                         ))
                         .expect("inner native call-frame publication");
-                    assert_eq!(inner.record().previous_top_frame, Some(FrameAddress(20)));
-                    assert_eq!(inner.top_frame(), Some(FrameAddress(30)));
+                    assert_eq!(inner.record().previous_top_frame, Some(outer_address));
+                    assert_eq!(inner.top_frame(), Some(inner_address));
                 }
-                assert_eq!(outer.top_frame(), Some(FrameAddress(20)));
+                assert_eq!(outer.top_frame(), Some(outer_address));
             }
             assert_eq!(entry.top_frame(), Some(FrameAddress(10)));
         }
@@ -974,7 +1062,7 @@ mod tests {
         assert_eq!(state.native_call_frame_publication_exits().len(), 2);
         assert_eq!(
             state.native_call_frame_publication_exits()[0].restored_top_frame,
-            Some(FrameAddress(20))
+            Some(outer_address)
         );
         assert_eq!(
             state.native_call_frame_publication_exits()[1].restored_top_frame,
@@ -985,9 +1073,17 @@ mod tests {
     #[test]
     fn native_call_frame_publication_rejects_missing_active_vm_entry() {
         let owner = CodeBlockId(CellId(16));
+        let mut storage = JscCallFrameStorage::default();
+        let published_top_frame = published_top_call_frame(
+            &mut storage,
+            owner,
+            CallFrameId(2),
+            Some(EntryFrameId(1)),
+            20,
+        );
         let mut state = VmEntryState::default();
         let error = state
-            .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+            .publish_native_call_frame(native_publication_request(owner, published_top_frame))
             .err()
             .expect("publication rejection");
 
@@ -998,9 +1094,17 @@ mod tests {
     #[test]
     fn native_call_frame_publication_rejects_missing_current_entry_or_top_frame() {
         let owner = CodeBlockId(CellId(17));
+        let mut storage = JscCallFrameStorage::default();
+        let published_top_frame = published_top_call_frame(
+            &mut storage,
+            owner,
+            CallFrameId(2),
+            Some(EntryFrameId(1)),
+            20,
+        );
         let mut missing_entry_frame = active_native_entry_state(None, Some(FrameAddress(10)));
         let entry_error = missing_entry_frame
-            .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+            .publish_native_call_frame(native_publication_request(owner, published_top_frame))
             .err()
             .expect("entry-frame rejection");
         assert_eq!(
@@ -1010,7 +1114,7 @@ mod tests {
 
         let mut missing_top_frame = active_native_entry_state(Some(FrameAddress(10)), None);
         let top_error = missing_top_frame
-            .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+            .publish_native_call_frame(native_publication_request(owner, published_top_frame))
             .err()
             .expect("top-frame rejection");
         assert_eq!(
@@ -1022,7 +1126,15 @@ mod tests {
     #[test]
     fn native_call_frame_publication_rejects_missing_launch_entry_or_top_frame() {
         let owner = CodeBlockId(CellId(18));
-        let mut missing_launch_entry = native_publication_request(owner, FrameAddress(20));
+        let mut storage = JscCallFrameStorage::default();
+        let published_top_frame = published_top_call_frame(
+            &mut storage,
+            owner,
+            CallFrameId(2),
+            Some(EntryFrameId(1)),
+            20,
+        );
+        let mut missing_launch_entry = native_publication_request(owner, published_top_frame);
         missing_launch_entry.scope.active_entry_frame = None;
         let entry_error = active_native_entry_state(Some(FrameAddress(10)), Some(FrameAddress(10)))
             .publish_native_call_frame(missing_launch_entry)
@@ -1033,7 +1145,7 @@ mod tests {
             VmNativeCallFramePublicationError::LaunchActiveEntryMissing
         );
 
-        let mut missing_launch_top = native_publication_request(owner, FrameAddress(20));
+        let mut missing_launch_top = native_publication_request(owner, published_top_frame);
         missing_launch_top.scope.active_top_call_frame = None;
         let top_error = active_native_entry_state(Some(FrameAddress(10)), Some(FrameAddress(10)))
             .publish_native_call_frame(missing_launch_top)
@@ -1048,7 +1160,15 @@ mod tests {
     #[test]
     fn native_call_frame_publication_rejects_symbolic_entry_or_top_mismatch() {
         let owner = CodeBlockId(CellId(19));
-        let mut entry_mismatch = native_publication_request(owner, FrameAddress(20));
+        let mut storage = JscCallFrameStorage::default();
+        let published_top_frame = published_top_call_frame(
+            &mut storage,
+            owner,
+            CallFrameId(2),
+            Some(EntryFrameId(1)),
+            20,
+        );
+        let mut entry_mismatch = native_publication_request(owner, published_top_frame);
         entry_mismatch.call_frame.entry_frame = Some(EntryFrameId(9));
         let entry_error = active_native_entry_state(Some(FrameAddress(10)), Some(FrameAddress(10)))
             .publish_native_call_frame(entry_mismatch)
@@ -1062,7 +1182,7 @@ mod tests {
             }
         );
 
-        let mut top_mismatch = native_publication_request(owner, FrameAddress(20));
+        let mut top_mismatch = native_publication_request(owner, published_top_frame);
         top_mismatch.call_frame.frame = CallFrameId(9);
         let top_error = active_native_entry_state(Some(FrameAddress(10)), Some(FrameAddress(10)))
             .publish_native_call_frame(top_mismatch)
@@ -1078,8 +1198,60 @@ mod tests {
     }
 
     #[test]
+    fn native_call_frame_publication_rejects_storage_proof_entry_or_top_mismatch() {
+        let owner = CodeBlockId(CellId(20));
+        let mut entry_storage = JscCallFrameStorage::default();
+        let wrong_entry_top_frame = published_top_call_frame(
+            &mut entry_storage,
+            owner,
+            CallFrameId(2),
+            Some(EntryFrameId(9)),
+            20,
+        );
+        let entry_error = active_native_entry_state(Some(FrameAddress(10)), Some(FrameAddress(10)))
+            .publish_native_call_frame(native_publication_request(owner, wrong_entry_top_frame))
+            .err()
+            .expect("storage entry-frame rejection");
+        assert_eq!(
+            entry_error,
+            VmNativeCallFramePublicationError::PublishedEntryFrameMismatch {
+                expected: EntryFrameId(1),
+                actual: Some(EntryFrameId(9))
+            }
+        );
+
+        let mut top_storage = JscCallFrameStorage::default();
+        let wrong_top_frame = published_top_call_frame(
+            &mut top_storage,
+            owner,
+            CallFrameId(9),
+            Some(EntryFrameId(1)),
+            24,
+        );
+        let top_error = active_native_entry_state(Some(FrameAddress(10)), Some(FrameAddress(10)))
+            .publish_native_call_frame(native_publication_request(owner, wrong_top_frame))
+            .err()
+            .expect("storage top-frame rejection");
+        assert_eq!(
+            top_error,
+            VmNativeCallFramePublicationError::PublishedTopFrameMismatch {
+                expected: CallFrameId(2),
+                actual: CallFrameId(9)
+            }
+        );
+    }
+
+    #[test]
     fn native_call_frame_publication_exit_closes_matching_record_on_drop() {
         let owner = CodeBlockId(CellId(21));
+        let mut storage = JscCallFrameStorage::default();
+        let published_top_frame = published_top_call_frame(
+            &mut storage,
+            owner,
+            CallFrameId(2),
+            Some(EntryFrameId(1)),
+            20,
+        );
         let mut state = VmEntryState::default();
         let publication_ordinal;
         {
@@ -1087,7 +1259,10 @@ mod tests {
                 state.enter_rooted(Some(FrameAddress(10)), EntryKind::Script, HeapId(8));
             {
                 let publication = entry
-                    .publish_native_call_frame(native_publication_request(owner, FrameAddress(20)))
+                    .publish_native_call_frame(native_publication_request(
+                        owner,
+                        published_top_frame,
+                    ))
                     .expect("native call-frame publication");
                 publication_ordinal = publication.record().ordinal;
             }
@@ -1291,10 +1466,10 @@ mod tests {
         }
     }
 
-    fn native_publication_request(
+    fn native_publication_request<'storage>(
         owner: CodeBlockId,
-        published_top_frame: FrameAddress,
-    ) -> VmNativeCallFramePublicationRequest {
+        published_top_frame: VmPublishedTopCallFrame<'storage>,
+    ) -> VmNativeCallFramePublicationRequest<'storage> {
         VmNativeCallFramePublicationRequest {
             reason: VmNativeCallFramePublicationReason::BaselineNativeEntry,
             owner,
@@ -1302,6 +1477,51 @@ mod tests {
             scope: launch_scope(owner),
             call_frame: launch_call_frame(owner),
             published_top_frame,
+        }
+    }
+
+    fn published_top_call_frame<'storage>(
+        storage: &'storage mut JscCallFrameStorage,
+        owner: CodeBlockId,
+        frame: CallFrameId,
+        entry: Option<EntryFrameId>,
+        base: usize,
+    ) -> VmPublishedTopCallFrame<'storage> {
+        let installed_frame = installed_frame(frame, entry, None, owner, base);
+        let handle = storage.register_installed_frame(&installed_frame);
+        storage
+            .published_top_call_frame(handle)
+            .expect("storage-derived published top frame")
+    }
+
+    fn installed_frame(
+        id: CallFrameId,
+        entry: Option<EntryFrameId>,
+        caller: Option<CallFrameId>,
+        owner: CodeBlockId,
+        base: usize,
+    ) -> InstalledCallFrame {
+        InstalledCallFrame {
+            id,
+            entry,
+            caller,
+            code_block: Some(owner),
+            callee: None,
+            callee_value: None,
+            lexical_scope: None,
+            bytecode_index: None,
+            return_address: None,
+            return_continuation: None,
+            argument_count_including_this: 1,
+            register_window: RegisterWindow {
+                owner: id,
+                base,
+                local_count: 4,
+                argument_base: base + 4,
+                argument_count: 1,
+                this_offset: CallFrameSlotLayout::JSC_RUST.this_argument_offset,
+            },
+            state: FrameState::Executing,
         }
     }
 

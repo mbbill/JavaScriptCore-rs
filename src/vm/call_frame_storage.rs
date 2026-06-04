@@ -6,6 +6,7 @@
 //! non-executing metadata skeleton that can eventually be the authority for a
 //! VM `FrameAddress` once conservative stack roots are wired.
 
+use core::marker::PhantomData;
 use std::ptr::NonNull;
 
 use crate::bytecode::BytecodeIndex;
@@ -58,11 +59,35 @@ impl JscCallFrameStorage {
         self.records
             .iter()
             .map(Box::as_ref)
-            .find(|record| record.matches(handle))
+            .find(|record| record.matches(handle) && record.is_active())
     }
 
     pub(crate) fn frame_address(&self, handle: JscCallFrameStorageHandle) -> Option<FrameAddress> {
         self.record(handle).map(|record| record.header_address())
+    }
+
+    pub(crate) fn published_top_call_frame(
+        &self,
+        handle: JscCallFrameStorageHandle,
+    ) -> Option<VmPublishedTopCallFrame<'_>> {
+        self.record(handle)
+            .map(VmPublishedTopCallFrame::from_storage_record)
+    }
+
+    pub(crate) fn retire(&mut self, handle: JscCallFrameStorageHandle) -> bool {
+        let Some(record) = self
+            .records
+            .iter_mut()
+            .map(Box::as_mut)
+            .find(|record| record.matches(handle))
+        else {
+            return false;
+        };
+        if !record.is_active() {
+            return false;
+        }
+        record.storage_state = JscCallFrameStorageRecordState::Retired;
+        true
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -92,6 +117,7 @@ impl JscCallFrameStorageHandle {
 pub(crate) struct JscCallFrameStorageRecord {
     ordinal: u64,
     handle: JscCallFrameStorageHandle,
+    storage_state: JscCallFrameStorageRecordState,
     pub(crate) frame: CallFrameId,
     pub(crate) entry: Option<EntryFrameId>,
     pub(crate) header: JscCallFrameHeaderSnapshot,
@@ -109,6 +135,7 @@ impl JscCallFrameStorageRecord {
                 frame: frame.id,
                 header: NonNull::dangling(),
             },
+            storage_state: JscCallFrameStorageRecordState::Active,
             frame: frame.id,
             entry: frame.entry,
             header: JscCallFrameHeaderSnapshot::from_installed_frame(frame),
@@ -121,8 +148,58 @@ impl JscCallFrameStorageRecord {
         self.handle == handle
     }
 
+    fn is_active(&self) -> bool {
+        self.storage_state == JscCallFrameStorageRecordState::Active
+    }
+
     pub(crate) fn header_address(&self) -> FrameAddress {
         FrameAddress((&self.header as *const JscCallFrameHeaderSnapshot) as usize)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JscCallFrameStorageRecordState {
+    Active,
+    Retired,
+}
+
+/// Storage-derived proof for publishing a native top call frame.
+///
+/// C++ publishes a `CallFrame*` directly from a live register-backed frame.
+/// Rust's wrapper is lifetime-tied to this VM-owned storage record so
+/// `VmEntryState` no longer accepts an arbitrary `FrameAddress` for native
+/// call-frame publication. This is still not a conservative-root proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VmPublishedTopCallFrame<'storage> {
+    frame: CallFrameId,
+    entry_frame: Option<EntryFrameId>,
+    address: FrameAddress,
+    storage_ordinal: u64,
+    _storage: PhantomData<&'storage JscCallFrameStorageRecord>,
+}
+
+#[allow(dead_code)]
+impl<'storage> VmPublishedTopCallFrame<'storage> {
+    fn from_storage_record(record: &'storage JscCallFrameStorageRecord) -> Self {
+        Self {
+            frame: record.frame,
+            entry_frame: record.entry,
+            address: record.header_address(),
+            storage_ordinal: record.ordinal,
+            _storage: PhantomData,
+        }
+    }
+
+    pub(crate) fn frame(self) -> CallFrameId {
+        self.frame
+    }
+
+    pub(crate) fn entry_frame(self) -> Option<EntryFrameId> {
+        self.entry_frame
+    }
+
+    pub(crate) fn address(self) -> FrameAddress {
+        self.address
     }
 }
 
@@ -203,6 +280,7 @@ mod tests {
         assert_eq!(handle.frame(), frame.id);
         assert_eq!(record.frame, frame.id);
         assert_eq!(record.entry, frame.entry);
+        assert_eq!(record.storage_state, JscCallFrameStorageRecordState::Active);
         assert_eq!(record.header.caller, JscCallerFrame::Call(CallFrameId(6)));
         assert_eq!(record.header.return_address, frame.return_address);
         assert_eq!(record.header.code_block, frame.code_block);
@@ -226,6 +304,36 @@ mod tests {
         let record = storage.record(handle).expect("registered frame record");
 
         assert_eq!(record.header.caller, JscCallerFrame::Entry(EntryFrameId(4)));
+    }
+
+    #[test]
+    fn active_handle_yields_storage_derived_publication_proof() {
+        let frame = installed_frame(CallFrameId(9), Some(EntryFrameId(4)), None, 512);
+        let mut storage = JscCallFrameStorage::default();
+        let handle = storage.register_installed_frame(&frame);
+
+        let published = storage
+            .published_top_call_frame(handle)
+            .expect("published top call-frame proof");
+
+        assert_eq!(published.frame(), frame.id);
+        assert_eq!(published.entry_frame(), frame.entry);
+        assert_eq!(published.address(), storage.frame_address(handle).unwrap());
+    }
+
+    #[test]
+    fn retired_handle_rejects_record_address_and_publication_proof() {
+        let frame = installed_frame(CallFrameId(10), Some(EntryFrameId(4)), None, 1024);
+        let mut storage = JscCallFrameStorage::default();
+        let handle = storage.register_installed_frame(&frame);
+        assert!(storage.frame_address(handle).is_some());
+        assert!(storage.published_top_call_frame(handle).is_some());
+
+        assert!(storage.retire(handle));
+        assert_eq!(storage.record(handle), None);
+        assert_eq!(storage.frame_address(handle), None);
+        assert_eq!(storage.published_top_call_frame(handle), None);
+        assert!(!storage.retire(handle));
     }
 
     #[test]
@@ -265,12 +373,27 @@ mod tests {
         assert_ne!(stored_address, FrameAddress(frame.register_window.base));
         assert_ne!(stored_address, FrameAddress(frame.id.0 as usize));
 
+        let raw_base_handle = JscCallFrameStorageHandle {
+            ordinal: frame.register_window.base as u64,
+            frame: CallFrameId(frame.register_window.base as u32),
+            header: NonNull::dangling(),
+        };
+        let symbolic_id_handle = JscCallFrameStorageHandle {
+            ordinal: frame.id.0 as u64,
+            frame: frame.id,
+            header: NonNull::dangling(),
+        };
         let fabricated = JscCallFrameStorageHandle {
             ordinal: handle.ordinal.saturating_add(1),
             frame: frame.id,
             header: NonNull::dangling(),
         };
+        assert_eq!(storage.frame_address(raw_base_handle), None);
+        assert_eq!(storage.published_top_call_frame(raw_base_handle), None);
+        assert_eq!(storage.frame_address(symbolic_id_handle), None);
+        assert_eq!(storage.published_top_call_frame(symbolic_id_handle), None);
         assert_eq!(storage.frame_address(fabricated), None);
+        assert_eq!(storage.published_top_call_frame(fabricated), None);
     }
 
     fn installed_frame(
