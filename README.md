@@ -134,7 +134,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            crate-internal, heap/epoch-bound current-thread gather+ingest
            closure with real macOS/aarch64 stack-bounds and x19-x28 capture,
            without treating boxed VM frame storage as machine-stack evidence;
-           native execution unchanged.
+           src/gc/heap/run_current_phase.rs adds the dormant
+           Heap::runCurrentPhase / collectInMutatorThread NeedCurrentThreadState
+           handshake that reruns mutator Fixpoint with the exact captured
+           CurrentThreadState; native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler

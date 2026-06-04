@@ -237,9 +237,23 @@ impl JscMachineStackMarker {
     ) -> Result<R, JscMachineStackMarkerError> {
         validate_collection_state(heap_state)?;
         self.call_with_current_thread_state(|state| {
-            self.gather_from_current_thread_state(heap, epoch, heap_state, state)
-                .map(lambda)
+            self.with_current_thread_conservative_roots_from_state(
+                heap, epoch, heap_state, state, lambda,
+            )
         })?
+    }
+
+    pub(in crate::gc) fn with_current_thread_conservative_roots_from_state<'state, R>(
+        &self,
+        heap: HeapId,
+        epoch: HeapEpoch,
+        heap_state: HeapStateDescriptor,
+        state: &'state JscCurrentThreadState<'state>,
+        lambda: impl FnOnce(JscMachineStackConservativeRootingProof<'state>) -> R,
+    ) -> Result<R, JscMachineStackMarkerError> {
+        validate_collection_state(heap_state)?;
+        self.gather_from_current_thread_state(heap, epoch, heap_state, state)
+            .map(lambda)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -292,7 +306,7 @@ impl JscMachineStackMarker {
     }
 
     #[cfg(test)]
-    fn synthetic_current_thread_state_for_testing<R>(
+    pub(in crate::gc) fn synthetic_current_thread_state_for_testing<R>(
         &self,
         stack_span: ConservativeRootSpan,
         lambda: impl for<'state> FnOnce(&'state JscCurrentThreadState<'state>) -> R,
@@ -317,8 +331,9 @@ impl JscMachineStackMarker {
     ) -> Result<R, JscMachineStackMarkerError> {
         validate_collection_state(heap_state)?;
         self.synthetic_current_thread_state_for_testing(stack_span, |state| {
-            self.gather_from_current_thread_state(heap, epoch, heap_state, state)
-                .map(lambda)
+            self.with_current_thread_conservative_roots_from_state(
+                heap, epoch, heap_state, state, lambda,
+            )
         })
     }
 

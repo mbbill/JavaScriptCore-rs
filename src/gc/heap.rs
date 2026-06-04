@@ -3,6 +3,8 @@
 use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet};
 
+mod run_current_phase;
+
 use super::machine_stack_marker::JscMachineStackRootingIngestError;
 use crate::gc::{
     evaluate_heap_semantics, static_allocation_schema_registry, static_barrier_schema_registry,
@@ -908,12 +910,12 @@ impl Heap {
         &mut self,
         marker: &JscMachineStackMarker,
     ) -> Result<(), JscMachineStackRootingIngestError> {
-        let heap = self.id;
-        let epoch = self.epoch;
-        let state = self.state_descriptor();
         marker
-            .with_current_thread_conservative_roots(heap, epoch, state, |proof| {
-                self.ingest_machine_stack_conservative_roots(proof)
+            .call_with_current_thread_state(|current_thread_state| {
+                self.ingest_current_thread_machine_stack_conservative_roots_from_state(
+                    marker,
+                    current_thread_state,
+                )
             })?
             .map_err(JscMachineStackRootingIngestError::from)
     }
