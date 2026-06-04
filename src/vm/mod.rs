@@ -13,6 +13,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod call_frame_storage;
 mod call_link;
 mod code_blocks;
 mod config;

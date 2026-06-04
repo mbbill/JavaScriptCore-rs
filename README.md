@@ -116,7 +116,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            C++ TopCallFrameSetter/NativeCallFrameTracer-shaped publish/restore
            records for future public ARM64 admission; src/vm/native_reentry.rs
            now separates missing top-call-frame publication from symbolic
-           publication-without-conservative-root proof; native execution unchanged.
+           publication-without-conservative-root proof; src/vm/call_frame_storage.rs
+           now adds a C++ CallFrame.h-shaped boxed header store whose stable
+           caller-slot address is the future FrameAddress source while the raw
+           native ABI frame-base stays separate; native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
