@@ -21,6 +21,7 @@ mod exceptions;
 mod executables;
 mod generated_executor;
 mod generated_metrics;
+mod native_reentry;
 mod property_handoff;
 mod runtime;
 mod side_exit;
@@ -162,6 +163,8 @@ use crate::jit::plan::{
 };
 #[cfg(test)]
 use crate::jit::P6BaselineNativeReentryTargetRecord;
+#[cfg(test)]
+use crate::jit::P6_X86_64_BASELINE_SIDE_EXIT_RETURN_PAYLOAD_LOW_TAG;
 use crate::jit::{
     emit_p6_arm64_baseline_callable_semantic_bytes,
     emit_p6_x86_64_baseline_callable_semantic_bytes_with_owner_continuation_map,
@@ -195,8 +198,7 @@ use crate::jit::{
     P6X86_64BaselineSemanticByteEmissionResult, P6X86_64BaselineSideExitReturnPayload,
     PropertyHasObservationDescriptor, PropertyLoadAccessCasePlanKind,
     PropertyLoadObservationDescriptor, PropertyStoreAccessCasePlanKind, TierFallbackReason,
-    TierPlanKind, TieringPolicy, P14_X86_64_BASELINE_LOOP_BACKEDGE_RETURN_PAYLOAD_LOW_TAG,
-    P6_X86_64_BASELINE_SIDE_EXIT_RETURN_PAYLOAD_LOW_TAG,
+    TierPlanKind, TieringPolicy,
 };
 use crate::platform::executable_memory::{
     materialize_platform_executable_memory_residency, ExecutableMemoryOperationOrdinal,
@@ -234,6 +236,13 @@ use executables::{
     ExecutableRegistryEntryPublication, ExecutableRegistryError,
 };
 
+#[cfg(test)]
+use self::native_reentry::p6_x86_64_callable_side_exit_payload_has_reserved_tag;
+use self::native_reentry::{
+    p6_arm64_emitted_semantic_native_raw_return, p6_arm64_reject_side_exit_reentry_execution,
+    p6_p9_p10_p14_x86_64_callable_native_return_payload, P6Arm64EmittedSemanticNativeRawReturn,
+    P6NativeSideExitReentryCallBridge, P6P9P10P14X86_64CallableNativeReturnPayload,
+};
 pub use self::runtime::{
     find_vm_global_descriptor, find_vm_service_descriptor, find_vm_structure_table_descriptor,
     global_root_id, select_vm_service_capabilities, validate_vm_service_descriptor,
@@ -568,7 +577,14 @@ struct P9OwnerPostCallReentryInvocation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum P6X86_64CallableNativeInvocation {
     Entry { entry_offset: u32 },
+    P6SideExitReentry(P6NativeSideExitReentryCallBridge),
     P9OwnerPostCallReentry(P9OwnerPostCallReentryInvocation),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum P6Arm64CallableNativeInvocation {
+    Entry { entry_offset: u32 },
+    P6SideExitReentry(P6NativeSideExitReentryCallBridge),
 }
 
 struct P9GeneratedOwnerPostCallReentryPlan {
@@ -5879,76 +5895,111 @@ impl Vm {
         if !self.can_execute_p6_arm64_emitted_native_entry() {
             return fallback(self, host);
         }
-        if let Some(reason) = self.exceptions.termination() {
-            return BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Terminated(reason));
-        }
-        let Some(active_frame) = self.execution.top_frame() else {
-            return fallback(self, host);
-        };
-        let active_frame_id = active_frame.id;
-        let active_frame_code_block = active_frame.code_block;
-        let active_callee_value = active_frame.callee_value;
-        let active_register_window = active_frame.register_window;
-        if active_frame_id != dispatch.expected_frame
-            || active_frame_code_block != Some(dispatch.code_block_id)
-        {
-            return fallback(self, host);
-        }
-        if p6_code_block_uses_load_callee(code_block) && active_callee_value.is_none() {
-            return fallback(self, host);
-        }
-        let callee_value_bits = active_callee_value
-            .unwrap_or_else(RuntimeValue::undefined)
-            .encoded()
-            .0;
-        let Some(platform_residency_index) =
-            self.platform_residency_index_for_native_entry(dispatch.readiness, dispatch.descriptor)
-        else {
-            return fallback(self, host);
-        };
         let vm = NonNull::from(&mut *self).cast::<c_void>();
-        let Ok(frame_base) = self
-            .registers
-            .borrow_active_frame_base_for_raw_native_entry(active_register_window)
-        else {
-            return fallback(self, host);
+        let mut invocation = P6Arm64CallableNativeInvocation::Entry {
+            entry_offset: dispatch.descriptor.machine_range.start_offset,
         };
-        let ic_store_base = self
-            .code_blocks
-            .get(dispatch.code_block_id)
-            .map(|registered| registered.code_block())
-            .and_then(|resident| resident.baseline_jit_data_record_store_base())
-            .and_then(|base| NonNull::new(base as *mut c_void))
-            .unwrap_or_else(NonNull::<c_void>::dangling);
-        let call_result = self.baseline_platform_executable_residencies[platform_residency_index]
-            .evidence
-            .compartment
-            .call_p6_arm64_entry(ExecutableMemoryP6CallRequest::new(
-                dispatch.descriptor.machine_range.start_offset,
-                vm,
-                frame_base.as_non_null(),
-                callee_value_bits,
-                ic_store_base,
-            ));
-        let Ok(result) = call_result else {
-            return fallback(self, host);
-        };
-        match p6_arm64_emitted_semantic_native_raw_return(result.encoded_js_value_bits) {
-            Ok(P6Arm64EmittedSemanticNativeRawReturn::RuntimeValue(value)) => {
-                BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Returned(value))
+        loop {
+            if let Some(reason) = self.exceptions.termination() {
+                return BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Terminated(
+                    reason,
+                ));
             }
-            Ok(P6Arm64EmittedSemanticNativeRawReturn::RetainedP6SideExit(payload)) => {
-                // ARM64 shares the retained P6 payload ABI tag with the x86_64
-                // callable bridge so the VM can reuse the same fallback/rooting
-                // table decode, but ARM64 has no native reentry ABI yet.
-                p6_arm64_reject_side_exit_reentry_execution(
-                    self.execute_p6_x86_64_callable_retained_native_exit_payload_in_current_region(
-                        code_block, &dispatch, payload, host, config,
+            let Some(active_frame) = self.execution.top_frame() else {
+                return fallback(self, host);
+            };
+            let active_frame_id = active_frame.id;
+            let active_frame_code_block = active_frame.code_block;
+            let active_callee_value = active_frame.callee_value;
+            let active_register_window = active_frame.register_window;
+            if active_frame_id != dispatch.expected_frame
+                || active_frame_code_block != Some(dispatch.code_block_id)
+            {
+                return fallback(self, host);
+            }
+            if p6_code_block_uses_load_callee(code_block) && active_callee_value.is_none() {
+                return fallback(self, host);
+            }
+            let callee_value_bits = active_callee_value
+                .unwrap_or_else(RuntimeValue::undefined)
+                .encoded()
+                .0;
+            let Some(platform_residency_index) = self
+                .platform_residency_index_for_native_entry(dispatch.readiness, dispatch.descriptor)
+            else {
+                return fallback(self, host);
+            };
+            let Ok(frame_base) = self
+                .registers
+                .borrow_active_frame_base_for_raw_native_entry(active_register_window)
+            else {
+                return fallback(self, host);
+            };
+            let ic_store_base = self
+                .code_blocks
+                .get(dispatch.code_block_id)
+                .map(|registered| registered.code_block())
+                .and_then(|resident| resident.baseline_jit_data_record_store_base())
+                .and_then(|base| NonNull::new(base as *mut c_void))
+                .unwrap_or_else(NonNull::<c_void>::dangling);
+            let request = match invocation {
+                P6Arm64CallableNativeInvocation::Entry { entry_offset } => {
+                    ExecutableMemoryP6CallRequest::new(
+                        entry_offset,
+                        vm,
+                        frame_base.as_non_null(),
+                        callee_value_bits,
+                        ic_store_base,
+                    )
+                }
+                P6Arm64CallableNativeInvocation::P6SideExitReentry(reentry) => reentry
+                    .call_request(
+                        vm,
+                        frame_base.as_non_null(),
+                        callee_value_bits,
+                        ic_store_base,
                     ),
-                )
-            }
-            Err(error) => {
-                BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(error))
+            };
+            let call_result = self.baseline_platform_executable_residencies
+                [platform_residency_index]
+                .evidence
+                .compartment
+                .call_p6_arm64_entry(request);
+            let Ok(result) = call_result else {
+                return fallback(self, host);
+            };
+            match p6_arm64_emitted_semantic_native_raw_return(result.encoded_js_value_bits) {
+                Ok(P6Arm64EmittedSemanticNativeRawReturn::RuntimeValue(value)) => {
+                    return BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Returned(
+                        value,
+                    ));
+                }
+                Ok(P6Arm64EmittedSemanticNativeRawReturn::RetainedP6SideExit(payload)) => {
+                    match self
+                        .execute_p6_x86_64_callable_retained_native_exit_payload_in_current_region(
+                            code_block, &dispatch, payload, host, config,
+                        ) {
+                        BaselineNativeEntryVmExecution::P6SideExitReentry(reentry) => {
+                            // Public ARM64 branch-aware callable admission stays
+                            // disabled. This private path consumes only a VM-
+                            // resolved retained P6 fallback target after the
+                            // active frame, callee, frame-base, IC-store, and
+                            // platform checks above have been revalidated.
+                            invocation = P6Arm64CallableNativeInvocation::P6SideExitReentry(
+                                P6NativeSideExitReentryCallBridge::new(reentry),
+                            );
+                            continue;
+                        }
+                        execution => {
+                            return p6_arm64_reject_side_exit_reentry_execution(execution);
+                        }
+                    }
+                }
+                Err(error) => {
+                    return BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(
+                        error,
+                    ));
+                }
             }
         }
     }
@@ -6073,6 +6124,16 @@ impl Vm {
                         callee_value_bits,
                         ic_store_base,
                     )),
+                P6X86_64CallableNativeInvocation::P6SideExitReentry(reentry) => self
+                    .baseline_platform_executable_residencies[platform_residency_index]
+                    .evidence
+                    .compartment
+                    .call_p6_x86_64_entry(reentry.call_request(
+                        vm,
+                        frame_base.as_non_null(),
+                        callee_value_bits,
+                        ic_store_base,
+                    )),
                 P6X86_64CallableNativeInvocation::P9OwnerPostCallReentry(reentry) => {
                     let Some(metadata_table_base) =
                         NonNull::new(reentry.metadata_table_base_address as *mut c_void)
@@ -6110,9 +6171,10 @@ impl Vm {
                             code_block, &dispatch, payload, host, config,
                         ) {
                         BaselineNativeEntryVmExecution::P6SideExitReentry(reentry) => {
-                            invocation = P6X86_64CallableNativeInvocation::Entry {
-                                entry_offset: reentry.entry_offset,
-                            };
+                            invocation =
+                                P6X86_64CallableNativeInvocation::P6SideExitReentry(
+                                    P6NativeSideExitReentryCallBridge::new(reentry),
+                                );
                             continue;
                         }
                         execution => return execution,
@@ -17292,92 +17354,6 @@ fn generated_baseline_fallback_record(
         bytecode_index: fallback.reason.bytecode_index,
         opcode: generated_baseline_fallback_opcode(fallback.reason.opcode),
         cause: generated_baseline_fallback_cause(fallback.reason.cause),
-    }
-}
-
-#[cfg(test)]
-fn p6_x86_64_callable_side_exit_payload_has_reserved_tag(raw_bits: u64) -> bool {
-    (raw_bits & 0xff) == u64::from(P6_X86_64_BASELINE_SIDE_EXIT_RETURN_PAYLOAD_LOW_TAG)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum P6P9P10P14X86_64CallableNativeReturnPayload {
-    P6(P6X86_64BaselineSideExitReturnPayload),
-    P9(P9X86_64BaselineJsCallNativeExitReturnPayload),
-    P10(P10X86_64BaselinePropertyNativeExitReturnPayload),
-    P14(P14X86_64BaselineLoopBackedgeReturnPayload),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum P6Arm64EmittedSemanticNativeRawReturn {
-    RuntimeValue(RuntimeValue),
-    RetainedP6SideExit(P6X86_64BaselineSideExitReturnPayload),
-}
-
-fn p6_p9_p10_p14_x86_64_callable_native_return_payload(
-    raw_bits: u64,
-) -> Result<Option<P6P9P10P14X86_64CallableNativeReturnPayload>, ExecutionError> {
-    match (raw_bits & 0xff) as u8 {
-        P6_X86_64_BASELINE_SIDE_EXIT_RETURN_PAYLOAD_LOW_TAG => {
-            let payload = P6X86_64BaselineSideExitReturnPayload::decode(raw_bits)
-                .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
-            Ok(Some(P6P9P10P14X86_64CallableNativeReturnPayload::P6(
-                payload,
-            )))
-        }
-        P9_X86_64_BASELINE_JS_CALL_NATIVE_EXIT_RETURN_PAYLOAD_LOW_TAG => {
-            let payload = P9X86_64BaselineJsCallNativeExitReturnPayload::decode(raw_bits)
-                .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
-            Ok(Some(P6P9P10P14X86_64CallableNativeReturnPayload::P9(
-                payload,
-            )))
-        }
-        P10_X86_64_BASELINE_PROPERTY_NATIVE_EXIT_RETURN_PAYLOAD_LOW_TAG => {
-            let payload = P10X86_64BaselinePropertyNativeExitReturnPayload::decode(raw_bits)
-                .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
-            Ok(Some(P6P9P10P14X86_64CallableNativeReturnPayload::P10(
-                payload,
-            )))
-        }
-        P14_X86_64_BASELINE_LOOP_BACKEDGE_RETURN_PAYLOAD_LOW_TAG => {
-            let payload = P14X86_64BaselineLoopBackedgeReturnPayload::decode(raw_bits)
-                .ok_or(ExecutionError::BaselineGeneratedExecutionRejected)?;
-            Ok(Some(P6P9P10P14X86_64CallableNativeReturnPayload::P14(
-                payload,
-            )))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn p6_arm64_emitted_semantic_native_raw_return(
-    raw_bits: u64,
-) -> Result<P6Arm64EmittedSemanticNativeRawReturn, ExecutionError> {
-    match p6_p9_p10_p14_x86_64_callable_native_return_payload(raw_bits)? {
-        Some(P6P9P10P14X86_64CallableNativeReturnPayload::P6(payload)) => Ok(
-            P6Arm64EmittedSemanticNativeRawReturn::RetainedP6SideExit(payload),
-        ),
-        Some(
-            P6P9P10P14X86_64CallableNativeReturnPayload::P9(_)
-            | P6P9P10P14X86_64CallableNativeReturnPayload::P10(_)
-            | P6P9P10P14X86_64CallableNativeReturnPayload::P14(_),
-        ) => Err(ExecutionError::BaselineGeneratedExecutionRejected),
-        None => Ok(P6Arm64EmittedSemanticNativeRawReturn::RuntimeValue(
-            RuntimeValue::from_encoded(EncodedJsValue(raw_bits)),
-        )),
-    }
-}
-
-fn p6_arm64_reject_side_exit_reentry_execution(
-    execution: BaselineNativeEntryVmExecution,
-) -> BaselineNativeEntryVmExecution {
-    match execution {
-        BaselineNativeEntryVmExecution::P6SideExitReentry(_) => {
-            BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(
-                ExecutionError::BaselineGeneratedExecutionRejected,
-            ))
-        }
-        execution => execution,
     }
 }
 
@@ -39187,7 +39163,25 @@ mod tests {
     }
 
     #[test]
-    fn vm_p6_side_exit_reentry_result_uses_backend_neutral_invocation_and_arm64_rejects() {
+    fn vm_p6_arm64_private_side_exit_reentry_bridge_builds_call_request() {
+        let reentry = P6CallableSideExitNativeReentryInvocation { entry_offset: 123 };
+        let bridge = P6NativeSideExitReentryCallBridge::new(reentry);
+        let vm = NonNull::new(0x1000usize as *mut c_void).unwrap();
+        let frame_base = NonNull::new(0x2000usize as *mut c_void).unwrap();
+        let ic_store_base = NonNull::new(0x3000usize as *mut c_void).unwrap();
+        let request = bridge.call_request(vm, frame_base, 0xfeed_beef, ic_store_base);
+
+        assert_eq!(bridge.entry_offset(), reentry.entry_offset);
+        assert_eq!(request.entry_offset, reentry.entry_offset);
+        assert_eq!(request.vm, vm);
+        assert_eq!(request.frame_base, frame_base);
+        assert_eq!(request.callee_value_bits, 0xfeed_beef);
+        assert_eq!(request.ic_store_base, ic_store_base);
+    }
+
+    #[test]
+    fn vm_p6_side_exit_reentry_result_uses_backend_neutral_invocation_and_public_arm64_guard_rejects(
+    ) {
         let reentry = P6CallableSideExitNativeReentryInvocation { entry_offset: 123 };
         let BaselineNativeEntryVmExecution::P6SideExitReentry(native_reentry) =
             BaselineNativeEntryVmExecution::P6SideExitReentry(reentry)
@@ -39204,7 +39198,7 @@ mod tests {
             BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(
                 ExecutionError::BaselineGeneratedExecutionRejected,
             )) => {}
-            _ => panic!("expected ARM64 retained P6 native reentry rejection"),
+            _ => panic!("expected public ARM64 retained P6 native reentry guard rejection"),
         }
     }
 
@@ -56973,7 +56967,7 @@ mod tests {
             BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(
                 ExecutionError::BaselineGeneratedExecutionRejected,
             )) => {}
-            _ => panic!("ARM64 side-exit reentry must remain rejected"),
+            _ => panic!("public ARM64 side-exit reentry guard must remain rejected"),
         }
     }
 

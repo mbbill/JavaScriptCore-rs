@@ -104,12 +104,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            (Rust native-entry ABI/rooting bridge only; C++ jfalse truthiness remains
            valueIsFalsey/LLInt slow-path work)
     [done] JIT/VM ARM64 retained side-exit records, VM retained-return tables,
-           and src/vm/side_exit.rs resolver/backend-neutral invocation
-           skeleton preserve dormant native reentry target metadata for
-           JumpIfFalse taken/fallthrough outcomes;
-           public ARM64 branch-aware callable admission still falls back to the
-           existing x86 semantic artifact until ARM64 native reentry/rooting is
-           designed.
+           src/vm/side_exit.rs resolver metadata, and src/vm/native_reentry.rs
+           request bridge preserve dormant JumpIfFalse taken/fallthrough native
+           reentry targets; retained ARM64 fallback can privately reenter a
+           resolved P6 target, while public ARM64 branch-aware callable
+           admission still falls back to the existing x86 semantic artifact.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler
