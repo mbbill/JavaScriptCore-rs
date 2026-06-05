@@ -635,7 +635,11 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> GeneratedDirectCallCalleeExecution {
-        let generated_entry_enabled = self.config.generated_direct_call_generated_entry_enabled();
+        let generated_entry_execution_enabled =
+            self.config.generated_direct_call_generated_entry_enabled();
+        let generated_entry_materialization_enabled = self
+            .config
+            .generated_direct_call_generated_entry_materialization_enabled();
 
         if preferred_route == Some(VmGeneratedDirectCallTransactionRoute::NativeEntry)
             && matches!(
@@ -751,7 +755,7 @@ impl Vm {
             }
         }
 
-        if generated_entry_enabled
+        if generated_entry_execution_enabled
             && preferred_route == Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry)
         {
             let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
@@ -787,7 +791,7 @@ impl Vm {
             code_block,
             expected_frame,
         );
-        let generated = if generated_entry_enabled {
+        let generated = if generated_entry_execution_enabled {
             self.try_execute_generated_direct_call_callee_with_generated_entry(
                 code_block_id,
                 code_block,
@@ -814,7 +818,8 @@ impl Vm {
             code_block,
             expected_frame,
             route_policy,
-            generated_entry_enabled,
+            generated_entry_materialization_enabled,
+            generated_entry_execution_enabled,
             host,
             config,
         ) {
@@ -924,7 +929,8 @@ impl Vm {
         code_block: &CodeBlock,
         expected_frame: CallFrameId,
         route_policy: GeneratedDirectCallCalleeRoutePolicy,
-        allow_generated_entry: bool,
+        allow_generated_entry_materialization: bool,
+        allow_generated_entry_execution: bool,
         host: &mut H,
         config: DispatchConfig,
     ) -> Option<GeneratedDirectCallCalleeExecution> {
@@ -951,7 +957,7 @@ impl Vm {
             VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64
                 if self.p15_host_blocked_native_generated_install_should_retry(code_block_id) =>
             {
-                let (generated, generated_detail) = if allow_generated_entry {
+                let (generated, generated_detail) = if allow_generated_entry_materialization {
                     let (generated, generated_detail) =
                         self.p15_auto_install_generated_baseline_artifact(code_block_id);
                     (Some(generated), generated_detail)
@@ -972,7 +978,7 @@ impl Vm {
                     self.next_p15_auto_baseline_native_entry_install_request(code_block_id);
                 match self.install_p6_x86_64_callable_semantic_baseline_native_entry(request) {
                     Ok(record) => {
-                        let (generated, generated_detail) = if allow_generated_entry
+                        let (generated, generated_detail) = if allow_generated_entry_materialization
                             && (self
                                 .p15_native_auto_install_requires_generated_host_fallback(&record)
                                 || route_policy
@@ -1004,14 +1010,15 @@ impl Vm {
                             generated_fallback_allowed,
                         };
                         let native_detail = Self::p15_auto_native_install_failure_detail(&error);
-                        let (generated, generated_detail) =
-                            if allow_generated_entry && generated_fallback_allowed {
-                                let (generated, generated_detail) = self
-                                    .p15_auto_install_generated_baseline_artifact(code_block_id);
-                                (Some(generated), generated_detail)
-                            } else {
-                                (None, None)
-                            };
+                        let (generated, generated_detail) = if allow_generated_entry_materialization
+                            && generated_fallback_allowed
+                        {
+                            let (generated, generated_detail) =
+                                self.p15_auto_install_generated_baseline_artifact(code_block_id);
+                            (Some(generated), generated_detail)
+                        } else {
+                            (None, None)
+                        };
                         (native, native_detail, generated, generated_detail)
                     }
                 }
@@ -1047,7 +1054,7 @@ impl Vm {
         if route_policy == GeneratedDirectCallCalleeRoutePolicy::NativeEntryOnly {
             return None;
         }
-        if !allow_generated_entry {
+        if !allow_generated_entry_execution {
             return None;
         }
         self.try_execute_generated_direct_call_callee_with_generated_entry(

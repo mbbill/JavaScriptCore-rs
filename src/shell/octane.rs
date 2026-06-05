@@ -18,9 +18,10 @@ use crate::interpreter::{
 };
 use crate::syntax::source::SourceText;
 use crate::vm::{
-    BaselineEntryAutoMaterializationRecord, GeneratedDirectCallGeneratedEntryPolicy,
-    SourceExecutionError, SourceSessionHandle, SourceSessionHostGlobalConfig, SourceSessionSource,
-    Vm, VmBaselineGeneratedDispatchedOpcodeCount, VmBaselineGeneratedDispatchedSiteOpcodeCount,
+    BaselineEntryAutoMaterializationRecord, BaselineGeneratedExecutionPolicy,
+    GeneratedDirectCallGeneratedEntryPolicy, SourceExecutionError, SourceSessionHandle,
+    SourceSessionHostGlobalConfig, SourceSessionSource, Vm,
+    VmBaselineGeneratedDispatchedOpcodeCount, VmBaselineGeneratedDispatchedSiteOpcodeCount,
     VmBaselineGeneratedExecutionSummary, VmBaselineGeneratedInvalidationSummary, VmConfig,
     VmGeneratedDirectCallCalleeFallbackSummary,
     VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
@@ -321,6 +322,7 @@ pub struct OctaneExecutionConfig {
     pub mode: OctaneExecutionMode,
     pub failure_policy: OctaneSuiteFailurePolicy,
     pub dispatch_config: DispatchConfig,
+    pub baseline_generated_execution_policy: BaselineGeneratedExecutionPolicy,
     pub generated_direct_call_generated_entry_policy: GeneratedDirectCallGeneratedEntryPolicy,
 }
 
@@ -330,6 +332,7 @@ impl OctaneExecutionConfig {
             mode,
             failure_policy,
             dispatch_config: DispatchConfig::unbounded(),
+            baseline_generated_execution_policy: BaselineGeneratedExecutionPolicy::Enabled,
             generated_direct_call_generated_entry_policy:
                 GeneratedDirectCallGeneratedEntryPolicy::Enabled,
         }
@@ -348,12 +351,21 @@ impl OctaneExecutionConfig {
         self
     }
 
+    pub const fn with_baseline_generated_execution_policy(
+        mut self,
+        policy: BaselineGeneratedExecutionPolicy,
+    ) -> Self {
+        self.baseline_generated_execution_policy = policy;
+        self
+    }
+
     pub fn vm_config(self) -> VmConfig {
         // Oversized-file exception: Octane execution config already owns the
         // probe dispatch plumbing in this file; keep this diagnostic VM policy
         // crossing here until the Octane shell config is extracted.
         self.mode
             .vm_config()
+            .with_baseline_generated_execution_policy(self.baseline_generated_execution_policy)
             .with_generated_direct_call_generated_entry_policy(
                 self.generated_direct_call_generated_entry_policy,
             )

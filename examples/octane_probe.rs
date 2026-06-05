@@ -23,7 +23,8 @@ use javascriptcore::syntax::{
     SourceProvider, SourceSpan, SourceText,
 };
 use javascriptcore::vm::{
-    GeneratedDirectCallGeneratedEntryPolicy, SourceSessionHostGlobalConfig, Vm, VmConfig,
+    BaselineGeneratedExecutionPolicy, GeneratedDirectCallGeneratedEntryPolicy,
+    SourceSessionHostGlobalConfig, Vm, VmConfig,
 };
 use javascriptcore::vm::{
     VmOwnedCallTargetValidationOutcome, VmOwnedCallTargetValidationRejection,
@@ -47,6 +48,7 @@ fn main() {
     let mut progress = false;
     let mut tiering_summary = false;
     let mut dispatch_steps = None;
+    let mut disable_baseline_generated_executor = false;
     let mut disable_generated_direct_call_generated_entry = false;
 
     let mut args = env::args().skip(1);
@@ -114,6 +116,9 @@ fn main() {
             "--collect-all" => failure_policy = OctaneSuiteFailurePolicy::CollectAll,
             "--progress" => progress = true,
             "--tiering-summary" => tiering_summary = true,
+            "--disable-baseline-generated-executor" => {
+                disable_baseline_generated_executor = true;
+            }
             "--disable-generated-direct-call-generated-entry" => {
                 disable_generated_direct_call_generated_entry = true;
             }
@@ -193,6 +198,7 @@ fn main() {
             mode,
             tiering_summary,
             dump_code_block,
+            disable_baseline_generated_executor,
             disable_generated_direct_call_generated_entry,
         );
         return;
@@ -209,6 +215,7 @@ fn main() {
             mode,
             tiering_summary,
             dump_code_block,
+            disable_baseline_generated_executor,
             disable_generated_direct_call_generated_entry,
         );
         return;
@@ -231,6 +238,7 @@ fn main() {
             mode,
             failure_policy,
             dispatch_steps,
+            disable_baseline_generated_executor,
             disable_generated_direct_call_generated_entry,
         );
         if let Some(source) = benchmark_eval {
@@ -241,6 +249,7 @@ fn main() {
                 dispatch_steps,
                 tiering_summary,
                 dump_code_block,
+                disable_baseline_generated_executor,
                 disable_generated_direct_call_generated_entry,
             );
             return;
@@ -275,6 +284,7 @@ fn main() {
         mode,
         failure_policy,
         dispatch_steps,
+        disable_baseline_generated_executor,
         disable_generated_direct_call_generated_entry,
     );
     let report = if progress {
@@ -307,9 +317,14 @@ fn execute_eval_source(
     mode: OctaneExecutionMode,
     tiering_summary: bool,
     dump_code_block: Option<u32>,
+    disable_baseline_generated_executor: bool,
     disable_generated_direct_call_generated_entry: bool,
 ) {
-    let config = vm_config_for_mode(mode, disable_generated_direct_call_generated_entry);
+    let config = vm_config_for_mode(
+        mode,
+        disable_baseline_generated_executor,
+        disable_generated_direct_call_generated_entry,
+    );
     let mut vm = Vm::new(config);
     match vm.execute_source_session_with_host_globals(
         [source_code_from_text(source)],
@@ -359,9 +374,14 @@ fn execute_prepared_benchmark_eval_source(
     dispatch_steps: Option<usize>,
     tiering_summary: bool,
     dump_code_block: Option<u32>,
+    disable_baseline_generated_executor: bool,
     disable_generated_direct_call_generated_entry: bool,
 ) {
-    let config = vm_config_for_mode(mode, disable_generated_direct_call_generated_entry);
+    let config = vm_config_for_mode(
+        mode,
+        disable_baseline_generated_executor,
+        disable_generated_direct_call_generated_entry,
+    );
     let dispatch_config = dispatch_steps
         .map(DispatchConfig::new)
         .unwrap_or_else(DispatchConfig::default);
@@ -447,9 +467,13 @@ fn octane_execution_config(
     mode: OctaneExecutionMode,
     failure_policy: OctaneSuiteFailurePolicy,
     dispatch_steps: Option<usize>,
+    disable_baseline_generated_executor: bool,
     disable_generated_direct_call_generated_entry: bool,
 ) -> OctaneExecutionConfig {
     let config = OctaneExecutionConfig::new(mode, failure_policy)
+        .with_baseline_generated_execution_policy(baseline_generated_execution_policy(
+            disable_baseline_generated_executor,
+        ))
         .with_generated_direct_call_generated_entry_policy(
             generated_direct_call_generated_entry_policy(
                 disable_generated_direct_call_generated_entry,
@@ -463,15 +487,32 @@ fn octane_execution_config(
 
 fn vm_config_for_mode(
     mode: OctaneExecutionMode,
+    disable_baseline_generated_executor: bool,
     disable_generated_direct_call_generated_entry: bool,
 ) -> VmConfig {
     let config = match mode {
         OctaneExecutionMode::InterpreterOnly => VmConfig::default(),
         OctaneExecutionMode::BaselineAllowed => VmConfig::baseline_allowed(),
     };
-    config.with_generated_direct_call_generated_entry_policy(
-        generated_direct_call_generated_entry_policy(disable_generated_direct_call_generated_entry),
-    )
+    config
+        .with_baseline_generated_execution_policy(baseline_generated_execution_policy(
+            disable_baseline_generated_executor,
+        ))
+        .with_generated_direct_call_generated_entry_policy(
+            generated_direct_call_generated_entry_policy(
+                disable_generated_direct_call_generated_entry,
+            ),
+        )
+}
+
+fn baseline_generated_execution_policy(
+    disable_baseline_generated_executor: bool,
+) -> BaselineGeneratedExecutionPolicy {
+    if disable_baseline_generated_executor {
+        BaselineGeneratedExecutionPolicy::Disabled
+    } else {
+        BaselineGeneratedExecutionPolicy::Enabled
+    }
 }
 
 fn generated_direct_call_generated_entry_policy(
@@ -2095,7 +2136,7 @@ fn usage_and_exit(message: &str) -> ! {
         eprintln!("{message}");
     }
     eprintln!(
-        "usage: cargo run --example octane_probe -- [--jetstream-root PATH] [--benchmark NAME|--core|--full|--smoke|--eval SOURCE|--eval-file PATH [--eval-append SOURCE]] [--interpreter|--baseline] [--collect-all|--fail-fast] [--progress] [--tiering-summary] [--iterations N --worst-case-count N|--official-iterations] [--dispatch-steps N] [--disable-generated-direct-call-generated-entry] [--dump-identifier ID] [--dump-code-block CELL_ID]"
+        "usage: cargo run --example octane_probe -- [--jetstream-root PATH] [--benchmark NAME|--core|--full|--smoke|--eval SOURCE|--eval-file PATH [--eval-append SOURCE]] [--interpreter|--baseline] [--collect-all|--fail-fast] [--progress] [--tiering-summary] [--iterations N --worst-case-count N|--official-iterations] [--dispatch-steps N] [--disable-baseline-generated-executor] [--disable-generated-direct-call-generated-entry] [--dump-identifier ID] [--dump-code-block CELL_ID]"
     );
     std::process::exit(if message.is_empty() { 0 } else { 2 });
 }

@@ -10,6 +10,7 @@ pub struct VmConfig {
     pub max_stack_bytes: Option<usize>,
     pub heap_policy: HeapPolicy,
     pub host_capabilities: HostCapabilities,
+    pub baseline_generated_execution_policy: BaselineGeneratedExecutionPolicy,
     pub generated_direct_call_generated_entry_policy: GeneratedDirectCallGeneratedEntryPolicy,
 }
 
@@ -55,8 +56,26 @@ impl VmConfig {
     }
 
     pub fn generated_direct_call_generated_entry_enabled(&self) -> bool {
+        self.baseline_generated_execution_enabled()
+            && self.generated_direct_call_generated_entry_policy
+                == GeneratedDirectCallGeneratedEntryPolicy::Enabled
+    }
+
+    pub fn generated_direct_call_generated_entry_materialization_enabled(&self) -> bool {
         self.generated_direct_call_generated_entry_policy
             == GeneratedDirectCallGeneratedEntryPolicy::Enabled
+    }
+
+    pub fn with_baseline_generated_execution_policy(
+        mut self,
+        policy: BaselineGeneratedExecutionPolicy,
+    ) -> Self {
+        self.baseline_generated_execution_policy = policy;
+        self
+    }
+
+    pub fn baseline_generated_execution_enabled(&self) -> bool {
+        self.baseline_generated_execution_policy == BaselineGeneratedExecutionPolicy::Enabled
     }
 }
 
@@ -65,6 +84,17 @@ pub enum VmExecutionMode {
     #[default]
     InterpreterOnly,
     BaselineAllowed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BaselineGeneratedExecutionPolicy {
+    // C++ JSC installs LLInt or real JITCode and enters through
+    // JITCode::addressForCall / JITCodeMap OSR locations. Rust baseline
+    // generated execution is a temporary bytecode shim, so this policy is
+    // diagnostic/probe-only and defaults to preserving existing execution.
+    #[default]
+    Enabled,
+    Disabled,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

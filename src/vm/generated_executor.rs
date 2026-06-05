@@ -85,6 +85,15 @@ impl Vm {
         validation: BaselineGeneratedExecutionValidation,
     ) -> GeneratedExecutionControl {
         self.drain_pending_property_load_runtime_invalidations(host);
+        if !self.config.baseline_generated_execution_enabled() {
+            // C++ JSC enters LLInt or real JITCode at this boundary. When the
+            // diagnostic policy disables Rust's temporary bytecode shim, callers
+            // with interpreter continuations must decline before reaching here;
+            // direct/generated helper callers fail closed.
+            return GeneratedExecutionControl::failed(
+                ExecutionError::BaselineGeneratedExecutionRejected,
+            );
+        }
         let Some(artifact) = self
             .tiering
             .baseline_generated_code_artifact_for(code_block_id)
@@ -1032,6 +1041,10 @@ impl Vm {
             expected_frame,
             runtime_helper_plan,
         } = request;
+
+        if !self.config.baseline_generated_execution_enabled() {
+            return ExecutionCompletion::Failed(ExecutionError::BaselineGeneratedExecutionRejected);
+        }
 
         let mut local_dispatch_budget = DispatchBudget::from_config(config);
         let dispatch_budget = self
