@@ -279,7 +279,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            that body evidence instead of callable-kind coverage diagnostics
     [done] ARM64 return-seed subset fallback policy: seed UnsupportedOpcodeSubset now keeps
            the existing prepared x86 semantic/generated artifact path; capped richards moves
-           hot native misses to HostBlockedX86_64, making broader ARM64 backend coverage next
+           hot native misses to HostBlockedX86_64; next native admission work must first
+           produce C++-shaped ARM64 native frame materialization before broadening opcode bytes
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
   [wip] arrays and indexed storage
@@ -380,6 +381,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
   [done] direct-call fallback evidence: top remaining richards nested fallback is
          caller=110@80 target=146 count=657,293 with generated_entry_miss=MissingArtifact and
          native_entry_miss=HostBlockedX86_64
+  [done] ARM64 native-admission audit evidence: C++ enters generated JS through
+         vmEntryToJavaScript with a stack CallFrame, VM top-frame publication, ARM64 prologue,
+         and conservative-stack visibility; Rust's current ARM64 lane is only a C-ABI
+         return seed, so HostBlockedX86_64 remains the x86 semantic fallback symptom and
+         real ARM64 admission is blocked on generated native frame materialization
   [done] direct-call callee auto-materialization evidence: focused arm64 test proves
          supported host-blocked native callees publish a generated entry; earlier richards
          probe showed target 146 blocked by PropertyHandoffPlan malformed bytecode cache
