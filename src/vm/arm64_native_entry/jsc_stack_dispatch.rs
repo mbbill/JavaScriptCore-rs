@@ -2,8 +2,9 @@
 //!
 //! C++ JSC map: `LowLevelInterpreter64.asm` `doVMEntry` publishes a machine
 //! stack `CallFrame`, then `_llint_call_javascript` enters generated code with
-//! `sp = CallFrame + sizeof(CallerFrameAndPC)`. The generated ARM64 prologue
-//! pushes `fp/lr`, so `fp/x29` becomes the callee `CallFrame*`.
+//! `sp = CallFrame + sizeof(CallerFrameAndPC)` while `cfr/fp` still names the
+//! `EntryFrame`. The generated ARM64 prologue pushes that `fp/lr` pair into the
+//! callee `CallerFrameAndPC` slots, then makes `fp/x29` the callee `CallFrame*`.
 //!
 //! This module is still dormant. It derives a platform request only from the
 //! already-proven stack-local JSC call frame and keeps the stack-frame lifetime
@@ -55,6 +56,9 @@ pub(crate) enum Arm64NativeEntryJscStackDispatchRequestError {
     NullEntryStackPointer {
         entry_sp: FrameAddress,
     },
+    NullEntryFrame {
+        entry_frame: FrameAddress,
+    },
     PlatformRequestInvalid {
         reason: ExecutableMemoryArm64JscStackCallRequestValidationError,
     },
@@ -65,6 +69,7 @@ pub(crate) enum Arm64NativeEntryJscStackDispatchRequestError {
 pub(crate) struct Arm64NativeEntryJscStackDispatchRequestProof<'frame> {
     pub(crate) entry_offset: u32,
     pub(crate) call_frame: FrameAddress,
+    pub(crate) entry_frame: FrameAddress,
     pub(crate) entry_sp: FrameAddress,
     pub(crate) platform_request: ExecutableMemoryArm64JscStackCallRequest,
     _stack_frame: PhantomData<&'frame ()>,
@@ -101,8 +106,17 @@ pub(crate) fn prove_arm64_native_entry_jsc_stack_dispatch_request<'frame>(
     )?;
     let entry_sp_ptr = non_null_frame_address(entry_sp)
         .ok_or(Arm64NativeEntryJscStackDispatchRequestError::NullEntryStackPointer { entry_sp })?;
-    let platform_request =
-        ExecutableMemoryArm64JscStackCallRequest::new(entry_offset, entry_sp_ptr, call_frame);
+    let entry_frame = non_null_frame_address(stack_call_proof.entry_frame).ok_or(
+        Arm64NativeEntryJscStackDispatchRequestError::NullEntryFrame {
+            entry_frame: stack_call_proof.entry_frame,
+        },
+    )?;
+    let platform_request = ExecutableMemoryArm64JscStackCallRequest::new(
+        entry_offset,
+        entry_sp_ptr,
+        call_frame,
+        entry_frame,
+    );
     platform_request.validate().map_err(|reason| {
         Arm64NativeEntryJscStackDispatchRequestError::PlatformRequestInvalid { reason }
     })?;
@@ -110,6 +124,7 @@ pub(crate) fn prove_arm64_native_entry_jsc_stack_dispatch_request<'frame>(
     Ok(Arm64NativeEntryJscStackDispatchRequestProof {
         entry_offset,
         call_frame: stack_call_proof.call_frame,
+        entry_frame: stack_call_proof.entry_frame,
         entry_sp,
         platform_request,
         _stack_frame: PhantomData,
@@ -264,11 +279,16 @@ mod tests {
 
         assert_eq!(dispatch.entry_offset, 24);
         assert_eq!(dispatch.call_frame, FrameAddress(0x2000));
+        assert_eq!(dispatch.entry_frame, FrameAddress(0x3000));
         assert_eq!(dispatch.entry_sp, FrameAddress(0x2010));
         assert_eq!(dispatch.platform_request.entry_offset, 24);
         assert_eq!(
             dispatch.platform_request.call_frame.as_ptr() as usize,
             0x2000
+        );
+        assert_eq!(
+            dispatch.platform_request.entry_frame.as_ptr() as usize,
+            0x3000
         );
         assert_eq!(dispatch.platform_request.entry_sp.as_ptr() as usize, 0x2010);
         assert_eq!(dispatch.platform_request.validate(), Ok(()));
@@ -325,6 +345,27 @@ mod tests {
             Err(
                 Arm64NativeEntryJscStackDispatchRequestError::EntryStackPointerOverflow {
                     call_frame: FrameAddress(usize::MAX - 8),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_jsc_stack_dispatch_request_rejects_null_entry_frame() {
+        let stack_frame = Arm64NativeEntryStackFrameProof {
+            entry_frame: FrameAddress(0),
+            ..stack_frame_proof()
+        };
+        let stack_call = Arm64NativeEntryJscStackCallRequestProof {
+            entry_frame: FrameAddress(0),
+            ..stack_call_proof()
+        };
+
+        assert_eq!(
+            prove_arm64_native_entry_jsc_stack_dispatch_request(&stack_call, &stack_frame, 0),
+            Err(
+                Arm64NativeEntryJscStackDispatchRequestError::NullEntryFrame {
+                    entry_frame: FrameAddress(0),
                 }
             )
         );
