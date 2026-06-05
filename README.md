@@ -37,7 +37,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
                  still showing owner 110@32/76 heat and zero generated invalidations.
                  Generated Call/CallWithThis sidecars now carry same-dispatch setup payloads
                  into VM direct-call validation, avoiding duplicate argument register reads
-                 while preserving the generated re-interpreter as the broad blocker.
+                 while preserving the generated re-interpreter as the broad blocker. A probe-only
+                 generated-entry disable policy confirms the 500k Richards cap can reroute
+                 28,762 direct calls from GeneratedEntry to nested interpreter fallback, but a
+                 no-cap run still exceeded ~3min; this is route evidence, not a default flip.
   Phase 2 [done] Octane feature completeness: all 15 benchmarks RUN correctly. Ground-truth
                  2026-05-30: ZERO throwers/aborts -- 3 score, 12 functional-but-slow
                  (perf-gated, Phase 1). Landed: implicit-global store, indirect eval, catchable
@@ -238,6 +241,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
     [done] generated executor per-invocation dispatch cap: Rust-only diagnostic guard
            makes the bytecode re-interpreter shim honor DispatchConfig for one generated
            invocation while default helper callers stay unbounded
+    [done] generated direct-call GeneratedEntry diagnostic policy: VM config and
+           octane_probe can disable the Rust-only direct-call bytecode re-interpreter,
+           preserving default routes while proving capped Richards switches those calls to
+           nested interpreter fallback under the current HostBlockedX86_64 native blocker
     [done] generated executor source-entry dispatch budget: VM/source-entry scoped budget
            is shared across generated-entry interpreter fallbacks and generated resumes; 50k
            capped richards runner now returns DispatchStepLimitExceeded instead of staying

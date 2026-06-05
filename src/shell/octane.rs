@@ -18,9 +18,9 @@ use crate::interpreter::{
 };
 use crate::syntax::source::SourceText;
 use crate::vm::{
-    BaselineEntryAutoMaterializationRecord, SourceExecutionError, SourceSessionHandle,
-    SourceSessionHostGlobalConfig, SourceSessionSource, Vm,
-    VmBaselineGeneratedDispatchedOpcodeCount, VmBaselineGeneratedDispatchedSiteOpcodeCount,
+    BaselineEntryAutoMaterializationRecord, GeneratedDirectCallGeneratedEntryPolicy,
+    SourceExecutionError, SourceSessionHandle, SourceSessionHostGlobalConfig, SourceSessionSource,
+    Vm, VmBaselineGeneratedDispatchedOpcodeCount, VmBaselineGeneratedDispatchedSiteOpcodeCount,
     VmBaselineGeneratedExecutionSummary, VmBaselineGeneratedInvalidationSummary, VmConfig,
     VmGeneratedDirectCallCalleeFallbackSummary,
     VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
@@ -321,6 +321,7 @@ pub struct OctaneExecutionConfig {
     pub mode: OctaneExecutionMode,
     pub failure_policy: OctaneSuiteFailurePolicy,
     pub dispatch_config: DispatchConfig,
+    pub generated_direct_call_generated_entry_policy: GeneratedDirectCallGeneratedEntryPolicy,
 }
 
 impl OctaneExecutionConfig {
@@ -329,12 +330,33 @@ impl OctaneExecutionConfig {
             mode,
             failure_policy,
             dispatch_config: DispatchConfig::unbounded(),
+            generated_direct_call_generated_entry_policy:
+                GeneratedDirectCallGeneratedEntryPolicy::Enabled,
         }
     }
 
     pub const fn with_dispatch_config(mut self, dispatch_config: DispatchConfig) -> Self {
         self.dispatch_config = dispatch_config;
         self
+    }
+
+    pub const fn with_generated_direct_call_generated_entry_policy(
+        mut self,
+        policy: GeneratedDirectCallGeneratedEntryPolicy,
+    ) -> Self {
+        self.generated_direct_call_generated_entry_policy = policy;
+        self
+    }
+
+    pub fn vm_config(self) -> VmConfig {
+        // Oversized-file exception: Octane execution config already owns the
+        // probe dispatch plumbing in this file; keep this diagnostic VM policy
+        // crossing here until the Octane shell config is extracted.
+        self.mode
+            .vm_config()
+            .with_generated_direct_call_generated_entry_policy(
+                self.generated_direct_call_generated_entry_policy,
+            )
     }
 }
 
@@ -1790,7 +1812,7 @@ pub fn execute_prepared_octane_benchmark(
     prepared: &OctanePreparedBenchmark,
     config: OctaneExecutionConfig,
 ) -> OctaneBenchmarkExecutionReport {
-    let mut vm = Vm::new(config.mode.vm_config());
+    let mut vm = Vm::new(config.vm_config());
     let mut progress = None;
     execute_prepared_octane_benchmark_run_with_vm(&mut vm, prepared, config, &mut progress).report
 }
@@ -1800,7 +1822,7 @@ pub fn execute_prepared_octane_benchmark_with_progress(
     config: OctaneExecutionConfig,
     progress: &mut dyn FnMut(OctaneExecutionProgress),
 ) -> OctaneBenchmarkExecutionReport {
-    let mut vm = Vm::new(config.mode.vm_config());
+    let mut vm = Vm::new(config.vm_config());
     let mut progress = Some(progress);
     execute_prepared_octane_benchmark_run_with_vm(&mut vm, prepared, config, &mut progress).report
 }
@@ -2030,7 +2052,7 @@ fn execute_prepared_octane_suite_with_optional_progress(
     progress: Option<&mut dyn FnMut(OctaneExecutionProgress)>,
 ) -> OctanePreparedSuiteExecutionReport {
     let mut progress = progress;
-    let mut vm = Vm::new(config.mode.vm_config());
+    let mut vm = Vm::new(config.vm_config());
     let mut retained_sessions = Vec::new();
     let mut benchmarks = Vec::with_capacity(prepared.benchmarks.len());
     let mut stopped_early = false;

@@ -265,7 +265,10 @@ use self::side_exit::{
     p6_side_exit_native_reentry_target_for_single_dispatch_outcome,
     P6CallableSideExitNativeReentryInvocation, P6X86_64CallableSideExitReturnSite,
 };
-pub use config::{HeapPolicy, HostCapabilities, VmConfig, VmExecutionMode};
+pub use config::{
+    GeneratedDirectCallGeneratedEntryPolicy, HeapPolicy, HostCapabilities, VmConfig,
+    VmExecutionMode,
+};
 pub use entry::{
     BaselineNativeDispatchTokenSelection, EntryKind, FrameAddress, VmEntryCallFrameMetadata,
     VmEntryDispatchSelection, VmEntryGuard, VmEntryLaunchArgumentValue, VmEntryLaunchDescriptor,

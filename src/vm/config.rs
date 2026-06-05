@@ -10,6 +10,7 @@ pub struct VmConfig {
     pub max_stack_bytes: Option<usize>,
     pub heap_policy: HeapPolicy,
     pub host_capabilities: HostCapabilities,
+    pub generated_direct_call_generated_entry_policy: GeneratedDirectCallGeneratedEntryPolicy,
 }
 
 impl VmConfig {
@@ -44,6 +45,19 @@ impl VmConfig {
             VmExecutionMode::BaselineAllowed => TieringPolicy::BaselineAllowed,
         }
     }
+
+    pub fn with_generated_direct_call_generated_entry_policy(
+        mut self,
+        policy: GeneratedDirectCallGeneratedEntryPolicy,
+    ) -> Self {
+        self.generated_direct_call_generated_entry_policy = policy;
+        self
+    }
+
+    pub fn generated_direct_call_generated_entry_enabled(&self) -> bool {
+        self.generated_direct_call_generated_entry_policy
+            == GeneratedDirectCallGeneratedEntryPolicy::Enabled
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -51,6 +65,17 @@ pub enum VmExecutionMode {
     #[default]
     InterpreterOnly,
     BaselineAllowed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GeneratedDirectCallGeneratedEntryPolicy {
+    // C++ JSC has no separate generated-entry bytecode shim for direct calls:
+    // CallLinkInfo targets the callee executable entrypoint. This Rust-only
+    // policy is diagnostic/probe-only, and the default keeps the existing
+    // GeneratedEntry route enabled.
+    #[default]
+    Enabled,
+    Disabled,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

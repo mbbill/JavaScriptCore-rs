@@ -207,28 +207,40 @@ impl Vm {
         };
 
         let rootless_generated_entry_rejection =
-            match self.generated_js_direct_call_rootless_generated_entry_proof(&validation) {
-                Ok(proof) => {
-                    self.tiering
-                        .record_generated_direct_call_rootless_generated_entry();
-                    let exception_snapshot = self.exceptions.clone();
-                    if proof.needs_deferred_exit_rooting() {
-                        self.enter_generated_direct_call_deferred_rooting();
+            if self.config.generated_direct_call_generated_entry_enabled() {
+                match self.generated_js_direct_call_rootless_generated_entry_proof(&validation) {
+                    Ok(proof) => {
+                        self.tiering
+                            .record_generated_direct_call_rootless_generated_entry();
+                        let exception_snapshot = self.exceptions.clone();
+                        if proof.needs_deferred_exit_rooting() {
+                            self.enter_generated_direct_call_deferred_rooting();
+                        }
+                        let result = self
+                            .execute_validated_generated_js_direct_call_with_return_mode(
+                                validation,
+                                caller_code_block,
+                                host,
+                                config,
+                                GeneratedDirectCallCalleeRoutePolicy::GeneratedEntryOnly,
+                                return_mode,
+                            );
+                        if proof.needs_deferred_exit_rooting() {
+                            self.leave_generated_direct_call_deferred_rooting();
+                        }
+                        return normalize_rootless(self, proof, exception_snapshot, result);
                     }
-                    let result = self.execute_validated_generated_js_direct_call_with_return_mode(
-                        validation,
-                        caller_code_block,
-                        host,
-                        config,
-                        GeneratedDirectCallCalleeRoutePolicy::GeneratedEntryOnly,
-                        return_mode,
-                    );
-                    if proof.needs_deferred_exit_rooting() {
-                        self.leave_generated_direct_call_deferred_rooting();
-                    }
-                    return normalize_rootless(self, proof, exception_snapshot, result);
+                    Err(reason) => reason,
                 }
-                Err(reason) => reason,
+            } else {
+                // C++ CallLinkInfo calls the callee executable entrypoint prepared by
+                // linkFor()/prepareForExecution(). Rust's GeneratedEntry is a
+                // diagnostic bytecode re-interpreter, so probes can disable it to
+                // compare the remaining native-or-interpreter route.
+                VmGeneratedDirectCallRootlessRejectionReason::PreferredRouteNotGeneratedEntry {
+                    native_entry_kind: self
+                        .generated_direct_call_native_entry_kind(validation.target_code_block_id),
+                }
             };
 
         if matches!(
@@ -623,6 +635,8 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> GeneratedDirectCallCalleeExecution {
+        let generated_entry_enabled = self.config.generated_direct_call_generated_entry_enabled();
+
         if preferred_route == Some(VmGeneratedDirectCallTransactionRoute::NativeEntry)
             && matches!(
                 route_policy,
@@ -737,7 +751,9 @@ impl Vm {
             }
         }
 
-        if preferred_route == Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry) {
+        if generated_entry_enabled
+            && preferred_route == Some(VmGeneratedDirectCallTransactionRoute::GeneratedEntry)
+        {
             let native_entry_miss = self.generated_direct_call_native_entry_miss_reason(
                 code_block_id,
                 code_block,
@@ -771,13 +787,17 @@ impl Vm {
             code_block,
             expected_frame,
         );
-        let generated = self.try_execute_generated_direct_call_callee_with_generated_entry(
-            code_block_id,
-            code_block,
-            expected_frame,
-            host,
-            config,
-        );
+        let generated = if generated_entry_enabled {
+            self.try_execute_generated_direct_call_callee_with_generated_entry(
+                code_block_id,
+                code_block,
+                expected_frame,
+                host,
+                config,
+            )
+        } else {
+            None
+        };
         if let Some(execution) = generated {
             self.record_generated_direct_call_route_opportunity(
                 continuation,
@@ -794,6 +814,7 @@ impl Vm {
             code_block,
             expected_frame,
             route_policy,
+            generated_entry_enabled,
             host,
             config,
         ) {
@@ -903,6 +924,7 @@ impl Vm {
         code_block: &CodeBlock,
         expected_frame: CallFrameId,
         route_policy: GeneratedDirectCallCalleeRoutePolicy,
+        allow_generated_entry: bool,
         host: &mut H,
         config: DispatchConfig,
     ) -> Option<GeneratedDirectCallCalleeExecution> {
@@ -929,12 +951,17 @@ impl Vm {
             VmGeneratedDirectCallNativeEntryMissReason::HostBlockedX86_64
                 if self.p15_host_blocked_native_generated_install_should_retry(code_block_id) =>
             {
-                let (generated, generated_detail) =
-                    self.p15_auto_install_generated_baseline_artifact(code_block_id);
+                let (generated, generated_detail) = if allow_generated_entry {
+                    let (generated, generated_detail) =
+                        self.p15_auto_install_generated_baseline_artifact(code_block_id);
+                    (Some(generated), generated_detail)
+                } else {
+                    (None, None)
+                };
                 (
                     BaselineEntryAutoNativeMaterializationOutcome::SkippedHostBlockedX86_64NativeEntry,
                     None,
-                    Some(generated),
+                    generated,
                     generated_detail,
                 )
             }
@@ -945,10 +972,11 @@ impl Vm {
                     self.next_p15_auto_baseline_native_entry_install_request(code_block_id);
                 match self.install_p6_x86_64_callable_semantic_baseline_native_entry(request) {
                     Ok(record) => {
-                        let (generated, generated_detail) = if self
-                            .p15_native_auto_install_requires_generated_host_fallback(&record)
-                            || route_policy
-                                == GeneratedDirectCallCalleeRoutePolicy::GeneratedEntryOnly
+                        let (generated, generated_detail) = if allow_generated_entry
+                            && (self
+                                .p15_native_auto_install_requires_generated_host_fallback(&record)
+                                || route_policy
+                                    == GeneratedDirectCallCalleeRoutePolicy::GeneratedEntryOnly)
                         {
                             // C++ JSC's linkFor() calls prepareForExecution() before
                             // entrypointFor() publishes the callee target. Rust may
@@ -976,13 +1004,14 @@ impl Vm {
                             generated_fallback_allowed,
                         };
                         let native_detail = Self::p15_auto_native_install_failure_detail(&error);
-                        let (generated, generated_detail) = if generated_fallback_allowed {
-                            let (generated, generated_detail) =
-                                self.p15_auto_install_generated_baseline_artifact(code_block_id);
-                            (Some(generated), generated_detail)
-                        } else {
-                            (None, None)
-                        };
+                        let (generated, generated_detail) =
+                            if allow_generated_entry && generated_fallback_allowed {
+                                let (generated, generated_detail) = self
+                                    .p15_auto_install_generated_baseline_artifact(code_block_id);
+                                (Some(generated), generated_detail)
+                            } else {
+                                (None, None)
+                            };
                         (native, native_detail, generated, generated_detail)
                     }
                 }
@@ -1016,6 +1045,9 @@ impl Vm {
             }
         }
         if route_policy == GeneratedDirectCallCalleeRoutePolicy::NativeEntryOnly {
+            return None;
+        }
+        if !allow_generated_entry {
             return None;
         }
         self.try_execute_generated_direct_call_callee_with_generated_entry(
