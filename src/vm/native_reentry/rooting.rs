@@ -52,40 +52,40 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
     },
-    TopCallFramePublicationWithConservativeRootMarkingPlan {
+    TopCallFramePublicationWithVmRootGatherPlan {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
-    },
-    TopCallFramePublicationWithCollectorEffectsPlan {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
-        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
-    },
-    TopCallFramePublicationWithCollectorEffectsAndJitStubTracePlan {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
-        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
-    },
-    TopCallFramePublicationWithCollectorEffectsJitStubTraceAndVmRootGatherPlan {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
-        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
         vm_root_gather_plan: VmRootGatherPlan,
     },
-    TopCallFramePublicationWithCollectorEffectsJitStubTraceVmRootGatherAndVerifierAppendProof {
+    TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+    },
+    TopCallFramePublicationWithVmRootGatherAndCollectorEffectsPlan {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
+    },
+    TopCallFramePublicationWithVmRootGatherCollectorEffectsAndVerifierAppendProof {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
+    },
+    TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierAppendAndJitStubTracePlan {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+        verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: JitStubRoutineTracePlan,
     },
 }
 
@@ -309,14 +309,6 @@ pub(in crate::vm) enum P6Arm64VmRootGatherProofMismatch {
     },
     MarkingEpochMismatch {
         receipt: HeapEpoch,
-        vm_roots: HeapEpoch,
-    },
-    JitStubTraceHeapMismatch {
-        jit_stub_trace: HeapId,
-        vm_roots: HeapId,
-    },
-    JitStubTraceMarkingEpochMismatch {
-        jit_stub_trace: HeapEpoch,
         vm_roots: HeapEpoch,
     },
     InvalidAppendRootMarkReason {
@@ -912,6 +904,10 @@ pub(super) fn validate_p6_arm64_jit_stub_routine_trace_plan(
     collector_effects_plan: &SlotVisitorCollectorEffectsPlan,
     jit_stub_trace_plan: &JitStubRoutineTracePlan,
 ) -> Result<(), P6Arm64JitStubRoutineTraceProofMismatch> {
+    // C++ marks `m_mayBeExecuting` through ConservativeRoots gather hooks
+    // before this trace. This proof only validates the later
+    // `traceMarkedStubRoutines` replay; real gather-hook provenance remains a
+    // native-rooting blocker.
     if jit_stub_trace_plan.heap != collector_effects_plan.heap {
         return Err(P6Arm64JitStubRoutineTraceProofMismatch::HeapMismatch {
             collector: collector_effects_plan.heap,
@@ -950,7 +946,6 @@ pub(super) fn validate_p6_arm64_jit_stub_routine_trace_plan(
 
 pub(super) fn validate_p6_arm64_vm_root_gather_plan(
     receipt: &HeapConservativeScanAppendReceipt,
-    jit_stub_trace_plan: &JitStubRoutineTracePlan,
     vm_root_gather_plan: &VmRootGatherPlan,
 ) -> Result<(), P6Arm64VmRootGatherProofMismatch> {
     if vm_root_gather_plan.heap != receipt.heap {
@@ -965,22 +960,6 @@ pub(super) fn validate_p6_arm64_vm_root_gather_plan(
             receipt: receipt.epoch,
             vm_roots: vm_root_gather_plan.marking_epoch,
         });
-    }
-
-    if vm_root_gather_plan.heap != jit_stub_trace_plan.heap {
-        return Err(P6Arm64VmRootGatherProofMismatch::JitStubTraceHeapMismatch {
-            jit_stub_trace: jit_stub_trace_plan.heap,
-            vm_roots: vm_root_gather_plan.heap,
-        });
-    }
-
-    if vm_root_gather_plan.marking_epoch != jit_stub_trace_plan.marking_epoch {
-        return Err(
-            P6Arm64VmRootGatherProofMismatch::JitStubTraceMarkingEpochMismatch {
-                jit_stub_trace: jit_stub_trace_plan.marking_epoch,
-                vm_roots: vm_root_gather_plan.marking_epoch,
-            },
-        );
     }
 
     if receipt.append_plan.root_mark_reason != RootMarkReason::ConservativeScan {

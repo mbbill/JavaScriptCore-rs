@@ -152,8 +152,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            src/vm/vm_roots.rs adds VM scratch-buffer / checkpoint side-state
            root gather evidence, src/gc/visitor/verifier.rs adds
            VerifierSlotVisitor conservative-root append evidence, and
-           src/vm/native_reentry.rs consumes them before rejecting at the
-           missing real native-rooting blocker;
+           src/vm/native_reentry.rs consumes them in Heap::addCoreConstraints
+           order before rejecting at the missing real native-rooting blocker;
            native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 

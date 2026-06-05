@@ -232,84 +232,84 @@ pub(super) enum P6Arm64BranchAwareCallableAdmissionRejection {
     MissingMachineStackAndConservativeRootingProof {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
     },
+    MissingVmRootGatherProof {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+    },
+    VmRootGatherProofMismatch {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
+        mismatch: P6Arm64VmRootGatherProofMismatch,
+    },
     MissingRealSlotVisitorConservativeRootMarkingProof {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
     },
     ConservativeRootMarkingProofMismatch {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
         mismatch: P6Arm64ConservativeRootMarkingProofMismatch,
     },
     MissingRealCollectorMarkStackCellStateAndContainerProof {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
     },
     CollectorEffectsProofMismatch {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         mismatch: P6Arm64CollectorEffectsProofMismatch,
     },
-    MissingVerifierAppendVmRootsAndJitStubTracingProof {
+    MissingVerifierAppendAndJitStubTracingProof {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
-    },
-    JitStubRoutineTraceProofMismatch {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
-        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
-        mismatch: P6Arm64JitStubRoutineTraceProofMismatch,
-    },
-    MissingVerifierAppendVmRootsAndRealNativeRootingProof {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
-        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
-    },
-    VmRootGatherProofMismatch {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
-        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
         vm_root_gather_plan: VmRootGatherPlan,
-        mismatch: P6Arm64VmRootGatherProofMismatch,
-    },
-    MissingVerifierAppendAndRealNativeRootingProof {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
-        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
-        vm_root_gather_plan: VmRootGatherPlan,
     },
     VerifierAppendProofMismatch {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+        verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
+        mismatch: P6Arm64VerifierAppendProofMismatch,
+    },
+    MissingJitStubTracingAndRealNativeRootingProof {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+        verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
+    },
+    JitStubRoutineTraceProofMismatch {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
-        vm_root_gather_plan: VmRootGatherPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
-        mismatch: P6Arm64VerifierAppendProofMismatch,
+        mismatch: P6Arm64JitStubRoutineTraceProofMismatch,
     },
     MissingRealNativeRootingProof {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
-        vm_root_gather_plan: VmRootGatherPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: JitStubRoutineTracePlan,
     },
 }
 
@@ -412,7 +412,7 @@ pub(super) fn p6_arm64_public_branch_aware_callable_admission_proof(
     // appends the same roots to VerifierSlotVisitor, then traces
     // may-be-executing JIT stubs under RootMarkReason::JITStubRoutines. Rust
     // intentionally diverges here: the top-call-frame, VM-root gather, GC
-    // marking, collector-effect, JIT-stub trace, and verifier append plans are
+    // marking, collector-effect, verifier append, and JIT-stub trace plans are
     // evidence rather than real scratch buffers, CheckpointOSRExitSideState
     // storage, machine stack pointers, MarkedBlock / PreciseAllocation bits,
     // JSCell header storage, collector-stack storage, verifier mark maps,
@@ -434,301 +434,301 @@ pub(super) fn p6_arm64_public_branch_aware_callable_admission_proof(
             top_call_frame_publication,
             conservative_scan_append_receipt,
         } => Err(
-            P6Arm64BranchAwareCallableAdmissionRejection::MissingRealSlotVisitorConservativeRootMarkingProof {
+            P6Arm64BranchAwareCallableAdmissionRejection::MissingVmRootGatherProof {
                 top_call_frame_publication: *top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
             },
         ),
-        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithConservativeRootMarkingPlan {
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherPlan {
             top_call_frame_publication,
             conservative_scan_append_receipt,
-            conservative_root_marking_plan,
-        } => match validate_p6_arm64_conservative_root_marking_plan(
+            vm_root_gather_plan,
+        } => match validate_p6_arm64_vm_root_gather_plan(
             conservative_scan_append_receipt,
-            conservative_root_marking_plan,
+            vm_root_gather_plan,
         ) {
             Ok(()) => Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::MissingRealCollectorMarkStackCellStateAndContainerProof {
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingRealSlotVisitorConservativeRootMarkingProof {
                     top_call_frame_publication: *top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                 },
             ),
             Err(mismatch) => Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
+                P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
                     top_call_frame_publication: *top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                     mismatch,
                 },
             ),
         },
-        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsPlan {
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
             top_call_frame_publication,
             conservative_scan_append_receipt,
+            vm_root_gather_plan,
             conservative_root_marking_plan,
-            collector_effects_plan,
-        } => match validate_p6_arm64_conservative_root_marking_plan(
+        } => match validate_p6_arm64_vm_root_gather_plan(
             conservative_scan_append_receipt,
-            conservative_root_marking_plan,
+            vm_root_gather_plan,
         ) {
-            Ok(()) => match validate_p6_arm64_collector_effects_plan(
+            Ok(()) => match validate_p6_arm64_conservative_root_marking_plan(
+                conservative_scan_append_receipt,
                 conservative_root_marking_plan,
-                collector_effects_plan,
             ) {
                 Ok(()) => Err(
-                    P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendVmRootsAndJitStubTracingProof {
+                    P6Arm64BranchAwareCallableAdmissionRejection::MissingRealCollectorMarkStackCellStateAndContainerProof {
                         top_call_frame_publication: *top_call_frame_publication,
                         conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                        vm_root_gather_plan: vm_root_gather_plan.clone(),
                         conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                        collector_effects_plan: collector_effects_plan.clone(),
                     },
                 ),
                 Err(mismatch) => Err(
-                    P6Arm64BranchAwareCallableAdmissionRejection::CollectorEffectsProofMismatch {
+                    P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
                         top_call_frame_publication: *top_call_frame_publication,
                         conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                        vm_root_gather_plan: vm_root_gather_plan.clone(),
                         conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                        collector_effects_plan: collector_effects_plan.clone(),
                         mismatch,
                     },
                 ),
             },
             Err(mismatch) => Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
+                P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
                     top_call_frame_publication: *top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                     mismatch,
                 },
             ),
         },
-        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsAndJitStubTracePlan {
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndCollectorEffectsPlan {
             top_call_frame_publication,
             conservative_scan_append_receipt,
+            vm_root_gather_plan,
             conservative_root_marking_plan,
             collector_effects_plan,
-            jit_stub_trace_plan,
-        } => match validate_p6_arm64_conservative_root_marking_plan(
+        } => match validate_p6_arm64_vm_root_gather_plan(
             conservative_scan_append_receipt,
-            conservative_root_marking_plan,
+            vm_root_gather_plan,
         ) {
-            Ok(()) => match validate_p6_arm64_collector_effects_plan(
+            Ok(()) => match validate_p6_arm64_conservative_root_marking_plan(
+                conservative_scan_append_receipt,
                 conservative_root_marking_plan,
-                collector_effects_plan,
             ) {
-                Ok(()) => match validate_p6_arm64_jit_stub_routine_trace_plan(
+                Ok(()) => match validate_p6_arm64_collector_effects_plan(
+                    conservative_root_marking_plan,
                     collector_effects_plan,
-                    jit_stub_trace_plan,
                 ) {
                     Ok(()) => Err(
-                        P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendVmRootsAndRealNativeRootingProof {
+                        P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendAndJitStubTracingProof {
                             top_call_frame_publication: *top_call_frame_publication,
                             conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                            vm_root_gather_plan: vm_root_gather_plan.clone(),
                             conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                             collector_effects_plan: collector_effects_plan.clone(),
-                            jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                         },
                     ),
                     Err(mismatch) => Err(
-                        P6Arm64BranchAwareCallableAdmissionRejection::JitStubRoutineTraceProofMismatch {
+                        P6Arm64BranchAwareCallableAdmissionRejection::CollectorEffectsProofMismatch {
                             top_call_frame_publication: *top_call_frame_publication,
                             conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                            vm_root_gather_plan: vm_root_gather_plan.clone(),
                             conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                             collector_effects_plan: collector_effects_plan.clone(),
-                            jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                             mismatch,
                         },
                     ),
                 },
                 Err(mismatch) => Err(
-                    P6Arm64BranchAwareCallableAdmissionRejection::CollectorEffectsProofMismatch {
+                    P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
                         top_call_frame_publication: *top_call_frame_publication,
                         conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                        vm_root_gather_plan: vm_root_gather_plan.clone(),
                         conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                        collector_effects_plan: collector_effects_plan.clone(),
                         mismatch,
                     },
                 ),
             },
             Err(mismatch) => Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
+                P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
                     top_call_frame_publication: *top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                     mismatch,
                 },
             ),
         },
-        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsJitStubTraceAndVmRootGatherPlan {
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsAndVerifierAppendProof {
             top_call_frame_publication,
             conservative_scan_append_receipt,
+            vm_root_gather_plan,
             conservative_root_marking_plan,
             collector_effects_plan,
-            jit_stub_trace_plan,
-            vm_root_gather_plan,
-        } => match validate_p6_arm64_conservative_root_marking_plan(
+            verifier_append_proof,
+        } => match validate_p6_arm64_vm_root_gather_plan(
             conservative_scan_append_receipt,
-            conservative_root_marking_plan,
+            vm_root_gather_plan,
         ) {
-            Ok(()) => match validate_p6_arm64_collector_effects_plan(
+            Ok(()) => match validate_p6_arm64_conservative_root_marking_plan(
+                conservative_scan_append_receipt,
                 conservative_root_marking_plan,
-                collector_effects_plan,
             ) {
-                Ok(()) => match validate_p6_arm64_jit_stub_routine_trace_plan(
+                Ok(()) => match validate_p6_arm64_collector_effects_plan(
+                    conservative_root_marking_plan,
                     collector_effects_plan,
-                    jit_stub_trace_plan,
                 ) {
-                    Ok(()) => match validate_p6_arm64_vm_root_gather_plan(
+                    Ok(()) => match validate_p6_arm64_verifier_append_proof(
                         conservative_scan_append_receipt,
-                        jit_stub_trace_plan,
+                        conservative_root_marking_plan,
                         vm_root_gather_plan,
+                        verifier_append_proof,
                     ) {
                         Ok(()) => Err(
-                            P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendAndRealNativeRootingProof {
+                            P6Arm64BranchAwareCallableAdmissionRejection::MissingJitStubTracingAndRealNativeRootingProof {
                                 top_call_frame_publication: *top_call_frame_publication,
                                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                                vm_root_gather_plan: vm_root_gather_plan.clone(),
                                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                                 collector_effects_plan: collector_effects_plan.clone(),
-                                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                                vm_root_gather_plan: vm_root_gather_plan.clone(),
+                                verifier_append_proof: verifier_append_proof.clone(),
                             },
                         ),
                         Err(mismatch) => Err(
-                            P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
+                            P6Arm64BranchAwareCallableAdmissionRejection::VerifierAppendProofMismatch {
                                 top_call_frame_publication: *top_call_frame_publication,
                                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                                vm_root_gather_plan: vm_root_gather_plan.clone(),
                                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                                 collector_effects_plan: collector_effects_plan.clone(),
-                                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                                vm_root_gather_plan: vm_root_gather_plan.clone(),
+                                verifier_append_proof: verifier_append_proof.clone(),
                                 mismatch,
                             },
                         ),
                     },
                     Err(mismatch) => Err(
-                        P6Arm64BranchAwareCallableAdmissionRejection::JitStubRoutineTraceProofMismatch {
+                        P6Arm64BranchAwareCallableAdmissionRejection::CollectorEffectsProofMismatch {
                             top_call_frame_publication: *top_call_frame_publication,
                             conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                            vm_root_gather_plan: vm_root_gather_plan.clone(),
                             conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                             collector_effects_plan: collector_effects_plan.clone(),
-                            jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                             mismatch,
                         },
                     ),
                 },
                 Err(mismatch) => Err(
-                    P6Arm64BranchAwareCallableAdmissionRejection::CollectorEffectsProofMismatch {
+                    P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
                         top_call_frame_publication: *top_call_frame_publication,
                         conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                        vm_root_gather_plan: vm_root_gather_plan.clone(),
                         conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                        collector_effects_plan: collector_effects_plan.clone(),
                         mismatch,
                     },
                 ),
             },
             Err(mismatch) => Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
+                P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
                     top_call_frame_publication: *top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                     mismatch,
                 },
             ),
         },
-        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsJitStubTraceVmRootGatherAndVerifierAppendProof {
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierAppendAndJitStubTracePlan {
             top_call_frame_publication,
             conservative_scan_append_receipt,
+            vm_root_gather_plan,
             conservative_root_marking_plan,
             collector_effects_plan,
-            jit_stub_trace_plan,
-            vm_root_gather_plan,
             verifier_append_proof,
-        } => match validate_p6_arm64_conservative_root_marking_plan(
+            jit_stub_trace_plan,
+        } => match validate_p6_arm64_vm_root_gather_plan(
             conservative_scan_append_receipt,
-            conservative_root_marking_plan,
+            vm_root_gather_plan,
         ) {
-            Ok(()) => match validate_p6_arm64_collector_effects_plan(
+            Ok(()) => match validate_p6_arm64_conservative_root_marking_plan(
+                conservative_scan_append_receipt,
                 conservative_root_marking_plan,
-                collector_effects_plan,
             ) {
-                Ok(()) => match validate_p6_arm64_jit_stub_routine_trace_plan(
+                Ok(()) => match validate_p6_arm64_collector_effects_plan(
+                    conservative_root_marking_plan,
                     collector_effects_plan,
-                    jit_stub_trace_plan,
                 ) {
-                    Ok(()) => match validate_p6_arm64_vm_root_gather_plan(
+                    Ok(()) => match validate_p6_arm64_verifier_append_proof(
                         conservative_scan_append_receipt,
-                        jit_stub_trace_plan,
+                        conservative_root_marking_plan,
                         vm_root_gather_plan,
+                        verifier_append_proof,
                     ) {
-                        Ok(()) => match validate_p6_arm64_verifier_append_proof(
-                            conservative_scan_append_receipt,
-                            conservative_root_marking_plan,
-                            vm_root_gather_plan,
-                            verifier_append_proof,
+                        Ok(()) => match validate_p6_arm64_jit_stub_routine_trace_plan(
+                            collector_effects_plan,
+                            jit_stub_trace_plan,
                         ) {
                             Ok(()) => Err(
                                 P6Arm64BranchAwareCallableAdmissionRejection::MissingRealNativeRootingProof {
                                     top_call_frame_publication: *top_call_frame_publication,
                                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                                     conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                                     collector_effects_plan: collector_effects_plan.clone(),
-                                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                                     verifier_append_proof: verifier_append_proof.clone(),
+                                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                                 },
                             ),
                             Err(mismatch) => Err(
-                                P6Arm64BranchAwareCallableAdmissionRejection::VerifierAppendProofMismatch {
+                                P6Arm64BranchAwareCallableAdmissionRejection::JitStubRoutineTraceProofMismatch {
                                     top_call_frame_publication: *top_call_frame_publication,
                                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                                     conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                                     collector_effects_plan: collector_effects_plan.clone(),
-                                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                                     verifier_append_proof: verifier_append_proof.clone(),
+                                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                                     mismatch,
                                 },
                             ),
                         },
                         Err(mismatch) => Err(
-                            P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
+                            P6Arm64BranchAwareCallableAdmissionRejection::VerifierAppendProofMismatch {
                                 top_call_frame_publication: *top_call_frame_publication,
                                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                                vm_root_gather_plan: vm_root_gather_plan.clone(),
                                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                                 collector_effects_plan: collector_effects_plan.clone(),
-                                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                                vm_root_gather_plan: vm_root_gather_plan.clone(),
+                                verifier_append_proof: verifier_append_proof.clone(),
                                 mismatch,
                             },
                         ),
                     },
                     Err(mismatch) => Err(
-                        P6Arm64BranchAwareCallableAdmissionRejection::JitStubRoutineTraceProofMismatch {
+                        P6Arm64BranchAwareCallableAdmissionRejection::CollectorEffectsProofMismatch {
                             top_call_frame_publication: *top_call_frame_publication,
                             conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                            vm_root_gather_plan: vm_root_gather_plan.clone(),
                             conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                             collector_effects_plan: collector_effects_plan.clone(),
-                            jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                             mismatch,
                         },
                     ),
                 },
                 Err(mismatch) => Err(
-                    P6Arm64BranchAwareCallableAdmissionRejection::CollectorEffectsProofMismatch {
+                    P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
                         top_call_frame_publication: *top_call_frame_publication,
                         conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                        vm_root_gather_plan: vm_root_gather_plan.clone(),
                         conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                        collector_effects_plan: collector_effects_plan.clone(),
                         mismatch,
                     },
                 ),
             },
             Err(mismatch) => Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
+                P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
                     top_call_frame_publication: *top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                     mismatch,
                 },
             ),
@@ -1477,17 +1477,36 @@ mod tests {
         assert_eq!(
             p6_arm64_public_branch_aware_callable_admission_proof(&request),
             Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::MissingRealSlotVisitorConservativeRootMarkingProof {
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingVmRootGatherProof {
                     top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
                 }
             )
         );
 
+        let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithConservativeRootMarkingPlan {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherPlan {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
+            };
+        assert_eq!(
+            p6_arm64_public_branch_aware_callable_admission_proof(&request),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingRealSlotVisitorConservativeRootMarkingProof {
+                    top_call_frame_publication,
+                    conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
+                }
+            )
+        );
+
+        request.fallback_rooting_proof =
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
+                top_call_frame_publication,
+                conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
             };
         assert_eq!(
@@ -1496,86 +1515,67 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::MissingRealCollectorMarkStackCellStateAndContainerProof {
                     top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                }
-            )
-        );
-
-        request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsPlan {
-                top_call_frame_publication,
-                conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                collector_effects_plan: collector_effects_plan.clone(),
-            };
-        assert_eq!(
-            p6_arm64_public_branch_aware_callable_admission_proof(&request),
-            Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendVmRootsAndJitStubTracingProof {
-                    top_call_frame_publication,
-                    conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                    collector_effects_plan: collector_effects_plan.clone(),
-                }
-            )
-        );
-
-        let jit_stub_trace_plan = jit_stub_trace_proof(&collector_effects_plan);
-        request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsAndJitStubTracePlan {
-                top_call_frame_publication,
-                conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                collector_effects_plan: collector_effects_plan.clone(),
-                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-            };
-        assert_eq!(
-            p6_arm64_public_branch_aware_callable_admission_proof(&request),
-            Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendVmRootsAndRealNativeRootingProof {
-                    top_call_frame_publication,
-                    conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                    collector_effects_plan: collector_effects_plan.clone(),
-                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                }
-            )
-        );
-
-        let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
-        request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsJitStubTraceAndVmRootGatherPlan {
-                top_call_frame_publication,
-                conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                collector_effects_plan: collector_effects_plan.clone(),
-                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                vm_root_gather_plan: vm_root_gather_plan.clone(),
-            };
-        assert_eq!(
-            p6_arm64_public_branch_aware_callable_admission_proof(&request),
-            Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendAndRealNativeRootingProof {
-                    top_call_frame_publication,
-                    conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                    collector_effects_plan: collector_effects_plan.clone(),
-                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                     vm_root_gather_plan: vm_root_gather_plan.clone(),
+                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                }
+            )
+        );
+
+        request.fallback_rooting_proof =
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndCollectorEffectsPlan {
+                top_call_frame_publication,
+                conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
+                conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                collector_effects_plan: collector_effects_plan.clone(),
+            };
+        assert_eq!(
+            p6_arm64_public_branch_aware_callable_admission_proof(&request),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendAndJitStubTracingProof {
+                    top_call_frame_publication,
+                    conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
+                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                    collector_effects_plan: collector_effects_plan.clone(),
                 }
             )
         );
 
         let verifier_append_proof = verifier_append_proof(&conservative_root_marking_plan);
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsJitStubTraceVmRootGatherAndVerifierAppendProof {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsAndVerifierAppendProof {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                 collector_effects_plan: collector_effects_plan.clone(),
-                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 verifier_append_proof: verifier_append_proof.clone(),
+            };
+        assert_eq!(
+            p6_arm64_public_branch_aware_callable_admission_proof(&request),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingJitStubTracingAndRealNativeRootingProof {
+                    top_call_frame_publication,
+                    conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
+                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                    collector_effects_plan: collector_effects_plan.clone(),
+                    verifier_append_proof: verifier_append_proof.clone(),
+                }
+            )
+        );
+
+        let jit_stub_trace_plan = jit_stub_trace_proof(&collector_effects_plan);
+        request.fallback_rooting_proof =
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierAppendAndJitStubTracePlan {
+                top_call_frame_publication,
+                conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
+                conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                collector_effects_plan: collector_effects_plan.clone(),
+                verifier_append_proof: verifier_append_proof.clone(),
+                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
             };
         assert_eq!(
             p6_arm64_public_branch_aware_callable_admission_proof(&request),
@@ -1583,11 +1583,11 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::MissingRealNativeRootingProof {
                     top_call_frame_publication,
                     conservative_scan_append_receipt,
+                    vm_root_gather_plan,
                     conservative_root_marking_plan,
                     collector_effects_plan,
-                    jit_stub_trace_plan,
-                    vm_root_gather_plan,
                     verifier_append_proof,
+                    jit_stub_trace_plan,
                 }
             )
         );
@@ -1612,11 +1612,13 @@ mod tests {
             expected_p6_arm64_collector_effect_action(&conservative_root_marking_plan.records[0]);
         collector_effects_plan.records[0].action =
             SlotVisitorCollectorEffectAction::AlreadyMarkedReturn;
+        let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
 
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsPlan {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndCollectorEffectsPlan {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                 collector_effects_plan: collector_effects_plan.clone(),
             };
@@ -1627,6 +1629,7 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::CollectorEffectsProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt,
+                    vm_root_gather_plan,
                     conservative_root_marking_plan,
                     collector_effects_plan,
                     mismatch: P6Arm64CollectorEffectsProofMismatch::CollectorActionMismatch {
@@ -1654,17 +1657,21 @@ mod tests {
             conservative_root_marking_plan,
             collector_effects_plan,
         ) = conservative_root_marking_and_collector_effects_proof();
+        let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
+        let verifier_append_proof = verifier_append_proof(&conservative_root_marking_plan);
         let mut jit_stub_trace_plan = jit_stub_trace_proof(&collector_effects_plan);
         let expected_trace_record = jit_stub_trace_plan.records[0].clone();
         jit_stub_trace_plan.records[0].required_edges[0].cell = CellId(0xdead);
         let actual_trace_record = jit_stub_trace_plan.records[0].clone();
 
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsAndJitStubTracePlan {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierAppendAndJitStubTracePlan {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                 collector_effects_plan: collector_effects_plan.clone(),
+                verifier_append_proof: verifier_append_proof.clone(),
                 jit_stub_trace_plan: jit_stub_trace_plan.clone(),
             };
 
@@ -1674,8 +1681,10 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::JitStubRoutineTraceProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt,
+                    vm_root_gather_plan,
                     conservative_root_marking_plan,
                     collector_effects_plan,
+                    verifier_append_proof,
                     jit_stub_trace_plan,
                     mismatch: P6Arm64JitStubRoutineTraceProofMismatch::TracePlanMismatch(
                         JitStubRoutineTraceError::TraceRecordMismatch {
@@ -1699,23 +1708,16 @@ mod tests {
             P6Arm64BranchAwareCallableTopCallFramePublicationProof::from_publication_record(
                 top_call_frame_publication_record(),
             );
-        let (
-            conservative_scan_append_receipt,
-            conservative_root_marking_plan,
-            collector_effects_plan,
-        ) = conservative_root_marking_and_collector_effects_proof();
-        let jit_stub_trace_plan = jit_stub_trace_proof(&collector_effects_plan);
+        let (conservative_scan_append_receipt, _, _) =
+            conservative_root_marking_and_collector_effects_proof();
         let valid_vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
 
         let mut heap_mismatch_plan = valid_vm_root_gather_plan.clone();
         heap_mismatch_plan.heap = HeapId(conservative_scan_append_receipt.heap.0 + 1);
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsJitStubTraceAndVmRootGatherPlan {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherPlan {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                collector_effects_plan: collector_effects_plan.clone(),
-                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                 vm_root_gather_plan: heap_mismatch_plan.clone(),
             };
         assert_eq!(
@@ -1724,9 +1726,6 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                    collector_effects_plan: collector_effects_plan.clone(),
-                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                     vm_root_gather_plan: heap_mismatch_plan,
                     mismatch: P6Arm64VmRootGatherProofMismatch::HeapMismatch {
                         receipt: conservative_scan_append_receipt.heap,
@@ -1739,12 +1738,9 @@ mod tests {
         let mut epoch_mismatch_plan = valid_vm_root_gather_plan.clone();
         epoch_mismatch_plan.marking_epoch = HeapEpoch(conservative_scan_append_receipt.epoch.0 + 1);
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsJitStubTraceAndVmRootGatherPlan {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherPlan {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                collector_effects_plan: collector_effects_plan.clone(),
-                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                 vm_root_gather_plan: epoch_mismatch_plan.clone(),
             };
         assert_eq!(
@@ -1753,9 +1749,6 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                    collector_effects_plan: collector_effects_plan.clone(),
-                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                     vm_root_gather_plan: epoch_mismatch_plan,
                     mismatch: P6Arm64VmRootGatherProofMismatch::MarkingEpochMismatch {
                         receipt: conservative_scan_append_receipt.epoch,
@@ -1769,12 +1762,9 @@ mod tests {
         source_mismatch_plan.scratch_buffer_records[0].source =
             VmRootSource::CheckpointOsrExitSideState;
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsJitStubTraceAndVmRootGatherPlan {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherPlan {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                collector_effects_plan: collector_effects_plan.clone(),
-                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
                 vm_root_gather_plan: source_mismatch_plan.clone(),
             };
         assert_eq!(
@@ -1783,9 +1773,6 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt,
-                    conservative_root_marking_plan,
-                    collector_effects_plan,
-                    jit_stub_trace_plan,
                     vm_root_gather_plan: source_mismatch_plan,
                     mismatch: P6Arm64VmRootGatherProofMismatch::GatherPlanMismatch(
                         VmRootGatherError::ScratchBufferSourceMismatch {
@@ -1813,7 +1800,6 @@ mod tests {
             conservative_root_marking_plan,
             collector_effects_plan,
         ) = conservative_root_marking_and_collector_effects_proof();
-        let jit_stub_trace_plan = jit_stub_trace_proof(&collector_effects_plan);
         let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
 
         let no_verifier_append_proof =
@@ -1822,13 +1808,12 @@ mod tests {
                 marking_epoch: conservative_scan_append_receipt.epoch,
             };
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsJitStubTraceVmRootGatherAndVerifierAppendProof {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsAndVerifierAppendProof {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                 collector_effects_plan: collector_effects_plan.clone(),
-                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 verifier_append_proof: no_verifier_append_proof.clone(),
             };
         assert_eq!(
@@ -1837,10 +1822,9 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::VerifierAppendProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                     conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                     collector_effects_plan: collector_effects_plan.clone(),
-                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                     verifier_append_proof: no_verifier_append_proof,
                     mismatch: P6Arm64VerifierAppendProofMismatch::MissingVerifierAppendPlan {
                         heap: conservative_scan_append_receipt.heap,
@@ -1859,13 +1843,12 @@ mod tests {
         }
 
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsJitStubTraceVmRootGatherAndVerifierAppendProof {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsAndVerifierAppendProof {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                 collector_effects_plan: collector_effects_plan.clone(),
-                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 verifier_append_proof: wrong_reason_verifier_append_proof.clone(),
             };
 
@@ -1875,10 +1858,9 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::VerifierAppendProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                     conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                     collector_effects_plan: collector_effects_plan.clone(),
-                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                    vm_root_gather_plan: vm_root_gather_plan.clone(),
                     verifier_append_proof: wrong_reason_verifier_append_proof,
                     mismatch: P6Arm64VerifierAppendProofMismatch::InvalidRootMarkReason {
                         actual: RootMarkReason::JitStubRoutines,
@@ -1894,13 +1876,12 @@ mod tests {
             plan.collector_stack_append_count = 0;
         }
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsJitStubTraceVmRootGatherAndVerifierAppendProof {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsAndVerifierAppendProof {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                 collector_effects_plan: collector_effects_plan.clone(),
-                jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 verifier_append_proof: verifier_append_proof.clone(),
             };
         assert_eq!(
@@ -1909,10 +1890,9 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::VerifierAppendProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt,
+                    vm_root_gather_plan,
                     conservative_root_marking_plan,
                     collector_effects_plan,
-                    jit_stub_trace_plan,
-                    vm_root_gather_plan,
                     verifier_append_proof,
                     mismatch: P6Arm64VerifierAppendProofMismatch::VerifierPlanMismatch(
                         VerifierSlotVisitorConservativeRootAppendError::CollectorStackAppendCountMismatch {
@@ -1938,11 +1918,13 @@ mod tests {
         let (conservative_scan_append_receipt, mut conservative_root_marking_plan) =
             conservative_root_marking_proof();
         conservative_root_marking_plan.records.clear();
+        let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
 
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithConservativeRootMarkingPlan {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
             };
 
@@ -1952,6 +1934,7 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt,
+                    vm_root_gather_plan,
                     conservative_root_marking_plan,
                     mismatch:
                         P6Arm64ConservativeRootMarkingProofMismatch::MarkingRecordCountMismatch {
@@ -1975,13 +1958,15 @@ mod tests {
             );
         let (conservative_scan_append_receipt, mut conservative_root_marking_plan) =
             conservative_root_marking_proof();
+        let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
         let marking_cell = CellId(0xdead);
         conservative_root_marking_plan.records[0].heap_marking.cell = marking_cell;
 
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithConservativeRootMarkingPlan {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
             };
 
@@ -1991,6 +1976,7 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                    vm_root_gather_plan,
                     conservative_root_marking_plan,
                     mismatch:
                         P6Arm64ConservativeRootMarkingProofMismatch::HeapMarkingCellMismatch {
@@ -2015,13 +2001,15 @@ mod tests {
             );
         let (conservative_scan_append_receipt, mut conservative_root_marking_plan) =
             conservative_root_marking_proof();
+        let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
         conservative_root_marking_plan.records[0].action =
             SlotVisitorConservativeRootMarkingAction::AlreadyMarked;
 
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithConservativeRootMarkingPlan {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
             };
 
@@ -2031,6 +2019,7 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt,
+                    vm_root_gather_plan,
                     conservative_root_marking_plan,
                     mismatch:
                         P6Arm64ConservativeRootMarkingProofMismatch::MarkingActionMismatch {
@@ -2058,12 +2047,14 @@ mod tests {
             );
         let (conservative_scan_append_receipt, mut conservative_root_marking_plan) =
             conservative_root_marking_proof();
+        let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
         conservative_root_marking_plan.queued_js_cell_count = 0;
 
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithConservativeRootMarkingPlan {
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
                 top_call_frame_publication,
                 conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                vm_root_gather_plan: vm_root_gather_plan.clone(),
                 conservative_root_marking_plan: conservative_root_marking_plan.clone(),
             };
 
@@ -2073,6 +2064,7 @@ mod tests {
                 P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
                     top_call_frame_publication,
                     conservative_scan_append_receipt,
+                    vm_root_gather_plan,
                     conservative_root_marking_plan,
                     mismatch:
                         P6Arm64ConservativeRootMarkingProofMismatch::QueuedJsCellCountMismatch {
