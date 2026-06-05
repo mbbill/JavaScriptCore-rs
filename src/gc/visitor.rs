@@ -1,7 +1,14 @@
 //! Marking worklists, slot visitors, and conservative root scan descriptors.
 
+mod collector_effects;
 mod conservative_marking;
 
+pub(crate) use collector_effects::{
+    SlotVisitorAppendToMarkStackRecord, SlotVisitorCollectorEffectAction,
+    SlotVisitorCollectorEffectRecord, SlotVisitorCollectorEffectsError,
+    SlotVisitorCollectorEffectsPlan, SlotVisitorContainerNoteMarkedRecord,
+    SlotVisitorNoteLiveAuxiliaryCellRecord,
+};
 pub(crate) use conservative_marking::{
     SlotVisitorConservativeRootMarkingAction, SlotVisitorConservativeRootMarkingError,
     SlotVisitorConservativeRootMarkingPlan, SlotVisitorConservativeRootMarkingRecord,

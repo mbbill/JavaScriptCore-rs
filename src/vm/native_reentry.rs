@@ -15,8 +15,10 @@ use crate::bytecode::{BytecodeIndex, CodeBlock, CoreOpcode};
 use crate::gc::{
     CellId, CellState, ConservativeRootCell, HeapCellKind, HeapConservativeScanAppendReceipt,
     HeapEpoch, HeapId, MarkDependency, MarkWorklistId, RootMarkReason,
-    SlotVisitorConservativeRootAppendRecord, SlotVisitorConservativeRootMarkingAction,
-    SlotVisitorConservativeRootMarkingPlan,
+    SlotVisitorAppendToMarkStackRecord, SlotVisitorCollectorEffectAction,
+    SlotVisitorCollectorEffectsPlan, SlotVisitorConservativeRootAppendRecord,
+    SlotVisitorConservativeRootMarkingAction, SlotVisitorConservativeRootMarkingPlan,
+    SlotVisitorContainerNoteMarkedRecord, SlotVisitorNoteLiveAuxiliaryCellRecord,
 };
 use crate::interpreter::{ExecutionCompletion, ExecutionError};
 use crate::jit::emitter::{
@@ -163,6 +165,12 @@ pub(super) enum P6Arm64BranchAwareCallableFallbackRootingProof {
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
     },
+    TopCallFramePublicationWithCollectorEffectsPlan {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+    },
 }
 
 #[allow(dead_code)]
@@ -308,6 +316,94 @@ pub(super) enum P6Arm64ConservativeRootMarkingProofMismatch {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum P6Arm64CollectorEffectsProofMismatch {
+    HeapMismatch {
+        marking: HeapId,
+        effects: HeapId,
+    },
+    MarkingEpochMismatch {
+        marking: HeapEpoch,
+        effects: HeapEpoch,
+    },
+    WorklistMismatch {
+        marking: MarkWorklistId,
+        effects: MarkWorklistId,
+    },
+    RootMarkReasonMismatch {
+        marking: RootMarkReason,
+        effects: RootMarkReason,
+    },
+    DependencyMismatch {
+        marking: MarkDependency,
+        effects: MarkDependency,
+    },
+    CollectorRecordCountMismatch {
+        marking: usize,
+        effects: usize,
+    },
+    CollectorRecordOrderMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    CollectorMarkingRecordMismatch {
+        order: usize,
+    },
+    CollectorActionMismatch {
+        order: usize,
+        expected: SlotVisitorCollectorEffectAction,
+        actual: SlotVisitorCollectorEffectAction,
+    },
+    VisitCountDeltaMismatch {
+        order: usize,
+        expected: usize,
+        actual: usize,
+    },
+    BytesVisitedDeltaMismatch {
+        order: usize,
+        expected: usize,
+        actual: usize,
+    },
+    NonCellVisitCountDeltaMismatch {
+        order: usize,
+        expected: usize,
+        actual: usize,
+    },
+    JsCellStateUpdateCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    ContainerNoteMarkedCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    MarkStackAppendCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    LiveAuxiliaryCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    AlreadyMarkedCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    VisitCountTotalMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    BytesVisitedTotalMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    NonCellVisitCountTotalMismatch {
+        expected: usize,
+        actual: usize,
+    },
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum P6Arm64BranchAwareCallableAdmissionRejection {
     MissingBranchAwareSemanticEmission,
@@ -372,6 +468,19 @@ pub(super) enum P6Arm64BranchAwareCallableAdmissionRejection {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+    },
+    CollectorEffectsProofMismatch {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+        mismatch: P6Arm64CollectorEffectsProofMismatch,
+    },
+    MissingVerifierAppendVmRootsAndJitStubTracingProof {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
     },
 }
 
@@ -474,11 +583,11 @@ pub(super) fn p6_arm64_public_branch_aware_callable_admission_proof(
     // the collector stack, or noting live Auxiliary containers under a
     // ConservativeScan referrer context. Rust intentionally diverges here: the
     // top-call-frame proof is symbolic VM-entry metadata, and the GC marking
-    // plan is still collector-owned evidence rather than real MarkedBlock /
-    // PreciseAllocation bits, JSCell header mutation, collector-stack storage,
-    // verifier append, VM-root gathering, or JIT-stub tracing. Public ARM64
-    // admission therefore remains rejected even after the marking evidence is
-    // present and internally consistent.
+    // plus collector-effect plans are still evidence rather than real
+    // MarkedBlock / PreciseAllocation bits, JSCell header storage, or
+    // collector-stack storage. Public ARM64 admission therefore remains
+    // rejected until verifier append, VM-root gathering, JIT-stub tracing, and
+    // the remaining native rooting pieces are proven.
     match &request.fallback_rooting_proof {
         P6Arm64BranchAwareCallableFallbackRootingProof::MissingTopCallFramePublication => {
             Err(P6Arm64BranchAwareCallableAdmissionRejection::MissingTopCallFramePublicationProof)
@@ -514,6 +623,46 @@ pub(super) fn p6_arm64_public_branch_aware_callable_admission_proof(
                     conservative_root_marking_plan: conservative_root_marking_plan.clone(),
                 },
             ),
+            Err(mismatch) => Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
+                    top_call_frame_publication: *top_call_frame_publication,
+                    conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                    mismatch,
+                },
+            ),
+        },
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsPlan {
+            top_call_frame_publication,
+            conservative_scan_append_receipt,
+            conservative_root_marking_plan,
+            collector_effects_plan,
+        } => match validate_p6_arm64_conservative_root_marking_plan(
+            conservative_scan_append_receipt,
+            conservative_root_marking_plan,
+        ) {
+            Ok(()) => match validate_p6_arm64_collector_effects_plan(
+                conservative_root_marking_plan,
+                collector_effects_plan,
+            ) {
+                Ok(()) => Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendVmRootsAndJitStubTracingProof {
+                        top_call_frame_publication: *top_call_frame_publication,
+                        conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                        conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                        collector_effects_plan: collector_effects_plan.clone(),
+                    },
+                ),
+                Err(mismatch) => Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::CollectorEffectsProofMismatch {
+                        top_call_frame_publication: *top_call_frame_publication,
+                        conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                        conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                        collector_effects_plan: collector_effects_plan.clone(),
+                        mismatch,
+                    },
+                ),
+            },
             Err(mismatch) => Err(
                 P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
                     top_call_frame_publication: *top_call_frame_publication,
@@ -793,6 +942,270 @@ fn validate_p6_arm64_conservative_root_marking_plan(
     }
 
     Ok(())
+}
+
+fn validate_p6_arm64_collector_effects_plan(
+    marking_plan: &SlotVisitorConservativeRootMarkingPlan,
+    effects_plan: &SlotVisitorCollectorEffectsPlan,
+) -> Result<(), P6Arm64CollectorEffectsProofMismatch> {
+    if effects_plan.heap != marking_plan.heap {
+        return Err(P6Arm64CollectorEffectsProofMismatch::HeapMismatch {
+            marking: marking_plan.heap,
+            effects: effects_plan.heap,
+        });
+    }
+
+    if effects_plan.marking_epoch != marking_plan.marking_epoch {
+        return Err(P6Arm64CollectorEffectsProofMismatch::MarkingEpochMismatch {
+            marking: marking_plan.marking_epoch,
+            effects: effects_plan.marking_epoch,
+        });
+    }
+
+    if effects_plan.worklist != marking_plan.worklist {
+        return Err(P6Arm64CollectorEffectsProofMismatch::WorklistMismatch {
+            marking: marking_plan.worklist,
+            effects: effects_plan.worklist,
+        });
+    }
+
+    if effects_plan.root_mark_reason != marking_plan.root_mark_reason {
+        return Err(
+            P6Arm64CollectorEffectsProofMismatch::RootMarkReasonMismatch {
+                marking: marking_plan.root_mark_reason,
+                effects: effects_plan.root_mark_reason,
+            },
+        );
+    }
+
+    if effects_plan.dependency != marking_plan.dependency {
+        return Err(P6Arm64CollectorEffectsProofMismatch::DependencyMismatch {
+            marking: marking_plan.dependency,
+            effects: effects_plan.dependency,
+        });
+    }
+
+    if effects_plan.records.len() != marking_plan.records.len() {
+        return Err(
+            P6Arm64CollectorEffectsProofMismatch::CollectorRecordCountMismatch {
+                marking: marking_plan.records.len(),
+                effects: effects_plan.records.len(),
+            },
+        );
+    }
+
+    let mut js_cell_state_update_count = 0;
+    let mut container_note_marked_count = 0;
+    let mut mark_stack_append_count = 0;
+    let mut live_auxiliary_count = 0;
+    let mut already_marked_count = 0;
+    let mut visit_count_delta = 0;
+    let mut bytes_visited_delta = 0;
+    let mut non_cell_visit_count_delta = 0;
+
+    for (order, (marking_record, effect_record)) in marking_plan
+        .records
+        .iter()
+        .zip(effects_plan.records.iter())
+        .enumerate()
+    {
+        if effect_record.order != order {
+            return Err(
+                P6Arm64CollectorEffectsProofMismatch::CollectorRecordOrderMismatch {
+                    expected: order,
+                    actual: effect_record.order,
+                },
+            );
+        }
+
+        if effect_record.marking_record != *marking_record {
+            return Err(
+                P6Arm64CollectorEffectsProofMismatch::CollectorMarkingRecordMismatch { order },
+            );
+        }
+
+        let expected_action = expected_p6_arm64_collector_effect_action(marking_record);
+        if effect_record.action != expected_action {
+            return Err(
+                P6Arm64CollectorEffectsProofMismatch::CollectorActionMismatch {
+                    order,
+                    expected: expected_action,
+                    actual: effect_record.action,
+                },
+            );
+        }
+
+        if effect_record.visit_count_delta != marking_record.visit_count_delta {
+            return Err(
+                P6Arm64CollectorEffectsProofMismatch::VisitCountDeltaMismatch {
+                    order,
+                    expected: marking_record.visit_count_delta,
+                    actual: effect_record.visit_count_delta,
+                },
+            );
+        }
+
+        if effect_record.bytes_visited_delta != marking_record.bytes_visited_delta {
+            return Err(
+                P6Arm64CollectorEffectsProofMismatch::BytesVisitedDeltaMismatch {
+                    order,
+                    expected: marking_record.bytes_visited_delta,
+                    actual: effect_record.bytes_visited_delta,
+                },
+            );
+        }
+
+        if effect_record.non_cell_visit_count_delta != marking_record.non_cell_visit_count_delta {
+            return Err(
+                P6Arm64CollectorEffectsProofMismatch::NonCellVisitCountDeltaMismatch {
+                    order,
+                    expected: marking_record.non_cell_visit_count_delta,
+                    actual: effect_record.non_cell_visit_count_delta,
+                },
+            );
+        }
+
+        match expected_action {
+            SlotVisitorCollectorEffectAction::AlreadyMarkedReturn => {
+                already_marked_count += 1;
+            }
+            SlotVisitorCollectorEffectAction::AppendToMarkStack(_) => {
+                js_cell_state_update_count += 1;
+                container_note_marked_count += 1;
+                mark_stack_append_count += 1;
+            }
+            SlotVisitorCollectorEffectAction::NoteLiveAuxiliaryCell(_) => {
+                container_note_marked_count += 1;
+                live_auxiliary_count += 1;
+            }
+        }
+
+        visit_count_delta += marking_record.visit_count_delta;
+        bytes_visited_delta += marking_record.bytes_visited_delta;
+        non_cell_visit_count_delta += marking_record.non_cell_visit_count_delta;
+    }
+
+    if effects_plan.js_cell_state_update_count != js_cell_state_update_count {
+        return Err(
+            P6Arm64CollectorEffectsProofMismatch::JsCellStateUpdateCountMismatch {
+                expected: js_cell_state_update_count,
+                actual: effects_plan.js_cell_state_update_count,
+            },
+        );
+    }
+
+    if effects_plan.container_note_marked_count != container_note_marked_count {
+        return Err(
+            P6Arm64CollectorEffectsProofMismatch::ContainerNoteMarkedCountMismatch {
+                expected: container_note_marked_count,
+                actual: effects_plan.container_note_marked_count,
+            },
+        );
+    }
+
+    if effects_plan.mark_stack_append_count != mark_stack_append_count {
+        return Err(
+            P6Arm64CollectorEffectsProofMismatch::MarkStackAppendCountMismatch {
+                expected: mark_stack_append_count,
+                actual: effects_plan.mark_stack_append_count,
+            },
+        );
+    }
+
+    if effects_plan.live_auxiliary_count != live_auxiliary_count {
+        return Err(
+            P6Arm64CollectorEffectsProofMismatch::LiveAuxiliaryCountMismatch {
+                expected: live_auxiliary_count,
+                actual: effects_plan.live_auxiliary_count,
+            },
+        );
+    }
+
+    if effects_plan.already_marked_count != already_marked_count {
+        return Err(
+            P6Arm64CollectorEffectsProofMismatch::AlreadyMarkedCountMismatch {
+                expected: already_marked_count,
+                actual: effects_plan.already_marked_count,
+            },
+        );
+    }
+
+    if effects_plan.visit_count_delta != visit_count_delta {
+        return Err(
+            P6Arm64CollectorEffectsProofMismatch::VisitCountTotalMismatch {
+                expected: visit_count_delta,
+                actual: effects_plan.visit_count_delta,
+            },
+        );
+    }
+
+    if effects_plan.bytes_visited_delta != bytes_visited_delta {
+        return Err(
+            P6Arm64CollectorEffectsProofMismatch::BytesVisitedTotalMismatch {
+                expected: bytes_visited_delta,
+                actual: effects_plan.bytes_visited_delta,
+            },
+        );
+    }
+
+    if effects_plan.non_cell_visit_count_delta != non_cell_visit_count_delta {
+        return Err(
+            P6Arm64CollectorEffectsProofMismatch::NonCellVisitCountTotalMismatch {
+                expected: non_cell_visit_count_delta,
+                actual: effects_plan.non_cell_visit_count_delta,
+            },
+        );
+    }
+
+    Ok(())
+}
+
+fn expected_p6_arm64_collector_effect_action(
+    marking_record: &crate::gc::SlotVisitorConservativeRootMarkingRecord,
+) -> SlotVisitorCollectorEffectAction {
+    let heap_marking = marking_record.heap_marking;
+    match marking_record.action {
+        SlotVisitorConservativeRootMarkingAction::AlreadyMarked => {
+            SlotVisitorCollectorEffectAction::AlreadyMarkedReturn
+        }
+        SlotVisitorConservativeRootMarkingAction::QueueJsCell {
+            cell_state,
+            worklist,
+        } => {
+            let container_note_marked = SlotVisitorContainerNoteMarkedRecord {
+                cell: heap_marking.cell,
+                heap_cell_kind: heap_marking.heap_cell_kind,
+                byte_size: heap_marking.byte_size,
+            };
+            SlotVisitorCollectorEffectAction::AppendToMarkStack(
+                SlotVisitorAppendToMarkStackRecord {
+                    cell: heap_marking.cell,
+                    heap_cell_kind: heap_marking.heap_cell_kind,
+                    cell_state,
+                    worklist,
+                    root_mark_reason: marking_record.append_record.root_mark_reason,
+                    dependency: marking_record.append_record.dependency,
+                    container_note_marked,
+                },
+            )
+        }
+        SlotVisitorConservativeRootMarkingAction::NoteLiveAuxiliary => {
+            let container_note_marked = SlotVisitorContainerNoteMarkedRecord {
+                cell: heap_marking.cell,
+                heap_cell_kind: heap_marking.heap_cell_kind,
+                byte_size: heap_marking.byte_size,
+            };
+            SlotVisitorCollectorEffectAction::NoteLiveAuxiliaryCell(
+                SlotVisitorNoteLiveAuxiliaryCellRecord {
+                    cell: heap_marking.cell,
+                    heap_cell_kind: heap_marking.heap_cell_kind,
+                    root_mark_reason: marking_record.append_record.root_mark_reason,
+                    dependency: marking_record.append_record.dependency,
+                    container_note_marked,
+                },
+            )
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1264,6 +1677,34 @@ mod tests {
         (receipt, marking_plan)
     }
 
+    fn conservative_root_marking_and_collector_effects_proof() -> (
+        HeapConservativeScanAppendReceipt,
+        SlotVisitorConservativeRootMarkingPlan,
+        SlotVisitorCollectorEffectsPlan,
+    ) {
+        let (mut heap, receipt) = heap_with_conservative_scan_append_receipt();
+        let marking_plan = receipt
+            .append_plan
+            .clone()
+            .mark_conservative_roots(&mut heap)
+            .expect("slot visitor conservative-root marking plan");
+        let collector_effects_plan = marking_plan
+            .clone()
+            .apply_collector_effects(&mut heap)
+            .expect("slot visitor collector-effects plan");
+
+        assert_eq!(collector_effects_plan.heap, marking_plan.heap);
+        assert_eq!(
+            collector_effects_plan.marking_epoch,
+            marking_plan.marking_epoch
+        );
+        assert_eq!(
+            collector_effects_plan.records[0].marking_record,
+            marking_plan.records[0]
+        );
+        (receipt, marking_plan, collector_effects_plan)
+    }
+
     fn installed_call_frame(
         id: CallFrameId,
         entry: Option<EntryFrameId>,
@@ -1365,8 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn public_arm64_branch_aware_admission_progresses_to_real_mark_stack_cell_state_and_container_blocker(
-    ) {
+    fn public_arm64_branch_aware_admission_progresses_to_verifier_vm_roots_and_jit_stub_blocker() {
         let code_block = jump_if_false_code_block(4);
         let site = jump_if_false_site();
         let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
@@ -1389,8 +1829,11 @@ mod tests {
             )
         );
 
-        let (conservative_scan_append_receipt, conservative_root_marking_plan) =
-            conservative_root_marking_proof();
+        let (
+            conservative_scan_append_receipt,
+            conservative_root_marking_plan,
+            collector_effects_plan,
+        ) = conservative_root_marking_and_collector_effects_proof();
         request.fallback_rooting_proof =
             P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithConservativeScanAppendReceipt {
                 top_call_frame_publication,
@@ -1417,8 +1860,73 @@ mod tests {
             Err(
                 P6Arm64BranchAwareCallableAdmissionRejection::MissingRealCollectorMarkStackCellStateAndContainerProof {
                     top_call_frame_publication,
+                    conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                }
+            )
+        );
+
+        request.fallback_rooting_proof =
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsPlan {
+                top_call_frame_publication,
+                conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                collector_effects_plan: collector_effects_plan.clone(),
+            };
+        assert_eq!(
+            p6_arm64_public_branch_aware_callable_admission_proof(&request),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendVmRootsAndJitStubTracingProof {
+                    top_call_frame_publication,
                     conservative_scan_append_receipt,
                     conservative_root_marking_plan,
+                    collector_effects_plan,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn public_arm64_branch_aware_admission_rejects_inconsistent_collector_effects_proof() {
+        let code_block = jump_if_false_code_block(4);
+        let site = jump_if_false_site();
+        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
+        let mut request = valid_request(&side_exits);
+        let top_call_frame_publication =
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof::from_publication_record(
+                top_call_frame_publication_record(),
+            );
+        let (
+            conservative_scan_append_receipt,
+            conservative_root_marking_plan,
+            mut collector_effects_plan,
+        ) = conservative_root_marking_and_collector_effects_proof();
+        let expected_action =
+            expected_p6_arm64_collector_effect_action(&conservative_root_marking_plan.records[0]);
+        collector_effects_plan.records[0].action =
+            SlotVisitorCollectorEffectAction::AlreadyMarkedReturn;
+
+        request.fallback_rooting_proof =
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithCollectorEffectsPlan {
+                top_call_frame_publication,
+                conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                collector_effects_plan: collector_effects_plan.clone(),
+            };
+
+        assert_eq!(
+            p6_arm64_public_branch_aware_callable_admission_proof(&request),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::CollectorEffectsProofMismatch {
+                    top_call_frame_publication,
+                    conservative_scan_append_receipt,
+                    conservative_root_marking_plan,
+                    collector_effects_plan,
+                    mismatch: P6Arm64CollectorEffectsProofMismatch::CollectorActionMismatch {
+                        order: 0,
+                        expected: expected_action,
+                        actual: SlotVisitorCollectorEffectAction::AlreadyMarkedReturn,
+                    },
                 }
             )
         );

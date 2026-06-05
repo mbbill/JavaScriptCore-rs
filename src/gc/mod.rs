@@ -119,8 +119,12 @@ pub use visitor::{
 };
 #[allow(unused_imports)]
 pub(crate) use visitor::{
-    SlotVisitorConservativeRootMarkingAction, SlotVisitorConservativeRootMarkingError,
-    SlotVisitorConservativeRootMarkingPlan, SlotVisitorConservativeRootMarkingRecord,
+    SlotVisitorAppendToMarkStackRecord, SlotVisitorCollectorEffectAction,
+    SlotVisitorCollectorEffectRecord, SlotVisitorCollectorEffectsError,
+    SlotVisitorCollectorEffectsPlan, SlotVisitorConservativeRootMarkingAction,
+    SlotVisitorConservativeRootMarkingError, SlotVisitorConservativeRootMarkingPlan,
+    SlotVisitorConservativeRootMarkingRecord, SlotVisitorContainerNoteMarkedRecord,
+    SlotVisitorNoteLiveAuxiliaryCellRecord,
 };
 pub use weak::{
     FinalizerKind, FinalizerPlan, FinalizerPlanEntry, FinalizerPlanningError,
