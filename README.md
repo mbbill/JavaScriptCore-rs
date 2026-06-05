@@ -138,10 +138,17 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            checks, retained ARM64 fallback can privately reenter a resolved P6
            target, and public ARM64 callable admission still rejects to the
            existing x86 semantic artifact.
+    [done] VM ARM64 public-admission proof cluster extracted to
+           src/vm/native_reentry/arm64_admission.rs (maps JSC VM entry,
+           FrameTracers/prepareCallOperation top-frame publication,
+           conservative-root append, JIT stub tracing, and ARM64 frame
+           materialization proof gates; behavior unchanged and public admission
+           still rejects).
     [done] VM native call-frame publication skeleton added to src/vm/entry.rs:
            C++ TopCallFrameSetter/NativeCallFrameTracer-shaped publish/restore
-           records for future public ARM64 admission; src/vm/native_reentry.rs
-           now separates missing top-call-frame publication from symbolic
+           records for future public ARM64 admission;
+           src/vm/native_reentry/arm64_admission.rs now separates missing
+           top-call-frame publication from symbolic
            publication-without-conservative-root proof; src/vm/call_frame_storage.rs
            now adds a C++ CallFrame.h-shaped boxed header store whose stable
            caller-slot address is the future FrameAddress source, with
@@ -152,9 +159,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            skeleton, and src/vm/entry.rs now has a dormant storage-backed
            VM-entry guard that validates/restores the distinct topCallFrame /
            topEntryFrame pair and is the only reachable entry-guard path for
-           native call-frame publication; src/vm/native_reentry.rs now derives
-           the publication proof from those storage-backed entry/call-frame
-           guards before rejecting at the conservative-root blocker;
+           native call-frame publication; arm64_admission.rs now derives the
+           publication proof from those storage-backed entry/call-frame guards
+           before rejecting at the conservative-root blocker;
            src/gc/machine_stack_marker.rs and src/wtf/stack_bounds.rs add the
            dormant MachineStackMarker/RegisterState/WTF StackBounds-shaped
            crate-internal, heap/epoch-bound current-thread gather+ingest
@@ -178,7 +185,7 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            src/vm/vm_roots.rs adds VM scratch-buffer / checkpoint side-state
            root gather evidence, src/gc/visitor/verifier.rs adds
            VerifierSlotVisitor conservative-root append evidence, and
-           src/vm/native_reentry.rs consumes them in Heap::addCoreConstraints
+           arm64_admission.rs consumes them in Heap::addCoreConstraints
            order plus native-frame machine-stack residency evidence before
            rejecting at the missing ARM64 generated native frame
            materialization blocker; src/jit/arm64_baseline/frame_materialization.rs
