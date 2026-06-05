@@ -35,6 +35,9 @@ pub(crate) enum Arm64NativeEntryJscStackDispatchProofField {
     CallFrame,
     EntryFrame,
     VmEntryRecord,
+    VmEntryCalleeSaveBuffer,
+    VmEntryCalleeSaveRegisterCount,
+    VmEntryCalleeSaveBufferBytes,
     PostAllocationSp,
 }
 
@@ -70,6 +73,9 @@ pub(crate) struct Arm64NativeEntryJscStackDispatchRequestProof<'frame> {
     pub(crate) entry_offset: u32,
     pub(crate) call_frame: FrameAddress,
     pub(crate) entry_frame: FrameAddress,
+    pub(crate) vm_entry_record_callee_save_buffer: FrameAddress,
+    pub(crate) vm_entry_record_callee_save_register_count: usize,
+    pub(crate) vm_entry_record_callee_save_buffer_bytes: usize,
     pub(crate) entry_sp: FrameAddress,
     pub(crate) platform_request: ExecutableMemoryArm64JscStackCallRequest,
     _stack_frame: PhantomData<&'frame ()>,
@@ -125,6 +131,11 @@ pub(crate) fn prove_arm64_native_entry_jsc_stack_dispatch_request<'frame>(
         entry_offset,
         call_frame: stack_call_proof.call_frame,
         entry_frame: stack_call_proof.entry_frame,
+        vm_entry_record_callee_save_buffer: stack_call_proof.vm_entry_record_callee_save_buffer,
+        vm_entry_record_callee_save_register_count: stack_call_proof
+            .vm_entry_record_callee_save_register_count,
+        vm_entry_record_callee_save_buffer_bytes: stack_call_proof
+            .vm_entry_record_callee_save_buffer_bytes,
         entry_sp,
         platform_request,
         _stack_frame: PhantomData,
@@ -166,6 +177,21 @@ fn validate_stack_frame_lifetime_match(
             Arm64NativeEntryJscStackDispatchProofField::VmEntryRecord,
         ),
         (
+            stack_call_proof.vm_entry_record_callee_save_buffer
+                == stack_frame_proof.vm_entry_record_callee_save_buffer,
+            Arm64NativeEntryJscStackDispatchProofField::VmEntryCalleeSaveBuffer,
+        ),
+        (
+            stack_call_proof.vm_entry_record_callee_save_register_count
+                == stack_frame_proof.vm_entry_record_callee_save_register_count,
+            Arm64NativeEntryJscStackDispatchProofField::VmEntryCalleeSaveRegisterCount,
+        ),
+        (
+            stack_call_proof.vm_entry_record_callee_save_buffer_bytes
+                == stack_frame_proof.vm_entry_record_callee_save_buffer_bytes,
+            Arm64NativeEntryJscStackDispatchProofField::VmEntryCalleeSaveBufferBytes,
+        ),
+        (
             stack_call_proof.post_allocation_sp == stack_frame_proof.post_allocation_sp,
             Arm64NativeEntryJscStackDispatchProofField::PostAllocationSp,
         ),
@@ -185,6 +211,9 @@ fn non_null_frame_address(address: FrameAddress) -> Option<NonNull<c_void>> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES, JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT,
+    };
     use super::*;
     use crate::gc::CellId;
     use crate::jit::{
@@ -202,6 +231,9 @@ mod tests {
             vm_entry_record: FrameAddress(0x2800),
             vm_entry_record_previous_top_call_frame: Some(FrameAddress(0x1000)),
             vm_entry_record_previous_top_entry_frame: Some(FrameAddress(0x1800)),
+            vm_entry_record_callee_save_buffer: FrameAddress(0x2820),
+            vm_entry_record_callee_save_register_count: JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT,
+            vm_entry_record_callee_save_buffer_bytes: JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES,
             call_frame: FrameAddress(0x2000),
             post_allocation_sp: FrameAddress(0x1ff0),
             local_area_words: 2,
@@ -226,6 +258,9 @@ mod tests {
             vm_entry_record: FrameAddress(0x2800),
             vm_entry_record_previous_top_call_frame: Some(FrameAddress(0x1000)),
             vm_entry_record_previous_top_entry_frame: Some(FrameAddress(0x1800)),
+            vm_entry_record_callee_save_buffer: FrameAddress(0x2820),
+            vm_entry_record_callee_save_register_count: JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT,
+            vm_entry_record_callee_save_buffer_bytes: JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES,
             post_allocation_sp: FrameAddress(0x1ff0),
             local_area_words: 2,
             live_local_count: 1,
@@ -280,6 +315,18 @@ mod tests {
         assert_eq!(dispatch.entry_offset, 24);
         assert_eq!(dispatch.call_frame, FrameAddress(0x2000));
         assert_eq!(dispatch.entry_frame, FrameAddress(0x3000));
+        assert_eq!(
+            dispatch.vm_entry_record_callee_save_buffer,
+            FrameAddress(0x2820)
+        );
+        assert_eq!(
+            dispatch.vm_entry_record_callee_save_register_count,
+            JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT
+        );
+        assert_eq!(
+            dispatch.vm_entry_record_callee_save_buffer_bytes,
+            JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES
+        );
         assert_eq!(dispatch.entry_sp, FrameAddress(0x2010));
         assert_eq!(dispatch.platform_request.entry_offset, 24);
         assert_eq!(

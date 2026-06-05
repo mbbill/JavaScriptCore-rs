@@ -39,6 +39,15 @@ mod jsc_stack_dispatch;
 const JSC_REGISTER_BYTES: usize = 8;
 const JSC_STACK_ALIGNMENT_BYTES: usize = 16;
 const JSC_CALLER_FRAME_AND_PC_WORDS: usize = 2;
+const JSC_VM_ENTRY_RECORD_HEADER_WORDS: usize = 4;
+const JSC_ARM64_VM_CALLEE_SAVE_GPR_COUNT: usize = 10;
+const JSC_ARM64_VM_CALLEE_SAVE_FPR_COUNT: usize = 8;
+const JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT: usize =
+    JSC_ARM64_VM_CALLEE_SAVE_GPR_COUNT + JSC_ARM64_VM_CALLEE_SAVE_FPR_COUNT;
+const JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES: usize =
+    JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT * JSC_REGISTER_BYTES;
+const JSC_ARM64_VM_CALLEE_SAVE_BUFFER_OFFSET_BYTES: usize =
+    JSC_VM_ENTRY_RECORD_HEADER_WORDS * JSC_REGISTER_BYTES;
 const JSC_CALL_FRAME_CALLER_FRAME_SLOT: u32 = 0;
 const JSC_CALL_FRAME_RETURN_PC_SLOT: u32 = 1;
 const JSC_CALL_FRAME_CODE_BLOCK_SLOT: u32 = 2;
@@ -82,6 +91,26 @@ pub(crate) enum Arm64NativeEntryStackFrameError {
     VmEntryRecordNotBetweenCallFrameAndEntryFrame {
         vm_entry_record: usize,
         call_frame: usize,
+        entry_frame: usize,
+    },
+    VmEntryCalleeSaveRegisterCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    VmEntryCalleeSaveBufferSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    VmEntryCalleeSaveBufferOffsetOverflow {
+        vm_entry_record: usize,
+    },
+    VmEntryCalleeSaveBufferOffsetMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    VmEntryCalleeSaveBufferExceedsEntryFrame {
+        buffer: usize,
+        byte_len: usize,
         entry_frame: usize,
     },
     NonStackLocalAddressSource {
@@ -273,6 +302,9 @@ pub(crate) struct Arm64NativeEntryJscStackCallRequestProof {
     vm_entry_record: FrameAddress,
     vm_entry_record_previous_top_call_frame: Option<FrameAddress>,
     vm_entry_record_previous_top_entry_frame: Option<FrameAddress>,
+    vm_entry_record_callee_save_buffer: FrameAddress,
+    vm_entry_record_callee_save_register_count: usize,
+    vm_entry_record_callee_save_buffer_bytes: usize,
     post_allocation_sp: FrameAddress,
     local_area_words: usize,
     live_local_count: usize,
@@ -306,10 +338,31 @@ pub(crate) struct Arm64VmEntryRecord {
     context: usize,
     previous_top_call_frame: usize,
     previous_top_entry_frame: usize,
-    // C++ stores a platform-dependent callee-save buffer after the top-frame
-    // pair. This placeholder preserves the boundary without claiming real
-    // register save/restore support.
-    callee_save_registers_buffer_placeholder: usize,
+    // C++ `VMEntryRecord` stores `CPURegister
+    // calleeSaveRegistersBuffer[NUMBER_OF_CALLEE_SAVES_REGISTERS]`. On ARM64
+    // that is 10 GPR slots (x19-x28) plus 8 FPR slots (d8-d15). Rust models the
+    // storage shape only; no save/restore assembly is implied here.
+    callee_save_registers_buffer: Arm64VmEntryCalleeSaveRegistersBuffer,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C, align(16))]
+pub(crate) struct Arm64VmEntryCalleeSaveRegistersBuffer {
+    registers: [u64; JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT],
+}
+
+impl Default for Arm64VmEntryCalleeSaveRegistersBuffer {
+    fn default() -> Self {
+        Self {
+            registers: [0; JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT],
+        }
+    }
+}
+
+impl Arm64VmEntryCalleeSaveRegistersBuffer {
+    const REGISTER_COUNT: usize = JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT;
+    const BYTE_LEN: usize = JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES;
 }
 
 #[allow(dead_code)]
@@ -359,6 +412,9 @@ pub(crate) struct Arm64NativeEntryStackFrameProof<'frame> {
     vm_entry_record: FrameAddress,
     vm_entry_record_previous_top_call_frame: Option<FrameAddress>,
     vm_entry_record_previous_top_entry_frame: Option<FrameAddress>,
+    vm_entry_record_callee_save_buffer: FrameAddress,
+    vm_entry_record_callee_save_register_count: usize,
+    vm_entry_record_callee_save_buffer_bytes: usize,
     call_frame: FrameAddress,
     post_allocation_sp: FrameAddress,
     local_area_words: usize,
@@ -508,6 +564,11 @@ pub(crate) fn prove_arm64_native_entry_jsc_stack_call_request(
             .vm_entry_record_previous_top_call_frame,
         vm_entry_record_previous_top_entry_frame: stack_frame_proof
             .vm_entry_record_previous_top_entry_frame,
+        vm_entry_record_callee_save_buffer: stack_frame_proof.vm_entry_record_callee_save_buffer,
+        vm_entry_record_callee_save_register_count: stack_frame_proof
+            .vm_entry_record_callee_save_register_count,
+        vm_entry_record_callee_save_buffer_bytes: stack_frame_proof
+            .vm_entry_record_callee_save_buffer_bytes,
         post_allocation_sp: stack_frame_proof.post_allocation_sp,
         local_area_words: stack_frame_proof.local_area_words,
         live_local_count: stack_frame_proof.live_local_count,
@@ -754,6 +815,9 @@ fn validate_arm64_native_entry_stack_frame_candidate(
     vm_entry_record: FrameAddress,
     previous_top_call_frame: Option<FrameAddress>,
     previous_top_entry_frame: Option<FrameAddress>,
+    vm_entry_record_callee_save_buffer: FrameAddress,
+    vm_entry_record_callee_save_register_count: usize,
+    vm_entry_record_callee_save_buffer_bytes: usize,
     call_frame: FrameAddress,
     post_allocation_sp: FrameAddress,
     local_area_words: usize,
@@ -768,12 +832,22 @@ fn validate_arm64_native_entry_stack_frame_candidate(
     let undefined_fill_count =
         validate_padded_argument_storage(argument_count_excluding_this, padded_argument_count)?;
     validate_addresses(entry_frame, call_frame, post_allocation_sp, vm_entry_record)?;
+    validate_vm_entry_callee_save_buffer(
+        entry_frame,
+        vm_entry_record,
+        vm_entry_record_callee_save_buffer,
+        vm_entry_record_callee_save_register_count,
+        vm_entry_record_callee_save_buffer_bytes,
+    )?;
     Ok(Arm64NativeEntryStackFrameProof {
         source,
         entry_frame,
         vm_entry_record,
         vm_entry_record_previous_top_call_frame: previous_top_call_frame,
         vm_entry_record_previous_top_entry_frame: previous_top_entry_frame,
+        vm_entry_record_callee_save_buffer,
+        vm_entry_record_callee_save_register_count,
+        vm_entry_record_callee_save_buffer_bytes,
         call_frame,
         post_allocation_sp,
         local_area_words,
@@ -816,7 +890,7 @@ impl<
                 previous_top_entry_frame: option_frame_address_to_raw(
                     request.previous_top_entry_frame,
                 ),
-                callee_save_registers_buffer_placeholder: 0,
+                callee_save_registers_buffer: Arm64VmEntryCalleeSaveRegistersBuffer::default(),
             },
             entry_frame: Arm64VmEntryFrame { anchor: 0 },
             live_local_count: request.live_local_count,
@@ -833,6 +907,9 @@ impl<
             self.vm_entry_record_address(),
             raw_frame_address_to_option(self.vm_entry_record.previous_top_call_frame),
             raw_frame_address_to_option(self.vm_entry_record.previous_top_entry_frame),
+            self.vm_entry_record_callee_save_buffer_address(),
+            Arm64VmEntryCalleeSaveRegistersBuffer::REGISTER_COUNT,
+            Arm64VmEntryCalleeSaveRegistersBuffer::BYTE_LEN,
             self.call_frame_address(),
             self.post_allocation_sp(),
             LOCAL_AREA_WORDS,
@@ -860,6 +937,13 @@ impl<
 
     fn vm_entry_record_address(&self) -> FrameAddress {
         FrameAddress((&self.vm_entry_record as *const Arm64VmEntryRecord) as usize)
+    }
+
+    fn vm_entry_record_callee_save_buffer_address(&self) -> FrameAddress {
+        FrameAddress(
+            (&self.vm_entry_record.callee_save_registers_buffer
+                as *const Arm64VmEntryCalleeSaveRegistersBuffer) as usize,
+        )
     }
 }
 
@@ -1002,6 +1086,71 @@ fn validate_addresses(
             },
         );
     }
+    Ok(())
+}
+
+fn validate_vm_entry_callee_save_buffer(
+    entry_frame: FrameAddress,
+    vm_entry_record: FrameAddress,
+    buffer: FrameAddress,
+    register_count: usize,
+    buffer_bytes: usize,
+) -> Result<(), Arm64NativeEntryStackFrameError> {
+    if register_count != JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT {
+        return Err(
+            Arm64NativeEntryStackFrameError::VmEntryCalleeSaveRegisterCountMismatch {
+                expected: JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT,
+                actual: register_count,
+            },
+        );
+    }
+    if buffer_bytes != JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES {
+        return Err(
+            Arm64NativeEntryStackFrameError::VmEntryCalleeSaveBufferSizeMismatch {
+                expected: JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES,
+                actual: buffer_bytes,
+            },
+        );
+    }
+
+    let Some(expected_buffer) = vm_entry_record
+        .0
+        .checked_add(JSC_ARM64_VM_CALLEE_SAVE_BUFFER_OFFSET_BYTES)
+    else {
+        return Err(
+            Arm64NativeEntryStackFrameError::VmEntryCalleeSaveBufferOffsetOverflow {
+                vm_entry_record: vm_entry_record.0,
+            },
+        );
+    };
+    if buffer.0 != expected_buffer {
+        return Err(
+            Arm64NativeEntryStackFrameError::VmEntryCalleeSaveBufferOffsetMismatch {
+                expected: expected_buffer,
+                actual: buffer.0,
+            },
+        );
+    }
+
+    let Some(buffer_end) = buffer.0.checked_add(buffer_bytes) else {
+        return Err(
+            Arm64NativeEntryStackFrameError::VmEntryCalleeSaveBufferExceedsEntryFrame {
+                buffer: buffer.0,
+                byte_len: buffer_bytes,
+                entry_frame: entry_frame.0,
+            },
+        );
+    };
+    if buffer_end > entry_frame.0 {
+        return Err(
+            Arm64NativeEntryStackFrameError::VmEntryCalleeSaveBufferExceedsEntryFrame {
+                buffer: buffer.0,
+                byte_len: buffer_bytes,
+                entry_frame: entry_frame.0,
+            },
+        );
+    }
+
     Ok(())
 }
 
@@ -1195,10 +1344,51 @@ mod tests {
             assert!(proof.post_allocation_sp.0 < proof.call_frame.0);
             assert!(proof.call_frame.0 < proof.vm_entry_record.0);
             assert!(proof.vm_entry_record.0 < proof.entry_frame.0);
+            assert_eq!(
+                proof.vm_entry_record_callee_save_buffer.0,
+                proof.vm_entry_record.0 + JSC_ARM64_VM_CALLEE_SAVE_BUFFER_OFFSET_BYTES
+            );
+            assert_eq!(
+                proof.vm_entry_record_callee_save_register_count,
+                JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT
+            );
+            assert_eq!(
+                proof.vm_entry_record_callee_save_buffer_bytes,
+                JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES
+            );
             assert_eq!(proof.call_frame.0 % JSC_STACK_ALIGNMENT_BYTES, 0);
             assert_eq!(proof.post_allocation_sp.0 % JSC_STACK_ALIGNMENT_BYTES, 0);
         })
         .expect("stack-local ARM64 entry proof");
+    }
+
+    #[test]
+    fn arm64_native_entry_vm_entry_record_callee_save_buffer_matches_jsc_arm64_shape() {
+        let record = Arm64VmEntryRecord {
+            vm: 0,
+            context: 0,
+            previous_top_call_frame: 0,
+            previous_top_entry_frame: 0,
+            callee_save_registers_buffer: Arm64VmEntryCalleeSaveRegistersBuffer::default(),
+        };
+        let record_base = (&record as *const Arm64VmEntryRecord) as usize;
+        let buffer_base = (&record.callee_save_registers_buffer
+            as *const Arm64VmEntryCalleeSaveRegistersBuffer) as usize;
+
+        assert_eq!(Arm64VmEntryCalleeSaveRegistersBuffer::REGISTER_COUNT, 18);
+        assert_eq!(Arm64VmEntryCalleeSaveRegistersBuffer::BYTE_LEN, 144);
+        assert_eq!(
+            core::mem::size_of::<Arm64VmEntryCalleeSaveRegistersBuffer>(),
+            JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES
+        );
+        assert_eq!(
+            core::mem::size_of::<Arm64VmEntryRecord>(),
+            JSC_ARM64_VM_CALLEE_SAVE_BUFFER_OFFSET_BYTES + JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES
+        );
+        assert_eq!(
+            buffer_base - record_base,
+            JSC_ARM64_VM_CALLEE_SAVE_BUFFER_OFFSET_BYTES
+        );
     }
 
     #[test]
@@ -1235,6 +1425,9 @@ mod tests {
                 FrameAddress(0x3000),
                 None,
                 None,
+                FrameAddress(0x3020),
+                JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT,
+                JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES,
                 FrameAddress(0x2000),
                 FrameAddress(0x1ff0),
                 2,
@@ -1259,6 +1452,9 @@ mod tests {
                 FrameAddress(0x2800),
                 None,
                 None,
+                FrameAddress(0x2820),
+                JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT,
+                JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES,
                 FrameAddress(0x2000),
                 FrameAddress(0x1ff0),
                 2,
@@ -1283,6 +1479,9 @@ mod tests {
                 FrameAddress(0x3000),
                 None,
                 None,
+                FrameAddress(0x3020),
+                JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT,
+                JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES,
                 FrameAddress(0x2000),
                 FrameAddress(0x1ff0),
                 2,
@@ -1295,6 +1494,59 @@ mod tests {
                     vm_entry_record: 0x3000,
                     call_frame: 0x2000,
                     entry_frame: 0x3000,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_candidate_rejects_vm_entry_callee_save_buffer_mismatch() {
+        assert_eq!(
+            validate_arm64_native_entry_stack_frame_candidate(
+                Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard,
+                FrameAddress(0x3000),
+                FrameAddress(0x2800),
+                None,
+                None,
+                FrameAddress(0x2820),
+                JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT - 1,
+                JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES,
+                FrameAddress(0x2000),
+                FrameAddress(0x1ff0),
+                2,
+                1,
+                0,
+                1,
+            ),
+            Err(
+                Arm64NativeEntryStackFrameError::VmEntryCalleeSaveRegisterCountMismatch {
+                    expected: JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT,
+                    actual: JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT - 1,
+                }
+            )
+        );
+
+        assert_eq!(
+            validate_arm64_native_entry_stack_frame_candidate(
+                Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard,
+                FrameAddress(0x3000),
+                FrameAddress(0x2800),
+                None,
+                None,
+                FrameAddress(0x2828),
+                JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT,
+                JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES,
+                FrameAddress(0x2000),
+                FrameAddress(0x1ff0),
+                2,
+                1,
+                0,
+                1,
+            ),
+            Err(
+                Arm64NativeEntryStackFrameError::VmEntryCalleeSaveBufferOffsetMismatch {
+                    expected: 0x2820,
+                    actual: 0x2828,
                 }
             )
         );
@@ -1354,6 +1606,18 @@ mod tests {
             assert_eq!(request_proof.call_frame, stack_frame.call_frame);
             assert_eq!(request_proof.entry_frame, stack_frame.entry_frame);
             assert_eq!(request_proof.vm_entry_record, stack_frame.vm_entry_record);
+            assert_eq!(
+                request_proof.vm_entry_record_callee_save_buffer,
+                stack_frame.vm_entry_record_callee_save_buffer
+            );
+            assert_eq!(
+                request_proof.vm_entry_record_callee_save_register_count,
+                JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT
+            );
+            assert_eq!(
+                request_proof.vm_entry_record_callee_save_buffer_bytes,
+                JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES
+            );
             assert_eq!(
                 request_proof.post_allocation_sp,
                 stack_frame.post_allocation_sp
@@ -1506,6 +1770,9 @@ mod tests {
             vm_entry_record: FrameAddress(0x2800),
             vm_entry_record_previous_top_call_frame: None,
             vm_entry_record_previous_top_entry_frame: None,
+            vm_entry_record_callee_save_buffer: FrameAddress(0x2820),
+            vm_entry_record_callee_save_register_count: JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT,
+            vm_entry_record_callee_save_buffer_bytes: JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES,
             call_frame: FrameAddress(0x2000),
             post_allocation_sp: FrameAddress(0x1ff0),
             local_area_words: 2,

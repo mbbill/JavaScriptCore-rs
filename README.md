@@ -114,8 +114,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            src/vm/arm64_native_entry/jsc_stack_dispatch.rs and
            ExecutableMemoryArm64JscStackCallRequest (derives
            sp=CallFrame+CallerFrameAndPC and carries EntryFrame as the future
-           fp/x29 source from stack-call proof; platform trampoline still
-           deferred pending Rust stack/fp restore and callee-save design)
+           fp/x29 source from stack-call proof; stack proof now models the
+           ARM64 VMEntryRecord 18-slot callee-save buffer; platform trampoline
+           still deferred pending Rust stack/fp restore and live save/restore)
     [done] JIT ARM64 dormant virtual-register frame materialization helpers and
            private JumpIfFalse branch-aware callable encoder skeleton added to
            src/jit/arm64_baseline.rs (public branch-aware callable emission
