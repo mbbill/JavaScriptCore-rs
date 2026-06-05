@@ -5433,9 +5433,11 @@ impl Vm {
         let argument_count_including_this = top_frame.argument_count_including_this;
         let formal_argument_count_including_this =
             code_block.unlinked().frame().num_parameters_including_this;
-        let padded_argument_count = argument_count_including_this
-            .max(provided.saturating_add(1))
-            .max(formal_argument_count_including_this);
+        let padded_argument_count = entry::round_vm_entry_argument_count_to_align_frame(
+            argument_count_including_this
+                .max(provided.saturating_add(1))
+                .max(formal_argument_count_including_this),
+        );
         Some((
             VmEntryLaunchScope {
                 owner,
@@ -65014,7 +65016,7 @@ mod tests {
 
         assert_eq!(call_frame.argument_count_including_this, 1);
         assert_eq!(call_frame.provided_argument_count, 0);
-        assert_eq!(call_frame.padded_argument_count, 4);
+        assert_eq!(call_frame.padded_argument_count, 5);
         vm.execution.pop_frame(&mut vm.registers, frame).unwrap();
         vm.execution.leave(entry).unwrap();
     }

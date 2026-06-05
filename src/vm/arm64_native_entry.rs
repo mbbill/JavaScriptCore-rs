@@ -20,8 +20,8 @@ use crate::jit::{
 use crate::runtime::{CallFrameId, CodeBlockId, EntryFrameId};
 
 use super::entry::{
-    BaselineNativeDispatchTokenSelection, FrameAddress, VmEntryDispatchSelection,
-    VmEntryLaunchDescriptor,
+    vm_entry_argument_count_is_frame_aligned, BaselineNativeDispatchTokenSelection, FrameAddress,
+    VmEntryDispatchSelection, VmEntryLaunchDescriptor,
 };
 
 const JSC_REGISTER_BYTES: usize = 8;
@@ -109,6 +109,9 @@ pub(crate) enum Arm64NativeEntryLaunchProofError {
     ArgumentCountDoesNotIncludeThis,
     PaddedArgumentCountTooSmall {
         argument_count_including_this: u32,
+        padded_argument_count: u32,
+    },
+    PaddedArgumentCountNotFrameAligned {
         padded_argument_count: u32,
     },
 }
@@ -312,6 +315,13 @@ pub(crate) fn prove_arm64_native_entry_launch_descriptor(
         return Err(
             Arm64NativeEntryLaunchProofError::PaddedArgumentCountTooSmall {
                 argument_count_including_this: descriptor.call_frame.argument_count_including_this,
+                padded_argument_count: descriptor.call_frame.padded_argument_count,
+            },
+        );
+    }
+    if !vm_entry_argument_count_is_frame_aligned(descriptor.call_frame.padded_argument_count) {
+        return Err(
+            Arm64NativeEntryLaunchProofError::PaddedArgumentCountNotFrameAligned {
                 padded_argument_count: descriptor.call_frame.padded_argument_count,
             },
         );
@@ -641,7 +651,7 @@ mod tests {
             entry_value: VmEntryLaunchArgumentValue::This(RuntimeValue::from_i32(41)),
             argument_count_including_this: 3,
             provided_argument_count: 2,
-            padded_argument_count: 4,
+            padded_argument_count: 5,
             specialization: CodeSpecializationKind::Call,
             arity_mode: ArityCheckMode::AlreadyChecked,
         }
@@ -835,7 +845,7 @@ mod tests {
         assert_eq!(proof.active_entry_frame, EntryFrameId(1));
         assert_eq!(proof.active_top_call_frame, CallFrameId(2));
         assert_eq!(proof.argument_count_excluding_this, 2);
-        assert_eq!(proof.padded_argument_count, 4);
+        assert_eq!(proof.padded_argument_count, 5);
         assert_eq!(
             proof.required_frame_source,
             Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard
@@ -891,6 +901,25 @@ mod tests {
                 expected: CallFrameId(2),
                 actual: CallFrameId(99),
             })
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_launch_proof_rejects_unaligned_padded_argument_count() {
+        let mut descriptor = launch_descriptor();
+        descriptor.call_frame.padded_argument_count = 4;
+
+        assert_eq!(
+            prove_arm64_native_entry_launch_descriptor(Arm64NativeEntryLaunchProofRequest {
+                launch_descriptor: &descriptor,
+                callable_kind: BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
+                callable_token: descriptor.native_entry.normal_entry,
+            }),
+            Err(
+                Arm64NativeEntryLaunchProofError::PaddedArgumentCountNotFrameAligned {
+                    padded_argument_count: 4,
+                }
+            )
         );
     }
 }

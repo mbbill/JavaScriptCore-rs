@@ -23,6 +23,11 @@ use super::tiering::{
     BaselineNativeEntryReadinessOutcome, BaselineNativeEntryReadinessRecord,
 };
 
+// C++ JSC map: `CallFrame::headerSizeInRegisters` on JSValue64 and
+// `StackAlignment.h::stackAlignmentRegisters()`.
+const JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS: u32 = 5;
+const JSC_STACK_ALIGNMENT_REGISTERS: u32 = 2;
+
 /// Opaque stack/frame address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
@@ -780,10 +785,12 @@ impl VmEntryCallFrameMetadata {
             .argument_count_including_this
             .max(request.proto.argument_count.saturating_add(1))
             .max(request.provided_argument_count.saturating_add(1));
-        let padded_argument_count = request
-            .proto
-            .padded_argument_count
-            .max(argument_count_including_this);
+        let padded_argument_count = round_vm_entry_argument_count_to_align_frame(
+            request
+                .proto
+                .padded_argument_count
+                .max(argument_count_including_this),
+        );
         let entry_value = request
             .construct_new_target
             .map(VmEntryLaunchArgumentValue::ConstructNewTarget)
@@ -805,6 +812,19 @@ impl VmEntryCallFrameMetadata {
             arity_mode: request.arity_mode,
         }
     }
+}
+
+pub(crate) const fn round_vm_entry_argument_count_to_align_frame(argument_count: u32) -> u32 {
+    let count_with_header = argument_count.saturating_add(JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS);
+    let aligned_count_with_header = count_with_header
+        .saturating_add(JSC_STACK_ALIGNMENT_REGISTERS - 1)
+        / JSC_STACK_ALIGNMENT_REGISTERS
+        * JSC_STACK_ALIGNMENT_REGISTERS;
+    aligned_count_with_header.saturating_sub(JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS)
+}
+
+pub(crate) const fn vm_entry_argument_count_is_frame_aligned(argument_count: u32) -> bool {
+    argument_count == round_vm_entry_argument_count_to_align_frame(argument_count)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1866,6 +1886,16 @@ mod tests {
         assert_eq!(call_frame.provided_argument_count, 4);
         assert_eq!(call_frame.argument_count_including_this, 5);
         assert_eq!(call_frame.padded_argument_count, 5);
+    }
+
+    #[test]
+    fn vm_entry_argument_count_padding_matches_jsc_frame_alignment() {
+        assert_eq!(round_vm_entry_argument_count_to_align_frame(1), 1);
+        assert_eq!(round_vm_entry_argument_count_to_align_frame(2), 3);
+        assert_eq!(round_vm_entry_argument_count_to_align_frame(3), 3);
+        assert_eq!(round_vm_entry_argument_count_to_align_frame(4), 5);
+        assert!(vm_entry_argument_count_is_frame_aligned(5));
+        assert!(!vm_entry_argument_count_is_frame_aligned(4));
     }
 
     #[test]
