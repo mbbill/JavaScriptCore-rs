@@ -17,7 +17,7 @@ use crate::jit::{
     BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableKind,
     BaselineNativeEntryToken, BaselineNativeEntryTokenKind,
 };
-use crate::runtime::{CallFrameId, CodeBlockId, EntryFrameId};
+use crate::runtime::{CallFrameId, CodeBlockId, EntryFrameId, RuntimeValue};
 
 use super::entry::{
     vm_entry_argument_count_is_frame_aligned, BaselineNativeDispatchTokenSelection, FrameAddress,
@@ -74,6 +74,16 @@ pub(crate) enum Arm64NativeEntryStackFrameError {
     },
     NonStackLocalAddressSource {
         source: Arm64NativeEntryFrameAddressSource,
+    },
+    ArgumentCountIncludingThisOverflow {
+        argument_count_excluding_this: usize,
+    },
+    PaddedArgumentCountIncludingThisOverflow {
+        padded_argument_count_excluding_this: usize,
+    },
+    PaddedArgumentStorageDoesNotCoverProvidedArguments {
+        argument_count_including_this: usize,
+        padded_argument_count: usize,
     },
 }
 
@@ -159,6 +169,13 @@ pub(crate) enum Arm64NativeEntryJscStackCallRequestError {
         argument_count_excluding_this: u32,
     },
     PaddedArgumentStorageMissing {
+        padded_argument_count: u32,
+        stored_argument_count_including_this: u32,
+    },
+    PaddedArgumentCountTooLarge {
+        actual: usize,
+    },
+    PaddedArgumentStorageTooLarge {
         padded_argument_count: u32,
         stored_argument_count_including_this: u32,
     },
@@ -274,7 +291,7 @@ pub(crate) struct Arm64VmEntryFrame {
 #[repr(C, align(16))]
 pub(crate) struct Arm64StackCallFrame<
     const LOCAL_AREA_WORDS: usize,
-    const ARGUMENTS_EXCLUDING_THIS: usize,
+    const PADDED_ARGUMENTS_EXCLUDING_THIS: usize,
 > {
     local_area: [u64; LOCAL_AREA_WORDS],
     caller_frame_and_pc: [usize; JSC_CALLER_FRAME_AND_PC_WORDS],
@@ -282,7 +299,7 @@ pub(crate) struct Arm64StackCallFrame<
     callee: u64,
     argument_count_including_this: u64,
     this_value: u64,
-    arguments: [u64; ARGUMENTS_EXCLUDING_THIS],
+    arguments: [u64; PADDED_ARGUMENTS_EXCLUDING_THIS],
 }
 
 #[allow(dead_code)]
@@ -291,8 +308,9 @@ pub(crate) struct Arm64StackCallFrame<
 pub(crate) struct Arm64NativeEntryStackFrame<
     const LOCAL_AREA_WORDS: usize,
     const ARGUMENTS_EXCLUDING_THIS: usize,
+    const PADDED_ARGUMENTS_EXCLUDING_THIS: usize,
 > {
-    call_frame: Arm64StackCallFrame<LOCAL_AREA_WORDS, ARGUMENTS_EXCLUDING_THIS>,
+    call_frame: Arm64StackCallFrame<LOCAL_AREA_WORDS, PADDED_ARGUMENTS_EXCLUDING_THIS>,
     vm_entry_record: Arm64VmEntryRecord,
     entry_frame: Arm64VmEntryFrame,
     live_local_count: usize,
@@ -311,6 +329,8 @@ pub(crate) struct Arm64NativeEntryStackFrameProof<'frame> {
     local_area_words: usize,
     live_local_count: usize,
     argument_count_excluding_this: usize,
+    padded_argument_count: usize,
+    undefined_fill_count: usize,
     _stack_frame: PhantomData<&'frame ()>,
 }
 
@@ -408,21 +428,33 @@ pub(crate) fn prove_arm64_native_entry_jsc_stack_call_request(
             },
         );
     }
-    let stored_argument_count_including_this =
-        actual_argument_count_excluding_this.checked_add(1).ok_or(
-            Arm64NativeEntryJscStackCallRequestError::ArgumentCountIncludingThisOverflow {
-                argument_count_excluding_this: actual_argument_count_excluding_this,
+    actual_argument_count_excluding_this.checked_add(1).ok_or(
+        Arm64NativeEntryJscStackCallRequestError::ArgumentCountIncludingThisOverflow {
+            argument_count_excluding_this: actual_argument_count_excluding_this,
+        },
+    )?;
+    let actual_padded_argument_count = u32::try_from(stack_frame_proof.padded_argument_count)
+        .map_err(
+            |_| Arm64NativeEntryJscStackCallRequestError::PaddedArgumentCountTooLarge {
+                actual: stack_frame_proof.padded_argument_count,
             },
         )?;
-    // C++ `doVMEntry` allocates all padded argument slots and fills the missing
-    // ones with `undefined`. The current Rust stack-local skeleton stores only
-    // supplied arguments, so it cannot prove a JSC call request when padding is
-    // required.
-    if stored_argument_count_including_this < layout_proof.padded_argument_count {
+    // C++ `doVMEntry` allocates exactly the padded argument slots before
+    // dispatching generated code. Rust must prove the same storage shape before
+    // treating a stack-local frame as a JSC call request.
+    if actual_padded_argument_count < layout_proof.padded_argument_count {
         return Err(
             Arm64NativeEntryJscStackCallRequestError::PaddedArgumentStorageMissing {
                 padded_argument_count: layout_proof.padded_argument_count,
-                stored_argument_count_including_this,
+                stored_argument_count_including_this: actual_padded_argument_count,
+            },
+        );
+    }
+    if actual_padded_argument_count > layout_proof.padded_argument_count {
+        return Err(
+            Arm64NativeEntryJscStackCallRequestError::PaddedArgumentStorageTooLarge {
+                padded_argument_count: layout_proof.padded_argument_count,
+                stored_argument_count_including_this: actual_padded_argument_count,
             },
         );
     }
@@ -571,9 +603,31 @@ pub(crate) fn with_arm64_native_entry_stack_frame<
     request: Arm64NativeEntryStackFrameRequest<ARGUMENTS_EXCLUDING_THIS>,
     body: impl for<'frame> FnOnce(Arm64NativeEntryStackFrameProof<'frame>),
 ) -> Result<(), Arm64NativeEntryStackFrameError> {
+    with_arm64_native_entry_padded_stack_frame::<
+        LOCAL_AREA_WORDS,
+        ARGUMENTS_EXCLUDING_THIS,
+        ARGUMENTS_EXCLUDING_THIS,
+    >(request, body)
+}
+
+#[allow(dead_code)]
+pub(crate) fn with_arm64_native_entry_padded_stack_frame<
+    const LOCAL_AREA_WORDS: usize,
+    const ARGUMENTS_EXCLUDING_THIS: usize,
+    const PADDED_ARGUMENTS_EXCLUDING_THIS: usize,
+>(
+    request: Arm64NativeEntryStackFrameRequest<ARGUMENTS_EXCLUDING_THIS>,
+    body: impl for<'frame> FnOnce(Arm64NativeEntryStackFrameProof<'frame>),
+) -> Result<(), Arm64NativeEntryStackFrameError> {
     validate_local_area::<LOCAL_AREA_WORDS>(request.live_local_count)?;
-    let frame =
-        Arm64NativeEntryStackFrame::<LOCAL_AREA_WORDS, ARGUMENTS_EXCLUDING_THIS>::new(request);
+    let padded_argument_count =
+        padded_argument_count_including_this(PADDED_ARGUMENTS_EXCLUDING_THIS)?;
+    validate_padded_argument_storage(ARGUMENTS_EXCLUDING_THIS, padded_argument_count)?;
+    let frame = Arm64NativeEntryStackFrame::<
+        LOCAL_AREA_WORDS,
+        ARGUMENTS_EXCLUDING_THIS,
+        PADDED_ARGUMENTS_EXCLUDING_THIS,
+    >::new(request);
     let proof = frame.proof(Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard)?;
     body(proof);
     Ok(())
@@ -590,11 +644,14 @@ fn validate_arm64_native_entry_stack_frame_candidate(
     local_area_words: usize,
     live_local_count: usize,
     argument_count_excluding_this: usize,
+    padded_argument_count: usize,
 ) -> Result<Arm64NativeEntryStackFrameProof<'static>, Arm64NativeEntryStackFrameError> {
     if source != Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard {
         return Err(Arm64NativeEntryStackFrameError::NonStackLocalAddressSource { source });
     }
     validate_local_area_runtime(local_area_words, live_local_count)?;
+    let undefined_fill_count =
+        validate_padded_argument_storage(argument_count_excluding_this, padded_argument_count)?;
     validate_addresses(entry_frame, call_frame, post_allocation_sp, vm_entry_record)?;
     Ok(Arm64NativeEntryStackFrameProof {
         source,
@@ -607,12 +664,22 @@ fn validate_arm64_native_entry_stack_frame_candidate(
         local_area_words,
         live_local_count,
         argument_count_excluding_this,
+        padded_argument_count,
+        undefined_fill_count,
         _stack_frame: PhantomData,
     })
 }
 
-impl<const LOCAL_AREA_WORDS: usize, const ARGUMENTS_EXCLUDING_THIS: usize>
-    Arm64NativeEntryStackFrame<LOCAL_AREA_WORDS, ARGUMENTS_EXCLUDING_THIS>
+impl<
+        const LOCAL_AREA_WORDS: usize,
+        const ARGUMENTS_EXCLUDING_THIS: usize,
+        const PADDED_ARGUMENTS_EXCLUDING_THIS: usize,
+    >
+    Arm64NativeEntryStackFrame<
+        LOCAL_AREA_WORDS,
+        ARGUMENTS_EXCLUDING_THIS,
+        PADDED_ARGUMENTS_EXCLUDING_THIS,
+    >
 {
     fn new(request: Arm64NativeEntryStackFrameRequest<ARGUMENTS_EXCLUDING_THIS>) -> Self {
         Self {
@@ -623,7 +690,7 @@ impl<const LOCAL_AREA_WORDS: usize, const ARGUMENTS_EXCLUDING_THIS: usize>
                 callee: request.callee,
                 argument_count_including_this: (ARGUMENTS_EXCLUDING_THIS as u64).saturating_add(1),
                 this_value: request.this_value,
-                arguments: request.arguments,
+                arguments: padded_arguments(request.arguments),
             },
             vm_entry_record: Arm64VmEntryRecord {
                 vm: request.vm,
@@ -656,6 +723,7 @@ impl<const LOCAL_AREA_WORDS: usize, const ARGUMENTS_EXCLUDING_THIS: usize>
             LOCAL_AREA_WORDS,
             self.live_local_count,
             ARGUMENTS_EXCLUDING_THIS,
+            padded_argument_count_including_this(PADDED_ARGUMENTS_EXCLUDING_THIS)?,
         )
         .map(|proof| Arm64NativeEntryStackFrameProof {
             _stack_frame: PhantomData,
@@ -678,6 +746,59 @@ impl<const LOCAL_AREA_WORDS: usize, const ARGUMENTS_EXCLUDING_THIS: usize>
     fn vm_entry_record_address(&self) -> FrameAddress {
         FrameAddress((&self.vm_entry_record as *const Arm64VmEntryRecord) as usize)
     }
+}
+
+fn padded_arguments<
+    const ARGUMENTS_EXCLUDING_THIS: usize,
+    const PADDED_ARGUMENTS_EXCLUDING_THIS: usize,
+>(
+    arguments: [u64; ARGUMENTS_EXCLUDING_THIS],
+) -> [u64; PADDED_ARGUMENTS_EXCLUDING_THIS] {
+    // C++ `doVMEntry` fills missing padded argument slots with ValueUndefined.
+    let mut padded = [RuntimeValue::undefined().encoded().0; PADDED_ARGUMENTS_EXCLUDING_THIS];
+    let mut index = 0;
+    while index < ARGUMENTS_EXCLUDING_THIS {
+        padded[index] = arguments[index];
+        index += 1;
+    }
+    padded
+}
+
+fn argument_count_including_this(
+    argument_count_excluding_this: usize,
+) -> Result<usize, Arm64NativeEntryStackFrameError> {
+    argument_count_excluding_this.checked_add(1).ok_or(
+        Arm64NativeEntryStackFrameError::ArgumentCountIncludingThisOverflow {
+            argument_count_excluding_this,
+        },
+    )
+}
+
+fn padded_argument_count_including_this(
+    padded_argument_count_excluding_this: usize,
+) -> Result<usize, Arm64NativeEntryStackFrameError> {
+    padded_argument_count_excluding_this.checked_add(1).ok_or(
+        Arm64NativeEntryStackFrameError::PaddedArgumentCountIncludingThisOverflow {
+            padded_argument_count_excluding_this,
+        },
+    )
+}
+
+fn validate_padded_argument_storage(
+    argument_count_excluding_this: usize,
+    padded_argument_count: usize,
+) -> Result<usize, Arm64NativeEntryStackFrameError> {
+    let argument_count_including_this =
+        argument_count_including_this(argument_count_excluding_this)?;
+    if padded_argument_count < argument_count_including_this {
+        return Err(
+            Arm64NativeEntryStackFrameError::PaddedArgumentStorageDoesNotCoverProvidedArguments {
+                argument_count_including_this,
+                padded_argument_count,
+            },
+        );
+    }
+    Ok(padded_argument_count - argument_count_including_this)
 }
 
 const fn option_frame_address_to_raw(address: Option<FrameAddress>) -> usize {
@@ -952,6 +1073,8 @@ mod tests {
                 Some(FrameAddress(0x4000))
             );
             assert_eq!(proof.argument_count_excluding_this, 2);
+            assert_eq!(proof.padded_argument_count, 3);
+            assert_eq!(proof.undefined_fill_count, 0);
             assert_eq!(proof.local_area_words, 2);
             assert_eq!(proof.live_local_count, 1);
             assert!(proof.post_allocation_sp.0 < proof.call_frame.0);
@@ -1002,6 +1125,7 @@ mod tests {
                 2,
                 1,
                 0,
+                1,
             ),
             Err(
                 Arm64NativeEntryStackFrameError::NonStackLocalAddressSource {
@@ -1025,6 +1149,7 @@ mod tests {
                 2,
                 1,
                 0,
+                1,
             ),
             Err(
                 Arm64NativeEntryStackFrameError::NonStackLocalAddressSource {
@@ -1048,6 +1173,7 @@ mod tests {
                 2,
                 1,
                 0,
+                1,
             ),
             Err(
                 Arm64NativeEntryStackFrameError::VmEntryRecordNotBetweenCallFrameAndEntryFrame {
@@ -1055,6 +1181,38 @@ mod tests {
                     call_frame: 0x2000,
                     entry_frame: 0x3000,
                 }
+            )
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_padded_stack_guard_fills_do_vm_entry_undefined_slots() {
+        let frame = Arm64NativeEntryStackFrame::<2, 2, 4>::new(request());
+        let undefined_bits = RuntimeValue::undefined().encoded().0;
+
+        assert_eq!(
+            frame.call_frame.arguments,
+            [0x8000, 0x9000, undefined_bits, undefined_bits]
+        );
+        assert_eq!(frame.call_frame.argument_count_including_this, 3);
+
+        let proof = frame
+            .proof(Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard)
+            .expect("padded stack-local ARM64 entry proof");
+        assert_eq!(proof.argument_count_excluding_this, 2);
+        assert_eq!(proof.padded_argument_count, 5);
+        assert_eq!(proof.undefined_fill_count, 2);
+    }
+
+    #[test]
+    fn arm64_native_entry_padded_stack_guard_rejects_too_few_padded_slots() {
+        assert_eq!(
+            with_arm64_native_entry_padded_stack_frame::<2, 2, 1>(request(), |_| ()),
+            Err(
+                Arm64NativeEntryStackFrameError::PaddedArgumentStorageDoesNotCoverProvidedArguments {
+                    argument_count_including_this: 3,
+                    padded_argument_count: 2,
+                },
             )
         );
     }
@@ -1095,6 +1253,27 @@ mod tests {
     }
 
     #[test]
+    fn arm64_native_entry_jsc_stack_call_request_accepts_padded_stack_frame() {
+        let descriptor = launch_descriptor();
+        let layout = do_vm_entry_layout(&descriptor);
+
+        with_arm64_native_entry_padded_stack_frame::<2, 2, 4>(request(), |stack_frame| {
+            let request_proof =
+                prove_arm64_native_entry_jsc_stack_call_request(layout, &stack_frame)
+                    .expect("padded JSC stack-call request proof");
+
+            assert_eq!(request_proof.owner, descriptor.owner);
+            assert_eq!(request_proof.code_block, descriptor.code_block);
+            assert_eq!(request_proof.argument_count_including_this, 3);
+            assert_eq!(request_proof.padded_argument_count, 5);
+            assert_eq!(request_proof.undefined_fill_count, 2);
+            assert_eq!(request_proof.frame_word_count, 10);
+            assert_eq!(request_proof.frame_size_bytes, 80);
+        })
+        .expect("padded stack-local ARM64 entry proof");
+    }
+
+    #[test]
     fn arm64_native_entry_jsc_stack_call_request_rejects_missing_padded_slots() {
         let descriptor = launch_descriptor();
         let layout = do_vm_entry_layout(&descriptor);
@@ -1129,6 +1308,8 @@ mod tests {
             local_area_words: 2,
             live_local_count: 1,
             argument_count_excluding_this: 2,
+            padded_argument_count: 3,
+            undefined_fill_count: 0,
             _stack_frame: PhantomData,
         };
 

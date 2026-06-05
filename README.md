@@ -171,9 +171,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            selected VmEntryLaunchDescriptor / normal ARM64 token against the
            C++ doVMEntry active-frame and StackAlignment.h padded-argument
            shape and derives the doVMEntry stack CallFrame slot/size proof
-           before raw ARM64 dispatch, with a JSC stack-call request proof that
-           still rejects the current stack skeleton when doVMEntry padding needs
-           undefined-fill slots and rejects raw register-window frame sources,
+           before raw ARM64 dispatch, with a JSC stack-call request proof and
+           stack-local padded argument storage that fills doVMEntry padding
+           slots with undefined while still rejecting raw register-window
+           frame sources,
            while valid descriptors still reject before public native admission;
            native execution unchanged.
   [missing] commit-message decision log discipline for new batches
