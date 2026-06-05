@@ -146,8 +146,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            src/gc/heap/marking.rs and src/gc/visitor/conservative_marking.rs
            add heap-owned conservative-root test-and-set evidence plus the
            SlotVisitor JSCell queue / Auxiliary live-note action split;
-           src/vm/native_reentry.rs consumes that receipt before rejecting at
-           the missing real SlotVisitor conservative-root marking blocker;
+           src/vm/native_reentry.rs consumes that receipt plus the conservative
+           marking evidence before rejecting at the missing real collector
+           mark-stack/cell-state/container-effects blocker;
            native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
