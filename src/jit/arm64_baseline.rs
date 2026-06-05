@@ -283,6 +283,7 @@ pub(crate) mod register_contract {
 }
 
 mod control_flow;
+mod frame_addressing;
 mod frame_materialization;
 mod frame_materialization_producer;
 

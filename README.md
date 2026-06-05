@@ -102,6 +102,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            linking plus JIT Jump/JumpList/JumpTable/SlowCaseEntry; behavior unchanged)
     [done] JIT ARM64 GPRInfo/JSRInfo/AssemblyHelpers register materialization
            contract skeleton added to src/jit/arm64_baseline.rs (metadata only)
+    [done] JIT ARM64 JSC CallFrame address-mode proof added to
+           src/jit/arm64_baseline/frame_addressing.rs (maps
+           AssemblyHelpers::addressFor / VirtualRegister::offsetInBytes from
+           fp/x29; raw register-window ARM64 seed remains rejected)
     [done] JIT ARM64 dormant virtual-register frame materialization helpers and
            private JumpIfFalse branch-aware callable encoder skeleton added to
            src/jit/arm64_baseline.rs (public branch-aware callable emission
