@@ -129,6 +129,14 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            VM::topCallFrame / VM::topEntryFrame publication; boxed
            entry/call-frame storage is no longer a public-admission
            top-frame source; admission still rejects).
+    [done] VM ARM64 first conservative-rooting admission stage now requires
+           stack-local top-frame publication plus
+           JscMachineStackConservativeRootingProof-derived current-thread span,
+           ConservativeRoots, and SlotVisitor append evidence; a free
+           conservative-scan append receipt no longer progresses public ARM64
+           admission, which now reaches MissingVmRootGatherProof only after the
+           stack span covers the published top CallFrame and roots match the
+           append receipt.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of
