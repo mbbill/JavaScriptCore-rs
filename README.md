@@ -148,8 +148,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            a proof produced by replaying the heap-produced marking proof through
            SlotVisitorConservativeRootMarkingPlan::apply_collector_effects(&mut
            Heap); caller-supplied raw collector effects no longer progress
-           public ARM64 admission, which still rejects at
-           MissingVerifierAppendAndJitStubTracingProof.
+           public ARM64 admission; the following optional verifier-state stage
+           accepts the C++ `m_verifierSlotVisitor == nullptr` branch from that
+           proof and still rejects at MissingJitStubRoutineTraceProof.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of

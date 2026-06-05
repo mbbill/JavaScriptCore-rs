@@ -236,6 +236,47 @@ impl Deref for P6Arm64SlotVisitorCollectorEffectsProof {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) struct P6Arm64VerifierSlotVisitorConservativeRootAppendProof {
+    // C++ `Heap::addCoreConstraints` appends conservative roots to
+    // `m_verifierSlotVisitor` only when that optional visitor is installed.
+    // Rust has no heap-owned verifier visitor state yet, so current ARM64
+    // admission can only prove the faithful `m_verifierSlotVisitor == nullptr`
+    // branch from the prior heap-produced collector-effects proof.
+    verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
+}
+
+impl P6Arm64VerifierSlotVisitorConservativeRootAppendProof {
+    #[allow(dead_code)]
+    pub(in crate::vm) fn no_verifier_slot_visitor_from_collector_effects_proof(
+        collector_effects_proof: &P6Arm64SlotVisitorCollectorEffectsProof,
+    ) -> Self {
+        let collector_effects_plan = collector_effects_proof.collector_effects_plan();
+        Self {
+            verifier_append_proof:
+                VerifierSlotVisitorConservativeRootAppendProof::NoVerifierSlotVisitor {
+                    heap: collector_effects_plan.heap,
+                    marking_epoch: collector_effects_plan.marking_epoch,
+                },
+        }
+    }
+
+    pub(in crate::vm) fn verifier_append_proof(
+        &self,
+    ) -> &VerifierSlotVisitorConservativeRootAppendProof {
+        &self.verifier_append_proof
+    }
+
+    pub(in crate::vm) fn heap(&self) -> HeapId {
+        self.verifier_append_proof.heap()
+    }
+
+    pub(in crate::vm) fn marking_epoch(&self) -> HeapEpoch {
+        self.verifier_append_proof.marking_epoch()
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::vm) enum P6Arm64NativeRootSlotKind {
     Callee,
@@ -428,7 +469,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
-        verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
     },
     TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierAppendAndJitStubTracePlan {
         top_call_frame_publication:
@@ -437,7 +478,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
-        verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
     },
     TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceAndMachineStackResidencyProof
@@ -448,7 +489,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
-        verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
         native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
     },
@@ -1953,7 +1994,7 @@ pub(super) fn validate_p6_arm64_verifier_append_proof(
     receipt: &HeapConservativeScanAppendReceipt,
     marking_plan: &SlotVisitorConservativeRootMarkingPlan,
     vm_root_gather_plan: &VmRootGatherPlan,
-    verifier_append_proof: &VerifierSlotVisitorConservativeRootAppendProof,
+    verifier_append_proof: &P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
 ) -> Result<(), P6Arm64VerifierAppendProofMismatch> {
     if verifier_append_proof.heap() != receipt.heap {
         return Err(P6Arm64VerifierAppendProofMismatch::HeapMismatch {
@@ -1987,22 +2028,8 @@ pub(super) fn validate_p6_arm64_verifier_append_proof(
         );
     }
 
-    match verifier_append_proof {
-        VerifierSlotVisitorConservativeRootAppendProof::NoVerifierSlotVisitor {
-            heap,
-            marking_epoch,
-        } => {
-            // C++ skips `VerifierSlotVisitor::append(conservativeRoots)` only
-            // when the heap has no verifier visitor installed. Rust has no
-            // heap-owned verifier-state proof yet, so this native admission
-            // path requires the append plan instead of accepting absence.
-            Err(
-                P6Arm64VerifierAppendProofMismatch::MissingVerifierAppendPlan {
-                    heap: *heap,
-                    marking_epoch: *marking_epoch,
-                },
-            )
-        }
+    match verifier_append_proof.verifier_append_proof() {
+        VerifierSlotVisitorConservativeRootAppendProof::NoVerifierSlotVisitor { .. } => Ok(()),
         VerifierSlotVisitorConservativeRootAppendProof::AppendPlan(verifier_append_plan) => {
             validate_p6_arm64_verifier_append_plan(receipt, marking_plan, verifier_append_plan)
         }

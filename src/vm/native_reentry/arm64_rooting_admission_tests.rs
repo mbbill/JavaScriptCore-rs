@@ -343,7 +343,7 @@ fn public_arm64_branch_aware_admission_progresses_through_rooting_stages() {
         assert_eq!(
             p6_arm64_public_branch_aware_callable_admission_proof(&request),
             Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendAndJitStubTracingProof {
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierSlotVisitorAppendOrAbsenceProof {
                     top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
                     vm_root_gather_plan: vm_root_gather_plan.clone(),
@@ -353,7 +353,7 @@ fn public_arm64_branch_aware_admission_progresses_through_rooting_stages() {
             )
         );
 
-        let verifier_append_proof = tests::verifier_append_proof(&conservative_root_marking_plan);
+        let verifier_append_proof = tests::verifier_append_proof(&collector_effects_plan);
         request.fallback_rooting_proof =
             P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsAndVerifierAppendProof {
                 top_call_frame_publication,
@@ -366,7 +366,7 @@ fn public_arm64_branch_aware_admission_progresses_through_rooting_stages() {
         assert_eq!(
             p6_arm64_public_branch_aware_callable_admission_proof(&request),
             Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::MissingJitStubTracingAndRealNativeRootingProof {
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingJitStubRoutineTraceProof {
                     top_call_frame_publication,
                     conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
                     vm_root_gather_plan: vm_root_gather_plan.clone(),

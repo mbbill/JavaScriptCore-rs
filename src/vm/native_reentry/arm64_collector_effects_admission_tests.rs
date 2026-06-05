@@ -85,7 +85,7 @@ fn public_arm64_collector_effects_stage_progresses_with_heap_produced_effects_pr
         assert_eq!(
             p6_arm64_public_branch_aware_callable_admission_proof(&request),
             Err(
-                P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierAppendAndJitStubTracingProof {
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingVerifierSlotVisitorAppendOrAbsenceProof {
                     top_call_frame_publication,
                     conservative_scan_append_receipt,
                     vm_root_gather_plan,
