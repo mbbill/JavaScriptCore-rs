@@ -15,8 +15,8 @@ use crate::bytecode::{BytecodeIndex, CodeBlock, CoreOpcode};
 use crate::gc::HeapConservativeScanAppendReceipt;
 use crate::jit::arm64_baseline::Arm64BaselineGeneratedNativeFrameMaterializationMismatch;
 use crate::jit::{
-    BaselineNativeEntryCallableKind, JitStubRoutineTracePlan, MachineCodeRange,
-    P6X86_64BaselineSelectedSideExitReason, P6X86_64BaselineTerminalPolicy,
+    BaselineNativeEntryCallableKind, MachineCodeRange, P6X86_64BaselineSelectedSideExitReason,
+    P6X86_64BaselineTerminalPolicy,
 };
 
 use super::super::side_exit::{
@@ -32,8 +32,8 @@ use super::rooting::{
     validate_p6_arm64_verifier_append_proof, validate_p6_arm64_vm_root_gather_plan,
     P6Arm64BranchAwareCallableFallbackRootingProof,
     P6Arm64BranchAwareCallableTopCallFramePublicationProof, P6Arm64CollectorEffectsProofMismatch,
-    P6Arm64ConservativeRootMarkingProofMismatch, P6Arm64JitStubRoutineTraceProofMismatch,
-    P6Arm64MachineStackConservativeRootingProof,
+    P6Arm64ConservativeRootMarkingProofMismatch, P6Arm64JitStubRoutineTraceProof,
+    P6Arm64JitStubRoutineTraceProofMismatch, P6Arm64MachineStackConservativeRootingProof,
     P6Arm64MachineStackConservativeRootingProofMismatch,
     P6Arm64NativeFrameMachineStackResidencyProof,
     P6Arm64NativeFrameMachineStackResidencyProofMismatch, P6Arm64SlotVisitorCollectorEffectsProof,
@@ -220,7 +220,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
         verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
         mismatch: P6Arm64JitStubRoutineTraceProofMismatch,
     },
@@ -232,7 +232,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
     },
     NativeFrameMachineStackResidencyProofMismatch {
         top_call_frame_publication:
@@ -242,7 +242,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
         native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
         mismatch: P6Arm64NativeFrameMachineStackResidencyProofMismatch,
     },
@@ -254,7 +254,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
         native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
     },
     Arm64GeneratedNativeFrameMaterializationProofMismatch {
@@ -688,7 +688,7 @@ pub(in crate::vm) fn p6_arm64_public_branch_aware_callable_admission_proof<'publ
                     ) {
                         Ok(()) => match validate_p6_arm64_jit_stub_routine_trace_plan(
                             collector_effects_plan,
-                            jit_stub_trace_plan,
+                            jit_stub_trace_plan.trace_plan(),
                         ) {
                             Ok(()) => Err(
                                 P6Arm64BranchAwareCallableAdmissionRejection::MissingNativeFrameMachineStackResidencyProof {
@@ -792,7 +792,7 @@ pub(in crate::vm) fn p6_arm64_public_branch_aware_callable_admission_proof<'publ
                     ) {
                         Ok(()) => match validate_p6_arm64_jit_stub_routine_trace_plan(
                             collector_effects_plan,
-                            jit_stub_trace_plan,
+                            jit_stub_trace_plan.trace_plan(),
                         ) {
                             Ok(()) => match validate_p6_arm64_native_frame_machine_stack_residency_proof(
                                 top_call_frame_publication,
@@ -1002,8 +1002,13 @@ mod arm64_collector_effects_admission_tests;
 mod arm64_verifier_admission_tests;
 
 #[cfg(test)]
+#[path = "arm64_jit_stub_admission_tests.rs"]
+mod arm64_jit_stub_admission_tests;
+
+#[cfg(test)]
 pub(super) mod tests {
     use super::super::rooting::{
+        P6Arm64JitStubRoutineConservativeScanHookProof, P6Arm64JitStubRoutineTraceProof,
         P6Arm64MachineStackConservativeRootingProof, P6Arm64NativeFrameMachineStackSpanKind,
         P6Arm64NativeFrameMachineStackSpanRecord, P6Arm64NativeRootSlotKind,
         P6Arm64NativeRootSlotRecord, P6Arm64SlotVisitorConservativeRootMarkingProof,
@@ -1021,13 +1026,12 @@ pub(super) mod tests {
         AllocationMode, CellMetadata, ConservativeRootCell, ConservativeRootSpan,
         ConservativeRoots, GcConductor, GcPhase, Heap, HeapAllocationRequest,
         HeapConservativeScanAppendReceipt, HeapEpoch, HeapId, HeapStateDescriptor,
-        JscMachineStackMarker, MutatorState, RootMarkReason, SlotVisitorCollectorEffectsPlan,
-        SlotVisitorDescriptor,
+        JscMachineStackMarker, MutatorState,
     };
     use crate::jit::{
         CodeLiveness, CodeRetentionPolicy, ExecutableAllocationId, GcAwareJitStubRoutineDescriptor,
         JitCodeId, JitStubRoutineCandidateAddress, JitStubRoutineSetDescriptor,
-        JitStubRoutineTraceError, P6BaselineNativeReentryTargetRecord,
+        P6BaselineNativeReentryTargetRecord,
     };
     use crate::runtime::CellId;
 
@@ -1427,38 +1431,47 @@ pub(super) mod tests {
         }
     }
 
-    pub(super) fn jit_stub_trace_proof(
-        collector_effects_plan: &SlotVisitorCollectorEffectsPlan,
-    ) -> JitStubRoutineTracePlan {
-        let set = JitStubRoutineSetDescriptor::new(vec![
+    pub(super) fn jit_stub_set_descriptor() -> JitStubRoutineSetDescriptor {
+        JitStubRoutineSetDescriptor::new(vec![
             jit_stub_routine(1, 320, 24, false, vec![CellId(91), CellId(92)]),
             jit_stub_routine(2, 420, 24, false, vec![CellId(93)]),
             jit_stub_routine(9, 260, 16, true, vec![CellId(94)]),
-        ]);
-        let mut scan = set
-            .prepare_for_conservative_scan()
-            .expect("prepare JIT stub conservative scan");
-        scan.mark_candidate(JitStubRoutineCandidateAddress {
+        ])
+    }
+
+    pub(super) fn jit_stub_candidate_for_first_mutable_routine() -> JitStubRoutineCandidateAddress {
+        JitStubRoutineCandidateAddress {
             allocation: ExecutableAllocationId(17),
             offset: 328,
-        })
-        .expect("mark may-be-executing JIT stub routine");
+        }
+    }
 
-        let mut visitor = SlotVisitorDescriptor::new(
-            collector_effects_plan.heap,
-            "native-reentry-jit-stub-trace-test",
-            collector_effects_plan.marking_epoch,
-        );
-        visitor.worklist = collector_effects_plan.worklist;
-        visitor.root_mark_reason = RootMarkReason::JitStubRoutines;
+    pub(super) fn jit_stub_scan_hook_proof() -> P6Arm64JitStubRoutineConservativeScanHookProof {
+        let set = jit_stub_set_descriptor();
+        P6Arm64JitStubRoutineConservativeScanHookProof::from_prepared_set_and_conservative_scan_hook_candidates(
+            &set,
+            [jit_stub_candidate_for_first_mutable_routine()],
+        )
+        .expect("JIT stub conservative-scan hook proof")
+    }
 
-        let trace_plan = scan
-            .trace_marked_stub_routines(&visitor)
-            .expect("trace marked JIT stub routine");
+    pub(super) fn jit_stub_trace_proof(
+        collector_effects_proof: &P6Arm64SlotVisitorCollectorEffectsProof,
+        verifier_append_proof: &P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+    ) -> P6Arm64JitStubRoutineTraceProof {
+        let scan_hook_proof = jit_stub_scan_hook_proof();
+        let trace_proof =
+            P6Arm64JitStubRoutineTraceProof::from_collector_effects_verifier_and_scan_hook_proofs(
+                collector_effects_proof,
+                verifier_append_proof,
+                &scan_hook_proof,
+            )
+            .expect("trace marked JIT stub routine proof");
+        let trace_plan = trace_proof.trace_plan();
         assert_eq!(trace_plan.traced_routine_count, 1);
         assert_eq!(trace_plan.required_edge_count, 2);
         assert_eq!(trace_plan.records[0].routine, JitCodeId(1));
-        trace_plan
+        trace_proof
     }
 
     pub(super) fn vm_root_gather_proof(
@@ -1620,7 +1633,7 @@ pub(super) mod tests {
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
         native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
     ) -> P6Arm64BranchAwareCallableFallbackRootingProof<'publication> {
         P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceAndMachineStackResidencyProof {
@@ -1646,7 +1659,7 @@ pub(super) mod tests {
         pub(super) conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         pub(super) collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         pub(super) verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
-        pub(super) jit_stub_trace_plan: JitStubRoutineTracePlan,
+        pub(super) jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
         pub(super) native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
     }
 
@@ -1696,7 +1709,8 @@ pub(super) mod tests {
         ) = conservative_root_marking_and_collector_effects_proof();
         let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
         let verifier_append_proof = verifier_append_proof(&collector_effects_plan);
-        let jit_stub_trace_plan = jit_stub_trace_proof(&collector_effects_plan);
+        let jit_stub_trace_plan =
+            jit_stub_trace_proof(&collector_effects_plan, &verifier_append_proof);
         let machine_stack_conservative_rooting_proof =
             machine_stack_conservative_rooting_proof_from_marker(
                 top_call_frame_publication,
@@ -2133,65 +2147,6 @@ pub(super) mod tests {
                         .mutator_state,
                     machine_stack: MutatorState::Running,
                 },
-            );
-        });
-    }
-
-    #[test]
-    fn public_arm64_branch_aware_admission_rejects_inconsistent_jit_stub_trace_proof() {
-        let code_block = jump_if_false_code_block(4);
-        let site = jump_if_false_site();
-        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
-        with_stack_top_call_frame_publication(|top_call_frame_publication| {
-            let mut request = valid_request(&side_exits);
-            let (
-                conservative_scan_append_receipt,
-                conservative_root_marking_plan,
-                collector_effects_plan,
-            ) = conservative_root_marking_and_collector_effects_proof();
-            let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
-            let verifier_append_proof = verifier_append_proof(&collector_effects_plan);
-            let mut jit_stub_trace_plan = jit_stub_trace_proof(&collector_effects_plan);
-            let machine_stack_conservative_rooting_proof =
-                machine_stack_conservative_rooting_proof_from_marker(
-                    top_call_frame_publication,
-                    &conservative_scan_append_receipt,
-                );
-            let expected_trace_record = jit_stub_trace_plan.records[0].clone();
-            jit_stub_trace_plan.records[0].required_edges[0].cell = CellId(0xdead);
-            let actual_trace_record = jit_stub_trace_plan.records[0].clone();
-
-            request.fallback_rooting_proof =
-                P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierAppendAndJitStubTracePlan {
-                    top_call_frame_publication,
-                    machine_stack_conservative_rooting_proof,
-                    vm_root_gather_plan: vm_root_gather_plan.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                    collector_effects_plan: collector_effects_plan.clone(),
-                    verifier_append_proof: verifier_append_proof.clone(),
-                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                };
-
-            assert_eq!(
-                p6_arm64_public_branch_aware_callable_admission_proof(&request),
-                Err(
-                    P6Arm64BranchAwareCallableAdmissionRejection::JitStubRoutineTraceProofMismatch {
-                        top_call_frame_publication,
-                        conservative_scan_append_receipt,
-                        vm_root_gather_plan,
-                        conservative_root_marking_plan,
-                        collector_effects_plan,
-                        verifier_append_proof,
-                        jit_stub_trace_plan,
-                        mismatch: P6Arm64JitStubRoutineTraceProofMismatch::TracePlanMismatch(
-                            JitStubRoutineTraceError::TraceRecordMismatch {
-                                order: 0,
-                                expected: expected_trace_record,
-                                actual: actual_trace_record,
-                            },
-                        ),
-                    }
-                )
             );
         });
     }

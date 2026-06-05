@@ -18,8 +18,9 @@ use crate::gc::{
     SlotVisitorCollectorEffectsPlan, SlotVisitorConservativeRootAppendRecord,
     SlotVisitorConservativeRootMarkingAction, SlotVisitorConservativeRootMarkingError,
     SlotVisitorConservativeRootMarkingPlan, SlotVisitorContainerNoteMarkedRecord,
-    SlotVisitorNoteLiveAuxiliaryCellRecord, VerifierSlotVisitorConservativeRootAppendError,
-    VerifierSlotVisitorConservativeRootAppendPlan, VerifierSlotVisitorConservativeRootAppendProof,
+    SlotVisitorDescriptor, SlotVisitorNoteLiveAuxiliaryCellRecord,
+    VerifierSlotVisitorConservativeRootAppendError, VerifierSlotVisitorConservativeRootAppendPlan,
+    VerifierSlotVisitorConservativeRootAppendProof,
 };
 use crate::jit::arm64_baseline::{
     produce_arm64_baseline_generated_native_frame_materialization_descriptor,
@@ -32,7 +33,10 @@ use crate::jit::arm64_baseline::{
     Arm64BaselineLiveRootSlotKind, Arm64BaselineMachineStackRootSlotDescriptor,
     Arm64BaselineMachineStackSpanKind,
 };
-use crate::jit::{JitStubRoutineTraceError, JitStubRoutineTracePlan};
+use crate::jit::{
+    JitStubRoutineCandidateAddress, JitStubRoutineConservativeScanPlan,
+    JitStubRoutineSetDescriptor, JitStubRoutineTraceError, JitStubRoutineTracePlan,
+};
 
 use super::super::arm64_native_entry::Arm64NativeEntryStackPublicationGuard;
 use super::super::entry::FrameAddress;
@@ -277,6 +281,84 @@ impl P6Arm64VerifierSlotVisitorConservativeRootAppendProof {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) struct P6Arm64JitStubRoutineConservativeScanHookProof {
+    // C++ `Heap::addCoreConstraints` calls
+    // `JITStubRoutineSet::prepareForConservativeScan()` before conservative
+    // roots are gathered, and `ConservativeRoots` forwards every scanned
+    // candidate through the mark hook to `JITStubRoutineSet::mark(void*)`.
+    // Rust carries descriptor candidates instead of real executable addresses,
+    // so this proof must be produced by prepare + hook replay rather than by
+    // accepting a caller-supplied prepared scan plan.
+    scan_plan: JitStubRoutineConservativeScanPlan,
+}
+
+impl P6Arm64JitStubRoutineConservativeScanHookProof {
+    #[allow(dead_code)]
+    pub(in crate::vm) fn from_prepared_set_and_conservative_scan_hook_candidates(
+        set: &JitStubRoutineSetDescriptor,
+        candidates: impl IntoIterator<Item = JitStubRoutineCandidateAddress>,
+    ) -> Result<Self, JitStubRoutineTraceError> {
+        let mut scan_plan = set.prepare_for_conservative_scan()?;
+        for candidate in candidates {
+            scan_plan.mark_candidate(candidate)?;
+        }
+        scan_plan.validate_consistency()?;
+        Ok(Self { scan_plan })
+    }
+
+    pub(in crate::vm) fn scan_plan(&self) -> &JitStubRoutineConservativeScanPlan {
+        &self.scan_plan
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) struct P6Arm64JitStubRoutineTraceProof {
+    // C++ traces `m_jitStubRoutines` only after SlotVisitor consumed the
+    // conservative roots because marked stubs depend on gather-hook state.
+    // This remains descriptor-only until real executable-address hooks and
+    // `GCAwareJITStubRoutine::markRequiredObjects` traversal are ported.
+    trace_plan: JitStubRoutineTracePlan,
+}
+
+impl P6Arm64JitStubRoutineTraceProof {
+    #[allow(dead_code)]
+    pub(in crate::vm) fn from_collector_effects_verifier_and_scan_hook_proofs(
+        collector_effects_proof: &P6Arm64SlotVisitorCollectorEffectsProof,
+        _verifier_append_proof: &P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+        scan_hook_proof: &P6Arm64JitStubRoutineConservativeScanHookProof,
+    ) -> Result<Self, JitStubRoutineTraceError> {
+        let collector_effects_plan = collector_effects_proof.collector_effects_plan();
+        let mut visitor = SlotVisitorDescriptor::new(
+            collector_effects_plan.heap,
+            "arm64-jit-stub-routine-trace-proof",
+            collector_effects_plan.marking_epoch,
+        );
+        visitor.worklist = collector_effects_plan.worklist;
+        visitor.root_mark_reason = RootMarkReason::JitStubRoutines;
+
+        Ok(Self {
+            trace_plan: scan_hook_proof
+                .scan_plan()
+                .trace_marked_stub_routines(&visitor)?,
+        })
+    }
+
+    pub(in crate::vm) fn trace_plan(&self) -> &JitStubRoutineTracePlan {
+        &self.trace_plan
+    }
+}
+
+impl Deref for P6Arm64JitStubRoutineTraceProof {
+    type Target = JitStubRoutineTracePlan;
+
+    fn deref(&self) -> &Self::Target {
+        self.trace_plan()
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::vm) enum P6Arm64NativeRootSlotKind {
     Callee,
@@ -479,7 +561,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
     },
     TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceAndMachineStackResidencyProof
     {
@@ -490,7 +572,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
         native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
     },
 }
@@ -1435,10 +1517,6 @@ pub(super) fn validate_p6_arm64_jit_stub_routine_trace_plan(
     collector_effects_plan: &SlotVisitorCollectorEffectsPlan,
     jit_stub_trace_plan: &JitStubRoutineTracePlan,
 ) -> Result<(), P6Arm64JitStubRoutineTraceProofMismatch> {
-    // C++ marks `m_mayBeExecuting` through ConservativeRoots gather hooks
-    // before this trace. This proof only validates the later
-    // `traceMarkedStubRoutines` replay; real gather-hook provenance remains a
-    // native-rooting blocker.
     if jit_stub_trace_plan.heap != collector_effects_plan.heap {
         return Err(P6Arm64JitStubRoutineTraceProofMismatch::HeapMismatch {
             collector: collector_effects_plan.heap,

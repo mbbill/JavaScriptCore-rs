@@ -377,7 +377,8 @@ fn public_arm64_branch_aware_admission_progresses_through_rooting_stages() {
             )
         );
 
-        let jit_stub_trace_plan = tests::jit_stub_trace_proof(&collector_effects_plan);
+        let jit_stub_trace_plan =
+            tests::jit_stub_trace_proof(&collector_effects_plan, &verifier_append_proof);
         request.fallback_rooting_proof =
             P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierAppendAndJitStubTracePlan {
                 top_call_frame_publication,

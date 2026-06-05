@@ -151,6 +151,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            public ARM64 admission; the following optional verifier-state stage
            accepts the C++ `m_verifierSlotVisitor == nullptr` branch from that
            proof and still rejects at MissingJitStubRoutineTraceProof.
+    [done] VM ARM64 JIT-stub tracing admission stage now requires prepare +
+           ConservativeRoots hook-mark evidence and a trace proof produced from
+           the prior collector/verifier proofs; caller-supplied raw
+           JitStubRoutineTracePlan no longer progresses public ARM64 admission,
+           which still rejects at MissingNativeFrameMachineStackResidencyProof.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of
