@@ -1678,6 +1678,7 @@ pub(crate) fn execute_baseline_generated_code_with_metrics_and_validation_and_di
     validation: BaselineGeneratedExecutionValidation,
     dispatch_config: DispatchConfig,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    metrics.apply_dispatch_config(dispatch_config);
     let mut dispatch_budget = DispatchBudget::from_config(dispatch_config);
     execute_baseline_generated_code_with_metrics_and_validation_and_dispatch_budget(
         request,
@@ -1813,6 +1814,7 @@ pub(crate) fn execute_baseline_generated_code_with_generated_call_link_sidecar_a
     validation: BaselineGeneratedExecutionValidation,
     dispatch_config: DispatchConfig,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    metrics.apply_dispatch_config(dispatch_config);
     let mut dispatch_budget = DispatchBudget::from_config(dispatch_config);
     execute_baseline_generated_code_with_generated_call_link_sidecar_and_metrics_and_validation_and_dispatch_budget(
         request,
@@ -1950,6 +1952,7 @@ pub(crate) fn execute_baseline_generated_code_with_property_sidecars_and_metrics
     validation: BaselineGeneratedExecutionValidation,
     dispatch_config: DispatchConfig,
 ) -> Result<BaselineGeneratedExecutionResult, BaselineGeneratedExecutionError> {
+    metrics.apply_dispatch_config(dispatch_config);
     let mut dispatch_budget = DispatchBudget::from_config(dispatch_config);
     execute_baseline_generated_code_with_property_sidecars_and_metrics_and_validation_and_dispatch_budget(
         request,
@@ -2115,6 +2118,7 @@ pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_metrics_a
     validation: BaselineGeneratedExecutionValidation,
     dispatch_config: DispatchConfig,
 ) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    metrics.apply_dispatch_config(dispatch_config);
     let mut dispatch_budget = DispatchBudget::from_config(dispatch_config);
     execute_baseline_generated_code_with_runtime_helpers_and_metrics_and_validation_and_dispatch_budget(
         request,
@@ -2216,6 +2220,7 @@ pub(crate) fn execute_baseline_generated_code_with_runtime_helpers_and_sidecars_
     validation: BaselineGeneratedExecutionValidation,
     dispatch_config: DispatchConfig,
 ) -> Result<BaselineGeneratedExecutionWithRuntimeHelpersResult, BaselineGeneratedExecutionError> {
+    metrics.apply_dispatch_config(dispatch_config);
     let mut dispatch_budget = DispatchBudget::from_config(dispatch_config);
     execute_baseline_generated_code_with_runtime_helpers_and_sidecars_and_metrics_and_validation_and_dispatch_budget(
         request,
@@ -2332,22 +2337,26 @@ fn execute_baseline_generated_code_internal(
         execution.stack.mark_top_bytecode_index(bytecode_index);
         let opcode = CoreOpcode::from_opcode(instruction.opcode);
         if let Some(metrics) = metrics.as_deref_mut() {
-            let property_sidecars_for_metrics =
-                property_sidecars.as_ref().map(|sidecars| &**sidecars);
-            let property_load_sidecar_readiness =
-                generated_readiness::property_load_sidecar_readiness_for_instruction(
-                    owner,
-                    code_block,
-                    instruction,
-                    property_handoff_plan,
-                    property_sidecars_for_metrics,
+            if metrics.diagnostic_heat_enabled() {
+                let property_sidecars_for_metrics =
+                    property_sidecars.as_ref().map(|sidecars| &**sidecars);
+                let property_load_sidecar_readiness =
+                    generated_readiness::property_load_sidecar_readiness_for_instruction(
+                        owner,
+                        code_block,
+                        instruction,
+                        property_handoff_plan,
+                        property_sidecars_for_metrics,
+                        opcode,
+                    );
+                metrics.record_dispatched_instruction_with_diagnostic_heat(
+                    bytecode_index,
                     opcode,
+                    property_load_sidecar_readiness,
                 );
-            metrics.record_dispatched_instruction(
-                bytecode_index,
-                opcode,
-                property_load_sidecar_readiness,
-            );
+            } else {
+                metrics.record_dispatched_instruction(bytecode_index, opcode);
+            }
         }
 
         let outcome = match execute_instruction(

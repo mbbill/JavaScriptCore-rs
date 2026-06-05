@@ -28,9 +28,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
                  Host-callability fallback moves ~3.39M to GeneratedEntry; ready sealed native
                  direct-call callees now outrank GeneratedEntry when both artifacts exist, but the
                  broad blocker remains: generated baseline is still a Rust bytecode re-interpreter
-                 and is slower than the optimized interpreter on richards. Capped telemetry now
-                 shows generated dispatch heat dominated by GetByName, JumpIfFalse, PutByName,
-                 and CallWithThis in the hot generated owners; generated-entry depth-1
+                 and is slower than the optimized interpreter on richards. Default generated
+                 execution now keeps only bytecode-count + LoopHint accounting; capped probes
+                 still collect generated dispatch heat, currently dominated by GetByName,
+                 JumpIfFalse, PutByName, and CallWithThis in hot owners; generated-entry depth-1
                  GuardedPrototypeData loads now use the C++ GetByIdPrototype-shaped
                  receiver-structure + holder/offset fast path, with the 500k richards cap
                  still showing owner 110@32/76 heat and zero generated invalidations.

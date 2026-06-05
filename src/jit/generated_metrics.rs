@@ -2,11 +2,14 @@
 //!
 //! C++ Baseline JIT emits machine code per bytecode in `JIT.cpp` and routes
 //! calls/properties through generated fast paths plus slow-path thunks. Rust's
-//! generated executor is still a bytecode-dispatch shim, so these metrics are a
-//! Rust diagnostic bridge: they identify which C++ `JIT::emit_op_*` families
-//! should be ported next without changing generated-code behavior.
+//! generated executor is still a bytecode-dispatch shim, so opcode/site heat is
+//! a Rust diagnostic bridge: it identifies which C++ `JIT::emit_op_*` families
+//! should be ported next without changing generated-code behavior. Production
+//! generated execution keeps only the C++-mapped mandatory accounting:
+//! executed-bytecode totals and `op_loop_hint` observations for tiering replay.
 
 use crate::bytecode::{BytecodeIndex, CoreOpcode};
+use crate::interpreter::DispatchConfig;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BaselineGeneratedLoopHintObservation {
@@ -46,27 +49,68 @@ pub(crate) struct BaselineGeneratedDispatchedSiteOpcodeCount {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BaselineGeneratedExecutionMetrics {
     pub(crate) executed_bytecode_count: u64,
+    diagnostic_heat_enabled: bool,
     loop_hint_observations: Vec<BaselineGeneratedLoopHintObservation>,
     dispatched_opcode_counts: Vec<BaselineGeneratedDispatchedOpcodeCount>,
     dispatched_site_opcode_counts: Vec<BaselineGeneratedDispatchedSiteOpcodeCount>,
 }
 
 impl BaselineGeneratedExecutionMetrics {
+    pub(crate) const fn for_dispatch_config(config: DispatchConfig) -> Self {
+        Self {
+            executed_bytecode_count: 0,
+            diagnostic_heat_enabled: config.max_steps != usize::MAX,
+            loop_hint_observations: Vec::new(),
+            dispatched_opcode_counts: Vec::new(),
+            dispatched_site_opcode_counts: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    const fn diagnostic_probe() -> Self {
+        Self {
+            executed_bytecode_count: 0,
+            diagnostic_heat_enabled: true,
+            loop_hint_observations: Vec::new(),
+            dispatched_opcode_counts: Vec::new(),
+            dispatched_site_opcode_counts: Vec::new(),
+        }
+    }
+
+    pub(crate) const fn diagnostic_heat_enabled(&self) -> bool {
+        self.diagnostic_heat_enabled
+    }
+
+    pub(crate) fn apply_dispatch_config(&mut self, config: DispatchConfig) {
+        self.diagnostic_heat_enabled = config.max_steps != usize::MAX;
+    }
+
     pub(crate) fn record_dispatched_instruction(
+        &mut self,
+        bytecode_index: BytecodeIndex,
+        opcode: Option<CoreOpcode>,
+    ) {
+        self.executed_bytecode_count = self.executed_bytecode_count.saturating_add(1);
+        if opcode == Some(CoreOpcode::LoopHint) {
+            self.record_loop_hint(bytecode_index);
+        }
+    }
+
+    pub(crate) fn record_dispatched_instruction_with_diagnostic_heat(
         &mut self,
         bytecode_index: BytecodeIndex,
         opcode: Option<CoreOpcode>,
         property_load_sidecar_readiness: BaselineGeneratedPropertyLoadSidecarReadiness,
     ) {
-        self.executed_bytecode_count = self.executed_bytecode_count.saturating_add(1);
+        self.record_dispatched_instruction(bytecode_index, opcode);
+        if !self.diagnostic_heat_enabled {
+            return;
+        }
         let Some(opcode) = opcode else {
             return;
         };
         self.record_dispatched_opcode(opcode);
         self.record_dispatched_site_opcode(bytecode_index, opcode, property_load_sidecar_readiness);
-        if opcode == CoreOpcode::LoopHint {
-            self.record_loop_hint(bytecode_index);
-        }
     }
 
     pub(crate) fn record_skipped_bytecodes(&mut self, count: u64) {
@@ -152,21 +196,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn records_dispatched_opcode_heat_separately_from_skipped_bytecodes() {
+    fn default_records_mandatory_accounting_without_diagnostic_heat() {
         let loop_hint_index = BytecodeIndex::from_offset(24);
         let mut metrics = BaselineGeneratedExecutionMetrics::default();
 
         metrics.record_dispatched_instruction(
             BytecodeIndex::from_offset(8),
             Some(CoreOpcode::LoadInt32),
+        );
+        metrics.record_dispatched_instruction(loop_hint_index, Some(CoreOpcode::LoopHint));
+        metrics.record_skipped_bytecodes(4);
+
+        assert_eq!(metrics.executed_bytecode_count, 6);
+        assert_eq!(
+            metrics.loop_hint_observations(),
+            &[BaselineGeneratedLoopHintObservation {
+                bytecode_index: loop_hint_index,
+                count: 1,
+            }]
+        );
+        assert!(metrics.dispatched_opcode_counts().is_empty());
+        assert!(metrics.dispatched_site_opcode_counts().is_empty());
+    }
+
+    #[test]
+    fn bounded_dispatch_config_enables_diagnostic_heat() {
+        let metrics =
+            BaselineGeneratedExecutionMetrics::for_dispatch_config(DispatchConfig::new(1));
+        assert!(metrics.diagnostic_heat_enabled());
+
+        let metrics =
+            BaselineGeneratedExecutionMetrics::for_dispatch_config(DispatchConfig::unbounded());
+        assert!(!metrics.diagnostic_heat_enabled());
+    }
+
+    #[test]
+    fn diagnostic_probe_records_opcode_heat_separately_from_skipped_bytecodes() {
+        let loop_hint_index = BytecodeIndex::from_offset(24);
+        let mut metrics = BaselineGeneratedExecutionMetrics::diagnostic_probe();
+
+        metrics.record_dispatched_instruction_with_diagnostic_heat(
+            BytecodeIndex::from_offset(8),
+            Some(CoreOpcode::LoadInt32),
             BaselineGeneratedPropertyLoadSidecarReadiness::NotPropertyLoad,
         );
-        metrics.record_dispatched_instruction(
+        metrics.record_dispatched_instruction_with_diagnostic_heat(
             BytecodeIndex::from_offset(16),
             Some(CoreOpcode::LoadInt32),
             BaselineGeneratedPropertyLoadSidecarReadiness::NotPropertyLoad,
         );
-        metrics.record_dispatched_instruction(
+        metrics.record_dispatched_instruction_with_diagnostic_heat(
             loop_hint_index,
             Some(CoreOpcode::LoopHint),
             BaselineGeneratedPropertyLoadSidecarReadiness::NotPropertyLoad,
@@ -223,26 +302,26 @@ mod tests {
     }
 
     #[test]
-    fn records_site_opcode_heat_with_readiness_and_ignores_skipped_sites() {
-        let mut metrics = BaselineGeneratedExecutionMetrics::default();
+    fn diagnostic_probe_records_site_opcode_heat_with_readiness_and_ignores_skipped_sites() {
+        let mut metrics = BaselineGeneratedExecutionMetrics::diagnostic_probe();
         let bytecode_index = BytecodeIndex::from_offset(42);
 
-        metrics.record_dispatched_instruction(
+        metrics.record_dispatched_instruction_with_diagnostic_heat(
             bytecode_index,
             Some(CoreOpcode::GetByName),
             BaselineGeneratedPropertyLoadSidecarReadiness::OwnDataPlan,
         );
-        metrics.record_dispatched_instruction(
+        metrics.record_dispatched_instruction_with_diagnostic_heat(
             bytecode_index,
             Some(CoreOpcode::GetByName),
             BaselineGeneratedPropertyLoadSidecarReadiness::OwnDataPlan,
         );
-        metrics.record_dispatched_instruction(
+        metrics.record_dispatched_instruction_with_diagnostic_heat(
             bytecode_index,
             Some(CoreOpcode::GetByName),
             BaselineGeneratedPropertyLoadSidecarReadiness::GuardedPrototypeData,
         );
-        metrics.record_dispatched_instruction(
+        metrics.record_dispatched_instruction_with_diagnostic_heat(
             BytecodeIndex::from_offset(43),
             None,
             BaselineGeneratedPropertyLoadSidecarReadiness::NoLoadPlan,

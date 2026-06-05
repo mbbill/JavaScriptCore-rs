@@ -185,7 +185,8 @@ impl Vm {
                     .with_property_has_megamorphic_candidate_table(Some(
                         &megamorphic_has_candidate_table,
                     ));
-                    let mut metrics = BaselineGeneratedExecutionMetrics::default();
+                    let mut metrics =
+                        BaselineGeneratedExecutionMetrics::for_dispatch_config(config);
                     let mut local_dispatch_budget = DispatchBudget::from_config(config);
                     let dispatch_budget = self
                         .active_dispatch_budget
@@ -314,7 +315,8 @@ impl Vm {
                             &generated_direct_call_hot_slots,
                             host,
                         );
-                    let mut metrics = BaselineGeneratedExecutionMetrics::default();
+                    let mut metrics =
+                        BaselineGeneratedExecutionMetrics::for_dispatch_config(config);
                     let mut local_dispatch_budget = DispatchBudget::from_config(config);
                     let dispatch_budget = self
                         .active_dispatch_budget
@@ -380,7 +382,7 @@ impl Vm {
                 );
             }
 
-            let mut metrics = BaselineGeneratedExecutionMetrics::default();
+            let mut metrics = BaselineGeneratedExecutionMetrics::for_dispatch_config(config);
             let mut local_dispatch_budget = DispatchBudget::from_config(config);
             let dispatch_budget = self
                 .active_dispatch_budget
@@ -511,7 +513,8 @@ impl Vm {
                     .with_property_has_megamorphic_candidate_table(Some(
                         &megamorphic_has_candidate_table,
                     ));
-                    let mut metrics = BaselineGeneratedExecutionMetrics::default();
+                    let mut metrics =
+                        BaselineGeneratedExecutionMetrics::for_dispatch_config(config);
                     let mut local_dispatch_budget = DispatchBudget::from_config(config);
                     let dispatch_budget = self
                         .active_dispatch_budget
@@ -647,7 +650,8 @@ impl Vm {
                             &generated_direct_call_hot_slots,
                             host,
                         );
-                    let mut metrics = BaselineGeneratedExecutionMetrics::default();
+                    let mut metrics =
+                        BaselineGeneratedExecutionMetrics::for_dispatch_config(config);
                     let mut local_dispatch_budget = DispatchBudget::from_config(config);
                     let dispatch_budget = self
                         .active_dispatch_budget
@@ -709,7 +713,7 @@ impl Vm {
                     config,
                 );
             }
-            let mut metrics = BaselineGeneratedExecutionMetrics::default();
+            let mut metrics = BaselineGeneratedExecutionMetrics::for_dispatch_config(config);
             let mut local_dispatch_budget = DispatchBudget::from_config(config);
             let dispatch_budget = self
                 .active_dispatch_budget
