@@ -4,9 +4,11 @@ use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet};
 
 mod conservative_scan;
+mod marking;
 mod run_current_phase;
 
 pub(crate) use conservative_scan::HeapConservativeScanAppendReceipt;
+pub(crate) use marking::{HeapMarkingError, HeapMarkingRecord};
 
 use super::machine_stack_marker::JscMachineStackRootingIngestError;
 use crate::gc::{
@@ -393,6 +395,7 @@ pub struct Heap {
     object_space: MarkedSpaceDescriptor,
     requests: Vec<CollectionRequest>,
     allocations: Vec<HeapAllocationRecord>,
+    marked_cells: HashMap<CellId, HeapEpoch>,
     payload_to_cell: HashMap<usize, CellId>,
     cell_to_payload: HashMap<CellId, usize>,
     barriers: Vec<WriteBarrierApplicationRecord>,
@@ -423,6 +426,7 @@ impl Heap {
             object_space: MarkedSpaceDescriptor::new(id),
             requests: Vec::new(),
             allocations: Vec::new(),
+            marked_cells: HashMap::new(),
             payload_to_cell: HashMap::new(),
             cell_to_payload: HashMap::new(),
             barriers: Vec::new(),

@@ -50,7 +50,6 @@ pub use cell::{
 };
 pub use conservative_roots::{ConservativeRootCell, ConservativeRoots};
 pub use fast_hash::{FxIntBuildHasher, FxIntHasher};
-pub(crate) use heap::HeapConservativeScanAppendReceipt;
 pub use heap::{
     static_heap_schema_descriptor, AllocationPlan, CellArena, CellInit, ConservativeRootSpan,
     FinalizationRegistry, FinalizerId, FinalizerQueueRecord, FinalizerQueueTransitionRecord, Heap,
@@ -64,6 +63,7 @@ pub use heap::{
     WeakProcessingTransitionRecord, WeakRegistrationRecord, WeakRegistry,
     WriteBarrierApplicationRecord, WriteBarrierApplicationRequest, STATIC_HEAP_SCHEMA_DESCRIPTOR,
 };
+pub(crate) use heap::{HeapConservativeScanAppendReceipt, HeapMarkingError, HeapMarkingRecord};
 pub(crate) use machine_stack_marker::{
     JscMachineStackConservativeRootingProof, JscMachineStackMarker,
 };
@@ -116,6 +116,11 @@ pub use visitor::{
     ReferrerTokenKind, RootMarkReason, RootMarkingPlan, RootPlanStep, RootPlanningError,
     SlotVisitorConservativeRootAppendError, SlotVisitorConservativeRootAppendPlan,
     SlotVisitorConservativeRootAppendRecord, SlotVisitorDescriptor,
+};
+#[allow(unused_imports)]
+pub(crate) use visitor::{
+    SlotVisitorConservativeRootMarkingAction, SlotVisitorConservativeRootMarkingError,
+    SlotVisitorConservativeRootMarkingPlan, SlotVisitorConservativeRootMarkingRecord,
 };
 pub use weak::{
     FinalizerKind, FinalizerPlan, FinalizerPlanEntry, FinalizerPlanningError,

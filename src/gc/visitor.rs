@@ -1,5 +1,12 @@
 //! Marking worklists, slot visitors, and conservative root scan descriptors.
 
+mod conservative_marking;
+
+pub(crate) use conservative_marking::{
+    SlotVisitorConservativeRootMarkingAction, SlotVisitorConservativeRootMarkingError,
+    SlotVisitorConservativeRootMarkingPlan, SlotVisitorConservativeRootMarkingRecord,
+};
+
 use crate::gc::{
     CellId, ConservativeRootCell, ConservativeRootSpan, ConservativeRoots, GcRef, HeapEpoch,
     HeapId, JsCell, MarkReason, RootRecord, TargetedRootRecord,

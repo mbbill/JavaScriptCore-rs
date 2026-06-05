@@ -143,6 +143,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            SlotVisitor::append(ConservativeRoots) boundary, and
            src/gc/heap/conservative_scan.rs adds the heap conservative-scan
            append receipt that scopes the visitor reason locally;
+           src/gc/heap/marking.rs and src/gc/visitor/conservative_marking.rs
+           add heap-owned conservative-root test-and-set evidence plus the
+           SlotVisitor JSCell queue / Auxiliary live-note action split;
            src/vm/native_reentry.rs consumes that receipt before rejecting at
            the missing real SlotVisitor conservative-root marking blocker;
            native execution unchanged.
