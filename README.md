@@ -148,9 +148,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            SlotVisitor JSCell queue / Auxiliary live-note action split;
            src/gc/visitor/collector_effects.rs adds the SlotVisitor
            mark-stack/cell-state/container-effect proof, src/jit/stub_routines.rs
-           adds the JITStubRoutineSet may-be-executing trace proof, and
-           src/vm/native_reentry.rs consumes them before rejecting at the
-           missing verifier append / VM roots / real native-rooting blocker;
+           adds the JITStubRoutineSet may-be-executing trace proof,
+           src/vm/vm_roots.rs adds VM scratch-buffer / checkpoint side-state
+           root gather evidence, and src/vm/native_reentry.rs consumes them
+           before rejecting at the missing verifier append / real native-rooting
+           blocker;
            native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 

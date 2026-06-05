@@ -28,6 +28,7 @@ mod property_handoff;
 mod runtime;
 mod side_exit;
 mod tiering;
+mod vm_roots;
 
 use crate::api::{
     ApiProtectionOutcome, ApiProtectionRegistry, ApiProtectionRegistryError, ApiProtectionSlot,
