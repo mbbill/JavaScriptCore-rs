@@ -174,7 +174,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            before raw ARM64 dispatch, with a JSC stack-call request proof and
            stack-local padded argument storage that fills doVMEntry padding
            slots with undefined while still rejecting raw register-window
-           frame sources,
+           frame sources, and now derives plus validates the existing ARM64
+           baseline frame-materialization descriptor from that stack-call proof,
            while valid descriptors still reject before public native admission;
            native execution unchanged.
   [missing] commit-message decision log discipline for new batches

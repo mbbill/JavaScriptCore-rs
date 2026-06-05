@@ -13,6 +13,16 @@
 
 use core::marker::PhantomData;
 
+use crate::jit::arm64_baseline::{
+    produce_arm64_baseline_generated_native_frame_materialization_descriptor,
+    validate_arm64_baseline_generated_native_frame_materialization,
+    Arm64BaselineGeneratedNativeFrameMaterializationDescriptor,
+    Arm64BaselineGeneratedNativeFrameMaterializationMismatch,
+    Arm64BaselineGeneratedNativeFrameMaterializationProductionError,
+    Arm64BaselineGeneratedNativeFrameMaterializationProductionRequest,
+    Arm64BaselineGeneratedNativeFrameMaterializationValidationContext,
+    Arm64BaselineMachineStackRootSlotDescriptor,
+};
 use crate::jit::{
     BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableKind,
     BaselineNativeEntryToken, BaselineNativeEntryTokenKind,
@@ -182,6 +192,24 @@ pub(crate) enum Arm64NativeEntryJscStackCallRequestError {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Arm64NativeEntryFrameMaterializationProofError {
+    FrameTopOffsetTooLarge {
+        call_frame: FrameAddress,
+        post_allocation_sp: FrameAddress,
+    },
+    LiveLocalCountTooLarge {
+        live_local_count: usize,
+    },
+    Production {
+        error: Arm64BaselineGeneratedNativeFrameMaterializationProductionError,
+    },
+    Validation {
+        error: Arm64BaselineGeneratedNativeFrameMaterializationMismatch,
+    },
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Arm64NativeEntryLaunchProofRequest<'descriptor> {
     pub(crate) launch_descriptor: &'descriptor VmEntryLaunchDescriptor,
@@ -241,10 +269,15 @@ pub(crate) struct Arm64NativeEntryJscStackCallRequestProof {
     call_frame: FrameAddress,
     entry_frame: FrameAddress,
     vm_entry_record: FrameAddress,
+    vm_entry_record_previous_top_call_frame: Option<FrameAddress>,
+    vm_entry_record_previous_top_entry_frame: Option<FrameAddress>,
     post_allocation_sp: FrameAddress,
+    local_area_words: usize,
+    live_local_count: usize,
     frame_word_count: u32,
     frame_size_bytes: usize,
     argument_count_including_this: u32,
+    argument_count_excluding_this: u32,
     padded_argument_count: u32,
     undefined_fill_count: u32,
 }
@@ -469,13 +502,93 @@ pub(crate) fn prove_arm64_native_entry_jsc_stack_call_request(
         call_frame: stack_frame_proof.call_frame,
         entry_frame: stack_frame_proof.entry_frame,
         vm_entry_record: stack_frame_proof.vm_entry_record,
+        vm_entry_record_previous_top_call_frame: stack_frame_proof
+            .vm_entry_record_previous_top_call_frame,
+        vm_entry_record_previous_top_entry_frame: stack_frame_proof
+            .vm_entry_record_previous_top_entry_frame,
         post_allocation_sp: stack_frame_proof.post_allocation_sp,
+        local_area_words: stack_frame_proof.local_area_words,
+        live_local_count: stack_frame_proof.live_local_count,
         frame_word_count: layout_proof.frame_word_count,
         frame_size_bytes: layout_proof.frame_size_bytes,
         argument_count_including_this: layout_proof.argument_count_including_this,
+        argument_count_excluding_this: layout_proof.argument_count_excluding_this,
         padded_argument_count: layout_proof.padded_argument_count,
         undefined_fill_count: layout_proof.undefined_fill_count,
     })
+}
+
+#[allow(dead_code)]
+pub(crate) fn prove_arm64_native_entry_frame_materialization_descriptor(
+    stack_call_proof: &Arm64NativeEntryJscStackCallRequestProof,
+    live_root_slots: Vec<Arm64BaselineMachineStackRootSlotDescriptor>,
+) -> Result<
+    Arm64BaselineGeneratedNativeFrameMaterializationDescriptor,
+    Arm64NativeEntryFrameMaterializationProofError,
+> {
+    let local_area_bytes = stack_call_proof
+        .call_frame
+        .0
+        .checked_sub(stack_call_proof.post_allocation_sp.0)
+        .ok_or(
+            Arm64NativeEntryFrameMaterializationProofError::FrameTopOffsetTooLarge {
+                call_frame: stack_call_proof.call_frame,
+                post_allocation_sp: stack_call_proof.post_allocation_sp,
+            },
+        )?;
+    let frame_top_offset_bytes = isize::try_from(local_area_bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_neg())
+        .ok_or(
+            Arm64NativeEntryFrameMaterializationProofError::FrameTopOffsetTooLarge {
+                call_frame: stack_call_proof.call_frame,
+                post_allocation_sp: stack_call_proof.post_allocation_sp,
+            },
+        )?;
+    let live_local_count = u32::try_from(stack_call_proof.live_local_count).map_err(|_| {
+        Arm64NativeEntryFrameMaterializationProofError::LiveLocalCountTooLarge {
+            live_local_count: stack_call_proof.live_local_count,
+        }
+    })?;
+    let previous_top_call_frame = stack_call_proof
+        .vm_entry_record_previous_top_call_frame
+        .map(|frame| frame.0);
+    let previous_top_entry_frame = stack_call_proof
+        .vm_entry_record_previous_top_entry_frame
+        .map(|frame| frame.0);
+    let descriptor = produce_arm64_baseline_generated_native_frame_materialization_descriptor(
+        Arm64BaselineGeneratedNativeFrameMaterializationProductionRequest {
+            call_frame: stack_call_proof.call_frame.0,
+            frame_top_offset_bytes,
+            argument_count_excluding_this: stack_call_proof.argument_count_excluding_this,
+            live_local_count,
+            live_root_slots: live_root_slots.clone(),
+            vm_entry_previous_top_call_frame: previous_top_call_frame,
+            vm_entry_previous_top_entry_frame: previous_top_entry_frame,
+            published_top_entry_frame: stack_call_proof.entry_frame.0,
+        },
+    )
+    .map_err(|error| Arm64NativeEntryFrameMaterializationProofError::Production { error })?;
+    // C++ baseline entry materializes metadata from CallFrameSlot::codeBlock
+    // after AssemblyHelpers::emitFunctionPrologue establishes fp/x29 as the
+    // JSC CallFrame. Validate the produced descriptor before exposing it to the
+    // VM-entry admission proof.
+    validate_arm64_baseline_generated_native_frame_materialization(
+        &Arm64BaselineGeneratedNativeFrameMaterializationValidationContext {
+            published_top_frame: stack_call_proof.call_frame.0,
+            residency_top_frame: stack_call_proof.call_frame.0,
+            expected_argument_slots_excluding_this: stack_call_proof.argument_count_excluding_this
+                as usize,
+            expected_live_local_slots: stack_call_proof.live_local_count,
+            vm_entry_previous_top_call_frame: previous_top_call_frame,
+            vm_entry_previous_top_entry_frame: previous_top_entry_frame,
+            current_top_entry_frame: stack_call_proof.entry_frame.0,
+            residency_live_root_slots: live_root_slots,
+        },
+        &descriptor,
+    )
+    .map_err(|error| Arm64NativeEntryFrameMaterializationProofError::Validation { error })?;
+    Ok(descriptor)
 }
 
 #[allow(dead_code)]
@@ -1269,6 +1382,94 @@ mod tests {
             assert_eq!(request_proof.undefined_fill_count, 2);
             assert_eq!(request_proof.frame_word_count, 10);
             assert_eq!(request_proof.frame_size_bytes, 80);
+        })
+        .expect("padded stack-local ARM64 entry proof");
+    }
+
+    #[test]
+    fn arm64_native_entry_frame_materialization_derives_descriptor_from_stack_call_request() {
+        let descriptor = launch_descriptor();
+        let layout = do_vm_entry_layout(&descriptor);
+
+        with_arm64_native_entry_padded_stack_frame::<2, 2, 4>(request(), |stack_frame| {
+            let stack_call = prove_arm64_native_entry_jsc_stack_call_request(layout, &stack_frame)
+                .expect("padded JSC stack-call request proof");
+            let materialization =
+                prove_arm64_native_entry_frame_materialization_descriptor(&stack_call, Vec::new())
+                    .expect("ARM64 frame materialization descriptor");
+
+            assert_eq!(
+                materialization.prologue.call_frame,
+                stack_frame.call_frame.0
+            );
+            assert_eq!(
+                materialization.prologue.entry_sp,
+                stack_frame.call_frame.0 + JSC_CALLER_FRAME_AND_PC_WORDS * JSC_REGISTER_BYTES
+            );
+            assert_eq!(
+                materialization.prologue.post_push_sp,
+                stack_frame.call_frame.0
+            );
+            assert_eq!(
+                materialization.prologue.post_prologue_fp,
+                stack_frame.call_frame.0
+            );
+            assert_eq!(
+                materialization.post_frame_allocation.frame_top_offset_bytes,
+                -16
+            );
+            assert_eq!(
+                materialization.post_frame_allocation.post_allocation_sp,
+                stack_frame.post_allocation_sp.0
+            );
+            assert_eq!(materialization.header.arguments.len(), 2);
+            assert_eq!(materialization.header.live_locals.len(), 1);
+            assert_eq!(
+                materialization
+                    .entry_linkage
+                    .vm_entry_record_previous_top_call_frame,
+                Some(0x3000)
+            );
+            assert_eq!(
+                materialization
+                    .entry_linkage
+                    .vm_entry_record_previous_top_entry_frame,
+                Some(0x4000)
+            );
+            assert_eq!(
+                materialization.entry_linkage.published_top_call_frame,
+                stack_frame.call_frame.0
+            );
+            assert_eq!(
+                materialization.entry_linkage.published_top_entry_frame,
+                stack_frame.entry_frame.0
+            );
+            assert!(!materialization.materialized_registers.is_empty());
+            assert!(materialization.live_root_slots.is_empty());
+        })
+        .expect("padded stack-local ARM64 entry proof");
+    }
+
+    #[test]
+    fn arm64_native_entry_frame_materialization_rejects_inverted_stack_extent() {
+        let descriptor = launch_descriptor();
+        let layout = do_vm_entry_layout(&descriptor);
+
+        with_arm64_native_entry_padded_stack_frame::<2, 2, 4>(request(), |stack_frame| {
+            let mut stack_call =
+                prove_arm64_native_entry_jsc_stack_call_request(layout, &stack_frame)
+                    .expect("padded JSC stack-call request proof");
+            stack_call.post_allocation_sp = FrameAddress(stack_call.call_frame.0 + 16);
+
+            assert_eq!(
+                prove_arm64_native_entry_frame_materialization_descriptor(&stack_call, Vec::new()),
+                Err(
+                    Arm64NativeEntryFrameMaterializationProofError::FrameTopOffsetTooLarge {
+                        call_frame: stack_call.call_frame,
+                        post_allocation_sp: stack_call.post_allocation_sp,
+                    },
+                )
+            );
         })
         .expect("padded stack-local ARM64 entry proof");
     }
