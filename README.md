@@ -119,9 +119,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            request carries/validates that proof metadata; platform now has a
            private normal-return-only ARM64 JSC-stack trampoline that restores
            the Rust C ABI envelope, but public admission remains blocked on
-           turning descriptor rooting/prologue proofs into real conservative
-           stack visibility, final admission authority, and exception/unwind
-           restore support)
+           turning descriptor collector/rooting/prologue proofs into real
+           conservative stack visibility, final admission authority, and
+           exception/unwind restore support)
     [done] VM ARM64 public-admission proof now consumes stack-local
            top-frame publication from
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
@@ -137,6 +137,13 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            admission, which now reaches MissingVmRootGatherProof only after the
            stack span covers the published top CallFrame and roots match the
            append receipt.
+    [done] VM ARM64 SlotVisitor conservative-root marking admission stage now
+           requires a proof produced by replaying the conservative-scan append
+           receipt through SlotVisitorConservativeRootAppendPlan::
+           mark_conservative_roots(&mut Heap); caller-supplied raw marking
+           plans no longer progress public ARM64 admission, which still rejects
+           at MissingRealCollectorMarkStackCellStateAndContainerProof after a
+           valid VM-root gather plus heap-produced marking proof.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of

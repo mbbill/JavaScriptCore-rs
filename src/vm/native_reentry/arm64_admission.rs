@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use crate::bytecode::{BytecodeIndex, CodeBlock, CoreOpcode};
 use crate::gc::{
     HeapConservativeScanAppendReceipt, SlotVisitorCollectorEffectsPlan,
-    SlotVisitorConservativeRootMarkingPlan, VerifierSlotVisitorConservativeRootAppendProof,
+    VerifierSlotVisitorConservativeRootAppendProof,
 };
 use crate::jit::arm64_baseline::Arm64BaselineGeneratedNativeFrameMaterializationMismatch;
 use crate::jit::{
@@ -39,7 +39,8 @@ use super::rooting::{
     P6Arm64MachineStackConservativeRootingProof,
     P6Arm64MachineStackConservativeRootingProofMismatch,
     P6Arm64NativeFrameMachineStackResidencyProof,
-    P6Arm64NativeFrameMachineStackResidencyProofMismatch, P6Arm64VerifierAppendProofMismatch,
+    P6Arm64NativeFrameMachineStackResidencyProofMismatch,
+    P6Arm64SlotVisitorConservativeRootMarkingProof, P6Arm64VerifierAppendProofMismatch,
     P6Arm64VmRootGatherProofMismatch,
 };
 
@@ -169,7 +170,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         mismatch: P6Arm64ConservativeRootMarkingProofMismatch,
     },
     MissingRealCollectorMarkStackCellStateAndContainerProof {
@@ -177,14 +178,14 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
     },
     CollectorEffectsProofMismatch {
         top_call_frame_publication:
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         mismatch: P6Arm64CollectorEffectsProofMismatch,
     },
@@ -193,7 +194,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
     },
     VerifierAppendProofMismatch {
@@ -201,7 +202,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
         mismatch: P6Arm64VerifierAppendProofMismatch,
@@ -211,7 +212,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
     },
@@ -220,7 +221,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
@@ -231,7 +232,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
@@ -241,7 +242,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
@@ -253,7 +254,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
@@ -992,11 +993,15 @@ mod frame_materialization_tests;
 mod arm64_rooting_admission_tests;
 
 #[cfg(test)]
+#[path = "arm64_marking_admission_tests.rs"]
+mod arm64_marking_admission_tests;
+
+#[cfg(test)]
 pub(super) mod tests {
     use super::super::rooting::{
         P6Arm64MachineStackConservativeRootingProof, P6Arm64NativeFrameMachineStackSpanKind,
         P6Arm64NativeFrameMachineStackSpanRecord, P6Arm64NativeRootSlotKind,
-        P6Arm64NativeRootSlotRecord,
+        P6Arm64NativeRootSlotRecord, P6Arm64SlotVisitorConservativeRootMarkingProof,
     };
     use super::*;
     use std::convert::Infallible;
@@ -1007,12 +1012,12 @@ pub(super) mod tests {
         UnlinkedCodeBlock, VirtualRegister,
     };
     use crate::gc::{
-        AllocationMode, CellMetadata, CellState, ConservativeRootCell, ConservativeRootSpan,
+        AllocationMode, CellMetadata, ConservativeRootCell, ConservativeRootSpan,
         ConservativeRoots, GcConductor, GcPhase, Heap, HeapAllocationRequest,
         HeapConservativeScanAppendReceipt, HeapEpoch, HeapId, HeapStateDescriptor,
         JscMachineStackMarker, MarkWorklistId, MutatorState, RootMarkReason,
-        SlotVisitorCollectorEffectAction, SlotVisitorConservativeRootMarkingAction,
-        SlotVisitorDescriptor, VerifierSlotVisitorConservativeRootAppendError,
+        SlotVisitorCollectorEffectAction, SlotVisitorDescriptor,
+        VerifierSlotVisitorConservativeRootAppendError,
         VerifierSlotVisitorConservativeRootAppendProof, VerifierSlotVisitorDescriptor,
     };
     use crate::jit::{
@@ -1321,7 +1326,8 @@ pub(super) mod tests {
         )
     }
 
-    fn heap_with_conservative_scan_append_receipt() -> (Heap, HeapConservativeScanAppendReceipt) {
+    pub(super) fn heap_with_conservative_scan_append_receipt(
+    ) -> (Heap, HeapConservativeScanAppendReceipt) {
         let mut heap = Heap::new();
         let cell = heap
             .allocate_record(HeapAllocationRequest {
@@ -1362,38 +1368,18 @@ pub(super) mod tests {
         (heap, receipt)
     }
 
-    fn conservative_root_marking_proof() -> (
-        HeapConservativeScanAppendReceipt,
-        SlotVisitorConservativeRootMarkingPlan,
-    ) {
-        let (mut heap, receipt) = heap_with_conservative_scan_append_receipt();
-        let marking_plan = receipt
-            .append_plan
-            .clone()
-            .mark_conservative_roots(&mut heap)
-            .expect("slot visitor conservative-root marking plan");
-
-        assert_eq!(marking_plan.heap, receipt.heap);
-        assert_eq!(marking_plan.marking_epoch, receipt.epoch);
-        assert_eq!(marking_plan.records.len(), receipt.appended_record_count);
-        assert_eq!(
-            marking_plan.records[0].append_record,
-            receipt.append_plan.records[0]
-        );
-        (receipt, marking_plan)
-    }
-
     pub(super) fn conservative_root_marking_and_collector_effects_proof() -> (
         HeapConservativeScanAppendReceipt,
-        SlotVisitorConservativeRootMarkingPlan,
+        P6Arm64SlotVisitorConservativeRootMarkingProof,
         SlotVisitorCollectorEffectsPlan,
     ) {
         let (mut heap, receipt) = heap_with_conservative_scan_append_receipt();
-        let marking_plan = receipt
-            .append_plan
-            .clone()
-            .mark_conservative_roots(&mut heap)
+        let marking_proof =
+            P6Arm64SlotVisitorConservativeRootMarkingProof::from_conservative_scan_append_receipt(
+                &receipt, &mut heap,
+            )
             .expect("slot visitor conservative-root marking plan");
+        let marking_plan = marking_proof.marking_plan();
         let collector_effects_plan = marking_plan
             .clone()
             .apply_collector_effects(&mut heap)
@@ -1408,7 +1394,7 @@ pub(super) mod tests {
             collector_effects_plan.records[0].marking_record,
             marking_plan.records[0]
         );
-        (receipt, marking_plan, collector_effects_plan)
+        (receipt, marking_proof, collector_effects_plan)
     }
 
     fn jit_stub_routine(
@@ -1495,8 +1481,9 @@ pub(super) mod tests {
     }
 
     pub(super) fn verifier_append_proof(
-        marking_plan: &SlotVisitorConservativeRootMarkingPlan,
+        marking_proof: &P6Arm64SlotVisitorConservativeRootMarkingProof,
     ) -> VerifierSlotVisitorConservativeRootAppendProof {
+        let marking_plan = marking_proof.marking_plan();
         let mut verifier =
             VerifierSlotVisitorDescriptor::new(marking_plan.heap, marking_plan.marking_epoch);
         verifier.worklist = MarkWorklistId(707);
@@ -1630,7 +1617,7 @@ pub(super) mod tests {
         >,
         machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
@@ -1656,7 +1643,7 @@ pub(super) mod tests {
         pub(super) machine_stack_conservative_rooting_proof:
             P6Arm64MachineStackConservativeRootingProof,
         pub(super) vm_root_gather_plan: VmRootGatherPlan,
-        pub(super) conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        pub(super) conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         pub(super) collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         pub(super) verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
         pub(super) jit_stub_trace_plan: JitStubRoutineTracePlan,
@@ -2473,189 +2460,6 @@ pub(super) mod tests {
                 }
             )
         );
-        });
-    }
-
-    #[test]
-    fn public_arm64_branch_aware_admission_rejects_inconsistent_conservative_root_marking_proof() {
-        let code_block = jump_if_false_code_block(4);
-        let site = jump_if_false_site();
-        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
-        with_stack_top_call_frame_publication(|top_call_frame_publication| {
-            let mut request = valid_request(&side_exits);
-            let (conservative_scan_append_receipt, mut conservative_root_marking_plan) =
-                conservative_root_marking_proof();
-            conservative_root_marking_plan.records.clear();
-            let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
-            let machine_stack_conservative_rooting_proof =
-                machine_stack_conservative_rooting_proof_from_marker(
-                    top_call_frame_publication,
-                    &conservative_scan_append_receipt,
-                );
-
-            request.fallback_rooting_proof =
-                P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
-                    top_call_frame_publication,
-                    machine_stack_conservative_rooting_proof,
-                    vm_root_gather_plan: vm_root_gather_plan.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                };
-
-            assert_eq!(
-                p6_arm64_public_branch_aware_callable_admission_proof(&request),
-                Err(
-                    P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
-                        top_call_frame_publication,
-                        conservative_scan_append_receipt,
-                        vm_root_gather_plan,
-                        conservative_root_marking_plan,
-                        mismatch:
-                            P6Arm64ConservativeRootMarkingProofMismatch::MarkingRecordCountMismatch {
-                                receipt: 1,
-                                marking: 0,
-                            },
-                    }
-                )
-            );
-        });
-    }
-
-    #[test]
-    fn public_arm64_branch_aware_admission_rejects_inconsistent_conservative_root_marking_record() {
-        let code_block = jump_if_false_code_block(4);
-        let site = jump_if_false_site();
-        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
-        with_stack_top_call_frame_publication(|top_call_frame_publication| {
-            let mut request = valid_request(&side_exits);
-            let (conservative_scan_append_receipt, mut conservative_root_marking_plan) =
-                conservative_root_marking_proof();
-            let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
-            let machine_stack_conservative_rooting_proof =
-                machine_stack_conservative_rooting_proof_from_marker(
-                    top_call_frame_publication,
-                    &conservative_scan_append_receipt,
-                );
-            let marking_cell = CellId(0xdead);
-            conservative_root_marking_plan.records[0].heap_marking.cell = marking_cell;
-
-            request.fallback_rooting_proof =
-                P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
-                    top_call_frame_publication,
-                    machine_stack_conservative_rooting_proof,
-                    vm_root_gather_plan: vm_root_gather_plan.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                };
-
-            assert_eq!(
-                p6_arm64_public_branch_aware_callable_admission_proof(&request),
-                Err(
-                    P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
-                        top_call_frame_publication,
-                        conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                        vm_root_gather_plan,
-                        conservative_root_marking_plan,
-                        mismatch:
-                            P6Arm64ConservativeRootMarkingProofMismatch::HeapMarkingCellMismatch {
-                                order: 0,
-                                append: conservative_scan_append_receipt.append_plan.records[0].cell,
-                                marking: marking_cell,
-                            },
-                    }
-                )
-            );
-        });
-    }
-
-    #[test]
-    fn public_arm64_branch_aware_admission_rejects_inconsistent_conservative_root_marking_action() {
-        let code_block = jump_if_false_code_block(4);
-        let site = jump_if_false_site();
-        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
-        with_stack_top_call_frame_publication(|top_call_frame_publication| {
-            let mut request = valid_request(&side_exits);
-            let (conservative_scan_append_receipt, mut conservative_root_marking_plan) =
-                conservative_root_marking_proof();
-            let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
-            let machine_stack_conservative_rooting_proof =
-                machine_stack_conservative_rooting_proof_from_marker(
-                    top_call_frame_publication,
-                    &conservative_scan_append_receipt,
-                );
-            conservative_root_marking_plan.records[0].action =
-                SlotVisitorConservativeRootMarkingAction::AlreadyMarked;
-
-            request.fallback_rooting_proof =
-                P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
-                    top_call_frame_publication,
-                    machine_stack_conservative_rooting_proof,
-                    vm_root_gather_plan: vm_root_gather_plan.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                };
-
-            assert_eq!(
-                p6_arm64_public_branch_aware_callable_admission_proof(&request),
-                Err(
-                    P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
-                        top_call_frame_publication,
-                        conservative_scan_append_receipt,
-                        vm_root_gather_plan,
-                        conservative_root_marking_plan,
-                        mismatch:
-                            P6Arm64ConservativeRootMarkingProofMismatch::MarkingActionMismatch {
-                                order: 0,
-                                expected: SlotVisitorConservativeRootMarkingAction::QueueJsCell {
-                                    cell_state: CellState::PossiblyGrey,
-                                    worklist: MarkWorklistId::default(),
-                                },
-                                actual: SlotVisitorConservativeRootMarkingAction::AlreadyMarked,
-                            },
-                    }
-                )
-            );
-        });
-    }
-
-    #[test]
-    fn public_arm64_branch_aware_admission_rejects_inconsistent_conservative_root_marking_totals() {
-        let code_block = jump_if_false_code_block(4);
-        let site = jump_if_false_site();
-        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
-        with_stack_top_call_frame_publication(|top_call_frame_publication| {
-            let mut request = valid_request(&side_exits);
-            let (conservative_scan_append_receipt, mut conservative_root_marking_plan) =
-                conservative_root_marking_proof();
-            let vm_root_gather_plan = vm_root_gather_proof(&conservative_scan_append_receipt);
-            let machine_stack_conservative_rooting_proof =
-                machine_stack_conservative_rooting_proof_from_marker(
-                    top_call_frame_publication,
-                    &conservative_scan_append_receipt,
-                );
-            conservative_root_marking_plan.queued_js_cell_count = 0;
-
-            request.fallback_rooting_proof =
-                P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
-                    top_call_frame_publication,
-                    machine_stack_conservative_rooting_proof,
-                    vm_root_gather_plan: vm_root_gather_plan.clone(),
-                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                };
-
-            assert_eq!(
-                p6_arm64_public_branch_aware_callable_admission_proof(&request),
-                Err(
-                    P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
-                        top_call_frame_publication,
-                        conservative_scan_append_receipt,
-                        vm_root_gather_plan,
-                        conservative_root_marking_plan,
-                        mismatch:
-                            P6Arm64ConservativeRootMarkingProofMismatch::QueuedJsCellCountMismatch {
-                                expected: 1,
-                                actual: 0,
-                            },
-                    }
-                )
-            );
         });
     }
 

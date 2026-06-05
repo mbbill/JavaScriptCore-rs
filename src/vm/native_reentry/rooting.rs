@@ -7,18 +7,19 @@
 //! an admission `Ok` path, verifier mark-map storage, verifier drain, or real
 //! native rooting.
 
-use core::marker::PhantomData;
+use core::{marker::PhantomData, ops::Deref};
 
 use crate::gc::{
     CellId, CellState, ConservativeRootCell, ConservativeRootSpan, ConservativeRoots, GcPhase,
-    HeapCellKind, HeapConservativeScanAppendReceipt, HeapEpoch, HeapId,
+    Heap, HeapCellKind, HeapConservativeScanAppendReceipt, HeapEpoch, HeapId,
     JscMachineStackConservativeRootingProof, JscMachineStackRootSpanKind, MarkDependency,
     MarkWorklistId, MutatorState, RootMarkReason, SlotVisitorAppendToMarkStackRecord,
     SlotVisitorCollectorEffectAction, SlotVisitorCollectorEffectsPlan,
     SlotVisitorConservativeRootAppendRecord, SlotVisitorConservativeRootMarkingAction,
-    SlotVisitorConservativeRootMarkingPlan, SlotVisitorContainerNoteMarkedRecord,
-    SlotVisitorNoteLiveAuxiliaryCellRecord, VerifierSlotVisitorConservativeRootAppendError,
-    VerifierSlotVisitorConservativeRootAppendPlan, VerifierSlotVisitorConservativeRootAppendProof,
+    SlotVisitorConservativeRootMarkingError, SlotVisitorConservativeRootMarkingPlan,
+    SlotVisitorContainerNoteMarkedRecord, SlotVisitorNoteLiveAuxiliaryCellRecord,
+    VerifierSlotVisitorConservativeRootAppendError, VerifierSlotVisitorConservativeRootAppendPlan,
+    VerifierSlotVisitorConservativeRootAppendProof,
 };
 use crate::jit::arm64_baseline::{
     produce_arm64_baseline_generated_native_frame_materialization_descriptor,
@@ -159,6 +160,40 @@ impl P6Arm64MachineStackConservativeRootingProof {
         &self,
     ) -> &HeapConservativeScanAppendReceipt {
         &self.conservative_scan_append_receipt
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) struct P6Arm64SlotVisitorConservativeRootMarkingProof {
+    // C++ `SlotVisitor::append(ConservativeRoots)` performs marking through the
+    // visitor and heap. Rust admission must not accept a caller-supplied marking
+    // plan as equivalent evidence, so this proof can only be built by replaying
+    // the conservative-scan append plan against the live `Heap`.
+    marking_plan: SlotVisitorConservativeRootMarkingPlan,
+}
+
+impl P6Arm64SlotVisitorConservativeRootMarkingProof {
+    #[allow(dead_code)]
+    pub(in crate::vm) fn from_conservative_scan_append_receipt(
+        receipt: &HeapConservativeScanAppendReceipt,
+        heap: &mut Heap,
+    ) -> Result<Self, SlotVisitorConservativeRootMarkingError> {
+        Ok(Self {
+            marking_plan: receipt.append_plan.clone().mark_conservative_roots(heap)?,
+        })
+    }
+
+    pub(in crate::vm) fn marking_plan(&self) -> &SlotVisitorConservativeRootMarkingPlan {
+        &self.marking_plan
+    }
+}
+
+impl Deref for P6Arm64SlotVisitorConservativeRootMarkingProof {
+    type Target = SlotVisitorConservativeRootMarkingPlan;
+
+    fn deref(&self) -> &Self::Target {
+        self.marking_plan()
     }
 }
 
@@ -338,14 +373,14 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
     },
     TopCallFramePublicationWithVmRootGatherAndCollectorEffectsPlan {
         top_call_frame_publication:
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
     },
     TopCallFramePublicationWithVmRootGatherCollectorEffectsAndVerifierAppendProof {
@@ -353,7 +388,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
     },
@@ -362,7 +397,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
@@ -373,7 +408,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
         vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
