@@ -20,6 +20,7 @@ pub(crate) mod integration;
 pub(crate) mod machine;
 pub(crate) mod plan;
 pub(crate) mod semantics;
+pub(crate) mod stub_routines;
 pub(crate) mod tiering;
 pub(crate) mod watchpoint;
 
@@ -205,6 +206,12 @@ pub use plan::{
 };
 pub use plan::{CompilationPlan, CompilationPlanId, CompilationPlanState, JitPlanHost};
 pub use semantics::EffectSummary;
+pub use stub_routines::{
+    GcAwareJitStubRoutineDescriptor, JitStubRoutineCandidateAddress,
+    JitStubRoutineConservativeScanPlan, JitStubRoutineMarkRecord,
+    JitStubRoutineRequiredObjectEdgeRecord, JitStubRoutineSetDescriptor, JitStubRoutineTraceError,
+    JitStubRoutineTracePlan, JitStubRoutineTraceRecord,
+};
 pub use tiering::{
     select_tier_plan, BaselineTierPlan, OptimizingTierPlan, OsrState, StaticTierDescriptor,
     TierCounters, TierDescriptorMutationAuthority, TierDescriptorOwner, TierDescriptorTable,
