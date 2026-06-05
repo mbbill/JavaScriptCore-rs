@@ -144,6 +144,12 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            plans no longer progress public ARM64 admission, which still rejects
            at MissingRealCollectorMarkStackCellStateAndContainerProof after a
            valid VM-root gather plus heap-produced marking proof.
+    [done] VM ARM64 SlotVisitor collector-effects admission stage now requires
+           a proof produced by replaying the heap-produced marking proof through
+           SlotVisitorConservativeRootMarkingPlan::apply_collector_effects(&mut
+           Heap); caller-supplied raw collector effects no longer progress
+           public ARM64 admission, which still rejects at
+           MissingVerifierAppendAndJitStubTracingProof.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of

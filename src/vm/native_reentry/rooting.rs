@@ -14,12 +14,12 @@ use crate::gc::{
     Heap, HeapCellKind, HeapConservativeScanAppendReceipt, HeapEpoch, HeapId,
     JscMachineStackConservativeRootingProof, JscMachineStackRootSpanKind, MarkDependency,
     MarkWorklistId, MutatorState, RootMarkReason, SlotVisitorAppendToMarkStackRecord,
-    SlotVisitorCollectorEffectAction, SlotVisitorCollectorEffectsPlan,
-    SlotVisitorConservativeRootAppendRecord, SlotVisitorConservativeRootMarkingAction,
-    SlotVisitorConservativeRootMarkingError, SlotVisitorConservativeRootMarkingPlan,
-    SlotVisitorContainerNoteMarkedRecord, SlotVisitorNoteLiveAuxiliaryCellRecord,
-    VerifierSlotVisitorConservativeRootAppendError, VerifierSlotVisitorConservativeRootAppendPlan,
-    VerifierSlotVisitorConservativeRootAppendProof,
+    SlotVisitorCollectorEffectAction, SlotVisitorCollectorEffectsError,
+    SlotVisitorCollectorEffectsPlan, SlotVisitorConservativeRootAppendRecord,
+    SlotVisitorConservativeRootMarkingAction, SlotVisitorConservativeRootMarkingError,
+    SlotVisitorConservativeRootMarkingPlan, SlotVisitorContainerNoteMarkedRecord,
+    SlotVisitorNoteLiveAuxiliaryCellRecord, VerifierSlotVisitorConservativeRootAppendError,
+    VerifierSlotVisitorConservativeRootAppendPlan, VerifierSlotVisitorConservativeRootAppendProof,
 };
 use crate::jit::arm64_baseline::{
     produce_arm64_baseline_generated_native_frame_materialization_descriptor,
@@ -194,6 +194,44 @@ impl Deref for P6Arm64SlotVisitorConservativeRootMarkingProof {
 
     fn deref(&self) -> &Self::Target {
         self.marking_plan()
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) struct P6Arm64SlotVisitorCollectorEffectsProof {
+    // C++ `SlotVisitor::appendJSCellOrAuxiliary` mutates JSCell state, notes
+    // containers, and appends to the collector stack after `Heap::testAndSetMarked`.
+    // Rust admission must not accept a caller-supplied collector-effects plan as
+    // equivalent evidence, so this proof can only be built by replaying the
+    // prior heap-produced marking proof against the live `Heap`.
+    collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+}
+
+impl P6Arm64SlotVisitorCollectorEffectsProof {
+    #[allow(dead_code)]
+    pub(in crate::vm) fn from_conservative_root_marking_proof(
+        marking_proof: &P6Arm64SlotVisitorConservativeRootMarkingProof,
+        heap: &mut Heap,
+    ) -> Result<Self, SlotVisitorCollectorEffectsError> {
+        Ok(Self {
+            collector_effects_plan: marking_proof
+                .marking_plan()
+                .clone()
+                .apply_collector_effects(heap)?,
+        })
+    }
+
+    pub(in crate::vm) fn collector_effects_plan(&self) -> &SlotVisitorCollectorEffectsPlan {
+        &self.collector_effects_plan
+    }
+}
+
+impl Deref for P6Arm64SlotVisitorCollectorEffectsProof {
+    type Target = SlotVisitorCollectorEffectsPlan;
+
+    fn deref(&self) -> &Self::Target {
+        self.collector_effects_plan()
     }
 }
 
@@ -381,7 +419,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
     },
     TopCallFramePublicationWithVmRootGatherCollectorEffectsAndVerifierAppendProof {
         top_call_frame_publication:
@@ -389,7 +427,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
     },
     TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierAppendAndJitStubTracePlan {
@@ -398,7 +436,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
     },
@@ -409,7 +447,7 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
         native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
