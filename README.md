@@ -168,6 +168,12 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            proof plus matching residency evidence; raw descriptor attachments no
            longer progress public ARM64 admission, which now reaches
            MissingArm64JscStackDispatchAdmissionAuthority.
+    [done] VM ARM64 public-admission prior-stage validation helper extracted to
+           src/vm/native_reentry/arm64_admission_prior_stage.rs (maps JSC
+           VM-entry top-frame publication, ConservativeRoots / SlotVisitor /
+           verifier append, JIT-stub trace, native-frame residency, and ARM64
+           prologue materialization; behavior unchanged, admission still rejects
+           at MissingArm64JscStackDispatchAdmissionAuthority).
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of
