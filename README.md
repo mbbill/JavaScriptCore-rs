@@ -167,7 +167,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            CallFrame header, x25-x28 materialization, live root slots, and
            VMEntryRecord linkage; src/jit/arm64_baseline/frame_materialization_producer.rs
            now produces the descriptor from top-frame publication / machine-stack
-           residency proof; src/vm/arm64_native_entry.rs now validates the
+           residency proof using the actual CallFrame argument count rather
+           than padded storage; src/vm/arm64_native_entry.rs now validates the
            selected VmEntryLaunchDescriptor / normal ARM64 token against the
            C++ doVMEntry active-frame and StackAlignment.h padded-argument
            shape and derives the doVMEntry stack CallFrame slot/size proof

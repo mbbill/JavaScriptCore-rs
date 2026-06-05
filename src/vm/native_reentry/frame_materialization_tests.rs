@@ -42,3 +42,44 @@ fn public_arm64_branch_aware_admission_keeps_valid_materialized_frame_descriptor
         )
     );
 }
+
+#[test]
+fn arm64_materialized_frame_descriptor_uses_actual_argument_count_not_padding() {
+    let code_block = tests::jump_if_false_code_block(4);
+    let site = tests::jump_if_false_site();
+    let side_exits = [tests::branch_aware_side_exit_proof(&code_block, &site)];
+    let mut request = tests::valid_request(&side_exits);
+    let mut fixture = tests::native_frame_residency_fixture();
+    fixture
+        .top_call_frame_publication
+        .publication
+        .call_frame
+        .argument_count_including_this = 3;
+    fixture
+        .top_call_frame_publication
+        .publication
+        .call_frame
+        .provided_argument_count = 2;
+    fixture
+        .top_call_frame_publication
+        .publication
+        .call_frame
+        .padded_argument_count = 5;
+    attach_materialization_descriptor_to_fixture(&mut fixture);
+
+    let descriptor = fixture
+        .native_frame_residency_proof
+        .generated_native_frame_materialization
+        .as_ref()
+        .expect("attached frame materialization descriptor");
+    assert_eq!(descriptor.header.arguments.len(), 2);
+    assert_eq!(descriptor.header.live_locals.len(), 1);
+
+    request.fallback_rooting_proof = fixture.fallback();
+    assert_eq!(
+        p6_arm64_public_branch_aware_callable_admission_proof(&request),
+        Err(
+            P6Arm64BranchAwareCallableAdmissionRejection::Arm64GeneratedNativeFrameMaterializationProofAcceptedButPublicAdmissionBlocked
+        )
+    );
+}

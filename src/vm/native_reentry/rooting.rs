@@ -190,7 +190,7 @@ impl P6Arm64NativeFrameMachineStackResidencyProof {
                 argument_count_excluding_this: top_call_frame_publication
                     .publication
                     .call_frame
-                    .padded_argument_count
+                    .argument_count_including_this
                     .saturating_sub(1),
                 live_local_count: expected_live_local_slots,
                 live_root_slots,
@@ -1408,7 +1408,7 @@ pub(super) fn validate_p6_arm64_generated_native_frame_materialization_proof(
         expected_argument_slots_excluding_this: top_call_frame_publication
             .publication
             .call_frame
-            .padded_argument_count
+            .argument_count_including_this
             .saturating_sub(1) as usize,
         expected_live_local_slots,
         vm_entry_previous_top_call_frame: top_call_frame_publication
