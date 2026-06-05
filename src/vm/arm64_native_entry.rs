@@ -13,7 +13,16 @@
 
 use core::marker::PhantomData;
 
-use super::entry::FrameAddress;
+use crate::jit::{
+    BaselineNativeEntryCallableAuthority, BaselineNativeEntryCallableKind,
+    BaselineNativeEntryToken, BaselineNativeEntryTokenKind,
+};
+use crate::runtime::{CallFrameId, CodeBlockId, EntryFrameId};
+
+use super::entry::{
+    BaselineNativeDispatchTokenSelection, FrameAddress, VmEntryDispatchSelection,
+    VmEntryLaunchDescriptor,
+};
 
 const JSC_REGISTER_BYTES: usize = 8;
 const JSC_STACK_ALIGNMENT_BYTES: usize = 16;
@@ -59,6 +68,70 @@ pub(crate) enum Arm64NativeEntryStackFrameError {
     NonStackLocalAddressSource {
         source: Arm64NativeEntryFrameAddressSource,
     },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Arm64NativeEntryLaunchProofError {
+    UnsupportedCallableKind {
+        actual: BaselineNativeEntryCallableKind,
+    },
+    DispatchSelectionNotNormalEntry,
+    CallableTokenMismatch {
+        expected: BaselineNativeEntryToken,
+        actual: BaselineNativeEntryToken,
+    },
+    NativeDescriptorTokenMismatch {
+        expected: BaselineNativeEntryToken,
+        actual: BaselineNativeEntryToken,
+    },
+    SelectedTokenKindMismatch {
+        actual: BaselineNativeEntryTokenKind,
+    },
+    MissingActiveEntryFrame,
+    MissingActiveTopCallFrame,
+    ActiveTopFrameMismatch {
+        expected: CallFrameId,
+        actual: CallFrameId,
+    },
+    EntryCodeBlockMismatch {
+        expected: CodeBlockId,
+        actual: Option<CodeBlockId>,
+    },
+    TopFrameCodeBlockMismatch {
+        expected: CodeBlockId,
+        actual: Option<CodeBlockId>,
+    },
+    TopFrameEntryMismatch {
+        expected: EntryFrameId,
+        actual: Option<EntryFrameId>,
+    },
+    ArgumentCountDoesNotIncludeThis,
+    PaddedArgumentCountTooSmall {
+        argument_count_including_this: u32,
+        padded_argument_count: u32,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Arm64NativeEntryLaunchProofRequest<'descriptor> {
+    pub(crate) launch_descriptor: &'descriptor VmEntryLaunchDescriptor,
+    pub(crate) callable_kind: BaselineNativeEntryCallableKind,
+    pub(crate) callable_token: BaselineNativeEntryToken,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Arm64NativeEntryLaunchProof {
+    owner: CodeBlockId,
+    code_block: CodeBlockId,
+    active_entry_frame: EntryFrameId,
+    active_top_call_frame: CallFrameId,
+    selected_token: BaselineNativeEntryToken,
+    argument_count_excluding_this: u32,
+    padded_argument_count: u32,
+    required_frame_source: Arm64NativeEntryFrameAddressSource,
 }
 
 #[allow(dead_code)]
@@ -141,6 +214,127 @@ pub(crate) struct Arm64NativeEntryStackFrameProof<'frame> {
     live_local_count: usize,
     argument_count_excluding_this: usize,
     _stack_frame: PhantomData<&'frame ()>,
+}
+
+#[allow(dead_code)]
+pub(crate) fn prove_arm64_native_entry_launch_descriptor_for_callable(
+    launch_descriptor: &VmEntryLaunchDescriptor,
+    callable: BaselineNativeEntryCallableAuthority,
+) -> Result<Arm64NativeEntryLaunchProof, Arm64NativeEntryLaunchProofError> {
+    prove_arm64_native_entry_launch_descriptor(Arm64NativeEntryLaunchProofRequest {
+        launch_descriptor,
+        callable_kind: callable.kind(),
+        callable_token: callable.token(),
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn prove_arm64_native_entry_launch_descriptor(
+    request: Arm64NativeEntryLaunchProofRequest<'_>,
+) -> Result<Arm64NativeEntryLaunchProof, Arm64NativeEntryLaunchProofError> {
+    if request.callable_kind != BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry {
+        return Err(Arm64NativeEntryLaunchProofError::UnsupportedCallableKind {
+            actual: request.callable_kind,
+        });
+    }
+
+    let descriptor = request.launch_descriptor;
+    let selected_token = match descriptor.dispatch {
+        VmEntryDispatchSelection::BaselineNative(
+            BaselineNativeDispatchTokenSelection::NormalEntry { token },
+        ) => token,
+        VmEntryDispatchSelection::BaselineNative(_) => {
+            return Err(Arm64NativeEntryLaunchProofError::DispatchSelectionNotNormalEntry);
+        }
+    };
+    if selected_token != request.callable_token {
+        return Err(Arm64NativeEntryLaunchProofError::CallableTokenMismatch {
+            expected: selected_token,
+            actual: request.callable_token,
+        });
+    }
+    if selected_token != descriptor.native_entry.normal_entry {
+        return Err(
+            Arm64NativeEntryLaunchProofError::NativeDescriptorTokenMismatch {
+                expected: descriptor.native_entry.normal_entry,
+                actual: selected_token,
+            },
+        );
+    }
+    if selected_token.kind != BaselineNativeEntryTokenKind::Normal {
+        return Err(
+            Arm64NativeEntryLaunchProofError::SelectedTokenKindMismatch {
+                actual: selected_token.kind,
+            },
+        );
+    }
+
+    let active_entry_frame = descriptor
+        .scope
+        .active_entry_frame
+        .ok_or(Arm64NativeEntryLaunchProofError::MissingActiveEntryFrame)?;
+    let active_top_call_frame = descriptor
+        .scope
+        .active_top_call_frame
+        .ok_or(Arm64NativeEntryLaunchProofError::MissingActiveTopCallFrame)?;
+    if descriptor.call_frame.frame != active_top_call_frame {
+        return Err(Arm64NativeEntryLaunchProofError::ActiveTopFrameMismatch {
+            expected: active_top_call_frame,
+            actual: descriptor.call_frame.frame,
+        });
+    }
+    if descriptor.scope.entry_code_block != Some(descriptor.owner) {
+        return Err(Arm64NativeEntryLaunchProofError::EntryCodeBlockMismatch {
+            expected: descriptor.owner,
+            actual: descriptor.scope.entry_code_block,
+        });
+    }
+    if descriptor.call_frame.code_block != Some(descriptor.code_block) {
+        return Err(
+            Arm64NativeEntryLaunchProofError::TopFrameCodeBlockMismatch {
+                expected: descriptor.code_block,
+                actual: descriptor.call_frame.code_block,
+            },
+        );
+    }
+    if descriptor.call_frame.entry_frame != Some(active_entry_frame) {
+        return Err(Arm64NativeEntryLaunchProofError::TopFrameEntryMismatch {
+            expected: active_entry_frame,
+            actual: descriptor.call_frame.entry_frame,
+        });
+    }
+    if descriptor.call_frame.argument_count_including_this == 0 {
+        return Err(Arm64NativeEntryLaunchProofError::ArgumentCountDoesNotIncludeThis);
+    }
+    if descriptor.call_frame.padded_argument_count
+        < descriptor.call_frame.argument_count_including_this
+    {
+        return Err(
+            Arm64NativeEntryLaunchProofError::PaddedArgumentCountTooSmall {
+                argument_count_including_this: descriptor.call_frame.argument_count_including_this,
+                padded_argument_count: descriptor.call_frame.padded_argument_count,
+            },
+        );
+    }
+
+    Ok(Arm64NativeEntryLaunchProof {
+        owner: descriptor.owner,
+        code_block: descriptor.code_block,
+        active_entry_frame,
+        active_top_call_frame,
+        selected_token,
+        argument_count_excluding_this: descriptor
+            .call_frame
+            .argument_count_including_this
+            .saturating_sub(1),
+        padded_argument_count: descriptor.call_frame.padded_argument_count,
+        // C++ `doVMEntry` materializes a machine-stack CallFrame and publishes
+        // that address as VM::topCallFrame. Rust still calls the temporary ARM64
+        // raw-register C ABI in production; this proof records the required
+        // future stack source without treating that register window as valid
+        // JSC frame residency.
+        required_frame_source: Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard,
+    })
 }
 
 #[allow(dead_code)]
@@ -351,7 +545,24 @@ fn validate_addresses(
 
 #[cfg(test)]
 mod tests {
+    use super::super::entry::{
+        VmEntryCallFrameMetadata, VmEntryLaunchArgumentValue, VmEntryLaunchScope,
+    };
+    use super::super::tiering::{
+        BaselineEntryGateOutcome, BaselineEntryGateRecord, BaselineNativeEntryExecutionPolicy,
+        BaselineNativeEntryReadinessOutcome, BaselineNativeEntryReadinessRecord,
+    };
     use super::*;
+    use crate::gc::CellId;
+    use crate::jit::code::BaselineEntryArtifact;
+    use crate::jit::{
+        CodeFinalizationAuthority, CodeLiveness, CodeOrigin, CodeOriginKind, CodeOwnership,
+        EntryAbi, Entrypoint, EntrypointKind, ExecutableAllocationId,
+        ExecutableAllocationLifecycle, ExecutableMemoryProtection, ExecutableMutationAuthority,
+        JitCodeArtifact, JitCodeId, JitType, MachineCodeHandle, MachineCodeOwnership,
+        MachineCodeRange,
+    };
+    use crate::runtime::{ArityCheckMode, CodeSpecializationKind, NativeCodeId, RuntimeValue};
 
     fn request() -> Arm64NativeEntryStackFrameRequest<2> {
         Arm64NativeEntryStackFrameRequest {
@@ -364,6 +575,124 @@ mod tests {
             this_value: 0x7000,
             arguments: [0x8000, 0x9000],
             live_local_count: 1,
+        }
+    }
+
+    fn launch_descriptor() -> VmEntryLaunchDescriptor {
+        let owner = CodeBlockId(CellId(20));
+        let artifact = baseline_entry_artifact(owner, 20);
+        let descriptor = artifact
+            .validate_native_entry_descriptor()
+            .expect("native entry descriptor");
+        let readiness = BaselineNativeEntryReadinessRecord {
+            ordinal: 7,
+            owner,
+            materialization_ordinal: 1,
+            install_ordinal: 2,
+            artifact_id: Some(artifact.id),
+            native_code: Some(artifact.native_code),
+            machine_code: Some(artifact.machine_code),
+            machine_range: Some(artifact.machine_code.range),
+            bytecode_snapshot: None,
+            body_capability: None,
+            execution_policy: BaselineNativeEntryExecutionPolicy::Enabled,
+            descriptor: Some(descriptor),
+            callable: None,
+            outcome: BaselineNativeEntryReadinessOutcome::Ready,
+        };
+        let gate = BaselineEntryGateRecord {
+            owner,
+            requested_tier: JitType::Baseline,
+            native_artifact: Some(artifact),
+            native_entry_readiness_ordinal: Some(readiness.ordinal),
+            generated_artifact: None,
+            outcome: BaselineEntryGateOutcome::NativeEntryReady,
+        };
+        VmEntryLaunchDescriptor::baseline_native_entry(
+            launch_scope(owner),
+            launch_call_frame(owner),
+            gate,
+            &readiness,
+        )
+        .expect("valid ARM64 launch descriptor")
+    }
+
+    fn launch_scope(owner: CodeBlockId) -> VmEntryLaunchScope {
+        VmEntryLaunchScope {
+            owner,
+            entry_code_block: Some(owner),
+            active_entry_frame: Some(EntryFrameId(1)),
+            previous_entry_frame: None,
+            saved_top_call_frame: None,
+            active_top_call_frame: Some(CallFrameId(2)),
+        }
+    }
+
+    fn launch_call_frame(owner: CodeBlockId) -> VmEntryCallFrameMetadata {
+        VmEntryCallFrameMetadata {
+            frame: CallFrameId(2),
+            entry_frame: Some(EntryFrameId(1)),
+            caller_frame: Some(CallFrameId(1)),
+            code_block: Some(owner),
+            callee: None,
+            callee_value: None,
+            context: None,
+            global_object: None,
+            entry_value: VmEntryLaunchArgumentValue::This(RuntimeValue::from_i32(41)),
+            argument_count_including_this: 3,
+            provided_argument_count: 2,
+            padded_argument_count: 4,
+            specialization: CodeSpecializationKind::Call,
+            arity_mode: ArityCheckMode::AlreadyChecked,
+        }
+    }
+
+    fn baseline_entry_artifact(owner: CodeBlockId, id: u64) -> BaselineEntryArtifact {
+        baseline_artifact(owner, id)
+            .validate_baseline_entry_artifact(owner)
+            .expect("baseline entry artifact")
+    }
+
+    fn baseline_artifact(owner: CodeBlockId, id: u64) -> JitCodeArtifact {
+        let code = JitCodeId(id);
+        let native_code = NativeCodeId(id as u32 + 100);
+        let allocation = ExecutableAllocationId(id + 200);
+        JitCodeArtifact {
+            id: code,
+            tier: JitType::Baseline,
+            origin: CodeOrigin {
+                kind: CodeOriginKind::BaselineCodeBlock,
+                owner: Some(owner),
+                executable: None,
+                bytecode_index: Some(0),
+            },
+            ownership: CodeOwnership::CodeBlockOwned,
+            native_code: Some(native_code),
+            machine_code: Some(MachineCodeHandle {
+                allocation,
+                owner: MachineCodeOwnership::CodeBlock(owner),
+                range: MachineCodeRange {
+                    allocation,
+                    start_offset: 0,
+                    size_bytes: 64,
+                },
+                symbol: Some(native_code),
+                protection: ExecutableMemoryProtection::Executable,
+                lifecycle: ExecutableAllocationLifecycle::LinkedExecutable,
+                mutation_authority: ExecutableMutationAuthority::LinkBuffer,
+            }),
+            entrypoint: Entrypoint {
+                kind: EntrypointKind::GeneratedCode,
+                abi: EntryAbi::GeneratedCode,
+                code: Some(code),
+                boundary: None,
+            },
+            patchpoints: Vec::new(),
+            dependencies: Vec::new(),
+            byproducts: Vec::new(),
+            disassembly: None,
+            liveness: CodeLiveness::Live,
+            finalization_authority: CodeFinalizationAuthority::MainThread,
         }
     }
 
@@ -487,6 +816,81 @@ mod tests {
                     entry_frame: 0x3000,
                 }
             )
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_launch_proof_accepts_normal_arm64_descriptor() {
+        let descriptor = launch_descriptor();
+        let proof =
+            prove_arm64_native_entry_launch_descriptor(Arm64NativeEntryLaunchProofRequest {
+                launch_descriptor: &descriptor,
+                callable_kind: BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
+                callable_token: descriptor.native_entry.normal_entry,
+            })
+            .expect("ARM64 launch proof");
+
+        assert_eq!(proof.owner, descriptor.owner);
+        assert_eq!(proof.code_block, descriptor.code_block);
+        assert_eq!(proof.active_entry_frame, EntryFrameId(1));
+        assert_eq!(proof.active_top_call_frame, CallFrameId(2));
+        assert_eq!(proof.argument_count_excluding_this, 2);
+        assert_eq!(proof.padded_argument_count, 4);
+        assert_eq!(
+            proof.required_frame_source,
+            Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_launch_proof_rejects_non_arm64_callable_kind() {
+        let descriptor = launch_descriptor();
+        assert_eq!(
+            prove_arm64_native_entry_launch_descriptor(Arm64NativeEntryLaunchProofRequest {
+                launch_descriptor: &descriptor,
+                callable_kind: BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry,
+                callable_token: descriptor.native_entry.normal_entry,
+            }),
+            Err(Arm64NativeEntryLaunchProofError::UnsupportedCallableKind {
+                actual: BaselineNativeEntryCallableKind::P6X86_64EmittedSemanticCAbiEntry,
+            })
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_launch_proof_rejects_arity_dispatch() {
+        let mut descriptor = launch_descriptor();
+        descriptor.dispatch = VmEntryDispatchSelection::BaselineNative(
+            BaselineNativeDispatchTokenSelection::ArityCheckUnavailable {
+                reason: crate::jit::BaselineArityCheckUnavailableReason::NotEmitted,
+            },
+        );
+
+        assert_eq!(
+            prove_arm64_native_entry_launch_descriptor(Arm64NativeEntryLaunchProofRequest {
+                launch_descriptor: &descriptor,
+                callable_kind: BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
+                callable_token: descriptor.native_entry.normal_entry,
+            }),
+            Err(Arm64NativeEntryLaunchProofError::DispatchSelectionNotNormalEntry)
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_launch_proof_rejects_top_frame_mismatch() {
+        let mut descriptor = launch_descriptor();
+        descriptor.call_frame.frame = CallFrameId(99);
+
+        assert_eq!(
+            prove_arm64_native_entry_launch_descriptor(Arm64NativeEntryLaunchProofRequest {
+                launch_descriptor: &descriptor,
+                callable_kind: BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
+                callable_token: descriptor.native_entry.normal_entry,
+            }),
+            Err(Arm64NativeEntryLaunchProofError::ActiveTopFrameMismatch {
+                expected: CallFrameId(2),
+                actual: CallFrameId(99),
+            })
         );
     }
 }

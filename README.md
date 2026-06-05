@@ -167,8 +167,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            CallFrame header, x25-x28 materialization, live root slots, and
            VMEntryRecord linkage; src/jit/arm64_baseline/frame_materialization_producer.rs
            now produces the descriptor from top-frame publication / machine-stack
-           residency proof, while valid descriptors still reject before public
-           native admission;
+           residency proof; src/vm/arm64_native_entry.rs now validates the
+           selected VmEntryLaunchDescriptor / normal ARM64 token against the
+           C++ doVMEntry active-frame and argument shape before raw ARM64
+           dispatch, while valid descriptors still reject before public native
+           admission;
            native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 

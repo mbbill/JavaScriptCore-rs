@@ -5848,6 +5848,11 @@ impl Vm {
                         descriptor: &descriptor,
                         allow_interpreter_fallback,
                     },
+                    arm64_native_entry::prove_arm64_native_entry_launch_descriptor_for_callable(
+                        &launch_descriptor,
+                        callable,
+                    )
+                    .ok()?,
                     host,
                     config,
                 ),
@@ -5918,6 +5923,7 @@ impl Vm {
         &mut self,
         code_block: &CodeBlock,
         dispatch: P6EmittedNativeDispatch<'_>,
+        _launch_proof: arm64_native_entry::Arm64NativeEntryLaunchProof,
         host: &mut H,
         config: DispatchConfig,
     ) -> BaselineNativeEntryVmExecution {
