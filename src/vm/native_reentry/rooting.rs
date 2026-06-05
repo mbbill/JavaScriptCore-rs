@@ -19,9 +19,12 @@ use crate::gc::{
     VerifierSlotVisitorConservativeRootAppendPlan, VerifierSlotVisitorConservativeRootAppendProof,
 };
 use crate::jit::arm64_baseline::{
+    produce_arm64_baseline_generated_native_frame_materialization_descriptor,
     validate_arm64_baseline_generated_native_frame_materialization,
     Arm64BaselineGeneratedNativeFrameMaterializationDescriptor,
     Arm64BaselineGeneratedNativeFrameMaterializationMismatch,
+    Arm64BaselineGeneratedNativeFrameMaterializationProductionError,
+    Arm64BaselineGeneratedNativeFrameMaterializationProductionRequest,
     Arm64BaselineGeneratedNativeFrameMaterializationValidationContext,
     Arm64BaselineLiveRootSlotKind, Arm64BaselineMachineStackRootSlotDescriptor,
     Arm64BaselineMachineStackSpanKind,
@@ -147,6 +150,75 @@ impl P6Arm64NativeFrameMachineStackResidencyProof {
             generated_native_frame_materialization: None,
         }
     }
+
+    #[allow(dead_code)]
+    pub(in crate::vm) fn with_generated_native_frame_materialization(
+        mut self,
+        top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        frame_top_offset_bytes: isize,
+        expected_live_local_slots: u32,
+    ) -> Result<Self, P6Arm64GeneratedNativeFrameMaterializationAttachError> {
+        let live_root_slots = self
+            .slot_records
+            .iter()
+            .enumerate()
+            .map(|(order, slot)| {
+                let span = containing_span_for_word_slot(
+                    &self.machine_stack_spans,
+                    slot.slot_address,
+                )
+                .ok_or(
+                    P6Arm64GeneratedNativeFrameMaterializationAttachError::LiveRootSlotSpanMissing {
+                        order,
+                        slot_address: slot.slot_address,
+                    },
+                )?;
+                Ok(Arm64BaselineMachineStackRootSlotDescriptor {
+                    kind: slot.kind.into(),
+                    slot_address: slot.slot_address,
+                    encoded_payload: slot.encoded_payload,
+                    expected_root: slot.expected_root,
+                    containing_span: slot.containing_span.into(),
+                    span,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let descriptor = produce_arm64_baseline_generated_native_frame_materialization_descriptor(
+            Arm64BaselineGeneratedNativeFrameMaterializationProductionRequest {
+                call_frame: top_call_frame_publication.publication.published_top_frame.0,
+                frame_top_offset_bytes,
+                argument_count_excluding_this: top_call_frame_publication
+                    .publication
+                    .call_frame
+                    .padded_argument_count
+                    .saturating_sub(1),
+                live_local_count: expected_live_local_slots,
+                live_root_slots,
+                vm_entry_previous_top_call_frame: top_call_frame_publication
+                    .publication
+                    .vm_entry_previous_top_call_frame
+                    .map(|frame| frame.0),
+                vm_entry_previous_top_entry_frame: top_call_frame_publication
+                    .publication
+                    .vm_entry_previous_top_entry_frame
+                    .map(|frame| frame.0),
+                published_top_entry_frame: top_call_frame_publication
+                    .publication
+                    .current_entry_frame
+                    .0,
+            },
+        )
+        .map_err(P6Arm64GeneratedNativeFrameMaterializationAttachError::Producer)?;
+        self.generated_native_frame_materialization = Some(descriptor);
+        Ok(self)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) enum P6Arm64GeneratedNativeFrameMaterializationAttachError {
+    LiveRootSlotSpanMissing { order: usize, slot_address: usize },
+    Producer(Arm64BaselineGeneratedNativeFrameMaterializationProductionError),
 }
 
 #[allow(dead_code)]

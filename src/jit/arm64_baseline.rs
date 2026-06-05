@@ -284,6 +284,7 @@ pub(crate) mod register_contract {
 
 mod control_flow;
 mod frame_materialization;
+mod frame_materialization_producer;
 
 pub(crate) use frame_materialization::{
     validate_arm64_baseline_generated_native_frame_materialization,
@@ -294,12 +295,11 @@ pub(crate) use frame_materialization::{
     Arm64BaselineMachineStackSpanKind,
 };
 #[cfg(test)]
-pub(crate) use frame_materialization::{
-    Arm64BaselineCallFrameHeaderDescriptor, Arm64BaselineEntryLinkageDescriptor,
-    Arm64BaselineFrameAddressSource, Arm64BaselineFrameMaterializationTerminalPolicy,
-    Arm64BaselineFramePointerSource, Arm64BaselineJscPrologueDescriptor,
-    Arm64BaselineMaterializedRegisterDescriptor, Arm64BaselineMaterializedRegisterSource,
-    Arm64BaselinePostFrameAllocationDescriptor,
+pub(crate) use frame_materialization::{JSC_REGISTER_BYTES, JSC_STACK_ALIGNMENT_BYTES};
+pub(crate) use frame_materialization_producer::{
+    produce_arm64_baseline_generated_native_frame_materialization_descriptor,
+    Arm64BaselineGeneratedNativeFrameMaterializationProductionError,
+    Arm64BaselineGeneratedNativeFrameMaterializationProductionRequest,
 };
 
 fn encode_p6_arm64_callable_return_seed_selection(

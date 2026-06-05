@@ -165,8 +165,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            materialization blocker; src/jit/arm64_baseline/frame_materialization.rs
            adds the descriptor/validator proof boundary for JSC ARM64 prologue,
            CallFrame header, x25-x28 materialization, live root slots, and
-           VMEntryRecord linkage, while valid descriptors still reject before
-           public native admission;
+           VMEntryRecord linkage; src/jit/arm64_baseline/frame_materialization_producer.rs
+           now produces the descriptor from top-frame publication / machine-stack
+           residency proof, while valid descriptors still reject before public
+           native admission;
            native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
@@ -281,6 +283,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            the existing prepared x86 semantic/generated artifact path; capped richards moves
            hot native misses to HostBlockedX86_64; next native admission work must first
            produce C++-shaped ARM64 native frame materialization before broadening opcode bytes
+    [done] ARM64 generated native frame descriptor producer: converts top-frame publication
+           and machine-stack residency evidence into the JSC-shaped ARM64 frame descriptor;
+           public branch-aware admission still rejects valid descriptors until real execution
+           can publish/scavenge the generated native frame
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
   [wip] arrays and indexed storage
