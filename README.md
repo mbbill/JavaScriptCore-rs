@@ -287,6 +287,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            and machine-stack residency evidence into the JSC-shaped ARM64 frame descriptor;
            public branch-aware admission still rejects valid descriptors until real execution
            can publish/scavenge the generated native frame
+    [done] ARM64 JSC-shaped native-entry stack skeleton: new VM module models
+           the LLInt EntryFrame/VMEntryRecord plus stack CallFrame ordering and
+           keeps boxed storage / register-file windows distinct from admissible
+           stack-local entry evidence; public admission remains blocked
     [missing] full CallLinkInfo/function executable fidelity
     [missing] constructor and new-target breadth audit
   [wip] arrays and indexed storage
