@@ -34,6 +34,8 @@ use super::entry::{
     VmEntryDispatchSelection, VmEntryLaunchDescriptor, JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS,
 };
 
+mod jsc_stack_dispatch;
+
 const JSC_REGISTER_BYTES: usize = 8;
 const JSC_STACK_ALIGNMENT_BYTES: usize = 16;
 const JSC_CALLER_FRAME_AND_PC_WORDS: usize = 2;

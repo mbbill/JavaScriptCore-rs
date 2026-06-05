@@ -110,6 +110,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            src/jit/arm64_baseline/entry_prologue.rs (maps
            AssemblyHelpers::emitFunctionPrologue / emitFunctionEpilogue plus
            LLInt makeJavaScriptCall; live raw C ABI seed bytes unchanged)
+    [done] VM/platform ARM64 JSC stack dispatch request proof added to
+           src/vm/arm64_native_entry/jsc_stack_dispatch.rs and
+           ExecutableMemoryArm64JscStackCallRequest (derives
+           sp=CallFrame+CallerFrameAndPC from stack-call proof; platform
+           trampoline still deferred)
     [done] JIT ARM64 dormant virtual-register frame materialization helpers and
            private JumpIfFalse branch-aware callable encoder skeleton added to
            src/jit/arm64_baseline.rs (public branch-aware callable emission

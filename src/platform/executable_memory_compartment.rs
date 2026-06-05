@@ -63,6 +63,34 @@ pub struct ExecutableMemoryP6CallRequest {
     pub ic_store_base: NonNull<c_void>,
 }
 
+/// Request shape for a future ARM64 JSC stack-call trampoline.
+///
+/// C++ `LowLevelInterpreter64.asm` `_llint_call_javascript` enters generated
+/// code with `sp = CallFrame + sizeof(CallerFrameAndPC)`. The generated ARM64
+/// prologue then pushes `fp/lr`, making `fp/x29` equal the callee `CallFrame*`.
+/// This request carries that checked stack-entry pointer; it is not the current
+/// raw Rust register-window C ABI frame pointer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutableMemoryArm64JscStackCallRequest {
+    pub entry_offset: u32,
+    pub entry_sp: NonNull<c_void>,
+    pub call_frame: NonNull<c_void>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutableMemoryArm64JscStackCallRequestValidationError {
+    CallFrameUnaligned {
+        call_frame: usize,
+    },
+    EntryStackPointerOverflow {
+        call_frame: usize,
+    },
+    EntryStackPointerMismatch {
+        expected_entry_sp: usize,
+        actual_entry_sp: usize,
+    },
+}
+
 /// Request to invoke a result-seeded P9 owner post-call reentry stub.
 ///
 /// `result_bits` is passed as the third C-ABI argument so the reentry stub can
@@ -219,6 +247,52 @@ impl ExecutableMemoryP6CallRequest {
             callee_value_bits,
             ic_store_base,
         }
+    }
+}
+
+impl ExecutableMemoryArm64JscStackCallRequest {
+    pub const CALLER_FRAME_AND_PC_BYTES: usize = 16;
+    pub const STACK_ALIGNMENT_BYTES: usize = 16;
+
+    pub const fn new(
+        entry_offset: u32,
+        entry_sp: NonNull<c_void>,
+        call_frame: NonNull<c_void>,
+    ) -> Self {
+        Self {
+            entry_offset,
+            entry_sp,
+            call_frame,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), ExecutableMemoryArm64JscStackCallRequestValidationError> {
+        let call_frame = self.call_frame.as_ptr() as usize;
+        if call_frame % Self::STACK_ALIGNMENT_BYTES != 0 {
+            return Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::CallFrameUnaligned {
+                    call_frame,
+                },
+            );
+        }
+        let Some(expected_entry_sp) = call_frame.checked_add(Self::CALLER_FRAME_AND_PC_BYTES)
+        else {
+            return Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::EntryStackPointerOverflow {
+                    call_frame,
+                },
+            );
+        };
+        let actual_entry_sp = self.entry_sp.as_ptr() as usize;
+        if actual_entry_sp != expected_entry_sp {
+            return Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::EntryStackPointerMismatch {
+                    expected_entry_sp,
+                    actual_entry_sp,
+                },
+            );
+        }
+        Ok(())
     }
 }
 
@@ -856,6 +930,49 @@ mod tests {
     #[cfg(all(unix, target_arch = "x86_64"))]
     fn opaque_test_ptr() -> NonNull<c_void> {
         NonNull::<u8>::dangling().cast()
+    }
+
+    fn non_null_addr(address: usize) -> NonNull<c_void> {
+        NonNull::new(address as *mut c_void).expect("non-null test address")
+    }
+
+    #[test]
+    fn arm64_jsc_stack_call_request_validates_call_frame_relative_entry_sp() {
+        let request = ExecutableMemoryArm64JscStackCallRequest::new(
+            12,
+            non_null_addr(0x2010),
+            non_null_addr(0x2000),
+        );
+        assert_eq!(request.validate(), Ok(()));
+
+        let mismatch = ExecutableMemoryArm64JscStackCallRequest::new(
+            12,
+            non_null_addr(0x2018),
+            non_null_addr(0x2000),
+        );
+        assert_eq!(
+            mismatch.validate(),
+            Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::EntryStackPointerMismatch {
+                    expected_entry_sp: 0x2010,
+                    actual_entry_sp: 0x2018,
+                }
+            )
+        );
+
+        let unaligned = ExecutableMemoryArm64JscStackCallRequest::new(
+            12,
+            non_null_addr(0x2018),
+            non_null_addr(0x2008),
+        );
+        assert_eq!(
+            unaligned.validate(),
+            Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::CallFrameUnaligned {
+                    call_frame: 0x2008,
+                }
+            )
+        );
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]
