@@ -183,6 +183,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            requires a verified wrapper tying JSC stack-dispatch proof to the
            stack-local publication exit record; public admission now reaches
            MissingArm64VmEntryExceptionUnwindRestorationAuthority.
+    [done] VM ARM64 VM-entry exception/unwind restoration admission stage now
+           requires descriptor proof for both caught catch-dispatch restore and
+           uncaught VMEntryRecord previous-top restore; public admission now
+           reaches MissingArm64PublicJscStackDispatchExecutionAuthority.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of

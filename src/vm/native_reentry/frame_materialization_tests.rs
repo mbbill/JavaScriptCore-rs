@@ -1,6 +1,18 @@
 use super::super::super::arm64_native_entry::Arm64NativeEntryJscStackDispatchRequestError;
 use super::super::super::entry::FrameAddress;
+use super::super::arm64_exception_unwind::{
+    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof,
+    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofError,
+    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofMismatch,
+    P6Arm64VmEntryCalleeSaveBufferRestorationRecord,
+    P6Arm64VmEntryCaughtExceptionDispatchRestorationRecord, P6Arm64VmEntryExceptionHandlerTarget,
+    P6Arm64VmEntryExceptionHandlerTargetKind,
+    P6Arm64VmEntryExceptionUnwindRestorationLinkageMismatch,
+    P6Arm64VmEntryExceptionUnwindStagingRecord,
+    P6Arm64VmEntryUncaughtExceptionEntryRestorationRecord,
+};
 use super::super::arm64_vm_entry_normal_return::{
+    P6Arm64VerifiedVmEntryNormalReturnRestorationProof,
     P6Arm64VerifiedVmEntryNormalReturnRestorationProofError,
     P6Arm64VerifiedVmEntryNormalReturnRestorationProofMismatch,
     P6Arm64VmEntryNormalReturnRestorationLinkageMismatch,
@@ -14,11 +26,13 @@ use super::super::rooting::{
 };
 use super::tests;
 use super::*;
+use crate::bytecode::BytecodeIndex;
 use crate::jit::arm64_baseline::{
     Arm64BaselineGeneratedNativeFrameMaterializationMismatch, JSC_REGISTER_BYTES,
     JSC_STACK_ALIGNMENT_BYTES,
 };
 use crate::jit::{BaselineNativeEntryTokenKind, EntryAbi, ExecutableMemoryProtection};
+use crate::runtime::NativeCodeId;
 
 fn attach_materialization_descriptor_to_fixture(
     fixture: &mut tests::NativeFrameResidencyFixture<'_>,
@@ -52,6 +66,117 @@ fn assert_missing_verified_generated_materialization(
         result,
         Err(P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64GeneratedNativeFrameMaterializationProof { .. })
     ));
+}
+
+fn caught_exception_dispatch_restore_record(
+    normal_return_restoration_proof: &P6Arm64VerifiedVmEntryNormalReturnRestorationProof<'_>,
+) -> P6Arm64VmEntryCaughtExceptionDispatchRestorationRecord {
+    let dispatch = normal_return_restoration_proof
+        .jsc_stack_dispatch_request_proof()
+        .jsc_stack_dispatch_request_proof();
+    let materialization = normal_return_restoration_proof
+        .jsc_stack_dispatch_request_proof()
+        .generated_native_frame_materialization_proof()
+        .materialization_descriptor();
+    P6Arm64VmEntryCaughtExceptionDispatchRestorationRecord {
+        staging: P6Arm64VmEntryExceptionUnwindStagingRecord {
+            call_frame_for_catch: dispatch.call_frame,
+            target_machine_pc_for_throw: P6Arm64VmEntryExceptionHandlerTarget {
+                kind: P6Arm64VmEntryExceptionHandlerTargetKind::LlIntOpCatch,
+                address: NativeCodeId(701),
+            },
+            target_machine_pc_after_catch: Some(P6Arm64VmEntryExceptionHandlerTarget {
+                kind: P6Arm64VmEntryExceptionHandlerTargetKind::DispatchAndCatch,
+                address: NativeCodeId(702),
+            }),
+            target_interpreter_pc_for_throw: Some(BytecodeIndex::from_offset(12)),
+            target_interpreter_metadata_pc_for_throw: Some(0x1230),
+            target_try_depth_for_throw: 2,
+        },
+        callee_save_restore: P6Arm64VmEntryCalleeSaveBufferRestorationRecord {
+            buffer: dispatch.vm_entry_record_callee_save_buffer,
+            register_count: dispatch.vm_entry_record_callee_save_register_count,
+            buffer_bytes: dispatch.vm_entry_record_callee_save_buffer_bytes,
+        },
+        reconstructed_catch_sp: FrameAddress(
+            materialization.post_frame_allocation.post_allocation_sp,
+        ),
+        pending_exception_cleared: true,
+        catchable_exception_retrieved: true,
+        exception_operand_store_frame: dispatch.call_frame,
+        thrown_value_operand_store_frame: dispatch.call_frame,
+        catch_profile_recorded: true,
+        dispatches_after_catch: true,
+    }
+}
+
+fn uncaught_exception_entry_restore_record(
+    normal_return_restoration_proof: &P6Arm64VerifiedVmEntryNormalReturnRestorationProof<'_>,
+) -> P6Arm64VmEntryUncaughtExceptionEntryRestorationRecord {
+    let dispatch = normal_return_restoration_proof
+        .jsc_stack_dispatch_request_proof()
+        .jsc_stack_dispatch_request_proof();
+    let exit_record = normal_return_restoration_proof.normal_return_exit_record();
+    P6Arm64VmEntryUncaughtExceptionEntryRestorationRecord {
+        staging: P6Arm64VmEntryExceptionUnwindStagingRecord {
+            call_frame_for_catch: dispatch.call_frame,
+            target_machine_pc_for_throw: P6Arm64VmEntryExceptionHandlerTarget {
+                kind: P6Arm64VmEntryExceptionHandlerTargetKind::LlIntHandleUncaughtException,
+                address: NativeCodeId(801),
+            },
+            target_machine_pc_after_catch: None,
+            target_interpreter_pc_for_throw: None,
+            target_interpreter_metadata_pc_for_throw: None,
+            target_try_depth_for_throw: 0,
+        },
+        callee_save_restore: P6Arm64VmEntryCalleeSaveBufferRestorationRecord {
+            buffer: dispatch.vm_entry_record_callee_save_buffer,
+            register_count: dispatch.vm_entry_record_callee_save_register_count,
+            buffer_bytes: dispatch.vm_entry_record_callee_save_buffer_bytes,
+        },
+        top_entry_frame_loaded: exit_record.closed_publication.top_entry_frame,
+        vm_entry_record: exit_record.closed_publication.vm_entry_record,
+        restored_top_call_frame: exit_record.restored_top_call_frame,
+        restored_top_entry_frame: exit_record.restored_top_entry_frame,
+        call_frame_for_catch_cleared: true,
+        returned_undefined: true,
+    }
+}
+
+fn verified_exception_unwind_restoration_proof_from_normal_return<'publication>(
+    normal_return_restoration_proof: P6Arm64VerifiedVmEntryNormalReturnRestorationProof<
+        'publication,
+    >,
+) -> Result<
+    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof<'publication>,
+    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofError,
+> {
+    let caught = caught_exception_dispatch_restore_record(&normal_return_restoration_proof);
+    let uncaught = uncaught_exception_entry_restore_record(&normal_return_restoration_proof);
+    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof::from_exception_unwind_restoration_records(
+        normal_return_restoration_proof,
+        caught,
+        uncaught,
+    )
+}
+
+fn full_exception_unwind_restoration_fallback<'publication>(
+    fixture: &tests::NativeFrameResidencyFixture<'publication>,
+    vm_entry_exception_unwind_restoration_proof:
+        P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof<'publication>,
+) -> P6Arm64BranchAwareCallableFallbackRootingProof<'publication> {
+    P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceVmEntryNormalReturnAndExceptionUnwindRestorationProof {
+        top_call_frame_publication: fixture.top_call_frame_publication,
+        machine_stack_conservative_rooting_proof: fixture
+            .machine_stack_conservative_rooting_proof
+            .clone(),
+        vm_root_gather_plan: fixture.vm_root_gather_plan.clone(),
+        conservative_root_marking_plan: fixture.conservative_root_marking_plan.clone(),
+        collector_effects_plan: fixture.collector_effects_plan.clone(),
+        verifier_append_proof: fixture.verifier_append_proof.clone(),
+        jit_stub_trace_plan: fixture.jit_stub_trace_plan.clone(),
+        vm_entry_exception_unwind_restoration_proof,
+    }
 }
 
 #[test]
@@ -262,6 +387,396 @@ fn public_arm64_branch_aware_admission_reaches_exception_unwind_blocker_after_no
                         verifier_append_proof: fixture.verifier_append_proof.clone(),
                         jit_stub_trace_plan: fixture.jit_stub_trace_plan.clone(),
                         vm_entry_normal_return_restoration_proof: normal_return_restoration_proof,
+                    }
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn public_arm64_branch_aware_admission_reaches_public_jsc_stack_dispatch_execution_blocker_after_exception_unwind_restoration(
+) {
+    let code_block = tests::jump_if_false_code_block(4);
+    let site = tests::jump_if_false_site();
+    let side_exits = [tests::branch_aware_side_exit_proof(&code_block, &site)];
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+
+            let mut request = tests::valid_request(&side_exits);
+            request.fallback_rooting_proof = full_exception_unwind_restoration_fallback(
+                &fixture,
+                exception_unwind_restoration_proof.clone(),
+            );
+
+            assert_eq!(
+                p6_arm64_public_branch_aware_callable_admission_proof(&request),
+                Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64PublicJscStackDispatchExecutionAuthority {
+                        top_call_frame_publication: fixture.top_call_frame_publication,
+                        conservative_scan_append_receipt: fixture.conservative_scan_append_receipt.clone(),
+                        vm_root_gather_plan: fixture.vm_root_gather_plan.clone(),
+                        conservative_root_marking_plan: fixture.conservative_root_marking_plan.clone(),
+                        collector_effects_plan: fixture.collector_effects_plan.clone(),
+                        verifier_append_proof: fixture.verifier_append_proof.clone(),
+                        jit_stub_trace_plan: fixture.jit_stub_trace_plan.clone(),
+                        vm_entry_exception_unwind_restoration_proof:
+                            exception_unwind_restoration_proof,
+                    }
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_exception_unwind_wrapper_rejects_forged_caught_restore_record() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let mut caught =
+                caught_exception_dispatch_restore_record(&normal_return_restoration_proof);
+            caught.pending_exception_cleared = false;
+            let uncaught =
+                uncaught_exception_entry_restore_record(&normal_return_restoration_proof);
+
+            assert_eq!(
+                P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof::from_exception_unwind_restoration_records(
+                    normal_return_restoration_proof,
+                    caught,
+                    uncaught,
+                ),
+                Err(
+                    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofError::Linkage(
+                        P6Arm64VmEntryExceptionUnwindRestorationLinkageMismatch::CaughtPendingExceptionNotCleared,
+                    )
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_exception_unwind_wrapper_rejects_zero_caught_handler_targets() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+
+            let mut caught =
+                caught_exception_dispatch_restore_record(&normal_return_restoration_proof);
+            caught.staging.target_machine_pc_for_throw.address = NativeCodeId::default();
+            let uncaught =
+                uncaught_exception_entry_restore_record(&normal_return_restoration_proof);
+            assert_eq!(
+                P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof::from_exception_unwind_restoration_records(
+                    normal_return_restoration_proof.clone(),
+                    caught,
+                    uncaught,
+                ),
+                Err(
+                    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofError::Linkage(
+                        P6Arm64VmEntryExceptionUnwindRestorationLinkageMismatch::CaughtTargetAddressZero,
+                    )
+                )
+            );
+
+            let mut caught =
+                caught_exception_dispatch_restore_record(&normal_return_restoration_proof);
+            caught
+                .staging
+                .target_machine_pc_after_catch
+                .as_mut()
+                .expect("fixture has dispatch-and-catch target")
+                .address = NativeCodeId::default();
+            let uncaught =
+                uncaught_exception_entry_restore_record(&normal_return_restoration_proof);
+            assert_eq!(
+                P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof::from_exception_unwind_restoration_records(
+                    normal_return_restoration_proof,
+                    caught,
+                    uncaught,
+                ),
+                Err(
+                    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofError::Linkage(
+                        P6Arm64VmEntryExceptionUnwindRestorationLinkageMismatch::CaughtDispatchAndCatchTargetAddressZero,
+                    )
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_exception_unwind_wrapper_rejects_forged_uncaught_restore_record() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let caught = caught_exception_dispatch_restore_record(&normal_return_restoration_proof);
+            let mut uncaught =
+                uncaught_exception_entry_restore_record(&normal_return_restoration_proof);
+            uncaught.returned_undefined = false;
+
+            assert_eq!(
+                P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof::from_exception_unwind_restoration_records(
+                    normal_return_restoration_proof,
+                    caught,
+                    uncaught,
+                ),
+                Err(
+                    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofError::Linkage(
+                        P6Arm64VmEntryExceptionUnwindRestorationLinkageMismatch::UncaughtUndefinedReturnMissing,
+                    )
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_exception_unwind_wrapper_rejects_zero_uncaught_handler_target() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let caught = caught_exception_dispatch_restore_record(&normal_return_restoration_proof);
+            let mut uncaught =
+                uncaught_exception_entry_restore_record(&normal_return_restoration_proof);
+            uncaught.staging.target_machine_pc_for_throw.address = NativeCodeId::default();
+
+            assert_eq!(
+                P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof::from_exception_unwind_restoration_records(
+                    normal_return_restoration_proof,
+                    caught,
+                    uncaught,
+                ),
+                Err(
+                    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofError::Linkage(
+                        P6Arm64VmEntryExceptionUnwindRestorationLinkageMismatch::UncaughtTargetAddressZero,
+                    )
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_exception_unwind_wrapper_rejects_cross_paired_restore_records() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+
+            tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+                |other_top_call_frame_publication,
+                 other_stack_call_proof,
+                 other_stack_frame_proof,
+                 other_exit_record| {
+                    let other_fixture = tests::native_frame_residency_fixture_for_publication(
+                        other_top_call_frame_publication,
+                    );
+                    let other_jsc_stack_dispatch_request_proof =
+                        tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                            &other_fixture,
+                            &other_stack_call_proof,
+                            other_stack_frame_proof,
+                            1,
+                        )
+                        .expect("other JSC stack dispatch request proof should verify");
+                    let other_normal_return_restoration_proof =
+                        tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                            &other_fixture,
+                            other_jsc_stack_dispatch_request_proof,
+                            other_exit_record,
+                        )
+                        .expect("other VM-entry normal return proof should verify");
+                    let caught = caught_exception_dispatch_restore_record(
+                        &other_normal_return_restoration_proof,
+                    );
+                    let uncaught = uncaught_exception_entry_restore_record(
+                        &other_normal_return_restoration_proof,
+                    );
+
+                    assert!(matches!(
+                        P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof::from_exception_unwind_restoration_records(
+                            normal_return_restoration_proof,
+                            caught,
+                            uncaught,
+                        ),
+                        Err(
+                            P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofError::Linkage(
+                                P6Arm64VmEntryExceptionUnwindRestorationLinkageMismatch::CaughtCallFrameForCatchMismatch {
+                                    ..
+                                },
+                            )
+                        )
+                    ));
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn public_arm64_branch_aware_admission_rejects_exception_unwind_admission_time_drift() {
+    let code_block = tests::jump_if_false_code_block(4);
+    let site = tests::jump_if_false_site();
+    let side_exits = [tests::branch_aware_side_exit_proof(&code_block, &site)];
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let expected = FrameAddress(
+                normal_return_restoration_proof
+                    .jsc_stack_dispatch_request_proof()
+                    .generated_native_frame_materialization_proof()
+                    .materialization_descriptor()
+                    .post_frame_allocation
+                    .post_allocation_sp,
+            );
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let actual = FrameAddress(expected.0 + JSC_REGISTER_BYTES);
+            let mut caught =
+                *exception_unwind_restoration_proof.caught_exception_dispatch_restore();
+            caught.reconstructed_catch_sp = actual;
+            let exception_unwind_restoration_proof = exception_unwind_restoration_proof
+                .with_caught_exception_dispatch_restore_for_testing(caught);
+
+            let mut request = tests::valid_request(&side_exits);
+            request.fallback_rooting_proof = full_exception_unwind_restoration_fallback(
+                &fixture,
+                exception_unwind_restoration_proof,
+            );
+
+            assert_eq!(
+                p6_arm64_public_branch_aware_callable_admission_proof(&request),
+                Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::Arm64VmEntryExceptionUnwindRestorationAuthorityMismatch {
+                        mismatch:
+                            P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofMismatch::Linkage(
+                                P6Arm64VmEntryExceptionUnwindRestorationLinkageMismatch::CaughtReconstructedStackPointerMismatch {
+                                    expected,
+                                    actual,
+                                },
+                            ),
                     }
                 )
             );

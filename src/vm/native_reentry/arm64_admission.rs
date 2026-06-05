@@ -23,6 +23,10 @@ use super::super::side_exit::{
     p6_jump_if_false_truthiness_side_exit_resume_shape, P6X86_64CallableSideExitReturnSite,
 };
 use super::super::vm_roots::VmRootGatherPlan;
+use super::arm64_exception_unwind::{
+    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof,
+    P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofMismatch,
+};
 use super::arm64_vm_entry_normal_return::{
     P6Arm64VerifiedVmEntryNormalReturnRestorationProof,
     P6Arm64VerifiedVmEntryNormalReturnRestorationProofMismatch,
@@ -306,6 +310,21 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
         vm_entry_normal_return_restoration_proof:
             P6Arm64VerifiedVmEntryNormalReturnRestorationProof<'publication>,
     },
+    Arm64VmEntryExceptionUnwindRestorationAuthorityMismatch {
+        mismatch: P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofMismatch,
+    },
+    MissingArm64PublicJscStackDispatchExecutionAuthority {
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
+        vm_entry_exception_unwind_restoration_proof:
+            P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof<'publication>,
+    },
 }
 
 pub(in crate::vm) const fn p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate(
@@ -323,6 +342,7 @@ use self::arm64_admission_prior_stage::{
     p6_arm64_validate_generated_native_frame_materialization_or_reject,
     p6_arm64_validate_jsc_stack_dispatch_request_or_reject,
     p6_arm64_validate_native_frame_residency_or_reject,
+    p6_arm64_validate_vm_entry_exception_unwind_restoration_or_reject,
     p6_arm64_validate_vm_entry_normal_return_restoration_or_reject,
     p6_arm64_verifier_append_context_or_reject, p6_arm64_vm_root_gather_context_or_reject,
 };
@@ -556,6 +576,34 @@ pub(in crate::vm) fn p6_arm64_public_branch_aware_callable_admission_proof<'publ
             )?;
             Err(jit_stub_trace.missing_vm_entry_exception_unwind_restoration(
                 vm_entry_normal_return_restoration_proof,
+            ))
+        }
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceVmEntryNormalReturnAndExceptionUnwindRestorationProof {
+            top_call_frame_publication,
+            machine_stack_conservative_rooting_proof,
+            vm_root_gather_plan,
+            conservative_root_marking_plan,
+            collector_effects_plan,
+            verifier_append_proof,
+            jit_stub_trace_plan,
+            vm_entry_exception_unwind_restoration_proof,
+        } => {
+            let jit_stub_trace = p6_arm64_jit_stub_trace_context_or_reject(
+                top_call_frame_publication,
+                machine_stack_conservative_rooting_proof,
+                vm_root_gather_plan,
+                conservative_root_marking_plan,
+                collector_effects_plan,
+                verifier_append_proof,
+                jit_stub_trace_plan,
+            )?;
+            p6_arm64_validate_vm_entry_exception_unwind_restoration_or_reject(
+                jit_stub_trace,
+                vm_entry_exception_unwind_restoration_proof,
+                expected_live_local_slots,
+            )?;
+            Err(jit_stub_trace.missing_public_jsc_stack_dispatch_execution(
+                vm_entry_exception_unwind_restoration_proof,
             ))
         }
         P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
