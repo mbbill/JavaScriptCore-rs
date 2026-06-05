@@ -75,6 +75,7 @@ fn arm64_materialized_frame_descriptor_uses_actual_argument_count_not_padding() 
 
         let descriptor = fixture
             .native_frame_residency_proof
+            .residency_proof()
             .generated_native_frame_materialization
             .as_ref()
             .expect("attached frame materialization descriptor");

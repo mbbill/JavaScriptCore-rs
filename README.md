@@ -156,6 +156,13 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            the prior collector/verifier proofs; caller-supplied raw
            JitStubRoutineTracePlan no longer progresses public ARM64 admission,
            which still rejects at MissingNativeFrameMachineStackResidencyProof.
+    [done] VM ARM64 native-frame machine-stack residency admission stage now
+           requires a verified wrapper built from stack-local top-frame
+           publication, current machine-stack conservative-rooting proof, and
+           descriptor-only live root slots; caller-supplied raw residency
+           descriptors no longer progress public ARM64 admission, which now
+           reaches MissingArm64GeneratedNativeFrameMaterializationProof after
+           wrapper validation.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of

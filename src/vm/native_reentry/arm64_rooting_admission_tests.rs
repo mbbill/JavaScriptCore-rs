@@ -405,10 +405,12 @@ fn public_arm64_branch_aware_admission_progresses_through_rooting_stages() {
         );
 
         let native_frame_residency_proof =
-            tests::native_frame_machine_stack_residency_proof_from_marker(
+            tests::verified_native_frame_machine_stack_residency_proof_from_rooting(
                 top_call_frame_publication,
+                &machine_stack_conservative_rooting_proof,
                 &conservative_scan_append_receipt,
-            );
+            )
+            .expect("valid wrapper should verify native frame machine-stack residency");
         request.fallback_rooting_proof = tests::full_machine_stack_residency_fallback(
             top_call_frame_publication,
             machine_stack_conservative_rooting_proof,

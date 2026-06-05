@@ -28,16 +28,16 @@ use super::rooting::{
     validate_p6_arm64_generated_native_frame_materialization_proof,
     validate_p6_arm64_jit_stub_routine_trace_plan,
     validate_p6_arm64_machine_stack_conservative_rooting_proof,
-    validate_p6_arm64_native_frame_machine_stack_residency_proof,
+    validate_p6_arm64_verified_native_frame_machine_stack_residency_proof,
     validate_p6_arm64_verifier_append_proof, validate_p6_arm64_vm_root_gather_plan,
     P6Arm64BranchAwareCallableFallbackRootingProof,
     P6Arm64BranchAwareCallableTopCallFramePublicationProof, P6Arm64CollectorEffectsProofMismatch,
     P6Arm64ConservativeRootMarkingProofMismatch, P6Arm64JitStubRoutineTraceProof,
     P6Arm64JitStubRoutineTraceProofMismatch, P6Arm64MachineStackConservativeRootingProof,
     P6Arm64MachineStackConservativeRootingProofMismatch,
-    P6Arm64NativeFrameMachineStackResidencyProof,
     P6Arm64NativeFrameMachineStackResidencyProofMismatch, P6Arm64SlotVisitorCollectorEffectsProof,
-    P6Arm64SlotVisitorConservativeRootMarkingProof, P6Arm64VerifierAppendProofMismatch,
+    P6Arm64SlotVisitorConservativeRootMarkingProof,
+    P6Arm64VerifiedNativeFrameMachineStackResidencyProof, P6Arm64VerifierAppendProofMismatch,
     P6Arm64VerifierSlotVisitorConservativeRootAppendProof, P6Arm64VmRootGatherProofMismatch,
 };
 
@@ -243,7 +243,8 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
-        native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
+        native_frame_residency_proof:
+            P6Arm64VerifiedNativeFrameMachineStackResidencyProof<'publication>,
         mismatch: P6Arm64NativeFrameMachineStackResidencyProofMismatch,
     },
     MissingArm64GeneratedNativeFrameMaterializationProof {
@@ -255,7 +256,8 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
-        native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
+        native_frame_residency_proof:
+            P6Arm64VerifiedNativeFrameMachineStackResidencyProof<'publication>,
     },
     Arm64GeneratedNativeFrameMaterializationProofMismatch {
         mismatch: Arm64BaselineGeneratedNativeFrameMaterializationMismatch,
@@ -794,16 +796,16 @@ pub(in crate::vm) fn p6_arm64_public_branch_aware_callable_admission_proof<'publ
                             collector_effects_plan,
                             jit_stub_trace_plan.trace_plan(),
                         ) {
-                            Ok(()) => match validate_p6_arm64_native_frame_machine_stack_residency_proof(
+                            Ok(()) => match validate_p6_arm64_verified_native_frame_machine_stack_residency_proof(
                                 top_call_frame_publication,
-                                conservative_scan_append_receipt,
+                                machine_stack_conservative_rooting_proof,
                                 native_frame_residency_proof,
                             ) {
-                                Ok(()) => match &native_frame_residency_proof.generated_native_frame_materialization {
+                                Ok(()) => match &native_frame_residency_proof.residency_proof().generated_native_frame_materialization {
                                     Some(descriptor) => {
                                         match validate_p6_arm64_generated_native_frame_materialization_proof(
                                             top_call_frame_publication,
-                                            native_frame_residency_proof,
+                                            native_frame_residency_proof.residency_proof(),
                                             descriptor,
                                             expected_live_local_slots,
                                         ) {
@@ -986,6 +988,10 @@ fn p6_arm64_image_entry_offset_points_inside_descriptor_range(
 mod frame_materialization_tests;
 
 #[cfg(test)]
+#[path = "arm64_native_frame_residency_admission_tests.rs"]
+mod arm64_native_frame_residency_admission_tests;
+
+#[cfg(test)]
 #[path = "arm64_rooting_admission_tests.rs"]
 mod arm64_rooting_admission_tests;
 
@@ -1008,10 +1014,14 @@ mod arm64_jit_stub_admission_tests;
 #[cfg(test)]
 pub(super) mod tests {
     use super::super::rooting::{
+        validate_p6_arm64_native_frame_machine_stack_residency_proof,
         P6Arm64JitStubRoutineConservativeScanHookProof, P6Arm64JitStubRoutineTraceProof,
-        P6Arm64MachineStackConservativeRootingProof, P6Arm64NativeFrameMachineStackSpanKind,
-        P6Arm64NativeFrameMachineStackSpanRecord, P6Arm64NativeRootSlotKind,
-        P6Arm64NativeRootSlotRecord, P6Arm64SlotVisitorConservativeRootMarkingProof,
+        P6Arm64MachineStackConservativeRootingProof, P6Arm64NativeFrameMachineStackResidencyProof,
+        P6Arm64NativeFrameMachineStackSpanKind, P6Arm64NativeFrameMachineStackSpanRecord,
+        P6Arm64NativeRootSlotKind, P6Arm64NativeRootSlotRecord,
+        P6Arm64SlotVisitorConservativeRootMarkingProof,
+        P6Arm64VerifiedNativeFrameMachineStackResidencyProof,
+        P6Arm64VerifiedNativeFrameMachineStackResidencyProofError,
         P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
     };
     use super::*;
@@ -1624,6 +1634,39 @@ pub(super) mod tests {
             .expect("synthetic current-thread machine-stack proof")
     }
 
+    pub(super) fn native_frame_root_slot_records_for_publication(
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof<'_>,
+        receipt: &HeapConservativeScanAppendReceipt,
+    ) -> Vec<P6Arm64NativeRootSlotRecord> {
+        let top_frame_address = top_call_frame_publication.publication.published_top_frame.0;
+        let slot_address = top_frame_address + core::mem::size_of::<usize>();
+        let root = receipt.append_plan.records[0].root;
+        vec![P6Arm64NativeRootSlotRecord {
+            kind: P6Arm64NativeRootSlotKind::ThisValue,
+            slot_address,
+            encoded_payload: root.candidate_address,
+            expected_root: root,
+            containing_span: P6Arm64NativeFrameMachineStackSpanKind::Stack,
+        }]
+    }
+
+    pub(super) fn verified_native_frame_machine_stack_residency_proof_from_rooting<'publication>(
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof<
+            'publication,
+        >,
+        machine_stack_conservative_rooting_proof: &P6Arm64MachineStackConservativeRootingProof,
+        receipt: &HeapConservativeScanAppendReceipt,
+    ) -> Result<
+        P6Arm64VerifiedNativeFrameMachineStackResidencyProof<'publication>,
+        P6Arm64VerifiedNativeFrameMachineStackResidencyProofError,
+    > {
+        P6Arm64VerifiedNativeFrameMachineStackResidencyProof::from_machine_stack_conservative_rooting_proof(
+            &top_call_frame_publication,
+            machine_stack_conservative_rooting_proof,
+            native_frame_root_slot_records_for_publication(top_call_frame_publication, receipt),
+        )
+    }
+
     pub(super) fn full_machine_stack_residency_fallback<'publication>(
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof<
             'publication,
@@ -1634,7 +1677,9 @@ pub(super) mod tests {
         collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
         jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
-        native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
+        native_frame_residency_proof: P6Arm64VerifiedNativeFrameMachineStackResidencyProof<
+            'publication,
+        >,
     ) -> P6Arm64BranchAwareCallableFallbackRootingProof<'publication> {
         P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceAndMachineStackResidencyProof {
             top_call_frame_publication,
@@ -1660,7 +1705,9 @@ pub(super) mod tests {
         pub(super) collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
         pub(super) verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
         pub(super) jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
-        pub(super) native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
+        pub(super) native_frame_residency_descriptor: P6Arm64NativeFrameMachineStackResidencyProof,
+        pub(super) native_frame_residency_proof:
+            P6Arm64VerifiedNativeFrameMachineStackResidencyProof<'publication>,
     }
 
     impl<'publication> NativeFrameResidencyFixture<'publication> {
@@ -1677,23 +1724,6 @@ pub(super) mod tests {
                 self.jit_stub_trace_plan.clone(),
                 self.native_frame_residency_proof.clone(),
             )
-        }
-
-        fn expected_mismatch(
-            &self,
-            mismatch: P6Arm64NativeFrameMachineStackResidencyProofMismatch,
-        ) -> P6Arm64BranchAwareCallableAdmissionRejection<'publication> {
-            P6Arm64BranchAwareCallableAdmissionRejection::NativeFrameMachineStackResidencyProofMismatch {
-                top_call_frame_publication: self.top_call_frame_publication,
-                conservative_scan_append_receipt: self.conservative_scan_append_receipt.clone(),
-                vm_root_gather_plan: self.vm_root_gather_plan.clone(),
-                conservative_root_marking_plan: self.conservative_root_marking_plan.clone(),
-                collector_effects_plan: self.collector_effects_plan.clone(),
-                verifier_append_proof: self.verifier_append_proof.clone(),
-                jit_stub_trace_plan: self.jit_stub_trace_plan.clone(),
-                native_frame_residency_proof: self.native_frame_residency_proof.clone(),
-                mismatch,
-            }
         }
     }
 
@@ -1720,6 +1750,13 @@ pub(super) mod tests {
             top_call_frame_publication,
             &conservative_scan_append_receipt,
         );
+        let verified_native_frame_residency_proof =
+            verified_native_frame_machine_stack_residency_proof_from_rooting(
+                top_call_frame_publication,
+                &machine_stack_conservative_rooting_proof,
+                &conservative_scan_append_receipt,
+            )
+            .expect("fixture should verify native frame machine-stack residency");
 
         NativeFrameResidencyFixture {
             top_call_frame_publication,
@@ -1730,7 +1767,8 @@ pub(super) mod tests {
             collector_effects_plan,
             verifier_append_proof,
             jit_stub_trace_plan,
-            native_frame_residency_proof,
+            native_frame_residency_descriptor: native_frame_residency_proof,
+            native_frame_residency_proof: verified_native_frame_residency_proof,
         }
     }
 
@@ -1744,19 +1782,17 @@ pub(super) mod tests {
         })
     }
 
-    fn assert_native_frame_residency_rejection(
+    fn assert_native_frame_residency_descriptor_rejection(
         fixture: NativeFrameResidencyFixture<'_>,
         expected_mismatch: P6Arm64NativeFrameMachineStackResidencyProofMismatch,
     ) {
-        let code_block = jump_if_false_code_block(4);
-        let site = jump_if_false_site();
-        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
-        let mut request = valid_request(&side_exits);
-        request.fallback_rooting_proof = fixture.fallback();
-
         assert_eq!(
-            p6_arm64_public_branch_aware_callable_admission_proof(&request),
-            Err(fixture.expected_mismatch(expected_mismatch))
+            validate_p6_arm64_native_frame_machine_stack_residency_proof(
+                &fixture.top_call_frame_publication,
+                &fixture.conservative_scan_append_receipt,
+                &fixture.native_frame_residency_descriptor,
+            ),
+            Err(expected_mismatch)
         );
     }
 
@@ -1900,17 +1936,25 @@ pub(super) mod tests {
     #[test]
     fn public_arm64_branch_aware_admission_rejects_top_frame_outside_scanned_machine_stack_spans() {
         with_native_frame_residency_fixture(|mut fixture| {
-            let register_span = fixture.native_frame_residency_proof.machine_stack_spans[0].span;
+            let register_span = fixture
+                .native_frame_residency_descriptor
+                .machine_stack_spans[0]
+                .span;
             let stack_span = ConservativeRootSpan {
                 begin: 0x2000,
                 end: 0x2100,
             };
-            let root = fixture.native_frame_residency_proof.slot_records[0].expected_root;
-            fixture.native_frame_residency_proof.machine_stack_spans[1].span = stack_span;
-            fixture.native_frame_residency_proof.machine_stack_roots =
+            let root = fixture.native_frame_residency_descriptor.slot_records[0].expected_root;
+            fixture
+                .native_frame_residency_descriptor
+                .machine_stack_spans[1]
+                .span = stack_span;
+            fixture
+                .native_frame_residency_descriptor
+                .machine_stack_roots =
                 machine_stack_roots_for_residency(register_span, stack_span, root);
 
-            assert_native_frame_residency_rejection(
+            assert_native_frame_residency_descriptor_rejection(
                 fixture.clone(),
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::TopCallFrameOutsideScannedSpans {
                     address: fixture
@@ -1930,18 +1974,18 @@ pub(super) mod tests {
                 end: 0x3100,
             };
             fixture
-                .native_frame_residency_proof
+                .native_frame_residency_descriptor
                 .machine_stack_spans
                 .push(P6Arm64NativeFrameMachineStackSpanRecord {
                     kind: P6Arm64NativeFrameMachineStackSpanKind::Stack,
                     span: extra_span,
                 });
             fixture
-                .native_frame_residency_proof
+                .native_frame_residency_descriptor
                 .machine_stack_roots
                 .add_span(extra_span);
 
-            assert_native_frame_residency_rejection(
+            assert_native_frame_residency_descriptor_rejection(
                 fixture,
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::CurrentThreadSpanOrderMismatch {
                     observed: vec![
@@ -1966,13 +2010,21 @@ pub(super) mod tests {
                 top_frame_address,
                 top_frame_address + core::mem::size_of::<usize>(),
             );
-            let stack_span = fixture.native_frame_residency_proof.machine_stack_spans[1].span;
-            let root = fixture.native_frame_residency_proof.slot_records[0].expected_root;
-            fixture.native_frame_residency_proof.machine_stack_spans[0].span = register_span;
-            fixture.native_frame_residency_proof.machine_stack_roots =
+            let stack_span = fixture
+                .native_frame_residency_descriptor
+                .machine_stack_spans[1]
+                .span;
+            let root = fixture.native_frame_residency_descriptor.slot_records[0].expected_root;
+            fixture
+                .native_frame_residency_descriptor
+                .machine_stack_spans[0]
+                .span = register_span;
+            fixture
+                .native_frame_residency_descriptor
+                .machine_stack_roots =
                 machine_stack_roots_for_residency(register_span, stack_span, root);
 
-            assert_native_frame_residency_rejection(
+            assert_native_frame_residency_descriptor_rejection(
                 fixture,
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::TopCallFrameContainingSpanMismatch {
                     expected: P6Arm64NativeFrameMachineStackSpanKind::Stack,
@@ -1990,22 +2042,22 @@ pub(super) mod tests {
                 end: 0x4100,
             };
             fixture
-                .native_frame_residency_proof
+                .native_frame_residency_descriptor
                 .machine_stack_roots
                 .add_span(extra_span);
             let expected = fixture
-                .native_frame_residency_proof
+                .native_frame_residency_descriptor
                 .machine_stack_spans
                 .iter()
                 .map(|record| record.span)
                 .collect();
             let actual = fixture
-                .native_frame_residency_proof
+                .native_frame_residency_descriptor
                 .machine_stack_roots
                 .spans()
                 .to_vec();
 
-            assert_native_frame_residency_rejection(
+            assert_native_frame_residency_descriptor_rejection(
                 fixture,
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::MachineStackRootSpanMismatch {
                     expected,
@@ -2018,13 +2070,15 @@ pub(super) mod tests {
     #[test]
     fn public_arm64_branch_aware_admission_rejects_slot_address_outside_scanned_spans() {
         with_native_frame_residency_fixture(|mut fixture| {
-            let slot_address = fixture.native_frame_residency_proof.machine_stack_spans[1]
+            let slot_address = fixture
+                .native_frame_residency_descriptor
+                .machine_stack_spans[1]
                 .span
                 .end
                 + core::mem::size_of::<usize>();
-            fixture.native_frame_residency_proof.slot_records[0].slot_address = slot_address;
+            fixture.native_frame_residency_descriptor.slot_records[0].slot_address = slot_address;
 
-            assert_native_frame_residency_rejection(
+            assert_native_frame_residency_descriptor_rejection(
                 fixture,
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::SlotAddressOutsideScannedSpans {
                     order: 0,
@@ -2037,13 +2091,15 @@ pub(super) mod tests {
     #[test]
     fn public_arm64_branch_aware_admission_rejects_unaligned_native_root_slot_address() {
         with_native_frame_residency_fixture(|mut fixture| {
-            let slot_address = fixture.native_frame_residency_proof.machine_stack_spans[1]
+            let slot_address = fixture
+                .native_frame_residency_descriptor
+                .machine_stack_spans[1]
                 .span
                 .begin
                 + 1;
-            fixture.native_frame_residency_proof.slot_records[0].slot_address = slot_address;
+            fixture.native_frame_residency_descriptor.slot_records[0].slot_address = slot_address;
 
-            assert_native_frame_residency_rejection(
+            assert_native_frame_residency_descriptor_rejection(
                 fixture,
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::SlotAddressUnaligned {
                     order: 0,
@@ -2056,14 +2112,19 @@ pub(super) mod tests {
     #[test]
     fn public_arm64_branch_aware_admission_rejects_slot_payload_absent_from_machine_stack_roots() {
         with_native_frame_residency_fixture(|mut fixture| {
-            let root = fixture.native_frame_residency_proof.slot_records[0].expected_root;
+            let root = fixture.native_frame_residency_descriptor.slot_records[0].expected_root;
             let mut roots = ConservativeRoots::new();
-            for span in &fixture.native_frame_residency_proof.machine_stack_spans {
+            for span in &fixture
+                .native_frame_residency_descriptor
+                .machine_stack_spans
+            {
                 roots.add_span(span.span);
             }
-            fixture.native_frame_residency_proof.machine_stack_roots = roots;
+            fixture
+                .native_frame_residency_descriptor
+                .machine_stack_roots = roots;
 
-            assert_native_frame_residency_rejection(
+            assert_native_frame_residency_descriptor_rejection(
                 fixture,
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::SlotRootAbsentFromMachineStackRoots {
                     order: 0,
@@ -2080,17 +2141,22 @@ pub(super) mod tests {
                 candidate_address: 0x9_0000,
                 cell: CellId(0xdead),
             };
-            fixture.native_frame_residency_proof.slot_records[0].encoded_payload =
+            fixture.native_frame_residency_descriptor.slot_records[0].encoded_payload =
                 fake_root.candidate_address;
-            fixture.native_frame_residency_proof.slot_records[0].expected_root = fake_root;
+            fixture.native_frame_residency_descriptor.slot_records[0].expected_root = fake_root;
             let mut roots = ConservativeRoots::new();
-            for span in &fixture.native_frame_residency_proof.machine_stack_spans {
+            for span in &fixture
+                .native_frame_residency_descriptor
+                .machine_stack_spans
+            {
                 roots.add_span(span.span);
             }
             roots.add_validated_cell(fake_root);
-            fixture.native_frame_residency_proof.machine_stack_roots = roots;
+            fixture
+                .native_frame_residency_descriptor
+                .machine_stack_roots = roots;
 
-            assert_native_frame_residency_rejection(
+            assert_native_frame_residency_descriptor_rejection(
                 fixture,
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::SlotRootAbsentFromConservativeScanAppendReceipt {
                     order: 0,
@@ -2103,32 +2169,36 @@ pub(super) mod tests {
     #[test]
     fn public_arm64_branch_aware_admission_rejects_stale_machine_stack_residency_state() {
         with_native_frame_residency_fixture(|mut heap_mismatch| {
-            heap_mismatch.native_frame_residency_proof.heap =
+            heap_mismatch.native_frame_residency_descriptor.heap =
                 HeapId(heap_mismatch.conservative_scan_append_receipt.heap.0 + 1);
-            assert_native_frame_residency_rejection(
+            assert_native_frame_residency_descriptor_rejection(
                 heap_mismatch.clone(),
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::HeapMismatch {
                     receipt: heap_mismatch.conservative_scan_append_receipt.heap,
-                    machine_stack: heap_mismatch.native_frame_residency_proof.heap,
+                    machine_stack: heap_mismatch.native_frame_residency_descriptor.heap,
                 },
             );
         });
 
         with_native_frame_residency_fixture(|mut epoch_mismatch| {
-            epoch_mismatch.native_frame_residency_proof.marking_epoch =
+            epoch_mismatch
+                .native_frame_residency_descriptor
+                .marking_epoch =
                 HeapEpoch(epoch_mismatch.conservative_scan_append_receipt.epoch.0 + 1);
-            assert_native_frame_residency_rejection(
+            assert_native_frame_residency_descriptor_rejection(
                 epoch_mismatch.clone(),
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::MarkingEpochMismatch {
                     receipt: epoch_mismatch.conservative_scan_append_receipt.epoch,
-                    machine_stack: epoch_mismatch.native_frame_residency_proof.marking_epoch,
+                    machine_stack: epoch_mismatch
+                        .native_frame_residency_descriptor
+                        .marking_epoch,
                 },
             );
         });
 
         with_native_frame_residency_fixture(|mut phase_mismatch| {
-            phase_mismatch.native_frame_residency_proof.phase = GcPhase::NotRunning;
-            assert_native_frame_residency_rejection(
+            phase_mismatch.native_frame_residency_descriptor.phase = GcPhase::NotRunning;
+            assert_native_frame_residency_descriptor_rejection(
                 phase_mismatch.clone(),
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::PhaseMismatch {
                     receipt: phase_mismatch.conservative_scan_append_receipt.phase,
@@ -2138,8 +2208,10 @@ pub(super) mod tests {
         });
 
         with_native_frame_residency_fixture(|mut mutator_mismatch| {
-            mutator_mismatch.native_frame_residency_proof.mutator_state = MutatorState::Running;
-            assert_native_frame_residency_rejection(
+            mutator_mismatch
+                .native_frame_residency_descriptor
+                .mutator_state = MutatorState::Running;
+            assert_native_frame_residency_descriptor_rejection(
                 mutator_mismatch.clone(),
                 P6Arm64NativeFrameMachineStackResidencyProofMismatch::MutatorStateMismatch {
                     receipt: mutator_mismatch
