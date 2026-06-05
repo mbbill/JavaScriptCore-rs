@@ -12,6 +12,7 @@ use core::ffi::c_void;
 use std::{convert::Infallible, ptr::NonNull};
 
 use crate::bytecode::{BytecodeIndex, CodeBlock, CoreOpcode};
+use crate::gc::HeapConservativeScanAppendReceipt;
 use crate::interpreter::{ExecutionCompletion, ExecutionError};
 use crate::jit::emitter::{
     P10X86_64BaselinePropertyNativeExitReturnPayload,
@@ -142,12 +143,16 @@ impl P6Arm64BranchAwareCallableTopCallFramePublicationProof {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum P6Arm64BranchAwareCallableFallbackRootingProof {
     MissingTopCallFramePublication,
-    TopCallFramePublicationWithoutConservativeRoots(
+    TopCallFramePublicationWithoutConservativeScanAppend(
         P6Arm64BranchAwareCallableTopCallFramePublicationProof,
     ),
+    TopCallFramePublicationWithConservativeScanAppendReceipt {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+    },
 }
 
 #[allow(dead_code)]
@@ -179,7 +184,7 @@ pub(super) struct P6Arm64BranchAwareCallableSideExitProof<'a> {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct P6Arm64BranchAwareCallableAdmissionProofRequest<'a> {
     pub(super) callable_kind: BaselineNativeEntryCallableKind,
     pub(super) terminal_policy: Option<P6X86_64BaselineTerminalPolicy>,
@@ -191,7 +196,7 @@ pub(super) struct P6Arm64BranchAwareCallableAdmissionProofRequest<'a> {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum P6Arm64BranchAwareCallableAdmissionRejection {
     MissingBranchAwareSemanticEmission,
     CallableKindNotArm64 {
@@ -240,6 +245,10 @@ pub(super) enum P6Arm64BranchAwareCallableAdmissionRejection {
     MissingTopCallFramePublicationProof,
     MissingMachineStackAndConservativeRootingProof {
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+    },
+    MissingRealSlotVisitorConservativeRootMarkingProof {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
     },
 }
 
@@ -336,23 +345,31 @@ pub(super) fn p6_arm64_public_branch_aware_callable_admission_proof(
         );
     }
 
-    // C++ JSC publishes an actual CallFrame* into VM::topCallFrame via
-    // TopCallFrameSetter/NativeCallFrameTracer/prepareCallOperation, and
-    // StackVisitor plus conservative roots consume that machine-stack fact.
-    // Rust intentionally diverges here: VmNativeCallFramePublicationRecord is
-    // symbolic VM-entry metadata, not a proof that generated ARM64 state is
-    // visible to conservative stack/root scanning. The `Infallible` success
-    // type keeps public ARM64 admission rejected after distinguishing these
-    // two missing pieces.
-    match request.fallback_rooting_proof {
+    // C++ JSC publishes an actual CallFrame* into VM::topCallFrame, gathers
+    // conservative stack/VM roots, and `SlotVisitor::append(ConservativeRoots)`
+    // mutates mark bits plus the mark stack under a ConservativeScan referrer
+    // context. Rust intentionally diverges here: the top-call-frame proof is
+    // symbolic VM-entry metadata and the heap append receipt is descriptor-only,
+    // so public ARM64 admission stays rejected until real conservative-root
+    // marking is ported.
+    match &request.fallback_rooting_proof {
         P6Arm64BranchAwareCallableFallbackRootingProof::MissingTopCallFramePublication => {
             Err(P6Arm64BranchAwareCallableAdmissionRejection::MissingTopCallFramePublicationProof)
         }
-        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithoutConservativeRoots(
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithoutConservativeScanAppend(
             top_call_frame_publication,
         ) => Err(
             P6Arm64BranchAwareCallableAdmissionRejection::MissingMachineStackAndConservativeRootingProof {
-                top_call_frame_publication,
+                top_call_frame_publication: *top_call_frame_publication,
+            },
+        ),
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithConservativeScanAppendReceipt {
+            top_call_frame_publication,
+            conservative_scan_append_receipt,
+        } => Err(
+            P6Arm64BranchAwareCallableAdmissionRejection::MissingRealSlotVisitorConservativeRootMarkingProof {
+                top_call_frame_publication: *top_call_frame_publication,
+                conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
             },
         ),
     }
@@ -486,7 +503,10 @@ mod tests {
         Operand, OperandWidth, PackedInstructionStream, RegisterFrameShape, TypedInstruction,
         UnlinkedCodeBlock, VirtualRegister,
     };
-    use crate::gc::HeapId;
+    use crate::gc::{
+        AllocationMode, CellMetadata, ConservativeRoots, GcConductor, GcPhase, Heap,
+        HeapAllocationRequest, HeapConservativeScanAppendReceipt, HeapId, MutatorState,
+    };
     use crate::interpreter::{FrameState, InstalledCallFrame, RegisterWindow};
     use crate::jit::{ExecutableAllocationId, P6BaselineNativeReentryTargetRecord};
     use crate::runtime::{
@@ -762,6 +782,47 @@ mod tests {
         record
     }
 
+    fn conservative_scan_append_receipt() -> HeapConservativeScanAppendReceipt {
+        let mut heap = Heap::new();
+        let cell = heap
+            .allocate_record(HeapAllocationRequest {
+                heap: heap.id(),
+                subspace: "object",
+                metadata: CellMetadata::default(),
+                byte_size: 64,
+                mode: AllocationMode::Normal,
+                may_trigger_collection: false,
+            })
+            .map(|response| response.cell)
+            .expect("test allocation");
+        let payload = 0x5000;
+        heap.bind_cell_payload(cell, payload)
+            .expect("bind conservative-root payload");
+        heap.publish_cell(cell)
+            .expect("publish conservative root cell");
+
+        let mut roots = ConservativeRoots::new();
+        roots.add_validated_cell(
+            heap.validate_conservative_root_candidate_exact_payload(payload)
+                .expect("validated conservative root"),
+        );
+        heap.ingest_conservative_roots(roots)
+            .expect("ingest conservative roots");
+        heap.enter_phase(
+            GcPhase::Fixpoint,
+            MutatorState::Collecting,
+            GcConductor::Mutator,
+        );
+
+        let visitor = heap.slot_visitor_descriptor("native-reentry-conservative-scan-test");
+        let receipt = heap
+            .append_conservative_roots_to_slot_visitor_descriptor(&visitor)
+            .expect("heap conservative-scan append receipt");
+        assert_eq!(receipt.conservative_root_count, 1);
+        assert_eq!(receipt.appended_record_count, 1);
+        receipt
+    }
+
     fn installed_call_frame(
         id: CallFrameId,
         entry: Option<EntryFrameId>,
@@ -837,7 +898,8 @@ mod tests {
     }
 
     #[test]
-    fn public_arm64_branch_aware_admission_rejects_missing_machine_roots_after_publication() {
+    fn public_arm64_branch_aware_admission_rejects_missing_conservative_scan_append_after_publication(
+    ) {
         let code_block = jump_if_false_code_block(4);
         let site = jump_if_false_site();
         let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
@@ -847,7 +909,7 @@ mod tests {
                 top_call_frame_publication_record(),
             );
         request.fallback_rooting_proof =
-            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithoutConservativeRoots(
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithoutConservativeScanAppend(
                 top_call_frame_publication,
             );
 
@@ -856,6 +918,47 @@ mod tests {
             Err(
                 P6Arm64BranchAwareCallableAdmissionRejection::MissingMachineStackAndConservativeRootingProof {
                     top_call_frame_publication,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn public_arm64_branch_aware_admission_rejects_real_marking_after_conservative_scan_append() {
+        let code_block = jump_if_false_code_block(4);
+        let site = jump_if_false_site();
+        let side_exits = [branch_aware_side_exit_proof(&code_block, &site)];
+        let mut request = valid_request(&side_exits);
+        let top_call_frame_publication =
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof::from_publication_record(
+                top_call_frame_publication_record(),
+            );
+
+        request.fallback_rooting_proof =
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithoutConservativeScanAppend(
+                top_call_frame_publication,
+            );
+        assert_eq!(
+            p6_arm64_public_branch_aware_callable_admission_proof(&request),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingMachineStackAndConservativeRootingProof {
+                    top_call_frame_publication,
+                }
+            )
+        );
+
+        let conservative_scan_append_receipt = conservative_scan_append_receipt();
+        request.fallback_rooting_proof =
+            P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithConservativeScanAppendReceipt {
+                top_call_frame_publication,
+                conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+            };
+        assert_eq!(
+            p6_arm64_public_branch_aware_callable_admission_proof(&request),
+            Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::MissingRealSlotVisitorConservativeRootMarkingProof {
+                    top_call_frame_publication,
+                    conservative_scan_append_receipt,
                 }
             )
         );

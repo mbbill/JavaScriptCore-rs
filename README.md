@@ -142,8 +142,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            only, src/gc/visitor.rs adds the descriptor-only
            SlotVisitor::append(ConservativeRoots) boundary, and
            src/gc/heap/conservative_scan.rs adds the heap conservative-scan
-           append receipt that scopes the visitor reason locally; native
-           execution unchanged.
+           append receipt that scopes the visitor reason locally;
+           src/vm/native_reentry.rs consumes that receipt before rejecting at
+           the missing real SlotVisitor conservative-root marking blocker;
+           native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
 [wip] Parser and bytecompiler

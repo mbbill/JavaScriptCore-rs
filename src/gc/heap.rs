@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 mod conservative_scan;
 mod run_current_phase;
 
+pub(crate) use conservative_scan::HeapConservativeScanAppendReceipt;
+
 use super::machine_stack_marker::JscMachineStackRootingIngestError;
 use crate::gc::{
     evaluate_heap_semantics, static_allocation_schema_registry, static_barrier_schema_registry,

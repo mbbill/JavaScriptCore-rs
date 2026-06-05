@@ -50,6 +50,7 @@ pub use cell::{
 };
 pub use conservative_roots::{ConservativeRootCell, ConservativeRoots};
 pub use fast_hash::{FxIntBuildHasher, FxIntHasher};
+pub(crate) use heap::HeapConservativeScanAppendReceipt;
 pub use heap::{
     static_heap_schema_descriptor, AllocationPlan, CellArena, CellInit, ConservativeRootSpan,
     FinalizationRegistry, FinalizerId, FinalizerQueueRecord, FinalizerQueueTransitionRecord, Heap,
