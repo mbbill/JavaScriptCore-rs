@@ -38,7 +38,11 @@ use crate::jit::{
     JitStubRoutineSetDescriptor, JitStubRoutineTraceError, JitStubRoutineTracePlan,
 };
 
-use super::super::arm64_native_entry::Arm64NativeEntryStackPublicationGuard;
+use super::super::arm64_native_entry::{
+    prove_arm64_native_entry_frame_materialization_descriptor,
+    Arm64NativeEntryFrameMaterializationProofError, Arm64NativeEntryJscStackCallRequestProof,
+    Arm64NativeEntryStackPublicationGuard,
+};
 use super::super::entry::FrameAddress;
 use super::super::vm_roots::{VmRootGatherError, VmRootGatherPlan};
 
@@ -441,31 +445,7 @@ impl P6Arm64NativeFrameMachineStackResidencyProof {
         frame_top_offset_bytes: isize,
         expected_live_local_slots: u32,
     ) -> Result<Self, P6Arm64GeneratedNativeFrameMaterializationAttachError> {
-        let live_root_slots = self
-            .slot_records
-            .iter()
-            .enumerate()
-            .map(|(order, slot)| {
-                let span = containing_span_for_word_slot(
-                    &self.machine_stack_spans,
-                    slot.slot_address,
-                )
-                .ok_or(
-                    P6Arm64GeneratedNativeFrameMaterializationAttachError::LiveRootSlotSpanMissing {
-                        order,
-                        slot_address: slot.slot_address,
-                    },
-                )?;
-                Ok(Arm64BaselineMachineStackRootSlotDescriptor {
-                    kind: slot.kind.into(),
-                    slot_address: slot.slot_address,
-                    encoded_payload: slot.encoded_payload,
-                    expected_root: slot.expected_root,
-                    containing_span: slot.containing_span.into(),
-                    span,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let live_root_slots = live_root_slots_for_residency_proof(&self)?;
         let argument_count_excluding_this = top_call_frame_publication
             .publication
             .argument_count_excluding_this
@@ -599,6 +579,112 @@ impl Deref for P6Arm64VerifiedNativeFrameMachineStackResidencyProof<'_> {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) struct P6Arm64VerifiedGeneratedNativeFrameMaterializationProof<'publication> {
+    // C++ has no separate admission wrapper: `_llint_call_javascript` enters
+    // generated code with `sp = CallFrame + CallerFrameAndPC`, and baseline
+    // `AssemblyHelpers::emitFunctionPrologue` makes fp/x29 the JSC CallFrame.
+    // Rust keeps this newtype as public-admission authority because raw
+    // materialization descriptors remain caller-owned test evidence.
+    native_frame_residency_proof:
+        P6Arm64VerifiedNativeFrameMachineStackResidencyProof<'publication>,
+    materialization_descriptor: Arm64BaselineGeneratedNativeFrameMaterializationDescriptor,
+}
+
+impl<'publication> P6Arm64VerifiedGeneratedNativeFrameMaterializationProof<'publication> {
+    #[allow(dead_code)]
+    pub(in crate::vm) fn from_jsc_stack_call_request_proof(
+        top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof<
+            'publication,
+        >,
+        machine_stack_conservative_rooting_proof: &P6Arm64MachineStackConservativeRootingProof,
+        native_frame_residency_proof: P6Arm64VerifiedNativeFrameMachineStackResidencyProof<
+            'publication,
+        >,
+        stack_call_proof: &Arm64NativeEntryJscStackCallRequestProof,
+        expected_live_local_slots: usize,
+    ) -> Result<Self, P6Arm64VerifiedGeneratedNativeFrameMaterializationProofError> {
+        validate_p6_arm64_verified_native_frame_machine_stack_residency_proof(
+            top_call_frame_publication,
+            machine_stack_conservative_rooting_proof,
+            &native_frame_residency_proof,
+        )
+        .map_err(P6Arm64VerifiedGeneratedNativeFrameMaterializationProofError::Residency)?;
+
+        let live_root_slots =
+            live_root_slots_for_residency_proof(native_frame_residency_proof.residency_proof())
+                .map_err(
+                    P6Arm64VerifiedGeneratedNativeFrameMaterializationProofError::LiveRootSlots,
+                )?;
+        let materialization_descriptor = prove_arm64_native_entry_frame_materialization_descriptor(
+            stack_call_proof,
+            live_root_slots,
+        )
+        .map_err(
+            P6Arm64VerifiedGeneratedNativeFrameMaterializationProofError::StackCallMaterialization,
+        )?;
+
+        validate_p6_arm64_generated_native_frame_materialization_proof(
+            top_call_frame_publication,
+            native_frame_residency_proof.residency_proof(),
+            &materialization_descriptor,
+            expected_live_local_slots,
+        )
+        .map_err(P6Arm64VerifiedGeneratedNativeFrameMaterializationProofError::Materialization)?;
+
+        Ok(Self {
+            native_frame_residency_proof,
+            materialization_descriptor,
+        })
+    }
+
+    pub(in crate::vm) fn native_frame_residency_proof(
+        &self,
+    ) -> &P6Arm64VerifiedNativeFrameMachineStackResidencyProof<'publication> {
+        &self.native_frame_residency_proof
+    }
+
+    pub(in crate::vm) fn materialization_descriptor(
+        &self,
+    ) -> &Arm64BaselineGeneratedNativeFrameMaterializationDescriptor {
+        &self.materialization_descriptor
+    }
+}
+
+fn live_root_slots_for_residency_proof(
+    residency_proof: &P6Arm64NativeFrameMachineStackResidencyProof,
+) -> Result<
+    Vec<Arm64BaselineMachineStackRootSlotDescriptor>,
+    P6Arm64GeneratedNativeFrameMaterializationAttachError,
+> {
+    residency_proof
+        .slot_records
+        .iter()
+        .enumerate()
+        .map(|(order, slot)| {
+            let span = containing_span_for_word_slot(
+                &residency_proof.machine_stack_spans,
+                slot.slot_address,
+            )
+            .ok_or(
+                P6Arm64GeneratedNativeFrameMaterializationAttachError::LiveRootSlotSpanMissing {
+                    order,
+                    slot_address: slot.slot_address,
+                },
+            )?;
+            Ok(Arm64BaselineMachineStackRootSlotDescriptor {
+                kind: slot.kind.into(),
+                slot_address: slot.slot_address,
+                encoded_payload: slot.encoded_payload,
+                expected_root: slot.expected_root,
+                containing_span: slot.containing_span.into(),
+                span,
+            })
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::vm) enum P6Arm64VerifiedNativeFrameMachineStackResidencyProofError {
     MachineStack(P6Arm64MachineStackConservativeRootingProofMismatch),
     Residency(P6Arm64NativeFrameMachineStackResidencyProofMismatch),
@@ -610,6 +696,15 @@ pub(in crate::vm) enum P6Arm64GeneratedNativeFrameMaterializationAttachError {
     LiveRootSlotSpanMissing { order: usize, slot_address: usize },
     ArgumentCountExcludingThisOverflow { count: usize },
     Producer(Arm64BaselineGeneratedNativeFrameMaterializationProductionError),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) enum P6Arm64VerifiedGeneratedNativeFrameMaterializationProofError {
+    Residency(P6Arm64NativeFrameMachineStackResidencyProofMismatch),
+    LiveRootSlots(P6Arm64GeneratedNativeFrameMaterializationAttachError),
+    StackCallMaterialization(Arm64NativeEntryFrameMaterializationProofError),
+    Materialization(Arm64BaselineGeneratedNativeFrameMaterializationMismatch),
 }
 
 #[allow(dead_code)]
@@ -676,6 +771,19 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
         native_frame_residency_proof:
             P6Arm64VerifiedNativeFrameMachineStackResidencyProof<'publication>,
+    },
+    TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceMachineStackResidencyAndGeneratedNativeFrameMaterializationProof
+    {
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+        machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
+        generated_native_frame_materialization_proof:
+            P6Arm64VerifiedGeneratedNativeFrameMaterializationProof<'publication>,
     },
 }
 

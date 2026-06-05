@@ -37,6 +37,7 @@ use super::rooting::{
     P6Arm64MachineStackConservativeRootingProofMismatch,
     P6Arm64NativeFrameMachineStackResidencyProofMismatch, P6Arm64SlotVisitorCollectorEffectsProof,
     P6Arm64SlotVisitorConservativeRootMarkingProof,
+    P6Arm64VerifiedGeneratedNativeFrameMaterializationProof,
     P6Arm64VerifiedNativeFrameMachineStackResidencyProof, P6Arm64VerifierAppendProofMismatch,
     P6Arm64VerifierSlotVisitorConservativeRootAppendProof, P6Arm64VmRootGatherProofMismatch,
 };
@@ -262,7 +263,18 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
     Arm64GeneratedNativeFrameMaterializationProofMismatch {
         mismatch: Arm64BaselineGeneratedNativeFrameMaterializationMismatch,
     },
-    Arm64GeneratedNativeFrameMaterializationProofAcceptedButPublicAdmissionBlocked,
+    MissingArm64JscStackDispatchAdmissionAuthority {
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
+        generated_native_frame_materialization_proof:
+            P6Arm64VerifiedGeneratedNativeFrameMaterializationProof<'publication>,
+    },
 }
 
 pub(in crate::vm) const fn p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate(
@@ -451,6 +463,150 @@ pub(in crate::vm) fn p6_arm64_public_branch_aware_callable_admission_proof<'publ
                     vm_root_gather_plan: vm_root_gather_plan.clone(),
                 },
             ),
+            Err(mismatch) => Err(
+                P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
+                    top_call_frame_publication: *top_call_frame_publication,
+                    conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                    vm_root_gather_plan: vm_root_gather_plan.clone(),
+                    mismatch,
+                },
+            ),
+            }
+        },
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceMachineStackResidencyAndGeneratedNativeFrameMaterializationProof {
+            top_call_frame_publication,
+            machine_stack_conservative_rooting_proof,
+            vm_root_gather_plan,
+            conservative_root_marking_plan,
+            collector_effects_plan,
+            verifier_append_proof,
+            jit_stub_trace_plan,
+            generated_native_frame_materialization_proof,
+        } => {
+            let conservative_scan_append_receipt =
+                p6_arm64_conservative_scan_append_receipt_or_reject(
+                    top_call_frame_publication,
+                    machine_stack_conservative_rooting_proof,
+                )?;
+            match validate_p6_arm64_vm_root_gather_plan(
+                conservative_scan_append_receipt,
+                vm_root_gather_plan,
+            ) {
+            Ok(()) => match validate_p6_arm64_conservative_root_marking_plan(
+                conservative_scan_append_receipt,
+                conservative_root_marking_plan,
+            ) {
+                Ok(()) => match validate_p6_arm64_collector_effects_plan(
+                    conservative_root_marking_plan,
+                    collector_effects_plan,
+                ) {
+                    Ok(()) => match validate_p6_arm64_verifier_append_proof(
+                        conservative_scan_append_receipt,
+                        conservative_root_marking_plan,
+                        vm_root_gather_plan,
+                        verifier_append_proof,
+                    ) {
+                        Ok(()) => match validate_p6_arm64_jit_stub_routine_trace_plan(
+                            collector_effects_plan,
+                            jit_stub_trace_plan.trace_plan(),
+                        ) {
+                            Ok(()) => match validate_p6_arm64_verified_native_frame_machine_stack_residency_proof(
+                                top_call_frame_publication,
+                                machine_stack_conservative_rooting_proof,
+                                generated_native_frame_materialization_proof
+                                    .native_frame_residency_proof(),
+                            ) {
+                                Ok(()) => match validate_p6_arm64_generated_native_frame_materialization_proof(
+                                    top_call_frame_publication,
+                                    generated_native_frame_materialization_proof
+                                        .native_frame_residency_proof()
+                                        .residency_proof(),
+                                    generated_native_frame_materialization_proof
+                                        .materialization_descriptor(),
+                                    expected_live_local_slots,
+                                ) {
+                                    Ok(()) => Err(
+                                        P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64JscStackDispatchAdmissionAuthority {
+                                            top_call_frame_publication: *top_call_frame_publication,
+                                            conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                                            vm_root_gather_plan: vm_root_gather_plan.clone(),
+                                            conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                                            collector_effects_plan: collector_effects_plan.clone(),
+                                            verifier_append_proof: verifier_append_proof.clone(),
+                                            jit_stub_trace_plan: jit_stub_trace_plan.clone(),
+                                            generated_native_frame_materialization_proof:
+                                                generated_native_frame_materialization_proof.clone(),
+                                        },
+                                    ),
+                                    Err(mismatch) => Err(
+                                        P6Arm64BranchAwareCallableAdmissionRejection::Arm64GeneratedNativeFrameMaterializationProofMismatch {
+                                            mismatch,
+                                        },
+                                    ),
+                                },
+                                Err(mismatch) => Err(
+                                    P6Arm64BranchAwareCallableAdmissionRejection::NativeFrameMachineStackResidencyProofMismatch {
+                                        top_call_frame_publication: *top_call_frame_publication,
+                                        conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                                        vm_root_gather_plan: vm_root_gather_plan.clone(),
+                                        conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                                        collector_effects_plan: collector_effects_plan.clone(),
+                                        verifier_append_proof: verifier_append_proof.clone(),
+                                        jit_stub_trace_plan: jit_stub_trace_plan.clone(),
+                                        native_frame_residency_proof:
+                                            generated_native_frame_materialization_proof
+                                                .native_frame_residency_proof()
+                                                .clone(),
+                                        mismatch,
+                                    },
+                                ),
+                            },
+                            Err(mismatch) => Err(
+                                P6Arm64BranchAwareCallableAdmissionRejection::JitStubRoutineTraceProofMismatch {
+                                    top_call_frame_publication: *top_call_frame_publication,
+                                    conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                                    vm_root_gather_plan: vm_root_gather_plan.clone(),
+                                    conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                                    collector_effects_plan: collector_effects_plan.clone(),
+                                    verifier_append_proof: verifier_append_proof.clone(),
+                                    jit_stub_trace_plan: jit_stub_trace_plan.clone(),
+                                    mismatch,
+                                },
+                            ),
+                        },
+                        Err(mismatch) => Err(
+                            P6Arm64BranchAwareCallableAdmissionRejection::VerifierAppendProofMismatch {
+                                top_call_frame_publication: *top_call_frame_publication,
+                                conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                                vm_root_gather_plan: vm_root_gather_plan.clone(),
+                                conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                                collector_effects_plan: collector_effects_plan.clone(),
+                                verifier_append_proof: verifier_append_proof.clone(),
+                                mismatch,
+                            },
+                        ),
+                    },
+                    Err(mismatch) => Err(
+                        P6Arm64BranchAwareCallableAdmissionRejection::CollectorEffectsProofMismatch {
+                            top_call_frame_publication: *top_call_frame_publication,
+                            conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                            vm_root_gather_plan: vm_root_gather_plan.clone(),
+                            conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                            collector_effects_plan: collector_effects_plan.clone(),
+                            mismatch,
+                        },
+                    ),
+                },
+                Err(mismatch) => Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::ConservativeRootMarkingProofMismatch {
+                        top_call_frame_publication: *top_call_frame_publication,
+                        conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                        vm_root_gather_plan: vm_root_gather_plan.clone(),
+                        conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                        mismatch,
+                    },
+                ),
+            },
             Err(mismatch) => Err(
                 P6Arm64BranchAwareCallableAdmissionRejection::VmRootGatherProofMismatch {
                     top_call_frame_publication: *top_call_frame_publication,
@@ -801,35 +957,18 @@ pub(in crate::vm) fn p6_arm64_public_branch_aware_callable_admission_proof<'publ
                                 machine_stack_conservative_rooting_proof,
                                 native_frame_residency_proof,
                             ) {
-                                Ok(()) => match &native_frame_residency_proof.residency_proof().generated_native_frame_materialization {
-                                    Some(descriptor) => {
-                                        match validate_p6_arm64_generated_native_frame_materialization_proof(
-                                            top_call_frame_publication,
-                                            native_frame_residency_proof.residency_proof(),
-                                            descriptor,
-                                            expected_live_local_slots,
-                                        ) {
-                                            Ok(()) => Err(P6Arm64BranchAwareCallableAdmissionRejection::Arm64GeneratedNativeFrameMaterializationProofAcceptedButPublicAdmissionBlocked),
-                                            Err(mismatch) => Err(
-                                                P6Arm64BranchAwareCallableAdmissionRejection::Arm64GeneratedNativeFrameMaterializationProofMismatch {
-                                                    mismatch,
-                                                },
-                                            ),
-                                        }
+                                Ok(()) => Err(
+                                    P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64GeneratedNativeFrameMaterializationProof {
+                                        top_call_frame_publication: *top_call_frame_publication,
+                                        conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                                        vm_root_gather_plan: vm_root_gather_plan.clone(),
+                                        conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                                        collector_effects_plan: collector_effects_plan.clone(),
+                                        verifier_append_proof: verifier_append_proof.clone(),
+                                        jit_stub_trace_plan: jit_stub_trace_plan.clone(),
+                                        native_frame_residency_proof: native_frame_residency_proof.clone(),
                                     },
-                                    None => Err(
-                                        P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64GeneratedNativeFrameMaterializationProof {
-                                            top_call_frame_publication: *top_call_frame_publication,
-                                            conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                                            vm_root_gather_plan: vm_root_gather_plan.clone(),
-                                            conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                                            collector_effects_plan: collector_effects_plan.clone(),
-                                            verifier_append_proof: verifier_append_proof.clone(),
-                                            jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                                            native_frame_residency_proof: native_frame_residency_proof.clone(),
-                                        },
-                                    ),
-                                },
+                                ),
                                 Err(mismatch) => Err(
                                     P6Arm64BranchAwareCallableAdmissionRejection::NativeFrameMachineStackResidencyProofMismatch {
                                         top_call_frame_publication: *top_call_frame_publication,
@@ -1020,6 +1159,8 @@ pub(super) mod tests {
         P6Arm64NativeFrameMachineStackSpanKind, P6Arm64NativeFrameMachineStackSpanRecord,
         P6Arm64NativeRootSlotKind, P6Arm64NativeRootSlotRecord,
         P6Arm64SlotVisitorConservativeRootMarkingProof,
+        P6Arm64VerifiedGeneratedNativeFrameMaterializationProof,
+        P6Arm64VerifiedGeneratedNativeFrameMaterializationProofError,
         P6Arm64VerifiedNativeFrameMachineStackResidencyProof,
         P6Arm64VerifiedNativeFrameMachineStackResidencyProofError,
         P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
@@ -1038,22 +1179,40 @@ pub(super) mod tests {
         HeapConservativeScanAppendReceipt, HeapEpoch, HeapId, HeapStateDescriptor,
         JscMachineStackMarker, MutatorState,
     };
+    use crate::jit::code::BaselineEntryArtifact;
     use crate::jit::{
-        CodeLiveness, CodeRetentionPolicy, ExecutableAllocationId, GcAwareJitStubRoutineDescriptor,
-        JitCodeId, JitStubRoutineCandidateAddress, JitStubRoutineSetDescriptor,
-        P6BaselineNativeReentryTargetRecord,
+        CodeFinalizationAuthority, CodeLiveness, CodeOrigin, CodeOriginKind, CodeOwnership,
+        CodeRetentionPolicy, EntryAbi, Entrypoint, EntrypointKind, ExecutableAllocationId,
+        ExecutableAllocationLifecycle, ExecutableMemoryProtection, ExecutableMutationAuthority,
+        GcAwareJitStubRoutineDescriptor, JitCodeArtifact, JitCodeId,
+        JitStubRoutineCandidateAddress, JitStubRoutineSetDescriptor, JitType, MachineCodeHandle,
+        MachineCodeOwnership, P6BaselineNativeReentryTargetRecord,
     };
-    use crate::runtime::CellId;
+    use crate::runtime::{
+        ArityCheckMode, CallFrameId, CellId, CodeBlockId, CodeSpecializationKind, EntryFrameId,
+        NativeCodeId, RuntimeValue,
+    };
 
     use super::super::super::arm64_native_entry::{
-        enter_arm64_native_entry_stack_publication, with_arm64_native_entry_padded_stack_frame,
-        with_arm64_native_entry_stack_frame, Arm64NativeEntryStackFrameRequest,
+        enter_arm64_native_entry_stack_publication,
+        prove_arm64_native_entry_do_vm_entry_stack_layout,
+        prove_arm64_native_entry_jsc_stack_call_request,
+        prove_arm64_native_entry_launch_descriptor, with_arm64_native_entry_padded_stack_frame,
+        with_arm64_native_entry_stack_frame, Arm64NativeEntryJscStackCallRequestProof,
+        Arm64NativeEntryLaunchProofRequest, Arm64NativeEntryStackFrameRequest,
         Arm64NativeEntryStackPublicationError,
     };
-    use super::super::super::entry::{EntryKind, FrameAddress, VmEntryState};
+    use super::super::super::entry::{
+        EntryKind, FrameAddress, VmEntryCallFrameMetadata, VmEntryLaunchArgumentValue,
+        VmEntryLaunchDescriptor, VmEntryLaunchScope, VmEntryState,
+    };
     use super::super::super::vm_roots::{
         VmRootGatherDescriptor, VmRootGatherError, VmRootSource, VmScratchBufferCandidateSlot,
         VmScratchBufferDescriptor, VmScratchBufferId, ENCODED_JS_VALUE_BYTES,
+    };
+    use super::super::super::{
+        BaselineEntryGateOutcome, BaselineEntryGateRecord, BaselineNativeEntryExecutionPolicy,
+        BaselineNativeEntryReadinessOutcome, BaselineNativeEntryReadinessRecord,
     };
 
     fn bci(offset: u32) -> BytecodeIndex {
@@ -1264,6 +1423,158 @@ pub(super) mod tests {
         }
     }
 
+    fn launch_descriptor_for_stack_frame(
+        argument_count_excluding_this: u32,
+        padded_argument_count_excluding_this: u32,
+    ) -> VmEntryLaunchDescriptor {
+        let owner = CodeBlockId(CellId(20));
+        let artifact = baseline_entry_artifact(owner, 20);
+        let descriptor = artifact
+            .validate_native_entry_descriptor()
+            .expect("native entry descriptor");
+        let readiness = BaselineNativeEntryReadinessRecord {
+            ordinal: 7,
+            owner,
+            materialization_ordinal: 1,
+            install_ordinal: 2,
+            artifact_id: Some(artifact.id),
+            native_code: Some(artifact.native_code),
+            machine_code: Some(artifact.machine_code),
+            machine_range: Some(artifact.machine_code.range),
+            bytecode_snapshot: None,
+            body_capability: None,
+            execution_policy: BaselineNativeEntryExecutionPolicy::Enabled,
+            descriptor: Some(descriptor),
+            callable: None,
+            outcome: BaselineNativeEntryReadinessOutcome::Ready,
+        };
+        let gate = BaselineEntryGateRecord {
+            owner,
+            requested_tier: JitType::Baseline,
+            native_artifact: Some(artifact),
+            native_entry_readiness_ordinal: Some(readiness.ordinal),
+            generated_artifact: None,
+            outcome: BaselineEntryGateOutcome::NativeEntryReady,
+        };
+        VmEntryLaunchDescriptor::baseline_native_entry(
+            launch_scope(owner),
+            launch_call_frame(
+                owner,
+                argument_count_excluding_this,
+                padded_argument_count_excluding_this,
+            ),
+            gate,
+            &readiness,
+        )
+        .expect("valid ARM64 launch descriptor")
+    }
+
+    fn launch_scope(owner: CodeBlockId) -> VmEntryLaunchScope {
+        VmEntryLaunchScope {
+            owner,
+            entry_code_block: Some(owner),
+            active_entry_frame: Some(EntryFrameId(1)),
+            previous_entry_frame: None,
+            saved_top_call_frame: None,
+            active_top_call_frame: Some(CallFrameId(2)),
+        }
+    }
+
+    fn launch_call_frame(
+        owner: CodeBlockId,
+        argument_count_excluding_this: u32,
+        padded_argument_count_excluding_this: u32,
+    ) -> VmEntryCallFrameMetadata {
+        VmEntryCallFrameMetadata {
+            frame: CallFrameId(2),
+            entry_frame: Some(EntryFrameId(1)),
+            caller_frame: Some(CallFrameId(1)),
+            code_block: Some(owner),
+            callee: None,
+            callee_value: None,
+            context: None,
+            global_object: None,
+            entry_value: VmEntryLaunchArgumentValue::This(RuntimeValue::from_i32(41)),
+            argument_count_including_this: argument_count_excluding_this
+                .checked_add(1)
+                .expect("argument count including this"),
+            provided_argument_count: argument_count_excluding_this,
+            padded_argument_count: padded_argument_count_excluding_this
+                .checked_add(1)
+                .expect("padded argument count including this"),
+            specialization: CodeSpecializationKind::Call,
+            arity_mode: ArityCheckMode::AlreadyChecked,
+        }
+    }
+
+    fn baseline_entry_artifact(owner: CodeBlockId, id: u64) -> BaselineEntryArtifact {
+        baseline_artifact(owner, id)
+            .validate_baseline_entry_artifact(owner)
+            .expect("baseline entry artifact")
+    }
+
+    fn baseline_artifact(owner: CodeBlockId, id: u64) -> JitCodeArtifact {
+        let code = JitCodeId(id);
+        let native_code = NativeCodeId(id as u32 + 100);
+        let allocation = ExecutableAllocationId(id + 200);
+        JitCodeArtifact {
+            id: code,
+            tier: JitType::Baseline,
+            origin: CodeOrigin {
+                kind: CodeOriginKind::BaselineCodeBlock,
+                owner: Some(owner),
+                executable: None,
+                bytecode_index: Some(0),
+            },
+            ownership: CodeOwnership::CodeBlockOwned,
+            native_code: Some(native_code),
+            machine_code: Some(MachineCodeHandle {
+                allocation,
+                owner: MachineCodeOwnership::CodeBlock(owner),
+                range: MachineCodeRange {
+                    allocation,
+                    start_offset: 0,
+                    size_bytes: 64,
+                },
+                symbol: Some(native_code),
+                protection: ExecutableMemoryProtection::Executable,
+                lifecycle: ExecutableAllocationLifecycle::LinkedExecutable,
+                mutation_authority: ExecutableMutationAuthority::LinkBuffer,
+            }),
+            entrypoint: Entrypoint {
+                kind: EntrypointKind::GeneratedCode,
+                abi: EntryAbi::GeneratedCode,
+                code: Some(code),
+                boundary: None,
+            },
+            patchpoints: Vec::new(),
+            dependencies: Vec::new(),
+            byproducts: Vec::new(),
+            disassembly: None,
+            liveness: CodeLiveness::Live,
+            finalization_authority: CodeFinalizationAuthority::MainThread,
+        }
+    }
+
+    fn do_vm_entry_layout_for_stack_frame(
+        argument_count_excluding_this: u32,
+        padded_argument_count_excluding_this: u32,
+    ) -> super::super::super::arm64_native_entry::Arm64NativeEntryDoVmEntryLayoutProof {
+        let descriptor = launch_descriptor_for_stack_frame(
+            argument_count_excluding_this,
+            padded_argument_count_excluding_this,
+        );
+        let launch_proof =
+            prove_arm64_native_entry_launch_descriptor(Arm64NativeEntryLaunchProofRequest {
+                launch_descriptor: &descriptor,
+                callable_kind: BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
+                callable_token: descriptor.native_entry.normal_entry,
+            })
+            .expect("ARM64 launch proof");
+        prove_arm64_native_entry_do_vm_entry_stack_layout(launch_proof)
+            .expect("doVMEntry stack layout proof")
+    }
+
     fn with_stack_top_call_frame_publication_from_request<
         const LOCAL_AREA_WORDS: usize,
         const ARGUMENTS_EXCLUDING_THIS: usize,
@@ -1275,12 +1586,41 @@ pub(super) mod tests {
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         ) -> R,
     ) -> R {
+        with_stack_top_call_frame_publication_and_stack_call_from_request::<
+            LOCAL_AREA_WORDS,
+            ARGUMENTS_EXCLUDING_THIS,
+            PADDED_ARGUMENTS_EXCLUDING_THIS,
+            R,
+        >(request, |top_call_frame_publication, _stack_call_proof| {
+            body(top_call_frame_publication)
+        })
+    }
+
+    pub(super) fn with_stack_top_call_frame_publication_and_stack_call_from_request<
+        const LOCAL_AREA_WORDS: usize,
+        const ARGUMENTS_EXCLUDING_THIS: usize,
+        const PADDED_ARGUMENTS_EXCLUDING_THIS: usize,
+        R,
+    >(
+        request: Arm64NativeEntryStackFrameRequest<ARGUMENTS_EXCLUDING_THIS>,
+        body: impl for<'publication> FnOnce(
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+            Arm64NativeEntryJscStackCallRequestProof,
+        ) -> R,
+    ) -> R {
+        let layout_proof = do_vm_entry_layout_for_stack_frame(
+            u32::try_from(ARGUMENTS_EXCLUDING_THIS).expect("argument count"),
+            u32::try_from(PADDED_ARGUMENTS_EXCLUDING_THIS).expect("padded argument count"),
+        );
         let mut result = None;
         with_arm64_native_entry_padded_stack_frame::<
             LOCAL_AREA_WORDS,
             ARGUMENTS_EXCLUDING_THIS,
             PADDED_ARGUMENTS_EXCLUDING_THIS,
         >(request, |stack_frame| {
+            let stack_call_proof =
+                prove_arm64_native_entry_jsc_stack_call_request(layout_proof, &stack_frame)
+                    .expect("JSC stack-call request proof");
             let mut state = VmEntryState::default();
             let guard = enter_arm64_native_entry_stack_publication(
                 &mut state,
@@ -1313,7 +1653,7 @@ pub(super) mod tests {
                     .vm_entry_previous_top_entry_frame,
                 None
             );
-            result = Some(body(top_call_frame_publication));
+            result = Some(body(top_call_frame_publication, stack_call_proof));
             drop(guard);
             assert_eq!(state.top_frame(), None);
             assert_eq!(state.entry_frame(), None);
@@ -1328,6 +1668,18 @@ pub(super) mod tests {
         ) -> R,
     ) -> R {
         with_stack_top_call_frame_publication_from_request::<2, 0, 0, R>(
+            stack_frame_request(None, None),
+            body,
+        )
+    }
+
+    pub(super) fn with_stack_top_call_frame_publication_and_stack_call<R>(
+        body: impl for<'publication> FnOnce(
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+            Arm64NativeEntryJscStackCallRequestProof,
+        ) -> R,
+    ) -> R {
+        with_stack_top_call_frame_publication_and_stack_call_from_request::<2, 0, 0, R>(
             stack_frame_request(None, None),
             body,
         )
@@ -1690,6 +2042,50 @@ pub(super) mod tests {
             verifier_append_proof,
             jit_stub_trace_plan,
             native_frame_residency_proof,
+        }
+    }
+
+    pub(super) fn verified_generated_native_frame_materialization_proof_from_stack_call<
+        'publication,
+    >(
+        fixture: &NativeFrameResidencyFixture<'publication>,
+        stack_call_proof: &Arm64NativeEntryJscStackCallRequestProof,
+        expected_live_local_slots: usize,
+    ) -> Result<
+        P6Arm64VerifiedGeneratedNativeFrameMaterializationProof<'publication>,
+        P6Arm64VerifiedGeneratedNativeFrameMaterializationProofError,
+    > {
+        P6Arm64VerifiedGeneratedNativeFrameMaterializationProof::from_jsc_stack_call_request_proof(
+            &fixture.top_call_frame_publication,
+            &fixture.machine_stack_conservative_rooting_proof,
+            fixture.native_frame_residency_proof.clone(),
+            stack_call_proof,
+            expected_live_local_slots,
+        )
+    }
+
+    pub(super) fn full_generated_native_frame_materialization_fallback<'publication>(
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof<
+            'publication,
+        >,
+        machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
+        generated_native_frame_materialization_proof:
+            P6Arm64VerifiedGeneratedNativeFrameMaterializationProof<'publication>,
+    ) -> P6Arm64BranchAwareCallableFallbackRootingProof<'publication> {
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceMachineStackResidencyAndGeneratedNativeFrameMaterializationProof {
+            top_call_frame_publication,
+            machine_stack_conservative_rooting_proof,
+            vm_root_gather_plan,
+            conservative_root_marking_plan,
+            collector_effects_plan,
+            verifier_append_proof,
+            jit_stub_trace_plan,
+            generated_native_frame_materialization_proof,
         }
     }
 

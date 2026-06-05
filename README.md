@@ -163,6 +163,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            descriptors no longer progress public ARM64 admission, which now
            reaches MissingArm64GeneratedNativeFrameMaterializationProof after
            wrapper validation.
+    [done] VM ARM64 generated native-frame materialization admission stage now
+           requires a verified wrapper produced from the JSC stack-call request
+           proof plus matching residency evidence; raw descriptor attachments no
+           longer progress public ARM64 admission, which now reaches
+           MissingArm64JscStackDispatchAdmissionAuthority.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of
