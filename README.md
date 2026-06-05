@@ -116,8 +116,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            sp=CallFrame+CallerFrameAndPC and carries EntryFrame as the future
            fp/x29 source from stack-call proof; stack proof now models the
            ARM64 VMEntryRecord 18-slot callee-save buffer and the platform
-           request carries/validates that proof metadata; platform trampoline
-           still deferred pending Rust stack/fp restore and live save/restore)
+           request carries/validates that proof metadata; platform now has a
+           private normal-return-only ARM64 JSC-stack trampoline that restores
+           the Rust C ABI envelope, but public admission remains blocked on VM
+           top-frame publication, conservative rooting, and exception/unwind
+           restore support)
     [done] JIT ARM64 dormant virtual-register frame materialization helpers and
            private JumpIfFalse branch-aware callable encoder skeleton added to
            src/jit/arm64_baseline.rs (public branch-aware callable emission
