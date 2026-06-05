@@ -143,6 +143,29 @@ pub(crate) enum Arm64NativeEntryDoVmEntryLayoutError {
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Arm64NativeEntryJscStackCallRequestError {
+    FrameSourceMismatch {
+        expected: Arm64NativeEntryFrameAddressSource,
+        actual: Arm64NativeEntryFrameAddressSource,
+    },
+    ArgumentCountExcludingThisTooLarge {
+        actual: usize,
+    },
+    ArgumentCountExcludingThisMismatch {
+        expected: u32,
+        actual: u32,
+    },
+    ArgumentCountIncludingThisOverflow {
+        argument_count_excluding_this: u32,
+    },
+    PaddedArgumentStorageMissing {
+        padded_argument_count: u32,
+        stored_argument_count_including_this: u32,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Arm64NativeEntryLaunchProofRequest<'descriptor> {
     pub(crate) launch_descriptor: &'descriptor VmEntryLaunchDescriptor,
     pub(crate) callable_kind: BaselineNativeEntryCallableKind,
@@ -187,6 +210,26 @@ pub(crate) struct Arm64NativeEntryDoVmEntryLayoutProof {
     frame_size_bytes: usize,
     stack_alignment_bytes: usize,
     required_frame_source: Arm64NativeEntryFrameAddressSource,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Arm64NativeEntryJscStackCallRequestProof {
+    owner: CodeBlockId,
+    code_block: CodeBlockId,
+    active_entry_frame: EntryFrameId,
+    active_top_call_frame: CallFrameId,
+    selected_token: BaselineNativeEntryToken,
+    frame_source: Arm64NativeEntryFrameAddressSource,
+    call_frame: FrameAddress,
+    entry_frame: FrameAddress,
+    vm_entry_record: FrameAddress,
+    post_allocation_sp: FrameAddress,
+    frame_word_count: u32,
+    frame_size_bytes: usize,
+    argument_count_including_this: u32,
+    padded_argument_count: u32,
+    undefined_fill_count: u32,
 }
 
 #[allow(dead_code)]
@@ -335,6 +378,71 @@ pub(crate) fn prove_arm64_native_entry_do_vm_entry_stack_layout(
         frame_size_bytes,
         stack_alignment_bytes: JSC_STACK_ALIGNMENT_BYTES,
         required_frame_source: launch_proof.required_frame_source,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn prove_arm64_native_entry_jsc_stack_call_request(
+    layout_proof: Arm64NativeEntryDoVmEntryLayoutProof,
+    stack_frame_proof: &Arm64NativeEntryStackFrameProof<'_>,
+) -> Result<Arm64NativeEntryJscStackCallRequestProof, Arm64NativeEntryJscStackCallRequestError> {
+    if stack_frame_proof.source != layout_proof.required_frame_source {
+        return Err(
+            Arm64NativeEntryJscStackCallRequestError::FrameSourceMismatch {
+                expected: layout_proof.required_frame_source,
+                actual: stack_frame_proof.source,
+            },
+        );
+    }
+    let actual_argument_count_excluding_this =
+        u32::try_from(stack_frame_proof.argument_count_excluding_this).map_err(|_| {
+            Arm64NativeEntryJscStackCallRequestError::ArgumentCountExcludingThisTooLarge {
+                actual: stack_frame_proof.argument_count_excluding_this,
+            }
+        })?;
+    if actual_argument_count_excluding_this != layout_proof.argument_count_excluding_this {
+        return Err(
+            Arm64NativeEntryJscStackCallRequestError::ArgumentCountExcludingThisMismatch {
+                expected: layout_proof.argument_count_excluding_this,
+                actual: actual_argument_count_excluding_this,
+            },
+        );
+    }
+    let stored_argument_count_including_this =
+        actual_argument_count_excluding_this.checked_add(1).ok_or(
+            Arm64NativeEntryJscStackCallRequestError::ArgumentCountIncludingThisOverflow {
+                argument_count_excluding_this: actual_argument_count_excluding_this,
+            },
+        )?;
+    // C++ `doVMEntry` allocates all padded argument slots and fills the missing
+    // ones with `undefined`. The current Rust stack-local skeleton stores only
+    // supplied arguments, so it cannot prove a JSC call request when padding is
+    // required.
+    if stored_argument_count_including_this < layout_proof.padded_argument_count {
+        return Err(
+            Arm64NativeEntryJscStackCallRequestError::PaddedArgumentStorageMissing {
+                padded_argument_count: layout_proof.padded_argument_count,
+                stored_argument_count_including_this,
+            },
+        );
+    }
+
+    Ok(Arm64NativeEntryJscStackCallRequestProof {
+        owner: layout_proof.owner,
+        code_block: layout_proof.code_block,
+        active_entry_frame: layout_proof.active_entry_frame,
+        active_top_call_frame: layout_proof.active_top_call_frame,
+        selected_token: layout_proof.selected_token,
+        frame_source: stack_frame_proof.source,
+        call_frame: stack_frame_proof.call_frame,
+        entry_frame: stack_frame_proof.entry_frame,
+        vm_entry_record: stack_frame_proof.vm_entry_record,
+        post_allocation_sp: stack_frame_proof.post_allocation_sp,
+        frame_word_count: layout_proof.frame_word_count,
+        frame_size_bytes: layout_proof.frame_size_bytes,
+        argument_count_including_this: layout_proof.argument_count_including_this,
+        padded_argument_count: layout_proof.padded_argument_count,
+        undefined_fill_count: layout_proof.undefined_fill_count,
     })
 }
 
@@ -814,6 +922,20 @@ mod tests {
         }
     }
 
+    fn do_vm_entry_layout(
+        descriptor: &VmEntryLaunchDescriptor,
+    ) -> Arm64NativeEntryDoVmEntryLayoutProof {
+        let launch_proof =
+            prove_arm64_native_entry_launch_descriptor(Arm64NativeEntryLaunchProofRequest {
+                launch_descriptor: descriptor,
+                callable_kind: BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
+                callable_token: descriptor.native_entry.normal_entry,
+            })
+            .expect("ARM64 launch proof");
+        prove_arm64_native_entry_do_vm_entry_stack_layout(launch_proof)
+            .expect("doVMEntry stack layout proof")
+    }
+
     #[test]
     fn arm64_native_entry_stack_guard_builds_jsc_ordered_frame_proof() {
         with_arm64_native_entry_stack_frame::<2, 2>(request(), |proof| {
@@ -933,6 +1055,90 @@ mod tests {
                     call_frame: 0x2000,
                     entry_frame: 0x3000,
                 }
+            )
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_jsc_stack_call_request_accepts_no_padding_stack_frame() {
+        let mut descriptor = launch_descriptor();
+        descriptor.call_frame.padded_argument_count = 3;
+        let layout = do_vm_entry_layout(&descriptor);
+
+        with_arm64_native_entry_stack_frame::<2, 2>(request(), |stack_frame| {
+            let request_proof =
+                prove_arm64_native_entry_jsc_stack_call_request(layout, &stack_frame)
+                    .expect("JSC stack-call request proof");
+
+            assert_eq!(request_proof.owner, descriptor.owner);
+            assert_eq!(request_proof.code_block, descriptor.code_block);
+            assert_eq!(request_proof.active_entry_frame, EntryFrameId(1));
+            assert_eq!(request_proof.active_top_call_frame, CallFrameId(2));
+            assert_eq!(
+                request_proof.frame_source,
+                Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard
+            );
+            assert_eq!(request_proof.call_frame, stack_frame.call_frame);
+            assert_eq!(request_proof.entry_frame, stack_frame.entry_frame);
+            assert_eq!(request_proof.vm_entry_record, stack_frame.vm_entry_record);
+            assert_eq!(
+                request_proof.post_allocation_sp,
+                stack_frame.post_allocation_sp
+            );
+            assert_eq!(request_proof.frame_word_count, 8);
+            assert_eq!(request_proof.frame_size_bytes, 64);
+            assert_eq!(request_proof.argument_count_including_this, 3);
+            assert_eq!(request_proof.padded_argument_count, 3);
+            assert_eq!(request_proof.undefined_fill_count, 0);
+        })
+        .expect("stack-local ARM64 entry proof");
+    }
+
+    #[test]
+    fn arm64_native_entry_jsc_stack_call_request_rejects_missing_padded_slots() {
+        let descriptor = launch_descriptor();
+        let layout = do_vm_entry_layout(&descriptor);
+
+        with_arm64_native_entry_stack_frame::<2, 2>(request(), |stack_frame| {
+            assert_eq!(
+                prove_arm64_native_entry_jsc_stack_call_request(layout, &stack_frame),
+                Err(
+                    Arm64NativeEntryJscStackCallRequestError::PaddedArgumentStorageMissing {
+                        padded_argument_count: 5,
+                        stored_argument_count_including_this: 3,
+                    },
+                )
+            );
+        })
+        .expect("stack-local ARM64 entry proof");
+    }
+
+    #[test]
+    fn arm64_native_entry_jsc_stack_call_request_rejects_register_window_source() {
+        let mut descriptor = launch_descriptor();
+        descriptor.call_frame.padded_argument_count = 3;
+        let layout = do_vm_entry_layout(&descriptor);
+        let stack_frame = Arm64NativeEntryStackFrameProof {
+            source: Arm64NativeEntryFrameAddressSource::RegisterFileWindow,
+            entry_frame: FrameAddress(0x3000),
+            vm_entry_record: FrameAddress(0x2800),
+            vm_entry_record_previous_top_call_frame: None,
+            vm_entry_record_previous_top_entry_frame: None,
+            call_frame: FrameAddress(0x2000),
+            post_allocation_sp: FrameAddress(0x1ff0),
+            local_area_words: 2,
+            live_local_count: 1,
+            argument_count_excluding_this: 2,
+            _stack_frame: PhantomData,
+        };
+
+        assert_eq!(
+            prove_arm64_native_entry_jsc_stack_call_request(layout, &stack_frame),
+            Err(
+                Arm64NativeEntryJscStackCallRequestError::FrameSourceMismatch {
+                    expected: Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard,
+                    actual: Arm64NativeEntryFrameAddressSource::RegisterFileWindow,
+                },
             )
         );
     }
