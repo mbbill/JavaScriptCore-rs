@@ -34,19 +34,10 @@ use crate::jit::emitter::{
     P6X86_64SemanticEncodedSelection, P6X86_64SemanticTerminalSelection,
 };
 
-// ARM64 JSC map: GPRInfo::callFrameRegister is fp/x29 and returnValueGPR is
-// x0. The C ABI passes Rust's VM/frame/callee/IC-store carrier in x0/x1/x2/x3;
-// this seed pins x29 to the Rust frame-base carrier, emits only no-call/no-heap
-// return-shaped code, and leaves JSC metadata/jitData materialization for the
-// later full ARM64 baseline lane.
-const P6_ARM64_CALLABLE_PROLOGUE_BYTES: &[u8] = &[
-    0xfd, 0x7b, 0xbf, 0xa9, // stp fp, lr, [sp, #-16]!
-    0xfd, 0x03, 0x01, 0xaa, // mov fp, x1
-];
-const P6_ARM64_CALLABLE_EPILOGUE_BYTES: &[u8] = &[
-    0xfd, 0x7b, 0xc1, 0xa8, // ldp fp, lr, [sp], #16
-    0xc0, 0x03, 0x5f, 0xd6, // ret
-];
+const P6_ARM64_CALLABLE_PROLOGUE_BYTES: &[u8] =
+    entry_prologue::P6_ARM64_RAW_C_ABI_CALLABLE_PROLOGUE_BYTES;
+const P6_ARM64_CALLABLE_EPILOGUE_BYTES: &[u8] =
+    entry_prologue::P6_ARM64_RAW_C_ABI_CALLABLE_EPILOGUE_BYTES;
 
 pub fn emit_p6_arm64_baseline_callable_semantic_bytes(
     contract: P6X86_64BaselineBackendContractRecord,
@@ -283,6 +274,7 @@ pub(crate) mod register_contract {
 }
 
 mod control_flow;
+mod entry_prologue;
 mod frame_addressing;
 mod frame_materialization;
 mod frame_materialization_producer;
