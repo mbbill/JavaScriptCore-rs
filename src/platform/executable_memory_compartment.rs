@@ -69,8 +69,13 @@ pub struct ExecutableMemoryP6CallRequest {
 /// code with `sp = CallFrame + sizeof(CallerFrameAndPC)` while `cfr/fp` still
 /// names the `EntryFrame`. The generated ARM64 prologue pushes that `fp/lr`
 /// pair into the callee `CallerFrameAndPC` slots, then makes `fp/x29` equal the
-/// callee `CallFrame*`. This request carries both checked machine-register
-/// inputs for the future trampoline; it is not the current raw Rust
+/// callee `CallFrame*`.
+///
+/// C++ derives the VM callee-save buffer from `EntryFrame -> VMEntryRecord ->
+/// calleeSaveRegistersBuffer`. Rust carries the already-proven buffer metadata
+/// to the dormant platform request so a future trampoline cannot accept a
+/// buffer that bypassed the VMEntryRecord proof. This remains proof metadata,
+/// not live save/restore behavior, and it is not the current raw Rust
 /// register-window C ABI frame pointer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutableMemoryArm64JscStackCallRequest {
@@ -78,6 +83,9 @@ pub struct ExecutableMemoryArm64JscStackCallRequest {
     pub entry_sp: NonNull<c_void>,
     pub call_frame: NonNull<c_void>,
     pub entry_frame: NonNull<c_void>,
+    pub vm_entry_record_callee_save_buffer: NonNull<c_void>,
+    pub vm_entry_record_callee_save_register_count: usize,
+    pub vm_entry_record_callee_save_buffer_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +106,29 @@ pub enum ExecutableMemoryArm64JscStackCallRequestValidationError {
     EntryFrameNotAboveCallFrame {
         entry_frame: usize,
         call_frame: usize,
+    },
+    VmEntryCalleeSaveRegisterCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    VmEntryCalleeSaveBufferSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    VmEntryCalleeSaveBufferUnaligned {
+        buffer: usize,
+    },
+    VmEntryCalleeSaveBufferNotAboveCallFrame {
+        buffer: usize,
+        call_frame: usize,
+    },
+    VmEntryCalleeSaveBufferEndOverflow {
+        buffer: usize,
+        byte_len: usize,
+    },
+    VmEntryCalleeSaveBufferEndMismatch {
+        expected_entry_frame: usize,
+        actual_buffer_end: usize,
     },
 }
 
@@ -263,18 +294,26 @@ impl ExecutableMemoryP6CallRequest {
 impl ExecutableMemoryArm64JscStackCallRequest {
     pub const CALLER_FRAME_AND_PC_BYTES: usize = 16;
     pub const STACK_ALIGNMENT_BYTES: usize = 16;
+    pub const VM_CALLEE_SAVE_REGISTER_COUNT: usize = 18;
+    pub const VM_CALLEE_SAVE_BUFFER_BYTES: usize = 144;
 
     pub const fn new(
         entry_offset: u32,
         entry_sp: NonNull<c_void>,
         call_frame: NonNull<c_void>,
         entry_frame: NonNull<c_void>,
+        vm_entry_record_callee_save_buffer: NonNull<c_void>,
+        vm_entry_record_callee_save_register_count: usize,
+        vm_entry_record_callee_save_buffer_bytes: usize,
     ) -> Self {
         Self {
             entry_offset,
             entry_sp,
             call_frame,
             entry_frame,
+            vm_entry_record_callee_save_buffer,
+            vm_entry_record_callee_save_register_count,
+            vm_entry_record_callee_save_buffer_bytes,
         }
     }
 
@@ -317,6 +356,56 @@ impl ExecutableMemoryArm64JscStackCallRequest {
                 ExecutableMemoryArm64JscStackCallRequestValidationError::EntryFrameNotAboveCallFrame {
                     entry_frame,
                     call_frame,
+                },
+            );
+        }
+        if self.vm_entry_record_callee_save_register_count != Self::VM_CALLEE_SAVE_REGISTER_COUNT {
+            return Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveRegisterCountMismatch {
+                    expected: Self::VM_CALLEE_SAVE_REGISTER_COUNT,
+                    actual: self.vm_entry_record_callee_save_register_count,
+                },
+            );
+        }
+        if self.vm_entry_record_callee_save_buffer_bytes != Self::VM_CALLEE_SAVE_BUFFER_BYTES {
+            return Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveBufferSizeMismatch {
+                    expected: Self::VM_CALLEE_SAVE_BUFFER_BYTES,
+                    actual: self.vm_entry_record_callee_save_buffer_bytes,
+                },
+            );
+        }
+        let callee_save_buffer = self.vm_entry_record_callee_save_buffer.as_ptr() as usize;
+        if callee_save_buffer % Self::STACK_ALIGNMENT_BYTES != 0 {
+            return Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveBufferUnaligned {
+                    buffer: callee_save_buffer,
+                },
+            );
+        }
+        if callee_save_buffer <= call_frame {
+            return Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveBufferNotAboveCallFrame {
+                    buffer: callee_save_buffer,
+                    call_frame,
+                },
+            );
+        }
+        let Some(callee_save_buffer_end) =
+            callee_save_buffer.checked_add(self.vm_entry_record_callee_save_buffer_bytes)
+        else {
+            return Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveBufferEndOverflow {
+                    buffer: callee_save_buffer,
+                    byte_len: self.vm_entry_record_callee_save_buffer_bytes,
+                },
+            );
+        };
+        if callee_save_buffer_end != entry_frame {
+            return Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveBufferEndMismatch {
+                    expected_entry_frame: entry_frame,
+                    actual_buffer_end: callee_save_buffer_end,
                 },
             );
         }
@@ -964,22 +1053,47 @@ mod tests {
         NonNull::new(address as *mut c_void).expect("non-null test address")
     }
 
+    fn arm64_jsc_stack_call_request(
+        entry_sp: usize,
+        call_frame: usize,
+        entry_frame: usize,
+        vm_entry_record_callee_save_buffer: usize,
+    ) -> ExecutableMemoryArm64JscStackCallRequest {
+        arm64_jsc_stack_call_request_with_callee_save_shape(
+            entry_sp,
+            call_frame,
+            entry_frame,
+            vm_entry_record_callee_save_buffer,
+            ExecutableMemoryArm64JscStackCallRequest::VM_CALLEE_SAVE_REGISTER_COUNT,
+            ExecutableMemoryArm64JscStackCallRequest::VM_CALLEE_SAVE_BUFFER_BYTES,
+        )
+    }
+
+    fn arm64_jsc_stack_call_request_with_callee_save_shape(
+        entry_sp: usize,
+        call_frame: usize,
+        entry_frame: usize,
+        vm_entry_record_callee_save_buffer: usize,
+        vm_entry_record_callee_save_register_count: usize,
+        vm_entry_record_callee_save_buffer_bytes: usize,
+    ) -> ExecutableMemoryArm64JscStackCallRequest {
+        ExecutableMemoryArm64JscStackCallRequest::new(
+            12,
+            non_null_addr(entry_sp),
+            non_null_addr(call_frame),
+            non_null_addr(entry_frame),
+            non_null_addr(vm_entry_record_callee_save_buffer),
+            vm_entry_record_callee_save_register_count,
+            vm_entry_record_callee_save_buffer_bytes,
+        )
+    }
+
     #[test]
     fn arm64_jsc_stack_call_request_validates_call_frame_relative_entry_sp() {
-        let request = ExecutableMemoryArm64JscStackCallRequest::new(
-            12,
-            non_null_addr(0x2010),
-            non_null_addr(0x2000),
-            non_null_addr(0x3000),
-        );
+        let request = arm64_jsc_stack_call_request(0x2010, 0x2000, 0x3000, 0x2f70);
         assert_eq!(request.validate(), Ok(()));
 
-        let mismatch = ExecutableMemoryArm64JscStackCallRequest::new(
-            12,
-            non_null_addr(0x2018),
-            non_null_addr(0x2000),
-            non_null_addr(0x3000),
-        );
+        let mismatch = arm64_jsc_stack_call_request(0x2018, 0x2000, 0x3000, 0x2f70);
         assert_eq!(
             mismatch.validate(),
             Err(
@@ -990,12 +1104,7 @@ mod tests {
             )
         );
 
-        let unaligned = ExecutableMemoryArm64JscStackCallRequest::new(
-            12,
-            non_null_addr(0x2018),
-            non_null_addr(0x2008),
-            non_null_addr(0x3000),
-        );
+        let unaligned = arm64_jsc_stack_call_request(0x2018, 0x2008, 0x3000, 0x2f70);
         assert_eq!(
             unaligned.validate(),
             Err(
@@ -1008,12 +1117,7 @@ mod tests {
 
     #[test]
     fn arm64_jsc_stack_call_request_validates_entry_frame_anchor_for_fp() {
-        let unaligned_entry_frame = ExecutableMemoryArm64JscStackCallRequest::new(
-            12,
-            non_null_addr(0x2010),
-            non_null_addr(0x2000),
-            non_null_addr(0x3008),
-        );
+        let unaligned_entry_frame = arm64_jsc_stack_call_request(0x2010, 0x2000, 0x3008, 0x2f70);
         assert_eq!(
             unaligned_entry_frame.validate(),
             Err(
@@ -1023,18 +1127,86 @@ mod tests {
             )
         );
 
-        let inverted_entry_frame = ExecutableMemoryArm64JscStackCallRequest::new(
-            12,
-            non_null_addr(0x2010),
-            non_null_addr(0x2000),
-            non_null_addr(0x1800),
-        );
+        let inverted_entry_frame = arm64_jsc_stack_call_request(0x2010, 0x2000, 0x1800, 0x1770);
         assert_eq!(
             inverted_entry_frame.validate(),
             Err(
                 ExecutableMemoryArm64JscStackCallRequestValidationError::EntryFrameNotAboveCallFrame {
                     entry_frame: 0x1800,
                     call_frame: 0x2000,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn arm64_jsc_stack_call_request_validates_vm_entry_callee_save_buffer_shape() {
+        let count_mismatch = arm64_jsc_stack_call_request_with_callee_save_shape(
+            0x2010, 0x2000, 0x3000, 0x2f70, 17, 144,
+        );
+        assert_eq!(
+            count_mismatch.validate(),
+            Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveRegisterCountMismatch {
+                    expected: 18,
+                    actual: 17,
+                }
+            )
+        );
+
+        let size_mismatch = arm64_jsc_stack_call_request_with_callee_save_shape(
+            0x2010, 0x2000, 0x3000, 0x2f70, 18, 136,
+        );
+        assert_eq!(
+            size_mismatch.validate(),
+            Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveBufferSizeMismatch {
+                    expected: 144,
+                    actual: 136,
+                }
+            )
+        );
+
+        let unaligned_buffer = arm64_jsc_stack_call_request(0x2010, 0x2000, 0x3000, 0x2f78);
+        assert_eq!(
+            unaligned_buffer.validate(),
+            Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveBufferUnaligned {
+                    buffer: 0x2f78,
+                }
+            )
+        );
+
+        let below_call_frame = arm64_jsc_stack_call_request(0x2010, 0x2000, 0x3000, 0x1ff0);
+        assert_eq!(
+            below_call_frame.validate(),
+            Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveBufferNotAboveCallFrame {
+                    buffer: 0x1ff0,
+                    call_frame: 0x2000,
+                }
+            )
+        );
+
+        let overflowing_buffer =
+            arm64_jsc_stack_call_request(0x2010, 0x2000, 0x3000, usize::MAX - 15);
+        assert_eq!(
+            overflowing_buffer.validate(),
+            Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveBufferEndOverflow {
+                    buffer: usize::MAX - 15,
+                    byte_len: 144,
+                }
+            )
+        );
+
+        let end_mismatch = arm64_jsc_stack_call_request(0x2010, 0x2000, 0x3000, 0x2f60);
+        assert_eq!(
+            end_mismatch.validate(),
+            Err(
+                ExecutableMemoryArm64JscStackCallRequestValidationError::VmEntryCalleeSaveBufferEndMismatch {
+                    expected_entry_frame: 0x3000,
+                    actual_buffer_end: 0x2ff0,
                 }
             )
         );

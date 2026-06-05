@@ -62,6 +62,9 @@ pub(crate) enum Arm64NativeEntryJscStackDispatchRequestError {
     NullEntryFrame {
         entry_frame: FrameAddress,
     },
+    NullVmEntryCalleeSaveBuffer {
+        buffer: FrameAddress,
+    },
     PlatformRequestInvalid {
         reason: ExecutableMemoryArm64JscStackCallRequestValidationError,
     },
@@ -117,11 +120,20 @@ pub(crate) fn prove_arm64_native_entry_jsc_stack_dispatch_request<'frame>(
             entry_frame: stack_call_proof.entry_frame,
         },
     )?;
+    let vm_entry_record_callee_save_buffer =
+        non_null_frame_address(stack_call_proof.vm_entry_record_callee_save_buffer).ok_or(
+            Arm64NativeEntryJscStackDispatchRequestError::NullVmEntryCalleeSaveBuffer {
+                buffer: stack_call_proof.vm_entry_record_callee_save_buffer,
+            },
+        )?;
     let platform_request = ExecutableMemoryArm64JscStackCallRequest::new(
         entry_offset,
         entry_sp_ptr,
         call_frame,
         entry_frame,
+        vm_entry_record_callee_save_buffer,
+        stack_call_proof.vm_entry_record_callee_save_register_count,
+        stack_call_proof.vm_entry_record_callee_save_buffer_bytes,
     );
     platform_request.validate().map_err(|reason| {
         Arm64NativeEntryJscStackDispatchRequestError::PlatformRequestInvalid { reason }
@@ -227,7 +239,7 @@ mod tests {
     fn stack_frame_proof<'frame>() -> Arm64NativeEntryStackFrameProof<'frame> {
         Arm64NativeEntryStackFrameProof {
             source: Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard,
-            entry_frame: FrameAddress(0x3000),
+            entry_frame: FrameAddress(0x28b0),
             vm_entry_record: FrameAddress(0x2800),
             vm_entry_record_previous_top_call_frame: Some(FrameAddress(0x1000)),
             vm_entry_record_previous_top_entry_frame: Some(FrameAddress(0x1800)),
@@ -254,7 +266,7 @@ mod tests {
             selected_token: token(),
             frame_source: Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard,
             call_frame: FrameAddress(0x2000),
-            entry_frame: FrameAddress(0x3000),
+            entry_frame: FrameAddress(0x28b0),
             vm_entry_record: FrameAddress(0x2800),
             vm_entry_record_previous_top_call_frame: Some(FrameAddress(0x1000)),
             vm_entry_record_previous_top_entry_frame: Some(FrameAddress(0x1800)),
@@ -314,7 +326,7 @@ mod tests {
 
         assert_eq!(dispatch.entry_offset, 24);
         assert_eq!(dispatch.call_frame, FrameAddress(0x2000));
-        assert_eq!(dispatch.entry_frame, FrameAddress(0x3000));
+        assert_eq!(dispatch.entry_frame, FrameAddress(0x28b0));
         assert_eq!(
             dispatch.vm_entry_record_callee_save_buffer,
             FrameAddress(0x2820)
@@ -335,7 +347,26 @@ mod tests {
         );
         assert_eq!(
             dispatch.platform_request.entry_frame.as_ptr() as usize,
-            0x3000
+            0x28b0
+        );
+        assert_eq!(
+            dispatch
+                .platform_request
+                .vm_entry_record_callee_save_buffer
+                .as_ptr() as usize,
+            0x2820
+        );
+        assert_eq!(
+            dispatch
+                .platform_request
+                .vm_entry_record_callee_save_register_count,
+            JSC_ARM64_VM_CALLEE_SAVE_REGISTER_COUNT
+        );
+        assert_eq!(
+            dispatch
+                .platform_request
+                .vm_entry_record_callee_save_buffer_bytes,
+            JSC_ARM64_VM_CALLEE_SAVE_BUFFER_BYTES
         );
         assert_eq!(dispatch.platform_request.entry_sp.as_ptr() as usize, 0x2010);
         assert_eq!(dispatch.platform_request.validate(), Ok(()));
@@ -413,6 +444,27 @@ mod tests {
             Err(
                 Arm64NativeEntryJscStackDispatchRequestError::NullEntryFrame {
                     entry_frame: FrameAddress(0),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_jsc_stack_dispatch_request_rejects_null_callee_save_buffer() {
+        let stack_frame = Arm64NativeEntryStackFrameProof {
+            vm_entry_record_callee_save_buffer: FrameAddress(0),
+            ..stack_frame_proof()
+        };
+        let stack_call = Arm64NativeEntryJscStackCallRequestProof {
+            vm_entry_record_callee_save_buffer: FrameAddress(0),
+            ..stack_call_proof()
+        };
+
+        assert_eq!(
+            prove_arm64_native_entry_jsc_stack_dispatch_request(&stack_call, &stack_frame, 0),
+            Err(
+                Arm64NativeEntryJscStackDispatchRequestError::NullVmEntryCalleeSaveBuffer {
+                    buffer: FrameAddress(0),
                 }
             )
         );

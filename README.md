@@ -115,7 +115,8 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            ExecutableMemoryArm64JscStackCallRequest (derives
            sp=CallFrame+CallerFrameAndPC and carries EntryFrame as the future
            fp/x29 source from stack-call proof; stack proof now models the
-           ARM64 VMEntryRecord 18-slot callee-save buffer; platform trampoline
+           ARM64 VMEntryRecord 18-slot callee-save buffer and the platform
+           request carries/validates that proof metadata; platform trampoline
            still deferred pending Rust stack/fp restore and live save/restore)
     [done] JIT ARM64 dormant virtual-register frame materialization helpers and
            private JumpIfFalse branch-aware callable encoder skeleton added to
