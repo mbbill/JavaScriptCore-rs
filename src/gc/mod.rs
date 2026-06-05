@@ -65,7 +65,7 @@ pub use heap::{
 };
 pub(crate) use heap::{HeapConservativeScanAppendReceipt, HeapMarkingError, HeapMarkingRecord};
 pub(crate) use machine_stack_marker::{
-    JscMachineStackConservativeRootingProof, JscMachineStackMarker,
+    JscMachineStackConservativeRootingProof, JscMachineStackMarker, JscMachineStackRootSpanKind,
 };
 pub use phase::{
     evaluate_heap_semantics, CollectionCompletionCallbackId, CollectionKind, CollectionRequest,

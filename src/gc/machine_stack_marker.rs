@@ -217,7 +217,7 @@ pub(crate) struct JscMachineStackMarker {
 }
 
 impl JscMachineStackMarker {
-    pub(in crate::gc) const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self { _private: () }
     }
 
@@ -321,7 +321,7 @@ impl JscMachineStackMarker {
     }
 
     #[cfg(test)]
-    fn with_synthetic_current_thread_conservative_roots_for_testing<R>(
+    pub(crate) fn with_synthetic_current_thread_conservative_roots_for_testing<R>(
         &self,
         heap: HeapId,
         epoch: HeapEpoch,

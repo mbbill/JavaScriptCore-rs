@@ -153,7 +153,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            root gather evidence, src/gc/visitor/verifier.rs adds
            VerifierSlotVisitor conservative-root append evidence, and
            src/vm/native_reentry.rs consumes them in Heap::addCoreConstraints
-           order before rejecting at the missing real native-rooting blocker;
+           order plus native-frame machine-stack residency evidence before
+           rejecting at the missing ARM64 generated native frame
+           materialization blocker;
            native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 
