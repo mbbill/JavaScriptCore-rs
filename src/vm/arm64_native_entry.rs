@@ -37,6 +37,12 @@ use super::entry::{
 mod jsc_stack_dispatch;
 mod stack_entry_publication;
 
+pub(in crate::vm) use self::stack_entry_publication::Arm64NativeEntryStackPublicationGuard;
+#[cfg(test)]
+pub(in crate::vm) use self::stack_entry_publication::{
+    enter_arm64_native_entry_stack_publication, Arm64NativeEntryStackPublicationError,
+};
+
 const JSC_REGISTER_BYTES: usize = 8;
 const JSC_STACK_ALIGNMENT_BYTES: usize = 16;
 const JSC_CALLER_FRAME_AND_PC_WORDS: usize = 2;

@@ -119,8 +119,16 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            request carries/validates that proof metadata; platform now has a
            private normal-return-only ARM64 JSC-stack trampoline that restores
            the Rust C ABI envelope, but public admission remains blocked on
-           threading stack-local top-frame publication into admission/rooting,
-           conservative rooting, and exception/unwind restore support)
+           turning descriptor rooting/prologue proofs into real conservative
+           stack visibility, final admission authority, and exception/unwind
+           restore support)
+    [done] VM ARM64 public-admission proof now consumes stack-local
+           top-frame publication from
+           src/vm/arm64_native_entry/stack_entry_publication.rs (maps
+           doVMEntry VMEntryRecord previous-top validation plus
+           VM::topCallFrame / VM::topEntryFrame publication; boxed
+           entry/call-frame storage is no longer a public-admission
+           top-frame source; admission still rejects).
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of
@@ -165,9 +173,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            skeleton, and src/vm/entry.rs now has a dormant storage-backed
            VM-entry guard that validates/restores the distinct topCallFrame /
            topEntryFrame pair and is the only reachable entry-guard path for
-           native call-frame publication; arm64_admission.rs now derives the
-           publication proof from those storage-backed entry/call-frame guards
-           before rejecting at the conservative-root blocker;
+           native call-frame publication; arm64_admission.rs now requires the
+           stack-local publication guard for public ARM64 admission proof and
+           keeps storage-backed publication separate from that source;
            src/gc/machine_stack_marker.rs and src/wtf/stack_bounds.rs add the
            dormant MachineStackMarker/RegisterState/WTF StackBounds-shaped
            crate-internal, heap/epoch-bound current-thread gather+ingest

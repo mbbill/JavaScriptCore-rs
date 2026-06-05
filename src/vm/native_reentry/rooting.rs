@@ -7,6 +7,8 @@
 //! an admission `Ok` path, verifier mark-map storage, verifier drain, or real
 //! native rooting.
 
+use core::marker::PhantomData;
+
 use crate::gc::{
     CellId, CellState, ConservativeRootCell, ConservativeRootSpan, ConservativeRoots, GcPhase,
     HeapCellKind, HeapConservativeScanAppendReceipt, HeapEpoch, HeapId,
@@ -31,25 +33,53 @@ use crate::jit::arm64_baseline::{
 };
 use crate::jit::{JitStubRoutineTraceError, JitStubRoutineTracePlan};
 
-use super::super::entry::{FrameAddress, VmNativeCallFramePublicationRecord};
+use super::super::arm64_native_entry::Arm64NativeEntryStackPublicationGuard;
+use super::super::entry::FrameAddress;
 use super::super::vm_roots::{VmRootGatherError, VmRootGatherPlan};
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::vm) struct P6Arm64BranchAwareCallableTopCallFramePublicationProof {
-    // C++ JSC stores a raw CallFrame* in VM::topCallFrame; this Rust evidence
-    // is tied to the symbolic publication record from `entry.rs`, so it proves
-    // top-frame metadata exists but not that conservative machine-stack roots
-    // can see generated ARM64 state.
-    pub(in crate::vm) publication: VmNativeCallFramePublicationRecord,
+pub(in crate::vm) struct P6Arm64BranchAwareCallableTopCallFramePublicationRecord {
+    pub(in crate::vm) published_top_frame: FrameAddress,
+    pub(in crate::vm) current_entry_frame: FrameAddress,
+    pub(in crate::vm) vm_entry_record: FrameAddress,
+    pub(in crate::vm) vm_entry_previous_top_call_frame: Option<FrameAddress>,
+    pub(in crate::vm) vm_entry_previous_top_entry_frame: Option<FrameAddress>,
+    pub(in crate::vm) argument_count_excluding_this: usize,
+    pub(in crate::vm) padded_argument_count: usize,
+    pub(in crate::vm) live_local_count: usize,
 }
 
-impl P6Arm64BranchAwareCallableTopCallFramePublicationProof {
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::vm) struct P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication> {
+    // C++ JSC stores a raw stack CallFrame* in VM::topCallFrame. Rust accepts
+    // this dormant admission evidence only from an active
+    // `Arm64NativeEntryStackPublicationGuard`, so boxed entry/call-frame storage
+    // cannot masquerade as stack-local `doVMEntry` publication.
+    pub(in crate::vm) publication: P6Arm64BranchAwareCallableTopCallFramePublicationRecord,
+    _stack_publication_guard: PhantomData<&'publication ()>,
+}
+
+impl P6Arm64BranchAwareCallableTopCallFramePublicationProof<'_> {
     #[allow(dead_code)]
-    pub(in crate::vm) const fn from_publication_record(
-        publication: VmNativeCallFramePublicationRecord,
-    ) -> Self {
-        Self { publication }
+    pub(in crate::vm) fn from_stack_publication_guard<'publication>(
+        publication: &'publication Arm64NativeEntryStackPublicationGuard<'_, '_>,
+    ) -> P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication> {
+        let proof = publication.proof();
+        P6Arm64BranchAwareCallableTopCallFramePublicationProof {
+            publication: P6Arm64BranchAwareCallableTopCallFramePublicationRecord {
+                published_top_frame: proof.top_call_frame,
+                current_entry_frame: proof.top_entry_frame,
+                vm_entry_record: proof.vm_entry_record,
+                vm_entry_previous_top_call_frame: proof.previous_top_call_frame,
+                vm_entry_previous_top_entry_frame: proof.previous_top_entry_frame,
+                argument_count_excluding_this: proof.argument_count_excluding_this,
+                padded_argument_count: proof.padded_argument_count,
+                live_local_count: proof.live_local_count,
+            },
+            _stack_publication_guard: PhantomData,
+        }
     }
 }
 
@@ -123,7 +153,7 @@ pub(in crate::vm) struct P6Arm64NativeFrameMachineStackResidencyProof {
 impl P6Arm64NativeFrameMachineStackResidencyProof {
     #[allow(dead_code)]
     pub(in crate::vm) fn from_machine_stack_proof(
-        top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof<'_>,
         machine_stack_proof: &JscMachineStackConservativeRootingProof<'_>,
         machine_stack_roots: ConservativeRoots,
         top_call_frame_span: P6Arm64NativeFrameMachineStackSpanKind,
@@ -154,7 +184,7 @@ impl P6Arm64NativeFrameMachineStackResidencyProof {
     #[allow(dead_code)]
     pub(in crate::vm) fn with_generated_native_frame_materialization(
         mut self,
-        top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof<'_>,
         frame_top_offset_bytes: isize,
         expected_live_local_slots: u32,
     ) -> Result<Self, P6Arm64GeneratedNativeFrameMaterializationAttachError> {
@@ -183,15 +213,22 @@ impl P6Arm64NativeFrameMachineStackResidencyProof {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let argument_count_excluding_this = top_call_frame_publication
+            .publication
+            .argument_count_excluding_this
+            .try_into()
+            .map_err(|_| {
+                P6Arm64GeneratedNativeFrameMaterializationAttachError::ArgumentCountExcludingThisOverflow {
+                    count: top_call_frame_publication
+                        .publication
+                        .argument_count_excluding_this,
+                }
+            })?;
         let descriptor = produce_arm64_baseline_generated_native_frame_materialization_descriptor(
             Arm64BaselineGeneratedNativeFrameMaterializationProductionRequest {
                 call_frame: top_call_frame_publication.publication.published_top_frame.0,
                 frame_top_offset_bytes,
-                argument_count_excluding_this: top_call_frame_publication
-                    .publication
-                    .call_frame
-                    .argument_count_including_this
-                    .saturating_sub(1),
+                argument_count_excluding_this,
                 live_local_count: expected_live_local_slots,
                 live_root_slots,
                 vm_entry_previous_top_call_frame: top_call_frame_publication
@@ -218,40 +255,46 @@ impl P6Arm64NativeFrameMachineStackResidencyProof {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::vm) enum P6Arm64GeneratedNativeFrameMaterializationAttachError {
     LiveRootSlotSpanMissing { order: usize, slot_address: usize },
+    ArgumentCountExcludingThisOverflow { count: usize },
     Producer(Arm64BaselineGeneratedNativeFrameMaterializationProductionError),
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof {
+pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publication> {
     MissingTopCallFramePublication,
     TopCallFramePublicationWithoutConservativeScanAppend(
-        P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
     ),
     TopCallFramePublicationWithConservativeScanAppendReceipt {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
     },
     TopCallFramePublicationWithVmRootGatherPlan {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
     },
     TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
     },
     TopCallFramePublicationWithVmRootGatherAndCollectorEffectsPlan {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
     },
     TopCallFramePublicationWithVmRootGatherCollectorEffectsAndVerifierAppendProof {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
@@ -259,7 +302,8 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof {
         verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
     },
     TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierAppendAndJitStubTracePlan {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
@@ -269,7 +313,8 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof {
     },
     TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceAndMachineStackResidencyProof
     {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
         conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
         vm_root_gather_plan: VmRootGatherPlan,
         conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
@@ -1207,17 +1252,15 @@ pub(super) fn validate_p6_arm64_jit_stub_routine_trace_plan(
 }
 
 pub(super) fn validate_p6_arm64_native_frame_machine_stack_residency_proof(
-    top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+    top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof<'_>,
     receipt: &HeapConservativeScanAppendReceipt,
     residency_proof: &P6Arm64NativeFrameMachineStackResidencyProof,
 ) -> Result<(), P6Arm64NativeFrameMachineStackResidencyProofMismatch> {
-    // C++ `NativeCallFrameTracer` publishes a `CallFrame*` that is backed by
-    // the native entry stack/register state later scanned by
-    // `MachineThreads::gatherFromCurrentThread`. Rust's current
-    // `VmPublishedTopCallFrame` comes from boxed VM storage and is metadata
-    // only; this proof requires independent machine-stack span/root evidence
-    // before progressing to the remaining generated-frame materialization
-    // blocker.
+    // C++ `NativeCallFrameTracer` publishes a `CallFrame*` backed by native
+    // stack/register state that `MachineThreads::gatherFromCurrentThread` later
+    // scans. Rust's publication proof is now stack-local, but it is still
+    // descriptor evidence; this proof requires independent machine-stack
+    // span/root evidence before progressing to generated-frame materialization.
     if residency_proof.heap != receipt.heap {
         return Err(
             P6Arm64NativeFrameMachineStackResidencyProofMismatch::HeapMismatch {
@@ -1397,19 +1440,26 @@ pub(super) fn validate_p6_arm64_native_frame_machine_stack_residency_proof(
 }
 
 pub(super) fn validate_p6_arm64_generated_native_frame_materialization_proof(
-    top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+    top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof<'_>,
     residency_proof: &P6Arm64NativeFrameMachineStackResidencyProof,
     descriptor: &Arm64BaselineGeneratedNativeFrameMaterializationDescriptor,
     expected_live_local_slots: usize,
 ) -> Result<(), Arm64BaselineGeneratedNativeFrameMaterializationMismatch> {
+    if top_call_frame_publication.publication.live_local_count != expected_live_local_slots {
+        return Err(
+            Arm64BaselineGeneratedNativeFrameMaterializationMismatch::LiveLocalSlotCountMismatch {
+                expected: expected_live_local_slots,
+                actual: top_call_frame_publication.publication.live_local_count,
+            },
+        );
+    }
+
     let context = Arm64BaselineGeneratedNativeFrameMaterializationValidationContext {
         published_top_frame: top_call_frame_publication.publication.published_top_frame.0,
         residency_top_frame: residency_proof.published_top_frame.0,
         expected_argument_slots_excluding_this: top_call_frame_publication
             .publication
-            .call_frame
-            .argument_count_including_this
-            .saturating_sub(1) as usize,
+            .argument_count_excluding_this,
         expected_live_local_slots,
         vm_entry_previous_top_call_frame: top_call_frame_publication
             .publication

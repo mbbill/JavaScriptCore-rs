@@ -23,7 +23,7 @@ use crate::vm::entry::{
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Arm64NativeEntryStackPublicationError {
+pub(in crate::vm) enum Arm64NativeEntryStackPublicationError {
     NonStackLocalFrameSource {
         actual: Arm64NativeEntryFrameAddressSource,
     },
@@ -50,25 +50,28 @@ pub(crate) enum Arm64NativeEntryStackPublicationError {
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Arm64NativeEntryStackPublicationProof<'frame> {
-    pub(crate) top_call_frame: FrameAddress,
-    pub(crate) top_entry_frame: FrameAddress,
-    pub(crate) vm_entry_record: FrameAddress,
-    pub(crate) previous_top_call_frame: Option<FrameAddress>,
-    pub(crate) previous_top_entry_frame: Option<FrameAddress>,
-    pub(crate) record: VmStackEntryPublicationRecord,
+pub(in crate::vm) struct Arm64NativeEntryStackPublicationProof<'frame> {
+    pub(in crate::vm) top_call_frame: FrameAddress,
+    pub(in crate::vm) top_entry_frame: FrameAddress,
+    pub(in crate::vm) vm_entry_record: FrameAddress,
+    pub(in crate::vm) previous_top_call_frame: Option<FrameAddress>,
+    pub(in crate::vm) previous_top_entry_frame: Option<FrameAddress>,
+    pub(in crate::vm) argument_count_excluding_this: usize,
+    pub(in crate::vm) padded_argument_count: usize,
+    pub(in crate::vm) live_local_count: usize,
+    pub(in crate::vm) record: VmStackEntryPublicationRecord,
     _stack_frame: PhantomData<&'frame ()>,
 }
 
 #[allow(dead_code)]
-pub(crate) struct Arm64NativeEntryStackPublicationGuard<'vm, 'frame> {
+pub(in crate::vm) struct Arm64NativeEntryStackPublicationGuard<'vm, 'frame> {
     guard: VmStackEntryPublicationGuard<'vm, 'frame>,
     proof: Arm64NativeEntryStackPublicationProof<'frame>,
 }
 
 #[allow(dead_code)]
 impl<'vm, 'frame> Arm64NativeEntryStackPublicationGuard<'vm, 'frame> {
-    pub(crate) fn proof(&self) -> Arm64NativeEntryStackPublicationProof<'frame> {
+    pub(in crate::vm) fn proof(&self) -> Arm64NativeEntryStackPublicationProof<'frame> {
         self.proof
     }
 
@@ -107,7 +110,7 @@ impl<'vm, 'frame> Arm64NativeEntryStackPublicationGuard<'vm, 'frame> {
 }
 
 #[allow(dead_code)]
-pub(crate) fn enter_arm64_native_entry_stack_publication<'vm, 'frame>(
+pub(in crate::vm) fn enter_arm64_native_entry_stack_publication<'vm, 'frame>(
     state: &'vm mut VmEntryState,
     stack_frame: &Arm64NativeEntryStackFrameProof<'frame>,
     kind: EntryKind,
@@ -189,6 +192,9 @@ fn guard_from_vm_entry_guard<'vm, 'frame>(
             vm_entry_record: stack_frame.vm_entry_record,
             previous_top_call_frame: stack_frame.vm_entry_record_previous_top_call_frame,
             previous_top_entry_frame: stack_frame.vm_entry_record_previous_top_entry_frame,
+            argument_count_excluding_this: stack_frame.argument_count_excluding_this,
+            padded_argument_count: stack_frame.padded_argument_count,
+            live_local_count: stack_frame.live_local_count,
             record,
             _stack_frame: PhantomData,
         },
