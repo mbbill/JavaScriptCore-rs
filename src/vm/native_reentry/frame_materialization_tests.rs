@@ -1,10 +1,19 @@
-use super::super::rooting::P6Arm64VerifiedGeneratedNativeFrameMaterializationProofError;
+use super::super::super::arm64_native_entry::Arm64NativeEntryJscStackDispatchRequestError;
+use super::super::super::entry::FrameAddress;
+use super::super::rooting::{
+    P6Arm64JscStackDispatchExecutableEntryProofError,
+    P6Arm64JscStackDispatchMaterializationLinkageMismatch,
+    P6Arm64VerifiedGeneratedNativeFrameMaterializationProofError,
+    P6Arm64VerifiedJscStackDispatchRequestProof, P6Arm64VerifiedJscStackDispatchRequestProofError,
+    P6Arm64VerifiedJscStackDispatchRequestProofMismatch,
+};
 use super::tests;
 use super::*;
 use crate::jit::arm64_baseline::{
     Arm64BaselineGeneratedNativeFrameMaterializationMismatch, JSC_REGISTER_BYTES,
     JSC_STACK_ALIGNMENT_BYTES,
 };
+use crate::jit::{BaselineNativeEntryTokenKind, EntryAbi, ExecutableMemoryProtection};
 
 fn attach_materialization_descriptor_to_fixture(
     fixture: &mut tests::NativeFrameResidencyFixture<'_>,
@@ -143,6 +152,215 @@ fn public_arm64_branch_aware_admission_reaches_stack_dispatch_blocker_after_veri
                     }
                 )
             );
+        },
+    );
+}
+
+#[test]
+fn public_arm64_branch_aware_admission_reaches_vm_entry_exit_restoration_blocker_after_verified_dispatch(
+) {
+    let code_block = tests::jump_if_false_code_block(4);
+    let site = tests::jump_if_false_site();
+    let side_exits = [tests::branch_aware_side_exit_proof(&code_block, &site)];
+    tests::with_stack_top_call_frame_publication_stack_call_and_frame(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+
+            let mut request = tests::valid_request(&side_exits);
+            request.fallback_rooting_proof = tests::full_jsc_stack_dispatch_request_fallback(
+                fixture.top_call_frame_publication,
+                fixture.machine_stack_conservative_rooting_proof.clone(),
+                fixture.vm_root_gather_plan.clone(),
+                fixture.conservative_root_marking_plan.clone(),
+                fixture.collector_effects_plan.clone(),
+                fixture.verifier_append_proof.clone(),
+                fixture.jit_stub_trace_plan.clone(),
+                jsc_stack_dispatch_request_proof.clone(),
+            );
+
+            assert_eq!(
+                p6_arm64_public_branch_aware_callable_admission_proof(&request),
+                Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64VmEntryExitRestorationAuthority {
+                        top_call_frame_publication: fixture.top_call_frame_publication,
+                        conservative_scan_append_receipt: fixture.conservative_scan_append_receipt.clone(),
+                        vm_root_gather_plan: fixture.vm_root_gather_plan.clone(),
+                        conservative_root_marking_plan: fixture.conservative_root_marking_plan.clone(),
+                        collector_effects_plan: fixture.collector_effects_plan.clone(),
+                        verifier_append_proof: fixture.verifier_append_proof.clone(),
+                        jit_stub_trace_plan: fixture.jit_stub_trace_plan.clone(),
+                        jsc_stack_dispatch_request_proof,
+                    }
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_jsc_stack_dispatch_wrapper_rejects_cross_paired_stack_frame() {
+    tests::with_stack_top_call_frame_publication_stack_call_and_frame(
+        |top_call_frame_publication, stack_call_proof, _stack_frame_proof| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let generated_native_frame_materialization_proof =
+                tests::verified_generated_native_frame_materialization_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    1,
+                )
+                .expect("stack-call materialization proof should verify");
+
+            tests::with_stack_top_call_frame_publication_stack_call_and_frame(
+                |_other_top_call_frame_publication,
+                 _other_stack_call_proof,
+                 other_stack_frame_proof| {
+                    assert!(matches!(
+                        P6Arm64VerifiedJscStackDispatchRequestProof::from_jsc_stack_dispatch_request_proof(
+                            generated_native_frame_materialization_proof.clone(),
+                            &stack_call_proof,
+                            other_stack_frame_proof,
+                            stack_call_proof.selected_token(),
+                        ),
+                        Err(P6Arm64VerifiedJscStackDispatchRequestProofError::StackDispatch(
+                            Arm64NativeEntryJscStackDispatchRequestError::StackFrameProofMismatch {
+                                ..
+                            }
+                        ))
+                    ));
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn public_arm64_branch_aware_admission_rejects_dispatch_entry_sp_drift() {
+    let code_block = tests::jump_if_false_code_block(4);
+    let site = tests::jump_if_false_site();
+    let side_exits = [tests::branch_aware_side_exit_proof(&code_block, &site)];
+    tests::with_stack_top_call_frame_publication_stack_call_and_frame(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let expected_entry_sp = jsc_stack_dispatch_request_proof
+                .jsc_stack_dispatch_request_proof()
+                .entry_sp
+                .0;
+            let actual_entry_sp = expected_entry_sp + JSC_REGISTER_BYTES;
+            let jsc_stack_dispatch_request_proof = jsc_stack_dispatch_request_proof
+                .with_dispatch_entry_sp_for_testing(FrameAddress(actual_entry_sp));
+
+            let mut request = tests::valid_request(&side_exits);
+            request.fallback_rooting_proof = tests::full_jsc_stack_dispatch_request_fallback(
+                fixture.top_call_frame_publication,
+                fixture.machine_stack_conservative_rooting_proof.clone(),
+                fixture.vm_root_gather_plan.clone(),
+                fixture.conservative_root_marking_plan.clone(),
+                fixture.collector_effects_plan.clone(),
+                fixture.verifier_append_proof.clone(),
+                fixture.jit_stub_trace_plan.clone(),
+                jsc_stack_dispatch_request_proof,
+            );
+
+            assert_eq!(
+                p6_arm64_public_branch_aware_callable_admission_proof(&request),
+                Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::Arm64JscStackDispatchAdmissionAuthorityMismatch {
+                        mismatch: P6Arm64VerifiedJscStackDispatchRequestProofMismatch::Linkage(
+                            P6Arm64JscStackDispatchMaterializationLinkageMismatch::EntryStackPointerMismatch {
+                                expected: expected_entry_sp,
+                                actual: actual_entry_sp,
+                            },
+                        ),
+                    }
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_jsc_stack_dispatch_wrapper_rejects_bad_executable_entry_metadata() {
+    tests::with_stack_top_call_frame_publication_stack_call_and_frame(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let generated_native_frame_materialization_proof =
+                tests::verified_generated_native_frame_materialization_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    1,
+                )
+                .expect("stack-call materialization proof should verify");
+
+            let mut arity_token = stack_call_proof.selected_token();
+            arity_token.kind = BaselineNativeEntryTokenKind::ArityCheck;
+            assert_eq!(
+                P6Arm64VerifiedJscStackDispatchRequestProof::from_jsc_stack_dispatch_request_proof(
+                    generated_native_frame_materialization_proof.clone(),
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    arity_token,
+                ),
+                Err(P6Arm64VerifiedJscStackDispatchRequestProofError::ExecutableEntry(
+                    P6Arm64JscStackDispatchExecutableEntryProofError::SelectedTokenKindMismatch {
+                        actual: BaselineNativeEntryTokenKind::ArityCheck,
+                    },
+                ))
+            );
+
+            let mut wrong_abi_token = stack_call_proof.selected_token();
+            wrong_abi_token.entrypoint.abi = EntryAbi::Rust;
+            assert_eq!(
+                P6Arm64VerifiedJscStackDispatchRequestProof::from_jsc_stack_dispatch_request_proof(
+                    generated_native_frame_materialization_proof.clone(),
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    wrong_abi_token,
+                ),
+                Err(
+                    P6Arm64VerifiedJscStackDispatchRequestProofError::ExecutableEntry(
+                        P6Arm64JscStackDispatchExecutableEntryProofError::EntrypointAbiMismatch {
+                            actual: EntryAbi::Rust,
+                        },
+                    )
+                )
+            );
+
+            let mut writable_token = stack_call_proof.selected_token();
+            writable_token.machine_code.protection = ExecutableMemoryProtection::Writable;
+            assert!(matches!(
+                P6Arm64VerifiedJscStackDispatchRequestProof::from_jsc_stack_dispatch_request_proof(
+                    generated_native_frame_materialization_proof,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    writable_token,
+                ),
+                Err(P6Arm64VerifiedJscStackDispatchRequestProofError::ExecutableEntry(
+                    P6Arm64JscStackDispatchExecutableEntryProofError::MachineCodeNotExecutable {
+                        protection: ExecutableMemoryProtection::Writable,
+                        ..
+                    },
+                ))
+            ));
         },
     );
 }

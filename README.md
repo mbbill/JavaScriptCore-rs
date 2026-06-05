@@ -174,6 +174,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            verifier append, JIT-stub trace, native-frame residency, and ARM64
            prologue materialization; behavior unchanged, admission still rejects
            at MissingArm64JscStackDispatchAdmissionAuthority).
+    [done] VM ARM64 JSC stack-dispatch request admission stage now requires a
+           verified wrapper tying generated-frame materialization, matching
+           stack-call / stack-frame evidence, lower dispatch request proof, and
+           selected normal generated-code token metadata; public admission now
+           reaches MissingArm64VmEntryExitRestorationAuthority.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of

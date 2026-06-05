@@ -37,6 +37,10 @@ use super::entry::{
 mod jsc_stack_dispatch;
 mod stack_entry_publication;
 
+pub(in crate::vm) use self::jsc_stack_dispatch::{
+    prove_arm64_native_entry_jsc_stack_dispatch_request,
+    Arm64NativeEntryJscStackDispatchRequestError, Arm64NativeEntryJscStackDispatchRequestProof,
+};
 pub(in crate::vm) use self::stack_entry_publication::Arm64NativeEntryStackPublicationGuard;
 #[cfg(test)]
 pub(in crate::vm) use self::stack_entry_publication::{
@@ -321,6 +325,12 @@ pub(crate) struct Arm64NativeEntryJscStackCallRequestProof {
     argument_count_excluding_this: u32,
     padded_argument_count: u32,
     undefined_fill_count: u32,
+}
+
+impl Arm64NativeEntryJscStackCallRequestProof {
+    pub(in crate::vm) const fn selected_token(&self) -> BaselineNativeEntryToken {
+        self.selected_token
+    }
 }
 
 #[allow(dead_code)]

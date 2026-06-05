@@ -15,6 +15,7 @@ use super::super::rooting::{
     validate_p6_arm64_generated_native_frame_materialization_proof,
     validate_p6_arm64_jit_stub_routine_trace_plan,
     validate_p6_arm64_machine_stack_conservative_rooting_proof,
+    validate_p6_arm64_verified_jsc_stack_dispatch_request_proof,
     validate_p6_arm64_verified_native_frame_machine_stack_residency_proof,
     validate_p6_arm64_verifier_append_proof, validate_p6_arm64_vm_root_gather_plan,
     P6Arm64BranchAwareCallableTopCallFramePublicationProof, P6Arm64CollectorEffectsProofMismatch,
@@ -23,6 +24,7 @@ use super::super::rooting::{
     P6Arm64NativeFrameMachineStackResidencyProofMismatch, P6Arm64SlotVisitorCollectorEffectsProof,
     P6Arm64SlotVisitorConservativeRootMarkingProof,
     P6Arm64VerifiedGeneratedNativeFrameMaterializationProof,
+    P6Arm64VerifiedJscStackDispatchRequestProof,
     P6Arm64VerifiedNativeFrameMachineStackResidencyProof, P6Arm64VerifierAppendProofMismatch,
     P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
 };
@@ -325,6 +327,32 @@ impl<'publication> P6Arm64JitStubTraceAdmissionContext<'_, 'publication> {
                 generated_native_frame_materialization_proof.clone(),
         }
     }
+
+    pub(super) fn missing_vm_entry_exit_restoration(
+        self,
+        jsc_stack_dispatch_request_proof: &P6Arm64VerifiedJscStackDispatchRequestProof<
+            'publication,
+        >,
+    ) -> P6Arm64BranchAwareCallableAdmissionRejection<'publication> {
+        let verifier_append = self.verifier_append;
+        let collector_effects = verifier_append.collector_effects;
+        let conservative_root_marking = collector_effects.conservative_root_marking;
+        let vm_root_gather = conservative_root_marking.vm_root_gather;
+        P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64VmEntryExitRestorationAuthority {
+            top_call_frame_publication: *vm_root_gather.top_call_frame_publication,
+            conservative_scan_append_receipt: vm_root_gather
+                .conservative_scan_append_receipt
+                .clone(),
+            vm_root_gather_plan: vm_root_gather.vm_root_gather_plan.clone(),
+            conservative_root_marking_plan: conservative_root_marking
+                .conservative_root_marking_plan
+                .clone(),
+            collector_effects_plan: collector_effects.collector_effects_plan.clone(),
+            verifier_append_proof: verifier_append.verifier_append_proof.clone(),
+            jit_stub_trace_plan: self.jit_stub_trace_plan.clone(),
+            jsc_stack_dispatch_request_proof: jsc_stack_dispatch_request_proof.clone(),
+        }
+    }
 }
 
 // C++ JSC carries this sequence as live VM-entry state:
@@ -541,6 +569,33 @@ pub(super) fn p6_arm64_validate_generated_native_frame_materialization_or_reject
     )
     .map_err(|mismatch| {
         P6Arm64BranchAwareCallableAdmissionRejection::Arm64GeneratedNativeFrameMaterializationProofMismatch {
+            mismatch,
+        }
+    })
+}
+
+pub(super) fn p6_arm64_validate_jsc_stack_dispatch_request_or_reject<'publication>(
+    jit_stub_trace: P6Arm64JitStubTraceAdmissionContext<'_, 'publication>,
+    jsc_stack_dispatch_request_proof: &P6Arm64VerifiedJscStackDispatchRequestProof<'publication>,
+    expected_live_local_slots: usize,
+) -> Result<(), P6Arm64BranchAwareCallableAdmissionRejection<'publication>> {
+    p6_arm64_validate_generated_native_frame_materialization_or_reject(
+        jit_stub_trace,
+        jsc_stack_dispatch_request_proof.generated_native_frame_materialization_proof(),
+        expected_live_local_slots,
+    )?;
+    let vm_root_gather = jit_stub_trace
+        .verifier_append
+        .collector_effects
+        .conservative_root_marking
+        .vm_root_gather;
+    validate_p6_arm64_verified_jsc_stack_dispatch_request_proof(
+        vm_root_gather.top_call_frame_publication,
+        jsc_stack_dispatch_request_proof,
+        expected_live_local_slots,
+    )
+    .map_err(|mismatch| {
+        P6Arm64BranchAwareCallableAdmissionRejection::Arm64JscStackDispatchAdmissionAuthorityMismatch {
             mismatch,
         }
     })

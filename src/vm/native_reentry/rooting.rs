@@ -34,14 +34,20 @@ use crate::jit::arm64_baseline::{
     Arm64BaselineMachineStackSpanKind,
 };
 use crate::jit::{
+    BaselineNativeEntryToken, BaselineNativeEntryTokenKind, EntryAbi, EntrypointKind,
+    ExecutableAllocationLifecycle, ExecutableMemoryProtection, JitCodeId,
     JitStubRoutineCandidateAddress, JitStubRoutineConservativeScanPlan,
     JitStubRoutineSetDescriptor, JitStubRoutineTraceError, JitStubRoutineTracePlan,
+    MachineCodeOwnership, MachineCodeRange, MachineCodeValidationError,
 };
+use crate::runtime::NativeCodeId;
 
 use super::super::arm64_native_entry::{
     prove_arm64_native_entry_frame_materialization_descriptor,
+    prove_arm64_native_entry_jsc_stack_dispatch_request,
     Arm64NativeEntryFrameMaterializationProofError, Arm64NativeEntryJscStackCallRequestProof,
-    Arm64NativeEntryStackPublicationGuard,
+    Arm64NativeEntryJscStackDispatchRequestError, Arm64NativeEntryJscStackDispatchRequestProof,
+    Arm64NativeEntryStackFrameProof, Arm64NativeEntryStackPublicationGuard,
 };
 use super::super::entry::FrameAddress;
 use super::super::vm_roots::{VmRootGatherError, VmRootGatherPlan};
@@ -709,6 +715,330 @@ pub(in crate::vm) enum P6Arm64VerifiedGeneratedNativeFrameMaterializationProofEr
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) struct P6Arm64VerifiedJscStackDispatchRequestProof<'publication> {
+    // C++ `vmEntryToJavaScript(jitCode->addressForCall(), ...)` reaches
+    // `_llint_call_javascript` with a live VM-entry stack frame and a
+    // `JSEntryPtrTag` code pointer. Rust stores the stack-frame-tied lower
+    // request at the publication lifetime, which is stricter than C++ raw stack
+    // state but keeps this dormant public proof from escaping the active
+    // top-frame publication.
+    generated_native_frame_materialization_proof:
+        P6Arm64VerifiedGeneratedNativeFrameMaterializationProof<'publication>,
+    jsc_stack_dispatch_request_proof: Arm64NativeEntryJscStackDispatchRequestProof<'publication>,
+    executable_entry: P6Arm64JscStackDispatchExecutableEntryProof,
+}
+
+impl<'publication> P6Arm64VerifiedJscStackDispatchRequestProof<'publication> {
+    #[allow(dead_code)]
+    pub(in crate::vm) fn from_jsc_stack_dispatch_request_proof(
+        generated_native_frame_materialization_proof:
+            P6Arm64VerifiedGeneratedNativeFrameMaterializationProof<'publication>,
+        stack_call_proof: &Arm64NativeEntryJscStackCallRequestProof,
+        stack_frame_proof: &Arm64NativeEntryStackFrameProof<'publication>,
+        selected_token: BaselineNativeEntryToken,
+    ) -> Result<Self, P6Arm64VerifiedJscStackDispatchRequestProofError> {
+        let executable_entry =
+            prove_p6_arm64_jsc_stack_dispatch_executable_entry(selected_token)
+                .map_err(P6Arm64VerifiedJscStackDispatchRequestProofError::ExecutableEntry)?;
+        if selected_token != stack_call_proof.selected_token() {
+            return Err(
+                P6Arm64VerifiedJscStackDispatchRequestProofError::SelectedTokenMismatch {
+                    expected: stack_call_proof.selected_token(),
+                    actual: selected_token,
+                },
+            );
+        }
+
+        let jsc_stack_dispatch_request_proof = prove_arm64_native_entry_jsc_stack_dispatch_request(
+            stack_call_proof,
+            stack_frame_proof,
+            executable_entry.entry_offset,
+        )
+        .map_err(P6Arm64VerifiedJscStackDispatchRequestProofError::StackDispatch)?;
+        validate_p6_arm64_jsc_stack_dispatch_materialization_linkage(
+            generated_native_frame_materialization_proof.materialization_descriptor(),
+            &jsc_stack_dispatch_request_proof,
+            &executable_entry,
+        )
+        .map_err(P6Arm64VerifiedJscStackDispatchRequestProofError::Linkage)?;
+
+        Ok(Self {
+            generated_native_frame_materialization_proof,
+            jsc_stack_dispatch_request_proof,
+            executable_entry,
+        })
+    }
+
+    pub(in crate::vm) fn generated_native_frame_materialization_proof(
+        &self,
+    ) -> &P6Arm64VerifiedGeneratedNativeFrameMaterializationProof<'publication> {
+        &self.generated_native_frame_materialization_proof
+    }
+
+    pub(in crate::vm) fn jsc_stack_dispatch_request_proof(
+        &self,
+    ) -> &Arm64NativeEntryJscStackDispatchRequestProof<'publication> {
+        &self.jsc_stack_dispatch_request_proof
+    }
+
+    pub(in crate::vm) const fn executable_entry(
+        &self,
+    ) -> &P6Arm64JscStackDispatchExecutableEntryProof {
+        &self.executable_entry
+    }
+
+    #[cfg(test)]
+    pub(in crate::vm) fn with_dispatch_entry_sp_for_testing(
+        mut self,
+        entry_sp: FrameAddress,
+    ) -> Self {
+        self.jsc_stack_dispatch_request_proof.entry_sp = entry_sp;
+        self
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::vm) struct P6Arm64JscStackDispatchExecutableEntryProof {
+    pub(in crate::vm) selected_token: BaselineNativeEntryToken,
+    pub(in crate::vm) machine_range: MachineCodeRange,
+    pub(in crate::vm) entry_offset: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) enum P6Arm64VerifiedJscStackDispatchRequestProofError {
+    ExecutableEntry(P6Arm64JscStackDispatchExecutableEntryProofError),
+    SelectedTokenMismatch {
+        expected: BaselineNativeEntryToken,
+        actual: BaselineNativeEntryToken,
+    },
+    StackDispatch(Arm64NativeEntryJscStackDispatchRequestError),
+    Linkage(P6Arm64JscStackDispatchMaterializationLinkageMismatch),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::vm) enum P6Arm64JscStackDispatchExecutableEntryProofError {
+    SelectedTokenKindMismatch {
+        actual: BaselineNativeEntryTokenKind,
+    },
+    MachineCodeNotExecutable {
+        protection: ExecutableMemoryProtection,
+        lifecycle: ExecutableAllocationLifecycle,
+    },
+    MachineCodeInvalid {
+        error: MachineCodeValidationError,
+    },
+    MachineCodeOwnerMismatch {
+        expected: MachineCodeOwnership,
+        actual: MachineCodeOwnership,
+    },
+    MachineCodeSymbolMismatch {
+        expected: Option<NativeCodeId>,
+        actual: Option<NativeCodeId>,
+    },
+    EntrypointKindMismatch {
+        actual: EntrypointKind,
+    },
+    EntrypointAbiMismatch {
+        actual: EntryAbi,
+    },
+    EntrypointCodeMismatch {
+        expected: Option<JitCodeId>,
+        actual: Option<JitCodeId>,
+    },
+    EntryOffsetOutOfRange {
+        entry_offset: u32,
+        range: MachineCodeRange,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) enum P6Arm64VerifiedJscStackDispatchRequestProofMismatch {
+    Materialization(Arm64BaselineGeneratedNativeFrameMaterializationMismatch),
+    Linkage(P6Arm64JscStackDispatchMaterializationLinkageMismatch),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::vm) enum P6Arm64JscStackDispatchMaterializationLinkageMismatch {
+    CallFrameMismatch { expected: usize, actual: usize },
+    EntryStackPointerMismatch { expected: usize, actual: usize },
+    EntryFrameMismatch { expected: usize, actual: usize },
+    EntryOffsetMismatch { expected: u32, actual: u32 },
+}
+
+pub(in crate::vm) fn validate_p6_arm64_verified_jsc_stack_dispatch_request_proof(
+    top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof<'_>,
+    dispatch_request_proof: &P6Arm64VerifiedJscStackDispatchRequestProof<'_>,
+    expected_live_local_slots: usize,
+) -> Result<(), P6Arm64VerifiedJscStackDispatchRequestProofMismatch> {
+    validate_p6_arm64_generated_native_frame_materialization_proof(
+        top_call_frame_publication,
+        dispatch_request_proof
+            .generated_native_frame_materialization_proof()
+            .native_frame_residency_proof()
+            .residency_proof(),
+        dispatch_request_proof
+            .generated_native_frame_materialization_proof()
+            .materialization_descriptor(),
+        expected_live_local_slots,
+    )
+    .map_err(P6Arm64VerifiedJscStackDispatchRequestProofMismatch::Materialization)?;
+    validate_p6_arm64_jsc_stack_dispatch_materialization_linkage(
+        dispatch_request_proof
+            .generated_native_frame_materialization_proof()
+            .materialization_descriptor(),
+        dispatch_request_proof.jsc_stack_dispatch_request_proof(),
+        dispatch_request_proof.executable_entry(),
+    )
+    .map_err(P6Arm64VerifiedJscStackDispatchRequestProofMismatch::Linkage)
+}
+
+fn prove_p6_arm64_jsc_stack_dispatch_executable_entry(
+    selected_token: BaselineNativeEntryToken,
+) -> Result<
+    P6Arm64JscStackDispatchExecutableEntryProof,
+    P6Arm64JscStackDispatchExecutableEntryProofError,
+> {
+    if selected_token.kind != BaselineNativeEntryTokenKind::Normal {
+        return Err(
+            P6Arm64JscStackDispatchExecutableEntryProofError::SelectedTokenKindMismatch {
+                actual: selected_token.kind,
+            },
+        );
+    }
+    if selected_token.machine_code.protection != ExecutableMemoryProtection::Executable
+        || selected_token.machine_code.lifecycle != ExecutableAllocationLifecycle::LinkedExecutable
+    {
+        return Err(
+            P6Arm64JscStackDispatchExecutableEntryProofError::MachineCodeNotExecutable {
+                protection: selected_token.machine_code.protection,
+                lifecycle: selected_token.machine_code.lifecycle,
+            },
+        );
+    }
+    selected_token.machine_code.validate().map_err(|error| {
+        P6Arm64JscStackDispatchExecutableEntryProofError::MachineCodeInvalid { error }
+    })?;
+
+    let expected_owner = MachineCodeOwnership::CodeBlock(selected_token.owner);
+    if selected_token.machine_code.owner != expected_owner {
+        return Err(
+            P6Arm64JscStackDispatchExecutableEntryProofError::MachineCodeOwnerMismatch {
+                expected: expected_owner,
+                actual: selected_token.machine_code.owner,
+            },
+        );
+    }
+    let expected_symbol = Some(selected_token.native_symbol);
+    if selected_token.machine_code.symbol != expected_symbol {
+        return Err(
+            P6Arm64JscStackDispatchExecutableEntryProofError::MachineCodeSymbolMismatch {
+                expected: expected_symbol,
+                actual: selected_token.machine_code.symbol,
+            },
+        );
+    }
+    if selected_token.entrypoint.kind != EntrypointKind::GeneratedCode {
+        return Err(
+            P6Arm64JscStackDispatchExecutableEntryProofError::EntrypointKindMismatch {
+                actual: selected_token.entrypoint.kind,
+            },
+        );
+    }
+    if selected_token.entrypoint.abi != EntryAbi::GeneratedCode {
+        return Err(
+            P6Arm64JscStackDispatchExecutableEntryProofError::EntrypointAbiMismatch {
+                actual: selected_token.entrypoint.abi,
+            },
+        );
+    }
+    let expected_code = Some(selected_token.artifact_id);
+    if selected_token.entrypoint.code != expected_code {
+        return Err(
+            P6Arm64JscStackDispatchExecutableEntryProofError::EntrypointCodeMismatch {
+                expected: expected_code,
+                actual: selected_token.entrypoint.code,
+            },
+        );
+    }
+
+    let machine_range = selected_token.machine_code.range;
+    let entry_offset = machine_range.start_offset;
+    let Some(end_offset) = machine_range.end_offset() else {
+        return Err(
+            P6Arm64JscStackDispatchExecutableEntryProofError::EntryOffsetOutOfRange {
+                entry_offset,
+                range: machine_range,
+            },
+        );
+    };
+    if entry_offset < machine_range.start_offset || entry_offset >= end_offset {
+        return Err(
+            P6Arm64JscStackDispatchExecutableEntryProofError::EntryOffsetOutOfRange {
+                entry_offset,
+                range: machine_range,
+            },
+        );
+    }
+
+    Ok(P6Arm64JscStackDispatchExecutableEntryProof {
+        selected_token,
+        machine_range,
+        entry_offset,
+    })
+}
+
+fn validate_p6_arm64_jsc_stack_dispatch_materialization_linkage(
+    materialization_descriptor: &Arm64BaselineGeneratedNativeFrameMaterializationDescriptor,
+    dispatch_request_proof: &Arm64NativeEntryJscStackDispatchRequestProof<'_>,
+    executable_entry: &P6Arm64JscStackDispatchExecutableEntryProof,
+) -> Result<(), P6Arm64JscStackDispatchMaterializationLinkageMismatch> {
+    let expected_call_frame = materialization_descriptor.prologue.call_frame;
+    if dispatch_request_proof.call_frame.0 != expected_call_frame {
+        return Err(
+            P6Arm64JscStackDispatchMaterializationLinkageMismatch::CallFrameMismatch {
+                expected: expected_call_frame,
+                actual: dispatch_request_proof.call_frame.0,
+            },
+        );
+    }
+    let expected_entry_sp = materialization_descriptor.prologue.entry_sp;
+    if dispatch_request_proof.entry_sp.0 != expected_entry_sp {
+        return Err(
+            P6Arm64JscStackDispatchMaterializationLinkageMismatch::EntryStackPointerMismatch {
+                expected: expected_entry_sp,
+                actual: dispatch_request_proof.entry_sp.0,
+            },
+        );
+    }
+    let expected_entry_frame = materialization_descriptor
+        .entry_linkage
+        .published_top_entry_frame;
+    if dispatch_request_proof.entry_frame.0 != expected_entry_frame {
+        return Err(
+            P6Arm64JscStackDispatchMaterializationLinkageMismatch::EntryFrameMismatch {
+                expected: expected_entry_frame,
+                actual: dispatch_request_proof.entry_frame.0,
+            },
+        );
+    }
+    if dispatch_request_proof.entry_offset != executable_entry.entry_offset {
+        return Err(
+            P6Arm64JscStackDispatchMaterializationLinkageMismatch::EntryOffsetMismatch {
+                expected: executable_entry.entry_offset,
+                actual: dispatch_request_proof.entry_offset,
+            },
+        );
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publication> {
     MissingTopCallFramePublication,
     TopCallFramePublicationWithoutConservativeScanAppend(
@@ -784,6 +1114,18 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
         generated_native_frame_materialization_proof:
             P6Arm64VerifiedGeneratedNativeFrameMaterializationProof<'publication>,
+    },
+    TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceGeneratedNativeFrameMaterializationAndJscStackDispatchRequestProof
+    {
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+        machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
+        jsc_stack_dispatch_request_proof: P6Arm64VerifiedJscStackDispatchRequestProof<'publication>,
     },
 }
 
