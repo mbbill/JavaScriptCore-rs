@@ -170,8 +170,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            residency proof; src/vm/arm64_native_entry.rs now validates the
            selected VmEntryLaunchDescriptor / normal ARM64 token against the
            C++ doVMEntry active-frame and StackAlignment.h padded-argument
-           shape before raw ARM64 dispatch, while valid descriptors still
-           reject before public native admission;
+           shape and derives the doVMEntry stack CallFrame slot/size proof
+           before raw ARM64 dispatch, while valid descriptors still reject
+           before public native admission;
            native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 

@@ -5925,7 +5925,7 @@ impl Vm {
         &mut self,
         code_block: &CodeBlock,
         dispatch: P6EmittedNativeDispatch<'_>,
-        _launch_proof: arm64_native_entry::Arm64NativeEntryLaunchProof,
+        launch_proof: arm64_native_entry::Arm64NativeEntryLaunchProof,
         host: &mut H,
         config: DispatchConfig,
     ) -> BaselineNativeEntryVmExecution {
@@ -5944,6 +5944,11 @@ impl Vm {
                     ExecutionError::BaselineGeneratedExecutionRejected,
                 ))
             }
+        };
+        let Ok(_do_vm_entry_layout_proof) =
+            arm64_native_entry::prove_arm64_native_entry_do_vm_entry_stack_layout(launch_proof)
+        else {
+            return fallback(self, host);
         };
         if !self.can_execute_p6_arm64_emitted_native_entry() {
             return fallback(self, host);

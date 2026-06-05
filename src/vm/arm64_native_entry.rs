@@ -21,12 +21,19 @@ use crate::runtime::{CallFrameId, CodeBlockId, EntryFrameId};
 
 use super::entry::{
     vm_entry_argument_count_is_frame_aligned, BaselineNativeDispatchTokenSelection, FrameAddress,
-    VmEntryDispatchSelection, VmEntryLaunchDescriptor,
+    VmEntryDispatchSelection, VmEntryLaunchDescriptor, JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS,
 };
 
 const JSC_REGISTER_BYTES: usize = 8;
 const JSC_STACK_ALIGNMENT_BYTES: usize = 16;
 const JSC_CALLER_FRAME_AND_PC_WORDS: usize = 2;
+const JSC_CALL_FRAME_CALLER_FRAME_SLOT: u32 = 0;
+const JSC_CALL_FRAME_RETURN_PC_SLOT: u32 = 1;
+const JSC_CALL_FRAME_CODE_BLOCK_SLOT: u32 = 2;
+const JSC_CALL_FRAME_CALLEE_SLOT: u32 = 3;
+const JSC_CALL_FRAME_ARGUMENT_COUNT_SLOT: u32 = 4;
+const JSC_CALL_FRAME_THIS_ARGUMENT_SLOT: u32 = JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS;
+const JSC_CALL_FRAME_FIRST_ARGUMENT_SLOT: u32 = JSC_CALL_FRAME_THIS_ARGUMENT_SLOT + 1;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,6 +125,24 @@ pub(crate) enum Arm64NativeEntryLaunchProofError {
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Arm64NativeEntryDoVmEntryLayoutError {
+    PaddedArgumentCountNotFrameAligned {
+        padded_argument_count: u32,
+    },
+    FrameWordCountOverflow {
+        call_frame_header_slots: u32,
+        padded_argument_count: u32,
+    },
+    FrameByteSizeOverflow {
+        frame_word_count: u32,
+    },
+    FrameSizeNotStackAligned {
+        frame_size_bytes: usize,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Arm64NativeEntryLaunchProofRequest<'descriptor> {
     pub(crate) launch_descriptor: &'descriptor VmEntryLaunchDescriptor,
     pub(crate) callable_kind: BaselineNativeEntryCallableKind,
@@ -132,8 +157,35 @@ pub(crate) struct Arm64NativeEntryLaunchProof {
     active_entry_frame: EntryFrameId,
     active_top_call_frame: CallFrameId,
     selected_token: BaselineNativeEntryToken,
+    argument_count_including_this: u32,
     argument_count_excluding_this: u32,
     padded_argument_count: u32,
+    required_frame_source: Arm64NativeEntryFrameAddressSource,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Arm64NativeEntryDoVmEntryLayoutProof {
+    owner: CodeBlockId,
+    code_block: CodeBlockId,
+    active_entry_frame: EntryFrameId,
+    active_top_call_frame: CallFrameId,
+    selected_token: BaselineNativeEntryToken,
+    caller_frame_slot: u32,
+    return_pc_slot: u32,
+    code_block_slot: u32,
+    callee_slot: u32,
+    argument_count_slot: u32,
+    this_argument_slot: u32,
+    first_argument_slot: u32,
+    call_frame_header_slots: u32,
+    argument_count_including_this: u32,
+    argument_count_excluding_this: u32,
+    padded_argument_count: u32,
+    undefined_fill_count: u32,
+    frame_word_count: u32,
+    frame_size_bytes: usize,
+    stack_alignment_bytes: usize,
     required_frame_source: Arm64NativeEntryFrameAddressSource,
 }
 
@@ -228,6 +280,61 @@ pub(crate) fn prove_arm64_native_entry_launch_descriptor_for_callable(
         launch_descriptor,
         callable_kind: callable.kind(),
         callable_token: callable.token(),
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn prove_arm64_native_entry_do_vm_entry_stack_layout(
+    launch_proof: Arm64NativeEntryLaunchProof,
+) -> Result<Arm64NativeEntryDoVmEntryLayoutProof, Arm64NativeEntryDoVmEntryLayoutError> {
+    let frame_word_count = JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS
+        .checked_add(launch_proof.padded_argument_count)
+        .ok_or(
+            Arm64NativeEntryDoVmEntryLayoutError::FrameWordCountOverflow {
+                call_frame_header_slots: JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS,
+                padded_argument_count: launch_proof.padded_argument_count,
+            },
+        )?;
+    if !vm_entry_argument_count_is_frame_aligned(launch_proof.padded_argument_count) {
+        return Err(
+            Arm64NativeEntryDoVmEntryLayoutError::PaddedArgumentCountNotFrameAligned {
+                padded_argument_count: launch_proof.padded_argument_count,
+            },
+        );
+    }
+    let frame_size_bytes = (frame_word_count as usize)
+        .checked_mul(JSC_REGISTER_BYTES)
+        .ok_or(Arm64NativeEntryDoVmEntryLayoutError::FrameByteSizeOverflow { frame_word_count })?;
+    if frame_size_bytes % JSC_STACK_ALIGNMENT_BYTES != 0 {
+        return Err(
+            Arm64NativeEntryDoVmEntryLayoutError::FrameSizeNotStackAligned { frame_size_bytes },
+        );
+    }
+
+    Ok(Arm64NativeEntryDoVmEntryLayoutProof {
+        owner: launch_proof.owner,
+        code_block: launch_proof.code_block,
+        active_entry_frame: launch_proof.active_entry_frame,
+        active_top_call_frame: launch_proof.active_top_call_frame,
+        selected_token: launch_proof.selected_token,
+        caller_frame_slot: JSC_CALL_FRAME_CALLER_FRAME_SLOT,
+        return_pc_slot: JSC_CALL_FRAME_RETURN_PC_SLOT,
+        code_block_slot: JSC_CALL_FRAME_CODE_BLOCK_SLOT,
+        callee_slot: JSC_CALL_FRAME_CALLEE_SLOT,
+        argument_count_slot: JSC_CALL_FRAME_ARGUMENT_COUNT_SLOT,
+        this_argument_slot: JSC_CALL_FRAME_THIS_ARGUMENT_SLOT,
+        first_argument_slot: JSC_CALL_FRAME_FIRST_ARGUMENT_SLOT,
+        call_frame_header_slots: JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS,
+        argument_count_including_this: launch_proof.argument_count_including_this,
+        argument_count_excluding_this: launch_proof.argument_count_excluding_this,
+        padded_argument_count: launch_proof.padded_argument_count,
+        undefined_fill_count: launch_proof
+            .padded_argument_count
+            .saturating_sub(launch_proof.argument_count_including_this),
+        frame_word_count,
+        frame_size_bytes,
+        stack_alignment_bytes: JSC_STACK_ALIGNMENT_BYTES,
+        required_frame_source: launch_proof.required_frame_source,
     })
 }
 
@@ -333,6 +440,7 @@ pub(crate) fn prove_arm64_native_entry_launch_descriptor(
         active_entry_frame,
         active_top_call_frame,
         selected_token,
+        argument_count_including_this: descriptor.call_frame.argument_count_including_this,
         argument_count_excluding_this: descriptor
             .call_frame
             .argument_count_including_this
@@ -844,10 +952,48 @@ mod tests {
         assert_eq!(proof.code_block, descriptor.code_block);
         assert_eq!(proof.active_entry_frame, EntryFrameId(1));
         assert_eq!(proof.active_top_call_frame, CallFrameId(2));
+        assert_eq!(proof.argument_count_including_this, 3);
         assert_eq!(proof.argument_count_excluding_this, 2);
         assert_eq!(proof.padded_argument_count, 5);
         assert_eq!(
             proof.required_frame_source,
+            Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_do_vm_entry_layout_derives_jsc_stack_words_from_launch_proof() {
+        let descriptor = launch_descriptor();
+        let launch_proof =
+            prove_arm64_native_entry_launch_descriptor(Arm64NativeEntryLaunchProofRequest {
+                launch_descriptor: &descriptor,
+                callable_kind: BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
+                callable_token: descriptor.native_entry.normal_entry,
+            })
+            .expect("ARM64 launch proof");
+
+        let layout = prove_arm64_native_entry_do_vm_entry_stack_layout(launch_proof)
+            .expect("doVMEntry stack layout proof");
+
+        assert_eq!(layout.owner, descriptor.owner);
+        assert_eq!(layout.code_block, descriptor.code_block);
+        assert_eq!(layout.caller_frame_slot, 0);
+        assert_eq!(layout.return_pc_slot, 1);
+        assert_eq!(layout.code_block_slot, 2);
+        assert_eq!(layout.callee_slot, 3);
+        assert_eq!(layout.argument_count_slot, 4);
+        assert_eq!(layout.this_argument_slot, 5);
+        assert_eq!(layout.first_argument_slot, 6);
+        assert_eq!(layout.call_frame_header_slots, 5);
+        assert_eq!(layout.argument_count_including_this, 3);
+        assert_eq!(layout.argument_count_excluding_this, 2);
+        assert_eq!(layout.padded_argument_count, 5);
+        assert_eq!(layout.undefined_fill_count, 2);
+        assert_eq!(layout.frame_word_count, 10);
+        assert_eq!(layout.frame_size_bytes, 80);
+        assert_eq!(layout.stack_alignment_bytes, JSC_STACK_ALIGNMENT_BYTES);
+        assert_eq!(
+            layout.required_frame_source,
             Arm64NativeEntryFrameAddressSource::StackLocalRustEntryGuard
         );
     }
@@ -918,6 +1064,51 @@ mod tests {
             Err(
                 Arm64NativeEntryLaunchProofError::PaddedArgumentCountNotFrameAligned {
                     padded_argument_count: 4,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_do_vm_entry_layout_rejects_unaligned_padding() {
+        let descriptor = launch_descriptor();
+        let mut launch_proof =
+            prove_arm64_native_entry_launch_descriptor(Arm64NativeEntryLaunchProofRequest {
+                launch_descriptor: &descriptor,
+                callable_kind: BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
+                callable_token: descriptor.native_entry.normal_entry,
+            })
+            .expect("ARM64 launch proof");
+        launch_proof.padded_argument_count = 4;
+
+        assert_eq!(
+            prove_arm64_native_entry_do_vm_entry_stack_layout(launch_proof),
+            Err(
+                Arm64NativeEntryDoVmEntryLayoutError::PaddedArgumentCountNotFrameAligned {
+                    padded_argument_count: 4,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn arm64_native_entry_do_vm_entry_layout_rejects_frame_word_overflow() {
+        let descriptor = launch_descriptor();
+        let mut launch_proof =
+            prove_arm64_native_entry_launch_descriptor(Arm64NativeEntryLaunchProofRequest {
+                launch_descriptor: &descriptor,
+                callable_kind: BaselineNativeEntryCallableKind::P6Arm64EmittedSemanticCAbiEntry,
+                callable_token: descriptor.native_entry.normal_entry,
+            })
+            .expect("ARM64 launch proof");
+        launch_proof.padded_argument_count = u32::MAX;
+
+        assert_eq!(
+            prove_arm64_native_entry_do_vm_entry_stack_layout(launch_proof),
+            Err(
+                Arm64NativeEntryDoVmEntryLayoutError::FrameWordCountOverflow {
+                    call_frame_header_slots: JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS,
+                    padded_argument_count: u32::MAX,
                 }
             )
         );

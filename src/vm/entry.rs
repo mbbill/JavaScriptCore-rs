@@ -25,7 +25,7 @@ use super::tiering::{
 
 // C++ JSC map: `CallFrame::headerSizeInRegisters` on JSValue64 and
 // `StackAlignment.h::stackAlignmentRegisters()`.
-const JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS: u32 = 5;
+pub(crate) const JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS: u32 = 5;
 const JSC_STACK_ALIGNMENT_REGISTERS: u32 = 2;
 
 /// Opaque stack/frame address.
