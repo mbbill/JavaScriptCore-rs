@@ -64,6 +64,8 @@ pub struct VmEntryState {
     native_call_frame_publication_exits: Vec<VmNativeCallFramePublicationExitRecord>,
     storage_backed_entries: Vec<VmStorageBackedEntryRecord>,
     storage_backed_entry_exits: Vec<VmStorageBackedEntryExitRecord>,
+    stack_entry_publications: Vec<VmStackEntryPublicationRecord>,
+    stack_entry_publication_exits: Vec<VmStackEntryPublicationExitRecord>,
     next_ordinal: u64,
 }
 
@@ -116,6 +118,16 @@ impl VmEntryState {
     #[allow(dead_code)]
     pub(crate) fn storage_backed_entry_exits(&self) -> &[VmStorageBackedEntryExitRecord] {
         &self.storage_backed_entry_exits
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn stack_entry_publications(&self) -> &[VmStackEntryPublicationRecord] {
+        &self.stack_entry_publications
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn stack_entry_publication_exits(&self) -> &[VmStackEntryPublicationExitRecord] {
+        &self.stack_entry_publication_exits
     }
 
     pub(crate) fn record_launch_descriptor(&mut self, descriptor: VmEntryLaunchDescriptor) {
@@ -357,6 +369,77 @@ impl VmEntryState {
         })
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn enter_stack_published<'stack>(
+        &mut self,
+        request: VmStackEntryPublicationRequest<'stack>,
+    ) -> Result<VmStackEntryPublicationGuard<'_, 'stack>, VmStackEntryPublicationError> {
+        let previous_top_call_frame = self.top_frame;
+        let previous_top_entry_frame = self.entry_frame;
+        if request.previous_top_call_frame != previous_top_call_frame {
+            return Err(VmStackEntryPublicationError::PreviousTopCallFrameMismatch {
+                expected: previous_top_call_frame,
+                actual: request.previous_top_call_frame,
+            });
+        }
+        if request.previous_top_entry_frame != previous_top_entry_frame {
+            return Err(
+                VmStackEntryPublicationError::PreviousTopEntryFrameMismatch {
+                    expected: previous_top_entry_frame,
+                    actual: request.previous_top_entry_frame,
+                },
+            );
+        }
+
+        let previous_kind = self.kind;
+        let previous_disallow = self.disallow_user_observable_work;
+        self.entry_depth += 1;
+        self.next_ordinal = self.next_ordinal.saturating_add(1);
+        let ordinal = self.next_ordinal;
+        self.top_frame = Some(request.top_call_frame);
+        // C++ `doVMEntry` writes the adjacent VM::topCallFrame /
+        // VM::topEntryFrame pair from stack-local `(sp, cfr)`. Rust keeps this
+        // dormant path tied to a stack-frame lifetime proof instead of treating
+        // arbitrary raw addresses as publishable VM state.
+        self.entry_frame = Some(request.top_entry_frame);
+        self.kind = Some(request.kind);
+        self.disallow_user_observable_work = matches!(request.kind, EntryKind::VmInquiry);
+        let root_scope = VmEntryRootScope {
+            root: RootRecord {
+                id: RootId(4_000_000_u64.saturating_add(ordinal)),
+                kind: RootKind::Host,
+                heap: request.heap,
+            },
+            ordinal,
+            kind: request.kind,
+            heap: request.heap,
+        };
+        let record = VmStackEntryPublicationRecord {
+            ordinal,
+            depth: self.entry_depth,
+            previous_top_call_frame,
+            previous_top_entry_frame,
+            top_call_frame: request.top_call_frame,
+            top_entry_frame: request.top_entry_frame,
+            vm_entry_record: request.vm_entry_record,
+            kind: request.kind,
+            root_scope,
+        };
+        self.stack_entry_publications.push(record);
+
+        Ok(VmStackEntryPublicationGuard {
+            state: self,
+            record,
+            root_scope,
+            previous_top_call_frame,
+            previous_top_entry_frame,
+            previous_kind,
+            previous_disallow,
+            _stack: PhantomData,
+            _borrow: PhantomData,
+        })
+    }
+
     pub fn root_scopes(&self) -> impl Iterator<Item = VmEntryRootScope> + '_ {
         let legacy_scopes =
             self.records
@@ -378,7 +461,17 @@ impl VmEntryState {
                     .iter()
                     .any(|exit| exit.closed_root_scope.ordinal == scope.ordinal)
             });
-        legacy_scopes.chain(storage_scopes)
+        let stack_scopes = self
+            .stack_entry_publications
+            .iter()
+            .map(|record| record.root_scope)
+            .filter(move |scope| {
+                !self
+                    .stack_entry_publication_exits
+                    .iter()
+                    .any(|exit| exit.closed_root_scope.ordinal == scope.ordinal)
+            });
+        legacy_scopes.chain(storage_scopes).chain(stack_scopes)
     }
 }
 
@@ -419,6 +512,115 @@ pub(crate) enum VmStorageBackedEntryError {
         expected: Option<FrameAddress>,
         actual: Option<FrameAddress>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct VmStackEntryPublicationRequest<'stack> {
+    pub(crate) top_call_frame: FrameAddress,
+    pub(crate) top_entry_frame: FrameAddress,
+    pub(crate) vm_entry_record: FrameAddress,
+    pub(crate) previous_top_call_frame: Option<FrameAddress>,
+    pub(crate) previous_top_entry_frame: Option<FrameAddress>,
+    pub(crate) kind: EntryKind,
+    pub(crate) heap: HeapId,
+    pub(crate) _stack: PhantomData<&'stack ()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct VmStackEntryPublicationRecord {
+    pub ordinal: u64,
+    pub depth: usize,
+    pub previous_top_call_frame: Option<FrameAddress>,
+    pub previous_top_entry_frame: Option<FrameAddress>,
+    pub top_call_frame: FrameAddress,
+    pub top_entry_frame: FrameAddress,
+    pub vm_entry_record: FrameAddress,
+    pub kind: EntryKind,
+    pub root_scope: VmEntryRootScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct VmStackEntryPublicationExitRecord {
+    pub ordinal: u64,
+    pub depth_before_exit: usize,
+    pub restored_top_call_frame: Option<FrameAddress>,
+    pub restored_top_entry_frame: Option<FrameAddress>,
+    pub restored_kind: Option<EntryKind>,
+    pub closed_publication: VmStackEntryPublicationRecord,
+    pub closed_root_scope: VmEntryRootScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum VmStackEntryPublicationError {
+    PreviousTopCallFrameMismatch {
+        expected: Option<FrameAddress>,
+        actual: Option<FrameAddress>,
+    },
+    PreviousTopEntryFrameMismatch {
+        expected: Option<FrameAddress>,
+        actual: Option<FrameAddress>,
+    },
+}
+
+#[allow(dead_code)]
+pub(crate) struct VmStackEntryPublicationGuard<'vm, 'stack> {
+    state: &'vm mut VmEntryState,
+    record: VmStackEntryPublicationRecord,
+    root_scope: VmEntryRootScope,
+    previous_top_call_frame: Option<FrameAddress>,
+    previous_top_entry_frame: Option<FrameAddress>,
+    previous_kind: Option<EntryKind>,
+    previous_disallow: bool,
+    _stack: PhantomData<&'stack ()>,
+    _borrow: PhantomData<&'vm mut VmEntryState>,
+}
+
+#[allow(dead_code)]
+impl<'stack> VmStackEntryPublicationGuard<'_, 'stack> {
+    pub(crate) fn record(&self) -> VmStackEntryPublicationRecord {
+        self.record
+    }
+
+    pub(crate) fn top_call_frame(&self) -> Option<FrameAddress> {
+        self.state.top_frame
+    }
+
+    pub(crate) fn top_entry_frame(&self) -> Option<FrameAddress> {
+        self.state.entry_frame
+    }
+
+    pub(crate) fn enter_stack_published<'nested>(
+        &mut self,
+        request: VmStackEntryPublicationRequest<'nested>,
+    ) -> Result<VmStackEntryPublicationGuard<'_, 'nested>, VmStackEntryPublicationError> {
+        self.state.enter_stack_published(request)
+    }
+}
+
+impl Drop for VmStackEntryPublicationGuard<'_, '_> {
+    fn drop(&mut self) {
+        let depth_before_exit = self.state.entry_depth;
+        self.state.entry_depth = self.state.entry_depth.saturating_sub(1);
+        self.state.top_frame = self.previous_top_call_frame;
+        self.state.entry_frame = self.previous_top_entry_frame;
+        self.state.kind = self.previous_kind;
+        self.state.disallow_user_observable_work = self.previous_disallow;
+        self.state
+            .stack_entry_publication_exits
+            .push(VmStackEntryPublicationExitRecord {
+                ordinal: self.record.ordinal,
+                depth_before_exit,
+                restored_top_call_frame: self.state.top_frame,
+                restored_top_entry_frame: self.state.entry_frame,
+                restored_kind: self.state.kind,
+                closed_publication: self.record,
+                closed_root_scope: self.root_scope,
+            });
+    }
 }
 
 #[allow(dead_code)]

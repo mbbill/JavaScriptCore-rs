@@ -35,6 +35,7 @@ use super::entry::{
 };
 
 mod jsc_stack_dispatch;
+mod stack_entry_publication;
 
 const JSC_REGISTER_BYTES: usize = 8;
 const JSC_STACK_ALIGNMENT_BYTES: usize = 16;

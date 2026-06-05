@@ -118,9 +118,15 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            ARM64 VMEntryRecord 18-slot callee-save buffer and the platform
            request carries/validates that proof metadata; platform now has a
            private normal-return-only ARM64 JSC-stack trampoline that restores
-           the Rust C ABI envelope, but public admission remains blocked on VM
-           top-frame publication, conservative rooting, and exception/unwind
-           restore support)
+           the Rust C ABI envelope, but public admission remains blocked on
+           threading stack-local top-frame publication into admission/rooting,
+           conservative rooting, and exception/unwind restore support)
+    [done] VM ARM64 stack-local top-frame publication proof added to
+           src/vm/arm64_native_entry/stack_entry_publication.rs (maps
+           LowLevelInterpreter64.asm doVMEntry save/publish/restore of
+           VM::topCallFrame / VM::topEntryFrame and VMEntryRecord previous-top
+           pair; validates and restores through a stack-lifetime VmEntryState
+           guard; public admission still rejects).
     [done] JIT ARM64 dormant virtual-register frame materialization helpers and
            private JumpIfFalse branch-aware callable encoder skeleton added to
            src/jit/arm64_baseline.rs (public branch-aware callable emission
