@@ -124,7 +124,12 @@ pub(crate) use visitor::{
     SlotVisitorCollectorEffectsPlan, SlotVisitorConservativeRootMarkingAction,
     SlotVisitorConservativeRootMarkingError, SlotVisitorConservativeRootMarkingPlan,
     SlotVisitorConservativeRootMarkingRecord, SlotVisitorContainerNoteMarkedRecord,
-    SlotVisitorNoteLiveAuxiliaryCellRecord,
+    SlotVisitorNoteLiveAuxiliaryCellRecord, VerifierSlotVisitorCollectorStackAppendRecord,
+    VerifierSlotVisitorConservativeRootAppendAction,
+    VerifierSlotVisitorConservativeRootAppendError, VerifierSlotVisitorConservativeRootAppendPlan,
+    VerifierSlotVisitorConservativeRootAppendProof,
+    VerifierSlotVisitorConservativeRootAppendRecord, VerifierSlotVisitorDescriptor,
+    VerifierSlotVisitorTestAndSetMarkRecord,
 };
 pub use weak::{
     FinalizerKind, FinalizerPlan, FinalizerPlanEntry, FinalizerPlanningError,

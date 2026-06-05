@@ -4,7 +4,8 @@
 //! `Heap::addCoreConstraints` native-entry rooting chain. It keeps
 //! `native_reentry.rs` below the oversized-file guardrail while preserving
 //! the same descriptor validation behavior; it does not add engine behavior,
-//! an admission `Ok` path, verifier append, or real native rooting.
+//! an admission `Ok` path, verifier mark-map storage, verifier drain, or real
+//! native rooting.
 
 use crate::gc::{
     CellId, CellState, ConservativeRootCell, HeapCellKind, HeapConservativeScanAppendReceipt,
@@ -13,6 +14,8 @@ use crate::gc::{
     SlotVisitorCollectorEffectsPlan, SlotVisitorConservativeRootAppendRecord,
     SlotVisitorConservativeRootMarkingAction, SlotVisitorConservativeRootMarkingPlan,
     SlotVisitorContainerNoteMarkedRecord, SlotVisitorNoteLiveAuxiliaryCellRecord,
+    VerifierSlotVisitorConservativeRootAppendError, VerifierSlotVisitorConservativeRootAppendPlan,
+    VerifierSlotVisitorConservativeRootAppendProof,
 };
 use crate::jit::{JitStubRoutineTraceError, JitStubRoutineTracePlan};
 
@@ -74,6 +77,15 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof {
         collector_effects_plan: SlotVisitorCollectorEffectsPlan,
         jit_stub_trace_plan: JitStubRoutineTracePlan,
         vm_root_gather_plan: VmRootGatherPlan,
+    },
+    TopCallFramePublicationWithCollectorEffectsJitStubTraceVmRootGatherAndVerifierAppendProof {
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+        jit_stub_trace_plan: JitStubRoutineTracePlan,
+        vm_root_gather_plan: VmRootGatherPlan,
+        verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
     },
 }
 
@@ -313,6 +325,53 @@ pub(in crate::vm) enum P6Arm64VmRootGatherProofMismatch {
     GatherPlanMismatch(VmRootGatherError),
     ReceiptMissingVmRoot {
         root: ConservativeRootCell,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::vm) enum P6Arm64VerifierAppendProofMismatch {
+    HeapMismatch {
+        receipt: HeapId,
+        verifier: HeapId,
+    },
+    MarkingEpochMismatch {
+        receipt: HeapEpoch,
+        verifier: HeapEpoch,
+    },
+    VmRootGatherHeapMismatch {
+        vm_roots: HeapId,
+        verifier: HeapId,
+    },
+    VmRootGatherMarkingEpochMismatch {
+        vm_roots: HeapEpoch,
+        verifier: HeapEpoch,
+    },
+    MissingVerifierAppendPlan {
+        heap: HeapId,
+        marking_epoch: HeapEpoch,
+    },
+    InvalidRootMarkReason {
+        actual: RootMarkReason,
+    },
+    VerifierPlanMismatch(VerifierSlotVisitorConservativeRootAppendError),
+    VerifierRecordCountMismatch {
+        receipt: usize,
+        verifier: usize,
+    },
+    VerifierMarkingRecordCountMismatch {
+        marking: usize,
+        verifier: usize,
+    },
+    VerifierAppendRecordMismatch {
+        order: usize,
+        receipt: SlotVisitorConservativeRootAppendRecord,
+        verifier: SlotVisitorConservativeRootAppendRecord,
+    },
+    VerifierHeapCellKindMismatch {
+        order: usize,
+        marking: HeapCellKind,
+        verifier: HeapCellKind,
     },
 }
 
@@ -959,6 +1018,126 @@ pub(super) fn validate_p6_arm64_vm_root_gather_plan(
             receipt_roots.remove(position);
         } else {
             return Err(P6Arm64VmRootGatherProofMismatch::ReceiptMissingVmRoot { root });
+        }
+    }
+
+    Ok(())
+}
+
+pub(super) fn validate_p6_arm64_verifier_append_proof(
+    receipt: &HeapConservativeScanAppendReceipt,
+    marking_plan: &SlotVisitorConservativeRootMarkingPlan,
+    vm_root_gather_plan: &VmRootGatherPlan,
+    verifier_append_proof: &VerifierSlotVisitorConservativeRootAppendProof,
+) -> Result<(), P6Arm64VerifierAppendProofMismatch> {
+    if verifier_append_proof.heap() != receipt.heap {
+        return Err(P6Arm64VerifierAppendProofMismatch::HeapMismatch {
+            receipt: receipt.heap,
+            verifier: verifier_append_proof.heap(),
+        });
+    }
+
+    if verifier_append_proof.marking_epoch() != receipt.epoch {
+        return Err(P6Arm64VerifierAppendProofMismatch::MarkingEpochMismatch {
+            receipt: receipt.epoch,
+            verifier: verifier_append_proof.marking_epoch(),
+        });
+    }
+
+    if verifier_append_proof.heap() != vm_root_gather_plan.heap {
+        return Err(
+            P6Arm64VerifierAppendProofMismatch::VmRootGatherHeapMismatch {
+                vm_roots: vm_root_gather_plan.heap,
+                verifier: verifier_append_proof.heap(),
+            },
+        );
+    }
+
+    if verifier_append_proof.marking_epoch() != vm_root_gather_plan.marking_epoch {
+        return Err(
+            P6Arm64VerifierAppendProofMismatch::VmRootGatherMarkingEpochMismatch {
+                vm_roots: vm_root_gather_plan.marking_epoch,
+                verifier: verifier_append_proof.marking_epoch(),
+            },
+        );
+    }
+
+    match verifier_append_proof {
+        VerifierSlotVisitorConservativeRootAppendProof::NoVerifierSlotVisitor {
+            heap,
+            marking_epoch,
+        } => {
+            // C++ skips `VerifierSlotVisitor::append(conservativeRoots)` only
+            // when the heap has no verifier visitor installed. Rust has no
+            // heap-owned verifier-state proof yet, so this native admission
+            // path requires the append plan instead of accepting absence.
+            Err(
+                P6Arm64VerifierAppendProofMismatch::MissingVerifierAppendPlan {
+                    heap: *heap,
+                    marking_epoch: *marking_epoch,
+                },
+            )
+        }
+        VerifierSlotVisitorConservativeRootAppendProof::AppendPlan(verifier_append_plan) => {
+            validate_p6_arm64_verifier_append_plan(receipt, marking_plan, verifier_append_plan)
+        }
+    }
+}
+
+fn validate_p6_arm64_verifier_append_plan(
+    receipt: &HeapConservativeScanAppendReceipt,
+    marking_plan: &SlotVisitorConservativeRootMarkingPlan,
+    verifier_append_plan: &VerifierSlotVisitorConservativeRootAppendPlan,
+) -> Result<(), P6Arm64VerifierAppendProofMismatch> {
+    if verifier_append_plan.root_mark_reason != RootMarkReason::ConservativeScan {
+        return Err(P6Arm64VerifierAppendProofMismatch::InvalidRootMarkReason {
+            actual: verifier_append_plan.root_mark_reason,
+        });
+    }
+
+    verifier_append_plan
+        .validate_consistency()
+        .map_err(P6Arm64VerifierAppendProofMismatch::VerifierPlanMismatch)?;
+
+    if verifier_append_plan.records.len() != receipt.appended_record_count {
+        return Err(
+            P6Arm64VerifierAppendProofMismatch::VerifierRecordCountMismatch {
+                receipt: receipt.appended_record_count,
+                verifier: verifier_append_plan.records.len(),
+            },
+        );
+    }
+
+    if verifier_append_plan.records.len() != marking_plan.records.len() {
+        return Err(
+            P6Arm64VerifierAppendProofMismatch::VerifierMarkingRecordCountMismatch {
+                marking: marking_plan.records.len(),
+                verifier: verifier_append_plan.records.len(),
+            },
+        );
+    }
+
+    for (order, verifier_record) in verifier_append_plan.records.iter().enumerate() {
+        let receipt_record = receipt.append_plan.records[order];
+        if verifier_record.append_record != receipt_record {
+            return Err(
+                P6Arm64VerifierAppendProofMismatch::VerifierAppendRecordMismatch {
+                    order,
+                    receipt: receipt_record,
+                    verifier: verifier_record.append_record,
+                },
+            );
+        }
+
+        let marking_kind = marking_plan.records[order].heap_marking.heap_cell_kind;
+        if verifier_record.heap_cell_kind != marking_kind {
+            return Err(
+                P6Arm64VerifierAppendProofMismatch::VerifierHeapCellKindMismatch {
+                    order,
+                    marking: marking_kind,
+                    verifier: verifier_record.heap_cell_kind,
+                },
+            );
         }
     }
 

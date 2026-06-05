@@ -150,9 +150,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            mark-stack/cell-state/container-effect proof, src/jit/stub_routines.rs
            adds the JITStubRoutineSet may-be-executing trace proof,
            src/vm/vm_roots.rs adds VM scratch-buffer / checkpoint side-state
-           root gather evidence, and src/vm/native_reentry.rs consumes them
-           before rejecting at the missing verifier append / real native-rooting
-           blocker;
+           root gather evidence, src/gc/visitor/verifier.rs adds
+           VerifierSlotVisitor conservative-root append evidence, and
+           src/vm/native_reentry.rs consumes them before rejecting at the
+           missing real native-rooting blocker;
            native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 

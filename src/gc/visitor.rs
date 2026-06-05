@@ -2,6 +2,7 @@
 
 mod collector_effects;
 mod conservative_marking;
+mod verifier;
 
 pub(crate) use collector_effects::{
     SlotVisitorAppendToMarkStackRecord, SlotVisitorCollectorEffectAction,
@@ -12,6 +13,13 @@ pub(crate) use collector_effects::{
 pub(crate) use conservative_marking::{
     SlotVisitorConservativeRootMarkingAction, SlotVisitorConservativeRootMarkingError,
     SlotVisitorConservativeRootMarkingPlan, SlotVisitorConservativeRootMarkingRecord,
+};
+pub(crate) use verifier::{
+    VerifierSlotVisitorCollectorStackAppendRecord, VerifierSlotVisitorConservativeRootAppendAction,
+    VerifierSlotVisitorConservativeRootAppendError, VerifierSlotVisitorConservativeRootAppendPlan,
+    VerifierSlotVisitorConservativeRootAppendProof,
+    VerifierSlotVisitorConservativeRootAppendRecord, VerifierSlotVisitorDescriptor,
+    VerifierSlotVisitorTestAndSetMarkRecord,
 };
 
 use crate::gc::{
