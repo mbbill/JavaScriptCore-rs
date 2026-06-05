@@ -18,6 +18,14 @@ use crate::gc::{
     SlotVisitorNoteLiveAuxiliaryCellRecord, VerifierSlotVisitorConservativeRootAppendError,
     VerifierSlotVisitorConservativeRootAppendPlan, VerifierSlotVisitorConservativeRootAppendProof,
 };
+use crate::jit::arm64_baseline::{
+    validate_arm64_baseline_generated_native_frame_materialization,
+    Arm64BaselineGeneratedNativeFrameMaterializationDescriptor,
+    Arm64BaselineGeneratedNativeFrameMaterializationMismatch,
+    Arm64BaselineGeneratedNativeFrameMaterializationValidationContext,
+    Arm64BaselineLiveRootSlotKind, Arm64BaselineMachineStackRootSlotDescriptor,
+    Arm64BaselineMachineStackSpanKind,
+};
 use crate::jit::{JitStubRoutineTraceError, JitStubRoutineTracePlan};
 
 use super::super::entry::{FrameAddress, VmNativeCallFramePublicationRecord};
@@ -105,6 +113,8 @@ pub(in crate::vm) struct P6Arm64NativeFrameMachineStackResidencyProof {
     pub(in crate::vm) machine_stack_spans: Vec<P6Arm64NativeFrameMachineStackSpanRecord>,
     pub(in crate::vm) machine_stack_roots: ConservativeRoots,
     pub(in crate::vm) slot_records: Vec<P6Arm64NativeRootSlotRecord>,
+    pub(in crate::vm) generated_native_frame_materialization:
+        Option<Arm64BaselineGeneratedNativeFrameMaterializationDescriptor>,
 }
 
 impl P6Arm64NativeFrameMachineStackResidencyProof {
@@ -134,6 +144,7 @@ impl P6Arm64NativeFrameMachineStackResidencyProof {
                 .collect(),
             machine_stack_roots,
             slot_records,
+            generated_native_frame_materialization: None,
         }
     }
 }
@@ -1313,6 +1324,74 @@ pub(super) fn validate_p6_arm64_native_frame_machine_stack_residency_proof(
     Ok(())
 }
 
+pub(super) fn validate_p6_arm64_generated_native_frame_materialization_proof(
+    top_call_frame_publication: &P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+    residency_proof: &P6Arm64NativeFrameMachineStackResidencyProof,
+    descriptor: &Arm64BaselineGeneratedNativeFrameMaterializationDescriptor,
+    expected_live_local_slots: usize,
+) -> Result<(), Arm64BaselineGeneratedNativeFrameMaterializationMismatch> {
+    let context = Arm64BaselineGeneratedNativeFrameMaterializationValidationContext {
+        published_top_frame: top_call_frame_publication.publication.published_top_frame.0,
+        residency_top_frame: residency_proof.published_top_frame.0,
+        expected_argument_slots_excluding_this: top_call_frame_publication
+            .publication
+            .call_frame
+            .padded_argument_count
+            .saturating_sub(1) as usize,
+        expected_live_local_slots,
+        vm_entry_previous_top_call_frame: top_call_frame_publication
+            .publication
+            .vm_entry_previous_top_call_frame
+            .map(|frame| frame.0),
+        vm_entry_previous_top_entry_frame: top_call_frame_publication
+            .publication
+            .vm_entry_previous_top_entry_frame
+            .map(|frame| frame.0),
+        current_top_entry_frame: top_call_frame_publication.publication.current_entry_frame.0,
+        residency_live_root_slots: residency_proof
+            .slot_records
+            .iter()
+            .map(|slot| {
+                let span = containing_span_for_word_slot(
+                    &residency_proof.machine_stack_spans,
+                    slot.slot_address,
+                )
+                .unwrap_or(ConservativeRootSpan { begin: 0, end: 0 });
+                Arm64BaselineMachineStackRootSlotDescriptor {
+                    kind: slot.kind.into(),
+                    slot_address: slot.slot_address,
+                    encoded_payload: slot.encoded_payload,
+                    expected_root: slot.expected_root,
+                    containing_span: slot.containing_span.into(),
+                    span,
+                }
+            })
+            .collect(),
+    };
+    validate_arm64_baseline_generated_native_frame_materialization(&context, descriptor)
+}
+
+impl From<P6Arm64NativeRootSlotKind> for Arm64BaselineLiveRootSlotKind {
+    fn from(kind: P6Arm64NativeRootSlotKind) -> Self {
+        match kind {
+            P6Arm64NativeRootSlotKind::Callee => Self::Callee,
+            P6Arm64NativeRootSlotKind::ThisValue => Self::ThisValue,
+            P6Arm64NativeRootSlotKind::Argument => Self::Argument,
+            P6Arm64NativeRootSlotKind::Local => Self::Local,
+            P6Arm64NativeRootSlotKind::Scratch => Self::Scratch,
+        }
+    }
+}
+
+impl From<P6Arm64NativeFrameMachineStackSpanKind> for Arm64BaselineMachineStackSpanKind {
+    fn from(kind: P6Arm64NativeFrameMachineStackSpanKind) -> Self {
+        match kind {
+            P6Arm64NativeFrameMachineStackSpanKind::RegisterState => Self::RegisterState,
+            P6Arm64NativeFrameMachineStackSpanKind::Stack => Self::Stack,
+        }
+    }
+}
+
 fn current_thread_spans_begin_register_then_stack(
     spans: &[P6Arm64NativeFrameMachineStackSpanRecord],
 ) -> bool {
@@ -1345,11 +1424,24 @@ fn containing_span_kind_for_word_slot(
     spans: &[P6Arm64NativeFrameMachineStackSpanRecord],
     address: usize,
 ) -> Option<P6Arm64NativeFrameMachineStackSpanKind> {
+    containing_span_record_for_word_slot(spans, address).map(|record| record.kind)
+}
+
+fn containing_span_for_word_slot(
+    spans: &[P6Arm64NativeFrameMachineStackSpanRecord],
+    address: usize,
+) -> Option<ConservativeRootSpan> {
+    containing_span_record_for_word_slot(spans, address).map(|record| record.span)
+}
+
+fn containing_span_record_for_word_slot(
+    spans: &[P6Arm64NativeFrameMachineStackSpanRecord],
+    address: usize,
+) -> Option<&P6Arm64NativeFrameMachineStackSpanRecord> {
     let end = address.checked_add(core::mem::size_of::<usize>())?;
     spans
         .iter()
         .find(|record| address >= record.span.begin && end <= record.span.end)
-        .map(|record| record.kind)
 }
 
 pub(super) fn validate_p6_arm64_vm_root_gather_plan(

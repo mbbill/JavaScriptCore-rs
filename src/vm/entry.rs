@@ -172,6 +172,20 @@ impl VmEntryState {
         let ordinal = self.next_ordinal;
         let published_top_frame_proof = request.published_top_frame;
         let published_top_frame = request.published_top_frame.address();
+        let (vm_entry_previous_top_call_frame, vm_entry_previous_top_entry_frame) = self
+            .storage_backed_entries
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.depth == self.entry_depth && entry.top_entry_frame == current_entry_frame
+            })
+            .map(|entry| {
+                (
+                    entry.previous_top_call_frame,
+                    entry.previous_top_entry_frame,
+                )
+            })
+            .unwrap_or((None, None));
         let record = VmNativeCallFramePublicationRecord {
             ordinal,
             entry_depth: self.entry_depth,
@@ -180,6 +194,8 @@ impl VmEntryState {
             code_block: request.code_block,
             current_entry_frame,
             previous_top_frame: Some(previous_top_frame),
+            vm_entry_previous_top_call_frame,
+            vm_entry_previous_top_entry_frame,
             published_top_frame,
             active_entry_frame,
             previous_entry_frame: request.scope.previous_entry_frame,
@@ -517,6 +533,8 @@ pub struct VmNativeCallFramePublicationRecord {
     pub code_block: CodeBlockId,
     pub current_entry_frame: FrameAddress,
     pub previous_top_frame: Option<FrameAddress>,
+    pub vm_entry_previous_top_call_frame: Option<FrameAddress>,
+    pub vm_entry_previous_top_entry_frame: Option<FrameAddress>,
     pub published_top_frame: FrameAddress,
     pub active_entry_frame: EntryFrameId,
     pub previous_entry_frame: Option<EntryFrameId>,

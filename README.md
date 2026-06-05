@@ -155,7 +155,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            src/vm/native_reentry.rs consumes them in Heap::addCoreConstraints
            order plus native-frame machine-stack residency evidence before
            rejecting at the missing ARM64 generated native frame
-           materialization blocker;
+           materialization blocker; src/jit/arm64_baseline/frame_materialization.rs
+           adds the descriptor/validator proof boundary for JSC ARM64 prologue,
+           CallFrame header, x25-x28 materialization, live root slots, and
+           VMEntryRecord linkage, while valid descriptors still reject before
+           public native admission;
            native execution unchanged.
   [missing] commit-message decision log discipline for new batches
 

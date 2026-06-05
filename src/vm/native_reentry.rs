@@ -17,6 +17,7 @@ use crate::gc::{
     SlotVisitorConservativeRootMarkingPlan, VerifierSlotVisitorConservativeRootAppendProof,
 };
 use crate::interpreter::{ExecutionCompletion, ExecutionError};
+use crate::jit::arm64_baseline::Arm64BaselineGeneratedNativeFrameMaterializationMismatch;
 use crate::jit::emitter::{
     P10X86_64BaselinePropertyNativeExitReturnPayload,
     P9X86_64BaselineJsCallNativeExitReturnPayload,
@@ -48,6 +49,7 @@ mod rooting;
 use self::rooting::expected_p6_arm64_collector_effect_action;
 use self::rooting::{
     validate_p6_arm64_collector_effects_plan, validate_p6_arm64_conservative_root_marking_plan,
+    validate_p6_arm64_generated_native_frame_materialization_proof,
     validate_p6_arm64_jit_stub_routine_trace_plan,
     validate_p6_arm64_native_frame_machine_stack_residency_proof,
     validate_p6_arm64_verifier_append_proof, validate_p6_arm64_vm_root_gather_plan,
@@ -336,6 +338,10 @@ pub(super) enum P6Arm64BranchAwareCallableAdmissionRejection {
         jit_stub_trace_plan: JitStubRoutineTracePlan,
         native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
     },
+    Arm64GeneratedNativeFrameMaterializationProofMismatch {
+        mismatch: Arm64BaselineGeneratedNativeFrameMaterializationMismatch,
+    },
+    Arm64GeneratedNativeFrameMaterializationProofAcceptedButPublicAdmissionBlocked,
 }
 
 pub(super) const fn p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate(
@@ -382,6 +388,15 @@ pub(super) fn p6_arm64_public_branch_aware_callable_admission_proof(
     for proof in request.side_exits {
         validate_p6_arm64_branch_aware_callable_side_exit_proof(*proof, range)?;
     }
+    // The metadata proof above is the owner/code-block identity evidence for
+    // the side-exit records; with that established, JIT.cpp frame allocation is
+    // derived from the compiled CodeBlock's unlinked frame shape.
+    let generated_frame_shape = request.side_exits[0].code_block.unlinked().frame();
+    let expected_live_local_slots = generated_frame_shape.num_callee_locals.max(
+        generated_frame_shape
+            .num_vars
+            .saturating_add(generated_frame_shape.num_temporaries),
+    ) as usize;
 
     let exit_counts = request.exit_counts;
     if exit_counts.runtime_helper_native_exits != 0 {
@@ -795,18 +810,35 @@ pub(super) fn p6_arm64_public_branch_aware_callable_admission_proof(
                                 conservative_scan_append_receipt,
                                 native_frame_residency_proof,
                             ) {
-                                Ok(()) => Err(
-                                    P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64GeneratedNativeFrameMaterializationProof {
-                                        top_call_frame_publication: *top_call_frame_publication,
-                                        conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
-                                        vm_root_gather_plan: vm_root_gather_plan.clone(),
-                                        conservative_root_marking_plan: conservative_root_marking_plan.clone(),
-                                        collector_effects_plan: collector_effects_plan.clone(),
-                                        verifier_append_proof: verifier_append_proof.clone(),
-                                        jit_stub_trace_plan: jit_stub_trace_plan.clone(),
-                                        native_frame_residency_proof: native_frame_residency_proof.clone(),
+                                Ok(()) => match &native_frame_residency_proof.generated_native_frame_materialization {
+                                    Some(descriptor) => {
+                                        match validate_p6_arm64_generated_native_frame_materialization_proof(
+                                            top_call_frame_publication,
+                                            native_frame_residency_proof,
+                                            descriptor,
+                                            expected_live_local_slots,
+                                        ) {
+                                            Ok(()) => Err(P6Arm64BranchAwareCallableAdmissionRejection::Arm64GeneratedNativeFrameMaterializationProofAcceptedButPublicAdmissionBlocked),
+                                            Err(mismatch) => Err(
+                                                P6Arm64BranchAwareCallableAdmissionRejection::Arm64GeneratedNativeFrameMaterializationProofMismatch {
+                                                    mismatch,
+                                                },
+                                            ),
+                                        }
                                     },
-                                ),
+                                    None => Err(
+                                        P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64GeneratedNativeFrameMaterializationProof {
+                                            top_call_frame_publication: *top_call_frame_publication,
+                                            conservative_scan_append_receipt: conservative_scan_append_receipt.clone(),
+                                            vm_root_gather_plan: vm_root_gather_plan.clone(),
+                                            conservative_root_marking_plan: conservative_root_marking_plan.clone(),
+                                            collector_effects_plan: collector_effects_plan.clone(),
+                                            verifier_append_proof: verifier_append_proof.clone(),
+                                            jit_stub_trace_plan: jit_stub_trace_plan.clone(),
+                                            native_frame_residency_proof: native_frame_residency_proof.clone(),
+                                        },
+                                    ),
+                                },
                                 Err(mismatch) => Err(
                                     P6Arm64BranchAwareCallableAdmissionRejection::NativeFrameMachineStackResidencyProofMismatch {
                                         top_call_frame_publication: *top_call_frame_publication,
@@ -997,7 +1029,11 @@ impl P6NativeSideExitReentryCallBridge {
 }
 
 #[cfg(test)]
-mod tests {
+#[path = "native_reentry/frame_materialization_tests.rs"]
+mod frame_materialization_tests;
+
+#[cfg(test)]
+pub(super) mod tests {
     use super::rooting::{
         P6Arm64NativeFrameMachineStackSpanKind, P6Arm64NativeFrameMachineStackSpanRecord,
         P6Arm64NativeRootSlotKind, P6Arm64NativeRootSlotRecord,
@@ -1105,7 +1141,7 @@ mod tests {
         .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
     }
 
-    fn jump_if_false_code_block(taken_target: u32) -> CodeBlock {
+    pub(super) fn jump_if_false_code_block(taken_target: u32) -> CodeBlock {
         code_block_from_instructions(vec![
             typed_core_instruction_with_operands(
                 0,
@@ -1153,7 +1189,7 @@ mod tests {
         ])
     }
 
-    fn jump_if_false_site() -> P6X86_64CallableSideExitReturnSite {
+    pub(super) fn jump_if_false_site() -> P6X86_64CallableSideExitReturnSite {
         P6X86_64CallableSideExitReturnSite {
             bytecode_index: bci(1),
             reason: P6X86_64BaselineSelectedSideExitReason::UnsupportedTruthinessOperand,
@@ -1165,7 +1201,7 @@ mod tests {
         }
     }
 
-    fn branch_aware_side_exit_proof<'a>(
+    pub(super) fn branch_aware_side_exit_proof<'a>(
         code_block: &'a CodeBlock,
         site: &'a P6X86_64CallableSideExitReturnSite,
     ) -> P6Arm64BranchAwareCallableSideExitProof<'a> {
@@ -1203,7 +1239,7 @@ mod tests {
         }
     }
 
-    fn valid_request<'a>(
+    pub(super) fn valid_request<'a>(
         side_exits: &'a [P6Arm64BranchAwareCallableSideExitProof<'a>],
     ) -> P6Arm64BranchAwareCallableAdmissionProofRequest<'a> {
         P6Arm64BranchAwareCallableAdmissionProofRequest {
@@ -1586,19 +1622,20 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct NativeFrameResidencyFixture {
-        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof,
-        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
-        vm_root_gather_plan: VmRootGatherPlan,
-        conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
-        collector_effects_plan: SlotVisitorCollectorEffectsPlan,
-        verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
-        jit_stub_trace_plan: JitStubRoutineTracePlan,
-        native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
+    pub(super) struct NativeFrameResidencyFixture {
+        pub(super) top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof,
+        pub(super) conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        pub(super) vm_root_gather_plan: VmRootGatherPlan,
+        pub(super) conservative_root_marking_plan: SlotVisitorConservativeRootMarkingPlan,
+        pub(super) collector_effects_plan: SlotVisitorCollectorEffectsPlan,
+        pub(super) verifier_append_proof: VerifierSlotVisitorConservativeRootAppendProof,
+        pub(super) jit_stub_trace_plan: JitStubRoutineTracePlan,
+        pub(super) native_frame_residency_proof: P6Arm64NativeFrameMachineStackResidencyProof,
     }
 
     impl NativeFrameResidencyFixture {
-        fn fallback(&self) -> P6Arm64BranchAwareCallableFallbackRootingProof {
+        pub(super) fn fallback(&self) -> P6Arm64BranchAwareCallableFallbackRootingProof {
             full_machine_stack_residency_fallback(
                 self.top_call_frame_publication,
                 self.conservative_scan_append_receipt.clone(),
@@ -1629,7 +1666,7 @@ mod tests {
         }
     }
 
-    fn native_frame_residency_fixture() -> NativeFrameResidencyFixture {
+    pub(super) fn native_frame_residency_fixture() -> NativeFrameResidencyFixture {
         let top_call_frame_publication =
             P6Arm64BranchAwareCallableTopCallFramePublicationProof::from_publication_record(
                 top_call_frame_publication_record(),

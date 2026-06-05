@@ -283,6 +283,24 @@ pub(crate) mod register_contract {
 }
 
 mod control_flow;
+mod frame_materialization;
+
+pub(crate) use frame_materialization::{
+    validate_arm64_baseline_generated_native_frame_materialization,
+    Arm64BaselineGeneratedNativeFrameMaterializationDescriptor,
+    Arm64BaselineGeneratedNativeFrameMaterializationMismatch,
+    Arm64BaselineGeneratedNativeFrameMaterializationValidationContext,
+    Arm64BaselineLiveRootSlotKind, Arm64BaselineMachineStackRootSlotDescriptor,
+    Arm64BaselineMachineStackSpanKind,
+};
+#[cfg(test)]
+pub(crate) use frame_materialization::{
+    Arm64BaselineCallFrameHeaderDescriptor, Arm64BaselineEntryLinkageDescriptor,
+    Arm64BaselineFrameAddressSource, Arm64BaselineFrameMaterializationTerminalPolicy,
+    Arm64BaselineFramePointerSource, Arm64BaselineJscPrologueDescriptor,
+    Arm64BaselineMaterializedRegisterDescriptor, Arm64BaselineMaterializedRegisterSource,
+    Arm64BaselinePostFrameAllocationDescriptor,
+};
 
 fn encode_p6_arm64_callable_return_seed_selection(
     contract: &P6X86_64BaselineBackendContractRecord,
