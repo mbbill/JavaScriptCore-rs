@@ -32,6 +32,8 @@ use super::BaselineNativeEntryVmExecution;
 
 #[path = "native_reentry/arm64_admission.rs"]
 mod arm64_admission;
+#[path = "native_reentry/arm64_vm_entry_normal_return.rs"]
+mod arm64_vm_entry_normal_return;
 #[path = "native_reentry/rooting.rs"]
 mod rooting;
 

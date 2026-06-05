@@ -179,6 +179,10 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            stack-call / stack-frame evidence, lower dispatch request proof, and
            selected normal generated-code token metadata; public admission now
            reaches MissingArm64VmEntryExitRestorationAuthority.
+    [done] VM ARM64 VM-entry normal-return restoration admission stage now
+           requires a verified wrapper tying JSC stack-dispatch proof to the
+           stack-local publication exit record; public admission now reaches
+           MissingArm64VmEntryExceptionUnwindRestorationAuthority.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of

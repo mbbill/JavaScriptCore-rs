@@ -585,6 +585,18 @@ impl<'stack> VmStackEntryPublicationGuard<'_, 'stack> {
         self.record
     }
 
+    pub(crate) fn normal_return_exit_record(&self) -> VmStackEntryPublicationExitRecord {
+        VmStackEntryPublicationExitRecord {
+            ordinal: self.record.ordinal,
+            depth_before_exit: self.state.entry_depth,
+            restored_top_call_frame: self.previous_top_call_frame,
+            restored_top_entry_frame: self.previous_top_entry_frame,
+            restored_kind: self.previous_kind,
+            closed_publication: self.record,
+            closed_root_scope: self.root_scope,
+        }
+    }
+
     pub(crate) fn top_call_frame(&self) -> Option<FrameAddress> {
         self.state.top_frame
     }

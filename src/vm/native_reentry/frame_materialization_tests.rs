@@ -1,5 +1,10 @@
 use super::super::super::arm64_native_entry::Arm64NativeEntryJscStackDispatchRequestError;
 use super::super::super::entry::FrameAddress;
+use super::super::arm64_vm_entry_normal_return::{
+    P6Arm64VerifiedVmEntryNormalReturnRestorationProofError,
+    P6Arm64VerifiedVmEntryNormalReturnRestorationProofMismatch,
+    P6Arm64VmEntryNormalReturnRestorationLinkageMismatch,
+};
 use super::super::rooting::{
     P6Arm64JscStackDispatchExecutableEntryProofError,
     P6Arm64JscStackDispatchMaterializationLinkageMismatch,
@@ -201,6 +206,245 @@ fn public_arm64_branch_aware_admission_reaches_vm_entry_exit_restoration_blocker
                         jsc_stack_dispatch_request_proof,
                     }
                 )
+            );
+        },
+    );
+}
+
+#[test]
+fn public_arm64_branch_aware_admission_reaches_exception_unwind_blocker_after_normal_return_restoration(
+) {
+    let code_block = tests::jump_if_false_code_block(4);
+    let site = tests::jump_if_false_site();
+    let side_exits = [tests::branch_aware_side_exit_proof(&code_block, &site)];
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+
+            let mut request = tests::valid_request(&side_exits);
+            request.fallback_rooting_proof =
+                tests::full_vm_entry_normal_return_restoration_fallback(
+                    fixture.top_call_frame_publication,
+                    fixture.machine_stack_conservative_rooting_proof.clone(),
+                    fixture.vm_root_gather_plan.clone(),
+                    fixture.conservative_root_marking_plan.clone(),
+                    fixture.collector_effects_plan.clone(),
+                    fixture.verifier_append_proof.clone(),
+                    fixture.jit_stub_trace_plan.clone(),
+                    normal_return_restoration_proof.clone(),
+                );
+
+            assert_eq!(
+                p6_arm64_public_branch_aware_callable_admission_proof(&request),
+                Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64VmEntryExceptionUnwindRestorationAuthority {
+                        top_call_frame_publication: fixture.top_call_frame_publication,
+                        conservative_scan_append_receipt: fixture.conservative_scan_append_receipt.clone(),
+                        vm_root_gather_plan: fixture.vm_root_gather_plan.clone(),
+                        conservative_root_marking_plan: fixture.conservative_root_marking_plan.clone(),
+                        collector_effects_plan: fixture.collector_effects_plan.clone(),
+                        verifier_append_proof: fixture.verifier_append_proof.clone(),
+                        jit_stub_trace_plan: fixture.jit_stub_trace_plan.clone(),
+                        vm_entry_normal_return_restoration_proof: normal_return_restoration_proof,
+                    }
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_vm_entry_normal_return_wrapper_rejects_restored_previous_top_pair_drift() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, mut exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let actual = Some(FrameAddress(0xfeed_0000));
+            exit_record.restored_top_call_frame = actual;
+
+            assert_eq!(
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                ),
+                Err(
+                    P6Arm64VerifiedVmEntryNormalReturnRestorationProofError::Linkage(
+                        P6Arm64VmEntryNormalReturnRestorationLinkageMismatch::RestoredTopCallFrameMismatch {
+                            expected: None,
+                            actual,
+                        },
+                    )
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn public_arm64_branch_aware_admission_rejects_normal_return_restored_top_pair_drift() {
+    let code_block = tests::jump_if_false_code_block(4);
+    let site = tests::jump_if_false_site();
+    let side_exits = [tests::branch_aware_side_exit_proof(&code_block, &site)];
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let actual = Some(FrameAddress(0xfeed_1000));
+            let mut stale_exit_record =
+                *normal_return_restoration_proof.normal_return_exit_record();
+            stale_exit_record.restored_top_entry_frame = actual;
+            let normal_return_restoration_proof = normal_return_restoration_proof
+                .with_normal_return_exit_record_for_testing(stale_exit_record);
+
+            let mut request = tests::valid_request(&side_exits);
+            request.fallback_rooting_proof =
+                tests::full_vm_entry_normal_return_restoration_fallback(
+                    fixture.top_call_frame_publication,
+                    fixture.machine_stack_conservative_rooting_proof.clone(),
+                    fixture.vm_root_gather_plan.clone(),
+                    fixture.conservative_root_marking_plan.clone(),
+                    fixture.collector_effects_plan.clone(),
+                    fixture.verifier_append_proof.clone(),
+                    fixture.jit_stub_trace_plan.clone(),
+                    normal_return_restoration_proof,
+                );
+
+            assert_eq!(
+                p6_arm64_public_branch_aware_callable_admission_proof(&request),
+                Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::Arm64VmEntryNormalReturnRestorationAuthorityMismatch {
+                        mismatch:
+                            P6Arm64VerifiedVmEntryNormalReturnRestorationProofMismatch::Linkage(
+                                P6Arm64VmEntryNormalReturnRestorationLinkageMismatch::RestoredTopEntryFrameMismatch {
+                                    expected: None,
+                                    actual,
+                                },
+                            ),
+                    }
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_vm_entry_normal_return_wrapper_rejects_cross_paired_dispatch_proof() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, _stack_call_proof, _stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+                |_other_top_call_frame_publication,
+                 other_stack_call_proof,
+                 other_stack_frame_proof,
+                 _other_exit_record| {
+                    let other_fixture = tests::native_frame_residency_fixture_for_publication(
+                        _other_top_call_frame_publication,
+                    );
+                    let other_jsc_stack_dispatch_request_proof =
+                        tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                            &other_fixture,
+                            &other_stack_call_proof,
+                            other_stack_frame_proof,
+                            1,
+                        )
+                        .expect("other JSC stack dispatch request proof should verify");
+
+                    assert!(matches!(
+                        tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                            &fixture,
+                            other_jsc_stack_dispatch_request_proof,
+                            exit_record,
+                        ),
+                        Err(
+                            P6Arm64VerifiedVmEntryNormalReturnRestorationProofError::Linkage(
+                                P6Arm64VmEntryNormalReturnRestorationLinkageMismatch::DispatchCallFrameMismatch {
+                                    ..
+                                },
+                            )
+                        )
+                    ));
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_vm_entry_normal_return_wrapper_rejects_cross_paired_exit_record() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, _exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+
+            tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+                |_other_top_call_frame_publication,
+                 _other_stack_call_proof,
+                 _other_stack_frame_proof,
+                 other_exit_record| {
+                    assert!(matches!(
+                        tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                            &fixture,
+                            jsc_stack_dispatch_request_proof,
+                            other_exit_record,
+                        ),
+                        Err(
+                            P6Arm64VerifiedVmEntryNormalReturnRestorationProofError::Linkage(
+                                P6Arm64VmEntryNormalReturnRestorationLinkageMismatch::ClosedTopCallFrameMismatch {
+                                    ..
+                                },
+                            )
+                        )
+                    ));
+                },
             );
         },
     );

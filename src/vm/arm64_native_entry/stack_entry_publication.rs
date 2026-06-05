@@ -18,7 +18,8 @@ use crate::gc::HeapId;
 use super::{Arm64NativeEntryFrameAddressSource, Arm64NativeEntryStackFrameProof};
 use crate::vm::entry::{
     EntryKind, FrameAddress, VmEntryState, VmStackEntryPublicationError,
-    VmStackEntryPublicationGuard, VmStackEntryPublicationRecord, VmStackEntryPublicationRequest,
+    VmStackEntryPublicationExitRecord, VmStackEntryPublicationGuard, VmStackEntryPublicationRecord,
+    VmStackEntryPublicationRequest,
 };
 
 #[allow(dead_code)]
@@ -85,6 +86,10 @@ impl<'vm, 'frame> Arm64NativeEntryStackPublicationGuard<'vm, 'frame> {
 
     pub(crate) fn record(&self) -> VmStackEntryPublicationRecord {
         self.guard.record()
+    }
+
+    pub(crate) fn normal_return_exit_record(&self) -> VmStackEntryPublicationExitRecord {
+        self.guard.normal_return_exit_record()
     }
 
     pub(crate) fn enter_nested<'nested>(

@@ -10,6 +10,10 @@
 use crate::gc::HeapConservativeScanAppendReceipt;
 
 use super::super::super::vm_roots::VmRootGatherPlan;
+use super::super::arm64_vm_entry_normal_return::{
+    validate_p6_arm64_verified_vm_entry_normal_return_restoration_proof,
+    P6Arm64VerifiedVmEntryNormalReturnRestorationProof,
+};
 use super::super::rooting::{
     validate_p6_arm64_collector_effects_plan, validate_p6_arm64_conservative_root_marking_plan,
     validate_p6_arm64_generated_native_frame_materialization_proof,
@@ -353,6 +357,32 @@ impl<'publication> P6Arm64JitStubTraceAdmissionContext<'_, 'publication> {
             jsc_stack_dispatch_request_proof: jsc_stack_dispatch_request_proof.clone(),
         }
     }
+
+    pub(super) fn missing_vm_entry_exception_unwind_restoration(
+        self,
+        vm_entry_normal_return_restoration_proof:
+            &P6Arm64VerifiedVmEntryNormalReturnRestorationProof<'publication>,
+    ) -> P6Arm64BranchAwareCallableAdmissionRejection<'publication> {
+        let verifier_append = self.verifier_append;
+        let collector_effects = verifier_append.collector_effects;
+        let conservative_root_marking = collector_effects.conservative_root_marking;
+        let vm_root_gather = conservative_root_marking.vm_root_gather;
+        P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64VmEntryExceptionUnwindRestorationAuthority {
+            top_call_frame_publication: *vm_root_gather.top_call_frame_publication,
+            conservative_scan_append_receipt: vm_root_gather
+                .conservative_scan_append_receipt
+                .clone(),
+            vm_root_gather_plan: vm_root_gather.vm_root_gather_plan.clone(),
+            conservative_root_marking_plan: conservative_root_marking
+                .conservative_root_marking_plan
+                .clone(),
+            collector_effects_plan: collector_effects.collector_effects_plan.clone(),
+            verifier_append_proof: verifier_append.verifier_append_proof.clone(),
+            jit_stub_trace_plan: self.jit_stub_trace_plan.clone(),
+            vm_entry_normal_return_restoration_proof:
+                vm_entry_normal_return_restoration_proof.clone(),
+        }
+    }
 }
 
 // C++ JSC carries this sequence as live VM-entry state:
@@ -596,6 +626,35 @@ pub(super) fn p6_arm64_validate_jsc_stack_dispatch_request_or_reject<'publicatio
     )
     .map_err(|mismatch| {
         P6Arm64BranchAwareCallableAdmissionRejection::Arm64JscStackDispatchAdmissionAuthorityMismatch {
+            mismatch,
+        }
+    })
+}
+
+pub(super) fn p6_arm64_validate_vm_entry_normal_return_restoration_or_reject<'publication>(
+    jit_stub_trace: P6Arm64JitStubTraceAdmissionContext<'_, 'publication>,
+    vm_entry_normal_return_restoration_proof: &P6Arm64VerifiedVmEntryNormalReturnRestorationProof<
+        'publication,
+    >,
+    expected_live_local_slots: usize,
+) -> Result<(), P6Arm64BranchAwareCallableAdmissionRejection<'publication>> {
+    p6_arm64_validate_jsc_stack_dispatch_request_or_reject(
+        jit_stub_trace,
+        vm_entry_normal_return_restoration_proof.jsc_stack_dispatch_request_proof(),
+        expected_live_local_slots,
+    )?;
+    let vm_root_gather = jit_stub_trace
+        .verifier_append
+        .collector_effects
+        .conservative_root_marking
+        .vm_root_gather;
+    validate_p6_arm64_verified_vm_entry_normal_return_restoration_proof(
+        vm_root_gather.top_call_frame_publication,
+        vm_entry_normal_return_restoration_proof,
+        expected_live_local_slots,
+    )
+    .map_err(|mismatch| {
+        P6Arm64BranchAwareCallableAdmissionRejection::Arm64VmEntryNormalReturnRestorationAuthorityMismatch {
             mismatch,
         }
     })

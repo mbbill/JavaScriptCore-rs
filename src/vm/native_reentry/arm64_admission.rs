@@ -23,6 +23,10 @@ use super::super::side_exit::{
     p6_jump_if_false_truthiness_side_exit_resume_shape, P6X86_64CallableSideExitReturnSite,
 };
 use super::super::vm_roots::VmRootGatherPlan;
+use super::arm64_vm_entry_normal_return::{
+    P6Arm64VerifiedVmEntryNormalReturnRestorationProof,
+    P6Arm64VerifiedVmEntryNormalReturnRestorationProofMismatch,
+};
 use super::rooting::{
     P6Arm64BranchAwareCallableFallbackRootingProof,
     P6Arm64BranchAwareCallableTopCallFramePublicationProof, P6Arm64CollectorEffectsProofMismatch,
@@ -287,6 +291,21 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
         jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
         jsc_stack_dispatch_request_proof: P6Arm64VerifiedJscStackDispatchRequestProof<'publication>,
     },
+    Arm64VmEntryNormalReturnRestorationAuthorityMismatch {
+        mismatch: P6Arm64VerifiedVmEntryNormalReturnRestorationProofMismatch,
+    },
+    MissingArm64VmEntryExceptionUnwindRestorationAuthority {
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
+        vm_entry_normal_return_restoration_proof:
+            P6Arm64VerifiedVmEntryNormalReturnRestorationProof<'publication>,
+    },
 }
 
 pub(in crate::vm) const fn p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate(
@@ -303,8 +322,9 @@ use self::arm64_admission_prior_stage::{
     p6_arm64_conservative_scan_append_receipt_or_reject, p6_arm64_jit_stub_trace_context_or_reject,
     p6_arm64_validate_generated_native_frame_materialization_or_reject,
     p6_arm64_validate_jsc_stack_dispatch_request_or_reject,
-    p6_arm64_validate_native_frame_residency_or_reject, p6_arm64_verifier_append_context_or_reject,
-    p6_arm64_vm_root_gather_context_or_reject,
+    p6_arm64_validate_native_frame_residency_or_reject,
+    p6_arm64_validate_vm_entry_normal_return_restoration_or_reject,
+    p6_arm64_verifier_append_context_or_reject, p6_arm64_vm_root_gather_context_or_reject,
 };
 
 #[allow(dead_code)]
@@ -508,6 +528,34 @@ pub(in crate::vm) fn p6_arm64_public_branch_aware_callable_admission_proof<'publ
             )?;
             Err(jit_stub_trace.missing_vm_entry_exit_restoration(
                 jsc_stack_dispatch_request_proof,
+            ))
+        }
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceJscStackDispatchRequestAndVmEntryNormalReturnRestorationProof {
+            top_call_frame_publication,
+            machine_stack_conservative_rooting_proof,
+            vm_root_gather_plan,
+            conservative_root_marking_plan,
+            collector_effects_plan,
+            verifier_append_proof,
+            jit_stub_trace_plan,
+            vm_entry_normal_return_restoration_proof,
+        } => {
+            let jit_stub_trace = p6_arm64_jit_stub_trace_context_or_reject(
+                top_call_frame_publication,
+                machine_stack_conservative_rooting_proof,
+                vm_root_gather_plan,
+                conservative_root_marking_plan,
+                collector_effects_plan,
+                verifier_append_proof,
+                jit_stub_trace_plan,
+            )?;
+            p6_arm64_validate_vm_entry_normal_return_restoration_or_reject(
+                jit_stub_trace,
+                vm_entry_normal_return_restoration_proof,
+                expected_live_local_slots,
+            )?;
+            Err(jit_stub_trace.missing_vm_entry_exception_unwind_restoration(
+                vm_entry_normal_return_restoration_proof,
             ))
         }
         P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {
@@ -718,6 +766,10 @@ mod arm64_jit_stub_admission_tests;
 
 #[cfg(test)]
 pub(super) mod tests {
+    use super::super::arm64_vm_entry_normal_return::{
+        P6Arm64VerifiedVmEntryNormalReturnRestorationProof,
+        P6Arm64VerifiedVmEntryNormalReturnRestorationProofError,
+    };
     use super::super::rooting::{
         validate_p6_arm64_native_frame_machine_stack_residency_proof,
         P6Arm64JitStubRoutineConservativeScanHookProof, P6Arm64JitStubRoutineTraceProof,
@@ -773,6 +825,7 @@ pub(super) mod tests {
     use super::super::super::entry::{
         EntryKind, FrameAddress, VmEntryCallFrameMetadata, VmEntryLaunchArgumentValue,
         VmEntryLaunchDescriptor, VmEntryLaunchScope, VmEntryState,
+        VmStackEntryPublicationExitRecord,
     };
     use super::super::super::vm_roots::{
         VmRootGatherDescriptor, VmRootGatherError, VmRootSource, VmScratchBufferCandidateSlot,
@@ -1317,6 +1370,78 @@ pub(super) mod tests {
         )
     }
 
+    pub(super) fn with_stack_top_call_frame_publication_stack_call_frame_and_exit<R>(
+        body: impl for<'publication> FnOnce(
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+            Arm64NativeEntryJscStackCallRequestProof,
+            &'publication Arm64NativeEntryStackFrameProof<'publication>,
+            VmStackEntryPublicationExitRecord,
+        ) -> R,
+    ) -> R {
+        with_stack_top_call_frame_publication_stack_call_frame_and_exit_from_request::<2, 0, 0, R>(
+            stack_frame_request(None, None),
+            body,
+        )
+    }
+
+    pub(super) fn with_stack_top_call_frame_publication_stack_call_frame_and_exit_from_request<
+        const LOCAL_AREA_WORDS: usize,
+        const ARGUMENTS_EXCLUDING_THIS: usize,
+        const PADDED_ARGUMENTS_EXCLUDING_THIS: usize,
+        R,
+    >(
+        request: Arm64NativeEntryStackFrameRequest<ARGUMENTS_EXCLUDING_THIS>,
+        body: impl for<'publication> FnOnce(
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+            Arm64NativeEntryJscStackCallRequestProof,
+            &'publication Arm64NativeEntryStackFrameProof<'publication>,
+            VmStackEntryPublicationExitRecord,
+        ) -> R,
+    ) -> R {
+        let layout_proof = do_vm_entry_layout_for_stack_frame(
+            u32::try_from(ARGUMENTS_EXCLUDING_THIS).expect("argument count"),
+            u32::try_from(PADDED_ARGUMENTS_EXCLUDING_THIS).expect("padded argument count"),
+        );
+        let mut result = None;
+        with_arm64_native_entry_padded_stack_frame::<
+            LOCAL_AREA_WORDS,
+            ARGUMENTS_EXCLUDING_THIS,
+            PADDED_ARGUMENTS_EXCLUDING_THIS,
+        >(request, |stack_frame| {
+            let stack_call_proof =
+                prove_arm64_native_entry_jsc_stack_call_request(layout_proof, &stack_frame)
+                    .expect("JSC stack-call request proof");
+            let mut state = VmEntryState::default();
+            let guard = enter_arm64_native_entry_stack_publication(
+                &mut state,
+                &stack_frame,
+                EntryKind::Script,
+                HeapId::default(),
+            )
+            .expect("stack-local VM top-frame publication");
+            let top_call_frame_publication =
+                P6Arm64BranchAwareCallableTopCallFramePublicationProof::from_stack_publication_guard(
+                    &guard,
+                );
+            let normal_return_exit_record = guard.normal_return_exit_record();
+            result = Some(body(
+                top_call_frame_publication,
+                stack_call_proof,
+                &stack_frame,
+                normal_return_exit_record,
+            ));
+            drop(guard);
+            assert_eq!(state.top_frame(), None);
+            assert_eq!(state.entry_frame(), None);
+            assert_eq!(
+                state.stack_entry_publication_exits(),
+                &[normal_return_exit_record]
+            );
+        })
+        .expect("stack frame fixture");
+        result.expect("stack publication fixture body")
+    }
+
     pub(super) fn with_padded_stack_top_call_frame_publication<R>(
         body: impl for<'publication> FnOnce(
             P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
@@ -1720,6 +1845,21 @@ pub(super) mod tests {
         )
     }
 
+    pub(super) fn verified_vm_entry_normal_return_restoration_proof_from_dispatch<'publication>(
+        fixture: &NativeFrameResidencyFixture<'publication>,
+        jsc_stack_dispatch_request_proof: P6Arm64VerifiedJscStackDispatchRequestProof<'publication>,
+        normal_return_exit_record: VmStackEntryPublicationExitRecord,
+    ) -> Result<
+        P6Arm64VerifiedVmEntryNormalReturnRestorationProof<'publication>,
+        P6Arm64VerifiedVmEntryNormalReturnRestorationProofError,
+    > {
+        P6Arm64VerifiedVmEntryNormalReturnRestorationProof::from_vm_entry_normal_return_exit_record(
+            &fixture.top_call_frame_publication,
+            jsc_stack_dispatch_request_proof,
+            normal_return_exit_record,
+        )
+    }
+
     pub(super) fn full_generated_native_frame_materialization_fallback<'publication>(
         top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof<
             'publication,
@@ -1766,6 +1906,31 @@ pub(super) mod tests {
             verifier_append_proof,
             jit_stub_trace_plan,
             jsc_stack_dispatch_request_proof,
+        }
+    }
+
+    pub(super) fn full_vm_entry_normal_return_restoration_fallback<'publication>(
+        top_call_frame_publication: P6Arm64BranchAwareCallableTopCallFramePublicationProof<
+            'publication,
+        >,
+        machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
+        vm_entry_normal_return_restoration_proof:
+            P6Arm64VerifiedVmEntryNormalReturnRestorationProof<'publication>,
+    ) -> P6Arm64BranchAwareCallableFallbackRootingProof<'publication> {
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceJscStackDispatchRequestAndVmEntryNormalReturnRestorationProof {
+            top_call_frame_publication,
+            machine_stack_conservative_rooting_proof,
+            vm_root_gather_plan,
+            conservative_root_marking_plan,
+            collector_effects_plan,
+            verifier_append_proof,
+            jit_stub_trace_plan,
+            vm_entry_normal_return_restoration_proof,
         }
     }
 
