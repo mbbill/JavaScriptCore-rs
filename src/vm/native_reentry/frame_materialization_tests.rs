@@ -1,5 +1,13 @@
 use super::super::super::arm64_native_entry::Arm64NativeEntryJscStackDispatchRequestError;
 use super::super::super::entry::FrameAddress;
+use super::super::arm64_exception_exit_routing::{
+    P6Arm64PublicJscStackDispatchCaughtExceptionRouteRecord,
+    P6Arm64PublicJscStackDispatchExceptionExitRoutingCapabilityRecord,
+    P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch,
+    P6Arm64PublicJscStackDispatchUncaughtExceptionRouteRecord,
+    P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof,
+    P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProofError,
+};
 use super::super::arm64_exception_unwind::{
     P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof,
     P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofError,
@@ -378,6 +386,127 @@ fn full_public_dispatch_preconditions_fallback<'publication>(
     }
 }
 
+fn exception_exit_routing_records<'publication>(
+    public_jsc_stack_dispatch_preconditions_proof:
+        &P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof<'publication>,
+) -> (
+    P6Arm64PublicJscStackDispatchExceptionExitRoutingCapabilityRecord,
+    P6Arm64PublicJscStackDispatchCaughtExceptionRouteRecord,
+    P6Arm64PublicJscStackDispatchUncaughtExceptionRouteRecord,
+) {
+    let exception_unwind =
+        public_jsc_stack_dispatch_preconditions_proof.vm_entry_exception_unwind_restoration_proof();
+    let caught = exception_unwind.caught_exception_dispatch_restore();
+    let uncaught = exception_unwind.uncaught_exception_entry_restore();
+    let routing_capabilities = P6Arm64PublicJscStackDispatchExceptionExitRoutingCapabilityRecord {
+        metadata_supports_normal_return: true,
+        metadata_supports_caught_exception_exit: true,
+        metadata_supports_uncaught_exception_exit: true,
+        platform_implementation_available: false,
+        arm64e_exception_handler_gate_claimed: false,
+    };
+    let caught_route = P6Arm64PublicJscStackDispatchCaughtExceptionRouteRecord {
+        target_machine_pc_for_throw: caught.staging.target_machine_pc_for_throw,
+        target_machine_pc_after_catch: caught.staging.target_machine_pc_after_catch,
+        call_frame_for_catch: caught.staging.call_frame_for_catch,
+        call_frame_for_catch_consumed: true,
+        call_frame_for_catch_cleared: true,
+        callee_save_restore: caught.callee_save_restore,
+        code_block_frame_extent_sp_restored: true,
+        restored_catch_sp: public_jsc_stack_dispatch_preconditions_proof
+            .code_block_frame_extent()
+            .restored_stack_pointer,
+        catchable_exception_retrieved: true,
+        pending_exception_cleared: true,
+        exception_operand_store_frame: caught.exception_operand_store_frame,
+        thrown_value_operand_store_frame: caught.thrown_value_operand_store_frame,
+        catch_profile_recorded: true,
+        dispatches_after_catch: true,
+    };
+    let uncaught_route = P6Arm64PublicJscStackDispatchUncaughtExceptionRouteRecord {
+        target_machine_pc_for_throw: uncaught.staging.target_machine_pc_for_throw,
+        call_frame_for_catch: uncaught.staging.call_frame_for_catch,
+        call_frame_for_catch_cleared: true,
+        callee_save_restore_from_vm_entry_record: true,
+        callee_save_restore: uncaught.callee_save_restore,
+        top_entry_frame_loaded: uncaught.top_entry_frame_loaded,
+        vm_entry_record: uncaught.vm_entry_record,
+        vm_entry_record_previous_top_pair_restored: true,
+        restored_top_call_frame: uncaught.restored_top_call_frame,
+        restored_top_entry_frame: uncaught.restored_top_entry_frame,
+        returned_undefined: true,
+    };
+    (routing_capabilities, caught_route, uncaught_route)
+}
+
+fn verified_exception_exit_routing_proof_from_public_dispatch_preconditions<'publication>(
+    public_jsc_stack_dispatch_preconditions_proof:
+        P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof<'publication>,
+) -> Result<
+    P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof<'publication>,
+    P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProofError,
+> {
+    let (routing_capabilities, caught_route, uncaught_route) =
+        exception_exit_routing_records(&public_jsc_stack_dispatch_preconditions_proof);
+    P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof::from_exception_exit_routing_records(
+        public_jsc_stack_dispatch_preconditions_proof,
+        routing_capabilities,
+        caught_route,
+        uncaught_route,
+    )
+}
+
+fn full_exception_exit_routing_fallback<'publication>(
+    fixture: &tests::NativeFrameResidencyFixture<'publication>,
+    public_jsc_stack_dispatch_exception_exit_routing_proof:
+        P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof<'publication>,
+) -> P6Arm64BranchAwareCallableFallbackRootingProof<'publication> {
+    P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTracePublicJscStackDispatchPreconditionsAndExceptionExitRoutingProof {
+        top_call_frame_publication: fixture.top_call_frame_publication,
+        machine_stack_conservative_rooting_proof: fixture
+            .machine_stack_conservative_rooting_proof
+            .clone(),
+        vm_root_gather_plan: fixture.vm_root_gather_plan.clone(),
+        conservative_root_marking_plan: fixture.conservative_root_marking_plan.clone(),
+        collector_effects_plan: fixture.collector_effects_plan.clone(),
+        verifier_append_proof: fixture.verifier_append_proof.clone(),
+        jit_stub_trace_plan: fixture.jit_stub_trace_plan.clone(),
+        public_jsc_stack_dispatch_exception_exit_routing_proof,
+    }
+}
+
+fn assert_exception_exit_routing_linkage_error<'publication>(
+    public_jsc_stack_dispatch_preconditions_proof:
+        &P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof<'publication>,
+    mutate: impl FnOnce(
+        &mut P6Arm64PublicJscStackDispatchExceptionExitRoutingCapabilityRecord,
+        &mut P6Arm64PublicJscStackDispatchCaughtExceptionRouteRecord,
+        &mut P6Arm64PublicJscStackDispatchUncaughtExceptionRouteRecord,
+    ),
+    expected: P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch,
+) {
+    let (mut routing_capabilities, mut caught_route, mut uncaught_route) =
+        exception_exit_routing_records(public_jsc_stack_dispatch_preconditions_proof);
+    mutate(
+        &mut routing_capabilities,
+        &mut caught_route,
+        &mut uncaught_route,
+    );
+    assert_eq!(
+        P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof::from_exception_exit_routing_records(
+            public_jsc_stack_dispatch_preconditions_proof.clone(),
+            routing_capabilities,
+            caught_route,
+            uncaught_route,
+        ),
+        Err(
+            P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProofError::Linkage(
+                expected,
+            )
+        )
+    );
+}
+
 fn non_null_c_void(address: usize) -> NonNull<c_void> {
     NonNull::new(address as *mut c_void).expect("non-null test address")
 }
@@ -708,6 +837,637 @@ fn arm64_public_dispatch_preconditions_advance_admission_to_exception_exit_routi
                         jit_stub_trace_plan: fixture.jit_stub_trace_plan.clone(),
                         public_jsc_stack_dispatch_preconditions_proof:
                             public_dispatch_preconditions_proof,
+                    }
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_exception_exit_routing_advances_admission_to_platform_implementation_blocker() {
+    let code_block = tests::jump_if_false_code_block(4);
+    let site = tests::jump_if_false_site();
+    let side_exits = [tests::branch_aware_side_exit_proof(&code_block, &site)];
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let public_dispatch_preconditions_proof =
+                verified_public_dispatch_preconditions_proof_from_exception_unwind(
+                    exception_unwind_restoration_proof,
+                )
+                .expect("public dispatch preconditions proof should verify");
+            let exception_exit_routing_proof =
+                verified_exception_exit_routing_proof_from_public_dispatch_preconditions(
+                    public_dispatch_preconditions_proof,
+                )
+                .expect("exception exit routing proof should verify");
+
+            let mut request = tests::valid_request(&side_exits);
+            request.fallback_rooting_proof = full_exception_exit_routing_fallback(
+                &fixture,
+                exception_exit_routing_proof.clone(),
+            );
+
+            assert_eq!(
+                p6_arm64_public_branch_aware_callable_admission_proof(&request),
+                Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64PublicJscStackDispatchPlatformImplementationAuthority {
+                        top_call_frame_publication: fixture.top_call_frame_publication,
+                        conservative_scan_append_receipt: fixture.conservative_scan_append_receipt.clone(),
+                        vm_root_gather_plan: fixture.vm_root_gather_plan.clone(),
+                        conservative_root_marking_plan: fixture.conservative_root_marking_plan.clone(),
+                        collector_effects_plan: fixture.collector_effects_plan.clone(),
+                        verifier_append_proof: fixture.verifier_append_proof.clone(),
+                        jit_stub_trace_plan: fixture.jit_stub_trace_plan.clone(),
+                        public_jsc_stack_dispatch_exception_exit_routing_proof:
+                            exception_exit_routing_proof,
+                    }
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_exception_exit_routing_rejects_missing_capabilities_and_arm64e_gate_claims() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let public_dispatch_preconditions_proof =
+                verified_public_dispatch_preconditions_proof_from_exception_unwind(
+                    exception_unwind_restoration_proof,
+                )
+                .expect("public dispatch preconditions proof should verify");
+
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |capabilities, _, _| capabilities.metadata_supports_normal_return = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::MetadataNormalReturnCapabilityMissing,
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |capabilities, _, _| capabilities.metadata_supports_caught_exception_exit = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::MetadataCaughtExceptionExitCapabilityMissing,
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |capabilities, _, _| capabilities.metadata_supports_uncaught_exception_exit = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::MetadataUncaughtExceptionExitCapabilityMissing,
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |capabilities, _, _| capabilities.platform_implementation_available = true,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::PlatformImplementationClaimed,
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |capabilities, _, _| capabilities.arm64e_exception_handler_gate_claimed = true,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::Arm64eExceptionHandlerGateClaimed,
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_exception_exit_routing_rejects_caught_target_drift() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let public_dispatch_preconditions_proof =
+                verified_public_dispatch_preconditions_proof_from_exception_unwind(
+                    exception_unwind_restoration_proof,
+                )
+                .expect("public dispatch preconditions proof should verify");
+            let caught = public_dispatch_preconditions_proof
+                .vm_entry_exception_unwind_restoration_proof()
+                .caught_exception_dispatch_restore();
+            let expected_target = caught.staging.target_machine_pc_for_throw;
+            let mut actual_target = expected_target;
+            actual_target.address = NativeCodeId(0xf001);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| caught_route.target_machine_pc_for_throw = actual_target,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtTargetMismatch {
+                    expected: expected_target,
+                    actual: actual_target,
+                },
+            );
+
+            let expected_dispatch_and_catch = caught.staging.target_machine_pc_after_catch;
+            let mut actual_dispatch_and_catch =
+                expected_dispatch_and_catch.expect("fixture has dispatch-and-catch target");
+            actual_dispatch_and_catch.address = NativeCodeId(0xf002);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| {
+                    caught_route.target_machine_pc_after_catch = Some(actual_dispatch_and_catch)
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtDispatchAndCatchTargetMismatch {
+                    expected: expected_dispatch_and_catch,
+                    actual: Some(actual_dispatch_and_catch),
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_exception_exit_routing_rejects_uncaught_target_drift() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let public_dispatch_preconditions_proof =
+                verified_public_dispatch_preconditions_proof_from_exception_unwind(
+                    exception_unwind_restoration_proof,
+                )
+                .expect("public dispatch preconditions proof should verify");
+            let expected_target = public_dispatch_preconditions_proof
+                .vm_entry_exception_unwind_restoration_proof()
+                .uncaught_exception_entry_restore()
+                .staging
+                .target_machine_pc_for_throw;
+            let mut actual_target = expected_target;
+            actual_target.address = NativeCodeId(0xf003);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| uncaught_route.target_machine_pc_for_throw = actual_target,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtTargetMismatch {
+                    expected: expected_target,
+                    actual: actual_target,
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_exception_exit_routing_rejects_incomplete_caught_route() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let public_dispatch_preconditions_proof =
+                verified_public_dispatch_preconditions_proof_from_exception_unwind(
+                    exception_unwind_restoration_proof,
+                )
+                .expect("public dispatch preconditions proof should verify");
+            let caught = public_dispatch_preconditions_proof
+                .vm_entry_exception_unwind_restoration_proof()
+                .caught_exception_dispatch_restore();
+
+            let actual_call_frame_for_catch =
+                FrameAddress(caught.staging.call_frame_for_catch.0 + JSC_REGISTER_BYTES);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| {
+                    caught_route.call_frame_for_catch = actual_call_frame_for_catch
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtCallFrameForCatchMismatch {
+                    expected: caught.staging.call_frame_for_catch,
+                    actual: actual_call_frame_for_catch,
+                },
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| caught_route.call_frame_for_catch_consumed = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtCallFrameForCatchNotConsumed,
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| caught_route.call_frame_for_catch_cleared = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtCallFrameForCatchNotCleared,
+            );
+            let actual_callee_save_buffer =
+                FrameAddress(caught.callee_save_restore.buffer.0 + JSC_REGISTER_BYTES);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| {
+                    caught_route.callee_save_restore.buffer = actual_callee_save_buffer
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtCalleeSaveBufferMismatch {
+                    expected: caught.callee_save_restore.buffer,
+                    actual: actual_callee_save_buffer,
+                },
+            );
+            let actual_register_count = caught.callee_save_restore.register_count + 1;
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| {
+                    caught_route.callee_save_restore.register_count = actual_register_count
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtCalleeSaveRegisterCountMismatch {
+                    expected: caught.callee_save_restore.register_count,
+                    actual: actual_register_count,
+                },
+            );
+            let actual_buffer_bytes = caught.callee_save_restore.buffer_bytes + JSC_REGISTER_BYTES;
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| {
+                    caught_route.callee_save_restore.buffer_bytes = actual_buffer_bytes
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtCalleeSaveBufferBytesMismatch {
+                    expected: caught.callee_save_restore.buffer_bytes,
+                    actual: actual_buffer_bytes,
+                },
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| caught_route.code_block_frame_extent_sp_restored = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtStackPointerNotRestored,
+            );
+            let expected_restored_sp = public_dispatch_preconditions_proof
+                .code_block_frame_extent()
+                .restored_stack_pointer;
+            let actual_restored_sp = FrameAddress(expected_restored_sp.0 + JSC_REGISTER_BYTES);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| caught_route.restored_catch_sp = actual_restored_sp,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtRestoredStackPointerMismatch {
+                    expected: expected_restored_sp,
+                    actual: actual_restored_sp,
+                },
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| caught_route.catchable_exception_retrieved = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtCatchableExceptionNotRetrieved,
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| caught_route.pending_exception_cleared = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtPendingExceptionNotCleared,
+            );
+
+            let actual_exception_store =
+                FrameAddress(caught.exception_operand_store_frame.0 + JSC_REGISTER_BYTES);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| {
+                    caught_route.exception_operand_store_frame = actual_exception_store
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtExceptionOperandStoreFrameMismatch {
+                    expected: caught.exception_operand_store_frame,
+                    actual: actual_exception_store,
+                },
+            );
+
+            let actual_thrown_value_store =
+                FrameAddress(caught.thrown_value_operand_store_frame.0 + JSC_REGISTER_BYTES);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| {
+                    caught_route.thrown_value_operand_store_frame = actual_thrown_value_store
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtThrownValueOperandStoreFrameMismatch {
+                    expected: caught.thrown_value_operand_store_frame,
+                    actual: actual_thrown_value_store,
+                },
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| caught_route.catch_profile_recorded = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtProfileNotRecorded,
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, caught_route, _| caught_route.dispatches_after_catch = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtDispatchNotRecorded,
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_exception_exit_routing_rejects_incomplete_uncaught_route() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let public_dispatch_preconditions_proof =
+                verified_public_dispatch_preconditions_proof_from_exception_unwind(
+                    exception_unwind_restoration_proof,
+                )
+                .expect("public dispatch preconditions proof should verify");
+            let uncaught = public_dispatch_preconditions_proof
+                .vm_entry_exception_unwind_restoration_proof()
+                .uncaught_exception_entry_restore();
+
+            let actual_call_frame_for_catch =
+                FrameAddress(uncaught.staging.call_frame_for_catch.0 + JSC_REGISTER_BYTES);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| {
+                    uncaught_route.call_frame_for_catch = actual_call_frame_for_catch
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtCallFrameForCatchMismatch {
+                    expected: uncaught.staging.call_frame_for_catch,
+                    actual: actual_call_frame_for_catch,
+                },
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| uncaught_route.call_frame_for_catch_cleared = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtCallFrameForCatchNotCleared,
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| {
+                    uncaught_route.callee_save_restore_from_vm_entry_record = false
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtCalleeSaveNotRestoredFromVmEntryRecord,
+            );
+
+            let actual_callee_save_buffer =
+                FrameAddress(uncaught.callee_save_restore.buffer.0 + JSC_REGISTER_BYTES);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| {
+                    uncaught_route.callee_save_restore.buffer = actual_callee_save_buffer
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtCalleeSaveBufferMismatch {
+                    expected: uncaught.callee_save_restore.buffer,
+                    actual: actual_callee_save_buffer,
+                },
+            );
+            let actual_register_count = uncaught.callee_save_restore.register_count + 1;
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| {
+                    uncaught_route.callee_save_restore.register_count = actual_register_count
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtCalleeSaveRegisterCountMismatch {
+                    expected: uncaught.callee_save_restore.register_count,
+                    actual: actual_register_count,
+                },
+            );
+            let actual_buffer_bytes =
+                uncaught.callee_save_restore.buffer_bytes + JSC_REGISTER_BYTES;
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| {
+                    uncaught_route.callee_save_restore.buffer_bytes = actual_buffer_bytes
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtCalleeSaveBufferBytesMismatch {
+                    expected: uncaught.callee_save_restore.buffer_bytes,
+                    actual: actual_buffer_bytes,
+                },
+            );
+            let actual_top_entry_frame =
+                FrameAddress(uncaught.top_entry_frame_loaded.0 + JSC_REGISTER_BYTES);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| {
+                    uncaught_route.top_entry_frame_loaded = actual_top_entry_frame
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtTopEntryFrameMismatch {
+                    expected: uncaught.top_entry_frame_loaded,
+                    actual: actual_top_entry_frame,
+                },
+            );
+            let actual_vm_entry_record =
+                FrameAddress(uncaught.vm_entry_record.0 + JSC_REGISTER_BYTES);
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| uncaught_route.vm_entry_record = actual_vm_entry_record,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtVmEntryRecordMismatch {
+                    expected: uncaught.vm_entry_record,
+                    actual: actual_vm_entry_record,
+                },
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| {
+                    uncaught_route.vm_entry_record_previous_top_pair_restored = false
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtVmEntryPreviousTopPairNotRestored,
+            );
+            let actual_restored_top_call_frame = uncaught
+                .restored_top_call_frame
+                .map(|frame| FrameAddress(frame.0 + JSC_REGISTER_BYTES))
+                .or(Some(FrameAddress(0xf005)));
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| {
+                    uncaught_route.restored_top_call_frame = actual_restored_top_call_frame
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtRestoredTopCallFrameMismatch {
+                    expected: uncaught.restored_top_call_frame,
+                    actual: actual_restored_top_call_frame,
+                },
+            );
+            let actual_restored_top_entry_frame = uncaught
+                .restored_top_entry_frame
+                .map(|frame| FrameAddress(frame.0 + JSC_REGISTER_BYTES))
+                .or(Some(FrameAddress(0xf006)));
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| {
+                    uncaught_route.restored_top_entry_frame = actual_restored_top_entry_frame
+                },
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtRestoredTopEntryFrameMismatch {
+                    expected: uncaught.restored_top_entry_frame,
+                    actual: actual_restored_top_entry_frame,
+                },
+            );
+            assert_exception_exit_routing_linkage_error(
+                &public_dispatch_preconditions_proof,
+                |_, _, uncaught_route| uncaught_route.returned_undefined = false,
+                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::UncaughtUndefinedReturnMissing,
+            );
+        },
+    );
+}
+
+#[test]
+fn public_arm64_branch_aware_admission_rejects_exception_exit_routing_admission_time_drift() {
+    let code_block = tests::jump_if_false_code_block(4);
+    let site = tests::jump_if_false_site();
+    let side_exits = [tests::branch_aware_side_exit_proof(&code_block, &site)];
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let public_dispatch_preconditions_proof =
+                verified_public_dispatch_preconditions_proof_from_exception_unwind(
+                    exception_unwind_restoration_proof,
+                )
+                .expect("public dispatch preconditions proof should verify");
+            let exception_exit_routing_proof =
+                verified_exception_exit_routing_proof_from_public_dispatch_preconditions(
+                    public_dispatch_preconditions_proof,
+                )
+                .expect("exception exit routing proof should verify");
+            let expected_target = exception_exit_routing_proof
+                .caught_route()
+                .target_machine_pc_for_throw;
+            let mut actual_target = expected_target;
+            actual_target.address = NativeCodeId(0xf004);
+            let mut caught_route = *exception_exit_routing_proof.caught_route();
+            caught_route.target_machine_pc_for_throw = actual_target;
+            let exception_exit_routing_proof =
+                exception_exit_routing_proof.with_caught_route_for_testing(caught_route);
+
+            let mut request = tests::valid_request(&side_exits);
+            request.fallback_rooting_proof =
+                full_exception_exit_routing_fallback(&fixture, exception_exit_routing_proof);
+
+            assert_eq!(
+                p6_arm64_public_branch_aware_callable_admission_proof(&request),
+                Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::Arm64PublicJscStackDispatchExceptionExitRoutingMismatch {
+                        mismatch:
+                            super::super::arm64_exception_exit_routing::P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProofMismatch::Linkage(
+                                P6Arm64PublicJscStackDispatchExceptionExitRoutingLinkageMismatch::CaughtTargetMismatch {
+                                    expected: expected_target,
+                                    actual: actual_target,
+                                },
+                            ),
                     }
                 )
             );

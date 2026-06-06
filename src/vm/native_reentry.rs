@@ -32,6 +32,8 @@ use super::BaselineNativeEntryVmExecution;
 
 #[path = "native_reentry/arm64_admission.rs"]
 mod arm64_admission;
+#[path = "native_reentry/arm64_exception_exit_routing.rs"]
+mod arm64_exception_exit_routing;
 #[path = "native_reentry/arm64_exception_unwind.rs"]
 mod arm64_exception_unwind;
 #[path = "native_reentry/arm64_public_dispatch.rs"]

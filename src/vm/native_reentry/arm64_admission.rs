@@ -23,6 +23,10 @@ use super::super::side_exit::{
     p6_jump_if_false_truthiness_side_exit_resume_shape, P6X86_64CallableSideExitReturnSite,
 };
 use super::super::vm_roots::VmRootGatherPlan;
+use super::arm64_exception_exit_routing::{
+    P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof,
+    P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProofMismatch,
+};
 use super::arm64_exception_unwind::{
     P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof,
     P6Arm64VerifiedVmEntryExceptionUnwindRestorationProofMismatch,
@@ -344,6 +348,21 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
         public_jsc_stack_dispatch_preconditions_proof:
             P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof<'publication>,
     },
+    Arm64PublicJscStackDispatchExceptionExitRoutingMismatch {
+        mismatch: P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProofMismatch,
+    },
+    MissingArm64PublicJscStackDispatchPlatformImplementationAuthority {
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+        conservative_scan_append_receipt: HeapConservativeScanAppendReceipt,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
+        public_jsc_stack_dispatch_exception_exit_routing_proof:
+            P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof<'publication>,
+    },
 }
 
 pub(in crate::vm) const fn p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate(
@@ -361,6 +380,7 @@ use self::arm64_admission_prior_stage::{
     p6_arm64_validate_generated_native_frame_materialization_or_reject,
     p6_arm64_validate_jsc_stack_dispatch_request_or_reject,
     p6_arm64_validate_native_frame_residency_or_reject,
+    p6_arm64_validate_public_jsc_stack_dispatch_exception_exit_routing_or_reject,
     p6_arm64_validate_public_jsc_stack_dispatch_preconditions_or_reject,
     p6_arm64_validate_vm_entry_exception_unwind_restoration_or_reject,
     p6_arm64_validate_vm_entry_normal_return_restoration_or_reject,
@@ -652,6 +672,34 @@ pub(in crate::vm) fn p6_arm64_public_branch_aware_callable_admission_proof<'publ
             )?;
             Err(jit_stub_trace.missing_public_jsc_stack_dispatch_exception_exit_routing(
                 public_jsc_stack_dispatch_preconditions_proof,
+            ))
+        }
+        P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTracePublicJscStackDispatchPreconditionsAndExceptionExitRoutingProof {
+            top_call_frame_publication,
+            machine_stack_conservative_rooting_proof,
+            vm_root_gather_plan,
+            conservative_root_marking_plan,
+            collector_effects_plan,
+            verifier_append_proof,
+            jit_stub_trace_plan,
+            public_jsc_stack_dispatch_exception_exit_routing_proof,
+        } => {
+            let jit_stub_trace = p6_arm64_jit_stub_trace_context_or_reject(
+                top_call_frame_publication,
+                machine_stack_conservative_rooting_proof,
+                vm_root_gather_plan,
+                conservative_root_marking_plan,
+                collector_effects_plan,
+                verifier_append_proof,
+                jit_stub_trace_plan,
+            )?;
+            p6_arm64_validate_public_jsc_stack_dispatch_exception_exit_routing_or_reject(
+                jit_stub_trace,
+                public_jsc_stack_dispatch_exception_exit_routing_proof,
+                expected_live_local_slots,
+            )?;
+            Err(jit_stub_trace.missing_public_jsc_stack_dispatch_platform_implementation(
+                public_jsc_stack_dispatch_exception_exit_routing_proof,
             ))
         }
         P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherAndConservativeRootMarkingPlan {

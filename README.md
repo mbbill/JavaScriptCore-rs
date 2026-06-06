@@ -192,6 +192,12 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            metadata, CodeBlock frame-extent catch-SP proof, and the current
            normal-return-only platform envelope; public admission now reaches
            MissingArm64PublicJscStackDispatchExceptionExitRoutingAuthority.
+    [done] VM ARM64 public JSC stack-dispatch exception-exit routing admission
+           stage now requires descriptor proof for normal/caught/uncaught exit
+           metadata, caught and uncaught handler target routing, VMEntryRecord
+           callee-save / previous-top restoration shape, and explicit ARM64E
+           gate rejection; public admission now reaches
+           MissingArm64PublicJscStackDispatchPlatformImplementationAuthority.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of

@@ -10,6 +10,10 @@
 use crate::gc::HeapConservativeScanAppendReceipt;
 
 use super::super::super::vm_roots::VmRootGatherPlan;
+use super::super::arm64_exception_exit_routing::{
+    validate_p6_arm64_verified_public_jsc_stack_dispatch_exception_exit_routing_proof,
+    P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof,
+};
 use super::super::arm64_exception_unwind::{
     validate_p6_arm64_verified_vm_entry_exception_unwind_restoration_proof,
     P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof,
@@ -443,6 +447,32 @@ impl<'publication> P6Arm64JitStubTraceAdmissionContext<'_, 'publication> {
                 public_jsc_stack_dispatch_preconditions_proof.clone(),
         }
     }
+
+    pub(super) fn missing_public_jsc_stack_dispatch_platform_implementation(
+        self,
+        public_jsc_stack_dispatch_exception_exit_routing_proof:
+            &P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof<'publication>,
+    ) -> P6Arm64BranchAwareCallableAdmissionRejection<'publication> {
+        let verifier_append = self.verifier_append;
+        let collector_effects = verifier_append.collector_effects;
+        let conservative_root_marking = collector_effects.conservative_root_marking;
+        let vm_root_gather = conservative_root_marking.vm_root_gather;
+        P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64PublicJscStackDispatchPlatformImplementationAuthority {
+            top_call_frame_publication: *vm_root_gather.top_call_frame_publication,
+            conservative_scan_append_receipt: vm_root_gather
+                .conservative_scan_append_receipt
+                .clone(),
+            vm_root_gather_plan: vm_root_gather.vm_root_gather_plan.clone(),
+            conservative_root_marking_plan: conservative_root_marking
+                .conservative_root_marking_plan
+                .clone(),
+            collector_effects_plan: collector_effects.collector_effects_plan.clone(),
+            verifier_append_proof: verifier_append.verifier_append_proof.clone(),
+            jit_stub_trace_plan: self.jit_stub_trace_plan.clone(),
+            public_jsc_stack_dispatch_exception_exit_routing_proof:
+                public_jsc_stack_dispatch_exception_exit_routing_proof.clone(),
+        }
+    }
 }
 
 // C++ JSC carries this sequence as live VM-entry state:
@@ -771,6 +801,37 @@ pub(super) fn p6_arm64_validate_public_jsc_stack_dispatch_preconditions_or_rejec
     )
     .map_err(|mismatch| {
         P6Arm64BranchAwareCallableAdmissionRejection::Arm64PublicJscStackDispatchPreconditionsMismatch {
+            mismatch,
+        }
+    })
+}
+
+pub(super) fn p6_arm64_validate_public_jsc_stack_dispatch_exception_exit_routing_or_reject<
+    'publication,
+>(
+    jit_stub_trace: P6Arm64JitStubTraceAdmissionContext<'_, 'publication>,
+    public_jsc_stack_dispatch_exception_exit_routing_proof:
+        &P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof<'publication>,
+    expected_live_local_slots: usize,
+) -> Result<(), P6Arm64BranchAwareCallableAdmissionRejection<'publication>> {
+    p6_arm64_validate_public_jsc_stack_dispatch_preconditions_or_reject(
+        jit_stub_trace,
+        public_jsc_stack_dispatch_exception_exit_routing_proof
+            .public_jsc_stack_dispatch_preconditions_proof(),
+        expected_live_local_slots,
+    )?;
+    let vm_root_gather = jit_stub_trace
+        .verifier_append
+        .collector_effects
+        .conservative_root_marking
+        .vm_root_gather;
+    validate_p6_arm64_verified_public_jsc_stack_dispatch_exception_exit_routing_proof(
+        vm_root_gather.top_call_frame_publication,
+        public_jsc_stack_dispatch_exception_exit_routing_proof,
+        expected_live_local_slots,
+    )
+    .map_err(|mismatch| {
+        P6Arm64BranchAwareCallableAdmissionRejection::Arm64PublicJscStackDispatchExceptionExitRoutingMismatch {
             mismatch,
         }
     })
