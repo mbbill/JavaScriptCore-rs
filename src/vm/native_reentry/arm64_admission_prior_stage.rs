@@ -8,6 +8,7 @@
 //! preserving the same public rejection behavior.
 
 use crate::gc::HeapConservativeScanAppendReceipt;
+use crate::platform::executable_memory_compartment::ExecutableMemoryArm64JscStackDispatchImplementationDescriptor;
 
 use super::super::super::vm_roots::VmRootGatherPlan;
 use super::super::arm64_exception_exit_routing::{
@@ -18,6 +19,7 @@ use super::super::arm64_exception_unwind::{
     validate_p6_arm64_verified_vm_entry_exception_unwind_restoration_proof,
     P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof,
 };
+use super::super::arm64_platform_implementation::validate_p6_arm64_public_jsc_stack_dispatch_platform_implementation_descriptor;
 use super::super::arm64_public_dispatch::{
     validate_p6_arm64_verified_public_jsc_stack_dispatch_preconditions_proof,
     P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof,
@@ -832,6 +834,34 @@ pub(super) fn p6_arm64_validate_public_jsc_stack_dispatch_exception_exit_routing
     )
     .map_err(|mismatch| {
         P6Arm64BranchAwareCallableAdmissionRejection::Arm64PublicJscStackDispatchExceptionExitRoutingMismatch {
+            mismatch,
+        }
+    })
+}
+
+pub(super) fn p6_arm64_validate_public_jsc_stack_dispatch_platform_implementation_or_reject<
+    'publication,
+>(
+    jit_stub_trace: P6Arm64JitStubTraceAdmissionContext<'_, 'publication>,
+    public_jsc_stack_dispatch_exception_exit_routing_proof:
+        &P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof<'publication>,
+    platform_implementation_descriptor:
+        ExecutableMemoryArm64JscStackDispatchImplementationDescriptor,
+    expected_live_local_slots: usize,
+) -> Result<(), P6Arm64BranchAwareCallableAdmissionRejection<'publication>> {
+    let vm_root_gather = jit_stub_trace
+        .verifier_append
+        .collector_effects
+        .conservative_root_marking
+        .vm_root_gather;
+    validate_p6_arm64_public_jsc_stack_dispatch_platform_implementation_descriptor(
+        vm_root_gather.top_call_frame_publication,
+        public_jsc_stack_dispatch_exception_exit_routing_proof,
+        platform_implementation_descriptor,
+        expected_live_local_slots,
+    )
+    .map_err(|mismatch| {
+        P6Arm64BranchAwareCallableAdmissionRejection::Arm64PublicJscStackDispatchPlatformImplementationMismatch {
             mismatch,
         }
     })

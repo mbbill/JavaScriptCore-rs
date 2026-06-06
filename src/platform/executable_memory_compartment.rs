@@ -131,6 +131,50 @@ pub enum ExecutableMemoryArm64JscStackCallRequestValidationError {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutableMemoryArm64JscStackDispatchImplementationKind {
+    NormalReturnOnlyPrivateTrampoline,
+    FullDoVmEntryMakeJavaScriptCall,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutableMemoryArm64JscStackDispatchArm64eGatePolicy {
+    Arm64OnlyNoGate,
+    Arm64eGateRejected,
+    Arm64eGateModeled,
+}
+
+/// Platform-owned description of the ARM64 JSC-stack dispatch implementation.
+///
+/// C++ JSC's `doVMEntry(makeJavaScriptCall)` constructs a VMEntryRecord frame,
+/// publishes `VM::topCallFrame` / `VM::topEntryFrame`, calls generated code,
+/// then restores the previous top-frame pair on normal return. Its exception
+/// paths jump through `VM::targetMachinePCForThrow` and the catch/uncaught
+/// handlers consume VM throw fields and the VMEntryRecord callee-save buffer.
+///
+/// Rust intentionally diverges today: the private platform trampoline only
+/// installs the requested generated-code `sp`/`fp` and restores Rust's C ABI
+/// state after a normal return. It does not implement C++ `doVMEntry`, does not
+/// mutate VM top-frame fields, and does not provide caught or uncaught machine
+/// exception exits. This descriptor lets the VM reject that trampoline for
+/// public platform authority using platform-produced evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutableMemoryArm64JscStackDispatchImplementationDescriptor {
+    platform_request: ExecutableMemoryArm64JscStackCallRequest,
+    implementation_kind: ExecutableMemoryArm64JscStackDispatchImplementationKind,
+    supports_normal_return: bool,
+    supports_caught_exception_exit: bool,
+    supports_uncaught_exception_exit: bool,
+    constructs_vm_entry_record_frame: bool,
+    publishes_vm_top_frame_pair: bool,
+    restores_vm_top_frame_pair_on_normal_return: bool,
+    copies_callee_saves_to_vm_entry_record_on_exception: bool,
+    restores_callee_saves_from_vm_entry_record_on_exception: bool,
+    routes_caught_exception_via_target_machine_pc_for_throw: bool,
+    routes_uncaught_exception_via_target_machine_pc_for_throw: bool,
+    arm64e_gate_policy: ExecutableMemoryArm64JscStackDispatchArm64eGatePolicy,
+}
+
 /// Request to invoke a result-seeded P9 owner post-call reentry stub.
 ///
 /// `result_bits` is passed as the third C-ABI argument so the reentry stub can
@@ -413,6 +457,220 @@ impl ExecutableMemoryArm64JscStackCallRequest {
             );
         }
         Ok(())
+    }
+}
+
+impl ExecutableMemoryArm64JscStackDispatchImplementationDescriptor {
+    const fn normal_return_only_private_trampoline(
+        platform_request: ExecutableMemoryArm64JscStackCallRequest,
+    ) -> Self {
+        Self {
+            platform_request,
+            implementation_kind:
+                ExecutableMemoryArm64JscStackDispatchImplementationKind::NormalReturnOnlyPrivateTrampoline,
+            supports_normal_return: true,
+            supports_caught_exception_exit: false,
+            supports_uncaught_exception_exit: false,
+            constructs_vm_entry_record_frame: false,
+            publishes_vm_top_frame_pair: false,
+            restores_vm_top_frame_pair_on_normal_return: false,
+            copies_callee_saves_to_vm_entry_record_on_exception: false,
+            restores_callee_saves_from_vm_entry_record_on_exception: false,
+            routes_caught_exception_via_target_machine_pc_for_throw: false,
+            routes_uncaught_exception_via_target_machine_pc_for_throw: false,
+            arm64e_gate_policy:
+                ExecutableMemoryArm64JscStackDispatchArm64eGatePolicy::Arm64eGateRejected,
+        }
+    }
+
+    #[cfg(test)]
+    const fn full_do_vm_entry_make_javascript_call_for_testing(
+        platform_request: ExecutableMemoryArm64JscStackCallRequest,
+    ) -> Self {
+        Self {
+            platform_request,
+            implementation_kind:
+                ExecutableMemoryArm64JscStackDispatchImplementationKind::FullDoVmEntryMakeJavaScriptCall,
+            supports_normal_return: true,
+            supports_caught_exception_exit: true,
+            supports_uncaught_exception_exit: true,
+            constructs_vm_entry_record_frame: true,
+            publishes_vm_top_frame_pair: true,
+            restores_vm_top_frame_pair_on_normal_return: true,
+            copies_callee_saves_to_vm_entry_record_on_exception: true,
+            restores_callee_saves_from_vm_entry_record_on_exception: true,
+            routes_caught_exception_via_target_machine_pc_for_throw: true,
+            routes_uncaught_exception_via_target_machine_pc_for_throw: true,
+            arm64e_gate_policy:
+                ExecutableMemoryArm64JscStackDispatchArm64eGatePolicy::Arm64OnlyNoGate,
+        }
+    }
+
+    pub const fn platform_request(self) -> ExecutableMemoryArm64JscStackCallRequest {
+        self.platform_request
+    }
+
+    pub const fn implementation_kind(
+        self,
+    ) -> ExecutableMemoryArm64JscStackDispatchImplementationKind {
+        self.implementation_kind
+    }
+
+    pub const fn supports_normal_return(self) -> bool {
+        self.supports_normal_return
+    }
+
+    pub const fn supports_caught_exception_exit(self) -> bool {
+        self.supports_caught_exception_exit
+    }
+
+    pub const fn supports_uncaught_exception_exit(self) -> bool {
+        self.supports_uncaught_exception_exit
+    }
+
+    pub const fn constructs_vm_entry_record_frame(self) -> bool {
+        self.constructs_vm_entry_record_frame
+    }
+
+    pub const fn publishes_vm_top_frame_pair(self) -> bool {
+        self.publishes_vm_top_frame_pair
+    }
+
+    pub const fn restores_vm_top_frame_pair_on_normal_return(self) -> bool {
+        self.restores_vm_top_frame_pair_on_normal_return
+    }
+
+    pub const fn copies_callee_saves_to_vm_entry_record_on_exception(self) -> bool {
+        self.copies_callee_saves_to_vm_entry_record_on_exception
+    }
+
+    pub const fn restores_callee_saves_from_vm_entry_record_on_exception(self) -> bool {
+        self.restores_callee_saves_from_vm_entry_record_on_exception
+    }
+
+    pub const fn routes_caught_exception_via_target_machine_pc_for_throw(self) -> bool {
+        self.routes_caught_exception_via_target_machine_pc_for_throw
+    }
+
+    pub const fn routes_uncaught_exception_via_target_machine_pc_for_throw(self) -> bool {
+        self.routes_uncaught_exception_via_target_machine_pc_for_throw
+    }
+
+    pub const fn arm64e_gate_policy(self) -> ExecutableMemoryArm64JscStackDispatchArm64eGatePolicy {
+        self.arm64e_gate_policy
+    }
+
+    #[cfg(test)]
+    pub const fn with_platform_request_for_testing(
+        mut self,
+        platform_request: ExecutableMemoryArm64JscStackCallRequest,
+    ) -> Self {
+        self.platform_request = platform_request;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn with_supports_caught_exception_exit_for_testing(
+        mut self,
+        supports_caught_exception_exit: bool,
+    ) -> Self {
+        self.supports_caught_exception_exit = supports_caught_exception_exit;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn with_supports_normal_return_for_testing(
+        mut self,
+        supports_normal_return: bool,
+    ) -> Self {
+        self.supports_normal_return = supports_normal_return;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn with_supports_uncaught_exception_exit_for_testing(
+        mut self,
+        supports_uncaught_exception_exit: bool,
+    ) -> Self {
+        self.supports_uncaught_exception_exit = supports_uncaught_exception_exit;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn with_constructs_vm_entry_record_frame_for_testing(
+        mut self,
+        constructs_vm_entry_record_frame: bool,
+    ) -> Self {
+        self.constructs_vm_entry_record_frame = constructs_vm_entry_record_frame;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn with_publishes_vm_top_frame_pair_for_testing(
+        mut self,
+        publishes_vm_top_frame_pair: bool,
+    ) -> Self {
+        self.publishes_vm_top_frame_pair = publishes_vm_top_frame_pair;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn with_restores_vm_top_frame_pair_on_normal_return_for_testing(
+        mut self,
+        restores_vm_top_frame_pair_on_normal_return: bool,
+    ) -> Self {
+        self.restores_vm_top_frame_pair_on_normal_return =
+            restores_vm_top_frame_pair_on_normal_return;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn with_copies_callee_saves_to_vm_entry_record_on_exception_for_testing(
+        mut self,
+        copies_callee_saves_to_vm_entry_record_on_exception: bool,
+    ) -> Self {
+        self.copies_callee_saves_to_vm_entry_record_on_exception =
+            copies_callee_saves_to_vm_entry_record_on_exception;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn with_restores_callee_saves_from_vm_entry_record_on_exception_for_testing(
+        mut self,
+        restores_callee_saves_from_vm_entry_record_on_exception: bool,
+    ) -> Self {
+        self.restores_callee_saves_from_vm_entry_record_on_exception =
+            restores_callee_saves_from_vm_entry_record_on_exception;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn with_routes_caught_exception_via_target_machine_pc_for_throw_for_testing(
+        mut self,
+        routes_caught_exception_via_target_machine_pc_for_throw: bool,
+    ) -> Self {
+        self.routes_caught_exception_via_target_machine_pc_for_throw =
+            routes_caught_exception_via_target_machine_pc_for_throw;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn with_routes_uncaught_exception_via_target_machine_pc_for_throw_for_testing(
+        mut self,
+        routes_uncaught_exception_via_target_machine_pc_for_throw: bool,
+    ) -> Self {
+        self.routes_uncaught_exception_via_target_machine_pc_for_throw =
+            routes_uncaught_exception_via_target_machine_pc_for_throw;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn with_arm64e_gate_policy_for_testing(
+        mut self,
+        arm64e_gate_policy: ExecutableMemoryArm64JscStackDispatchArm64eGatePolicy,
+    ) -> Self {
+        self.arm64e_gate_policy = arm64e_gate_policy;
+        self
     }
 }
 
@@ -717,11 +975,7 @@ impl ExecutableMemoryCompartment {
         &self,
         request: ExecutableMemoryArm64JscStackCallRequest,
     ) -> Result<ExecutableMemoryP6CallResult, ExecutableMemoryCompartmentError> {
-        self.require_executable_lifecycle()?;
-        self.validate_entry_offset(request.entry_offset)?;
-        request.validate().map_err(|reason| {
-            ExecutableMemoryCompartmentError::Arm64JscStackCallRequestInvalid { reason }
-        })?;
+        self.validate_arm64_jsc_stack_dispatch_request(request)?;
 
         #[cfg(all(unix, target_arch = "aarch64"))]
         {
@@ -746,6 +1000,44 @@ impl ExecutableMemoryCompartment {
             let _ = request;
             Err(ExecutableMemoryCompartmentError::UnsupportedPlatform)
         }
+    }
+
+    pub fn arm64_jsc_stack_dispatch_implementation_descriptor(
+        &self,
+        request: ExecutableMemoryArm64JscStackCallRequest,
+    ) -> Result<
+        ExecutableMemoryArm64JscStackDispatchImplementationDescriptor,
+        ExecutableMemoryCompartmentError,
+    > {
+        self.validate_arm64_jsc_stack_dispatch_request(request)?;
+        #[cfg(all(unix, target_arch = "aarch64"))]
+        {
+            Ok(
+                ExecutableMemoryArm64JscStackDispatchImplementationDescriptor::normal_return_only_private_trampoline(
+                    request,
+                ),
+            )
+        }
+        #[cfg(any(not(unix), not(target_arch = "aarch64")))]
+        {
+            Err(ExecutableMemoryCompartmentError::UnsupportedPlatform)
+        }
+    }
+
+    #[cfg(test)]
+    pub fn arm64_jsc_stack_dispatch_full_do_vm_entry_descriptor_for_testing(
+        &self,
+        request: ExecutableMemoryArm64JscStackCallRequest,
+    ) -> Result<
+        ExecutableMemoryArm64JscStackDispatchImplementationDescriptor,
+        ExecutableMemoryCompartmentError,
+    > {
+        self.validate_arm64_jsc_stack_dispatch_request(request)?;
+        Ok(
+            ExecutableMemoryArm64JscStackDispatchImplementationDescriptor::full_do_vm_entry_make_javascript_call_for_testing(
+                request,
+            ),
+        )
     }
 
     pub fn call_p9_x86_64_owner_post_call_reentry(
@@ -838,6 +1130,17 @@ impl ExecutableMemoryCompartment {
             });
         }
         Ok(())
+    }
+
+    fn validate_arm64_jsc_stack_dispatch_request(
+        &self,
+        request: ExecutableMemoryArm64JscStackCallRequest,
+    ) -> Result<(), ExecutableMemoryCompartmentError> {
+        self.require_executable_lifecycle()?;
+        self.validate_entry_offset(request.entry_offset)?;
+        request.validate().map_err(|reason| {
+            ExecutableMemoryCompartmentError::Arm64JscStackCallRequestInvalid { reason }
+        })
     }
 
     fn validate_mapped_machine_range(
@@ -1520,6 +1823,62 @@ mod tests {
                         },
                 }
             )
+        );
+    }
+
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn arm64_jsc_stack_dispatch_descriptor_reports_current_normal_return_only_trampoline() {
+        let bytes = [0xc0, 0x03, 0x5f, 0xd6];
+        let mut compartment =
+            ExecutableMemoryCompartment::allocate(test_request(bytes.len() as u32)).unwrap();
+        compartment
+            .copy_from_slice(compartment.machine_range(), &bytes)
+            .unwrap();
+        compartment.protect_executable().unwrap();
+
+        let request = valid_arm64_jsc_stack_call_request_at_offset(0);
+        let descriptor = compartment
+            .arm64_jsc_stack_dispatch_implementation_descriptor(request)
+            .unwrap();
+
+        assert_eq!(descriptor.platform_request(), request);
+        assert_eq!(
+            descriptor.implementation_kind(),
+            ExecutableMemoryArm64JscStackDispatchImplementationKind::NormalReturnOnlyPrivateTrampoline
+        );
+        assert!(descriptor.supports_normal_return());
+        assert!(!descriptor.supports_caught_exception_exit());
+        assert!(!descriptor.supports_uncaught_exception_exit());
+        assert!(!descriptor.constructs_vm_entry_record_frame());
+        assert!(!descriptor.publishes_vm_top_frame_pair());
+        assert!(!descriptor.restores_vm_top_frame_pair_on_normal_return());
+        assert!(!descriptor.copies_callee_saves_to_vm_entry_record_on_exception());
+        assert!(!descriptor.restores_callee_saves_from_vm_entry_record_on_exception());
+        assert!(!descriptor.routes_caught_exception_via_target_machine_pc_for_throw());
+        assert!(!descriptor.routes_uncaught_exception_via_target_machine_pc_for_throw());
+        assert_eq!(
+            descriptor.arm64e_gate_policy(),
+            ExecutableMemoryArm64JscStackDispatchArm64eGatePolicy::Arm64eGateRejected
+        );
+    }
+
+    #[cfg(all(unix, not(target_arch = "aarch64")))]
+    #[test]
+    fn arm64_jsc_stack_dispatch_descriptor_is_unsupported_after_safe_checks_off_aarch64() {
+        let bytes = [0xc0, 0x03, 0x5f, 0xd6];
+        let mut compartment =
+            ExecutableMemoryCompartment::allocate(test_request(bytes.len() as u32)).unwrap();
+        compartment
+            .copy_from_slice(compartment.machine_range(), &bytes)
+            .unwrap();
+        compartment.protect_executable().unwrap();
+
+        assert_eq!(
+            compartment.arm64_jsc_stack_dispatch_implementation_descriptor(
+                valid_arm64_jsc_stack_call_request_at_offset(0)
+            ),
+            Err(ExecutableMemoryCompartmentError::UnsupportedPlatform)
         );
     }
 

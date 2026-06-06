@@ -40,6 +40,7 @@ use crate::jit::{
     JitStubRoutineSetDescriptor, JitStubRoutineTraceError, JitStubRoutineTracePlan,
     MachineCodeOwnership, MachineCodeRange, MachineCodeValidationError,
 };
+use crate::platform::executable_memory_compartment::ExecutableMemoryArm64JscStackDispatchImplementationDescriptor;
 use crate::runtime::NativeCodeId;
 
 use super::super::arm64_native_entry::{
@@ -1182,6 +1183,21 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
         public_jsc_stack_dispatch_exception_exit_routing_proof:
             P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof<'publication>,
+    },
+    TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceExceptionExitRoutingAndPlatformImplementationDescriptor
+    {
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+        machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
+        public_jsc_stack_dispatch_exception_exit_routing_proof:
+            P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof<'publication>,
+        platform_implementation_descriptor:
+            ExecutableMemoryArm64JscStackDispatchImplementationDescriptor,
     },
 }
 

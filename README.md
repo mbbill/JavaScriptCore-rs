@@ -198,6 +198,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            callee-save / previous-top restoration shape, and explicit ARM64E
            gate rejection; public admission now reaches
            MissingArm64PublicJscStackDispatchPlatformImplementationAuthority.
+    [done] VM ARM64 public JSC stack-dispatch platform implementation boundary
+           now requires a platform-produced full `doVMEntry(makeJavaScriptCall)`
+           descriptor; the current private normal-return-only trampoline is
+           rejected as insufficient, and public admission still does not
+           succeed.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of

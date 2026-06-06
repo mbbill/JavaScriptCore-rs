@@ -36,6 +36,8 @@ mod arm64_admission;
 mod arm64_exception_exit_routing;
 #[path = "native_reentry/arm64_exception_unwind.rs"]
 mod arm64_exception_unwind;
+#[path = "native_reentry/arm64_platform_implementation.rs"]
+mod arm64_platform_implementation;
 #[path = "native_reentry/arm64_public_dispatch.rs"]
 mod arm64_public_dispatch;
 #[path = "native_reentry/arm64_vm_entry_normal_return.rs"]

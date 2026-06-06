@@ -174,7 +174,7 @@ fn uncaught_exception_entry_restore_record(
     }
 }
 
-fn verified_exception_unwind_restoration_proof_from_normal_return<'publication>(
+pub(super) fn verified_exception_unwind_restoration_proof_from_normal_return<'publication>(
     normal_return_restoration_proof: P6Arm64VerifiedVmEntryNormalReturnRestorationProof<
         'publication,
     >,
@@ -348,7 +348,7 @@ fn public_dispatch_precondition_records<'publication>(
     )
 }
 
-fn verified_public_dispatch_preconditions_proof_from_exception_unwind<'publication>(
+pub(super) fn verified_public_dispatch_preconditions_proof_from_exception_unwind<'publication>(
     exception_unwind_restoration_proof: P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof<
         'publication,
     >,
@@ -439,7 +439,9 @@ fn exception_exit_routing_records<'publication>(
     (routing_capabilities, caught_route, uncaught_route)
 }
 
-fn verified_exception_exit_routing_proof_from_public_dispatch_preconditions<'publication>(
+pub(super) fn verified_exception_exit_routing_proof_from_public_dispatch_preconditions<
+    'publication,
+>(
     public_jsc_stack_dispatch_preconditions_proof:
         P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof<'publication>,
 ) -> Result<
@@ -456,7 +458,7 @@ fn verified_exception_exit_routing_proof_from_public_dispatch_preconditions<'pub
     )
 }
 
-fn full_exception_exit_routing_fallback<'publication>(
+pub(super) fn full_exception_exit_routing_fallback<'publication>(
     fixture: &tests::NativeFrameResidencyFixture<'publication>,
     public_jsc_stack_dispatch_exception_exit_routing_proof:
         P6Arm64VerifiedPublicJscStackDispatchExceptionExitRoutingProof<'publication>,
