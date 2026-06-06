@@ -187,6 +187,11 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            requires descriptor proof for both caught catch-dispatch restore and
            uncaught VMEntryRecord previous-top restore; public admission now
            reaches MissingArm64PublicJscStackDispatchExecutionAuthority.
+    [done] VM ARM64 public JSC stack-dispatch preconditions admission stage now
+           requires retained baseline executable identity, no-GC/trap-deferral
+           metadata, CodeBlock frame-extent catch-SP proof, and the current
+           normal-return-only platform envelope; public admission now reaches
+           MissingArm64PublicJscStackDispatchExceptionExitRoutingAuthority.
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of

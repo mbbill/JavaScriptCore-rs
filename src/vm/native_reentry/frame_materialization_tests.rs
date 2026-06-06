@@ -11,6 +11,16 @@ use super::super::arm64_exception_unwind::{
     P6Arm64VmEntryExceptionUnwindStagingRecord,
     P6Arm64VmEntryUncaughtExceptionEntryRestorationRecord,
 };
+use super::super::arm64_public_dispatch::{
+    P6Arm64PublicJscStackDispatchCodeBlockFrameExtentRecord,
+    P6Arm64PublicJscStackDispatchExecutableLifetimeRecord,
+    P6Arm64PublicJscStackDispatchPlatformEnvelopeRecord,
+    P6Arm64PublicJscStackDispatchPlatformRequestField,
+    P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch,
+    P6Arm64PublicJscStackDispatchVmEntryWindowRecord,
+    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof,
+    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError,
+};
 use super::super::arm64_vm_entry_normal_return::{
     P6Arm64VerifiedVmEntryNormalReturnRestorationProof,
     P6Arm64VerifiedVmEntryNormalReturnRestorationProofError,
@@ -27,12 +37,25 @@ use super::super::rooting::{
 use super::tests;
 use super::*;
 use crate::bytecode::BytecodeIndex;
+use crate::bytecode::{
+    CodeBlockLifecycleState, ExecutableAritySelection, ExecutableBaselineNativeEntryRecord,
+    ExecutableBaselineNativeEntrySelection, ExecutableEntryCacheKey, ExecutableEntryCacheRecord,
+    JitCodeSlot,
+};
 use crate::jit::arm64_baseline::{
     Arm64BaselineGeneratedNativeFrameMaterializationMismatch, JSC_REGISTER_BYTES,
     JSC_STACK_ALIGNMENT_BYTES,
 };
-use crate::jit::{BaselineNativeEntryTokenKind, EntryAbi, ExecutableMemoryProtection};
+use crate::jit::code::BaselineEntryArtifact;
+use crate::jit::{
+    BaselineNativeEntryToken, BaselineNativeEntryTokenKind, CodeFinalizationAuthority,
+    CodeLiveness, CodeOrigin, CodeOriginKind, CodeOwnership, CodeRetentionPolicy, EntryAbi,
+    ExecutableAllocationLifecycle, ExecutableMemoryProtection, JitCodeArtifact, JitType,
+};
+use crate::platform::executable_memory_compartment::ExecutableMemoryArm64JscStackCallRequest;
 use crate::runtime::NativeCodeId;
+use core::ffi::c_void;
+use core::ptr::NonNull;
 
 fn attach_materialization_descriptor_to_fixture(
     fixture: &mut tests::NativeFrameResidencyFixture<'_>,
@@ -177,6 +200,186 @@ fn full_exception_unwind_restoration_fallback<'publication>(
         jit_stub_trace_plan: fixture.jit_stub_trace_plan.clone(),
         vm_entry_exception_unwind_restoration_proof,
     }
+}
+
+fn baseline_entry_artifact_from_token(
+    token: BaselineNativeEntryToken,
+    liveness: CodeLiveness,
+) -> BaselineEntryArtifact {
+    JitCodeArtifact {
+        id: token.artifact_id,
+        tier: JitType::Baseline,
+        origin: CodeOrigin {
+            kind: CodeOriginKind::BaselineCodeBlock,
+            owner: Some(token.owner),
+            executable: None,
+            bytecode_index: Some(0),
+        },
+        ownership: CodeOwnership::CodeBlockOwned,
+        native_code: Some(token.native_symbol),
+        machine_code: Some(token.machine_code),
+        entrypoint: token.entrypoint,
+        patchpoints: Vec::new(),
+        dependencies: Vec::new(),
+        byproducts: Vec::new(),
+        disassembly: None,
+        liveness,
+        finalization_authority: CodeFinalizationAuthority::MainThread,
+    }
+    .validate_baseline_entry_artifact(token.owner)
+    .unwrap_or_else(|_| {
+        let live = JitCodeArtifact {
+            id: token.artifact_id,
+            tier: JitType::Baseline,
+            origin: CodeOrigin {
+                kind: CodeOriginKind::BaselineCodeBlock,
+                owner: Some(token.owner),
+                executable: None,
+                bytecode_index: Some(0),
+            },
+            ownership: CodeOwnership::CodeBlockOwned,
+            native_code: Some(token.native_symbol),
+            machine_code: Some(token.machine_code),
+            entrypoint: token.entrypoint,
+            patchpoints: Vec::new(),
+            dependencies: Vec::new(),
+            byproducts: Vec::new(),
+            disassembly: None,
+            liveness: CodeLiveness::Live,
+            finalization_authority: CodeFinalizationAuthority::MainThread,
+        }
+        .validate_baseline_entry_artifact(token.owner)
+        .expect("live baseline artifact from selected token");
+        BaselineEntryArtifact { liveness, ..live }
+    })
+}
+
+fn executable_entry_cache_record_from_token(
+    token: BaselineNativeEntryToken,
+    baseline_jit_slot: JitCodeSlot,
+) -> ExecutableEntryCacheRecord {
+    ExecutableEntryCacheRecord {
+        key: ExecutableEntryCacheKey::new(
+            crate::runtime::CodeSpecializationKind::Call,
+            ExecutableAritySelection::AlreadyChecked,
+        ),
+        executable: None,
+        owner: token.owner,
+        code_block: token.owner,
+        readiness_ordinal: 7,
+        baseline_jit_slot,
+        baseline_native_entry: ExecutableBaselineNativeEntryRecord {
+            artifact_id: token.artifact_id,
+            native_symbol: token.native_symbol,
+            machine_code: token.machine_code,
+            machine_range: token.machine_code.range,
+            entrypoint: token.entrypoint,
+            selection: ExecutableBaselineNativeEntrySelection::Normal(token),
+        },
+    }
+}
+
+fn public_dispatch_precondition_records<'publication>(
+    exception_unwind_restoration_proof: &P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof<
+        'publication,
+    >,
+) -> (
+    P6Arm64PublicJscStackDispatchExecutableLifetimeRecord,
+    P6Arm64PublicJscStackDispatchVmEntryWindowRecord,
+    P6Arm64PublicJscStackDispatchCodeBlockFrameExtentRecord,
+    P6Arm64PublicJscStackDispatchPlatformEnvelopeRecord,
+) {
+    let dispatch_proof = exception_unwind_restoration_proof
+        .vm_entry_normal_return_restoration_proof()
+        .jsc_stack_dispatch_request_proof();
+    let token = dispatch_proof.executable_entry().selected_token;
+    let baseline_jit_slot = JitCodeSlot(313);
+    let executable_lifetime = P6Arm64PublicJscStackDispatchExecutableLifetimeRecord {
+        baseline_entry_artifact: baseline_entry_artifact_from_token(token, CodeLiveness::Live),
+        executable_entry_record: executable_entry_cache_record_from_token(token, baseline_jit_slot),
+        selected_token: token,
+        current_baseline_jit_slot: baseline_jit_slot,
+        code_block_lifecycle: CodeBlockLifecycleState::BaselineInstalled,
+        code_liveness: CodeLiveness::Live,
+        retention_policy: CodeRetentionPolicy::CodeBlockKeepsAlive,
+        machine_code: token.machine_code,
+        entry_offset: dispatch_proof.executable_entry().entry_offset,
+    };
+    let vm_entry_window = P6Arm64PublicJscStackDispatchVmEntryWindowRecord {
+        traps_deferred: true,
+        no_gc: true,
+        retained_jit_code_ref: true,
+    };
+    let caught = exception_unwind_restoration_proof.caught_exception_dispatch_restore();
+    let frame_extent_bytes = caught
+        .staging
+        .call_frame_for_catch
+        .0
+        .checked_sub(caught.reconstructed_catch_sp.0)
+        .expect("fixture catch SP is below CallFrame");
+    let code_block_frame_extent = P6Arm64PublicJscStackDispatchCodeBlockFrameExtentRecord {
+        code_block: token.owner,
+        call_frame: caught.staging.call_frame_for_catch,
+        num_callee_locals: 0,
+        max_frame_extent_for_slow_path_call_bytes: frame_extent_bytes,
+        restored_stack_pointer: caught.reconstructed_catch_sp,
+    };
+    let platform_envelope = P6Arm64PublicJscStackDispatchPlatformEnvelopeRecord {
+        platform_request: dispatch_proof
+            .jsc_stack_dispatch_request_proof()
+            .platform_request,
+        supports_normal_return: true,
+        supports_caught_exception_exit: false,
+        supports_uncaught_exception_exit: false,
+    };
+    (
+        executable_lifetime,
+        vm_entry_window,
+        code_block_frame_extent,
+        platform_envelope,
+    )
+}
+
+fn verified_public_dispatch_preconditions_proof_from_exception_unwind<'publication>(
+    exception_unwind_restoration_proof: P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof<
+        'publication,
+    >,
+) -> Result<
+    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof<'publication>,
+    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError,
+> {
+    let (executable_lifetime, vm_entry_window, code_block_frame_extent, platform_envelope) =
+        public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+        exception_unwind_restoration_proof,
+        executable_lifetime,
+        vm_entry_window,
+        code_block_frame_extent,
+        platform_envelope,
+    )
+}
+
+fn full_public_dispatch_preconditions_fallback<'publication>(
+    fixture: &tests::NativeFrameResidencyFixture<'publication>,
+    public_jsc_stack_dispatch_preconditions_proof:
+        P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof<'publication>,
+) -> P6Arm64BranchAwareCallableFallbackRootingProof<'publication> {
+    P6Arm64BranchAwareCallableFallbackRootingProof::TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceExceptionUnwindAndPublicJscStackDispatchPreconditionsProof {
+        top_call_frame_publication: fixture.top_call_frame_publication,
+        machine_stack_conservative_rooting_proof: fixture
+            .machine_stack_conservative_rooting_proof
+            .clone(),
+        vm_root_gather_plan: fixture.vm_root_gather_plan.clone(),
+        conservative_root_marking_plan: fixture.conservative_root_marking_plan.clone(),
+        collector_effects_plan: fixture.collector_effects_plan.clone(),
+        verifier_append_proof: fixture.verifier_append_proof.clone(),
+        jit_stub_trace_plan: fixture.jit_stub_trace_plan.clone(),
+        public_jsc_stack_dispatch_preconditions_proof,
+    }
+}
+
+fn non_null_c_void(address: usize) -> NonNull<c_void> {
+    NonNull::new(address as *mut c_void).expect("non-null test address")
 }
 
 #[test]
@@ -445,6 +648,653 @@ fn public_arm64_branch_aware_admission_reaches_public_jsc_stack_dispatch_executi
                         vm_entry_exception_unwind_restoration_proof:
                             exception_unwind_restoration_proof,
                     }
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_public_dispatch_preconditions_advance_admission_to_exception_exit_routing_blocker() {
+    let code_block = tests::jump_if_false_code_block(4);
+    let site = tests::jump_if_false_site();
+    let side_exits = [tests::branch_aware_side_exit_proof(&code_block, &site)];
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let public_dispatch_preconditions_proof =
+                verified_public_dispatch_preconditions_proof_from_exception_unwind(
+                    exception_unwind_restoration_proof,
+                )
+                .expect("public dispatch preconditions proof should verify");
+
+            let mut request = tests::valid_request(&side_exits);
+            request.fallback_rooting_proof = full_public_dispatch_preconditions_fallback(
+                &fixture,
+                public_dispatch_preconditions_proof.clone(),
+            );
+
+            assert_eq!(
+                p6_arm64_public_branch_aware_callable_admission_proof(&request),
+                Err(
+                    P6Arm64BranchAwareCallableAdmissionRejection::MissingArm64PublicJscStackDispatchExceptionExitRoutingAuthority {
+                        top_call_frame_publication: fixture.top_call_frame_publication,
+                        conservative_scan_append_receipt: fixture.conservative_scan_append_receipt.clone(),
+                        vm_root_gather_plan: fixture.vm_root_gather_plan.clone(),
+                        conservative_root_marking_plan: fixture.conservative_root_marking_plan.clone(),
+                        collector_effects_plan: fixture.collector_effects_plan.clone(),
+                        verifier_append_proof: fixture.verifier_append_proof.clone(),
+                        jit_stub_trace_plan: fixture.jit_stub_trace_plan.clone(),
+                        public_jsc_stack_dispatch_preconditions_proof:
+                            public_dispatch_preconditions_proof,
+                    }
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_public_dispatch_preconditions_reject_non_live_or_jettisoning_executable_evidence() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let (mut executable_lifetime, vm_entry_window, frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            executable_lifetime.baseline_entry_artifact.liveness = CodeLiveness::PendingJettison;
+            executable_lifetime.code_liveness = CodeLiveness::PendingJettison;
+            assert_eq!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof.clone(),
+                    executable_lifetime.clone(),
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::ArtifactLivenessMismatch {
+                            actual: CodeLiveness::PendingJettison,
+                        },
+                    )
+                )
+            );
+
+            for lifecycle in [
+                CodeBlockLifecycleState::Jettisoned,
+                CodeBlockLifecycleState::Finalizing,
+                CodeBlockLifecycleState::Destructed,
+            ] {
+                let (mut executable_lifetime, vm_entry_window, frame_extent, platform_envelope) =
+                    public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+                executable_lifetime.code_block_lifecycle = lifecycle;
+                assert_eq!(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                        exception_unwind_restoration_proof.clone(),
+                        executable_lifetime,
+                        vm_entry_window,
+                        frame_extent,
+                        platform_envelope,
+                    ),
+                    Err(
+                        P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                            P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::CodeBlockLifecycleMismatch {
+                                actual: lifecycle,
+                            },
+                        )
+                    )
+                );
+            }
+
+            let (mut executable_lifetime, vm_entry_window, frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            executable_lifetime.machine_code.protection = ExecutableMemoryProtection::Writable;
+            executable_lifetime.machine_code.lifecycle =
+                ExecutableAllocationLifecycle::AllocatedWritable;
+            assert_eq!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof,
+                    executable_lifetime,
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::MachineCodeNotExecutable {
+                            protection: ExecutableMemoryProtection::Writable,
+                            lifecycle: ExecutableAllocationLifecycle::AllocatedWritable,
+                        },
+                    )
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_public_dispatch_preconditions_reject_executable_identity_drift() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let (mut executable_lifetime, vm_entry_window, frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            executable_lifetime.selected_token.native_symbol = NativeCodeId(9_001);
+            assert!(matches!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof.clone(),
+                    executable_lifetime,
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::SelectedTokenMismatch {
+                            ..
+                        },
+                    )
+                )
+            ));
+
+            let (mut executable_lifetime, vm_entry_window, frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            executable_lifetime.baseline_entry_artifact.id = crate::jit::JitCodeId(9_002);
+            assert!(matches!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof.clone(),
+                    executable_lifetime,
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::ArtifactIdMismatch {
+                            ..
+                        },
+                    )
+                )
+            ));
+
+            let (mut executable_lifetime, vm_entry_window, frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            executable_lifetime.baseline_entry_artifact.native_code = NativeCodeId(9_003);
+            assert!(matches!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof.clone(),
+                    executable_lifetime,
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::ArtifactNativeSymbolMismatch {
+                            ..
+                        },
+                    )
+                )
+            ));
+
+            let (mut executable_lifetime, vm_entry_window, frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            executable_lifetime.entry_offset += 4;
+            assert!(matches!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof.clone(),
+                    executable_lifetime,
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::EntryOffsetMismatch {
+                            ..
+                        },
+                    )
+                )
+            ));
+
+            let (mut executable_lifetime, vm_entry_window, frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            executable_lifetime.machine_code.symbol = Some(NativeCodeId(9_004));
+            assert!(matches!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof,
+                    executable_lifetime,
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::MachineCodeDrift {
+                            ..
+                        },
+                    )
+                )
+            ));
+        },
+    );
+}
+
+#[test]
+fn arm64_public_dispatch_preconditions_reject_platform_request_identity_drift() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+
+            let cases: [(
+                fn(&mut ExecutableMemoryArm64JscStackCallRequest),
+                P6Arm64PublicJscStackDispatchPlatformRequestField,
+            ); 7] = [
+                (
+                    |request: &mut ExecutableMemoryArm64JscStackCallRequest| {
+                        request.entry_offset += JSC_REGISTER_BYTES as u32;
+                    },
+                    P6Arm64PublicJscStackDispatchPlatformRequestField::EntryOffset,
+                ),
+                (
+                    |request: &mut ExecutableMemoryArm64JscStackCallRequest| {
+                        request.call_frame = non_null_c_void(
+                            request.call_frame.as_ptr() as usize + JSC_REGISTER_BYTES,
+                        );
+                    },
+                    P6Arm64PublicJscStackDispatchPlatformRequestField::CallFrame,
+                ),
+                (
+                    |request: &mut ExecutableMemoryArm64JscStackCallRequest| {
+                        request.entry_sp = non_null_c_void(
+                            request.entry_sp.as_ptr() as usize + JSC_REGISTER_BYTES,
+                        );
+                    },
+                    P6Arm64PublicJscStackDispatchPlatformRequestField::EntryStackPointer,
+                ),
+                (
+                    |request: &mut ExecutableMemoryArm64JscStackCallRequest| {
+                        request.entry_frame = non_null_c_void(
+                            request.entry_frame.as_ptr() as usize + JSC_REGISTER_BYTES,
+                        );
+                    },
+                    P6Arm64PublicJscStackDispatchPlatformRequestField::EntryFrame,
+                ),
+                (
+                    |request: &mut ExecutableMemoryArm64JscStackCallRequest| {
+                        request.vm_entry_record_callee_save_buffer = non_null_c_void(
+                            request.vm_entry_record_callee_save_buffer.as_ptr() as usize
+                                + JSC_REGISTER_BYTES,
+                        );
+                    },
+                    P6Arm64PublicJscStackDispatchPlatformRequestField::VmEntryCalleeSaveBuffer,
+                ),
+                (
+                    |request: &mut ExecutableMemoryArm64JscStackCallRequest| {
+                        request.vm_entry_record_callee_save_register_count += 1;
+                    },
+                    P6Arm64PublicJscStackDispatchPlatformRequestField::VmEntryCalleeSaveRegisterCount,
+                ),
+                (
+                    |request: &mut ExecutableMemoryArm64JscStackCallRequest| {
+                        request.vm_entry_record_callee_save_buffer_bytes += JSC_REGISTER_BYTES;
+                    },
+                    P6Arm64PublicJscStackDispatchPlatformRequestField::VmEntryCalleeSaveBufferBytes,
+                ),
+            ];
+            for (mutator, expected_field) in cases {
+                let (executable_lifetime, vm_entry_window, frame_extent, mut platform_envelope) =
+                    public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+                mutator(&mut platform_envelope.platform_request);
+                assert!(matches!(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                        exception_unwind_restoration_proof.clone(),
+                        executable_lifetime,
+                        vm_entry_window,
+                        frame_extent,
+                        platform_envelope,
+                    ),
+                    Err(
+                        P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                            P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::PlatformRequestMismatch {
+                                field,
+                                ..
+                            },
+                        )
+                    ) if field == expected_field
+                ));
+            }
+        },
+    );
+}
+
+#[test]
+fn arm64_public_dispatch_preconditions_reject_code_block_frame_extent_mismatch() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+            let (executable_lifetime, vm_entry_window, mut frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            let expected = frame_extent.restored_stack_pointer;
+            frame_extent.restored_stack_pointer = FrameAddress(expected.0 + JSC_REGISTER_BYTES);
+
+            assert_eq!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof.clone(),
+                    executable_lifetime.clone(),
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::FrameExtentRestoredStackPointerMismatch {
+                            expected,
+                            actual: frame_extent.restored_stack_pointer,
+                        },
+                    )
+                )
+            );
+
+            let (executable_lifetime, vm_entry_window, mut frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            let caught_sp = exception_unwind_restoration_proof
+                .caught_exception_dispatch_restore()
+                .reconstructed_catch_sp;
+            let reduced_extent = frame_extent
+                .max_frame_extent_for_slow_path_call_bytes
+                .checked_sub(JSC_REGISTER_BYTES)
+                .expect("fixture frame extent leaves room for one register word");
+            frame_extent.max_frame_extent_for_slow_path_call_bytes = reduced_extent;
+            frame_extent.restored_stack_pointer = FrameAddress(caught_sp.0 + JSC_REGISTER_BYTES);
+            assert_eq!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof,
+                    executable_lifetime,
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::CaughtRestoreStackPointerMismatch {
+                            expected: frame_extent.restored_stack_pointer,
+                            actual: caught_sp,
+                        },
+                    )
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_public_dispatch_preconditions_reject_missing_vm_entry_window_guards() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+
+            let (executable_lifetime, mut vm_entry_window, frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            vm_entry_window.traps_deferred = false;
+            assert_eq!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof.clone(),
+                    executable_lifetime.clone(),
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::TrapDeferralMissing,
+                    )
+                )
+            );
+
+            let (executable_lifetime, mut vm_entry_window, frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            vm_entry_window.no_gc = false;
+            assert_eq!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof.clone(),
+                    executable_lifetime.clone(),
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::NoGcMissing,
+                    )
+                )
+            );
+
+            let (executable_lifetime, mut vm_entry_window, frame_extent, platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            vm_entry_window.retained_jit_code_ref = false;
+            assert_eq!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof,
+                    executable_lifetime,
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::RetainedJitCodeRefMissing,
+                    )
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn arm64_public_dispatch_preconditions_reject_caught_or_uncaught_platform_exit_claims() {
+    tests::with_stack_top_call_frame_publication_stack_call_frame_and_exit(
+        |top_call_frame_publication, stack_call_proof, stack_frame_proof, exit_record| {
+            let fixture =
+                tests::native_frame_residency_fixture_for_publication(top_call_frame_publication);
+            let jsc_stack_dispatch_request_proof =
+                tests::verified_jsc_stack_dispatch_request_proof_from_stack_call(
+                    &fixture,
+                    &stack_call_proof,
+                    stack_frame_proof,
+                    1,
+                )
+                .expect("JSC stack dispatch request proof should verify");
+            let normal_return_restoration_proof =
+                tests::verified_vm_entry_normal_return_restoration_proof_from_dispatch(
+                    &fixture,
+                    jsc_stack_dispatch_request_proof,
+                    exit_record,
+                )
+                .expect("VM-entry normal return restoration proof should verify");
+            let exception_unwind_restoration_proof =
+                verified_exception_unwind_restoration_proof_from_normal_return(
+                    normal_return_restoration_proof,
+                )
+                .expect("VM-entry exception/unwind restoration proof should verify");
+
+            let (executable_lifetime, vm_entry_window, frame_extent, mut platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            platform_envelope.supports_normal_return = false;
+            assert_eq!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof.clone(),
+                    executable_lifetime,
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::PlatformNormalReturnUnsupported,
+                    )
+                )
+            );
+
+            let (executable_lifetime, vm_entry_window, frame_extent, mut platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            platform_envelope.supports_caught_exception_exit = true;
+            assert_eq!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof.clone(),
+                    executable_lifetime.clone(),
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::PlatformCaughtExceptionExitClaimed,
+                    )
+                )
+            );
+
+            let (executable_lifetime, vm_entry_window, frame_extent, mut platform_envelope) =
+                public_dispatch_precondition_records(&exception_unwind_restoration_proof);
+            platform_envelope.supports_uncaught_exception_exit = true;
+            assert_eq!(
+                P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof::from_public_jsc_stack_dispatch_preconditions(
+                    exception_unwind_restoration_proof,
+                    executable_lifetime,
+                    vm_entry_window,
+                    frame_extent,
+                    platform_envelope,
+                ),
+                Err(
+                    P6Arm64VerifiedPublicJscStackDispatchPreconditionsProofError::Linkage(
+                        P6Arm64PublicJscStackDispatchPreconditionsLinkageMismatch::PlatformUncaughtExceptionExitClaimed,
+                    )
                 )
             );
         },

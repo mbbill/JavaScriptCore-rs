@@ -52,6 +52,7 @@ use super::super::arm64_native_entry::{
 use super::super::entry::FrameAddress;
 use super::super::vm_roots::{VmRootGatherError, VmRootGatherPlan};
 use super::arm64_exception_unwind::P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof;
+use super::arm64_public_dispatch::P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof;
 use super::arm64_vm_entry_normal_return::P6Arm64VerifiedVmEntryNormalReturnRestorationProof;
 
 #[allow(dead_code)]
@@ -1154,6 +1155,19 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableFallbackRootingProof<'publicati
         jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
         vm_entry_exception_unwind_restoration_proof:
             P6Arm64VerifiedVmEntryExceptionUnwindRestorationProof<'publication>,
+    },
+    TopCallFramePublicationWithVmRootGatherCollectorEffectsVerifierJitStubTraceExceptionUnwindAndPublicJscStackDispatchPreconditionsProof
+    {
+        top_call_frame_publication:
+            P6Arm64BranchAwareCallableTopCallFramePublicationProof<'publication>,
+        machine_stack_conservative_rooting_proof: P6Arm64MachineStackConservativeRootingProof,
+        vm_root_gather_plan: VmRootGatherPlan,
+        conservative_root_marking_plan: P6Arm64SlotVisitorConservativeRootMarkingProof,
+        collector_effects_plan: P6Arm64SlotVisitorCollectorEffectsProof,
+        verifier_append_proof: P6Arm64VerifierSlotVisitorConservativeRootAppendProof,
+        jit_stub_trace_plan: P6Arm64JitStubRoutineTraceProof,
+        public_jsc_stack_dispatch_preconditions_proof:
+            P6Arm64VerifiedPublicJscStackDispatchPreconditionsProof<'publication>,
     },
 }
 
