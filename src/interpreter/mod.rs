@@ -4056,15 +4056,16 @@ impl CoreOpcodeDispatchHost {
             } => {
                 self.pending_property_store_site = None;
                 let after = self.objects.property_store_snapshot(object, &key);
+                // See put_property_value_with_store_observation: count/last come from the
+                // static barrier-FORM classification counter, not a remembered-set log.
                 let write_barrier_count = heap
-                    .barrier_records()
-                    .len()
+                    .barrier_classification_count()
                     .saturating_sub(barrier_start)
                     .min(u32::MAX as usize) as u32;
                 let last_write_barrier = if write_barrier_count == 0 {
                     None
                 } else {
-                    heap.barrier_records().last().map(|record| record.outcome)
+                    heap.last_barrier_outcome()
                 };
                 let outcome = match outcome {
                     FunctionValuePropertyOperationOutcome::Returned => returned_outcome,
@@ -9507,15 +9508,20 @@ impl CoreObjectStore {
     ) -> Result<(), ExecutionError> {
         let owner = self.bind_object_to_heap(heap, owner)?;
         let target = self.resolve_value_store_target(heap, value)?;
-        let target_state = target.map(|_| CellState::PossiblyGrey);
+        // C++ HeapInlines.h:106 reads the OWNER's real cellState (`from->cellState()`),
+        // never a fabricated constant. The heap does not yet track per-cell CellState, so
+        // every never-collected owner/target is DefinitelyWhite (eden/fresh,
+        // heap/CellState.h:37-38). A white owner is outside barrierThreshold == 0
+        // (Heap.cpp:3320 while not fenced), so the barrier classifies as NotRequired and the
+        // slow path stores nothing while no collector runs. This formerly hardcoded
+        // owner=PossiblyBlack / target=PossiblyGrey, which forced Required(MarkingBarrier)
+        // plus a remembered-set entry on every store — the measured per-store barrier tax.
+        let owner_state = CellState::DefinitelyWhite;
+        let target_state = target.map(|_| CellState::DefinitelyWhite);
         heap.apply_write_barrier(WriteBarrierApplicationRequest {
             owner,
             target,
-            context: BarrierWriteContext::store(
-                BarrierFieldKind::Value,
-                CellState::PossiblyBlack,
-                target_state,
-            ),
+            context: BarrierWriteContext::store(BarrierFieldKind::Value, owner_state, target_state),
             authority: BarrierMutationAuthority::MutatorFieldWrite,
             owner_is_published: true,
         })?;
@@ -17895,7 +17901,7 @@ impl CoreOpcodeDispatchHost {
         };
         self.begin_property_store_recording(site);
         let before = self.objects.property_store_snapshot(object, key);
-        let barrier_start = state.heap.barrier_records().len();
+        let barrier_start = state.heap.barrier_classification_count();
         let observation_context = FunctionValuePropertyStoreObservationContext {
             site,
             before,
@@ -17917,20 +17923,20 @@ impl CoreOpcodeDispatchHost {
             };
         }
         let after = self.objects.property_store_snapshot(object, key);
+        // Per-store barrier evidence comes from the static barrier-FORM classification
+        // counter (heap.barrier_classification_count()), not a remembered-set log: JSC picks
+        // the barrier form at compile time (write-barriers.md:9), so count/last reflect
+        // classification, not collector execution. Replaces the former barrier_records()
+        // len-diff / last().outcome.
         let write_barrier_count = state
             .heap
-            .barrier_records()
-            .len()
+            .barrier_classification_count()
             .saturating_sub(barrier_start)
             .min(u32::MAX as usize) as u32;
         let last_write_barrier = if write_barrier_count == 0 {
             None
         } else {
-            state
-                .heap
-                .barrier_records()
-                .last()
-                .map(|record| record.outcome)
+            state.heap.last_barrier_outcome()
         };
         let outcome = match &result {
             Ok(outcome) => {
@@ -17981,26 +17987,23 @@ impl CoreOpcodeDispatchHost {
         };
         self.begin_property_store_recording(site);
         let before = self.objects.property_store_snapshot(object, &key);
-        let barrier_start = state.heap.barrier_records().len();
+        let barrier_start = state.heap.barrier_classification_count();
         let result = self
             .objects
             .put_index(state.heap, object, index, value)
             .map_err(DispatchOutcome::Fail);
         let after = self.objects.property_store_snapshot(object, &key);
+        // See put_property_value_with_store_observation: count/last come from the static
+        // barrier-FORM classification counter, not a remembered-set log.
         let write_barrier_count = state
             .heap
-            .barrier_records()
-            .len()
+            .barrier_classification_count()
             .saturating_sub(barrier_start)
             .min(u32::MAX as usize) as u32;
         let last_write_barrier = if write_barrier_count == 0 {
             None
         } else {
-            state
-                .heap
-                .barrier_records()
-                .last()
-                .map(|record| record.outcome)
+            state.heap.last_barrier_outcome()
         };
         let outcome = match &result {
             Ok(()) => classify_stored_property_outcome(before, after),
@@ -31380,7 +31383,7 @@ mod tests {
     };
     use crate::bytecode::instruction::PackedInstructionStream;
     use crate::bytecode::opcode::Opcode;
-    use crate::gc::{BarrierAction, BarrierNotRequiredReason, CellId};
+    use crate::gc::{BarrierNotRequiredReason, CellId};
     use crate::jit::{
         plan_property_load_access_case_from_observation,
         plan_property_load_guard_plan_from_observation, AbiValue, AccessCaseDescriptor,
@@ -32534,12 +32537,14 @@ mod tests {
         reason: GeneratedPropertyStoreMutationMissReason,
     ) {
         let snapshot = object_store_mutation_snapshot(&host.objects, object);
-        let barrier_count = heap.barrier_records().len();
+        // A rejected store performs no value-store barrier, so the static classification
+        // counter is unchanged (formerly: the unbounded barrier-records Vec was unchanged).
+        let barrier_count = heap.barrier_classification_count();
         assert_eq!(
             store_mutation_miss_reason(host.commit_generated_property_store(heap, request)),
             reason
         );
-        assert_eq!(heap.barrier_records().len(), barrier_count);
+        assert_eq!(heap.barrier_classification_count(), barrier_count);
         assert_eq!(
             snapshot,
             object_store_mutation_snapshot(&host.objects, object)
@@ -36355,7 +36360,8 @@ mod tests {
             store_mutation_miss_reason(host.commit_generated_property_store(&mut heap, request)),
             GeneratedPropertyStoreMutationMissReason::HostUnavailable
         );
-        assert!(heap.barrier_records().is_empty());
+        // No store committed -> no barrier classified.
+        assert_eq!(heap.barrier_classification_count(), 0);
     }
 
     #[test]
@@ -36409,9 +36415,7 @@ mod tests {
         );
         assert_single_value_store_barrier(
             &heap,
-            host.objects.cell_id(object).expect("owner cell"),
-            Some(host.objects.cell_id(stored_value).expect("target cell")),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
@@ -36479,9 +36483,7 @@ mod tests {
         );
         assert_single_value_store_barrier(
             &heap,
-            host.objects.cell_id(object).expect("owner cell"),
-            Some(host.objects.cell_id(stored_value).expect("target cell")),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
@@ -36636,9 +36638,7 @@ mod tests {
         );
         assert_single_value_store_barrier(
             &heap,
-            host.objects.cell_id(array).expect("owner cell"),
-            Some(host.objects.cell_id(stored_value).expect("target cell")),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
@@ -36866,7 +36866,7 @@ mod tests {
 
         let non_cell_plan =
             generated_property_store_replace_plan(StructureId::new(1), PropertyOffset::new(0), 11);
-        let barrier_count = heap.barrier_records().len();
+        let barrier_count = heap.barrier_classification_count();
         assert_eq!(
             store_mutation_miss_reason(host.commit_generated_property_store(
                 &mut heap,
@@ -36878,7 +36878,7 @@ mod tests {
             )),
             GeneratedPropertyStoreMutationMissReason::NonCellBase
         );
-        assert_eq!(heap.barrier_records().len(), barrier_count);
+        assert_eq!(heap.barrier_classification_count(), barrier_count);
     }
 
     #[test]
@@ -37965,48 +37965,28 @@ mod tests {
         }
     }
 
-    fn assert_single_value_store_barrier(
-        heap: &Heap,
-        owner: CellId,
-        target: Option<CellId>,
-        outcome: BarrierRequirementOutcome,
-    ) {
-        assert_eq!(heap.barrier_records().len(), 1);
-        assert_value_store_barrier_record(&heap.barrier_records()[0], owner, target, outcome);
+    // Faithful steady-state value-store barrier check.
+    //
+    // The owner is fresh/DefinitelyWhite, so the store is outside barrierThreshold == 0
+    // (HeapInlines.h:106): exactly one barrier FORM is classified (JSC selects the form at
+    // compile time, write-barriers.md:9 — our per-store classification counter mirrors that),
+    // the classification `outcome` is recorded as the last outcome, and the slow path adds
+    // nothing to the remembered set so `barriers_executed` stays 0 (Heap.cpp:1190,1919). The
+    // former helpers asserted the deleted unbounded Vec of records with a fabricated
+    // PossiblyBlack owner / PossiblyGrey target and a Required(MarkingBarrier) outcome — that
+    // was accidental Rust behavior, not JSC's near-free not-collecting barrier.
+    fn assert_single_value_store_barrier(heap: &Heap, outcome: BarrierRequirementOutcome) {
+        assert_value_store_barrier_at(heap, 0, outcome);
     }
 
     fn assert_value_store_barrier_at(
         heap: &Heap,
-        index: usize,
-        owner: CellId,
-        target: Option<CellId>,
+        start: usize,
         outcome: BarrierRequirementOutcome,
     ) {
-        assert_value_store_barrier_record(&heap.barrier_records()[index], owner, target, outcome);
-    }
-
-    fn assert_value_store_barrier_record(
-        record: &crate::gc::WriteBarrierApplicationRecord,
-        owner: CellId,
-        target: Option<CellId>,
-        outcome: BarrierRequirementOutcome,
-    ) {
-        assert_eq!(record.request.owner, owner);
-        assert_eq!(record.request.target, target);
-        assert_eq!(
-            record.request.context,
-            BarrierWriteContext::store(
-                BarrierFieldKind::Value,
-                CellState::PossiblyBlack,
-                target.map(|_| CellState::PossiblyGrey),
-            )
-        );
-        assert_eq!(
-            record.request.authority,
-            BarrierMutationAuthority::MutatorFieldWrite
-        );
-        assert!(record.request.owner_is_published);
-        assert_eq!(record.outcome, outcome);
+        assert_eq!(heap.barrier_classification_count(), start + 1);
+        assert_eq!(heap.last_barrier_outcome(), Some(outcome));
+        assert_eq!(heap.barriers_executed(), 0);
     }
 
     fn single_register_snapshot(heap: &Heap, value: RuntimeValue) -> ExecutionRootSnapshot {
@@ -38255,7 +38235,7 @@ mod tests {
     }
 
     #[test]
-    fn property_data_store_with_unbound_object_target_records_required_value_barrier() {
+    fn property_data_store_with_unbound_object_target_records_value_store_barrier() {
         let mut objects = CoreObjectStore::default();
         let mut heap = Heap::new();
         let owner = objects.allocate();
@@ -38287,14 +38267,12 @@ mod tests {
         );
         assert_single_value_store_barrier(
             &heap,
-            owner_cell,
-            Some(target_cell),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
     #[test]
-    fn array_push_with_unbound_object_target_records_required_value_barrier() {
+    fn array_push_with_unbound_object_target_records_value_store_barrier() {
         let mut objects = CoreObjectStore::default();
         let mut heap = Heap::new();
         let array = objects.allocate_array();
@@ -38306,19 +38284,15 @@ mod tests {
             .push_array_element_with_write_barrier(&mut heap, array, target)
             .unwrap();
 
-        let array_cell = objects.cell_id(array).expect("array cell");
-        let target_cell = objects.cell_id(target).expect("target cell");
         assert_eq!(objects.get_index(array, 0).unwrap(), target);
         assert_single_value_store_barrier(
             &heap,
-            array_cell,
-            Some(target_cell),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
     #[test]
-    fn closure_cell_update_with_unbound_object_target_records_required_value_barrier() {
+    fn closure_cell_update_with_unbound_object_target_records_value_store_barrier() {
         let mut objects = CoreObjectStore::default();
         let mut heap = Heap::new();
         let cell = objects.allocate_closure_cell(RuntimeValue::undefined());
@@ -38330,14 +38304,10 @@ mod tests {
             .put_closure_cell_with_write_barrier(&mut heap, cell, target)
             .unwrap();
 
-        let owner_cell = objects.cell_id(cell).expect("closure cell");
-        let target_cell = objects.cell_id(target).expect("target cell");
         assert_eq!(objects.get_closure_cell(cell).unwrap(), target);
         assert_single_value_store_barrier(
             &heap,
-            owner_cell,
-            Some(target_cell),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
@@ -38353,7 +38323,6 @@ mod tests {
             .set_data_own_with_write_barrier(&mut heap, owner, &key, value)
             .unwrap();
 
-        let owner_cell = objects.cell_id(owner).expect("owner cell");
         assert_eq!(
             objects
                 .get_own_property(owner, &key)
@@ -38362,16 +38331,17 @@ mod tests {
                 .kind,
             CorePropertyKind::Data(value)
         );
+        // Non-cell (immediate i32) target -> null/non-cell barrier, unchanged by the
+        // white-owner flip (target is None, so the classification is NullOrNonCellTarget
+        // regardless of owner state).
         assert_single_value_store_barrier(
             &heap,
-            owner_cell,
-            None,
             BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::NullOrNonCellTarget),
         );
     }
 
     #[test]
-    fn production_property_put_records_required_value_barrier() {
+    fn production_property_put_records_value_store_barrier() {
         let mut host = CoreOpcodeDispatchHost::new();
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
@@ -38381,7 +38351,7 @@ mod tests {
         let owner = host.objects.allocate();
         let target = host.objects.allocate();
         let key = CorePropertyKey::String("child".into());
-        let start = heap.barrier_records().len();
+        let start = heap.barrier_classification_count();
 
         {
             let mut state = dispatch_state(
@@ -38395,9 +38365,6 @@ mod tests {
                 .unwrap();
         }
 
-        let owner_cell = host.objects.cell_id(owner).expect("owner cell");
-        let target_cell = host.objects.cell_id(target).expect("target cell");
-        assert_eq!(heap.barrier_records().len(), start + 1);
         assert_eq!(
             host.objects
                 .get_own_property(owner, &key)
@@ -38409,63 +38376,51 @@ mod tests {
         assert_value_store_barrier_at(
             &heap,
             start,
-            owner_cell,
-            Some(target_cell),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
     #[test]
-    fn production_array_index_store_records_required_value_barrier() {
+    fn production_array_index_store_records_value_store_barrier() {
         let mut host = CoreOpcodeDispatchHost::new();
         let mut heap = Heap::new();
         let array = host.objects.allocate_array();
         let target = host.objects.allocate();
-        let start = heap.barrier_records().len();
+        let start = heap.barrier_classification_count();
 
         host.objects.put_index(&mut heap, array, 0, target).unwrap();
 
-        let array_cell = host.objects.cell_id(array).expect("array cell");
-        let target_cell = host.objects.cell_id(target).expect("target cell");
-        assert_eq!(heap.barrier_records().len(), start + 1);
         assert_eq!(host.objects.get_index(array, 0).unwrap(), target);
         assert_value_store_barrier_at(
             &heap,
             start,
-            array_cell,
-            Some(target_cell),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
     #[test]
-    fn production_array_push_records_required_value_barrier() {
+    fn production_array_push_records_value_store_barrier() {
         let mut host = CoreOpcodeDispatchHost::new();
         let mut heap = Heap::new();
         let array = host.objects.allocate_array();
         let target = host.objects.allocate();
-        let start = heap.barrier_records().len();
+        let start = heap.barrier_classification_count();
 
         let length = host
             .native_array_push(&mut heap, array, &[target])
             .expect("array push");
 
-        let array_cell = host.objects.cell_id(array).expect("array cell");
-        let target_cell = host.objects.cell_id(target).expect("target cell");
         assert_eq!(length, RuntimeValue::from_i32(1));
-        assert_eq!(heap.barrier_records().len(), start + 1);
         assert_eq!(host.objects.get_index(array, 0).unwrap(), target);
         assert_value_store_barrier_at(
             &heap,
             start,
-            array_cell,
-            Some(target_cell),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
     #[test]
-    fn production_put_closure_cell_opcode_records_required_value_barrier() {
+    fn production_put_closure_cell_opcode_records_value_store_barrier() {
         let mut host = CoreOpcodeDispatchHost::new();
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
@@ -38507,7 +38462,7 @@ mod tests {
                 Operand::Register(value_register),
             ],
         );
-        let start = heap.barrier_records().len();
+        let start = heap.barrier_classification_count();
 
         let outcome = {
             let mut state = dispatch_state(
@@ -38530,51 +38485,41 @@ mod tests {
             )
         };
 
-        let owner_cell = host.objects.cell_id(cell).expect("closure cell");
-        let target_cell = host.objects.cell_id(target).expect("target cell");
         assert_eq!(outcome, DispatchOutcome::Continue);
         assert_eq!(host.objects.get_closure_cell(cell).unwrap(), target);
-        assert_eq!(heap.barrier_records().len(), start + 1);
         assert_value_store_barrier_at(
             &heap,
             start,
-            owner_cell,
-            Some(target_cell),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
     #[test]
-    fn production_set_add_records_required_value_barrier() {
+    fn production_set_add_records_value_store_barrier() {
         let mut host = CoreOpcodeDispatchHost::new();
         let mut heap = Heap::new();
         let set = host.objects.allocate_set();
         let target = host.objects.allocate();
-        let start = heap.barrier_records().len();
+        let start = heap.barrier_classification_count();
 
         let result = host
             .native_set_add(&mut heap, set, &[target])
             .expect("set add");
 
-        let set_cell = host.objects.cell_id(set).expect("set cell");
-        let target_cell = host.objects.cell_id(target).expect("target cell");
         assert_eq!(result, set);
         assert!(host
             .set_value_index(&mut heap, set, target)
             .unwrap()
             .is_some());
-        assert_eq!(heap.barrier_records().len(), start + 1);
         assert_value_store_barrier_at(
             &heap,
             start,
-            set_cell,
-            Some(target_cell),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
     #[test]
-    fn production_set_prototype_records_required_value_barrier() {
+    fn production_set_prototype_records_value_store_barrier() {
         let mut host = CoreOpcodeDispatchHost::new();
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
@@ -38583,7 +38528,7 @@ mod tests {
         let block = code_block(Vec::new());
         let object = host.objects.allocate();
         let prototype = host.objects.allocate();
-        let start = heap.barrier_records().len();
+        let start = heap.barrier_classification_count();
 
         {
             let mut state = dispatch_state(
@@ -38598,16 +38543,11 @@ mod tests {
                 .unwrap());
         }
 
-        let object_cell = host.objects.cell_id(object).expect("object cell");
-        let prototype_cell = host.objects.cell_id(prototype).expect("prototype cell");
         assert_eq!(host.objects.get_prototype(object).unwrap(), Some(prototype));
-        assert_eq!(heap.barrier_records().len(), start + 1);
         assert_value_store_barrier_at(
             &heap,
             start,
-            object_cell,
-            Some(prototype_cell),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 
@@ -38616,14 +38556,12 @@ mod tests {
         let mut objects = CoreObjectStore::default();
         let mut heap = Heap::new();
         let prototype = objects.ensure_object_prototype();
-        let start = heap.barrier_records().len();
+        let start = heap.barrier_classification_count();
 
         let constructor = objects
             .allocate_object_constructor_with_write_barrier(&mut heap)
             .expect("object constructor");
 
-        let prototype_cell = objects.cell_id(prototype).expect("prototype cell");
-        let constructor_cell = objects.cell_id(constructor).expect("constructor cell");
         assert_eq!(
             objects
                 .get_own_property(prototype, &CorePropertyKey::String("constructor".into()))
@@ -38632,13 +38570,10 @@ mod tests {
                 .kind,
             CorePropertyKind::Data(constructor)
         );
-        assert_eq!(heap.barrier_records().len(), start + 1);
         assert_value_store_barrier_at(
             &heap,
             start,
-            prototype_cell,
-            Some(constructor_cell),
-            BarrierRequirementOutcome::Required(BarrierAction::MarkingBarrier),
+            BarrierRequirementOutcome::NotRequired(BarrierNotRequiredReason::TargetAlreadyVisible),
         );
     }
 

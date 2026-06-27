@@ -71,9 +71,18 @@ pub enum CellType {
 #[repr(u8)]
 pub enum CellState {
     /// Scanned or otherwise treated as live by the current marking epoch.
-    #[default]
     PossiblyBlack = 0,
     /// Newly allocated or eden-like. During a collection this is not yet proven live.
+    ///
+    /// C++ heap/CellState.h:37-38: a fresh allocation lives in eden and is
+    /// `DefinitelyWhite` (not yet marked). This is the faithful default for every
+    /// fresh cell header. The former `#[default]` was the inverted `PossiblyBlack`,
+    /// which made the write-barrier fast path (`isWithinThreshold(owner->cellState(),
+    /// barrierThreshold())`, HeapInlines.h:106) hit on every store. With the white
+    /// default and `barrierThreshold == blackThreshold == 0` (Heap.cpp:3320 while not
+    /// fenced) the compare misses and the store does zero remembered-set work while no
+    /// collector runs.
+    #[default]
     DefinitelyWhite = 1,
     /// Barriered or queued for scanning. This may still be white in a full collection.
     PossiblyGrey = 2,
@@ -569,7 +578,10 @@ impl JsCellHeader {
         Self {
             structure_id,
             cell_type,
-            state: CellState::PossiblyBlack,
+            // Fresh cells are eden/`DefinitelyWhite` (heap/CellState.h:37-38), matching
+            // the enum `#[default]`. Keeping both in sync ensures every fresh-cell path
+            // is white so the write barrier's fast path misses while no collector runs.
+            state: CellState::DefinitelyWhite,
             flags: CellHeaderFlags::empty(),
         }
     }

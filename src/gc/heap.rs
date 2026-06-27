@@ -25,8 +25,8 @@ use crate::gc::{
     AllocationMode, AllocationProfile, AllocationSchemaRegistry, BarrierDecisionError,
     BarrierMutationAuthority, BarrierRequirementOutcome, BarrierRequirementRequest,
     BarrierWriteContext, CellDestructionState, CellId, CellLifecycleRecord, CellMetadata,
-    CellZapReason, CollectionRequest, ConservativeRootCell, ConservativeRoots, FinalizerKind,
-    FinalizerPlan, FinalizerPlanningError, FinalizerPlanningRecord, FinalizerRecord,
+    CellState, CellZapReason, CollectionRequest, ConservativeRootCell, ConservativeRoots,
+    FinalizerKind, FinalizerPlan, FinalizerPlanningError, FinalizerPlanningRecord, FinalizerRecord,
     FinalizerState, FinalizerStateTransitionError, FinalizerTransitionRequest, FxIntBuildHasher,
     GcActivityCallbackState, GcConductor, GcPhase, GcRef, HeapFinalizerCallback,
     HeapFinalizerCallbackId, HeapMutationAuthority, HeapSemanticError, HeapSemanticOperation,
@@ -412,7 +412,20 @@ pub struct Heap {
     marked_cells: HashMap<CellId, HeapEpoch>,
     payload_to_cell: HashMap<usize, CellId>,
     cell_to_payload: HashMap<CellId, usize>,
-    barriers: Vec<WriteBarrierApplicationRecord>,
+    // C++ heap/Heap.h:1026 `uintptr_t m_barriersExecuted{0}` — number of remembered-set
+    // additions performed by writeBarrierSlowPath (incremented in addToRememberedSet,
+    // heap/Heap.cpp:1190; reset each cycle in resumeThePeriphery, heap/Heap.cpp:1919). It stays 0 while
+    // no collector runs. Replaces the former unbounded
+    // `Vec<WriteBarrierApplicationRecord>` that nothing consumed.
+    barriers_executed: u64,
+    // Rust-only diagnostic (no C++ counterpart): a per-store barrier-FORM classification
+    // counter plus the last classification outcome. JSC selects the barrier form at
+    // compile time from the static field type (mcts_mem write-barriers.md:9), so it keeps
+    // no per-store log. The interpreter reconstructs the compile-time barrier evidence the
+    // IC/tiering proofs read by taking the delta of this counter across a store and reading
+    // the last outcome — the scalar that replaces the old Vec's `.len()` / `.last()`.
+    barrier_classifications: usize,
+    last_barrier_outcome: Option<BarrierRequirementOutcome>,
     conservative_roots: ConservativeRoots,
     snapshots: Vec<HeapSnapshotRecord>,
     full_activity: GcActivityCallbackState,
@@ -443,7 +456,9 @@ impl Heap {
             marked_cells: HashMap::new(),
             payload_to_cell: HashMap::new(),
             cell_to_payload: HashMap::new(),
-            barriers: Vec::new(),
+            barriers_executed: 0,
+            barrier_classifications: 0,
+            last_barrier_outcome: None,
             conservative_roots: ConservativeRoots::new(),
             snapshots: Vec::new(),
             full_activity: GcActivityCallbackState::default(),
@@ -562,8 +577,24 @@ impl Heap {
         self.cell_to_payload.get(&cell).copied()
     }
 
-    pub fn barrier_records(&self) -> &[WriteBarrierApplicationRecord] {
-        &self.barriers
+    /// C++ `m_barriersExecuted` (heap/Heap.h:1026): remembered-set additions performed
+    /// by the barrier slow path. 0 while no collector runs.
+    pub fn barriers_executed(&self) -> u64 {
+        self.barriers_executed
+    }
+
+    /// Rust-only diagnostic: count of per-store barrier-FORM classifications performed by
+    /// `apply_write_barrier`. The interpreter takes the delta across a store to recover the
+    /// `write_barrier_count` the IC/tiering barrier-evidence proofs consume; it replaces the
+    /// former `barrier_records().len()`.
+    pub fn barrier_classification_count(&self) -> usize {
+        self.barrier_classifications
+    }
+
+    /// Rust-only diagnostic: the outcome of the most recent barrier-FORM classification.
+    /// Replaces the former `barrier_records().last().map(|record| record.outcome)`.
+    pub fn last_barrier_outcome(&self) -> Option<BarrierRequirementOutcome> {
+        self.last_barrier_outcome
     }
 
     pub fn conservative_root_records(&self) -> &ConservativeRoots {
@@ -848,31 +879,67 @@ impl Heap {
         &mut self,
         request: WriteBarrierApplicationRequest,
     ) -> Result<WriteBarrierApplicationRecord, HeapIntegrationError> {
-        self.require_known_cell(request.owner)?;
-        if let Some(target) = request.target {
-            self.require_known_cell(target)?;
-        }
-
-        let operation = if request.context.initializing {
-            HeapSemanticOperation::InitializeUnpublishedCell
-        } else {
-            HeapSemanticOperation::MutatePublishedCell
-        };
-        evaluate_heap_semantics(
-            self.state_descriptor(),
-            HeapMutationAuthority::Mutator,
-            operation,
-        )?;
-
+        // Static, compile-time-style classification of the barrier FORM for this field.
+        // JSC selects the barrier form at compile time from the static field type
+        // (`WriteBarrier<T>` / JIT stub), not from a runtime per-store scan (mcts_mem
+        // write-barriers.md:9, heap/WriteBarrier.h). This is O(1) over the small static
+        // schema list and never scans `self.allocations`, so it is cheap enough to run on
+        // every store. It is the source of the IC/tiering barrier evidence, so it must run
+        // regardless of collector phase.
         let outcome =
             static_barrier_schema_registry().evaluate_requirement(BarrierRequirementRequest {
                 context: request.context,
                 authority: request.authority,
                 owner_is_published: request.owner_is_published,
             })?;
-        let record = WriteBarrierApplicationRecord { request, outcome };
-        self.barriers.push(record);
-        Ok(record)
+
+        // Rust-only diagnostic. Replaces the former unbounded
+        // `Vec<WriteBarrierApplicationRecord>` that nothing consumed: the interpreter counts
+        // per-store barrier classifications via the delta of this scalar (mirroring the old
+        // Vec len-diff) and reads the last outcome below.
+        self.barrier_classifications = self.barrier_classifications.wrapping_add(1);
+        self.last_barrier_outcome = Some(outcome);
+
+        // Fast-path mirror of HeapInlines.h:106
+        //   if (isWithinThreshold(from->cellState(), barrierThreshold())) writeBarrierSlowPath(from)
+        // `barrierThreshold()` is `blackThreshold == 0` when not fenced and
+        // `tautologicalThreshold` when fenced (heap/Heap.cpp:3320); `isWithinThreshold` is
+        // `cellState <= threshold` (heap/CellState.h:46-51). The heap does not yet track
+        // per-cell CellState, so the owner's actual state is DefinitelyWhite(1) for every
+        // never-collected cell (heap/CellState.h:37-38). With threshold 0 the compare is
+        // false: NOTHING is stored — no `require_known_cell` allocations scan, no
+        // remembered-set entry. The slow path runs only once a collector has blackened the
+        // owner (owner_state == PossiblyBlack) or the mutator is fenced.
+        let barrier_threshold = if self.mutator_should_be_fenced {
+            // heap/Heap.cpp:3320 tautologicalThreshold: every CellState compares within range.
+            CellState::PossiblyGrey as u8
+        } else {
+            // heap/Heap.cpp:3320 blackThreshold == 0 (== CellState::PossiblyBlack).
+            CellState::PossiblyBlack as u8
+        };
+        if (request.context.owner_state as u8) <= barrier_threshold {
+            // writeBarrierSlowPath (heap/Heap.cpp:2803): validate the cells and add the owner
+            // to the BOUNDED remembered set, bumping m_barriersExecuted (heap/Heap.cpp:1190).
+            // `require_known_cell` is the O(n) scan over `self.allocations`; it now runs only
+            // here, never on the fast path.
+            self.require_known_cell(request.owner)?;
+            if let Some(target) = request.target {
+                self.require_known_cell(target)?;
+            }
+            let operation = if request.context.initializing {
+                HeapSemanticOperation::InitializeUnpublishedCell
+            } else {
+                HeapSemanticOperation::MutatePublishedCell
+            };
+            evaluate_heap_semantics(
+                self.state_descriptor(),
+                HeapMutationAuthority::Mutator,
+                operation,
+            )?;
+            self.barriers_executed = self.barriers_executed.wrapping_add(1);
+        }
+
+        Ok(WriteBarrierApplicationRecord { request, outcome })
     }
 
     pub fn register_weak_set(
@@ -2740,7 +2807,10 @@ mod tests {
     }
 
     #[test]
-    fn heap_barrier_application_records_required_marking_barrier() {
+    fn heap_barrier_within_threshold_executes_remembered_set() {
+        // A PossiblyBlack owner is within barrierThreshold == 0 (HeapInlines.h:106), i.e.
+        // the collector has blackened it, so the slow path runs: the barrier classifies
+        // Required(MarkingBarrier) and m_barriersExecuted is bumped once (Heap.cpp:1190).
         let mut heap = Heap::new();
         let subspace = test_subspace(&heap);
         let owner = heap
@@ -2771,7 +2841,56 @@ mod tests {
                 crate::gc::BarrierAction::MarkingBarrier
             ))
         );
-        assert_eq!(heap.barrier_records().len(), 1);
+        assert_eq!(heap.barrier_classification_count(), 1);
+        assert_eq!(heap.barriers_executed(), 1);
+    }
+
+    #[test]
+    fn heap_barrier_white_owner_skips_remembered_set() {
+        // Faithful steady state: a fresh DefinitelyWhite owner is outside
+        // barrierThreshold == 0 (HeapInlines.h:106, Heap.cpp:3320), so the store does zero
+        // remembered-set work — no allocations scan, no m_barriersExecuted bump — while the
+        // barrier is still classified (NotRequired) for the IC/tiering evidence. This was
+        // formerly the always-fires path (hardcoded PossiblyBlack owner + unbounded Vec push),
+        // which tested accidental Rust behavior, not JSC's near-free not-collecting barrier.
+        let mut heap = Heap::new();
+        let subspace = test_subspace(&heap);
+        let owner = heap
+            .allocate(heap.allocation_plan(&subspace), 64)
+            .map(|response| response.cell)
+            .expect("owner allocation");
+        let target = heap
+            .allocate(heap.allocation_plan(&subspace), 64)
+            .map(|response| response.cell)
+            .expect("target allocation");
+        heap.publish_cell(owner).expect("publish owner");
+
+        let record = heap.apply_write_barrier(WriteBarrierApplicationRequest {
+            owner,
+            target: Some(target),
+            context: BarrierWriteContext::store(
+                BarrierFieldKind::CellReference,
+                CellState::DefinitelyWhite,
+                Some(CellState::DefinitelyWhite),
+            ),
+            authority: BarrierMutationAuthority::MutatorFieldWrite,
+            owner_is_published: true,
+        });
+
+        assert_eq!(
+            record.map(|record| record.outcome),
+            Ok(BarrierRequirementOutcome::NotRequired(
+                crate::gc::BarrierNotRequiredReason::TargetAlreadyVisible
+            ))
+        );
+        assert_eq!(heap.barrier_classification_count(), 1);
+        assert_eq!(heap.barriers_executed(), 0);
+        assert_eq!(
+            heap.last_barrier_outcome(),
+            Some(BarrierRequirementOutcome::NotRequired(
+                crate::gc::BarrierNotRequiredReason::TargetAlreadyVisible
+            ))
+        );
     }
 
     #[test]
