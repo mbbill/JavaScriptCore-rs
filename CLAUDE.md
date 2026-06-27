@@ -4,6 +4,22 @@
 
 - FINAL GOAL: JetStream 3 Octane correctness and performance parity with local
   C++ JavaScriptCore on the same machine and inputs.
+- MEASURING RULE (how "parity" is decided, unambiguously — this is the scoreboard):
+  - INSTRUMENT: the local C++ `jsc` (release) and the Rust engine (release,
+    default/non-experimental config) are both run through the IDENTICAL
+    JetStream 3 Octane harness, on the SAME machine, same inputs, same iteration
+    counts and standard scoring. The C++ baseline is the measuring instrument and
+    is re-measured on the same machine, never assumed.
+  - CORRECTNESS GATE (precondition): all 15 Octane benchmarks run to completion
+    and pass their built-in validation — ZERO thrown exceptions and ZERO
+    oracle/wrong-answer failures — so the suite yields a valid geomean. Until all
+    15 pass, performance parity is undefined and MUST NOT be claimed.
+  - PERFORMANCE METRIC: R = geomean(Rust per-bench scores) / geomean(C++ JSC
+    per-bench scores) from that identical run. Also track every per-bench ratio
+    r_i = Rust_i / C++_i to localize where the gap lives.
+  - PARITY TARGET: R ≥ 1.0 (the Rust suite geomean matches or beats local C++
+    JSC). Effective-parity milestone: R ≥ 0.90. Progress is reported as R and the
+    set of r_i, never as a single bench or a partial suite.
 - METHOD: faithful C++-first rewrite into safe Rust.
 - SUCCESS PATH: choose the fastest credible route to parity; no feature is
   mandatory unless it is the best path to parity.
@@ -12,6 +28,43 @@
   C++→Rust port, verify fidelity, and converge. This contract defines the
   durable roles and method, not tasks. It carries no task list, no status, and
   no benchmark-specific findings — those live in commits and the status tree.
+
+## Main-Agent Prime Focus
+
+Four things the main agent holds in view at ALL times; re-read on resume and
+whenever a turn drifts. The recurring failure mode these correct: shipping LOCAL
+wins while losing the GLOBAL view, OPTIMIZING AROUND divergences instead of
+correcting them, and working SINGLE-THREADED.
+
+1. GLOBAL VIEW — the biggest missing piece for SCORE parity is the optimizing
+   JIT (baseline → DFG/FTL/B3); the interpreter alone asymptotes far below C++.
+   Every focus decision must answer: "What is the single biggest missing part
+   for parity, and why are we — or are we not — on its critical path right now?"
+   If the answer is not the JIT, the reason must be a HARD, evidence-backed
+   dependency (the JIT needs a sound GC, value representation, profiling, and
+   faithful bytecode foundation that does not yet exist), not drift. The JIT and
+   the load-bearing divergence corrections are the SAME path: the JIT requires
+   direct cell pointers, a real GC, faithful profiling, and faithful
+   representations.
+
+2. CORRECT DIVERGENCES; NEVER OPTIMIZE AROUND THEM — every divergence from JSC's
+   design that persists accrues DEPENDENT code, so optimizing/caching/feature-
+   building on top ENTRENCHES it and the rewrite quietly becomes a DIFFERENT
+   engine that is exponentially harder to correct. JSC is the baseline, never
+   "the accidental Rust design." Hunt divergences proactively; schedule their
+   correction prioritized by how load-bearing they are, while few dependents
+   exist.
+
+3. FAN OUT MASSIVELY — the C++ source is enormous (the optimizing tiers alone are
+   ~280k+ LoC); a single-threaded, one-workflow-at-a-time cadence never finishes.
+   Decompose into MANY independent units and run dozens of agents concurrently;
+   the bottleneck must be the main agent's integration capacity, not agent
+   throughput. If a turn launches one small workflow, ask whether ten units could
+   have gone in parallel.
+
+4. mcts-mem IS READ-ONLY JSC AUTHORITY — consult it before designing, inject it
+   into every subagent, never write the port's own choices into it (see
+   Source-of-Truth Rules).
 
 ## Source-of-Truth Rules
 
@@ -24,6 +77,12 @@ These hold for the main agent and every subagent, in every phase.
   ICs, GC/rooting, tiering, runtime calls, allocation behavior, and benchmark
   semantics.
 - MUST inspect the relevant C++ JSC source before any non-trivial Rust change.
+- MUST consult the `mcts_mem/` design tree (distilled FROM C++ JSC) as READ-ONLY
+  authority before designing a unit, and inject the relevant node into every
+  subagent prompt. It records JSC's settled decisions and its REJECTED
+  alternatives (`.alt/`) so agents do not re-tread JSC's dead ends or invent
+  non-faithful methods. Follow its decisions unless Rust-the-language makes one
+  impossible.
 - MUST first ask how Rust diverges from C++ JSC when a bug, timeout, crash, or
   performance issue appears.
 - MUST build the Rust ownership/rooting/borrowing skeleton needed to host the
@@ -35,6 +94,10 @@ These hold for the main agent and every subagent, in every phase.
   C++ JSC counterpart or to a Rust ownership/rooting/safety requirement.
 - MUST comment every non-obvious permanent Rust divergence at the code site:
   state what C++ JSC does and why Rust differs.
+- MUST treat any divergence from JSC's design as a DEFECT to CORRECT toward
+  faithful, not a baseline to optimize on top of. Hunt divergences proactively
+  and prioritize correcting load-bearing ones early, while few dependents exist —
+  divergence compounds as dependent code accrues.
 - MUST test the JSC-derived behavior, not accidental Rust behavior.
 - MUST keep accepted batches reviewable and commit-sized.
 - MUST keep the status tree accurate and rely on it for current status, but MUST
@@ -52,6 +115,13 @@ These hold for the main agent and every subagent, in every phase.
   panic placeholders, or broad `Rc<RefCell<_>>` designs to move a metric.
 - MUST NOT create non-trivial Rust-only file/type hierarchies when an existing
   JSC concept should be ported.
+- MUST NOT optimize around, cache around, index, or build features on top of a
+  known JSC divergence — that entrenches the divergence and breeds dependents.
+  Correct it to faithful instead.
+- MUST NOT write the port's own choices, status, or progress into the `mcts_mem/`
+  tree; it is read-only JSC authority. The ONLY permitted tree write is a
+  decision that must differ because Rust-the-language forces it, as a minimal
+  faithful note marked as a language divergence.
 - MUST NOT put unrelated engine subsystems into one huge file.
 - MUST NOT split one C++ concept across many Rust-only helper types unless Rust
   ownership/rooting/safety requires it.
@@ -82,6 +152,11 @@ Main Agent MUST:
 
 - MUST author workflow scripts: decide phase structure, fan-out shape, what
   verifies what, and the structured-output schema each phase returns.
+- MUST fan out for BREADTH: decompose work into many independent parallel units
+  (per-opcode/builtin/subsystem audits, ports, divergence-corrections,
+  verifications) and run them concurrently, so the bottleneck is the main agent's
+  integration capacity, not single-threaded agent cadence. One small workflow per
+  turn is a smell — ask whether ten units could run in parallel.
 - MUST make serial architecture/ownership decisions BETWEEN phases, never inside
   a parallel agent (see Parallel-Safe vs Serial).
 - MUST identify the highest-value unblocked shared dependency for Octane parity
@@ -233,6 +308,10 @@ from EVIDENCE, not from memory.
   major change, or on resume after compaction.
 - Do not commit engineering to a dependency without falsifiable evidence that it
   moves correctness count or performance parity.
+- Hold the GLOBAL view: the assessment MUST locate current work on the dependency
+  path to the optimizing JIT (where score parity lives) and justify any focus
+  that is not on that path with a hard, evidence-backed dependency — not a local
+  win. The JIT and the load-bearing divergence corrections are the same path.
 
 A good plan moves fastest toward Octane parity, reuses C++ JSC behavior and
 structure, unlocks shared dependencies, minimizes main-agent context load, has
@@ -316,6 +395,14 @@ not a new engine: C++ JSC is the source of truth for behavior, algorithms,
 bytecode lowering, runtime invariants, file/type structure, ICs, JIT/tiering,
 GC/rooting, runtime calls, allocation behavior, and benchmark semantics.
 
+Keep the GLOBAL view: the biggest missing piece for score parity is the
+optimizing JIT, and the path to it is correcting the load-bearing JSC divergences
+faithfully. Parity is measured by R = geomean(Rust)/geomean(C++ JSC) on the same
+machine and harness, with all 15 Octane benchmarks passing first (see the
+Measuring Rule). Correct divergences, never optimize around them. Consult the
+read-only mcts_mem tree as JSC authority. FAN OUT MASSIVELY — many parallel units,
+not one workflow at a time.
+
 Drive the fastest credible path to parity through dynamic workflows. Do not be
 the primary implementer. Before fanning out, re-derive the highest-value
 unblocked dependency from current source evidence with an adversarial anti-anchor
@@ -340,13 +427,16 @@ README.md as the compact status source.
 
 After resume or compaction:
 
-1. Inspect `git status --short` and recent commits.
-2. Read `README.md` for current per-subsystem status; it is the
+1. Re-read the Main-Agent Prime Focus and the Goal's Measuring Rule; check the
+   current plan against all four (global JIT view, correct-don't-optimize-around
+   divergences, fan out massively, mcts-mem read-only).
+2. Inspect `git status --short` and recent commits.
+3. Read `README.md` for current per-subsystem status; it is the
    maintained tracker — rely on it, and correct it as you learn more.
-3. Decide whether to run a fresh strategic-assessment workflow to re-derive the
+4. Decide whether to run a fresh strategic-assessment workflow to re-derive the
    highest-value unblocked dependency — the one thing the tracker does not
    settle, and the place where inherited priorities must be re-verified.
-4. Build a small work queue: serial architecture decisions first; independent
+5. Build a small work queue: serial architecture decisions first; independent
    audits/implementations/verifications fanned out via workflow; lower-value work
    deferred.
 
