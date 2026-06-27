@@ -10,5 +10,7 @@
 pub mod executable_memory;
 pub mod executable_memory_compartment;
 
+#[cfg(all(unix, target_arch = "aarch64"))]
+mod unix_arm64_jsc_stack_dispatch;
 #[cfg(unix)]
 mod unix_executable_memory;

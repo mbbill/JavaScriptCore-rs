@@ -203,6 +203,9 @@ ACTIVE ROADMAP (settled 2026-05-29, strict order; see git log + memory):
            descriptor; the current private normal-return-only trampoline is
            rejected as insufficient, and public admission still does not
            succeed.
+    [done] Platform Unix ARM64 JSC-stack dispatch trampoline extracted to
+           src/platform/unix_arm64_jsc_stack_dispatch.rs (behavior unchanged:
+           still private normal-return-only, not C++ doVMEntry).
     [done] VM ARM64 stack-local top-frame publication proof added to
            src/vm/arm64_native_entry/stack_entry_publication.rs (maps
            LowLevelInterpreter64.asm doVMEntry save/publish/restore of

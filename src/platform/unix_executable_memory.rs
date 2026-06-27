@@ -261,7 +261,7 @@ impl ExecutableMemoryMapping {
         // callee-save buffer remains JSC VM/JIT metadata for unwind/exception
         // paths, not a public admission or rooting guarantee here.
         unsafe {
-            call_arm64_jsc_stack_entry(
+            super::unix_arm64_jsc_stack_dispatch::call_arm64_jsc_stack_entry(
                 ptr.as_ptr().add(entry_offset).cast_const(),
                 request.entry_sp,
                 request.entry_frame,
@@ -375,100 +375,6 @@ pub(super) fn page_size() -> Result<u32, ExecutableMemoryPlatformError> {
     Ok(page_size)
 }
 
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-core::arch::global_asm!(
-    r#"
-    .text
-    .private_extern _jsc_rs_arm64_jsc_stack_trampoline
-    .p2align 2
-_jsc_rs_arm64_jsc_stack_trampoline:
-    sub sp, sp, #160
-    stp x29, x30, [sp, #0]
-    stp x19, x20, [sp, #16]
-    stp x21, x22, [sp, #32]
-    stp x23, x24, [sp, #48]
-    stp x25, x26, [sp, #64]
-    stp x27, x28, [sp, #80]
-    stp d8, d9, [sp, #96]
-    stp d10, d11, [sp, #112]
-    stp d12, d13, [sp, #128]
-    stp d14, d15, [sp, #144]
-
-    mov x19, sp
-    mov x9, x0
-    mov sp, x1
-    mov x29, x2
-    blr x9
-
-    mov sp, x19
-    ldp d14, d15, [sp, #144]
-    ldp d12, d13, [sp, #128]
-    ldp d10, d11, [sp, #112]
-    ldp d8, d9, [sp, #96]
-    ldp x27, x28, [sp, #80]
-    ldp x25, x26, [sp, #64]
-    ldp x23, x24, [sp, #48]
-    ldp x21, x22, [sp, #32]
-    ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp, #0]
-    add sp, sp, #160
-    ret
-"#
-);
-
-#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
-core::arch::global_asm!(
-    r#"
-    .text
-    .globl jsc_rs_arm64_jsc_stack_trampoline
-    .hidden jsc_rs_arm64_jsc_stack_trampoline
-    .type jsc_rs_arm64_jsc_stack_trampoline, %function
-    .p2align 2
-jsc_rs_arm64_jsc_stack_trampoline:
-    sub sp, sp, #160
-    stp x29, x30, [sp, #0]
-    stp x19, x20, [sp, #16]
-    stp x21, x22, [sp, #32]
-    stp x23, x24, [sp, #48]
-    stp x25, x26, [sp, #64]
-    stp x27, x28, [sp, #80]
-    stp d8, d9, [sp, #96]
-    stp d10, d11, [sp, #112]
-    stp d12, d13, [sp, #128]
-    stp d14, d15, [sp, #144]
-
-    mov x19, sp
-    mov x9, x0
-    mov sp, x1
-    mov x29, x2
-    blr x9
-
-    mov sp, x19
-    ldp d14, d15, [sp, #144]
-    ldp d12, d13, [sp, #128]
-    ldp d10, d11, [sp, #112]
-    ldp d8, d9, [sp, #96]
-    ldp x27, x28, [sp, #80]
-    ldp x25, x26, [sp, #64]
-    ldp x23, x24, [sp, #48]
-    ldp x21, x22, [sp, #32]
-    ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp, #0]
-    add sp, sp, #160
-    ret
-    .size jsc_rs_arm64_jsc_stack_trampoline, .-jsc_rs_arm64_jsc_stack_trampoline
-"#
-);
-
-#[cfg(target_arch = "aarch64")]
-unsafe extern "C" {
-    fn jsc_rs_arm64_jsc_stack_trampoline(
-        entry: *const u8,
-        entry_sp: *mut c_void,
-        entry_frame: *mut c_void,
-    ) -> u64;
-}
-
 #[cfg(target_arch = "x86_64")]
 unsafe fn call_p6_x86_64_entry(
     entry: *const u8,
@@ -503,29 +409,6 @@ unsafe fn call_p6_x86_64_entry(
             ic_store_base.as_ptr(),
         )
     })
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn call_arm64_jsc_stack_entry(
-    entry: *const u8,
-    entry_sp: NonNull<c_void>,
-    entry_frame: NonNull<c_void>,
-) -> Result<u64, ExecutableMemoryPlatformError> {
-    if entry.is_null() {
-        return Err(ExecutableMemoryPlatformError::RangeOutOfBounds);
-    }
-
-    // SAFETY: callers pass a non-null address inside a live RX mapping plus a
-    // request already validated by the safe wrapper. The global assembly helper
-    // restores the Rust stack, frame pointer, link register, and ARM64 C ABI
-    // callee-save set before returning to Rust. This relies on the normal JSC
-    // generated-code return convention; exception and unwind restores are not
-    // implemented by this private trampoline.
-    Ok(
-        unsafe {
-            jsc_rs_arm64_jsc_stack_trampoline(entry, entry_sp.as_ptr(), entry_frame.as_ptr())
-        },
-    )
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -599,25 +482,4 @@ fn map_failed() -> *mut c_void {
 
 fn last_errno() -> Option<i32> {
     std::io::Error::last_os_error().raw_os_error()
-}
-
-#[cfg(all(test, target_arch = "aarch64"))]
-mod tests {
-    const ARM64_JSC_STACK_TRAMPOLINE_HOST_SAVE_GPRS: [u8; 10] =
-        [19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
-    const ARM64_JSC_STACK_TRAMPOLINE_HOST_SAVE_FPRS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
-    const ARM64_JSC_STACK_TRAMPOLINE_HOST_SAVE_BYTES: usize = 160;
-
-    #[test]
-    fn arm64_jsc_stack_trampoline_host_save_descriptor_matches_jsc_arm64_set() {
-        assert_eq!(
-            ARM64_JSC_STACK_TRAMPOLINE_HOST_SAVE_GPRS,
-            [19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
-        );
-        assert_eq!(
-            ARM64_JSC_STACK_TRAMPOLINE_HOST_SAVE_FPRS,
-            [8, 9, 10, 11, 12, 13, 14, 15]
-        );
-        assert_eq!(ARM64_JSC_STACK_TRAMPOLINE_HOST_SAVE_BYTES, 160);
-    }
 }
