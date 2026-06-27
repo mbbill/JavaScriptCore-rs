@@ -63,10 +63,16 @@ pub use heap::{
     WeakProcessingTransitionRecord, WeakRegistrationRecord, WeakRegistry,
     WriteBarrierApplicationRecord, WriteBarrierApplicationRequest, STATIC_HEAP_SCHEMA_DESCRIPTOR,
 };
+#[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use heap::{HeapConservativeScanAppendReceipt, HeapMarkingError, HeapMarkingRecord};
 pub(crate) use machine_stack_marker::{
-    JscMachineStackConservativeRootingProof, JscMachineStackMarker, JscMachineStackRootSpanKind,
+    JscMachineStackConservativeRootingProof, JscMachineStackMarker,
 };
+// JscMachineStackRootSpanKind is consumed only by the gated ARM64
+// admission-proof cluster (native_reentry/rooting.rs); the always-compiled
+// machine_stack_marker module and its other two re-exports stay live.
+#[cfg(feature = "arm64_native_entry_proof")]
+pub(crate) use machine_stack_marker::JscMachineStackRootSpanKind;
 pub use phase::{
     evaluate_heap_semantics, CollectionCompletionCallbackId, CollectionKind, CollectionRequest,
     CollectionScope, CollectionTriggerKind, GcActivityCallbackState, GcActivityKind, GcConductor,
@@ -117,6 +123,11 @@ pub use visitor::{
     SlotVisitorConservativeRootAppendError, SlotVisitorConservativeRootAppendPlan,
     SlotVisitorConservativeRootAppendRecord, SlotVisitorDescriptor,
 };
+// Salvage: SlotVisitor collector-effects / conservative-root-marking and
+// VerifierSlotVisitor append, consumed only by the gated ARM64 admission-proof
+// cluster + their own tests. Gated off by default. (Map: heap/SlotVisitor.cpp /
+// VerifierSlotVisitor.cpp — gated, never deleted.)
+#[cfg(feature = "arm64_native_entry_proof")]
 #[allow(unused_imports)]
 pub(crate) use visitor::{
     SlotVisitorAppendToMarkStackRecord, SlotVisitorCollectorEffectAction,

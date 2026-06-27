@@ -3,11 +3,20 @@
 use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet};
 
+// Salvage: SlotVisitor::append(ConservativeRoots) handoff (conservative_scan)
+// and Heap::testAndSetMarked mark bits (marking), consumed only by the gated
+// ARM64 admission-proof cluster + their own tests. Gated off by default; the
+// core Heap struct does not depend on them. (Map: heap/Heap.cpp gatherStackRoots
+// / testAndSetMarked — gated, never deleted.)
+#[cfg(feature = "arm64_native_entry_proof")]
 mod conservative_scan;
+#[cfg(feature = "arm64_native_entry_proof")]
 mod marking;
 mod run_current_phase;
 
+#[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use conservative_scan::HeapConservativeScanAppendReceipt;
+#[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use marking::{HeapMarkingError, HeapMarkingRecord};
 
 use super::machine_stack_marker::JscMachineStackRootingIngestError;
@@ -395,6 +404,11 @@ pub struct Heap {
     object_space: MarkedSpaceDescriptor,
     requests: Vec<CollectionRequest>,
     allocations: Vec<HeapAllocationRecord>,
+    // Read only by the salvage `marking` module (Heap::testAndSetMarked), which
+    // is gated behind `arm64_native_entry_proof`. The field is still allocated
+    // and initialized identically with the feature off; only its sole reader is
+    // gated, so relax the dead-code lint for the default build.
+    #[cfg_attr(not(feature = "arm64_native_entry_proof"), allow(dead_code))]
     marked_cells: HashMap<CellId, HeapEpoch>,
     payload_to_cell: HashMap<usize, CellId>,
     cell_to_payload: HashMap<CellId, usize>,

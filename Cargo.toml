@@ -7,6 +7,19 @@ publish = false
 
 [dependencies]
 
+[features]
+# Off-by-default gate for the ARM64 native-entry "admission proof" cluster
+# (vm/native_reentry/arm64_admission + its sub-modules, the arm64_native_entry
+# stack-dispatch/publication/frame-materialization proof submodules, and the
+# GC/JIT salvage modules they exercise: stub_routines, vm_roots,
+# heap/conservative_scan, heap/marking, visitor/collector_effects,
+# visitor/conservative_marking, visitor/verifier). This apparatus has no C++
+# JSC counterpart on the live path; it is reachable only from these gated
+# proof entry points and #[cfg(test)] code, so it is excluded from the default
+# build. Gating (not deleting) preserves the GC/JIT salvage for future
+# baseline-JIT/GC work, which DOES map to real WebKit C++ counterparts.
+arm64_native_entry_proof = []
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

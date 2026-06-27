@@ -1,19 +1,30 @@
 //! Marking worklists, slot visitors, and conservative root scan descriptors.
 
+// Salvage: collector-effects / conservative-root-marking / verifier slot-visitor
+// proofs, consumed only by the gated ARM64 admission-proof cluster + their own
+// tests. Gated off by default; the live SlotVisitor path (below) does not use
+// them. (Map: heap/SlotVisitor.cpp / VerifierSlotVisitor.cpp — gated, never
+// deleted.)
+#[cfg(feature = "arm64_native_entry_proof")]
 mod collector_effects;
+#[cfg(feature = "arm64_native_entry_proof")]
 mod conservative_marking;
+#[cfg(feature = "arm64_native_entry_proof")]
 mod verifier;
 
+#[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use collector_effects::{
     SlotVisitorAppendToMarkStackRecord, SlotVisitorCollectorEffectAction,
     SlotVisitorCollectorEffectRecord, SlotVisitorCollectorEffectsError,
     SlotVisitorCollectorEffectsPlan, SlotVisitorContainerNoteMarkedRecord,
     SlotVisitorNoteLiveAuxiliaryCellRecord,
 };
+#[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use conservative_marking::{
     SlotVisitorConservativeRootMarkingAction, SlotVisitorConservativeRootMarkingError,
     SlotVisitorConservativeRootMarkingPlan, SlotVisitorConservativeRootMarkingRecord,
 };
+#[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use verifier::{
     VerifierSlotVisitorCollectorStackAppendRecord, VerifierSlotVisitorConservativeRootAppendAction,
     VerifierSlotVisitorConservativeRootAppendError, VerifierSlotVisitorConservativeRootAppendPlan,

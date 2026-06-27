@@ -30,21 +30,35 @@ use crate::value::EncodedJsValue;
 use super::side_exit::P6CallableSideExitNativeReentryInvocation;
 use super::BaselineNativeEntryVmExecution;
 
+// ARM64 native-entry admission-proof cluster: no C++ JSC counterpart on the
+// live path; reachable only from the gated proof entry points and #[cfg(test)]
+// code. Gated off by default (see Cargo.toml `arm64_native_entry_proof`).
+#[cfg(feature = "arm64_native_entry_proof")]
 #[path = "native_reentry/arm64_admission.rs"]
 mod arm64_admission;
+#[cfg(feature = "arm64_native_entry_proof")]
 #[path = "native_reentry/arm64_exception_exit_routing.rs"]
 mod arm64_exception_exit_routing;
+#[cfg(feature = "arm64_native_entry_proof")]
 #[path = "native_reentry/arm64_exception_unwind.rs"]
 mod arm64_exception_unwind;
+#[cfg(feature = "arm64_native_entry_proof")]
 #[path = "native_reentry/arm64_platform_implementation.rs"]
 mod arm64_platform_implementation;
+#[cfg(feature = "arm64_native_entry_proof")]
 #[path = "native_reentry/arm64_public_dispatch.rs"]
 mod arm64_public_dispatch;
+#[cfg(feature = "arm64_native_entry_proof")]
 #[path = "native_reentry/arm64_vm_entry_normal_return.rs"]
 mod arm64_vm_entry_normal_return;
+#[cfg(feature = "arm64_native_entry_proof")]
 #[path = "native_reentry/rooting.rs"]
 mod rooting;
 
+// Re-exported for the gated #[cfg(test)] proof test in vm/mod.rs; unused in a
+// non-test feature build now that the live debug_assert consumer is gone.
+#[cfg(feature = "arm64_native_entry_proof")]
+#[allow(unused_imports)]
 pub(super) use self::arm64_admission::{
     p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate,
     P6Arm64BranchAwareCallableAdmissionRejection,

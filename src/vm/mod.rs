@@ -29,6 +29,9 @@ mod property_handoff;
 mod runtime;
 mod side_exit;
 mod tiering;
+// Salvage: VM::gatherScratchBufferRoots / scanSideState rooting, consumed only
+// by the gated ARM64 admission-proof cluster. Gated off by default.
+#[cfg(feature = "arm64_native_entry_proof")]
 mod vm_roots;
 
 use crate::api::{
@@ -245,12 +248,23 @@ use self::entry_frame_storage::JscEntryFrameStorage;
 #[cfg(test)]
 use self::native_reentry::p6_x86_64_callable_side_exit_payload_has_reserved_tag;
 use self::native_reentry::{
-    p6_arm64_emitted_semantic_native_raw_return,
-    p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate,
-    p6_arm64_reject_side_exit_reentry_execution,
-    p6_p9_p10_p14_x86_64_callable_native_return_payload,
-    P6Arm64BranchAwareCallableAdmissionRejection, P6Arm64EmittedSemanticNativeRawReturn,
+    p6_arm64_emitted_semantic_native_raw_return, p6_arm64_reject_side_exit_reentry_execution,
+    p6_p9_p10_p14_x86_64_callable_native_return_payload, P6Arm64EmittedSemanticNativeRawReturn,
     P6NativeSideExitReentryCallBridge, P6P9P10P14X86_64CallableNativeReturnPayload,
+};
+// ARM64 admission-rejection proof symbols are gated with the proof cluster
+// (see Cargo.toml `arm64_native_entry_proof`). Their only consumer is the
+// gated #[cfg(all(unix, target_arch = "aarch64"))] proof test below; the live
+// x86 semantic fallback no longer references them.
+#[cfg(all(
+    test,
+    unix,
+    target_arch = "aarch64",
+    feature = "arm64_native_entry_proof"
+))]
+use self::native_reentry::{
+    p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate,
+    P6Arm64BranchAwareCallableAdmissionRejection,
 };
 pub use self::runtime::{
     find_vm_global_descriptor, find_vm_service_descriptor, find_vm_structure_table_descriptor,
@@ -3536,12 +3550,13 @@ impl Vm {
                                     ..
                                 },
                             ) => {
-                                let admission_rejection =
-                                    p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate();
-                                debug_assert_eq!(
-                                    admission_rejection,
-                                    P6Arm64BranchAwareCallableAdmissionRejection::MissingBranchAwareSemanticEmission
-                                );
+                                // An ARM64 seed-lowered operation with no
+                                // branch-aware semantic emission falls back to
+                                // the x86 semantic artifact unconditionally. The
+                                // proof-only admission rejection that previously
+                                // asserted here lives in the gated
+                                // `arm64_native_entry_proof` cluster and did not
+                                // influence this control flow.
                                 Self::emit_p6_x86_64_callable_semantic_from_lowering_plan(
                                     &lowering.plan,
                                     owner_continuation_map_for_emission.as_ref(),
@@ -56842,7 +56857,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[cfg(all(unix, target_arch = "aarch64", feature = "arm64_native_entry_proof"))]
     #[test]
     fn vm_p6_arm64_public_branch_aware_jump_if_false_uses_x86_semantic_fallback_artifact() {
         assert_eq!(

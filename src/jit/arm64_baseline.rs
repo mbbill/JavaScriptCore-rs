@@ -276,9 +276,16 @@ pub(crate) mod register_contract {
 mod control_flow;
 mod entry_prologue;
 mod frame_addressing;
+// Generated-frame materialization proof submodules: consumed only by the gated
+// ARM64 native-entry/admission proof apparatus (vm/arm64_native_entry.rs proof
+// fn + vm/native_reentry cluster). Gated off by default; the live baseline
+// codegen path in this file does not use them.
+#[cfg(feature = "arm64_native_entry_proof")]
 mod frame_materialization;
+#[cfg(feature = "arm64_native_entry_proof")]
 mod frame_materialization_producer;
 
+#[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use frame_materialization::{
     validate_arm64_baseline_generated_native_frame_materialization,
     Arm64BaselineGeneratedNativeFrameMaterializationDescriptor,
@@ -287,8 +294,9 @@ pub(crate) use frame_materialization::{
     Arm64BaselineLiveRootSlotKind, Arm64BaselineMachineStackRootSlotDescriptor,
     Arm64BaselineMachineStackSpanKind,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "arm64_native_entry_proof"))]
 pub(crate) use frame_materialization::{JSC_REGISTER_BYTES, JSC_STACK_ALIGNMENT_BYTES};
+#[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use frame_materialization_producer::{
     produce_arm64_baseline_generated_native_frame_materialization_descriptor,
     Arm64BaselineGeneratedNativeFrameMaterializationProductionError,

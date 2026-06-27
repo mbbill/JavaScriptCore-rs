@@ -20,6 +20,11 @@ pub(crate) mod integration;
 pub(crate) mod machine;
 pub(crate) mod plan;
 pub(crate) mod semantics;
+// Salvage: GCAwareJITStubRoutine / JITStubRoutineSet tracing, consumed only by
+// the gated ARM64 admission-proof cluster. Gated off by default; no live JIT or
+// interpreter path uses it. (Maps to jit/GCAwareJITStubRoutine.h for future
+// baseline-JIT/GC work — gated, never deleted.)
+#[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) mod stub_routines;
 pub(crate) mod tiering;
 pub(crate) mod watchpoint;
@@ -206,6 +211,7 @@ pub use plan::{
 };
 pub use plan::{CompilationPlan, CompilationPlanId, CompilationPlanState, JitPlanHost};
 pub use semantics::EffectSummary;
+#[cfg(feature = "arm64_native_entry_proof")]
 pub use stub_routines::{
     GcAwareJitStubRoutineDescriptor, JitStubRoutineCandidateAddress,
     JitStubRoutineConservativeScanPlan, JitStubRoutineMarkRecord,

@@ -13,6 +13,10 @@
 
 use core::marker::PhantomData;
 
+// Frame-materialization proof imports: consumed only by the gated proof fn
+// `prove_arm64_native_entry_frame_materialization_descriptor` below and the
+// ARM64 admission-proof cluster. Gated off by default.
+#[cfg(feature = "arm64_native_entry_proof")]
 use crate::jit::arm64_baseline::{
     produce_arm64_baseline_generated_native_frame_materialization_descriptor,
     validate_arm64_baseline_generated_native_frame_materialization,
@@ -34,15 +38,23 @@ use super::entry::{
     VmEntryDispatchSelection, VmEntryLaunchDescriptor, JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS,
 };
 
+// JSC-shaped stack-dispatch / entry-publication proof submodules: consumed only
+// by the gated ARM64 admission-proof cluster (native_reentry/rooting.rs).
+// Gated off by default; the live launch-descriptor path in this file does not
+// use them.
+#[cfg(feature = "arm64_native_entry_proof")]
 mod jsc_stack_dispatch;
+#[cfg(feature = "arm64_native_entry_proof")]
 mod stack_entry_publication;
 
+#[cfg(feature = "arm64_native_entry_proof")]
 pub(in crate::vm) use self::jsc_stack_dispatch::{
     prove_arm64_native_entry_jsc_stack_dispatch_request,
     Arm64NativeEntryJscStackDispatchRequestError, Arm64NativeEntryJscStackDispatchRequestProof,
 };
+#[cfg(feature = "arm64_native_entry_proof")]
 pub(in crate::vm) use self::stack_entry_publication::Arm64NativeEntryStackPublicationGuard;
-#[cfg(test)]
+#[cfg(all(test, feature = "arm64_native_entry_proof"))]
 pub(in crate::vm) use self::stack_entry_publication::{
     enter_arm64_native_entry_stack_publication, Arm64NativeEntryStackPublicationError,
 };
@@ -233,6 +245,10 @@ pub(crate) enum Arm64NativeEntryJscStackCallRequestError {
     },
 }
 
+// Frame-materialization proof error: references the gated frame-materialization
+// proof types and is produced only by the gated proof fn below + admission
+// cluster. Gated off by default.
+#[cfg(feature = "arm64_native_entry_proof")]
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Arm64NativeEntryFrameMaterializationProofError {
@@ -328,6 +344,9 @@ pub(crate) struct Arm64NativeEntryJscStackCallRequestProof {
 }
 
 impl Arm64NativeEntryJscStackCallRequestProof {
+    // Accessor consumed only by the gated ARM64 admission-proof cluster
+    // (native_reentry/rooting.rs + arm64_admission.rs). Gated off by default.
+    #[cfg(feature = "arm64_native_entry_proof")]
     pub(in crate::vm) const fn selected_token(&self) -> BaselineNativeEntryToken {
         self.selected_token
     }
@@ -598,6 +617,10 @@ pub(crate) fn prove_arm64_native_entry_jsc_stack_call_request(
     })
 }
 
+// Proof-only: derives a generated-frame materialization descriptor. Callers are
+// the gated admission-proof cluster and #[cfg(test)] proofs. Gated off by
+// default; not on the live launch path.
+#[cfg(feature = "arm64_native_entry_proof")]
 #[allow(dead_code)]
 pub(crate) fn prove_arm64_native_entry_frame_materialization_descriptor(
     stack_call_proof: &Arm64NativeEntryJscStackCallRequestProof,
@@ -1669,6 +1692,7 @@ mod tests {
         .expect("padded stack-local ARM64 entry proof");
     }
 
+    #[cfg(feature = "arm64_native_entry_proof")]
     #[test]
     fn arm64_native_entry_frame_materialization_derives_descriptor_from_stack_call_request() {
         let descriptor = launch_descriptor();
@@ -1733,6 +1757,7 @@ mod tests {
         .expect("padded stack-local ARM64 entry proof");
     }
 
+    #[cfg(feature = "arm64_native_entry_proof")]
     #[test]
     fn arm64_native_entry_frame_materialization_rejects_inverted_stack_extent() {
         let descriptor = launch_descriptor();

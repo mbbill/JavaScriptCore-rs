@@ -369,6 +369,10 @@ pub(in crate::vm) enum P6Arm64BranchAwareCallableAdmissionRejection<'publication
     },
 }
 
+// Consumed only by the gated #[cfg(test)] proof test in vm/mod.rs (the live
+// debug_assert consumer was removed when this cluster was gated). Retained as
+// salvage for the feature-on proof apparatus.
+#[allow(dead_code)]
 pub(in crate::vm) const fn p6_arm64_public_branch_aware_callable_admission_rejection_for_unemitted_seed_candidate(
 ) -> P6Arm64BranchAwareCallableAdmissionRejection<'static> {
     P6Arm64BranchAwareCallableAdmissionRejection::MissingBranchAwareSemanticEmission
@@ -914,38 +918,6 @@ fn p6_arm64_image_entry_offset_points_inside_descriptor_range(
         && allocation_relative_entry_offset >= range.start_offset
         && allocation_relative_entry_offset < end_offset
 }
-
-#[cfg(test)]
-#[path = "frame_materialization_tests.rs"]
-mod frame_materialization_tests;
-
-#[cfg(test)]
-#[path = "arm64_platform_implementation_tests.rs"]
-mod arm64_platform_implementation_tests;
-
-#[cfg(test)]
-#[path = "arm64_native_frame_residency_admission_tests.rs"]
-mod arm64_native_frame_residency_admission_tests;
-
-#[cfg(test)]
-#[path = "arm64_rooting_admission_tests.rs"]
-mod arm64_rooting_admission_tests;
-
-#[cfg(test)]
-#[path = "arm64_marking_admission_tests.rs"]
-mod arm64_marking_admission_tests;
-
-#[cfg(test)]
-#[path = "arm64_collector_effects_admission_tests.rs"]
-mod arm64_collector_effects_admission_tests;
-
-#[cfg(test)]
-#[path = "arm64_verifier_admission_tests.rs"]
-mod arm64_verifier_admission_tests;
-
-#[cfg(test)]
-#[path = "arm64_jit_stub_admission_tests.rs"]
-mod arm64_jit_stub_admission_tests;
 
 #[cfg(test)]
 pub(super) mod tests {
