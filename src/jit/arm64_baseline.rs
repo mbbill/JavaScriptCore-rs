@@ -378,8 +378,11 @@ fn encode_p6_arm64_callable_return_seed_selection(
                 );
             }
             P6X86_64BaselineLoweredOperation::LoadInt32 { destination, value } => {
-                let bits = ((value as u32 as u64) << contract.value_layout.payload_shift)
-                    | contract.value_layout.immediate_int32_tag;
+                // boxInt32: NumberTag | static_cast<uint32_t>(value)
+                // (JSCJSValue.h:1023-1026). The int32 lives in the low 32 bits
+                // under NumberTag, not shifted under a low-byte tag. The 64-bit
+                // immediate emitter lowers this to a MOVZ/MOVK chain.
+                let bits = contract.value_layout.number_tag | (value as u32 as u64);
                 p6_arm64_seed_set_value(
                     &mut known_values,
                     destination,
@@ -903,6 +906,10 @@ fn p6_arm64_emit_materialize_seed_frame_write(
             (destination, P6Arm64ReturnSeedValue::Immediate(bits))
         }
         P6X86_64BaselineLoweredOperation::LoadInt32 { destination, value } => {
+            // TRANSITIONAL (D1a): this dormant frame-write builder is not yet
+            // live-executed (the live return seed rejects branch-aware bodies),
+            // so it stays on the low-byte int32 scheme like the x86 byte-emitter.
+            // The live return seed uses JSVALUE64 boxInt32 (`number_tag | u32`).
             let bits = ((value as u32 as u64) << value_layout.payload_shift)
                 | value_layout.immediate_int32_tag;
             (destination, P6Arm64ReturnSeedValue::Immediate(bits))
@@ -1863,20 +1870,27 @@ mod tests {
     }
 
     fn rust_low_byte_value_layout() -> P6X86_64BaselineValueLayoutContract {
+        // JSVALUE64 immediate VALUES (undefined 0xa / null 0x2 / false 0x6 /
+        // true 0x7, runtime/JSCJSValue.h:472-491) plus the live `number_tag`/
+        // `double_encode_offset` the arm64 seed uses for boxInt32/boxDouble.
+        // int32/double/cell stay on the transitional low-byte scheme that the
+        // x86 byte-emitter (and the dormant frame-write helper) still emit.
         P6X86_64BaselineValueLayoutContract {
-            layout_name: "rust-low-byte-tagged",
+            layout_name: "rust-jsvalue64-immediates-transitional-cells",
             storage_bits: 64,
             slot_width_bytes: 8,
             tag_mask: 0xff,
             payload_shift: 8,
-            immediate_undefined_tag: 0x01,
+            immediate_undefined_tag: 0x0a,
             immediate_null_tag: 0x02,
-            immediate_false_tag: 0x03,
-            immediate_true_tag: 0x04,
+            immediate_false_tag: 0x06,
+            immediate_true_tag: 0x07,
             immediate_int32_tag: 0x10,
             immediate_double_tag: 0x30,
             cell_tag: 0x20,
             double_tag: 0x30,
+            number_tag: 0xfffe_0000_0000_0000,
+            double_encode_offset: 1 << 49,
         }
     }
 
@@ -2074,6 +2088,9 @@ mod tests {
         )
         .unwrap();
 
+        // TRANSITIONAL (D1a): this dormant frame-write builder still emits the
+        // low-byte int32 `(7 << 8) | 0x10` = 0x710 (single MOVZ X9, #0x710); the
+        // live return seed uses JSVALUE64 boxInt32 instead.
         assert_eq!(arm64_word(&bytes, 0), 0xd280_e209);
         assert_eq!(arm64_word(&bytes, 4), 0xf900_03a9);
         assert_eq!(arm64_word(&bytes, 8), 0xd280_e209);
@@ -2437,10 +2454,12 @@ mod tests {
                 .unwrap()
                 .instruction_word
         );
-        assert_eq!(arm64_word(builder.bytes(), 8), 0xf100_055f);
+        // JSVALUE64 immediate values: cmp X10,#0xa (undefined), #0x2 (null),
+        // #0x6 (false), #0x7 (true). int32 (#0x10) stays transitional low-byte.
+        assert_eq!(arm64_word(builder.bytes(), 8), 0xf100_295f);
         assert_eq!(arm64_word(builder.bytes(), 16), 0xf100_095f);
-        assert_eq!(arm64_word(builder.bytes(), 24), 0xf100_0d5f);
-        assert_eq!(arm64_word(builder.bytes(), 32), 0xf100_115f);
+        assert_eq!(arm64_word(builder.bytes(), 24), 0xf100_195f);
+        assert_eq!(arm64_word(builder.bytes(), 32), 0xf100_1d5f);
         assert_eq!(arm64_word(builder.bytes(), 36), 0x5400_00a0);
         assert_eq!(arm64_word(builder.bytes(), 40), 0xf100_415f);
         assert_eq!(arm64_word(builder.bytes(), 48), 0xf100_413f);

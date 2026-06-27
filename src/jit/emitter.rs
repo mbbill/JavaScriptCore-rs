@@ -552,16 +552,46 @@ pub struct P6X86_64BaselineValueLayoutContract {
     pub layout_name: &'static str,
     pub storage_bits: u8,
     pub slot_width_bytes: u8,
+    // The immediate sentinel fields below carry the JSVALUE64 immediate VALUES
+    // (undefined 0xa / null 0x2 / false 0x6 / true 0x7, runtime/JSCJSValue.h:
+    // 472-491), which is what the live arm64 return seed materializes and the
+    // interpreter (value/repr.rs) decodes.
+    //
+    // TRANSITIONAL (D1a): `tag_mask`/`payload_shift`/`cell_tag`/`double_tag` and
+    // `immediate_int32_tag`/`immediate_double_tag` still describe the low-byte
+    // scheme that the x86 byte-emitter (and the dormant arm64 frame-write helper)
+    // emit for cells AND for int32/double machine code. Cells are encoded
+    // `(ptr << 8) | cell_tag` (see `from_cell`); the x86 int32/double box/unbox
+    // and type-guards are likewise still low-byte. The LIVE JSVALUE64 number
+    // encoding lives in `number_tag`/`double_encode_offset`. Porting the x86
+    // byte-emitter int32/double path off the low-byte fields (which needs a
+    // NumberTag scratch register) is the follow-up baseline-JIT batch.
     pub tag_mask: u64,
     pub payload_shift: u8,
     pub immediate_undefined_tag: u64,
     pub immediate_null_tag: u64,
     pub immediate_false_tag: u64,
     pub immediate_true_tag: u64,
+    /// TRANSITIONAL low-byte int32 tag for the x86 byte-emitter path; the live
+    /// JSVALUE64 int32 (boxInt32 = `number_tag | u32`, JSCJSValue.h:1023-1026) is
+    /// carried by `number_tag`.
     pub immediate_int32_tag: u64,
+    /// TRANSITIONAL low-byte double placeholder for the x86 byte-emitter path;
+    /// live doubles are `isNumber && !isInt32`, boxed via `double_encode_offset`.
     pub immediate_double_tag: u64,
     pub cell_tag: u64,
     pub double_tag: u64,
+    /// JSVALUE64 `NumberTag` = 0xfffe000000000000 (JSCJSValue.h:457). The live
+    /// arm64 return seed materializes int32 as `number_tag | u32` (boxInt32).
+    /// C++ JSC pins this in numberTagRegister; this skeleton has no pinned tag
+    /// register yet, so the future x86 guard/box port must materialize it into a
+    /// scratch.
+    pub number_tag: u64,
+    /// JSVALUE64 `DoubleEncodeOffset` = 2^49 (JSCJSValue.h:450-452). boxDouble
+    /// adds this (== sub NumberTag); unboxDouble adds NumberTag (AssemblyHelpers.h
+    /// :1507-1524). Used by the live encoding; the x86 byte-emitter double path
+    /// is not yet ported to it.
+    pub double_encode_offset: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7358,6 +7388,12 @@ fn validate_p6_x86_64_backend_contract_subset_and_effect_contract(
     Ok(())
 }
 
+/// JSVALUE64 `NumberTag` (runtime/JSCJSValue.h:457): set on every number; all of
+/// it set means int32, some-but-not-all means an offset-encoded double.
+pub(crate) const P6_X86_64_JSVALUE64_NUMBER_TAG: u64 = 0xfffe_0000_0000_0000;
+/// JSVALUE64 `DoubleEncodeOffset` = 2^49 (runtime/JSCJSValue.h:450-452).
+pub(crate) const P6_X86_64_JSVALUE64_DOUBLE_ENCODE_OFFSET: u64 = 1 << 49;
+
 fn p6_x86_64_baseline_value_layout_contract(
 ) -> Result<P6X86_64BaselineValueLayoutContract, P6X86_64BaselineBackendContractError> {
     let layout = static_value_representation_layout();
@@ -7366,6 +7402,8 @@ fn p6_x86_64_baseline_value_layout_contract(
         .map_err(|error| P6X86_64BaselineBackendContractError::ValueLayoutInvalid { error })?;
 
     let slot_width_bytes = layout.storage_bits / 8;
+    // The cell path stays transitional, so the layout still legitimately
+    // advertises tag_mask=0xff / payload_shift=8 for `(ptr << 8) | cell_tag`.
     if layout.storage_bits != 64
         || !layout.storage_bits.is_multiple_of(8)
         || slot_width_bytes != 8
@@ -7394,8 +7432,6 @@ fn p6_x86_64_baseline_value_layout_contract(
         p6_named_immediate_tag(layout.immediate_tags(), "false", ImmediateKind::Boolean)?;
     let immediate_true_tag =
         p6_named_immediate_tag(layout.immediate_tags(), "true", ImmediateKind::Boolean)?;
-    let immediate_int32_tag =
-        p6_named_immediate_tag(layout.immediate_tags(), "int32", ImmediateKind::Int32)?;
     let immediate_double_tag =
         p6_named_immediate_tag(layout.immediate_tags(), "double", ImmediateKind::Double)?;
 
@@ -7407,6 +7443,17 @@ fn p6_x86_64_baseline_value_layout_contract(
             },
         );
     }
+
+    // TRANSITIONAL (D1a): `immediate_int32_tag` remains the low-byte tag read by
+    // the still-transitional x86 byte-emitter int32/double machine code (guards
+    // + box/unbox), exactly as `cell_tag` stays transitional. The live JSVALUE64
+    // int32 encoding (boxInt32 = `NumberTag | u32`, JSCJSValue.h:1023-1026) is
+    // carried separately in `number_tag` and is what the live arm64 return seed
+    // and the interpreter use. Porting the x86 byte-emitter int32/double path to
+    // `number_tag`/`double_encode_offset` (which needs a NumberTag scratch
+    // register) is the follow-up baseline-JIT batch.
+    let immediate_int32_tag =
+        p6_named_immediate_tag(layout.immediate_tags(), "int32", ImmediateKind::Int32)?;
 
     Ok(P6X86_64BaselineValueLayoutContract {
         layout_name: layout.name,
@@ -7422,6 +7469,8 @@ fn p6_x86_64_baseline_value_layout_contract(
         immediate_double_tag,
         cell_tag: layout.cell_tag,
         double_tag: layout.double_tag,
+        number_tag: P6_X86_64_JSVALUE64_NUMBER_TAG,
+        double_encode_offset: P6_X86_64_JSVALUE64_DOUBLE_ENCODE_OFFSET,
     })
 }
 
@@ -9453,6 +9502,10 @@ fn p6_select_primitive_to_number(
         P6X86_64BaselinePrimitiveToNumberSideExitReason::UnsupportedOperand,
         policy.unsupported_operand_exit,
     )?;
+    // TRANSITIONAL (D1a): the x86 byte-emitter PrimitiveToNumber path stays on
+    // the low-byte int32/double scheme (see `p6_encoded_immediate_from_source_location`
+    // and `p6_primitive_to_number_undefined_nan_value`); porting it to JSVALUE64
+    // boxInt32/boxDouble is the follow-up baseline-JIT batch.
     let int32_zero_value = contract.value_layout.immediate_int32_tag;
     let int32_one_value =
         (1_u64 << contract.value_layout.payload_shift) | contract.value_layout.immediate_int32_tag;
@@ -10546,6 +10599,10 @@ fn p6_encoded_immediate_from_source_location(
         P6X86_64BaselineImmediateOperand::Boolean(false) => value_layout.immediate_false_tag,
         P6X86_64BaselineImmediateOperand::Boolean(true) => value_layout.immediate_true_tag,
         P6X86_64BaselineImmediateOperand::Int32(value) => {
+            // TRANSITIONAL (D1a): the x86 byte-emitter int32 path is still on the
+            // low-byte scheme `(u32 << payload_shift) | immediate_int32_tag`.
+            // The live JSVALUE64 boxInt32 (`number_tag | u32`) is used by the
+            // arm64 return seed; porting this x86 path is the follow-up batch.
             ((value as u32 as u64) << value_layout.payload_shift) | value_layout.immediate_int32_tag
         }
         P6X86_64BaselineImmediateOperand::BytecodeIndex(_) => 0,
@@ -10555,6 +10612,10 @@ fn p6_encoded_immediate_from_source_location(
 fn p6_primitive_to_number_undefined_nan_value(
     value_layout: P6X86_64BaselineValueLayoutContract,
 ) -> u64 {
+    // TRANSITIONAL (D1a): the x86 byte-emitter still boxes ToNumber(undefined)'s
+    // PNaN with the low-byte double scheme. The live JSVALUE64 boxDouble form is
+    // `pureNaN_bits + DoubleEncodeOffset`; the interpreter uses that via
+    // value/repr.rs. Porting this x86 path is the follow-up baseline-JIT batch.
     const JSC_PURE_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
     (JSC_PURE_NAN_BITS & !value_layout.tag_mask) | value_layout.double_tag
 }
