@@ -15,17 +15,26 @@ Legend:
 - [frozen] quarantined dead code retained as salvage; not on the active path
 
 ```text
-ACTIVE ROADMAP (validated dependency order; default execution path = InterpreterOnly):
-  Phase A [active]  de-anchor + quarantine (DONE this batch) -- ENABLING/HYGIENE, score-neutral.
-                 ARM64 native-entry admission-proof cluster + GC/JIT salvage gated behind
-                 cfg(feature="arm64_native_entry_proof") off-by-default; pure #[cfg(test)] proof
-                 files deleted. The 0.0458 figure was a --baseline-only probe artifact; the
-                 default path is InterpreterOnly (shell/octane.rs), so this moves no score.
-  Phase B [next]    local C++ JSC same-machine comparison harness + per-bench subsystem profiling
-                 -- gates the codegen-vs-GC ordering.
-  Phase C [planned] real machine-code baseline JIT (MacroAssemblerARM64 + ExecutableAllocator).
-  Phase D [planned] real mark/sweep GC + safepoint + conservative-scan (heap.rs:603-636 never
-                 collects) -- may gate Phase C since rooting dominates the one real profile.
+ACTIVE ROADMAP (validated, profiling-earned dependency order; default execution path = InterpreterOnly):
+  Phase A [done]    de-anchor + quarantine (commit c8e83ad) -- ENABLING/HYGIENE, score-neutral.
+                 ARM64 admission-proof cluster + GC/JIT salvage gated behind
+                 cfg(feature="arm64_native_entry_proof") off-by-default; #[cfg(test)] proof files
+                 deleted. The 0.0458 figure was a --baseline-only probe artifact; default path is
+                 InterpreterOnly (shell/octane.rs).
+  Phase B [done]    per-bench subsystem profiling (WF2a). VERDICT (medium confidence, /usr/bin/sample
+                 on 5 benches, live path): per-op GC bookkeeping dominates self-time -- ~79% richards,
+                 ~49-65% crypto, ~99% splay, ~80% gbemu; codegen-addressable <=22% best / <5% on
+                 three; real GC collection ~0% (never runs). EARNED: GC-first, baseline JIT deferred.
+  Phase B2 [pending] local C++ JSC same-machine comparison harness (parity-gap number; jsc build by owner).
+  Phase C [active]  real mark/sweep GC + safepoints + conservative stack scan + inline write barriers
+                 + direct cell pointers -- retires the per-op targeted-root registry, the unbounded
+                 write-barrier Vec (heap.rs:847-876), and the payload->cell HashMap identity bridge
+                 (bind_object_to_heap). Gate: re-run the 5-bench profile; rooting buckets must collapse.
+  Phase C2 [parallel] navier-stokes object-model fix (independent of GC/JIT): O(1) observation buffer
+                 (vs Vec::remove(0) over 1024-entry ring, interpreter/mod.rs:3583-3588) + integer-indexed
+                 dense butterfly storage (vs String(index.to_string())).
+  Phase D [deferred] real machine-code baseline JIT (MacroAssemblerARM64 + ExecutableAllocator) --
+                 codegen share becomes the bottleneck only after the rooting tax is removed.
   Phase E [planned] structural refactor: split vm/mod.rs (74k) + interpreter/mod.rs (42k).
   Phase F [blocked] DFG/FTL/B3 optimizing tier -- where suite-SCORE parity ultimately lives.
   Phase G [parallel] Yarr/RegExp.
@@ -41,7 +50,7 @@ ACTIVE ROADMAP (validated dependency order; default execution path = Interpreter
          typescript, octane-zlib (asm.js). Gate to all-15-Succeed is throughput.
   [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
          __defineGetter__/Setter__, global Function, Math, apply/bind, globals
-  [missing] Octane score parity with local C++ JSC (needs Phases B-F)
+  [missing] Octane score parity with local C++ JSC (needs Phases C-F)
 
 [frozen] ARM64 native-entry admission-proof state machine
   (src/vm/native_reentry/arm64_*, src/vm/arm64_native_entry/, gc proof cluster): never admits,
@@ -108,14 +117,16 @@ ACTIVE ROADMAP (validated dependency order; default execution path = Interpreter
   [missing] CRITICAL PATH: call-dispatch-into-generated -> mc put_by_id/call/construct/get_by_val
          -> slow-case rejoin -> inline alloc -> real reg-alloc; then DFG/FTL/B3 (Phase F)
 
-[wip] GC, rooting, barriers, and handles
-  [done] bytecode root maps; targeted-root sync gated on register cell-membership (non-cell hot
-         loops skip per-op recompute); register/stack stores not barriered (C++ barriers only heap
-         fields); VM-owned interpreter root scope mirrors C++ live call-frame stack lifetime
-  [risk] still a per-op targeted-root registry vs C++ conservative-scan-at-safepoint; full
-         safepoint rewrite is GC-coupled -> Phase D
-  [missing] no GC collection runs during execution (heap.rs:603-636 never collects, unbounded
-            heap growth); full moving/marking GC; finalization/weak/ephemerons; rooting audit
+[wip] GC, rooting, barriers, and handles  <- Phase C, NOW THE ACTIVE PRIORITY (profiling: per-op
+      rooting/barrier/heap-binding bookkeeping is ~50-99% of self-time on 4/5 profiled benches)
+  [done] bytecode root maps; targeted-root sync gated on register cell-membership; register/stack
+         stores not barriered (C++ barriers only heap fields); VM-owned interpreter root scope
+  [risk] per-op targeted-root REGISTRY (HashMap insert per dispatch) vs C++ conservative-scan-at-
+         safepoint -- the dominant self-time tax; unbounded write-barrier Vec (heap.rs:847-876)
+         records into a Vec nothing consumes; payload->cell HashMap identity bridge (bind_object_to_heap)
+  [missing] no GC collection runs (heap.rs:603-636 never collects, unbounded growth); safepoints +
+            conservative stack scan; inline/elided write barriers; direct cell pointers; full
+            moving/marking GC; finalization/weak/ephemerons; rooting audit
 
 [wip] Verification and integration discipline
   [done] focused Rust gates; macOS arm64 bring-up gate (x86_64 P6 entries guarded non-callable on
