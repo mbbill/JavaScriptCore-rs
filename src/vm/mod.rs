@@ -65,12 +65,11 @@ use crate::gc::{
 };
 use crate::interpreter::{
     cleanup_targeted_root_sets,
-    execute_baseline_fallback_deferring_ordinary_calls_with_root_scope_and_dispatch_budget,
+    execute_baseline_fallback_deferring_ordinary_calls_with_dispatch_budget,
     execute_code_block as execute_interpreter_code_block,
-    execute_code_block_deferring_ordinary_calls_with_root_scope_and_dispatch_budget,
-    execute_single_dispatch, execute_single_dispatch_deferring_ordinary_calls, find_handler,
-    finish_ordinary_js_call_return, pop_call_return_callee, sync_targeted_frame_roots,
-    sync_targeted_nonlocal_frame_roots, validate_call_return_continuation,
+    execute_code_block_deferring_ordinary_calls_with_dispatch_budget, execute_single_dispatch,
+    execute_single_dispatch_deferring_ordinary_calls, find_handler, finish_ordinary_js_call_return,
+    pop_call_return_callee, validate_call_return_continuation,
     validate_construct_return_continuation, BaselineFallbackRequest, BaselineLoopHandoffRequest,
     CallObservationDescriptor, CallObservationDrainRequest, CallObservationOutcome,
     CallReturnContinuation, ConstructReturnContinuation, CoreGlobalLexicalDeclaration,
@@ -84,9 +83,8 @@ use crate::interpreter::{
     FunctionValuePropertyOperationOutcome, FunctionValuePropertyOperationResume,
     FunctionValueReturnTransform, GeneratedNativeIntrinsicCallRequest,
     GeneratedNativeIntrinsicCallResult, InterpreterExecutionState, InterpreterFunctionCodeBlock,
-    InterpreterRootScopeMode, InterpreterRootSyncScope, OrdinaryBytecodeCallHandling,
-    OrdinaryBytecodeCallRequest, OrdinaryBytecodeConstructRequest, ProgramExecutionEntry,
-    PropertyHasObservationDrainRequest, PropertyLoadObservationDrainRequest,
+    OrdinaryBytecodeCallHandling, OrdinaryBytecodeCallRequest, OrdinaryBytecodeConstructRequest,
+    ProgramExecutionEntry, PropertyHasObservationDrainRequest, PropertyLoadObservationDrainRequest,
     PropertyStoreObservationDescriptor, PropertyStoreObservationDrainRequest, RegisterFile,
     RegisterWindow, SingleDispatchOutcome, SingleDispatchRequest, StructureChainInvalidationEvent,
     StructureTransitionWatchpointRequest, StructureTransitionWatchpointSnapshot,
@@ -909,7 +907,6 @@ pub struct Vm {
     services: VmServices,
     execution: ExecutionContextStack,
     registers: RegisterFile,
-    interpreter_root_scope: InterpreterRootSyncScope,
     active_dispatch_budget: Option<DispatchBudget>,
     gc_execution: VmGcExecutionState,
     tiering: VmTieringIntegration,
@@ -1409,17 +1406,10 @@ struct GeneratedRuntimeHelperExitValidation {
     may_throw: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct OrdinaryBytecodeConstructResume {
-    owner: CodeBlockId,
-    frame: CallFrameId,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct OrdinaryBytecodeCallResume {
-    owner: CodeBlockId,
-    frame: CallFrameId,
-}
+// D2i/Wave 2b: `OrdinaryBytecodeCallResume` / `OrdinaryBytecodeConstructResume`
+// existed only to carry the owner/caller-frame to the retired per-call
+// frame-header root sync; with that sync gone (frame headers are gathered at the
+// safepoint), they have no remaining constructor and are removed.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FunctionValueCallResume {
@@ -1869,7 +1859,6 @@ impl Vm {
             services: VmServices::default(),
             execution: ExecutionContextStack::default(),
             registers: RegisterFile::default(),
-            interpreter_root_scope: InterpreterRootSyncScope::new(),
             active_dispatch_budget: None,
             gc_execution: VmGcExecutionState::default(),
             tiering: VmTieringIntegration::default(),
@@ -5498,7 +5487,7 @@ impl Vm {
             .active_dispatch_budget
             .as_mut()
             .unwrap_or(&mut local_dispatch_budget);
-        execute_code_block_deferring_ordinary_calls_with_root_scope_and_dispatch_budget(
+        execute_code_block_deferring_ordinary_calls_with_dispatch_budget(
             InterpreterExecutionState {
                 stack: &mut self.execution,
                 registers: &mut self.registers,
@@ -5509,7 +5498,6 @@ impl Vm {
             code_block,
             &mut host,
             dispatch_budget,
-            &mut self.interpreter_root_scope,
         )
     }
 
@@ -6356,21 +6344,12 @@ impl Vm {
     ) -> BaselineNativeEntryVmExecution {
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        if let Err(error) = self.sync_generated_direct_call_deferred_nonlocal_roots(
-            dispatch.expected_frame,
-            host,
-            &mut active_register_roots,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return BaselineNativeEntryVmExecution::Native(ExecutionCompletion::Failed(
-                cleanup.err().unwrap_or(error),
-            ));
-        }
+        // D2i/Wave 2b: the deferred direct-call exit no longer syncs the caller
+        // (nonlocal) frame-header roots here; every live frame's header cells
+        // are gathered at the safepoint (`gather_vm_frame_header_roots`) over
+        // the whole call-frame stack, which already covers caller frames. The
+        // `active_*_roots` vecs stay (empty) for the deferred-rooting cleanup
+        // boundary, gated by the non-frame deferred-direct-call flag.
         let completion = if Self::p6_x86_64_callable_side_exit_single_dispatch_resume_allowed(
             code_block, &side_exit,
         ) {
@@ -9314,22 +9293,12 @@ impl Vm {
         };
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        if let Err(error) = self.sync_generated_direct_call_deferred_nonlocal_roots(
-            transaction.resume.frame,
-            host,
-            &mut active_register_roots,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_generated_single_dispatch_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
+        // D2i/Wave 2b: the deferred direct-call exit no longer syncs the caller
+        // (nonlocal) frame-header roots here; every live frame's header cells
+        // are gathered at the safepoint (`gather_vm_frame_header_roots`) over
+        // the whole call-frame stack, which already covers caller frames. The
+        // `active_*_roots` vecs stay (empty) for the deferred-rooting cleanup
+        // boundary, gated by the non-frame deferred-direct-call flag.
         let exception_snapshot = self.exceptions.clone();
         let outcome = execute_single_dispatch_deferring_ordinary_calls(
             InterpreterExecutionState {
@@ -12025,26 +11994,20 @@ impl Vm {
             Err(_) => return ExecutionCompletion::Failed(ExecutionError::GcBoundaryViolation),
         };
 
-        // D2i: only frame-header roots are reconciled at the call boundary; the
-        // register file is a GC root by being live and is gathered at the
-        // safepoint (`gather_vm_register_roots`), not synced per call.
-        // `active_register_roots` stays as an (empty) handle for cleanup.
+        // D2i/Wave 2b: neither register-file NOR frame-header roots are synced at
+        // the call boundary anymore; both are GC roots by being live and are
+        // gathered at the safepoint (`gather_vm_register_roots` /
+        // `gather_vm_frame_header_roots`, the analog of the conservative
+        // call-frame-chain scan), not reconciled per call. The `active_*_roots`
+        // vecs stay as (empty) handles so the deferred-rooting cleanup boundary
+        // below is unchanged (it is gated by the non-frame deferred-direct-call
+        // flag, not by frame rooting).
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        let prepared = sync_targeted_frame_roots(
-            resume.frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            &mut active_frame_roots,
-        );
 
-        // Run the eval body (compile + link + enter) while roots are pinned. The
-        // eval-body `ExecutionCompletion` is then folded into the caller resume.
-        let eval_completion = match prepared {
-            Ok(()) => self.build_and_run_eval_code_block(source, global_this, host, config),
-            Err(error) => Err(error),
-        };
+        // Run the eval body (compile + link + enter). The eval-body
+        // `ExecutionCompletion` is then folded into the caller resume.
+        let eval_completion = self.build_and_run_eval_code_block(source, global_this, host, config);
 
         let cleanup = cleanup_targeted_root_sets(
             &mut self.heap,
@@ -12404,7 +12367,6 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> SingleDispatchOutcome {
-        let resume = Self::function_value_call_resume(&request.completion);
         let suspended = match self.suspend_no_gc_execution_region() {
             Ok(suspended) => suspended,
             Err(_) => return SingleDispatchOutcome::Failed(ExecutionError::GcBoundaryViolation),
@@ -12412,25 +12374,14 @@ impl Vm {
 
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        if let Err(error) = sync_targeted_frame_roots(
-            resume.frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_function_value_call_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
-        // D2i: register-file roots are gathered at the safepoint, not synced at
-        // the call boundary; only the frame-header roots above are reconciled.
+        // D2i/Wave 2b: neither register-file NOR frame-header roots are synced
+        // at the call boundary anymore; both are GC roots by being live and are
+        // gathered at the safepoint (`gather_vm_register_roots` /
+        // `gather_vm_frame_header_roots`, the analog of the conservative
+        // call-frame-chain scan), not reconciled per call. The `active_*_roots`
+        // vecs above stay as (empty) handles so the deferred-rooting cleanup
+        // boundary below is unchanged (it is gated by the non-frame
+        // deferred-direct-call flag, not by frame rooting).
 
         let outcome = self.execute_function_value_call_as_single_dispatch(
             request,
@@ -12832,10 +12783,6 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> SingleDispatchOutcome {
-        let resume = OrdinaryBytecodeCallResume {
-            owner: request.continuation.owner,
-            frame: request.continuation.caller_frame,
-        };
         let suspended = match self.suspend_no_gc_execution_region() {
             Ok(suspended) => suspended,
             Err(_) => return SingleDispatchOutcome::Failed(ExecutionError::GcBoundaryViolation),
@@ -12843,25 +12790,14 @@ impl Vm {
 
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        if let Err(error) = sync_targeted_frame_roots(
-            resume.frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_ordinary_bytecode_call_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
-        // D2i: register-file roots are gathered at the safepoint, not synced at
-        // the call boundary; only the frame-header roots above are reconciled.
+        // D2i/Wave 2b: neither register-file NOR frame-header roots are synced
+        // at the call boundary anymore; both are GC roots by being live and are
+        // gathered at the safepoint (`gather_vm_register_roots` /
+        // `gather_vm_frame_header_roots`, the analog of the conservative
+        // call-frame-chain scan), not reconciled per call. The `active_*_roots`
+        // vecs above stay as (empty) handles so the deferred-rooting cleanup
+        // boundary below is unchanged (it is gated by the non-frame
+        // deferred-direct-call flag, not by frame rooting).
 
         let outcome = self.execute_ordinary_bytecode_call_link_direct_dispatch_body(
             request,
@@ -13063,10 +12999,6 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> SingleDispatchOutcome {
-        let resume = OrdinaryBytecodeCallResume {
-            owner: request.continuation.owner,
-            frame: request.continuation.caller_frame,
-        };
         let suspended = match self.suspend_no_gc_execution_region() {
             Ok(suspended) => suspended,
             Err(_) => return SingleDispatchOutcome::Failed(ExecutionError::GcBoundaryViolation),
@@ -13074,25 +13006,14 @@ impl Vm {
 
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        if let Err(error) = sync_targeted_frame_roots(
-            resume.frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_ordinary_bytecode_call_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
-        // D2i: register-file roots are gathered at the safepoint, not synced at
-        // the call boundary; only the frame-header roots above are reconciled.
+        // D2i/Wave 2b: neither register-file NOR frame-header roots are synced
+        // at the call boundary anymore; both are GC roots by being live and are
+        // gathered at the safepoint (`gather_vm_register_roots` /
+        // `gather_vm_frame_header_roots`, the analog of the conservative
+        // call-frame-chain scan), not reconciled per call. The `active_*_roots`
+        // vecs above stay as (empty) handles so the deferred-rooting cleanup
+        // boundary below is unchanged (it is gated by the non-frame
+        // deferred-direct-call flag, not by frame rooting).
 
         let outcome = self.execute_ordinary_bytecode_call_as_single_dispatch(
             request,
@@ -13260,10 +13181,6 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> SingleDispatchOutcome {
-        let resume = OrdinaryBytecodeConstructResume {
-            owner: request.continuation.owner,
-            frame: request.continuation.caller_frame,
-        };
         let suspended = match self.suspend_no_gc_execution_region() {
             Ok(suspended) => suspended,
             Err(_) => return SingleDispatchOutcome::Failed(ExecutionError::GcBoundaryViolation),
@@ -13271,25 +13188,14 @@ impl Vm {
 
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        if let Err(error) = sync_targeted_frame_roots(
-            resume.frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_ordinary_bytecode_construct_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
-        // D2i: register-file roots are gathered at the safepoint, not synced at
-        // the call boundary; only the frame-header roots above are reconciled.
+        // D2i/Wave 2b: neither register-file NOR frame-header roots are synced
+        // at the call boundary anymore; both are GC roots by being live and are
+        // gathered at the safepoint (`gather_vm_register_roots` /
+        // `gather_vm_frame_header_roots`, the analog of the conservative
+        // call-frame-chain scan), not reconciled per call. The `active_*_roots`
+        // vecs above stay as (empty) handles so the deferred-rooting cleanup
+        // boundary below is unchanged (it is gated by the non-frame
+        // deferred-direct-call flag, not by frame rooting).
 
         let outcome = self.execute_ordinary_bytecode_construct_as_single_dispatch(
             request,
@@ -13331,10 +13237,6 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> SingleDispatchOutcome {
-        let resume = OrdinaryBytecodeConstructResume {
-            owner: request.continuation.owner,
-            frame: request.continuation.caller_frame,
-        };
         let suspended = match self.suspend_no_gc_execution_region() {
             Ok(suspended) => suspended,
             Err(_) => return SingleDispatchOutcome::Failed(ExecutionError::GcBoundaryViolation),
@@ -13342,25 +13244,14 @@ impl Vm {
 
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        if let Err(error) = sync_targeted_frame_roots(
-            resume.frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_ordinary_bytecode_construct_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
-        // D2i: register-file roots are gathered at the safepoint, not synced at
-        // the call boundary; only the frame-header roots above are reconciled.
+        // D2i/Wave 2b: neither register-file NOR frame-header roots are synced
+        // at the call boundary anymore; both are GC roots by being live and are
+        // gathered at the safepoint (`gather_vm_register_roots` /
+        // `gather_vm_frame_header_roots`, the analog of the conservative
+        // call-frame-chain scan), not reconciled per call. The `active_*_roots`
+        // vecs above stay as (empty) handles so the deferred-rooting cleanup
+        // boundary below is unchanged (it is gated by the non-frame
+        // deferred-direct-call flag, not by frame rooting).
 
         let outcome = self.execute_ordinary_bytecode_construct_link_direct_dispatch_body(
             request,
@@ -13981,22 +13872,12 @@ impl Vm {
         };
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        if let Err(error) = self.sync_generated_direct_call_deferred_nonlocal_roots(
-            handoff.resume.frame,
-            host,
-            &mut active_register_roots,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_generated_single_dispatch_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
+        // D2i/Wave 2b: the deferred direct-call exit no longer syncs the caller
+        // (nonlocal) frame-header roots here; every live frame's header cells
+        // are gathered at the safepoint (`gather_vm_frame_header_roots`) over
+        // the whole call-frame stack, which already covers caller frames. The
+        // `active_*_roots` vecs stay (empty) for the deferred-rooting cleanup
+        // boundary, gated by the non-frame deferred-direct-call flag.
         let validation =
             match self.validate_generated_runtime_helper_exit_handoff(handoff, code_block) {
                 Ok(validation) => validation,
@@ -14329,29 +14210,18 @@ impl Vm {
             .saturating_sub(1);
     }
 
-    fn sync_generated_direct_call_deferred_nonlocal_roots<H: DispatchHost>(
-        &mut self,
-        current_frame: CallFrameId,
-        // D2i: the deferred direct-call path no longer eagerly syncs the
-        // caller-frame REGISTER-file roots (`host`/`_active_register_roots` are
-        // unused now); those slots are GC roots by being live and are gathered at
-        // the safepoint (`gather_vm_register_roots`). Only the nonlocal
-        // FRAME-header roots are reconciled here.
-        _host: &mut H,
-        _active_register_roots: &mut Vec<RootRecord>,
-        active_frame_roots: &mut Vec<RootRecord>,
-    ) -> Result<(), ExecutionError> {
-        if !self.generated_direct_call_deferred_rooting_is_active() {
-            return Ok(());
-        }
-        sync_targeted_nonlocal_frame_roots(
-            current_frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            active_frame_roots,
-        )
-    }
+    // D2i/Wave 2b: `sync_generated_direct_call_deferred_nonlocal_roots` (which
+    // reconciled the caller/nonlocal frame-header roots into the precise registry
+    // while in a deferred direct-call region) is retired. Every live frame's
+    // header cells -- including caller frames -- are now gathered at the safepoint
+    // by `gather_vm_frame_header_roots` over the whole call-frame stack, so the
+    // per-call nonlocal frame sync is fully subsumed. The
+    // `generated_direct_call_deferred_rooting_depth` flag and its
+    // enter/leave/is_active accessors are KEPT: the flag is NOT frame-rooting-only
+    // -- it also suppresses generated direct-call selection
+    // (`p9_x86_64_authorized_generated_js_direct_call_for_native_exit`) and forces
+    // the Int32-no-overflow property-increment numeric mode during a deferred
+    // region, so it remains a load-bearing non-frame control flag.
 
     fn normalize_generated_single_dispatch_outcome(
         &mut self,
@@ -14408,22 +14278,12 @@ impl Vm {
         };
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        if let Err(error) = self.sync_generated_direct_call_deferred_nonlocal_roots(
-            request.frame,
-            host,
-            &mut active_register_roots,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_generated_single_dispatch_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
+        // D2i/Wave 2b: the deferred direct-call exit no longer syncs the caller
+        // (nonlocal) frame-header roots here; every live frame's header cells
+        // are gathered at the safepoint (`gather_vm_frame_header_roots`) over
+        // the whole call-frame stack, which already covers caller frames. The
+        // `active_*_roots` vecs stay (empty) for the deferred-rooting cleanup
+        // boundary, gated by the non-frame deferred-direct-call flag.
         let outcome = execute_single_dispatch_deferring_ordinary_calls(
             InterpreterExecutionState {
                 stack: &mut self.execution,
@@ -14795,7 +14655,7 @@ impl Vm {
             .active_dispatch_budget
             .as_mut()
             .unwrap_or(&mut local_dispatch_budget);
-        execute_baseline_fallback_deferring_ordinary_calls_with_root_scope_and_dispatch_budget(
+        execute_baseline_fallback_deferring_ordinary_calls_with_dispatch_budget(
             InterpreterExecutionState {
                 stack: &mut self.execution,
                 registers: &mut self.registers,
@@ -14806,8 +14666,6 @@ impl Vm {
             code_block,
             host,
             dispatch_budget,
-            &mut self.interpreter_root_scope,
-            InterpreterRootScopeMode::VmStack,
         )
     }
 

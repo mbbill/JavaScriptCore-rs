@@ -386,22 +386,12 @@ impl Vm {
         };
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        if let Err(error) = self.sync_generated_direct_call_deferred_nonlocal_roots(
-            transaction.resume.frame,
-            host,
-            &mut active_register_roots,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_generated_single_dispatch_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
+        // D2i/Wave 2b: the deferred direct-call exit no longer syncs the caller
+        // (nonlocal) frame-header roots here; every live frame's header cells
+        // are gathered at the safepoint (`gather_vm_frame_header_roots`) over
+        // the whole call-frame stack, which already covers caller frames. The
+        // `active_*_roots` vecs stay (empty) for the deferred-rooting cleanup
+        // boundary, gated by the non-frame deferred-direct-call flag.
         let exception_snapshot = self.exceptions.clone();
         let outcome = execute_single_dispatch_deferring_ordinary_calls(
             InterpreterExecutionState {

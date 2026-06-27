@@ -157,8 +157,6 @@ impl Vm {
             ));
         }
 
-        let resume_frame = handoff.resume.frame;
-
         let failed = |error| {
             GeneratedJsDirectCallTransactionResult::Outcome(SingleDispatchOutcome::Failed(error))
         };
@@ -183,15 +181,6 @@ impl Vm {
                     }
                 }
             };
-
-        let resume_generated_no_gc = |vm: &mut Self,
-                                      suspended,
-                                      outcome: SingleDispatchOutcome|
-         -> GeneratedJsDirectCallTransactionResult {
-            GeneratedJsDirectCallTransactionResult::Outcome(
-                vm.resume_generated_single_dispatch_no_gc(suspended, outcome),
-            )
-        };
 
         let validation = match self
             .try_validate_generated_js_direct_call_hot_slot(&handoff, caller_code_block)
@@ -286,46 +275,17 @@ impl Vm {
             Err(_) => return failed(ExecutionError::GcBoundaryViolation),
         };
 
+        // D2i/Wave 2b: the generated direct-call boundary no longer syncs the
+        // caller (nonlocal) frame-header roots NOR the owner frame-header roots
+        // here; every live frame's header cells (codeblock/callee) are gathered
+        // at the safepoint (`gather_vm_frame_header_roots`) over the whole
+        // call-frame stack, exactly as register-file roots are gathered by
+        // `gather_vm_register_roots`. The `active_*_roots` vecs stay as (empty)
+        // handles so the deferred-rooting cleanup boundary below is unchanged (it
+        // is gated by the non-frame deferred-direct-call flag, not frame
+        // rooting).
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
-        if let Err(error) = self.sync_generated_direct_call_deferred_nonlocal_roots(
-            resume_frame,
-            host,
-            &mut active_register_roots,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return resume_generated_no_gc(
-                self,
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
-        if let Err(error) = sync_targeted_frame_roots(
-            resume_frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            &mut active_frame_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return resume_generated_no_gc(
-                self,
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
-        // D2i: register-file roots are gathered at the safepoint, not synced at
-        // the generated direct-call boundary; only the frame-header roots above
-        // are reconciled.
 
         let result = self.execute_validated_generated_js_direct_call_with_return_mode(
             validation,

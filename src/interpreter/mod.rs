@@ -845,20 +845,6 @@ impl ExecutionContextStack {
         self.root_snapshot_with_frame_roots(heap, registers, frame_roots)
     }
 
-    #[cfg(test)]
-    fn root_snapshot_for_heap(
-        &self,
-        heap: &Heap,
-        registers: &RegisterFile,
-    ) -> Result<ExecutionRootSnapshot, RootSetSemanticError> {
-        let frame_roots = self
-            .frames
-            .iter()
-            .flat_map(|frame| frame.root_descriptors_for_heap(heap))
-            .collect::<Vec<_>>();
-        self.root_snapshot_with_frame_roots(heap.id(), registers, frame_roots)
-    }
-
     fn root_snapshot_with_frame_roots(
         &self,
         heap: HeapId,
@@ -879,42 +865,6 @@ impl ExecutionContextStack {
         Ok(ExecutionRootSnapshot {
             frame_roots,
             register_roots,
-        })
-    }
-
-    fn frame_root_snapshot_for_heap(
-        &self,
-        heap: &Heap,
-        owner_frame: CallFrameId,
-    ) -> Result<ExecutionRootSnapshot, RootSetSemanticError> {
-        let frame_roots = self
-            .frames
-            .iter()
-            .filter(|frame| frame.id == owner_frame)
-            .flat_map(|frame| frame.root_descriptors_for_heap(heap))
-            .collect::<Vec<_>>();
-        validate_root_records(frame_roots.iter().map(|descriptor| descriptor.root))?;
-        Ok(ExecutionRootSnapshot {
-            frame_roots,
-            register_roots: Vec::new(),
-        })
-    }
-
-    fn nonlocal_frame_root_snapshot_for_heap(
-        &self,
-        heap: &Heap,
-        owner_frame: CallFrameId,
-    ) -> Result<ExecutionRootSnapshot, RootSetSemanticError> {
-        let frame_roots = self
-            .frames
-            .iter()
-            .filter(|frame| frame.id != owner_frame)
-            .flat_map(|frame| frame.root_descriptors_for_heap(heap))
-            .collect::<Vec<_>>();
-        validate_root_records(frame_roots.iter().map(|descriptor| descriptor.root))?;
-        Ok(ExecutionRootSnapshot {
-            frame_roots,
-            register_roots: Vec::new(),
         })
     }
 
@@ -1090,10 +1040,6 @@ impl InstalledCallFrame {
 
     pub fn root_descriptors(&self, heap: HeapId) -> Vec<FrameRootDescriptor> {
         self.root_descriptors_with_policy(heap, |_| FrameRootTarget::unknown())
-    }
-
-    fn root_descriptors_for_heap(&self, heap: &Heap) -> Vec<FrameRootDescriptor> {
-        self.root_descriptors_with_policy(heap.id(), |cell| frame_root_target_for_cell(heap, cell))
     }
 
     fn root_descriptors_with_policy<F>(
@@ -29471,7 +29417,6 @@ pub fn execute_code_block<H: DispatchHost>(
     host: &mut H,
     config: DispatchConfig,
 ) -> ExecutionCompletion {
-    let mut root_scope = InterpreterRootSyncScope::new();
     let mut dispatch_budget = DispatchBudget::from_config(config);
     execute_code_block_with_resume(
         execution,
@@ -29481,8 +29426,6 @@ pub fn execute_code_block<H: DispatchHost>(
         &mut dispatch_budget,
         None,
         InterpreterCallHandling::direct_interpreter(),
-        &mut root_scope,
-        InterpreterRootScopeMode::ScopedDispatch,
     )
 }
 
@@ -29494,7 +29437,6 @@ pub(crate) fn execute_baseline_fallback<H: DispatchHost>(
     host: &mut H,
     config: DispatchConfig,
 ) -> ExecutionCompletion {
-    let mut root_scope = InterpreterRootSyncScope::new();
     let mut dispatch_budget = DispatchBudget::from_config(config);
     execute_code_block_with_resume(
         execution,
@@ -29504,40 +29446,21 @@ pub(crate) fn execute_baseline_fallback<H: DispatchHost>(
         &mut dispatch_budget,
         Some(request),
         InterpreterCallHandling::direct_interpreter(),
-        &mut root_scope,
-        InterpreterRootScopeMode::ScopedDispatch,
     )
 }
 
-#[allow(dead_code)]
-pub(crate) fn execute_code_block_deferring_ordinary_calls_with_root_scope<H: DispatchHost>(
-    execution: InterpreterExecutionState<'_>,
-    code_block_id: CodeBlockId,
-    code_block: &CodeBlock,
-    host: &mut H,
-    config: DispatchConfig,
-    root_scope: &mut InterpreterRootSyncScope,
-) -> ExecutionCompletion {
-    let mut dispatch_budget = DispatchBudget::from_config(config);
-    execute_code_block_deferring_ordinary_calls_with_root_scope_and_dispatch_budget(
-        execution,
-        code_block_id,
-        code_block,
-        host,
-        &mut dispatch_budget,
-        root_scope,
-    )
-}
-
-pub(crate) fn execute_code_block_deferring_ordinary_calls_with_root_scope_and_dispatch_budget<
-    H: DispatchHost,
->(
+// Wave 2b: the per-frame root scope is retired. Frame-header roots
+// (codeblock/callee/lexical-scope) are no longer reconciled per dispatch entry;
+// they are gathered at the safepoint by `gather_vm_frame_header_roots`, exactly
+// as register-file roots were retired in Wave 2 (D2i). These call-boundary
+// entry points therefore no longer thread an `InterpreterRootSyncScope` /
+// `InterpreterRootScopeMode`.
+pub(crate) fn execute_code_block_deferring_ordinary_calls_with_dispatch_budget<H: DispatchHost>(
     execution: InterpreterExecutionState<'_>,
     code_block_id: CodeBlockId,
     code_block: &CodeBlock,
     host: &mut H,
     dispatch_budget: &mut DispatchBudget,
-    root_scope: &mut InterpreterRootSyncScope,
 ) -> ExecutionCompletion {
     execute_code_block_with_resume(
         execution,
@@ -29547,36 +29470,10 @@ pub(crate) fn execute_code_block_deferring_ordinary_calls_with_root_scope_and_di
         dispatch_budget,
         None,
         InterpreterCallHandling::defer_to_vm(),
-        root_scope,
-        InterpreterRootScopeMode::VmStack,
     )
 }
 
-#[allow(dead_code)]
-pub(crate) fn execute_baseline_fallback_deferring_ordinary_calls_with_root_scope<
-    H: DispatchHost,
->(
-    execution: InterpreterExecutionState<'_>,
-    request: BaselineFallbackRequest,
-    code_block: &CodeBlock,
-    host: &mut H,
-    config: DispatchConfig,
-    root_scope: &mut InterpreterRootSyncScope,
-    root_scope_mode: InterpreterRootScopeMode,
-) -> ExecutionCompletion {
-    let mut dispatch_budget = DispatchBudget::from_config(config);
-    execute_baseline_fallback_deferring_ordinary_calls_with_root_scope_and_dispatch_budget(
-        execution,
-        request,
-        code_block,
-        host,
-        &mut dispatch_budget,
-        root_scope,
-        root_scope_mode,
-    )
-}
-
-pub(crate) fn execute_baseline_fallback_deferring_ordinary_calls_with_root_scope_and_dispatch_budget<
+pub(crate) fn execute_baseline_fallback_deferring_ordinary_calls_with_dispatch_budget<
     H: DispatchHost,
 >(
     execution: InterpreterExecutionState<'_>,
@@ -29584,8 +29481,6 @@ pub(crate) fn execute_baseline_fallback_deferring_ordinary_calls_with_root_scope
     code_block: &CodeBlock,
     host: &mut H,
     dispatch_budget: &mut DispatchBudget,
-    root_scope: &mut InterpreterRootSyncScope,
-    root_scope_mode: InterpreterRootScopeMode,
 ) -> ExecutionCompletion {
     execute_code_block_with_resume(
         execution,
@@ -29595,15 +29490,7 @@ pub(crate) fn execute_baseline_fallback_deferring_ordinary_calls_with_root_scope
         dispatch_budget,
         Some(request),
         InterpreterCallHandling::defer_to_vm(),
-        root_scope,
-        root_scope_mode,
     )
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InterpreterRootScopeMode {
-    ScopedDispatch,
-    VmStack,
 }
 
 #[allow(dead_code)]
@@ -29649,49 +29536,28 @@ fn execute_single_dispatch_with_ordinary_call_handling<H: DispatchHost>(
         Ok(frame) => frame,
         Err(error) => return SingleDispatchOutcome::Failed(error),
     };
-    // Frame-header roots (codeblock/callee/lexical-scope) are still reconciled
-    // into the precise registry here; only the per-op REGISTER-FILE rooting was
-    // retired (D2i). `active_targeted_register_roots` stays as an (empty) handle
-    // so the shared cleanup signature is unchanged.
-    let mut active_targeted_register_roots: Vec<RootRecord> = Vec::new();
-    let mut active_targeted_frame_roots = Vec::new();
 
-    if let Err(error) = sync_targeted_frame_roots(
-        frame.id,
-        execution.stack,
-        execution.registers,
-        execution.heap,
-        &mut active_targeted_frame_roots,
-    ) {
-        return finish_single_dispatch_with_targeted_root_cleanup(
-            execution.heap,
-            &mut active_targeted_register_roots,
-            &mut active_targeted_frame_roots,
-            SingleDispatchOutcome::Failed(error),
-        );
-    }
-
-    // VM-entry safepoint poll (D2i). C++ JSC polls for a GC handshake at
-    // VM/call entry; under worldIsStopped the live register file is gathered
-    // ONCE via gather_vm_register_roots (the analog of
-    // CLoopStack::gatherConservativeRoots), replacing the retired per-op
-    // register-root sync that used to run here. No collection runs in the
-    // single-threaded InterpreterOnly configuration (heap.rs
-    // mutator_has_heap_access stays true), so this returns immediately.
+    // VM-entry safepoint poll (D2i; Wave 2b). C++ JSC polls for a GC handshake
+    // at VM/call entry; under worldIsStopped both the live register file and the
+    // frame-header slots (codeBlock/callee, physical register slots in the frame
+    // header, CallFrame.h:176-184) are scanned ONCE off the live call-frame chain
+    // (gather_vm_register_roots is the analog of
+    // CLoopStack::gatherConservativeRoots; gather_vm_frame_header_roots is the
+    // analog of StackVisitor reading the header slots off the chain,
+    // StackVisitor.cpp:182-188). Both replace the retired per-op
+    // register-root/frame-root syncs that used to run here. No collection runs in
+    // the single-threaded InterpreterOnly configuration (heap.rs
+    // mutator_has_heap_access stays true), so both return immediately.
     let _ = poll_register_root_safepoint(execution.registers, execution.heap);
+    let _ = poll_frame_header_root_safepoint(execution.stack, execution.heap);
 
     let index = request.bytecode_index.offset() as usize;
     let view = match cursor.get(index) {
         Some(view) => view,
         None => {
-            return finish_single_dispatch_with_targeted_root_cleanup(
-                execution.heap,
-                &mut active_targeted_register_roots,
-                &mut active_targeted_frame_roots,
-                SingleDispatchOutcome::Failed(ExecutionError::InvalidBytecodeIndex(
-                    request.bytecode_index,
-                )),
-            );
+            return SingleDispatchOutcome::Failed(ExecutionError::InvalidBytecodeIndex(
+                request.bytecode_index,
+            ));
         }
     };
     let bytecode_index = view.bytecode_index(index);
@@ -29720,11 +29586,11 @@ fn execute_single_dispatch_with_ordinary_call_handling<H: DispatchHost>(
         host.dispatch_instruction(&mut state, instruction)
     };
 
-    // D2i: no post-op register-root sync. The register file is a GC root by
-    // virtue of being live; it is scanned once at a safepoint, not reconciled
-    // after every dispatch.
+    // D2i/Wave 2b: no post-op register-root or frame-root sync. The register
+    // file and frame header are GC roots by virtue of being live; they are
+    // scanned once at a safepoint, not reconciled after every dispatch.
 
-    let outcome = map_single_dispatch_outcome(
+    map_single_dispatch_outcome(
         SingleDispatchOutcomeState {
             stack: &mut *execution.stack,
             registers: &mut *execution.registers,
@@ -29738,12 +29604,6 @@ fn execute_single_dispatch_with_ordinary_call_handling<H: DispatchHost>(
             bytecode_index,
             call_handling,
         },
-        outcome,
-    );
-    finish_single_dispatch_with_targeted_root_cleanup(
-        execution.heap,
-        &mut active_targeted_register_roots,
-        &mut active_targeted_frame_roots,
         outcome,
     )
 }
@@ -29771,8 +29631,6 @@ fn execute_code_block_with_resume<H: DispatchHost>(
     dispatch_budget: &mut DispatchBudget,
     resume: Option<BaselineFallbackRequest>,
     call_handling: InterpreterCallHandling,
-    root_scope: &mut InterpreterRootSyncScope,
-    root_scope_mode: InterpreterRootScopeMode,
 ) -> ExecutionCompletion {
     let cursor = InstructionCursor::new(code_block.unlinked().instructions());
     let (frame, mut pc) = match resume {
@@ -29799,45 +29657,27 @@ fn execute_code_block_with_resume<H: DispatchHost>(
         }
     };
 
-    if let Err(error) = sync_targeted_frame_roots_for_dispatch_entry(
-        frame.id,
-        execution.stack,
-        execution.registers,
-        execution.heap,
-        root_scope,
-    ) {
-        return finish_with_root_scope_cleanup(
-            execution.heap,
-            root_scope,
-            root_scope_mode,
-            frame.id,
-            frame.register_window,
-            ExecutionCompletion::Failed(error),
-        );
-    }
-
-    // VM-entry / loop-entry safepoint poll (D2i). C++ JSC roots the register
-    // file by conservatively scanning the live call-frame span ONCE per GC under
+    // VM-entry / loop-entry safepoint poll (D2i; Wave 2b). C++ JSC roots the
+    // register file AND the frame-header slots (codeBlock/callee) by
+    // conservatively scanning the live call-frame span ONCE per GC under
     // worldIsStopped (heap/Heap.cpp:903 gatherStackRoots, :3021 worldIsStopped;
-    // interpreter/CLoopStack.cpp:111-114 gatherConservativeRoots), polled only at
-    // VM-entry, loop back-edges, and trap-service boundaries
-    // (interpreter.md:3). The retired per-op register-root sync that used to run
-    // here (and after every dispatch below) is replaced by this poll, which
-    // gathers the live register file via gather_vm_register_roots only when a
-    // collection has stopped the world. No collector runs in InterpreterOnly, so
-    // it returns immediately and the hot loop pays nothing per op.
+    // interpreter/CLoopStack.cpp:111-114 gatherConservativeRoots covers the whole
+    // contiguous register span, which includes the physical header slots
+    // CallFrame.h:176-184; StackVisitor.cpp:182-188 reads them off the chain),
+    // polled only at VM-entry, loop back-edges, and trap-service boundaries
+    // (interpreter.md items 2-3). The retired per-op register-root AND
+    // frame-root syncs that used to run here (and after every dispatch below) are
+    // replaced by these sibling polls, which gather the live register file
+    // (gather_vm_register_roots) and the live frame headers
+    // (gather_vm_frame_header_roots) only when a collection has stopped the
+    // world. No collector runs in InterpreterOnly, so both return immediately and
+    // the hot loop pays nothing per op.
     let _ = poll_register_root_safepoint(execution.registers, execution.heap);
+    let _ = poll_frame_header_root_safepoint(execution.stack, execution.heap);
 
     loop {
         if let Some(reason) = execution.exceptions.termination() {
-            return finish_with_root_scope_cleanup(
-                execution.heap,
-                root_scope,
-                root_scope_mode,
-                frame.id,
-                frame.register_window,
-                ExecutionCompletion::Terminated(reason),
-            );
+            return ExecutionCompletion::Terminated(reason);
         }
         // C++ JSC executes a VM entry under VMEntryScope and services watchdog
         // timeouts through VM traps; it does not maintain a bytecode dispatch
@@ -29845,26 +29685,12 @@ fn execute_code_block_with_resume<H: DispatchHost>(
         // therefore be VM/source-entry scoped, not reset for each fallback or
         // generated shim that re-enters this interpreter loop.
         if let Err(error) = dispatch_budget.spend_step() {
-            return finish_with_root_scope_cleanup(
-                execution.heap,
-                root_scope,
-                root_scope_mode,
-                frame.id,
-                frame.register_window,
-                ExecutionCompletion::Failed(error),
-            );
+            return ExecutionCompletion::Failed(error);
         }
 
         let index = pc.offset() as usize;
         let Some(view) = cursor.get(index) else {
-            return finish_with_root_scope_cleanup(
-                execution.heap,
-                root_scope,
-                root_scope_mode,
-                frame.id,
-                frame.register_window,
-                ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(pc)),
-            );
+            return ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(pc));
         };
         let bytecode_index = view.bytecode_index(index);
         execution.stack.mark_top_bytecode_index(bytecode_index);
@@ -29891,71 +29717,56 @@ fn execute_code_block_with_resume<H: DispatchHost>(
             };
             host.dispatch_instruction(&mut state, instruction)
         };
-        // C++ JSC divergence retired (D2i): there is NO per-bytecode rooting
-        // here anymore. The LLInt dispatch macro only advances PC and jumps
-        // (llint/LowLevelInterpreter.asm), and a value is a GC root simply by
-        // being live in the register file, which is conservatively span-scanned
-        // ONCE per GC at a safepoint (interpreter/CLoopStack.cpp:111-114
-        // gatherConservativeRoots; heap/Heap.cpp:903 gatherStackRoots under
-        // worldIsStopped). The prior per-op targeted-root registry sync that ran
-        // after every dispatch (the #1 measured interpreter self-time tax) is
-        // removed; the register file is gathered at the safepoint poll points
-        // (VM-entry above, loop back-edges below) by gather_vm_register_roots.
+        // C++ JSC divergence retired (D2i; Wave 2b): there is NO per-bytecode
+        // register OR frame-header rooting here anymore. The LLInt dispatch macro
+        // only advances PC and jumps (llint/LowLevelInterpreter.asm), and a value
+        // is a GC root simply by being live in the register file / frame header,
+        // which is conservatively span-scanned ONCE per GC at a safepoint
+        // (interpreter/CLoopStack.cpp:111-114 gatherConservativeRoots covers the
+        // whole register span incl. the header slots CallFrame.h:176-184;
+        // heap/Heap.cpp:903 gatherStackRoots under worldIsStopped). The prior
+        // per-op targeted-root registry syncs that ran after every dispatch (the
+        // #1 measured interpreter self-time tax) are removed; the register file is
+        // gathered by gather_vm_register_roots and the frame headers by
+        // gather_vm_frame_header_roots at the safepoint poll points (VM-entry
+        // above, loop back-edges below).
 
         match outcome {
             DispatchOutcome::Continue => {
                 let next = index.saturating_add(1);
                 if next >= cursor.len() {
-                    return finish_with_root_scope_cleanup(
-                        execution.heap,
-                        root_scope,
-                        root_scope_mode,
-                        frame.id,
-                        frame.register_window,
-                        ExecutionCompletion::Returned(RuntimeValue::undefined()),
-                    );
+                    return ExecutionCompletion::Returned(RuntimeValue::undefined());
                 }
                 pc = BytecodeIndex::from_offset(next as u32);
             }
             DispatchOutcome::ContinueTo(target) => {
                 let Some(target) = target else {
-                    return finish_with_root_scope_cleanup(
-                        execution.heap,
-                        root_scope,
-                        root_scope_mode,
-                        frame.id,
-                        frame.register_window,
-                        ExecutionCompletion::Returned(RuntimeValue::undefined()),
-                    );
+                    return ExecutionCompletion::Returned(RuntimeValue::undefined());
                 };
                 if cursor.get(target.offset() as usize).is_none() {
-                    return finish_with_root_scope_cleanup(
-                        execution.heap,
-                        root_scope,
-                        root_scope_mode,
-                        frame.id,
-                        frame.register_window,
-                        ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(target)),
-                    );
+                    return ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(
+                        target,
+                    ));
                 }
                 poll_register_root_safepoint_on_backedge(
                     index,
                     target,
                     execution.registers,
+                    execution.heap,
+                );
+                poll_frame_header_root_safepoint_on_backedge(
+                    index,
+                    target,
+                    execution.stack,
                     execution.heap,
                 );
                 pc = target;
             }
             DispatchOutcome::Jump(target) => {
                 if cursor.get(target.offset() as usize).is_none() {
-                    return finish_with_root_scope_cleanup(
-                        execution.heap,
-                        root_scope,
-                        root_scope_mode,
-                        frame.id,
-                        frame.register_window,
-                        ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(target)),
-                    );
+                    return ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(
+                        target,
+                    ));
                 }
                 poll_register_root_safepoint_on_backedge(
                     index,
@@ -29963,87 +29774,37 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                     execution.registers,
                     execution.heap,
                 );
+                poll_frame_header_root_safepoint_on_backedge(
+                    index,
+                    target,
+                    execution.stack,
+                    execution.heap,
+                );
                 pc = target;
             }
             DispatchOutcome::Return(value) => {
-                return finish_with_root_scope_cleanup(
-                    execution.heap,
-                    root_scope,
-                    root_scope_mode,
-                    frame.id,
-                    frame.register_window,
-                    ExecutionCompletion::Returned(value),
-                );
+                return ExecutionCompletion::Returned(value);
             }
             DispatchOutcome::BaselineLoopHandoff(request) => {
-                return finish_with_root_scope_cleanup(
-                    execution.heap,
-                    root_scope,
-                    root_scope_mode,
-                    frame.id,
-                    frame.register_window,
-                    ExecutionCompletion::BaselineLoopHandoff(request),
-                );
+                return ExecutionCompletion::BaselineLoopHandoff(request);
             }
             DispatchOutcome::OrdinaryBytecodeCall(request) => {
-                return finish_with_root_scope_cleanup(
-                    execution.heap,
-                    root_scope,
-                    root_scope_mode,
-                    frame.id,
-                    frame.register_window,
-                    ExecutionCompletion::OrdinaryBytecodeCall(request),
-                );
+                return ExecutionCompletion::OrdinaryBytecodeCall(request);
             }
             DispatchOutcome::OrdinaryBytecodeConstruct(request) => {
-                return finish_with_root_scope_cleanup(
-                    execution.heap,
-                    root_scope,
-                    root_scope_mode,
-                    frame.id,
-                    frame.register_window,
-                    ExecutionCompletion::OrdinaryBytecodeConstruct(request),
-                );
+                return ExecutionCompletion::OrdinaryBytecodeConstruct(request);
             }
             DispatchOutcome::FunctionValueCall(request) => {
-                return finish_with_root_scope_cleanup(
-                    execution.heap,
-                    root_scope,
-                    root_scope_mode,
-                    frame.id,
-                    frame.register_window,
-                    ExecutionCompletion::FunctionValueCall(request),
-                );
+                return ExecutionCompletion::FunctionValueCall(request);
             }
             DispatchOutcome::EvalRequest(request) => {
-                return finish_with_root_scope_cleanup(
-                    execution.heap,
-                    root_scope,
-                    root_scope_mode,
-                    frame.id,
-                    frame.register_window,
-                    ExecutionCompletion::EvalRequest(request),
-                );
+                return ExecutionCompletion::EvalRequest(request);
             }
             DispatchOutcome::Suspend(record) => {
-                return finish_with_root_scope_cleanup(
-                    execution.heap,
-                    root_scope,
-                    root_scope_mode,
-                    frame.id,
-                    frame.register_window,
-                    ExecutionCompletion::Suspended(record),
-                );
+                return ExecutionCompletion::Suspended(record);
             }
             DispatchOutcome::Fail(error) => {
-                return finish_with_root_scope_cleanup(
-                    execution.heap,
-                    root_scope,
-                    root_scope_mode,
-                    frame.id,
-                    frame.register_window,
-                    ExecutionCompletion::Failed(error),
-                );
+                return ExecutionCompletion::Failed(error);
             }
             DispatchOutcome::Throw(value) => {
                 execution.exceptions.throw(value);
@@ -30064,14 +29825,7 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                         &mut unwind,
                     );
                     execution.exceptions.replace_unwind(unwind);
-                    return finish_with_root_scope_cleanup(
-                        execution.heap,
-                        root_scope,
-                        root_scope_mode,
-                        frame.id,
-                        frame.register_window,
-                        ExecutionCompletion::Threw(pending),
-                    );
+                    return ExecutionCompletion::Threw(pending);
                 }
             }
         }
@@ -30211,334 +29965,6 @@ fn map_single_dispatch_outcome(
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct TargetedFrameRootPlan {
-    records: Vec<TargetedRootRecord>,
-    rootless_descriptors: Vec<FrameRootDescriptor>,
-}
-
-impl TargetedFrameRootPlan {
-    fn resolve(
-        heap: &Heap,
-        snapshot: &ExecutionRootSnapshot,
-    ) -> Result<TargetedFrameRootPlan, ExecutionError> {
-        validate_root_records(
-            snapshot
-                .frame_roots
-                .iter()
-                .map(|descriptor| descriptor.root),
-        )?;
-
-        let mut records = Vec::new();
-        let mut rootless_descriptors = Vec::new();
-        for descriptor in &snapshot.frame_roots {
-            if descriptor.root.heap != heap.id() {
-                return Err(RootSetSemanticError::HeapMismatch {
-                    expected: heap.id(),
-                    actual: descriptor.root.heap,
-                }
-                .into());
-            }
-
-            let target = match descriptor.target {
-                FrameRootTarget::Known(target) => target,
-                FrameRootTarget::NoTarget | FrameRootTarget::Unknown => {
-                    rootless_descriptors.push(*descriptor);
-                    continue;
-                }
-            };
-
-            records.push(TargetedRootRecord {
-                root: descriptor.root,
-                target,
-            });
-        }
-
-        let set = TargetedRootSet::from_records(heap.id(), records)?;
-        for record in set.records() {
-            if !heap_has_allocation(heap, record.target) {
-                return Err(HeapIntegrationError::UnknownCell(record.target).into());
-            }
-        }
-
-        Ok(Self {
-            records: set.records().to_vec(),
-            rootless_descriptors,
-        })
-    }
-
-    fn into_records(self) -> Vec<TargetedRootRecord> {
-        self.records
-    }
-}
-
-pub(crate) fn sync_targeted_frame_roots(
-    owner_frame: CallFrameId,
-    stack: &ExecutionContextStack,
-    _registers: &RegisterFile,
-    heap: &mut Heap,
-    active_roots: &mut Vec<RootRecord>,
-) -> Result<(), ExecutionError> {
-    let snapshot = stack.frame_root_snapshot_for_heap(heap, owner_frame)?;
-    let targeted = TargetedFrameRootPlan::resolve(heap, &snapshot)?;
-    sync_targeted_vm_roots(heap, active_roots, targeted.into_records())
-}
-
-pub(crate) fn sync_targeted_nonlocal_frame_roots(
-    owner_frame: CallFrameId,
-    stack: &ExecutionContextStack,
-    _registers: &RegisterFile,
-    heap: &mut Heap,
-    active_roots: &mut Vec<RootRecord>,
-) -> Result<(), ExecutionError> {
-    let snapshot = stack.nonlocal_frame_root_snapshot_for_heap(heap, owner_frame)?;
-    let targeted = TargetedFrameRootPlan::resolve(heap, &snapshot)?;
-    sync_targeted_vm_roots(heap, active_roots, targeted.into_records())
-}
-
-fn sync_targeted_vm_roots(
-    heap: &mut Heap,
-    active_roots: &mut Vec<RootRecord>,
-    desired_records: Vec<TargetedRootRecord>,
-) -> Result<(), ExecutionError> {
-    let desired_records = desired_records
-        .into_iter()
-        .filter(|record| record.root.kind == RootKind::VMRegister)
-        .collect::<Vec<_>>();
-    let desired = TargetedRootSet::from_records(heap.id(), desired_records)?;
-    let desired_root_ids = desired
-        .records()
-        .iter()
-        .map(|record| record.root.id)
-        .collect::<HashSet<_>>();
-    let stale_roots = active_roots
-        .iter()
-        .copied()
-        .filter(|root| !desired_root_ids.contains(&root.id))
-        .collect::<Vec<_>>();
-
-    apply_desired_vm_roots(heap, active_roots, &desired, &stale_roots)
-}
-
-/// VM-owned interpreter root state for live call frames.
-///
-/// C++ JSC does not create per-dispatch root scopes: VM registers live in one
-/// call-frame stack and `Heap::gatherStackRoots` scans that live span only at a
-/// GC safepoint. Rust still exposes a precise targeted-root registry for the
-/// future collector, so this scope is the Rust ownership skeleton that lets the
-/// FRAME-header registry (codeblock/callee/lexical-scope) mirror C++'s stack
-/// lifetime: caller frame roots stay active while a callee runs, and only the
-/// popped/finished frame is cleaned. Register-FILE roots were retired (D2i):
-/// they are gathered directly from the live register backing store at the
-/// safepoint (`gather_vm_register_roots`), not tracked per-scope.
-#[derive(Debug, Default)]
-pub(crate) struct InterpreterRootSyncScope {
-    active_targeted_frame_roots: Vec<RootRecord>,
-    synced_frame_roots: HashSet<CallFrameId>,
-}
-
-impl InterpreterRootSyncScope {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    fn cleanup_all(&mut self, heap: &mut Heap) -> Result<(), ExecutionError> {
-        let frame_cleanup = cleanup_targeted_vm_roots(heap, &mut self.active_targeted_frame_roots);
-        self.synced_frame_roots.clear();
-        frame_cleanup
-    }
-
-    fn cleanup_frame(
-        &mut self,
-        heap: &mut Heap,
-        frame: CallFrameId,
-        // Register-file roots are no longer tracked per-scope (D2i); only the
-        // frame-header roots are cleaned here. The window is retained in the
-        // signature for call-site symmetry with the VM-stack lifetime.
-        _window: RegisterWindow,
-    ) -> Result<(), ExecutionError> {
-        let frame_roots = self
-            .active_targeted_frame_roots
-            .iter()
-            .copied()
-            .filter(|root| root_is_frame_root_for_frame(*root, frame))
-            .collect::<Vec<_>>();
-        let frame_cleanup = cleanup_selected_targeted_vm_roots(
-            heap,
-            &mut self.active_targeted_frame_roots,
-            &frame_roots,
-        );
-
-        self.synced_frame_roots.remove(&frame);
-        frame_cleanup
-    }
-}
-
-fn sync_targeted_frame_roots_scoped(
-    owner_frame: CallFrameId,
-    stack: &ExecutionContextStack,
-    _registers: &RegisterFile,
-    heap: &mut Heap,
-    active_roots: &mut Vec<RootRecord>,
-) -> Result<(), ExecutionError> {
-    let snapshot = stack.frame_root_snapshot_for_heap(heap, owner_frame)?;
-    let targeted = TargetedFrameRootPlan::resolve(heap, &snapshot)?;
-    sync_targeted_vm_roots_scoped(heap, active_roots, targeted.into_records(), |root| {
-        root_is_frame_root_for_frame(root, owner_frame)
-    })
-}
-
-fn sync_targeted_frame_roots_for_dispatch_entry(
-    owner_frame: CallFrameId,
-    stack: &ExecutionContextStack,
-    registers: &RegisterFile,
-    heap: &mut Heap,
-    root_scope: &mut InterpreterRootSyncScope,
-) -> Result<(), ExecutionError> {
-    if root_scope.synced_frame_roots.contains(&owner_frame) {
-        return Ok(());
-    }
-    let result = sync_targeted_frame_roots_scoped(
-        owner_frame,
-        stack,
-        registers,
-        heap,
-        &mut root_scope.active_targeted_frame_roots,
-    );
-    if result.is_ok() {
-        root_scope.synced_frame_roots.insert(owner_frame);
-    }
-    result
-}
-
-fn sync_targeted_vm_roots_scoped<F>(
-    heap: &mut Heap,
-    active_roots: &mut Vec<RootRecord>,
-    desired_records: Vec<TargetedRootRecord>,
-    mut stale_scope: F,
-) -> Result<(), ExecutionError>
-where
-    F: FnMut(RootRecord) -> bool,
-{
-    let desired_records = desired_records
-        .into_iter()
-        .filter(|record| record.root.kind == RootKind::VMRegister)
-        .collect::<Vec<_>>();
-    let desired = TargetedRootSet::from_records(heap.id(), desired_records)?;
-    let desired_root_ids = desired
-        .records()
-        .iter()
-        .map(|record| record.root.id)
-        .collect::<HashSet<_>>();
-    let stale_roots = active_roots
-        .iter()
-        .copied()
-        .filter(|root| stale_scope(*root) && !desired_root_ids.contains(&root.id))
-        .collect::<Vec<_>>();
-
-    apply_desired_vm_roots(heap, active_roots, &desired, &stale_roots)
-}
-
-/// Shared reconcile core of the FRAME-header targeted-root sync
-/// (`sync_targeted_vm_roots` / `sync_targeted_vm_roots_scoped`). `desired` is the
-/// validated desired targeted-root set; `stale_roots` is the precomputed set of
-/// currently-active roots that are absent from `desired`. (Register-FILE rooting
-/// no longer uses this path; it is gathered at the safepoint, D2i.)
-fn apply_desired_vm_roots(
-    heap: &mut Heap,
-    active_roots: &mut Vec<RootRecord>,
-    desired: &TargetedRootSet,
-    stale_roots: &[RootRecord],
-) -> Result<(), ExecutionError> {
-    for root in stale_roots {
-        let root = *root;
-        // O(1) membership test by root identity instead of scanning the whole
-        // live targeted-root set on every stale root (see TargetedRootSet index).
-        if heap.targeted_roots().contains_root(root) {
-            heap.unregister_targeted_root(root, RootSetMutationAuthority::VmRegisterFile)?;
-        }
-        active_roots.retain(|active| active.id != root.id);
-    }
-
-    for record in desired.records() {
-        // O(1) lookup of the existing record by root identity instead of a linear
-        // scan of the live targeted-root set per desired record.
-        let existing = heap.targeted_roots().record_for_root(record.root).copied();
-        let scope_already_owns_root = active_roots
-            .iter()
-            .any(|active| active.id == record.root.id);
-        match existing {
-            Some(existing) if existing == *record => {
-                // If this active scope already owns the root, keep tracking it.
-                // If another overlapping scope owns the same VM-register root,
-                // leave ownership with that scope; otherwise this temporary scope
-                // would unregister a caller root it did not create. C++ JSC has
-                // one stack-root lifetime, so overlapping Rust scopes must not
-                // steal roots from each other.
-            }
-            Some(_) => {
-                heap.retarget_targeted_root(*record, RootSetMutationAuthority::VmRegisterFile)?;
-                if !scope_already_owns_root {
-                    continue;
-                }
-            }
-            None => {
-                heap.register_targeted_root(*record, RootSetMutationAuthority::VmRegisterFile)?;
-                if !scope_already_owns_root {
-                    active_roots.push(record.root);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn finish_with_root_scope_cleanup(
-    heap: &mut Heap,
-    root_scope: &mut InterpreterRootSyncScope,
-    mode: InterpreterRootScopeMode,
-    frame: CallFrameId,
-    window: RegisterWindow,
-    completion: ExecutionCompletion,
-) -> ExecutionCompletion {
-    let cleanup = match mode {
-        InterpreterRootScopeMode::ScopedDispatch => root_scope.cleanup_all(heap),
-        InterpreterRootScopeMode::VmStack if completion_retains_current_frame(&completion) => {
-            Ok(())
-        }
-        InterpreterRootScopeMode::VmStack => root_scope.cleanup_frame(heap, frame, window),
-    };
-    match cleanup {
-        Ok(()) => completion,
-        Err(error) => ExecutionCompletion::Failed(error),
-    }
-}
-
-fn completion_retains_current_frame(completion: &ExecutionCompletion) -> bool {
-    matches!(
-        completion,
-        ExecutionCompletion::OrdinaryBytecodeCall(_)
-            | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
-            | ExecutionCompletion::BaselineLoopHandoff(_)
-            | ExecutionCompletion::FunctionValueCall(_)
-            | ExecutionCompletion::EvalRequest(_)
-            | ExecutionCompletion::Suspended(_)
-    )
-}
-
-fn finish_single_dispatch_with_targeted_root_cleanup(
-    heap: &mut Heap,
-    active_register_roots: &mut Vec<RootRecord>,
-    active_frame_roots: &mut Vec<RootRecord>,
-    outcome: SingleDispatchOutcome,
-) -> SingleDispatchOutcome {
-    match cleanup_targeted_root_sets(heap, active_register_roots, active_frame_roots) {
-        Ok(()) => outcome,
-        Err(error) => SingleDispatchOutcome::Failed(error),
-    }
-}
-
 pub(crate) fn cleanup_targeted_root_sets(
     heap: &mut Heap,
     active_register_roots: &mut Vec<RootRecord>,
@@ -30564,35 +29990,6 @@ fn cleanup_targeted_vm_roots(
         }
     }
     Ok(())
-}
-
-fn cleanup_selected_targeted_vm_roots(
-    heap: &mut Heap,
-    active_roots: &mut Vec<RootRecord>,
-    selected_roots: &[RootRecord],
-) -> Result<(), ExecutionError> {
-    for root in selected_roots {
-        let root = *root;
-        if heap.targeted_roots().contains_root(root) {
-            heap.unregister_targeted_root(root, RootSetMutationAuthority::VmRegisterFile)?;
-        }
-        active_roots.retain(|active| active.id != root.id);
-    }
-    Ok(())
-}
-
-fn heap_has_allocation(heap: &Heap, cell: CellId) -> bool {
-    heap.allocation_records()
-        .iter()
-        .any(|record| record.response.cell == cell)
-}
-
-fn frame_root_target_for_cell(heap: &Heap, cell: CellId) -> FrameRootTarget {
-    if heap_has_allocation(heap, cell) {
-        FrameRootTarget::known(cell)
-    } else {
-        FrameRootTarget::unknown()
-    }
 }
 
 pub(crate) fn find_handler(
@@ -30628,15 +30025,6 @@ fn register_root_id(slot: usize) -> RootId {
             .saturating_add(slot as u64)
             .saturating_add(1),
     )
-}
-
-fn root_is_frame_root_for_frame(root: RootRecord, frame: CallFrameId) -> bool {
-    if root.kind != RootKind::VMRegister {
-        return false;
-    }
-    root.id == frame_root_id(frame, FrameRootSource::CodeBlock)
-        || root.id == frame_root_id(frame, FrameRootSource::Callee)
-        || root.id == frame_root_id(frame, FrameRootSource::LexicalScope)
 }
 
 fn value_cell_payload(value: RuntimeValue) -> Option<usize> {
@@ -30725,6 +30113,102 @@ fn poll_register_root_safepoint_on_backedge(
         return None;
     }
     poll_register_root_safepoint(registers, heap)
+}
+
+/// Gather the live VM FRAME-HEADER roots at a GC safepoint (D2i; Wave 2b).
+///
+/// C++ JSC stores `codeBlock` and `callee` as PHYSICAL register slots in the
+/// call-frame header (interpreter/CallFrame.h:176-184: `CallFrameSlot::codeBlock
+/// = CallerFrameAndPC::sizeInRegisters`, `callee = codeBlock + 1`), part of the
+/// same contiguous register span, so the single conservative scan
+/// `currentStackPointer..highAddress` covers them with zero extra work
+/// (interpreter/CLoopStack.cpp:111-113); `StackVisitor` reads them off the linked
+/// call-frame chain via `callFrame->codeBlock()`/`callee()`
+/// (interpreter/StackVisitor.cpp:182-188; interpreter.md items 1-2). JSC
+/// registers ZERO frame-header roots during execution -- a header cell is a root
+/// simply by being live in the frame, scanned ONCE per GC under worldIsStopped.
+///
+/// This Rust port stores the header cells OUT-OF-LINE in `InstalledCallFrame`
+/// (`code_block`/`callee`) rather than in `RegisterFile::values`, so the register
+/// gather (`gather_vm_register_roots`, which walks only `RegisterFile::values`)
+/// does NOT cover them -- this sibling frame walk is the analog of `StackVisitor`
+/// reading the header slots off the chain. It walks the SAME `stack.frames`
+/// iterator `root_snapshot` uses over ALL live frames and emits the raw cell for
+/// every `Some(code_block)`/`Some(callee)` (via `root_descriptors_with_policy`
+/// with `FrameRootTarget::known`), reading the cell DIRECTLY off the frame field
+/// with NO `heap_has_allocation` gate and NO `TargetedRootSet` validation -- the
+/// faithful safepoint analog of `gather_vm_register_roots` emitting the raw slot
+/// payload (deferred D1 resolution at mark time). The root-id namespace stays
+/// `frame_root_id(frame, source)` (`FRAME_ROOT_ID_BASE + frame*16 + ordinal`),
+/// identical to the retired registry and disjoint from `REGISTER_ROOT_ID_BASE`.
+///
+/// Root-coverage equivalence with the retired per-op frame registry: the registry
+/// only ever snapshotted `stack.frames` (the owner frame via
+/// `frame_root_snapshot_for_heap`, entered frames via the dispatch-entry
+/// accumulation kept active until pop, and caller frames via
+/// `nonlocal_frame_root_snapshot_for_heap`) -- collectively every element of
+/// `stack.frames`, which this gather iterates identically. Both paths read the
+/// same `code_block`/`callee` fields and stamp the same `frame_root_id`. The
+/// registry REGISTERED a frame cell only when `heap_has_allocation(cell)` held
+/// (cells without an allocation went rootless and were never registered); this
+/// gather drops that gate and emits the raw cell for every `Some` field, so the
+/// gathered set is a SUPERSET of the registered set -- it can only add coverage,
+/// never lose a root, and the extra pre-publication cells are a harmless
+/// conservative over-root resolved (or ignored) at mark time, exactly as the
+/// register gather emits the raw slot payload. `lexical_scope` is a `ScopeId(u32)`
+/// (not a heap cell), so it is rootless in BOTH paths
+/// (`root_descriptors_with_policy` hardcodes `FrameRootTarget::no_target` for it)
+/// -- a pre-existing D1-class gap, unchanged in this wave. Unlike the register
+/// sync (which lost an eager `bind_object_to_heap` publication side effect on
+/// store), the frame sync had NO publication side effect, so retiring it changes
+/// nothing about cell publication. Single-threaded `InterpreterOnly` => no
+/// fencing.
+pub(crate) fn gather_vm_frame_header_roots(
+    stack: &ExecutionContextStack,
+    heap: HeapId,
+) -> Vec<FrameRootDescriptor> {
+    stack
+        .frames
+        .iter()
+        .flat_map(|frame| frame.root_descriptors_with_policy(heap, FrameRootTarget::known))
+        .collect()
+}
+
+/// Safepoint poll for the frame-header root gather (D2i; Wave 2b). Sibling of
+/// [`poll_register_root_safepoint`] at the SAME poll points, gated on the SAME
+/// stop-the-world handshake (`register_root_safepoint_is_active`, the
+/// `worldIsStopped` analog -- one handshake, not a second flag). The two gathers
+/// walk different backing stores (`RegisterFile::values` vs
+/// `ExecutionContextStack.frames`) with different plan element types, so each
+/// stays a faithful single-store walk rather than extending the register gather.
+/// In `InterpreterOnly` the predicate is always false, so this returns `None` and
+/// the hot loop pays nothing. The gather borrows `stack`/`heap` immutably and a
+/// real collection borrows `heap` mutably as a separate later step, so no new
+/// shared lifetime model is needed beyond the Wave 2 `Heap reads the live
+/// call-frame stack at the safepoint` borrow.
+pub(crate) fn poll_frame_header_root_safepoint(
+    stack: &ExecutionContextStack,
+    heap: &Heap,
+) -> Option<Vec<FrameRootDescriptor>> {
+    if !heap.register_root_safepoint_is_active() {
+        return None;
+    }
+    Some(gather_vm_frame_header_roots(stack, heap.id()))
+}
+
+/// Loop back-edge variant of [`poll_frame_header_root_safepoint`]: polls only on
+/// a backward branch (the C++ loop/back-edge poll site, interpreter.md:3),
+/// mirroring [`poll_register_root_safepoint_on_backedge`].
+fn poll_frame_header_root_safepoint_on_backedge(
+    current_index: usize,
+    target: BytecodeIndex,
+    stack: &ExecutionContextStack,
+    heap: &Heap,
+) -> Option<Vec<FrameRootDescriptor>> {
+    if (target.offset() as usize) > current_index {
+        return None;
+    }
+    poll_frame_header_root_safepoint(stack, heap)
 }
 
 fn validate_root_records(
@@ -38878,6 +38362,11 @@ mod tests {
                 Vec::new(),
             );
             let frame = stack.top_frame().unwrap().id;
+            // Wave 2b: the frame-header gather covers the code_block cell at the
+            // safepoint (before any frame pop/unwind from the dispatch outcome).
+            assert!(gather_vm_frame_header_roots(&stack, heap.id())
+                .iter()
+                .any(|descriptor| descriptor.target == FrameRootTarget::Known(code_block_id.0)));
             let mut host = FixedTargetRootHost {
                 target: code_block_id.0,
                 outcome: dispatch_outcome,
@@ -38899,9 +38388,14 @@ mod tests {
             assert_eq!(outcome, expected_outcome);
             assert_eq!(exceptions.pending(), expected_pending);
             assert_eq!(host.dispatch_roots.len(), 1);
-            assert!(host.dispatch_roots[0]
-                .iter()
-                .any(|record| record.target == code_block_id.0));
+            // D2i/Wave 2b: the dispatch path never invokes the host's
+            // `targeted_register_roots` hook NOR the retired per-op frame sync, so
+            // the precise targeted-root registry is empty DURING dispatch -- a
+            // register/frame-header cell is a GC root simply by being live and is
+            // gathered at the safepoint, not registered per op. (Previously the
+            // frame sync registered the code_block root here; the frame header is
+            // now covered by the safepoint gather, asserted before dispatch above.)
+            assert!(host.dispatch_roots[0].is_empty());
             assert!(heap.targeted_roots().records().is_empty());
         }
     }
@@ -39065,6 +38559,11 @@ mod tests {
                 Vec::new(),
             );
             let frame = stack.top_frame().unwrap().id;
+            // Wave 2b: the frame-header gather covers the code_block cell at the
+            // safepoint (before any frame pop/unwind from the dispatch outcome).
+            assert!(gather_vm_frame_header_roots(&stack, heap.id())
+                .iter()
+                .any(|descriptor| descriptor.target == FrameRootTarget::Known(code_block_id.0)));
             let mut host = FixedTargetRootHost {
                 target: code_block_id.0,
                 outcome,
@@ -39086,9 +38585,14 @@ mod tests {
 
             assert_eq!(completion, expected_completion);
             assert_eq!(host.dispatch_roots.len(), 1);
-            assert!(host.dispatch_roots[0]
-                .iter()
-                .any(|record| record.target == code_block_id.0));
+            // D2i/Wave 2b: the dispatch path never invokes the host's
+            // `targeted_register_roots` hook NOR the retired per-op frame sync, so
+            // the precise targeted-root registry is empty DURING dispatch -- a
+            // register/frame-header cell is a GC root simply by being live and is
+            // gathered at the safepoint, not registered per op. (Previously the
+            // frame sync registered the code_block root here; the frame header is
+            // now covered by the safepoint gather, asserted before dispatch above.)
+            assert!(host.dispatch_roots[0].is_empty());
             assert!(heap.targeted_roots().records().is_empty());
         }
     }
@@ -39321,6 +38825,132 @@ mod tests {
         assert!(heap.targeted_roots().records().is_empty());
     }
 
+    /// Wave 2b root-coverage equivalence gate (the prime invariant), mirroring the
+    /// register gather's `gather_vm_register_roots_matches_full_window_recompute_*`:
+    /// `gather_vm_frame_header_roots` over the whole live frame stack equals the
+    /// full per-frame recompute over ALL `stack.frames`, including a CALLER frame's
+    /// codeblock/callee while the callee runs (the all-frames coverage the retired
+    /// per-op path reproduced via dispatch-entry accumulation + the nonlocal sync).
+    /// The recompute reference reads the header fields directly (not via the gather)
+    /// so it independently catches a dropped/added frame or slot.
+    #[test]
+    fn gather_vm_frame_header_roots_matches_full_frame_recompute_across_live_frames() {
+        let heap_id = HeapId(3);
+        let block = code_block_with_frame(vec![typed(0)], gather_shape());
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+
+        // Caller frame: code_block + callee + lexical_scope all set; both header
+        // cells stay live while the callee runs (raw synthetic cells -- the gather
+        // emits them unresolved, like the register gather's raw payload).
+        let caller_code_block = CodeBlockId(CellId(0x51));
+        let caller_callee = ObjectId(CellId(0x52));
+        stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+            code_block: caller_code_block,
+            global_object: GlobalObjectId(ObjectId(CellId(1_000))),
+            this_value: RuntimeValue::undefined(),
+        }));
+        let caller = stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(caller_code_block),
+                    callee: Some(caller_callee),
+                    callee_value: None,
+                    lexical_scope: Some(ScopeId(1)),
+                    shape: block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: vec![RuntimeValue::from_i32(7)],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+
+        // Callee frame on top: its own code_block + callee, caller stays live.
+        let callee_code_block = CodeBlockId(CellId(0x61));
+        let callee_callee = ObjectId(CellId(0x62));
+        let callee = stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(callee_code_block),
+                    callee: Some(callee_callee),
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: vec![RuntimeValue::from_i32(9)],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+
+        // Independent full recompute over ALL live frames, reading the header
+        // fields directly (CodeBlock, then Callee, then LexicalScope per frame, in
+        // stack order) -- the equivalence reference.
+        let mut expected: Vec<(CallFrameId, FrameRootSource, FrameRootTarget)> = Vec::new();
+        for f in stack.frames.iter() {
+            if let Some(code_block) = f.code_block {
+                expected.push((
+                    f.id,
+                    FrameRootSource::CodeBlock,
+                    FrameRootTarget::Known(code_block.0),
+                ));
+            }
+            if let Some(callee_id) = f.callee {
+                expected.push((
+                    f.id,
+                    FrameRootSource::Callee,
+                    FrameRootTarget::Known(callee_id.0),
+                ));
+            }
+            if f.lexical_scope.is_some() {
+                expected.push((
+                    f.id,
+                    FrameRootSource::LexicalScope,
+                    FrameRootTarget::NoTarget,
+                ));
+            }
+        }
+
+        let descriptors = gather_vm_frame_header_roots(&stack, heap_id);
+        let gathered: Vec<(CallFrameId, FrameRootSource, FrameRootTarget)> = descriptors
+            .iter()
+            .map(|descriptor| (descriptor.frame, descriptor.source, descriptor.target))
+            .collect();
+        assert_eq!(gathered, expected);
+        assert!(!gathered.is_empty(), "guard against a vacuous empty match");
+
+        // The CALLER's header cells are gathered while the CALLEE frame is live --
+        // the whole live frame stack is walked.
+        for cell in [CellId(0x51), CellId(0x52), CellId(0x61), CellId(0x62)] {
+            assert!(
+                gathered
+                    .iter()
+                    .any(|(_, _, target)| *target == FrameRootTarget::Known(cell)),
+                "missing live frame-header root cell {cell:?}"
+            );
+        }
+
+        // Stable, disjoint id namespace; all VMRegister-kind on this heap; the
+        // first descriptor is the caller's CodeBlock.
+        assert!(descriptors
+            .iter()
+            .all(|descriptor| descriptor.root.kind == RootKind::VMRegister
+                && descriptor.root.heap == heap_id));
+        assert_eq!(
+            descriptors[0].root.id,
+            frame_root_id(caller, FrameRootSource::CodeBlock)
+        );
+        let _ = callee;
+
+        // The gather is pure: it never mutates the targeted-root registry.
+        let heap = Heap::new();
+        assert!(heap.targeted_roots().records().is_empty());
+    }
+
     /// Immediate register slots are skipped by the gather (the slot predicate is
     /// TAG_CELL, identical to the retired registry's `value.as_cell()` test).
     #[test]
@@ -39410,8 +39040,16 @@ mod tests {
         assert!(heap.cell_for_payload(cell_payload(value)).is_none());
     }
 
+    /// Wave 2b safepoint model (migrated from the retired per-op
+    /// `targeted_frame_root_registers_known_code_block_*`, which asserted the
+    /// transient registry shape -- accidental Rust behavior, not JSC): the
+    /// frame-header CodeBlock cell is covered by the safepoint gather
+    /// (`gather_vm_frame_header_roots`), and dispatch never mutates the precise
+    /// targeted-root registry (`host.dispatch_roots` is empty per op), exactly as
+    /// JSC scans the header slots once per GC off the live call-frame chain rather
+    /// than registering them per dispatch.
     #[test]
-    fn targeted_frame_root_registers_known_code_block_and_unregisters_on_completion() {
+    fn frame_header_gather_covers_code_block_and_dispatch_leaves_registry_empty() {
         let block = code_block(vec![typed(0)]);
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
@@ -39440,19 +39078,17 @@ mod tests {
                 },
             )
             .unwrap();
-        let expected = TargetedRootRecord {
-            root: RootRecord {
-                id: frame_root_id(frame, FrameRootSource::CodeBlock),
-                kind: RootKind::VMRegister,
-                heap: heap_id,
-            },
-            target: code_block_id.0,
-        };
-        let snapshot = stack.root_snapshot_for_heap(&heap, &registers).unwrap();
-        assert!(snapshot.frame_roots.iter().any(|descriptor| {
-            descriptor.source == FrameRootSource::CodeBlock
+        // The safepoint gather emits the CodeBlock cell for this frame, in the
+        // same `frame_root_id` namespace the retired registry used, with NO
+        // registry mutation.
+        let gathered = gather_vm_frame_header_roots(&stack, heap_id);
+        assert!(gathered.iter().any(|descriptor| {
+            descriptor.frame == frame
+                && descriptor.source == FrameRootSource::CodeBlock
                 && descriptor.target == FrameRootTarget::Known(code_block_id.0)
+                && descriptor.root.id == frame_root_id(frame, FrameRootSource::CodeBlock)
         }));
+        assert!(heap.targeted_roots().records().is_empty());
         let mut host = TargetedRootObservingHost::default();
 
         let result = execute_code_block(
@@ -39472,16 +39108,26 @@ mod tests {
             result,
             ExecutionCompletion::Returned(RuntimeValue::undefined())
         );
-        assert_eq!(host.dispatch_roots, vec![vec![expected]]);
+        // Retired per-op path registered a frame root before each dispatch
+        // (`dispatch_roots == [[expected]]`); the safepoint model never mutates
+        // the registry during dispatch.
+        assert_eq!(host.dispatch_roots, vec![Vec::new()]);
         assert!(heap.targeted_roots().records().is_empty());
     }
 
+    /// Wave 2b (migrated from the retired per-op
+    /// `targeted_frame_root_records_no_target_lexical_root_as_rootless`):
+    /// `lexical_scope` is a `ScopeId(u32)`, not a heap cell, so the safepoint
+    /// gather emits it with `FrameRootTarget::NoTarget` (rootless) -- a
+    /// pre-existing D1-class gap unchanged by this wave (the per-op path also left
+    /// it rootless). With `code_block`/`callee` `None`, the gather emits exactly
+    /// that one rootless descriptor and never touches the registry.
     #[test]
-    fn targeted_frame_root_records_no_target_lexical_root_as_rootless() {
+    fn frame_header_gather_emits_lexical_scope_as_rootless() {
         let block = code_block(vec![typed(0)]);
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
-        let mut heap = Heap::new();
+        let heap = Heap::new();
         stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
             code_block: CodeBlockId(CellId(43)),
             global_object: GlobalObjectId(ObjectId(CellId(1_000))),
@@ -39504,28 +39150,24 @@ mod tests {
             )
             .unwrap();
 
-        let snapshot = stack.root_snapshot_for_heap(&heap, &registers).unwrap();
-        assert_eq!(snapshot.frame_roots.len(), 1);
-        assert_eq!(
-            snapshot.frame_roots[0].source,
-            FrameRootSource::LexicalScope
-        );
-        assert_eq!(snapshot.frame_roots[0].target, FrameRootTarget::NoTarget);
-        let plan = TargetedFrameRootPlan::resolve(&heap, &snapshot).unwrap();
-
-        assert!(plan.records.is_empty());
-        assert_eq!(
-            plan.rootless_descriptors.as_slice(),
-            snapshot.frame_roots.as_slice()
-        );
-        let mut active_roots = Vec::new();
-        sync_targeted_frame_roots(frame, &stack, &registers, &mut heap, &mut active_roots).unwrap();
-        assert!(active_roots.is_empty());
+        let gathered = gather_vm_frame_header_roots(&stack, heap.id());
+        assert_eq!(gathered.len(), 1);
+        assert_eq!(gathered[0].frame, frame);
+        assert_eq!(gathered[0].source, FrameRootSource::LexicalScope);
+        assert_eq!(gathered[0].target, FrameRootTarget::NoTarget);
         assert!(heap.targeted_roots().records().is_empty());
     }
 
+    /// Wave 2b (migrated from the retired per-op
+    /// `targeted_frame_root_sync_filters_before_register_root_validation`): the
+    /// frame-header gather walks the WHOLE live frame stack, so a caller frame's
+    /// codeblock root is gathered while the callee is live -- the all-frames
+    /// coverage the retired per-op path reproduced via dispatch-entry accumulation
+    /// plus the nonlocal sync. Each frame gets a distinct `frame_root_id`, so
+    /// there is no collision (the duplicate caller shares the register window, but
+    /// the frame-header gather keys on the frame id, not the window).
     #[test]
-    fn targeted_frame_root_sync_filters_before_register_root_validation() {
+    fn frame_header_gather_walks_every_live_frame() {
         let block = code_block_with_frame(
             vec![typed(0)],
             RegisterFrameShape {
@@ -39539,7 +39181,7 @@ mod tests {
         let code_block_id = CodeBlockId(CellId(44));
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
-        let mut heap = Heap::new();
+        let heap = Heap::new();
         stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
             code_block: code_block_id,
             global_object: GlobalObjectId(ObjectId(CellId(1_000))),
@@ -39566,22 +39208,33 @@ mod tests {
         duplicate.caller = Some(frame);
         stack.frames.push(duplicate);
 
-        assert_eq!(
-            stack.root_snapshot_for_heap(&heap, &registers),
-            Err(RootSetSemanticError::DuplicateRoot(register_root_id(0)))
-        );
-
-        let mut active_roots = Vec::new();
-        sync_targeted_frame_roots(frame, &stack, &registers, &mut heap, &mut active_roots).unwrap();
-        assert!(active_roots.is_empty());
+        let gathered = gather_vm_frame_header_roots(&stack, heap.id());
+        let code_block_roots: Vec<_> = gathered
+            .iter()
+            .filter(|descriptor| descriptor.source == FrameRootSource::CodeBlock)
+            .collect();
+        // One CodeBlock root per live frame (owner + caller), distinct ids.
+        assert_eq!(code_block_roots.len(), 2);
+        assert!(code_block_roots
+            .iter()
+            .any(|descriptor| descriptor.frame == frame
+                && descriptor.root.id == frame_root_id(frame, FrameRootSource::CodeBlock)));
+        assert!(code_block_roots
+            .iter()
+            .any(|descriptor| descriptor.frame == CallFrameId(99)
+                && descriptor.root.id
+                    == frame_root_id(CallFrameId(99), FrameRootSource::CodeBlock)));
+        assert!(code_block_roots
+            .iter()
+            .all(|descriptor| descriptor.target == FrameRootTarget::Known(code_block_id.0)));
         assert!(heap.targeted_roots().records().is_empty());
     }
 
-    /// The eager `root_snapshot_for_heap` validation still rejects a malformed
-    /// (duplicate-frame) snapshot. The retired per-op register sync used to
-    /// owner-filter before validating; the safepoint gather instead walks the
-    /// live register backing store directly (independent of stack-frame
-    /// bookkeeping) and emits exactly the live cell-bearing slot.
+    /// The precise register snapshot still rejects a malformed (duplicate-frame)
+    /// snapshot. The retired per-op register sync used to owner-filter before
+    /// validating; the safepoint gather instead walks the live register backing
+    /// store directly (independent of stack-frame bookkeeping) and emits exactly
+    /// the live cell-bearing slot.
     #[test]
     fn safepoint_gather_emits_live_register_cell_independent_of_frame_bookkeeping() {
         let block = code_block_with_frame(
@@ -39626,9 +39279,9 @@ mod tests {
         duplicate.caller = Some(frame);
         stack.frames.push(duplicate);
 
-        // The eager precise-snapshot validation still rejects the duplicate.
+        // The precise register snapshot validation still rejects the duplicate.
         assert_eq!(
-            stack.root_snapshot_for_heap(&heap, &registers),
+            stack.root_snapshot(heap.id(), &registers),
             Err(RootSetSemanticError::DuplicateRoot(register_root_id(0)))
         );
 
@@ -39650,8 +39303,21 @@ mod tests {
         assert!(heap.targeted_roots().records().is_empty());
     }
 
+    /// Wave 2b superset behavior (migrated from the retired per-op
+    /// `targeted_frame_root_records_unknown_synthetic_target_as_rootless`): the
+    /// retired per-op path REGISTERED a frame cell only when
+    /// `heap_has_allocation(cell)` held; an unallocated synthetic code_block went
+    /// rootless and was never registered. The safepoint gather DROPS that gate and
+    /// emits the RAW cell for every `Some(code_block)` -- a harmless conservative
+    /// over-root resolved at mark time, identical to how the register gather emits
+    /// the raw slot payload. The cell is still NOT a valid precise registry target
+    /// (`register_targeted_root` -> `UnknownCell`); that resolution is deferred to
+    /// mark time. Dispatch never mutates the registry. (The retired
+    /// `TargetedFrameRootPlan::resolve` validation -- and its
+    /// `targeted_frame_root_rejects_invalid_known_target` test -- are removed with
+    /// the resolver.)
     #[test]
-    fn targeted_frame_root_records_unknown_synthetic_target_as_rootless() {
+    fn frame_header_gather_emits_unallocated_code_block_cell_as_raw_superset() {
         let block = code_block(vec![typed(0)]);
         let code_block_id = CodeBlockId(CellId(44));
         let mut stack = ExecutionContextStack::default();
@@ -39667,16 +39333,19 @@ mod tests {
             Vec::new(),
         );
         let frame = stack.top_frame().unwrap().id;
-        let snapshot = stack.root_snapshot_for_heap(&heap, &registers).unwrap();
-        assert_eq!(snapshot.frame_roots[0].target, FrameRootTarget::Unknown);
-        let plan = TargetedFrameRootPlan::resolve(&heap, &snapshot).unwrap();
 
-        assert!(plan.records.is_empty());
-        assert_eq!(
-            plan.rootless_descriptors.as_slice(),
-            snapshot.frame_roots.as_slice()
-        );
+        // The gather emits the raw (unallocated) code_block cell as Known, with no
+        // allocation gate -- coverage is a superset of the retired registry's.
+        let gathered = gather_vm_frame_header_roots(&stack, heap_id);
+        assert!(gathered.iter().any(|descriptor| {
+            descriptor.frame == frame
+                && descriptor.source == FrameRootSource::CodeBlock
+                && descriptor.target == FrameRootTarget::Known(code_block_id.0)
+        }));
 
+        // That raw cell is not yet a valid PRECISE registry target (no heap
+        // allocation): the eager per-op resolver rejected it; the gather defers
+        // the payload->CellId resolution to mark time.
         let unknown_frame_root = TargetedRootRecord {
             root: RootRecord {
                 id: frame_root_id(frame, FrameRootSource::CodeBlock),
@@ -39715,37 +39384,15 @@ mod tests {
         assert!(heap.targeted_roots().records().is_empty());
     }
 
+    /// Wave 2b: register-file roots and FRAME-header roots both come from
+    /// safepoint gathers now, in DISJOINT id namespaces, and NEITHER gather
+    /// touches the precise targeted-root registry. (Migrated from the combined
+    /// `safepoint_gather_register_roots_coexist_with_known_frame_roots`, whose
+    /// frame half used the retired `sync_targeted_frame_roots` +
+    /// `cleanup_targeted_root_sets`; the register half is kept and extended with
+    /// the frame-header gather assertion.)
     #[test]
-    fn targeted_frame_root_rejects_invalid_known_target() {
-        let heap = Heap::new();
-        let heap_id = heap.id();
-        let target = CellId(45);
-        let frame = CallFrameId(1);
-        let snapshot = ExecutionRootSnapshot {
-            frame_roots: vec![FrameRootDescriptor::new(
-                heap_id,
-                frame,
-                FrameRootSource::CodeBlock,
-                FrameRootTarget::Known(target),
-            )],
-            register_roots: Vec::new(),
-        };
-
-        assert_eq!(
-            TargetedFrameRootPlan::resolve(&heap, &snapshot),
-            Err(ExecutionError::HeapIntegration(
-                HeapIntegrationError::UnknownCell(target)
-            ))
-        );
-        assert!(heap.targeted_roots().records().is_empty());
-    }
-
-    /// Register-file roots (from the safepoint gather) coexist with the
-    /// FRAME-header roots (still reconciled into the precise registry) without
-    /// interference: their id namespaces are disjoint, and the gather never
-    /// touches the registry.
-    #[test]
-    fn safepoint_gather_register_roots_coexist_with_known_frame_roots() {
+    fn safepoint_gathers_register_and_frame_roots_use_disjoint_namespaces() {
         let block = code_block_with_frame(vec![typed(0)], gather_shape());
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
@@ -39771,29 +39418,20 @@ mod tests {
             .write(window, VirtualRegister::local(1), cell)
             .unwrap();
 
-        // Frame-header roots are still reconciled into the precise registry.
-        let mut active_frame_roots = Vec::new();
-        sync_targeted_frame_roots(
-            frame,
-            &stack,
-            &registers,
-            &mut heap,
-            &mut active_frame_roots,
-        )
-        .unwrap();
-        let frame_root = RootRecord {
-            id: frame_root_id(frame, FrameRootSource::CodeBlock),
-            kind: RootKind::VMRegister,
-            heap: heap_id,
-        };
-        assert!(heap
-            .targeted_roots()
-            .records()
-            .iter()
-            .any(|record| record.root == frame_root && record.target == code_block_id.0));
+        // Frame-header roots now come from the safepoint gather (not the
+        // registry): the CodeBlock cell for this frame is covered, with NO
+        // registry mutation.
+        let frame_plan = gather_vm_frame_header_roots(&stack, heap_id);
+        let frame_root_id_cb = frame_root_id(frame, FrameRootSource::CodeBlock);
+        assert!(frame_plan.iter().any(|descriptor| {
+            descriptor.root.id == frame_root_id_cb
+                && descriptor.source == FrameRootSource::CodeBlock
+                && descriptor.target == FrameRootTarget::Known(code_block_id.0)
+        }));
+        assert!(heap.targeted_roots().records().is_empty());
 
-        // Register-file roots come from the gather in a disjoint id namespace,
-        // with NO registry mutation.
+        // Register-file roots come from the register gather in a disjoint id
+        // namespace, also with NO registry mutation.
         let plan = gather_vm_register_roots(&registers, heap_id).unwrap();
         let ids: Vec<RootId> = plan.roots.iter().map(|root| root.root.id).collect();
         assert!(plan
@@ -39803,11 +39441,9 @@ mod tests {
         assert!(ids.contains(&register_root_id(window.base)));
         assert!(ids.contains(&register_root_id(window.base + 1)));
         assert!(
-            !ids.contains(&frame_root.id),
+            !ids.contains(&frame_root_id_cb),
             "register and frame root id namespaces must stay disjoint"
         );
-
-        cleanup_targeted_root_sets(&mut heap, &mut Vec::new(), &mut active_frame_roots).unwrap();
         assert!(heap.targeted_roots().records().is_empty());
     }
 
@@ -39905,8 +39541,12 @@ mod tests {
             )
             .unwrap();
 
+        // Wave 2b: the diagnostic `root_snapshot` (unknown frame-target policy)
+        // replaces the retired heap-resolving `root_snapshot_for_heap`. The
+        // unresolved cells here are not heap-allocated, so both yielded the same
+        // Unknown/Unknown/NoTarget frame-target shape.
         let snapshot = stack
-            .root_snapshot_for_heap(&heap, &registers)
+            .root_snapshot(heap.id(), &registers)
             .expect("valid roots");
 
         assert_eq!(snapshot.frame_roots.len(), 3);
