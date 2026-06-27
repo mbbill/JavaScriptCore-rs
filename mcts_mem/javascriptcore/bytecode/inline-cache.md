@@ -1,0 +1,31 @@
+- Property and call bytecodes own inline-cache feedback that starts generic and is specialized from observed Structures, offsets, call targets, access cases, and watchpoints.
+- Property inline caches use StructureStubInfo, AccessCase, and repatching to turn repeated get/put/in/by-val operations into guarded fast paths while falling back for uncacheable or over-polymorphic sites.
+- Call sites use CallLinkInfo as a parallel cache that records call kind, target executable/function variation, and tail/getter/setter cases needed by later tiers.
+- Inline-cache state is safe for concurrent tier compilation by separating main-thread mutation from locked or immutable compiler-readable summaries.
+- Cache invalidation is watchpoint-driven: structure transitions, prototype-chain changes, dictionary flattening, and adaptive clearing reset or fire cache state before stale stubs can be reused.
+
+## Facts
+
+- 2008-09-04 (80995d32) rationale: cache-miss prototype walks demote dictionary-mode intermediate prototypes to normal structures instead of refusing to cache, because a heavily accessed prototype is unlikely to be a true dictionary (sourced).
+- 2008-09-14 (8cc2701d) measurement: caching new-property put_by_id transitions for constructor-shaped property additions improved access-binary-trees by 34% and overall SunSpider by 0.8% (sourced).
+- 2008-09-15 (7585ae3f) measurement: CTI get_by_id/put_by_id speculative inline caching improved SunSpider by 2.8% and V8 by 13% by repatching x86 instructions after the first miss (sourced).
+- 2008-11-25 (a74fd2aa) measurement: allowing one polymorphic get_by_id list to mix direct-prototype and prototype-chain stubs improved V8 by about 2%, mostly deltablue (sourced).
+- 2010-03-05 (fe458ccf) rationale: C-function static property getters are a distinct cache kind from JS getters because the cache hit has the same structure check but calls a stored C function pointer instead of dispatching through a JSFunction (code).
+- 2013-07-25 (4caf7d97) rationale: inline-cache writes happen on the main thread after a slow-path action, while a per-CodeBlock ByteSpinLock protects only the short recording step so concurrent DFG/FTL compilation can read cache data safely (code).
+- 2016-04-14 (bc70ccbe) rationale: megamorphic load cases are delayed until the IC would otherwise hit maxAccessVariantListSize, because they are expensive and should be used only instead of giving up on caching (sourced).
+- 2018-04-08 (f112ad1d) rationale: private-symbol internal fields use own-property bytecodes because internal-field reads must not traverse the prototype chain (sourced).
+- 2019-10-14 (9291a683) pitfall: a single prototype-chain preparation pass is required so inline caching does not use a stale property offset after flattening an uncacheable dictionary (code).
+- 2021-12-08 (690fb658) measurement: try_get_by_id own-value LLInt caching was performance-neutral in current JSC uses but improved try_get_by_id microbenchmarks by about 2.02x geometrically (sourced).
+- 2022-11-24 (1a5636ac) measurement: separate resizable TypedArray IC cases improved emscripten-cube2hash-resizable from 19.1501 to 9.1659, a 2.0893x speedup (sourced).
+- 2026-04-09 (da43fc76) rationale: the ArrayLengthStore stub handles only int32 length shrinks on int32/contiguous arrays and falls back for growth, non-int32 values, DoubleShape, and other indexing modes (code).
+
+## Moves
+
+- 2008-11-22 (d9cbee6f) replaced [[prototype-structure-list]]: Extending inline-cache polymorphism to cover self-slot accesses (not only prototype chain) required the structure-list type to be shared between op_get_by_id_self_list and op_get_by_id_proto_list, so the prototype-only PrototypeStructureList was generalized to PolymorphicAccessStructureList that can record either kind. (code)
+- 2008-11-25 (a74fd2aa) replaced [[polymorphic-get-by-id-proto-only-list]]: The old PolymorphicStubInfo held a single Structure* proto field and could only record direct-prototype accesses; the new version uses a union { Structure* proto; StructureChain* chain } plus an isChain bit, enabling a single polymorphic list to hold both proto and proto-chain stubs and yielding ~2% on v8 benchmarks. (sourced)
+- 2010-01-18 (f1d57724) replaced [[ptr-and-flags-jit-link-info]]: PtrAndFlags<> hides pointer bits from the OS X Leaks tool (which scans memory for recognizable pointers), breaking leak detection; the replacement uses a plain C++ bitfield member for CallLinkInfo and a sentinel pointer value (MethodCallLinkInfo_seenFlag = (Structure*)1) encoding state in cachedPrototypeStructure for MethodCallLinkInfo. (code)
+- 2014-03-23 (a67a45ec) replaced [[return-pc-indexed-call-link-info-vector]]: Passing CallLinkInfo* directly to call-link slow paths lets call inline caches be planted inside other inline caches or stubs without requiring association with an op_call/op_construct return PC and a CodeBlock vector index. (code)
+- 2019-02-02 (a91eff59) replaced [[codeblock-flat-jit-data]]: JIT-only data (stub infos, math ICs, call link infos, rare-case profiles, incoming call lists, PC-to-origin map, JIT code map) was always allocated inside every CodeBlock even though only a small fraction of CodeBlocks ever reach JIT compilation; moving them into a lazily-created CodeBlock::JITData reduces CodeBlock size from 512 to 352 bytes and yields 1.1% RAMification improvement. (sourced)
+- 2019-10-14 (9291a683) replaced [[prototype-chain-prepare-per-call-site]]: Inline caching could use a stale PropertyOffset after flattening an uncacheable dictionary because generateConditions* and PolyProtoAccessChain each flattened independently; a single preparePrototypeChainForCaching() function consolidates the walk so both paths see consistent offsets. (code)
+- 2021-10-30 (24dcd913) replaced [[codeblock-bag-backed-inline-cache-metadata]]: Baseline JIT knows the final counts of StructureStubInfo and CallLinkInfo after compilation, so it can install fixed vectors instead of growing Bags, while DFG/FTL still allocate these records dynamically in DFG::CommonData. (code)
+- 2024-04-06 (ed2c1288) replaced [[stub-routine-held-structure-clearing-watchpoints]]: Structure/adaptive clearing watchpoints now fire a WatchpointSet instead of invalidating a PolymorphicAccessJITStubRoutine directly, so the watchpoint target is no longer a stub-routine pointer. (code)

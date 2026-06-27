@@ -1,0 +1,46 @@
+- JavaScriptCore keeps distinct active profiling surfaces: a per-VM compilation profiler database, a VM sampling profiler integrated with inspector script profiling, type/control-flow instrumentation channels, and profiler-support export channels.
+- The compilation profiler database records per-compilation bytecode snapshots, origin stacks, execution counters, OSR exits, inline statistics, jettison reasons, events, and typed identifiers.
+- Type and control-flow profilers are opt-in instrumentation channels with VM-level enable counts and inspector query APIs for source ranges, type locations, and basic-block/function execution coverage.
+- The sampling profiler runs on a dedicated thread, samples a registered JavaScript execution thread under a lock, records unprocessed frames while the target thread is suspended, then verifies and expands inline stacks after resumption.
+- Sampling frames distinguish executable, WebAssembly, host, regexp, C, and unknown frames, and carry both semantic source locations and machine-frame locations for inlined code.
+- Sampling JSON uses structured JSON values, monotonic timestamps, and source metadata tables.
+- Inspector script profiling combines sampling-profiler traces with per-evaluation timing events through the debugger profiling client.
+- Profiler support exports markers, signposts, source hooks, and JIT-related metadata asynchronously through a shared profiler work queue.
+
+## Facts
+
+- 2008-04-24 (413664e9) rationale: global profiling would instrument DevTools and unrelated page groups, so profiling became scoped to the page group that started it. (sourced)
+- 2008-05-09 (f1b6ae9d) rationale: a single call tree could not preserve multiple completed profiles for later retrieval, so the legacy profiler gained a profile store. (sourced)
+- 2008-05-20 (b2cc0eea) rationale: call identifiers preserve function name, URL, and line number separately so profile consumers can link call sites to resource locations. (sourced)
+- 2008-06-06 (44d845e4) pitfall: recursive profile-tree traversal exhausted the native stack on deep JavaScript call graphs, so traversal moved to iterative post-order walking. (sourced)
+- 2008-07-07 (a23cd4be) rationale: the legacy profiler split mutable collection state from finished profile data so gathering-phase state cannot be accessed through persistent profile results. (code)
+- 2009-04-24 (d8067047) rationale: C++ top-down and bottom-up profile views double-counted recursive call paths, so view computation moved out of the engine. (sourced)
+- 2010-11-19 (34fa876a) rationale: function-boundary hooks make the callee available from the call frame and avoid JIT/interpreter call-site reconstruction machinery. (sourced)
+- 2012-06-05 (4cd5d542) rationale: VM-owned enabled-profiler state lets interpreter, LLInt, and JIT stubs read current profiling state instead of carrying a profiler-reference pointer through JIT entry. (sourced)
+- 2012-12-05 (d374936a) rationale: the compilation profiler is always compiled in but has no cost unless a per-VM database is installed. (sourced)
+- 2012-12-10 (64e9468d) rationale: OSR exit data is split between machine-code exit sites and logical exits because multiple logical exits can share a single patch point. (code)
+- 2012-12-12 (1c9f61f8) rationale: bytecode and profiling data are snapshotted per compilation because value and array profiles mutate across recompilations. (sourced)
+- 2013-03-26 (a2f7a3a1) rationale: profiler databases register a process-exit save callback so profiler output can be saved independently of the embedding client. (sourced)
+- 2013-07-25 (664f53cc) rationale: profiler database mutation uses a full adaptive mutex because bytecode generation and compilation recording are infrequent and can hold the lock long enough that spin-waiting would waste CPU. (sourced)
+- 2014-01-26 (55488f2b) rationale: inspector-side view computation made engine-side focus, exclude, sorting, and visible-time mutation unnecessary. (sourced)
+- 2014-12-05 (5395af1a) rationale: type and control-flow profilers use reference-counted enable helpers so multiple clients can enable instrumentation while construction and teardown occur only on zero-to-one and one-to-zero transitions. (code)
+- 2015-01-20 (0ef73b6c) rationale: inspector-facing control-flow ranges include both executed and unexecuted functions so the front end can distinguish function coverage from basic-block coverage. (code)
+- 2015-09-23 (e79c5971) pitfall: type-profiler location lookup must include the search descriptor because normal-expression and function-return queries can collide at the same source offset. (code)
+- 2016-01-20 (d69f667b) rationale: inspector script profiling switched from legacy per-evaluation CPU profile trees to VM sampling-profiler traces exposed through the ScriptProfiler domain. (code)
+- 2016-01-30 (d707cee2) rationale: inline stacks are expanded after the sampled thread resumes because walking inline metadata while the target is suspended can observe tables being modified by the mutator. (sourced)
+- 2016-04-06 (4ef32c6f) rationale: the sampling loop uses a dedicated sample-then-sleep thread because a WorkQueue timer produced intervals farther from the requested sampling period. (sourced)
+- 2016-05-21 (ef7a3b1e) rationale: the legacy call-hook profiler was removed after sampling profiling became available on all ports and Web Inspector consumed sampling data. (sourced)
+- 2016-06-14 (549785b2) rationale: sampling intervals are randomized because fixed intervals can synchronize with regular program or scheduler activity and bias samples. (sourced)
+- 2017-01-28 (0f34b63e) rationale: inlined semantic frames also retain their containing machine-frame location so profiler output can attribute inline code to its optimized DFG/FTL container. (sourced)
+- 2017-07-19 (4b8fc0b1) rationale: machine-thread tracking moved to WTF ThreadGroup because a per-instance TLS destructor registry consumed TLS space and was difficult to maintain. (sourced)
+- 2018-03-02 (e05d544b) rationale: profiler and debugger timestamps use typed Seconds internally, converting to raw doubles only at protocol boundaries. (sourced)
+- 2019-01-25 (8c5faaa1) rationale: the sampling profiler exposes its own thread so external consumers can identify and exclude profiler activity. (code)
+- 2019-09-16 (44b0a050) pitfall: reporting sampling-profiler data must hold the VM API lock when it can query JSFunction names and allocate rare data. (sourced)
+- 2020-09-01 (a4d10e58) rationale: exposing the sampling thread as a portable WTF thread lets clients derive platform thread identifiers without a Darwin-only API. (code)
+- 2022-02-05 (33a14273) pitfall: thread suspension and resumption are serialized by a global suspension locker because two threads can otherwise suspend each other and deadlock. (sourced)
+- 2023-08-31 (1b873228) rationale: sampling JSON uses monotonic epoch timestamps so samples can be synchronized with system-wide traces, while inspector-facing script-profiler times remain stopwatch-relative. (sourced)
+- 2024-08-23 (010b05ae) rationale: sampling JSON emits source metadata once in a top-level table instead of repeating URL and source-map identity on every sampled frame. (code)
+- 2024-09-22 (89d48d63) rationale: profiler database and compilation identifiers use the engine-wide typed atomic identifier abstraction rather than profiler-specific counters. (code)
+- 2025-03-21 (8304b752) rationale: the source-profiling ABI is versioned and append-only, with major bumps for incompatible payload changes and minor bumps for appended fields. (code)
+- 2025-04-06 (3b0d8612) rationale: profiler-side text marker and JITDump work share one asynchronous profiler support queue rather than each sink owning its own queue. (code)
+- 2026-03-18 (c0b0c8d8) pitfall: profiler support must drain the shared asynchronous queue at process exit or large JITDump work can remain pending when the shell exits. (sourced)

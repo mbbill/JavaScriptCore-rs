@@ -1,0 +1,36 @@
+- JavaScriptCore is the JavaScript and WebAssembly engine of WebKit: it parses, compiles, and executes ECMAScript and Wasm within a single virtual machine.
+- Execution is multi-tier and adaptive: source is parsed to bytecode, run first by an interpreter (LLInt), then promoted through progressively more optimizing compilers (Baseline, DFG, FTL) as code becomes hot.
+- A single register-based bytecode is the common program representation that every execution tier consumes, produced once from the AST and reused across tiers via an unlinked/linked split.
+- Speculative optimization is the core performance strategy: upper tiers compile under type assumptions gathered from runtime profiles and deoptimize via on-stack replacement when assumptions fail.
+- Optimizing compilation flows through a shared SSA backend that lowers to a low-level abstract IR before machine-code emission, and all native code is produced through a portable assembler abstraction.
+- Objects use Structure-based hidden classes with inline and out-of-line storage, and every JS value is a single NaN-boxed machine word.
+- Memory is reclaimed by a concurrent generational garbage collector with a segregated-fit allocator and conservative stack scanning.
+- WebAssembly has its own separate tiered compilation pipeline and memory model that share the VM, heap, and backend infrastructure with JavaScript.
+- Regular expressions are handled by the YARR engine, which shares one pattern representation between a bytecode interpreter and a regex JIT.
+- Runtime support is organized around per-realm global objects, explicit VM/thread coordination, module loading, promise/microtask queues, and VM trap coordination.
+- WTF supplies JavaScriptCore's cross-platform substrate for allocation, containers, ownership wrappers, random numbers, Unicode, and threading.
+- A C and Objective-C embedder API exposes the engine to host applications, and inspector, debugger, and profiler facilities hook into VM execution.
+- Standard-library builtins are self-hosted in JavaScript and several layers are generated at build time from domain-specific definition languages.
+
+- [[parser]]
+- [[bytecode]]
+- [[llint]]
+- [[interpreter]]
+- [[baseline-jit]]
+- [[assembler]]
+- [[dfg]]
+- [[ftl]]
+- [[b3]]
+- [[object-model]]
+- [[value-representation]]
+- [[builtin-objects]]
+- [[intl-and-dates]]
+- [[heap]]
+- [[wasm]]
+- [[yarr]]
+- [[builtins-codegen]]
+- [[runtime]]
+- [[wtf-platform]]
+- [[c-api]]
+- [[inspector-debugger]]
+- [[profiler]]

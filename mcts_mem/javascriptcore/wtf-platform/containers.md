@@ -1,0 +1,18 @@
+- WTF containers are value-aware primitives: hash tables explicitly construct, move, destroy, plus translate non-POD and ownership values without refcount churn.
+- Vector-style APIs expose indexes and `notFound` sentinels where clients reason about positions rather than raw iterators.
+- Hash tables expose traits for empty values, deleted values, and minimum table size, giving each key/value family control over storage and allocation costs.
+- Small cache containers avoid redundant randomness when the hash table's own ordering is sufficient for eviction.
+
+## Facts
+
+- 2008-04-28 (35810d6f) pitfall: folding pointer-key hash tables through integer storage violated C99/C++03 strict-aliasing rules and broke with GCC 4.2 `-fstrict-aliasing`. (sourced)
+
+## Moves
+
+- 2005-12-23 (9d272aad) replaced [[hashtable-pod-only]]: The old table used calloc/free and value-copy semantics that required trivially-constructible/destructible types (POD); storing RefPtr<T> in a HashMap caused reference-count thrash on every rehash because values were copied instead of moved; the new implementation uses placement new for initialization, explicit destructor calls for teardown, a Mover template that swaps non-POD values during rehash, and a HashTranslator class approach to defer pair construction during insertion, enabling non-POD types without excess refcount operations. (code)
+- 2006-04-05 (1c33acee) replaced [[hashmap-ptr-specialization-file]]: The old per-type specialization file (HashMapPtrSpec.h) could not express a hash table over RefPtr<StringImpl> that uses raw-pointer storage with -1 as deleted value without a global-initializer static; the new StorageTraits mechanism lets any type declare an underlying storage type sharing the same HashTable instantiation, eliminating the global initializer. (sourced)
+- 2008-04-28 (35810d6f) replaced [[hashtable-shared-backend-via-storage-traits]]: The StorageTraits/HashKeyStorageTraits mechanism reinterpreted pointer and RefPtr keys as integers so one HashTable<int> back-end could serve all pointer-keyed tables, but reinterpreting pointer storage through integer aliases violates C99/C++03 strict-aliasing rules and broke with GCC 4.2 -fstrict-aliasing; each key type now gets its own HashTable instantiation. (sourced)
+- 2008-07-29 (5059fa56) replaced [[vector-find-returns-iterator]]: Returning an iterator from Vector::find was unnatural because Vector is index-oriented; callers had to subtract begin() to get the index, and iterator invalidation rules are confusing; returning a size_t index with sentinel WTF::notFound matches how Vector is used throughout JSC. (sourced)
+- 2011-08-29 (5c165f17) replaced [[hashtable-hardcoded-min-table-size]]: Hard-coding m_minTableSize=64 inside HashTable prevented individual key types from choosing a smaller initial capacity, forcing all hash tables to allocate at least 64-slot arrays even for collections that are almost always tiny; moving minimumTableSize into HashTraits lets callers specialize it per key type. (sourced)
+- 2011-11-09 (b3673a3b) replaced [[hashtable-copy-constructed-empty-bucket]]: HashTable needed an empty-bucket path that does not copy the empty value so noncopyable value types such as OwnPtr can be used as HashMap values. (sourced)
+- 2013-02-15 (e99e2204) replaced [[cache-map-random-eviction]]: The old CacheMap used a side FixedArray indexed by a WeakRandom-generated slot number for eviction, requiring both a HashMap<key,index> and the FixedArray; the commit notes that hash tables are already pseudo-random so a second randomness source adds complexity without benefit, and the new implementation simply removes the first HashMap entry (FIFO) when the map is full. (sourced)

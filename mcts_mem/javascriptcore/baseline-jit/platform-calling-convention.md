@@ -1,0 +1,25 @@
+- Baseline code follows a JIT ABI that fixes call-frame, value-register, callee-save, trampoline, and slow-path-operation conventions per value representation and CPU port.
+- JSVALUE64 passes a JavaScript value in one GPR, while JSVALUE32_64 uses tag/payload pairs and width-aware register abstractions.
+- Platform ports may differ in entry thunks, return-value packing, frame-pointer use, and executable-memory write protocol, but these differences are hidden behind shared MacroAssembler and JIT operation contracts.
+
+## Facts
+
+- 2008-09-07 (9b948e40) rationale: CTI was initially enabled only on x86 Mac and Windows because the macro assembler only implemented x86 instruction encoding at merge time. (code)
+- 2008-10-20 (dc8bc449) pitfall: MSVC cannot return a JSValue wrapper struct in a register from ctiTrampoline, so Windows CTI return positions used raw JSValue* or JSObject* types. (sourced)
+- 2009-02-13 (369058a6) rationale: hard-wired x86 register names were replaced with regT0/regT1-style aliases to enable other architectures and future dynamic register allocation. (sourced)
+- 2009-02-16 (b33f2493) measurement: completing GCC SSE2 runtime detection for x86 Linux enabled a reported 6.6% SunSpider improvement on SSE2-capable machines. (sourced)
+- 2009-06-02 (9703565a) rationale: W^X-exclusive support is feature-gated so makeWritable/makeExecutable can be no-ops when the mode is disabled. (code)
+- 2018-08-17 (fc31691b) pitfall: invalid GPR/FPR register IDs must be representable enum members, not out-of-range -1 values, to avoid UBSan undefined behavior. (code)
+
+## Moves
+
+- 2008-10-07 (a00bca94) replaced [[cti-callframe-init-in-runtime-helper]]: Initializing the new call frame (CodeBlock, ScopeChain, CallerRegisters, ArgumentCount, Callee, OptionalCalleeArguments) inside the C++ runtime helper required storing those fields through ARG_setR and returning the new ctiCode pointer as a void*, with the second result (new r pointer) passed through a hidden CTI_ARGS slot (CTI_ARGS_2ndResult); emitting the frame-init stores as inline JIT instructions and returning both ctiCode and the new r as a VoidPtrPair struct eliminates the hidden-slot round-trip and lets the JIT place r directly in edi without a memory reload. (code)
+- 2008-10-30 (2c36e779) replaced [[voidptrpair-pod-struct]]: Linux ABI does not pass POD structs of two pointers in registers; wrapping the struct in a union with a uint64_t member forces the pair into a single register-sized value, matching Darwin and MSVC behavior needed for correct CTI calling convention. (sourced)
+- 2008-12-05 (1ff382e8) replaced [[jit-direct-x86assembler-calls]]: The JIT was ported from direct X86Assembler calls (via the '__ m_assembler.' macro) to the MacroAssembler abstraction layer to enable future cross-platform portability; the commit notes no change in performance. (sourced)
+- 2009-05-07 (77f3ce7f) replaced [[jit-stub-arg-access-macros]]: Raw void** array access via numbered-index macros (ARG_src1, ARG_callFrame) was replaced with a typed JITStackFrame struct giving named, typed fields so the compiler can type-check stub argument access instead of relying on unsafe casts. (code)
+- 2009-10-26 (64bf77e0) replaced [[arm-traditional-jit-return-address-on-stack]]: ARM Traditional JIT stored thunk return address by pushing it onto the hardware stack (below JITStackFrame), but JSValue32_64 support requires the return address to be at a fixed struct offset inside JITStackFrame (as ARM Thumb2 already did); commit message explicitly states this as a requirement. (sourced)
+- 2013-11-07 (8e5fe7bd) replaced [[dedicated-call-frame-register]]: Using the architected frame pointer as callFrameRegister frees the previously dedicated call-frame register for the DFG register allocator. (sourced)
+- 2016-12-12 (32765c8c) replaced [[arity-only-jit-entrypoints]]: Register-argument JS calls need distinct compiled entries and thunks from stack-argument calls because callers may arrive with callee, argument count, and leading JS arguments in platform argument registers instead of the call frame. (code)
+- 2019-06-06 (906bc2cf) replaced [[gigacage-arm64-disabled]]: ARM64E uses Pointer Authentication Codes (PAC) in the high bits of pointers; the old Gigacage cage() used a simple AND+ADD that would strip PAC bits. The new cageWithoutUntaging() uses bitFieldInsert64 to preserve high PAC bits while replacing only the Gigacage-controlled low bits. (sourced)
+- 2022-03-29 (26b13a47) replaced [[armv7-high-temporary-and-reversed-callee-save-register-map]]: ARMv7 maps lower-order temporaries to r4/r5 and orders regCS0/regCS1 as r10/r11 so Thumb-2 can use shorter encodings for common temporaries and LLInt callee-save code no longer needs target-specific reversed-order handling. (code)
+- 2024-06-20 (0b1e4218) replaced [[windows-x64-jit-ms-abi-shims]]: JSC marks JIT entrypoints and operations SYSV_ABI on Windows so Baseline JIT calls can use the same argument and multi-register return convention as other x86_64 ports instead of Windows shadow-space and hidden-return-pointer shims. (code)
