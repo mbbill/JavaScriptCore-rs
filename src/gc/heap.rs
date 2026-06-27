@@ -662,6 +662,11 @@ impl Heap {
             },
         )?;
 
+        // Allocation slow path: C++ Heap::collectIfNecessaryOrDefer decides
+        // whether to begin a collection here (D2i safepoint poll). No collector
+        // runs in InterpreterOnly, so this defers.
+        self.poll_collection_at_allocation_slow_path();
+
         let cell = CellId(self.next_cell);
         self.next_cell += 1;
         let response = HeapAllocationResponse {
@@ -819,6 +824,35 @@ impl Heap {
         self.conductor = GcConductor::Mutator;
         self.mutator_has_heap_access = true;
         self.mutator_should_be_fenced = false;
+    }
+
+    /// Whether the collector has stopped the world at a GC safepoint so that the
+    /// live register file must be gathered into the marking plan (D2i).
+    ///
+    /// C++ JSC scans the register/stack span only while `worldIsStopped`
+    /// (heap/Heap.cpp:3021 -> Heap::gatherStackRoots, :903); during normal
+    /// execution the mutator holds heap access and no register-root gather runs.
+    /// In the single-threaded `InterpreterOnly` configuration the mutator always
+    /// holds heap access (no collector runs), so this is always false and the
+    /// interpreter safepoint poll (`poll_register_root_safepoint`) performs no
+    /// gather. `mutator_should_be_fenced` is likewise false in `NotRunning`.
+    pub fn register_root_safepoint_is_active(&self) -> bool {
+        !self.mutator_has_heap_access
+    }
+
+    /// Allocation-slow-path collection poll (C++ Heap::collectIfNecessaryOrDefer,
+    /// heap/Heap.cpp). C++ JSC polls here to decide whether to start a collection;
+    /// the live register/stack scan that actually roots the mutator runs
+    /// separately under `worldIsStopped` (Heap::gatherStackRoots ->
+    /// CLoopStack::gatherConservativeRoots), reached at the interpreter safepoint
+    /// poll points which hold the live `RegisterFile`. No collector runs in the
+    /// single-threaded `InterpreterOnly` configuration, so this always defers
+    /// (no-op). Kept as the documented poll site for the future collector (D2i).
+    fn poll_collection_at_allocation_slow_path(&self) {
+        debug_assert!(
+            !self.register_root_safepoint_is_active(),
+            "InterpreterOnly never stops the world at an allocation",
+        );
     }
 
     pub fn enter_no_gc_scope(&mut self) -> NoGcScopeDepth {
@@ -1669,27 +1703,6 @@ impl TargetedRootSet {
         set.validate(heap)?;
         set.rebuild_index();
         Ok(set)
-    }
-
-    /// In-place reload of this set from `records`, reusing the existing `records`
-    /// Vec and `index` HashMap allocations instead of allocating a fresh set.
-    ///
-    /// Semantically identical to constructing a new set via `from_records`
-    /// (validate, then rebuild the id->position index), but used by the
-    /// per-instruction interpreter root sync where a fresh allocation every
-    /// bytecode dominated the hot loop. This is a Rust-internal allocation reuse
-    /// path with no C++ JSC counterpart (C++ JSC roots VM registers through
-    /// conservative stack scanning, not an eager precise targeted-root set).
-    pub fn refill_from_records(
-        &mut self,
-        heap: HeapId,
-        records: impl IntoIterator<Item = TargetedRootRecord>,
-    ) -> Result<(), RootSetSemanticError> {
-        self.records.clear();
-        self.records.extend(records);
-        self.validate(heap)?;
-        self.rebuild_index();
-        Ok(())
     }
 
     pub fn validate(&self, heap: HeapId) -> Result<(), RootSetSemanticError> {

@@ -70,8 +70,7 @@ use crate::interpreter::{
     execute_code_block_deferring_ordinary_calls_with_root_scope_and_dispatch_budget,
     execute_single_dispatch, execute_single_dispatch_deferring_ordinary_calls, find_handler,
     finish_ordinary_js_call_return, pop_call_return_callee, sync_targeted_frame_roots,
-    sync_targeted_nonlocal_frame_roots, sync_targeted_nonlocal_register_roots,
-    sync_targeted_register_roots, validate_call_return_continuation,
+    sync_targeted_nonlocal_frame_roots, validate_call_return_continuation,
     validate_construct_return_continuation, BaselineFallbackRequest, BaselineLoopHandoffRequest,
     CallObservationDescriptor, CallObservationDrainRequest, CallObservationOutcome,
     CallReturnContinuation, ConstructReturnContinuation, CoreGlobalLexicalDeclaration,
@@ -12026,6 +12025,10 @@ impl Vm {
             Err(_) => return ExecutionCompletion::Failed(ExecutionError::GcBoundaryViolation),
         };
 
+        // D2i: only frame-header roots are reconciled at the call boundary; the
+        // register file is a GC root by being live and is gathered at the
+        // safepoint (`gather_vm_register_roots`), not synced per call.
+        // `active_register_roots` stays as an (empty) handle for cleanup.
         let mut active_register_roots = Vec::new();
         let mut active_frame_roots = Vec::new();
         let prepared = sync_targeted_frame_roots(
@@ -12034,17 +12037,7 @@ impl Vm {
             &self.registers,
             &mut self.heap,
             &mut active_frame_roots,
-        )
-        .and_then(|()| {
-            sync_targeted_register_roots(
-                resume.frame,
-                &self.execution,
-                &self.registers,
-                &mut self.heap,
-                host,
-                &mut active_register_roots,
-            )
-        });
+        );
 
         // Run the eval body (compile + link + enter) while roots are pinned. The
         // eval-body `ExecutionCompletion` is then folded into the caller resume.
@@ -12436,24 +12429,8 @@ impl Vm {
                 SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
             );
         }
-        if let Err(error) = sync_targeted_register_roots(
-            resume.frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            host,
-            &mut active_register_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_function_value_call_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
+        // D2i: register-file roots are gathered at the safepoint, not synced at
+        // the call boundary; only the frame-header roots above are reconciled.
 
         let outcome = self.execute_function_value_call_as_single_dispatch(
             request,
@@ -12883,24 +12860,8 @@ impl Vm {
                 SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
             );
         }
-        if let Err(error) = sync_targeted_register_roots(
-            resume.frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            host,
-            &mut active_register_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_ordinary_bytecode_call_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
+        // D2i: register-file roots are gathered at the safepoint, not synced at
+        // the call boundary; only the frame-header roots above are reconciled.
 
         let outcome = self.execute_ordinary_bytecode_call_link_direct_dispatch_body(
             request,
@@ -13130,24 +13091,8 @@ impl Vm {
                 SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
             );
         }
-        if let Err(error) = sync_targeted_register_roots(
-            resume.frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            host,
-            &mut active_register_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_ordinary_bytecode_call_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
+        // D2i: register-file roots are gathered at the safepoint, not synced at
+        // the call boundary; only the frame-header roots above are reconciled.
 
         let outcome = self.execute_ordinary_bytecode_call_as_single_dispatch(
             request,
@@ -13343,24 +13288,8 @@ impl Vm {
                 SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
             );
         }
-        if let Err(error) = sync_targeted_register_roots(
-            resume.frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            host,
-            &mut active_register_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_ordinary_bytecode_construct_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
+        // D2i: register-file roots are gathered at the safepoint, not synced at
+        // the call boundary; only the frame-header roots above are reconciled.
 
         let outcome = self.execute_ordinary_bytecode_construct_as_single_dispatch(
             request,
@@ -13430,24 +13359,8 @@ impl Vm {
                 SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
             );
         }
-        if let Err(error) = sync_targeted_register_roots(
-            resume.frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            host,
-            &mut active_register_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return self.resume_ordinary_bytecode_construct_no_gc(
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
+        // D2i: register-file roots are gathered at the safepoint, not synced at
+        // the call boundary; only the frame-header roots above are reconciled.
 
         let outcome = self.execute_ordinary_bytecode_construct_link_direct_dispatch_body(
             request,
@@ -14419,8 +14332,13 @@ impl Vm {
     fn sync_generated_direct_call_deferred_nonlocal_roots<H: DispatchHost>(
         &mut self,
         current_frame: CallFrameId,
-        host: &mut H,
-        active_register_roots: &mut Vec<RootRecord>,
+        // D2i: the deferred direct-call path no longer eagerly syncs the
+        // caller-frame REGISTER-file roots (`host`/`_active_register_roots` are
+        // unused now); those slots are GC roots by being live and are gathered at
+        // the safepoint (`gather_vm_register_roots`). Only the nonlocal
+        // FRAME-header roots are reconciled here.
+        _host: &mut H,
+        _active_register_roots: &mut Vec<RootRecord>,
         active_frame_roots: &mut Vec<RootRecord>,
     ) -> Result<(), ExecutionError> {
         if !self.generated_direct_call_deferred_rooting_is_active() {
@@ -14432,14 +14350,6 @@ impl Vm {
             &self.registers,
             &mut self.heap,
             active_frame_roots,
-        )?;
-        sync_targeted_nonlocal_register_roots(
-            current_frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            host,
-            active_register_roots,
         )
     }
 
@@ -23386,10 +23296,15 @@ mod tests {
     fn create_empty_object_for_test(vm: &mut Vm, host: &mut RecordingCoreHost) -> RuntimeValue {
         let setup = empty_object_setup_code_block();
         let owner = register_test_code_block(vm, setup.clone());
-        match execute_registered_code_block_with_host(vm, owner, &setup, host) {
+        let value = match execute_registered_code_block_with_host(vm, owner, &setup, host) {
             ExecutionCompletion::Returned(value) => value,
             completion => unreachable!("expected empty setup object, got {completion:?}"),
-        }
+        };
+        // D2i: the setup object is no longer eagerly published by a per-op
+        // register sync, so publish it explicitly for tests that need a bound
+        // cell (lazy publication, the D1-coupled remainder).
+        publish_object_for_test(vm, host, value);
+        value
     }
 
     fn create_indexed_array_for_test(
@@ -27062,9 +26977,9 @@ mod tests {
         }
     }
 
-    fn load_function_value_for_test<H: DispatchHost>(
+    fn load_function_value_for_test(
         vm: &mut Vm,
-        host: &mut H,
+        host: &mut RecordingCoreHost,
         function_index: u32,
     ) -> RuntimeValue {
         let setup = linked_p6_test_code_block(vec![
@@ -27084,10 +26999,17 @@ mod tests {
             ),
         ]);
         let setup_owner = register_test_code_block(vm, setup.clone());
-        match execute_registered_code_block_with_host(vm, setup_owner, &setup, host) {
+        let value = match execute_registered_code_block_with_host(vm, setup_owner, &setup, host) {
             ExecutionCompletion::Returned(value) => value,
             completion => unreachable!("expected setup function value, got {completion:?}"),
-        }
+        };
+        // D2i: the function value is no longer eagerly published by a per-op
+        // register sync; publish it explicitly (lazy publication, the D1-coupled
+        // remainder) so tests can resolve its heap cell.
+        host.core
+            .publish_object_to_heap_for_test(&mut vm.heap, value)
+            .expect("publish function value");
+        value
     }
 
     fn load_object_constructor_value_for_test<H: DispatchHost>(
@@ -28629,6 +28551,24 @@ mod tests {
         vm.heap()
             .cell_for_payload(payload)
             .expect("cell should be bound to the heap")
+    }
+
+    /// Test-only: publish a register-resident object into the heap payload<->cell
+    /// bridge and return its `CellId`.
+    ///
+    /// D2i retired the eager per-op register-root bind that used to publish such
+    /// objects as a side effect; tests that need a published cell for a
+    /// freshly-created object now arrange it explicitly (publication reverts to
+    /// lazy real-heap-publish + the future-GC safepoint resolver -- the
+    /// D1-coupled remainder). This reuses the unchanged D1 binding code.
+    fn publish_object_for_test(
+        vm: &mut Vm,
+        host: &mut RecordingCoreHost,
+        value: RuntimeValue,
+    ) -> CellId {
+        host.core
+            .publish_object_to_heap_for_test(&mut vm.heap, value)
+            .expect("publish object to heap")
     }
 
     fn assert_heap_published_cell_type(
@@ -32637,6 +32577,11 @@ mod tests {
         } else {
             unreachable!("expected returned object, got {completion:?}");
         };
+        // D2i: the returned object is no longer eagerly published by a per-op
+        // register sync; publish it explicitly (lazy publication, the D1-coupled
+        // remainder) so its heap cell can be inspected.
+        host.publish_object_to_heap_for_test(&mut vm.heap, returned)
+            .unwrap();
         let cell = heap_cell_for_returned_value(&vm, returned);
         let allocation = vm
             .heap()
@@ -32707,6 +32652,10 @@ mod tests {
         } else {
             unreachable!("expected returned array, got {completion:?}");
         };
+        // D2i: publish the returned array explicitly (lazy publication, the
+        // D1-coupled remainder) so its heap cell can be inspected.
+        host.publish_object_to_heap_for_test(&mut vm.heap, returned_array)
+            .unwrap();
         let cell = heap_cell_for_returned_value(&vm, returned_array);
         let allocation = vm
             .heap()
@@ -32800,12 +32749,14 @@ mod tests {
             vm.heap().targeted_roots().records(),
             boundary_snapshot.targeted_roots.as_slice()
         );
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == object_cell));
-        assert!(!host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == other_cell));
+        // D2i: the per-op register-root registry that surfaced the live argument
+        // cell in `dispatch_roots` is retired. Both live argument cells are now
+        // GC roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the previous
+        // `dispatch_roots`/`!other_cell` checks asserted the transient,
+        // partially-synced registry shape (accidental Rust behavior), so they are
+        // dropped. The registry still holds no register roots during dispatch:
+        let _ = (object_cell, other_cell);
         assert!(!vm
             .heap()
             .targeted_roots()
@@ -32978,9 +32929,12 @@ mod tests {
             vm.exception_state().unwind_state().popped_frames(),
             &[host.dispatches[0].0]
         );
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == object_cell));
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert!(!vm
             .heap()
             .targeted_roots()
@@ -33091,9 +33045,12 @@ mod tests {
             Some((BytecodeIndex::from_offset(0), Some(CoreOpcode::TypeOf)))
         );
         assert_eq!(host.dispatch_heap_no_gc_depths, vec![0]);
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == object_cell));
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert!(!vm
             .heap()
             .targeted_roots()
@@ -33576,9 +33533,12 @@ mod tests {
                 Some((BytecodeIndex::from_offset(1), Some(CoreOpcode::Call)))
             );
         }
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == callee_cell));
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert!(
             !host.core.has_call_observation_record(),
             "generated call handoff should drain the local call record"
@@ -38540,12 +38500,12 @@ mod tests {
             host.get_by_name_destination_values_before_dispatch,
             vec![(BytecodeIndex::from_offset(1), RuntimeValue::undefined())]
         );
-        assert!(
-            host.targeted_root_syncs
-                .iter()
-                .any(|(_, desired)| desired.iter().any(|record| record.target == object_cell)),
-            "deferred property exit should publish the caller object root before slow-path dispatch"
-        );
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert_eq!(
             vm.heap().targeted_roots().records(),
             boundary_snapshot.targeted_roots.as_slice()
@@ -38874,12 +38834,12 @@ mod tests {
             .iter()
             .any(|(_, index, opcode)| *index == BytecodeIndex::from_offset(1)
                 && *opcode == Some(CoreOpcode::PutByName)));
-        assert!(
-            host.targeted_root_syncs
-                .iter()
-                .any(|(_, desired)| desired.iter().any(|record| record.target == object_cell)),
-            "deferred property-store exit should publish the caller object root before slow-path dispatch"
-        );
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert_eq!(
             vm.heap().targeted_roots().records(),
             boundary_snapshot.targeted_roots.as_slice()
@@ -39030,12 +38990,12 @@ mod tests {
             .iter()
             .any(|(_, index, opcode)| *index == BytecodeIndex::from_offset(1)
                 && *opcode == Some(CoreOpcode::CallWithThis)));
-        assert!(
-            host.targeted_root_syncs.iter().any(|(_, desired)| desired
-                .iter()
-                .any(|record| record.target == second_inner_cell)),
-            "deferred CallWithThis exit should publish the caller's live inner callee before slow nested dispatch"
-        );
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert_eq!(
             vm.heap().targeted_roots().records(),
             boundary_snapshot.targeted_roots.as_slice()
@@ -39148,12 +39108,12 @@ mod tests {
             .iter()
             .any(|(_, index, opcode)| *index == BytecodeIndex::from_offset(1)
                 && *opcode == Some(CoreOpcode::Construct)));
-        assert!(
-            host.targeted_root_syncs.iter().any(|(_, desired)| desired
-                .iter()
-                .any(|record| record.target == second_constructor_cell)),
-            "deferred Construct exit should publish the caller's live constructor root before slow nested dispatch"
-        );
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert_eq!(
             vm.heap().targeted_roots().records(),
             boundary_snapshot.targeted_roots.as_slice()
@@ -46373,11 +46333,12 @@ mod tests {
             .tiering_integration()
             .call_link_inline_cache_attachment_records()
             .is_empty());
-        assert!(host.dispatch_roots[call_dispatch].iter().any(|record| {
-            descriptor
-                .callee_object
-                .is_some_and(|object| record.target == object.0)
-        }));
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert_eq!(
             *code_block.side_tables().inline_caches(),
             inline_caches_before,
@@ -46810,12 +46771,12 @@ mod tests {
             vm.exception_state().unwind_state().popped_frames(),
             &[host.dispatches[0].0]
         );
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == callee_cell));
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == thrown_cell));
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert!(
             !host.core.has_call_observation_record(),
             "throwing generated call handoff should drain the local call record"
@@ -46960,9 +46921,12 @@ mod tests {
                 (BytecodeIndex::from_offset(1), Some(CoreOpcode::Return)),
             ]
         );
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == callee_cell));
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert_eq!(
             vm.tiering_integration().fallback_records().len(),
             fallback_count_before,
@@ -47040,12 +47004,12 @@ mod tests {
                 ))
             );
         }
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == callee_cell));
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == this_cell));
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert!(
             !host.core.has_call_observation_record(),
             "generated CallWithThis handoff should drain the local call record"
@@ -47543,15 +47507,12 @@ mod tests {
             vm.exception_state().unwind_state().popped_frames(),
             &[host.dispatches[0].0]
         );
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == callee_cell));
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == this_cell));
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == thrown_cell));
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert!(
             vm.tiering_integration()
                 .call_link_descriptor_records()
@@ -47664,13 +47625,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(BytecodeIndex::from_offset(1), Some(CoreOpcode::GetByName))]
         );
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == object_cell));
-        assert!(host
-            .targeted_root_syncs
-            .iter()
-            .any(|(_, desired)| desired.iter().any(|record| record.target == object_cell)));
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
         assert!(
             !host.core.has_property_lookup_record(),
             "generated property handoff should drain the local lookup record"
@@ -53318,9 +53278,12 @@ mod tests {
             vm.exception_state().unwind_state().popped_frames(),
             &[host.dispatches[0].0]
         );
-        assert!(host.dispatch_roots[0]
-            .iter()
-            .any(|record| record.target == object_cell));
+        // D2i: the live register cells (callee/this/object/thrown) are GC
+        // roots by being live in the register file and are covered by the
+        // safepoint gather (`gather_vm_register_roots`); the retired per-op
+        // register-root registry no longer surfaces them in
+        // `dispatch_roots`/`targeted_root_syncs`, so those transient-registry
+        // assertions are dropped.
 
         let exception_plan = vm
             .exception_state()
@@ -53625,6 +53588,12 @@ mod tests {
         } else {
             unreachable!("expected returned object, got {completion:?}");
         };
+        // D2i: the returned object is no longer eagerly published by a per-op
+        // register sync; publish it explicitly (lazy publication, the D1-coupled
+        // remainder) so its heap cell can be inspected.
+        host.core
+            .publish_object_to_heap_for_test(&mut vm.heap, returned)
+            .unwrap();
         let cell = heap_cell_for_returned_value(&vm, returned);
         let allocation = vm
             .heap()
@@ -58248,6 +58217,10 @@ mod tests {
             ExecutionCompletion::Returned(value) => value,
             completion => panic!("expected runtime-helper object return, got {completion:?}"),
         };
+        // D2i: publish the returned object explicitly (lazy publication, the
+        // D1-coupled remainder) so its heap cell type can be inspected.
+        host.publish_object_to_heap_for_test(&mut vm.heap, returned)
+            .unwrap();
         assert_eq!(
             heap_cell_type_for_returned_value(&vm, returned),
             CellType::Object

@@ -323,25 +323,9 @@ impl Vm {
                 SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
             );
         }
-        if let Err(error) = sync_targeted_register_roots(
-            resume_frame,
-            &self.execution,
-            &self.registers,
-            &mut self.heap,
-            host,
-            &mut active_register_roots,
-        ) {
-            let cleanup = cleanup_targeted_root_sets(
-                &mut self.heap,
-                &mut active_register_roots,
-                &mut active_frame_roots,
-            );
-            return resume_generated_no_gc(
-                self,
-                suspended,
-                SingleDispatchOutcome::Failed(cleanup.err().unwrap_or(error)),
-            );
-        }
+        // D2i: register-file roots are gathered at the safepoint, not synced at
+        // the generated direct-call boundary; only the frame-header roots above
+        // are reconciled.
 
         let result = self.execute_validated_generated_js_direct_call_with_return_mode(
             validation,

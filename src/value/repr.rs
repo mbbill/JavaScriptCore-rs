@@ -719,6 +719,7 @@ pub struct ValueStackRootPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValueStackRootError {
+    Conversion(ValueStackConversionError),
     RootSet(RootSetSemanticError),
     RootIdOverflow,
 }
@@ -726,6 +727,12 @@ pub enum ValueStackRootError {
 impl From<RootSetSemanticError> for ValueStackRootError {
     fn from(error: RootSetSemanticError) -> Self {
         Self::RootSet(error)
+    }
+}
+
+impl From<ValueStackConversionError> for ValueStackRootError {
+    fn from(error: ValueStackConversionError) -> Self {
+        Self::Conversion(error)
     }
 }
 

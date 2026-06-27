@@ -35,9 +35,9 @@ use crate::bytecompiler::BytecompilerGlobalBindingSet;
 use crate::gc::{
     static_cell_metadata_registry, AllocationMode, BarrierDecisionError, BarrierFieldKind,
     BarrierMutationAuthority, BarrierRequirementOutcome, BarrierWriteContext, CellId, CellState,
-    CellType, GcRef, Heap, HeapAllocationRequest, HeapId, HeapIntegrationError, RootId, RootIdSet,
-    RootKind, RootRecord, RootSetMutationAuthority, RootSetSemanticError, StructureId,
-    TargetedRootRecord, TargetedRootSet, WriteBarrierApplicationRequest,
+    CellType, GcRef, Heap, HeapAllocationRequest, HeapId, HeapIntegrationError, RootId, RootKind,
+    RootRecord, RootSetMutationAuthority, RootSetSemanticError, StructureId, TargetedRootRecord,
+    TargetedRootSet, WriteBarrierApplicationRequest,
 };
 use crate::jit::ic::{
     GeneratedPropertyStoreMutationCommit, GeneratedPropertyStoreMutationMissReason,
@@ -74,7 +74,10 @@ use crate::runtime::{
     WatchpointGeneration,
 };
 use crate::strings::{AtomId, Identifier, PropertyIndex, PropertyKey};
-use crate::value::{EncodedJsValue, NumberValue, ValueKind};
+use crate::value::{
+    encode_value_stack, plan_value_stack_roots, EncodedJsValue, NumberValue, ValueKind,
+    ValueStackConversionError, ValueStackRootPlan, ValueStackSnapshot,
+};
 use crate::vm::{
     ExceptionState, ExceptionUnwindState, PendingException, TerminationReason, UnwindHandler,
 };
@@ -897,81 +900,6 @@ impl ExecutionContextStack {
         })
     }
 
-    fn register_root_snapshot_for_frame(
-        &self,
-        heap: &Heap,
-        registers: &RegisterFile,
-        owner_frame: CallFrameId,
-    ) -> Result<ExecutionRootSnapshot, RootSetSemanticError> {
-        let register_roots = self
-            .frames
-            .iter()
-            .filter(|frame| frame.id == owner_frame)
-            .flat_map(|frame| {
-                registers.root_descriptors_for_window(heap.id(), frame.register_window)
-            })
-            .collect::<Vec<_>>();
-        validate_root_records(register_roots.iter().map(|descriptor| descriptor.root))?;
-        Ok(ExecutionRootSnapshot {
-            frame_roots: Vec::new(),
-            register_roots,
-        })
-    }
-
-    /// Fill `register_roots` (cleared first) with the per-frame register-root
-    /// descriptors for `owner_frame`, reusing the caller-owned buffer instead of
-    /// allocating a fresh Vec. Behaves exactly like the `register_roots` field of
-    /// `register_root_snapshot_for_frame` (same descriptors, same order, same
-    /// validation); only the allocation is reused. Used by the per-instruction
-    /// dispatch-loop root sync.
-    fn register_root_snapshot_for_frame_into(
-        &self,
-        heap: &Heap,
-        registers: &RegisterFile,
-        owner_frame: CallFrameId,
-        register_roots: &mut Vec<RegisterRootDescriptor>,
-    ) -> Result<(), RootSetSemanticError> {
-        register_roots.clear();
-        for frame in self.frames.iter().filter(|frame| frame.id == owner_frame) {
-            registers.root_descriptors_for_window_into(
-                heap.id(),
-                frame.register_window,
-                register_roots,
-            );
-        }
-        validate_root_records(register_roots.iter().map(|descriptor| descriptor.root))?;
-        Ok(())
-    }
-
-    /// Range-narrowed form of `register_root_snapshot_for_frame_into`: fill
-    /// `register_roots` (cleared first) with the per-frame register-root
-    /// descriptors for `owner_frame` whose absolute slot index lies in
-    /// `lo..=hi`. Produces exactly the in-range subset the full-window form
-    /// would produce; used by the dispatch-loop per-op sync when only a
-    /// coalesced slot span is dirty (`CellRootDirty::Slots`).
-    fn register_root_snapshot_for_frame_range_into(
-        &self,
-        heap: &Heap,
-        registers: &RegisterFile,
-        owner_frame: CallFrameId,
-        lo: usize,
-        hi: usize,
-        register_roots: &mut Vec<RegisterRootDescriptor>,
-    ) -> Result<(), RootSetSemanticError> {
-        register_roots.clear();
-        for frame in self.frames.iter().filter(|frame| frame.id == owner_frame) {
-            registers.root_descriptors_for_window_range_into(
-                heap.id(),
-                frame.register_window,
-                lo,
-                hi,
-                register_roots,
-            );
-        }
-        validate_root_records(register_roots.iter().map(|descriptor| descriptor.root))?;
-        Ok(())
-    }
-
     fn nonlocal_frame_root_snapshot_for_heap(
         &self,
         heap: &Heap,
@@ -987,27 +915,6 @@ impl ExecutionContextStack {
         Ok(ExecutionRootSnapshot {
             frame_roots,
             register_roots: Vec::new(),
-        })
-    }
-
-    fn nonlocal_register_root_snapshot_for_frame(
-        &self,
-        heap: &Heap,
-        registers: &RegisterFile,
-        owner_frame: CallFrameId,
-    ) -> Result<ExecutionRootSnapshot, RootSetSemanticError> {
-        let register_roots = self
-            .frames
-            .iter()
-            .filter(|frame| frame.id != owner_frame)
-            .flat_map(|frame| {
-                registers.root_descriptors_for_window(heap.id(), frame.register_window)
-            })
-            .collect::<Vec<_>>();
-        validate_root_records(register_roots.iter().map(|descriptor| descriptor.root))?;
-        Ok(ExecutionRootSnapshot {
-            frame_roots: Vec::new(),
-            register_roots,
         })
     }
 
@@ -1292,90 +1199,24 @@ impl FrameRootDescriptor {
     }
 }
 
-/// Coalesced cell-membership dirty signal for the per-instruction register-root
-/// sync.
-///
-/// C++ JSC has no per-op rooting at all (the LLInt dispatch macro just advances
-/// PC; the JS register file is conservatively span-scanned once per GC at a
-/// safepoint -- interpreter/CLoopStack.cpp gatherConservativeRoots,
-/// heap/Heap.cpp:903 gatherStackRoots), so this whole signal is a Rust-only
-/// device to approximate that lazy model while keeping a precise targeted root
-/// registry exact for the future Phase-3 safepoint collector.
-///
-/// The prior signal was a single bool ("something changed; rescan the whole
-/// callee window"). On wide richards frames a full-window rescan
-/// (`root_descriptors_for_window_into` over every local + every argument slot)
-/// dominated the in-loop cost. This enum coalesces the per-slot write
-/// information the `write` funnel already has so the in-loop sync can patch only
-/// the slots that actually changed:
-///
-/// - `Clean`: no cell-membership change since the last reconcile; sync skipped.
-/// - `Slots { lo, hi }`: an inclusive span of ABSOLUTE register-file slot
-///   indices (the same index `RegisterFile::write` resolves and the same index
-///   `register_root_id` keys on) whose cell-membership may have changed. The
-///   in-loop sync patches the registry for exactly slots `lo..=hi`.
-/// - `FullWindow`: a whole-span mutation happened outside the per-slot funnel
-///   (`allocate_frame`); the in-loop sync must rescan the full window, exactly
-///   like the prior bool. Releasing the top frame is handled by the root owner
-///   cleaning that frame's window and does not dirty the surviving caller.
-///
-/// Coalescing widens the span monotonically: two writes to different slots
-/// between syncs produce a `Slots` span covering both, so both are patched.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CellRootDirty {
-    Clean,
-    Slots { lo: usize, hi: usize },
-    FullWindow,
-}
-
-impl Default for CellRootDirty {
-    fn default() -> Self {
-        CellRootDirty::Clean
-    }
-}
-
-impl CellRootDirty {
-    /// Widen the dirty signal to include the single absolute slot index `slot`.
-    /// `Clean` becomes a one-slot span; `Slots` grows to cover `slot`;
-    /// `FullWindow` stays `FullWindow` (already maximal). Used by the `write`
-    /// funnel, the only per-slot mutation site.
-    fn widen_slot(&mut self, slot: usize) {
-        *self = match *self {
-            CellRootDirty::Clean => CellRootDirty::Slots { lo: slot, hi: slot },
-            CellRootDirty::Slots { lo, hi } => CellRootDirty::Slots {
-                lo: lo.min(slot),
-                hi: hi.max(slot),
-            },
-            CellRootDirty::FullWindow => CellRootDirty::FullWindow,
-        };
-    }
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RegisterFile {
     values: Vec<RuntimeValue>,
     windows: Vec<RegisterWindow>,
     // C++ JSC divergence: C++ JSC does ZERO per-bytecode rooting. The LLInt
     // dispatch macro just advances PC and jumps
-    // (llint/LowLevelInterpreter.asm dispatch); the JS register file is rooted
-    // by a single conservative span scan gathered ONLY in the GC marking phase
-    // (interpreter/CLoopStack.cpp gatherConservativeRoots,
-    // heap/Heap.cpp gatherStackRoots), so rooting cost is O(stack) once per GC,
-    // not per op.
-    //
-    // Rust instead maintains a precise targeted VM-register root registry that
-    // the dispatch loop reconciles. To approximate the C++ safepoint model
-    // (pay nothing on a pure-arith / cell-stable hot loop), this signal tracks
-    // whether -- and now WHICH SLOTS' -- cell-membership could have changed
-    // since the last reconcile. The targeted VM-register root set is a pure
-    // function of which slots hold cells and which cells those are
-    // (`targeted_register_roots_into` skips non-cell slots), so a write that
-    // neither stores a cell nor overwrites a cell cannot change the root set and
-    // need not trigger a recompute. The dispatch loop gates its per-op sync on
-    // this signal and clears it after a successful sync. The signal coalesces a
-    // dirty SLOT RANGE (see `CellRootDirty`) so the in-loop sync can patch only
-    // the changed slots instead of rescanning the whole callee window.
-    cell_root_dirty: CellRootDirty,
+    // (llint/LowLevelInterpreter.asm dispatch); a value is rooted simply by
+    // being live in a register/stack slot, and the whole live register-file
+    // span is conservatively scanned ONCE per GC at a safepoint
+    // (interpreter/CLoopStack.cpp:111 gatherConservativeRoots adds
+    // currentStackPointer..highAddress; heap/Heap.cpp:903 gatherStackRoots under
+    // worldIsStopped, :3021), so rooting cost is O(stack) once per GC, not per
+    // op. The Rust port now matches that model: there is NO per-store root
+    // bookkeeping; `gather_vm_register_roots` walks this whole live backing
+    // store at the safepoint poll points (D2i). The retired
+    // `cell_root_dirty`/`CellRootDirty` signal and the per-op targeted-root
+    // registry it drove were the prior Rust-only approximation of the safepoint
+    // model and have been removed.
 }
 
 impl RegisterFile {
@@ -1383,18 +1224,21 @@ impl RegisterFile {
         self.values.len()
     }
 
-    /// The coalesced cell-membership dirty signal accumulated since the last
-    /// reconcile (see the `cell_root_dirty` field comment and `CellRootDirty`).
-    /// `Clean` means the dispatch loop can skip the per-op sync entirely.
-    pub(crate) fn cell_root_dirty(&self) -> CellRootDirty {
-        self.cell_root_dirty
-    }
-
-    /// Clears the cell-membership dirty signal to `Clean`. The dispatch loop
-    /// calls this after a successful targeted-root sync, and the pre-loop sync
-    /// calls it after establishing initial state.
-    pub(crate) fn clear_cell_root_dirty(&mut self) {
-        self.cell_root_dirty = CellRootDirty::Clean;
+    /// Encode the whole live register backing store as a value-stack snapshot
+    /// for the safepoint root gather (`gather_vm_register_roots`).
+    ///
+    /// `values` is the contiguous concatenation of every live window's locals
+    /// then arguments (`allocate_frame` grows `values` by `local_count` and then
+    /// pushes the argument slots; `release_frame` truncates back to the window
+    /// base), so there are no gaps and a slot's position in `values` is exactly
+    /// the absolute register-file slot index that `register_root_id` keys on.
+    /// This is the Rust analog of `CLoopStack::gatherConservativeRoots` adding
+    /// the live `currentStackPointer..highAddress` span once at GC time
+    /// (interpreter/CLoopStack.cpp:111-114).
+    pub(crate) fn live_value_stack_snapshot(
+        &self,
+    ) -> Result<ValueStackSnapshot, ValueStackConversionError> {
+        encode_value_stack(&self.values)
     }
 
     pub fn active_windows(&self) -> &[RegisterWindow] {
@@ -1467,82 +1311,6 @@ impl RegisterFile {
         locals.chain(arguments).collect()
     }
 
-    /// Append the register-root descriptors for `window` onto `out` (locals then
-    /// arguments, same order as `root_descriptors_for_window`), reusing the
-    /// caller-owned buffer instead of allocating. Used by the per-instruction
-    /// dispatch-loop root sync to avoid a fresh Vec every bytecode.
-    fn root_descriptors_for_window_into(
-        &self,
-        heap: HeapId,
-        window: RegisterWindow,
-        out: &mut Vec<RegisterRootDescriptor>,
-    ) {
-        for offset in 0..window.local_count {
-            if let Some(descriptor) = self.register_root_descriptor(
-                heap,
-                window,
-                window.base.saturating_add(offset),
-                RegisterSlotKind::Local,
-            ) {
-                out.push(descriptor);
-            }
-        }
-        for offset in 0..window.argument_count {
-            if let Some(descriptor) = self.register_root_descriptor(
-                heap,
-                window,
-                window.argument_base.saturating_add(offset),
-                RegisterSlotKind::Argument,
-            ) {
-                out.push(descriptor);
-            }
-        }
-    }
-
-    /// Append the register-root descriptors for `window` whose ABSOLUTE slot
-    /// index lies in the inclusive range `lo..=hi` onto `out`, in the same
-    /// (locals-then-arguments) order as `root_descriptors_for_window_into`.
-    ///
-    /// This is the range-narrowed counterpart of
-    /// `root_descriptors_for_window_into`, used by the dispatch-loop per-op sync
-    /// when only a coalesced slot span (`CellRootDirty::Slots`) is dirty: it
-    /// produces exactly the descriptors the full-window scan would have produced
-    /// for the in-range slots, and emits NOTHING for out-of-range slots (whose
-    /// roots must be left untouched). Slots in `lo..=hi` that fall outside this
-    /// window (locals/arguments) simply contribute nothing, matching the
-    /// full-window scan which only ever visits in-window slots.
-    fn root_descriptors_for_window_range_into(
-        &self,
-        heap: HeapId,
-        window: RegisterWindow,
-        lo: usize,
-        hi: usize,
-        out: &mut Vec<RegisterRootDescriptor>,
-    ) {
-        for offset in 0..window.local_count {
-            let slot = window.base.saturating_add(offset);
-            if slot < lo || slot > hi {
-                continue;
-            }
-            if let Some(descriptor) =
-                self.register_root_descriptor(heap, window, slot, RegisterSlotKind::Local)
-            {
-                out.push(descriptor);
-            }
-        }
-        for offset in 0..window.argument_count {
-            let slot = window.argument_base.saturating_add(offset);
-            if slot < lo || slot > hi {
-                continue;
-            }
-            if let Some(descriptor) =
-                self.register_root_descriptor(heap, window, slot, RegisterSlotKind::Argument)
-            {
-                out.push(descriptor);
-            }
-        }
-    }
-
     pub fn allocate_frame(
         &mut self,
         owner: CallFrameId,
@@ -1577,22 +1345,12 @@ impl RegisterFile {
             this_offset: CallFrameSlotLayout::JSC_RUST.this_argument_offset,
         };
         self.windows.push(window);
-        // Conservative dirty signal: frame establishment writes argument values
-        // (which may be cells) into freshly grown slots without funneling
-        // through `write` -- a whole-span mutation outside the per-slot funnel.
-        // It therefore forces a FULL-WINDOW rescan (the `FullWindow` sentinel)
-        // rather than a per-slot patch: the affected slots are an entire window
-        // span, not a single resolved index, so coalescing them as a range
-        // would be both wasteful and (because new slots are appended at the
-        // tail) fragile. The interpreter dispatch loop is single-frame -- it
-        // exits the loop at every call/construct boundary (DispatchOutcome::
-        // OrdinaryBytecodeCall/Construct/FunctionValueCall/Return), and the
-        // nested `execute_code_block` performs a fresh-frame full sync for the
-        // new window -- so this signal is not strictly required for correctness
-        // today. Setting it is cheap and keeps the dirty signal sound if a
-        // future path retains the same loop frame across an allocation. When in
-        // doubt, full-rescan.
-        self.cell_root_dirty = CellRootDirty::FullWindow;
+        // C++ JSC does no per-store/per-frame root bookkeeping: the newly
+        // established window's slots become roots simply by being live in the
+        // register file, which the GC-time safepoint scan
+        // (`gather_vm_register_roots`, the analog of
+        // CLoopStack::gatherConservativeRoots) walks in full. No dirty signal is
+        // recorded here (D2i).
         Ok(window)
     }
 
@@ -1688,23 +1446,14 @@ impl RegisterFile {
         // put_data_own_with_write_barrier / put_array_element_with_write_barrier
         // and are independent of this method and untouched.
         //
-        // Mark the targeted register-root set as possibly stale only when this
-        // write changes the cell-membership of the slot: storing a cell adds a
-        // root, overwriting a cell removes or retargets one. A non-cell ->
-        // non-cell write (the pure-arithmetic hot-loop case) leaves the root set
-        // unchanged, so it does not touch the signal and pays no per-op sync
-        // (see the `cell_root_dirty` field comment for the C++ JSC divergence).
-        //
-        // This is the per-slot mutation funnel: it knows the exact absolute slot
-        // index, so it COALESCES that index into the dirty SLOT RANGE rather than
-        // forcing a full-window rescan. The in-loop sync then patches only the
-        // changed slots. Both the cell->non-cell (unregister) and non-cell->cell
-        // (register) and cell->cell (retarget) transitions widen the same range,
-        // so the range covers every slot whose desired root may have changed.
-        let old = *target;
-        if old.as_cell().is_some() || value.as_cell().is_some() {
-            self.cell_root_dirty.widen_slot(slot);
-        }
+        // C++ JSC divergence (D2i): a register store does NO root bookkeeping
+        // either. The slot is a GC root by virtue of being live in the register
+        // file; the GC-time safepoint scan (`gather_vm_register_roots`, the
+        // analog of CLoopStack::gatherConservativeRoots) walks the whole live
+        // span once per collection. The prior per-store
+        // `cell_root_dirty.widen_slot` trigger -- which drove a per-op
+        // targeted-root registry recompute and was the #1 measured interpreter
+        // self-time tax -- has been removed.
         *target = value;
         Ok(())
     }
@@ -3410,16 +3159,14 @@ impl CoreOpcodeDispatchHost {
     /// caller-owned buffer instead of allocating a `records` Vec plus a
     /// `TargetedRootSet` plus a `.to_vec()` copy per call.
     ///
-    /// Divergence from `targeted_register_roots`: this variant does not run the
-    /// `TargetedRootSet::from_records` validation here. That validation
-    /// (no-duplicate-root-id and per-record targeted-root validity over the full
-    /// resolved set) is instead performed once, downstream, by the buffered VM
-    /// root sync (`refill_from_records` on the desired set). This is equivalent
-    /// for this host: every register root produced here is `RootKind::VMRegister`
-    /// (see `register_root_descriptor`), so the downstream VMRegister filter is a
-    /// pass-through and validates exactly the same record set with the same
-    /// errors; the snapshot's root records are also already validated upstream by
-    /// `register_root_snapshot_for_frame_into`.
+    /// D2i: the per-op register-root sync that consumed this is retired, so this
+    /// is no longer on a hot path. It is RETAINED as the D1-coupled
+    /// payload->CellId resolver (cell_for_payload + lazy bind via
+    /// `resolve_register_root_target`) the future safepoint collector will reuse
+    /// to resolve the raw `CellValue`s `gather_vm_register_roots` emits. Unlike
+    /// `targeted_register_roots`, it does not run `TargetedRootSet::from_records`
+    /// validation inline; the caller validates the resolved set (every record is
+    /// `RootKind::VMRegister`, see `register_root_descriptor`).
     pub fn targeted_register_roots_into(
         &mut self,
         heap: &mut Heap,
@@ -3506,6 +3253,24 @@ impl CoreOpcodeDispatchHost {
         Err(ExecutionError::UnresolvedRegisterRoot {
             slot: descriptor.slot,
         })
+    }
+
+    /// Test-only: publish a register-resident object into the payload<->cell heap
+    /// bridge, returning its `CellId`.
+    ///
+    /// D2i removed the EAGER per-op register-root bind that used to publish such
+    /// objects as a side effect (`resolve_register_root_target` ->
+    /// `bind_object_to_heap`); publication now reverts to lazy real-heap-publish
+    /// sites + the future-GC safepoint resolver (the D1-coupled remainder). Tests
+    /// that need a published cell for a freshly-created object now arrange it
+    /// explicitly through this helper, which reuses the unchanged D1 binding code.
+    #[cfg(test)]
+    pub(crate) fn publish_object_to_heap_for_test(
+        &mut self,
+        heap: &mut Heap,
+        value: RuntimeValue,
+    ) -> Result<CellId, ExecutionError> {
+        self.objects.bind_object_to_heap(heap, value)
     }
 
     #[cfg(test)]
@@ -29884,9 +29649,12 @@ fn execute_single_dispatch_with_ordinary_call_handling<H: DispatchHost>(
         Ok(frame) => frame,
         Err(error) => return SingleDispatchOutcome::Failed(error),
     };
-    let mut active_targeted_register_roots = Vec::new();
+    // Frame-header roots (codeblock/callee/lexical-scope) are still reconciled
+    // into the precise registry here; only the per-op REGISTER-FILE rooting was
+    // retired (D2i). `active_targeted_register_roots` stays as an (empty) handle
+    // so the shared cleanup signature is unchanged.
+    let mut active_targeted_register_roots: Vec<RootRecord> = Vec::new();
     let mut active_targeted_frame_roots = Vec::new();
-    let mut register_root_scratch = RegisterRootSyncScratch::new();
 
     if let Err(error) = sync_targeted_frame_roots(
         frame.id,
@@ -29903,22 +29671,14 @@ fn execute_single_dispatch_with_ordinary_call_handling<H: DispatchHost>(
         );
     }
 
-    if let Err(error) = sync_targeted_register_roots_buffered(
-        frame.id,
-        execution.stack,
-        execution.registers,
-        execution.heap,
-        host,
-        &mut active_targeted_register_roots,
-        &mut register_root_scratch,
-    ) {
-        return finish_single_dispatch_with_targeted_root_cleanup(
-            execution.heap,
-            &mut active_targeted_register_roots,
-            &mut active_targeted_frame_roots,
-            SingleDispatchOutcome::Failed(error),
-        );
-    }
+    // VM-entry safepoint poll (D2i). C++ JSC polls for a GC handshake at
+    // VM/call entry; under worldIsStopped the live register file is gathered
+    // ONCE via gather_vm_register_roots (the analog of
+    // CLoopStack::gatherConservativeRoots), replacing the retired per-op
+    // register-root sync that used to run here. No collection runs in the
+    // single-threaded InterpreterOnly configuration (heap.rs
+    // mutator_has_heap_access stays true), so this returns immediately.
+    let _ = poll_register_root_safepoint(execution.registers, execution.heap);
 
     let index = request.bytecode_index.offset() as usize;
     let view = match cursor.get(index) {
@@ -29960,22 +29720,9 @@ fn execute_single_dispatch_with_ordinary_call_handling<H: DispatchHost>(
         host.dispatch_instruction(&mut state, instruction)
     };
 
-    if let Err(error) = sync_targeted_register_roots_buffered(
-        frame.id,
-        execution.stack,
-        execution.registers,
-        execution.heap,
-        host,
-        &mut active_targeted_register_roots,
-        &mut register_root_scratch,
-    ) {
-        return finish_single_dispatch_with_targeted_root_cleanup(
-            execution.heap,
-            &mut active_targeted_register_roots,
-            &mut active_targeted_frame_roots,
-            SingleDispatchOutcome::Failed(error),
-        );
-    }
+    // D2i: no post-op register-root sync. The register file is a GC root by
+    // virtue of being live; it is scanned once at a safepoint, not reconciled
+    // after every dispatch.
 
     let outcome = map_single_dispatch_outcome(
         SingleDispatchOutcomeState {
@@ -30028,7 +29775,6 @@ fn execute_code_block_with_resume<H: DispatchHost>(
     root_scope_mode: InterpreterRootScopeMode,
 ) -> ExecutionCompletion {
     let cursor = InstructionCursor::new(code_block.unlinked().instructions());
-    let force_pre_loop_register_sync = resume.is_some();
     let (frame, mut pc) = match resume {
         Some(request) => match validate_baseline_fallback_request(
             execution.stack,
@@ -30070,32 +29816,17 @@ fn execute_code_block_with_resume<H: DispatchHost>(
         );
     }
 
-    // A fresh frame or baseline resume still needs a full register-window
-    // sync, but a VM-owned root scope can keep a caller frame's roots active
-    // across nested calls. C++ JSC keeps the caller slots in the same stack span
-    // and scans that span only at GC; this mirrors that lifetime while retaining
-    // Rust's precise targeted-root registry. Baseline fallback resumes are
-    // forced full because generated code may have changed slots outside this
-    // loop's `write` funnel.
-    if let Err(error) = sync_targeted_register_roots_for_dispatch_entry(
-        frame.id,
-        execution.stack,
-        execution.registers,
-        execution.heap,
-        host,
-        root_scope,
-        force_pre_loop_register_sync,
-    ) {
-        return finish_with_root_scope_cleanup(
-            execution.heap,
-            root_scope,
-            root_scope_mode,
-            frame.id,
-            frame.register_window,
-            ExecutionCompletion::Failed(error),
-        );
-    }
-    execution.registers.clear_cell_root_dirty();
+    // VM-entry / loop-entry safepoint poll (D2i). C++ JSC roots the register
+    // file by conservatively scanning the live call-frame span ONCE per GC under
+    // worldIsStopped (heap/Heap.cpp:903 gatherStackRoots, :3021 worldIsStopped;
+    // interpreter/CLoopStack.cpp:111-114 gatherConservativeRoots), polled only at
+    // VM-entry, loop back-edges, and trap-service boundaries
+    // (interpreter.md:3). The retired per-op register-root sync that used to run
+    // here (and after every dispatch below) is replaced by this poll, which
+    // gathers the live register file via gather_vm_register_roots only when a
+    // collection has stopped the world. No collector runs in InterpreterOnly, so
+    // it returns immediately and the hot loop pays nothing per op.
+    let _ = poll_register_root_safepoint(execution.registers, execution.heap);
 
     loop {
         if let Some(reason) = execution.exceptions.termination() {
@@ -30160,68 +29891,16 @@ fn execute_code_block_with_resume<H: DispatchHost>(
             };
             host.dispatch_instruction(&mut state, instruction)
         };
-        // C++ JSC divergence: C++ JSC does ZERO per-bytecode rooting -- the
-        // LLInt dispatch macro only advances PC and jumps
-        // (llint/LowLevelInterpreter.asm), and the JS register file is rooted
-        // by one conservative span scan taken ONLY at a GC safepoint
-        // (interpreter/CLoopStack.cpp gatherConservativeRoots,
-        // heap/Heap.cpp gatherStackRoots), so rooting is O(stack) per GC, not
-        // per op. Rust keeps a precise targeted VM-register root registry, but
-        // recomputes it lazily: the per-op sync runs only when a write since the
-        // last reconcile may have changed a slot's cell-membership
-        // (`RegisterFile::cell_root_dirty`). The dispatched op is the only
-        // in-loop write source (`write_register` -> `write`), and
-        // call/construct/return/unwind all EXIT this single-frame loop (the
-        // `match outcome` below), so a clean signal here proves the root set is
-        // still in the correct state -- identical to syncing unconditionally,
-        // but a pure-arith / cell-stable hot loop pays nothing, approximating
-        // the C++ safepoint model.
-        //
-        // The dirty signal is coalesced (see `CellRootDirty`): on `Clean` skip;
-        // on `Slots(lo,hi)` PATCH only the changed slot span (the common case,
-        // ~21% of richards ops, which previously rescanned the whole wide callee
-        // window); on `FullWindow` (frame allocation touched whole spans outside
-        // the per-slot `write` funnel) do the original full-window rescan. The
-        // post-state is identical to an unconditional full-window sync in every
-        // case. Clear to `Clean` only after a successful sync.
-        let sync_result = match execution.registers.cell_root_dirty() {
-            CellRootDirty::Clean => Ok(()),
-            CellRootDirty::Slots { lo, hi } => sync_targeted_register_roots_range_buffered(
-                frame.id,
-                execution.stack,
-                execution.registers,
-                execution.heap,
-                host,
-                &mut root_scope.active_targeted_register_roots,
-                &mut root_scope.register_root_scratch,
-                lo,
-                hi,
-            ),
-            CellRootDirty::FullWindow => sync_targeted_register_roots_buffered_scoped(
-                frame.id,
-                execution.stack,
-                execution.registers,
-                execution.heap,
-                host,
-                &mut root_scope.active_targeted_register_roots,
-                &mut root_scope.register_root_scratch,
-            ),
-        };
-        match sync_result {
-            Ok(()) => {
-                execution.registers.clear_cell_root_dirty();
-            }
-            Err(error) => {
-                return finish_with_root_scope_cleanup(
-                    execution.heap,
-                    root_scope,
-                    root_scope_mode,
-                    frame.id,
-                    frame.register_window,
-                    ExecutionCompletion::Failed(error),
-                );
-            }
-        }
+        // C++ JSC divergence retired (D2i): there is NO per-bytecode rooting
+        // here anymore. The LLInt dispatch macro only advances PC and jumps
+        // (llint/LowLevelInterpreter.asm), and a value is a GC root simply by
+        // being live in the register file, which is conservatively span-scanned
+        // ONCE per GC at a safepoint (interpreter/CLoopStack.cpp:111-114
+        // gatherConservativeRoots; heap/Heap.cpp:903 gatherStackRoots under
+        // worldIsStopped). The prior per-op targeted-root registry sync that ran
+        // after every dispatch (the #1 measured interpreter self-time tax) is
+        // removed; the register file is gathered at the safepoint poll points
+        // (VM-entry above, loop back-edges below) by gather_vm_register_roots.
 
         match outcome {
             DispatchOutcome::Continue => {
@@ -30259,6 +29938,12 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                         ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(target)),
                     );
                 }
+                poll_register_root_safepoint_on_backedge(
+                    index,
+                    target,
+                    execution.registers,
+                    execution.heap,
+                );
                 pc = target;
             }
             DispatchOutcome::Jump(target) => {
@@ -30272,6 +29957,12 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                         ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(target)),
                     );
                 }
+                poll_register_root_safepoint_on_backedge(
+                    index,
+                    target,
+                    execution.registers,
+                    execution.heap,
+                );
                 pc = target;
             }
             DispatchOutcome::Return(value) => {
@@ -30593,172 +30284,6 @@ pub(crate) fn sync_targeted_frame_roots(
     sync_targeted_vm_roots(heap, active_roots, targeted.into_records())
 }
 
-pub(crate) fn sync_targeted_register_roots<H: DispatchHost>(
-    owner_frame: CallFrameId,
-    stack: &ExecutionContextStack,
-    registers: &RegisterFile,
-    heap: &mut Heap,
-    host: &mut H,
-    active_roots: &mut Vec<RootRecord>,
-) -> Result<(), ExecutionError> {
-    let snapshot = stack.register_root_snapshot_for_frame(heap, registers, owner_frame)?;
-    let targeted = host.targeted_register_roots(heap, &snapshot)?;
-    sync_targeted_vm_roots(heap, active_roots, targeted)
-}
-
-/// Allocation-free-per-instruction form of `sync_targeted_register_roots`.
-///
-/// Identical roots, identical register/retarget/unregister order; the only
-/// difference is that every working collection is reused from `scratch` instead
-/// of being freshly allocated each bytecode. The dispatch loops own one
-/// `RegisterRootSyncScratch` across iterations and pass it in here per
-/// instruction. See `RegisterRootSyncScratch` for why this exists (interpreter
-/// hot-loop allocation churn) and that it has no C++ JSC counterpart.
-pub(crate) fn sync_targeted_register_roots_buffered<H: DispatchHost>(
-    owner_frame: CallFrameId,
-    stack: &ExecutionContextStack,
-    registers: &RegisterFile,
-    heap: &mut Heap,
-    host: &mut H,
-    active_roots: &mut Vec<RootRecord>,
-    scratch: &mut RegisterRootSyncScratch,
-) -> Result<(), ExecutionError> {
-    // 1. Fill the register-root snapshot into the reused buffer, then build a
-    //    transient snapshot view that borrows it (no Vec allocation).
-    stack.register_root_snapshot_for_frame_into(
-        heap,
-        registers,
-        owner_frame,
-        &mut scratch.snapshot_registers,
-    )?;
-    let snapshot = ExecutionRootSnapshot {
-        frame_roots: Vec::new(),
-        register_roots: std::mem::take(&mut scratch.snapshot_registers),
-    };
-    // 2. Resolve targeted records into the reused buffer.
-    let targeted_result =
-        host.targeted_register_roots_into(heap, &snapshot, &mut scratch.targeted_records);
-    // Return the snapshot's register buffer to the scratch so its capacity is
-    // reused next instruction, regardless of whether resolution succeeded.
-    scratch.snapshot_registers = snapshot.register_roots;
-    targeted_result?;
-
-    sync_targeted_vm_roots_buffered(heap, active_roots, scratch)
-}
-
-/// Range-narrowed per-instruction register-root sync: reconcile the targeted
-/// VM-register roots for ONLY the slots in the inclusive absolute-slot range
-/// `lo..=hi`, leaving out-of-range active roots exactly as-is.
-///
-/// This is the `CellRootDirty::Slots` fast path of the dispatch loop. The
-/// full-window form (`sync_targeted_register_roots_buffered`) rebuilds the
-/// desired set over the WHOLE callee window and then unregisters every active
-/// root absent from it; doing that with a range-only desired set would wrongly
-/// unregister every live OUT-OF-RANGE root. So this variant instead PATCHES the
-/// registry for the dirty range only:
-///
-///   - It resolves the desired roots for the in-range slots
-///     (`register_root_snapshot_for_frame_range_into` -> `targeted_register_roots_into`).
-///   - It registers/retargets each in-range desired root.
-///   - It unregisters only those currently-active roots whose SLOT IS IN RANGE
-///     and that are absent from the in-range desired set (a cell->non-cell write
-///     in the range). Out-of-range active roots are never considered stale.
-///
-/// The post-state for the in-range slots is byte-identical to what the
-/// unconditional full-window sync would have produced (the verifier invariant);
-/// out-of-range slots did not change, so leaving their roots untouched is also
-/// identical to a full sync (which would re-register them with the same record).
-pub(crate) fn sync_targeted_register_roots_range_buffered<H: DispatchHost>(
-    owner_frame: CallFrameId,
-    stack: &ExecutionContextStack,
-    registers: &RegisterFile,
-    heap: &mut Heap,
-    host: &mut H,
-    active_roots: &mut Vec<RootRecord>,
-    scratch: &mut RegisterRootSyncScratch,
-    lo: usize,
-    hi: usize,
-) -> Result<(), ExecutionError> {
-    // 1. Fill the in-range register-root snapshot into the reused buffer.
-    stack.register_root_snapshot_for_frame_range_into(
-        heap,
-        registers,
-        owner_frame,
-        lo,
-        hi,
-        &mut scratch.snapshot_registers,
-    )?;
-    let snapshot = ExecutionRootSnapshot {
-        frame_roots: Vec::new(),
-        register_roots: std::mem::take(&mut scratch.snapshot_registers),
-    };
-    // 2. Resolve targeted records for the in-range descriptors into the reused
-    //    buffer (same resolution the full-window path uses).
-    let targeted_result =
-        host.targeted_register_roots_into(heap, &snapshot, &mut scratch.targeted_records);
-    scratch.snapshot_registers = snapshot.register_roots;
-    targeted_result?;
-
-    sync_targeted_vm_roots_range_buffered(heap, active_roots, scratch, lo, hi)
-}
-
-/// Range-scoped core of the VM-register-root patch. Mirrors
-/// `sync_targeted_vm_roots_buffered`, but the stale set is restricted to active
-/// roots whose slot is IN the dirty range `lo..=hi`: an out-of-range active root
-/// absent from the (range-only) desired set is NOT stale -- its slot did not
-/// change, so its root must be left alone.
-fn sync_targeted_vm_roots_range_buffered(
-    heap: &mut Heap,
-    active_roots: &mut Vec<RootRecord>,
-    scratch: &mut RegisterRootSyncScratch,
-    lo: usize,
-    hi: usize,
-) -> Result<(), ExecutionError> {
-    let heap_id = heap.id();
-    scratch.desired_set.refill_from_records(
-        heap_id,
-        scratch
-            .targeted_records
-            .iter()
-            .copied()
-            .filter(|record| record.root.kind == RootKind::VMRegister),
-    )?;
-
-    scratch.desired_root_ids.clear();
-    scratch
-        .desired_root_ids
-        .extend(scratch.desired_set.records().iter().map(|r| r.root.id));
-
-    // Stale = active roots whose SLOT lies in [lo, hi] and that the in-range
-    // desired set does not keep. `register_root_slot` is the exact inverse of
-    // `register_root_id` over register-root ids; the register-root active set
-    // contains only such ids, so this in-range test is exact. Out-of-range
-    // active roots are deliberately excluded -- they correspond to slots that
-    // did not change and whose roots a full-window sync would have left
-    // identical.
-    scratch.stale_roots.clear();
-    scratch
-        .stale_roots
-        .extend(
-            active_roots
-                .iter()
-                .copied()
-                .filter(|root| match register_root_slot(root.id) {
-                    Some(slot) => {
-                        slot >= lo && slot <= hi && !scratch.desired_root_ids.contains(&root.id)
-                    }
-                    None => false,
-                }),
-        );
-
-    apply_desired_vm_roots(
-        heap,
-        active_roots,
-        &scratch.desired_set,
-        &scratch.stale_roots,
-    )
-}
-
 pub(crate) fn sync_targeted_nonlocal_frame_roots(
     owner_frame: CallFrameId,
     stack: &ExecutionContextStack,
@@ -30769,19 +30294,6 @@ pub(crate) fn sync_targeted_nonlocal_frame_roots(
     let snapshot = stack.nonlocal_frame_root_snapshot_for_heap(heap, owner_frame)?;
     let targeted = TargetedFrameRootPlan::resolve(heap, &snapshot)?;
     sync_targeted_vm_roots(heap, active_roots, targeted.into_records())
-}
-
-pub(crate) fn sync_targeted_nonlocal_register_roots<H: DispatchHost>(
-    owner_frame: CallFrameId,
-    stack: &ExecutionContextStack,
-    registers: &RegisterFile,
-    heap: &mut Heap,
-    host: &mut H,
-    active_roots: &mut Vec<RootRecord>,
-) -> Result<(), ExecutionError> {
-    let snapshot = stack.nonlocal_register_root_snapshot_for_frame(heap, registers, owner_frame)?;
-    let targeted = host.targeted_register_roots(heap, &snapshot)?;
-    sync_targeted_vm_roots(heap, active_roots, targeted)
 }
 
 fn sync_targeted_vm_roots(
@@ -30808,52 +30320,20 @@ fn sync_targeted_vm_roots(
     apply_desired_vm_roots(heap, active_roots, &desired, &stale_roots)
 }
 
-/// Reusable scratch buffers for the per-instruction register-root sync.
-///
-/// The interpreter dispatch loop runs `sync_targeted_register_roots` after every
-/// bytecode instruction. The straightforward version (`sync_targeted_vm_roots`)
-/// allocates several fresh collections per instruction (the register snapshot
-/// Vec, the host's targeted-record Vec, the filtered desired-record Vec, the
-/// desired `TargetedRootSet`, the desired-id `HashSet`, and the stale-root Vec).
-/// That allocation churn dominated the interpreter hot loop, so the dispatch
-/// loops own one `RegisterRootSyncScratch` across iterations and clear-and-reuse
-/// these buffers each instruction. This is a Rust-internal allocation-reuse
-/// optimization with no C++ JSC counterpart; the produced roots and the order in
-/// which they are registered/retargeted/unregistered are identical to the
-/// allocating path.
-#[derive(Debug, Default)]
-pub(crate) struct RegisterRootSyncScratch {
-    snapshot_registers: Vec<RegisterRootDescriptor>,
-    targeted_records: Vec<TargetedRootRecord>,
-    desired_set: TargetedRootSet,
-    // `RootId`-keyed set using the in-tree integer hasher rather than std's
-    // DoS-resistant SipHash. `RootId` is a VM-internal integer, so SipHash is
-    // pure overhead on this per-bytecode buffer; only set membership is read,
-    // so the swap is semantically inert.
-    desired_root_ids: RootIdSet,
-    stale_roots: Vec<RootRecord>,
-}
-
-impl RegisterRootSyncScratch {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-}
-
 /// VM-owned interpreter root state for live call frames.
 ///
 /// C++ JSC does not create per-dispatch root scopes: VM registers live in one
 /// call-frame stack and `Heap::gatherStackRoots` scans that live span only at a
 /// GC safepoint. Rust still exposes a precise targeted-root registry for the
 /// future collector, so this scope is the Rust ownership skeleton that lets the
-/// registry mirror C++'s stack lifetime: caller roots stay active while a callee
-/// runs, and only the popped/finished frame is cleaned.
+/// FRAME-header registry (codeblock/callee/lexical-scope) mirror C++'s stack
+/// lifetime: caller frame roots stay active while a callee runs, and only the
+/// popped/finished frame is cleaned. Register-FILE roots were retired (D2i):
+/// they are gathered directly from the live register backing store at the
+/// safepoint (`gather_vm_register_roots`), not tracked per-scope.
 #[derive(Debug, Default)]
 pub(crate) struct InterpreterRootSyncScope {
-    active_targeted_register_roots: Vec<RootRecord>,
     active_targeted_frame_roots: Vec<RootRecord>,
-    register_root_scratch: RegisterRootSyncScratch,
-    synced_register_frames: HashSet<CallFrameId>,
     synced_frame_roots: HashSet<CallFrameId>,
 }
 
@@ -30863,32 +30343,20 @@ impl InterpreterRootSyncScope {
     }
 
     fn cleanup_all(&mut self, heap: &mut Heap) -> Result<(), ExecutionError> {
-        let register_cleanup =
-            cleanup_targeted_vm_roots(heap, &mut self.active_targeted_register_roots);
         let frame_cleanup = cleanup_targeted_vm_roots(heap, &mut self.active_targeted_frame_roots);
-        self.synced_register_frames.clear();
         self.synced_frame_roots.clear();
-        register_cleanup.and(frame_cleanup)
+        frame_cleanup
     }
 
     fn cleanup_frame(
         &mut self,
         heap: &mut Heap,
         frame: CallFrameId,
-        window: RegisterWindow,
+        // Register-file roots are no longer tracked per-scope (D2i); only the
+        // frame-header roots are cleaned here. The window is retained in the
+        // signature for call-site symmetry with the VM-stack lifetime.
+        _window: RegisterWindow,
     ) -> Result<(), ExecutionError> {
-        let register_roots = self
-            .active_targeted_register_roots
-            .iter()
-            .copied()
-            .filter(|root| root_is_register_root_for_window(*root, window))
-            .collect::<Vec<_>>();
-        let register_cleanup = cleanup_selected_targeted_vm_roots(
-            heap,
-            &mut self.active_targeted_register_roots,
-            &register_roots,
-        );
-
         let frame_roots = self
             .active_targeted_frame_roots
             .iter()
@@ -30901,52 +30369,9 @@ impl InterpreterRootSyncScope {
             &frame_roots,
         );
 
-        self.synced_register_frames.remove(&frame);
         self.synced_frame_roots.remove(&frame);
-        register_cleanup.and(frame_cleanup)
+        frame_cleanup
     }
-}
-
-/// Buffered form of `sync_targeted_vm_roots`: filter `scratch.targeted_records`
-/// to VMRegister roots and load them into the reused `scratch.desired_set`
-/// (validating in place via `refill_from_records`), compute the stale set in the
-/// reused `scratch.stale_roots`/`scratch.desired_root_ids` buffers, then apply
-/// the same mutations as `sync_targeted_vm_roots`. No per-instruction
-/// allocation.
-fn sync_targeted_vm_roots_buffered(
-    heap: &mut Heap,
-    active_roots: &mut Vec<RootRecord>,
-    scratch: &mut RegisterRootSyncScratch,
-) -> Result<(), ExecutionError> {
-    let heap_id = heap.id();
-    scratch.desired_set.refill_from_records(
-        heap_id,
-        scratch
-            .targeted_records
-            .iter()
-            .copied()
-            .filter(|record| record.root.kind == RootKind::VMRegister),
-    )?;
-
-    scratch.desired_root_ids.clear();
-    scratch
-        .desired_root_ids
-        .extend(scratch.desired_set.records().iter().map(|r| r.root.id));
-
-    scratch.stale_roots.clear();
-    scratch.stale_roots.extend(
-        active_roots
-            .iter()
-            .copied()
-            .filter(|root| !scratch.desired_root_ids.contains(&root.id)),
-    );
-
-    apply_desired_vm_roots(
-        heap,
-        active_roots,
-        &scratch.desired_set,
-        &scratch.stale_roots,
-    )
 }
 
 fn sync_targeted_frame_roots_scoped(
@@ -30961,90 +30386,6 @@ fn sync_targeted_frame_roots_scoped(
     sync_targeted_vm_roots_scoped(heap, active_roots, targeted.into_records(), |root| {
         root_is_frame_root_for_frame(root, owner_frame)
     })
-}
-
-fn sync_targeted_register_roots_buffered_scoped<H: DispatchHost>(
-    owner_frame: CallFrameId,
-    stack: &ExecutionContextStack,
-    registers: &RegisterFile,
-    heap: &mut Heap,
-    host: &mut H,
-    active_roots: &mut Vec<RootRecord>,
-    scratch: &mut RegisterRootSyncScratch,
-) -> Result<(), ExecutionError> {
-    let window = stack
-        .frame(owner_frame)
-        .map(|frame| frame.register_window)
-        .ok_or(ExecutionError::FrameMismatch {
-            expected: owner_frame,
-            actual: stack.top_frame().map(|frame| frame.id),
-        })?;
-    stack.register_root_snapshot_for_frame_into(
-        heap,
-        registers,
-        owner_frame,
-        &mut scratch.snapshot_registers,
-    )?;
-    let snapshot = ExecutionRootSnapshot {
-        frame_roots: Vec::new(),
-        register_roots: std::mem::take(&mut scratch.snapshot_registers),
-    };
-    let targeted_result =
-        host.targeted_register_roots_into(heap, &snapshot, &mut scratch.targeted_records);
-    scratch.snapshot_registers = snapshot.register_roots;
-    targeted_result?;
-
-    sync_targeted_vm_roots_window_buffered(heap, active_roots, scratch, window)
-}
-
-fn sync_targeted_register_roots_for_dispatch_entry<H: DispatchHost>(
-    owner_frame: CallFrameId,
-    stack: &ExecutionContextStack,
-    registers: &RegisterFile,
-    heap: &mut Heap,
-    host: &mut H,
-    root_scope: &mut InterpreterRootSyncScope,
-    force_full_window: bool,
-) -> Result<(), ExecutionError> {
-    let result = if force_full_window || !root_scope.synced_register_frames.contains(&owner_frame) {
-        sync_targeted_register_roots_buffered_scoped(
-            owner_frame,
-            stack,
-            registers,
-            heap,
-            host,
-            &mut root_scope.active_targeted_register_roots,
-            &mut root_scope.register_root_scratch,
-        )
-    } else {
-        match registers.cell_root_dirty() {
-            CellRootDirty::Clean => Ok(()),
-            CellRootDirty::Slots { lo, hi } => sync_targeted_register_roots_range_buffered(
-                owner_frame,
-                stack,
-                registers,
-                heap,
-                host,
-                &mut root_scope.active_targeted_register_roots,
-                &mut root_scope.register_root_scratch,
-                lo,
-                hi,
-            ),
-            CellRootDirty::FullWindow => sync_targeted_register_roots_buffered_scoped(
-                owner_frame,
-                stack,
-                registers,
-                heap,
-                host,
-                &mut root_scope.active_targeted_register_roots,
-                &mut root_scope.register_root_scratch,
-            ),
-        }
-    };
-    if result.is_ok() {
-        root_scope.synced_register_frames.insert(owner_frame);
-    }
-    result
 }
 
 fn sync_targeted_frame_roots_for_dispatch_entry(
@@ -31068,43 +30409,6 @@ fn sync_targeted_frame_roots_for_dispatch_entry(
         root_scope.synced_frame_roots.insert(owner_frame);
     }
     result
-}
-
-fn sync_targeted_vm_roots_window_buffered(
-    heap: &mut Heap,
-    active_roots: &mut Vec<RootRecord>,
-    scratch: &mut RegisterRootSyncScratch,
-    window: RegisterWindow,
-) -> Result<(), ExecutionError> {
-    let heap_id = heap.id();
-    scratch.desired_set.refill_from_records(
-        heap_id,
-        scratch
-            .targeted_records
-            .iter()
-            .copied()
-            .filter(|record| record.root.kind == RootKind::VMRegister),
-    )?;
-
-    scratch.desired_root_ids.clear();
-    scratch
-        .desired_root_ids
-        .extend(scratch.desired_set.records().iter().map(|r| r.root.id));
-
-    scratch.stale_roots.clear();
-    scratch
-        .stale_roots
-        .extend(active_roots.iter().copied().filter(|root| {
-            root_is_register_root_for_window(*root, window)
-                && !scratch.desired_root_ids.contains(&root.id)
-        }));
-
-    apply_desired_vm_roots(
-        heap,
-        active_roots,
-        &scratch.desired_set,
-        &scratch.stale_roots,
-    )
 }
 
 fn sync_targeted_vm_roots_scoped<F>(
@@ -31135,11 +30439,11 @@ where
     apply_desired_vm_roots(heap, active_roots, &desired, &stale_roots)
 }
 
-/// Shared core of the VM-register-root sync, used by both the allocating
-/// (`sync_targeted_vm_roots`) and the buffered per-instruction
-/// (`sync_targeted_register_roots_buffered`) entry points. `desired` is the
+/// Shared reconcile core of the FRAME-header targeted-root sync
+/// (`sync_targeted_vm_roots` / `sync_targeted_vm_roots_scoped`). `desired` is the
 /// validated desired targeted-root set; `stale_roots` is the precomputed set of
-/// currently-active roots that are absent from `desired`.
+/// currently-active roots that are absent from `desired`. (Register-FILE rooting
+/// no longer uses this path; it is gathered at the safepoint, D2i.)
 fn apply_desired_vm_roots(
     heap: &mut Heap,
     active_roots: &mut Vec<RootRecord>,
@@ -31326,36 +30630,6 @@ fn register_root_id(slot: usize) -> RootId {
     )
 }
 
-/// Exact inverse of `register_root_id` over the register-root id namespace:
-/// recovers the absolute slot index a register root keys on, or `None` if the
-/// id is not a register-root id. Used by the range-scoped per-op root sync to
-/// decide which active roots fall inside the dirty slot span (and are therefore
-/// eligible to be unregistered as stale). Frame-root ids live in a separate
-/// reserved namespace (`FRAME_ROOT_ID_BASE`) below `REGISTER_ROOT_ID_BASE`, so
-/// they map to `None` and are never treated as in-range register slots.
-fn register_root_slot(id: RootId) -> Option<usize> {
-    id.0.checked_sub(REGISTER_ROOT_ID_BASE)
-        .and_then(|offset| offset.checked_sub(1))
-        .map(|slot| slot as usize)
-}
-
-fn register_window_contains_slot(window: RegisterWindow, slot: usize) -> bool {
-    let local_end = window.base.saturating_add(window.local_count);
-    let argument_end = window.argument_base.saturating_add(window.argument_count);
-    (slot >= window.base && slot < local_end)
-        || (slot >= window.argument_base && slot < argument_end)
-}
-
-fn root_is_register_root_for_window(root: RootRecord, window: RegisterWindow) -> bool {
-    if root.kind != RootKind::VMRegister {
-        return false;
-    }
-    match register_root_slot(root.id) {
-        Some(slot) => register_window_contains_slot(window, slot),
-        None => false,
-    }
-}
-
 fn root_is_frame_root_for_frame(root: RootRecord, frame: CallFrameId) -> bool {
     if root.kind != RootKind::VMRegister {
         return false;
@@ -31367,6 +30641,90 @@ fn root_is_frame_root_for_frame(root: RootRecord, frame: CallFrameId) -> bool {
 
 fn value_cell_payload(value: RuntimeValue) -> Option<usize> {
     value.as_cell().map(|cell| cell.pointer_payload_bits())
+}
+
+/// Gather the live VM register-file roots at a GC safepoint (D2i).
+///
+/// C++ JSC registers ZERO roots during execution: a value is rooted simply by
+/// living in a register/stack slot, and the whole live span is scanned ONCE per
+/// GC under worldIsStopped (heap/Heap.cpp:3021 worldIsStopped ->
+/// Heap::gatherStackRoots, :903; the live register span is added by
+/// interpreter/CLoopStack.cpp:111-114 CLoopStack::gatherConservativeRoots, which
+/// adds `currentStackPointer..highAddress` once). This routine is that gather:
+/// it walks the WHOLE live register backing store (every slot of every live
+/// window, which `RegisterFile::values` covers contiguously) and emits one
+/// `RootKind::VMRegister` root per cell-tagged slot, with NO per-op registration
+/// and NO identity binding -- the precise typed analog of the conservative span
+/// add, expressed via `plan_value_stack_roots` (value/repr.rs).
+///
+/// Root-coverage equivalence with the retired per-op registry: the registry
+/// selected a slot iff `value_cell_payload(value) = value.as_cell()` was `Some`
+/// (i.e. the slot held a TAG_CELL value); `plan_value_stack_roots` selects iff
+/// `classify_encoded == Cell` (also TAG_CELL). Identical slot predicate over the
+/// identical current register contents over all live frames => identical
+/// register-file root set. The emitted root-id namespace also matches the
+/// registry's `register_root_id(slot) = REGISTER_ROOT_ID_BASE + slot + 1`,
+/// because the snapshot slot index is the absolute register-file slot index and
+/// `first_root` is seeded to `REGISTER_ROOT_ID_BASE + 1`.
+///
+/// Two differences are deferred D1 identity work and have ZERO effect today
+/// because no collector runs: (a) the emitted `CellValue` is the raw slot
+/// payload, NOT a resolved heap `CellId` -- the registry resolved it eagerly via
+/// `resolve_register_root_target` (cell_for_payload + lazy bind); at a real GC
+/// that resolution becomes a mark-time `heap.cell_for_payload(...)` read of the
+/// existing payload<->cell bridge (the analog of resolving a conservative
+/// pointer to a MarkedBlock cell), and (b) register-resident cells that were
+/// never published are no longer force-published on store. Both are D1.
+pub(crate) fn gather_vm_register_roots(
+    registers: &RegisterFile,
+    heap: HeapId,
+) -> Result<ValueStackRootPlan, crate::value::ValueStackRootError> {
+    let snapshot = registers.live_value_stack_snapshot()?;
+    // Seed `first_root` so emitted ids equal the retired registry's
+    // `register_root_id(slot)` namespace (REGISTER_ROOT_ID_BASE + slot + 1).
+    plan_value_stack_roots(&snapshot, heap, RootId(REGISTER_ROOT_ID_BASE + 1)).map_err(Into::into)
+}
+
+/// Safepoint poll for the register-file root gather (D2i).
+///
+/// C++ JSC polls for a GC handshake only at VM-entry, loop back-edges, and
+/// trap-service boundaries (interpreter.md:3; the slow-script/timeout backedge
+/// poll, fact 2008-06-24), never per dispatch. When a collection has stopped the
+/// world (`Heap::worldIsStopped`, heap/Heap.cpp:3021), the collector gathers the
+/// live register file once (`gather_vm_register_roots`, the analog of
+/// `CLoopStack::gatherConservativeRoots` feeding `Heap::gatherStackRoots`,
+/// Heap.cpp:903-908) and consumes the plan with `&mut Heap` afterwards. In the
+/// single-threaded `InterpreterOnly` configuration no collection is ever
+/// requested -- the mutator keeps heap access throughout
+/// (`register_root_safepoint_is_active` is false; heap.rs `mutator_should_be_fenced`
+/// is false in `NotRunning`) -- so this returns `None` immediately and the hot
+/// loop pays nothing. Gather borrows `registers` immutably and a real collection
+/// would borrow `heap` mutably as a non-overlapping later step, so no shared
+/// ownership/lifetime model is required (the borrow `Heap reads the live register
+/// file at the safepoint` already holds at every poll point).
+pub(crate) fn poll_register_root_safepoint(
+    registers: &RegisterFile,
+    heap: &Heap,
+) -> Option<ValueStackRootPlan> {
+    if !heap.register_root_safepoint_is_active() {
+        return None;
+    }
+    gather_vm_register_roots(registers, heap.id()).ok()
+}
+
+/// Loop back-edge variant of [`poll_register_root_safepoint`]: polls only on a
+/// backward branch (the C++ loop/back-edge poll site, interpreter.md:3), so the
+/// forward hot path pays nothing.
+fn poll_register_root_safepoint_on_backedge(
+    current_index: usize,
+    target: BytecodeIndex,
+    registers: &RegisterFile,
+    heap: &Heap,
+) -> Option<ValueStackRootPlan> {
+    if (target.offset() as usize) > current_index {
+        return None;
+    }
+    poll_register_root_safepoint(registers, heap)
 }
 
 fn validate_root_records(
@@ -39390,8 +38748,14 @@ mod tests {
         let value = registers
             .read(window, destination, Some(block.constants()))
             .unwrap();
-        let cell = heap_cell_for_value(&heap, value);
-        assert_eq!(host.objects.cell_id(value), Some(cell));
+        // The object lives in the core object store and is a live register-file
+        // root by virtue of occupying `destination`.
+        assert!(host.objects.cell_id(value).is_some());
+        // D1-coupled remainder (D2i): the retired per-op register sync used to
+        // EAGERLY publish the new object into the payload<->cell heap bridge; it
+        // no longer does, so the payload is not yet heap-bound. Frame-root cleanup
+        // still leaves the targeted-root registry empty.
+        assert!(heap.cell_for_payload(cell_payload(value)).is_none());
         assert!(heap.targeted_roots().records().is_empty());
     }
 
@@ -39862,8 +39226,140 @@ mod tests {
         assert_eq!(exceptions.unwind_state().popped_frames(), &[frame]);
     }
 
+    /// Frame shape with four local slots, used to exercise the safepoint gather
+    /// over a mix of cell and immediate register slots.
+    fn gather_shape() -> RegisterFrameShape {
+        RegisterFrameShape {
+            num_parameters_including_this: 2,
+            num_vars: 3,
+            num_callee_locals: 0,
+            num_temporaries: 1,
+            special: Default::default(),
+        }
+    }
+
+    fn boxed_cell(payload: u64) -> RuntimeValue {
+        RuntimeValue::from_encoded(EncodedJsValue((payload << 8) | 0x20))
+    }
+
+    /// ROOT-COVERAGE EQUIVALENCE (the D2i prime invariant): `gather_vm_register_roots`
+    /// over the live call-frame stack yields EXACTLY the cell-bearing register
+    /// slot set the retired per-op registry held -- same slot predicate (TAG_CELL),
+    /// same `register_root_id` namespace, across every live frame -- and caller-frame
+    /// cells are still gathered while a callee frame is live.
     #[test]
-    fn core_dispatch_registers_targeted_root_and_unregisters_on_completion() {
+    fn gather_vm_register_roots_matches_full_window_recompute_across_live_frames() {
+        let heap_id = HeapId(3);
+        let mut registers = RegisterFile::default();
+
+        // Caller frame: a cell local, an immediate local, and a cell argument.
+        let caller_arg_cell = boxed_cell(0x2222);
+        let caller = registers
+            .allocate_frame(
+                CallFrameId(1),
+                gather_shape(),
+                2,
+                &[RuntimeValue::undefined(), caller_arg_cell],
+            )
+            .unwrap();
+        registers
+            .write(caller, VirtualRegister::local(0), boxed_cell(0x1111))
+            .unwrap();
+        registers
+            .write(caller, VirtualRegister::local(1), RuntimeValue::from_i32(7))
+            .unwrap();
+
+        // Callee frame on top of the caller: one more cell local.
+        let callee = registers
+            .allocate_frame(
+                CallFrameId(2),
+                gather_shape(),
+                1,
+                &[RuntimeValue::undefined()],
+            )
+            .unwrap();
+        registers
+            .write(callee, VirtualRegister::local(2), boxed_cell(0x3333))
+            .unwrap();
+
+        // Reference: the retired registry selected a slot iff its descriptor
+        // carried a cell payload (value.as_cell() == Some), keyed by
+        // register_root_id(slot). `root_descriptors` is the full-window recompute.
+        let mut expected: Vec<(RootId, usize)> = registers
+            .root_descriptors(heap_id)
+            .iter()
+            .filter_map(|descriptor| descriptor.cell_payload.map(|p| (descriptor.root.id, p)))
+            .collect();
+        expected.sort_by_key(|(id, _)| id.0);
+
+        let plan = gather_vm_register_roots(&registers, heap_id).unwrap();
+        let mut gathered: Vec<(RootId, usize)> = plan
+            .roots
+            .iter()
+            .map(|root| (root.root.id, root.cell.pointer_payload_bits()))
+            .collect();
+        gathered.sort_by_key(|(id, _)| id.0);
+
+        assert_eq!(gathered, expected);
+        assert!(!gathered.is_empty(), "guard against a vacuous empty match");
+        assert!(plan
+            .roots
+            .iter()
+            .all(|root| root.root.kind == RootKind::VMRegister && root.root.heap == heap_id));
+        // Caller-frame cells (0x1111, 0x2222) are still gathered while the callee
+        // frame (0x3333) is live -- C++ scans the whole live stack span.
+        for payload in [0x1111usize, 0x2222, 0x3333] {
+            assert!(
+                plan.roots
+                    .iter()
+                    .any(|root| root.cell.pointer_payload_bits() == payload),
+                "missing live register root payload {payload:#x}"
+            );
+        }
+        // The gather is pure: it never mutates the targeted-root registry.
+        let heap = Heap::new();
+        assert!(heap.targeted_roots().records().is_empty());
+    }
+
+    /// Immediate register slots are skipped by the gather (the slot predicate is
+    /// TAG_CELL, identical to the retired registry's `value.as_cell()` test).
+    #[test]
+    fn gather_vm_register_roots_skips_immediate_register_slots() {
+        let heap_id = HeapId(3);
+        let mut registers = RegisterFile::default();
+        let window = registers
+            .allocate_frame(
+                CallFrameId(1),
+                gather_shape(),
+                1,
+                &[RuntimeValue::undefined()],
+            )
+            .unwrap();
+        registers
+            .write(
+                window,
+                VirtualRegister::local(0),
+                RuntimeValue::from_i32(11),
+            )
+            .unwrap();
+        registers
+            .write(window, VirtualRegister::local(1), RuntimeValue::undefined())
+            .unwrap();
+
+        let plan = gather_vm_register_roots(&registers, heap_id).unwrap();
+        assert!(
+            plan.roots.is_empty(),
+            "no cell-tagged slot, so the safepoint gather emits no roots"
+        );
+    }
+
+    /// D2i: a full interpreter run that creates and returns an object no longer
+    /// drives any per-op register-root registry mutation -- the host's
+    /// `targeted_register_roots` hook is never invoked, and `heap.targeted_roots()`
+    /// records nothing from register-file rooting. The object cell is instead a
+    /// root by being live in the register file (proven by the gather above).
+    #[test]
+    fn dispatch_does_not_mutate_register_root_registry() {
         let register = VirtualRegister::local(0);
         let block = code_block(vec![
             core_typed(0, CoreOpcode::NewObject, vec![Operand::Register(register)]),
@@ -39901,118 +39397,17 @@ mod tests {
         } else {
             unreachable!("expected returned object, got {result:?}");
         };
-        let cell = heap_cell_for_value(&heap, value);
-        assert_eq!(host.core.objects.cell_id(value), Some(cell));
-        assert!(host.observations.iter().any(|observation| observation
-            .desired
-            .iter()
-            .any(|record| record.root.kind == RootKind::VMRegister && record.target == cell)));
+        // The retired per-op register sync used to call this hook after every
+        // dispatch; the safepoint model never does (no collection runs).
+        assert!(host.observations.is_empty());
         assert!(heap.targeted_roots().records().is_empty());
-    }
-
-    #[test]
-    fn targeted_register_root_retargets_when_register_cell_changes() {
-        let register = VirtualRegister::local(0);
-        let block = code_block(vec![
-            core_typed(0, CoreOpcode::NewObject, vec![Operand::Register(register)]),
-            core_typed(1, CoreOpcode::NewObject, vec![Operand::Register(register)]),
-            core_typed(2, CoreOpcode::Return, vec![Operand::Register(register)]),
-        ]);
-        let code_block_id = CodeBlockId(CellId(32));
-        let mut stack = ExecutionContextStack::default();
-        let mut registers = RegisterFile::default();
-        let mut exceptions = ExceptionState::default();
-        let mut heap = Heap::new();
-        enter_program_frame(
-            &mut stack,
-            &mut registers,
-            code_block_id,
-            &block,
-            Vec::new(),
-        );
-        let mut host = ObservingCoreHost::new();
-
-        let result = execute_code_block(
-            InterpreterExecutionState {
-                stack: &mut stack,
-                registers: &mut registers,
-                exceptions: &mut exceptions,
-                heap: &mut heap,
-            },
-            code_block_id,
-            &block,
-            &mut host,
-            DispatchConfig::default(),
-        );
-
-        let value = if let ExecutionCompletion::Returned(value) = result {
-            value
-        } else {
-            unreachable!("expected returned object, got {result:?}");
-        };
-        let returned_cell = heap_cell_for_value(&heap, value);
-        let retarget = host
-            .observations
-            .iter()
-            .find(|observation| {
-                observation.existing.len() == 1
-                    && observation.desired.len() == 1
-                    && observation.existing[0].root == observation.desired[0].root
-                    && observation.existing[0].target != observation.desired[0].target
-            })
-            .expect("register root retarget observation");
-
-        assert_eq!(retarget.desired[0].target, returned_cell);
-        assert!(heap.targeted_roots().records().is_empty());
-    }
-
-    #[test]
-    fn targeted_register_root_unregisters_when_register_becomes_immediate() {
-        let register = VirtualRegister::local(0);
-        let block = code_block(vec![
-            core_typed(0, CoreOpcode::NewObject, vec![Operand::Register(register)]),
-            core_typed(
-                1,
-                CoreOpcode::LoadInt32,
-                vec![Operand::Register(register), Operand::SignedImmediate(7)],
-            ),
-            core_typed(2, CoreOpcode::Return, vec![Operand::Register(register)]),
-        ]);
-        let code_block_id = CodeBlockId(CellId(33));
-        let mut stack = ExecutionContextStack::default();
-        let mut registers = RegisterFile::default();
-        let mut exceptions = ExceptionState::default();
-        let mut heap = Heap::new();
-        enter_program_frame(
-            &mut stack,
-            &mut registers,
-            code_block_id,
-            &block,
-            Vec::new(),
-        );
-        let mut host = ObservingCoreHost::new();
-
-        let result = execute_code_block(
-            InterpreterExecutionState {
-                stack: &mut stack,
-                registers: &mut registers,
-                exceptions: &mut exceptions,
-                heap: &mut heap,
-            },
-            code_block_id,
-            &block,
-            &mut host,
-            DispatchConfig::default(),
-        );
-
-        assert_eq!(
-            result,
-            ExecutionCompletion::Returned(RuntimeValue::from_i32(7))
-        );
-        assert!(host.observations.iter().any(|observation| {
-            observation.existing.len() == 1 && observation.desired.is_empty()
-        }));
-        assert!(heap.targeted_roots().records().is_empty());
+        // D1-coupled remainder (intentional, returned as a note): the per-op
+        // register sync used to EAGERLY publish a register-resident object to the
+        // heap (resolve_register_root_target -> bind_object_to_heap). With it
+        // retired, the object is no longer force-published on store -- its payload
+        // is not yet bound in the payload<->cell bridge. Publication reverts to
+        // the lazy real-heap-publish sites + the future-GC safepoint resolution.
+        assert!(heap.cell_for_payload(cell_payload(value)).is_none());
     }
 
     #[test]
@@ -40182,8 +39577,13 @@ mod tests {
         assert!(heap.targeted_roots().records().is_empty());
     }
 
+    /// The eager `root_snapshot_for_heap` validation still rejects a malformed
+    /// (duplicate-frame) snapshot. The retired per-op register sync used to
+    /// owner-filter before validating; the safepoint gather instead walks the
+    /// live register backing store directly (independent of stack-frame
+    /// bookkeeping) and emits exactly the live cell-bearing slot.
     #[test]
-    fn targeted_register_root_sync_filters_owner_before_root_validation() {
+    fn safepoint_gather_emits_live_register_cell_independent_of_frame_bookkeeping() {
         let block = code_block_with_frame(
             vec![typed(0)],
             RegisterFrameShape {
@@ -40198,7 +39598,7 @@ mod tests {
         let mut host = CoreOpcodeDispatchHost::new();
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
-        let mut heap = Heap::new();
+        let heap = Heap::new();
         let object = host.objects.allocate();
         stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
             code_block: code_block_id,
@@ -40226,32 +39626,27 @@ mod tests {
         duplicate.caller = Some(frame);
         stack.frames.push(duplicate);
 
+        // The eager precise-snapshot validation still rejects the duplicate.
         assert_eq!(
             stack.root_snapshot_for_heap(&heap, &registers),
             Err(RootSetSemanticError::DuplicateRoot(register_root_id(0)))
         );
 
-        let mut active_roots = Vec::new();
-        sync_targeted_register_roots(
-            frame,
-            &stack,
-            &registers,
-            &mut heap,
-            &mut host,
-            &mut active_roots,
-        )
-        .unwrap();
+        // The register backing store has a single live window (one argument), so
+        // the safepoint gather emits exactly one VMRegister root for that slot,
+        // with NO registry mutation.
+        let plan = gather_vm_register_roots(&registers, heap.id()).unwrap();
         assert_eq!(
-            active_roots,
-            vec![RootRecord {
-                id: register_root_id(0),
-                kind: RootKind::VMRegister,
-                heap: heap.id(),
-            }]
+            plan.roots
+                .iter()
+                .map(|root| root.root.id)
+                .collect::<Vec<_>>(),
+            vec![register_root_id(0)]
         );
-        assert_eq!(heap.targeted_roots().records().len(), 1);
-        cleanup_targeted_vm_roots(&mut heap, &mut active_roots).unwrap();
-        assert!(active_roots.is_empty());
+        assert_eq!(
+            plan.roots[0].cell.pointer_payload_bits(),
+            cell_payload(object)
+        );
         assert!(heap.targeted_roots().records().is_empty());
     }
 
@@ -40345,29 +39740,15 @@ mod tests {
         assert!(heap.targeted_roots().records().is_empty());
     }
 
+    /// Register-file roots (from the safepoint gather) coexist with the
+    /// FRAME-header roots (still reconciled into the precise registry) without
+    /// interference: their id namespaces are disjoint, and the gather never
+    /// touches the registry.
     #[test]
-    fn targeted_register_roots_sync_alongside_known_frame_roots() {
-        let register = VirtualRegister::local(0);
-        let mirror = VirtualRegister::local(1);
-        // NewObject installs a cell root for local0, then Move copies that cell
-        // into local1. The Move is a genuine cell-membership change (it sets the
-        // register-root dirty signal), so the sync after it runs with local0's
-        // register root already in `existing` -- exercising steady-state
-        // register/frame root coexistence without depending on a redundant
-        // recompute after a non-mutating op (the per-op tax this gating removes;
-        // see the dispatch-loop gate comment).
-        let block = code_block(vec![
-            core_typed(0, CoreOpcode::NewObject, vec![Operand::Register(register)]),
-            core_typed(
-                1,
-                CoreOpcode::Move,
-                vec![Operand::Register(mirror), Operand::Register(register)],
-            ),
-            core_typed(2, CoreOpcode::Return, vec![Operand::Register(register)]),
-        ]);
+    fn safepoint_gather_register_roots_coexist_with_known_frame_roots() {
+        let block = code_block_with_frame(vec![typed(0)], gather_shape());
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
-        let mut exceptions = ExceptionState::default();
         let mut heap = Heap::new();
         let code_block_id = allocate_test_code_block_id(&mut heap);
         let heap_id = heap.id();
@@ -40379,47 +39760,54 @@ mod tests {
             Vec::new(),
         );
         let frame = stack.top_frame().unwrap().id;
-        let frame_root = TargetedRootRecord {
-            root: RootRecord {
-                id: frame_root_id(frame, FrameRootSource::CodeBlock),
-                kind: RootKind::VMRegister,
-                heap: heap_id,
-            },
-            target: code_block_id.0,
-        };
-        let mut host = ObservingCoreHost::new();
+        let window = stack.top_frame().unwrap().register_window;
 
-        let result = execute_code_block(
-            InterpreterExecutionState {
-                stack: &mut stack,
-                registers: &mut registers,
-                exceptions: &mut exceptions,
-                heap: &mut heap,
-            },
-            code_block_id,
-            &block,
-            &mut host,
-            DispatchConfig::default(),
+        // A cell mirrored into two locals (the NewObject + Move pattern).
+        let cell = boxed_cell(0x4242);
+        registers
+            .write(window, VirtualRegister::local(0), cell)
+            .unwrap();
+        registers
+            .write(window, VirtualRegister::local(1), cell)
+            .unwrap();
+
+        // Frame-header roots are still reconciled into the precise registry.
+        let mut active_frame_roots = Vec::new();
+        sync_targeted_frame_roots(
+            frame,
+            &stack,
+            &registers,
+            &mut heap,
+            &mut active_frame_roots,
+        )
+        .unwrap();
+        let frame_root = RootRecord {
+            id: frame_root_id(frame, FrameRootSource::CodeBlock),
+            kind: RootKind::VMRegister,
+            heap: heap_id,
+        };
+        assert!(heap
+            .targeted_roots()
+            .records()
+            .iter()
+            .any(|record| record.root == frame_root && record.target == code_block_id.0));
+
+        // Register-file roots come from the gather in a disjoint id namespace,
+        // with NO registry mutation.
+        let plan = gather_vm_register_roots(&registers, heap_id).unwrap();
+        let ids: Vec<RootId> = plan.roots.iter().map(|root| root.root.id).collect();
+        assert!(plan
+            .roots
+            .iter()
+            .all(|root| root.cell.pointer_payload_bits() == 0x4242));
+        assert!(ids.contains(&register_root_id(window.base)));
+        assert!(ids.contains(&register_root_id(window.base + 1)));
+        assert!(
+            !ids.contains(&frame_root.id),
+            "register and frame root id namespaces must stay disjoint"
         );
 
-        let value = if let ExecutionCompletion::Returned(value) = result {
-            value
-        } else {
-            unreachable!("expected returned object, got {result:?}");
-        };
-        let returned_cell = heap_cell_for_value(&heap, value);
-        assert!(host.observations.iter().any(|observation| {
-            observation.existing.contains(&frame_root)
-                && observation.desired.iter().any(|record| {
-                    record.root.id == register_root_id(0) && record.target == returned_cell
-                })
-        }));
-        assert!(host.observations.iter().any(|observation| {
-            observation.existing.contains(&frame_root)
-                && observation.existing.iter().any(|record| {
-                    record.root.id == register_root_id(0) && record.target == returned_cell
-                })
-        }));
+        cleanup_targeted_root_sets(&mut heap, &mut Vec::new(), &mut active_frame_roots).unwrap();
         assert!(heap.targeted_roots().records().is_empty());
     }
 
@@ -41594,498 +40982,19 @@ mod tests {
             .unwrap();
 
         // C++ JSC divergence: a register/stack store emits no write barrier
-        // (op_mov -> storeValue), so there is no per-write barrier record to
-        // assert. The faithful behavior this test proves is that storing a cell
-        // into a register registers it as a targeted VM-register GC root, which
-        // is what the conservative stack span scan covers in C++
-        // (heap/Heap.cpp:903 gatherStackRoots).
+        // (op_mov -> storeValue) AND no per-op root bookkeeping (D2i). The
+        // faithful behavior this proves is that storing a cell into a register
+        // makes that slot a GC root by being live -- the safepoint gather
+        // (`gather_vm_register_roots`, the analog of the conservative stack span
+        // scan, heap/Heap.cpp:903 gatherStackRoots) emits exactly that slot, with
+        // the same cell payload the descriptor predicate reports.
         assert_eq!(
             registers.root_descriptors(HeapId(3))[0].cell_payload,
             Some(0x1234)
         );
-    }
-
-    // ----- in-loop dirty-range narrowing: differential + targeted invariants -----
-
-    /// One parallel-state harness for the dirty-range narrowing differential.
-    /// Each instance owns its own heap/register-file/host/active-root set/scratch
-    /// so two harnesses can replay an identical mutation sequence and have their
-    /// final `heap.targeted_roots()` compared. (`Heap::new()` uses a constant
-    /// default `HeapId`, and both heaps allocate cells in the same order, so the
-    /// produced root records and cell targets are directly comparable.)
-    struct RootSyncHarness {
-        stack: ExecutionContextStack,
-        registers: RegisterFile,
-        heap: Heap,
-        host: CoreOpcodeDispatchHost,
-        frame: CallFrameId,
-        window: RegisterWindow,
-        active_roots: Vec<RootRecord>,
-        scratch: RegisterRootSyncScratch,
-    }
-
-    impl RootSyncHarness {
-        fn new(shape: RegisterFrameShape) -> Self {
-            let block = code_block_with_frame(vec![typed(0)], shape);
-            let mut stack = ExecutionContextStack::default();
-            let mut registers = RegisterFile::default();
-            let mut heap = Heap::new();
-            let code_block_id = allocate_test_code_block_id(&mut heap);
-            enter_program_frame(
-                &mut stack,
-                &mut registers,
-                code_block_id,
-                &block,
-                Vec::new(),
-            );
-            let frame = stack.top_frame().unwrap().id;
-            let window = *registers.active_windows().last().unwrap();
-            // Pre-loop sync establishes a clean baseline (mirrors the
-            // unconditional pre-loop sync in the dispatch loop).
-            let mut active_roots = Vec::new();
-            let mut scratch = RegisterRootSyncScratch::new();
-            sync_targeted_register_roots_buffered(
-                frame,
-                &stack,
-                &registers,
-                &mut heap,
-                &mut CoreOpcodeDispatchHost::new(),
-                &mut active_roots,
-                &mut scratch,
-            )
-            .unwrap();
-            registers.clear_cell_root_dirty();
-            Self {
-                stack,
-                registers,
-                heap,
-                host: CoreOpcodeDispatchHost::new(),
-                frame,
-                window,
-                active_roots,
-                scratch,
-            }
-        }
-
-        /// Allocate a fresh object cell value (resolvable by the host) on this
-        /// harness's object store.
-        fn fresh_cell(&mut self) -> RuntimeValue {
-            self.host.objects.allocate()
-        }
-
-        fn write_local(&mut self, index: u32, value: RuntimeValue) {
-            self.registers
-                .write(self.window, VirtualRegister::local(index), value)
-                .unwrap();
-        }
-
-        /// Reconcile using the FULL-WINDOW buffered sync (the `FullWindow` path),
-        /// then clear the dirty signal -- the reference behavior.
-        fn sync_full(&mut self) {
-            sync_targeted_register_roots_buffered(
-                self.frame,
-                &self.stack,
-                &self.registers,
-                &mut self.heap,
-                &mut self.host,
-                &mut self.active_roots,
-                &mut self.scratch,
-            )
-            .unwrap();
-            self.registers.clear_cell_root_dirty();
-        }
-
-        /// Reconcile exactly as the dispatch loop now does: dispatch on the
-        /// coalesced `CellRootDirty`, taking the range-narrowed path for `Slots`.
-        fn sync_narrowed(&mut self) {
-            match self.registers.cell_root_dirty() {
-                CellRootDirty::Clean => {}
-                CellRootDirty::Slots { lo, hi } => sync_targeted_register_roots_range_buffered(
-                    self.frame,
-                    &self.stack,
-                    &self.registers,
-                    &mut self.heap,
-                    &mut self.host,
-                    &mut self.active_roots,
-                    &mut self.scratch,
-                    lo,
-                    hi,
-                )
-                .unwrap(),
-                CellRootDirty::FullWindow => sync_targeted_register_roots_buffered(
-                    self.frame,
-                    &self.stack,
-                    &self.registers,
-                    &mut self.heap,
-                    &mut self.host,
-                    &mut self.active_roots,
-                    &mut self.scratch,
-                )
-                .unwrap(),
-            }
-            self.registers.clear_cell_root_dirty();
-        }
-
-        fn sorted_targeted_records(&self) -> Vec<TargetedRootRecord> {
-            let mut records = self.heap.targeted_roots().records().to_vec();
-            records.sort_by_key(|record| (record.root.id.0, record.target.0));
-            records
-        }
-
-        fn sorted_active_roots(&self) -> Vec<RootRecord> {
-            let mut roots = self.active_roots.clone();
-            roots.sort_by_key(|root| root.id.0);
-            roots
-        }
-    }
-
-    fn churn_shape() -> RegisterFrameShape {
-        RegisterFrameShape {
-            num_parameters_including_this: 1,
-            num_vars: 4,
-            num_callee_locals: 0,
-            num_temporaries: 4,
-            special: Default::default(),
-        }
-    }
-
-    /// Replay an identical cell-churning mutation sequence against two parallel
-    /// harnesses, reconciling one with the full-window sync and the other with
-    /// the range-narrowed sync after every step. The host-visible observations
-    /// (the resolved cell targets per slot) and the final
-    /// `heap.targeted_roots()` and active-root sets MUST be byte-identical.
-    /// This is the core fidelity check for the narrowing.
-    #[test]
-    fn dirty_range_narrowing_matches_full_window_over_cell_churn() {
-        let mut full = RootSyncHarness::new(churn_shape());
-        let mut narrowed = RootSyncHarness::new(churn_shape());
-
-        // A churning script: each step is a batch of writes (possibly to several
-        // slots, exercising coalescing) followed by one reconcile. We mirror the
-        // exact same writes into both harnesses, allocating cells in lock-step so
-        // both heaps bind the same CellIds.
-        // Step 1: store cells into two different locals (coalesced two-slot span).
-        let (a0, n0) = (full.fresh_cell(), narrowed.fresh_cell());
-        let (a1, n1) = (full.fresh_cell(), narrowed.fresh_cell());
-        full.write_local(0, a0);
-        full.write_local(2, a1);
-        narrowed.write_local(0, n0);
-        narrowed.write_local(2, n1);
-        full.sync_full();
-        narrowed.sync_narrowed();
-        assert_eq!(
-            full.sorted_targeted_records(),
-            narrowed.sorted_targeted_records()
-        );
-        assert_eq!(full.sorted_active_roots(), narrowed.sorted_active_roots());
-
-        // Step 2: retarget local0 to a new cell, leave local2 untouched.
-        let (a2, n2) = (full.fresh_cell(), narrowed.fresh_cell());
-        full.write_local(0, a2);
-        narrowed.write_local(0, n2);
-        full.sync_full();
-        narrowed.sync_narrowed();
-        assert_eq!(
-            full.sorted_targeted_records(),
-            narrowed.sorted_targeted_records()
-        );
-        assert_eq!(full.sorted_active_roots(), narrowed.sorted_active_roots());
-
-        // Step 3: cell -> non-cell write at local2 (must unregister local2's root)
-        // while local0 stays live and out of this write's range.
-        full.write_local(2, RuntimeValue::from_i32(7));
-        narrowed.write_local(2, RuntimeValue::from_i32(7));
-        full.sync_full();
-        narrowed.sync_narrowed();
-        assert_eq!(
-            full.sorted_targeted_records(),
-            narrowed.sorted_targeted_records()
-        );
-        assert_eq!(full.sorted_active_roots(), narrowed.sorted_active_roots());
-
-        // Step 4: store a cell into a third local; local0 still untouched/live.
-        let (a3, n3) = (full.fresh_cell(), narrowed.fresh_cell());
-        full.write_local(5, a3);
-        narrowed.write_local(5, n3);
-        full.sync_full();
-        narrowed.sync_narrowed();
-        assert_eq!(
-            full.sorted_targeted_records(),
-            narrowed.sorted_targeted_records()
-        );
-        assert_eq!(full.sorted_active_roots(), narrowed.sorted_active_roots());
-
-        // The narrowed run must have actually rooted something (guards against a
-        // vacuously-equal "both empty" pass).
-        assert!(!narrowed.heap.targeted_roots().records().is_empty());
-    }
-
-    /// A cell -> non-cell write at a slot must UNREGISTER that slot's targeted
-    /// root under the range-narrowed sync (the slot is in-range).
-    #[test]
-    fn dirty_range_narrowing_cell_to_noncell_write_unregisters_slot() {
-        let mut h = RootSyncHarness::new(churn_shape());
-        let cell = h.fresh_cell();
-        h.write_local(1, cell);
-        h.sync_narrowed();
-        assert!(h
-            .heap
-            .targeted_roots()
-            .records()
-            .iter()
-            .any(|record| record.root.id == register_root_id(h.window.base + 1)));
-
-        // Overwrite the cell with an immediate; the range-narrowed sync must drop
-        // that slot's root and leave the active set empty.
-        h.write_local(1, RuntimeValue::from_i32(99));
-        h.sync_narrowed();
-        assert!(h.heap.targeted_roots().records().is_empty());
-        assert!(h.active_roots.is_empty());
-    }
-
-    /// Two writes to DIFFERENT slots between syncs must BOTH be covered by the
-    /// coalesced range -- both slots end up rooted after a single narrowed sync.
-    #[test]
-    fn dirty_range_narrowing_two_slot_writes_both_covered() {
-        let mut h = RootSyncHarness::new(churn_shape());
-        let c0 = h.fresh_cell();
-        let c1 = h.fresh_cell();
-        // Write the low slot then a higher slot; the coalesced Slots span must
-        // include both, so a single narrowed sync roots both.
-        h.write_local(0, c0);
-        h.write_local(6, c1);
-        match h.registers.cell_root_dirty() {
-            CellRootDirty::Slots { lo, hi } => {
-                assert_eq!(lo, h.window.base);
-                assert_eq!(hi, h.window.base + 6);
-            }
-            other => panic!("expected coalesced Slots span, got {other:?}"),
-        }
-        h.sync_narrowed();
-        assert!(h
-            .heap
-            .targeted_roots()
-            .records()
-            .iter()
-            .any(|record| record.root.id == register_root_id(h.window.base)));
-        assert!(h
-            .heap
-            .targeted_roots()
-            .records()
-            .iter()
-            .any(|record| record.root.id == register_root_id(h.window.base + 6)));
-        assert_eq!(h.active_roots.len(), 2);
-    }
-
-    /// An out-of-range write must NOT disturb a live root for an out-of-range
-    /// slot. This is the sharp edge: the narrowed reconcile must patch only the
-    /// dirty range, never unregister live roots whose slots did not change.
-    #[test]
-    fn dirty_range_narrowing_leaves_out_of_range_roots_untouched() {
-        let mut h = RootSyncHarness::new(churn_shape());
-        // Root local0 with a cell.
-        let kept = h.fresh_cell();
-        h.write_local(0, kept);
-        h.sync_narrowed();
-        let kept_cell = heap_cell_for_value(&h.heap, kept);
-        assert!(h
-            .heap
-            .targeted_roots()
-            .records()
-            .iter()
-            .any(|record| record.target == kept_cell));
-
-        // Now churn a DIFFERENT slot (local3) cell-on/cell-off without ever
-        // touching local0. local0's root must survive every narrowed sync.
-        let other = h.fresh_cell();
-        h.write_local(3, other);
-        h.sync_narrowed();
-        assert!(
-            h.heap
-                .targeted_roots()
-                .records()
-                .iter()
-                .any(|record| record.target == kept_cell),
-            "out-of-range live root was wrongly unregistered when local3 changed"
-        );
-
-        h.write_local(3, RuntimeValue::from_i32(0));
-        h.sync_narrowed();
-        assert!(
-            h.heap
-                .targeted_roots()
-                .records()
-                .iter()
-                .any(|record| record.target == kept_cell),
-            "out-of-range live root was wrongly unregistered on cell->non-cell at local3"
-        );
-        // local0's root is the only survivor.
-        assert_eq!(h.active_roots.len(), 1);
-        assert_eq!(h.active_roots[0].id, register_root_id(h.window.base));
-    }
-
-    /// VM-owned root scopes mirror C++ JSC's live call-frame stack: syncing a
-    /// callee frame must not consider the caller frame's roots stale, and
-    /// cleaning the callee must leave caller roots in place until the caller
-    /// itself finishes.
-    #[test]
-    fn vm_stack_root_scope_keeps_caller_roots_across_callee_sync_and_cleanup() {
-        let block = code_block_with_frame(vec![typed(0)], churn_shape());
-        let mut stack = ExecutionContextStack::default();
-        let mut registers = RegisterFile::default();
-        let mut heap = Heap::new();
-        let mut host = CoreOpcodeDispatchHost::new();
-        let caller_owner = allocate_test_code_block_id(&mut heap);
-        enter_program_frame(&mut stack, &mut registers, caller_owner, &block, Vec::new());
-        let caller_frame = stack.top_frame().unwrap().id;
-        let caller_window = stack.top_frame().unwrap().register_window;
-        let caller_cell_value = host.objects.allocate();
-        registers
-            .write(caller_window, VirtualRegister::local(0), caller_cell_value)
-            .unwrap();
-
-        let mut root_scope = InterpreterRootSyncScope::new();
-        sync_targeted_frame_roots_for_dispatch_entry(
-            caller_frame,
-            &stack,
-            &registers,
-            &mut heap,
-            &mut root_scope,
-        )
-        .unwrap();
-        sync_targeted_register_roots_for_dispatch_entry(
-            caller_frame,
-            &stack,
-            &registers,
-            &mut heap,
-            &mut host,
-            &mut root_scope,
-            false,
-        )
-        .unwrap();
-        registers.clear_cell_root_dirty();
-
-        let caller_root = RootRecord {
-            id: register_root_id(caller_window.base),
-            kind: RootKind::VMRegister,
-            heap: heap.id(),
-        };
-        let caller_target = heap_cell_for_value(&heap, caller_cell_value);
-        assert!(heap
-            .targeted_roots()
-            .records()
-            .iter()
-            .any(|record| record.root == caller_root && record.target == caller_target));
-
-        let callee_owner = allocate_test_code_block_id(&mut heap);
-        let callee_frame = stack
-            .push_frame(
-                &mut registers,
-                FramePushRequest {
-                    code_block: Some(callee_owner),
-                    callee: None,
-                    callee_value: None,
-                    lexical_scope: None,
-                    shape: block.unlinked().frame(),
-                    argument_count_including_this: 1,
-                    argument_values: vec![RuntimeValue::undefined()],
-                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
-                    return_bytecode_index: None,
-                },
-            )
-            .unwrap();
-        let callee_window = stack.frame(callee_frame).unwrap().register_window;
-
-        sync_targeted_frame_roots_for_dispatch_entry(
-            callee_frame,
-            &stack,
-            &registers,
-            &mut heap,
-            &mut root_scope,
-        )
-        .unwrap();
-        sync_targeted_register_roots_for_dispatch_entry(
-            callee_frame,
-            &stack,
-            &registers,
-            &mut heap,
-            &mut host,
-            &mut root_scope,
-            false,
-        )
-        .unwrap();
-
-        assert!(heap
-            .targeted_roots()
-            .records()
-            .iter()
-            .any(|record| record.root == caller_root && record.target == caller_target));
-
-        root_scope
-            .cleanup_frame(&mut heap, callee_frame, callee_window)
-            .unwrap();
-        stack.pop_frame(&mut registers, callee_frame).unwrap();
-        assert!(heap
-            .targeted_roots()
-            .records()
-            .iter()
-            .any(|record| record.root == caller_root && record.target == caller_target));
-
-        root_scope
-            .cleanup_frame(&mut heap, caller_frame, caller_window)
-            .unwrap();
-        assert!(!heap
-            .targeted_roots()
-            .records()
-            .iter()
-            .any(|record| record.root == caller_root));
-    }
-
-    /// `allocate_frame` must force a FULL-WINDOW rescan via the `FullWindow`
-    /// sentinel. `release_frame` pops the top window and leaves the surviving
-    /// frame's dirty state alone; the root owner cleans the popped frame.
-    #[test]
-    fn dirty_range_narrowing_frame_allocation_forces_full_window_release_does_not_escalate() {
-        let mut registers = RegisterFile::default();
-        let shape = churn_shape();
-        let window = registers
-            .allocate_frame(CallFrameId(1), shape, 1, &[])
-            .unwrap();
-        assert_eq!(registers.cell_root_dirty(), CellRootDirty::FullWindow);
-        registers.clear_cell_root_dirty();
-
-        // A per-slot write coalesces into a Slots span...
-        let cell = RuntimeValue::from_encoded(EncodedJsValue((0xABCD << 8) | 0x20));
-        registers
-            .write(window, VirtualRegister::local(0), cell)
-            .unwrap();
-        assert!(matches!(
-            registers.cell_root_dirty(),
-            CellRootDirty::Slots { .. }
-        ));
-
-        // ...and releasing the top frame does not make a surviving caller window
-        // dirty. In this standalone register-file test there is no caller, so the
-        // pre-existing slot dirty signal is simply preserved rather than
-        // escalated to FullWindow.
-        registers.release_frame(window).unwrap();
-        assert!(matches!(
-            registers.cell_root_dirty(),
-            CellRootDirty::Slots { .. }
-        ));
-    }
-
-    /// `register_root_slot` is the exact inverse of `register_root_id` over the
-    /// register-root id namespace and rejects frame-root ids. The range-scoped
-    /// stale computation depends on this.
-    #[test]
-    fn register_root_slot_inverts_register_root_id_and_rejects_frame_ids() {
-        for slot in [0usize, 1, 7, 4096, 1_000_000] {
-            assert_eq!(register_root_slot(register_root_id(slot)), Some(slot));
-        }
-        // A frame-root id lives below REGISTER_ROOT_ID_BASE and must not be read
-        // as an in-range register slot.
-        let frame_id = frame_root_id(CallFrameId(3), FrameRootSource::CodeBlock);
-        assert_eq!(register_root_slot(frame_id), None);
+        let plan = gather_vm_register_roots(&registers, HeapId(3)).unwrap();
+        assert_eq!(plan.roots.len(), 1);
+        assert_eq!(plan.roots[0].cell.pointer_payload_bits(), 0x1234);
+        assert_eq!(plan.roots[0].root.id, register_root_id(window.base));
     }
 }
