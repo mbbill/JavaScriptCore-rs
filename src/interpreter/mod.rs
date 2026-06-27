@@ -5,7 +5,7 @@
 //! the generic bytecode dispatch loop over prepared bytecode streams.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::fs;
 use std::marker::PhantomData;
@@ -3009,7 +3009,17 @@ pub struct CoreOpcodeDispatchHost {
     last_property_lookup: Option<CorePropertyLookupRecord>,
     pending_property_lookup_site: Option<CorePropertyLookupSite>,
     last_property_store: Option<CorePropertyStoreRecord>,
-    property_store_records: Vec<CorePropertyStoreRecord>,
+    // C++ JSC ValueProfile/ArrayProfile metadata is a fixed-size inline bucket
+    // array (`EncodedJSValue m_buckets[totalNumberOfBuckets]`,
+    // bytecode/ValueProfile.h:149; totalNumberOfBuckets is a compile-time
+    // constant, lines 49-51) whose update paths only iterate the array — there
+    // is no FIFO shift or eviction memmove on the per-store hot path. This Rust
+    // store-observation pipeline is a baseline-JIT-tiering input that does not
+    // exist in the C++ LLInt, so it keeps a bounded ring of recent store
+    // records; a VecDeque models that ring with O(1) front eviction at cap
+    // (mirroring JSC's "no shift on update"), instead of an O(n) Vec::remove(0)
+    // on every indexed store.
+    property_store_records: VecDeque<CorePropertyStoreRecord>,
     pending_property_store_site: Option<CorePropertyStoreSite>,
     last_array_profile_observation: Option<CoreArrayProfileObservationRecord>,
     last_call_observation: Option<CoreCallObservationRecord>,
@@ -3038,7 +3048,7 @@ impl Default for CoreOpcodeDispatchHost {
             last_property_lookup: None,
             pending_property_lookup_site: None,
             last_property_store: None,
-            property_store_records: Vec::new(),
+            property_store_records: VecDeque::new(),
             pending_property_store_site: None,
             last_array_profile_observation: None,
             last_call_observation: None,
@@ -3582,10 +3592,16 @@ impl CoreOpcodeDispatchHost {
 
     fn record_property_store(&mut self, record: CorePropertyStoreRecord) {
         self.last_property_store = Some(record.clone());
+        // O(1) ring eviction at cap: drop the oldest (front) record, then append
+        // the newest (back). Faithful to JSC ValueProfile's "no shift on update"
+        // (bytecode/ValueProfile.h:149); the previous Vec::remove(0) was an O(n)
+        // memmove over the whole ring on every store. FIFO order is preserved so
+        // the drain consumer's front-to-back position() still finds the oldest
+        // match and pop_front() drops the oldest at cap.
         if self.property_store_records.len() >= CORE_HOST_OUTPUT_RECORD_LIMIT {
-            self.property_store_records.remove(0);
+            self.property_store_records.pop_front();
         }
-        self.property_store_records.push(record);
+        self.property_store_records.push_back(record);
     }
 
     fn begin_property_store_recording(&mut self, site: CorePropertyStoreSite) {
@@ -3866,8 +3882,15 @@ impl CoreOpcodeDispatchHost {
             self.pending_property_store_site = None;
             return Ok(None);
         };
-        let record = self.property_store_records.remove(record_index);
-        self.last_property_store = self.property_store_records.last().cloned();
+        // `record_index` came from position() over this same deque, so it is in
+        // bounds; VecDeque::remove returns Option (unlike Vec::remove), hence the
+        // expect. Drain still runs only once per tiering observation, not on the
+        // per-store hot path, so this O(n) middle removal is unchanged in cost.
+        let record = self
+            .property_store_records
+            .remove(record_index)
+            .expect("record_index from position() over property_store_records");
+        self.last_property_store = self.property_store_records.back().cloned();
         self.pending_property_store_site = None;
 
         let Some(cache_key) =
