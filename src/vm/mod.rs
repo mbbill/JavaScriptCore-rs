@@ -65912,6 +65912,106 @@ mod tests {
         assert!(returns_true("5-2 === 3;"));
     }
 
+    #[test]
+    fn vm_loose_equality_object_vs_primitive_uses_to_primitive() {
+        // ECMAScript IsLooselyEqual (7.2.14) S10/S11; C++ JSValue::
+        // equalSlowCaseInline (JSCJSValueInlines.h:281-299): one operand object,
+        // the other a primitive -> ToPrimitive the object (default hint: valueOf
+        // then toString) and re-compare. Both directions.
+        assert!(returns_true("({valueOf:function(){return 5}}) == 5;"));
+        assert!(returns_true("5 == ({valueOf:function(){return 5}});"));
+        // Array ToPrimitive: valueOf returns the array (non-primitive), so
+        // toString runs -> "5" -> Number 5.
+        assert!(returns_true("[5] == 5;"));
+        // Plain object stringifies to "[object Object]" -> NaN, never equal to 5.
+        assert!(returns_true("(({}) == 5) === false;"));
+        // valueOf is tried before toString (default/NoPreference hint).
+        assert!(returns_true(
+            "({valueOf:function(){return 42},toString:function(){return \"no\"}}) == 42;"
+        ));
+        // valueOf returning a non-primitive falls through to toString.
+        assert!(returns_true(
+            "({valueOf:function(){return {}},toString:function(){return \"7\"}}) == 7;"
+        ));
+        // NotEqual is the negation of the loose-equality result.
+        assert!(returns_true(
+            "(({valueOf:function(){return 5}}) != 5) === false;"
+        ));
+    }
+
+    #[test]
+    fn vm_loose_equality_object_to_primitive_side_effects_and_throws() {
+        // The single object operand's valueOf runs exactly once.
+        assert!(returns_true(
+            "let n=0; let o={valueOf:function(){n=n+1;return 5}}; let r=(o==5); r && n===1;"
+        ));
+        // A user valueOf that throws propagates as a catchable exception (C++ JSC
+        // toPrimitive uses the throw scope, JSCJSValueInlines.h:285
+        // RETURN_IF_EXCEPTION), never a fatal abort.
+        assert!(returns_true(
+            "var c=0; try { ({valueOf:function(){throw 1}}) == 5; } catch(e) { c=e; } c === 1;"
+        ));
+        // Neither valueOf nor toString yielding a primitive throws a catchable
+        // TypeError ("No default value", JSObject.cpp:2589).
+        assert!(returns_true(
+            "var c=false; try { ({valueOf:null,toString:null}) == 5; } \
+             catch(e) { c=(e instanceof TypeError); } c;"
+        ));
+        // C++ JSC ToPrimitives the object even when the other operand is a Symbol
+        // (the object branch at JSCJSValueInlines.h:281-290 fires before the
+        // Symbol check at :301), so the side effect is observable; the final
+        // comparison (5 == Symbol) is false.
+        assert!(returns_true(
+            "let n=0; let r=(({valueOf:function(){n=n+1;return 5}}) == Symbol(\"x\")); \
+             (r===false) && (n===1);"
+        ));
+    }
+
+    #[test]
+    fn vm_loose_equality_null_nan_and_identity_edges() {
+        // null/undefined are NOT ToPrimitive'd against an object (spec S10/S11
+        // exclude them; C++ JSCJSValueInlines.h:267-278 handle them before the
+        // object branch). This engine has no document.all masquerading object, so
+        // object vs null/undefined is always false.
+        assert!(returns_true("(({}) == null) === false;"));
+        assert!(returns_true("(({}) == undefined) === false;"));
+        // NaN is never loosely equal to anything, including via ToPrimitive.
+        assert!(returns_true("(NaN == NaN) === false;"));
+        assert!(returns_true(
+            "(({valueOf:function(){return NaN}}) == NaN) === false;"
+        ));
+        // Regression: null == undefined stays true (S2/S3).
+        assert!(returns_true("null == undefined;"));
+        // Two distinct objects are never equal (S1, C++ :282-283); identical ones
+        // are, and are NOT ToPrimitive'd (valueOf must not run for identity).
+        assert!(returns_true("(({}) == ({})) === false;"));
+        assert!(returns_true(
+            "let n=0; let o={valueOf:function(){n=n+1;return 1}}; let r=(o==o); r && n===0;"
+        ));
+    }
+
+    #[test]
+    fn vm_loose_equality_bigint_vs_number_and_string() {
+        // BigInt vs Number: exact mathematical equality; non-integer/non-finite
+        // never equal (C++ JSCJSValueInlines.h:363-372, JSBigInt::equalsToNumber).
+        assert!(returns_true("2n == 2;"));
+        assert!(returns_true("2 == 2n;"));
+        assert!(returns_true("(2n == 2.5) === false;"));
+        assert!(returns_true("(2n == NaN) === false;"));
+        assert!(returns_true("(2n == Infinity) === false;"));
+        // BigInt vs String: StringToBigInt(string); parse failure -> false (C++
+        // :319-327). 0x/0o/0b prefixes parse; a fractional string fails.
+        assert!(returns_true("1n == \"1\";"));
+        assert!(returns_true("1n == \"0x1\";"));
+        assert!(returns_true("(1n == \"1.5\") === false;"));
+        assert!(returns_true("\"1\" == 1n;"));
+        // StringToBigInt("") is 0n (empty/whitespace-only string).
+        assert!(returns_true("0n == \"\";"));
+        // BigInt vs object: object ToPrimitive yields a BigInt primitive, then the
+        // BigInt==BigInt comparison re-runs.
+        assert!(returns_true("0n == ({valueOf:function(){return 0n}});"));
+    }
+
     // C++ JSC jsc shell binds `read` as a host-function alias of readFile
     // (jsc.cpp:682-683: two separate addFunction calls to functionReadFile).
     // octane-zlib's shell-env branch references `read`; without it the engine

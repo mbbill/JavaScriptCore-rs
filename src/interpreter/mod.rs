@@ -1972,7 +1972,6 @@ pub enum ExecutionError {
     ExpectedArrayIndex,
     ExpectedFunction,
     ExpectedPropertyKey,
-    UnsupportedLooseEquality,
     MissingSuperBinding,
     MissingStringLiteral(u32),
     MissingIdentifierText(u32),
@@ -14380,11 +14379,15 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
                 let equals = match opcode {
-                    CoreOpcode::Equal | CoreOpcode::NotEqual => match self.loose_equal(left, right)
-                    {
-                        Ok(equals) => equals,
-                        Err(error) => return DispatchOutcome::Fail(error),
-                    },
+                    CoreOpcode::Equal | CoreOpcode::NotEqual => {
+                        // loose_equal may run ToPrimitive (user valueOf/toString),
+                        // so it threads `state` and yields a catchable
+                        // DispatchOutcome on throw rather than ExecutionError.
+                        match self.loose_equal(state, left, right) {
+                            Ok(equals) => equals,
+                            Err(outcome) => return outcome,
+                        }
+                    }
                     CoreOpcode::StrictEqual | CoreOpcode::StrictNotEqual => {
                         self.strict_same_value(left, right)
                     }
@@ -16342,41 +16345,120 @@ impl CoreOpcodeDispatchHost {
             .unwrap_or_else(|| left.strict_equals(right))
     }
 
-    fn loose_equal(&self, left: RuntimeValue, right: RuntimeValue) -> Result<bool, ExecutionError> {
+    // C++ JSC JSValue::equalSlowCaseInline (runtime/JSCJSValueInlines.h:250-376),
+    // i.e. ECMAScript IsLooselyEqual / Abstract Equality Comparison (7.2.14).
+    //
+    // The primitive/primitive fast branches stay first (S1, null/undefined, S8/S9
+    // boolean folding, S4/S5 string<->number) so number/number, string/string and
+    // int/int never pay the ToPrimitive cost. The object and BigInt slow branches
+    // that follow mirror C++ :281-372.
+    //
+    // This is `&mut self` taking `state` because the object branch performs
+    // ToPrimitive (valueOf/toString), which can execute user JS re-entrantly and
+    // throw a catchable TypeError; the only error path is therefore a
+    // DispatchOutcome (catchable), exactly like arithmetic_binary_result /
+    // numeric_compare. Every primitive branch returns Ok(...).
+    fn loose_equal(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        left: RuntimeValue,
+        right: RuntimeValue,
+    ) -> Result<bool, DispatchOutcome> {
+        // S1 Type(x) == Type(y) -> IsStrictlyEqual. C++ :255-257 number==number,
+        // :264 bit-equality fast path, :282-283 object==object identity (two
+        // distinct objects never compare equal in the slow path; identical ones
+        // do, and are NEVER ToPrimitive'd).
         if self.same_loose_equality_type(left, right) {
             return Ok(self.strict_same_value(left, right));
         }
+        // S2/S3 (null,undefined)/(undefined,null) -> true. C++ :267-269.
         if is_nullish(left) && is_nullish(right) {
             return Ok(true);
         }
+        // One side null/undefined and the other a non-nullish value. C++ :270-272
+        // / :275-278 return structure->masqueradesAsUndefined(globalObject). This
+        // engine has no document.all-style masquerading object, so this is always
+        // false (documented permanent divergence). Note: spec S10/S11 and C++
+        // :281-299 never ToPrimitive against null/undefined, so e.g. `{} == null`
+        // is false and must NOT fall through to the object branch below.
         if is_nullish(left) || is_nullish(right) {
             return Ok(false);
         }
+        // S8 x Boolean -> IsLooselyEqual(ToNumber(x), y). C++ :339-346.
         if let Some(left) = left.as_bool() {
-            return self.loose_equal(RuntimeValue::from_i32(i32::from(left)), right);
+            return self.loose_equal(state, RuntimeValue::from_i32(i32::from(left)), right);
         }
+        // S9 y Boolean -> IsLooselyEqual(x, ToNumber(y)). C++ :347-351.
         if let Some(right) = right.as_bool() {
-            return self.loose_equal(left, RuntimeValue::from_i32(i32::from(right)));
+            return self.loose_equal(state, left, RuntimeValue::from_i32(i32::from(right)));
         }
+        // S5 x String, y Number -> IsLooselyEqual(ToNumber(x), y). C++ :314 swap
+        // then :329-336.
         if self.strings.text(left).is_some() && right.as_number().is_some() {
             return Ok(self.strict_same_value(
                 number_from_string(self.strings.text(left).unwrap_or_default()),
                 right,
             ));
         }
+        // S4 x Number, y String -> IsLooselyEqual(x, ToNumber(y)). C++ :329-336.
         if left.as_number().is_some() && self.strings.text(right).is_some() {
             return Ok(self.strict_same_value(
                 left,
                 number_from_string(self.strings.text(right).unwrap_or_default()),
             ));
         }
-        if self.is_object_loose_equality_operand(left)
-            || self.is_object_loose_equality_operand(right)
-            || self.bigints.is_bigint(left)
-            || self.bigints.is_bigint(right)
-        {
-            return Err(ExecutionError::UnsupportedLooseEquality);
+        // S11 x Object -> IsLooselyEqual(ToPrimitive(x), y). C++ :281-290:
+        // `v1 = v1.toPrimitive(globalObject); continue`. The object branch MUST run
+        // before any BigInt logic so an object operand is reduced to a primitive
+        // first, then we re-enter (the C++ `continue`). ToPrimitive uses the
+        // default/NoPreference hint (valueOf then toString), matching
+        // JSValue::toPrimitive(globalObject) and object_to_number_hint_primitive.
+        // C++ ToPrimitives the object even when the other operand is a Symbol (an
+        // observable side effect), so we do not special-case Symbol here. As with
+        // arithmetic/relational ToPrimitive, @@toPrimitive (Symbol.toPrimitive) is
+        // not consulted -- a pre-existing shared limitation, not introduced here.
+        if self.is_object_loose_equality_operand(left) {
+            let left = self.object_to_number_hint_primitive(state, left)?;
+            return self.loose_equal(state, left, right);
         }
+        // S10 x primitive, y Object -> IsLooselyEqual(x, ToPrimitive(y)). C++ :292-299.
+        if self.is_object_loose_equality_operand(right) {
+            let right = self.object_to_number_hint_primitive(state, right)?;
+            return self.loose_equal(state, left, right);
+        }
+        // S6 x BigInt, y String / S7 x String, y BigInt -> n = StringToBigInt(y);
+        // if n is undefined return false; else IsLooselyEqual(x, n). C++ :319-327
+        // via JSBigInt::stringToBigInt (parse failure -> false).
+        if let Some(bigint) = self.bigints.value(left) {
+            if let Some(text) = self.strings.text(right) {
+                return Ok(string_to_bigint(text).is_some_and(|number| number == bigint));
+            }
+        }
+        if let Some(bigint) = self.bigints.value(right) {
+            if let Some(text) = self.strings.text(left) {
+                return Ok(string_to_bigint(text).is_some_and(|number| number == bigint));
+            }
+        }
+        // S12 BigInt vs Number (either direction) -> exact mathematical equality;
+        // a non-finite or non-integer Number is never equal. C++ :363-372 via
+        // JSBigInt::equalsToNumber -> compareToDouble (NaN/Inf -> not equal,
+        // non-integer -> not equal, else exact). from_f64_integer returns None for
+        // NaN/Inf/non-integer and otherwise the EXACT integer the f64 represents
+        // (f64 integers are exact), so this is precise with no rounding hazard.
+        if let Some(bigint) = self.bigints.value(left) {
+            if let Some(number) = right.as_number() {
+                return Ok(CoreBigIntValue::from_f64_integer(number_to_f64(number))
+                    .is_some_and(|number| number == bigint));
+            }
+        }
+        if let Some(bigint) = self.bigints.value(right) {
+            if let Some(number) = left.as_number() {
+                return Ok(CoreBigIntValue::from_f64_integer(number_to_f64(number))
+                    .is_some_and(|number| number == bigint));
+            }
+        }
+        // S13 default -> false (e.g. Symbol vs Number/String/BigInt). C++ :301-307
+        // / :374.
         Ok(false)
     }
 
@@ -28015,6 +28097,19 @@ fn parse_bigint_literal(text: &str) -> Result<CoreBigIntValue, ExecutionError> {
 
 fn parse_bigint_constructor_text(text: &str) -> Result<CoreBigIntValue, ExecutionError> {
     parse_bigint_text(text.trim(), false)
+}
+
+// C++ JSC JSBigInt::stringToBigInt / ECMAScript StringToBigInt, used by loose
+// equality (BigInt vs String, JSCJSValueInlines.h:319-327). Leading/trailing
+// whitespace is stripped; an empty or all-whitespace string is 0n; any other
+// invalid input yields undefined (None here -> a false loose-equality result).
+// parse_bigint_constructor_text rejects an empty digit run, so the empty-string
+// case is handled explicitly to stay faithful to StringToBigInt("") == 0n.
+fn string_to_bigint(text: &str) -> Option<CoreBigIntValue> {
+    if text.trim().is_empty() {
+        return Some(CoreBigIntValue::zero());
+    }
+    parse_bigint_constructor_text(text).ok()
 }
 
 fn parse_bigint_text(text: &str, allow_suffix: bool) -> Result<CoreBigIntValue, ExecutionError> {
