@@ -70,7 +70,7 @@ use crate::runtime::typed_array::{
 };
 use crate::runtime::{
     CallFrameId, CodeBlockId, CodeSpecializationKind, EntryFrameId, ExecutableId, GlobalObjectId,
-    ObjectId, PromiseState, RuntimeValue, ScopeId, StackFrameId, VmEntryReason,
+    JsType, ObjectId, PromiseState, RuntimeValue, ScopeId, StackFrameId, VmEntryReason,
     WatchpointGeneration,
 };
 use crate::strings::{AtomId, Identifier, PropertyIndex, PropertyKey};
@@ -5541,6 +5541,21 @@ struct CoreObjectCell {
     // C++ JSC JSCell::m_structureID (runtime/JSCell.h:236) at structureIDOffset()==0.
     // MUST stay the first declared field; STRUCTURE_ID_OFFSET asserts it is at 0.
     structure_id: StructureId,
+    // C++ JSC JSCell::m_type (runtime/JSCell.h:298), the one-byte in-header JSType
+    // tag read via JSCell::type() (runtime/JSCell.h:154) to decide a cell's kind
+    // BEFORE downcasting it. Lands at offset 4 here, filling the 4-byte pad between
+    // the 4-byte structure_id and the 8-byte-aligned storage_ptr; offset_of! asserts
+    // it is at 4 on every cell kind (the fixed, kind-consistent offset a future
+    // type-check-before-deref step relies on).
+    //
+    // DIVERGENCE: C++ places m_type at BYTE 5 of the header (byte 4 is
+    // m_indexingTypeAndMisc, byte 6 m_flags, byte 7 m_cellState — the union/blob at
+    // runtime/JSCell.h:294-302). The port does not yet carry m_indexingTypeAndMisc as
+    // a header byte (array/indexing shape lives in CoreObjectKind + elements), so
+    // m_type sits at byte 4 here. The load-bearing guarantee is OFFSET CONSISTENCY
+    // across all cell kinds (asserted ==4), not byte-5 parity; exact byte-5 parity is
+    // deferred until an m_indexingTypeAndMisc header byte is modeled.
+    js_type: JsType,
     // C++ JSC: the JSObject Butterfly pointer slot (runtime/JSObject.h:1572-1577).
     // Rust butterfly-pointer analog: a cached `out_of_line_storage.as_ptr()` kept
     // coherent by refresh_storage_ptr at every Vec mutation. MUST stay the second
@@ -5657,6 +5672,15 @@ const _: () = assert!(
     std::mem::size_of::<RuntimeValue>() == 8,
     "RuntimeValue must be 8 bytes (EncodedJsValue) for the [storage_ptr + offset*8] stride"
 );
+// C++ JSC JSCell::m_type analog (runtime/JSCell.h:298). The FIXED, kind-consistent
+// offset of the in-cell JSType tag: it must be identical across every cell kind so a
+// future type-check-before-downcast can read it blind. Pinned at 4 on all four cell
+// kinds (object here; string/symbol/bigint asserts at their struct defs). See the
+// js_type field comment for why offset 4 (not C++ byte 5) and why that is sound.
+const _: () = assert!(
+    std::mem::offset_of!(CoreObjectCell, js_type) == 4,
+    "CoreObjectCell::js_type must be at offset 4 (fixed kind-consistent JSCell::m_type analog)"
+);
 
 impl Default for CoreObjectCell {
     fn default() -> Self {
@@ -5668,6 +5692,10 @@ impl Default for CoreObjectCell {
         // prior matching structure guard (a 0-slot shape has no valid offset).
         let mut cell = Self {
             structure_id: StructureId::default(),
+            // Default kind is Ordinary => FinalObject; allocate_cell overwrites this
+            // from cell.kind.js_type() for every published cell, so the tag always
+            // matches the final kind regardless of how the cell was built.
+            js_type: JsType::FinalObject,
             storage_ptr: core::ptr::null(),
             cell_id: CellId::default(),
             kind: CoreObjectKind::default(),
@@ -5729,6 +5757,9 @@ impl Clone for CoreObjectCell {
         // valid after the cell is re-pinned.
         let mut cloned = Self {
             structure_id: self.structure_id,
+            // Copy the type tag normally (unlike storage_ptr, it is layout/identity-
+            // independent); a clone of an object cell is the same JSType.
+            js_type: self.js_type,
             storage_ptr: core::ptr::null(),
             cell_id: self.cell_id,
             kind: self.kind,
@@ -5802,6 +5833,42 @@ enum CoreObjectKind {
     Uint8Array,
     DataView,
     Proxy,
+}
+
+impl CoreObjectKind {
+    /// Faithful `JSCell::m_type` (runtime/JSCell.h:298) for an object cell of this
+    /// kind. A plain ordinary `{}` object is JSC `FinalObjectType` (runtime/JSType.h:78);
+    /// every other kind is mapped to the `ObjectType` object-range umbrella
+    /// (runtime/JSType.h:77).
+    ///
+    /// DIVERGENCE / known under-modeling: C++ gives each JSObject subclass its own
+    /// JSType (ArrayType, JSFunctionType, JSPromiseType, JSDateType, ProxyObjectType,
+    /// Uint8ArrayType, ...; runtime/JSType.h:80-160). This port collapses all of them
+    /// to `Object` for now. That is faithful for the object-vs-primitive distinction
+    /// `is_object()` needs (and for a type-check-before-downcast gate, which only needs
+    /// the object range); per-subclass JSType refinement is deferred and localized to
+    /// this single helper so it can be sharpened in one place.
+    fn js_type(self) -> JsType {
+        match self {
+            CoreObjectKind::Ordinary => JsType::FinalObject,
+            CoreObjectKind::Array
+            | CoreObjectKind::Function
+            | CoreObjectKind::NativeFunction
+            | CoreObjectKind::BoundFunction
+            | CoreObjectKind::ClosureCell
+            | CoreObjectKind::Map
+            | CoreObjectKind::Set
+            | CoreObjectKind::WeakMap
+            | CoreObjectKind::WeakSet
+            | CoreObjectKind::RegExp
+            | CoreObjectKind::Promise
+            | CoreObjectKind::Date
+            | CoreObjectKind::ArrayBuffer
+            | CoreObjectKind::Uint8Array
+            | CoreObjectKind::DataView
+            | CoreObjectKind::Proxy => JsType::Object,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8798,6 +8865,11 @@ impl CoreObjectStore {
     }
 
     fn allocate_cell(&mut self, mut cell: CoreObjectCell) -> RuntimeValue {
+        // Set the faithful JSCell::m_type (runtime/JSCell.h:298) header from the cell's
+        // final kind at the single allocation chokepoint, so every published object
+        // cell carries a coherent tag without per-call-site edits (covers all
+        // `..CoreObjectCell::default()` literals).
+        cell.js_type = cell.kind.js_type();
         cell.install_initial_shape_metadata();
         // install_initial_shape_metadata already refreshes storage_ptr; refresh once
         // more so EVERY published cell is guaranteed to carry a coherent
@@ -11841,6 +11913,15 @@ impl CoreObjectStore {
         let index = self.object_indices_by_payload.get(&payload).copied()?;
         let object = self.objects.get(index)?.as_ref().get_ref();
         debug_assert_eq!(core::ptr::from_ref(object) as usize, payload);
+        // Cross-check the new in-cell JSCell::m_type (runtime/JSCell.h:298) against the
+        // existing object_indices_by_payload type gate: a cell reached through the
+        // object index MUST report an object-range JSType (C++ `m_type >= ObjectType`,
+        // runtime/JSType.h:204). Exercises the header on every object lookup; debug-only
+        // so release behavior is unchanged.
+        debug_assert!(
+            object.js_type.is_object(),
+            "object reached via object_indices_by_payload must carry an object JSType"
+        );
         let _ = object.cell_id;
         Some(object)
     }
@@ -12036,12 +12117,27 @@ struct CoreStringStore {
     indices_by_payload: HashMap<usize, usize>,
 }
 
+// #[repr(C)] pins the header layout so offset_of!(js_type)==4 is stable (only the
+// field name is accessed today, so fixing the layout is behavior-neutral).
 #[derive(Clone, Debug, Default)]
+#[repr(C)]
 struct CoreStringCell {
     cell_id: CellId,
+    // C++ JSC JSCell::m_type (runtime/JSCell.h:298) == StringType (runtime/JSType.h:37)
+    // for every JSString cell; read via JSCell::isString() (runtime/JSCell.h:127).
+    // Placed at offset 4 (after the 4-byte cell_id) for kind-consistency with the
+    // other cell headers; see the CoreObjectCell::js_type comment for the offset-4
+    // (not C++ byte-5) divergence rationale.
+    js_type: JsType,
     text: CoreStringCellText,
     atom: Option<Identifier>,
 }
+
+// Fixed, kind-consistent JSCell::m_type offset guard (mirrors CoreObjectCell's).
+const _: () = assert!(
+    std::mem::offset_of!(CoreStringCell, js_type) == 4,
+    "CoreStringCell::js_type must be at offset 4 (fixed kind-consistent JSCell::m_type analog)"
+);
 
 #[derive(Clone, Debug, Default)]
 enum CoreStringCellText {
@@ -12118,6 +12214,7 @@ impl CoreStringStore {
         }
         let mut string = Box::pin(CoreStringCell {
             cell_id: CellId::default(),
+            js_type: JsType::String,
             text: CoreStringCellText::Flat(text.to_owned()),
             atom: None,
         });
@@ -12144,6 +12241,7 @@ impl CoreStringStore {
             allocate_primitive_interpreter_cell(heap, CellType::String, |cell_id| {
                 CoreStringCell {
                     cell_id,
+                    js_type: JsType::String,
                     text: CoreStringCellText::Flat(text.to_owned()),
                     atom: None,
                 }
@@ -12214,6 +12312,7 @@ impl CoreStringStore {
             allocate_primitive_interpreter_cell(heap, CellType::String, |cell_id| {
                 CoreStringCell {
                     cell_id,
+                    js_type: JsType::String,
                     text: substring,
                     atom: None,
                 }
@@ -12319,6 +12418,12 @@ impl CoreStringStore {
 
     fn value_for_index(&self, index: usize) -> RuntimeValue {
         let string = self.strings[index].as_ref().get_ref();
+        // Cross-check the in-cell JSCell::m_type against the store gate: a cell owned
+        // by the string store MUST report StringType (runtime/JSCell.h:127). Debug-only.
+        debug_assert!(
+            string.js_type == JsType::String,
+            "cell owned by CoreStringStore must carry JsType::String"
+        );
         let _ = string.cell_id;
         let ptr = NonNull::from(string);
         // SAFETY: The indexed string cell is owned by this store and remains
@@ -12333,11 +12438,25 @@ struct CoreBigIntStore {
     by_value: HashMap<CoreBigIntValue, usize>,
 }
 
+// #[repr(C)] pins the header layout so offset_of!(js_type)==4 is stable. js_type is a
+// constant (always HeapBigInt) so its participation in the derived Eq/Hash/PartialEq
+// is behavior-neutral (the store keys on CoreBigIntValue, not the cell).
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[repr(C)]
 struct CoreBigIntCell {
     cell_id: CellId,
+    // C++ JSC JSCell::m_type (runtime/JSCell.h:298) == HeapBigIntType
+    // (runtime/JSType.h:38) for every heap JSBigInt cell; read via
+    // JSCell::isHeapBigInt() (runtime/JSCell.h:128). At offset 4 for kind-consistency.
+    js_type: JsType,
     value: CoreBigIntValue,
 }
+
+// Fixed, kind-consistent JSCell::m_type offset guard (mirrors CoreObjectCell's).
+const _: () = assert!(
+    std::mem::offset_of!(CoreBigIntCell, js_type) == 4,
+    "CoreBigIntCell::js_type must be at offset 4 (fixed kind-consistent JSCell::m_type analog)"
+);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CoreBigIntValue {
@@ -12867,6 +12986,7 @@ impl CoreBigIntStore {
             allocate_primitive_interpreter_cell(heap, CellType::BigInt, |cell_id| {
                 CoreBigIntCell {
                     cell_id,
+                    js_type: JsType::HeapBigInt,
                     value: value.clone(),
                 }
             })?;
@@ -12885,7 +13005,17 @@ impl CoreBigIntStore {
         self.bigints
             .iter()
             .find(|bigint| core::ptr::from_ref(bigint.as_ref().get_ref()) as usize == payload)
-            .map(|bigint| bigint.as_ref().get_ref().value.clone())
+            .map(|bigint| {
+                let bigint = bigint.as_ref().get_ref();
+                // Cross-check the in-cell JSCell::m_type against the store gate: a cell
+                // owned by the bigint store MUST report HeapBigIntType
+                // (runtime/JSCell.h:128). Debug-only.
+                debug_assert!(
+                    bigint.js_type == JsType::HeapBigInt,
+                    "cell owned by CoreBigIntStore must carry JsType::HeapBigInt"
+                );
+                bigint.value.clone()
+            })
     }
 
     fn to_string(&self, value: RuntimeValue) -> Option<String> {
@@ -12916,17 +13046,31 @@ struct CoreSymbolStore {
     well_known: HashMap<String, RuntimeValue>,
 }
 
+// #[repr(C)] pins the header layout so offset_of!(js_type)==4 is stable (only the
+// field name is accessed today, so fixing the layout is behavior-neutral).
 #[derive(Clone, Debug, Default)]
+#[repr(C)]
 struct CoreSymbolCell {
     cell_id: CellId,
+    // C++ JSC JSCell::m_type (runtime/JSCell.h:298) == SymbolType (runtime/JSType.h:40)
+    // for every JSC Symbol cell; read via JSCell::isSymbol() (runtime/JSCell.h:129).
+    // At offset 4 for kind-consistency.
+    js_type: JsType,
     description: Option<String>,
     registry_key: Option<String>,
 }
+
+// Fixed, kind-consistent JSCell::m_type offset guard (mirrors CoreObjectCell's).
+const _: () = assert!(
+    std::mem::offset_of!(CoreSymbolCell, js_type) == 4,
+    "CoreSymbolCell::js_type must be at offset 4 (fixed kind-consistent JSCell::m_type analog)"
+);
 
 impl CoreSymbolStore {
     fn allocate_untracked(&mut self, description: Option<String>) -> RuntimeValue {
         let mut symbol = Box::pin(CoreSymbolCell {
             cell_id: CellId::default(),
+            js_type: JsType::Symbol,
             description,
             registry_key: None,
         });
@@ -12953,6 +13097,7 @@ impl CoreSymbolStore {
     ) -> Result<RuntimeValue, ExecutionError> {
         self.allocate_cell(heap, |cell_id| CoreSymbolCell {
             cell_id,
+            js_type: JsType::Symbol,
             description,
             registry_key: None,
         })
@@ -12964,6 +13109,7 @@ impl CoreSymbolStore {
         }
         let symbol = self.allocate_cell(heap, |cell_id| CoreSymbolCell {
             cell_id,
+            js_type: JsType::Symbol,
             description: Some(key.to_owned()),
             registry_key: Some(key.to_owned()),
         })?;
@@ -12977,6 +13123,7 @@ impl CoreSymbolStore {
         }
         let symbol = self.allocate_cell(heap, |cell_id| CoreSymbolCell {
             cell_id,
+            js_type: JsType::Symbol,
             description: Some(name.to_owned()),
             registry_key: None,
         })?;
@@ -13065,7 +13212,17 @@ impl CoreSymbolStore {
                 let _ = symbol.cell_id;
                 core::ptr::from_ref(symbol) as usize == payload
             })
-            .map(|symbol| symbol.as_ref().get_ref())
+            .map(|symbol| {
+                let symbol = symbol.as_ref().get_ref();
+                // Cross-check the in-cell JSCell::m_type against the store gate: a cell
+                // owned by the symbol store MUST report SymbolType
+                // (runtime/JSCell.h:129). Debug-only.
+                debug_assert!(
+                    symbol.js_type == JsType::Symbol,
+                    "cell owned by CoreSymbolStore must carry JsType::Symbol"
+                );
+                symbol
+            })
     }
 }
 
@@ -31672,6 +31829,66 @@ mod tests {
             let payload = core::ptr::from_ref(object.as_ref().get_ref()) as usize;
             assert_eq!(cloned.object_indices_by_payload.get(&payload), Some(&index));
         }
+    }
+
+    /// Route B S1 cross-check: the new in-cell JSCell::m_type analog (JsType) must
+    /// (i) sit at a fixed, kind-consistent offset on every cell kind, (ii) match the
+    /// kind of the cell reached through the EXISTING store/payload type gate, and
+    /// (iii) bridge to the pre-existing coarse heap-side gc::CellType each kind is
+    /// published with. This exercises the header (it is not dead) and proves it
+    /// agrees with the type discrimination that gated cells before S1. No carried
+    /// value pointer is dereferenced: cells are reached only through their store gate.
+    #[test]
+    fn js_type_header_agrees_with_existing_type_discrimination() {
+        // (iii) The fixed, kind-consistent offset every cell kind must share.
+        assert_eq!(std::mem::offset_of!(CoreObjectCell, js_type), 4);
+        assert_eq!(std::mem::offset_of!(CoreStringCell, js_type), 4);
+        assert_eq!(std::mem::offset_of!(CoreSymbolCell, js_type), 4);
+        assert_eq!(std::mem::offset_of!(CoreBigIntCell, js_type), 4);
+
+        // Object: resolve via object_indices_by_payload (the S1 type gate).
+        let mut objects = CoreObjectStore::default();
+        let object_value = objects.allocate_with_prototype(None);
+        let object = objects
+            .find(object_value)
+            .expect("object resolves via gate");
+        assert!(object.js_type.is_object());
+        assert_eq!(object.js_type, JsType::FinalObject);
+        assert_eq!(object.js_type.cell_type(), CellType::Object);
+
+        // String: resolve via CoreStringStore::index_for_value (payload gate).
+        let mut strings = CoreStringStore::default();
+        let string_value = strings.allocate_untracked("route-b-s1");
+        let string_index = strings
+            .index_for_value(string_value)
+            .expect("string resolves via gate");
+        let string = strings.strings[string_index].as_ref().get_ref();
+        assert_eq!(string.js_type, JsType::String);
+        assert!(!string.js_type.is_object());
+        assert_eq!(string.js_type.cell_type(), CellType::String);
+
+        // Symbol: resolve via CoreSymbolStore::find (payload scan gate).
+        let mut symbols = CoreSymbolStore::default();
+        let symbol_value = symbols.allocate_untracked(Some("route-b-s1".to_owned()));
+        let symbol = symbols
+            .find(symbol_value)
+            .expect("symbol resolves via gate");
+        assert_eq!(symbol.js_type, JsType::Symbol);
+        assert!(!symbol.js_type.is_object());
+        assert_eq!(symbol.js_type.cell_type(), CellType::Symbol);
+
+        // BigInt: allocate through the heap-backed store, resolve via value()
+        // (which itself debug-asserts the header), then read the owned cell's tag.
+        let mut heap = Heap::new();
+        let mut bigints = CoreBigIntStore::default();
+        let bigint_value = bigints
+            .allocate(&mut heap, CoreBigIntValue::from_i32(7))
+            .expect("bigint allocation");
+        assert!(bigints.value(bigint_value).is_some());
+        let bigint = bigints.bigints[0].as_ref().get_ref();
+        assert_eq!(bigint.js_type, JsType::HeapBigInt);
+        assert!(!bigint.js_type.is_object());
+        assert_eq!(bigint.js_type.cell_type(), CellType::BigInt);
     }
 
     #[test]
