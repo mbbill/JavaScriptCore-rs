@@ -35,9 +35,9 @@ use crate::bytecompiler::BytecompilerGlobalBindingSet;
 use crate::gc::{
     static_cell_metadata_registry, AllocationMode, BarrierDecisionError, BarrierFieldKind,
     BarrierMutationAuthority, BarrierRequirementOutcome, BarrierWriteContext, CellId, CellState,
-    CellType, GcRef, Heap, HeapAllocationRequest, HeapId, HeapIntegrationError, RootId, RootKind,
-    RootRecord, RootSetMutationAuthority, RootSetSemanticError, StructureId, TargetedRootRecord,
-    TargetedRootSet, WriteBarrierApplicationRequest,
+    CellType, FxIntBuildHasher, GcRef, Heap, HeapAllocationRequest, HeapId, HeapIntegrationError,
+    RootId, RootKind, RootRecord, RootSetMutationAuthority, RootSetSemanticError, StructureId,
+    TargetedRootRecord, TargetedRootSet, WriteBarrierApplicationRequest,
 };
 use crate::jit::ic::{
     GeneratedPropertyStoreMutationCommit, GeneratedPropertyStoreMutationMissReason,
@@ -5255,7 +5255,11 @@ fn can_use_put_by_id_megamorphic_property_name(text: &str) -> bool {
 #[derive(Debug, Default)]
 struct CoreObjectStore {
     objects: Vec<Pin<Box<CoreObjectCell>>>,
-    object_indices_by_payload: HashMap<usize, usize>,
+    // VM-internal payload-bits -> object-slot index; keyed by interpreter pointer-bits,
+    // never JS/adversary-controlled, so it needs no SipHash DoS resistance. Use the
+    // in-tree FxIntBuildHasher (gc/fast_hash.rs, WTF IntHash/PtrHash family); the swap is
+    // semantically inert (get/insert/contains/clear/len are BuildHasher-independent).
+    object_indices_by_payload: HashMap<usize, usize, FxIntBuildHasher>,
     structure_ids: CoreStructureIdAllocator,
     // C++ JSC: Structure::m_transitionTable (runtime/StructureTransitionTable.h)
     // plus the implicit StructureID identity from Structure::create. In C++ each
@@ -5407,7 +5411,7 @@ impl Clone for CoreObjectStore {
     fn clone(&self) -> Self {
         let mut cloned = Self {
             objects: self.objects.clone(),
-            object_indices_by_payload: HashMap::new(),
+            object_indices_by_payload: HashMap::default(),
             structure_ids: self.structure_ids.clone(),
             // add_property_transitions is keyed by StructureId (flat ids, stable across
             // clone), so the transition graph stays valid. structure_seed_roots is keyed

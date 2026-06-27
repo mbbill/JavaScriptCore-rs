@@ -410,8 +410,14 @@ pub struct Heap {
     // gated, so relax the dead-code lint for the default build.
     #[cfg_attr(not(feature = "arm64_native_entry_proof"), allow(dead_code))]
     marked_cells: HashMap<CellId, HeapEpoch>,
-    payload_to_cell: HashMap<usize, CellId>,
-    cell_to_payload: HashMap<CellId, usize>,
+    // These two maps carry the dual interpreter<->heap identity (payload bits <->
+    // CellId). Both keys are VM-internal integers (interpreter pointer-bits and the
+    // monotonic CellId), never JS/adversary-controlled, so they need no SipHash DoS
+    // resistance; use the in-tree FxIntBuildHasher (gc/fast_hash.rs, WTF IntHash/PtrHash
+    // family) to drop the per-probe cryptographic-hash cost. Swap is semantically inert:
+    // get/insert/contains/len are BuildHasher-independent (only bucket placement changes).
+    payload_to_cell: HashMap<usize, CellId, FxIntBuildHasher>,
+    cell_to_payload: HashMap<CellId, usize, FxIntBuildHasher>,
     // C++ heap/Heap.h:1026 `uintptr_t m_barriersExecuted{0}` — number of remembered-set
     // additions performed by writeBarrierSlowPath (incremented in addToRememberedSet,
     // heap/Heap.cpp:1190; reset each cycle in resumeThePeriphery, heap/Heap.cpp:1919). It stays 0 while
@@ -454,8 +460,8 @@ impl Heap {
             requests: Vec::new(),
             allocations: Vec::new(),
             marked_cells: HashMap::new(),
-            payload_to_cell: HashMap::new(),
-            cell_to_payload: HashMap::new(),
+            payload_to_cell: HashMap::default(),
+            cell_to_payload: HashMap::default(),
             barriers_executed: 0,
             barrier_classifications: 0,
             last_barrier_outcome: None,
@@ -557,10 +563,7 @@ impl Heap {
         }
 
         let cell = self.cell_for_payload(candidate_address)?;
-        let record = self
-            .allocations
-            .iter()
-            .find(|record| record.response.cell == cell)?;
+        let record = self.allocation_record(cell)?;
         if !record.published
             || record.lifecycle.destruction_state != CellDestructionState::NotPending
         {
@@ -685,11 +688,55 @@ impl Heap {
         Ok(response)
     }
 
+    /// O(1) lookup of the allocation record owning `cell`.
+    ///
+    /// INVARIANT (Rust-only bookkeeping; no C++ JSC counterpart): `allocations` is a
+    /// dense, monotonic, push-only Vec indexed by `CellId`. `allocate_record` is the
+    /// sole producer — it mints `cell = CellId(self.next_cell)` with `next_cell` starting
+    /// at 1 and strictly incrementing, then pushes exactly one record — so
+    /// `allocations[i].response.cell == CellId(i + 1)` always holds. Nothing ever removes,
+    /// reorders, or clears a record: no collector/sweep runs in InterpreterOnly
+    /// (`poll_collection_at_allocation_slow_path` defers, above) and `allocations` has no
+    /// remove/retain/clear/swap_remove/drain/truncate/insert site. Thus `cell` resolves
+    /// directly to index `cell.0 - 1`, replacing the former O(N) `iter().find(...)` scans
+    /// that grew with the run length on every property observation.
+    ///
+    /// The `response.cell == cell` re-check preserves the EXACT `UnknownCell` error
+    /// contract of those scans for synthetic CellIds minted OUTSIDE `allocate_record`
+    /// (e.g. CodeBlockId / session ids based at 50_000): such an id either lands out of
+    /// range -> `None`, or (defensively, should `next_cell` ever reach that base) on a
+    /// real but different record -> rejected by the equality check -> `None`. `CellId(0)`
+    /// is the null id (never minted); guard it so `cell.0 - 1` cannot wrap to `usize::MAX`.
+    ///
+    /// C++ NOTE: JSC has NO payload->id or id->record indirection at all — a JSCell's
+    /// identity IS its address and ArrayProfile/ValueProfile read StructureID/
+    /// EncodedJSValue straight off the cell (no lookup). This helper only removes
+    /// accidental Rust scan cost; it adds no JSC concept and does not unify identity.
+    fn allocation_record(&self, cell: CellId) -> Option<&HeapAllocationRecord> {
+        if cell.0 == 0 {
+            return None;
+        }
+        self.allocations
+            .get((cell.0 - 1) as usize)
+            .filter(|record| record.response.cell == cell)
+    }
+
+    fn allocation_record_mut(&mut self, cell: CellId) -> Option<&mut HeapAllocationRecord> {
+        if cell.0 == 0 {
+            return None;
+        }
+        self.allocations
+            .get_mut((cell.0 - 1) as usize)
+            .filter(|record| record.response.cell == cell)
+    }
+
     pub fn publish_cell(&mut self, cell: CellId) -> Result<(), HeapIntegrationError> {
+        // Warm path on every repeat property observation: the cell is already
+        // published=true (publish is the only writer and never un-publishes), so this is
+        // an idempotent bit write — but the prior O(N) scan still walked the whole growing
+        // Vec each time. The O(1) record lookup keeps the identical write/error contract.
         let record = self
-            .allocations
-            .iter_mut()
-            .find(|record| record.response.cell == cell)
+            .allocation_record_mut(cell)
             .ok_or(HeapIntegrationError::UnknownCell(cell))?;
         record.published = true;
         Ok(())
@@ -700,9 +747,7 @@ impl Heap {
         request: HeapCellInvalidationRequest,
     ) -> Result<CellLifecycleRecord, HeapIntegrationError> {
         let record = self
-            .allocations
-            .iter_mut()
-            .find(|record| record.response.cell == request.cell)
+            .allocation_record_mut(request.cell)
             .ok_or(HeapIntegrationError::UnknownCell(request.cell))?;
         record.lifecycle = CellLifecycleRecord {
             destruction_state: CellDestructionState::PendingDestruction,
@@ -1235,11 +1280,7 @@ impl Heap {
     }
 
     fn require_known_cell(&self, cell: CellId) -> Result<(), HeapIntegrationError> {
-        if self
-            .allocations
-            .iter()
-            .any(|record| record.response.cell == cell)
-        {
+        if self.allocation_record(cell).is_some() {
             Ok(())
         } else {
             Err(HeapIntegrationError::UnknownCell(cell))
@@ -2433,6 +2474,38 @@ mod tests {
             Err(HeapIntegrationError::UnknownCell(CellId(99)))
         );
         assert_eq!(heap.cell_for_payload(0x1000), None);
+    }
+
+    #[test]
+    fn heap_o1_record_lookup_rejects_synthetic_and_null_cell_ids() {
+        // Locks in the bounds-checked direct-index contract that replaced the O(N)
+        // allocations scan: a CellId minted OUTSIDE allocate_record (synthetic
+        // CodeBlock/session ids based at 50_000) and the null CellId(0) must still
+        // resolve to UnknownCell, exactly as the former iter().find(...) scan did.
+        let mut heap = Heap::new();
+        let real = allocate_test_cell(&mut heap); // CellId(1)
+        assert_eq!(real, CellId(1));
+
+        // Out-of-range synthetic id -> get() bounds None -> UnknownCell.
+        assert_eq!(
+            heap.publish_cell(CellId(50_000)),
+            Err(HeapIntegrationError::UnknownCell(CellId(50_000)))
+        );
+        // Null id -> explicit cell.0 == 0 guard (never minted) -> UnknownCell, with no
+        // (0 - 1) == usize::MAX index wrap.
+        assert_eq!(
+            heap.publish_cell(CellId(0)),
+            Err(HeapIntegrationError::UnknownCell(CellId(0)))
+        );
+        assert_eq!(
+            heap.invalidate_cell(HeapCellInvalidationRequest {
+                cell: CellId(0),
+                reason: CellZapReason::Destruction,
+            }),
+            Err(HeapIntegrationError::UnknownCell(CellId(0)))
+        );
+        // The real cell still publishes through the O(1) path.
+        assert_eq!(heap.publish_cell(real), Ok(()));
     }
 
     #[test]
