@@ -42,12 +42,15 @@ ACTIVE ROADMAP (validated, profiling-earned dependency order; default execution 
 [wip] JetStream 3 Octane parity
   [done] Runner/benchmark contract: JetStreamDriver load order, shell globals, iteration,
          validation, scoring, telemetry, probe command surface
-  [done] All 15 Octane benchmarks RUN correctly (zero throwers/aborts); suite geomean is None
-         until all 15 Succeed (shell/octane.rs:1996), score=5000/time_ms per bench
-  [done] SCORES (3): octane-code-load, crypto, navier-stokes
-  [wip]  FUNCTIONAL-BUT-SLOW (12; perf-gated, not a feature gap): Box2D, delta-blue,
-         earley-boyer, gbemu, mandreel, pdfjs, raytrace, regexp, richards, splay (GC-stress),
-         typescript, octane-zlib (asm.js). Gate to all-15-Succeed is throughput.
+  [wip]  Run-state (2026-06-27 sweep, interpreter, iter=2): 7 SCORE / 4 too-slow / 4 throw.
+         Suite geomean is None until all 15 Succeed (shell/octane.rs:1996), score=5000/time_ms.
+  [done] SCORES (7, up from 3 pre-GC-waves; richards ~7.5x): octane-code-load 89, navier 5.3,
+         crypto 3.5, splay 1.0, richards 0.91, delta-blue 0.62, raytrace 0.23
+  [wip]  TOO-SLOW (4; perf-gated, >90s): earley-boyer, typescript, mandreel (asm.js),
+         octane-zlib (asm.js). mandreel/zlib likely need the JIT (Phase F).
+  [missing] THROW a feature-gap exception (4; Completion(Threw), NOT GC-wave regressions --
+         verified identical vs baseline c8e83ad): Box2D, gbemu, pdfjs, regexp (regexp=Yarr gap).
+         Box2D/pdfjs were masked by slowness pre-waves; the faster interpreter now reaches the throw.
   [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
          __defineGetter__/Setter__, global Function, Math, apply/bind, globals
   [missing] Octane score parity with local C++ JSC (needs Phases C-F)
