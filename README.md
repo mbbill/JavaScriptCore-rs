@@ -15,29 +15,27 @@ Legend:
 - [frozen] quarantined dead code retained as salvage; not on the active path
 
 ```text
-ACTIVE ROADMAP (validated, profiling-earned dependency order; default execution path = InterpreterOnly):
-  Phase A [done]    de-anchor + quarantine (commit c8e83ad) -- ENABLING/HYGIENE, score-neutral.
-                 ARM64 admission-proof cluster + GC/JIT salvage gated behind
-                 cfg(feature="arm64_native_entry_proof") off-by-default; #[cfg(test)] proof files
-                 deleted. The 0.0458 figure was a --baseline-only probe artifact; default path is
-                 InterpreterOnly (shell/octane.rs).
-  Phase B [done]    per-bench subsystem profiling (WF2a). VERDICT (medium confidence, /usr/bin/sample
-                 on 5 benches, live path): per-op GC bookkeeping dominates self-time -- ~79% richards,
-                 ~49-65% crypto, ~99% splay, ~80% gbemu; codegen-addressable <=22% best / <5% on
-                 three; real GC collection ~0% (never runs). EARNED: GC-first, baseline JIT deferred.
-  Phase B2 [pending] local C++ JSC same-machine comparison harness (parity-gap number; jsc build by owner).
-  Phase C [active]  real mark/sweep GC + safepoints + conservative stack scan + inline write barriers
-                 + direct cell pointers -- retires the per-op targeted-root registry, the unbounded
-                 write-barrier Vec (heap.rs:847-876), and the payload->cell HashMap identity bridge
-                 (bind_object_to_heap). Gate: re-run the 5-bench profile; rooting buckets must collapse.
-  Phase C2 [parallel] navier-stokes object-model fix (independent of GC/JIT): O(1) observation buffer
-                 (vs Vec::remove(0) over 1024-entry ring, interpreter/mod.rs:3583-3588) + integer-indexed
-                 dense butterfly storage (vs String(index.to_string())).
-  Phase D [deferred] real machine-code baseline JIT (MacroAssemblerARM64 + ExecutableAllocator) --
-                 codegen share becomes the bottleneck only after the rooting tax is removed.
-  Phase E [planned] structural refactor: split vm/mod.rs (74k) + interpreter/mod.rs (42k).
+ACTIVE ROADMAP (validated, profiling-earned; default path = InterpreterOnly; status 2026-06-27):
+  Phase A [done]   de-anchor + quarantine (c8e83ad): ARM64 admission cluster gated off-by-default.
+  Phase B [done]   per-bench profiling -> GC-first earned (per-op bookkeeping was 50-99% self-time).
+  Phase C [wip]    GC-first tax removal -- DONE: barrier elision (db23cbd), safepoint register-rooting
+                 (830b686) + frame-rooting (9fdc938) = richards ~7.5x; O(1) cell-record lookup + FxHash
+                 maps (3f8ee9b); JSCell type-header = Route B S1 (6e96182). Abstract-equality fix lands
+                 pdfjs (e499fd9). 8/15 score (was 3).
+  Phase C-BLOCKED  Route B cell-deref (S2) + the real mark/sweep collector are BLOCKED on S4 (a
+                 provenance-stable Heap-owned arena): the carried int->ptr cell deref is miri-proven UB
+                 (Stacked+Tree Borrows) in the current Vec<Pin<Box>> skeleton, and a sweeping collector
+                 breaks the dense CellId index. S4 = the irreversible, pervasively-unsafe gate -> OWNER.
+  Phase B2 [pending] local C++ JSC same-machine comparison harness (parity-gap; jsc build by owner).
+  Phase D [deferred] real machine-code baseline JIT (MacroAssemblerARM64 + ExecutableAllocator).
+  Phase E [planned] structural refactor: split vm/mod.rs (74k) + interpreter/mod.rs (42k) -- owner to
+                 guide module boundaries.
   Phase F [blocked] DFG/FTL/B3 optimizing tier -- where suite-SCORE parity ultimately lives.
-  Phase G [parallel] Yarr/RegExp.
+  Phase G [parallel] Yarr/RegExp (regexp throw on lookahead + \b correctness).
+  NEAR-TERM LEVERS (profiling-earned, faithful, owner-overseen): (1) call-link tiering PER-CALLSITE
+                 refactor -- bound the unbounded O(N^2) logs to JSC CallLinkInfo -> lands earley-boyer +
+                 typescript (-> 10/15); (2) string rep UTF-8 -> WTF::StringImpl Latin-1/UTF-16 -> ~10x
+                 pdfjs + all string-heavy benches; (3) gbemu/Box2D value-divergence BUGS (need jsc compare).
 
 [wip] JetStream 3 Octane parity
   [done] Runner/benchmark contract: JetStreamDriver load order, shell globals, iteration,
