@@ -2042,10 +2042,27 @@ impl CoreObjectStore {
                 },
             );
         }
+        // C++ JSC MathObject::finishCreation (runtime/MathObject.cpp:83-90)
+        // installs eight constants, each DontDelete | DontEnum | ReadOnly, in this
+        // order. JSC computes them via libm at startup (e.g. Math::log(10.0)); the
+        // port uses Rust's correctly-rounded std::f64::consts equivalents, which
+        // represent the same mathematical constants (any difference is sub-ULP and
+        // unobservable). FRAC_1_SQRT_2 == sqrt(0.5) and SQRT_2 == sqrt(2.0).
         for (name, value) in [
             ("E", RuntimeValue::from_double(std::f64::consts::E)),
             ("LN2", RuntimeValue::from_double(std::f64::consts::LN_2)),
+            ("LN10", RuntimeValue::from_double(std::f64::consts::LN_10)),
+            ("LOG2E", RuntimeValue::from_double(std::f64::consts::LOG2_E)),
+            (
+                "LOG10E",
+                RuntimeValue::from_double(std::f64::consts::LOG10_E),
+            ),
             ("PI", RuntimeValue::from_double(std::f64::consts::PI)),
+            (
+                "SQRT1_2",
+                RuntimeValue::from_double(std::f64::consts::FRAC_1_SQRT_2),
+            ),
+            ("SQRT2", RuntimeValue::from_double(std::f64::consts::SQRT_2)),
         ] {
             let key = CorePropertyKey::String(name.into());
             let _ = self.define_data_property(
@@ -2138,6 +2155,56 @@ impl CoreObjectStore {
         let prototype = self.ensure_number_prototype();
         self.install_constructor_prototype(constructor, prototype);
         self.install_prototype_constructor_with_write_barrier(heap, prototype, constructor)?;
+        // C++ JSC NumberConstructor::finishCreation (runtime/NumberConstructor.cpp:80-88)
+        // installs the eight numeric constants directly on the Number constructor,
+        // each with DontDelete | DontEnum | ReadOnly (writable:false,
+        // enumerable:false, configurable:false), in this exact order. Without them
+        // Number.MIN_VALUE is undefined, so box2d's
+        // `b2Assert(1 - m.t0 > Number.MIN_VALUE)` compares against undefined->NaN
+        // and throws (Octane/box2d.js:110,157). Each value matches the C++
+        // jsDoubleNumber argument exactly; none is an int32, so from_double's
+        // strict-int32 canonicalization never fires (all stay doubles like
+        // jsDoubleNumber).
+        for (name, value) in [
+            ("EPSILON", f64::EPSILON),
+            ("MAX_VALUE", f64::MAX),
+            // C++ literal 5E-324 rounds to the smallest positive subnormal double
+            // (== f64::from_bits(1)); the Rust literal rounds to the same value.
+            ("MIN_VALUE", 5e-324),
+            ("MAX_SAFE_INTEGER", 9007199254740991.0),
+            ("MIN_SAFE_INTEGER", -9007199254740991.0),
+            ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+            ("POSITIVE_INFINITY", f64::INFINITY),
+            ("NaN", f64::NAN),
+        ] {
+            let key = CorePropertyKey::String(name.into());
+            let _ = self.define_data_property(
+                constructor,
+                &key,
+                RuntimeValue::from_double(value),
+                CorePropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+        // C++ JSC NumberConstructor::finishCreation (NumberConstructor.cpp:89-90)
+        // installs Number.parseInt / Number.parseFloat as DontEnum, reusing the
+        // realm's existing parseInt/parseFloat function objects
+        // (realm()->parseIntFunction()). The port has no stored handle to those
+        // objects here, so it installs fresh ParseInt/ParseFloat natives with
+        // identical behavior; the only divergence is object identity
+        // (Number.parseInt === parseInt is false), which no Octane bench observes.
+        // FOLLOW-UP: reuse the realm's parseInt/parseFloat objects once exposed.
+        self.install_native_method(constructor, "parseInt", CoreNativeFunction::ParseInt);
+        self.install_native_method(constructor, "parseFloat", CoreNativeFunction::ParseFloat);
+        // FOLLOW-UP (out of scope here): Number.isFinite/isNaN/isInteger/
+        // isSafeInteger (NumberConstructor.cpp:92 + NumberConstructor.lut.h) need
+        // NEW non-coercing natives. They are NOT the global isFinite/isNaN
+        // (CoreNativeFunction::GlobalIsFinite/GlobalIsNaN), which ToNumber-coerce
+        // their argument; the Number.* forms do not coerce, so reusing the global
+        // natives would be a behavior divergence. Box2d needs only the constants.
         Ok(constructor)
     }
 
