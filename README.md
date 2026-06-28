@@ -66,8 +66,13 @@ ACTIVE ROADMAP (validated, profiling-earned; default path = InterpreterOnly; sta
          richards 0.91, pdfjs 0.88 (slow ~194s), delta-blue 0.62, raytrace 0.23, gbemu 0.026
   [wip]  TOO-SLOW/perf-gated (>90s under the interpreter): earley-boyer, typescript, mandreel
          (asm.js), octane-zlib (asm.js), Box2D (now correct, just slow). mandreel/zlib need the JIT.
-  [missing] THROW (1): regexp (full Yarr gap). Box2D FIXED (missing Number/Math static constants,
-         NOT a value bug -- 1983a63). gbemu FIXED (new Function dynamic compile via CompileFunctionRequest
+         LEVER: call-link per-callsite CallLinkInfo (B1 API landed fbd17aa; B2-B4 rewire pending)
+         -- profiled 68-70% of earley-boyer self-time is the unbounded VM-global call-link Vec scans;
+         the per-site rewire is the O(N^2)->O(1) fix expected to land earley-boyer+typescript -> score.
+  [wip]  THROW (1): regexp. Faithful YARR ENGINE BUILT + C++-oracle-verified: parser->PatternDisjunction
+         tree+setupOffsets (B1, 58a187a) + ByteCompiler+flat backtracking interpreter (B2, 1616a70),
+         both unwired. B3 (unfreeze PatternTerm quantity/frame fields + wire RegExp + delete simple_exec)
+         closes the thrower. Box2D FIXED (Number/Math constants -- 1983a63). gbemu FIXED (new Function
          -- 6e542ee). pdfjs FIXED (abstract-equality ToPrimitive).
   [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
          __defineGetter__/Setter__, global Function, Math, apply/bind, globals
