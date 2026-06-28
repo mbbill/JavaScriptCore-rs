@@ -13,6 +13,7 @@ pub(crate) mod gc;
 pub(crate) mod generator;
 pub(crate) mod ic;
 pub(crate) mod instruction;
+pub(crate) mod instruction_stream;
 pub(crate) mod integration;
 pub(crate) mod metadata;
 pub(crate) mod opcode;
