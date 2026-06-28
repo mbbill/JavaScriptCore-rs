@@ -672,51 +672,554 @@ impl ArrayProfileFlags {
     };
 }
 
-/// Arithmetic profile bitfield split into observed result and operand types.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub struct ArithProfile {
-    pub bytecode_index: BytecodeIndex,
-    pub result: ObservedResults,
-    pub lhs: ObservedType,
-    pub rhs: ObservedType,
-    pub special_fast_path_taken: bool,
-}
+// === Arithmetic profiling (ArithProfile.h) ===
+//
+// Faithful packed-bitfield port of JSC's arithmetic profiles. `ObservedType`
+// (ArithProfile.h:37-67) and `ObservedResults` (ArithProfile.h:69-100) are the
+// two bit-packed components; `ArithProfile` (ArithProfile.h:102-182) is the
+// shared base holding the low `ObservedResults` bits, and the
+// `UnaryArithProfile` (ArithProfile.h:193-263) / `BinaryArithProfile`
+// (ArithProfile.h:272-388) subclasses pack their operand `ObservedType`s above
+// it. JSC templates `ArithProfile<BitfieldType>` but only instantiates
+// `ArithProfile<uint16_t>` (ArithProfile.h:185), so the Rust base fixes the
+// storage to `u16`. The bool-field stubs that used to live here were a
+// divergence: they could not reproduce JSC's exact bit positions, the
+// `observe*` merge order, or the `m_bits` single-store discipline the JIT reads
+// concurrently. This port restores all three.
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub struct ObservedResults {
-    pub non_negative_zero_double: bool,
-    pub negative_zero_double: bool,
-    pub non_numeric: bool,
-    pub int32_overflow: bool,
-    pub int52_overflow: bool,
-    pub heap_big_int: bool,
-    pub big_int32: bool,
-}
-
+/// `ObservedType` (ArithProfile.h:37-67): 3-bit observed-type lattice for one
+/// arithmetic operand.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct ObservedType {
-    pub int32: bool,
-    pub number: bool,
-    pub non_number: bool,
+    bits: u8,
 }
 
-/// Execution counter contract used for LLInt and tier-up thresholds.
+impl ObservedType {
+    // ArithProfile.h:58-63.
+    const TYPE_EMPTY: u8 = 0x0;
+    const TYPE_INT32: u8 = 0x1;
+    const TYPE_NUMBER: u8 = 0x2;
+    const TYPE_NON_NUMBER: u8 = 0x4;
+    const NUM_BITS_NEEDED: u32 = 3;
+
+    // ArithProfile.h:38-40 (ObservedType(uint8_t bits = TypeEmpty)).
+    pub const fn new(bits: u8) -> Self {
+        Self { bits }
+    }
+
+    pub const fn empty() -> Self {
+        Self {
+            bits: Self::TYPE_EMPTY,
+        }
+    }
+
+    // ArithProfile.h:42-49.
+    pub const fn saw_int32(self) -> bool {
+        self.bits & Self::TYPE_INT32 != 0
+    }
+    pub const fn is_only_int32(self) -> bool {
+        self.bits == Self::TYPE_INT32
+    }
+    pub const fn saw_number(self) -> bool {
+        self.bits & Self::TYPE_NUMBER != 0
+    }
+    pub const fn is_only_number(self) -> bool {
+        self.bits == Self::TYPE_NUMBER
+    }
+    pub const fn saw_non_number(self) -> bool {
+        self.bits & Self::TYPE_NON_NUMBER != 0
+    }
+    pub const fn is_only_non_number(self) -> bool {
+        self.bits == Self::TYPE_NON_NUMBER
+    }
+    pub const fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+    pub const fn bits(self) -> u8 {
+        self.bits
+    }
+
+    // ArithProfile.h:51-54.
+    pub const fn with_int32(self) -> Self {
+        Self {
+            bits: self.bits | Self::TYPE_INT32,
+        }
+    }
+    pub const fn with_number(self) -> Self {
+        Self {
+            bits: self.bits | Self::TYPE_NUMBER,
+        }
+    }
+    pub const fn with_non_number(self) -> Self {
+        Self {
+            bits: self.bits | Self::TYPE_NON_NUMBER,
+        }
+    }
+    pub const fn without_non_number(self) -> Self {
+        Self {
+            bits: self.bits & !Self::TYPE_NON_NUMBER,
+        }
+    }
+}
+
+/// `ObservedResults` (ArithProfile.h:69-100): 7-bit set of result observations
+/// shared by the unary and binary profiles.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub struct BytecodeExecutionCounter {
-    pub counter: i32,
-    pub total_count: i32,
-    pub active_threshold: i32,
-    pub variant: CountingVariant,
-    pub state: ExecutionCounterState,
+pub struct ObservedResults {
+    bits: u8,
 }
 
+impl ObservedResults {
+    // ArithProfile.h:71-80 (enum Tags + numBitsNeeded).
+    const NON_NEG_ZERO_DOUBLE: u8 = 1 << 0;
+    const NEG_ZERO_DOUBLE: u8 = 1 << 1;
+    const NON_NUMERIC: u8 = 1 << 2;
+    const INT32_OVERFLOW: u8 = 1 << 3;
+    const INT52_OVERFLOW: u8 = 1 << 4;
+    const HEAP_BIG_INT: u8 = 1 << 5;
+    const BIG_INT32: u8 = 1 << 6;
+    const NUM_BITS_NEEDED: u32 = 7;
+
+    // ArithProfile.h:83-85.
+    pub const fn new(bits: u8) -> Self {
+        Self { bits }
+    }
+
+    // ArithProfile.h:87-96.
+    pub const fn did_observe_non_int32(self) -> bool {
+        self.bits
+            & (Self::NON_NEG_ZERO_DOUBLE
+                | Self::NEG_ZERO_DOUBLE
+                | Self::NON_NUMERIC
+                | Self::HEAP_BIG_INT
+                | Self::BIG_INT32)
+            != 0
+    }
+    pub const fn did_observe_double(self) -> bool {
+        self.bits & (Self::NON_NEG_ZERO_DOUBLE | Self::NEG_ZERO_DOUBLE) != 0
+    }
+    pub const fn did_observe_non_neg_zero_double(self) -> bool {
+        self.bits & Self::NON_NEG_ZERO_DOUBLE != 0
+    }
+    pub const fn did_observe_neg_zero_double(self) -> bool {
+        self.bits & Self::NEG_ZERO_DOUBLE != 0
+    }
+    pub const fn did_observe_non_numeric(self) -> bool {
+        self.bits & Self::NON_NUMERIC != 0
+    }
+    pub const fn did_observe_big_int(self) -> bool {
+        self.bits & (Self::HEAP_BIG_INT | Self::BIG_INT32) != 0
+    }
+    pub const fn did_observe_heap_big_int(self) -> bool {
+        self.bits & Self::HEAP_BIG_INT != 0
+    }
+    pub const fn did_observe_big_int32(self) -> bool {
+        self.bits & Self::BIG_INT32 != 0
+    }
+    pub const fn did_observe_int32_overflow(self) -> bool {
+        self.bits & Self::INT32_OVERFLOW != 0
+    }
+    pub const fn did_observe_int52_overflow(self) -> bool {
+        self.bits & Self::INT52_OVERFLOW != 0
+    }
+    pub const fn bits(self) -> u8 {
+        self.bits
+    }
+}
+
+/// `ArithProfile<uint16_t>` base (ArithProfile.h:102-182): owns the low
+/// `ObservedResults` bits shared by the unary and binary subclasses, plus the
+/// `observeResult`/`setObserved*` mutators and `observedResults`/`didObserve*`
+/// read predicates.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct ArithProfile {
+    // ArithProfile.h:181. JSC updates m_bits only in a single store so a
+    // concurrent JIT reader never observes a half-written bitfield; the
+    // subclass `observe*` methods mirror that by computing into a copy first.
+    bits: u16,
+}
+
+impl ArithProfile {
+    // ArithProfile.h:105-108.
+    pub const fn observed_results(self) -> ObservedResults {
+        ObservedResults::new((self.bits & ((1u16 << ObservedResults::NUM_BITS_NEEDED) - 1)) as u8)
+    }
+
+    // ArithProfile.h:109-118.
+    pub const fn did_observe_non_int32(self) -> bool {
+        self.observed_results().did_observe_non_int32()
+    }
+    pub const fn did_observe_double(self) -> bool {
+        self.observed_results().did_observe_double()
+    }
+    pub const fn did_observe_non_neg_zero_double(self) -> bool {
+        self.observed_results().did_observe_non_neg_zero_double()
+    }
+    pub const fn did_observe_neg_zero_double(self) -> bool {
+        self.observed_results().did_observe_neg_zero_double()
+    }
+    pub const fn did_observe_non_numeric(self) -> bool {
+        self.observed_results().did_observe_non_numeric()
+    }
+    pub const fn did_observe_big_int(self) -> bool {
+        self.observed_results().did_observe_big_int()
+    }
+    pub const fn did_observe_heap_big_int(self) -> bool {
+        self.observed_results().did_observe_heap_big_int()
+    }
+    pub const fn did_observe_big_int32(self) -> bool {
+        self.observed_results().did_observe_big_int32()
+    }
+    pub const fn did_observe_int32_overflow(self) -> bool {
+        self.observed_results().did_observe_int32_overflow()
+    }
+    pub const fn did_observe_int52_overflow(self) -> bool {
+        self.observed_results().did_observe_int52_overflow()
+    }
+
+    // ArithProfile.h:120-126.
+    pub fn set_observed_non_neg_zero_double(&mut self) {
+        self.set_bit(ObservedResults::NON_NEG_ZERO_DOUBLE as u16);
+    }
+    pub fn set_observed_neg_zero_double(&mut self) {
+        self.set_bit(ObservedResults::NEG_ZERO_DOUBLE as u16);
+    }
+    pub fn set_observed_non_numeric(&mut self) {
+        self.set_bit(ObservedResults::NON_NUMERIC as u16);
+    }
+    pub fn set_observed_heap_big_int(&mut self) {
+        self.set_bit(ObservedResults::HEAP_BIG_INT as u16);
+    }
+    pub fn set_observed_big_int32(&mut self) {
+        self.set_bit(ObservedResults::BIG_INT32 as u16);
+    }
+    pub fn set_observed_int32_overflow(&mut self) {
+        self.set_bit(ObservedResults::INT32_OVERFLOW as u16);
+    }
+    pub fn set_observed_int52_overflow(&mut self) {
+        self.set_bit(ObservedResults::INT52_OVERFLOW as u16);
+    }
+
+    // ArithProfile.h:128-145.
+    pub fn observe_result(&mut self, value: JsValue) {
+        if value.is_int32() {
+            return;
+        }
+        if value.is_number() {
+            self.bits |= (ObservedResults::INT32_OVERFLOW
+                | ObservedResults::INT52_OVERFLOW
+                | ObservedResults::NON_NEG_ZERO_DOUBLE
+                | ObservedResults::NEG_ZERO_DOUBLE) as u16;
+            return;
+        }
+        // C++ JSC (ArithProfile.h:136-143) then checks isBigInt32()/isHeapBigInt()
+        // and sets BigInt32/HeapBigInt respectively. The Rust value model does not
+        // yet represent BigInt (JsValue has no isBigInt32/isHeapBigInt predicate),
+        // so those branches are unreachable here and every non-numeric value —
+        // including a BigInt cell once it exists — falls through to NonNumeric.
+        // This is a transitional value-model gap, not an intentional semantic
+        // change; restore the BigInt branches when JsValue gains BigInt
+        // classification.
+        self.bits |= ObservedResults::NON_NUMERIC as u16;
+    }
+
+    // ArithProfile.h:173.
+    pub const fn bits(self) -> u16 {
+        self.bits
+    }
+
+    // ArithProfile.h:178-179. `hasBits` feeds the JIT `emit*` helpers, which are
+    // not ported in this UNWIRED unit, so it is exercised only by tests here.
+    #[allow(dead_code)]
+    const fn has_bits(self, mask: u16) -> bool {
+        self.bits & mask != 0
+    }
+    fn set_bit(&mut self, mask: u16) {
+        self.bits |= mask;
+    }
+}
+
+/// `UnaryArithProfile` (ArithProfile.h:193-263): `ObservedResults` plus one
+/// operand `ObservedType` packed into 16 bits.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct UnaryArithProfile {
+    base: ArithProfile,
+}
+
+#[allow(dead_code)]
+impl UnaryArithProfile {
+    // ArithProfile.h:194.
+    const ARG_OBSERVED_TYPE_SHIFT: u32 = ObservedResults::NUM_BITS_NEEDED;
+    // ArithProfile.h:198.
+    const CLEAR_ARG_OBSERVED_TYPE_BIT_MASK: u16 = !(0b111u16 << Self::ARG_OBSERVED_TYPE_SHIFT);
+    // ArithProfile.h:200.
+    const OBSERVED_TYPE_MASK: u16 = (1u16 << ObservedType::NUM_BITS_NEEDED) - 1;
+
+    pub const fn bits(self) -> u16 {
+        self.base.bits()
+    }
+    pub fn arith(&self) -> &ArithProfile {
+        &self.base
+    }
+    pub fn arith_mut(&mut self) -> &mut ArithProfile {
+        &mut self.base
+    }
+
+    // ArithProfile.h:210-227.
+    pub const fn observed_int_bits() -> u16 {
+        (ObservedType::empty().with_int32().bits() as u16) << Self::ARG_OBSERVED_TYPE_SHIFT
+    }
+    pub const fn observed_number_bits() -> u16 {
+        (ObservedType::empty().with_number().bits() as u16) << Self::ARG_OBSERVED_TYPE_SHIFT
+    }
+    pub const fn observed_non_number_bits() -> u16 {
+        (ObservedType::empty().with_non_number().bits() as u16) << Self::ARG_OBSERVED_TYPE_SHIFT
+    }
+
+    // ArithProfile.h:229.
+    pub const fn arg_observed_type(self) -> ObservedType {
+        ObservedType::new(
+            ((self.base.bits() >> Self::ARG_OBSERVED_TYPE_SHIFT) & Self::OBSERVED_TYPE_MASK) as u8,
+        )
+    }
+    // ArithProfile.h:230-237.
+    pub fn set_arg_observed_type(&mut self, ty: ObservedType) {
+        let mut bits = self.base.bits();
+        bits &= Self::CLEAR_ARG_OBSERVED_TYPE_BIT_MASK;
+        bits |= (ty.bits() as u16) << Self::ARG_OBSERVED_TYPE_SHIFT;
+        self.base.bits = bits;
+    }
+
+    // ArithProfile.h:239-241.
+    pub fn arg_saw_int32(&mut self) {
+        let ty = self.arg_observed_type().with_int32();
+        self.set_arg_observed_type(ty);
+    }
+    pub fn arg_saw_number(&mut self) {
+        let ty = self.arg_observed_type().with_number();
+        self.set_arg_observed_type(ty);
+    }
+    pub fn arg_saw_non_number(&mut self) {
+        let ty = self.arg_observed_type().with_non_number();
+        self.set_arg_observed_type(ty);
+    }
+
+    // ArithProfile.h:243-255.
+    pub fn observe_arg(&mut self, arg: JsValue) {
+        let mut new_profile = *self;
+        if arg.is_number() {
+            if arg.is_int32() {
+                new_profile.arg_saw_int32();
+            } else {
+                new_profile.arg_saw_number();
+            }
+        } else {
+            new_profile.arg_saw_non_number();
+        }
+        self.base.bits = new_profile.bits();
+    }
+
+    // ArithProfile.h:257-260.
+    pub fn is_observed_type_empty(self) -> bool {
+        self.arg_observed_type().is_empty()
+    }
+}
+
+const _: () = {
+    // ArithProfile.h:196 (Should fit in the type of the underlying bitfield).
+    assert!(UnaryArithProfile::ARG_OBSERVED_TYPE_SHIFT + ObservedType::NUM_BITS_NEEDED <= 16);
+};
+
+/// `BinaryArithProfile` (ArithProfile.h:272-388): `ObservedResults` plus rhs/lhs
+/// `ObservedType`s plus the division special-fast-path bit, packed into 16 bits.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct BinaryArithProfile {
+    base: ArithProfile,
+}
+
+#[allow(dead_code)]
+impl BinaryArithProfile {
+    // ArithProfile.h:273-274.
+    const RHS_OBSERVED_TYPE_SHIFT: u32 = ObservedResults::NUM_BITS_NEEDED;
+    const LHS_OBSERVED_TYPE_SHIFT: u32 =
+        Self::RHS_OBSERVED_TYPE_SHIFT + ObservedType::NUM_BITS_NEEDED;
+    // ArithProfile.h:277-278.
+    const CLEAR_RHS_OBSERVED_TYPE_BIT_MASK: u16 = !(0b111u16 << Self::RHS_OBSERVED_TYPE_SHIFT);
+    const CLEAR_LHS_OBSERVED_TYPE_BIT_MASK: u16 = !(0b111u16 << Self::LHS_OBSERVED_TYPE_SHIFT);
+    // ArithProfile.h:280.
+    const OBSERVED_TYPE_MASK: u16 = (1u16 << ObservedType::NUM_BITS_NEEDED) - 1;
+    // ArithProfile.h:283.
+    pub const SPECIAL_FAST_PATH_BIT: u16 =
+        1u16 << (Self::LHS_OBSERVED_TYPE_SHIFT + ObservedType::NUM_BITS_NEEDED);
+
+    pub const fn bits(self) -> u16 {
+        self.base.bits()
+    }
+    pub fn arith(&self) -> &ArithProfile {
+        &self.base
+    }
+    pub fn arith_mut(&mut self) -> &mut ArithProfile {
+        &mut self.base
+    }
+
+    // ArithProfile.h:296-321.
+    pub const fn observed_int_int_bits() -> u16 {
+        ((ObservedType::empty().with_int32().bits() as u16) << Self::LHS_OBSERVED_TYPE_SHIFT)
+            | ((ObservedType::empty().with_int32().bits() as u16) << Self::RHS_OBSERVED_TYPE_SHIFT)
+    }
+    pub const fn observed_number_int_bits() -> u16 {
+        ((ObservedType::empty().with_number().bits() as u16) << Self::LHS_OBSERVED_TYPE_SHIFT)
+            | ((ObservedType::empty().with_int32().bits() as u16) << Self::RHS_OBSERVED_TYPE_SHIFT)
+    }
+    pub const fn observed_int_number_bits() -> u16 {
+        ((ObservedType::empty().with_int32().bits() as u16) << Self::LHS_OBSERVED_TYPE_SHIFT)
+            | ((ObservedType::empty().with_number().bits() as u16) << Self::RHS_OBSERVED_TYPE_SHIFT)
+    }
+    pub const fn observed_number_number_bits() -> u16 {
+        ((ObservedType::empty().with_number().bits() as u16) << Self::LHS_OBSERVED_TYPE_SHIFT)
+            | ((ObservedType::empty().with_number().bits() as u16) << Self::RHS_OBSERVED_TYPE_SHIFT)
+    }
+
+    // ArithProfile.h:323-324.
+    pub const fn lhs_observed_type(self) -> ObservedType {
+        ObservedType::new(
+            ((self.base.bits() >> Self::LHS_OBSERVED_TYPE_SHIFT) & Self::OBSERVED_TYPE_MASK) as u8,
+        )
+    }
+    pub const fn rhs_observed_type(self) -> ObservedType {
+        ObservedType::new(
+            ((self.base.bits() >> Self::RHS_OBSERVED_TYPE_SHIFT) & Self::OBSERVED_TYPE_MASK) as u8,
+        )
+    }
+
+    // ArithProfile.h:325-332.
+    pub fn set_lhs_observed_type(&mut self, ty: ObservedType) {
+        let mut bits = self.base.bits();
+        bits &= Self::CLEAR_LHS_OBSERVED_TYPE_BIT_MASK;
+        bits |= (ty.bits() as u16) << Self::LHS_OBSERVED_TYPE_SHIFT;
+        self.base.bits = bits;
+    }
+    // ArithProfile.h:334-341.
+    pub fn set_rhs_observed_type(&mut self, ty: ObservedType) {
+        let mut bits = self.base.bits();
+        bits &= Self::CLEAR_RHS_OBSERVED_TYPE_BIT_MASK;
+        bits |= (ty.bits() as u16) << Self::RHS_OBSERVED_TYPE_SHIFT;
+        self.base.bits = bits;
+    }
+
+    // ArithProfile.h:343.
+    pub const fn took_special_fast_path(self) -> bool {
+        self.base.bits() & Self::SPECIAL_FAST_PATH_BIT != 0
+    }
+
+    // ArithProfile.h:345-350.
+    pub fn lhs_saw_int32(&mut self) {
+        let ty = self.lhs_observed_type().with_int32();
+        self.set_lhs_observed_type(ty);
+    }
+    pub fn lhs_saw_number(&mut self) {
+        let ty = self.lhs_observed_type().with_number();
+        self.set_lhs_observed_type(ty);
+    }
+    pub fn lhs_saw_non_number(&mut self) {
+        let ty = self.lhs_observed_type().with_non_number();
+        self.set_lhs_observed_type(ty);
+    }
+    pub fn rhs_saw_int32(&mut self) {
+        let ty = self.rhs_observed_type().with_int32();
+        self.set_rhs_observed_type(ty);
+    }
+    pub fn rhs_saw_number(&mut self) {
+        let ty = self.rhs_observed_type().with_number();
+        self.set_rhs_observed_type(ty);
+    }
+    pub fn rhs_saw_non_number(&mut self) {
+        let ty = self.rhs_observed_type().with_non_number();
+        self.set_rhs_observed_type(ty);
+    }
+
+    // ArithProfile.h:352-364.
+    pub fn observe_lhs(&mut self, lhs: JsValue) {
+        let mut new_profile = *self;
+        if lhs.is_number() {
+            if lhs.is_int32() {
+                new_profile.lhs_saw_int32();
+            } else {
+                new_profile.lhs_saw_number();
+            }
+        } else {
+            new_profile.lhs_saw_non_number();
+        }
+        self.base.bits = new_profile.bits();
+    }
+
+    // ArithProfile.h:366-380.
+    pub fn observe_lhs_and_rhs(&mut self, lhs: JsValue, rhs: JsValue) {
+        self.observe_lhs(lhs);
+
+        let mut new_profile = *self;
+        if rhs.is_number() {
+            if rhs.is_int32() {
+                new_profile.rhs_saw_int32();
+            } else {
+                new_profile.rhs_saw_number();
+            }
+        } else {
+            new_profile.rhs_saw_non_number();
+        }
+        self.base.bits = new_profile.bits();
+    }
+
+    // ArithProfile.h:382-385.
+    pub fn is_observed_type_empty(self) -> bool {
+        self.lhs_observed_type().is_empty() && self.rhs_observed_type().is_empty()
+    }
+}
+
+const _: () = {
+    // ArithProfile.h:284-287 (static_asserts pinning the special-fast-path bit).
+    assert!(BinaryArithProfile::LHS_OBSERVED_TYPE_SHIFT + ObservedType::NUM_BITS_NEEDED + 1 <= 16);
+    assert!(
+        BinaryArithProfile::SPECIAL_FAST_PATH_BIT
+            & !BinaryArithProfile::CLEAR_LHS_OBSERVED_TYPE_BIT_MASK
+            == 0
+    );
+    assert!(
+        BinaryArithProfile::SPECIAL_FAST_PATH_BIT
+            & BinaryArithProfile::CLEAR_LHS_OBSERVED_TYPE_BIT_MASK
+            != 0
+    );
+    assert!(
+        BinaryArithProfile::SPECIAL_FAST_PATH_BIT
+            > !BinaryArithProfile::CLEAR_LHS_OBSERVED_TYPE_BIT_MASK
+    );
+};
+
+// === Execution / tier-up counter (ExecutionCounter.{h,cpp}) ===
+
+/// `CountingVariant` (ExecutionCounter.h:37-40). JSC uses this as a template
+/// parameter on `ExecutionCounter`; the Rust port carries it as a field
+/// (matching the `BaselineExecutionCounter`/`UpperTierExecutionCounter`
+/// typedefs, ExecutionCounter.h:106-107).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum CountingVariant {
+    /// `CountingForBaseline`.
     #[default]
     Baseline,
+    /// `CountingForUpperTiers`.
     UpperTiers,
 }
 
+/// Lifecycle labels retained for the existing `bytecode` re-export. JSC's
+/// `ExecutionCounter` (ExecutionCounter.{h,cpp}) does NOT store an explicit
+/// state; its lifecycle is encoded in the counter/threshold sentinel values
+/// (`forceSlowPathConcurrently` -> m_counter = 0; `deferIndefinitely` ->
+/// m_activeThreshold = INT32_MAX, m_counter = INT32_MIN). The faithful counter
+/// below therefore carries no `state` field. This enum is kept (not deleted)
+/// because it is a cross-module re-export; unifying it with the live tier-up
+/// state machine in jit/tiering.rs is flagged as a serial coupling.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum ExecutionCounterState {
     #[default]
@@ -726,7 +1229,199 @@ pub enum ExecutionCounterState {
     ForcedSlowPath,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// The two `CodeBlock*`-derived inputs JSC's `ExecutionCounter` methods read.
+/// `applyMemoryUsageHeuristics` (ExecutionCounter.cpp:76-88) multiplies a
+/// threshold by `ExecutableAllocator::memoryPressureMultiplier` (>= 1.0; 1.0
+/// when `codeBlock` is null), and `maximumExecutionCountsBetweenCheckpoints`
+/// (ExecutionCounter.cpp:102-127) resolves the per-variant `Options` cap. This
+/// unit is self-contained and UNWIRED (no CodeBlock/Options/ExecutableAllocator
+/// yet), so the caller supplies the already-resolved values instead of passing a
+/// `CodeBlock*`.
+#[derive(Clone, Copy, Debug)]
+pub struct ExecutionCounterEnvironment {
+    pub memory_usage_multiplier: f64,
+    pub maximum_execution_counts_between_checkpoints: i32,
+}
+
+impl ExecutionCounterEnvironment {
+    /// The `codeBlock == nullptr` defaults: multiplier 1.0
+    /// (ExecutionCounter.cpp:78) with the supplied per-variant cap.
+    #[allow(dead_code)]
+    pub const fn with_max_counts(maximum_execution_counts_between_checkpoints: i32) -> Self {
+        Self {
+            memory_usage_multiplier: 1.0,
+            maximum_execution_counts_between_checkpoints,
+        }
+    }
+}
+
+/// `formattedTotalExecutionCount` (ExecutionCounter.h:46-54): reinterpret the
+/// float total-count bits as int32 (the in-memory form machine code adds to).
+#[allow(dead_code)]
+pub fn formatted_total_execution_count(value: f32) -> i32 {
+    value.to_bits() as i32
+}
+
+/// `applyMemoryUsageHeuristics` (ExecutionCounter.cpp:76-88).
+fn apply_memory_usage_heuristics(value: i32, multiplier: f64) -> f64 {
+    debug_assert!(multiplier >= 1.0);
+    multiplier * value as f64
+}
+
+/// `applyMemoryUsageHeuristicsAndConvertToInt` (ExecutionCounter.cpp:90-100).
+#[allow(dead_code)]
+pub fn apply_memory_usage_heuristics_and_convert_to_int(value: i32, multiplier: f64) -> i32 {
+    let double_result = apply_memory_usage_heuristics(value, multiplier);
+    debug_assert!(double_result >= 0.0);
+    if double_result > i32::MAX as f64 {
+        return i32::MAX;
+    }
+    double_result as i32
+}
+
+/// `ExecutionCounter<countingVariant>` (ExecutionCounter.h:56-101): a down-
+/// counter the JIT/LLInt increments toward zero, the float running total, and
+/// the original (uncorrected) target threshold.
+///
+/// `m_totalCount` is `float` in JSC (ExecutionCounter.h:96); the port mirrors
+/// that with `f32`, which is why this struct cannot derive `Eq`/`Hash`. The
+/// prior stub used `i32` (a divergence) and added a `state` field with no JSC
+/// counterpart. The derived `Default` reproduces the C++ constructor, which
+/// calls `reset()` -> all zero (ExecutionCounter.cpp:36-40, 199-205).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BytecodeExecutionCounter {
+    /// ExecutionCounter.h:90 (m_counter): negative, counted up toward zero.
+    pub counter: i32,
+    /// ExecutionCounter.h:96 (m_totalCount).
+    pub total_count: f32,
+    /// ExecutionCounter.h:100 (m_activeThreshold): uncorrected target.
+    pub active_threshold: i32,
+    /// Mirrors the `countingVariant` template parameter (ExecutionCounter.h:56).
+    pub variant: CountingVariant,
+}
+
+impl BytecodeExecutionCounter {
+    /// `ExecutionCounter()` (ExecutionCounter.cpp:36-40) -> `reset()`.
+    #[allow(dead_code)]
+    pub fn new(variant: CountingVariant) -> Self {
+        let mut counter = Self {
+            variant,
+            ..Self::default()
+        };
+        counter.reset();
+        counter
+    }
+
+    /// `forceSlowPathConcurrently` (ExecutionCounter.cpp:42-46).
+    #[allow(dead_code)]
+    pub fn force_slow_path_concurrently(&mut self) {
+        self.counter = 0;
+    }
+
+    /// `checkIfThresholdCrossedAndSet` (ExecutionCounter.cpp:48-58).
+    #[allow(dead_code)]
+    pub fn check_if_threshold_crossed_and_set(&mut self, env: ExecutionCounterEnvironment) -> bool {
+        if self.has_crossed_threshold(env) {
+            return true;
+        }
+        if self.set_threshold(env) {
+            return true;
+        }
+        false
+    }
+
+    /// `setNewThreshold` (ExecutionCounter.cpp:60-66).
+    #[allow(dead_code)]
+    pub fn set_new_threshold(&mut self, threshold: i32, env: ExecutionCounterEnvironment) {
+        self.reset();
+        self.active_threshold = threshold;
+        self.set_threshold(env);
+    }
+
+    /// `deferIndefinitely` (ExecutionCounter.cpp:68-74).
+    #[allow(dead_code)]
+    pub fn defer_indefinitely(&mut self) {
+        self.total_count = 0.0;
+        self.active_threshold = i32::MAX;
+        self.counter = i32::MIN;
+    }
+
+    /// `count()` (ExecutionCounter.h:66): total executions = m_totalCount +
+    /// m_counter (m_counter's negative threshold cancels the seeded total).
+    #[allow(dead_code)]
+    pub fn count(&self) -> f64 {
+        self.total_count as f64 + self.counter as f64
+    }
+
+    /// `clippedThreshold` (ExecutionCounter.h:69-76): cap at the per-variant
+    /// maximum execution counts between checkpoints.
+    #[allow(dead_code)]
+    pub fn clipped_threshold(
+        threshold: f64,
+        maximum_execution_counts_between_checkpoints: i32,
+    ) -> f64 {
+        let max_threshold = maximum_execution_counts_between_checkpoints as f64;
+        if threshold > max_threshold {
+            max_threshold
+        } else {
+            threshold
+        }
+    }
+
+    /// `hasCrossedThreshold` (ExecutionCounter.cpp:129-161): declare victory a
+    /// bit early (within half the original threshold) to avoid thrashing.
+    fn has_crossed_threshold(&self, env: ExecutionCounterEnvironment) -> bool {
+        let modified_threshold =
+            apply_memory_usage_heuristics(self.active_threshold, env.memory_usage_multiplier);
+        let actual_count = self.total_count as f64 + self.counter as f64;
+        let desired_count = modified_threshold
+            - (self
+                .active_threshold
+                .min(env.maximum_execution_counts_between_checkpoints) as f64)
+                / 2.0;
+        actual_count >= desired_count
+    }
+
+    /// `setThreshold` (ExecutionCounter.cpp:163-197): re-seed `m_counter` so the
+    /// JIT/LLInt counts up by `threshold` more executions before re-checking.
+    fn set_threshold(&mut self, env: ExecutionCounterEnvironment) -> bool {
+        if self.active_threshold == i32::MAX {
+            self.defer_indefinitely();
+            return false;
+        }
+
+        let true_total_count = self.count();
+        let mut threshold =
+            apply_memory_usage_heuristics(self.active_threshold, env.memory_usage_multiplier);
+        debug_assert!(threshold >= 0.0);
+        threshold -= true_total_count;
+
+        if threshold <= 0.0 {
+            self.counter = 0;
+            self.total_count = true_total_count as f32;
+            return true;
+        }
+
+        threshold =
+            Self::clipped_threshold(threshold, env.maximum_execution_counts_between_checkpoints);
+        self.counter = (-threshold) as i32;
+        self.total_count = (true_total_count + threshold) as f32;
+        false
+    }
+
+    /// `reset()` (ExecutionCounter.cpp:199-205).
+    fn reset(&mut self) {
+        self.counter = 0;
+        self.total_count = 0.0;
+        self.active_threshold = 0;
+    }
+}
+
+// `BytecodeExecutionCounter` carries a faithful `f32` `total_count`
+// (ExecutionCounter.h:96), so neither it nor this aggregate can derive `Eq`. The
+// live `CodeBlockTierState` compares `profiling_counters` via a hand-written
+// `PartialEq`, so `PartialEq` is retained.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProfilingCounterSet {
     pub baseline: BytecodeExecutionCounter,
     pub upper_tier: BytecodeExecutionCounter,
@@ -1166,6 +1861,263 @@ mod tests {
                 slot,
                 kind: ValueProfileBucketKind::Sample,
             })
+        );
+    }
+
+    // === ArithProfile (ArithProfile.h) ===
+
+    #[test]
+    fn observed_type_bit_layout_matches_arith_profile_header() {
+        // ArithProfile.h:58-63.
+        assert_eq!(ObservedType::TYPE_EMPTY, 0x0);
+        assert_eq!(ObservedType::TYPE_INT32, 0x1);
+        assert_eq!(ObservedType::TYPE_NUMBER, 0x2);
+        assert_eq!(ObservedType::TYPE_NON_NUMBER, 0x4);
+        assert_eq!(ObservedType::NUM_BITS_NEEDED, 3);
+
+        // ArithProfile.h:42-54 round-trips.
+        let t = ObservedType::empty().with_int32().with_number();
+        assert!(t.saw_int32() && t.saw_number() && !t.saw_non_number());
+        assert!(!t.is_only_int32());
+        assert!(ObservedType::empty().with_int32().is_only_int32());
+        assert!(ObservedType::empty().is_empty());
+        assert_eq!(
+            ObservedType::empty().with_non_number().without_non_number(),
+            ObservedType::empty()
+        );
+    }
+
+    #[test]
+    fn observed_results_tag_bits_and_predicates_match_header() {
+        // ArithProfile.h:71-80.
+        assert_eq!(ObservedResults::NON_NEG_ZERO_DOUBLE, 1 << 0);
+        assert_eq!(ObservedResults::NEG_ZERO_DOUBLE, 1 << 1);
+        assert_eq!(ObservedResults::NON_NUMERIC, 1 << 2);
+        assert_eq!(ObservedResults::INT32_OVERFLOW, 1 << 3);
+        assert_eq!(ObservedResults::INT52_OVERFLOW, 1 << 4);
+        assert_eq!(ObservedResults::HEAP_BIG_INT, 1 << 5);
+        assert_eq!(ObservedResults::BIG_INT32, 1 << 6);
+        assert_eq!(ObservedResults::NUM_BITS_NEEDED, 7);
+
+        // ArithProfile.h:87-96.
+        let r = ObservedResults::new(ObservedResults::NEG_ZERO_DOUBLE);
+        assert!(
+            r.did_observe_double() && r.did_observe_neg_zero_double() && r.did_observe_non_int32()
+        );
+        assert!(!r.did_observe_non_neg_zero_double());
+        let big = ObservedResults::new(ObservedResults::HEAP_BIG_INT);
+        assert!(
+            big.did_observe_big_int()
+                && big.did_observe_heap_big_int()
+                && !big.did_observe_big_int32()
+        );
+        assert!(big.did_observe_non_int32());
+        let overflow = ObservedResults::new(ObservedResults::INT32_OVERFLOW);
+        assert!(overflow.did_observe_int32_overflow() && !overflow.did_observe_non_int32());
+    }
+
+    #[test]
+    fn arith_profile_observe_result_sets_double_or_non_numeric_bits() {
+        // ArithProfile.h:128-145, low-7-bit read ArithProfile.h:105-108.
+        let mut p = ArithProfile::default();
+        p.observe_result(JsValue::from_i32(7));
+        assert_eq!(
+            p.bits(),
+            0,
+            "int32 takes the early return, recording no bits"
+        );
+
+        p.observe_result(JsValue::from_double(1.5));
+        // Int32Overflow|Int52Overflow|NonNegZeroDouble|NegZeroDouble.
+        assert_eq!(p.bits(), 0b0001_1011);
+        let r = p.observed_results();
+        assert!(
+            r.did_observe_int32_overflow()
+                && r.did_observe_int52_overflow()
+                && r.did_observe_non_neg_zero_double()
+                && r.did_observe_neg_zero_double()
+        );
+        assert!(!r.did_observe_non_numeric());
+
+        let mut q = ArithProfile::default();
+        q.observe_result(JsValue::undefined());
+        assert!(q.observed_results().did_observe_non_numeric());
+        assert_eq!(q.bits(), ObservedResults::NON_NUMERIC as u16);
+    }
+
+    #[test]
+    fn arith_profile_set_observed_bits_are_independent() {
+        // ArithProfile.h:120-126 (setObserved* / setBit) + observedResults read.
+        let mut p = ArithProfile::default();
+        p.set_observed_int52_overflow();
+        assert!(p.has_bits(ObservedResults::INT52_OVERFLOW as u16));
+        assert_eq!(p.bits(), ObservedResults::INT52_OVERFLOW as u16);
+        p.set_observed_non_numeric();
+        assert_eq!(
+            p.bits(),
+            (ObservedResults::INT52_OVERFLOW | ObservedResults::NON_NUMERIC) as u16
+        );
+    }
+
+    #[test]
+    fn unary_arith_profile_packs_arg_type_above_results() {
+        // ArithProfile.h:194 (shift), :229 (read), :243-255 (observe).
+        assert_eq!(UnaryArithProfile::ARG_OBSERVED_TYPE_SHIFT, 7);
+
+        let mut p = UnaryArithProfile::default();
+        p.observe_arg(JsValue::from_i32(3));
+        assert!(p.arg_observed_type().saw_int32());
+        // TypeInt32 (0x1) packed at bit 7.
+        assert_eq!(p.bits(), 0x1 << 7);
+
+        // ArithProfile.h:210-221.
+        assert_eq!(UnaryArithProfile::observed_int_bits(), 0x1 << 7);
+        assert_eq!(UnaryArithProfile::observed_number_bits(), 0x2 << 7);
+        assert_eq!(UnaryArithProfile::observed_non_number_bits(), 0x4 << 7);
+
+        // A double records Number (not Int32) in the arg slot.
+        let mut d = UnaryArithProfile::default();
+        assert!(d.is_observed_type_empty());
+        d.observe_arg(JsValue::from_double(2.5));
+        assert!(d.arg_observed_type().saw_number() && !d.arg_observed_type().saw_int32());
+        assert!(!d.is_observed_type_empty());
+    }
+
+    #[test]
+    fn binary_arith_profile_packs_lhs_rhs_and_special_fast_path() {
+        // ArithProfile.h:273-283.
+        assert_eq!(BinaryArithProfile::RHS_OBSERVED_TYPE_SHIFT, 7);
+        assert_eq!(BinaryArithProfile::LHS_OBSERVED_TYPE_SHIFT, 10);
+        assert_eq!(BinaryArithProfile::SPECIAL_FAST_PATH_BIT, 1 << 13);
+
+        // ArithProfile.h:296-321 static bit patterns.
+        assert_eq!(
+            BinaryArithProfile::observed_int_int_bits(),
+            (0x1 << 10) | (0x1 << 7)
+        );
+        assert_eq!(
+            BinaryArithProfile::observed_number_int_bits(),
+            (0x2 << 10) | (0x1 << 7)
+        );
+        assert_eq!(
+            BinaryArithProfile::observed_int_number_bits(),
+            (0x1 << 10) | (0x2 << 7)
+        );
+        assert_eq!(
+            BinaryArithProfile::observed_number_number_bits(),
+            (0x2 << 10) | (0x2 << 7)
+        );
+
+        // ArithProfile.h:366-380 observeLHSAndRHS round-trip: lhs int32, rhs double.
+        let mut p = BinaryArithProfile::default();
+        assert!(p.is_observed_type_empty());
+        p.observe_lhs_and_rhs(JsValue::from_i32(1), JsValue::from_double(2.5));
+        assert!(p.lhs_observed_type().saw_int32());
+        assert!(p.rhs_observed_type().saw_number() && !p.rhs_observed_type().saw_int32());
+        assert_eq!(p.bits(), (0x1 << 10) | (0x2 << 7));
+        // ArithProfile.h:343: the special-fast-path bit is not touched by observe*.
+        assert!(!p.took_special_fast_path());
+    }
+
+    // === ExecutionCounter (ExecutionCounter.{h,cpp}) ===
+
+    #[test]
+    fn formatted_total_execution_count_reinterprets_float_bits() {
+        // ExecutionCounter.h:46-54 (union { int32_t i; float f; }).
+        assert_eq!(formatted_total_execution_count(0.0), 0);
+        assert_eq!(
+            formatted_total_execution_count(1000.0),
+            1000.0_f32.to_bits() as i32
+        );
+    }
+
+    #[test]
+    fn execution_counter_count_is_total_plus_counter() {
+        // ExecutionCounter.h:66 (count = m_totalCount + m_counter).
+        let counter = BytecodeExecutionCounter {
+            counter: -600,
+            total_count: 1000.0,
+            active_threshold: 1000,
+            variant: CountingVariant::Baseline,
+        };
+        assert_eq!(counter.count(), 400.0);
+    }
+
+    #[test]
+    fn execution_counter_set_new_threshold_seeds_down_counter() {
+        // ExecutionCounter.cpp:60-66 (setNewThreshold) + 163-197 (setThreshold).
+        let env = ExecutionCounterEnvironment::with_max_counts(1_000_000);
+        let mut counter = BytecodeExecutionCounter::new(CountingVariant::Baseline);
+        counter.set_new_threshold(1000, env);
+        assert_eq!(counter.counter, -1000);
+        assert_eq!(counter.total_count, 1000.0_f32);
+        // No real executions have happened yet.
+        assert_eq!(counter.count(), 0.0);
+    }
+
+    #[test]
+    fn execution_counter_crosses_threshold_at_half_via_memory_heuristics() {
+        // ExecutionCounter.cpp:150-156: desiredCount = modifiedThreshold
+        //   - min(activeThreshold, maxCounts) / 2 -> early victory at the half mark.
+        let env = ExecutionCounterEnvironment::with_max_counts(1_000_000);
+        let mut counter = BytecodeExecutionCounter::new(CountingVariant::Baseline);
+        counter.set_new_threshold(1000, env);
+
+        // Counted up 400 of 1000 (counter -1000 -> -600): below desiredCount 500,
+        // not crossed; setThreshold reseeds the down-counter to the same value.
+        counter.counter = -600;
+        assert!(!counter.check_if_threshold_crossed_and_set(env));
+        assert_eq!(counter.counter, -600);
+
+        // Counted up to the half mark (actualCount 500 >= desiredCount 500):
+        // crossed.
+        counter.counter = -500;
+        assert!(counter.check_if_threshold_crossed_and_set(env));
+    }
+
+    #[test]
+    fn execution_counter_defer_indefinitely_sets_sentinels() {
+        // ExecutionCounter.cpp:68-74.
+        let mut counter = BytecodeExecutionCounter::new(CountingVariant::UpperTiers);
+        counter.defer_indefinitely();
+        assert_eq!(counter.total_count, 0.0_f32);
+        assert_eq!(counter.active_threshold, i32::MAX);
+        assert_eq!(counter.counter, i32::MIN);
+    }
+
+    #[test]
+    fn execution_counter_force_slow_path_zeroes_counter() {
+        // ExecutionCounter.cpp:42-46.
+        let mut counter = BytecodeExecutionCounter::new(CountingVariant::Baseline);
+        counter.set_new_threshold(500, ExecutionCounterEnvironment::with_max_counts(1_000_000));
+        counter.force_slow_path_concurrently();
+        assert_eq!(counter.counter, 0);
+    }
+
+    #[test]
+    fn apply_memory_usage_heuristics_scales_and_clamps() {
+        // ExecutionCounter.cpp:76-100.
+        assert_eq!(apply_memory_usage_heuristics(100, 2.0), 200.0);
+        assert_eq!(
+            apply_memory_usage_heuristics_and_convert_to_int(100, 2.0),
+            200
+        );
+        assert_eq!(
+            apply_memory_usage_heuristics_and_convert_to_int(i32::MAX, 2.0),
+            i32::MAX
+        );
+    }
+
+    #[test]
+    fn clipped_threshold_caps_at_maximum_counts() {
+        // ExecutionCounter.h:69-76.
+        assert_eq!(
+            BytecodeExecutionCounter::clipped_threshold(5000.0, 1000),
+            1000.0
+        );
+        assert_eq!(
+            BytecodeExecutionCounter::clipped_threshold(500.0, 1000),
+            500.0
         );
     }
 }
