@@ -64,9 +64,16 @@ emitted-offset change) so it doesn't calcify into the rejected private-register-
 - **B3:** dual-write bridge — drive entry seeding + `push_frame` from the live model, writing
   the arena header slots alongside the existing InstalledCallFrame with debug_assert they
   agree; reads still come from the Vec. Add the CallFrameId↔FrameAddress side table.
-- **B4 (megafile, serial, dedicated refactor):** flip `RegisterFile::read/write` +
-  `resolve_value_slot` to address the in-arena window via `base.add(fp + vr.offset())`,
-  invert growth downward. RegisterFile becomes a thin window. Gated by B3's dual-write asserts.
+- **B4 (megafile, serial, dedicated refactor) — READ-FLIP LANDED:** the seed now
+  reserves the FULL window (`callee_local_count` locals undefined-filled below
+  `fp`, SP lowered past them, so nested callees never overlap the caller's
+  locals). `RegisterFile::read` is served from the arena via the gate at
+  `fp + vreg.raw()*8` (`frame_register_at`); `write` dual-writes arena + `Vec`.
+  The `Vec` is RETAINED as a debug ORACLE: every read debug-asserts `arena == Vec`
+  over the full window (locals + temporaries + args), proving the offset mapping.
+  Reversible: the `Vec` is still dual-written; reads fall back to it when the
+  shadow is inactive (overflow / mmap fail / non-unix / raw-native bypass, which
+  disables the shadow). FOLLOW-UP B4b/B6: drop the `Vec` once green suite-wide.
 - **B5:** frame push/pop = prologue/epilogue (move sp in-arena); overlapping outgoing/incoming
   arg region (copy-first acceptable until tail-calls/varargs need the CallFrameShuffler).
 - **B6 (megafile, serial):** retire `CallFrameId(u32)` (~401 refs) — Stage A offset-backed

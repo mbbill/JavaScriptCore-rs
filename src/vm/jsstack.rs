@@ -148,6 +148,25 @@ pub(crate) const fn operand_offset_in_bytes(operand: i32) -> isize {
     (operand as isize) * (REGISTER_SIZE_IN_BYTES as isize)
 }
 
+/// Byte address of the value `Register` at FP-relative `operand` within the
+/// frame whose slot-0 (`fp`) address is `fp`. This is the single
+/// `VirtualRegister -> arena-address` mapping the B4 read-flip uses, faithful to
+/// `AssemblyHelpers::addressFor(vreg) = Address(x29, vreg.offset()*8)`
+/// (`AssemblyHelpers.h:1290-1298`, cfr == x29) and `VirtualRegister::offsetInBytes
+/// = operand * sizeof(Register)` (`VirtualRegister.h:79`): the operand IS the
+/// VirtualRegister's raw value, so locals (operand < 0) land below `fp` and the
+/// header/`this`/arguments (operand >= 0) at/above `fp`. Returns `None` only on
+/// arithmetic overflow (never in practice: `fp` is a live mmap address and the
+/// operand is a small in-frame offset).
+pub(crate) fn frame_slot_addr(fp: usize, operand: i32) -> Option<usize> {
+    let byte_offset = (operand as isize).checked_mul(REGISTER_SIZE_IN_BYTES as isize)?;
+    let addr = (fp as isize).checked_add(byte_offset)?;
+    if addr < 0 {
+        return None;
+    }
+    Some(addr as usize)
+}
+
 // === Register (Register.h:45-106) ===
 
 /// `JSC::Register` (`Register.h:45-106`): one JS stack slot. A `union` over
@@ -922,30 +941,36 @@ impl JsStack {
     // --- VM-entry frame seeding (doVMEntry, B2) ---
 
     /// Seed ONE JS `CallFrame` for a program/function call into the live arena,
-    /// faithful to `doVMEntry` (`LowLevelInterpreter64.asm` `doVMEntry`). This is
-    /// the additive seeding primitive the B3 dual-write feeds; it is NOT wired
-    /// into live dispatch (the read-flip is B4).
+    /// faithful to `doVMEntry` (`LowLevelInterpreter64.asm` `doVMEntry`) PLUS the
+    /// callee prologue's local reservation (`sub sp, fp, #localsBytes`). This is
+    /// the seeding primitive the B3/B4 dual-write feeds; B4 flips the live engine
+    /// reads onto the window it establishes.
     ///
-    /// Algorithm (matching `doVMEntry`):
-    /// 1. Frame size in registers = `headerSizeInRegisters + paddedArgCount`
-    ///    (`addp CallFrameHeaderSlots, t4` / `lshiftp 3`), where `paddedArgCount`
-    ///    counts `this` + padded args. The new `CallFrame*` (the new SP) is
-    ///    `current_sp - frameSize` (`subp sp, t4, t3`).
+    /// Algorithm (matching `doVMEntry` + prologue):
+    /// 1. The header + `this` + (padded) args occupy `headerSizeInRegisters +
+    ///    paddedArgCount` slots AT/ABOVE `fp` (`addp CallFrameHeaderSlots, t4` /
+    ///    `lshiftp 3`); `fp` (the new `CallFrame*`) is `current_sp - aboveFpBytes`
+    ///    (`subp sp, t4, t3`). The new SP is then lowered a further
+    ///    `callee_local_count` slots for the locals/temporaries that grow DOWN
+    ///    from `fp` (the prologue reservation, brought forward for B4).
     /// 2. STACK-LIMIT GUARD (the mandatory bound): reject — as a `Result`,
-    ///    writing NOTHING — if the new SP would drop below [`Self::stack_limit`]
-    ///    (`bpaeq t3, VMCLoopStackLimit`). This runs BEFORE any slot write, so an
-    ///    over-deep push never touches the guard page.
+    ///    writing NOTHING — if the new SP (lowest occupied address, incl. locals)
+    ///    would drop below [`Self::stack_limit`] (`bpaeq t3, VMCLoopStackLimit`).
+    ///    This runs BEFORE any slot write, so an over-deep push never touches the
+    ///    guard page.
     /// 3. Copy the header words from the `ProtoCallFrame`-shaped inputs into the
     ///    callee frame: `codeBlock`/`callee`/`argumentCountIncludingThis`/`this`
     ///    at slots 2..5 (`copyHeaderLoop`), and the caller-frame/return-PC pair
     ///    at slots 0..1 (which `doVMEntry`'s callee prologue + call instruction
     ///    write; the seeding primitive writes them directly).
     /// 4. Fill `undefined` into the padded-but-unprovided arg slots
-    ///    (`fillExtraArgsLoop`) then copy the real args (`copyArgsLoop`).
-    /// 5. Publish the new SP (`move t3, sp`).
+    ///    (`fillExtraArgsLoop`), copy the real args (`copyArgsLoop`), then
+    ///    undefined-fill the reserved locals (operands -1 .. -callee_local_count).
+    /// 5. Publish the new SP (`move t3, sp`), now below the reserved locals.
     ///
-    /// On success the new `CallFrame` is returned and `current_stack_pointer` is
-    /// lowered to it. On any error nothing is written and the SP is unchanged.
+    /// On success the new `CallFrame` (slot-0 / `fp`) is returned and
+    /// `current_stack_pointer` is lowered to `fp - callee_local_count*8`. On any
+    /// error nothing is written and the SP is unchanged.
     pub(crate) fn try_seed_entry_frame(
         &mut self,
         seed: &VmEntryFrameSeed<'_>,
@@ -973,23 +998,45 @@ impl JsStack {
             });
         }
 
-        // Step 1: frame size and new CallFrame address.
-        let frame_registers = (HEADER_SIZE_IN_REGISTERS as usize)
+        // Step 1: frame size and new CallFrame address. The header + `this` +
+        // (padded) arguments sit AT/ABOVE `fp` (`CallFrame.h:176-181`); `fp` (the
+        // new `CallFrame*`, slot 0) is the current SP minus that above-`fp`
+        // footprint.
+        let above_fp_registers = (HEADER_SIZE_IN_REGISTERS as usize)
             .checked_add(seed.padded_argument_count as usize)
             .ok_or(JsStackPushError::AddressOverflow)?;
-        let frame_bytes = frame_registers
+        let above_fp_bytes = above_fp_registers
             .checked_mul(REGISTER_SIZE_IN_BYTES)
             .ok_or(JsStackPushError::AddressOverflow)?;
         let new_call_frame = self
             .current_stack_pointer
-            .checked_sub(frame_bytes)
+            .checked_sub(above_fp_bytes)
             .ok_or(JsStackPushError::AddressOverflow)?;
 
-        // Step 2: MANDATORY stack-limit guard, BEFORE any write.
+        // B4 FULL-WINDOW reservation: the callee's LOCALS/temporaries grow DOWN
+        // from `fp` (operand -1 -> `fp-8`, ..., `VirtualRegister::localToOperand`
+        // `VirtualRegister.h:111`). Reserve `callee_local_count` slots below `fp`
+        // so the new SP is the LOWEST address the frame occupies and a nested
+        // callee seeds strictly BELOW this frame's locals (no overlap). This
+        // brings forward the prologue's `sub sp, fp, #localsBytes`: the live
+        // `RegisterFile::allocate_frame` reserves locals + args in ONE step, so
+        // the faithful arena mirror reserves the full window here rather than
+        // splitting entry-seeding from a later prologue.
+        let locals_bytes = (seed.callee_local_count as usize)
+            .checked_mul(REGISTER_SIZE_IN_BYTES)
+            .ok_or(JsStackPushError::AddressOverflow)?;
+        let new_stack_pointer = new_call_frame
+            .checked_sub(locals_bytes)
+            .ok_or(JsStackPushError::AddressOverflow)?;
+
+        // Step 2: MANDATORY stack-limit guard, BEFORE any write. The guard checks
+        // the LOWEST occupied address (the new SP, including the reserved locals).
+        // With `callee_local_count == 0` this is exactly `new_call_frame`, the
+        // pre-B4 doVMEntry check.
         let limit = self.stack_limit();
-        if new_call_frame < limit {
+        if new_stack_pointer < limit {
             return Err(JsStackPushError::StackOverflow {
-                new_top_of_frame: new_call_frame,
+                new_top_of_frame: new_stack_pointer,
                 limit,
             });
         }
@@ -1003,13 +1050,15 @@ impl JsStack {
             .ok_or(JsStackPushError::AddressOverflow)?;
 
         // Steps 3-4: write the frame. SAFETY for every `set_slot` below: the
-        // frame occupies `[new_call_frame, current_sp)`; the highest slot written
-        // is `firstArgument + (paddedArgCount - 2)` ==
-        // `new_call_frame + frame_bytes - 8` == `current_sp - 8`, which is `<
-        // highAddress` because `current_sp <= highAddress`. The lowest is slot 0
-        // at `new_call_frame >= limit >= lowAddress`. So every slot lies inside
-        // the once-exposed reservation, is 8-aligned, and holds (zeroed) POD
-        // `Register` storage; `set_slot` overwrites a `Copy` POD (no `Drop`).
+        // frame occupies `[new_stack_pointer, current_sp)`. The above-`fp` slots
+        // (header/`this`/args) span `[new_call_frame, current_sp)`; the highest is
+        // `firstArgument + (paddedArgCount - 2)` == `current_sp - 8` `< highAddress`
+        // (`current_sp <= highAddress`). The reserved-locals slots span
+        // `[new_stack_pointer, new_call_frame)`, all `>= limit >= lowAddress` and
+        // `< fp`. So every written slot lies inside the once-exposed reservation,
+        // is 8-aligned, and holds (zeroed) POD `Register` storage; `set_slot`
+        // overwrites a `Copy` POD (no `Drop`). The frame pointer carries the
+        // whole reservation's provenance (exposed once), valid below `fp` too.
         unsafe {
             // Slots 0..1: caller-frame (EntryFrame sentinel) and return PC.
             frame.set_slot(CallFrameSlot::CALLER_FRAME, seed.caller_frame_or_entry);
@@ -1033,10 +1082,21 @@ impl JsStack {
             for (i, arg) in seed.arguments.iter().enumerate() {
                 frame.set_slot(argument_offset(i as i32), *arg);
             }
+
+            // B4 FULL-WINDOW reservation: undefined-fill the reserved locals
+            // (operands -1 .. -callee_local_count, i.e. `fp-8` .. SP) so an
+            // unwritten local reads back `undefined`, matching the live
+            // `RegisterFile::allocate_frame`'s `RuntimeValue::undefined()` local
+            // fill (the analog of `op_enter` clearing callee locals,
+            // `LowLevelInterpreter64.asm` op_enter -> `op_enter` undefined loop).
+            for local in 0..(seed.callee_local_count as i32) {
+                frame.set_slot(local_to_operand(local), undefined);
+            }
         }
 
-        // Step 5: publish the new SP (`move t3, sp`).
-        self.current_stack_pointer = new_call_frame;
+        // Step 5: publish the new SP (`move t3, sp`), now below the reserved
+        // locals (== `new_call_frame` when there are no locals).
+        self.current_stack_pointer = new_stack_pointer;
         Ok(frame)
     }
 }
@@ -1069,8 +1129,16 @@ pub(crate) struct VmEntryFrameSeed<'a> {
     /// (`ProtoCallFrame.h:54`). Length must equal `argumentCountIncludingThis - 1`.
     pub(crate) arguments: &'a [Register],
     /// `ProtoCallFrame::paddedArgCount` (`ProtoCallFrame.h:53`): the
-    /// alignment-rounded argument-count-including-this driving the frame size.
+    /// alignment-rounded argument-count-including-this driving the above-`fp`
+    /// frame size.
     pub(crate) padded_argument_count: u32,
+    /// The callee's local/temporary register count — `CodeBlock::m_numCalleeLocals`
+    /// (the locals that grow DOWN from `fp`, `VirtualRegister.h:111`). B4 reserves
+    /// and undefined-fills exactly this many slots below `fp` so EVERY
+    /// VirtualRegister the interpreter addresses (locals AND args) has an arena
+    /// slot and nested callees do not overlap the locals. Driven from the live
+    /// `RegisterWindow::local_count` (`RegisterFile::allocate_frame`).
+    pub(crate) callee_local_count: u32,
 }
 
 /// Why [`JsStack::try_seed_entry_frame`] refused to seed a frame. Every variant
@@ -1162,28 +1230,32 @@ pub(crate) struct ShadowFrameImage {
     pub(crate) this_value: Register,
 }
 
-/// The B3 DUAL-WRITE SHADOW: a [`JsStack`] arena that mirrors every frame the
-/// live `ExecutionContextStack`/`RegisterFile` model pushes, so B4's read-flip
-/// (pointing `RegisterFile::read/write` at the arena window) is safe.
+/// The DUAL-WRITE SHADOW: a [`JsStack`] arena that mirrors every frame the live
+/// `ExecutionContextStack`/`RegisterFile` model pushes. As of B4 it is the
+/// register window the live engine READS from (`RegisterFile::read`), with the
+/// `Vec` kept as a cross-checked oracle.
 ///
-/// ## What B3 writes (and does NOT)
+/// ## What the shadow writes (the FULL window, B4)
 ///
 /// On each live `push_frame`, the dual-write seeds ONE arena `CallFrame` via the
-/// proven B2 `doVMEntry`-shaped primitive ([`JsStack::try_seed_entry_frame`]):
-/// the 5 header slots + `this` + arguments (`CallFrame.h:176-181`). Locals
-/// (negative offsets) are NOT written here — `try_seed_entry_frame` sets the new
-/// SP to the callee `fp` (sp == fp after `doVMEntry`), exactly as JSC's entry
-/// path does; the prologue's local reservation (`sub sp, fp, #frameSize`) is B5.
-/// So across nested pushes the arena packs frames WITHOUT a local gap; this is
-/// harmless in B3 because nothing reads the arena and no caller's locals are
-/// written, and B5 adds the prologue reservation before the arena is read.
+/// `doVMEntry`-shaped primitive ([`JsStack::try_seed_entry_frame`]): the 5 header
+/// slots + `this` + arguments at/above `fp` (`CallFrame.h:176-181`) AND the
+/// callee's locals/temporaries reserved + undefined-filled BELOW `fp` (operands
+/// -1 .. -callee_local_count, `VirtualRegister.h:111`). The new SP descends past
+/// the locals (the prologue's `sub sp, fp, #localsBytes`, brought forward), so
+/// across nested pushes each callee seeds STRICTLY BELOW the caller's locals with
+/// no overlap, and EVERY VirtualRegister the interpreter reads/writes has an
+/// arena slot. [`Self::frame_register_at`]/[`Self::write_frame_register`] are the
+/// gate-checked accessors `RegisterFile` uses for the read-flip.
 ///
-/// ## Behavior-neutral
+/// ## Reversible + cross-checked
 ///
-/// Reads still come from the live `Vec`/`RegisterFile` (the read-flip is B4).
-/// The arena writes are unobserved, so the dual-write must NEVER change control
-/// flow: if the arena cannot hold a frame (overflow) or LIFO nesting desyncs,
-/// the OWNER (`RegisterFile`) DISABLES the shadow rather than erroring/panicking.
+/// The `Vec` is still dual-written (`RegisterFile::write` writes BOTH), so the
+/// read-flip stays REVERSIBLE and every arena read is debug-cross-checked against
+/// the `Vec` oracle. The dual-write must NEVER change control flow: if the arena
+/// cannot hold a frame (overflow) or LIFO nesting desyncs, the OWNER
+/// (`RegisterFile`) DISABLES the shadow and reads fall back to the `Vec`, so
+/// behavior is identical. (B4b/B6 drop the `Vec` once proven green suite-wide.)
 pub(crate) struct JsStackShadow {
     /// The descending arena the live frames are mirrored into (B2).
     stack: JsStack,
@@ -1301,11 +1373,7 @@ impl JsStackShadow {
     /// holds. Confines the arena `unsafe` reads here (the interpreter cross-check
     /// calls this safe API).
     pub(crate) fn frame_header_image(&self, address: FrameAddress) -> Option<ShadowFrameImage> {
-        if !self
-            .frames
-            .iter()
-            .any(|record| record.frame_address == address.0)
-        {
+        if !self.holds(address) {
             return None;
         }
         let frame = self.stack.call_frame_at(address.0)?;
@@ -1330,17 +1398,61 @@ impl JsStackShadow {
     /// Read back argument `index` (0-based, EXCLUDING `this`) of a frame this
     /// shadow seeded, for the B3 cross-check. `None` if `address` is unknown.
     pub(crate) fn frame_argument(&self, address: FrameAddress, index: i32) -> Option<Register> {
-        if !self
-            .frames
-            .iter()
-            .any(|record| record.frame_address == address.0)
-        {
+        if !self.holds(address) {
             return None;
         }
         let frame = self.stack.call_frame_at(address.0)?;
         // SAFETY: as `frame_header_image`; argument `index` is `firstArgument +
         // index` (`CallFrame.h:288`), inside the seeded frame's argument area.
         Some(unsafe { frame.argument(index) })
+    }
+
+    /// `true` if `address` is the slot-0 (`fp`) of a frame this shadow currently
+    /// holds (a live mirrored frame).
+    fn holds(&self, address: FrameAddress) -> bool {
+        self.frames
+            .iter()
+            .any(|record| record.frame_address == address.0)
+    }
+
+    /// B4 read-flip: read the value `Register` at FP-relative `operand` within the
+    /// frame whose slot-0 is `address`, through the provenance gate. `operand` is
+    /// the VirtualRegister's raw value (locals negative, header/`this`/args
+    /// non-negative); the byte address is `fp + operand*8` ([`frame_slot_addr`]).
+    /// `None` if `address` is not a held frame or the slot is out of the
+    /// reservation / misaligned. The full window is reserved at seed time, so any
+    /// in-frame operand resolves to a live slot.
+    pub(crate) fn frame_register_at(
+        &self,
+        address: FrameAddress,
+        operand: i32,
+    ) -> Option<Register> {
+        if !self.holds(address) {
+            return None;
+        }
+        let addr = frame_slot_addr(address.0, operand)?;
+        // The gate re-verifies `addr` is 8-aligned and inside `[low, high)`.
+        self.stack.read_slot(addr)
+    }
+
+    /// B4 read-flip: write `value` to the value `Register` at FP-relative
+    /// `operand` within the frame whose slot-0 is `address` (the dual-write half
+    /// of [`Self::frame_register_at`]). Returns `false` if `address` is not a held
+    /// frame or the slot is out of range; the caller (`RegisterFile::write`) has
+    /// already written the `Vec` oracle, so a `false` here is behavior-neutral.
+    pub(crate) fn write_frame_register(
+        &self,
+        address: FrameAddress,
+        operand: i32,
+        value: Register,
+    ) -> bool {
+        if !self.holds(address) {
+            return false;
+        }
+        let Some(addr) = frame_slot_addr(address.0, operand) else {
+            return false;
+        };
+        self.stack.write_slot(addr, value)
     }
 }
 
@@ -1567,6 +1679,7 @@ mod live_tests {
             this_value: Register::from_encoded(JsValue::from_i32(1).encoded()),
             arguments: &[],
             padded_argument_count: 1,
+            callee_local_count: 0,
         };
         let frame_bytes = (HEADER_SIZE_IN_REGISTERS as usize + 1) * REGISTER_SIZE_IN_BYTES;
         let would_be_base = high - frame_bytes;
@@ -1615,6 +1728,9 @@ mod live_tests {
             this_value: Register::from_encoded(this_value.encoded()),
             arguments: &arg_regs,
             padded_argument_count: padded,
+            // B4: this entry-frame test exercises only the above-`fp` window
+            // (sp == fp after seeding), so no locals are reserved.
+            callee_local_count: 0,
         };
 
         let frame = stack
@@ -1716,6 +1832,7 @@ mod live_tests {
             this_value: Register::from_encoded(this_value.encoded()),
             arguments: &arg_regs,
             padded_argument_count: padded,
+            callee_local_count: 0,
         };
 
         let frame = stack.try_seed_entry_frame(&seed).expect("seed");
@@ -1767,6 +1884,7 @@ mod live_tests {
             this_value: Register::from_encoded(JsValue::undefined().encoded()),
             arguments: &arg,
             padded_argument_count: 3,
+            callee_local_count: 0,
         };
         assert_eq!(
             stack.try_seed_entry_frame(&seed).unwrap_err(),
@@ -1776,5 +1894,135 @@ mod live_tests {
             }
         );
         assert_eq!(stack.current_stack_pointer(), sp_before);
+    }
+
+    #[test]
+    fn seed_reserves_and_undefined_fills_callee_locals_below_fp() {
+        // B4 FULL-WINDOW reservation: locals grow DOWN from `fp`; the seed
+        // reserves + undefined-fills `callee_local_count` slots and lowers SP a
+        // further `local_count*8` past them. The above-`fp` window is untouched.
+        let mut stack = live_stack(64 * 1024);
+        let sp_before = stack.current_stack_pointer();
+        let local_count: u32 = 3;
+        let this_value = JsValue::from_i32(7);
+        let args = [JsValue::from_i32(11)];
+        let count_including_this = 1 + args.len() as u32; // this + 1 = 2
+        let arg_regs: Vec<Register> = args
+            .iter()
+            .map(|value| Register::from_encoded(value.encoded()))
+            .collect();
+        let seed = VmEntryFrameSeed {
+            caller_frame_or_entry: Register::from_bits(0),
+            return_pc: Register::from_bits(0),
+            code_block: Register::from_bits(0),
+            callee: Register::from_bits(0),
+            argument_count_including_this: Register::from_bits(count_including_this as u64),
+            this_value: Register::from_encoded(this_value.encoded()),
+            arguments: &arg_regs,
+            padded_argument_count: count_including_this,
+            callee_local_count: local_count,
+        };
+        let frame = stack.try_seed_entry_frame(&seed).expect("seed with locals");
+        let fp = frame.registers().as_ptr() as usize;
+
+        // `fp = sp_before - (header + paddedArgs)*8`; the new SP is `fp - locals*8`.
+        let above = (HEADER_SIZE_IN_REGISTERS as usize + count_including_this as usize)
+            * REGISTER_SIZE_IN_BYTES;
+        assert_eq!(fp, sp_before - above);
+        assert_eq!(
+            stack.current_stack_pointer(),
+            fp - local_count as usize * REGISTER_SIZE_IN_BYTES
+        );
+
+        // Every reserved local reads back `undefined` at `fp - 8*(i+1)`
+        // (operand -1-i), via the FP-relative mapping `frame_slot_addr`.
+        let undefined = JsValue::undefined();
+        for i in 0..local_count as i32 {
+            let addr = frame_slot_addr(fp, local_to_operand(i)).unwrap();
+            assert_eq!(addr, (fp as isize - (i as isize + 1) * 8) as usize);
+            assert_eq!(stack.read_slot(addr).unwrap().js_value(), undefined);
+        }
+        // `this` @ fp+40 and arg0 @ fp+48 are still the above-`fp` values.
+        assert_eq!(
+            stack
+                .read_slot(frame_slot_addr(fp, CallFrameSlot::THIS_ARGUMENT).unwrap())
+                .unwrap()
+                .js_value(),
+            this_value
+        );
+        assert_eq!(
+            stack
+                .read_slot(frame_slot_addr(fp, CallFrameSlot::FIRST_ARGUMENT).unwrap())
+                .unwrap()
+                .js_value(),
+            args[0]
+        );
+    }
+
+    #[test]
+    fn shadow_full_window_read_write_round_trips_every_vreg() {
+        // B4 read-flip: the arena window is read/written via
+        // `frame_register_at` / `write_frame_register` for locals (operand < 0),
+        // `this` (operand 5) and args (operand >= 6), through the provenance gate.
+        let mut shadow = JsStackShadow::new().expect("shadow arena");
+        let this_value = JsValue::from_i32(100);
+        let args = [JsValue::from_i32(101), JsValue::from_i32(102)];
+        let count_including_this = 1 + args.len() as u32; // 3
+        let local_count: u32 = 4;
+        let arg_regs: Vec<Register> = args
+            .iter()
+            .map(|value| Register::from_encoded(value.encoded()))
+            .collect();
+        let seed = VmEntryFrameSeed {
+            caller_frame_or_entry: Register::from_bits(0),
+            return_pc: Register::from_bits(0),
+            code_block: Register::from_bits(0),
+            callee: Register::from_bits(0),
+            argument_count_including_this: Register::from_bits(count_including_this as u64),
+            this_value: Register::from_encoded(this_value.encoded()),
+            arguments: &arg_regs,
+            padded_argument_count: count_including_this,
+            callee_local_count: local_count,
+        };
+        let addr = shadow.seed_frame(7, &seed).expect("seed mirrored frame");
+
+        // Initial reads: header `this`/args, and undefined locals.
+        assert_eq!(
+            shadow.frame_register_at(addr, 5).unwrap().js_value(),
+            this_value
+        );
+        assert_eq!(
+            shadow.frame_register_at(addr, 6).unwrap().js_value(),
+            args[0]
+        );
+        assert_eq!(
+            shadow.frame_register_at(addr, 7).unwrap().js_value(),
+            args[1]
+        );
+        for i in 0..local_count as i32 {
+            assert_eq!(
+                shadow.frame_register_at(addr, -1 - i).unwrap().js_value(),
+                JsValue::undefined()
+            );
+        }
+
+        // Writes round-trip at every value register (locals and args alike).
+        for (operand, payload) in [(-1i32, 200), (-4, 203), (5, 300), (6, 301), (7, 302)] {
+            let value = JsValue::from_i32(payload);
+            assert!(shadow.write_frame_register(
+                addr,
+                operand,
+                Register::from_encoded(value.encoded())
+            ));
+            assert_eq!(
+                shadow.frame_register_at(addr, operand).unwrap().js_value(),
+                value
+            );
+        }
+
+        // An address that is not a held frame is rejected (None / false).
+        let bogus = FrameAddress(addr.0 + REGISTER_SIZE_IN_BYTES);
+        assert!(shadow.frame_register_at(bogus, -1).is_none());
+        assert!(!shadow.write_frame_register(bogus, -1, Register::from_bits(0)));
     }
 }

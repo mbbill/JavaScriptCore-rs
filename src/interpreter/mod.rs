@@ -1063,6 +1063,11 @@ fn dual_write_shadow_frame(
         // alignment padding, so paddedArgCount == count (no `undefined` fill
         // beyond the supplied args).
         padded_argument_count: count,
+        // B4 FULL-WINDOW: reserve + undefined-fill the callee's locals below `fp`,
+        // exactly matching `allocate_frame`'s `local_count` (the `Vec` window's
+        // local region), so every VirtualRegister the interpreter reads/writes has
+        // an arena slot and nested callees never overlap this frame's locals.
+        callee_local_count: frame.register_window.local_count as u32,
     };
 
     let Some(address) = registers.shadow_seed_frame(frame.id, &seed) else {
@@ -1759,6 +1764,16 @@ impl RegisterFile {
             return Err(ExecutionError::RegisterOutOfBounds);
         }
 
+        // B4 READ-FLIP: raw native (P3b/P6) code writes this frame's slots
+        // through the returned raw pointer, BYPASSING `RegisterFile::write`, so
+        // the arena window cannot observe those stores and would go stale under
+        // it. Until B7 wires the JIT to emit FP-relative loads/stores directly
+        // against the arena, DISABLE the shadow on this path: `read` then falls
+        // back to the `Vec` oracle, keeping the read-flip cross-check sound and
+        // behavior identical. Disable BEFORE taking the mutable `values` borrow
+        // (which extends `&mut self` for the borrow's lifetime).
+        self.shadow = ShadowState::Disabled;
+
         let first_local = self
             .values
             .get_mut(active.base)
@@ -1784,10 +1799,35 @@ impl RegisterFile {
             return read_constant(constants, index);
         }
         let slot = self.resolve_value_slot(window, register)?;
-        self.values
+        let vec_value = self
+            .values
             .get(slot)
             .copied()
-            .ok_or(ExecutionError::RegisterOutOfBounds)
+            .ok_or(ExecutionError::RegisterOutOfBounds)?;
+        // B4 READ-FLIP: the JsStack arena window is now the live register store.
+        // When the shadow is active, read the `Register` from the arena via the
+        // provenance gate at `fp + vreg.raw()*8` and return THAT — faithful to
+        // `AssemblyHelpers::addressFor(vreg) = Address(x29, vreg.offset()*8)`
+        // (`AssemblyHelpers.h:1290-1298`), the FP-relative addressing the baseline
+        // JIT bakes into emitted loads. The `Vec` is retained as a debug ORACLE:
+        // `arena == Vec` is asserted for EVERY read (locals/temporaries included),
+        // so an off-by-one or sign error in the offset mapping fires immediately
+        // (the same cross-check discipline as B3, now over the full window). This
+        // keeps B4 REVERSIBLE; a follow-up (B4b/B6) drops the `Vec`. When the
+        // shadow is inactive/disabled (deep-recursion overflow past the 5 MiB
+        // arena, mmap failure, non-unix, or the raw-native bypass), reads fall
+        // back to the `Vec` so behavior is identical.
+        match self.arena_read_value(window, register) {
+            Some(arena_value) => {
+                debug_assert_eq!(
+                    arena_value, vec_value,
+                    "B4 arena read disagrees with the Vec oracle at {register:?} \
+                     (window {window:?}) — arena offset mapping is wrong",
+                );
+                Ok(arena_value)
+            }
+            None => Ok(vec_value),
+        }
     }
 
     pub fn write(
@@ -1832,7 +1872,49 @@ impl RegisterFile {
         // targeted-root registry recompute and was the #1 measured interpreter
         // self-time tax -- has been removed.
         *target = value;
+        // B4 READ-FLIP: the arena window is the live register store, so mirror
+        // this store into it at `fp + vreg.raw()*8` (the new truth that `read`
+        // returns), keeping the `Vec` above as the cross-checked oracle. No-op
+        // when the shadow is inactive/disabled (reversible, behavior-neutral).
+        self.arena_write_value(window, register, value);
         Ok(())
+    }
+
+    /// B4 read-flip: read `register`'s value from the JsStack arena window of
+    /// `window.owner`, or `None` if the shadow is inactive (then `read` uses the
+    /// `Vec`). The arena address is `fp + register.raw()*8` via the gate; the bits
+    /// decode losslessly because `RuntimeValue` is a `repr(transparent)` wrapper
+    /// over the same `EncodedJsValue` a `Register` stores.
+    fn arena_read_value(
+        &self,
+        window: RegisterWindow,
+        register: VirtualRegister,
+    ) -> Option<RuntimeValue> {
+        let ShadowState::Active(shadow) = &self.shadow else {
+            return None;
+        };
+        let fp = shadow.address_of(window.owner.0)?;
+        let reg = shadow.frame_register_at(fp, register.raw())?;
+        Some(reg.js_value())
+    }
+
+    /// B4 read-flip: mirror a `register` store into the JsStack arena window of
+    /// `window.owner` (the dual-write half of [`Self::arena_read_value`]). No-op
+    /// when the shadow is inactive/disabled. `resolve_value_slot` already bounded
+    /// `register` to this frame's reserved window, so the gate write succeeds.
+    fn arena_write_value(
+        &self,
+        window: RegisterWindow,
+        register: VirtualRegister,
+        value: RuntimeValue,
+    ) {
+        let ShadowState::Active(shadow) = &self.shadow else {
+            return;
+        };
+        if let Some(fp) = shadow.address_of(window.owner.0) {
+            let reg = JsStackRegister::from_encoded(value.encoded());
+            shadow.write_frame_register(fp, register.raw(), reg);
+        }
     }
 
     pub(crate) fn validate_writable_register(
@@ -30501,9 +30583,13 @@ mod tests {
         assert_eq!(registers.shadow_depth(), 1);
         let addr_a = registers.shadow_address_of(id_a).expect("A mirrored");
         let sp_at_a = registers.shadow_current_stack_pointer().unwrap();
+        // B4 FULL-WINDOW: the arena SP descends past A's reserved locals, so it is
+        // A's `fp` minus the locals region (shape(2) -> local_count 2 -> 16 bytes),
+        // NOT `fp` itself.
         assert_eq!(
-            sp_at_a, addr_a.0,
-            "arena SP == A's CallFrame* after seeding A"
+            sp_at_a,
+            addr_a.0 - 2 * 8,
+            "arena SP == A's fp - locals after seeding A"
         );
 
         // A's slot 0 is the EntryFrame sentinel (no JS caller).
@@ -30545,9 +30631,13 @@ mod tests {
         assert_eq!(registers.shadow_depth(), 2);
         let addr_b = registers.shadow_address_of(id_b).expect("B mirrored");
         let sp_at_b = registers.shadow_current_stack_pointer().unwrap();
-        assert_eq!(sp_at_b, addr_b.0);
-        // B sits strictly BELOW A (the arena grows down).
+        // B's locals (shape(3) -> local_count 3 -> 24 bytes) are reserved below
+        // B's fp.
+        assert_eq!(sp_at_b, addr_b.0 - 3 * 8);
+        // B sits strictly BELOW A's whole window incl. A's locals (the arena grows
+        // down and B was seeded from A's post-locals SP).
         assert!(addr_b.0 < addr_a.0, "B's frame is below A's");
+        assert!(addr_b.0 <= sp_at_a, "B's fp is at/below A's post-locals SP");
 
         // B's slot 0 links to A's arena address (a genuine linked frame chain).
         let image_b = registers.shadow_frame_header_image(addr_b).unwrap();
@@ -30591,8 +30681,10 @@ mod tests {
         assert_eq!(registers.shadow_depth(), 3);
         let addr_c = registers.shadow_address_of(id_c).expect("C mirrored");
         let sp_at_c = registers.shadow_current_stack_pointer().unwrap();
-        assert_eq!(sp_at_c, addr_c.0);
+        // C's locals (shape(1) -> local_count 1 -> 8 bytes) below C's fp.
+        assert_eq!(sp_at_c, addr_c.0 - 8);
         assert!(addr_c.0 < addr_b.0, "C's frame is below B's");
+        assert!(addr_c.0 <= sp_at_b, "C's fp is at/below B's post-locals SP");
 
         let image_c = registers.shadow_frame_header_image(addr_c).unwrap();
         assert_eq!(image_c.caller_frame_bits, addr_b.0);
@@ -30620,12 +30712,205 @@ mod tests {
 
         stack.pop_frame(&mut registers, id_a).unwrap();
         assert_eq!(registers.shadow_depth(), 0);
-        // After the last pop the arena SP returns to the pre-A top: A's frame was
-        // header(5) + paddedArgs(2) = 7 registers = 56 bytes.
+        // After the last pop the arena SP returns to the pre-A top: A's FULL
+        // window was header(5) + paddedArgs(2) + locals(2) = 9 registers = 72
+        // bytes (sp_at_a is already below A's locals).
         assert_eq!(
             registers.shadow_current_stack_pointer(),
-            Some(sp_at_a + 7 * 8)
+            Some(sp_at_a + 9 * 8)
         );
+    }
+
+    // B4 READ-FLIP: with reads served from the JsStack arena window, a function
+    // with locals + temporaries + nested calls must read back EVERY
+    // VirtualRegister (locals, `this`, args) at EVERY depth byte-identically to
+    // the `Vec` oracle. `RegisterFile::read` debug-asserts `arena == Vec` on every
+    // read, so this test (run with debug_assertions) PROVES the offset mapping
+    // `fp + vreg.raw()*8` is byte-faithful over the full window — a sign or
+    // off-by-one error would fire the assert. Gated to `unix` (mmap arena).
+    #[cfg(unix)]
+    #[test]
+    fn b4_read_flip_full_window_arena_equals_vec_across_locals_and_nested_calls() {
+        let this_offset = CallFrameSlotLayout::JSC_RUST.this_argument_offset;
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+
+        // local_count = max(num_callee_locals 4, num_vars 2 + num_temporaries 2) = 4.
+        let shape = RegisterFrameShape {
+            num_parameters_including_this: 2,
+            num_vars: 2,
+            num_callee_locals: 4,
+            num_temporaries: 2,
+            special: Default::default(),
+        };
+
+        let entry = stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+            code_block: CodeBlockId(CellId(100)),
+            global_object: GlobalObjectId(ObjectId(CellId(1))),
+            this_value: RuntimeValue::undefined(),
+        }));
+
+        // --- Frame A: this + 1 arg, 4 locals/temporaries ---
+        let id_a = stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(CodeBlockId(CellId(101))),
+                    callee: Some(ObjectId(CellId(201))),
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape,
+                    argument_count_including_this: 2,
+                    argument_values: vec![
+                        RuntimeValue::from_i32(1000), // this
+                        RuntimeValue::from_i32(1001), // arg0
+                    ],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        // The arena is active, so `read` is served from it (not the Vec fallback).
+        assert_eq!(registers.shadow_depth(), 1);
+        let window_a = stack.frame(id_a).unwrap().register_window;
+
+        // Write distinct values to A's locals (incl. a temporary at local 3) and
+        // overwrite arg0; each later `read` cross-checks arena == Vec internally.
+        let a_locals = [10i32, 11, 12, 13];
+        for (i, payload) in a_locals.iter().enumerate() {
+            registers
+                .write(
+                    window_a,
+                    VirtualRegister::local(i as u32),
+                    RuntimeValue::from_i32(*payload),
+                )
+                .unwrap();
+        }
+        registers
+            .write(
+                window_a,
+                VirtualRegister::argument_including_this(1, this_offset),
+                RuntimeValue::from_i32(1999),
+            )
+            .unwrap();
+
+        let read_a = |registers: &RegisterFile, vreg: VirtualRegister| {
+            registers.read(window_a, vreg, None).unwrap()
+        };
+        for (i, payload) in a_locals.iter().enumerate() {
+            assert_eq!(
+                read_a(&registers, VirtualRegister::local(i as u32)),
+                RuntimeValue::from_i32(*payload)
+            );
+        }
+        // `this` unchanged; arg0 reflects the overwrite.
+        assert_eq!(
+            read_a(
+                &registers,
+                VirtualRegister::argument_including_this(0, this_offset)
+            ),
+            RuntimeValue::from_i32(1000)
+        );
+        assert_eq!(
+            read_a(
+                &registers,
+                VirtualRegister::argument_including_this(1, this_offset)
+            ),
+            RuntimeValue::from_i32(1999)
+        );
+
+        // --- Frame B: nested under A, this + 2 args, own locals ---
+        let id_b = stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(CodeBlockId(CellId(102))),
+                    callee: Some(ObjectId(CellId(202))),
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape,
+                    argument_count_including_this: 3,
+                    argument_values: vec![
+                        RuntimeValue::from_i32(2000), // this
+                        RuntimeValue::from_i32(2001), // arg0
+                        RuntimeValue::from_i32(2002), // arg1
+                    ],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(registers.shadow_depth(), 2);
+        let window_b = stack.frame(id_b).unwrap().register_window;
+
+        let b_locals = [20i32, 21, 22, 23];
+        for (i, payload) in b_locals.iter().enumerate() {
+            registers
+                .write(
+                    window_b,
+                    VirtualRegister::local(i as u32),
+                    RuntimeValue::from_i32(*payload),
+                )
+                .unwrap();
+        }
+        for (i, payload) in b_locals.iter().enumerate() {
+            assert_eq!(
+                registers
+                    .read(window_b, VirtualRegister::local(i as u32), None)
+                    .unwrap(),
+                RuntimeValue::from_i32(*payload)
+            );
+        }
+        assert_eq!(
+            registers
+                .read(
+                    window_b,
+                    VirtualRegister::argument_including_this(0, this_offset),
+                    None
+                )
+                .unwrap(),
+            RuntimeValue::from_i32(2000)
+        );
+        assert_eq!(
+            registers
+                .read(
+                    window_b,
+                    VirtualRegister::argument_including_this(2, this_offset),
+                    None
+                )
+                .unwrap(),
+            RuntimeValue::from_i32(2002)
+        );
+
+        // CRUCIAL: A's window is undisturbed by B's push (B is reserved strictly
+        // BELOW A's locals). Re-read A at depth 2 — still arena==Vec for every
+        // vreg, proving nested frames do not clobber the caller's full window.
+        for (i, payload) in a_locals.iter().enumerate() {
+            assert_eq!(
+                read_a(&registers, VirtualRegister::local(i as u32)),
+                RuntimeValue::from_i32(*payload)
+            );
+        }
+        assert_eq!(
+            read_a(
+                &registers,
+                VirtualRegister::argument_including_this(1, this_offset)
+            ),
+            RuntimeValue::from_i32(1999)
+        );
+
+        // --- Unwind: A stays consistent after B pops ---
+        stack.pop_frame(&mut registers, id_b).unwrap();
+        assert_eq!(registers.shadow_depth(), 1);
+        for (i, payload) in a_locals.iter().enumerate() {
+            assert_eq!(
+                read_a(&registers, VirtualRegister::local(i as u32)),
+                RuntimeValue::from_i32(*payload)
+            );
+        }
+        stack.pop_frame(&mut registers, id_a).unwrap();
+        let _ = stack.leave(entry).unwrap();
+        assert_eq!(registers.register_count(), 0);
     }
 
     #[test]
