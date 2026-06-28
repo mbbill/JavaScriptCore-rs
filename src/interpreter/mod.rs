@@ -4,6 +4,11 @@
 //! owns executable frame state, register windows, VM-visible entry records, and
 //! the generic bytecode dispatch loop over prepared bytecode streams.
 
+// Phase E: runtime-class stores split back out of the dispatch host, restoring
+// the interpreter/runtime boundary this module's header declares.
+mod string_store;
+use string_store::*;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
@@ -12109,49 +12114,10 @@ impl CoreObjectStore {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct CoreStringStore {
-    strings: Vec<Pin<Box<CoreStringCell>>>,
-    by_text: HashMap<String, usize>,
-    indices_by_payload: HashMap<usize, usize>,
-}
-
-// #[repr(C)] pins the header layout so offset_of!(js_type)==4 is stable (only the
-// field name is accessed today, so fixing the layout is behavior-neutral).
-#[derive(Clone, Debug, Default)]
-#[repr(C)]
-struct CoreStringCell {
-    cell_id: CellId,
-    // C++ JSC JSCell::m_type (runtime/JSCell.h:298) == StringType (runtime/JSType.h:37)
-    // for every JSString cell; read via JSCell::isString() (runtime/JSCell.h:127).
-    // Placed at offset 4 (after the 4-byte cell_id) for kind-consistency with the
-    // other cell headers; see the CoreObjectCell::js_type comment for the offset-4
-    // (not C++ byte-5) divergence rationale.
-    js_type: JsType,
-    text: CoreStringCellText,
-    atom: Option<Identifier>,
-}
-
-// Fixed, kind-consistent JSCell::m_type offset guard (mirrors CoreObjectCell's).
-const _: () = assert!(
-    std::mem::offset_of!(CoreStringCell, js_type) == 4,
-    "CoreStringCell::js_type must be at offset 4 (fixed kind-consistent JSCell::m_type analog)"
-);
-
-#[derive(Clone, Debug, Default)]
-enum CoreStringCellText {
-    #[default]
-    Empty,
-    Flat(String),
-    Substring {
-        base: usize,
-        start_byte: usize,
-        end_byte: usize,
-    },
-}
-
-const SHARED_SUBSTRING_MIN_CODE_UNITS: usize = 32;
-
+// Shared interpreter store-cell allocation helpers, used by the object/string/
+// bigint/symbol cell stores. Kept in the dispatch host until a dedicated shared
+// cell-alloc submodule is warranted; the two generic helpers are pub(super) so
+// the extracted store submodules (Phase E) can call them.
 fn allocate_object_interpreter_cell_id(heap: &mut Heap) -> Result<CellId, ExecutionError> {
     let metadata = static_cell_metadata_registry()
         .metadata_for_type(CellType::Object)
@@ -12168,7 +12134,7 @@ fn allocate_object_interpreter_cell_id(heap: &mut Heap) -> Result<CellId, Execut
     Ok(allocation.cell)
 }
 
-fn allocate_primitive_interpreter_cell<T>(
+pub(super) fn allocate_primitive_interpreter_cell<T>(
     heap: &mut Heap,
     cell_type: CellType,
     make_cell: impl FnOnce(CellId) -> T,
@@ -12186,7 +12152,7 @@ fn allocate_primitive_interpreter_cell<T>(
     Ok((cell, value))
 }
 
-fn allocate_primitive_interpreter_cell_id(
+pub(super) fn allocate_primitive_interpreter_cell_id(
     heap: &mut Heap,
     cell_type: CellType,
     byte_size: usize,
@@ -12204,231 +12170,6 @@ fn allocate_primitive_interpreter_cell_id(
         may_trigger_collection: false,
     })?;
     Ok(allocation.cell)
-}
-
-impl CoreStringStore {
-    fn allocate_untracked(&mut self, text: &str) -> RuntimeValue {
-        if let Some(index) = self.by_text.get(text).copied() {
-            return self.value_for_index(index);
-        }
-        let mut string = Box::pin(CoreStringCell {
-            cell_id: CellId::default(),
-            js_type: JsType::String,
-            text: CoreStringCellText::Flat(text.to_owned()),
-            atom: None,
-        });
-        let ptr = NonNull::from(string.as_mut().get_mut());
-        let payload = ptr.as_ptr() as usize;
-        let index = self.strings.len();
-        self.strings.push(string);
-        self.by_text.insert(text.to_owned(), index);
-        self.indices_by_payload.insert(payload, index);
-        // SAFETY: The host owns the boxed cell for the lifetime of the dispatch
-        // run and never moves the allocation after the value is published.
-        RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
-    }
-
-    fn allocate_with_heap(
-        &mut self,
-        heap: &mut Heap,
-        text: &str,
-    ) -> Result<RuntimeValue, ExecutionError> {
-        if let Some(index) = self.by_text.get(text).copied() {
-            return self.bind_index_to_heap(heap, index);
-        }
-        let (string, value) =
-            allocate_primitive_interpreter_cell(heap, CellType::String, |cell_id| {
-                CoreStringCell {
-                    cell_id,
-                    js_type: JsType::String,
-                    text: CoreStringCellText::Flat(text.to_owned()),
-                    atom: None,
-                }
-            })?;
-        let index = self.strings.len();
-        let payload = core::ptr::from_ref(string.as_ref().get_ref()) as usize;
-        self.strings.push(string);
-        self.by_text.insert(text.to_owned(), index);
-        self.indices_by_payload.insert(payload, index);
-        Ok(value)
-    }
-
-    fn allocate_substring_with_heap(
-        &mut self,
-        heap: &mut Heap,
-        base_value: RuntimeValue,
-        start: usize,
-        end: usize,
-    ) -> Result<RuntimeValue, ExecutionError> {
-        let Some(base) = self.index_for_value(base_value) else {
-            return self.allocate_with_heap(heap, "");
-        };
-        let substring = {
-            let Some(text) = self.text_for_index(base) else {
-                return self.allocate_with_heap(heap, "");
-            };
-            let length = string_code_unit_len(text);
-            let start = start.min(length);
-            let end = end.min(length);
-            if start >= end {
-                return self.allocate_with_heap(heap, "");
-            }
-            if start == 0 && end == length {
-                return self.bind_index_to_heap(heap, base);
-            }
-            let substring_len = end.saturating_sub(start);
-            if substring_len < SHARED_SUBSTRING_MIN_CODE_UNITS {
-                return self.allocate_with_heap(heap, &string_slice_code_units(text, start, end));
-            }
-            let Some(start_byte) = string_byte_index_for_code_unit(text, start) else {
-                return self.allocate_with_heap(heap, &string_slice_code_units(text, start, end));
-            };
-            let Some(end_byte) = string_byte_index_for_code_unit(text, end) else {
-                return self.allocate_with_heap(heap, &string_slice_code_units(text, start, end));
-            };
-            if !text.is_ascii() {
-                return self.allocate_with_heap(heap, &string_slice_code_units(text, start, end));
-            }
-            let (base, start_byte, end_byte) = match &self.strings[base].as_ref().get_ref().text {
-                CoreStringCellText::Substring {
-                    base,
-                    start_byte: base_start,
-                    ..
-                } => (
-                    *base,
-                    base_start.saturating_add(start_byte),
-                    base_start.saturating_add(end_byte),
-                ),
-                _ => (base, start_byte, end_byte),
-            };
-            CoreStringCellText::Substring {
-                base,
-                start_byte,
-                end_byte,
-            }
-        };
-        let (string, value) =
-            allocate_primitive_interpreter_cell(heap, CellType::String, |cell_id| {
-                CoreStringCell {
-                    cell_id,
-                    js_type: JsType::String,
-                    text: substring,
-                    atom: None,
-                }
-            })?;
-        let index = self.strings.len();
-        let payload = core::ptr::from_ref(string.as_ref().get_ref()) as usize;
-        self.strings.push(string);
-        self.indices_by_payload.insert(payload, index);
-        Ok(value)
-    }
-
-    fn allocate_atom_with_heap(
-        &mut self,
-        heap: &mut Heap,
-        identifier: Identifier,
-        text: &str,
-    ) -> Result<RuntimeValue, ExecutionError> {
-        let value = self.allocate_with_heap(heap, text)?;
-        if let Some(index) = self.index_for_value(value) {
-            let string = self.strings[index].as_mut().get_mut();
-            if string.atom.is_none() {
-                string.atom = Some(identifier);
-            }
-        }
-        Ok(value)
-    }
-
-    fn bind_index_to_heap(
-        &mut self,
-        heap: &mut Heap,
-        index: usize,
-    ) -> Result<RuntimeValue, ExecutionError> {
-        let string = self.strings[index].as_ref().get_ref();
-        let payload = core::ptr::from_ref(string) as usize;
-        let cell_id = if let Some(cell_id) = heap.cell_for_payload(payload) {
-            heap.publish_cell(cell_id)?;
-            cell_id
-        } else {
-            let cell_id = allocate_primitive_interpreter_cell_id(
-                heap,
-                CellType::String,
-                std::mem::size_of::<CoreStringCell>().max(1),
-            )?;
-            heap.bind_cell_payload(cell_id, payload)?;
-            heap.publish_cell(cell_id)?;
-            cell_id
-        };
-        self.strings[index].as_mut().get_mut().cell_id = cell_id;
-        Ok(self.value_for_index(index))
-    }
-
-    fn strict_equals(&self, left: RuntimeValue, right: RuntimeValue) -> Option<bool> {
-        match (self.text(left), self.text(right)) {
-            (Some(left), Some(right)) => Some(left == right),
-            (Some(_), None) | (None, Some(_)) => Some(false),
-            (None, None) => None,
-        }
-    }
-
-    fn primitive_to_string(&self, value: RuntimeValue) -> Option<String> {
-        if let Some(text) = self.text(value) {
-            return Some(text.to_owned());
-        }
-        match value.kind() {
-            ValueKind::Undefined => Some("undefined".to_owned()),
-            ValueKind::Null => Some("null".to_owned()),
-            ValueKind::Boolean => Some(if value.as_bool().unwrap_or(false) {
-                "true".to_owned()
-            } else {
-                "false".to_owned()
-            }),
-            ValueKind::Int32 | ValueKind::Double => value.as_number().map(number_to_string),
-            ValueKind::Cell | ValueKind::Unknown => None,
-        }
-    }
-
-    fn text(&self, value: RuntimeValue) -> Option<&str> {
-        let index = self.index_for_value(value)?;
-        self.text_for_index(index)
-    }
-
-    fn text_for_index(&self, index: usize) -> Option<&str> {
-        match &self.strings.get(index)?.as_ref().get_ref().text {
-            CoreStringCellText::Empty => Some(""),
-            CoreStringCellText::Flat(text) => Some(text.as_str()),
-            CoreStringCellText::Substring {
-                base,
-                start_byte,
-                end_byte,
-            } => self.text_for_index(*base)?.get(*start_byte..*end_byte),
-        }
-    }
-
-    fn atom_identifier(&self, value: RuntimeValue) -> Option<Identifier> {
-        let index = self.index_for_value(value)?;
-        self.strings[index].as_ref().get_ref().atom
-    }
-
-    fn index_for_value(&self, value: RuntimeValue) -> Option<usize> {
-        let payload = value.as_cell()?.pointer_payload_bits();
-        self.indices_by_payload.get(&payload).copied()
-    }
-
-    fn value_for_index(&self, index: usize) -> RuntimeValue {
-        let string = self.strings[index].as_ref().get_ref();
-        // Cross-check the in-cell JSCell::m_type against the store gate: a cell owned
-        // by the string store MUST report StringType (runtime/JSCell.h:127). Debug-only.
-        debug_assert!(
-            string.js_type == JsType::String,
-            "cell owned by CoreStringStore must carry JsType::String"
-        );
-        let _ = string.cell_id;
-        let ptr = NonNull::from(string);
-        // SAFETY: The indexed string cell is owned by this store and remains
-        // pinned while the dispatch host is alive.
-        RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
-    }
 }
 
 #[derive(Clone, Debug, Default)]
