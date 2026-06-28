@@ -19,6 +19,7 @@ pub(crate) mod opcode;
 pub(crate) mod origin;
 pub(crate) mod profiling;
 pub(crate) mod register;
+pub(crate) mod speculated_type;
 
 pub use crate::gc::StructureId;
 pub use code_block::{
