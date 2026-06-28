@@ -25,7 +25,7 @@ pub use bytecode::{
     YarrBytecodeValidationError,
 };
 pub use execution::{
-    describe_regexp_program_invocation, describe_regexp_program_result,
+    describe_regexp_program_invocation, describe_regexp_program_result, execute_regexp_bytecode,
     RegExpExecutionBoundaryError, RegExpProgramBody, RegExpProgramInvocationDescriptor,
     RegExpProgramInvocationRecord, RegExpProgramResultDescriptor, RegExpProgramResultRecord,
     RegExpRootBoundaryKind, RegExpRootBoundaryRecord,
@@ -37,10 +37,12 @@ pub use jit::{
     YarrJitPlanId, YarrJitTier,
 };
 pub use matching::{
-    describe_match_result_semantics, describe_match_state_semantics, MatchDirection, MatchFrom,
-    MatchInput, MatchRange, MatchResult, MatchResultSemanticDescriptor, MatchSemanticError,
+    describe_match_result_semantics, describe_match_state_semantics, interpret_bytecode,
+    interpret_bytecode_with_limit, JSRegExpResult, MatchDirection, MatchFrom, MatchInput,
+    MatchRange, MatchResult, MatchResultSemanticDescriptor, MatchSemanticError,
     MatchStackLimitSource, MatchState, MatchStateSemanticDescriptor, MatchStatus,
-    MatchingContextHolderDescriptor, YarrMatchContext,
+    MatchingContextHolderDescriptor, YarrInterpretOutcome, YarrMatchContext, YARR_MATCH_LIMIT,
+    YARR_OFFSET_NO_MATCH,
 };
 pub use parse::{
     compile_mode_for_flags, describe_regex_flag_semantics, describe_yarr_parse_semantics,

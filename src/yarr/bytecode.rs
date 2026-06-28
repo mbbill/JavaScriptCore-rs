@@ -5,8 +5,8 @@
 
 use crate::strings::StringId;
 use crate::yarr::{
-    CharacterClassDescriptor, MatchDirection, PatternAssertion, PatternTerm, PatternTermKind,
-    RegexFlags, YarrPattern, YarrPatternId,
+    CharacterClassDescriptor, MatchDirection, PatternAssertion, PatternDisjunction, PatternTerm,
+    PatternTermKind, RegexFlags, YarrPattern, YarrPatternId,
 };
 
 /// Stable identity for a bytecode pattern.
@@ -423,6 +423,19 @@ pub struct BytecodeTerm {
     pub character_class: Option<CharacterClassDescriptor>,
     pub subpattern_id: Option<u32>,
     pub subpattern_range: Option<BytecodeSubpatternRange>,
+    /// Index into `BytecodePattern::parentheses` for the adopted sub-disjunction
+    /// of a variable-count `ParenthesesSubpattern` term. Faithful safe mapping of
+    /// C++ `ByteTerm::atom.parenthesesDisjunction` (a `ByteDisjunction*`); see
+    /// YarrInterpreter.h:62-63 and YarrInterpreter.cpp:2563.
+    pub parentheses_disjunction: Option<u32>,
+    /// Term-distance between a parentheses begin/end pair. C++
+    /// `ByteTerm::atom.parenthesesWidth` (`endTerm - beginTerm`), used by the
+    /// interpreter to jump between Once/Terminal/Assertion begin and end terms
+    /// (YarrInterpreter.cpp:1183, 1317, 1371).
+    pub parentheses_width: Option<u32>,
+    /// DotStarEnclosure anchors. C++ `ByteTerm::anchors {m_bol, m_eol}`
+    /// (YarrInterpreter.h:75-78, :385-391).
+    pub dot_star_anchors: Option<(bool, bool)>,
     pub duplicate_named_group_id: Option<u32>,
     pub name: Option<StringId>,
     pub quantifier: Quantifier,
@@ -574,6 +587,9 @@ impl BytecodeTermBuilder {
                 character_class: None,
                 subpattern_id: None,
                 subpattern_range: None,
+                parentheses_disjunction: None,
+                parentheses_width: None,
+                dot_star_anchors: None,
                 duplicate_named_group_id: None,
                 name: None,
                 quantifier: DEFAULT_QUANTIFIER,
@@ -615,6 +631,21 @@ impl BytecodeTermBuilder {
 
     pub fn subpattern_range(mut self, range: BytecodeSubpatternRange) -> Self {
         self.term.subpattern_range = Some(range);
+        self
+    }
+
+    pub fn parentheses_disjunction(mut self, index: u32) -> Self {
+        self.term.parentheses_disjunction = Some(index);
+        self
+    }
+
+    pub fn parentheses_width(mut self, width: u32) -> Self {
+        self.term.parentheses_width = Some(width);
+        self
+    }
+
+    pub fn dot_star_anchors(mut self, bol: bool, eol: bool) -> Self {
+        self.term.dot_star_anchors = Some((bol, eol));
         self
     }
 
@@ -671,6 +702,13 @@ impl BytecodeTermBuilder {
     pub fn build(self) -> Result<BytecodeTerm, YarrBytecodeValidationError> {
         validate_bytecode_term(&self.term)?;
         Ok(self.term)
+    }
+
+    /// Returns the defaulted term without validation, for the ByteCompiler which
+    /// fills structural fields (alternative jumps, frame links) after creation and
+    /// validates the whole sequence at the end via `validate_term_sequence`.
+    pub fn build_unchecked(self) -> BytecodeTerm {
+        self.term
     }
 }
 
@@ -792,6 +830,321 @@ pub fn validate_yarr_bytecode_program(
     validate_bytecode_pattern(&program.pattern)
 }
 
+/// Faithful port of `class ByteCompiler` (YarrInterpreter.cpp:2276) for the
+/// subset of the parse tree the current `PatternTerm` descriptor can express:
+/// flat alternatives of FixedCount-1 atoms (characters, character classes,
+/// anchors, word boundaries, dot-star enclosures). It performs the real
+/// structural lowering — `regexBegin` wraps the body in
+/// `BodyAlternativeBegin/Disjunction/End`, `emitDisjunction` emits a per-
+/// alternative `CheckInput(minimumSize)` then the atoms, and
+/// `closeBodyAlternative` links the alternative `next`/`end` offsets
+/// (YarrInterpreter.cpp:2294-2534, :2683-2768).
+///
+/// SERIAL COUPLING (B1): the Rust `PatternTerm` does not yet carry
+/// `quantityType/quantityMinCount/quantityMaxCount`, a per-term `frameLocation`,
+/// or a disjunction pool to resolve nested `parentheses.disjunction`. Until B1
+/// supplies them, quantified atoms, back-references with frames, capturing/
+/// non-capturing groups, and lookaround cannot be lowered FROM THE TREE and are
+/// reported as `UnsupportedTerm`. The interpreter exercises those paths via
+/// hand-built `BytecodeTerm` fixtures, which fully express quantifiers and
+/// frames.
+struct ByteCompiler {
+    terms: Vec<BytecodeTerm>,
+    current_alternative_index: usize,
+    flags: RegexFlags,
+    contains_eol: bool,
+}
+
+impl ByteCompiler {
+    fn new(flags: RegexFlags) -> Self {
+        Self {
+            terms: Vec::new(),
+            current_alternative_index: 0,
+            flags,
+            contains_eol: false,
+        }
+    }
+
+    fn push(&mut self, kind: BytecodeTermKind) -> usize {
+        let index = self.terms.len();
+        let term = BytecodeTermBuilder::new(BytecodeTermId(index as u32), kind, self.flags)
+            .build_unchecked();
+        self.terms.push(term);
+        index
+    }
+
+    fn set_alt_jump(&mut self, index: usize, next: i32, end: i32, once_through: bool) {
+        self.terms[index].alternative_jump = Some(BytecodeAlternativeJump {
+            next,
+            end,
+            once_through,
+        });
+    }
+
+    /// regexBegin — YarrInterpreter.cpp:2652.
+    fn regex_begin(&mut self, once_through: bool) {
+        let idx = self.push(BytecodeTermKind::BodyAlternativeBegin);
+        self.set_alt_jump(idx, 0, 0, once_through);
+        self.current_alternative_index = 0;
+    }
+
+    /// regexEnd — YarrInterpreter.cpp:2660.
+    fn regex_end(&mut self) {
+        self.close_body_alternative();
+    }
+
+    /// alternativeBodyDisjunction — YarrInterpreter.cpp:2665.
+    fn alternative_body_disjunction(&mut self, once_through: bool) {
+        let new_index = self.terms.len();
+        let current = self.current_alternative_index;
+        // terms[current].alternative.next = newIndex - current
+        let cur_jump = self.terms[current]
+            .alternative_jump
+            .unwrap_or(EMPTY_ALT_JUMP);
+        self.set_alt_jump(
+            current,
+            (new_index - current) as i32,
+            cur_jump.end,
+            cur_jump.once_through,
+        );
+        let idx = self.push(BytecodeTermKind::BodyAlternativeDisjunction);
+        self.set_alt_jump(idx, 0, 0, once_through);
+        self.current_alternative_index = new_index;
+    }
+
+    /// closeBodyAlternative — YarrInterpreter.cpp:2514.
+    fn close_body_alternative(&mut self) {
+        let mut begin_term = 0usize;
+        let orig_begin_term = 0usize;
+        let end_index = self.terms.len();
+        while self.terms[begin_term]
+            .alternative_jump
+            .unwrap_or(EMPTY_ALT_JUMP)
+            .next
+            != 0
+        {
+            let next = self.terms[begin_term]
+                .alternative_jump
+                .unwrap_or(EMPTY_ALT_JUMP)
+                .next;
+            begin_term = (begin_term as i32 + next) as usize;
+            // C++ sets only `.end` here; the walked term's existing `.next`
+            // (0 for the last disjunction, the chain link otherwise) is preserved.
+            let existing = self.terms[begin_term]
+                .alternative_jump
+                .unwrap_or(EMPTY_ALT_JUMP);
+            self.set_alt_jump(
+                begin_term,
+                existing.next,
+                (end_index - begin_term) as i32,
+                existing.once_through,
+            );
+        }
+        let once = self.terms[begin_term]
+            .alternative_jump
+            .unwrap_or(EMPTY_ALT_JUMP)
+            .once_through;
+        let end = self.terms[begin_term]
+            .alternative_jump
+            .unwrap_or(EMPTY_ALT_JUMP)
+            .end;
+        self.set_alt_jump(
+            begin_term,
+            orig_begin_term as i32 - begin_term as i32,
+            end,
+            once,
+        );
+        let end_idx = self.push(BytecodeTermKind::BodyAlternativeEnd);
+        self.set_alt_jump(end_idx, 0, 0, false);
+    }
+
+    fn check_input(&mut self, count: u32) {
+        let idx = self.push(BytecodeTermKind::CheckInput);
+        self.terms[idx].input_check = Some(BytecodeInputCheck {
+            checked_count: count,
+        });
+    }
+
+    fn assertion_bol(&mut self, input_position: u32, flags: RegexFlags) {
+        let idx = self.push(BytecodeTermKind::AssertionBol);
+        self.terms[idx].input_position = input_position;
+        self.terms[idx].flags = flags;
+    }
+
+    fn assertion_eol(&mut self, input_position: u32, flags: RegexFlags) {
+        let idx = self.push(BytecodeTermKind::AssertionEol);
+        self.terms[idx].input_position = input_position;
+        self.terms[idx].flags = flags;
+        self.contains_eol = true;
+    }
+
+    fn assertion_word_boundary(&mut self, invert: bool, input_position: u32, flags: RegexFlags) {
+        let idx = self.push(BytecodeTermKind::AssertionWordBoundary);
+        self.terms[idx].input_position = input_position;
+        self.terms[idx].invert = invert;
+        self.terms[idx].flags = flags;
+    }
+
+    /// atomPatternCharacter — YarrInterpreter.cpp:2346. FixedCount-1 only;
+    /// ignoreCase emits a cased-character term when lower != upper.
+    fn atom_pattern_character(&mut self, ch: char, input_position: u32, flags: RegexFlags) {
+        if flags.ignore_case {
+            let lo = simple_lower(ch);
+            let hi = simple_upper(ch);
+            if lo != hi {
+                let idx = self.push(BytecodeTermKind::PatternCasedCharacterOnce);
+                self.terms[idx].cased_range = Some((lo, hi));
+                self.terms[idx].input_position = input_position;
+                self.terms[idx].flags = flags;
+                return;
+            }
+        }
+        let idx = self.push(BytecodeTermKind::PatternCharacterOnce);
+        self.terms[idx].character = Some(ch);
+        self.terms[idx].input_position = input_position;
+        self.terms[idx].flags = flags;
+    }
+
+    /// atomCharacterClass — YarrInterpreter.cpp:2363. FixedCount-1 only.
+    fn atom_character_class(
+        &mut self,
+        class: CharacterClassDescriptor,
+        invert: bool,
+        input_position: u32,
+        flags: RegexFlags,
+    ) {
+        let idx = self.push(BytecodeTermKind::CharacterClass);
+        self.terms[idx].character_class = Some(class);
+        self.terms[idx].invert = invert;
+        self.terms[idx].input_position = input_position;
+        self.terms[idx].flags = flags;
+    }
+
+    /// assertionDotStarEnclosure — YarrInterpreter.cpp:2471.
+    fn assertion_dot_star_enclosure(&mut self, bol: bool, eol: bool) {
+        let idx = self.push(BytecodeTermKind::DotStarEnclosure);
+        self.terms[idx].dot_star_anchors = Some((bol, eol));
+    }
+
+    /// emitDisjunction — YarrInterpreter.cpp:2683 (Forward, flat subset).
+    fn emit_disjunction(
+        &mut self,
+        disjunction: &PatternDisjunction,
+        parentheses_already_checked: u32,
+    ) -> Result<(), YarrBytecodeAssemblyError> {
+        for (alt_index, alternative) in disjunction.alternatives.iter().enumerate() {
+            if alt_index != 0 {
+                if disjunction.is_body {
+                    self.alternative_body_disjunction(alternative.once_through);
+                } else {
+                    // Nested (non-body) disjunctions need the full alternative
+                    // machinery + frame allocation; deferred to B1 (see struct doc).
+                    return Err(YarrBytecodeAssemblyError::UnsupportedTerm {
+                        index: self.terms.len(),
+                        kind: PatternTermKind::ParenthesesSubpattern,
+                    });
+                }
+            }
+
+            let minimum_size = alternative.minimum_size.unwrap_or(0);
+            let count_to_check = minimum_size.saturating_sub(parentheses_already_checked);
+            if count_to_check != 0 {
+                self.check_input(count_to_check);
+            }
+            let current_count = count_to_check + parentheses_already_checked;
+
+            for (term_index, term) in alternative.terms.iter().enumerate() {
+                let input_position = current_count.saturating_sub(term.input_position);
+                self.emit_term(term, term_index, input_position)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_term(
+        &mut self,
+        term: &PatternTerm,
+        index: usize,
+        input_position: u32,
+    ) -> Result<(), YarrBytecodeAssemblyError> {
+        match term.kind {
+            PatternTermKind::Assertion(PatternAssertion::Bol) => {
+                self.assertion_bol(input_position, term.flags)
+            }
+            PatternTermKind::Assertion(PatternAssertion::Eol) => {
+                self.assertion_eol(input_position, term.flags)
+            }
+            PatternTermKind::Assertion(PatternAssertion::WordBoundary) => {
+                self.assertion_word_boundary(term.invert, input_position, term.flags)
+            }
+            PatternTermKind::Assertion(PatternAssertion::NotWordBoundary) => {
+                self.assertion_word_boundary(true, input_position, term.flags)
+            }
+            PatternTermKind::PatternCharacter => {
+                let ch = term
+                    .character
+                    .ok_or(YarrBytecodeAssemblyError::MissingPayload {
+                        index,
+                        kind: term.kind,
+                    })?;
+                self.atom_pattern_character(ch, input_position, term.flags);
+            }
+            PatternTermKind::CharacterClass => {
+                let class = term.character_class.clone().ok_or(
+                    YarrBytecodeAssemblyError::MissingPayload {
+                        index,
+                        kind: term.kind,
+                    },
+                )?;
+                self.atom_character_class(class, term.invert, input_position, term.flags);
+            }
+            PatternTermKind::DotStarEnclosure => {
+                let (bol, eol) = term
+                    .dot_star_anchors
+                    .map(|a| (a.bol_anchor, a.eol_anchor))
+                    .unwrap_or((false, false));
+                self.assertion_dot_star_enclosure(bol, eol);
+            }
+            // The remaining kinds require B1's quantifier/frame/disjunction-pool
+            // support (see ByteCompiler doc). Reported, not silently mis-lowered.
+            PatternTermKind::NumberedBackReference
+            | PatternTermKind::NamedBackReference
+            | PatternTermKind::NumberedForwardReference
+            | PatternTermKind::NamedForwardReference
+            | PatternTermKind::ParenthesesSubpattern
+            | PatternTermKind::ParentheticalAssertion
+            | PatternTermKind::Assertion(PatternAssertion::LookAhead)
+            | PatternTermKind::Assertion(PatternAssertion::NegativeLookAhead)
+            | PatternTermKind::Assertion(PatternAssertion::LookBehind)
+            | PatternTermKind::Assertion(PatternAssertion::NegativeLookBehind) => {
+                return Err(YarrBytecodeAssemblyError::UnsupportedTerm {
+                    index,
+                    kind: term.kind,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+const EMPTY_ALT_JUMP: BytecodeAlternativeJump = BytecodeAlternativeJump {
+    next: 0,
+    end: 0,
+    once_through: false,
+};
+
+fn simple_lower(ch: char) -> char {
+    // C++ `u_tolower`; first scalar of Rust's full case fold (exact for BMP
+    // single-char foldings, which is the legacy interpreter path).
+    ch.to_lowercase().next().unwrap_or(ch)
+}
+
+fn simple_upper(ch: char) -> char {
+    ch.to_uppercase().next().unwrap_or(ch)
+}
+
+/// byteCompile — YarrInterpreter.cpp:2294 / :562. Faithful flat-subset compile of
+/// a parsed pattern into a `BytecodePattern` ready for `interpret_bytecode`.
 pub fn assemble_yarr_bytecode_plan(
     parsed: &YarrPattern,
     id: BytecodePatternId,
@@ -803,35 +1156,42 @@ pub fn assemble_yarr_bytecode_plan(
         ));
     }
 
-    let mut terms = Vec::new();
-    let mut contains_eol = false;
-    for alternative in &parsed.body.alternatives {
-        for term in &alternative.terms {
-            let id = BytecodeTermId(terms.len() as u32);
-            let bytecode = assemble_term(id, term, terms.len())?;
-            if bytecode.kind == BytecodeTermKind::AssertionEol {
-                contains_eol = true;
-            }
-            terms.push(bytecode);
-        }
-    }
+    let once_through = parsed
+        .body
+        .alternatives
+        .first()
+        .map(|alt| alt.once_through)
+        .unwrap_or(false);
 
+    let mut compiler = ByteCompiler::new(parsed.flags);
+    compiler.regex_begin(once_through);
+    compiler.emit_disjunction(&parsed.body, 0)?;
+    compiler.regex_end();
+
+    let terms = compiler.terms;
+    let contains_eol = compiler.contains_eol;
     validate_term_sequence(&terms)?;
+
+    // No frame users in the flat fixed-count-1 subset (only non-body Alternative
+    // and quantified/back-reference/parentheses terms reserve frame slots).
+    let frame_size = required_frame_size(&terms);
     let body = ByteDisjunction {
         terms: terms.clone(),
         subpattern_count: parsed.capture_count,
-        frame_size: parsed.body.call_frame_size,
+        frame_size,
     };
 
     let mut builder = BytecodePatternBuilder::new(id, parsed.id, body)
         .contains_bol(parsed.contains_bol)
         .contains_eol(contains_eol)
         .offset_vector(BytecodeOffsetVectorLayout {
-            base_for_named_captures: parsed.capture_count.saturating_mul(2),
-            offsets_size: 2 + parsed
-                .capture_count
-                .max(parsed.duplicate_named_capture_count)
-                .saturating_mul(2),
+            // C++ `offsetVectorBaseForNamedCaptures` == (numSubpatterns + 1) * 2:
+            // duplicate-named-group slots live AFTER the numbered-capture slots
+            // (overall + each group). The prior stub used `capture_count * 2`,
+            // which overlapped group N's slots and zeroed them on init.
+            base_for_named_captures: (parsed.capture_count + 1).saturating_mul(2),
+            offsets_size: (parsed.capture_count + 1).saturating_mul(2)
+                + parsed.duplicate_named_capture_count,
             duplicate_named_group_count: parsed.duplicate_named_capture_count,
         });
 
@@ -845,11 +1205,7 @@ pub fn assemble_yarr_bytecode_plan(
         builder = builder.alternative(BytecodeAlternative {
             begin: BytecodeTermId(0),
             end: BytecodeTermId(terms.len() as u32 - 1),
-            once_through: parsed
-                .body
-                .alternatives
-                .iter()
-                .all(|alternative| alternative.once_through),
+            once_through,
         });
     }
 
@@ -861,120 +1217,13 @@ pub fn assemble_yarr_bytecode_plan(
         .map_err(Into::into)
 }
 
-fn assemble_term(
-    id: BytecodeTermId,
-    term: &PatternTerm,
-    index: usize,
-) -> Result<BytecodeTerm, YarrBytecodeAssemblyError> {
-    let builder = BytecodeTermBuilder::new(id, bytecode_kind_for_term(term, index)?, term.flags)
-        .input_position(term.input_position)
-        .capture(term.capture)
-        .invert(term.invert);
-
-    match term.kind {
-        PatternTermKind::Assertion(PatternAssertion::Bol) => builder.build().map_err(Into::into),
-        PatternTermKind::Assertion(PatternAssertion::Eol) => builder.build().map_err(Into::into),
-        PatternTermKind::Assertion(PatternAssertion::WordBoundary)
-        | PatternTermKind::Assertion(PatternAssertion::NotWordBoundary) => {
-            builder.build().map_err(Into::into)
-        }
-        PatternTermKind::PatternCharacter => {
-            let character = term
-                .character
-                .ok_or(YarrBytecodeAssemblyError::MissingPayload {
-                    index,
-                    kind: term.kind,
-                })?;
-            builder.character(character).build().map_err(Into::into)
-        }
-        PatternTermKind::CharacterClass => {
-            let character_class =
-                term.character_class
-                    .clone()
-                    .ok_or(YarrBytecodeAssemblyError::MissingPayload {
-                        index,
-                        kind: term.kind,
-                    })?;
-            builder
-                .character_class(character_class)
-                .build()
-                .map_err(Into::into)
-        }
-        PatternTermKind::NumberedBackReference
-        | PatternTermKind::NamedBackReference
-        | PatternTermKind::NumberedForwardReference
-        | PatternTermKind::NamedForwardReference => {
-            let subpattern_id =
-                term.subpattern_id
-                    .ok_or(YarrBytecodeAssemblyError::MissingPayload {
-                        index,
-                        kind: term.kind,
-                    })?;
-            builder
-                .subpattern_id(subpattern_id)
-                .name_opt(term.name)
-                .build()
-                .map_err(Into::into)
-        }
-        PatternTermKind::ParenthesesSubpattern | PatternTermKind::ParentheticalAssertion => {
-            let parentheses =
-                term.parentheses
-                    .as_ref()
-                    .ok_or(YarrBytecodeAssemblyError::MissingPayload {
-                        index,
-                        kind: term.kind,
-                    })?;
-            builder
-                .subpattern_range(BytecodeSubpatternRange {
-                    first_subpattern_id: parentheses.subpattern_id,
-                    last_subpattern_id: parentheses.last_subpattern_id,
-                })
-                .build()
-                .map_err(Into::into)
-        }
-        PatternTermKind::DotStarEnclosure => builder.build().map_err(Into::into),
-        PatternTermKind::Assertion(PatternAssertion::LookAhead)
-        | PatternTermKind::Assertion(PatternAssertion::NegativeLookAhead)
-        | PatternTermKind::Assertion(PatternAssertion::LookBehind)
-        | PatternTermKind::Assertion(PatternAssertion::NegativeLookBehind) => {
-            Err(YarrBytecodeAssemblyError::UnsupportedTerm {
-                index,
-                kind: term.kind,
-            })
-        }
-    }
-}
-
-fn bytecode_kind_for_term(
-    term: &PatternTerm,
-    index: usize,
-) -> Result<BytecodeTermKind, YarrBytecodeAssemblyError> {
-    Ok(match term.kind {
-        PatternTermKind::Assertion(PatternAssertion::Bol) => BytecodeTermKind::AssertionBol,
-        PatternTermKind::Assertion(PatternAssertion::Eol) => BytecodeTermKind::AssertionEol,
-        PatternTermKind::Assertion(PatternAssertion::WordBoundary)
-        | PatternTermKind::Assertion(PatternAssertion::NotWordBoundary) => {
-            BytecodeTermKind::AssertionWordBoundary
-        }
-        PatternTermKind::PatternCharacter => BytecodeTermKind::PatternCharacterOnce,
-        PatternTermKind::CharacterClass => BytecodeTermKind::CharacterClass,
-        PatternTermKind::NumberedBackReference
-        | PatternTermKind::NamedBackReference
-        | PatternTermKind::NumberedForwardReference
-        | PatternTermKind::NamedForwardReference => BytecodeTermKind::BackReference,
-        PatternTermKind::ParenthesesSubpattern => BytecodeTermKind::ParenthesesSubpattern,
-        PatternTermKind::ParentheticalAssertion => BytecodeTermKind::ParentheticalAssertionBegin,
-        PatternTermKind::DotStarEnclosure => BytecodeTermKind::DotStarEnclosure,
-        PatternTermKind::Assertion(PatternAssertion::LookAhead)
-        | PatternTermKind::Assertion(PatternAssertion::NegativeLookAhead)
-        | PatternTermKind::Assertion(PatternAssertion::LookBehind)
-        | PatternTermKind::Assertion(PatternAssertion::NegativeLookBehind) => {
-            return Err(YarrBytecodeAssemblyError::UnsupportedTerm {
-                index,
-                kind: term.kind,
-            });
-        }
-    })
+fn required_frame_size(terms: &[BytecodeTerm]) -> u32 {
+    terms
+        .iter()
+        .filter_map(|term| term.frame.as_ref())
+        .map(|frame| frame.frame_location.saturating_add(frame.stack_slots))
+        .max()
+        .unwrap_or(0)
 }
 
 pub fn validate_bytecode_pattern(
@@ -1386,11 +1635,26 @@ mod tests {
         let program = assemble_yarr_bytecode_plan(&pattern, BytecodePatternId(9), 3).unwrap();
 
         assert_eq!(program.generation, 3);
-        assert_eq!(program.pattern.terms.len(), 1);
+        // Faithful ByteCompiler wraps the body in BodyAlternativeBegin / CheckInput
+        // / atom / BodyAlternativeEnd (YarrInterpreter.cpp:2652-2768), unlike the
+        // prior flat stub which emitted a bare atom.
+        let kinds: Vec<_> = program.pattern.terms.iter().map(|t| t.kind).collect();
         assert_eq!(
-            program.pattern.terms[0].kind,
-            BytecodeTermKind::PatternCharacterOnce
+            kinds,
+            vec![
+                BytecodeTermKind::BodyAlternativeBegin,
+                BytecodeTermKind::CheckInput,
+                BytecodeTermKind::PatternCharacterOnce,
+                BytecodeTermKind::BodyAlternativeEnd,
+            ]
         );
+        // CheckInput pre-checks minimumSize; the atom's inputPosition is the
+        // negative offset minimumSize - term.inputPosition (= 1 - 0).
+        assert_eq!(
+            program.pattern.terms[1].input_check.unwrap().checked_count,
+            1
+        );
+        assert_eq!(program.pattern.terms[2].input_position, 1);
         assert!(validate_yarr_bytecode_program(&program).is_ok());
     }
 

@@ -1,15 +1,17 @@
 //! RegExp execution boundary records.
 //!
 //! These records describe how runtime code enters and leaves a compiled RegExp
-//! program. They validate Yarr match-state/result contracts but never interpret
-//! bytecode, run JIT code, or search input.
+//! program, and provide the executable entry that runs the Yarr bytecode
+//! interpreter over a subject (mirroring C++ `Yarr::interpret`,
+//! YarrInterpreter.cpp:3221) and lifts its raw output vector into a `MatchResult`.
 
 use crate::gc::{RootKind, RootSetMutationAuthority};
 use crate::runtime::{ObjectId, RegExpMatchMode, RegExpProgramId};
 use crate::yarr::{
-    describe_match_result_semantics, describe_match_state_semantics, BytecodePatternId, MatchInput,
-    MatchResult, MatchResultSemanticDescriptor, MatchSemanticError, MatchStateSemanticDescriptor,
-    YarrMatchContext, YarrPatternId,
+    describe_match_result_semantics, describe_match_state_semantics, interpret_bytecode,
+    BytecodePattern, BytecodePatternId, JSRegExpResult, MatchInput, MatchRange, MatchResult,
+    MatchResultSemanticDescriptor, MatchSemanticError, MatchStateSemanticDescriptor, MatchStatus,
+    YarrMatchContext, YarrPatternId, YARR_OFFSET_NO_MATCH,
 };
 
 /// Storage backing selected for a RegExp program invocation.
@@ -214,6 +216,57 @@ pub fn describe_regexp_program_result(
         fell_back_to_interpreter: record.fell_back_to_interpreter,
         remaining_match_limit: record.remaining_match_limit,
     })
+}
+
+/// Executable RegExp entry: runs the Yarr bytecode interpreter over a UTF-16
+/// code-unit subject and lifts the raw output offset vector into a `MatchResult`.
+/// Mirrors the C++ exit path that reads `output[0]`/`output[1]` for the overall
+/// span and `output[2i]`/`output[2i+1]` for each capture (YarrInterpreter.cpp:
+/// 2234-2245; RegExp::matchInline lifts the same vector into capture ranges).
+pub fn execute_regexp_bytecode(
+    pattern: &BytecodePattern,
+    input: &[u16],
+    start: u32,
+) -> MatchResult {
+    let outcome = interpret_bytecode(pattern, input, start);
+    let status = match outcome.result {
+        JSRegExpResult::Match => MatchStatus::Match,
+        JSRegExpResult::NoMatch => MatchStatus::NoMatch,
+        JSRegExpResult::HitLimit => MatchStatus::ErrorHitLimit,
+    };
+
+    if outcome.result != JSRegExpResult::Match {
+        return MatchResult {
+            status,
+            overall: None,
+            captures: Vec::new(),
+        };
+    }
+
+    let overall = Some(MatchRange {
+        start: outcome.output[0],
+        end: outcome.output[1],
+    });
+
+    // Capture groups 1..=numSubpatterns; an unset begin (offsetNoMatch) means the
+    // group did not participate in the match (C++ leaves it as offsetNoMatch).
+    let num_subpatterns = pattern.body.subpattern_count;
+    let mut captures = Vec::with_capacity(num_subpatterns as usize);
+    for i in 1..=num_subpatterns {
+        let begin = outcome.output[(i << 1) as usize];
+        let end = outcome.output[((i << 1) + 1) as usize];
+        if begin == YARR_OFFSET_NO_MATCH || end == YARR_OFFSET_NO_MATCH {
+            captures.push(None);
+        } else {
+            captures.push(Some(MatchRange { start: begin, end }));
+        }
+    }
+
+    MatchResult {
+        status,
+        overall,
+        captures,
+    }
 }
 
 #[cfg(test)]
