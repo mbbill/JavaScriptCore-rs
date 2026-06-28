@@ -1,0 +1,25 @@
+# S4 arena soundness prototype -- THROWAWAY / OFF the live build.
+#
+# Standalone crate (empty [workspace] isolates it from the parent javascriptcore
+# crate so `cargo +nightly miri test` runs ONLY this prototype, not the whole
+# engine). It is the de-risking gate for the irreversible S4 cutover and does NOT
+# touch the live store (src/interpreter/mod.rs CoreObjectStore, src/gc/heap.rs).
+[package]
+name = "s4_arena_proto"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+# The S2 UB discriminator: PROVES miri flags the bad shape, so a clean run of the
+# arena is meaningful. Run separately; it is EXPECTED to report UB.
+name = "s2_ub"
+path = "src/bin/s2_ub.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
