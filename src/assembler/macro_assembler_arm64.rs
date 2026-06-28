@@ -318,6 +318,27 @@ impl MacroAssemblerArm64 {
         self.xor32(dest, src, dest);
     }
 
+    /// `and64(src1, src2, dest)` (MacroAssemblerARM64.h:532-535):
+    /// `and_<64>(dest, src1, src2)`.
+    pub fn and64(&mut self, src1: RegisterID, src2: RegisterID, dest: RegisterID) {
+        self.asm()
+            .emit_logical_reg(Datasize::D64, LogicalOp::And, dest, src1, src2);
+    }
+
+    /// `or64(op1, op2, dest)` (MacroAssemblerARM64.h:1359-1362):
+    /// `orr<64>(dest, op1, op2)`. Used by `boxInt32` / tag-register materialize.
+    pub fn or64(&mut self, op1: RegisterID, op2: RegisterID, dest: RegisterID) {
+        self.asm()
+            .emit_logical_reg(Datasize::D64, LogicalOp::Orr, dest, op1, op2);
+    }
+
+    /// `xor64(op1, op2, dest)` (MacroAssemblerARM64.h:1718-1721):
+    /// `eor<64>(dest, op1, op2)`.
+    pub fn xor64(&mut self, op1: RegisterID, op2: RegisterID, dest: RegisterID) {
+        self.asm()
+            .emit_logical_reg(Datasize::D64, LogicalOp::Eor, dest, op1, op2);
+    }
+
     // ========================================================================
     // Shifts (register-amount and immediate-amount).
     // ========================================================================
@@ -410,6 +431,23 @@ impl MacroAssemblerArm64 {
     pub fn move_double(&mut self, src: FPRegisterID, dest: FPRegisterID) {
         if src != dest {
             self.asm().emit_fmov_double(dest, src);
+        }
+    }
+
+    /// `zeroExtend32ToWord(src, dest)` (MacroAssemblerARM64.h:4340-4346): clear
+    /// the upper 32 bits by re-materializing the low word — `movz<32> #0` for the
+    /// `zr` source, else `mov<32>(dest, src)`. A non-flag-setting move, so it is
+    /// safe to interleave between a flag-setting op and the branch that reads the
+    /// flags (`branchMul32`). This is ALSO the JSVALUE64 int32 UNBOX: a boxed
+    /// int32 is `NumberTag | uint32(value)` and `asInt32()` reads the low 32 bits
+    /// (JSCJSValue.h:956-960), so writing the W view strips the tag and yields the
+    /// wrapped value.
+    pub fn zero_extend_32_to_word(&mut self, src: RegisterID, dest: RegisterID) {
+        if src.is_zr() && !dest.is_sp() {
+            self.asm()
+                .emit_move_wide(Datasize::D32, MoveWideOp::Z, dest, 0, 0);
+        } else {
+            self.asm().emit_mov_reg(Datasize::D32, dest, src);
         }
     }
 
@@ -573,6 +611,77 @@ impl MacroAssemblerArm64 {
         self.asm()
             .emit_logical_reg(Datasize::D32, LogicalOp::Ands, RegisterID::Zr, reg, mask);
         self.make_branch(cond.arm64_condition())
+    }
+
+    /// `branchTest64(cond, reg, mask)` (MacroAssemblerARM64.h:4914-4920), the
+    /// general register-mask form: `tst<64>(reg, mask)` (`ands xzr, reg, mask`)
+    /// then a conditional branch. This is the JSVALUE64 boolean-LSB test the
+    /// `jtrue`/`jfalse` int/bool fast paths use (the mask register holds 1).
+    ///
+    /// DEFERRED: the `reg == mask` + `Zero`/`NonZero` fold to `cbz`/`cbnz`
+    /// (`makeCompareAndBranch<64>`) — see the module note.
+    pub fn branch_test64(
+        &mut self,
+        cond: ResultCondition,
+        reg: RegisterID,
+        mask: RegisterID,
+    ) -> Jump {
+        self.asm()
+            .emit_logical_reg(Datasize::D64, LogicalOp::Ands, RegisterID::Zr, reg, mask);
+        self.make_branch(cond.arm64_condition())
+    }
+
+    /// `branchMul32(cond, src1, src2, dest)` (MacroAssemblerARM64.h:5194-5208).
+    ///
+    /// For a non-`Overflow` condition: `mul<32>` then `branchTest32(cond, dest)`.
+    /// For `Overflow` (the int32 `*` fast-path check): ARM64 has no 32-bit
+    /// multiply-that-sets-flags, so JSC computes the full SIGNED 64-bit product
+    /// with `smull` and checks whether it sign-extends from 32 bits — i.e. the
+    /// 32-bit result did not overflow iff bits 63..32 equal the sign of bit 31:
+    ///   smull   dest, src1, src2      ; 64-bit signed product into dest (X)
+    ///   cmp<64> dest, dest, SXTW #0   ; compare full product vs its low-32
+    ///                                 ;   sign-extension; NE  <=>  overflow
+    ///   zeroExtend32ToWord dest, dest ; deliver the wrapped int32 result (low 32)
+    ///   makeBranch(NotEqual)          ; b.ne, taken on overflow
+    /// (MacroAssemblerARM64.h:5203-5207). `zeroExtend32ToWord` (a non-flag-setting
+    /// `mov<32>`) preserves the `cmp` NZCV consumed by the branch.
+    pub fn branch_mul32(
+        &mut self,
+        cond: ResultCondition,
+        src1: RegisterID,
+        src2: RegisterID,
+        dest: RegisterID,
+    ) -> Jump {
+        debug_assert!(
+            !matches!(cond, ResultCondition::Signed),
+            "branchMul32 does not support the Signed condition (MacroAssemblerARM64.h:5196)"
+        );
+        if !matches!(cond, ResultCondition::Overflow) {
+            // mul<32>(dest, src1, src2): the macro `mul32(left, right, dest)` puts
+            // dest last, so dest = src1 * src2 is `mul32(src1, src2, dest)`.
+            self.mul32(src1, src2, dest);
+            // C++ `branchTest32(cond, dest)` (single-operand overload, mask == -1)
+            // lowers to `tst<32>(dest, dest)` then `makeBranch(cond)`; the
+            // register-mask `branch_test32(cond, dest, dest)` emits exactly that.
+            return self.branch_test32(cond, dest, dest);
+        }
+        // smull dest, src1, src2  (signed 32x32 -> 64).
+        self.asm().emit_smull(dest, src1, src2);
+        // cmp<64>(dest, dest, SXTW, 0) == sub<64, S>(zr, dest, dest, SXTW #0).
+        self.asm().emit_add_sub_extended_reg(
+            Datasize::D64,
+            AddOp::Sub,
+            SetFlags::S,
+            RegisterID::Zr,
+            dest,
+            dest,
+            super::arm64_encoder::ExtendType::Sxtw,
+            0,
+        );
+        // zeroExtend32ToWord(dest, dest): wrap the product to the int32 result.
+        self.zero_extend_32_to_word(dest, dest);
+        // makeBranch(NotEqual) -> b.ne (taken on overflow).
+        self.make_branch(RelationalCondition::NotEqual.arm64_condition())
     }
 
     /// `branchAdd32(cond, op1, op2, dest)` (MacroAssemblerARM64.h:5079-5083):
@@ -1427,6 +1536,119 @@ mod tests {
                 );
             }),
             vec![0x6b02_0020, 0x5400_0006, 0xd503_201f]
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // 64-bit register logic — or64/and64/xor64.
+    // ------------------------------------------------------------------------
+    #[test]
+    fn logical_register_64bit_forms() {
+        // and64(x1, x2, x0) -> and x0, x1, x2 : 0x8a020020.
+        assert_eq!(
+            emit(|m| m.and64(RegisterID::X1, RegisterID::X2, RegisterID::X0)),
+            vec![0x8a02_0020]
+        );
+        // or64(x1, x2, x0) -> orr x0, x1, x2 : 0xaa020020.
+        assert_eq!(
+            emit(|m| m.or64(RegisterID::X1, RegisterID::X2, RegisterID::X0)),
+            vec![0xaa02_0020]
+        );
+        // xor64(x1, x2, x0) -> eor x0, x1, x2 : 0xca020020.
+        assert_eq!(
+            emit(|m| m.xor64(RegisterID::X1, RegisterID::X2, RegisterID::X0)),
+            vec![0xca02_0020]
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // branchTest64 — tst<64> + b.cond.
+    // ------------------------------------------------------------------------
+    #[test]
+    fn branch_test64_emits_tst_bcond_nop() {
+        // branchTest64(NonZero, x0, x1) -> tst x0, x1 (ands xzr) : 0xea01001f ;
+        // b.ne #0 : 0x54000001 ; nop.
+        assert_eq!(
+            emit(|m| {
+                m.branch_test64(ResultCondition::NonZero, RegisterID::X0, RegisterID::X1);
+            }),
+            vec![0xea01_001f, 0x5400_0001, 0xd503_201f]
+        );
+        // branchTest64(Zero, x0, x1) -> tst x0, x1 ; b.eq #0 : 0x54000000 ; nop.
+        let mut masm = MacroAssemblerArm64::new();
+        let j = masm.branch_test64(ResultCondition::Zero, RegisterID::X0, RegisterID::X1);
+        assert_eq!(
+            words(masm.code()),
+            vec![0xea01_001f, 0x5400_0000, 0xd503_201f]
+        );
+        assert_eq!(j.condition(), Condition::Eq);
+        assert_eq!(j.label().label(), AssemblerLabel(4));
+    }
+
+    // ------------------------------------------------------------------------
+    // branchMul32 — the smull + sign-extend overflow check, and the non-overflow
+    // mul + test path.
+    // ------------------------------------------------------------------------
+    #[test]
+    fn branch_mul32_overflow_uses_smull_sxtw_check() {
+        // branchMul32(Overflow, x1, x2, x0):
+        //   smull x0, w1, w2          : 0x9b227c20
+        //   cmp x0, w0, sxtw  (subs xzr, x0, x0, SXTW #0) : 0xeb20c01f
+        //   mov w0, w0  (zeroExtend32ToWord) : 0x2a0003e0
+        //   b.ne #0 (taken on overflow) : 0x54000001
+        //   nop : 0xd503201f
+        let mut masm = MacroAssemblerArm64::new();
+        let j = masm.branch_mul32(
+            ResultCondition::Overflow,
+            RegisterID::X1,
+            RegisterID::X2,
+            RegisterID::X0,
+        );
+        assert_eq!(
+            words(masm.code()),
+            vec![
+                0x9b22_7c20,
+                0xeb20_c01f,
+                0x2a00_03e0,
+                0x5400_0001,
+                0xd503_201f
+            ]
+        );
+        assert_eq!(j.condition(), Condition::Ne);
+        // The b.ne token references the conditional branch word (offset 12).
+        assert_eq!(j.label().label(), AssemblerLabel(12));
+    }
+
+    #[test]
+    fn branch_mul32_non_overflow_uses_mul_then_test() {
+        // branchMul32(Zero, x1, x2, x0):
+        //   mul w0, w1, w2 : 0x1b027c20
+        //   tst w0, w0 (ands wzr, branchTest32(Zero, dest)) : 0x6a00001f
+        //   b.eq #0 : 0x54000000 ; nop : 0xd503201f
+        assert_eq!(
+            emit(|m| {
+                m.branch_mul32(
+                    ResultCondition::Zero,
+                    RegisterID::X1,
+                    RegisterID::X2,
+                    RegisterID::X0,
+                );
+            }),
+            vec![0x1b02_7c20, 0x6a00_001f, 0x5400_0000, 0xd503_201f]
+        );
+    }
+
+    #[test]
+    fn zero_extend_32_to_word_is_mov_w() {
+        // zeroExtend32ToWord(x0, x1) -> mov w1, w0 (orr w1, wzr, w0) : 0x2a0003e1.
+        assert_eq!(
+            emit(|m| m.zero_extend_32_to_word(RegisterID::X0, RegisterID::X1)),
+            vec![0x2a00_03e1]
+        );
+        // zr source -> movz w0, #0 : 0x52800000.
+        assert_eq!(
+            emit(|m| m.zero_extend_32_to_word(RegisterID::Zr, RegisterID::X0)),
+            vec![0x5280_0000]
         );
     }
 

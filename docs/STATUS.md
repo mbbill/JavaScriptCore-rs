@@ -31,6 +31,11 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 - [done] MacroAssemblerARM64 composite-op layer (add/sub/logic/shift/mul/move/load/store/branch over
   RegisterID/Address/BaseIndex; byte-oracle-proven; unwired — B7 emits through it). Deferred: logical-imm
   bitmask forms, CachedTempRegister, cbz/cbnz folds, extended-register cmp for sp operands.
+- [done] box/tag layer (baseline-JIT Rank-1, adversarially verified): or64/and64/xor64, branch_mul32
+  (smull+cmp-sxtw overflow), branch_test64 + jit/assembly_helpers.rs (AssemblyHelpers: numberTag x27/
+  notCellMask x28 model, branchIfInt32/boxInt32/unboxInt32) — value-rep-consistent via the SHARED
+  value::{NUMBER_TAG,NOT_CELL_MASK}. Forward: branch_test64 needs an Imm(1) overload for jtrue/jfalse
+  (Rank-2 adds it); x28 cell-check ≠ single-mask in the transitional cell encoding (defer to the IC wirer).
 - [done] LinkBuffer Label/Jump/Call + byte-exact in-place relocation.
 - [done] W^X executable memory (MAP_JIT + pthread_jit_write_protect; emit→finalize→call returns 42);
   unsafe scoped to jit/unsafe_platform_boundary.rs (forbid→deny).

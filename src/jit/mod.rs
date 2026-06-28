@@ -20,6 +20,11 @@
 
 pub(crate) mod abi;
 pub(crate) mod arm64_baseline;
+// The JSVALUE64 JSValue tag/box layer over `assembler::MacroAssemblerArm64`
+// (faithful port of jit/AssemblyHelpers.h's int32 subset). Safe under the tree's
+// `#![deny(unsafe_code)]`. Landed UNWIRED (`#![allow(dead_code)]`); the Rank-2
+// per-opcode ARM64 encoders + int32 fast paths emit through it later.
+pub mod assembly_helpers;
 pub(crate) mod baseline;
 pub(crate) mod code;
 pub(crate) mod disassembly;

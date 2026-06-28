@@ -30,7 +30,12 @@ use crate::gc::{GcRef, HeapId, RootId, RootKind, RootRecord, RootSet, RootSetSem
 
 /// `NumberTag`: all 15 high bits set => int32; some-but-not-all => double
 /// (JSCJSValue.h:457).
-const NUMBER_TAG: u64 = 0xfffe_0000_0000_0000;
+///
+/// `pub` so the JSVALUE64 JIT tag layer (`jit::assembly_helpers`) materializes
+/// the SAME constant it boxes int32 with that the runtime here decodes with — a
+/// JIT that boxed int32 against a different NumberTag would silently corrupt
+/// values. The JIT MUST reference this shared symbol, never a copied literal.
+pub const NUMBER_TAG: u64 = 0xfffe_0000_0000_0000;
 /// `DoubleEncodeOffset` = 2^49; biases a raw double so its encoded form lands in
 /// the 0x0002..0xFFFC high-bit window (JSCJSValue.h:450-452, PureNaN.h:79-80).
 const DOUBLE_ENCODE_OFFSET: u64 = 1 << 49;
@@ -42,10 +47,13 @@ const BOOL_TAG: u64 = 0x4;
 const UNDEFINED_TAG: u64 = 0x8;
 /// `NotCellMask` = NumberTag | OtherTag; in genuine JSVALUE64 a value is a cell
 /// iff none of these bits are set (JSCJSValue.h:479). Used by the faithful raw
-/// arm (feature `s4_raw_cell`); dead in the default transitional build (cells
-/// are the shifted encoding), hence `#[allow(dead_code)]`.
-#[allow(dead_code)]
-const NOT_CELL_MASK: u64 = NUMBER_TAG | OTHER_TAG;
+/// arm (feature `s4_raw_cell`).
+///
+/// `pub` so the JSVALUE64 JIT tag layer (`jit::assembly_helpers`) materializes
+/// the SAME NotCellMask into the dedicated `notCellMaskRegister` (x28) that the
+/// runtime here uses, referencing this shared symbol rather than a copied
+/// literal (see [`NUMBER_TAG`]).
+pub const NOT_CELL_MASK: u64 = NUMBER_TAG | OTHER_TAG;
 /// Combined non-numeric immediate values (JSCJSValue.h:472-475).
 const VALUE_FALSE: u64 = OTHER_TAG | BOOL_TAG; // 0x6
 const VALUE_TRUE: u64 = OTHER_TAG | BOOL_TAG | 1; // 0x7

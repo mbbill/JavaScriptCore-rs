@@ -178,6 +178,23 @@ pub enum DataOp2Source {
     Asrv = 10,
 }
 
+/// `ARM64Assembler::DataOp3Source` (ARM64Assembler.h:629-640): the
+/// three-source data-processing opcodes (`madd`/`smaddl`/`smulh`/...). Only the
+/// `madd` (32/64-bit `mul`) and `smaddl` (`smull`) forms are emitted today; the
+/// rest are ported for fidelity and unused (the module's `#![allow(dead_code)]`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum DataOp3Source {
+    Madd = 0,
+    Msub = 1,
+    Smaddl = 2,
+    Smsubl = 3,
+    Smulh = 4,
+    Umaddl = 10,
+    Umsubl = 11,
+    Umulh = 12,
+}
+
 /// `ARM64Assembler::BitfieldOp` (ARM64Assembler.h:605-609), restricted to the
 /// `sbfm`/`ubfm` forms that back the immediate shifts (`lsl`/`lsr`/`asr` by an
 /// immediate).
@@ -541,20 +558,29 @@ const fn data_processing_2_source(
         | x_or_zr(rd)
 }
 
-/// `dataProcessing3Source` (ARM64Assembler.h, the `0x1b000000` packer) for the
-/// `MADD` opcode (so `mul = madd(rd, rn, rm, zr)`). For `DataOp_MADD == 0` the
-/// `op54`/`op31`/`op0` sub-fields are all zero.
+/// `dataProcessing3Source` (ARM64Assembler.h:4592-4598, the `0x1b000000`
+/// packer): the three-source family (`madd`/`smaddl`/`smulh`/...). The opcode is
+/// split into `op54`/`op31`/`op0` exactly as JSC does. `mul = madd(rd,rn,rm,zr)`
+/// and `smull = smaddl(rd,rn,rm,zr)`.
 #[inline]
-const fn data_processing_3_source_madd(
+const fn data_processing_3_source(
     sf: Datasize,
+    opcode: DataOp3Source,
     rm: RegisterID,
     ra: RegisterID,
     rn: RegisterID,
     rd: RegisterID,
 ) -> u32 {
+    let opcode = opcode as u32;
+    let op54 = opcode >> 4;
+    let op31 = (opcode >> 1) & 7;
+    let op0 = opcode & 1;
     0x1b00_0000
         | (sf as u32) << 31
+        | op54 << 29
+        | op31 << 21
         | x_or_zr(rm) << 16
+        | op0 << 15
         | x_or_zr(ra) << 10
         | x_or_zr(rn) << 5
         | x_or_zr(rd)
@@ -1260,8 +1286,25 @@ impl<'a> Arm64Encoder<'a> {
     /// `madd(rd, rn, rm, zr)`.
     #[inline]
     pub fn emit_mul(&mut self, sf: Datasize, rd: RegisterID, rn: RegisterID, rm: RegisterID) {
-        self.insn(data_processing_3_source_madd(
+        self.insn(data_processing_3_source(
             sf,
+            DataOp3Source::Madd,
+            rm,
+            RegisterID::Zr,
+            rn,
+            rd,
+        ));
+    }
+
+    /// `smull(rd, rn, rm)` (ARM64Assembler.h:2835-2838): `smaddl(rd, rn, rm, zr)`,
+    /// the signed 32x32 -> 64-bit multiply. `rd` is the 64-bit (X) destination;
+    /// `rn`/`rm` are the 32-bit (W) source views. Always a 64-bit (`Datasize_64`)
+    /// instruction. Used by `MacroAssemblerARM64::branchMul32`'s overflow check.
+    #[inline]
+    pub fn emit_smull(&mut self, rd: RegisterID, rn: RegisterID, rm: RegisterID) {
+        self.insn(data_processing_3_source(
+            Datasize::D64,
+            DataOp3Source::Smaddl,
             rm,
             RegisterID::Zr,
             rn,
@@ -1551,6 +1594,37 @@ mod tests {
         assert_eq!(
             single(|e| e.emit_sub_reg(RegisterID::X0, RegisterID::X1, RegisterID::X2)),
             0xcb02_0020
+        );
+    }
+
+    #[test]
+    fn data_processing_3_source_mul_and_smull() {
+        // mul w0, w1, w2 == madd w0, w1, w2, wzr : 0x1b027c20 (matches the
+        // MacroAssemblerArm64 mul32 byte oracle).
+        assert_eq!(
+            single(|e| e.emit_mul(
+                Datasize::D32,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2
+            )),
+            0x1b02_7c20
+        );
+        // mul x0, x1, x2 == madd x0, x1, x2, xzr : 0x9b027c20.
+        assert_eq!(
+            single(|e| e.emit_mul(
+                Datasize::D64,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2
+            )),
+            0x9b02_7c20
+        );
+        // smull x0, w1, w2 == smaddl x0, w1, w2, xzr (DataOp_SMADDL=2 -> op31 bit
+        // 21 set) : 0x9b227c20.
+        assert_eq!(
+            single(|e| e.emit_smull(RegisterID::X0, RegisterID::X1, RegisterID::X2)),
+            0x9b22_7c20
         );
     }
 
