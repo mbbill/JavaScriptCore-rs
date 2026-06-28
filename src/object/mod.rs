@@ -11,6 +11,7 @@ mod indexing_type;
 mod operations;
 mod property;
 mod property_offset;
+mod property_table;
 mod storage;
 mod structure;
 mod structure_transition_table;
