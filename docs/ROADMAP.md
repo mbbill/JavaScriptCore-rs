@@ -71,6 +71,33 @@ These can fan out where independent (the JSStack substrate and the GC/POD-cell w
 different subsystems), but each touches megafiles serially at its cutover, so integration
 capacity is the bottleneck (Principle #3).
 
+### The baseline JIT is NOT one monolithic gated block (B7 audit 2026-06-28)
+
+A read-only audit of `src/jit/arm64_baseline.rs` (today only a return-seed proof-of-pipeline
+lane, emitting via hand-rolled encoders) found the baseline JIT splits into an **unblocked
+arith core** and **gated IC/call parts** — so its foundation advances IN PARALLEL with the GC
+and substrate tracks, additive in `jit/`+`assembler/` (no megafile conflict):
+
+- **WIREABLE TODAY** (frame arena live post-B4, value rep satisfied, integer/branch ops exist):
+  op_mov, int32 op_add/sub/mul/bitand/bitor/bitxor/lshift/rshift (fast path + slow-call),
+  op_jless/jgreater/jlesseq/jtrue/jfalse. Needs only: (1) the MacroAssembler **box/tag layer**
+  (or64/and64/xor64, branch_mul32, branch_test64, + a `jit/assembly_helpers.rs` AssemblyHelpers
+  analog: branchIfNotInt32/boxInt32/numberTag model — the assembler has ZERO JSValue-tag
+  awareness today); (2) ARM64 per-LoweredOperation encoders mirroring `jit/emitter.rs`
+  (the bytecode→selection contract already models Move/AddInt32/… ); (3) a slow-path C-call
+  shim (linkSlowCase scaffold exists at arm64_baseline.rs:1607); (4) bytecode→selection→ARM64
+  dispatch + tier-up.
+- **GATED on R4 + the inline/out-of-line storage split**: get_by_id/put_by_id + get_by_val/
+  put_by_val ICs (the IC fast path needs a stable direct cell pointer + StructureID-in-header +
+  PropertyInlineCache machinery).
+- **GATED on JSStack B5/B6**: op_call (the callee-frame push IS the B5 prologue/SP-in-arena work).
+
+So the baseline-JIT arith core is its own parallel track (box/tag layer → per-opcode encoders →
+slow-call shim → dispatch), started now; the property-access ICs and calls plug in once R4 and
+B5/B6 land. R moves materially only once the IC/call tiers are JIT-compiled, but the arith core
+builds the mandatory, reusable scaffolding (dispatch, tier-up, slow-call, box/tag) the higher
+tiers all sit on — pipelining, not a rabbit hole.
+
 ## Parallel, non-blocking correctness work (protects the gate, schedulable any time)
 
 - **typescript throw** — a pure-interpreter value-divergence (`undefined is not an object`
