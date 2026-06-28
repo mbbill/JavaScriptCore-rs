@@ -5136,22 +5136,13 @@ impl Vm {
         // work this entry must service) -- this preserves Batch 1's gate exactly.
         //
         // IDEMPOTENCY ASSUMPTION (load-bearing): a memo hit is sound only because
-        // the five skipped passes are idempotent given (fingerprint, plan_generation)
-        // -- they re-derive nothing once attached/materialized. There is ONE pass
-        // whose work also depends on RUNTIME HEAP LIVENESS, not on the six plan
-        // tables or the fingerprint: clear_stale_metadata_only_call_link_inline_caches_at_safepoint
-        // tests call_link_executable_cell_is_live (heap allocation_records), which
-        // can flip live->dead WITHOUT any six-table mutation or fingerprint change.
-        // This is benign TODAY because no production path destroys a published
-        // executable cell during an interpreter run (invalidate_cell has only
-        // test/fixture callers; there is no GC sweep mid-run). C++ JSC clears dead
-        // call links eagerly via GC finalizeUnconditionally/visitWeak, not per-call
-        // polling. WHEN a real GC-driven call-link finalization is added, it MUST
-        // route the retire through the clear recorders (record_call_link_inline_cache_clear
-        // / retire_call_link_inline_cache_metadata_for_clear), which bump
-        // plan_generation -- otherwise this memo would skip the stale-clear and a
-        // dead link would stay live. Do not add a mid-run executable-cell destroyer
-        // without that epoch bump.
+        // the three skipped property passes are idempotent given
+        // (fingerprint, plan_generation) -- they re-derive nothing once
+        // attached/materialized. (Before B3 a fourth/fifth call-link pass also
+        // ran here; one of them, clear_stale, depended on runtime heap liveness
+        // rather than the plan tables. B3 moved call-link linking to the per-site
+        // slow path and removed both call-link passes, so the memo now gates only
+        // plan-table/fingerprint-idempotent property work.)
         if pending.is_empty() {
             if let Some(fingerprint) = fingerprint {
                 if let Some(&(memo_fingerprint, memo_generation)) =
@@ -5166,9 +5157,26 @@ impl Vm {
             }
         }
 
-        // FULL path: the five idempotent passes. The full-branch counter is
-        // incremented ONLY here (as in Batch 1) so the probe sees per-call pass
-        // invocations collapse on a steady-state hot call path.
+        // FULL path: the three idempotent property passes. The full-branch
+        // counter is incremented ONLY here (as in Batch 1) so the probe sees
+        // per-call pass invocations collapse on a steady-state hot call path.
+        //
+        // B3 (call-link constant-factor correction): the two call-link passes
+        // (`clear_stale_metadata_only_call_link_inline_caches_at_safepoint` and
+        // `recheck_metadata_only_call_link_attachment_plans_at_safepoint`) USED
+        // to run here, re-scanning the VM-global call-link plan/attachment Vecs
+        // on EVERY call frame -- O(plans x rechecks) work that profiled to
+        // ~68-70% of earley-boyer self-time. They are removed: the per-site
+        // CallLinkInfo is linked in place at the slow path (the observation-time
+        // recheck->attach `set_monomorphic_callee`, faithful to
+        // RepatchInlines.h:130 `linkFor`/CallLinkInfo.cpp:134 setMonomorphicCallee),
+        // so a settled link has NOTHING for the safepoint to re-check, and the
+        // Rust heap never sweeps mid-run today, so a cached callee cannot go
+        // stale (there is nothing to clear). C++ JSC drives dead-link clearing
+        // from GC visitWeak/finalizeUnconditionally, NOT from per-call polling;
+        // when a real GC-driven call-link finalization lands it MUST route the
+        // retire through the clear recorders (which already exist), exactly as
+        // the C++ visitWeak model does -- not by reinstating a per-call scan.
         self.safepoint_pass_full_branch_invocations = self
             .safepoint_pass_full_branch_invocations
             .saturating_add(1);
@@ -5182,14 +5190,6 @@ impl Vm {
             code_block,
         );
         self.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
-            code_block_id,
-            code_block,
-        );
-        self.clear_stale_metadata_only_call_link_inline_caches_at_safepoint(
-            code_block_id,
-            code_block,
-        );
-        self.recheck_metadata_only_call_link_attachment_plans_at_safepoint(
             code_block_id,
             code_block,
         );
@@ -9607,6 +9607,50 @@ impl Vm {
         let Some(observation) = observation else {
             return Ok(());
         };
+        // B2 (call-link constant-factor correction). C++ `linkFor`
+        // (bytecode/RepatchInlines.h:130) is the per-call call slow path, but it
+        // is reached ONLY while a CallLinkInfo is unlinked: once the site is
+        // LINKED (Monomorphic or Polymorphic) its inline/stub fast path
+        // dispatches the call and `linkFor` is NOT re-entered (the `Mode::Init`
+        // arm links; the `Monomorphic`/`Polymorphic` arms re-enter only on a
+        // cached-callee MISS to widen the stub). The Rust port previously paid a
+        // VM-global record/boundary/plan/recheck/attach ladder PLUS an O(N)
+        // attachment-table scan (`call_observation_target_already_has_call_link_metadata`)
+        // on EVERY call, which call-site-diverse programs (earley-boyer,
+        // typescript) never let settle (their global call-link Vecs grew without
+        // bound, making each call O(N) -> O(N^2) overall). Mirror the C++ fast
+        // path: if the one per-site CallLinkInfo at (owner, bytecode_index) is
+        // already linked the metadata is settled, so skip the whole ladder in
+        // O(1). This is the exact slot the attach path links in place
+        // (`set_monomorphic_callee`), so there is exactly ONE CallLinkInfo per
+        // (owner, bytecode_index) and this cannot mis-key.
+        //
+        // DIVERGENCE + SAFETY (load-bearing): C++ `linkFor` re-enters on a cached-
+        // callee MISS to widen the monomorphic stub to polymorphic; this skip
+        // instead declines to re-record on ANY linked state, leaving the per-site
+        // cache monomorphic to the FIRST callee even when a later call observes a
+        // different callee. That is correctness-safe -- NOT a mis-dispatch -- only
+        // because the consumer of this metadata, the generated direct-call path,
+        // independently guards on the EXACT callee object before taking a direct
+        // call: `select_baseline_generated_js_direct_call` rejects any candidate
+        // whose `target.callee != callee_object` / `authorization.target_callee !=
+        // callee_object` (this file, the generated-direct-call probe + validate),
+        // so a stale monomorphic candidate can only DECLINE the fast path and fall
+        // back to the interpreter dispatching the real callee. The interpreter
+        // itself never consults CallLinkInfo for which function to call. (A future
+        // faithful poly-stub would re-record the transition; until then the guard
+        // makes the broad skip sound, and the metadata-only model carries no
+        // poly-variant list to widen.)
+        if let Some(code_block) = self.code_blocks.code_block_shared(observation.owner) {
+            let already_linked = code_block
+                .side_tables()
+                .inline_caches()
+                .call_for_bytecode_index(observation.bytecode_index)
+                .is_some_and(|call| call.is_linked());
+            if already_linked {
+                return Ok(());
+            }
+        }
         if self.call_observation_target_already_has_call_link_metadata(&observation) {
             return Ok(());
         }
@@ -15803,6 +15847,13 @@ impl Vm {
         Some(validation)
     }
 
+    // B3: no longer driven from the per-call IC/tiering safepoint (the per-call
+    // call-link re-scan was removed). Retained as the in-place clear primitive
+    // that the GC-driven `visitWeak` analog will call when a real collector lands
+    // (C++ JSC clears dead call links from finalizeUnconditionally/visitWeak, not
+    // per-call polling), and exercised directly by the call-link clear-semantics
+    // test. `#[allow(dead_code)]` because no live (non-test) path reaches it today.
+    #[allow(dead_code)]
     fn clear_stale_metadata_only_call_link_inline_caches_at_safepoint(
         &mut self,
         owner: CodeBlockId,
@@ -15836,23 +15887,6 @@ impl Vm {
                 &candidate,
             ));
         }
-    }
-
-    fn recheck_metadata_only_call_link_attachment_plans_at_safepoint(
-        &mut self,
-        owner: CodeBlockId,
-        code_block: &CodeBlock,
-    ) {
-        let Ok(bytecode_snapshot) =
-            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(code_block)
-        else {
-            return;
-        };
-
-        self.recheck_metadata_only_call_link_attachment_plans_for_snapshot(
-            owner,
-            bytecode_snapshot,
-        );
     }
 
     fn recheck_metadata_only_call_link_attachment_plans_for_snapshot(
@@ -46030,18 +46064,19 @@ mod tests {
         );
     }
 
-    // Batch 1 + Batch 2: a callee/owner WITH a registered plan (here a live
-    // call-link IC attachment record) takes the FULL safepoint path while it is
-    // still attaching/transitioning that work. Batch 1 alone re-ran the five
-    // idempotent passes on EVERY subsequent call; Batch 2's memo collapses the
-    // steady state to a skip. This test pins both halves of the invariant: the
-    // FIRST encounter of registered work runs the full path (the counter
-    // advances), and a forced plan mutation re-arms the full path (the guard does
-    // NOT skip when there is genuinely new plan work). The pure steady-state skip
-    // and the fingerprint-change resume are pinned by
-    // vm_safepoint_passes_skipped_in_steady_state_and_resume_on_mutation.
+    // B2 (call-link constant-factor correction). Re-targeted from the former
+    // `vm_safepoint_passes_run_full_path_for_owner_with_registered_plan`: after
+    // B3 a call-link attachment no longer drives the IC/tiering safepoint passes
+    // (call links are now materialized in place at the slow path, not re-scanned
+    // per call frame), so the old safepoint-counter assertions no longer apply.
+    // What this pins instead is the per-site link itself: executing a returning
+    // JS call must link the ONE CallLinkInfo at (owner, bytecode_index) IN PLACE,
+    // the Rust analogue of C++ `linkFor` -> `CallLinkInfo::setMonomorphicCallee`
+    // (bytecode/RepatchInlines.h:130, bytecode/CallLinkInfo.cpp:134). The
+    // VM-global attachment record is still written (dual-write) so existing
+    // record-shape consumers keep working.
     #[test]
-    fn vm_safepoint_passes_run_full_path_for_owner_with_registered_plan() {
+    fn vm_js_call_links_per_site_call_link_info_monomorphically_in_place() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
         let function_unlinked = js_call_return_41_function_code_block().unlinked().clone();
         let function_blocks = vm
@@ -46055,7 +46090,6 @@ mod tests {
         let owner = register_test_code_block(&mut vm, code_block.clone());
         install_typed_baseline_for_test(&mut vm, owner, 1322);
 
-        let before_first = vm.safepoint_pass_full_branch_invocations();
         let (completion, _) = execute_registered_code_block_with_boundary_snapshot_and_arguments(
             &mut vm,
             owner,
@@ -46068,91 +46102,58 @@ mod tests {
             ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
         );
 
-        // The first run attached a call-link IC for this owner, so the predicate
-        // must now report registered work, and the attaching run took the full
-        // safepoint path (the counter advanced while the IC was materialized).
-        assert!(
-            !vm.tiering_integration()
-                .call_link_inline_cache_attachment_records()
-                .is_empty(),
-            "first run must attach a call-link IC for the owner"
-        );
-        assert!(
-            vm.tiering_integration()
-                .owner_has_any_safepoint_plan_work(owner),
-            "owner with a registered call-link IC attachment must report safepoint work"
-        );
-        assert!(
-            vm.safepoint_pass_full_branch_invocations() > before_first,
-            "the first encounter of registered plan work must run the full safepoint path"
-        );
+        // Dual-write: the VM-global attachment record is still produced, and its
+        // accepted outcome carries the monomorphic target that was linked.
+        let attachment = vm
+            .tiering_integration()
+            .call_link_inline_cache_attachment_records()
+            .first()
+            .cloned()
+            .expect("first returning call must attach a call-link IC for the owner");
+        let expected_target = attachment
+            .code_block_outcome
+            .as_ref()
+            .expect("accepted attachment carries a bytecode outcome")
+            .target
+            .clone();
+        assert!(matches!(
+            expected_target,
+            CallTarget::MetadataOnlyMonomorphic { .. }
+        ));
 
-        // Drive to steady state so the memo engages (counter freezes across a
-        // step), then force a genuine plan mutation: the next run must RESUME the
-        // full path -- the guard must not skip when new plan work is registered.
-        let mut prev = vm.safepoint_pass_full_branch_invocations();
-        for _ in 0..8 {
-            let (completion, _) =
-                execute_registered_code_block_with_boundary_snapshot_and_arguments(
-                    &mut vm,
-                    owner,
-                    &code_block,
-                    &mut host,
-                    vec![RuntimeValue::undefined(), callee],
-                );
-            assert_eq!(
-                completion,
-                ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
-            );
-            let now = vm.safepoint_pass_full_branch_invocations();
-            if now == prev {
-                break;
-            }
-            prev = now;
-        }
-
-        let bytecode_snapshot =
-            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(&code_block)
-                .expect("owner code block fingerprint");
-        vm.tiering_integration_mut()
-            .record_call_link_attachment_plan(VmCallLinkAttachmentPlanRequest {
-                boundary_validation_ordinal: 0,
-                owner,
-                frame: Some(CallFrameId(1)),
-                bytecode_index: BytecodeIndex::from_offset(0),
-                opcode: CoreOpcode::Call,
-                bytecode_snapshot,
-                slot: InlineCacheSlotId(9),
-            });
-        let before = vm.safepoint_pass_full_branch_invocations();
-        let (completion, _) = execute_registered_code_block_with_boundary_snapshot_and_arguments(
-            &mut vm,
-            owner,
-            &code_block,
-            &mut host,
-            vec![RuntimeValue::undefined(), callee],
+        // The per-site CallLinkInfo at this call's slot is linked IN PLACE to that
+        // same monomorphic target. Clone so no registry `Ref` borrow escapes.
+        let registered = vm
+            .code_blocks
+            .get(owner)
+            .expect("registered owner code block")
+            .code_block();
+        let call =
+            registered.side_tables().inline_caches().calls[attachment.slot.0 as usize].clone();
+        assert!(
+            call.is_linked(),
+            "a returning JS call must leave its per-site CallLinkInfo linked"
         );
+        assert_eq!(call.mode, crate::bytecode::ic::CallLinkMode::Monomorphic);
         assert_eq!(
-            completion,
-            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
-        );
-        assert!(
-            vm.safepoint_pass_full_branch_invocations() > before,
-            "a forced plan mutation must re-arm the full safepoint path for an owner with registered plans"
+            call.target, expected_target,
+            "the per-site link must cache exactly the attached monomorphic callee"
         );
     }
 
-    // Batch 2 (call-dispatch constant-factor): an owner that HAS plans but is in
-    // STEADY STATE (no six-table plan mutation and an unchanged CodeBlock
-    // fingerprint since its last full pass) must SKIP the five idempotent passes
-    // via the safepoint memo -- the full-branch counter stops advancing across
-    // further calls. It must RESUME advancing after (a) a forced plan mutation
-    // (plan_generation bump) or (b) a CodeBlock fingerprint change (memo-key
-    // mismatch). This is the Rust analogue of C++ JSC materializing call links
-    // per-LINK (LLIntSlowPaths.cpp setUpCall/linkFor): once a link is
-    // materialized and nothing changes, the per-call work disappears.
+    // B2 (call-link constant-factor correction). Re-targeted from the former
+    // `vm_safepoint_passes_skipped_in_steady_state_and_resume_on_mutation`: that
+    // test drove the safepoint memo with a call-link attachment, which B3 no
+    // longer routes through the safepoint. The faithful steady-state behavior it
+    // now pins is the per-site link's O(1) settling: once a CallLinkInfo is
+    // linked, C++ `linkFor` is not re-entered for a hit (RepatchInlines.h:130),
+    // so repeated identical calls must NOT re-walk the VM-global
+    // record/plan/attach ladder, must NOT grow the global call-link Vecs, and
+    // must leave the per-site monomorphic link stable. (The safepoint memo's own
+    // steady-state skip + resume behavior is covered by the property-driven
+    // memo test, which is what the memo gates after B3.)
     #[test]
-    fn vm_safepoint_passes_skipped_in_steady_state_and_resume_on_mutation() {
+    fn vm_linked_per_site_call_link_info_settles_without_rerecording() {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
         let function_unlinked = js_call_return_41_function_code_block().unlinked().clone();
         let function_blocks = vm
@@ -46166,8 +46167,6 @@ mod tests {
         let owner = register_test_code_block(&mut vm, code_block.clone());
         install_typed_baseline_for_test(&mut vm, owner, 1322);
 
-        // Run 1: attaches the owner's call-link IC and records the memo. This is
-        // a full path (the attachment is this owner's first plan).
         let run = |vm: &mut Vm, host: &mut RecordingCoreHost| {
             let (completion, _) =
                 execute_registered_code_block_with_boundary_snapshot_and_arguments(
@@ -46182,88 +46181,63 @@ mod tests {
                 ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
             );
         };
+
+        // Read the per-site CallLinkInfo (mode, target) at the attached slot.
+        let linked_slot_state = |vm: &Vm| -> (crate::bytecode::ic::CallLinkMode, CallTarget) {
+            let attachment = vm
+                .tiering_integration()
+                .call_link_inline_cache_attachment_records()
+                .first()
+                .cloned()
+                .expect("the first call must attach a call-link IC");
+            let registered = vm
+                .code_blocks
+                .get(owner)
+                .expect("registered owner code block")
+                .code_block();
+            let call =
+                registered.side_tables().inline_caches().calls[attachment.slot.0 as usize].clone();
+            (call.mode, call.target)
+        };
+
+        // First call links the per-site CallLinkInfo monomorphically.
         run(&mut vm, &mut host);
-        assert!(
+        let (mode_after_link, target_after_link) = linked_slot_state(&vm);
+        assert_eq!(
+            mode_after_link,
+            crate::bytecode::ic::CallLinkMode::Monomorphic
+        );
+
+        // Capture the settled VM-global record counts after the link.
+        let attach_count = vm
+            .tiering_integration()
+            .call_link_inline_cache_attachment_records()
+            .len();
+        let observation_count = vm.tiering_integration().call_observations().len();
+
+        // Many more identical calls must short-circuit in O(1): no growth in the
+        // global call-link Vecs and a stable per-site link.
+        for _ in 0..16 {
+            run(&mut vm, &mut host);
+        }
+        assert_eq!(
             vm.tiering_integration()
-                .owner_has_any_safepoint_plan_work(owner),
-            "first run must attach a call-link IC for the owner"
+                .call_link_inline_cache_attachment_records()
+                .len(),
+            attach_count,
+            "a linked site must not re-attach: the per-site fast path settles the metadata"
         );
-        assert!(
-            vm.ic_tiering_safepoint_memo_contains_for_test(owner),
-            "the full path must record a memo for the owner"
-        );
-
-        // Run 2: still warming (the second run can take the full path while the
-        // attachment lifecycle settles). After it, the owner is in steady state.
-        run(&mut vm, &mut host);
-
-        // STEADY STATE: a further run must SKIP both safepoints -> counter frozen.
-        let steady = vm.safepoint_pass_full_branch_invocations();
-        run(&mut vm, &mut host);
-        run(&mut vm, &mut host);
         assert_eq!(
-            vm.safepoint_pass_full_branch_invocations(),
-            steady,
-            "steady-state runs with no plan mutation and unchanged fingerprint must skip the five passes"
+            vm.tiering_integration().call_observations().len(),
+            observation_count,
+            "a linked site must not re-record a call observation every call"
         );
-
-        // RESUME on a forced PLAN MUTATION: a genuine six-table mutation bumps the
-        // global plan_generation, so every memo (including this owner's) mismatches
-        // and the next safepoint takes the full path. Use a call-link attachment
-        // plan record (boundary_validation_ordinal 0 has no match -> a Rejected
-        // record is still pushed, which still bumps the epoch -- exactly the
-        // omission-proof behavior the coverage test asserts).
-        let bytecode_snapshot =
-            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(&code_block)
-                .expect("owner code block fingerprint");
-        let generation_before = vm.tiering_integration().plan_generation();
-        vm.tiering_integration_mut()
-            .record_call_link_attachment_plan(VmCallLinkAttachmentPlanRequest {
-                boundary_validation_ordinal: 0,
-                owner,
-                frame: Some(CallFrameId(1)),
-                bytecode_index: BytecodeIndex::from_offset(0),
-                opcode: CoreOpcode::Call,
-                bytecode_snapshot,
-                slot: InlineCacheSlotId(7),
-            });
-        assert!(
-            vm.tiering_integration().plan_generation() > generation_before,
-            "the forced plan mutation must bump plan_generation"
-        );
-        let before_mutation_resume = vm.safepoint_pass_full_branch_invocations();
-        run(&mut vm, &mut host);
-        assert!(
-            vm.safepoint_pass_full_branch_invocations() > before_mutation_resume,
-            "a plan-generation bump must force the full safepoint path on the next run"
-        );
-
-        // Back to steady state (the resume run re-recorded the memo at the new
-        // plan_generation): confirm the counter freezes again before the next case.
-        let steady_again = vm.safepoint_pass_full_branch_invocations();
-        run(&mut vm, &mut host);
+        let (mode_steady, target_steady) = linked_slot_state(&vm);
+        assert_eq!(mode_steady, crate::bytecode::ic::CallLinkMode::Monomorphic);
         assert_eq!(
-            vm.safepoint_pass_full_branch_invocations(),
-            steady_again,
-            "after re-recording the memo the owner must return to the steady-state skip"
-        );
-
-        // RESUME on a FINGERPRINT CHANGE: poke the memo's stored fingerprint to a
-        // structurally distinct value so the memo key mismatches even though
-        // plan_generation is unchanged. The next safepoint must take the full path.
-        let distinct = generated_native_call_return_object_code_block();
-        let distinct_fingerprint =
-            BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(&distinct)
-                .expect("distinct code block fingerprint");
-        assert!(
-            vm.corrupt_ic_tiering_safepoint_memo_fingerprint_for_test(owner, distinct_fingerprint),
-            "owner must have a memo entry to corrupt"
-        );
-        let before_fingerprint_resume = vm.safepoint_pass_full_branch_invocations();
-        run(&mut vm, &mut host);
-        assert!(
-            vm.safepoint_pass_full_branch_invocations() > before_fingerprint_resume,
-            "a CodeBlock fingerprint change must force the full safepoint path on the next run"
+            (mode_steady, &target_steady),
+            (mode_after_link, &target_after_link),
+            "the per-site monomorphic link must stay stable across the steady state"
         );
     }
 
