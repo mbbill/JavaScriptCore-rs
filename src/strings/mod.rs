@@ -7,6 +7,7 @@
 mod atom;
 mod property_key;
 mod string;
+mod string_impl;
 mod symbol;
 
 pub use atom::{
@@ -36,6 +37,7 @@ pub use string::{
     StringRegistryDescriptor, StringRegistryDescriptorBuilder, StringRegistryOwner,
     StringRegistryProvenance, StringValidationError, SubstringBase, SubstringString,
 };
+pub use string_impl::{BufferOwnership, StringData, StringImpl, StringKind, MAX_LENGTH};
 pub use symbol::{
     validate_symbol_registry_descriptor, validate_symbol_registry_entry, PrivateName, SymbolCell,
     SymbolDescription, SymbolIdentity, SymbolKind, SymbolRegistryDescriptor,
