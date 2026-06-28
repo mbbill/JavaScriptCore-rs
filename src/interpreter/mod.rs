@@ -90,8 +90,10 @@ use crate::value::{
     encode_value_stack, plan_value_stack_roots, EncodedJsValue, NumberValue, ValueKind,
     ValueStackConversionError, ValueStackRootPlan, ValueStackSnapshot,
 };
+use crate::vm::jsstack::{JsStackShadow, Register as JsStackRegister, VmEntryFrameSeed};
 use crate::vm::{
-    ExceptionState, ExceptionUnwindState, PendingException, TerminationReason, UnwindHandler,
+    ExceptionState, ExceptionUnwindState, FrameAddress, PendingException, TerminationReason,
+    UnwindHandler,
 };
 use crate::yarr::{
     construct_yarr_pattern, execute_regexp_match, parse_regex_flags, RegExpByteRange, RegexFlags,
@@ -836,6 +838,12 @@ impl ExecutionContextStack {
         if let Some(entry) = self.entries.last_mut() {
             entry.pushed_frames = entry.pushed_frames.saturating_add(1);
         }
+        // B3 dual-write: mirror this frame's header + `this` + args into the
+        // JsStack arena ALONGSIDE the `InstalledCallFrame`, with a debug
+        // cross-check that the two agree. Behavior-neutral (reads stay on the
+        // `Vec`); the arena is the substrate B4 flips reads onto. Driven here,
+        // not in `allocate_frame`, because the header bits live on this frame.
+        dual_write_shadow_frame(registers, &frame, &request.argument_values);
         self.frames.push(frame);
         Ok(id)
     }
@@ -974,6 +982,171 @@ impl ExecutionContextStack {
             frame_roots: Vec::new(),
             register_roots,
         })
+    }
+}
+
+/// Placeholder EntryFrame sentinel for slot 0 of a VM-entry frame (no JS
+/// caller). JSC stores the real `EntryFrame*` here
+/// (`callerFrameOrEntryFrame`, `interpreter/CallFrame.h:224`); the B3 shadow
+/// encodes the abstract `EntryFrameId` under a high marker so it is
+/// distinguishable from a real (large) arena caller address. Unobserved in B3
+/// (the read-flip is B4); mirrors the sentinel style of B2's byte-identity test.
+const ENTRY_FRAME_SHADOW_SENTINEL: u64 = 0x0000_7fff_0000_0000;
+
+fn entry_frame_sentinel_bits(entry: Option<EntryFrameId>) -> u64 {
+    ENTRY_FRAME_SHADOW_SENTINEL | u64::from(entry.map(|entry| entry.0).unwrap_or(0))
+}
+
+/// B3 dual-write: seed the arena shadow for a just-built `InstalledCallFrame`,
+/// then (debug only) cross-check the arena image against it.
+///
+/// The arena slot encoding faithfully follows `doVMEntry`/`CallFrame.h:176-181`
+/// given the live model's still-abstract identities (the divergence B6 retires):
+/// - slot 0 (`callerFrameOrEntryFrame`): a real JS caller's arena address (a
+///   genuinely linked frame chain), else the EntryFrame sentinel;
+/// - slot 1 (`returnPC`): the return `BytecodeIndex` bits (real machine returnPC
+///   is B7/JIT);
+/// - slots 2/3 (`codeBlock`/`callee`): the `CellId` value as placeholder pointer
+///   bits (real `CodeBlock*`/`JSCell*` lands when cells are direct pointers, B6);
+/// - slot 4 payload: `argumentCountIncludingThis`; tag (`CallSiteIndex`): 0;
+/// - slot 5 + args: the `this`/argument values, byte-identical via their
+///   NaN-boxed encoding.
+fn dual_write_shadow_frame(
+    registers: &mut RegisterFile,
+    frame: &InstalledCallFrame,
+    argument_values: &[RuntimeValue],
+) {
+    let count = frame.argument_count_including_this;
+    // `this` is window slot 0; `allocate_frame` fills `undefined` for any
+    // under-supplied argument tail, so mirror the window exactly:
+    // effective[k] = argument_values[k] else undefined.
+    let effective = |k: usize| -> RuntimeValue {
+        argument_values
+            .get(k)
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined)
+    };
+    let this_value = JsStackRegister::from_encoded(effective(0).encoded());
+    let arguments: Vec<JsStackRegister> = (1..count as usize)
+        .map(|k| JsStackRegister::from_encoded(effective(k).encoded()))
+        .collect();
+
+    let caller_or_entry_bits = match frame.caller {
+        Some(caller) => registers
+            .shadow_address_of(caller)
+            .map(|address| address.0 as u64)
+            .unwrap_or(0),
+        None => entry_frame_sentinel_bits(frame.entry),
+    };
+    let return_pc_bits = frame
+        .return_address
+        .map(|index| u64::from(index.as_bits()))
+        .unwrap_or(0);
+    let code_block_bits = frame
+        .code_block
+        .map(|code_block| u64::from(code_block.0 .0))
+        .unwrap_or(0);
+    let callee_bits = frame
+        .callee
+        .map(|callee| u64::from(callee.0 .0))
+        .unwrap_or(0);
+
+    let seed = VmEntryFrameSeed {
+        caller_frame_or_entry: JsStackRegister::from_bits(caller_or_entry_bits),
+        return_pc: JsStackRegister::from_bits(return_pc_bits),
+        code_block: JsStackRegister::from_bits(code_block_bits),
+        callee: JsStackRegister::from_bits(callee_bits),
+        argument_count_including_this: JsStackRegister::from_bits(u64::from(count)),
+        this_value,
+        arguments: &arguments,
+        // The value-stack window allocates exactly `count` argument slots with no
+        // alignment padding, so paddedArgCount == count (no `undefined` fill
+        // beyond the supplied args).
+        padded_argument_count: count,
+    };
+
+    let Some(address) = registers.shadow_seed_frame(frame.id, &seed) else {
+        return;
+    };
+    debug_assert_shadow_frame_matches(registers, frame, argument_values, address);
+}
+
+/// The B3 safety net (debug builds): assert the arena image read back through
+/// the provenance gate is byte-identical to the live `InstalledCallFrame` for
+/// the same frame. If the live model and the arena ever disagree, this fires —
+/// this is what makes B4's read-flip sound. No-op in release.
+fn debug_assert_shadow_frame_matches(
+    registers: &RegisterFile,
+    frame: &InstalledCallFrame,
+    argument_values: &[RuntimeValue],
+    address: FrameAddress,
+) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(image) = registers.shadow_frame_header_image(address) else {
+        return;
+    };
+    let expected_caller = match frame.caller {
+        Some(caller) => registers
+            .shadow_address_of(caller)
+            .map(|address| address.0)
+            .unwrap_or(0),
+        None => entry_frame_sentinel_bits(frame.entry) as usize,
+    };
+    debug_assert_eq!(
+        image.caller_frame_bits, expected_caller,
+        "B3 shadow slot-0 (callerFrame/entry) disagrees with InstalledCallFrame",
+    );
+    debug_assert_eq!(
+        image.return_pc_bits,
+        frame
+            .return_address
+            .map(|index| index.as_bits() as usize)
+            .unwrap_or(0),
+        "B3 shadow returnPC slot disagrees with InstalledCallFrame",
+    );
+    debug_assert_eq!(
+        image.code_block_bits,
+        frame
+            .code_block
+            .map(|code_block| code_block.0 .0 as usize)
+            .unwrap_or(0),
+        "B3 shadow codeBlock slot disagrees with InstalledCallFrame",
+    );
+    debug_assert_eq!(
+        image.callee_bits,
+        frame.callee.map(|callee| callee.0 .0 as usize).unwrap_or(0),
+        "B3 shadow callee slot disagrees with InstalledCallFrame",
+    );
+    debug_assert_eq!(
+        image.argument_count_including_this as u32, frame.argument_count_including_this,
+        "B3 shadow argumentCountIncludingThis disagrees with InstalledCallFrame",
+    );
+    debug_assert_eq!(
+        image.call_site_index_bits, 0,
+        "B3 shadow slot-4 CallSiteIndex tag should be 0",
+    );
+    let this_expected = argument_values
+        .first()
+        .copied()
+        .unwrap_or_else(RuntimeValue::undefined);
+    debug_assert_eq!(
+        image.this_value.js_value(),
+        this_expected,
+        "B3 shadow `this` disagrees with the frame's value",
+    );
+    for k in 1..frame.argument_count_including_this as usize {
+        let expected = argument_values
+            .get(k)
+            .copied()
+            .unwrap_or_else(RuntimeValue::undefined);
+        let actual = registers.shadow_frame_argument_value(address, (k - 1) as i32);
+        debug_assert_eq!(
+            actual,
+            Some(expected),
+            "B3 shadow argument disagrees with the frame's value",
+        );
     }
 }
 
@@ -1230,10 +1403,43 @@ impl FrameRootDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Lifecycle of the B3 JsStack dual-write shadow owned by a [`RegisterFile`].
+///
+/// The shadow is created LAZILY (the 5 MiB arena mmap is only reserved once a
+/// frame is actually pushed) and, once disabled, stays disabled (no retry).
+/// Disabling is how the dual-write stays BEHAVIOR-NEUTRAL: any arena problem
+/// (overflow, mmap failure, LIFO desync) drops the arena instead of changing
+/// control flow. This is a small Rust-port bridge state machine; JSC has no
+/// counterpart because there the native stack IS the only frame store.
+///
+/// `RegisterFile` cannot derive `Clone`/`Eq`/`PartialEq` once it owns this
+/// (the arena's `mmap` reservation is unique, non-cloneable, non-comparable);
+/// those derives were unused. `Default` is retained: an unpushed register file
+/// starts `Uninitialized`.
+#[derive(Debug, Default)]
+enum ShadowState {
+    /// No arena reserved yet (lazy); the next push attempts creation.
+    #[default]
+    Uninitialized,
+    /// A live arena mirroring the current frame stack.
+    Active(Box<JsStackShadow>),
+    /// Creation failed or a fault disabled it; the dual-write is a permanent
+    /// no-op for this register file.
+    Disabled,
+}
+
+#[derive(Debug, Default)]
 pub struct RegisterFile {
     values: Vec<RuntimeValue>,
     windows: Vec<RegisterWindow>,
+    // C++ JSC divergence (B3 dual-write bridge): the JsStack arena shadow. The
+    // native-thread-stack arena (`vm::jsstack`) is the faithful realization of
+    // the JS value stack that this `RegisterFile` abstracts; B3 mirrors every
+    // pushed frame's header + `this` + args into it ALONGSIDE the live
+    // `values`/`windows`, so B4 can flip `read`/`write` to address the arena.
+    // Reads are UNCHANGED in B3 (still `values`); the mirror is unobserved and
+    // behavior-neutral. See `ShadowState` and `dual_write_shadow_frame`.
+    shadow: ShadowState,
     // C++ JSC divergence: C++ JSC does ZERO per-bytecode rooting. The LLInt
     // dispatch macro just advances PC and jumps
     // (llint/LowLevelInterpreter.asm dispatch); a value is rooted simply by
@@ -1248,6 +1454,25 @@ pub struct RegisterFile {
     // `cell_root_dirty`/`CellRootDirty` signal and the per-op targeted-root
     // registry it drove were the prior Rust-only approximation of the safepoint
     // model and have been removed.
+}
+
+// Manual `Clone` (the derive cannot see through the `mmap`-backed shadow arena).
+// The JsStack dual-write shadow is a UNIQUE, non-cloneable bridge: its arena is
+// one mmap reservation, so a clone CANNOT share or duplicate it. A cloned
+// register file therefore starts a FRESH shadow (`Uninitialized`) and lazily
+// reserves its own arena on its next push. Clone copies the logical value-stack
+// state (`values`/`windows`); the shadow is a transient, unobserved B3 mirror
+// (reads still come from `values`), so resetting it on clone is behavior-neutral.
+// `Eq`/`PartialEq` were dropped with the derive — they were unused and cannot
+// hold for the arena anyway.
+impl Clone for RegisterFile {
+    fn clone(&self) -> Self {
+        RegisterFile {
+            values: self.values.clone(),
+            windows: self.windows.clone(),
+            shadow: ShadowState::Uninitialized,
+        }
+    }
 }
 
 impl RegisterFile {
@@ -1400,7 +1625,128 @@ impl RegisterFile {
         // the frame/root owner, not by forcing the next caller entry to rescan a
         // full surviving window. A returned cell still dirties the caller
         // through `write`, below, because that is an actual caller-slot change.
+        //
+        // B3 dual-write: raise the arena SP in lockstep with this value-stack
+        // truncation. This single mirror point covers EVERY frame release path
+        // (`pop_frame`, `unwind_to_entry`, `unwind_through_frame`), keeping the
+        // arena a faithful shadow across the whole call tree.
+        self.shadow_release_frame(window.owner);
         Ok(())
+    }
+
+    // --- B3 JsStack dual-write shadow (behavior-neutral; reads stay on `values`) ---
+
+    /// Seed the arena shadow for a freshly pushed frame, mirroring its header +
+    /// `this` + args alongside the live `InstalledCallFrame`. Lazily creates the
+    /// arena on first use. Any arena refusal (overflow / bad args) DISABLES the
+    /// shadow rather than affecting control flow (B3 is behavior-neutral).
+    /// Returns the seeded arena [`FrameAddress`], or `None` if the shadow is
+    /// inactive/disabled.
+    fn shadow_seed_frame(
+        &mut self,
+        frame_id: CallFrameId,
+        seed: &VmEntryFrameSeed<'_>,
+    ) -> Option<FrameAddress> {
+        if matches!(self.shadow, ShadowState::Uninitialized) {
+            self.shadow = match JsStackShadow::new() {
+                Some(shadow) => ShadowState::Active(Box::new(shadow)),
+                None => ShadowState::Disabled,
+            };
+        }
+        let ShadowState::Active(shadow) = &mut self.shadow else {
+            return None;
+        };
+        match shadow.seed_frame(frame_id.0, seed) {
+            Some(address) => Some(address),
+            None => {
+                // The arena could not hold this frame (e.g. deep recursion past
+                // the 5 MiB limit, exactly where JSC throws a stack overflow).
+                // Drop the arena and stop mirroring; the live `Vec` model keeps
+                // running, so behavior is unchanged.
+                self.shadow = ShadowState::Disabled;
+                None
+            }
+        }
+    }
+
+    /// Mirror a frame release into the arena (raise SP). A non-LIFO release
+    /// (only possible if a frame was created off the `push_frame` path) DISABLES
+    /// the shadow rather than panicking.
+    fn shadow_release_frame(&mut self, frame_id: CallFrameId) {
+        let ShadowState::Active(shadow) = &mut self.shadow else {
+            return;
+        };
+        if shadow.release_frame(frame_id.0).is_err() {
+            self.shadow = ShadowState::Disabled;
+        }
+    }
+
+    /// Forward side-table lookup: live `CallFrameId` -> arena `FrameAddress`.
+    pub(crate) fn shadow_address_of(&self, frame_id: CallFrameId) -> Option<FrameAddress> {
+        match &self.shadow {
+            ShadowState::Active(shadow) => shadow.address_of(frame_id.0),
+            _ => None,
+        }
+    }
+
+    /// Reverse side-table lookup: arena `FrameAddress` -> live `CallFrameId`.
+    ///
+    /// B3/B4/B6 bridge-inspection API: the reverse half of the
+    /// `CallFrameId <-> FrameAddress` round-trip (B6 consumes it to translate an
+    /// arena `CallFrame*` back to the live identity), exercised by the B3 test.
+    #[allow(dead_code)]
+    pub(crate) fn shadow_frame_id_at(&self, address: FrameAddress) -> Option<CallFrameId> {
+        match &self.shadow {
+            ShadowState::Active(shadow) => shadow.frame_id_at(address).map(CallFrameId),
+            _ => None,
+        }
+    }
+
+    /// Number of currently-mirrored frames in the arena shadow. Bridge-inspection
+    /// API exercised by the B3 lockstep test.
+    #[allow(dead_code)]
+    pub(crate) fn shadow_depth(&self) -> usize {
+        match &self.shadow {
+            ShadowState::Active(shadow) => shadow.depth(),
+            _ => 0,
+        }
+    }
+
+    /// The arena's current stack pointer (for the lockstep-SP cross-check), or
+    /// `None` if the shadow is inactive. Bridge-inspection API exercised by the
+    /// B3 lockstep test.
+    #[allow(dead_code)]
+    pub(crate) fn shadow_current_stack_pointer(&self) -> Option<usize> {
+        match &self.shadow {
+            ShadowState::Active(shadow) => Some(shadow.current_stack_pointer()),
+            _ => None,
+        }
+    }
+
+    /// Read back a mirrored frame's header + `this` for the cross-check.
+    pub(crate) fn shadow_frame_header_image(
+        &self,
+        address: FrameAddress,
+    ) -> Option<crate::vm::jsstack::ShadowFrameImage> {
+        match &self.shadow {
+            ShadowState::Active(shadow) => shadow.frame_header_image(address),
+            _ => None,
+        }
+    }
+
+    /// Read back a mirrored frame's argument `index` (excluding `this`) as a
+    /// decoded value, for the cross-check.
+    pub(crate) fn shadow_frame_argument_value(
+        &self,
+        address: FrameAddress,
+        index: i32,
+    ) -> Option<RuntimeValue> {
+        match &self.shadow {
+            ShadowState::Active(shadow) => shadow
+                .frame_argument(address, index)
+                .map(|reg| reg.js_value()),
+            _ => None,
+        }
     }
 
     #[allow(dead_code)]
@@ -30102,6 +30448,184 @@ mod tests {
         assert_eq!(registers.register_count(), 0);
         let exit = stack.leave(entry).unwrap();
         assert_eq!(exit.kind, ExecutionEntryKind::Eval);
+    }
+
+    // B3 dual-write: a nested call tree (A -> B -> C, each with args) must keep
+    // the JsStack arena shadow byte-identical to the `InstalledCallFrame` chain
+    // at EVERY depth, the `CallFrameId <-> FrameAddress` table must round-trip,
+    // and frame pops must restore the arena SP in lockstep. Gated to `unix`
+    // because the shadow arena is `mmap`-backed (`JsStack::new`).
+    #[cfg(unix)]
+    #[test]
+    fn b3_dual_write_shadow_tracks_nested_call_tree_byte_identically() {
+        use crate::bytecode::register::RegisterFrameShape;
+
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+
+        let shape = |callee_locals: u32| RegisterFrameShape {
+            num_parameters_including_this: 1,
+            num_vars: 1,
+            num_callee_locals: callee_locals,
+            num_temporaries: 0,
+            special: Default::default(),
+        };
+
+        let entry = stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+            code_block: CodeBlockId(CellId(100)),
+            global_object: GlobalObjectId(ObjectId(CellId(1))),
+            this_value: RuntimeValue::undefined(),
+        }));
+
+        // --- Frame A: VM-entry frame (no JS caller), this + 1 arg ---
+        let a_this = RuntimeValue::from_i32(10);
+        let a_arg0 = RuntimeValue::from_i32(11);
+        let id_a = stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(CodeBlockId(CellId(101))),
+                    callee: Some(ObjectId(CellId(201))),
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: shape(2),
+                    argument_count_including_this: 2,
+                    argument_values: vec![a_this, a_arg0],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+
+        // The shadow activates on the first push (mmap arena).
+        assert_eq!(registers.shadow_depth(), 1);
+        let addr_a = registers.shadow_address_of(id_a).expect("A mirrored");
+        let sp_at_a = registers.shadow_current_stack_pointer().unwrap();
+        assert_eq!(
+            sp_at_a, addr_a.0,
+            "arena SP == A's CallFrame* after seeding A"
+        );
+
+        // A's slot 0 is the EntryFrame sentinel (no JS caller).
+        let image_a = registers.shadow_frame_header_image(addr_a).unwrap();
+        assert_eq!(
+            image_a.caller_frame_bits,
+            entry_frame_sentinel_bits(Some(entry)) as usize
+        );
+        assert_eq!(image_a.code_block_bits, 101);
+        assert_eq!(image_a.callee_bits, 201);
+        assert_eq!(image_a.argument_count_including_this, 2);
+        assert_eq!(image_a.this_value.js_value(), a_this);
+        assert_eq!(
+            registers.shadow_frame_argument_value(addr_a, 0),
+            Some(a_arg0)
+        );
+
+        // --- Frame B: nested under A, this + 2 args ---
+        let b_this = RuntimeValue::from_i32(20);
+        let b_arg0 = RuntimeValue::from_i32(21);
+        let b_arg1 = RuntimeValue::from_i32(22);
+        let id_b = stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(CodeBlockId(CellId(102))),
+                    callee: Some(ObjectId(CellId(202))),
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: shape(3),
+                    argument_count_including_this: 3,
+                    argument_values: vec![b_this, b_arg0, b_arg1],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(registers.shadow_depth(), 2);
+        let addr_b = registers.shadow_address_of(id_b).expect("B mirrored");
+        let sp_at_b = registers.shadow_current_stack_pointer().unwrap();
+        assert_eq!(sp_at_b, addr_b.0);
+        // B sits strictly BELOW A (the arena grows down).
+        assert!(addr_b.0 < addr_a.0, "B's frame is below A's");
+
+        // B's slot 0 links to A's arena address (a genuine linked frame chain).
+        let image_b = registers.shadow_frame_header_image(addr_b).unwrap();
+        assert_eq!(image_b.caller_frame_bits, addr_a.0);
+        assert_eq!(image_b.code_block_bits, 102);
+        assert_eq!(image_b.callee_bits, 202);
+        assert_eq!(image_b.argument_count_including_this, 3);
+        assert_eq!(image_b.this_value.js_value(), b_this);
+        assert_eq!(
+            registers.shadow_frame_argument_value(addr_b, 0),
+            Some(b_arg0)
+        );
+        assert_eq!(
+            registers.shadow_frame_argument_value(addr_b, 1),
+            Some(b_arg1)
+        );
+
+        // A stays byte-identical after B was seeded below it (no clobber).
+        let image_a_after = registers.shadow_frame_header_image(addr_a).unwrap();
+        assert_eq!(image_a_after, image_a);
+
+        // --- Frame C: nested under B, this only (no args) ---
+        let c_this = RuntimeValue::from_i32(30);
+        let id_c = stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(CodeBlockId(CellId(103))),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: shape(1),
+                    argument_count_including_this: 1,
+                    argument_values: vec![c_this],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(registers.shadow_depth(), 3);
+        let addr_c = registers.shadow_address_of(id_c).expect("C mirrored");
+        let sp_at_c = registers.shadow_current_stack_pointer().unwrap();
+        assert_eq!(sp_at_c, addr_c.0);
+        assert!(addr_c.0 < addr_b.0, "C's frame is below B's");
+
+        let image_c = registers.shadow_frame_header_image(addr_c).unwrap();
+        assert_eq!(image_c.caller_frame_bits, addr_b.0);
+        assert_eq!(image_c.code_block_bits, 103);
+        assert_eq!(image_c.callee_bits, 0, "no callee -> null callee slot");
+        assert_eq!(image_c.argument_count_including_this, 1);
+        assert_eq!(image_c.this_value.js_value(), c_this);
+
+        // --- CallFrameId <-> FrameAddress table round-trips for every frame ---
+        assert_eq!(registers.shadow_frame_id_at(addr_a), Some(id_a));
+        assert_eq!(registers.shadow_frame_id_at(addr_b), Some(id_b));
+        assert_eq!(registers.shadow_frame_id_at(addr_c), Some(id_c));
+        // Distinct addresses for distinct frames.
+        assert_ne!(addr_a.0, addr_b.0);
+        assert_ne!(addr_b.0, addr_c.0);
+
+        // --- Pop C, B, A: the arena SP rises in lockstep with each release ---
+        stack.pop_frame(&mut registers, id_c).unwrap();
+        assert_eq!(registers.shadow_depth(), 2);
+        assert_eq!(registers.shadow_current_stack_pointer(), Some(sp_at_b));
+
+        stack.pop_frame(&mut registers, id_b).unwrap();
+        assert_eq!(registers.shadow_depth(), 1);
+        assert_eq!(registers.shadow_current_stack_pointer(), Some(sp_at_a));
+
+        stack.pop_frame(&mut registers, id_a).unwrap();
+        assert_eq!(registers.shadow_depth(), 0);
+        // After the last pop the arena SP returns to the pre-A top: A's frame was
+        // header(5) + paddedArgs(2) = 7 registers = 56 bytes.
+        assert_eq!(
+            registers.shadow_current_stack_pointer(),
+            Some(sp_at_a + 7 * 8)
+        );
     }
 
     #[test]

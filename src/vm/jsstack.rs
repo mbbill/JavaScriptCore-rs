@@ -58,6 +58,7 @@
 use core::ptr::{self, NonNull};
 
 use crate::value::{EncodedJsValue, JsValue};
+use crate::vm::FrameAddress;
 
 // === Constants ===
 
@@ -1098,6 +1099,249 @@ pub(crate) enum JsStackPushError {
     },
     /// Frame-size or new-SP arithmetic overflowed / underflowed `usize`.
     AddressOverflow,
+}
+
+// === B3 dual-write shadow (the bridge between the live model and the arena) ===
+
+/// One live frame's bookkeeping in the [`JsStackShadow`]: the arena address of
+/// its `CallFrame*` (slot 0) and the arena SP to restore when it is released.
+///
+/// This is the Rust-port bridge between the live model's abstract
+/// `CallFrameId(u32)` identity (`runtime::interpreter::CallFrameId`) and the
+/// arena's native `CallFrame*` address. JSC has no such table — the `CallFrame*`
+/// IS the identity (`CallFrame.h:189`); the table exists only because the live
+/// Rust model still keys frames by an out-of-line `u32` (the divergence B6
+/// retires). It mirrors `RegisterFile::windows` (a LIFO `Vec`) so the arena SP
+/// moves in lockstep with the value-stack truncation in `release_frame`.
+struct ShadowFrameRecord {
+    /// `runtime::interpreter::CallFrameId(u32)` of the live frame this mirrors.
+    frame_id: u32,
+    /// Arena address of slot 0 (the `CallFrame*` / `fp`), i.e.
+    /// `CallFrame::registers()` (`CallFrame.h:218`).
+    frame_address: usize,
+    /// `JsStack::current_stack_pointer` BEFORE this frame was seeded; restored on
+    /// release so the arena SP rises in lockstep with the live frame pop
+    /// (the analog of `RegisterFile::values.truncate(window.base)`).
+    sp_before: usize,
+}
+
+/// Why [`JsStackShadow::release_frame`] could not release a frame. Both variants
+/// mean the live model and the arena shadow have diverged from strict LIFO
+/// nesting; the dual-write caller responds by DISABLING the shadow (never by
+/// panicking or altering control flow), keeping B3 behavior-neutral.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShadowReleaseError {
+    /// The released frame id is not the top of the shadow stack (non-LIFO pop).
+    NotTopOfStack {
+        expected_top: Option<u32>,
+        requested: u32,
+    },
+    /// The shadow frame stack was empty when a release was requested.
+    Empty { requested: u32 },
+}
+
+/// A read-back image of a seeded arena frame's header slots + `this`, in RAW
+/// bits, for the B3 cross-check. Copied out (POD) so the comparison borrows
+/// nothing from the arena. Mirrors the slots `doVMEntry` writes
+/// (`CallFrame.h:176-181`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ShadowFrameImage {
+    /// Slot 0 — `callerFrameOrEntryFrame` (`CallFrame.h:224`).
+    pub(crate) caller_frame_bits: usize,
+    /// Slot 1 — `returnPC` (`CallFrame.h:234`).
+    pub(crate) return_pc_bits: usize,
+    /// Slot 2 — `codeBlock` (`CallFrame.h:204-205`).
+    pub(crate) code_block_bits: usize,
+    /// Slot 3 — `callee` raw `CalleeBits` (`CallFrame.h:202`).
+    pub(crate) callee_bits: usize,
+    /// Slot 4 payload — `argumentCountIncludingThis` (`CallFrame.h:287`).
+    pub(crate) argument_count_including_this: i32,
+    /// Slot 4 tag — `CallSiteIndex` (`CallFrame.h:165-167,245`).
+    pub(crate) call_site_index_bits: i32,
+    /// Slot 5 — `this` (`CallFrame.h:308-309`).
+    pub(crate) this_value: Register,
+}
+
+/// The B3 DUAL-WRITE SHADOW: a [`JsStack`] arena that mirrors every frame the
+/// live `ExecutionContextStack`/`RegisterFile` model pushes, so B4's read-flip
+/// (pointing `RegisterFile::read/write` at the arena window) is safe.
+///
+/// ## What B3 writes (and does NOT)
+///
+/// On each live `push_frame`, the dual-write seeds ONE arena `CallFrame` via the
+/// proven B2 `doVMEntry`-shaped primitive ([`JsStack::try_seed_entry_frame`]):
+/// the 5 header slots + `this` + arguments (`CallFrame.h:176-181`). Locals
+/// (negative offsets) are NOT written here — `try_seed_entry_frame` sets the new
+/// SP to the callee `fp` (sp == fp after `doVMEntry`), exactly as JSC's entry
+/// path does; the prologue's local reservation (`sub sp, fp, #frameSize`) is B5.
+/// So across nested pushes the arena packs frames WITHOUT a local gap; this is
+/// harmless in B3 because nothing reads the arena and no caller's locals are
+/// written, and B5 adds the prologue reservation before the arena is read.
+///
+/// ## Behavior-neutral
+///
+/// Reads still come from the live `Vec`/`RegisterFile` (the read-flip is B4).
+/// The arena writes are unobserved, so the dual-write must NEVER change control
+/// flow: if the arena cannot hold a frame (overflow) or LIFO nesting desyncs,
+/// the OWNER (`RegisterFile`) DISABLES the shadow rather than erroring/panicking.
+pub(crate) struct JsStackShadow {
+    /// The descending arena the live frames are mirrored into (B2).
+    stack: JsStack,
+    /// LIFO record of every currently-live mirrored frame, mirroring
+    /// `RegisterFile::windows`. `push` appends, `release_frame` pops the top.
+    frames: Vec<ShadowFrameRecord>,
+}
+
+impl core::fmt::Debug for JsStackShadow {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Terse: do not recurse into the mmap reservation / raw arena bytes.
+        f.debug_struct("JsStackShadow")
+            .field("depth", &self.frames.len())
+            .field("current_stack_pointer", &self.stack.current_stack_pointer())
+            .finish()
+    }
+}
+
+impl JsStackShadow {
+    /// Build a live shadow over a fresh default-size arena
+    /// (`Options::maxPerThreadStackUsage()`, 5 MiB). Returns `None` if the arena
+    /// cannot be reserved (e.g. `mmap` failure) or on a non-`unix` target, in
+    /// which case the owner leaves the shadow disabled and the dual-write is a
+    /// no-op (behavior-neutral).
+    pub(crate) fn new() -> Option<Self> {
+        #[cfg(unix)]
+        {
+            JsStack::new_default().ok().map(|stack| JsStackShadow {
+                stack,
+                frames: Vec::new(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    /// Seed one mirrored frame from `seed` and record its `frame_id` ->
+    /// arena-address mapping. Returns the seeded slot-0 [`FrameAddress`], or
+    /// `None` if the arena refused the push (overflow / bad args) — on `None`
+    /// the owner disables the shadow. The arena SP descends by exactly the
+    /// `doVMEntry` frame size.
+    pub(crate) fn seed_frame(
+        &mut self,
+        frame_id: u32,
+        seed: &VmEntryFrameSeed<'_>,
+    ) -> Option<FrameAddress> {
+        let sp_before = self.stack.current_stack_pointer();
+        match self.stack.try_seed_entry_frame(seed) {
+            Ok(frame) => {
+                let frame_address = frame.registers().as_ptr() as usize;
+                self.frames.push(ShadowFrameRecord {
+                    frame_id,
+                    frame_address,
+                    sp_before,
+                });
+                Some(FrameAddress(frame_address))
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Release the top mirrored frame, restoring the arena SP to its pre-push
+    /// value (lockstep with the live `release_frame`'s `values.truncate`). The
+    /// `frame_id` MUST be the top of the LIFO stack, mirroring
+    /// `RegisterFile::release_frame`'s `windows.pop()` identity check.
+    pub(crate) fn release_frame(&mut self, frame_id: u32) -> Result<(), ShadowReleaseError> {
+        match self.frames.last() {
+            Some(top) if top.frame_id == frame_id => {
+                let sp_before = top.sp_before;
+                self.frames.pop();
+                self.stack.set_current_stack_pointer(sp_before);
+                Ok(())
+            }
+            Some(top) => Err(ShadowReleaseError::NotTopOfStack {
+                expected_top: Some(top.frame_id),
+                requested: frame_id,
+            }),
+            None => Err(ShadowReleaseError::Empty {
+                requested: frame_id,
+            }),
+        }
+    }
+
+    /// `CallFrameId(u32)` -> arena `FrameAddress`: the forward side-table lookup.
+    pub(crate) fn address_of(&self, frame_id: u32) -> Option<FrameAddress> {
+        self.frames
+            .iter()
+            .find(|record| record.frame_id == frame_id)
+            .map(|record| FrameAddress(record.frame_address))
+    }
+
+    /// Arena `FrameAddress` -> `CallFrameId(u32)`: the reverse side-table lookup.
+    pub(crate) fn frame_id_at(&self, address: FrameAddress) -> Option<u32> {
+        self.frames
+            .iter()
+            .find(|record| record.frame_address == address.0)
+            .map(|record| record.frame_id)
+    }
+
+    /// Number of currently-live mirrored frames (mirrors
+    /// `RegisterFile::windows.len()`).
+    pub(crate) fn depth(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// `JsStack::current_stack_pointer` — for the lockstep-SP cross-check.
+    pub(crate) fn current_stack_pointer(&self) -> usize {
+        self.stack.current_stack_pointer()
+    }
+
+    /// Read back the header slots + `this` of a frame this shadow seeded, for the
+    /// B3 cross-check. `None` if `address` is not a frame this shadow currently
+    /// holds. Confines the arena `unsafe` reads here (the interpreter cross-check
+    /// calls this safe API).
+    pub(crate) fn frame_header_image(&self, address: FrameAddress) -> Option<ShadowFrameImage> {
+        if !self
+            .frames
+            .iter()
+            .any(|record| record.frame_address == address.0)
+        {
+            return None;
+        }
+        let frame = self.stack.call_frame_at(address.0)?;
+        // SAFETY: `address` is a frame THIS shadow seeded via
+        // `try_seed_entry_frame`, which wrote slots 0..=5 (header + `this`); those
+        // slots lie inside the live arena window `[address, sp_before)` and a
+        // nested callee occupies a strictly lower, disjoint region, so they are
+        // still live and initialized. The reads copy POD `Register` bits.
+        unsafe {
+            Some(ShadowFrameImage {
+                caller_frame_bits: frame.caller_frame_bits(),
+                return_pc_bits: frame.return_pc_bits(),
+                code_block_bits: frame.code_block_bits(),
+                callee_bits: frame.callee().raw_ptr(),
+                argument_count_including_this: frame.argument_count_including_this(),
+                call_site_index_bits: frame.call_site_index_bits(),
+                this_value: frame.this_value(),
+            })
+        }
+    }
+
+    /// Read back argument `index` (0-based, EXCLUDING `this`) of a frame this
+    /// shadow seeded, for the B3 cross-check. `None` if `address` is unknown.
+    pub(crate) fn frame_argument(&self, address: FrameAddress, index: i32) -> Option<Register> {
+        if !self
+            .frames
+            .iter()
+            .any(|record| record.frame_address == address.0)
+        {
+            return None;
+        }
+        let frame = self.stack.call_frame_at(address.0)?;
+        // SAFETY: as `frame_header_image`; argument `index` is `firstArgument +
+        // index` (`CallFrame.h:288`), inside the seeded frame's argument area.
+        Some(unsafe { frame.argument(index) })
+    }
 }
 
 #[cfg(test)]

@@ -24,7 +24,7 @@ mod exceptions;
 mod executables;
 mod generated_executor;
 mod generated_metrics;
-mod jsstack;
+pub(crate) mod jsstack;
 mod native_reentry;
 mod property_handoff;
 mod runtime;
