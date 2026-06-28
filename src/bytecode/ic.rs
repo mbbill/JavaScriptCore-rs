@@ -54,6 +54,31 @@ impl InlineCacheTable {
             .enumerate()
             .find(|(_, call)| call.bytecode_index == bytecode_index)
     }
+
+    // Mutable counterparts of `call_for_bytecode_index` /
+    // `call_slot_for_bytecode_index`. C++ reaches the one embedded
+    // `CallLinkInfo` for a call bytecode and mutates it in place at the slow
+    // path (LLIntSlowPaths.cpp:616 `linkFor` -> `setMonomorphicCallee`); these
+    // give the same O(call-sites-in-this-block) reach to the site for in-place
+    // `set_monomorphic_callee` / `bump_slow_path_count` / `reset_to_unlinked`.
+    pub fn call_for_bytecode_index_mut(
+        &mut self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<&mut CallLinkInfo> {
+        self.calls
+            .iter_mut()
+            .find(|call| call.bytecode_index == bytecode_index)
+    }
+
+    pub fn call_slot_for_bytecode_index_mut(
+        &mut self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<(usize, &mut CallLinkInfo)> {
+        self.calls
+            .iter_mut()
+            .enumerate()
+            .find(|(_, call)| call.bytecode_index == bytecode_index)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -997,6 +1022,69 @@ impl CallLinkInfo {
             CodeSpecialization::Construct,
         )
     }
+
+    // ---- C++-faithful in-place mutators/accessors for one call site ----
+    //
+    // These mirror the public method surface of C++ `CallLinkInfo`
+    // (bytecode/CallLinkInfo.h/.cpp), which is exactly ONE per op_call/
+    // op_construct/op_tail_call embedded in the owning CodeBlock's metadata and
+    // mutated O(1) in place by the call slow path and by GC visitWeak. They make
+    // THIS existing side-table descriptor executable in place so per-call
+    // linking can collapse onto the site itself instead of the VM-global record
+    // ladder (see `VmTieringIntegration`, src/vm/tiering.rs).
+
+    /// C++ `CallLinkInfo::mode()` (bytecode/CallLinkInfo.h:278): this site's
+    /// cached linking state.
+    pub fn mode(&self) -> CallLinkMode {
+        self.mode
+    }
+
+    /// C++ `CallLinkInfo::isLinked()` (bytecode/CallLinkInfo.h:124): a site is
+    /// linked once it caches a callee (Monomorphic) or a polymorphic stub, but
+    /// not while Init or Virtual.
+    pub fn is_linked(&self) -> bool {
+        self.mode != CallLinkMode::Init && self.mode != CallLinkMode::Virtual
+    }
+
+    /// C++ `CallLinkInfo::slowPathCount()` (bytecode/CallLinkInfo.h:254): this
+    /// site's own tiering counter.
+    pub fn slow_path_count(&self) -> u32 {
+        self.slow_path_count
+    }
+
+    /// C++ slow-path counter bump (`addi 1, CallLinkInfo::m_slowPathCount[t2]`,
+    /// llint/LowLevelInterpreter.asm:2878): each slow-path traversal of THIS
+    /// call site bumps its own counter in place. Saturating stands in for the
+    /// C++ `uint32_t` wrap; the counter is only ever read as a hotness
+    /// threshold, so saturation is a faithful-enough safe analog.
+    pub fn bump_slow_path_count(&mut self) {
+        self.slow_path_count = self.slow_path_count.saturating_add(1);
+    }
+
+    /// C++ `CallLinkInfo::setMonomorphicCallee(...)`
+    /// (bytecode/CallLinkInfo.cpp:134-141): cache one callee at this site and
+    /// flip `mode` to Monomorphic in place. The Rust `CallTarget` bundles the
+    /// callee, target CodeBlock, and entry destination that C++ holds as the
+    /// separate `m_callee`/`m_codeBlock`/`m_monomorphicCallDestination` fields.
+    pub fn set_monomorphic_callee(&mut self, target: CallTarget) {
+        self.target = target;
+        self.mode = CallLinkMode::Monomorphic;
+    }
+
+    /// C++ `CallLinkInfo::reset(VM&)` (bytecode/CallLinkInfo.cpp:258-268): clear
+    /// the cached callee/stub and return the site to the unlinked Init state.
+    /// `call_type`/`specialization` are re-supplied because clearing a linked
+    /// site re-derives them from the owning opcode's call shape (the caller
+    /// computes them via `call_link_descriptor_shape_for_opcode`).
+    pub fn reset_to_unlinked(&mut self, call_type: CallType, specialization: CodeSpecialization) {
+        self.call_type = call_type;
+        self.mode = CallLinkMode::Init;
+        self.specialization = specialization;
+        self.target = CallTarget::Unlinked;
+        self.slow_path_count = 0;
+        self.max_argument_count_including_this_for_varargs = 0;
+        self.flags = CallLinkFlags::default();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1529,5 +1617,153 @@ impl BaselineJitData {
     /// reads when there are zero sites.
     pub fn record_store_base(&self) -> *const HandlerPropertyInlineCacheRecord {
         self.property_caches.as_ptr()
+    }
+}
+
+#[cfg(test)]
+mod call_link_info_tests {
+    use super::*;
+    use crate::bytecode::code_block::CodeSpecialization;
+    use crate::gc::CellId;
+    use crate::jit::CallBoundaryId;
+    use crate::runtime::{CodeBlockId, ExecutableId, ObjectId};
+
+    fn unlinked_call(call_site: u32, offset: u32) -> CallLinkInfo {
+        CallLinkInfo::metadata_only_unlinked_call(
+            CallSiteIndex(call_site),
+            BytecodeIndex::from_offset(offset),
+            CoreOpcode::Call,
+        )
+    }
+
+    fn monomorphic_target() -> CallTarget {
+        // Mirrors the metadata-only monomorphic target the attach path caches.
+        CallTarget::MetadataOnlyMonomorphic {
+            callee: ObjectId(CellId(7)),
+            executable: ExecutableId(CellId(8)),
+            code_block: CodeBlockId(CellId(9)),
+            boundary: CallBoundaryId(11),
+        }
+    }
+
+    // C++ `CallLinkInfo` is constructed in the Init state with no cached callee
+    // (CallLinkInfo.h:306 `m_mode { Mode::Init }`, .cpp setMonomorphicCallee not
+    // yet run) and `isLinked()` false (CallLinkInfo.h:124).
+    #[test]
+    fn fresh_call_link_info_is_unlinked() {
+        let call = unlinked_call(10, 10);
+        assert_eq!(call.mode(), CallLinkMode::Init);
+        assert!(!call.is_linked());
+        assert_eq!(call.slow_path_count(), 0);
+        assert_eq!(call.target, CallTarget::Unlinked);
+    }
+
+    // C++ `setMonomorphicCallee` (CallLinkInfo.cpp:134-141): caches the callee
+    // and flips `m_mode` to Monomorphic in place; `isLinked()` then true.
+    #[test]
+    fn set_monomorphic_callee_links_site_in_place() {
+        let mut call = unlinked_call(10, 10);
+        let target = monomorphic_target();
+        call.set_monomorphic_callee(target.clone());
+        assert_eq!(call.mode(), CallLinkMode::Monomorphic);
+        assert!(call.is_linked());
+        assert_eq!(call.target, target);
+        // Linking does not by itself touch the slow-path counter.
+        assert_eq!(call.slow_path_count(), 0);
+    }
+
+    // C++ slow-path counter bump (LowLevelInterpreter.asm:2878): each slow-path
+    // traversal increments this site's own `m_slowPathCount`; saturating stands
+    // in for the C++ `uint32_t` wrap.
+    #[test]
+    fn bump_slow_path_count_increments_and_saturates() {
+        let mut call = unlinked_call(10, 10);
+        call.bump_slow_path_count();
+        call.bump_slow_path_count();
+        assert_eq!(call.slow_path_count(), 2);
+
+        call.slow_path_count = u32::MAX;
+        call.bump_slow_path_count();
+        assert_eq!(call.slow_path_count(), u32::MAX);
+    }
+
+    // C++ `reset(VM&)` (CallLinkInfo.cpp:258-268): clears the cached callee and
+    // returns the site to unlinked Init; the Rust clear path additionally
+    // re-derives call_type/specialization from the owning opcode shape and
+    // zeroes the per-site counters/flags.
+    #[test]
+    fn reset_to_unlinked_clears_link() {
+        let mut call = unlinked_call(10, 10);
+        call.set_monomorphic_callee(monomorphic_target());
+        call.bump_slow_path_count();
+        call.max_argument_count_including_this_for_varargs = 3;
+        call.flags.has_seen_closure = true;
+
+        call.reset_to_unlinked(CallType::Call, CodeSpecialization::Call);
+
+        assert_eq!(call.mode(), CallLinkMode::Init);
+        assert!(!call.is_linked());
+        assert_eq!(call.call_type, CallType::Call);
+        assert_eq!(call.specialization, CodeSpecialization::Call);
+        assert_eq!(call.target, CallTarget::Unlinked);
+        assert_eq!(call.slow_path_count(), 0);
+        assert_eq!(call.max_argument_count_including_this_for_varargs, 0);
+        assert_eq!(call.flags, CallLinkFlags::default());
+    }
+
+    // C++ reaches the one embedded `CallLinkInfo` for a call bytecode and
+    // mutates it in place (LLIntSlowPaths.cpp:616 `linkFor`). The mutable
+    // accessors give the same per-site reach by bytecode index, and the slot
+    // index agrees with the immutable lookup.
+    #[test]
+    fn call_get_mut_reaches_and_mutates_the_addressed_site() {
+        let mut table = InlineCacheTable {
+            calls: vec![
+                unlinked_call(10, 10),
+                unlinked_call(20, 20),
+                unlinked_call(30, 30),
+            ],
+            ..Default::default()
+        };
+
+        let (slot, _) = table
+            .call_slot_for_bytecode_index(BytecodeIndex::from_offset(20))
+            .expect("immutable slot lookup");
+        assert_eq!(slot, 1);
+
+        let (slot_mut, call) = table
+            .call_slot_for_bytecode_index_mut(BytecodeIndex::from_offset(20))
+            .expect("mutable slot lookup");
+        assert_eq!(slot_mut, slot);
+        call.set_monomorphic_callee(monomorphic_target());
+
+        // The mutation persisted on exactly the addressed site, and only it.
+        assert_eq!(
+            table
+                .call_for_bytecode_index(BytecodeIndex::from_offset(20))
+                .unwrap()
+                .mode(),
+            CallLinkMode::Monomorphic
+        );
+        assert_eq!(
+            table
+                .call_for_bytecode_index(BytecodeIndex::from_offset(10))
+                .unwrap()
+                .mode(),
+            CallLinkMode::Init
+        );
+        assert_eq!(
+            table
+                .call_for_bytecode_index(BytecodeIndex::from_offset(30))
+                .unwrap()
+                .mode(),
+            CallLinkMode::Init
+        );
+
+        // The mutable single-site accessor reaches the same object.
+        let direct = table
+            .call_for_bytecode_index_mut(BytecodeIndex::from_offset(20))
+            .expect("mutable single-site lookup");
+        assert!(direct.is_linked());
     }
 }

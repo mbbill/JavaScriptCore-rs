@@ -1492,8 +1492,8 @@ impl CodeBlock {
         let target = call_target_for_call_link_inline_cache_attachment_request(&request);
         let mut inline_caches = self.side_tables.inline_caches.borrow_mut();
         let call = &mut inline_caches.calls[request.slot];
-        call.mode = CallLinkMode::Monomorphic;
-        call.target = target;
+        // C++ `CallLinkInfo::setMonomorphicCallee` (CallLinkInfo.cpp:134-141).
+        call.set_monomorphic_callee(target);
         let mode = call.mode;
         let target = call.target.clone();
         let slow_path_count = call.slow_path_count;
@@ -1571,13 +1571,9 @@ impl CodeBlock {
                     slot: request.slot,
                     opcode: call.opcode,
                 })?;
-            call.call_type = call_type;
-            call.mode = CallLinkMode::Init;
-            call.specialization = specialization;
-            call.target = CallTarget::Unlinked;
-            call.slow_path_count = 0;
-            call.max_argument_count_including_this_for_varargs = 0;
-            call.flags = Default::default();
+            // C++ `CallLinkInfo::reset(VM&)` (CallLinkInfo.cpp:258-268): clear
+            // the cached callee and return the site to unlinked Init.
+            call.reset_to_unlinked(call_type, specialization);
             (
                 call.call_site,
                 call.opcode,
