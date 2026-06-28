@@ -14,6 +14,7 @@ mod property_offset;
 mod property_table;
 mod storage;
 mod structure;
+mod structure_cell;
 mod structure_transition_table;
 mod watchpoint;
 
