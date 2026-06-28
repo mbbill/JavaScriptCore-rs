@@ -59,15 +59,16 @@ ACTIVE ROADMAP (validated, profiling-earned; default path = InterpreterOnly; sta
 [wip] JetStream 3 Octane parity
   [done] Runner/benchmark contract: JetStreamDriver load order, shell globals, iteration,
          validation, scoring, telemetry, probe command surface
-  [wip]  Run-state (2026-06-27, interpreter, iter=2): 8 SCORE / 4 too-slow / 3 throw.
+  [wip]  Run-state (2026-06-28, interpreter): throwers 3->1 (only regexp). Box2D + gbemu FIXED
+         (gbemu scores ok=0.026; Box2D no-throw but interpreter-slow ~590s/2-iter -> perf-gated).
          Suite geomean is None until all 15 Succeed (shell/octane.rs:1996), score=5000/time_ms.
-  [done] SCORES (8, up from 3 pre-GC-waves; richards ~7.5x): octane-code-load 89, navier 5.3,
-         crypto 3.5, splay 1.0, richards 0.91, pdfjs 0.88 (slow ~194s), delta-blue 0.62, raytrace 0.23
-  [wip]  TOO-SLOW (4; perf-gated, >90s): earley-boyer, typescript, mandreel (asm.js),
-         octane-zlib (asm.js). mandreel/zlib likely need the JIT (Phase F).
-  [missing] THROW (3): Box2D + gbemu (value-divergence BUGS needing data-flow debugging, not
-         feature gaps), regexp (full Yarr gap). pdfjs FIXED -- was a feature gap (abstract
-         equality object==primitive ToPrimitive), now scores.
+  [done] SCORES (9; richards ~7.5x): octane-code-load 89, navier 5.3, crypto 3.5, splay 1.0,
+         richards 0.91, pdfjs 0.88 (slow ~194s), delta-blue 0.62, raytrace 0.23, gbemu 0.026
+  [wip]  TOO-SLOW/perf-gated (>90s under the interpreter): earley-boyer, typescript, mandreel
+         (asm.js), octane-zlib (asm.js), Box2D (now correct, just slow). mandreel/zlib need the JIT.
+  [missing] THROW (1): regexp (full Yarr gap). Box2D FIXED (missing Number/Math static constants,
+         NOT a value bug -- 1983a63). gbemu FIXED (new Function dynamic compile via CompileFunctionRequest
+         -- 6e542ee). pdfjs FIXED (abstract-equality ToPrimitive).
   [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
          __defineGetter__/Setter__, global Function, Math, apply/bind, globals
   [missing] Octane score parity with local C++ JSC (needs Phases C-F)
