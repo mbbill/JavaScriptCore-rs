@@ -51,6 +51,8 @@ ACTIVE ROADMAP (validated, profiling-earned; default path = InterpreterOnly; sta
          SpeculatedType uint64 bitset (new module) -- counter/speculation canonicalization is serial
   [done] assembler: AbstractMacroAssembler operands + RegisterID + ARM64 instruction encoder (new
          src/assembler/*, byte-oracle-proven vs the known-good prologue bytes) -- not yet emitting
+  [done] bytecode: faithful packed instruction-stream core (Vec<u8>, byte-offset index, Narrow/Wide16/
+         Wide32 width, size()-advance) -- replacement-in-waiting for the typed-Vec-by-ordinal divergence
   [missing] WIRING is gated on Phase E (now unblocked) -> R3/R4 arena cutover -> Structure-wire; the
          baseline JIT additionally needs arm64_baseline to emit via the encoder + the W^X unsafe keystone
 
