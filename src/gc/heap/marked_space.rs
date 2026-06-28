@@ -333,8 +333,11 @@ impl MarkedSpace {
     }
 
     /// Route a size to a directory/precise space (optimalSizeFor, MarkedSpace.h
-    /// :262-270) and allocate one cell; expose its address ONCE; register
-    /// membership. Returns the `CellPtr` the JsValue carries.
+    /// :262-270) and allocate one cell. For a MarkedBlock size class the
+    /// BlockDirectory hands the cell out through the LocalAllocator FreeList
+    /// interval fast path (heap/LocalAllocatorInlines.h:33-43; heap/FreeList.h
+    /// :82-123) — no longer a raw atom bump. The address is exposed ONCE and
+    /// membership registered. Returns the `CellPtr` the JsValue carries.
     pub(crate) fn allocate(&mut self, js_type: u8, payload: u64) -> CellPtr {
         match size_route(CELL_BYTES) {
             SizeRoute::Marked(sz) => {
