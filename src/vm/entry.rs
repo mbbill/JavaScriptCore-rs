@@ -962,6 +962,21 @@ impl VmEntryLaunchDescriptor {
             },
         })
     }
+
+    /// The JS-stack footprint, in `Register` slots, that `doVMEntry` reserves for
+    /// this call: `headerSizeInRegisters + paddedArgCount`
+    /// (`LowLevelInterpreter64.asm` doVMEntry: `addp CallFrameHeaderSlots, t4`
+    /// over `ProtoCallFrame::paddedArgCount`, then `lshiftp 3` for bytes).
+    ///
+    /// This is the footprint the B2 JS-stack seeding primitive
+    /// (`vm::jsstack::JsStack::try_seed_entry_frame`) lowers the SP by and
+    /// stack-limit-checks against; the B3 dual-write consumes this descriptor to
+    /// drive that seeding. It is additive here and not yet wired into live
+    /// dispatch (the read-flip cutover is B4).
+    #[allow(dead_code)]
+    pub(crate) fn vm_entry_frame_footprint_registers(&self) -> u32 {
+        JSC_JSVALUE64_CALL_FRAME_HEADER_SLOTS.saturating_add(self.call_frame.padded_argument_count)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

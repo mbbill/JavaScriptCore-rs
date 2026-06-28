@@ -3,14 +3,20 @@
 //! ## What this is
 //!
 //! The faithful C++-JSC TYPES and FP-relative offset table for the JavaScript
-//! call stack, plus a reservation-bookkeeping skeleton and the single
-//! provenance gate that recovers a `*Register` from a raw slot address. This is
-//! the ADDITIVE, parallel-safe FOUNDATION for moving JS execution onto the
-//! native thread stack. It is `dead_code` and is NOT wired into the live
-//! dispatch path: the live engine still uses the abstract
-//! `RegisterFile`/`runtime::interpreter::CallFrame` model. The owner-gated
-//! cutovers (B4/B6) are out of scope here, as are the B2 mmap reservation +
-//! `doVMEntry` seeding + stack-limit guard and the B3 dual-write.
+//! call stack, the single provenance gate that recovers a `*Register` from a
+//! raw slot address, and (B2) the LIVE contiguous mmap reservation it backs:
+//! `JsStack::new` reserves one immovable RW region with a low-end guard page,
+//! seeds `sp`/`fp` at the high end, and exposes the reservation's provenance
+//! once. On top of that B2 adds the MANDATORY stack-limit guard
+//! (`CLoopStack::isSafeToRecurse` / `ensureCapacityFor` + soft-reserved zone)
+//! and the `doVMEntry` frame-seeding primitive (`try_seed_entry_frame`) that
+//! materializes one `CallFrame` (header + `this` + args + undefined fill) into
+//! the arena. This is the ADDITIVE, parallel-safe FOUNDATION for moving JS
+//! execution onto the native thread stack. It is `dead_code` and is NOT wired
+//! into the live dispatch path: the live engine still uses the abstract
+//! `RegisterFile`/`runtime::interpreter::CallFrame` model. The B3 dual-write
+//! (which feeds this seeding primitive from the live model) and the owner-gated
+//! read-flip cutovers (B4/B6) are out of scope here.
 //!
 //! ## C++ ground truth
 //!
@@ -67,6 +73,18 @@ pub(crate) const CALLER_FRAME_AND_PC_SIZE_IN_REGISTERS: i32 = 2;
 /// exactly these five slots; `this`, arguments, and locals are NOT header slots
 /// (`VirtualRegister::isHeader`, `VirtualRegister.h:73`).
 pub(crate) const HEADER_SIZE_IN_REGISTERS: i32 = 5;
+
+/// Default JS-stack reservation size == `Options::maxPerThreadStackUsage()`
+/// (`runtime/OptionsList.h:92`, `5 * MB`). `CLoopStack::CLoopStack` rounds this
+/// to the page size before reserving (`CLoopStack.cpp:58-59`).
+pub(crate) const DEFAULT_JS_STACK_RESERVATION_BYTES: usize = 5 * 1024 * 1024;
+
+/// Default soft-reserved zone == `Options::softReservedZoneSize()`
+/// (`runtime/OptionsList.h:93`, `128 * KB`). `VM::updateSoftReservedZoneSize`
+/// feeds it to `CLoopStack::setSoftReservedZoneSize`
+/// (`runtime/VM.cpp:1140-1145`). The zone is the soft margin a frame push must
+/// stay above; the low-end guard page is the hard backstop below it.
+pub(crate) const DEFAULT_SOFT_RESERVED_ZONE_BYTES: usize = 128 * 1024;
 
 /// FP-relative `Register` slot indices, byte-exact to `enum class CallFrameSlot`
 /// (`CallFrame.h:176-181`). These reconcile EXACTLY with the private
@@ -507,10 +525,202 @@ pub(crate) struct JsStack {
     current_stack_pointer: usize,
     /// `m_softReservedZoneSizeInRegisters` (`CLoopStack.h:118`).
     soft_reserved_zone_in_registers: isize,
-    /// Owns the B1 test backing so its once-exposed provenance stays valid for
-    /// the lifetime of the gate. `None` for the live B2 mmap reservation. Dead in
-    /// production.
-    _backing: Option<Box<[Register]>>,
+    /// Owns the reservation backing so its once-exposed provenance stays valid
+    /// for the lifetime of the gate: the B1 owned `[Register]` test backing, or
+    /// (B2) the live mmap reservation whose `Drop` munmaps. Dead in production.
+    backing: ReservationBacking,
+}
+
+/// Owns the memory backing a [`JsStack`]'s once-exposed reservation provenance.
+///
+/// `Test` is the B1 owned-heap backing for the offset/gate unit tests. `Mmap`
+/// is the live B2 reservation: an immovable RW region (with a low-end guard
+/// page) whose `Drop` (via [`reservation::MmapReservation`]) munmaps the whole
+/// mapping. Both keep the exposed base valid for as long as the gate may run.
+enum ReservationBacking {
+    Test(Box<[Register]>),
+    #[cfg(unix)]
+    Mmap(reservation::MmapReservation),
+}
+
+/// Failure modes of the live mmap reservation (B2). These are control flow, not
+/// crashes — faithful to JSC, where reservation failure surfaces as a failed
+/// allocation rather than aborting (`OSAllocator`/`PageReservation`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JsStackReservationError {
+    /// A zero-byte reservation was requested.
+    EmptyRequest,
+    /// Page-rounding or the guard-page addition overflowed `usize`.
+    SizeOverflow,
+    /// `getpagesize()` returned a non-positive / non-power-of-two value.
+    InvalidPageSize { page_size: i64 },
+    /// `mmap(...)` failed (e.g. ENOMEM). The OS errno is captured for triage.
+    MmapFailed { errno: Option<i32> },
+    /// `mprotect(PROT_NONE)` of the low-end guard page failed.
+    MprotectFailed { errno: Option<i32> },
+}
+
+/// The single Unix FFI boundary for the live JS-stack mmap reservation.
+///
+/// C++ ground truth: `CLoopStack::CLoopStack` reserves the stack with a
+/// `PageReservation` (`CLoopStack.cpp:62`). On Apple Silicon the faithful
+/// realization of a JS *register* stack is a plain anonymous RW mapping — NOT
+/// `MAP_JIT`, because this holds JS values (data), not executable code — plus an
+/// `mprotect(PROT_NONE)` guard page at the low (growth) end so an overflow that
+/// escapes the soft limit faults instead of corrupting neighbouring memory.
+/// Mirrors the FFI pattern of `platform/unix_executable_memory.rs:17-51`.
+#[cfg(unix)]
+mod reservation {
+    use super::JsStackReservationError;
+    use core::ffi::{c_int, c_void};
+
+    const PROT_NONE: c_int = 0x0;
+    const PROT_READ: c_int = 0x1;
+    const PROT_WRITE: c_int = 0x2;
+    const MAP_PRIVATE: c_int = 0x02;
+
+    // `MAP_ANON` value, per OS family (mirrors
+    // `platform/unix_executable_memory.rs:22-35`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const MAP_ANON: c_int = 0x20;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const MAP_ANON: c_int = 0x1000;
+
+    unsafe extern "C" {
+        fn getpagesize() -> c_int;
+        fn mmap(
+            addr: *mut c_void,
+            length: usize,
+            prot: c_int,
+            flags: c_int,
+            fd: c_int,
+            offset: i64,
+        ) -> *mut c_void;
+        fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
+        fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    }
+
+    fn map_failed() -> *mut c_void {
+        usize::MAX as *mut c_void
+    }
+
+    fn last_errno() -> Option<i32> {
+        std::io::Error::last_os_error().raw_os_error()
+    }
+
+    fn page_size() -> Result<usize, JsStackReservationError> {
+        // SAFETY: `getpagesize` takes no arguments and only reads a process
+        // constant; it cannot violate memory safety.
+        let raw = unsafe { getpagesize() };
+        if raw <= 0 || !(raw as u32).is_power_of_two() {
+            return Err(JsStackReservationError::InvalidPageSize {
+                page_size: i64::from(raw),
+            });
+        }
+        Ok(raw as usize)
+    }
+
+    /// RAII owner of one live JS-stack mapping `[mmap_base, mmap_base + len)`,
+    /// whose low `guard_bytes` are `PROT_NONE` and whose remainder is the RW
+    /// allocatable JS register stack. `Drop` munmaps the whole mapping.
+    pub(crate) struct MmapReservation {
+        mmap_base: *mut c_void,
+        mmap_len: usize,
+    }
+
+    /// One reserved region: the owner plus the once-exposed allocatable base.
+    pub(crate) struct ReservedRegion {
+        pub(crate) reservation: MmapReservation,
+        /// Lowest *allocatable* address (== `mmap_base + guard_bytes`), with its
+        /// provenance already exposed ONCE (`precise_allocation.rs:57`).
+        pub(crate) allocatable_base: usize,
+        /// Page-rounded allocatable byte length (excludes the guard page).
+        pub(crate) allocatable_size: usize,
+    }
+
+    impl MmapReservation {
+        /// Reserve `allocatable_bytes` (page-rounded) of RW JS stack plus one
+        /// low-end `PROT_NONE` guard page, exposing the allocatable base's
+        /// provenance once.
+        pub(crate) fn reserve(
+            allocatable_bytes: usize,
+        ) -> Result<ReservedRegion, JsStackReservationError> {
+            if allocatable_bytes == 0 {
+                return Err(JsStackReservationError::EmptyRequest);
+            }
+            let page = page_size()?;
+            let alloc = allocatable_bytes
+                .checked_add(page - 1)
+                .map(|v| v & !(page - 1))
+                .ok_or(JsStackReservationError::SizeOverflow)?;
+            // One guard page at the low (growth-toward) end.
+            let guard = page;
+            let total = alloc
+                .checked_add(guard)
+                .ok_or(JsStackReservationError::SizeOverflow)?;
+
+            // SAFETY: null preferred address, non-zero page-rounded length, RW
+            // protection, anonymous private mapping, the required `fd=-1` /
+            // `offset=0`, and no input pointer to alias. The result is checked
+            // against MAP_FAILED/null before any use. NOT `MAP_JIT`: this is the
+            // JS value stack (data), not executable code.
+            let raw = unsafe {
+                mmap(
+                    core::ptr::null_mut(),
+                    total,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if raw == map_failed() || raw.is_null() {
+                return Err(JsStackReservationError::MmapFailed {
+                    errno: last_errno(),
+                });
+            }
+            // Take ownership immediately so any early return munmaps the mapping.
+            let reservation = MmapReservation {
+                mmap_base: raw,
+                mmap_len: total,
+            };
+
+            // SAFETY: `raw` is the live mapping just returned; `guard` (one page)
+            // is page-aligned at the base and `<= total`. `PROT_NONE` makes the
+            // low guard page fault on any access — the hard backstop below the
+            // soft stack limit.
+            let rc = unsafe { mprotect(raw, guard, PROT_NONE) };
+            if rc != 0 {
+                return Err(JsStackReservationError::MprotectFailed {
+                    errno: last_errno(),
+                });
+            }
+
+            // Expose the allocatable base's provenance ONCE
+            // (`precise_allocation.rs:57`); the gate recovers slot pointers from
+            // it with `with_exposed_provenance_mut`. The whole mapping shares one
+            // provenance, so exposing the allocatable base covers every slot in
+            // `[allocatable_base, allocatable_base + alloc)`.
+            let allocatable_ptr = raw.cast::<u8>().wrapping_add(guard);
+            let allocatable_base = allocatable_ptr.expose_provenance();
+            Ok(ReservedRegion {
+                reservation,
+                allocatable_base,
+                allocatable_size: alloc,
+            })
+        }
+    }
+
+    impl Drop for MmapReservation {
+        fn drop(&mut self) {
+            // SAFETY: this owner's single `munmap` of the live mapping it
+            // created. Errors are unreportable in `Drop` and harmless (process
+            // teardown reclaims).
+            unsafe {
+                munmap(self.mmap_base, self.mmap_len);
+            }
+        }
+    }
 }
 
 impl JsStack {
@@ -538,8 +748,48 @@ impl JsStack {
             // here.
             current_stack_pointer: high,
             soft_reserved_zone_in_registers: 0,
-            _backing: Some(backing),
+            backing: ReservationBacking::Test(backing),
         }
+    }
+
+    /// Build a LIVE `JsStack` over a fresh mmap reservation of `size` allocatable
+    /// bytes (page-rounded) plus a low-end guard page (B2). Faithful to
+    /// `CLoopStack::CLoopStack` (`CLoopStack.cpp:55-72`): reserve, seed
+    /// `sp`/`fp` at the high end (the stack grows DOWN), and default the
+    /// soft-reserved zone to `Options::softReservedZoneSize()`.
+    ///
+    /// DIVERGENCE (commented at the field): JSC commits lazily and moves
+    /// `m_end`/`m_commitTop` downward on demand via `grow()`
+    /// (`CLoopStack.cpp:82-109`). B2 commits the whole reservation up front and
+    /// relies on the fixed low-end guard page plus the soft-reserved-zone
+    /// software limit ([`Self::stack_limit`]) instead of the lazy grow path; the
+    /// grow/commit path is a memory-footprint optimization, not a correctness
+    /// requirement, so `m_end == m_commitTop == reservationTop()`.
+    #[cfg(unix)]
+    pub(crate) fn new(size: usize) -> Result<Self, JsStackReservationError> {
+        let region = reservation::MmapReservation::reserve(size)?;
+        let base = region.allocatable_base;
+        let alloc_size = region.allocatable_size;
+        let high = base + alloc_size;
+        Ok(JsStack {
+            reservation_base: base,
+            reservation_size: alloc_size,
+            // Full commit up front (see DIVERGENCE above).
+            commit_top: base,
+            end: base,
+            // Empty stack: SP at `highAddress()`; frames descend from here.
+            current_stack_pointer: high,
+            soft_reserved_zone_in_registers: (DEFAULT_SOFT_RESERVED_ZONE_BYTES
+                / REGISTER_SIZE_IN_BYTES) as isize,
+            backing: ReservationBacking::Mmap(region.reservation),
+        })
+    }
+
+    /// [`Self::new`] with the default reservation size
+    /// (`Options::maxPerThreadStackUsage()`, [`DEFAULT_JS_STACK_RESERVATION_BYTES`]).
+    #[cfg(unix)]
+    pub(crate) fn new_default() -> Result<Self, JsStackReservationError> {
+        Self::new(DEFAULT_JS_STACK_RESERVATION_BYTES)
     }
 
     /// `reservationTop()` (`CLoopStack.h:99-103`).
@@ -588,26 +838,33 @@ impl JsStack {
         self.low_address() <= addr && addr < self.high_address()
     }
 
-    /// `ensureCapacityFor(newTopOfStack)` (`CLoopStack.h:57`).
-    ///
-    /// B1 SKELETON: with a fully-committed test backing this only checks the new
-    /// top stays at/above `m_end` (`lowAddress()`). The real `grow()`/commit path
-    /// (`CLoopStack.cpp grow`) that extends `m_commitTop` toward
-    /// `reservationTop()` is B2.
+    /// The soft stack limit: a frame whose lowest address (its top-of-frame, the
+    /// new SP) drops BELOW this signals stack overflow. Faithful to the
+    /// `reservationTop() + m_softReservedZoneSizeInRegisters` limit used by
+    /// `CLoopStack::isSafeToRecurse` (`CLoopStack.cpp:156-157`) and to the
+    /// `VMCLoopStackLimit` that `doVMEntry` compares the new SP against before
+    /// copying args (`LowLevelInterpreter64.asm` doVMEntry `.stackHeightOK`).
+    /// With B2's full commit `m_end == reservationTop()`, so this equals
+    /// `lowAddress() + softReservedZone`.
+    pub(crate) fn stack_limit(&self) -> usize {
+        let reserved_bytes =
+            (self.soft_reserved_zone_in_registers.max(0) as usize) * REGISTER_SIZE_IN_BYTES;
+        self.reservation_top() + reserved_bytes
+    }
+
+    /// `ensureCapacityFor(newTopOfStack)` (`CLoopStack.h:51-56`): a new top
+    /// at/above the committed floor (`m_end`/`lowAddress()`) needs no growth.
+    /// With B2's full commit there is never anything to grow, so this is the
+    /// pure capacity predicate (the lazy `grow()`/commit path is the documented
+    /// divergence on [`Self::new`]).
     pub(crate) fn ensure_capacity_for(&self, new_top_of_stack: usize) -> bool {
         new_top_of_stack >= self.low_address()
     }
 
-    /// `isSafeToRecurse()` (`CLoopStack.h:79`).
-    ///
-    /// B1 SKELETON: the live test compares `currentStackPointer` against a
-    /// soft-reserved limit above `m_end`. Here the limit is
-    /// `lowAddress() + softReservedZone`; the full JSC limit derivation (which
-    /// also accounts for the reserved zone and the C++ stack origin) is B2.
+    /// `isSafeToRecurse()` (`CLoopStack.cpp:154-158`): the current SP must stay
+    /// above the soft-reserved limit ([`Self::stack_limit`]).
     pub(crate) fn is_safe_to_recurse(&self) -> bool {
-        let reserved_bytes =
-            (self.soft_reserved_zone_in_registers.max(0) as usize) * REGISTER_SIZE_IN_BYTES;
-        self.current_stack_pointer >= self.low_address() + reserved_bytes
+        self.current_stack_pointer >= self.stack_limit()
     }
 
     // --- Provenance gate (precise_allocation.rs:57,77) ---
@@ -660,6 +917,187 @@ impl JsStack {
         let p = self.register_ptr(frame_addr)?;
         NonNull::new(p).map(CallFrame::from_registers)
     }
+
+    // --- VM-entry frame seeding (doVMEntry, B2) ---
+
+    /// Seed ONE JS `CallFrame` for a program/function call into the live arena,
+    /// faithful to `doVMEntry` (`LowLevelInterpreter64.asm` `doVMEntry`). This is
+    /// the additive seeding primitive the B3 dual-write feeds; it is NOT wired
+    /// into live dispatch (the read-flip is B4).
+    ///
+    /// Algorithm (matching `doVMEntry`):
+    /// 1. Frame size in registers = `headerSizeInRegisters + paddedArgCount`
+    ///    (`addp CallFrameHeaderSlots, t4` / `lshiftp 3`), where `paddedArgCount`
+    ///    counts `this` + padded args. The new `CallFrame*` (the new SP) is
+    ///    `current_sp - frameSize` (`subp sp, t4, t3`).
+    /// 2. STACK-LIMIT GUARD (the mandatory bound): reject — as a `Result`,
+    ///    writing NOTHING — if the new SP would drop below [`Self::stack_limit`]
+    ///    (`bpaeq t3, VMCLoopStackLimit`). This runs BEFORE any slot write, so an
+    ///    over-deep push never touches the guard page.
+    /// 3. Copy the header words from the `ProtoCallFrame`-shaped inputs into the
+    ///    callee frame: `codeBlock`/`callee`/`argumentCountIncludingThis`/`this`
+    ///    at slots 2..5 (`copyHeaderLoop`), and the caller-frame/return-PC pair
+    ///    at slots 0..1 (which `doVMEntry`'s callee prologue + call instruction
+    ///    write; the seeding primitive writes them directly).
+    /// 4. Fill `undefined` into the padded-but-unprovided arg slots
+    ///    (`fillExtraArgsLoop`) then copy the real args (`copyArgsLoop`).
+    /// 5. Publish the new SP (`move t3, sp`).
+    ///
+    /// On success the new `CallFrame` is returned and `current_stack_pointer` is
+    /// lowered to it. On any error nothing is written and the SP is unchanged.
+    pub(crate) fn try_seed_entry_frame(
+        &mut self,
+        seed: &VmEntryFrameSeed<'_>,
+    ) -> Result<CallFrame, JsStackPushError> {
+        // doVMEntry: `loadi PayloadOffset + argCountAndCodeOriginValue; subi 1`.
+        let count_including_this = seed.argument_count_including_this.payload();
+        if count_including_this < 1 {
+            return Err(JsStackPushError::InvalidArgumentCount {
+                count_including_this,
+            });
+        }
+        let real_args = (count_including_this - 1) as usize;
+        if seed.arguments.len() != real_args {
+            return Err(JsStackPushError::ArgumentCountMismatch {
+                count_including_this,
+                provided: seed.arguments.len(),
+            });
+        }
+        // paddedArgCount must cover the real (incl-this) count (it is the
+        // alignment-rounded incl-this count; `fillExtraArgsLoop` fills the gap).
+        if (seed.padded_argument_count as i32) < count_including_this {
+            return Err(JsStackPushError::PaddedArgumentCountTooSmall {
+                count_including_this,
+                padded: seed.padded_argument_count,
+            });
+        }
+
+        // Step 1: frame size and new CallFrame address.
+        let frame_registers = (HEADER_SIZE_IN_REGISTERS as usize)
+            .checked_add(seed.padded_argument_count as usize)
+            .ok_or(JsStackPushError::AddressOverflow)?;
+        let frame_bytes = frame_registers
+            .checked_mul(REGISTER_SIZE_IN_BYTES)
+            .ok_or(JsStackPushError::AddressOverflow)?;
+        let new_call_frame = self
+            .current_stack_pointer
+            .checked_sub(frame_bytes)
+            .ok_or(JsStackPushError::AddressOverflow)?;
+
+        // Step 2: MANDATORY stack-limit guard, BEFORE any write.
+        let limit = self.stack_limit();
+        if new_call_frame < limit {
+            return Err(JsStackPushError::StackOverflow {
+                new_top_of_frame: new_call_frame,
+                limit,
+            });
+        }
+
+        // Recover the frame pointer through the provenance gate. This also
+        // re-verifies `new_call_frame` is in `[lowAddress, highAddress)` and
+        // 8-aligned; the limit check already guaranteed the former, and an
+        // 8-aligned `current_sp` minus an 8-multiple stays 8-aligned.
+        let frame = self
+            .call_frame_at(new_call_frame)
+            .ok_or(JsStackPushError::AddressOverflow)?;
+
+        // Steps 3-4: write the frame. SAFETY for every `set_slot` below: the
+        // frame occupies `[new_call_frame, current_sp)`; the highest slot written
+        // is `firstArgument + (paddedArgCount - 2)` ==
+        // `new_call_frame + frame_bytes - 8` == `current_sp - 8`, which is `<
+        // highAddress` because `current_sp <= highAddress`. The lowest is slot 0
+        // at `new_call_frame >= limit >= lowAddress`. So every slot lies inside
+        // the once-exposed reservation, is 8-aligned, and holds (zeroed) POD
+        // `Register` storage; `set_slot` overwrites a `Copy` POD (no `Drop`).
+        unsafe {
+            // Slots 0..1: caller-frame (EntryFrame sentinel) and return PC.
+            frame.set_slot(CallFrameSlot::CALLER_FRAME, seed.caller_frame_or_entry);
+            frame.set_slot(CallFrameSlot::RETURN_PC, seed.return_pc);
+            // Slots 2..5: copyHeaderLoop (codeBlock, callee, argCount, this).
+            frame.set_slot(CallFrameSlot::CODE_BLOCK, seed.code_block);
+            frame.set_slot(CallFrameSlot::CALLEE, seed.callee);
+            frame.set_slot(
+                CallFrameSlot::ARGUMENT_COUNT_INCLUDING_THIS,
+                seed.argument_count_including_this,
+            );
+            frame.set_slot(CallFrameSlot::THIS_ARGUMENT, seed.this_value);
+
+            // fillExtraArgsLoop: `undefined` into the padded-but-unprovided arg
+            // slots `firstArgument + [real_args .. paddedArgCount - 1)`.
+            let undefined = Register::from_encoded(JsValue::undefined().encoded());
+            for i in real_args..(seed.padded_argument_count as usize - 1) {
+                frame.set_slot(argument_offset(i as i32), undefined);
+            }
+            // copyArgsLoop: the real args at `firstArgument + [0 .. real_args)`.
+            for (i, arg) in seed.arguments.iter().enumerate() {
+                frame.set_slot(argument_offset(i as i32), *arg);
+            }
+        }
+
+        // Step 5: publish the new SP (`move t3, sp`).
+        self.current_stack_pointer = new_call_frame;
+        Ok(frame)
+    }
+}
+
+/// One JS call-frame's worth of raw `Register` inputs to seed via
+/// [`JsStack::try_seed_entry_frame`], faithful to the words `doVMEntry` copies
+/// from a `ProtoCallFrame` (`interpreter/ProtoCallFrame.h:48-54`) plus the
+/// caller-frame/return-PC pair that the callee prologue + call write.
+///
+/// All fields carry RAW NaN-boxed/`Register` bits (the arena is untyped 8-byte
+/// storage); typed/ID recovery is the gate's and the live model's job, not the
+/// seed's. `caller_frame_or_entry` is the slot-0 value `doVMEntry` leaves as the
+/// `EntryFrame` sentinel (`callerFrameOrEntryFrame`, `CallFrame.h:224`).
+pub(crate) struct VmEntryFrameSeed<'a> {
+    /// Slot 0 — `callerFrame` / EntryFrame sentinel (`CallFrame.h:110,224`).
+    pub(crate) caller_frame_or_entry: Register,
+    /// Slot 1 — `returnPC` (`CallFrame.h:111`).
+    pub(crate) return_pc: Register,
+    /// Slot 2 — `codeBlock` (`ProtoCallFrame::codeBlockValue`,
+    /// `ProtoCallFrame.h:48`).
+    pub(crate) code_block: Register,
+    /// Slot 3 — `callee` (`ProtoCallFrame::calleeValue`, `ProtoCallFrame.h:49`).
+    pub(crate) callee: Register,
+    /// Slot 4 — `argumentCountIncludingThis` (payload) + `CodeOrigin` (tag)
+    /// (`ProtoCallFrame::argCountAndCodeOriginValue`, `ProtoCallFrame.h:50`).
+    pub(crate) argument_count_including_this: Register,
+    /// Slot 5 — `this` (`ProtoCallFrame::thisArg`, `ProtoCallFrame.h:51`).
+    pub(crate) this_value: Register,
+    /// The real arguments (excluding `this`): `ProtoCallFrame::args`
+    /// (`ProtoCallFrame.h:54`). Length must equal `argumentCountIncludingThis - 1`.
+    pub(crate) arguments: &'a [Register],
+    /// `ProtoCallFrame::paddedArgCount` (`ProtoCallFrame.h:53`): the
+    /// alignment-rounded argument-count-including-this driving the frame size.
+    pub(crate) padded_argument_count: u32,
+}
+
+/// Why [`JsStack::try_seed_entry_frame`] refused to seed a frame. Every variant
+/// means NOTHING was written and the SP is unchanged. `StackOverflow` is the
+/// mandatory guard firing (`doVMEntry .stackCheckFailed` ->
+/// `_llint_throw_stack_overflow_error_from_vm_entry`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JsStackPushError {
+    /// The push would drop the new SP below the soft stack limit.
+    StackOverflow {
+        new_top_of_frame: usize,
+        limit: usize,
+    },
+    /// `argumentCountIncludingThis` (slot-4 payload) was `< 1`.
+    InvalidArgumentCount { count_including_this: i32 },
+    /// The provided `arguments` slice length disagreed with
+    /// `argumentCountIncludingThis - 1`.
+    ArgumentCountMismatch {
+        count_including_this: i32,
+        provided: usize,
+    },
+    /// `paddedArgCount` was smaller than `argumentCountIncludingThis`.
+    PaddedArgumentCountTooSmall {
+        count_including_this: i32,
+        padded: u32,
+    },
+    /// Frame-size or new-SP arithmetic overflowed / underflowed `usize`.
+    AddressOverflow,
 }
 
 #[cfg(test)]
@@ -819,5 +1257,280 @@ mod tests {
             frame.set_slot(local_to_operand(0), Register::from_bits(0x77));
             assert_eq!(frame.local(0).bits(), 0x77);
         }
+    }
+}
+
+// Live B2 tests over a real mmap reservation. Gated to `unix` because
+// `JsStack::new`/the guard page require `mmap`/`mprotect`.
+#[cfg(all(test, unix))]
+mod live_tests {
+    use super::*;
+    use crate::bytecode::register::CallFrameSlotLayout;
+    use crate::gc::CellId;
+    use crate::interpreter::{FrameState, InstalledCallFrame, RegisterWindow};
+    use crate::runtime::{CallFrameId, CodeBlockId, EntryFrameId, ObjectId};
+
+    /// A live reservation with the soft-reserved zone disabled so small frames
+    /// fit; the low-end guard PAGE still backs the reservation floor.
+    fn live_stack(allocatable_bytes: usize) -> JsStack {
+        let mut stack = JsStack::new(allocatable_bytes).expect("mmap reservation");
+        stack.set_soft_reserved_zone_in_registers(0);
+        stack
+    }
+
+    #[test]
+    fn live_reservation_round_trips_slot_write_read() {
+        let stack = JsStack::new(64 * 1024).expect("mmap reservation");
+        let base = stack.reservation_top();
+        // Page-rounded to at least the request; high = base + size; m_end == base.
+        assert!(stack.size() >= 64 * 1024);
+        assert_eq!(stack.high_address(), base + stack.size());
+        assert_eq!(stack.low_address(), base);
+        assert_eq!(stack.commit_top(), base);
+
+        // Write/read a slot across the live mmap via the provenance gate.
+        let slot = base + 7 * REGISTER_SIZE_IN_BYTES;
+        let value = Register::from_bits(0x0123_4567_89ab_cdef);
+        assert!(stack.write_slot(slot, value));
+        assert_eq!(stack.read_slot(slot), Some(value));
+
+        // The slot just below highAddress is in range; highAddress itself is not.
+        assert!(stack
+            .read_slot(stack.high_address() - REGISTER_SIZE_IN_BYTES)
+            .is_some());
+        assert_eq!(stack.read_slot(stack.high_address()), None);
+        // Anonymous mmap is zero-filled: untouched slots read as Register::default.
+        assert_eq!(stack.read_slot(base), Some(Register::default()));
+    }
+
+    #[test]
+    fn stack_limit_guard_rejects_over_deep_push_without_writing() {
+        // One-page reservation keeps the DEFAULT 128 KiB soft zone, whose limit
+        // sits far above highAddress, so ANY push overflows the soft limit.
+        let mut stack = JsStack::new(4096).expect("mmap reservation");
+        let limit = stack.stack_limit();
+        assert!(limit > stack.high_address());
+
+        let sp_before = stack.current_stack_pointer();
+        let high = stack.high_address();
+        // argumentCountIncludingThis = 1 (just `this`), padded = 1 -> frame = 6 regs.
+        let seed = VmEntryFrameSeed {
+            caller_frame_or_entry: Register::from_bits(0xEE),
+            return_pc: Register::from_bits(0xBB),
+            code_block: Register::from_bits(0xCB),
+            callee: Register::from_bits(0xCA),
+            argument_count_including_this: Register::from_bits(1),
+            this_value: Register::from_encoded(JsValue::from_i32(1).encoded()),
+            arguments: &[],
+            padded_argument_count: 1,
+        };
+        let frame_bytes = (HEADER_SIZE_IN_REGISTERS as usize + 1) * REGISTER_SIZE_IN_BYTES;
+        let would_be_base = high - frame_bytes;
+
+        let err = stack.try_seed_entry_frame(&seed).unwrap_err();
+        assert_eq!(
+            err,
+            JsStackPushError::StackOverflow {
+                new_top_of_frame: would_be_base,
+                limit,
+            }
+        );
+        // The guard fired BEFORE any write: SP unchanged, target slot still zero.
+        assert_eq!(stack.current_stack_pointer(), sp_before);
+        assert_eq!(stack.read_slot(would_be_base), Some(Register::default()));
+    }
+
+    #[test]
+    fn seeded_frame_is_byte_identical_to_installed_call_frame_model() {
+        let mut stack = live_stack(64 * 1024);
+        let sp_before = stack.current_stack_pointer();
+
+        // --- One ground-truth representative call feeds BOTH the arena seeding
+        // and the equivalent InstalledCallFrame model ---
+        let entry_bits = 0x0000_7fff_0000_0010u64; // EntryFrame sentinel (slot 0)
+        let return_pc_bits = 0x0000_7fff_0000_0020u64;
+        let code_block_bits = 0x0000_0001_0000_0040u64; // CodeBlock* (cell)
+        let callee_bits = 0x0000_0001_0000_0080u64; // JSCell* callee (8-aligned)
+        let this_value = JsValue::from_i32(7);
+        let args = [JsValue::from_i32(11), JsValue::from_i32(13)];
+        let count_including_this: i32 = 1 + args.len() as i32; // this + 2 = 3
+        let code_origin: u32 = 0; // VM entry: no call-site index in the slot-4 tag
+        let arg_count_bits = ((code_origin as u64) << 32) | (count_including_this as u32 as u64);
+        let padded = count_including_this as u32; // round(3) == 3: no undefined fill
+
+        let arg_regs: Vec<Register> = args
+            .iter()
+            .map(|value| Register::from_encoded(value.encoded()))
+            .collect();
+        let seed = VmEntryFrameSeed {
+            caller_frame_or_entry: Register::from_bits(entry_bits),
+            return_pc: Register::from_bits(return_pc_bits),
+            code_block: Register::from_bits(code_block_bits),
+            callee: Register::from_bits(callee_bits),
+            argument_count_including_this: Register::from_bits(arg_count_bits),
+            this_value: Register::from_encoded(this_value.encoded()),
+            arguments: &arg_regs,
+            padded_argument_count: padded,
+        };
+
+        let frame = stack
+            .try_seed_entry_frame(&seed)
+            .expect("seed program frame");
+        let frame_base = frame.registers().as_ptr() as usize;
+
+        // SP descended by EXACTLY the doVMEntry frame size (header + paddedArgs).
+        let frame_bytes =
+            (HEADER_SIZE_IN_REGISTERS as usize + padded as usize) * REGISTER_SIZE_IN_BYTES;
+        assert_eq!(frame_base, sp_before - frame_bytes);
+        assert_eq!(stack.current_stack_pointer(), frame_base);
+
+        // --- The equivalent live InstalledCallFrame for the SAME call ---
+        let layout = CallFrameSlotLayout::JSC_RUST;
+        let installed = InstalledCallFrame {
+            id: CallFrameId(1),
+            entry: Some(EntryFrameId(1)), // entered from the VM entry...
+            caller: None,                 // ...no JS caller frame above it
+            code_block: Some(CodeBlockId(CellId(0x40))),
+            callee: Some(ObjectId(CellId(0x80))),
+            callee_value: None,
+            lexical_scope: None,
+            bytecode_index: None,
+            return_address: None,
+            return_continuation: None,
+            argument_count_including_this: count_including_this as u32,
+            register_window: RegisterWindow {
+                owner: CallFrameId(1),
+                base: frame_base,
+                local_count: 0,
+                // thisArgument is the first value slot after the 5-slot header.
+                argument_base: frame_base
+                    + (layout.this_argument_offset.0 as usize) * REGISTER_SIZE_IN_BYTES,
+                argument_count: count_including_this as usize,
+                this_offset: layout.this_argument_offset,
+            },
+            state: FrameState::Executing,
+        };
+
+        // (a) Header raw bits round-trip across the live mmap; (b) the callee
+        // header agrees with the model (a non-null cell callee); (c) the count
+        // slot is byte-identical to the model's count and the tag is the origin.
+        // SAFETY: every accessed slot is inside the just-seeded frame window.
+        unsafe {
+            assert_eq!(frame.caller_frame_bits(), entry_bits as usize);
+            assert_eq!(frame.return_pc_bits(), return_pc_bits as usize);
+            assert_eq!(frame.code_block_bits(), code_block_bits as usize);
+            assert!(installed.callee.is_some());
+            assert!(frame.callee().is_cell());
+            assert_eq!(frame.callee().as_cell(), callee_bits as usize);
+            assert_eq!(
+                frame.argument_count_including_this() as u32,
+                installed.argument_count_including_this
+            );
+            assert_eq!(frame.call_site_index_bits() as u32, code_origin);
+        }
+
+        // (d) The model's entry/caller framing matches the seeded slot-0 sentinel.
+        assert!(installed.entry.is_some());
+        assert!(installed.caller.is_none());
+
+        // (e) `this` + args are byte-identical (decode to the SAME JsValues) AND
+        // land at the addresses the InstalledCallFrame's register window names.
+        let this_addr =
+            frame_base + (layout.this_argument_offset.0 as usize) * REGISTER_SIZE_IN_BYTES;
+        assert_eq!(this_addr, installed.register_window.argument_base);
+        assert_eq!(stack.read_slot(this_addr).unwrap().js_value(), this_value);
+        for (index, arg) in args.iter().enumerate() {
+            // Window slot 0 is `this`; arg i is at window slot (1 + i).
+            let arg_addr =
+                installed.register_window.argument_base + (1 + index) * REGISTER_SIZE_IN_BYTES;
+            assert_eq!(stack.read_slot(arg_addr).unwrap().js_value(), *arg);
+        }
+        assert_eq!(installed.register_window.argument_count, args.len() + 1);
+    }
+
+    #[test]
+    fn seeded_frame_fills_undefined_for_padded_arguments() {
+        let mut stack = live_stack(64 * 1024);
+        let sp_before = stack.current_stack_pointer();
+
+        let this_value = JsValue::from_i32(5);
+        // 1 real arg -> argumentCountIncludingThis = 2. round(2): (2 + 5) aligned
+        // to 2 -> 8, minus 5 -> paddedArgCount = 3, i.e. 1 undefined fill slot.
+        let args = [JsValue::from_i32(9)];
+        let count_including_this: i32 = 1 + args.len() as i32;
+        let padded: u32 = 3;
+        let arg_regs: Vec<Register> = args
+            .iter()
+            .map(|value| Register::from_encoded(value.encoded()))
+            .collect();
+        let seed = VmEntryFrameSeed {
+            caller_frame_or_entry: Register::from_bits(0),
+            return_pc: Register::from_bits(0),
+            code_block: Register::from_bits(0),
+            callee: Register::from_bits(0),
+            argument_count_including_this: Register::from_bits(count_including_this as u64),
+            this_value: Register::from_encoded(this_value.encoded()),
+            arguments: &arg_regs,
+            padded_argument_count: padded,
+        };
+
+        let frame = stack.try_seed_entry_frame(&seed).expect("seed");
+        let base = frame.registers().as_ptr() as usize;
+        let undefined = JsValue::undefined();
+
+        // this @ slot 5, real arg0 @ slot 6, undefined fill @ slot 7.
+        assert_eq!(
+            stack
+                .read_slot(base + 5 * REGISTER_SIZE_IN_BYTES)
+                .unwrap()
+                .js_value(),
+            this_value
+        );
+        assert_eq!(
+            stack
+                .read_slot(base + 6 * REGISTER_SIZE_IN_BYTES)
+                .unwrap()
+                .js_value(),
+            args[0]
+        );
+        assert_eq!(
+            stack
+                .read_slot(base + 7 * REGISTER_SIZE_IN_BYTES)
+                .unwrap()
+                .js_value(),
+            undefined
+        );
+        // Frame size = header(5) + padded(3) = 8 regs; SP lowered to the new base.
+        assert_eq!(stack.current_stack_pointer(), base);
+        assert_eq!(
+            base + (HEADER_SIZE_IN_REGISTERS as usize + padded as usize) * REGISTER_SIZE_IN_BYTES,
+            sp_before
+        );
+    }
+
+    #[test]
+    fn seed_rejects_argument_count_mismatch_without_writing() {
+        let mut stack = live_stack(64 * 1024);
+        let sp_before = stack.current_stack_pointer();
+        // Slot-4 payload says 3 (this + 2), but only 1 arg is provided.
+        let arg = [Register::from_encoded(JsValue::from_i32(1).encoded())];
+        let seed = VmEntryFrameSeed {
+            caller_frame_or_entry: Register::from_bits(0),
+            return_pc: Register::from_bits(0),
+            code_block: Register::from_bits(0),
+            callee: Register::from_bits(0),
+            argument_count_including_this: Register::from_bits(3),
+            this_value: Register::from_encoded(JsValue::undefined().encoded()),
+            arguments: &arg,
+            padded_argument_count: 3,
+        };
+        assert_eq!(
+            stack.try_seed_entry_frame(&seed).unwrap_err(),
+            JsStackPushError::ArgumentCountMismatch {
+                count_including_this: 3,
+                provided: 1,
+            }
+        );
+        assert_eq!(stack.current_stack_pointer(), sp_before);
     }
 }
