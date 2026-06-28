@@ -7,10 +7,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod identity;
+mod indexing_type;
 mod operations;
 mod property;
+mod property_offset;
 mod storage;
 mod structure;
+mod structure_transition_table;
 mod watchpoint;
 
 pub use self::identity::{
