@@ -161,6 +161,10 @@ pub enum Condition {
     Gt = 12,
     Le = 13,
     Al = 14,
+    /// `ConditionInvalid` (ARM64Assembler.h:290): the sentinel JSC stores in a
+    /// `LinkRecord` for non-conditional branches. Never reaches an encoded
+    /// instruction field.
+    Invalid = 15,
 }
 
 // ----------------------------------------------------------------------------
@@ -437,15 +441,23 @@ const fn load_store_register_pair_offset(
 
 /// `unconditionalBranchImmediate` (ARM64Assembler.h:4879-4883). `op` is the
 /// link bit; `imm26` is the word (4-byte) offset.
+///
+/// `pub(crate)` so the LinkBuffer relocation pass (`super::link_records`) can
+/// rebuild a `b`/`bl` word with a resolved displacement, exactly as JSC's
+/// `linkJumpOrCall` reuses this same encoder (ARM64Assembler.h:4255).
 #[inline]
-const fn unconditional_branch_immediate(op: bool, imm26: i32) -> u32 {
+pub(crate) const fn unconditional_branch_immediate(op: bool, imm26: i32) -> u32 {
     0x1400_0000 | (op as u32) << 31 | ((imm26 & 0x03ff_ffff) as u32)
 }
 
 /// `conditionalBranchImmediate` (ARM64Assembler.h:4542-4550). `imm19` is the
 /// word (4-byte) offset; `o1`/`o0` are always 0.
+///
+/// `pub(crate)` so the LinkBuffer relocation pass (`super::link_records`) can
+/// rebuild a `b.cond` word with a resolved displacement, exactly as JSC's
+/// `linkConditionalBranch` reuses this same encoder (ARM64Assembler.h:4299).
 #[inline]
-const fn conditional_branch_immediate(imm19: i32, cond: Condition) -> u32 {
+pub(crate) const fn conditional_branch_immediate(imm19: i32, cond: Condition) -> u32 {
     0x5400_0000 | ((imm19 & 0x0007_ffff) as u32) << 5 | (cond as u32)
 }
 

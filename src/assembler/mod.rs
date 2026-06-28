@@ -14,7 +14,19 @@ pub mod arm64_encoder;
 pub mod operands;
 pub mod registers;
 
+// Roadmap step 11 (cont.): the faithful LinkBuffer relocation / label-jump-call
+// model. `labels` ports the AbstractMacroAssembler offset-token types
+// (Label/Jump/Call/JumpList); `link_records` ports the per-arch ARM64Assembler
+// LinkRecord list and the in-place `b`/`bl`/`b.cond` link pass. Landed UNWIRED;
+// `link_assembler_byte_image` below now applies ARM64 branch/call relocations
+// through `link_records` instead of returning "unsupported". Rewiring the
+// baseline JIT (src/jit/arm64_baseline.rs) to *emit* Jump/Call tokens and feed
+// them here is a later, SERIAL integration step.
+pub mod labels;
+pub mod link_records;
+
 use crate::jit::{CodePatchPlan, ExecutableAllocationId};
+use link_records::{Arm64LinkError, BranchType};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct AssemblerBufferId(pub u64);
@@ -43,8 +55,38 @@ pub enum AssemblerBufferLifecycle {
     Released,
 }
 
+/// `AssemblerLabel` (AssemblerBuffer.h:67-109): a code-buffer byte offset token.
+///
+/// Note: this `#[derive(Default)]` yields offset `0` (a valid label), whereas
+/// JSC's default ctor stores `u32::MAX` as the "unset" sentinel
+/// (AssemblerBuffer.h:68). The descriptor/digest layer in this module relies on
+/// the `0` default; the unset sentinel is exposed separately as
+/// [`AssemblerLabel::UNSET`] for the token model in `labels.rs`.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct AssemblerLabel(pub u32);
+
+impl AssemblerLabel {
+    /// JSC's "unset" label sentinel (AssemblerBuffer.h:68): `u32::MAX`.
+    pub const UNSET: AssemblerLabel = AssemblerLabel(u32::MAX);
+
+    /// `offset()` (AssemblerBuffer.h:85-92): the raw byte offset.
+    #[inline]
+    pub const fn offset(self) -> u32 {
+        self.0
+    }
+
+    /// `isSet()` (AssemblerBuffer.h:76).
+    #[inline]
+    pub const fn is_set(self) -> bool {
+        self.0 != u32::MAX
+    }
+
+    /// `labelAtOffset(offset)` (AssemblerBuffer.h:78-81).
+    #[inline]
+    pub const fn label_at_offset(self, offset: i32) -> AssemblerLabel {
+        AssemblerLabel((self.0 as i64 + offset as i64) as u32)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct AssemblerJumpId(pub u32);
@@ -210,6 +252,15 @@ pub enum AssemblerValidationError {
     },
     LinkBufferLayoutRelocationsOutOfOrder,
     LinkBufferRelocationApplicationUnsupported(AssemblerRelocationKind),
+    /// A relocation lacked the target label needed to compute a displacement.
+    LinkBufferRelocationMissingTarget(AssemblerRelocationKind),
+    /// The ARM64 in-place link pass (`link_records`) rejected a branch/call
+    /// relocation (out-of-range displacement, misalignment, or an expansion the
+    /// in-place core defers). Carries the failing site and the link-pass cause.
+    LinkBufferArm64RelocationFailed {
+        at_offset: u32,
+        cause: Arm64LinkError,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -969,6 +1020,72 @@ fn validate_link_buffer_layout_for_image(
     Ok(profile)
 }
 
+/// Apply one generic code relocation to the in-flight code bytes via the
+/// faithful ARM64 link pass.
+///
+/// JSC's `LinkBuffer::copyCompactAndLinkCode` drives relocation from the
+/// assembler's concrete `LinkRecord` list (from/to/type/condition). This crate's
+/// generic [`AssemblerRelocation`] is a higher-level descriptor that records
+/// only `{kind, at_offset, target}` — enough to drive the UNCONDITIONAL branch
+/// and near/far call forms (`Jump`/`NearCall`/`FarCall` → `b`/`bl`), which need
+/// no condition. Conditional branches carry an ARM64 `Condition` the descriptor
+/// cannot express, so they must flow through the richer
+/// [`link_records::Arm64LinkRecord`] API directly (the baseline-JIT integration
+/// will supply real records) — flagged as a serial coupling.
+///
+/// Only `Arm64` code is relocated here; x86-64 / data-label / pointer
+/// relocations remain a separate, not-yet-ported repatch path and still report
+/// [`AssemblerValidationError::LinkBufferRelocationApplicationUnsupported`].
+fn apply_code_relocation(
+    code: &mut [u8],
+    architecture: Option<AssemblerArchitecture>,
+    relocation: &AssemblerRelocation,
+) -> Result<(), AssemblerValidationError> {
+    if architecture != Some(AssemblerArchitecture::Arm64) {
+        return Err(
+            AssemblerValidationError::LinkBufferRelocationApplicationUnsupported(relocation.kind),
+        );
+    }
+
+    let branch_type = match relocation.kind {
+        // An unconditional `b`. A conditional jump is also a `Jump` descriptor in
+        // JSC, but its condition is unrecoverable here; treat the descriptor form
+        // as the unconditional branch and route conditionals through the record
+        // API (see the function doc / serial coupling).
+        AssemblerRelocationKind::Jump | AssemblerRelocationKind::PatchableJump => BranchType::Jmp,
+        // `bl` near/far call (ARM64Assembler.h:3854-3858 linkCall).
+        AssemblerRelocationKind::NearCall | AssemblerRelocationKind::FarCall => BranchType::Call,
+        _ => {
+            return Err(
+                AssemblerValidationError::LinkBufferRelocationApplicationUnsupported(
+                    relocation.kind,
+                ),
+            )
+        }
+    };
+
+    let target =
+        relocation
+            .target
+            .ok_or(AssemblerValidationError::LinkBufferRelocationMissingTarget(
+                relocation.kind,
+            ))?;
+
+    let from = relocation.at_offset as i64;
+    let to = target.offset() as i64;
+    let result = match branch_type {
+        BranchType::Jmp => link_records::link_jump_or_call(code, from, to, false),
+        BranchType::Call => link_records::link_jump_or_call(code, from, to, true),
+        BranchType::Ret => Err(Arm64LinkError::NotRelocatable),
+    };
+    result.map_err(
+        |cause| AssemblerValidationError::LinkBufferArm64RelocationFailed {
+            at_offset: relocation.at_offset,
+            cause,
+        },
+    )
+}
+
 pub fn link_assembler_byte_image(
     image: &AssemblerByteImage,
     layout: &LinkBufferLayoutPlan,
@@ -976,13 +1093,16 @@ pub fn link_assembler_byte_image(
     image.validate()?;
     let profile = validate_link_buffer_layout_for_image(image, layout)?;
 
-    if let Some(relocation) = layout.ordered_relocations.first() {
-        return Err(
-            AssemblerValidationError::LinkBufferRelocationApplicationUnsupported(relocation.kind),
-        );
+    // LinkBuffer finalize: copy the frozen bytes, then patch each branch/call
+    // word in place with its resolved displacement (faithful to ARM64Assembler
+    // linkJump/linkCall, ARM64Assembler.h:4226-4258). Code-shifting jump
+    // compaction and jump islands are deferred (flagged serial couplings).
+    let mut output_bytes = image.bytes.clone();
+    let architecture = image.descriptor.architecture;
+    for relocation in &layout.ordered_relocations {
+        apply_code_relocation(&mut output_bytes, architecture, relocation)?;
     }
 
-    let output_bytes = image.bytes.clone();
     let output_digest = compute_assembler_byte_image_digest(&output_bytes);
     let linked = LinkedAssemblerByteImage {
         source_image_id: image.id(),
@@ -1404,6 +1524,114 @@ mod tests {
             Err(AssemblerValidationError::LinkBufferLayoutSourceMismatch {
                 expected: buffer.id,
                 actual: AssemblerBufferId(99),
+            })
+        );
+    }
+
+    // End-to-end: the LinkBuffer path that previously returned
+    // `LinkBufferRelocationApplicationUnsupported` now actually relocates an
+    // ARM64 `b`/`bl` in place via `link_records`.
+    #[test]
+    fn link_assembler_byte_image_relocates_arm64_branch_and_call() {
+        use super::arm64_encoder::Arm64Encoder;
+
+        // b #0 (unlinked) ; nop ; ret  — the b at offset 0 targets ret at 8.
+        let mut bytes = Vec::new();
+        {
+            let mut enc = Arm64Encoder::new(&mut bytes);
+            enc.emit_b(0);
+            enc.emit_nop();
+            enc.emit_ret();
+        }
+        let buffer = AssemblerBufferDescriptor::builder(AssemblerBufferId(31))
+            .architecture(AssemblerArchitecture::Arm64)
+            .lifecycle(AssemblerBufferLifecycle::FrozenForLink)
+            .capacity(bytes.len() as u32, bytes.len() as u32)
+            .label(AssemblerLabel(8))
+            .relocation(AssemblerRelocation {
+                kind: AssemblerRelocationKind::Jump,
+                at_offset: 0,
+                target: Some(AssemblerLabel(8)),
+            })
+            .build()
+            .unwrap();
+        let image =
+            freeze_assembler_byte_image(&buffer, AssemblerByteImageId(31), bytes.clone()).unwrap();
+        let layout = plan_link_buffer_layout(&buffer, LinkBufferProfile::Baseline, None).unwrap();
+        let linked = link_assembler_byte_image(&image, &layout).unwrap();
+
+        let out = linked.bytes();
+        let patched = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+        assert_eq!(patched, 0x1400_0002, "b .+8 (imm26 = 2 words)");
+        assert_eq!(&out[4..], &bytes[4..], "tail bytes untouched");
+        assert_eq!(linked.relocation_count, 1);
+        assert_eq!(linked.state, LinkBufferState::Linked);
+        assert_eq!(linked.validate(), Ok(()));
+
+        // A near call (bl) at offset 0 targeting offset 12.
+        let mut call_bytes = Vec::new();
+        {
+            let mut enc = Arm64Encoder::new(&mut call_bytes);
+            enc.emit_bl(0);
+            enc.emit_nop();
+            enc.emit_nop();
+            enc.emit_ret();
+        }
+        let call_buffer = AssemblerBufferDescriptor::builder(AssemblerBufferId(32))
+            .architecture(AssemblerArchitecture::Arm64)
+            .lifecycle(AssemblerBufferLifecycle::FrozenForLink)
+            .capacity(call_bytes.len() as u32, call_bytes.len() as u32)
+            .label(AssemblerLabel(12))
+            .relocation(AssemblerRelocation {
+                kind: AssemblerRelocationKind::NearCall,
+                at_offset: 0,
+                target: Some(AssemblerLabel(12)),
+            })
+            .build()
+            .unwrap();
+        let call_image =
+            freeze_assembler_byte_image(&call_buffer, AssemblerByteImageId(32), call_bytes.clone())
+                .unwrap();
+        let call_layout =
+            plan_link_buffer_layout(&call_buffer, LinkBufferProfile::Baseline, None).unwrap();
+        let call_linked = link_assembler_byte_image(&call_image, &call_layout).unwrap();
+        let cout = call_linked.bytes();
+        assert_eq!(
+            u32::from_le_bytes([cout[0], cout[1], cout[2], cout[3]]),
+            0x9400_0003,
+            "bl .+12 (imm26 = 3 words, link bit set)"
+        );
+    }
+
+    // An out-of-range ARM64 displacement is surfaced as a structured link-pass
+    // failure, not a silent truncation.
+    #[test]
+    fn link_assembler_byte_image_flags_out_of_range_arm64_branch() {
+        let bytes = vec![0u8; 4]; // a single unlinked `b` slot.
+        let far = 4u32 * (1 << 25); // word offset 2^25 -> just out of imm26.
+        let buffer = AssemblerBufferDescriptor::builder(AssemblerBufferId(33))
+            .architecture(AssemblerArchitecture::Arm64)
+            .lifecycle(AssemblerBufferLifecycle::FrozenForLink)
+            .capacity(bytes.len() as u32, bytes.len() as u32)
+            .label(AssemblerLabel(far))
+            .relocation(AssemblerRelocation {
+                kind: AssemblerRelocationKind::Jump,
+                at_offset: 0,
+                target: Some(AssemblerLabel(far)),
+            })
+            .build()
+            .unwrap();
+        let image = freeze_assembler_byte_image(&buffer, AssemblerByteImageId(33), bytes).unwrap();
+        let layout = plan_link_buffer_layout(&buffer, LinkBufferProfile::Baseline, None).unwrap();
+
+        assert_eq!(
+            link_assembler_byte_image(&image, &layout),
+            Err(AssemblerValidationError::LinkBufferArm64RelocationFailed {
+                at_offset: 0,
+                cause: Arm64LinkError::OutOfRange {
+                    offset_words: 1 << 25,
+                    field_bits: 26,
+                },
             })
         );
     }
