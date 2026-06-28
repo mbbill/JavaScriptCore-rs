@@ -59,21 +59,20 @@ ACTIVE ROADMAP (validated, profiling-earned; default path = InterpreterOnly; sta
 [wip] JetStream 3 Octane parity
   [done] Runner/benchmark contract: JetStreamDriver load order, shell globals, iteration,
          validation, scoring, telemetry, probe command surface
-  [wip]  Run-state (2026-06-28, interpreter): throwers 3->1 (only regexp). Box2D + gbemu FIXED
-         (gbemu scores ok=0.026; Box2D no-throw but interpreter-slow ~590s/2-iter -> perf-gated).
-         Suite geomean is None until all 15 Succeed (shell/octane.rs:1996), score=5000/time_ms.
-  [done] SCORES (9; richards ~7.5x): octane-code-load 89, navier 5.3, crypto 3.5, splay 1.0,
-         richards 0.91, pdfjs 0.88 (slow ~194s), delta-blue 0.62, raytrace 0.23, gbemu 0.026
+  [wip]  Run-state (2026-06-28, interpreter): 10 SCORE / 5 too-slow / 0 THROW. ALL THROWERS CLOSED
+         (Box2D+gbemu+regexp fixed). Remaining gate to a valid suite geomean is PERFORMANCE (the 5
+         too-slow benches completing). Suite geomean is None until all 15 Succeed (shell/octane.rs:1996).
+  [done] SCORES (10): octane-code-load 89, navier 5.3, crypto 3.5, regexp 1.06, splay 1.0, richards
+         0.91, pdfjs 0.88 (slow), delta-blue 0.62, raytrace 0.23, gbemu 0.026
   [wip]  TOO-SLOW/perf-gated (>90s under the interpreter): earley-boyer, typescript, mandreel
          (asm.js), octane-zlib (asm.js), Box2D (now correct, just slow). mandreel/zlib need the JIT.
          LEVER: call-link per-callsite CallLinkInfo (B1 API landed fbd17aa; B2-B4 rewire pending)
          -- profiled 68-70% of earley-boyer self-time is the unbounded VM-global call-link Vec scans;
          the per-site rewire is the O(N^2)->O(1) fix expected to land earley-boyer+typescript -> score.
-  [wip]  THROW (1): regexp. Faithful YARR ENGINE BUILT + C++-oracle-verified: parser->PatternDisjunction
-         tree+setupOffsets (B1, 58a187a) + ByteCompiler+flat backtracking interpreter (B2, 1616a70),
-         both unwired. B3 (unfreeze PatternTerm quantity/frame fields + wire RegExp + delete simple_exec)
-         closes the thrower. Box2D FIXED (Number/Math constants -- 1983a63). gbemu FIXED (new Function
-         -- 6e542ee). pdfjs FIXED (abstract-equality ToPrimitive).
+  [done] THROWERS (all 0): regexp -- faithful Yarr engine (parser+ByteCompiler+backtracking interpreter)
+         wired + simple_exec deleted, regexp bench validates checksum, scores 1.06, byte-identical to
+         jsc across 24650 ops (7c56113; deferred: lookbehind/full-Unicode/dup-named-groups, not in the
+         bench). Box2D (Number/Math constants 1983a63). gbemu (new Function 6e542ee). pdfjs (ToPrimitive).
   [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
          __defineGetter__/Setter__, global Function, Math, apply/bind, globals
   [missing] Octane score parity with local C++ JSC (needs Phases C-F)
