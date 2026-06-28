@@ -2058,6 +2058,7 @@ fn completion_kind(completion: &ExecutionCompletion) -> &'static str {
         ExecutionCompletion::BaselineLoopHandoff(_) => "baseline-loop-handoff",
         ExecutionCompletion::FunctionValueCall(_) => "function-value-call",
         ExecutionCompletion::EvalRequest(_) => "eval-request",
+        ExecutionCompletion::CompileFunctionRequest(_) => "compile-function-request",
         ExecutionCompletion::Terminated(_) => "terminated",
         ExecutionCompletion::Suspended(_) => "suspended",
         ExecutionCompletion::Failed(_) => "failed",

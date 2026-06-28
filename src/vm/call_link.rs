@@ -1222,7 +1222,7 @@ impl Vm {
             DispatchOutcome::FunctionValueCall(_) => {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
             }
-            DispatchOutcome::EvalRequest(_) => {
+            DispatchOutcome::EvalRequest(_) | DispatchOutcome::CompileFunctionRequest(_) => {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
             }
             DispatchOutcome::BaselineLoopHandoff(_) => {

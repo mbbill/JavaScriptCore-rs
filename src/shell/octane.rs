@@ -2627,6 +2627,7 @@ fn classify_completion(
         | ExecutionCompletion::BaselineLoopHandoff(_)
         | ExecutionCompletion::FunctionValueCall(_)
         | ExecutionCompletion::EvalRequest(_)
+        | ExecutionCompletion::CompileFunctionRequest(_)
         | ExecutionCompletion::Terminated(_)
         | ExecutionCompletion::Suspended(_) => OctaneExecutionPhase::ExecuteRuntime,
     };

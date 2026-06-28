@@ -872,11 +872,15 @@ impl Vm {
             ExecutionCompletion::FunctionValueCall(_) => {
                 VmBaselineGeneratedExecutionOutcome::FunctionValueCall
             }
-            // An eval deferral never originates from baseline-generated code (eval
-            // is a native call routed through interpreter dispatch). If one ever
-            // surfaces here, fall back to the interpreter loop, which owns the
-            // `ExecutionCompletion::EvalRequest` handler.
-            ExecutionCompletion::EvalRequest(_) => VmBaselineGeneratedExecutionOutcome::Fallback,
+            // An eval / Function(...) compile deferral never originates from
+            // baseline-generated code (both are native calls routed through
+            // interpreter dispatch). If one ever surfaces here, fall back to the
+            // interpreter loop, which owns the `EvalRequest` /
+            // `CompileFunctionRequest` handlers.
+            ExecutionCompletion::EvalRequest(_)
+            | ExecutionCompletion::CompileFunctionRequest(_) => {
+                VmBaselineGeneratedExecutionOutcome::Fallback
+            }
             ExecutionCompletion::BaselineLoopHandoff(_) => {
                 VmBaselineGeneratedExecutionOutcome::Fallback
             }

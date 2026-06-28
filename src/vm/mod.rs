@@ -72,19 +72,20 @@ use crate::interpreter::{
     pop_call_return_callee, validate_call_return_continuation,
     validate_construct_return_continuation, BaselineFallbackRequest, BaselineLoopHandoffRequest,
     CallObservationDescriptor, CallObservationDrainRequest, CallObservationOutcome,
-    CallReturnContinuation, ConstructReturnContinuation, CoreGlobalLexicalDeclaration,
-    CoreGlobalLexicalDeclarationKind, CoreHostOutputRecord, CoreHostResultRecord,
-    CoreOpcodeDispatchHost, DispatchBudget, DispatchConfig, DispatchHost, DispatchInstruction,
-    DispatchOutcome, DispatchState, EvalExecutionEntry, EvalHostSymbolSnapshot, EvalRequest,
-    ExecutionCompletion, ExecutionContextStack, ExecutionEntryRecord, ExecutionError,
-    ExecutionRootSnapshot, FramePushRequest, FunctionValueCallCompletion,
-    FunctionValueCallHandling, FunctionValueCallRequest, FunctionValueCallTailCompletion,
-    FunctionValuePropertyObservation, FunctionValuePropertyOperationCompletion,
-    FunctionValuePropertyOperationOutcome, FunctionValuePropertyOperationResume,
-    FunctionValueReturnTransform, GeneratedNativeIntrinsicCallRequest,
-    GeneratedNativeIntrinsicCallResult, InterpreterExecutionState, InterpreterFunctionCodeBlock,
-    OrdinaryBytecodeCallHandling, OrdinaryBytecodeCallRequest, OrdinaryBytecodeConstructRequest,
-    ProgramExecutionEntry, PropertyHasObservationDrainRequest, PropertyLoadObservationDrainRequest,
+    CallReturnContinuation, CompileFunctionRequest, ConstructReturnContinuation,
+    CoreGlobalLexicalDeclaration, CoreGlobalLexicalDeclarationKind, CoreHostOutputRecord,
+    CoreHostResultRecord, CoreOpcodeDispatchHost, DispatchBudget, DispatchConfig, DispatchHost,
+    DispatchInstruction, DispatchOutcome, DispatchState, EvalExecutionEntry,
+    EvalHostSymbolSnapshot, EvalRequest, ExecutionCompletion, ExecutionContextStack,
+    ExecutionEntryRecord, ExecutionError, ExecutionRootSnapshot, FramePushRequest,
+    FunctionValueCallCompletion, FunctionValueCallHandling, FunctionValueCallRequest,
+    FunctionValueCallTailCompletion, FunctionValuePropertyObservation,
+    FunctionValuePropertyOperationCompletion, FunctionValuePropertyOperationOutcome,
+    FunctionValuePropertyOperationResume, FunctionValueReturnTransform,
+    GeneratedNativeIntrinsicCallRequest, GeneratedNativeIntrinsicCallResult,
+    InterpreterExecutionState, InterpreterFunctionCodeBlock, OrdinaryBytecodeCallHandling,
+    OrdinaryBytecodeCallRequest, OrdinaryBytecodeConstructRequest, ProgramExecutionEntry,
+    PropertyHasObservationDrainRequest, PropertyLoadObservationDrainRequest,
     PropertyStoreObservationDescriptor, PropertyStoreObservationDrainRequest, RegisterFile,
     RegisterWindow, SingleDispatchOutcome, SingleDispatchRequest, StructureChainInvalidationEvent,
     StructureTransitionWatchpointRequest, StructureTransitionWatchpointSnapshot,
@@ -4954,6 +4955,16 @@ impl Vm {
                         host,
                         config,
                     ),
+                // C++ JSC callFunctionConstructor -> constructFunction (dynamic
+                // Function(...) compilation).
+                ExecutionCompletion::CompileFunctionRequest(request) => self
+                    .execute_compile_function_request_in_current_region(
+                        *request,
+                        code_block_id,
+                        code_block,
+                        host,
+                        config,
+                    ),
                 ExecutionCompletion::BaselineLoopHandoff(handoff) => {
                     match self.execute_baseline_loop_handoff_completion_in_current_region(
                         &mut region,
@@ -9685,6 +9696,7 @@ impl Vm {
             | SingleDispatchOutcome::OrdinaryBytecodeConstruct(_)
             | SingleDispatchOutcome::FunctionValueCall(_)
             | SingleDispatchOutcome::EvalRequest(_)
+            | SingleDispatchOutcome::CompileFunctionRequest(_)
             | SingleDispatchOutcome::Suspended(_)
             | SingleDispatchOutcome::Failed(_) => CallObservationOutcome::FailedOrOpaque,
         }
@@ -9927,9 +9939,11 @@ impl Vm {
             SingleDispatchOutcome::FunctionValueCall(_) => {
                 VmGeneratedDirectCallTransactionOutcome::FunctionValueCall
             }
-            // An eval deferral never originates from a generated direct call; if
-            // one did, it is an unexpected outcome for this accounting path.
-            SingleDispatchOutcome::EvalRequest(_) => {
+            // An eval / Function(...) compile deferral never originates from a
+            // generated direct call; if one did, it is an unexpected outcome for
+            // this accounting path.
+            SingleDispatchOutcome::EvalRequest(_)
+            | SingleDispatchOutcome::CompileFunctionRequest(_) => {
                 VmGeneratedDirectCallTransactionOutcome::Failed
             }
             SingleDispatchOutcome::Suspended(_) => {
@@ -12053,6 +12067,99 @@ impl Vm {
         )
     }
 
+    /// Vm-owned handler for `Function(...)` dynamic compilation, sibling of
+    /// `execute_eval_request_in_current_region`.
+    ///
+    /// C++ JSC callFunctionConstructor -> constructFunction
+    /// (FunctionConstructor.cpp:48-56, :320-323): stringify args, compile a
+    /// `FunctionExecutable` in the global realm via `fromGlobalCode`, and return
+    /// the resulting function object WITHOUT executing its body. The Rust port
+    /// reuses the eval compile+link+enter core (`build_and_run_eval_code_block`)
+    /// on a parenthesized function-expression source assembled by the native arm
+    /// (`assemble_function_constructor_program`): evaluating that expression
+    /// produces the function object as its completion value (the body is not run),
+    /// which is then written into the call destination via the same
+    /// `finish_function_value_call_return` resume path as a deferred call.
+    fn execute_compile_function_request_in_current_region<H: DispatchHost>(
+        &mut self,
+        request: CompileFunctionRequest,
+        caller_code_block_id: CodeBlockId,
+        caller_code_block: &CodeBlock,
+        host: &mut H,
+        config: DispatchConfig,
+    ) -> ExecutionCompletion {
+        let resume = Self::function_value_call_resume(&request.completion);
+        if resume.owner != caller_code_block_id {
+            return ExecutionCompletion::Failed(ExecutionError::CodeBlockMismatch {
+                expected: resume.owner,
+                actual: Some(caller_code_block_id),
+            });
+        }
+
+        let CompileFunctionRequest {
+            source,
+            completion,
+            global_this,
+        } = request;
+
+        let suspended = match self.suspend_no_gc_execution_region() {
+            Ok(suspended) => suspended,
+            Err(_) => return ExecutionCompletion::Failed(ExecutionError::GcBoundaryViolation),
+        };
+
+        // Mirror the eval handler's targeted-root bookkeeping (see
+        // `execute_eval_request_in_current_region`): both register-file and
+        // frame-header roots are gathered at the safepoint, so these stay empty.
+        let mut active_register_roots = Vec::new();
+        let mut active_frame_roots = Vec::new();
+
+        // Compile + link + enter the wrapping function expression. Its completion
+        // value is the freshly-built function object; the body is NOT executed.
+        let compile_completion =
+            self.build_and_run_eval_code_block(source, global_this, host, config);
+
+        let cleanup = cleanup_targeted_root_sets(
+            &mut self.heap,
+            &mut active_register_roots,
+            &mut active_frame_roots,
+        );
+
+        // A returned value (the function object) is written into the call
+        // destination; a compile error (SyntaxError) propagates as a throw at the
+        // Function(...) call site, identical to the eval handler.
+        let outcome = match (compile_completion, cleanup) {
+            (Ok(ExecutionCompletion::Returned(value)), Ok(())) => {
+                self.finish_function_value_call_return(completion, value, caller_code_block, host)
+            }
+            (Ok(ExecutionCompletion::Threw(pending)), Ok(())) => {
+                match self.sync_exception_targeted_roots() {
+                    Ok(()) => self.finish_function_value_call_throw(
+                        completion,
+                        caller_code_block,
+                        pending,
+                        host,
+                    ),
+                    Err(error) => SingleDispatchOutcome::Failed(error.into()),
+                }
+            }
+            (Ok(ExecutionCompletion::Failed(error)), _) | (Err(error), _) => {
+                SingleDispatchOutcome::Failed(error)
+            }
+            (Ok(_), Ok(())) => SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion),
+            (_, Err(error)) => SingleDispatchOutcome::Failed(error),
+        };
+
+        let outcome = self.resume_function_value_call_no_gc(suspended, outcome);
+        self.finish_single_dispatch_resume_in_current_region(
+            resume.owner,
+            resume.frame,
+            outcome,
+            caller_code_block,
+            host,
+            config,
+        )
+    }
+
     /// Compile + link + enter an Eval CodeBlock in GLOBAL scope and run it to
     /// completion. Must be called with the outer no-GC region suspended (compile
     /// allocates). Shared core intended to also back a future `Function(string)`.
@@ -12533,6 +12640,7 @@ impl Vm {
             | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
             | ExecutionCompletion::EvalRequest(_)
+            | ExecutionCompletion::CompileFunctionRequest(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => self.finish_function_value_call_fail(
                 completion,
@@ -13506,6 +13614,7 @@ impl Vm {
             | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
             | ExecutionCompletion::EvalRequest(_)
+            | ExecutionCompletion::CompileFunctionRequest(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => {
                 DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion)
@@ -13577,7 +13686,7 @@ impl Vm {
             DispatchOutcome::FunctionValueCall(_) => {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
             }
-            DispatchOutcome::EvalRequest(_) => {
+            DispatchOutcome::EvalRequest(_) | DispatchOutcome::CompileFunctionRequest(_) => {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
             }
             DispatchOutcome::BaselineLoopHandoff(_) => {
@@ -14356,7 +14465,8 @@ impl Vm {
             SingleDispatchOutcome::FunctionValueCall(_) => {
                 GeneratedExecutionControl::failed(ExecutionError::InvalidCallCompletion)
             }
-            SingleDispatchOutcome::EvalRequest(_) => {
+            SingleDispatchOutcome::EvalRequest(_)
+            | SingleDispatchOutcome::CompileFunctionRequest(_) => {
                 GeneratedExecutionControl::failed(ExecutionError::InvalidCallCompletion)
             }
             SingleDispatchOutcome::Suspended(record) => {
@@ -14500,7 +14610,8 @@ impl Vm {
             SingleDispatchOutcome::FunctionValueCall(_) => {
                 ExecutionCompletion::Failed(ExecutionError::InvalidCallCompletion)
             }
-            SingleDispatchOutcome::EvalRequest(_) => {
+            SingleDispatchOutcome::EvalRequest(_)
+            | SingleDispatchOutcome::CompileFunctionRequest(_) => {
                 ExecutionCompletion::Failed(ExecutionError::InvalidCallCompletion)
             }
             SingleDispatchOutcome::Suspended(record) => ExecutionCompletion::Suspended(record),
@@ -29475,6 +29586,65 @@ mod tests {
         assert_eq!(
             vm.execute_source(source("eval(\"\");")).unwrap(),
             ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+    }
+
+    // C++ JSC callFunctionConstructor (runtime/FunctionConstructor.cpp:48-56) ->
+    // constructFunction (:320-323): `Function(...)` stringifies its args, compiles
+    // a function in the global realm, and returns the function object WITHOUT
+    // running its body. These prove JSC behavior: the returned function, when
+    // called, computes from its params/body. The Function(...) compile defers to
+    // the Vm via CompileFunctionRequest, the sibling of the eval handler.
+    #[test]
+    fn vm_function_constructor_call_with_params_and_body_returns_callable() {
+        let mut vm = Vm::new(VmConfig::default());
+        // Function("a","b","return a*b+1") -> a function; calling (2,3) -> 7.
+        assert_eq!(
+            vm.execute_source(source("Function(\"a\",\"b\",\"return a*b+1\")(2,3);"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(7))
+        );
+    }
+
+    #[test]
+    fn vm_function_constructor_call_body_only_returns_callable() {
+        let mut vm = Vm::new(VmConfig::default());
+        // Function("return 1+2") -> a zero-arg function; calling () -> 3.
+        assert_eq!(
+            vm.execute_source(source("Function(\"return 1+2\")();"))
+                .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(3))
+        );
+    }
+
+    #[test]
+    fn vm_function_constructor_compiles_in_global_realm_not_caller_scope() {
+        let mut vm = Vm::new(VmConfig::default());
+        // FunctionConstructor.cpp:166 compiles in globalObject->globalScope(): the
+        // body's free variables resolve against the GLOBAL scope, never the
+        // caller's locals. A caller local `x` is invisible inside the body; only
+        // the global `x` is. Mirrors C++ (the body sees global x = 5, not local 99).
+        assert_eq!(
+            vm.execute_source(source(
+                "var x = 5; function outer(){ var x = 99; return Function(\"return x\")(); } outer();"
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(5))
+        );
+    }
+
+    #[test]
+    fn vm_function_constructor_gbemu_shaped_this_and_param_call() {
+        let mut vm = Vm::new(VmConfig::default());
+        // gbemu shape: `this.interpolate = Function("buffer", body)` then called as
+        // a method so `this` is the receiver and `buffer` is the parameter
+        // (Octane/gbemu-part1.js:416). The body reads `this.k` and `buffer`.
+        assert_eq!(
+            vm.execute_source(source(
+                "var o = { k: 10, f: Function(\"buffer\", \"return this.k + buffer\") }; o.f(7);"
+            ))
+            .unwrap(),
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(17))
         );
     }
 

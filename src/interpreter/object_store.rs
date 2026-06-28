@@ -1975,9 +1975,18 @@ impl CoreObjectStore {
     // constructor (DontEnum). The global name `Function` is bound to it.
     // We reuse the existing `ensure_function_prototype()` object rather than
     // creating a new prototype, matching that the same Function.prototype is
-    // shared by every function. Unlike Object/Array, we do not implement
-    // `new Function(string)` (dynamic compilation), so this constructor is not
-    // constructible (see construct_ability) and calling it throws.
+    // shared by every function.
+    //
+    // CALLING `Function(...)` IS supported: the native arm assembles a function
+    // program and defers compilation to the Vm via
+    // `DispatchOutcome::CompileFunctionRequest` (see `native_function_constructor`).
+    // CONSTRUCT (`new Function(...)`) is NOT yet wired: the op_construct native
+    // path runs synchronously with no deferred-completion mechanism (the same
+    // construct-side deferral the eval infra also lacks -- there is no `new eval`),
+    // so this constructor stays `CannotConstruct` (see construct_ability) and
+    // `new Function(...)` raises a catchable "not a constructor" TypeError. C++ JSC
+    // makes Function constructible; wiring construct requires threading a
+    // deferred completion through the native-construct dispatch.
     pub(crate) fn allocate_function_constructor_with_write_barrier(
         &mut self,
         heap: &mut Heap,

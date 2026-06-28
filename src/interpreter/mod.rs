@@ -539,6 +539,79 @@ pub struct EvalRequest {
     pub(crate) global_this: RuntimeValue,
 }
 
+/// Deferred `Function(...)` (dynamic function compilation) request.
+///
+/// C++ JSC callFunctionConstructor -> constructFunction
+/// (runtime/FunctionConstructor.cpp:48-56, :320-323) stringifies the arguments
+/// into a function-source program and compiles a `FunctionExecutable` in the
+/// global realm via `FunctionExecutable::fromGlobalCode`, returning a `JSFunction`
+/// WITHOUT running its body. This is a sibling of `EvalRequest`: like indirect
+/// eval, the native arm cannot compile inline (the compile pipeline mutates
+/// `&mut Vm` registries unreachable while per-instruction `DispatchState` borrows
+/// are held), so it extracts the ASSEMBLED source plus the call-site resume
+/// context, drops all borrows, and returns this request. The Vm handler
+/// (`execute_compile_function_request_in_current_region`) owns compile+link and
+/// writes the resulting function object back through the same
+/// `FunctionValueCallCompletion` resume path used by deferred function-value
+/// calls. It is a DISTINCT type from `EvalRequest` because `constructFunction`
+/// and `globalFuncEval` are distinct C++ runtime entries with distinct source
+/// assembly, even though the Rust port currently reuses the eval compile core.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompileFunctionRequest {
+    /// Already-ASSEMBLED program source. The native arm builds this faithfully to
+    /// `stringifyFunction` (FunctionConstructor.cpp:217-302), then wraps it in
+    /// parentheses so the Rust eval compile core (`build_and_run_eval_code_block`)
+    /// evaluates a function EXPRESSION and yields the function object as its
+    /// completion value (see `assemble_function_constructor_program`).
+    pub(crate) source: String,
+    /// Call-site resume context (reuses the deferred function-value-call
+    /// completion machinery; mirrors `EvalRequest::completion`).
+    pub(crate) completion: FunctionValueCallCompletion,
+    /// Global object value: `Function(...)` always compiles in the global realm
+    /// (`globalObject->globalScope()`, FunctionConstructor.cpp:166), so the
+    /// wrapping function expression captures the global scope as `[[Scope]]`.
+    pub(crate) global_this: RuntimeValue,
+}
+
+/// Build the program source for `Function(...)`, faithful to `stringifyFunction`
+/// (FunctionConstructor.cpp:217-302) for FunctionConstructionMode::Function
+/// (prefix `"function "`, name `"anonymous"`). `argument_strings` are the already
+/// ToString'd arguments; the last is the body and the rest are the parameters.
+///
+/// DIVERGENCE: C++ `FunctionExecutable::fromGlobalCode` parses the bare
+/// declaration program (`function anonymous(...) {...}`) through a dedicated
+/// function-constructor parse mode and returns a `FunctionExecutable` directly.
+/// The Rust port reuses the indirect-eval compile core
+/// (`build_and_run_eval_code_block`), which evaluates a PROGRAM and yields its
+/// completion value, so the declaration is wrapped in parentheses to become a
+/// function EXPRESSION whose evaluation produces the function object without
+/// running its body. The resulting closure is equivalent (global `[[Scope]]`,
+/// name `"anonymous"`, body not executed).
+fn assemble_function_constructor_program(argument_strings: &[String]) -> String {
+    const PREFIX_AND_NAME: &str = "function anonymous";
+    let program = match argument_strings.split_last() {
+        // args.isEmpty(): "function anonymous(\n) {\n\n}"
+        None => format!("{PREFIX_AND_NAME}(\n) {{\n\n}}"),
+        Some((body, parameters)) => {
+            if parameters.is_empty() {
+                // args.size()==1 (body only): "function anonymous(\n) {\n<body>\n}"
+                format!("{PREFIX_AND_NAME}(\n) {{\n{body}\n}}")
+            } else {
+                // args.size()>=2: "function anonymous(<p0>,<p1>,...\n) {\n<body>\n}"
+                // (parameters comma-joined with no space, matching the C++ builder).
+                let mut builder = String::from(PREFIX_AND_NAME);
+                builder.push('(');
+                builder.push_str(&parameters.join(","));
+                builder.push_str("\n) {\n");
+                builder.push_str(body);
+                builder.push_str("\n}");
+                builder
+            }
+        }
+    };
+    format!("({program})")
+}
+
 /// Snapshot of the host's identifier/string-literal namespace, used to seed the
 /// Vm-owned eval compile so newly compiled eval bytecode shares the host's
 /// identifier indices (see `DispatchHost::eval_symbol_namespace_snapshot`).
@@ -1865,6 +1938,7 @@ pub(crate) fn finish_ordinary_js_call_return(
         | ExecutionCompletion::BaselineLoopHandoff(_)
         | ExecutionCompletion::FunctionValueCall(_)
         | ExecutionCompletion::EvalRequest(_)
+        | ExecutionCompletion::CompileFunctionRequest(_)
         | ExecutionCompletion::Terminated(_)
         | ExecutionCompletion::Suspended(_) => {
             if let Err(error) = discard_call_return_callee_if_present(state, continuation) {
@@ -10828,6 +10902,7 @@ impl CoreOpcodeDispatchHost {
             | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
             | ExecutionCompletion::EvalRequest(_)
+            | ExecutionCompletion::CompileFunctionRequest(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => {
                 Err(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))
@@ -10874,6 +10949,7 @@ impl CoreOpcodeDispatchHost {
             | DispatchOutcome::OrdinaryBytecodeConstruct(_)
             | DispatchOutcome::FunctionValueCall(_)
             | DispatchOutcome::EvalRequest(_)
+            | DispatchOutcome::CompileFunctionRequest(_)
             | DispatchOutcome::Suspend(_)
             | DispatchOutcome::Fail(_) => CallObservationOutcome::FailedOrOpaque,
         }
@@ -12106,6 +12182,10 @@ impl CoreOpcodeDispatchHost {
                 // the deferred-call resume completion so the Vm handler can write
                 // back through the same `finish_function_value_call_return` path.
                 | CoreNativeFunction::GlobalEval
+                // C++ JSC callFunctionConstructor: dynamic Function(...) compiles
+                // in the global realm and writes the resulting function object into
+                // the call destination, reusing the same deferred-call resume path.
+                | CoreNativeFunction::FunctionConstructor
         ) {
             self.function_value_tail_completion_for_current_call(
                 state,
@@ -12462,6 +12542,7 @@ impl CoreOpcodeDispatchHost {
             | ExecutionCompletion::BaselineLoopHandoff(_)
             | ExecutionCompletion::FunctionValueCall(_)
             | ExecutionCompletion::EvalRequest(_)
+            | ExecutionCompletion::CompileFunctionRequest(_)
             | ExecutionCompletion::Terminated(_)
             | ExecutionCompletion::Suspended(_) => {
                 DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion)
@@ -12528,15 +12609,7 @@ impl CoreOpcodeDispatchHost {
                 self.native_function_bind(state, this_value, arguments)
             }
             CoreNativeFunction::FunctionConstructor => {
-                // C++ JSC callFunctionConstructor compiles a function from a
-                // source string (runtime/FunctionConstructor.cpp). Rust does not
-                // implement dynamic source compilation; calling `Function(...)`
-                // is unsupported. `Function` itself is only exposed so that
-                // `typeof Function`/`x instanceof Function` work.
-                Err(self.type_error_outcome_with_heap(
-                    state.heap,
-                    "Function constructor (dynamic compilation) is not supported",
-                ))
+                self.native_function_constructor(state, arguments, function_value_completion)
             }
             CoreNativeFunction::GlobalEval => {
                 self.native_global_eval(state, arguments, function_value_completion)
@@ -13071,6 +13144,66 @@ impl CoreOpcodeDispatchHost {
             completion,
             global_this,
         })))
+    }
+
+    /// C++ JSC callFunctionConstructor -> constructFunction
+    /// (runtime/FunctionConstructor.cpp:48-56, :320-323) for
+    /// FunctionConstructionMode::Function. Stringify the arguments into a function
+    /// program (`stringifyFunction`, :217-302), then compile it in the global
+    /// realm and return the resulting function object WITHOUT running its body.
+    ///
+    /// Like indirect `eval`, the compile pipeline lives on the Vm and cannot run
+    /// inline here, so the native arm assembles the source, drops its borrows, and
+    /// returns a `DispatchOutcome::CompileFunctionRequest`; the Vm handler
+    /// (`execute_compile_function_request_in_current_region`) owns compile+link and
+    /// writes the function object back through the deferred-call resume path. This
+    /// mirrors `native_global_eval` exactly except for the source assembly.
+    fn native_function_constructor(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        arguments: &[RuntimeValue],
+        completion: Option<FunctionValueCallCompletion>,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        // The completion is built by `function_value_tail_completion_for_native_call`
+        // only when the Vm owns re-entrancy (`DeferToVm`); a missing completion
+        // means Function(...) was invoked on a direct-interpreter path that cannot
+        // host the compile re-entry (same precondition as eval).
+        let Some(completion) = completion else {
+            return Err(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion));
+        };
+        // Stringify each argument (C++ stringifyFunction calls ToString on each).
+        // Primitive args (string/number/boolean/bigint/null/undefined) reduce here;
+        // for a string the result is the string itself, which is the only case
+        // Octane/gbemu exercises (`Function("buffer", body)`).
+        //
+        // DEFERRED: an OBJECT argument would require full ToString re-entrancy (its
+        // user `toString()` runs JS), which this native arm cannot host without a
+        // second deferral; C++ throws whatever that ToString throws. Until that is
+        // wired, a non-primitive argument raises a catchable TypeError rather than
+        // running its toString. Octane never passes an object to Function(...).
+        let mut argument_strings: Vec<String> = Vec::with_capacity(arguments.len());
+        for &argument in arguments {
+            match self.primitive_to_string(argument) {
+                Some(text) => argument_strings.push(text),
+                None => {
+                    return Err(self.type_error_outcome_with_heap(
+                        state.heap,
+                        "Function constructor argument is not a primitive value",
+                    ));
+                }
+            }
+        }
+        let source = assemble_function_constructor_program(&argument_strings);
+        let global_this = self
+            .active_global_object_value(state.stack)
+            .map_err(DispatchOutcome::Fail)?;
+        Err(DispatchOutcome::CompileFunctionRequest(Box::new(
+            CompileFunctionRequest {
+                source,
+                completion,
+                global_this,
+            },
+        )))
     }
 
     fn native_host_performance_now(&mut self) -> RuntimeValue {
@@ -20903,6 +21036,7 @@ fn property_store_outcome_from_dispatch_error(
         | DispatchOutcome::OrdinaryBytecodeConstruct(_)
         | DispatchOutcome::FunctionValueCall(_)
         | DispatchOutcome::EvalRequest(_)
+        | DispatchOutcome::CompileFunctionRequest(_)
         | DispatchOutcome::Suspend(_) => PropertyStoreObservationOutcome::Opaque,
     }
 }
@@ -21566,6 +21700,10 @@ pub enum DispatchOutcome {
     // C++ JSC globalFuncEval -> executeEval re-entrancy. Like FunctionValueCall,
     // this defers to the Vm, which owns the compile pipeline (see EvalRequest).
     EvalRequest(Box<EvalRequest>),
+    // C++ JSC callFunctionConstructor -> constructFunction re-entrancy. Sibling of
+    // EvalRequest: defers dynamic Function(...) compilation to the Vm (see
+    // CompileFunctionRequest).
+    CompileFunctionRequest(Box<CompileFunctionRequest>),
     Suspend(SuspensionRecord),
     Fail(ExecutionError),
 }
@@ -21580,6 +21718,9 @@ pub enum ExecutionCompletion {
     FunctionValueCall(Box<FunctionValueCallRequest>),
     // C++ JSC globalFuncEval -> executeEval re-entrancy (see EvalRequest).
     EvalRequest(Box<EvalRequest>),
+    // C++ JSC callFunctionConstructor -> constructFunction re-entrancy (see
+    // CompileFunctionRequest).
+    CompileFunctionRequest(Box<CompileFunctionRequest>),
     Terminated(TerminationReason),
     Suspended(SuspensionRecord),
     Failed(ExecutionError),
@@ -21607,6 +21748,9 @@ pub(crate) enum SingleDispatchOutcome {
     FunctionValueCall(Box<FunctionValueCallRequest>),
     // C++ JSC globalFuncEval -> executeEval re-entrancy (see EvalRequest).
     EvalRequest(Box<EvalRequest>),
+    // C++ JSC callFunctionConstructor -> constructFunction re-entrancy (see
+    // CompileFunctionRequest).
+    CompileFunctionRequest(Box<CompileFunctionRequest>),
     Suspended(SuspensionRecord),
     Failed(ExecutionError),
 }
@@ -22123,6 +22267,9 @@ fn execute_code_block_with_resume<H: DispatchHost>(
             DispatchOutcome::EvalRequest(request) => {
                 return ExecutionCompletion::EvalRequest(request);
             }
+            DispatchOutcome::CompileFunctionRequest(request) => {
+                return ExecutionCompletion::CompileFunctionRequest(request);
+            }
             DispatchOutcome::Suspend(record) => {
                 return ExecutionCompletion::Suspended(record);
             }
@@ -22265,6 +22412,15 @@ fn map_single_dispatch_outcome(
             // it is only valid where the Vm owns re-entrancy.
             if call_handling.function_value_call == FunctionValueCallHandling::DeferToVm {
                 SingleDispatchOutcome::EvalRequest(request)
+            } else {
+                SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
+            }
+        }
+        DispatchOutcome::CompileFunctionRequest(request) => {
+            // Dynamic Function(...) compilation defers to the Vm exactly like
+            // indirect eval; only valid where the Vm owns re-entrancy.
+            if call_handling.function_value_call == FunctionValueCallHandling::DeferToVm {
+                SingleDispatchOutcome::CompileFunctionRequest(request)
             } else {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidCallCompletion)
             }
@@ -22567,6 +22723,42 @@ mod tests {
     };
     use crate::strings::PropertyIndex;
     use crate::value::EncodedJsValue;
+
+    // C++ JSC stringifyFunction (runtime/FunctionConstructor.cpp:217-302) for
+    // FunctionConstructionMode::Function. These lock the assembled source string
+    // case-by-case (empty / body-only / one-param / multi-param). The Rust port
+    // wraps the C++ bare declaration in parens so the eval compile core yields the
+    // function object as a completion value (see assemble_function_constructor_program).
+    #[test]
+    fn function_constructor_source_assembly_matches_stringify_function() {
+        // args.isEmpty(): C++ "function anonymous(\n) {\n\n}".
+        assert_eq!(
+            assemble_function_constructor_program(&[]),
+            "(function anonymous(\n) {\n\n})"
+        );
+        // args.size()==1 (body only): C++ "function anonymous(\n) {\n<body>\n}".
+        assert_eq!(
+            assemble_function_constructor_program(&["return 1+2".to_owned()]),
+            "(function anonymous(\n) {\nreturn 1+2\n})"
+        );
+        // args.size()==2 (one param + body): C++ "function anonymous(<p>\n) {\n<body>\n}".
+        assert_eq!(
+            assemble_function_constructor_program(&[
+                "buffer".to_owned(),
+                "return buffer".to_owned()
+            ]),
+            "(function anonymous(buffer\n) {\nreturn buffer\n})"
+        );
+        // args.size()>2 (params comma-joined, no space): C++ builder path.
+        assert_eq!(
+            assemble_function_constructor_program(&[
+                "a".to_owned(),
+                "b".to_owned(),
+                "return a*b+1".to_owned()
+            ]),
+            "(function anonymous(a,b\n) {\nreturn a*b+1\n})"
+        );
+    }
 
     #[test]
     fn get_by_id_megamorphic_property_name_gate_matches_jsc_exclusions() {
