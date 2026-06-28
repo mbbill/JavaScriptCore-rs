@@ -1,0 +1,1224 @@
+//! ARM64 instruction-word encoder.
+//!
+//! Faithful port of the instruction-encoding core of
+//! `Source/JavaScriptCore/assembler/ARM64Assembler.h`: the private `static int`
+//! field-packing helpers (e.g. `addSubtractImmediate`,
+//! `loadStoreRegisterPairPreIndex`, `moveWideImediate`,
+//! `unconditionalBranchRegister`) and the public `ALWAYS_INLINE void` mnemonic
+//! wrappers (`stp`, `ldp`, `mov`, `movz`, `add`, `ldr`, `b`, `ret`, ...).
+//!
+//! In JSC every wrapper calls `insn(encoder(...))` and `insn` does
+//! `m_buffer.putInt(instruction)` — a little-endian 32-bit append. This port
+//! mirrors that exactly: [`Arm64Encoder`] borrows the output `Vec<u8>` (the
+//! moral equivalent of `ARM64Assembler::m_buffer`) and every `emit_*` method
+//! appends one 32-bit instruction word in little-endian order. Encoding is a
+//! pure byte computation, so this is all safe Rust — making the bytes
+//! executable (W^X / icache) is a separate, out-of-scope layer.
+//!
+//! Subset covered: the instructions the ARM64 baseline JIT currently hardcodes
+//! or emits by hand (prologue/epilogue pair ops, register & wide-immediate
+//! moves, add/sub, frame loads/stores, BaseIndex register-offset loads/stores,
+//! and the branch family). 32-bit (W-register) datasizes, FP/SIMD instructions,
+//! and the unscaled/literal addressing modes are deferred until a consumer
+//! needs them.
+#![allow(dead_code)]
+
+use super::operands::Scale;
+use super::registers::RegisterID;
+
+// ----------------------------------------------------------------------------
+// Encoding enums — faithful mirrors of the ARM64Assembler.h field enums.
+// ----------------------------------------------------------------------------
+
+/// `ARM64Assembler::Datasize` (ARM64Assembler.h:586-591). The `sf` bit value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Datasize {
+    D32 = 0,
+    D64 = 1,
+    D128 = 2,
+    D16 = 3,
+}
+
+/// `ARM64Assembler::MemOpSize` (ARM64Assembler.h:593-598). The load/store
+/// single-register size field (bits 31:30).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MemOpSize {
+    Size8Or128 = 0,
+    Size16 = 1,
+    Size32 = 2,
+    Size64 = 3,
+}
+
+/// `ARM64Assembler::MemPairOpSize` (ARM64Assembler.h:747-755). The load/store
+/// *pair* size field (bits 31:30).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MemPairOpSize {
+    Pair32 = 0,
+    PairLoadSigned32 = 1,
+    Pair64 = 2,
+}
+
+/// `ARM64Assembler::AddOp` (ARM64Assembler.h:600-603).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum AddOp {
+    Add = 0,
+    Sub = 1,
+}
+
+/// `ARM64Assembler::MemOp` (ARM64Assembler.h:737-745), restricted to the
+/// plain load/store opcodes this subset uses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MemOp {
+    Store = 0,
+    Load = 1,
+}
+
+/// `ARM64Assembler::MoveWideOp` (ARM64Assembler.h:757-761).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MoveWideOp {
+    /// MOVN (negate). Value 0.
+    N = 0,
+    /// MOVZ (zero). Value 2.
+    Z = 2,
+    /// MOVK (keep). Value 3.
+    K = 3,
+}
+
+/// `ARM64Assembler::LogicalOp` (ARM64Assembler.h:730-735).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum LogicalOp {
+    And = 0,
+    Orr = 1,
+    Eor = 2,
+    Ands = 3,
+}
+
+/// `ARM64Assembler::SetFlags` (ARM64Assembler.h:316-319).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum SetFlags {
+    DontSetFlags = 0,
+    S = 1,
+}
+
+/// `ARM64Assembler::BranchType` (ARM64Assembler.h:344-348).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum BranchType {
+    Jmp = 0,
+    Call = 1,
+    Ret = 2,
+}
+
+/// `ARM64Assembler::ShiftType` (ARM64Assembler.h:308-313).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ShiftType {
+    Lsl = 0,
+    Lsr = 1,
+    Asr = 2,
+    Ror = 3,
+}
+
+/// `ARM64Assembler::ExtendType` (ARM64Assembler.h:315-325 region).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ExtendType {
+    Uxtb = 0,
+    Uxth = 1,
+    Uxtw = 2,
+    Uxtx = 3,
+    Sxtb = 4,
+    Sxth = 5,
+    Sxtw = 6,
+    Sxtx = 7,
+}
+
+/// `ARM64Assembler::Condition` (ARM64Assembler.h:289-308). The 4-bit condition
+/// field for `b.cond`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Condition {
+    Eq = 0,
+    Ne = 1,
+    Hs = 2,
+    Lo = 3,
+    Mi = 4,
+    Pl = 5,
+    Vs = 6,
+    Vc = 7,
+    Hi = 8,
+    Ls = 9,
+    Ge = 10,
+    Lt = 11,
+    Gt = 12,
+    Le = 13,
+    Al = 14,
+}
+
+// ----------------------------------------------------------------------------
+// Register-field helpers — faithful mirrors of ARM64Assembler's xOr* helpers.
+// ----------------------------------------------------------------------------
+
+/// `ARM64Assembler::xOrZr` (ARM64Assembler.h:4485-4490): mask to 5 bits so the
+/// `zr` alias (`0x3f`) collapses to register field `31`.
+#[inline]
+const fn x_or_zr(reg: RegisterID) -> u32 {
+    reg.value() & 31
+}
+
+/// `ARM64Assembler::xOrSp` (ARM64Assembler.h:4478-4483): pass through the raw
+/// register value (`sp` is `31`); the caller guarantees it is not `zr`.
+#[inline]
+const fn x_or_sp(reg: RegisterID) -> u32 {
+    reg.value()
+}
+
+/// `ARM64Assembler::xOrZrOrSp` (ARM64Assembler.h:4492): pick the `zr` or `sp`
+/// interpretation of register field `31` based on whether flags are set.
+#[inline]
+const fn x_or_zr_or_sp(use_zr: bool, reg: RegisterID) -> u32 {
+    if use_zr {
+        x_or_zr(reg)
+    } else {
+        x_or_sp(reg)
+    }
+}
+
+/// `ARM64Assembler::memPairOffsetShift` (ARM64Assembler.h:785-791): log2 of the
+/// pair access size in bytes (64-bit GPR pair -> 3).
+#[inline]
+const fn mem_pair_offset_shift(v: bool, size: MemPairOpSize) -> u32 {
+    let size = size as u32;
+    if v {
+        size + 2
+    } else {
+        (size >> 1) + 2
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Instruction-word encoders — one `const fn` per ARM64Assembler.h static helper.
+// ----------------------------------------------------------------------------
+
+/// `addSubtractImmediate` (ARM64Assembler.h:4507-4512). `shift12` is the C++
+/// `shift == 12` boolean (shift the imm12 left by 12).
+#[inline]
+const fn add_subtract_immediate(
+    sf: Datasize,
+    op: AddOp,
+    s: SetFlags,
+    shift12: bool,
+    imm12: u32,
+    rn: RegisterID,
+    rd: RegisterID,
+) -> u32 {
+    let use_zr = (s as u32) != 0;
+    0x1100_0000
+        | (sf as u32) << 31
+        | (op as u32) << 30
+        | (s as u32) << 29
+        | (shift12 as u32) << 22
+        | (imm12 & 0xfff) << 10
+        | x_or_sp(rn) << 5
+        | x_or_zr_or_sp(use_zr, rd)
+}
+
+/// `addSubtractShiftedRegister` (ARM64Assembler.h:4514-4519).
+#[inline]
+const fn add_subtract_shifted_register(
+    sf: Datasize,
+    op: AddOp,
+    s: SetFlags,
+    shift: ShiftType,
+    rm: RegisterID,
+    imm6: u32,
+    rn: RegisterID,
+    rd: RegisterID,
+) -> u32 {
+    0x0b00_0000
+        | (sf as u32) << 31
+        | (op as u32) << 30
+        | (s as u32) << 29
+        | (shift as u32) << 22
+        | x_or_zr(rm) << 16
+        | (imm6 & 0x3f) << 10
+        | x_or_zr(rn) << 5
+        | x_or_zr(rd)
+}
+
+/// `addSubtractExtendedRegister` (ARM64Assembler.h:4496-4505). `opt` is always
+/// 0 in JSC.
+#[inline]
+const fn add_subtract_extended_register(
+    sf: Datasize,
+    op: AddOp,
+    s: SetFlags,
+    rm: RegisterID,
+    option: ExtendType,
+    imm3: u32,
+    rn: RegisterID,
+    rd: RegisterID,
+) -> u32 {
+    let use_zr = (s as u32) != 0;
+    let opt = 0u32;
+    0x0b20_0000
+        | (sf as u32) << 31
+        | (op as u32) << 30
+        | (s as u32) << 29
+        | opt << 22
+        | x_or_zr(rm) << 16
+        | (option as u32) << 13
+        | (imm3 & 0x7) << 10
+        | x_or_sp(rn) << 5
+        | x_or_zr_or_sp(use_zr, rd)
+}
+
+/// `logicalShiftedRegister` (ARM64Assembler.h:4866-4870). `n` negates `rm`.
+#[inline]
+const fn logical_shifted_register(
+    sf: Datasize,
+    opc: LogicalOp,
+    shift: ShiftType,
+    n: bool,
+    rm: RegisterID,
+    imm6: u32,
+    rn: RegisterID,
+    rd: RegisterID,
+) -> u32 {
+    0x0a00_0000
+        | (sf as u32) << 31
+        | (opc as u32) << 29
+        | (shift as u32) << 22
+        | (n as u32) << 21
+        | x_or_zr(rm) << 16
+        | (imm6 & 0x3f) << 10
+        | x_or_zr(rn) << 5
+        | x_or_zr(rd)
+}
+
+/// `moveWideImediate` (ARM64Assembler.h:4872-4876). `hw` is the halfword shift
+/// index (`shift >> 4`).
+#[inline]
+const fn move_wide_immediate(
+    sf: Datasize,
+    opc: MoveWideOp,
+    hw: u32,
+    imm16: u16,
+    rd: RegisterID,
+) -> u32 {
+    0x1280_0000
+        | (sf as u32) << 31
+        | (opc as u32) << 29
+        | hw << 21
+        | (imm16 as u32) << 5
+        | x_or_zr(rd)
+}
+
+/// `loadStoreRegisterUnsignedImmediate` (ARM64Assembler.h:4846-4852), GPR form.
+/// `imm12` is already the scaled (pimm / accessSize) immediate.
+#[inline]
+const fn load_store_register_unsigned_immediate(
+    size: MemOpSize,
+    v: bool,
+    opc: MemOp,
+    imm12: u32,
+    rn: RegisterID,
+    rt: RegisterID,
+) -> u32 {
+    0x3900_0000
+        | (size as u32) << 30
+        | (v as u32) << 26
+        | (opc as u32) << 22
+        | (imm12 & 0xfff) << 10
+        | x_or_sp(rn) << 5
+        | x_or_zr(rt)
+}
+
+/// `loadStoreRegisterRegisterOffset` (ARM64Assembler.h:4817-4823), GPR form.
+/// `s` shifts `rm` by log2(accessSize) when set.
+#[inline]
+const fn load_store_register_register_offset(
+    size: MemOpSize,
+    v: bool,
+    opc: MemOp,
+    rm: RegisterID,
+    option: ExtendType,
+    s: bool,
+    rn: RegisterID,
+    rt: RegisterID,
+) -> u32 {
+    0x3820_0800
+        | (size as u32) << 30
+        | (v as u32) << 26
+        | (opc as u32) << 22
+        | x_or_zr(rm) << 16
+        | (option as u32) << 13
+        | (s as u32) << 12
+        | x_or_sp(rn) << 5
+        | x_or_zr(rt)
+}
+
+/// `loadStoreRegisterPairPostIndex` (ARM64Assembler.h:4730-4740), GPR form.
+#[inline]
+const fn load_store_register_pair_post_index(
+    size: MemPairOpSize,
+    v: bool,
+    opc: MemOp,
+    immediate: i32,
+    rn: RegisterID,
+    rt: RegisterID,
+    rt2: RegisterID,
+) -> u32 {
+    let shift = mem_pair_offset_shift(v, size);
+    let imm7 = immediate >> shift;
+    0x2880_0000
+        | (size as u32) << 30
+        | (v as u32) << 26
+        | (opc as u32) << 22
+        | ((imm7 & 0x7f) as u32) << 15
+        | x_or_zr(rt2) << 10
+        | x_or_sp(rn) << 5
+        | x_or_zr(rt)
+}
+
+/// `loadStoreRegisterPairPreIndex` (ARM64Assembler.h:4762-4772), GPR form.
+#[inline]
+const fn load_store_register_pair_pre_index(
+    size: MemPairOpSize,
+    v: bool,
+    opc: MemOp,
+    immediate: i32,
+    rn: RegisterID,
+    rt: RegisterID,
+    rt2: RegisterID,
+) -> u32 {
+    let shift = mem_pair_offset_shift(v, size);
+    let imm7 = immediate >> shift;
+    0x2980_0000
+        | (size as u32) << 30
+        | (v as u32) << 26
+        | (opc as u32) << 22
+        | ((imm7 & 0x7f) as u32) << 15
+        | x_or_zr(rt2) << 10
+        | x_or_sp(rn) << 5
+        | x_or_zr(rt)
+}
+
+/// `loadStoreRegisterPairOffset` (ARM64Assembler.h:4780-4790), GPR form.
+#[inline]
+const fn load_store_register_pair_offset(
+    size: MemPairOpSize,
+    v: bool,
+    opc: MemOp,
+    immediate: i32,
+    rn: RegisterID,
+    rt: RegisterID,
+    rt2: RegisterID,
+) -> u32 {
+    let shift = mem_pair_offset_shift(v, size);
+    let imm7 = immediate >> shift;
+    0x2900_0000
+        | (size as u32) << 30
+        | (v as u32) << 26
+        | (opc as u32) << 22
+        | ((imm7 & 0x7f) as u32) << 15
+        | x_or_zr(rt2) << 10
+        | x_or_sp(rn) << 5
+        | x_or_zr(rt)
+}
+
+/// `unconditionalBranchImmediate` (ARM64Assembler.h:4879-4883). `op` is the
+/// link bit; `imm26` is the word (4-byte) offset.
+#[inline]
+const fn unconditional_branch_immediate(op: bool, imm26: i32) -> u32 {
+    0x1400_0000 | (op as u32) << 31 | ((imm26 & 0x03ff_ffff) as u32)
+}
+
+/// `conditionalBranchImmediate` (ARM64Assembler.h:4542-4550). `imm19` is the
+/// word (4-byte) offset; `o1`/`o0` are always 0.
+#[inline]
+const fn conditional_branch_immediate(imm19: i32, cond: Condition) -> u32 {
+    0x5400_0000 | ((imm19 & 0x0007_ffff) as u32) << 5 | (cond as u32)
+}
+
+/// `unconditionalBranchRegister` (ARM64Assembler.h:4925-4932). `op2` is `0x1f`,
+/// `op3`/`op4` are 0.
+#[inline]
+const fn unconditional_branch_register(opc: BranchType, rn: RegisterID) -> u32 {
+    let op2 = 0x1fu32;
+    0xd600_0000 | (opc as u32) << 21 | op2 << 16 | x_or_zr(rn) << 5
+}
+
+/// `system` (ARM64Assembler.h:4894-4897).
+#[inline]
+const fn system(l: bool, op0: u32, op1: u32, crn: u32, crm: u32, op2: u32, rt: RegisterID) -> u32 {
+    0xd500_0000
+        | (l as u32) << 21
+        | op0 << 19
+        | op1 << 16
+        | crn << 12
+        | crm << 8
+        | op2 << 5
+        | x_or_zr(rt)
+}
+
+/// `hintPseudo` (ARM64Assembler.h:4899-4903).
+#[inline]
+const fn hint_pseudo(imm: u32) -> u32 {
+    system(false, 0, 3, 2, (imm >> 3) & 0xf, imm & 0x7, RegisterID::Zr)
+}
+
+/// `nopPseudo` (ARM64Assembler.h:4905-4908).
+#[inline]
+const fn nop_pseudo() -> u32 {
+    hint_pseudo(0)
+}
+
+// ----------------------------------------------------------------------------
+// Arm64Encoder — the ARM64Assembler buffer-append surface.
+// ----------------------------------------------------------------------------
+
+/// Appends ARM64 instruction words to a borrowed code buffer.
+///
+/// C++ map: the buffer side of `ARM64Assembler` — `m_buffer` plus `insn`
+/// (`m_buffer.putInt`). Borrows `&mut Vec<u8>` so the encoder owns no storage of
+/// its own, exactly like `ARM64Assembler` borrows its `AssemblerBuffer`.
+pub struct Arm64Encoder<'a> {
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'a> Arm64Encoder<'a> {
+    /// Wrap a code buffer for emission.
+    #[inline]
+    pub fn new(buffer: &'a mut Vec<u8>) -> Self {
+        Self { buffer }
+    }
+
+    /// Current byte length of the emitted code (the buffer's `codeSize`).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// `ARM64Assembler::insn` -> `AssemblerBuffer::putInt`: append one 32-bit
+    /// instruction word little-endian (ARM64 is little-endian).
+    #[inline]
+    fn insn(&mut self, instruction: u32) {
+        self.buffer.extend_from_slice(&instruction.to_le_bytes());
+    }
+
+    // ---- Moves -------------------------------------------------------------
+
+    /// `mov<64>(rd, rm)` (ARM64Assembler.h:2375-2382): `add rd, rm, #0` when
+    /// either operand is `sp`, else `orr rd, xzr, rm`.
+    #[inline]
+    pub fn emit_mov(&mut self, rd: RegisterID, rm: RegisterID) {
+        if rd.is_sp() || rm.is_sp() {
+            self.emit_add_imm12(rd, rm, 0, false);
+        } else {
+            self.insn(logical_shifted_register(
+                Datasize::D64,
+                LogicalOp::Orr,
+                ShiftType::Lsl,
+                false,
+                rm,
+                0,
+                RegisterID::Zr,
+                rd,
+            ));
+        }
+    }
+
+    /// `orr<64>(rd, rn, rm)` (ARM64Assembler.h:2708-2711), `LSL #0`.
+    #[inline]
+    pub fn emit_orr_reg(&mut self, rd: RegisterID, rn: RegisterID, rm: RegisterID) {
+        self.insn(logical_shifted_register(
+            Datasize::D64,
+            LogicalOp::Orr,
+            ShiftType::Lsl,
+            false,
+            rm,
+            0,
+            rn,
+            rd,
+        ));
+    }
+
+    /// `movz<64>(rd, value, shift)` (ARM64Assembler.h:2544-2549). `shift` is a
+    /// byte-position multiple of 16 (0/16/32/48).
+    #[inline]
+    pub fn emit_movz(&mut self, rd: RegisterID, value: u16, shift: u32) {
+        self.insn(move_wide_immediate(
+            Datasize::D64,
+            MoveWideOp::Z,
+            shift >> 4,
+            value,
+            rd,
+        ));
+    }
+
+    /// `movk<64>(rd, value, shift)` (ARM64Assembler.h:2528-2533).
+    #[inline]
+    pub fn emit_movk(&mut self, rd: RegisterID, value: u16, shift: u32) {
+        self.insn(move_wide_immediate(
+            Datasize::D64,
+            MoveWideOp::K,
+            shift >> 4,
+            value,
+            rd,
+        ));
+    }
+
+    /// `movn<64>(rd, value, shift)` (ARM64Assembler.h:2536-2541).
+    #[inline]
+    pub fn emit_movn(&mut self, rd: RegisterID, value: u16, shift: u32) {
+        self.insn(move_wide_immediate(
+            Datasize::D64,
+            MoveWideOp::N,
+            shift >> 4,
+            value,
+            rd,
+        ));
+    }
+
+    /// Materialize a 64-bit immediate into `rd` with a `movz` then `movk`
+    /// sequence over the non-zero 16-bit halfwords.
+    ///
+    /// Mirrors the in-tree baseline pattern
+    /// `src/jit/arm64_baseline.rs::p6_arm64_emit_mov_xd_u64` (movz the lowest
+    /// non-zero halfword, then movk each higher non-zero halfword; movz #0 for a
+    /// zero value). This is the simple correct sequence; JSC's
+    /// `MacroAssemblerARM64::moveInternal` additionally optimizes all-ones runs
+    /// with `movn`, which is deferred (it never changes correctness, only size).
+    pub fn emit_move_immediate64(&mut self, rd: RegisterID, value: u64) {
+        let mut emitted_movz = false;
+        let mut shift = 0u32;
+        while shift < 64 {
+            let halfword = ((value >> shift) & 0xffff) as u16;
+            if halfword != 0 {
+                if !emitted_movz {
+                    self.emit_movz(rd, halfword, shift);
+                    emitted_movz = true;
+                } else {
+                    self.emit_movk(rd, halfword, shift);
+                }
+            }
+            shift += 16;
+        }
+        if !emitted_movz {
+            self.emit_movz(rd, 0, 0);
+        }
+    }
+
+    // ---- Add / Sub ---------------------------------------------------------
+
+    /// `add<64>(rd, rn, imm12, shift)` (ARM64Assembler.h:804-809).
+    #[inline]
+    pub fn emit_add_imm12(&mut self, rd: RegisterID, rn: RegisterID, imm12: u32, shift12: bool) {
+        self.insn(add_subtract_immediate(
+            Datasize::D64,
+            AddOp::Add,
+            SetFlags::DontSetFlags,
+            shift12,
+            imm12,
+            rn,
+            rd,
+        ));
+    }
+
+    /// `sub<64>(rd, rn, imm12, shift)` (ARM64Assembler.h:3013-3018).
+    #[inline]
+    pub fn emit_sub_imm12(&mut self, rd: RegisterID, rn: RegisterID, imm12: u32, shift12: bool) {
+        self.insn(add_subtract_immediate(
+            Datasize::D64,
+            AddOp::Sub,
+            SetFlags::DontSetFlags,
+            shift12,
+            imm12,
+            rn,
+            rd,
+        ));
+    }
+
+    /// `add<64>(rd, rn, rm)` (ARM64Assembler.h:812-833): shifted-register form,
+    /// except when `rd`/`rn` is `sp` JSC routes through the extended-register
+    /// form (`UXTX #0`), which this mirrors.
+    #[inline]
+    pub fn emit_add_reg(&mut self, rd: RegisterID, rn: RegisterID, rm: RegisterID) {
+        if rd.is_sp() || rn.is_sp() {
+            self.insn(add_subtract_extended_register(
+                Datasize::D64,
+                AddOp::Add,
+                SetFlags::DontSetFlags,
+                rm,
+                ExtendType::Uxtx,
+                0,
+                rn,
+                rd,
+            ));
+        } else {
+            self.insn(add_subtract_shifted_register(
+                Datasize::D64,
+                AddOp::Add,
+                SetFlags::DontSetFlags,
+                ShiftType::Lsl,
+                rm,
+                0,
+                rn,
+                rd,
+            ));
+        }
+    }
+
+    /// `sub<64>(rd, rn, rm)` (ARM64Assembler.h:3021-3045): shifted-register
+    /// form, with the same `sp` extended-register routing as `add`.
+    #[inline]
+    pub fn emit_sub_reg(&mut self, rd: RegisterID, rn: RegisterID, rm: RegisterID) {
+        if rd.is_sp() || rn.is_sp() {
+            self.insn(add_subtract_extended_register(
+                Datasize::D64,
+                AddOp::Sub,
+                SetFlags::DontSetFlags,
+                rm,
+                ExtendType::Uxtx,
+                0,
+                rn,
+                rd,
+            ));
+        } else {
+            self.insn(add_subtract_shifted_register(
+                Datasize::D64,
+                AddOp::Sub,
+                SetFlags::DontSetFlags,
+                ShiftType::Lsl,
+                rm,
+                0,
+                rn,
+                rd,
+            ));
+        }
+    }
+
+    // ---- Loads / Stores (single register) ----------------------------------
+
+    /// `ldr<64>(rt, rn, pimm)` (ARM64Assembler.h:1277-1281), unsigned-offset
+    /// form. `byte_offset` is the unscaled byte displacement and must be a
+    /// non-negative multiple of 8 (`encodePositiveImmediate<64>`).
+    #[inline]
+    pub fn emit_ldr_imm64(&mut self, rt: RegisterID, rn: RegisterID, byte_offset: u32) {
+        debug_assert!(byte_offset % 8 == 0, "64-bit ldr offset must be 8-aligned");
+        self.insn(load_store_register_unsigned_immediate(
+            MemOpSize::Size64,
+            false,
+            MemOp::Load,
+            byte_offset / 8,
+            rn,
+            rt,
+        ));
+    }
+
+    /// `str<64>(rt, rn, pimm)` (ARM64Assembler.h:2922-2926), unsigned-offset
+    /// form. Same scaling/alignment requirement as [`Self::emit_ldr_imm64`].
+    #[inline]
+    pub fn emit_str_imm64(&mut self, rt: RegisterID, rn: RegisterID, byte_offset: u32) {
+        debug_assert!(byte_offset % 8 == 0, "64-bit str offset must be 8-aligned");
+        self.insn(load_store_register_unsigned_immediate(
+            MemOpSize::Size64,
+            false,
+            MemOp::Store,
+            byte_offset / 8,
+            rn,
+            rt,
+        ));
+    }
+
+    /// `ldr<64>(rt, rn, rm, extend, amount)` (ARM64Assembler.h:1270-1274),
+    /// register-offset form for a `BaseIndex`. The `scale` selects the `S`
+    /// (scaled-index) bit: a `TimesEight` index on a 64-bit access scales, while
+    /// `TimesOne` does not.
+    #[inline]
+    pub fn emit_ldr_register_offset64(
+        &mut self,
+        rt: RegisterID,
+        rn: RegisterID,
+        rm: RegisterID,
+        extend: ExtendType,
+        scale: Scale,
+    ) {
+        self.insn(load_store_register_register_offset(
+            MemOpSize::Size64,
+            false,
+            MemOp::Load,
+            rm,
+            extend,
+            scale.log2() != 0,
+            rn,
+            rt,
+        ));
+    }
+
+    /// `str<64>(rt, rn, rm, extend, amount)` (ARM64Assembler.h:2915-2919),
+    /// register-offset form. See [`Self::emit_ldr_register_offset64`].
+    #[inline]
+    pub fn emit_str_register_offset64(
+        &mut self,
+        rt: RegisterID,
+        rn: RegisterID,
+        rm: RegisterID,
+        extend: ExtendType,
+        scale: Scale,
+    ) {
+        self.insn(load_store_register_register_offset(
+            MemOpSize::Size64,
+            false,
+            MemOp::Store,
+            rm,
+            extend,
+            scale.log2() != 0,
+            rn,
+            rt,
+        ));
+    }
+
+    // ---- Load/Store Pair (prologue/epilogue) -------------------------------
+
+    /// `stp<64>(rt, rt2, rn, PairPreIndex(simm))` (ARM64Assembler.h:2860-2864).
+    /// `byte_offset` is the unscaled (pre-shift) byte displacement.
+    #[inline]
+    pub fn emit_stp_pre_index64(
+        &mut self,
+        rt: RegisterID,
+        rt2: RegisterID,
+        rn: RegisterID,
+        byte_offset: i32,
+    ) {
+        self.insn(load_store_register_pair_pre_index(
+            MemPairOpSize::Pair64,
+            false,
+            MemOp::Store,
+            byte_offset,
+            rn,
+            rt,
+            rt2,
+        ));
+    }
+
+    /// `stp<64>(rt, rt2, rn, PairPostIndex(simm))` (ARM64Assembler.h:2853-2857).
+    #[inline]
+    pub fn emit_stp_post_index64(
+        &mut self,
+        rt: RegisterID,
+        rt2: RegisterID,
+        rn: RegisterID,
+        byte_offset: i32,
+    ) {
+        self.insn(load_store_register_pair_post_index(
+            MemPairOpSize::Pair64,
+            false,
+            MemOp::Store,
+            byte_offset,
+            rn,
+            rt,
+            rt2,
+        ));
+    }
+
+    /// `stp<64>(rt, rt2, rn, simm)` (ARM64Assembler.h:2867-2871), signed-offset
+    /// form (no writeback).
+    #[inline]
+    pub fn emit_stp_offset64(
+        &mut self,
+        rt: RegisterID,
+        rt2: RegisterID,
+        rn: RegisterID,
+        byte_offset: i32,
+    ) {
+        self.insn(load_store_register_pair_offset(
+            MemPairOpSize::Pair64,
+            false,
+            MemOp::Store,
+            byte_offset,
+            rn,
+            rt,
+            rt2,
+        ));
+    }
+
+    /// `ldp<64>(rt, rt2, rn, PairPreIndex(simm))` (ARM64Assembler.h:1215-1219).
+    #[inline]
+    pub fn emit_ldp_pre_index64(
+        &mut self,
+        rt: RegisterID,
+        rt2: RegisterID,
+        rn: RegisterID,
+        byte_offset: i32,
+    ) {
+        self.insn(load_store_register_pair_pre_index(
+            MemPairOpSize::Pair64,
+            false,
+            MemOp::Load,
+            byte_offset,
+            rn,
+            rt,
+            rt2,
+        ));
+    }
+
+    /// `ldp<64>(rt, rt2, rn, PairPostIndex(simm))`
+    /// (ARM64Assembler.h:1208-1212).
+    #[inline]
+    pub fn emit_ldp_post_index64(
+        &mut self,
+        rt: RegisterID,
+        rt2: RegisterID,
+        rn: RegisterID,
+        byte_offset: i32,
+    ) {
+        self.insn(load_store_register_pair_post_index(
+            MemPairOpSize::Pair64,
+            false,
+            MemOp::Load,
+            byte_offset,
+            rn,
+            rt,
+            rt2,
+        ));
+    }
+
+    /// `ldp<64>(rt, rt2, rn, simm)` (ARM64Assembler.h:1222-1226),
+    /// signed-offset form (no writeback).
+    #[inline]
+    pub fn emit_ldp_offset64(
+        &mut self,
+        rt: RegisterID,
+        rt2: RegisterID,
+        rn: RegisterID,
+        byte_offset: i32,
+    ) {
+        self.insn(load_store_register_pair_offset(
+            MemPairOpSize::Pair64,
+            false,
+            MemOp::Load,
+            byte_offset,
+            rn,
+            rt,
+            rt2,
+        ));
+    }
+
+    // ---- Branches ----------------------------------------------------------
+
+    /// `b()` (ARM64Assembler.h:892-895): unconditional immediate branch.
+    /// `imm26` is the word (4-byte) offset; `0` is the unlinked placeholder JSC
+    /// emits before relocation.
+    #[inline]
+    pub fn emit_b(&mut self, imm26: i32) {
+        self.insn(unconditional_branch_immediate(false, imm26));
+    }
+
+    /// `bl()` (ARM64Assembler.h:943-946): unconditional immediate branch with
+    /// link (call). `imm26` is the word offset (`0` when unlinked).
+    #[inline]
+    pub fn emit_bl(&mut self, imm26: i32) {
+        self.insn(unconditional_branch_immediate(true, imm26));
+    }
+
+    /// `b.cond` via `b_cond(cond, offset)` (ARM64Assembler.h:897-903). `imm19`
+    /// is the word (4-byte) offset.
+    #[inline]
+    pub fn emit_b_cond(&mut self, cond: Condition, imm19: i32) {
+        self.insn(conditional_branch_immediate(imm19, cond));
+    }
+
+    /// `blr(rn)` (ARM64Assembler.h:948-951): indirect call.
+    #[inline]
+    pub fn emit_blr(&mut self, rn: RegisterID) {
+        self.insn(unconditional_branch_register(BranchType::Call, rn));
+    }
+
+    /// `br(rn)` (ARM64Assembler.h:953-956): indirect branch.
+    #[inline]
+    pub fn emit_br(&mut self, rn: RegisterID) {
+        self.insn(unconditional_branch_register(BranchType::Jmp, rn));
+    }
+
+    /// `ret(rn = lr)` (ARM64Assembler.h:2734-2737).
+    #[inline]
+    pub fn emit_ret(&mut self) {
+        self.emit_ret_reg(RegisterID::Lr);
+    }
+
+    /// `ret(rn)` (ARM64Assembler.h:2734-2737), explicit return register.
+    #[inline]
+    pub fn emit_ret_reg(&mut self, rn: RegisterID) {
+        self.insn(unconditional_branch_register(BranchType::Ret, rn));
+    }
+
+    // ---- Misc --------------------------------------------------------------
+
+    /// `nop()` (ARM64Assembler.h:2600-2603).
+    #[inline]
+    pub fn emit_nop(&mut self) {
+        self.insn(nop_pseudo());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------------------------
+    // Byte oracle: the known-good prologue/epilogue byte constants from
+    // src/jit/arm64_baseline/entry_prologue.rs:17-36. Reproduced here (cited)
+    // so this new module stays self-contained and unwired; if the encoder
+    // diverges from these bytes the asm the baseline JIT relies on is wrong.
+    // ------------------------------------------------------------------------
+
+    /// entry_prologue.rs:17-20 — `stp fp,lr,[sp,#-16]!` ; `mov fp,x1`.
+    const RAW_C_ABI_PROLOGUE: [u8; 8] = [
+        0xfd, 0x7b, 0xbf, 0xa9, // stp fp, lr, [sp, #-16]!
+        0xfd, 0x03, 0x01, 0xaa, // mov fp, x1   (orr fp, xzr, x1)
+    ];
+    /// entry_prologue.rs:22-25 — `ldp fp,lr,[sp],#16` ; `ret`.
+    const RAW_C_ABI_EPILOGUE: [u8; 8] = [
+        0xfd, 0x7b, 0xc1, 0xa8, // ldp fp, lr, [sp], #16
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    /// entry_prologue.rs:27-30 — `stp fp,lr,[sp,#-16]!` ; `mov fp,sp`.
+    const JSC_GENERATED_PROLOGUE: [u8; 8] = [
+        0xfd, 0x7b, 0xbf, 0xa9, // stp fp, lr, [sp, #-16]!
+        0xfd, 0x03, 0x00, 0x91, // mov fp, sp   (add fp, sp, #0)
+    ];
+    /// entry_prologue.rs:32-36 — `mov sp,fp` ; `ldp fp,lr,[sp],#16` ; `ret`.
+    const JSC_GENERATED_EPILOGUE: [u8; 12] = [
+        0xbf, 0x03, 0x00, 0x91, // mov sp, fp   (add sp, fp, #0)
+        0xfd, 0x7b, 0xc1, 0xa8, // ldp fp, lr, [sp], #16
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+
+    fn word(bytes: &[u8], index: usize) -> u32 {
+        let s = index * 4;
+        u32::from_le_bytes([bytes[s], bytes[s + 1], bytes[s + 2], bytes[s + 3]])
+    }
+
+    #[test]
+    fn encoder_reproduces_raw_c_abi_prologue_bytes() {
+        let mut buf = Vec::new();
+        let mut enc = Arm64Encoder::new(&mut buf);
+        // stp fp, lr, [sp, #-16]!  /  mov fp, x1
+        enc.emit_stp_pre_index64(RegisterID::Fp, RegisterID::Lr, RegisterID::Sp, -16);
+        enc.emit_mov(RegisterID::Fp, RegisterID::X1);
+        assert_eq!(buf, RAW_C_ABI_PROLOGUE);
+        assert_eq!(word(&buf, 0), 0xa9bf_7bfd);
+        assert_eq!(word(&buf, 1), 0xaa01_03fd);
+    }
+
+    #[test]
+    fn encoder_reproduces_raw_c_abi_epilogue_bytes() {
+        let mut buf = Vec::new();
+        let mut enc = Arm64Encoder::new(&mut buf);
+        // ldp fp, lr, [sp], #16  /  ret
+        enc.emit_ldp_post_index64(RegisterID::Fp, RegisterID::Lr, RegisterID::Sp, 16);
+        enc.emit_ret();
+        assert_eq!(buf, RAW_C_ABI_EPILOGUE);
+        assert_eq!(word(&buf, 0), 0xa8c1_7bfd);
+        assert_eq!(word(&buf, 1), 0xd65f_03c0);
+    }
+
+    #[test]
+    fn encoder_reproduces_jsc_generated_prologue_bytes() {
+        let mut buf = Vec::new();
+        let mut enc = Arm64Encoder::new(&mut buf);
+        // stp fp, lr, [sp, #-16]!  /  mov fp, sp
+        enc.emit_stp_pre_index64(RegisterID::Fp, RegisterID::Lr, RegisterID::Sp, -16);
+        enc.emit_mov(RegisterID::Fp, RegisterID::Sp);
+        assert_eq!(buf, JSC_GENERATED_PROLOGUE);
+        assert_eq!(word(&buf, 1), 0x9100_03fd);
+    }
+
+    #[test]
+    fn encoder_reproduces_jsc_generated_epilogue_bytes() {
+        let mut buf = Vec::new();
+        let mut enc = Arm64Encoder::new(&mut buf);
+        // mov sp, fp  /  ldp fp, lr, [sp], #16  /  ret
+        enc.emit_mov(RegisterID::Sp, RegisterID::Fp);
+        enc.emit_ldp_post_index64(RegisterID::Fp, RegisterID::Lr, RegisterID::Sp, 16);
+        enc.emit_ret();
+        assert_eq!(buf, JSC_GENERATED_EPILOGUE);
+        assert_eq!(word(&buf, 0), 0x9100_03bf);
+    }
+
+    // ------------------------------------------------------------------------
+    // Hand cross-checks against ARM64Assembler.h field layout.
+    // ------------------------------------------------------------------------
+
+    fn single(emit: impl FnOnce(&mut Arm64Encoder)) -> u32 {
+        let mut buf = Vec::new();
+        let mut enc = Arm64Encoder::new(&mut buf);
+        emit(&mut enc);
+        assert_eq!(buf.len(), 4);
+        word(&buf, 0)
+    }
+
+    #[test]
+    fn nop_is_canonical_hint() {
+        // hintPseudo(0) -> system(0,0,3,2,0,0,zr) = 0xd503201f.
+        assert_eq!(single(|e| e.emit_nop()), 0xd503_201f);
+    }
+
+    #[test]
+    fn move_wide_immediate_matches() {
+        // movz x0, #0x1234 : 0x12800000|sf|Z<<29|imm<<5 = 0xd2824680.
+        assert_eq!(
+            single(|e| e.emit_movz(RegisterID::X0, 0x1234, 0)),
+            0xd282_4680
+        );
+        // movk x0, #0xabcd, lsl #16 : 0xf2b579a0.
+        assert_eq!(
+            single(|e| e.emit_movk(RegisterID::X0, 0xabcd, 16)),
+            0xf2b5_79a0
+        );
+        // movn x0, #0 : 0x92800000.
+        assert_eq!(single(|e| e.emit_movn(RegisterID::X0, 0, 0)), 0x9280_0000);
+    }
+
+    #[test]
+    fn move_immediate64_sequence() {
+        // 0x0000_abcd_0000_1234 -> movz x3,#0x1234 then movk x3,#0xabcd,lsl#32.
+        let mut buf = Vec::new();
+        let mut enc = Arm64Encoder::new(&mut buf);
+        enc.emit_move_immediate64(RegisterID::X3, 0x0000_abcd_0000_1234);
+        assert_eq!(buf.len(), 8);
+        assert_eq!(word(&buf, 0), 0xd282_4683); // movz x3, #0x1234
+        assert_eq!(word(&buf, 1), 0xf2d5_79a3); // movk x3, #0xabcd, lsl #32
+
+        // Zero materializes as a single movz #0.
+        let mut z = Vec::new();
+        Arm64Encoder::new(&mut z).emit_move_immediate64(RegisterID::X0, 0);
+        assert_eq!(z.len(), 4);
+        assert_eq!(word(&z, 0), 0xd280_0000);
+    }
+
+    #[test]
+    fn add_sub_immediate_and_register() {
+        // add x0, x1, #4    : 0x91001020
+        assert_eq!(
+            single(|e| e.emit_add_imm12(RegisterID::X0, RegisterID::X1, 4, false)),
+            0x9100_1020
+        );
+        // sub x0, x0, #1    : 0xd1000400
+        assert_eq!(
+            single(|e| e.emit_sub_imm12(RegisterID::X0, RegisterID::X0, 1, false)),
+            0xd100_0400
+        );
+        // add x0, x1, x2    : 0x8b020020
+        assert_eq!(
+            single(|e| e.emit_add_reg(RegisterID::X0, RegisterID::X1, RegisterID::X2)),
+            0x8b02_0020
+        );
+        // sub x0, x1, x2    : 0xcb020020
+        assert_eq!(
+            single(|e| e.emit_sub_reg(RegisterID::X0, RegisterID::X1, RegisterID::X2)),
+            0xcb02_0020
+        );
+    }
+
+    #[test]
+    fn load_store_unsigned_immediate() {
+        // ldr x0, [x1, #8]  : imm12 = 8/8 = 1 -> 0xf9400420
+        assert_eq!(
+            single(|e| e.emit_ldr_imm64(RegisterID::X0, RegisterID::X1, 8)),
+            0xf940_0420
+        );
+        // str x2, [x1, #16] : imm12 = 16/8 = 2 -> 0xf9000822
+        assert_eq!(
+            single(|e| e.emit_str_imm64(RegisterID::X2, RegisterID::X1, 16)),
+            0xf900_0822
+        );
+        // Cross-check against the in-tree baseline encoder constant
+        // (arm64_baseline.rs:2406 expects 0xf9400ba9 = ldr x9, [x29, #16]).
+        assert_eq!(
+            single(|e| e.emit_ldr_imm64(RegisterID::X9, RegisterID::Fp, 16)),
+            0xf940_0ba9
+        );
+    }
+
+    #[test]
+    fn load_store_register_offset_baseindex() {
+        // str x0, [x1, x2, lsl #3] : size=64, opc=STORE, option=UXTX, S=1.
+        // 0x38200800 | 0xC0000000 | (x2<<16) | (UXTX<<13) | (1<<12) | (x1<<5)
+        //   = 0xf8226820? recompute: base 0x38200800 + size 0xC0000000 =
+        //   0xf8200800; |2<<16=0xf8220800; |3<<13=0xf8226800; |1<<12=0xf8227800;
+        //   |1<<5=0xf8227820.
+        assert_eq!(
+            single(|e| e.emit_str_register_offset64(
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+                ExtendType::Uxtx,
+                Scale::TimesEight,
+            )),
+            0xf822_7820
+        );
+        // ldr x0, [x1, x2] (TimesOne => S=0) : 0xf8626820? base 0xf8200800
+        //   |opc LOAD 1<<22=0x400000 -> 0xf8600800; |x2<<16=0xf8620800;
+        //   |UXTX<<13=0xf8626800; |S=0; |x1<<5=0xf8626820; rt=0.
+        assert_eq!(
+            single(|e| e.emit_ldr_register_offset64(
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+                ExtendType::Uxtx,
+                Scale::TimesOne,
+            )),
+            0xf862_6820
+        );
+    }
+
+    #[test]
+    fn pair_offset_form_no_writeback() {
+        // stp x29, x30, [sp, #16] (signed offset) : 0xa9015bfd.
+        // base 0x29000000 | size 0x80000000 | imm7 (16/8=2)<<15=0x10000 |
+        //   x30<<10=0x7800 | sp<<5=0x3e0 | x29=0x1d -> 0xa9015bfd? compute:
+        //   0xa9000000|0x10000=0xa9010000;|0x7800=0xa9017800;|0x3e0=0xa90 17be0;
+        //   |0x1d=0xa9017bfd.
+        assert_eq!(
+            single(|e| e.emit_stp_offset64(RegisterID::Fp, RegisterID::Lr, RegisterID::Sp, 16)),
+            0xa901_7bfd
+        );
+        // ldp x29, x30, [sp, #16] : opc LOAD adds 0x400000 -> 0xa9417bfd.
+        assert_eq!(
+            single(|e| e.emit_ldp_offset64(RegisterID::Fp, RegisterID::Lr, RegisterID::Sp, 16)),
+            0xa941_7bfd
+        );
+    }
+
+    #[test]
+    fn branch_family() {
+        // b #0 (unlinked) : 0x14000000 ; bl #0 : 0x94000000.
+        assert_eq!(single(|e| e.emit_b(0)), 0x1400_0000);
+        assert_eq!(single(|e| e.emit_bl(0)), 0x9400_0000);
+        // b #(2 words forward) : imm26 = 2 -> 0x14000002.
+        assert_eq!(single(|e| e.emit_b(2)), 0x1400_0002);
+        // b.eq #0 : 0x54000000 ; b.ne #(1 word) : 0x54000021.
+        assert_eq!(single(|e| e.emit_b_cond(Condition::Eq, 0)), 0x5400_0000);
+        assert_eq!(single(|e| e.emit_b_cond(Condition::Ne, 1)), 0x5400_0021);
+        // blr x0 : 0xd63f0000 ; br x2 : 0xd61f0040 ; ret : 0xd65f03c0.
+        assert_eq!(single(|e| e.emit_blr(RegisterID::X0)), 0xd63f_0000);
+        assert_eq!(single(|e| e.emit_br(RegisterID::X2)), 0xd61f_0040);
+        assert_eq!(single(|e| e.emit_ret()), 0xd65f_03c0);
+    }
+}

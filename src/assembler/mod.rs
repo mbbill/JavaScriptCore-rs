@@ -5,6 +5,15 @@
 //! Wasm. This module names those ownership boundaries without making code
 //! executable.
 
+// Roadmap step 11: the faithful AbstractMacroAssembler operand model, ARM64
+// register IDs, and the ARM64Assembler instruction encoder. Landed UNWIRED
+// (each module is `#![allow(dead_code)]`); the baseline JIT
+// (src/jit/arm64_baseline.rs) still emits hardcoded byte blobs. Rewiring it to
+// emit through `arm64_encoder::Arm64Encoder` is a later, SERIAL integration step.
+pub mod arm64_encoder;
+pub mod operands;
+pub mod registers;
+
 use crate::jit::{CodePatchPlan, ExecutableAllocationId};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
