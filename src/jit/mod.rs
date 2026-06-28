@@ -3,8 +3,20 @@
 //! This module intentionally reserves the shape of JIT-visible execution state
 //! without generating code, interpreting bytecode, patching entrypoints, or
 //! defining a JavaScript execution path.
+//!
+//! ## Unsafe boundary
+//!
+//! `#![deny(unsafe_code)]` (not `forbid`) holds for the whole `jit/` tree, with
+//! exactly ONE module — [`unsafe_platform_boundary`] — overriding it with
+//! `#![allow(unsafe_code)]`. That module is the only place raw pointers, FFI, the
+//! W^X (`MAP_JIT` / `pthread_jit_write_protect_np` / `sys_icache_invalidate`)
+//! primitives, and the fn-pointer transmute live. Everything else under `jit/`
+//! (including [`executable_allocator`], which copies, relocates, seals, and calls
+//! real machine code) stays safe and reaches execution only through that
+//! boundary's sealed-safe wrappers. `deny` (vs `forbid`) is what lets the single
+//! boundary module re-enable unsafe locally, mirroring `platform/mod.rs`.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub(crate) mod abi;
 pub(crate) mod arm64_baseline;
@@ -14,6 +26,7 @@ pub(crate) mod disassembly;
 pub(crate) mod emission;
 pub(crate) mod emitter;
 pub(crate) mod executable;
+pub mod executable_allocator;
 pub(crate) mod generated_metrics;
 pub(crate) mod ic;
 pub(crate) mod integration;
@@ -27,6 +40,13 @@ pub(crate) mod semantics;
 #[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) mod stub_routines;
 pub(crate) mod tiering;
+// The single unsafe boundary for the JIT tree: Apple-Silicon W^X executable
+// memory (MAP_JIT + pthread_jit_write_protect_np + sys_icache_invalidate). The
+// only `#![allow(unsafe_code)]` under `jit/`. The module is `pub` so its error
+// type (`JitBoundaryError`) is publicly nameable through
+// `ExecutableAllocationError::Platform`; the raw `JitRegion` owner stays
+// `pub(crate)` and is never exposed.
+pub mod unsafe_platform_boundary;
 pub(crate) mod watchpoint;
 
 pub use abi::{
@@ -123,6 +143,10 @@ pub use executable::{
     ExecutableAllocationRecord, ExecutableAllocationRequest, ExecutableLedgerValidationError,
     LinkBufferCopyLinkOutcome, LinkBufferCopyLinkRecord, LinkBufferCopyLinkRequest,
     LinkBufferFinalizationOutcome, LinkBufferFinalizationRecord, LinkBufferFinalizationRequest,
+};
+pub use executable_allocator::{
+    finalize_arm64_link_buffer, ExecutableAllocationError, ExecutableAllocator,
+    ExecutableMemoryHandle, FixedCapacityExecutableAllocator, MapJitExecutableAllocator,
 };
 pub use generated_metrics::BaselineGeneratedPropertyLoadSidecarReadiness;
 pub use ic::{
