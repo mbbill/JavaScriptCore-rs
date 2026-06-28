@@ -363,6 +363,29 @@ bounded snapshot of WHERE EACH SUBSYSTEM STANDS, not a history of what happened.
   next; the choice of next priority is re-verified separately (see the
   anti-anchor MUST and Strategic Cadence), never read off the tree as settled.
 
+### Tracking & Recovery layout (the REPO is self-sufficient for recovery)
+
+The repo — not the agent's private cross-session memory — is the durable, shared,
+version-controlled source of truth. A fresh session (or a teammate on a clean
+clone, or the project owner) MUST be able to recover where-we-are, what's-next,
+and why from the repo ALONE. Read order:
+
+1. `CLAUDE.md` — the contract (this file): method, roles, principles, read-order.
+2. `README.md` — the bounded current-status snapshot (scoreboard + condensed
+   per-subsystem status + pointers).
+3. `docs/ROADMAP.md` — the PLAN: the JIT-anchored dependency order, the % workload
+   tracker, keystone status, and what's next + why. (README = status; ROADMAP =
+   plan. Keep the plan here, not in the bounded README.)
+4. `docs/design/*.md` — durable keystone DESIGNS (e.g. `jsstack.md`, `gc-r4.md`,
+   `scoreboard.md`): the settled architecture decisions + their evidence.
+5. `git log` — the decision log (detailed per-batch evidence; durable history).
+
+The agent's file-based memory is a FAST-RECALL CACHE that points INTO these repo
+docs and holds operational lessons — it is NEVER the sole home of project status,
+the plan, or a keystone design. When a strategic decision or keystone design is
+settled, write it to `docs/` (in-repo), not only to memory. (`mcts_mem/` remains
+read-only JSC authority, separate from all of this — see Source-of-Truth Rules.)
+
 ## PAUSE & Re-Evaluate
 
 Pause means leave the current local path, preserve evidence, and choose a
@@ -431,8 +454,9 @@ After resume or compaction:
    current plan against all four (global JIT view, correct-don't-optimize-around
    divergences, fan out massively, mcts-mem read-only).
 2. Inspect `git status --short` and recent commits.
-3. Read `README.md` for current per-subsystem status; it is the
-   maintained tracker — rely on it, and correct it as you learn more.
+3. Read `README.md` (current status), then `docs/ROADMAP.md` (the plan + %
+   tracker + what's next) and the relevant `docs/design/*.md` (keystone designs);
+   these are the maintained, in-repo trackers — rely on them, correct as you learn.
 4. Decide whether to run a fresh strategic-assessment workflow to re-derive the
    highest-value unblocked dependency — the one thing the tracker does not
    settle, and the place where inherited priorities must be re-verified.

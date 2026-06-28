@@ -1,170 +1,110 @@
-# JSC Rewrite Status Tree
+# Rust JavaScriptCore — Status
 
-Current compact status source for the Rust JavaScriptCore rewrite. Hard ceiling
-~200 lines; update only affected lines in accepted batches. Detailed decisions,
-evidence, and measurements belong in git commit messages, not this file.
+A faithful C++→Rust rewrite of JavaScriptCore. **Goal:** JetStream 3 Octane
+parity with local C++ `jsc` — `R = geomean(Rust)/geomean(C++ jsc) ≥ 1.0`, same
+machine/inputs/scoring, all 15 benches passing first. **R is undefined until all
+15 complete + validate** (zero throws / wrong answers); a partial suite yields no
+geomean and parity must not be claimed.
 
-Legend:
+**Recovery / where to read (a fresh session reads these, in order):**
+1. `CLAUDE.md` — the contract (method, roles, principles, this read-order).
+2. `README.md` (this file) — current status snapshot (bounded ~200 lines).
+3. `docs/ROADMAP.md` — the plan: JIT-anchored dependency order + the % workload
+   tracker + keystone status + what's next and why.
+4. `docs/design/*.md` — durable keystone designs (JSStack, GC/R4, the scoreboard).
+5. `git log` — the decision log (detailed per-batch evidence; the durable history).
 
-- [done] implemented and verified for the stated scope
-- [wip] partially implemented or actively being expanded
-- [missing] not implemented enough to rely on
-- [blocked] blocked by the named dependency
-- [risk] exists but needs fidelity or structure review
-- [deferred] intentionally later than the current path
-- [frozen] quarantined dead code retained as salvage; not on the active path
+The scoreboard instrument: `tools/octane-parity/run_cpp_baseline.sh` (C++ jsc) +
+`run_rust_baseline.sh` (Rust), both through the identical Octane harness. The C++
+baseline is re-measured on the machine, never assumed.
 
-```text
-ACTIVE ROADMAP (validated, profiling-earned; default path = InterpreterOnly; status 2026-06-27):
-  Phase A [done]   de-anchor + quarantine (c8e83ad): ARM64 admission cluster gated off-by-default.
-  Phase B [done]   per-bench profiling -> GC-first earned (per-op bookkeeping was 50-99% self-time).
-  Phase C [wip]    GC-first tax removal -- DONE: barrier elision (db23cbd), safepoint register-rooting
-                 (830b686) + frame-rooting (9fdc938) = richards ~7.5x; O(1) cell-record lookup + FxHash
-                 maps (3f8ee9b); JSCell type-header = Route B S1 (6e96182). Abstract-equality fix lands
-                 pdfjs (e499fd9). 8/15 score (was 3).
-  Phase C-BLOCKED  Route B cell-deref (S2) + the real mark/sweep collector are BLOCKED on S4 (a
-                 provenance-stable Heap-owned arena): the carried int->ptr cell deref is miri-proven UB
-                 (Stacked+Tree Borrows) in the current Vec<Pin<Box>> skeleton, and a sweeping collector
-                 breaks the dense CellId index. S4 = the irreversible, pervasively-unsafe gate -> OWNER.
-  Phase B2 [pending] local C++ JSC same-machine comparison harness (parity-gap; jsc build by owner).
-  Phase D [deferred] real machine-code baseline JIT (MacroAssemblerARM64 + ExecutableAllocator).
-  Phase E [wip]   megafile split by JSC runtime/ boundaries: interpreter/mod.rs 41k->33k, ALL 4
-                 runtime-class stores extracted to interpreter/{string,bigint,symbol,object}_store.rs
-                 (B1-B4 done, pure byte-exact code-motion, gates green). Stores isolated -> the cutovers
-                 (Structure-wire + R3 in object_store, StringImpl-swap in string_store) can now run in
-                 parallel. Remaining: interpreter-core split (E.2, non-blocking); vm/mod.rs (74k).
-  Phase F [blocked] DFG/FTL/B3 optimizing tier -- where suite-SCORE parity ultimately lives.
-  Phase G [parallel] Yarr/RegExp (regexp throw on lookahead + \b correctness).
-  NEAR-TERM LEVERS (profiling-earned, faithful, owner-overseen): (1) call-link tiering PER-CALLSITE
-                 refactor -- bound the unbounded O(N^2) logs to JSC CallLinkInfo -> lands earley-boyer +
-                 typescript (-> 10/15); (2) string rep UTF-8 -> WTF::StringImpl Latin-1/UTF-16 -> ~10x
-                 pdfjs + all string-heavy benches; (3) gbemu/Box2D value-divergence BUGS (need jsc compare).
+---
 
-[wip] Faithful foundation rebuild (JIT-anchored; all UNWIRED behind dead_code until Phase E cutovers)
-  [done] value -> JSVALUE64 NaN-boxing (lossless double + immediates); raw-cell cfg-fork s4_raw_cell
-  [done] S4 cell arena: MarkedSpace/MarkedBlock/BlockDirectory/FreeList/PreciseAllocation (miri-proven)
-  [done] SlotVisitor STW marking core (mark-stack drain + visitChildren) -- collector RUN-gated R3/R4
-  [done] Structure: leaf ports (PropertyOffset/IndexingType/TransitionTable/PropertyTable) + Structure
-         cell (StructureID/StructureIdTable/TypeInfoBlob) -- NEW module beside the live DSL
-  [done] StringImpl Stage A (8/16-bit Latin-1/UTF-16, O(1) index)
-  [done] profiling fuel: ArithProfile + ExecutionCounter (faithful packed bitfields, profiling.rs) +
-         SpeculatedType uint64 bitset (new module) -- counter/speculation canonicalization is serial
-  [done] assembler+codegen: the engine EMITS + RELOCATES + EXECUTES ARM64 machine code under W^X.
-         AbstractMacroAssembler operands/RegisterID + ARM64 encoder (byte-oracle-proven, b1394b6) +
-         LinkBuffer Label/Jump/Call + byte-exact in-place relocation (ff3191b) + W^X exec memory
-         (af822c3: MAP_JIT + pthread_jit_write_protect, emit->finalize->call returns 42, unsafe scoped
-         to jit/unsafe_platform_boundary.rs; forbid->deny). The codegen->execution path is PROVEN.
-  [done] bytecode: faithful packed instruction-stream core (Vec<u8>, byte-offset index, Narrow/Wide16/
-         Wide32 width, size()-advance) -- replacement-in-waiting for the typed-Vec-by-ordinal divergence
-  [missing] A RUNNING baseline JIT now needs: wire arm64_baseline to emit per-opcode via the encoder+
-         finalize (retire the byte blobs); the bytecode-stream cutover it lowers from; profiling wiring;
-         and the OWNER-GATED keystones -- R4 (arena cell identity / the GC the JIT assumes) + the JSStack
-         execution substrate (native-stack vs Vec<Register> fork). R stays ~0.001 until the JIT runs.
+## Scoreboard (2026-06-28, iters=2/wc=1) — the only thing that defines "done"
 
-[wip] JetStream 3 Octane parity
-  [done] Runner/benchmark contract: JetStreamDriver load order, shell globals, iteration,
-         validation, scoring, telemetry, probe command surface
-  [wip]  R SCOREBOARD (2026-06-28, both engines through tools/octane-parity/{run_cpp_baseline,run_rust_
-         baseline}.sh, IDENTICAL harness, iters=2/wc=1): R is UNDEFINED -- the completion+validation gate
-         is NOT met, so the suite yields no geomean and parity MUST NOT be claimed. 12/15 Rust complete+
-         validate; 3 FAIL: mandreel + octane-zlib (asm.js, DNF/timeout under the interpreter), typescript
-         (completes ~202s but THROWS the latent generated-direct-call bug -> a correctness failure, NOT
-         "0 throwers"). C++ jsc baseline re-measured all 15 (crypto 1611, richards 1240, ... typescript 36,
-         zlib 38). Per-bench r_i = Rust/C++ on the 12 completing: 5e-4..0.06; compute-bound 5e-4..2e-3
-         (500-6000x slower) -> QUANTIFIED proof parity is JIT-gated. The gate ITSELF is JIT-gated (asm.js).
-  [done] Rust per-bench scores (12 complete, iters=2): code-load 57.9, navier 2.37, crypto 2.07, regexp
-         1.77, richards 0.92, pdfjs 0.85, splay 0.65, delta-blue 0.55, earley-boyer 0.36, Box2D 0.31,
-         gbemu 0.13, raytrace 0.12. (vs C++ jsc: code-load 962, crypto 1612, ... raytrace 690.)
-  [missing] GATE-BLOCKING (3): mandreel + octane-zlib (asm.js -- DNF/timeout under the interpreter, need
-         the JIT to COMPLETE); typescript (string-op bound AND a latent generated-direct-call THROW exposed
-         once sped up to ~202s -- a correctness bug to fix + speed). The completion gate is JIT-gated.
-  [done] THROWERS fixed (the original 3, via faithful C++-verified corrections): regexp -- faithful Yarr
-         engine wired + simple_exec deleted, bench checksum validates, byte-identical to jsc across 24650
-         ops (7c56113). Box2D (Number/Math constants 1983a63). gbemu (new Function 6e542ee). pdfjs (ToPrim).
-         call-link per-site rewire (B2+B3, 6c29a30) landed earley-boyer (>31min-DNF -> 34s) + Box2D.
-  [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
-         __defineGetter__/Setter__, global Function, Math, apply/bind, globals
-  [missing] Octane score parity with local C++ JSC (needs Phases C-F)
+**R = UNDEFINED.** Completion gate not met: 3/15 fail. 12/15 Rust complete+validate.
 
-[frozen] ARM64 native-entry admission-proof state machine
-  (src/vm/native_reentry/arm64_*, src/vm/arm64_native_entry/, gc proof cluster): never admits,
-  zero bench movement, quarantined behind cfg(feature="arm64_native_entry_proof") off-by-default;
-  gated GC/stub modules retained as baseline-JIT/GC salvage -- see git log.
+- **PASS (12)** `r_i = Rust/C++`: code-load 0.060 · regexp 2.4e-3 · navier 2.0e-3 ·
+  crypto 1.3e-3 · gbemu 9.7e-4 · splay 9.2e-4 · richards 7.4e-4 · Box2D 6.8e-4 ·
+  earley-boyer 5.4e-4 · delta-blue 5.2e-4 · pdfjs 3.3e-3 · raytrace 1.7e-4.
+  Partial geomean ≈ 1.3e-3. (C++ jsc baseline: crypto 1611, richards 1240, navier
+  1184, delta-blue 1072, code-load 962, regexp 750, splay 700, raytrace 690,
+  earley-boyer 663, Box2D 462, pdfjs 261, gbemu 136, typescript 36, zlib 38.)
+- **FAIL (3, all JIT-gated):** mandreel + octane-zlib (asm.js — DNF/timeout under the
+  interpreter; need the JIT to *complete*); typescript (a latent **pure-interpreter
+  value-divergence** throw — `TypeError: undefined is not an object` in the TS
+  compiler; correctness bug, and also too-slow).
 
-[wip] C++ JSC structural fidelity
-  [done] VM cluster extractions mapped to C++: call_link.rs (CallLinkInfo/JITCall),
-         property_handoff.rs (JITPropertyAccess), generated_executor.rs (CodeBlock entry),
-         jit/arm64_baseline.rs + submodules (MacroAssemblerARM64; behavior unchanged)
-  [risk] existing Rust-only files/types need dedicated structure review
-  [wip]  vm/mod.rs (74k) still oversized; interpreter/mod.rs 41k->33k (Phase E B1-B4 done: all 4
-         runtime-class stores split to interpreter/*_store.rs by JSC runtime/ boundary)
-  [done] compact status tree is current status source
+**Verdict (proven, not asserted):** compute-bound `r_i` sit at 5e-4–2e-3 (~500–6000×
+slower than C++). The gap — and the completion gate itself (asm.js) — is **gated on
+the optimizing JIT**. The interpreter cannot reach a defined R, let alone parity.
 
-[wip] Parser and bytecompiler
-  [done] source session/identifier groundwork; labels, named break/continue, for-in, sequence
-         exprs; string escape cooking; selected TypeScript syntax
-  [wip]  large-program parser pressure; TypeScript parser-prefix bytecode shape
-  [done] core statement/expression lowering; LoopHint at JSC loop-body OSR headers
-  [missing] complete C++ parser parity; C++ ToNumeric/Inc lowering; full lowering parity audit
+## Progress — ~40% by effort (full table in docs/ROADMAP.md)
 
-[wip] Runtime semantics
-  [wip] objects/structures/properties/prototypes
-    [done] shared add-property StructureTransitionTable (siblings share structure_id, mirrors
-           C++ Structure transitions); offset-indexed Butterfly storage (out_of_line_storage,
-           getDirect/locationForOffset) lockstep w/ authoritative HashMap; INLINE_CAPACITY=0
-    [done] ordinary object ToPrimitive ordering for current relational path
-    [missing] full structure/watchpoint invalidation; dictionary/override/static-class predicates
-  [wip] property access and inline caches
-    [done] interpreter LLInt monomorphic GetByName/PutByName IC (GetByIdModeMetadata mirror)
-    [done] generated-entry depth-1 GuardedPrototypeData holder loads (C++ GetByIdPrototype DataIC)
-    [done] resident self-load + prototype-chain get_by_id DataIC machine code (CORRECT but
-           unreached: emitted on FUNCTION bodies that never run generated)
-    [missing] full Get/Put/In AccessCase taxonomy (multi-hop, transition, megamorphic)
-  [wip] calls, constructs, and function values
-    [done] direct-call/generated-call paths, callee preparation (mirrors C++ linkFor
-           prepareForExecution), auto-materialization/invalidation telemetry, sidecar projection
-           cache, call-link setup payloads (C++ JITCall.cpp shape)
-    [risk] baseline generated path is a bytecode RE-INTERPRETER, not machine code -> Phase C
-    [missing] full CallLinkInfo/function-executable fidelity; constructor/new-target breadth
-  [wip] arrays: basic indexed reads/writes + array profile; [missing] full ArrayProfile/ArrayMode,
-        indexed IC breadth
-  [wip] strings: selected TS helpers, UTF-16 subset, RegExp-backed replace/split; [missing] full
-        String.prototype + rope/string representation
-  [wip] RegExp/Yarr: TS AMD-dependency subset, simple executor; [missing] full Yarr
-        parse/execute/Unicode, RegExp JIT -> Phase G
-  [wip] typed arrays: 8 Number-content constructors (Int8..Float64); subarray/ArrayBuffer pending
-  [wip] Number autoboxing: toString(radix)/valueOf/wrapper construction done; [missing] Boolean
-        toString/valueOf
-  [wip] Array.prototype for array-likes: slice.call/toString done; [risk] other methods may not
-        support non-Array this
-  [wip] functions/globals: call/apply/bind (BoundFunction), global Function ctor, isFinite/isNaN,
-        NaN/Infinity/parseFloat; [missing] new Function(string) dynamic compile
-  [wip] Math: abs/floor/log/max/min/pow/random/sqrt/trunc + trig + ceil/round/sign/exp family;
-        [missing] clz32/fround/imul edge fidelity
-  [missing] Date, modules/jobs/microtasks/async ordering; [deferred] Wasm
+Done: interpreter/runtime/parser/builtins (12/15 validate), the faithful foundation
+(value/GC-arena/Structure/strings/profiling/bytecode), all 3 original throwers fixed,
+the call-link O(N²)→O(1) correction, and the **full assembler codegen layer — the
+engine emits, relocates, and executes ARM64 machine code under W^X**. The R scoreboard
+exists. To do (~60%, all parity-bearing, ~0% started): the JIT — JSStack substrate
+cutover + GC/R4 (the GC the JIT assumes) + the **baseline JIT** (per-opcode codegen) +
+**DFG** + **FTL/B3**. The baseline JIT is where R first moves off ~0.001; DFG+FTL take
+it to ≥1.0. See docs/ROADMAP.md.
 
-[deferred -> Phase C/F] Execution tiers and JIT
-  [done] stable CodeBlock identity (C++ single CodeBlock*): memoized fingerprint + Rc-shared
-  [done] baseline machine-code groundwork (number/move/jump subset, get_by_id DataIC, retained
-         exits, LoopHint handoff) -- ALL on the re-interpreter shim path; CORRECT but unreached
-  [risk] baseline is a Rust bytecode RE-INTERPRETER (no register allocation); real reg-alloc and
-         the absent optimizing tiers own score parity
-  [missing] CRITICAL PATH: call-dispatch-into-generated -> mc put_by_id/call/construct/get_by_val
-         -> slow-case rejoin -> inline alloc -> real reg-alloc; then DFG/FTL/B3 (Phase F)
+---
 
-[wip] GC, rooting, barriers, and handles  <- Phase C, NOW THE ACTIVE PRIORITY (profiling: per-op
-      rooting/barrier/heap-binding bookkeeping is ~50-99% of self-time on 4/5 profiled benches)
-  [done] bytecode root maps; targeted-root sync gated on register cell-membership; register/stack
-         stores not barriered (C++ barriers only heap fields); VM-owned interpreter root scope
-  [risk] per-op targeted-root REGISTRY (HashMap insert per dispatch) vs C++ conservative-scan-at-
-         safepoint -- the dominant self-time tax; unbounded write-barrier Vec (heap.rs:847-876)
-         records into a Vec nothing consumes; payload->cell HashMap identity bridge (bind_object_to_heap)
-  [missing] no GC collection runs (heap.rs:603-636 never collects, unbounded growth); safepoints +
-            conservative stack scan; inline/elided write barriers; direct cell pointers; full
-            moving/marking GC; finalization/weak/ephemerons; rooting audit
+## Subsystem status (condensed; legend below)
 
-[wip] Verification and integration discipline
-  [done] focused Rust gates; macOS arm64 bring-up gate (x86_64 P6 entries guarded non-callable on
-         arm64); subagent reviewer flow; one-logical-commit boundary
-  [missing] local C++ JSC same-machine comparison harness for parity claims -> Phase B
-```
+**Octane harness & correctness**
+- [done] JetStreamDriver load order, shell globals, iteration, validation, scoring, probe surface.
+- [done] All 3 original throwers fixed (faithful, C++-verified): regexp (full Yarr engine wired,
+  simple_exec deleted, checksum validates), Box2D (Number/Math constants), gbemu (`new Function`),
+  pdfjs (abstract-equality ToPrimitive). call-link per-site rewire landed earley-boyer + Box2D.
+- [missing] typescript pure-interpreter value-divergence throw (differential-trace vs jsc to localize).
+
+**Faithful foundation (built; mostly unwired behind dead_code)**
+- [done] value → JSVALUE64 NaN-boxing (lossless double + immediates).
+- [done] S4 cell arena (MarkedSpace/MarkedBlock/BlockDirectory/FreeList/PreciseAllocation, miri-proven)
+  + SlotVisitor STW marking core — collector RUN-gated on R3/R4.
+- [done] Structure leaf ports + Structure cell (StructureID/StructureIdTable/TypeInfoBlob/PropertyTable).
+- [done] StringImpl Stage A (8/16-bit Latin-1/UTF-16, O(1) index).
+- [done] profiling: ArithProfile + ExecutionCounter (faithful bitfields) + SpeculatedType u64 bitset.
+- [done] bytecode: faithful packed instruction-stream core (Vec<u8>, byte-offset index, width-aware).
+
+**Assembler / codegen (PROVEN end-to-end: emit → relocate → execute)**
+- [done] AbstractMacroAssembler operands + RegisterID + ARM64 encoder (byte-oracle-proven).
+- [done] LinkBuffer Label/Jump/Call + byte-exact in-place relocation.
+- [done] W^X executable memory (MAP_JIT + pthread_jit_write_protect; emit→finalize→call returns 42);
+  unsafe scoped to jit/unsafe_platform_boundary.rs (forbid→deny).
+
+**JSStack execution substrate (the running JIT's frame model; native-thread-stack — see docs/design)**
+- [done] B1 types + offset table + provenance gate; B2 live arena reservation + entry seeding + stack
+  guard (byte-identity cross-check vs the live model passes). Fixed the jit/abi.rs callee-slot defect.
+- [missing] B3 dual-write bridge → B4/B6 megafile read-flip + CallFrameId retirement → B7 wire the encoder.
+
+**GC / value cutover (toward R4 — the arena cell identity the JIT emits)**
+- [done] the arena + marking core (above), unwired.
+- [missing] POD object-model rewrite (retire the fat CoreObjectCell) → R3 shadow oracle → R4 flip
+  (gate = technical verification: shadow cross-check + miri + adversarial verify) → running collector.
+
+**Baseline JIT / DFG / FTL (parity lives here; ~0% started)**
+- [missing] wire arm64_baseline to emit per-opcode via the encoder/finalize (retire the byte-blob /
+  re-interpreter shim) + the bytecode-stream cutover + profiling wiring + tier-up.
+- [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
+
+**Structural fidelity**
+- [done] Phase E: interpreter/mod.rs 41k→33k, all 4 runtime-class stores split to interpreter/*_store.rs.
+- [wip] vm/mod.rs (74k) still oversized; existing Rust-only files/types need dedicated structure review.
+
+**Runtime semantics (interpreter-level, broadly working for Octane)**
+- [done] objects/structures/transitions/Butterfly; LLInt monomorphic Get/Put ICs; calls/constructs/
+  BoundFunction; typed arrays (8 Number ctors); Math/Number/String/Array breadth; Yarr regexp engine.
+- [missing] full AccessCase taxonomy (multi-hop/transition/megamorphic); full ArrayProfile/ArrayMode;
+  full String.prototype + ropes; Date, modules/microtasks; [deferred] Wasm.
+
+**[frozen]** ARM64 native-entry admission-proof cluster (cfg off-by-default; retained as JIT/GC salvage).
+
+---
+
+Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/expanding ·
+`[missing]` not yet reliable · `[risk]` exists, needs fidelity/structure review ·
+`[deferred]` intentionally later · `[frozen]` quarantined salvage.
