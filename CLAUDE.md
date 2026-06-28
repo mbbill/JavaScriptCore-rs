@@ -170,8 +170,10 @@ Main Agent MUST:
   translation, and either unblocking, delegating more audit/review, deferring,
   or rejecting the approach.
 - MUST own the serial integration/commit boundary: review, gate, and commit.
-- MUST maintain `README.md` as the compact current status source
-  and use git commit messages as the durable progress and decision log.
+- MUST maintain the in-repo trackers as the current status source — `README.md`
+  (the human progress dashboard), `docs/STATUS.md` (per-subsystem status),
+  `docs/ROADMAP.md` (the plan) — and use git commit messages as the durable
+  progress and decision log.
 
 Main Agent MUST NOT:
 
@@ -337,14 +339,19 @@ and commit boundaries.
 - The commit message is the durable decision log: C++ evidence, what changed,
   why this dependency was chosen, ownership/architecture decisions,
   tests/probes, and remaining risk or next blocker.
-- Update `README.md` only on the lines an accepted batch affects,
-  and keep it within its size budget (see Status Tree). Detailed decisions
-  belong in commit messages, not the tree.
+- Update the in-repo trackers only on the lines an accepted batch affects
+  (`docs/STATUS.md` per-subsystem; `README.md` when the human-facing scoreboard/%
+  move; `docs/ROADMAP.md` when the plan changes), and keep each within its size
+  budget (see Status Tree). Detailed decisions belong in commit messages, not the
+  trackers.
 
 ## Status Tree
 
-`README.md` is the project's controlled-size progress tracker: a
+`docs/STATUS.md` is the project's controlled-size per-subsystem status tracker: a
 bounded snapshot of WHERE EACH SUBSYSTEM STANDS, not a history of what happened.
+(`README.md` is the HUMAN-facing progress dashboard — the scoreboard, the %
+workload tracker, what's-next — kept readable for the owner at a glance; keep the
+detailed per-subsystem tree in `docs/STATUS.md`, the plan in `docs/ROADMAP.md`.)
 
 - CONTROLLED SIZE: it has a hard ceiling of ~200 lines and MUST stay under it.
   When an accepted batch would push it past the ceiling, prune or collapse
@@ -371,14 +378,14 @@ clone, or the project owner) MUST be able to recover where-we-are, what's-next,
 and why from the repo ALONE. Read order:
 
 1. `CLAUDE.md` — the contract (this file): method, roles, principles, read-order.
-2. `README.md` — the bounded current-status snapshot (scoreboard + condensed
-   per-subsystem status + pointers).
+2. `README.md` — the HUMAN progress dashboard (scoreboard + % workload tracker +
+   what's-next + pointers); readable at a glance, not a dense tree.
 3. `docs/ROADMAP.md` — the PLAN: the JIT-anchored dependency order, the % workload
-   tracker, keystone status, and what's next + why. (README = status; ROADMAP =
-   plan. Keep the plan here, not in the bounded README.)
-4. `docs/design/*.md` — durable keystone DESIGNS (e.g. `jsstack.md`, `gc-r4.md`,
-   `scoreboard.md`): the settled architecture decisions + their evidence.
-5. `git log` — the decision log (detailed per-batch evidence; durable history).
+   tracker, keystone status, and what's next + why.
+4. `docs/STATUS.md` — the agent's per-subsystem status tree (detailed current state).
+5. `docs/design/*.md` — durable keystone DESIGNS (e.g. `jsstack.md`, `scoreboard.md`):
+   the settled architecture decisions + their evidence.
+6. `git log` — the decision log (detailed per-batch evidence; durable history).
 
 The agent's file-based memory is a FAST-RECALL CACHE that points INTO these repo
 docs and holds operational lessons — it is NEVER the sole home of project status,
@@ -442,8 +449,9 @@ phases — never inside a parallel agent. Consume structured results, not
 transcripts, to preserve context. Workflows never auto-commit: review the diffs,
 run the gates, and integrate one logical commit per batch. Use commit messages
 as the durable decision log — why the dependency was chosen, what changed,
-ownership/architecture decisions, tests/probes, and the next blocker. Keep
-README.md as the compact status source.
+ownership/architecture decisions, tests/probes, and the next blocker. Keep the
+in-repo trackers current — README.md (human dashboard), docs/STATUS.md
+(per-subsystem), docs/ROADMAP.md (the plan) — so the repo alone is recoverable.
 ```
 
 ## Main-Agent Resume Checklist
@@ -454,9 +462,10 @@ After resume or compaction:
    current plan against all four (global JIT view, correct-don't-optimize-around
    divergences, fan out massively, mcts-mem read-only).
 2. Inspect `git status --short` and recent commits.
-3. Read `README.md` (current status), then `docs/ROADMAP.md` (the plan + %
-   tracker + what's next) and the relevant `docs/design/*.md` (keystone designs);
-   these are the maintained, in-repo trackers — rely on them, correct as you learn.
+3. Read `README.md` (human dashboard), then `docs/ROADMAP.md` (the plan + %
+   tracker + what's next), `docs/STATUS.md` (per-subsystem status), and the relevant
+   `docs/design/*.md` (keystone designs); these are the maintained, in-repo
+   trackers — rely on them, correct as you learn.
 4. Decide whether to run a fresh strategic-assessment workflow to re-derive the
    highest-value unblocked dependency — the one thing the tracker does not
    settle, and the place where inherited priorities must be re-verified.
