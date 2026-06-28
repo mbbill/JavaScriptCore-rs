@@ -28,14 +28,26 @@ ACTIVE ROADMAP (validated, profiling-earned; default path = InterpreterOnly; sta
                  breaks the dense CellId index. S4 = the irreversible, pervasively-unsafe gate -> OWNER.
   Phase B2 [pending] local C++ JSC same-machine comparison harness (parity-gap; jsc build by owner).
   Phase D [deferred] real machine-code baseline JIT (MacroAssemblerARM64 + ExecutableAllocator).
-  Phase E [planned] structural refactor: split vm/mod.rs (74k) + interpreter/mod.rs (42k) -- owner to
-                 guide module boundaries.
+  Phase E [wip]   megafile split by JSC runtime/ boundaries: interpreter/mod.rs 41k->39.9k, runtime-
+                 class stores extracted to interpreter/{string,bigint,symbol}_store.rs (B1-B3, pure
+                 byte-exact code-motion, gates green); B4 object_store (Structure-wiring + R3 target)
+                 next; then vm/mod.rs (74k). Unblocks the foundation cutovers.
   Phase F [blocked] DFG/FTL/B3 optimizing tier -- where suite-SCORE parity ultimately lives.
   Phase G [parallel] Yarr/RegExp (regexp throw on lookahead + \b correctness).
   NEAR-TERM LEVERS (profiling-earned, faithful, owner-overseen): (1) call-link tiering PER-CALLSITE
                  refactor -- bound the unbounded O(N^2) logs to JSC CallLinkInfo -> lands earley-boyer +
                  typescript (-> 10/15); (2) string rep UTF-8 -> WTF::StringImpl Latin-1/UTF-16 -> ~10x
                  pdfjs + all string-heavy benches; (3) gbemu/Box2D value-divergence BUGS (need jsc compare).
+
+[wip] Faithful foundation rebuild (JIT-anchored; all UNWIRED behind dead_code until Phase E cutovers)
+  [done] value -> JSVALUE64 NaN-boxing (lossless double + immediates); raw-cell cfg-fork s4_raw_cell
+  [done] S4 cell arena: MarkedSpace/MarkedBlock/BlockDirectory/FreeList/PreciseAllocation (miri-proven)
+  [done] SlotVisitor STW marking core (mark-stack drain + visitChildren) -- collector RUN-gated R3/R4
+  [done] Structure: leaf ports (PropertyOffset/IndexingType/TransitionTable/PropertyTable) + Structure
+         cell (StructureID/StructureIdTable/TypeInfoBlob) -- NEW module beside the live DSL
+  [done] StringImpl Stage A (8/16-bit Latin-1/UTF-16, O(1) index)
+  [wip]  profiling fuel (ArithProfile/ExecutionCounter/SpeculatedType bitset) -- in flight
+  [missing] WIRING is gated on Phase E (megafile split) -> R3/R4 arena cutover -> Structure-wire -> JIT
 
 [wip] JetStream 3 Octane parity
   [done] Runner/benchmark contract: JetStreamDriver load order, shell globals, iteration,
@@ -63,7 +75,8 @@ ACTIVE ROADMAP (validated, profiling-earned; default path = InterpreterOnly; sta
          property_handoff.rs (JITPropertyAccess), generated_executor.rs (CodeBlock entry),
          jit/arm64_baseline.rs + submodules (MacroAssemblerARM64; behavior unchanged)
   [risk] existing Rust-only files/types need dedicated structure review
-  [risk] vm/mod.rs (74k) + interpreter/mod.rs (42k) oversized -> Phase E split
+  [wip]  vm/mod.rs (74k) still oversized; interpreter/mod.rs 41k->39.9k (Phase E B1-B3: 3/4 runtime-
+         class stores split to interpreter/*_store.rs by JSC runtime/ boundary; B4 object_store next)
   [done] compact status tree is current status source
 
 [wip] Parser and bytecompiler
