@@ -56,10 +56,14 @@
 //! operations that C++ writes as `static Structure*` methods taking a
 //! `Structure*` are ported as [`StructureIdTable`] methods taking a handle.
 //!
-//! STANDALONE / NOT WIRED. Like the four leaf ports, this is the faithful
-//! reference: it is not yet a dependency of the interpreter's Rust-only DSL
-//! (`object/structure.rs`), which remains the live shape model until the
-//! megafile cutover. `#![allow(dead_code)]` documents the awaiting-wire state.
+//! WIRED (gc-r4 Batch 2): the interpreter's `CoreObjectStore` now mounts a
+//! [`StructureIdTable`] as the SINGLE structure-id + property-offset authority
+//! (replacing the per-cell `property_offsets`/`next_property_offset` divergence);
+//! named-property offsets flow from `add_property_transition`/`materialize_property
+//! _table` here. The Rust-only shape DSL (`object/structure.rs`) is a separate,
+//! still-standalone descriptor surface. `#![allow(dead_code)]` is retained because
+//! several faithful accessors (TypeInfoBlob getters, indexing helpers) have no
+//! interpreter consumer YET; they stay as the faithful reference.
 #![allow(dead_code)]
 
 use super::indexing_type::{
@@ -270,6 +274,13 @@ impl PrototypePointer {
 /// `Debug` is hand-written (not derived) because the committed `PropertyTable`
 /// leaf port does not implement `Debug` and must not be edited from this unit;
 /// the impl reports whether a table is materialized rather than its contents.
+///
+/// `Clone` is derived (now that `PropertyTable`/`StructureTransitionTable` are
+/// `Clone`) so the [`StructureIdTable`] can be cloned wholesale — the interpreter's
+/// `CoreObjectStore` snapshot/test path deep-clones the structure registry, and
+/// every cell's `StructureID` handle stays valid because the clone preserves slot
+/// order.
+#[derive(Clone)]
 pub struct Structure {
     /// `StructureID id()` is `StructureID::encode(this)` in C++ (Structure.h:252).
     /// In the registry model the handle is assigned by [`StructureIdTable::
@@ -573,7 +584,7 @@ impl Structure {
 /// addresses `structures[n - 1]`. Because the cells live here and reference each
 /// other by handle, the `static Structure*` transition/materialization methods of
 /// C++ are ported as methods on this table.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct StructureIdTable {
     structures: Vec<Structure>,
 }
@@ -809,11 +820,18 @@ impl StructureIdTable {
             };
             match structure.transition_kind {
                 TransitionKind::PropertyAddition => {
-                    // PropertyTableEntry entry(name, transitionOffset(), transitionPropertyAttributes());
+                    // auto nextOffset = table->nextOffset(structure->inlineCapacity());
                     // ASSERT(nextOffset == structure->transitionOffset());
+                    // nextOffset() is SIDE-EFFECTING: it advances the allocator
+                    // state by popping the PropertyTable m_deletedOffsets recycle
+                    // stack (PropertyTable::nextOffset -> takeDeletedOffset), so it
+                    // MUST run in release too -- it is not merely an assertion.
+                    // Wrapping it in debug_assert_eq! would elide the pop in the
+                    // release/parity build, leaking a freed offset onto a live
+                    // property and clobbering the value-storage mirror.
+                    let next_offset = table.next_offset(structure.inline_capacity as i32);
                     debug_assert_eq!(
-                        table.next_offset(structure.inline_capacity as i32),
-                        structure.transition_offset,
+                        next_offset, structure.transition_offset,
                         "replayed nextOffset must equal the recorded transitionOffset"
                     );
                     let entry = PropertyTableEntry::new(
@@ -850,31 +868,69 @@ impl StructureIdTable {
         }
         self.materialize_property_table(handle)
     }
+
+    /// The handle the NEXT [`Self::register`] will assign (1-based). Mirrors the
+    /// fact that in C++ a fresh `Structure`'s `StructureID` is fixed by its heap
+    /// address at allocation; here it is the next `Vec` slot. Used by the
+    /// interpreter to snapshot "did a new structure get allocated".
+    pub fn peek_next_handle(&self) -> StructureHandle {
+        StructureHandle::new((self.structures.len() + 1) as u32)
+    }
+
+    /// Mint a fresh, standalone (pinned dictionary) structure whose property table is
+    /// a faithful clone of `base`'s materialized table, with `removed` (if present)
+    /// taken out and its freed offset pushed onto the recycle stack.
+    ///
+    /// Models the NON-`PropertyAddition` shape change — property deletion,
+    /// data<->accessor conversion, attribute change — that JSC routes through a
+    /// dictionary / `removePropertyTransition` / `attributeChangeTransition`
+    /// (Structure.cpp). Those transition KINDS are not yet ported (this unit only
+    /// creates `PropertyAddition` edges, see `materialize_property_table`), so this is
+    /// the conservative fresh-id path: a new standalone structure (NOT recorded on
+    /// `base`'s transition table, so it is per-object, never shared) that carries the
+    /// exact SURVIVING offsets — the owning object's out-of-line storage stays valid
+    /// (never a wrong slot) — and recycles a removed offset exactly as
+    /// `PropertyTable::nextOffset`/`takeDeletedOffset` (PropertyTable.h:471/457) would,
+    /// so a later add reuses the freed slot instead of colliding.
+    pub fn create_dictionary_from(
+        &mut self,
+        base: StructureHandle,
+        removed: Option<AtomId>,
+    ) -> StructureHandle {
+        let mut table = self.materialize_property_table(base);
+        if let Some(uid) = removed {
+            let (offset, _attributes) = table.take(uid);
+            if offset != INVALID_OFFSET {
+                table.add_deleted_offset(offset);
+            }
+        }
+        let max_offset = self.structure(base).max_offset;
+        let mut dictionary = {
+            let base_structure = self.structure(base);
+            Structure::new_transition(base_structure, base)
+        };
+        // The dictionary OWNS its (pinned) table and exposes the same max offset, so
+        // `materialize`/`next_offset` over it never replays `base` and never shrinks
+        // the offset high-water mark across the removal.
+        dictionary.property_table = Some(table);
+        dictionary.pinned_property_table = true;
+        dictionary.max_offset = max_offset;
+        self.register(dictionary)
+    }
 }
 
 /// `PropertyTable* PropertyTable::copy(VM&, unsigned newCapacity)` /
 /// `PropertyTable::clone` (PropertyTable.h, not ported in the leaf).
 ///
-/// Rebuilds a `PropertyTable` from the public insertion-ordered iteration so the
-/// committed leaf port stays untouched. This reproduces the observable state
-/// (key -> `(offset, attributes)`, insertion order, size) exactly; it does not
-/// reproduce the internal `m_deletedOffsets` stack or the precise index layout,
-/// which a true `copy` preserves. That is observation-neutral for the
-/// addition-only transitions this unit creates (the deleted-offset stack is empty
-/// without property deletions); a full `copy`/`clone` belongs with the deletion
-/// and dictionary ports.
-fn clone_property_table(source: &PropertyTable, capacity: u32) -> PropertyTable {
-    let mut table = PropertyTable::with_capacity(capacity);
-    source.for_each_property(|entry| {
-        if let Some(key) = entry.key() {
-            table.add(PropertyTableEntry::new(
-                key,
-                entry.offset(),
-                entry.attributes(),
-            ));
-        }
-    });
-    table
+/// Now that `PropertyTable` derives `Clone`, this is a faithful deep copy: it
+/// preserves the index layout, the insertion-ordered value array, AND the
+/// `m_deletedOffsets` recycle stack — exactly what a true `PropertyTable::copy`
+/// preserves and what the dictionary/deletion path below relies on so a
+/// subsequently added property recycles a freed offset rather than colliding.
+/// `new_capacity` is advisory (the table rehashes on demand); it is kept in the
+/// signature to mirror the C++ `copy(VM&, newCapacity)` call shape.
+fn clone_property_table(source: &PropertyTable, _new_capacity: u32) -> PropertyTable {
+    source.clone()
 }
 
 #[cfg(test)]

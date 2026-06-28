@@ -297,7 +297,7 @@ impl TransitionStructure {
 /// strongly. Keyed on the encoded integer [`Key`] through the in-tree
 /// [`FxIntBuildHasher`] (gc/fast_hash.rs), the WTF `IntHash` analog for
 /// VM-internal integer-keyed maps.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct TransitionMap {
     map: HashMap<Key, TransitionStructure, FxIntBuildHasher>,
 }
@@ -328,7 +328,7 @@ impl TransitionMap {
 /// `m_data == UsingSingleSlotFlag` (empty); `SingleSlot(Some(_))` is one inline
 /// transition; `Map(_)` is the promoted form. The observable single->map
 /// promotion is unchanged.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum TransitionData {
     SingleSlot(Option<TransitionStructure>),
     Map(Box<TransitionMap>),
@@ -336,7 +336,7 @@ enum TransitionData {
 
 /// Faithful port of `class StructureTransitionTable`
 /// (StructureTransitionTable.h:154-315).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct StructureTransitionTable {
     data: TransitionData,
 }

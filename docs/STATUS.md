@@ -44,6 +44,11 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 
 ## GC / value cutover (toward R4 — see docs/design, the arena cell identity the JIT emits)
 - [done] the arena + marking core (above), unwired.
+- [done] Structure-wire: the #1 divergence corrected — per-cell offset map → per-shape
+  Structure::PropertyTable (StructureIdTable is the offset authority; offsets flow from
+  transitions; inline_cap=6; delete-then-readd recycles faithfully via m_deletedOffsets).
+- [wip] residual: cell still has property_order (per-cell enum order, ~15 sites) + vestigial
+  deleted_offsets → fold to the Structure entry order (small follow-up, before/with Butterfly-values).
 - [missing] POD object-model rewrite (retire the fat CoreObjectCell) → R3 shadow oracle → R4 flip
   (gate = technical verification: shadow cross-check + miri + adversarial verify) → running collector.
   Audited (gc-r4.md): R4 mostly mechanical (value carries the ptr; copy-out pattern exists), sharp

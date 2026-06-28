@@ -35,23 +35,31 @@ pub(crate) struct CoreObjectStore {
     // in-tree FxIntBuildHasher (gc/fast_hash.rs, WTF IntHash/PtrHash family); the swap is
     // semantically inert (get/insert/contains/clear/len are BuildHasher-independent).
     pub(crate) object_indices_by_payload: HashMap<usize, usize, FxIntBuildHasher>,
-    pub(crate) structure_ids: CoreStructureIdAllocator,
-    // C++ JSC: Structure::m_transitionTable (runtime/StructureTransitionTable.h)
-    // plus the implicit StructureID identity from Structure::create. In C++ each
-    // Structure object IS the identity, and addPropertyTransition (Structure.cpp:561)
-    // walks m_transitionTable keyed by (uid, attributes, TransitionKind) to find or
-    // create the shared successor Structure, so two same-shape objects converge on
-    // ONE Structure pointer (== one StructureID). The Rust interpreter carries a
-    // flat StructureId per cell instead of a Structure object graph, so these two
-    // maps stand in for that graph: `add_property_transitions` is the union of all
-    // per-Structure m_transitionTable PropertyAddition edges, keyed by the source
-    // StructureId, and `structure_seed_roots` reconstructs the per-(kind, prototype)
-    // root Structure (the empty-shape Structure JSGlobalObject hands out at object
-    // allocation) so fresh siblings start from one shared root id. Add-property only:
-    // deletion / attribute-change / dictionary / megamorphic transitions keep the
-    // prior fresh-id fallback (see allocate_structure_id call sites).
-    add_property_transitions:
-        HashMap<(StructureId, CorePropertyKey, CorePropertyAttributes), TransitionRecord>,
+    // C++ JSC: the per-VM Structure registry (`VM::structureIDTable`, in C++ implicit
+    // in the Structure heap address). gc-r4 Batch 2 mounts the ported faithful
+    // `StructureIdTable` (object/structure_cell.rs) as the SINGLE structure-id AND
+    // property-offset authority, replacing the former per-cell `property_offsets`
+    // HashMap + `next_property_offset` allocator (the load-bearing divergence: C++
+    // keeps the property->offset map in Structure::PropertyTable, per-SHAPE, never
+    // per-object). A cell's `structure_id` IS a `StructureIdTable` handle; the offset
+    // of a named property is read from that structure's PropertyTable (owned, or
+    // materialized-on-miss by replaying the transition chain, Structure.cpp:456).
+    // addPropertyTransition (Structure.cpp:561) lives inside the table and makes two
+    // same-shape objects converge on ONE successor structure (and ONE offset).
+    pub(crate) structure_table: StructureIdTable,
+    // CorePropertyKey -> uniqued uid adapter. C++ keys Structure::PropertyTable and
+    // m_transitionTable by the property name's `UniquedStringImpl*` identity; the
+    // interpreter's CorePropertyKey already encodes identity, so this interns each
+    // distinct named-offset key to a stable `AtomId` table slot (the uid the ported
+    // PropertyTable/transition table key on). Injective over the named-offset key set
+    // (Identifier + non-index String), so the structure graph keys by JSC identity.
+    pub(crate) property_uids: HashMap<CorePropertyKey, AtomId>,
+    // Monotonic allocator for fresh property uids (slot 0 reserved == AtomId::UNASSIGNED).
+    pub(crate) next_property_uid: u32,
+    // Per-(kind, prototype) empty-shape ROOT structure handle, the analog of the empty
+    // Structure JSGlobalObject hands every fresh object of a class+prototype so sibling
+    // objects begin from ONE shared root id and their first add-property transition
+    // converges. Values are `structure_table` root handles (create_root).
     pub(crate) structure_seed_roots: HashMap<(CoreObjectKind, CorePrototypeIdentity), StructureId>,
     structure_transition_watchpoints:
         HashMap<WatchpointSetId, CoreStructureTransitionWatchpointRecord>,
@@ -192,14 +200,17 @@ impl Clone for CoreObjectStore {
         let mut cloned = Self {
             objects: self.objects.clone(),
             object_indices_by_payload: HashMap::default(),
-            structure_ids: self.structure_ids.clone(),
-            // add_property_transitions is keyed by StructureId (flat ids, stable across
-            // clone), so the transition graph stays valid. structure_seed_roots is keyed
-            // by each prototype cell's pinned pointer payload (FIX 2); clone re-pins
-            // `objects` to new addresses, so seed lookups for the re-pinned prototypes
-            // may miss and fall back to fresh ids — conservative (IC misses, never wrong
-            // reads), and clone is a snapshot/test path, not the hot path.
-            add_property_transitions: self.add_property_transitions.clone(),
+            // structure_table is keyed by StructureId handle (stable Vec slots across
+            // clone), so every cloned cell's structure_id stays valid and the offset
+            // graph is preserved. property_uids interns CorePropertyKey -> uid; cloning
+            // it keeps interned identities stable. structure_seed_roots is keyed by each
+            // prototype cell's pinned pointer payload (FIX 2); clone re-pins `objects`
+            // to new addresses, so seed lookups for the re-pinned prototypes may miss
+            // and fall back to fresh roots — conservative (IC misses, never wrong reads),
+            // and clone is a snapshot/test path, not the hot path.
+            structure_table: self.structure_table.clone(),
+            property_uids: self.property_uids.clone(),
+            next_property_uid: self.next_property_uid,
             structure_seed_roots: self.structure_seed_roots.clone(),
             structure_transition_watchpoints: self.structure_transition_watchpoints.clone(),
             structure_transition_watchpoints_by_structure: self
@@ -240,42 +251,10 @@ pub(crate) struct CoreStructureTransitionWatchpointRecord {
     pub(crate) set: WatchpointSet,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct CoreStructureIdAllocator {
-    pub(crate) next: u32,
-}
-
-impl Default for CoreStructureIdAllocator {
-    fn default() -> Self {
-        Self {
-            next: StructureId::INVALID.raw().saturating_add(1),
-        }
-    }
-}
-
-impl CoreStructureIdAllocator {
-    pub(crate) fn allocate(&mut self) -> StructureId {
-        let raw = self.next;
-        assert_ne!(raw, StructureId::INVALID.raw());
-        self.next = raw
-            .checked_add(1)
-            .expect("interpreter structure id allocator exhausted");
-        StructureId::new(raw)
-    }
-}
-
-/// C++ JSC: one PropertyAddition edge of Structure::m_transitionTable. In C++ the
-/// successor Structure carries both its StructureID identity (the Structure*) and
-/// the property's PropertyOffset via Structure::transitionOffset()
-/// (StructureInlines.h:561 reads it back on the existing-structure fast path). The
-/// Rust interpreter has no Structure object, so the edge records the shared
-/// successor StructureId plus the cached offset so the fast path can reuse the same
-/// id AND the same offset without re-minting either.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TransitionRecord {
-    pub(crate) new_structure_id: StructureId,
-    pub(crate) offset: PropertyOffset,
-}
+// gc-r4 Batch 2: the per-cell offset allocator `CoreStructureIdAllocator` and the
+// ad-hoc `TransitionRecord` edge cache were retired. Structure-id allocation and the
+// property-addition transition graph (with offsets) now live in `structure_table`
+// (the ported `StructureIdTable`), the faithful analog of C++'s Structure registry.
 
 /// Stable identity of a stored prototype for the structure seed key.
 ///
@@ -358,30 +337,27 @@ pub(crate) struct CoreObjectCell {
     pub(crate) captures: Vec<RuntimeValue>,
     pub(crate) binding_value: RuntimeValue,
     pub(crate) properties: HashMap<CorePropertyKey, CoreProperty>,
-    pub(crate) property_offsets: HashMap<CorePropertyKey, PropertyOffset>,
-    pub(crate) next_property_offset: i32,
     // C++ JSC: a JSObject's named data properties live in either inline storage
     // (offset < firstOutOfLineOffset) or the Butterfly out-of-line region
     // (JSObject.h locationForOffset:711, Butterfly.h), and putDirectOffset writes
     // the value at offsetInRespectiveStorage(offset). `out_of_line_storage` is the
-    // Rust mirror of that Butterfly out-of-line property region: a contiguous
-    // [RuntimeValue] (RuntimeValue == EncodedJsValue == 8 bytes), indexable as
-    // [base + idx*8], which is what the batch-3 machine-code GET_BY_ID will mov
-    // from. The HashMap `properties` remains authoritative this batch; this Vec is
+    // Rust mirror of that Butterfly property region: a contiguous [RuntimeValue]
+    // (RuntimeValue == EncodedJsValue == 8 bytes), indexable as [base + idx*8], which
+    // is what the batch-3 machine-code GET_BY_ID will mov from. The HashMap
+    // `properties` remains the authoritative VALUE store this batch; this Vec is
     // written in lockstep (the putDirectOffset analog) and read by the offset path.
+    // The property->OFFSET map is no longer per-cell (gc-r4 Batch 2): the offset is a
+    // function of the cell's `structure_id` via the store's `structure_table`
+    // (Structure::PropertyTable), exactly as C++ JSC keeps it per-shape.
     //
     // DIVERGENCE: C++ indexes the out-of-line region with NEGATIVE indices growing
     // backward from the Butterfly base (offsetInOutOfLineStorage returns
     // -(offset-firstOutOfLineOffset)-1). The Rust mirror uses a FORWARD-indexed Vec
     // (slot index = offset_storage_index(offset)); for the batch-3 base register the
     // sign of the displacement is a codegen detail, and forward indexing is the
-    // natural Rust spill. See offset_storage_index.
-    //
-    // DIVERGENCE: INLINE_CAPACITY == 0 for this first cut, so EVERY data property is
-    // out-of-line and the flat per-cell offset allocator (0,1,2,...) doubles as the
-    // storage index. The inline/out-of-line split and offsetForPropertyNumber's
-    // jump-to-64 are deferred until INLINE_CAPACITY > 0; see the offset helper free
-    // functions below CoreObjectCell.
+    // natural Rust spill. With INLINE_CAPACITY == 6 (the JSFinalObject default), the
+    // inline band [0,6) and the out-of-line band [64,...) are both packed into this
+    // single forward Vec; the real inline-slot/Butterfly split is deferred to Batch 5.
     pub(crate) out_of_line_storage: Vec<RuntimeValue>,
     // C++ JSC: PropertyTable::m_deletedOffsets (PropertyTable.h) records offsets
     // freed by deletion so a later addition can reuse them instead of growing
@@ -490,8 +466,6 @@ impl Default for CoreObjectCell {
             captures: Vec::new(),
             binding_value: RuntimeValue::default(),
             properties: HashMap::new(),
-            property_offsets: HashMap::new(),
-            next_property_offset: 0,
             out_of_line_storage: Vec::new(),
             deleted_offsets: Vec::new(),
             property_order: Vec::new(),
@@ -554,8 +528,6 @@ impl Clone for CoreObjectCell {
             captures: self.captures.clone(),
             binding_value: self.binding_value,
             properties: self.properties.clone(),
-            property_offsets: self.property_offsets.clone(),
-            next_property_offset: self.next_property_offset,
             out_of_line_storage: self.out_of_line_storage.clone(),
             deleted_offsets: self.deleted_offsets.clone(),
             property_order: self.property_order.clone(),
@@ -1057,32 +1029,6 @@ impl<'a> GeneratedPropertyLoadCoreKey<'a> {
             Self::String(text) => CorePropertyKey::String(text.to_owned()),
         }
     }
-
-    /// Cheap is-Data + offset-validity check for the offset-indexed read path.
-    ///
-    /// Returns true iff this key currently maps to `expected_offset` in the cell's
-    /// property_offsets table. property_offsets holds only live DATA-property offsets
-    /// (accessor installs / deletions call remove_property_offset), so a match proves
-    /// the slot at `expected_offset` is a live data property without scanning
-    /// `properties` for the value. The Identifier path constructs a stack-only key
-    /// (no allocation); the String path falls back to an offset-map scan keyed by the
-    /// matched key (GET_BY_ID by string literal is rare vs. by identifier).
-    pub(crate) fn cell_named_data_offset_matches(
-        self,
-        cell: &CoreObjectCell,
-        expected_offset: PropertyOffset,
-    ) -> bool {
-        match self {
-            Self::Identifier(identifier) => {
-                cell.property_offsets
-                    .get(&CorePropertyKey::Identifier(identifier))
-                    == Some(&expected_offset)
-            }
-            Self::String(text) => cell.property_offsets.iter().any(|(stored_key, offset)| {
-                *offset == expected_offset && stored_key.is_string(text)
-            }),
-        }
-    }
 }
 
 pub(crate) fn generated_property_load_cell_has_own_property(
@@ -1100,18 +1046,18 @@ pub(crate) fn generated_property_load_cell_data_property_at_offset(
     expected_offset: PropertyOffset,
 ) -> Option<RuntimeValue> {
     // C++ JSC JSObject::getDirect(offset)/locationForOffset (JSObject.h:711,748):
-    // once the structure guard holds (verified by the caller against entry.structure),
-    // the value is read directly at the structure-assigned offset with NO key
-    // comparison or HashMap scan. This is exactly the offset-indexed load batch 3 will
-    // emit as `mov reg <- [storage_base + offset*8]` from out_of_line_storage.
-    // The is-Data check is kept cheap and structure-keyed: property_offsets only ever
-    // holds live DATA-property offsets (accessor installs and deletions call
-    // remove_property_offset, which drops the entry and clears the slot), so confirming
-    // the guarded key still maps to expected_offset proves the slot is a live data
-    // property without scanning `properties` for the value.
-    if !key.cell_named_data_offset_matches(cell, expected_offset) {
-        return None;
-    }
+    // once the structure guard holds (verified by the caller against
+    // entry.structure / base_structure), the value is read directly at the
+    // structure-assigned offset with NO key comparison or HashMap scan. This is
+    // exactly the offset-indexed load batch 3 will emit as
+    // `mov reg <- [storage_base + offset*8]` from out_of_line_storage.
+    //
+    // gc-r4 Batch 2: the offset is now owned by the cell's Structure::PropertyTable
+    // (per-shape), so the structure guard ALONE proves `expected_offset` is the live
+    // own-data slot for this shape (the faithful JSC IC invariant). The former
+    // per-cell offset-map recheck is removed with `property_offsets`; `key` is kept in
+    // the signature for the call shape but is not needed once the shape is guarded.
+    let _ = key;
     cell.read_data_property_offset_slot(expected_offset)
 }
 
@@ -1119,10 +1065,16 @@ pub(crate) fn generated_property_load_offset_miss_reason(
     cell: &CoreObjectCell,
     key: GeneratedPropertyLoadCoreKey<'_>,
     expected_offset: PropertyOffset,
+    actual_offset: Option<PropertyOffset>,
 ) -> GeneratedPropertyLoadProbeMissReason {
     use GeneratedPropertyLoadProbeMissReason as Miss;
 
-    let Some((stored_key, property)) = cell
+    // Diagnostic-only classification when the offset-indexed read returned None.
+    // `properties` (the authoritative VALUE store, kept this batch) localizes whether
+    // the key is absent or non-data; `actual_offset` is the key's real offset in the
+    // cell's Structure::PropertyTable (the offset authority), supplied by the caller so
+    // a cached offset that disagrees with the structure is reported as KeyOffsetMismatch.
+    let Some((_stored_key, property)) = cell
         .properties
         .iter()
         .find(|(stored_key, _)| key.matches(stored_key))
@@ -1132,8 +1084,8 @@ pub(crate) fn generated_property_load_offset_miss_reason(
     if !matches!(property.kind, CorePropertyKind::Data(_)) {
         return Miss::NonDataProperty;
     }
-    match cell.property_offset(stored_key) {
-        Some(actual_offset) if actual_offset != expected_offset => Miss::KeyOffsetMismatch,
+    match actual_offset {
+        Some(actual) if actual != expected_offset => Miss::KeyOffsetMismatch,
         _ => Miss::MissingOrInvalidOffset,
     }
 }
@@ -1145,22 +1097,54 @@ pub(crate) fn core_property_key_supports_named_property_offset(key: &CorePropert
     ) && key_array_index(key).is_none()
 }
 
+/// Encode `CorePropertyAttributes` as the `unsigned attributes` bitfield the ported
+/// Structure transition table + PropertyTable key on (C++ runtime/PropertyAttribute.h:
+/// ReadOnly == 1<<1, DontEnum == 1<<2, DontDelete == 1<<3). Only the writable/
+/// enumerable/configurable trio the interpreter models is encoded; the mapping is
+/// injective over those 8 combinations so distinct attribute sets produce distinct
+/// transition edges (the authoritative attribute VALUES stay in `properties`).
+pub(crate) fn core_attributes_to_u32(attributes: CorePropertyAttributes) -> u32 {
+    let mut bits = 0u32;
+    if !attributes.writable {
+        bits |= 1 << 1; // ReadOnly
+    }
+    if !attributes.enumerable {
+        bits |= 1 << 2; // DontEnum
+    }
+    if !attributes.configurable {
+        bits |= 1 << 3; // DontDelete
+    }
+    bits
+}
+
 // C++ JSC PropertyOffset.h mirror. firstOutOfLineOffset == 64 is the boundary
 // between inline storage (object header slots) and the Butterfly out-of-line
-// region. For this first cut INLINE_CAPACITY == 0, so isInlineOffset is never true
-// for a real data property and every offset is out-of-line; the inline split and
-// offsetForPropertyNumber's jump-to-64 (PropertyOffset.h:136) are deferred until
-// INLINE_CAPACITY > 0.
-const FIRST_OUT_OF_LINE_OFFSET: i32 = 64;
-const INLINE_CAPACITY: i32 = 0;
+// region. INLINE_CAPACITY == 6 is the JSFinalObject default inline capacity
+// (`JSObject::defaultInlineCapacity`, runtime/JSObject.h:1229 == (64 - 16)/8 == 6):
+// the structure's PropertyTable assigns offsets 0..5 inline then jumps the 7th
+// property to firstOutOfLineOffset == 64 (offsetForPropertyNumber, PropertyOffset.h:
+// 136). offset_storage_index packs BOTH bands into one forward Vec this batch; the
+// real inline-slot / Butterfly storage split is deferred to gc-r4 Batch 5.
+pub(crate) const FIRST_OUT_OF_LINE_OFFSET: i32 = 64;
+pub(crate) const INLINE_CAPACITY: i32 = 6;
 
-/// C++ JSC PropertyOffset.h isInlineOffset: offset < firstOutOfLineOffset.
-/// With INLINE_CAPACITY == 0 the per-cell allocator never produces offsets in the
-/// inline band [0, INLINE_CAPACITY); offset_storage_index still spills any such
-/// offset forward into out_of_line_storage because this cut keeps the flat
-/// allocator (deferral noted on offset_storage_index).
+const _: () = assert!(
+    FIRST_OUT_OF_LINE_OFFSET == crate::object::STRUCTURE_FIRST_OUT_OF_LINE_OFFSET,
+    "interpreter firstOutOfLineOffset must match the ported PropertyOffset.h constant"
+);
+const _: () = assert!(
+    INLINE_CAPACITY < FIRST_OUT_OF_LINE_OFFSET,
+    "JSObject.h:1230 static_assert(defaultInlineCapacity < firstOutOfLineOffset)"
+);
+
+/// C++ JSC PropertyOffset.h:87 isInlineOffset: offset < firstOutOfLineOffset.
+/// With INLINE_CAPACITY == 6 the structure assigns offsets 0..5 in the inline band;
+/// offset_storage_index maps them to forward indices 0..5 of out_of_line_storage.
+/// Part of the PropertyOffset.h mirror; offset_storage_index keys on INLINE_CAPACITY
+/// directly, so this predicate is kept for parity/readers but has no live caller yet.
+#[allow(dead_code)]
 pub(crate) fn is_inline_offset(offset: PropertyOffset) -> bool {
-    offset.raw() >= 0 && offset.raw() < INLINE_CAPACITY
+    offset.raw() >= 0 && offset.raw() < FIRST_OUT_OF_LINE_OFFSET
 }
 
 /// C++ JSC PropertyOffset.h isOutOfLineOffset.
@@ -1175,28 +1159,32 @@ pub(crate) fn is_out_of_line_offset(offset: PropertyOffset) -> bool {
 
 /// Index of an offset within `out_of_line_storage`.
 ///
-/// C++ JSC offsetInOutOfLineStorage (PropertyOffset.h:106) maps an out-of-line
-/// offset to a NEGATIVE Butterfly index: -(offset - firstOutOfLineOffset) - 1.
-/// DIVERGENCE: the Rust mirror uses a FORWARD-indexed Vec, so this returns the
-/// non-negative slot index. Because INLINE_CAPACITY == 0 and the flat allocator
-/// emits offsets 0,1,2,... directly, the storage index is simply offset.raw().
-/// When INLINE_CAPACITY > 0 lands, the out-of-line band becomes
-/// (offset - firstOutOfLineOffset) (offsetInOutOfLineStorage without the sign flip)
-/// and the inline band moves to separate inline storage instead of this Vec.
+/// C++ JSC splits the offset into an inline band `[0, inlineCapacity)` indexing the
+/// object's inline slots (offsetInInlineStorage, PropertyOffset.h:99) and an
+/// out-of-line band `[firstOutOfLineOffset, ...)` indexing the Butterfly at NEGATIVE
+/// indices (offsetInOutOfLineStorage = -(offset - firstOutOfLineOffset) - 1,
+/// PropertyOffset.h:106). DIVERGENCE (deferred to gc-r4 Batch 5): the Rust mirror
+/// packs BOTH bands into one FORWARD-indexed Vec, so this returns a non-negative
+/// contiguous slot index:
+///   - inline offset n in [0, INLINE_CAPACITY)  -> index n
+///   - out-of-line offset 64 + k                -> index INLINE_CAPACITY + k
+/// so offsets 0,1,2,3,4,5,64,65,... map to indices 0,1,2,3,4,5,6,7,..., exactly the
+/// allocation order. This must mirror Structure::PropertyTable's offsetForPropertyNumber
+/// (the offset source) or a property would read a wrong slot.
 pub(crate) fn offset_storage_index(offset: PropertyOffset) -> usize {
-    debug_assert!(offset.raw() >= 0, "negative property offset has no slot");
-    // INLINE_CAPACITY == 0 first cut: the flat allocator emits offsets 0,1,2,...
-    // contiguously, so every data property lives in out_of_line_storage at its raw
-    // index. SINGLE FORWARD FORMULA (index == raw): do NOT apply C++'s out-of-line
-    // subtraction (raw - FIRST_OUT_OF_LINE_OFFSET) here -- mixing that with the 0-based
-    // flat allocator aliased offset 0 with offset 64 (silent wrong read at >=65 props).
-    // The inline/out-of-line split + offsetForPropertyNumber's jump-to-64 land together
-    // with INLINE_CAPACITY > 0.
-    debug_assert!(
-        !is_inline_offset(offset),
-        "INLINE_CAPACITY==0 cut classifies no offset as inline"
-    );
-    offset.raw() as usize
+    let raw = offset.raw();
+    debug_assert!(raw >= 0, "negative property offset has no slot");
+    if raw < INLINE_CAPACITY {
+        // Inline band: the slot index is the inline offset itself.
+        raw as usize
+    } else {
+        debug_assert!(
+            raw >= FIRST_OUT_OF_LINE_OFFSET,
+            "offsets never fall in the (INLINE_CAPACITY, firstOutOfLineOffset) gap"
+        );
+        // Out-of-line band packed immediately after the inline slots.
+        (INLINE_CAPACITY + (raw - FIRST_OUT_OF_LINE_OFFSET)) as usize
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1576,126 +1564,39 @@ impl CoreObjectCell {
         self.storage_ptr = self.out_of_line_storage.as_ptr();
     }
 
-    pub(crate) fn install_initial_shape_metadata(&mut self) {
-        self.property_offsets.clear();
-        self.next_property_offset = 0;
-        // C++ JSC: a cell born with initial own properties reaches its shape by
-        // applying addPropertyTransition per property; the Butterfly out-of-line
-        // region is sized/filled in lockstep. The Rust mirror rebuilds the flat
-        // offset allocation here, so reset the out-of-line mirror too and re-fill it
-        // in lockstep below (putDirectOffset analog).
+    /// Reset the out-of-line VALUE mirror to empty before a cell is (re)seeded.
+    ///
+    /// C++ JSC: a cell born with initial own properties reaches its shape by applying
+    /// addPropertyTransition per property; the Butterfly is sized/filled in lockstep.
+    /// gc-r4 Batch 2: the offsets come from the store's structure_table now, so the
+    /// store seeds the structure and then fills this mirror (see
+    /// `CoreObjectStore::fill_initial_property_storage`). This only clears the mirror.
+    pub(crate) fn reset_property_storage_mirror(&mut self) {
         self.out_of_line_storage.clear();
-        // clear() can leave a non-coherent storage_ptr if the buffer was later moved;
-        // refresh now and again after the lockstep fill below so a cell with no data
-        // properties (no fill) still publishes a coherent pointer.
+        // clear() can leave a non-coherent storage_ptr; refresh so a cell with no data
+        // properties still publishes a coherent Butterfly-pointer analog.
         self.refresh_storage_ptr();
         self.deleted_offsets.clear();
-
-        for key in self.property_order.clone() {
-            if self
-                .properties
-                .get(&key)
-                .is_some_and(|property| matches!(property.kind, CorePropertyKind::Data(_)))
-            {
-                self.ensure_named_data_property_offset(&key);
-            }
-        }
-
-        let unordered_data_keys = self
-            .properties
-            .iter()
-            .filter_map(|(key, property)| {
-                if self.property_offsets.contains_key(key) {
-                    return None;
-                }
-                matches!(property.kind, CorePropertyKind::Data(_)).then(|| key.clone())
-            })
-            .collect::<Vec<_>>();
-        for key in unordered_data_keys {
-            self.ensure_named_data_property_offset(&key);
-        }
-
-        // Lockstep fill: every offset-bearing data property writes its current value
-        // into the out-of-line storage mirror at its assigned slot.
-        let offset_keys = self.property_offsets.keys().cloned().collect::<Vec<_>>();
-        for key in offset_keys {
-            if let Some(CorePropertyKind::Data(value)) =
-                self.properties.get(&key).map(|property| property.kind)
-            {
-                self.write_data_property_offset_slot(&key, value);
-            }
-        }
     }
 
-    pub(crate) fn property_offset(&self, key: &CorePropertyKey) -> Option<PropertyOffset> {
-        if !core_property_key_supports_named_property_offset(key) {
-            return None;
-        }
-        if !self
-            .properties
-            .get(key)
-            .is_some_and(|property| matches!(property.kind, CorePropertyKind::Data(_)))
-        {
-            return None;
-        }
-        self.property_offsets.get(key).copied()
-    }
-
-    pub(crate) fn ensure_named_data_property_offset(
-        &mut self,
-        key: &CorePropertyKey,
-    ) -> Option<PropertyOffset> {
-        if !core_property_key_supports_named_property_offset(key) {
-            return None;
-        }
-        if let Some(offset) = self.property_offsets.get(key).copied() {
-            return Some(offset);
-        }
-        let offset = PropertyOffset::new(self.next_property_offset);
-        self.next_property_offset = self
-            .next_property_offset
-            .checked_add(1)
-            .expect("interpreter property offset allocator exhausted");
-        self.property_offsets.insert(key.clone(), offset);
-        Some(offset)
-    }
-
-    pub(crate) fn remove_property_offset(&mut self, key: &CorePropertyKey) {
-        if let Some(offset) = self.property_offsets.remove(key) {
-            // C++ JSC: a deletion frees the property's offset; PropertyTable records
-            // it in m_deletedOffsets (PropertyTable.h) for later reuse and the slot
-            // is cleared. The HashMap stays authoritative this batch, but keep the
-            // out-of-line mirror consistent: clear the freed slot to undefined and
-            // record the offset. Reuse is deferred (see deleted_offsets comment).
-            let index = offset_storage_index(offset);
-            if let Some(slot) = self.out_of_line_storage.get_mut(index) {
-                *slot = RuntimeValue::undefined();
-            }
-            // In-place slot clear cannot realloc the Vec, so storage_ptr is already
-            // coherent here; refresh defensively so this mutation site obeys the same
-            // invariant as the growth paths (single rule: any Vec touch -> refresh).
-            self.refresh_storage_ptr();
-            self.deleted_offsets.push(offset);
-        }
-    }
-
-    /// Write a data value into the out-of-line storage mirror at `key`'s offset.
+    /// Write a data value into the out-of-line storage mirror at the
+    /// structure-assigned `offset` (the offset is sourced by the caller from the
+    /// store's structure_table — the per-shape Structure::PropertyTable).
     ///
-    /// C++ JSC JSObject::putDirectOffset / locationForOffset (JSObject.h:711): given
-    /// the structure-assigned offset, store the value at offsetInRespectiveStorage.
-    /// This is the lockstep companion to every `properties` data insert; the HashMap
-    /// remains authoritative this batch and this mirror is what the offset read path
-    /// (and batch-3 machine code) consumes. Grows the Vec with undefined fill so the
-    /// slot exists, mirroring Butterfly growth on out-of-line property addition.
-    /// No-op for keys without a named data offset (symbols, indices, accessors).
+    /// C++ JSC JSObject::putDirectOffset / locationForOffset (JSObject.h:711): store
+    /// the value at offsetInRespectiveStorage(offset). The HashMap `properties`
+    /// remains the authoritative VALUE store this batch; this mirror is what the
+    /// offset read path (and batch-3 machine code) consumes. Grows the Vec with
+    /// undefined fill so the slot exists, mirroring Butterfly growth on out-of-line
+    /// property addition. No-op for an invalid offset.
     pub(crate) fn write_data_property_offset_slot(
         &mut self,
-        key: &CorePropertyKey,
+        offset: PropertyOffset,
         value: RuntimeValue,
     ) {
-        let Some(offset) = self.property_offset(key) else {
+        if offset.raw() < 0 {
             return;
-        };
+        }
         let index = offset_storage_index(offset);
         if index >= self.out_of_line_storage.len() {
             self.out_of_line_storage
@@ -1706,6 +1607,25 @@ impl CoreObjectCell {
             self.refresh_storage_ptr();
         }
         self.out_of_line_storage[index] = value;
+    }
+
+    /// Clear the out-of-line storage slot for a freed offset (property deletion or
+    /// data->accessor conversion). C++ JSC: the freed PropertyOffset is recorded in
+    /// PropertyTable::m_deletedOffsets for reuse (handled in the structure_table) and
+    /// the storage slot is cleared. Here we clear the value mirror so a recycled
+    /// offset starts from undefined; no-op for an invalid offset.
+    pub(crate) fn clear_data_property_offset_slot(&mut self, offset: PropertyOffset) {
+        if offset.raw() < 0 {
+            return;
+        }
+        let index = offset_storage_index(offset);
+        if let Some(slot) = self.out_of_line_storage.get_mut(index) {
+            *slot = RuntimeValue::undefined();
+        }
+        // In-place slot clear cannot realloc the Vec, so storage_ptr is already
+        // coherent; refresh defensively (single rule: any Vec touch -> refresh).
+        self.refresh_storage_ptr();
+        self.deleted_offsets.push(offset);
     }
 
     /// Read the out-of-line storage mirror at `expected_offset`.
@@ -3739,11 +3659,9 @@ impl CoreObjectStore {
         // cell carries a coherent tag without per-call-site edits (covers all
         // `..CoreObjectCell::default()` literals).
         cell.js_type = cell.kind.js_type();
-        cell.install_initial_shape_metadata();
-        // install_initial_shape_metadata already refreshes storage_ptr; refresh once
-        // more so EVERY published cell is guaranteed to carry a coherent
-        // Butterfly-pointer analog regardless of how the cell was constructed.
-        cell.refresh_storage_ptr();
+        // Reset the out-of-line VALUE mirror; the structure (and its offsets) is seeded
+        // below and the mirror is then filled from the structure's PropertyTable.
+        cell.reset_property_storage_mirror();
         if cell.structure_id == StructureId::INVALID {
             // C++ JSC: a fresh object adopts the shared empty Structure for its
             // class+prototype instead of a private one, so same-shape siblings can
@@ -3760,11 +3678,15 @@ impl CoreObjectStore {
             // Taking the empty seed root would instead make a 0-property object and
             // a 1-property function share a structure id (different shapes, same id),
             // corrupting cross-instance ICs. seed_initial_shape_structure_id mirrors
-            // C++ by chaining transitions from the empty root over the recorded
-            // initial-property order; for a 0-property cell it degenerates to the
-            // plain empty seed root.
+            // C++ by chaining add_property_transition from the empty root over the
+            // recorded initial-property order; for a 0-property cell it degenerates to
+            // the plain empty seed root.
             cell.structure_id = self.seed_initial_shape_structure_id(&cell);
         }
+        // Fill the out-of-line VALUE mirror at each initial data property's
+        // structure-assigned offset (the putDirectOffset analog), now that the
+        // structure (offset authority) is known.
+        self.fill_initial_property_storage(&mut cell);
         let mut object = Box::pin(cell);
         let ptr = NonNull::from(object.as_mut().get_mut());
         let payload = ptr.as_ptr() as usize;
@@ -3788,8 +3710,178 @@ impl CoreObjectStore {
         }
     }
 
+    /// Mint a fresh, EMPTY standalone structure (a new root in the structure_table).
+    ///
+    /// gc-r4 Batch 2: the former flat id allocator is gone; a structure id IS a
+    /// `StructureIdTable` handle. This is the analog of C++ `Structure::create` for a
+    /// shape with NO properties to carry. Used where there is no prior shape to
+    /// preserve (and by tests fabricating a planned transition target). For a
+    /// non-PropertyAddition change that MUST preserve surviving offsets, use
+    /// `fresh_dictionary_structure` instead.
     pub(crate) fn allocate_structure_id(&mut self) -> StructureId {
-        self.structure_ids.allocate()
+        self.structure_table.create_root(
+            PrototypePointer::null(),
+            NON_ARRAY,
+            0,
+            0,
+            INLINE_CAPACITY as u8,
+        )
+    }
+
+    /// The `PrototypePointer` for a stored prototype (the prototype object's pinned
+    /// pointer bits, or null), the faithful key C++ Structure stores in `m_prototype`.
+    pub(crate) fn prototype_pointer(&self, prototype: Option<RuntimeValue>) -> PrototypePointer {
+        match prototype.and_then(|value| value.as_cell().map(|cell| cell.pointer_payload_bits())) {
+            Some(payload) => PrototypePointer::from_object(payload),
+            None => PrototypePointer::null(),
+        }
+    }
+
+    /// Intern a `CorePropertyKey` to a stable uniqued `AtomId` (the uid the ported
+    /// PropertyTable / transition table key on), the adapter from the interpreter's
+    /// key identity to JSC's `UniquedStringImpl*` identity. Slot 0 is reserved
+    /// (`AtomId::UNASSIGNED` / a null transition-table pointer), so uids start at 1.
+    pub(crate) fn intern_property_uid(&mut self, key: &CorePropertyKey) -> AtomId {
+        if let Some(uid) = self.property_uids.get(key) {
+            return *uid;
+        }
+        self.next_property_uid += 1;
+        let uid = AtomId::from_table_slot(self.next_property_uid);
+        self.property_uids.insert(key.clone(), uid);
+        uid
+    }
+
+    /// The uid a `CorePropertyKey` was interned to, if it has ever named an offset.
+    pub(crate) fn lookup_property_uid(&self, key: &CorePropertyKey) -> Option<AtomId> {
+        self.property_uids.get(key).copied()
+    }
+
+    /// True iff `sid` is a live registered structure handle.
+    fn is_live_structure(&self, sid: StructureId) -> bool {
+        sid != StructureId::INVALID && sid.raw() < self.structure_table.peek_next_handle().raw()
+    }
+
+    /// The property offset assigned to `key` by structure `sid` — read straight from
+    /// the structure's Structure::PropertyTable (owned, or materialized-on-miss by
+    /// replaying the transition chain, Structure.cpp:456). The SINGLE offset authority
+    /// (replacing the deleted per-cell `property_offsets`). Returns `None` for a key
+    /// with no named offset in this shape (symbol/index, never added, deleted, or an
+    /// accessor — those keys are taken out of the table).
+    pub(crate) fn structure_offset(
+        &self,
+        sid: StructureId,
+        key: &CorePropertyKey,
+    ) -> Option<PropertyOffset> {
+        if !self.is_live_structure(sid) {
+            return None;
+        }
+        let uid = self.lookup_property_uid(key)?;
+        let raw = match self.structure_table.structure(sid).property_table_or_null() {
+            Some(table) => table.get(uid).0,
+            // materialize-on-miss: the table was moved to a child via a transition;
+            // rebuild it by replaying the chain (cache-back deferred, gc-r4 B2).
+            None => {
+                self.structure_table
+                    .materialize_property_table(sid)
+                    .get(uid)
+                    .0
+            }
+        };
+        if raw < 0 {
+            None
+        } else {
+            Some(PropertyOffset::new(raw))
+        }
+    }
+
+    /// The offset the NEXT property added to structure `sid` would take — the analog
+    /// of `Structure::transitionOffset()` peeked ahead, used by the generated-store IC
+    /// to validate a planned transition offset. Mirrors PropertyTable::nextOffset
+    /// (PropertyOffset.h:136 / PropertyTable.h:471): recycle a freed offset, else the
+    /// fresh offset for property number `size()`.
+    pub(crate) fn next_property_offset_for_structure(&self, sid: StructureId) -> PropertyOffset {
+        if !self.is_live_structure(sid) {
+            return PropertyOffset::new(offset_for_property_number(0, INLINE_CAPACITY));
+        }
+        let cap = self.structure_table.structure(sid).inline_capacity() as i32;
+        let mut table = self.structure_table.materialize_property_table(sid);
+        PropertyOffset::new(table.next_offset(cap))
+    }
+
+    /// Convenience: `next_property_offset_for_structure` for an object value (the
+    /// generated-store IC validates a planned offset via the by-structure form; this
+    /// object-keyed wrapper is used by the store fidelity tests).
+    #[cfg(test)]
+    pub(crate) fn next_property_offset(&self, object: RuntimeValue) -> PropertyOffset {
+        match self.find(object) {
+            Some(cell) => {
+                let sid = cell.structure_id;
+                self.next_property_offset_for_structure(sid)
+            }
+            None => PropertyOffset::INVALID,
+        }
+    }
+
+    /// Faithful `Structure::addPropertyTransition` (Structure.cpp:561) wrapper: returns
+    /// the shared successor structure AND the property's offset for a property
+    /// ADDITION (a key that does not yet have a named offset in `old`). Two same-shape
+    /// objects adding the same `(key, attributes)` from the same `old` converge on ONE
+    /// successor (and ONE offset) via the transition table — the monomorphic-IC
+    /// guarantee. Symbol/index keys cannot key the transition table, so they take the
+    /// conservative fresh-dictionary fallback with an invalid offset (the value lives
+    /// only in the authoritative `properties` map; never a wrong slot).
+    pub(crate) fn structure_add_property(
+        &mut self,
+        old: StructureId,
+        key: &CorePropertyKey,
+        attributes: CorePropertyAttributes,
+    ) -> (StructureId, PropertyOffset) {
+        if !core_property_key_supports_named_property_offset(key) {
+            return (
+                self.fresh_dictionary_structure(old, None),
+                PropertyOffset::INVALID,
+            );
+        }
+        let uid = self.intern_property_uid(key);
+        let attributes_u32 = core_attributes_to_u32(attributes);
+        let (handle, raw_offset) =
+            self.structure_table
+                .add_property_transition(old, uid, attributes_u32);
+        (handle, PropertyOffset::new(raw_offset))
+    }
+
+    /// Mint a fresh per-object (dictionary) structure that carries `old`'s surviving
+    /// offsets, with `removed` (if it has a named offset) taken out and its slot freed
+    /// for recycle. The conservative fresh-id path for non-PropertyAddition shape
+    /// changes (delete / data<->accessor / attribute change); see
+    /// `StructureIdTable::create_dictionary_from`.
+    pub(crate) fn fresh_dictionary_structure(
+        &mut self,
+        old: StructureId,
+        removed: Option<&CorePropertyKey>,
+    ) -> StructureId {
+        if !self.is_live_structure(old) {
+            return self.allocate_structure_id();
+        }
+        let removed_uid = removed.and_then(|key| self.lookup_property_uid(key));
+        self.structure_table
+            .create_dictionary_from(old, removed_uid)
+    }
+
+    /// Fill the out-of-line VALUE mirror at each initial data property's
+    /// structure-assigned offset, after the cell's structure has been seeded.
+    fn fill_initial_property_storage(&self, cell: &mut CoreObjectCell) {
+        let sid = cell.structure_id;
+        for key in cell.property_order.clone() {
+            let Some(CorePropertyKind::Data(value)) =
+                cell.properties.get(&key).map(|property| property.kind)
+            else {
+                continue;
+            };
+            if let Some(offset) = self.structure_offset(sid, &key) {
+                cell.write_data_property_offset_slot(offset, value);
+            }
+        }
     }
 
     /// Stable seed-key identity of a stored prototype.
@@ -3819,13 +3911,13 @@ impl CoreObjectStore {
         }
     }
 
-    /// Shared empty-shape root StructureId for a (kind, prototype) pair.
+    /// Shared empty-shape ROOT structure for a (kind, prototype) pair.
     ///
-    /// C++ JSC: JSGlobalObject hands every fresh object of a given class+prototype
-    /// the same empty Structure, from which property additions transition. The Rust
-    /// interpreter reconstructs that shared root via structure_seed_roots so sibling
-    /// objects begin from ONE structure id and their first add-property transition
-    /// converges in add_property_transitions (cross-instance IC hits depend on this).
+    /// C++ JSC: JSGlobalObject hands every fresh object of a given class+prototype the
+    /// same empty Structure, from which property additions transition. The Rust
+    /// interpreter reconstructs that shared root via structure_seed_roots (the
+    /// create_root analog) so sibling objects begin from ONE structure id and their
+    /// first add-property transition converges (cross-instance IC hits depend on this).
     pub(crate) fn seed_structure_id(
         &mut self,
         kind: CoreObjectKind,
@@ -3835,96 +3927,50 @@ impl CoreObjectStore {
         if let Some(existing) = self.structure_seed_roots.get(&(kind, identity)).copied() {
             return existing;
         }
-        let id = self.allocate_structure_id();
+        let prototype_pointer = self.prototype_pointer(prototype);
+        let id = self.structure_table.create_root(
+            prototype_pointer,
+            NON_ARRAY,
+            0,
+            0,
+            INLINE_CAPACITY as u8,
+        );
         self.structure_seed_roots.insert((kind, identity), id);
         id
     }
 
     /// Structure id for a cell that may be born with initial own properties.
     ///
-    /// C++ JSC: an object with N initial own properties has the Structure reached
-    /// by applying addPropertyTransition N times from the empty (class, prototype)
-    /// Structure (Structure.cpp:561), so its Structure encodes the full shape. The
-    /// Rust interpreter installs some initial properties before allocate_cell (e.g.
-    /// a function's `.prototype`), so we mirror that by seeding the empty root and
-    /// then chaining add_property_transition over the recorded initial-property
-    /// order. The chained offsets come from install_initial_shape_metadata's
-    /// deterministic per-cell allocator (0,1,2,... over data keys in order), which
-    /// is exactly the order this chain visits, so the transition-cached offsets
-    /// agree and same-shape siblings converge on one structure id.
+    /// C++ JSC: an object with N initial own properties has the Structure reached by
+    /// applying addPropertyTransition N times from the empty (class, prototype)
+    /// Structure (Structure.cpp:561), so its Structure encodes the full shape. The Rust
+    /// interpreter installs some initial properties before allocate_cell (e.g. a
+    /// function's `.prototype`), so we mirror that by seeding the empty root and then
+    /// chaining structure_add_property over the recorded initial-property order. The
+    /// offsets COME FROM the transition (Structure::PropertyTable), so same-shape
+    /// siblings converge on one structure id AND one offset set. For a 0-property cell
+    /// this degenerates to the plain empty seed root.
     ///
-    /// Requires install_initial_shape_metadata to have already run on `cell` so
-    /// property_offsets is populated. For a 0-property cell this is identical to
-    /// the plain seed_structure_id empty root.
-    ///
-    /// Symbol/indexed keys: conservative fresh-id fallback. C++ keys transitions by
-    /// the property's uid including symbols; the Rust transition key only covers
-    /// named-offset keys (Identifier/String), so an initial Symbol property folds
-    /// the rest of the chain onto a fresh id. Fidelity gap, deferred (no Octane
-    /// consumer builds Symbol-keyed initial shapes on the hot path).
+    /// Symbol/indexed initial keys: structure_add_property folds them onto a fresh
+    /// per-object dictionary (preserving the named offsets, never a wrong slot); their
+    /// value lives only in the authoritative `properties` map. Fidelity gap deferred
+    /// (no Octane consumer builds Symbol-keyed initial shapes on the hot path).
     pub(crate) fn seed_initial_shape_structure_id(&mut self, cell: &CoreObjectCell) -> StructureId {
         let mut structure_id = self.seed_structure_id(cell.kind, cell.prototype);
-        let mut saw_unkeyed = false;
-        for key in &cell.property_order {
-            let Some(property) = cell.properties.get(key) else {
+        for key in cell.property_order.clone() {
+            let Some(property) = cell.properties.get(&key).copied() else {
                 continue;
             };
             if !matches!(property.kind, CorePropertyKind::Data(_)) {
-                // Accessors do not occupy a named-data offset; skip without
-                // disturbing the shared shape chain.
+                // Accessors do not occupy a named-data offset; skip without disturbing
+                // the shared shape chain.
                 continue;
             }
-            let Some(offset) = cell.property_offsets.get(key).copied() else {
-                // Symbol / indexed key: no named-data offset, so it cannot key the
-                // transition table. Conservatively fall to a fresh id for the
-                // remainder of the shape (see method comment, fidelity gap).
-                saw_unkeyed = true;
-                continue;
-            };
-            structure_id =
-                self.add_property_transition(structure_id, key, property.attributes, offset);
-        }
-        if saw_unkeyed {
-            return self.allocate_structure_id();
+            let (next_structure, _offset) =
+                self.structure_add_property(structure_id, &key, property.attributes);
+            structure_id = next_structure;
         }
         structure_id
-    }
-
-    /// Find-or-create the PropertyAddition transition for (old_structure, key,
-    /// attributes), mirroring Structure::addPropertyTransition (Structure.cpp:561):
-    /// the existing-structure fast path (StructureInlines.h:549) returns a cached
-    /// successor + offset, otherwise addNewPropertyTransition mints a successor and
-    /// records the edge in m_transitionTable (Structure.cpp:620).
-    ///
-    /// `computed_offset` is the offset the per-object property-table allocator
-    /// (ensure_named_data_property_offset) just produced for this add. On the
-    /// create path it is cached into the edge; on the reuse path it MUST equal the
-    /// cached offset, since both objects build the same property_order from the same
-    /// shared root, so the deterministic per-object allocator agrees with the edge.
-    pub(crate) fn add_property_transition(
-        &mut self,
-        old_structure: StructureId,
-        key: &CorePropertyKey,
-        attributes: CorePropertyAttributes,
-        computed_offset: PropertyOffset,
-    ) -> StructureId {
-        let map_key = (old_structure, key.clone(), attributes);
-        if let Some(record) = self.add_property_transitions.get(&map_key).copied() {
-            debug_assert_eq!(
-                record.offset, computed_offset,
-                "transition-cached offset disagrees with per-object offset allocator"
-            );
-            return record.new_structure_id;
-        }
-        let new_structure_id = self.allocate_structure_id();
-        self.add_property_transitions.insert(
-            map_key,
-            TransitionRecord {
-                new_structure_id,
-                offset: computed_offset,
-            },
-        );
-        new_structure_id
     }
 
     pub(crate) fn snapshot_structure_transition_watchpoints(
@@ -4284,6 +4330,10 @@ impl CoreObjectStore {
                         CorePropertyLookupClassification::AccessorWithoutGetter
                     }
                 };
+                // Capture the holding cell's structure, then read the offset from its
+                // Structure::PropertyTable (the offset authority) once the cell borrow
+                // ends, so the store's structure_table can be consulted.
+                let found_structure = cell.structure_id;
                 let mut record = CorePropertyLookupRecord::from_has_property_lookup(
                     site,
                     object,
@@ -4294,8 +4344,8 @@ impl CoreObjectStore {
                     true,
                 );
                 record.base_structure = base_structure;
-                record.offset = cell.property_offset(key);
                 record.chain = chain.clone();
+                record.offset = self.structure_offset(found_structure, key);
                 return Ok((true, record));
             }
             if cell.kind == CoreObjectKind::Array {
@@ -4386,6 +4436,7 @@ impl CoreObjectStore {
             };
         };
         let own_property = cell.properties.get(key);
+        let has_own_property = own_property.is_some();
         let has_own_data_property =
             own_property.is_some_and(|property| matches!(property.kind, CorePropertyKind::Data(_)));
         let indexed_key = key_array_index(key);
@@ -4400,15 +4451,19 @@ impl CoreObjectStore {
         });
         let is_indexed_or_typed_array_store =
             is_dense_array_indexed_store || matches!(cell.kind, CoreObjectKind::Uint8Array);
+        // Capture the structure, then read the offset from its PropertyTable once the
+        // cell borrow ends so the store's structure_table can be consulted.
+        let structure = cell.structure_id;
+        let offset = self.structure_offset(structure, key);
         CorePropertyStoreSnapshot {
             base_object: Some(object),
-            base_structure: Some(cell.structure_id),
-            has_own_property: own_property.is_some(),
+            base_structure: Some(structure),
+            has_own_property,
             has_own_data_property,
             is_indexed_or_typed_array_store,
             is_dense_array_indexed_store,
             has_own_indexed_element,
-            offset: cell.property_offset(key),
+            offset,
         }
     }
 
@@ -4740,62 +4795,52 @@ impl CoreObjectStore {
         key: &CorePropertyKey,
         value: RuntimeValue,
     ) -> Result<(), ExecutionError> {
-        // C++ JSC: a pure property addition routes through
-        // Structure::addPropertyTransition so same-shape siblings share a structure
-        // id; an accessor->data kind change is NOT an addition and keeps a fresh id
-        // (the out-of-scope fallback). `transition` carries the (old_structure,
-        // computed_offset) needed to resolve the shared successor after the cell
-        // borrow ends.
-        let mut transition: Option<(StructureId, PropertyOffset)> = None;
-        let old_structure = {
-            let Some(object) = self.find_mut(object) else {
+        // C++ JSC: a pure property addition (or an accessor->data kind change, which
+        // adds a fresh named-data offset) routes through Structure::addPropertyTransition
+        // so the offset comes from the per-shape Structure::PropertyTable and same-shape
+        // siblings share one successor structure + offset. A same-shape value replace
+        // keeps the structure and rewrites the existing offset slot.
+        let (old_structure, shape_changed) = {
+            let Some(object_cell) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object.structure_id;
-            let shape_changed;
-            if let Some(property) = object.properties.get_mut(key) {
-                shape_changed = !matches!(property.kind, CorePropertyKind::Data(_));
+            let old_structure = object_cell.structure_id;
+            let shape_changed = if let Some(property) = object_cell.properties.get_mut(key) {
+                let was_data = matches!(property.kind, CorePropertyKind::Data(_));
                 property.kind = CorePropertyKind::Data(value);
-                if shape_changed {
-                    object.ensure_named_data_property_offset(key);
-                }
+                !was_data // accessor -> data is a (offset-adding) shape change
             } else {
-                object.property_order.push(key.clone());
-                object.properties.insert(
+                object_cell.property_order.push(key.clone());
+                object_cell.properties.insert(
                     key.clone(),
                     CoreProperty {
                         kind: CorePropertyKind::Data(value),
                         attributes: CorePropertyAttributes::DATA_DEFAULT,
                     },
                 );
-                let offset = object.ensure_named_data_property_offset(key);
-                shape_changed = true;
-                if let Some(offset) = offset {
-                    transition = Some((old_structure, offset));
-                }
-            }
-            // putDirectOffset analog: write the value into the out-of-line storage
-            // mirror in lockstep with the authoritative HashMap insert above.
-            object.write_data_property_offset_slot(key, value);
-            if shape_changed {
-                Some(old_structure)
-            } else {
-                None
-            }
-        };
-        if let Some(old_structure) = old_structure {
-            let new_structure = match transition {
-                Some((from, offset)) => self.add_property_transition(
-                    from,
-                    key,
-                    CorePropertyAttributes::DATA_DEFAULT,
-                    offset,
-                ),
-                None => self.allocate_structure_id(),
+                true
             };
-            if let Some(object) = self.find_mut(object) {
-                object.structure_id = new_structure;
+            (old_structure, shape_changed)
+        };
+        // Offset authority = structure_table. A shape change adds a new named offset via
+        // the transition; a same-shape replace reuses the existing offset.
+        let (new_structure, offset) = if shape_changed {
+            self.structure_add_property(old_structure, key, CorePropertyAttributes::DATA_DEFAULT)
+        } else {
+            (
+                old_structure,
+                self.structure_offset(old_structure, key)
+                    .unwrap_or(PropertyOffset::INVALID),
+            )
+        };
+        if let Some(object_cell) = self.find_mut(object) {
+            // putDirectOffset analog: write the value at the structure-assigned offset.
+            object_cell.write_data_property_offset_slot(offset, value);
+            if shape_changed {
+                object_cell.structure_id = new_structure;
             }
+        }
+        if shape_changed {
             self.finish_structure_transition(old_structure);
         }
         Ok(())
@@ -4829,64 +4874,66 @@ impl CoreObjectStore {
         key: &CorePropertyKey,
         value: RuntimeValue,
     ) -> Result<(), ExecutionError> {
-        // C++ JSC: only the property-addition case (current property absent) routes
-        // through addPropertyTransition for shared structure ids. Converting an
-        // existing accessor/non-default-attribute property to a default data
-        // property is a non-addition shape change and keeps a fresh id (out of
-        // scope for the transition table).
-        let mut transition: Option<(StructureId, PropertyOffset)> = None;
-        let old_structure = {
-            let Some(object) = self.find_mut(object) else {
+        // C++ JSC: a property ADDITION (or accessor->data conversion, which adds a fresh
+        // named-data offset) routes through Structure::addPropertyTransition so the
+        // offset comes from the per-shape PropertyTable and siblings converge. An
+        // attribute change on an existing data property keeps that property's offset but
+        // is not a shareable transition, so it takes a fresh per-object dictionary
+        // (preserving the surviving offsets). A same-shape value replace keeps both.
+        let (old_structure, shape_changed, is_addition, was_accessor) = {
+            let Some(object_cell) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object.structure_id;
-            let current = object.properties.get(key).copied();
+            let old_structure = object_cell.structure_id;
+            let current = object_cell.properties.get(key).copied();
             let is_addition = current.is_none();
+            let was_accessor = current
+                .is_some_and(|current| matches!(current.kind, CorePropertyKind::Accessor { .. }));
             let shape_changed = match current {
                 Some(current) => {
                     !matches!(current.kind, CorePropertyKind::Data(_))
                         || current.attributes != CorePropertyAttributes::DATA_DEFAULT
                 }
                 None => {
-                    object.property_order.push(key.clone());
+                    object_cell.property_order.push(key.clone());
                     true
                 }
             };
-            object.properties.insert(
+            object_cell.properties.insert(
                 key.clone(),
                 CoreProperty {
                     kind: CorePropertyKind::Data(value),
                     attributes: CorePropertyAttributes::DATA_DEFAULT,
                 },
             );
-            let offset = object.ensure_named_data_property_offset(key);
-            // putDirectOffset analog: write the value into the out-of-line storage
-            // mirror in lockstep with the authoritative HashMap insert above.
-            object.write_data_property_offset_slot(key, value);
-            if shape_changed {
-                if is_addition {
-                    if let Some(offset) = offset {
-                        transition = Some((old_structure, offset));
-                    }
-                }
-                Some(old_structure)
-            } else {
-                None
-            }
+            (old_structure, shape_changed, is_addition, was_accessor)
         };
-        if let Some(old_structure) = old_structure {
-            let new_structure = match transition {
-                Some((from, offset)) => self.add_property_transition(
-                    from,
-                    key,
-                    CorePropertyAttributes::DATA_DEFAULT,
-                    offset,
-                ),
-                None => self.allocate_structure_id(),
-            };
-            if let Some(object) = self.find_mut(object) {
-                object.structure_id = new_structure;
+        let (new_structure, offset) = if !shape_changed {
+            // Value-only replace: same structure, existing offset.
+            (
+                old_structure,
+                self.structure_offset(old_structure, key)
+                    .unwrap_or(PropertyOffset::INVALID),
+            )
+        } else if is_addition || was_accessor {
+            // New named-data offset via a (shareable) transition.
+            self.structure_add_property(old_structure, key, CorePropertyAttributes::DATA_DEFAULT)
+        } else {
+            // Attribute change on an existing data property: offset preserved, fresh
+            // per-object dictionary structure.
+            let offset = self
+                .structure_offset(old_structure, key)
+                .unwrap_or(PropertyOffset::INVALID);
+            (self.fresh_dictionary_structure(old_structure, None), offset)
+        };
+        if let Some(object_cell) = self.find_mut(object) {
+            // putDirectOffset analog.
+            object_cell.write_data_property_offset_slot(offset, value);
+            if shape_changed {
+                object_cell.structure_id = new_structure;
             }
+        }
+        if shape_changed {
             self.finish_structure_transition(old_structure);
         }
         Ok(())
@@ -4903,13 +4950,12 @@ impl CoreObjectStore {
         // keyed by (uid, attributes) (StructureTransitionTable), so siblings defined
         // with the same key+attributes share a structure id. Redefining an existing
         // property (kind or attribute change) is out of scope and keeps a fresh id.
-        let mut transition: Option<(StructureId, PropertyOffset)> = None;
-        let old_structure = {
-            let Some(object) = self.find_mut(object) else {
+        let (old_structure, shape_changed, is_addition, was_accessor) = {
+            let Some(object_cell) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object.structure_id;
-            let current = object.properties.get(key).copied();
+            let old_structure = object_cell.structure_id;
+            let current = object_cell.properties.get(key).copied();
             let is_addition = current.is_none();
             if let Some(current) = current {
                 if !current.attributes.configurable {
@@ -4930,46 +4976,52 @@ impl CoreObjectStore {
                     }
                 }
             }
+            let was_accessor = current
+                .is_some_and(|current| matches!(current.kind, CorePropertyKind::Accessor { .. }));
             let shape_changed = match current {
                 Some(current) => {
                     !matches!(current.kind, CorePropertyKind::Data(_))
                         || current.attributes != attributes
                 }
                 None => {
-                    object.property_order.push(key.clone());
+                    object_cell.property_order.push(key.clone());
                     true
                 }
             };
-            object.properties.insert(
+            object_cell.properties.insert(
                 key.clone(),
                 CoreProperty {
                     kind: CorePropertyKind::Data(value),
                     attributes,
                 },
             );
-            let offset = object.ensure_named_data_property_offset(key);
-            // putDirectOffset analog: write the value into the out-of-line storage
-            // mirror in lockstep with the authoritative HashMap insert above.
-            object.write_data_property_offset_slot(key, value);
-            if shape_changed {
-                if is_addition {
-                    if let Some(offset) = offset {
-                        transition = Some((old_structure, offset));
-                    }
-                }
-                Some(old_structure)
-            } else {
-                None
-            }
+            (old_structure, shape_changed, is_addition, was_accessor)
         };
-        if let Some(old_structure) = old_structure {
-            let new_structure = match transition {
-                Some((from, offset)) => self.add_property_transition(from, key, attributes, offset),
-                None => self.allocate_structure_id(),
-            };
-            if let Some(object) = self.find_mut(object) {
-                object.structure_id = new_structure;
+        // Offset authority = structure_table. A brand-new property (or accessor->data)
+        // gets a fresh offset via the (uid, attributes)-keyed transition; an attribute
+        // change on an existing data property keeps its offset under a fresh dictionary.
+        let (new_structure, offset) = if !shape_changed {
+            (
+                old_structure,
+                self.structure_offset(old_structure, key)
+                    .unwrap_or(PropertyOffset::INVALID),
+            )
+        } else if is_addition || was_accessor {
+            self.structure_add_property(old_structure, key, attributes)
+        } else {
+            let offset = self
+                .structure_offset(old_structure, key)
+                .unwrap_or(PropertyOffset::INVALID);
+            (self.fresh_dictionary_structure(old_structure, None), offset)
+        };
+        if let Some(object_cell) = self.find_mut(object) {
+            // putDirectOffset analog.
+            object_cell.write_data_property_offset_slot(offset, value);
+            if shape_changed {
+                object_cell.structure_id = new_structure;
             }
+        }
+        if shape_changed {
             self.finish_structure_transition(old_structure);
         }
         Ok(true)
@@ -4992,45 +5044,59 @@ impl CoreObjectStore {
         object: RuntimeValue,
         key: &CorePropertyKey,
     ) -> Result<bool, ExecutionError> {
-        let new_structure = self.allocate_structure_id();
-        let old_structure = {
-            let Some(object) = self.find_mut(object) else {
+        // C++ JSC: deleting a named property is a removePropertyTransition / dictionary
+        // transition (Structure.cpp) — the property's offset is freed into the
+        // PropertyTable's deleted-offset recycle stack and the surviving offsets are
+        // preserved. The dictionary transition KINDS are not yet ported, so this takes
+        // the conservative fresh per-object dictionary that carries the surviving
+        // offsets with the deleted key taken out (offset freed for recycle).
+        let (old_structure, removed) = {
+            let Some(object_cell) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object.structure_id;
-            if object
+            let old_structure = object_cell.structure_id;
+            if object_cell
                 .properties
                 .get(key)
                 .is_some_and(|property| !property.attributes.configurable)
             {
                 return Ok(false);
             }
-            if object.kind == CoreObjectKind::Uint8Array {
+            if object_cell.kind == CoreObjectKind::Uint8Array {
                 if let Some(index) = key_array_index(key) {
-                    if index < object.view_length {
+                    if index < object_cell.view_length {
                         return Ok(false);
                     }
                 }
             }
-            if object.kind == CoreObjectKind::Array {
+            if object_cell.kind == CoreObjectKind::Array {
                 if let Some(index) = key_array_index(key) {
-                    if let Some(slot) = object.elements.get_mut(index) {
+                    if let Some(slot) = object_cell.elements.get_mut(index) {
                         *slot = None;
                     }
                 }
             }
-            if object.properties.remove(key).is_some() {
-                object
+            let removed = if object_cell.properties.remove(key).is_some() {
+                object_cell
                     .property_order
                     .retain(|ordered_key| ordered_key != key);
-                object.remove_property_offset(key);
-                object.structure_id = new_structure;
-                Some(old_structure)
+                true
             } else {
-                None
-            }
+                false
+            };
+            (old_structure, removed)
         };
-        if let Some(old_structure) = old_structure {
+        if removed {
+            // Free the deleted property's storage slot (its offset is read from the OLD
+            // structure before the dictionary takes it out, then recycled by the table).
+            let removed_offset = self.structure_offset(old_structure, key);
+            let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
+            if let Some(object_cell) = self.find_mut(object) {
+                if let Some(offset) = removed_offset {
+                    object_cell.clear_data_property_offset_slot(offset);
+                }
+                object_cell.structure_id = new_structure;
+            }
             self.finish_structure_transition(old_structure);
         }
         Ok(true)
@@ -5071,13 +5137,12 @@ impl CoreObjectStore {
         if let Some(setter) = setter {
             self.expect_function(setter)?;
         }
-        let new_structure = self.allocate_structure_id();
-        let old_structure = {
-            let Some(object) = self.find_mut(object) else {
+        let (old_structure, shape_changed) = {
+            let Some(object_cell) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object.structure_id;
-            let current = object.properties.get(key).copied();
+            let old_structure = object_cell.structure_id;
+            let current = object_cell.properties.get(key).copied();
             let mut property = current.unwrap_or(CoreProperty {
                 kind: CorePropertyKind::Accessor {
                     getter: None,
@@ -5107,20 +5172,25 @@ impl CoreObjectStore {
             let shape_changed = match current {
                 Some(current) => current != property,
                 None => {
-                    object.property_order.push(key.clone());
+                    object_cell.property_order.push(key.clone());
                     true
                 }
             };
-            object.properties.insert(key.clone(), property);
-            object.remove_property_offset(key);
-            if shape_changed {
-                object.structure_id = new_structure;
-                Some(old_structure)
-            } else {
-                None
-            }
+            object_cell.properties.insert(key.clone(), property);
+            (old_structure, shape_changed)
         };
-        if let Some(old_structure) = old_structure {
+        if shape_changed {
+            // Installing an accessor takes any displaced data offset out of the shape
+            // (the key no longer has a named-data slot) and frees it; surviving offsets
+            // are preserved on the fresh per-object dictionary structure.
+            let displaced_offset = self.structure_offset(old_structure, key);
+            let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
+            if let Some(object_cell) = self.find_mut(object) {
+                if let Some(offset) = displaced_offset {
+                    object_cell.clear_data_property_offset_slot(offset);
+                }
+                object_cell.structure_id = new_structure;
+            }
             self.finish_structure_transition(old_structure);
         }
         Ok(())
@@ -5157,13 +5227,12 @@ impl CoreObjectStore {
         if let Some(setter) = setter {
             self.expect_function(setter)?;
         }
-        let new_structure = self.allocate_structure_id();
-        let old_structure = {
-            let Some(object) = self.find_mut(object) else {
+        let (old_structure, shape_changed) = {
+            let Some(object_cell) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object.structure_id;
-            let current = object.properties.get(key).copied();
+            let old_structure = object_cell.structure_id;
+            let current = object_cell.properties.get(key).copied();
             if let Some(current) = current {
                 if !current.attributes.configurable {
                     if attributes.configurable
@@ -5191,20 +5260,22 @@ impl CoreObjectStore {
             let shape_changed = match current {
                 Some(current) => current != property,
                 None => {
-                    object.property_order.push(key.clone());
+                    object_cell.property_order.push(key.clone());
                     true
                 }
             };
-            object.properties.insert(key.clone(), property);
-            object.remove_property_offset(key);
-            if shape_changed {
-                object.structure_id = new_structure;
-                Some(old_structure)
-            } else {
-                None
-            }
+            object_cell.properties.insert(key.clone(), property);
+            (old_structure, shape_changed)
         };
-        if let Some(old_structure) = old_structure {
+        if shape_changed {
+            let displaced_offset = self.structure_offset(old_structure, key);
+            let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
+            if let Some(object_cell) = self.find_mut(object) {
+                if let Some(offset) = displaced_offset {
+                    object_cell.clear_data_property_offset_slot(offset);
+                }
+                object_cell.structure_id = new_structure;
+            }
             self.finish_structure_transition(old_structure);
         }
         Ok(true)
@@ -5278,18 +5349,25 @@ impl CoreObjectStore {
         // (a genuine later Object.setPrototypeOf / __proto__ assignment) we keep the
         // fresh-id fallback: that is a real prototype-change structure transition,
         // out of scope for the add-property transition table.
-        let kind = match self.find(object) {
-            Some(cell) => cell.kind,
+        let (kind, is_empty_object, current_structure) = match self.find(object) {
+            Some(cell) => (
+                cell.kind,
+                cell.properties.is_empty() && cell.property_order.is_empty(),
+                cell.structure_id,
+            ),
             None => return Err(ExecutionError::ExpectedObject),
         };
-        let is_empty_object = self
-            .find(object)
-            .map(|cell| cell.properties.is_empty() && cell.property_order.is_empty())
-            .unwrap_or(false);
         let new_structure = if is_empty_object {
             self.seed_structure_id(kind, prototype)
         } else {
-            self.allocate_structure_id()
+            // A prototype change on a non-empty object is a real structure transition
+            // (ChangePrototype, out of scope for the add-property transition table). Use
+            // a fresh per-object dictionary that PRESERVES the existing property offsets
+            // (the named-data slots are unaffected by the prototype change) — minting a
+            // fresh EMPTY structure would lose them. The structure's stored prototype
+            // pointer stays the prior one (the cell's `prototype` field is authoritative
+            // this batch; the faithful ChangePrototype transition is deferred).
+            self.fresh_dictionary_structure(current_structure, None)
         };
         let old_structure = {
             let Some(object) = self.find_mut(object) else {
@@ -6583,6 +6661,7 @@ impl CoreObjectStore {
                 structure: cell.structure_id,
             });
             if let Some(property) = cell.properties.get(key).copied() {
+                let found_structure = cell.structure_id;
                 return Ok(match property.kind {
                     CorePropertyKind::Data(value) => {
                         let mut record = CorePropertyLookupRecord::from_object_lookup(
@@ -6598,7 +6677,7 @@ impl CoreObjectStore {
                             },
                         );
                         record.base_structure = base_structure;
-                        record.offset = cell.property_offset(key);
+                        record.offset = self.structure_offset(found_structure, key);
                         record.returned_value = Some(value);
                         record.chain = chain.clone();
                         (CorePropertyGet::Data(value), record)
@@ -6782,6 +6861,7 @@ impl CoreObjectStore {
             }
             if let Some(property) = cell.properties.get(&key) {
                 if let CorePropertyKind::Data(value) = property.kind {
+                    let found_structure = cell.structure_id;
                     let mut record = CorePropertyLookupRecord::from_object_lookup(
                         site,
                         object,
@@ -6795,9 +6875,9 @@ impl CoreObjectStore {
                         },
                     );
                     record.base_structure = base_structure;
-                    record.offset = cell.property_offset(&key);
                     record.returned_value = Some(value);
                     record.chain = chain.clone();
+                    record.offset = self.structure_offset(found_structure, &key);
                     return Ok((value, record));
                 }
             }
@@ -7019,7 +7099,8 @@ impl CoreObjectStore {
         value: RuntimeValue,
         key: &CorePropertyKey,
     ) -> Option<PropertyOffset> {
-        self.find(value).and_then(|cell| cell.property_offset(key))
+        let structure = self.find(value)?.structure_id;
+        self.structure_offset(structure, key)
     }
 }
 

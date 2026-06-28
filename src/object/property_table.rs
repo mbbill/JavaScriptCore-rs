@@ -214,6 +214,14 @@ pub struct FindResult {
 /// divergences. Ownership skeleton: the table OWNS its index vector and value
 /// array directly. JSC co-allocates them in one tagged `malloc`; the safe-Rust
 /// port splits them into two `Vec`s of the non-compact width (module note).
+///
+/// `Clone` is derived to support `StructureIdTable` cloning (the interpreter's
+/// `CoreObjectStore` snapshot/test path clones the whole structure registry). A
+/// derived clone is a faithful deep copy: it preserves the index layout, the
+/// insertion-ordered value array, AND the `m_deletedOffsets` recycle stack
+/// exactly (which the insertion-order `clone_property_table` rebuild does not),
+/// so it is the more faithful analog of `PropertyTable::copy` (PropertyTable.h).
+#[derive(Clone)]
 pub struct PropertyTable {
     /// `unsigned m_indexSize` (PropertyTable.h:273): index-vector length, a power
     /// of two. `tableCapacity() == m_indexSize >> 1`.

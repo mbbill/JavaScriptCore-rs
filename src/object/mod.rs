@@ -73,3 +73,13 @@ pub use structure::{
     StructureTransitionMetadata, StructureTransitionPlan, StructureTransitionValidationError,
 };
 pub use watchpoint::{Watchpoint, WatchpointKind, WatchpointSet, WatchpointState};
+
+// gc-r4 Batch 2 (Structure-wire): the ported faithful Structure registry + offset
+// math, now mounted as the interpreter's live property-offset authority. The
+// `structure_cell::Structure` JSCell is re-exported as `StructureCell` to avoid
+// colliding with the still-standalone Rust-only `structure::Structure` descriptor.
+pub use indexing_type::NON_ARRAY;
+pub use property_offset::{
+    offset_for_property_number, FIRST_OUT_OF_LINE_OFFSET as STRUCTURE_FIRST_OUT_OF_LINE_OFFSET,
+};
+pub use structure_cell::{PrototypePointer, Structure as StructureCell, StructureIdTable};

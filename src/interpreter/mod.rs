@@ -72,8 +72,8 @@ use crate::jit::{
     WatchpointTarget,
 };
 use crate::object::{
-    PropertyCacheability, PropertyLookupMode, PropertyOffset, WatchpointKind, WatchpointSet,
-    WatchpointState,
+    offset_for_property_number, PropertyCacheability, PropertyLookupMode, PropertyOffset,
+    PrototypePointer, StructureIdTable, WatchpointKind, WatchpointSet, WatchpointState, NON_ARRAY,
 };
 use crate::runtime::scope::{BindingAttributes, BindingError, BindingSlot, BindingWriteOutcome};
 use crate::runtime::typed_array::{
@@ -4647,8 +4647,16 @@ impl CoreOpcodeDispatchHost {
         let Some(value) =
             generated_property_load_cell_data_property_at_offset(cell, key, expected_offset)
         else {
+            let actual_offset = self
+                .objects
+                .structure_offset(cell.structure_id, &key.to_core_property_key());
             return GeneratedPropertyLoadProbeResult::miss(
-                generated_property_load_offset_miss_reason(cell, key, expected_offset),
+                generated_property_load_offset_miss_reason(
+                    cell,
+                    key,
+                    expected_offset,
+                    actual_offset,
+                ),
             );
         };
 
@@ -4682,11 +4690,34 @@ impl CoreOpcodeDispatchHost {
             return GeneratedPropertyLoadProbeResult::miss(Miss::OpaqueObject);
         }
 
+        // The megamorphic holder probe carries NO structure guard, so the holder's
+        // Structure::PropertyTable (the offset authority) is the gate: confirm the key
+        // is a live own-data property at exactly request.offset before the blind slot
+        // read (a stale key/offset would otherwise read an unrelated slot).
+        let actual_offset = self
+            .objects
+            .structure_offset(holder.structure_id, &key.to_core_property_key());
+        if actual_offset != Some(request.offset) {
+            return GeneratedPropertyLoadProbeResult::miss(
+                generated_property_load_offset_miss_reason(
+                    holder,
+                    key,
+                    request.offset,
+                    actual_offset,
+                ),
+            );
+        }
+
         let Some(value) =
             generated_property_load_cell_data_property_at_offset(holder, key, request.offset)
         else {
             return GeneratedPropertyLoadProbeResult::miss(
-                generated_property_load_offset_miss_reason(holder, key, request.offset),
+                generated_property_load_offset_miss_reason(
+                    holder,
+                    key,
+                    request.offset,
+                    actual_offset,
+                ),
             );
         };
 
@@ -4778,7 +4809,9 @@ impl CoreOpcodeDispatchHost {
                 if !matches!(property.kind, CorePropertyKind::Data(_)) {
                     return GeneratedPropertyStoreProbeResult::miss(Miss::ExistingPropertyMismatch);
                 }
-                if cell.property_offset(stored_key) != Some(plan_hit.planned_offset) {
+                if self.objects.structure_offset(cell.structure_id, stored_key)
+                    != Some(plan_hit.planned_offset)
+                {
                     return GeneratedPropertyStoreProbeResult::miss(Miss::ExistingPropertyMismatch);
                 }
                 if plan_hit.planned_new_structure.is_some() {
@@ -4805,7 +4838,11 @@ impl CoreOpcodeDispatchHost {
                         Miss::TransitionStructureMismatch,
                     );
                 }
-                if plan_hit.planned_offset != PropertyOffset::new(cell.next_property_offset) {
+                if plan_hit.planned_offset
+                    != self
+                        .objects
+                        .next_property_offset_for_structure(cell.structure_id)
+                {
                     return GeneratedPropertyStoreProbeResult::miss(Miss::ExistingPropertyMismatch);
                 }
             }
@@ -4953,7 +4990,11 @@ impl CoreOpcodeDispatchHost {
                             Miss::ExistingPropertyMismatch,
                         );
                     }
-                    if cell.property_offset(&stored_key) != Some(hit.planned_offset) {
+                    if self
+                        .objects
+                        .structure_offset(cell.structure_id, &stored_key)
+                        != Some(hit.planned_offset)
+                    {
                         return GeneratedPropertyStoreMutationResult::rejected(
                             Miss::ExistingPropertyMismatch,
                         );
@@ -4981,7 +5022,11 @@ impl CoreOpcodeDispatchHost {
                             Miss::TransitionStructureMismatch,
                         );
                     }
-                    if hit.planned_offset != PropertyOffset::new(cell.next_property_offset) {
+                    if hit.planned_offset
+                        != self
+                            .objects
+                            .next_property_offset_for_structure(cell.structure_id)
+                    {
                         return GeneratedPropertyStoreMutationResult::rejected(
                             Miss::ExistingPropertyMismatch,
                         );
@@ -5025,8 +5070,9 @@ impl CoreOpcodeDispatchHost {
                     };
                     *value = hit.stored_value;
                     // putDirectOffset analog: keep the out-of-line mirror in lockstep
-                    // with the authoritative in-place HashMap update above.
-                    cell.write_data_property_offset_slot(&mutation_key, hit.stored_value);
+                    // with the authoritative in-place HashMap update. The offset is the
+                    // validated cached offset for this (already-guarded) shape.
+                    cell.write_data_property_offset_slot(hit.planned_offset, hit.stored_value);
                     None
                 }
                 PropertyStoreAccessCasePlanKind::DataOnlyTransition => {
@@ -5044,13 +5090,12 @@ impl CoreOpcodeDispatchHost {
                             attributes: CorePropertyAttributes::DATA_DEFAULT,
                         },
                     );
-                    let assigned_offset = cell
-                        .ensure_named_data_property_offset(&mutation_key)
-                        .expect("validated generated store transition key");
-                    assert_eq!(assigned_offset, hit.planned_offset);
-                    // putDirectOffset analog: write the value into the out-of-line
-                    // mirror in lockstep with the authoritative HashMap insert above.
-                    cell.write_data_property_offset_slot(&mutation_key, hit.stored_value);
+                    // The planned (new_structure, planned_offset) came from a real
+                    // add-property transition recorded into this access case, so
+                    // new_structure already maps mutation_key -> planned_offset in its
+                    // Structure::PropertyTable; stamp the structure and write the value
+                    // at that offset (putDirectOffset analog). No re-allocation here.
+                    cell.write_data_property_offset_slot(hit.planned_offset, hit.stored_value);
                     cell.structure_id = new_structure;
                     Some(old_structure)
                 }
@@ -5307,6 +5352,22 @@ impl CoreOpcodeDispatchHost {
                 return Self::generated_guarded_property_load_miss(
                     plan,
                     Miss::GuardOutcomeMismatch,
+                    Some(index),
+                );
+            }
+            // The structure guard above matches the cached holder structure; confirm
+            // against that structure's PropertyTable (the offset authority) that the key
+            // is STILL a live own-data property at `offset` before the blind slot read,
+            // so a property that became an accessor/was deleted under a matching cached
+            // structure is caught as a data-property-proof failure.
+            if self
+                .objects
+                .structure_offset(cell.structure_id, &key.to_core_property_key())
+                != Some(offset)
+            {
+                return Self::generated_guarded_property_load_miss(
+                    plan,
+                    Miss::GuardDataPropertyProofFailed,
                     Some(index),
                 );
             }
@@ -10035,10 +10096,11 @@ impl CoreOpcodeDispatchHost {
         let own_property = self.objects.find(string_prototype).and_then(|cell| {
             let structure = cell.structure_id;
             let property = cell.properties.get(key).copied()?;
-            let offset = cell.property_offset(key);
-            Some((structure, property, offset))
+            Some((structure, property))
         });
-        if let Some((structure, property, offset)) = own_property {
+        if let Some((structure, property)) = own_property {
+            // Offset from the prototype's Structure::PropertyTable (offset authority).
+            let offset = self.objects.structure_offset(structure, key);
             match property.kind {
                 CorePropertyKind::Data(property_value) => {
                     if let Some(site) = lookup_site {
@@ -24016,15 +24078,30 @@ mod tests {
         object: RuntimeValue,
     ) -> ObjectStoreMutationSnapshot {
         let cell = objects.find(object).expect("object cell");
+        let structure_id = cell.structure_id;
+        let properties = cell.properties.clone();
+        let property_order = cell.property_order.clone();
+        let elements = cell.elements.clone();
+        // gc-r4 Batch 2: the per-key offset map and the next-offset cursor are no longer
+        // per-cell; they are a function of the cell's structure (the offset authority).
+        // Rebuild the observable views from the structure_table for the snapshot.
+        let mut property_offsets = HashMap::new();
+        for key in &property_order {
+            if let Some(offset) = objects.structure_offset(structure_id, key) {
+                property_offsets.insert(key.clone(), offset);
+            }
+        }
         ObjectStoreMutationSnapshot {
             object_count: objects.objects.len(),
-            next_structure_id: objects.structure_ids.next,
-            structure_id: cell.structure_id,
-            properties: cell.properties.clone(),
-            property_offsets: cell.property_offsets.clone(),
-            next_property_offset: cell.next_property_offset,
-            property_order: cell.property_order.clone(),
-            elements: cell.elements.clone(),
+            next_structure_id: objects.structure_table.peek_next_handle().raw(),
+            structure_id,
+            properties,
+            property_offsets,
+            next_property_offset: objects
+                .next_property_offset_for_structure(structure_id)
+                .raw(),
+            property_order,
+            elements,
         }
     }
 
@@ -24873,12 +24950,7 @@ mod tests {
         let object = host.allocate_null_prototype_object_for_test();
         let old_structure = object_structure_id(&host.objects, object);
         let new_structure = host.objects.allocate_structure_id();
-        let planned_offset = PropertyOffset::new(
-            host.objects
-                .find(object)
-                .expect("object")
-                .next_property_offset,
-        );
+        let planned_offset = host.objects.next_property_offset(object);
         let plan = generated_property_store_transition_plan(
             old_structure,
             planned_offset,
@@ -27758,8 +27830,7 @@ mod tests {
         let object = host.objects.allocate_with_prototype(None);
         let key = CorePropertyKey::Identifier(11);
         let stored_value = RuntimeValue::from_i32(99);
-        let planned_offset =
-            PropertyOffset::new(host.objects.find(object).unwrap().next_property_offset);
+        let planned_offset = host.objects.next_property_offset(object);
         let planned_new_structure = host.objects.allocate_structure_id();
         let plan = generated_property_store_transition_plan(
             object_structure_id(&host.objects, object),
@@ -28034,8 +28105,7 @@ mod tests {
             .objects
             .allocate_proxy_with_write_barrier(&mut heap, target, handler)
             .unwrap();
-        let proxy_offset =
-            PropertyOffset::new(host.objects.find(proxy).unwrap().next_property_offset);
+        let proxy_offset = host.objects.next_property_offset(proxy);
         let proxy_new_structure = host.objects.allocate_structure_id();
         let proxy_plan = generated_property_store_transition_plan(
             object_structure_id(&host.objects, proxy),
@@ -28132,12 +28202,7 @@ mod tests {
         host.objects
             .set_data_own(transition_present, &key, RuntimeValue::from_i32(42))
             .unwrap();
-        let present_offset = PropertyOffset::new(
-            host.objects
-                .find(transition_present)
-                .unwrap()
-                .next_property_offset,
-        );
+        let present_offset = host.objects.next_property_offset(transition_present);
         let present_new_structure = host.objects.allocate_structure_id();
         let present_plan = generated_property_store_transition_plan(
             object_structure_id(&host.objects, transition_present),
@@ -28162,11 +28227,7 @@ mod tests {
         );
 
         let transition_offset = host.objects.allocate_with_prototype(None);
-        let next_offset = host
-            .objects
-            .find(transition_offset)
-            .unwrap()
-            .next_property_offset;
+        let next_offset = host.objects.next_property_offset(transition_offset).raw();
         let transition_new_structure = host.objects.allocate_structure_id();
         let transition_offset_plan = generated_property_store_transition_plan(
             object_structure_id(&host.objects, transition_offset),
@@ -28282,9 +28343,15 @@ mod tests {
             .set_data_own(object, &existing_key, RuntimeValue::from_i32(7))
             .unwrap();
         let stored_value = host.objects.allocate_with_prototype(None);
-        let planned_offset =
-            PropertyOffset::new(host.objects.find(object).unwrap().next_property_offset);
-        let planned_new_structure = host.objects.allocate_structure_id();
+        // Fabricate the planned transition from a REAL add-property transition so the
+        // planned structure actually maps `key` -> planned_offset in its PropertyTable
+        // (the offset authority); the commit then stamps that real successor.
+        let old_structure = object_structure_id(&host.objects, object);
+        let (planned_new_structure, planned_offset) = host.objects.structure_add_property(
+            old_structure,
+            &key,
+            CorePropertyAttributes::DATA_DEFAULT,
+        );
         let plan = generated_property_store_transition_plan(
             object_structure_id(&host.objects, object),
             planned_offset,
@@ -28364,7 +28431,9 @@ mod tests {
         let assert_offset_read_matches_hashmap =
             |objects: &CoreObjectStore, key: &CorePropertyKey, identifier: u32| {
                 let cell = objects.find(object).expect("object cell");
-                let offset = cell.property_offset(key).expect("named data offset");
+                let offset = objects
+                    .property_offset(object, key)
+                    .expect("named data offset");
                 let offset_value = generated_property_load_cell_data_property_at_offset(
                     cell,
                     GeneratedPropertyLoadCoreKey::Identifier(identifier),
@@ -28407,7 +28476,10 @@ mod tests {
             .set_data_own(object, &key_a, updated_a)
             .unwrap();
         let cell = host.objects.find(object).expect("object cell");
-        let offset_a = cell.property_offset(&key_a).expect("named data offset");
+        let offset_a = host
+            .objects
+            .property_offset(object, &key_a)
+            .expect("named data offset");
         assert_eq!(
             generated_property_load_cell_data_property_at_offset(
                 cell,
@@ -28420,15 +28492,16 @@ mod tests {
 
     #[test]
     fn offset_indexed_read_no_aliasing_across_64_property_boundary() {
-        // Regression for an offset_storage_index collision: the INLINE_CAPACITY==0 flat
-        // allocator emits offsets 0,1,2,...; a prior cut subtracted FIRST_OUT_OF_LINE_
-        // OFFSET(=64) for offsets >=64, aliasing offset 0 with offset 64, so the 65th
-        // property silently overwrote the 1st property's slot. Add >64 distinct data
-        // properties and assert each reads back its OWN value via the offset-indexed path.
+        // gc-r4 Batch 2: with INLINE_CAPACITY == 6 the structure assigns offsets 0..5
+        // (inline band) then jumps the 7th property to firstOutOfLineOffset == 64,65,...
+        // (out-of-line band); offset_storage_index packs both bands into one contiguous
+        // forward Vec (indices 0..N-1). Add >6 distinct data properties crossing the
+        // 6->64 boundary and assert each reads back its OWN value via the offset path
+        // (a wrong storage index would alias one property's slot onto another's).
         let mut host = CoreOpcodeDispatchHost::new();
         let object = host.objects.allocate_with_prototype(None);
 
-        const N: u32 = 70; // crosses the 64 boundary
+        const N: u32 = 70; // well past the 6-property inline band / 64 jump
         for i in 0..N {
             let key = CorePropertyKey::Identifier(1000 + i);
             host.objects
@@ -28439,7 +28512,10 @@ mod tests {
         for i in 0..N {
             let key = CorePropertyKey::Identifier(1000 + i);
             let cell = host.objects.find(object).expect("object cell");
-            let offset = cell.property_offset(&key).expect("named data offset");
+            let offset = host
+                .objects
+                .property_offset(object, &key)
+                .expect("named data offset");
             assert_eq!(
                 generated_property_load_cell_data_property_at_offset(
                     cell,
@@ -28450,6 +28526,164 @@ mod tests {
                 "property {i} must read its own value, not an aliased slot"
             );
         }
+    }
+
+    // gc-r4 Batch 2: the structure's PropertyTable is the single offset authority with
+    // inline_capacity == 6 (JSObject.h:1229). Build an object that crosses the 6->64
+    // inline/out-of-line boundary and assert (a) offsets follow offsetForPropertyNumber
+    // (identity below 6, then a jump to firstOutOfLineOffset == 64), and (b) GET/PUT
+    // return each property's OWN value across the boundary (no wrong-slot read).
+    #[test]
+    fn structure_offsets_cross_inline_to_out_of_line_boundary_and_get_put_unchanged() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let object = host.objects.allocate_with_prototype(None);
+
+        const N: u32 = 10; // 0..5 inline (offsets 0..5), 6..9 out-of-line (offsets 64..67)
+        for i in 0..N {
+            let key = CorePropertyKey::Identifier(2000 + i);
+            host.objects
+                .set_data_own(object, &key, RuntimeValue::from_i32(i as i32))
+                .unwrap();
+        }
+
+        for i in 0..N {
+            let key = CorePropertyKey::Identifier(2000 + i);
+            // (a) offsetForPropertyNumber(i, 6): identity in the inline band, jump to 64.
+            let expected_offset = offset_for_property_number(i as i32, 6);
+            assert_eq!(
+                object_property_offset(&host.objects, object, &key),
+                Some(PropertyOffset::new(expected_offset)),
+                "property {i} offset must follow the inline/out-of-line split",
+            );
+            // (b) GET returns this property's own value (slow + offset path agree).
+            let CorePropertyKind::Data(value) = host
+                .objects
+                .get_own_property(object, &key)
+                .unwrap()
+                .expect("own property")
+                .kind
+            else {
+                panic!("expected data property");
+            };
+            assert_eq!(
+                value,
+                RuntimeValue::from_i32(i as i32),
+                "GET must return property {i}'s own value, not an aliased slot",
+            );
+        }
+
+        // The 8th property is out-of-line (property number 7 -> offset 65). PUT it and
+        // re-read; a neighbouring out-of-line property must be unchanged.
+        let key8 = CorePropertyKey::Identifier(2007);
+        assert_eq!(
+            object_property_offset(&host.objects, object, &key8),
+            Some(PropertyOffset::new(65)),
+        );
+        host.objects
+            .set_data_own(object, &key8, RuntimeValue::from_i32(777))
+            .unwrap();
+        let CorePropertyKind::Data(updated) = host
+            .objects
+            .get_own_property(object, &key8)
+            .unwrap()
+            .unwrap()
+            .kind
+        else {
+            panic!("data");
+        };
+        assert_eq!(updated, RuntimeValue::from_i32(777));
+        let key6 = CorePropertyKey::Identifier(2006);
+        let CorePropertyKind::Data(neighbour) = host
+            .objects
+            .get_own_property(object, &key6)
+            .unwrap()
+            .unwrap()
+            .kind
+        else {
+            panic!("data");
+        };
+        assert_eq!(
+            neighbour,
+            RuntimeValue::from_i32(6),
+            "the PUT must not alias a neighbouring out-of-line slot",
+        );
+    }
+
+    // gc-r4 Batch 2: deleting a named property frees its offset into the structure's
+    // recycle stack (a fresh per-object dictionary structure) while PRESERVING every
+    // surviving property's offset; re-adding recycles the freed offset. Prove GET
+    // returns each property's OWN value throughout (delete-then-readd, no wrong slot).
+    #[test]
+    fn dictionary_on_delete_then_readd_keeps_offsets_and_no_wrong_slot() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let object = host.objects.allocate_with_prototype(None);
+        let a = CorePropertyKey::Identifier(3001);
+        let b = CorePropertyKey::Identifier(3002);
+        let c = CorePropertyKey::Identifier(3003);
+        host.objects
+            .set_data_own(object, &a, RuntimeValue::from_i32(10))
+            .unwrap();
+        host.objects
+            .set_data_own(object, &b, RuntimeValue::from_i32(20))
+            .unwrap();
+        host.objects
+            .set_data_own(object, &c, RuntimeValue::from_i32(30))
+            .unwrap();
+        assert_eq!(
+            object_property_offset(&host.objects, object, &a),
+            Some(PropertyOffset::new(0)),
+        );
+        assert_eq!(
+            object_property_offset(&host.objects, object, &b),
+            Some(PropertyOffset::new(1)),
+        );
+        assert_eq!(
+            object_property_offset(&host.objects, object, &c),
+            Some(PropertyOffset::new(2)),
+        );
+
+        let data_value = |host: &CoreOpcodeDispatchHost, key: &CorePropertyKey| {
+            host.objects
+                .get_own_property(object, key)
+                .unwrap()
+                .map(|property| match property.kind {
+                    CorePropertyKind::Data(value) => value,
+                    CorePropertyKind::Accessor { .. } => panic!("expected data property"),
+                })
+        };
+
+        // Delete b: its offset is freed; a@0 and c@2 are preserved (and read correctly).
+        assert!(host.objects.delete_property(object, &b).unwrap());
+        assert_eq!(
+            object_property_offset(&host.objects, object, &b),
+            None,
+            "a deleted key has no named offset",
+        );
+        assert_eq!(
+            object_property_offset(&host.objects, object, &a),
+            Some(PropertyOffset::new(0))
+        );
+        assert_eq!(
+            object_property_offset(&host.objects, object, &c),
+            Some(PropertyOffset::new(2))
+        );
+        assert_eq!(data_value(&host, &b), None, "deleted property is absent");
+        assert_eq!(data_value(&host, &a), Some(RuntimeValue::from_i32(10)));
+        assert_eq!(data_value(&host, &c), Some(RuntimeValue::from_i32(30)));
+
+        // Re-add b with a NEW value: it recycles the freed offset (1) and reads back its
+        // OWN value; a and c are still correct (no wrong-slot from the recycled slot).
+        host.objects
+            .set_data_own(object, &b, RuntimeValue::from_i32(99))
+            .unwrap();
+        assert_eq!(
+            object_property_offset(&host.objects, object, &b),
+            Some(PropertyOffset::new(1)),
+            "re-add recycles the freed offset (PropertyTable::nextOffset)",
+        );
+        assert_eq!(data_value(&host, &b), Some(RuntimeValue::from_i32(99)));
+        assert_eq!(data_value(&host, &a), Some(RuntimeValue::from_i32(10)));
+        assert_eq!(data_value(&host, &c), Some(RuntimeValue::from_i32(30)));
     }
 
     #[test]
@@ -28609,12 +28843,7 @@ mod tests {
         host.objects
             .set_data_own(transition_present, &key, RuntimeValue::from_i32(42))
             .unwrap();
-        let present_offset = PropertyOffset::new(
-            host.objects
-                .find(transition_present)
-                .unwrap()
-                .next_property_offset,
-        );
+        let present_offset = host.objects.next_property_offset(transition_present);
         let present_new_structure = host.objects.allocate_structure_id();
         let present_plan = generated_property_store_transition_plan(
             object_structure_id(&host.objects, transition_present),
@@ -28635,12 +28864,9 @@ mod tests {
         );
 
         let transition_missing_structure = host.objects.allocate_with_prototype(None);
-        let transition_missing_offset = PropertyOffset::new(
-            host.objects
-                .find(transition_missing_structure)
-                .unwrap()
-                .next_property_offset,
-        );
+        let transition_missing_offset = host
+            .objects
+            .next_property_offset(transition_missing_structure);
         let transition_missing_new_structure = host.objects.allocate_structure_id();
         let transition_missing_plan = generated_property_store_transition_plan(
             object_structure_id(&host.objects, transition_missing_structure),
@@ -28663,12 +28889,7 @@ mod tests {
         );
 
         let transition_same_structure = host.objects.allocate_with_prototype(None);
-        let transition_same_offset = PropertyOffset::new(
-            host.objects
-                .find(transition_same_structure)
-                .unwrap()
-                .next_property_offset,
-        );
+        let transition_same_offset = host.objects.next_property_offset(transition_same_structure);
         let transition_same_new_structure = host.objects.allocate_structure_id();
         let transition_same_plan = generated_property_store_transition_plan(
             object_structure_id(&host.objects, transition_same_structure),
@@ -28699,8 +28920,7 @@ mod tests {
             .objects
             .allocate_proxy_with_write_barrier(&mut heap, target, handler)
             .unwrap();
-        let proxy_offset =
-            PropertyOffset::new(host.objects.find(proxy).unwrap().next_property_offset);
+        let proxy_offset = host.objects.next_property_offset(proxy);
         let proxy_new_structure = host.objects.allocate_structure_id();
         let proxy_plan = generated_property_store_transition_plan(
             object_structure_id(&host.objects, proxy),

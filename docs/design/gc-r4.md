@@ -164,11 +164,15 @@ assert flips in the final unit → R3 (shadow oracle, arena==old per access, rev
 Composes with the JSStack track independently (different subsystems). The running collector +
 the JIT emitting raw pointers sit on top of R4.
 
-**Coupling to Structure-wire (verify at its integration):** `deleted_offsets`(392) and
-`property_order`(393) are PropertyTable-owned in C++ (m_deletedOffsets PropertyTable.h:292 +
-the entry-vector order), NOT per-cell aux — they belong with Structure-wire, not a per-kind
-unit. When Structure-wire lands, confirm it relocated them; if not, a small Structure-wire
-follow-up owns them before Butterfly-values touches the cell.
+**Residual after Structure-wire (VERIFIED at integration 2026-06-28):** Structure-wire folded
+the offset MAP and the `m_deletedOffsets` RECYCLING into the per-shape PropertyTable, but the
+cell still carries `deleted_offsets`(object_store.rs:368, now VESTIGIAL — the PropertyTable owns
+recycling) and `property_order`(369, still the LOAD-BEARING per-cell enumeration order, used at
+~15 enumeration sites). C++ keeps enumeration order in the Structure's PropertyTable entry vector,
+not per-cell. FOLLOW-UP (small, before/with Butterfly-values): fold `property_order` → the
+Structure entry order + delete the vestigial cell `deleted_offsets`. Correctness is unaffected
+(the verify pass confirmed no-wrong-slot + faithful recycling); this is dead-weight + an
+enum-order divergence to correct, not a bug.
 
 **GC edges in the POD cell:** ~14 of the STAYS scalar fields are `RuntimeValue` GC edges
 (prototype, bound_target/this, proxy_target/handler, promise_result, binding/primitive_value,
