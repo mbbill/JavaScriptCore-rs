@@ -20,6 +20,14 @@ publish = false
 # baseline-JIT/GC work, which DOES map to real WebKit C++ counterparts.
 arm64_native_entry_proof = []
 
+# S4 value-path cfg-fork (UNIT R2). OFF by default: the default build keeps the
+# transitional `(ptr << 8) | TAG_CELL` cell encoding bit-identical. When enabled,
+# src/value/repr.rs switches the three cell primitives (from_cell, is_cell,
+# CellValue::pointer_payload_bits) to the FAITHFUL raw JSVALUE64 encoding (raw
+# pointer bits, `!(v & NotCellMask)`; JSCJSValue.h:905-907, 998-1001, 1039-1043)
+# so the landed S4 cell-arena core can be wired behind the flag.
+s4_raw_cell = []
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

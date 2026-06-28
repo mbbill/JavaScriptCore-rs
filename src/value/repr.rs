@@ -41,8 +41,9 @@ const BOOL_TAG: u64 = 0x4;
 /// `UndefinedTag` (bit 3) (JSCJSValue.h:466).
 const UNDEFINED_TAG: u64 = 0x8;
 /// `NotCellMask` = NumberTag | OtherTag; in genuine JSVALUE64 a value is a cell
-/// iff none of these bits are set (JSCJSValue.h:479). Unused while cells are the
-/// transitional shifted encoding; documents the S4 target predicate.
+/// iff none of these bits are set (JSCJSValue.h:479). Used by the faithful raw
+/// arm (feature `s4_raw_cell`); dead in the default transitional build (cells
+/// are the shifted encoding), hence `#[allow(dead_code)]`.
 #[allow(dead_code)]
 const NOT_CELL_MASK: u64 = NUMBER_TAG | OTHER_TAG;
 /// Combined non-numeric immediate values (JSCJSValue.h:472-475).
@@ -613,22 +614,40 @@ impl JsValue {
     }
 
     pub fn from_cell<T: ?Sized>(cell: GcRef<T>) -> Self {
-        // TRANSITIONAL cell encoding (S4-gated). JSC stores a cell as the raw
-        // pointer (JSCJSValue.h:905-907) and tests isCell via
-        // !(v & NotCellMask) (JSCJSValue.h:998-1001), which is sound only for a
-        // raw pointer whose top 16 bits are clear. The port instead shifts the
-        // pointer left 8 and tags 0x20, so the genuine NotCellMask test is
-        // UNSOUND here (a shifted pointer reaching NumberTag bit 49 would alias
-        // a double). Cells are therefore recognized by the leftover low byte
-        // 0x20 after the NumberTag/immediate tests (see `kind`/`is_cell`),
-        // correct only while `(ptr << 8)` does not reach bit 49, i.e.
-        // `ptr < 2^41`. S4 drops the shift and restores the faithful mask.
+        // S4 value-path cfg-fork (feature `s4_raw_cell`). JSC encodes a cell as
+        // the raw pointer: `u.asInt64 = reinterpret_cast<uintptr_t>(ptr)`
+        // (JSCJSValue.h:905-907); isCell is then `!(v & NotCellMask)`
+        // (JSCJSValue.h:998-1001), sound only for a raw pointer whose top 16
+        // bits and OtherTag bit 1 are clear. Both arms compile so the landed S4
+        // cell-arena core can be wired behind the flag.
         let ptr_bits = cell.as_ptr() as *mut () as usize as u64;
-        debug_assert!(
-            (ptr_bits << 8) & NUMBER_TAG == 0,
-            "cell pointer too high for transitional JSVALUE64 coexistence (ptr must be < 2^41)"
-        );
-        Self(EncodedJsValue((ptr_bits << 8) | TAG_CELL))
+        #[cfg(not(feature = "s4_raw_cell"))]
+        {
+            // TRANSITIONAL cell encoding (default, unchanged). The port shifts
+            // the pointer left 8 and tags 0x20, so the genuine NotCellMask test
+            // is UNSOUND here (a shifted pointer reaching NumberTag bit 49 would
+            // alias a double). Cells are recognized by the leftover low byte
+            // 0x20 after the NumberTag/immediate tests (see `kind`/`is_cell`),
+            // correct only while `(ptr << 8)` does not reach bit 49, i.e.
+            // `ptr < 2^41`.
+            debug_assert!(
+                (ptr_bits << 8) & NUMBER_TAG == 0,
+                "cell pointer too high for transitional JSVALUE64 coexistence (ptr must be < 2^41)"
+            );
+            Self(EncodedJsValue((ptr_bits << 8) | TAG_CELL))
+        }
+        #[cfg(feature = "s4_raw_cell")]
+        {
+            // FAITHFUL raw JSVALUE64 (JSCJSValue.h:905-907): store the raw
+            // pointer bits unshifted. JSC relies on the pointer carrying none of
+            // the NotCellMask bits (top-16 number/double bits or OtherTag bit 1)
+            // so `asCell`/`isCell` round-trip; assert that invariant here.
+            debug_assert!(
+                (ptr_bits & NOT_CELL_MASK) == 0,
+                "raw cell pointer overlaps NotCellMask (top-16/OtherTag bits must be clear)"
+            );
+            Self(EncodedJsValue(ptr_bits))
+        }
     }
 
     /// JSCJSValue.h:1034-1037 (`isNumber`).
@@ -646,11 +665,25 @@ impl JsValue {
         self.is_number() && !self.is_int32()
     }
 
-    /// TRANSITIONAL: JSC uses `!(v & NotCellMask)` (JSCJSValue.h:998-1001); see
-    /// `from_cell` for why the port must use the leftover-low-byte test while
-    /// cells are shifted. Sound only while cell pointers stay below 2^41.
+    /// JSC uses `!(v & NotCellMask)` (JSCJSValue.h:998-1001). S4 value-path
+    /// cfg-fork: the default transitional build cannot use that mask (cells are
+    /// shifted `(ptr << 8) | 0x20`), so it classifies by the leftover low byte
+    /// after the NumberTag/immediate tests, sound only while cell pointers stay
+    /// below 2^41; the `s4_raw_cell` arm restores the faithful single-mask test.
     pub fn is_cell(self) -> bool {
-        !self.is_number() && (self.0 .0 & TAG_MASK) == TAG_CELL
+        #[cfg(not(feature = "s4_raw_cell"))]
+        {
+            !self.is_number() && (self.0 .0 & TAG_MASK) == TAG_CELL
+        }
+        #[cfg(feature = "s4_raw_cell")]
+        {
+            // FAITHFUL JSVALUE64 (JSCJSValue.h:998-1001): a value is a cell iff
+            // none of the NotCellMask bits are set. NumberTag is part of the
+            // mask, so numbers are excluded without a separate isNumber test.
+            // (As in JSC, ValueEmpty 0x0 also satisfies this; it is the
+            // zero-page Empty sentinel filtered by `isEmpty`, not by isCell.)
+            (self.0 .0 & NOT_CELL_MASK) == 0
+        }
     }
 
     /// JSCJSValue.h:987-991 (`isUndefinedOrNull`): undefined and null differ
@@ -887,7 +920,18 @@ impl CellValue {
     }
 
     pub fn pointer_payload_bits(self) -> usize {
-        (self.encoded.0 >> 8) as usize
+        // S4 value-path cfg-fork: the default transitional encoding shifts the
+        // pointer left 8 (`(ptr << 8) | 0x20`), so recover it with `>> 8`; the
+        // faithful `s4_raw_cell` arm stores the raw pointer, so the bits ARE the
+        // pointer (JSCJSValue.h:1039-1043, `asCell` returns `u.ptr`).
+        #[cfg(not(feature = "s4_raw_cell"))]
+        {
+            (self.encoded.0 >> 8) as usize
+        }
+        #[cfg(feature = "s4_raw_cell")]
+        {
+            self.encoded.0 as usize
+        }
     }
 }
 
@@ -1278,5 +1322,43 @@ mod tests {
             assert!(v.is_double());
             assert!(!v.is_int32());
         }
+    }
+
+    #[cfg(feature = "s4_raw_cell")]
+    #[test]
+    fn s4_raw_cell_round_trips_pointer_and_rejects_immediates() {
+        use core::ptr::NonNull;
+
+        // FAITHFUL raw JSVALUE64 (JSCJSValue.h:905-907, 998-1001, 1039-1043):
+        // a real 8-aligned heap pointer is stored unshifted, classifies as a
+        // cell by `!(v & NotCellMask)`, and `asCell` returns the same bits. A
+        // fabricated, never-dereferenced 8-aligned address with the top 16 bits
+        // and OtherTag bit 1 clear stands in for a heap-cell pointer; from_cell
+        // only reads the bits, so no live or pinned cell is required.
+        let addr: u64 = 0x1_0000_0000;
+        // SAFETY: the address is only encoded and round-tripped as bits; it is
+        // never dereferenced, so the live/pinned-cell precondition is vacuous.
+        let cell = unsafe { GcRef::from_non_null(NonNull::new(addr as *mut u8).unwrap()) };
+        let v = JsValue::from_cell(cell);
+        assert!(v.is_cell());
+        assert_eq!(v.encoded().0, addr); // raw pointer stored unshifted
+        assert_eq!(v.as_cell().unwrap().pointer_payload_bits(), addr as usize);
+
+        // JS-visible immediates carry OtherTag (bit 1), so `!(v & NotCellMask)`
+        // rejects them: null 0x2, false 0x6, undefined 0xa (JSCJSValue.h:472-475).
+        for bits in [0x2_u64, 0x6, 0xa] {
+            assert!(!JsValue::from_encoded(EncodedJsValue(bits)).is_cell());
+        }
+
+        // DIVERGENCE from the unit's literal "0x0 stays non-cell": in FAITHFUL
+        // JSVALUE64, ValueEmpty (0x0) has a 00 (pointer) tag with a zero-page
+        // payload, so `isCell()` is TRUE for it (JSCJSValue.h:893, 998-1001).
+        // JSC separates Empty via `isEmpty()` (== ValueEmpty), not via isCell;
+        // asserting is_cell == false here would be inventing non-JSC behavior,
+        // so the faithful assertion is is_cell == true, filtered by the Empty
+        // sentinel instead.
+        let empty = JsValue::from_encoded(EncodedJsValue(VALUE_EMPTY));
+        assert!(empty.is_cell());
+        assert!(empty.is_empty_or_deleted_sentinel());
     }
 }
