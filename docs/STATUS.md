@@ -46,6 +46,9 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 - [done] the arena + marking core (above), unwired.
 - [missing] POD object-model rewrite (retire the fat CoreObjectCell) → R3 shadow oracle → R4 flip
   (gate = technical verification: shadow cross-check + miri + adversarial verify) → running collector.
+  Audited (gc-r4.md): R4 mostly mechanical (value carries the ptr; copy-out pattern exists), sharp
+  edge = ~3 two-cell self-aliasing families. REAL gap = the collector: CoreObjectCell has NO trace
+  (GAP A) + NO sweep (GAP B); both gated on POD-ness (Batch 1). Author trace+sweep when Butterfly-values lands.
 
 ## Baseline JIT / DFG / FTL (parity lives here; ~0% started)
 - [missing] wire arm64_baseline to emit per-opcode via the encoder/finalize (retire the byte-blob /

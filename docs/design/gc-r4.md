@@ -83,21 +83,76 @@ the struct-def field-deletions + Default/Clone edits all touch object_store.rs:3
   arena butterfly pointer (so `storage_ptr@8` is a real `[base+8]→[ptr+off*8]` deref) lands at
   R4. A cross-cutting identity decision, settled this way to keep B1a/Butterfly-values reversible.
 
-## R3 → R4
+## R3 → R4 (refined by the readiness audit 2026-06-28)
 
-- **R3 (reversible):** route the ~7 store allocation choke points (object_store.rs:3660;
-  string_store.rs:72/99/170; symbol_store.rs:47/179; bigint_store.rs:572) to ALSO allocate the
-  POD cell in the MarkedSpace arena, keeping the old Vec storage as the oracle; a shadow_oracle
-  asserts arena==old every access + a suite-end population cross-check. Reversible; ~200–300 LoC.
-- **R4 (IRREVERSIBLE, 1 atomic commit):** delete the `Vec<Pin<Box>>` stores + the payload↔cell
-  HashMaps; arena address = sole cell identity; `RuntimeValue::from_cell` carries the bare
-  address; the ~177 `find_mut(obj)` sites become `arena.with_cell_mut(addr, |cell| …)` closures;
-  the collector sweeps the POD cells. ~300–500 deleted + ~1–2 kLoC modified.
-- **R4's technical gate (NOT human sign-off):** R3 shadow oracle green suite-wide (no assert,
-  population cross-check passes) + miri on the live deref under `-Zmiri-permissive-provenance`
-  + an **adversarial verifier** (refute UAF / double-drop / write-barrier-ordering / arena-deref
-  validity; grep that zero `find_mut` remain) + all 15 Octane benches pass. Orchestrator verifies
-  all four, then merges.
+R4 is LOW-risk MECHANICALLY — the value ALREADY carries the raw cell pointer
+(`RuntimeValue::from_cell`, object_store.rs:3780; `find_mut` round-trips the index map ONLY
+because safe Rust can't deref a raw ptr to `&mut`), and the `&mut self` borrow checker ALREADY
+forced the copy-out/re-lookup pattern R4 wants (every multi-cell site copies out Copy data,
+drops the borrow, re-looks-up). So `find_mut` → `arena.with_cell_mut(addr,|cell|…)` is mostly
+mechanical. The SHARP EDGE is below; the REAL work is the collector (next section).
+
+- **R3 (reversible):** the object choke point is `allocate_cell` (object_store.rs:3736-3781) —
+  NOT :3660 (that line drifted to `install_native_getter`). Others hold: string_store.rs
+  72/99/170 (+ atom ~175), symbol_store.rs 47/179, bigint_store.rs 572 — all the same
+  Box::pin→NonNull→payload→push→index-insert→`from_cell` template. R3 KEEPS that path unchanged
+  (it stays the ORACLE and keeps publishing the box pointer, so all 56 `find_mut` + read sites
+  work untouched → fully reversible) and ADDS a twin POD cell into MarkedSpace keyed by the same
+  payload; a `shadow_oracle(payload)` at the top of `find_mut`/`find` asserts the twin is
+  byte-equal to the box cell, + a suite-end population cross-check (arena live count == Σ store
+  lens). R3 only needs the arena to ACCEPT a POD blob — NOT sweep.
+- **R4 (IRREVERSIBLE, 1 atomic commit):** delete the `Vec<Pin<Box>>` stores + `objects`/
+  `object_indices_by_payload`; arena address = sole identity; the **56** `find_mut` sites (36
+  object_store.rs + 20 mod.rs) → `with_cell_mut` closures; the read-only `find` subset →
+  shared-deref closures (lower risk).
+- **THE SHARP EDGE — ~3 TWO-DISTINCT-CELL families** that JS lets be the SAME cell, which LOSE
+  compile-time aliasing safety at R4 (a naive `with_cell_mut(target,|t|{…with_cell(source)…})`
+  on `source===target` = overlapping borrows = instant UB). MUST stay copy-out; author a
+  self-aliasing verifier (these are stable JS semantics, authorable now):
+  - `Object.assign(o,o)` / `Object.defineProperties(o,o)` — mod.rs:26997/26798/26531 (source
+    slots → target slots).
+  - Map/Set self-key `m.set(m,v)` — mod.rs:23284/23365 + native_map_* 15504-16364 (copy the
+    key-index out FIRST, as native_map_delete:15501 already does).
+  - prototype-chain walkers (N-cell, not aliasing but most closures to thread) — 6578/6744/6475/6452.
+- **R4's technical gate (NOT human sign-off):** (a) R3 shadow oracle green suite-wide (no
+  assert + population cross-check passes) across all 15 benches; (b) miri on the live deref under
+  `-Zmiri-permissive-provenance` + `-Zmiri-tree-borrows`, exercising the self-aliasing hotspots
+  (`Object.assign(o,o)`, `defineProperties(o,o)`, `m.set(m,…)`, a proto-chain get) — zero UB on
+  the raw arena deref, the butterfly second deref (distinct provenance), and no double-`&mut`;
+  (c) adversarial verifier — grep zero `find_mut`/`objects.get_mut`/`object_indices_by_payload`
+  remain, zero `refresh_storage_ptr` (self-ref interior ptr gone), barrier-before-mutate ordering
+  preserved, every two-cell site provably copies out, `needs_drop::<CoreObjectCell>()==false`
+  compiles; (d) all 15 Octane benches pass. Orchestrator verifies all four, then merges.
+
+## The collector — the REAL gap (gated on POD-ness / Batch 1)
+
+The audit found the live cell has neither a trace nor a sweep; the only Trace impls are
+unwired no-op skeletons. "Make the collector run" = author these, all gated on the same
+POD-ness (Batch-1-complete) gate as R4. Author as soon as **Butterfly-values lands** (it
+de-self-references `storage_ptr`, unblocking both the trace's butterfly edge and the sweep's
+relocation-safety):
+
+- **GAP A — trace [BLOCKER]:** `CoreObjectCell` (and String/Symbol/BigInt cells) impl NEITHER
+  Trace NOR TraceCell; `JsCell::trace` is a no-op (gc/cell.rs:632-637); the skeleton `JsObject`
+  trace (object/identity.rs:126-137) is a stub. Write `CoreObjectCell::trace` visiting the ~14
+  inline `RuntimeValue` GC edges (prototype, super_base/constructor, binding/primitive_value,
+  promise_result, view_buffer, proxy_target/handler, bound_target/this, native_bound_*) + the
+  butterfly + (per-kind, added as each unit lands) the relocated backings. Mechanism exists
+  (`RuntimeValue::as_cell`→append); the visitor is just unwritten. Mirrors JSObject::visitChildren.
+- **GAP B — sweep [BLOCKER]:** `marked_block.rs` (the real 16KB S4 block) exposes NO sweep /
+  free-list rebuild. Write a sweep that, relying on `needs_drop==false` (the Batch-1 assert is
+  exactly what makes this legal — no destructor to run), reclaims unmarked atoms into the FreeList
+  (gc/heap/free_list.rs exists). Mirrors MarkedBlock::specializedSweep for DoesNotNeedDestruction.
+- **GAP C — JS-stack conservative scan [gated on JSStack track]:** native-stack conservative scan
+  IS wired (machine_stack_marker.rs:72-95 captures x19-x28 + spans), but the interpreter JSStack
+  is a separate span and not yet a single contiguous conservative span; today roots come from a
+  precise `root_snapshot` (mod.rs:928). Wiring the JSStack span into ConservativeRoots firms up
+  after the native-thread-stack migration (B4b/B6).
+- **GAP D — value-type reconciliation [divergence]:** live edges are `RuntimeValue` (value/repr.rs,
+  NaN-box, has as_cell/from_cell); the skeleton Trace/`ValueBarrier` path uses a DIFFERENT
+  `JsValue` (object/storage.rs). The trace MUST be written against `RuntimeValue` — the skeleton
+  impls target the wrong type and can't be reused as-is. Same reconciliation as the
+  storage.rs↔butterfly_handle.rs Butterfly consolidation (B1a): consolidate onto `RuntimeValue`.
 
 ## Dependency / ordering
 
