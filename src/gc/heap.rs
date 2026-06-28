@@ -14,6 +14,16 @@ mod conservative_scan;
 mod marking;
 mod run_current_phase;
 
+// S4 R1: the cell-arena UNSAFE CORE — a faithful port of the proven prototype
+// (tools/s4_arena_proto/src/lib.rs) mapped 1:1 to its JSC concepts. Pure additive
+// dead code in R1: NOT WIRED to CoreObjectStore / the live deref path / value.
+// (Map: heap/MarkedBlock.h, heap/BlockDirectory.h, heap/PreciseAllocation.h,
+// heap/MarkedSpace.h.) No `pub use` this batch — R2/R3/R4 wire it in.
+mod block_directory;
+mod marked_block;
+mod marked_space;
+mod precise_allocation;
+
 #[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use conservative_scan::HeapConservativeScanAppendReceipt;
 #[cfg(feature = "arm64_native_entry_proof")]
