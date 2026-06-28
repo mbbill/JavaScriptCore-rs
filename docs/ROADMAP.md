@@ -30,7 +30,7 @@ effort, engine-from-scratch to R ≥ 1.0.
 | 2 | Faithful foundation (value/GC-arena/Structure/strings/profiling/bytecode) + Phase E + throwers + call-link | 13% | ~95% | built, mostly unwired |
 | 3 | Assembler codegen (operands→encoder→LinkBuffer→W^X execution) | 3% | 100% | emit→relocate→execute proven |
 | 4 | R scoreboard / measurement harness | 1% | 100% | both engines, identical harness |
-| 5 | JSStack execution substrate (B1–B7 migration) | 5% | ~40% | B1+B2+B3 done; B4→B7 to go |
+| 5 | JSStack execution substrate (B1–B7 migration) | 5% | ~55% | B1–B4 done (arena=live register window); B5–B7 to go |
 | 6 | GC/value cutover: POD object model + R3 → R4 + running collector | 7% | ~10% | arena+SlotVisitor built, not wired |
 | 7 | **Baseline JIT** (per-opcode machine-code codegen + profiling wiring + tier-up) | 10% | ~5% | codegen layer ready, not emitting per-opcode |
 | 8 | **DFG** (bytecode→SSA→speculation→SpeculativeJIT+OSR) | 18% | 0% | — |
@@ -49,10 +49,9 @@ A running baseline JIT — the first thing that moves R — needs, in dependency
 
 1. **JSStack substrate** (row 5) — the JIT emits FP-relative frame access (`ldr/str
    [x29,#off]`) at the JSC offsets; this is the immovable Register stack it addresses.
-   `docs/design/jsstack.md`. **Status: B1+B2+B3 done (types/offsets/provenance gate; live
-   reservation+entry seeding+stack guard; dual-write shadow with a suite-wide byte-identity
-   cross-check). Next: B4 megafile read-flip → B5 push/pop → B6 CallFrameId retirement → B7
-   wire the encoder per-opcode.**
+   `docs/design/jsstack.md`. **Status: B1–B4 done -- the arena IS the live register window
+   (read-flip proven byte-faithful vs the Vec oracle suite-wide; reversible). Next: B4b/B6 drop
+   the Vec + retire CallFrameId → B5 prologue split → B7 wire the encoder per-opcode.**
 2. **GC / cell identity (R4)** (row 6) — the JIT emits raw cell pointers and assumes a
    real GC. `docs/design/gc-r4.md`. Needs the fat `CoreObjectCell` (HashMaps/Vecs)
    replaced by a POD inline-slots + Butterfly representation first (a sweep-managed
