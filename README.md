@@ -22,7 +22,7 @@ Overall: ~40% by effort  ███████▌░░░░░░░░░░�
 | Faithful foundation (value · GC arena · Structure · strings · profiling · bytecode) | 13% | 95% | █████████▉ |
 | Assembler codegen — **emit → relocate → execute machine code** | 3% | 100% | ██████████ |
 | Scoreboard / measurement harness | 1% | 100% | ██████████ |
-| JSStack execution substrate (frame model the JIT runs on) | 5% | 25% | ██▌░░░░░░░ |
+| JSStack execution substrate (frame model the JIT runs on) | 5% | 40% | ████░░░░░░ |
 | GC / cell-identity cutover (the GC the JIT assumes) | 7% | 10% | █░░░░░░░░░ |
 | **Baseline JIT** — per-opcode machine code *(R first moves here)* | 10% | 5% | ▌░░░░░░░░░ |
 | **DFG** optimizing tier | 18% | 0% | ░░░░░░░░░░ |
@@ -49,7 +49,7 @@ not by assertion.** (Re-measure with `tools/octane-parity/run_{cpp,rust}_baselin
 ## What's next (the critical path)
 
 A running **baseline JIT** is the next milestone that moves R. It needs, in order:
-**JSStack substrate** (B1+B2 done, B3→B7 next) → **GC / R4 cell identity** → **wire per-opcode
+**JSStack substrate** (B1–B3 done, B4 read-flip next) → **GC / R4 cell identity** → **wire per-opcode
 codegen** through the proven encoder. Then **DFG → FTL** take R to ≥ 1.0. In parallel, two
 correctness items protect the gate: the **typescript** value-divergence and **StringImpl**.
 

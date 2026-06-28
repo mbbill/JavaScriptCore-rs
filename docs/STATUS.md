@@ -33,9 +33,11 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   unsafe scoped to jit/unsafe_platform_boundary.rs (forbid→deny).
 
 ## JSStack execution substrate (native-thread-stack — see docs/design/jsstack.md)
-- [done] B1 types + offset table + provenance gate; B2 live arena reservation + entry seeding + stack
-  guard (byte-identity cross-check vs the live model passes). Fixed the jit/abi.rs callee-slot defect.
-- [missing] B3 dual-write bridge → B4/B6 megafile read-flip + CallFrameId retirement → B7 wire the encoder.
+- [done] B1 types/offsets/provenance gate; B2 live arena reservation + entry seeding + stack guard; B3
+  dual-write shadow bridge (arena mirrors the live frame model, byte-identity cross-check holds suite-wide).
+  Fixed the jit/abi.rs callee-slot defect.
+- [wip] B4 megafile read-flip (point RegisterFile reads at the arena window; de-risked by B3's cross-check)
+  → B5 push/pop=prologue → B6 CallFrameId retirement → B7 wire the encoder per-opcode.
 
 ## GC / value cutover (toward R4 — see docs/design, the arena cell identity the JIT emits)
 - [done] the arena + marking core (above), unwired.
