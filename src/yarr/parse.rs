@@ -247,7 +247,23 @@ pub struct DotStarEnclosureAnchors {
     pub eol_anchor: bool,
 }
 
+/// Quantifier family carried by a parsed term. Faithful to C++
+/// `QuantifierType` (YarrPattern.h:195): `FixedCount` / `Greedy` / `NonGreedy`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuantifierType {
+    FixedCount,
+    Greedy,
+    NonGreedy,
+}
+
 /// Parsed pattern term.
+///
+/// Mirrors C++ `struct PatternTerm` (YarrPattern.h:227-249): besides the atom
+/// payload it carries the quantifier (`quantityType`/`quantityMinCount`/
+/// `quantityMaxCount`), the backtrack-frame slot (`frameLocation`) assigned by
+/// `setupOffsets`, and the match direction (`m_matchDirection`). These were
+/// previously held in a side `term_info` arena while the type was frozen; they
+/// now live on the term exactly as C++ stores them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PatternTerm {
     pub kind: PatternTermKind,
@@ -261,6 +277,14 @@ pub struct PatternTerm {
     pub subpattern_id: Option<u32>,
     pub name: Option<StringId>,
     pub flags: RegexFlags,
+    /// YarrPattern.h:235-237 `quantityType`/`quantityMinCount`/`quantityMaxCount`.
+    pub quantity_type: QuantifierType,
+    pub quantity_min_count: u32,
+    pub quantity_max_count: u32,
+    /// YarrPattern.h:249 `frameLocation`, assigned by `setupOffsets`.
+    pub frame_location: u32,
+    /// YarrPattern.h:233 `m_matchDirection`.
+    pub match_direction: crate::yarr::MatchDirection,
 }
 
 /// One alternative inside a disjunction.
@@ -308,13 +332,22 @@ pub trait YarrSyntaxDelegate {
 /// Parsed pattern descriptor.
 /// The parser is the sole mutation authority for disjunctions, capture maps,
 /// and cached character classes until bytecode adopts them.
+///
+/// Faithful to C++ `class YarrPattern` (YarrPattern.h:769-770): the pattern owns
+/// the `m_disjunctions` arena (`disjunctions`, index 0 == `m_body`); nested
+/// parentheses/lookaround disjunctions are referenced by
+/// `PatternParenthesesDescriptor.disjunction` indices into this arena. The flat
+/// `plan_yarr_parse` validator does not build this tree; `construct_yarr_pattern`
+/// does.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct YarrPattern {
     pub id: YarrPatternId,
     pub source: StringId,
     pub flags: RegexFlags,
     pub compile_mode: CompileMode,
-    pub body: PatternDisjunction,
+    /// C++ `m_disjunctions` arena (YarrPattern.h:770). `disjunctions[0]` is the
+    /// body (`m_body`, YarrPattern.h:769).
+    pub disjunctions: Vec<PatternDisjunction>,
     pub capture_count: u32,
     pub named_capture_count: u32,
     pub duplicate_named_capture_count: u32,
@@ -325,6 +358,13 @@ pub struct YarrPattern {
     pub has_copied_parentheses: bool,
     pub save_initial_start_value: bool,
     pub error: YarrErrorCode,
+}
+
+impl YarrPattern {
+    /// Body disjunction (C++ `m_body`, YarrPattern.h:769 == `m_disjunctions[0]`).
+    pub fn body(&self) -> &PatternDisjunction {
+        &self.disjunctions[0]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1000,26 +1040,14 @@ fn yarr_parse_plan_atom_can_be_quantified(kind: YarrParsePlanAtomKind) -> bool {
 //
 // This replaces the use of `plan_yarr_parse` (a flat syntax validator) as the
 // pattern IR: it constructs the real nested disjunction tree and runs
-// setupOffsets. `plan_yarr_parse` is intentionally retained because
-// interpreter/mod.rs still calls it as a syntax validator; rewiring is a later
-// (B3) unit.
+// setupOffsets. `plan_yarr_parse` is retained only for its older callers/tests.
 //
-// FROZEN-TYPE DIVERGENCES (documented, deliberate; correct, not optimized
-// around — flagged to the orchestrator as a serial unfreeze coupling):
-//   * C++ PatternTerm (YarrPattern.h:227-249) carries quantityType /
-//     quantityMinCount / quantityMaxCount / frameLocation and m_matchDirection.
-//     The shared `PatternTerm` here (frozen with the in-flight bytecode unit)
-//     omits them, so the constructor keeps them in a side arena `term_info`
-//     held in lockstep with disjunctions[d].alternatives[a].terms[t].
-//   * C++ YarrPattern (YarrPattern.h:769-770) owns `m_body` plus an
-//     `m_disjunctions` arena; the frozen `YarrPattern` struct dropped the arena,
-//     and `PatternParenthesesDescriptor.disjunction` is an `Option<u32>` index
-//     with no backing store in `YarrPattern`. Nested disjunctions therefore
-//     cannot be hosted by the frozen `YarrPattern`. `construct_yarr_pattern`
-//     returns `ConstructedYarrPattern`, which owns the `disjunctions` arena
-//     (index 0 == body) exactly as C++ YarrPattern does. Folding the arena back
-//     into the shared `YarrPattern` requires unfreezing it in lockstep with the
-//     bytecode unit (serial decision).
+// The PatternTerm/YarrPattern types are now UNFROZEN (the serial coupling is
+// resolved): PatternTerm carries quantityType/quantityMinCount/quantityMaxCount/
+// frameLocation/m_matchDirection on the term (YarrPattern.h:227-249), and
+// YarrPattern owns the `m_disjunctions` arena (YarrPattern.h:769-770), so
+// `construct_yarr_pattern` returns a `YarrPattern` directly and the ByteCompiler
+// navigates `parentheses.disjunction` indices into `YarrPattern::disjunctions`.
 //
 // SCOPE: the legacy / non-Unicode subset sufficient for the Octane regexp
 // benchmark. Unicode/UnicodeSets canonicalization & class-set `[[..]]`,
@@ -1040,37 +1068,6 @@ const YARR_STACK_PARENTHESES_TERMINAL: u32 = 1;
 const YARR_STACK_PARENTHESES: u32 = 4;
 /// yarr/Yarr.h:45 `quantifyInfinite = UINT_MAX`.
 const QUANTIFY_INFINITE: u32 = u32::MAX;
-
-/// YarrPattern.h:195 `QuantifierType`. Construction-internal: the frozen public
-/// PatternTerm cannot store it (see module note).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QuantifierType {
-    FixedCount,
-    Greedy,
-    NonGreedy,
-}
-
-/// Per-term quantifier + frame data that C++ stores on PatternTerm
-/// (YarrPattern.h:227-249). Held in a side arena because the shared PatternTerm
-/// is frozen without these fields (see module note).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TermInfo {
-    quantity_type: QuantifierType,
-    min_count: u32,
-    max_count: u32,
-    frame_location: u32,
-}
-
-impl TermInfo {
-    fn fixed_one() -> Self {
-        TermInfo {
-            quantity_type: QuantifierType::FixedCount,
-            min_count: 1,
-            max_count: 1,
-            frame_location: 0,
-        }
-    }
-}
 
 /// YarrParser.h:2204 `ParenthesesType`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1112,35 +1109,6 @@ impl Default for ParenthesisContextFrame {
     }
 }
 
-/// Result of `construct_yarr_pattern`: the compiled pattern with its owned
-/// disjunction arena, mirroring C++ YarrPattern's `m_body` + `m_disjunctions`
-/// (YarrPattern.h:769-770). `disjunctions[0]` is the body; nested disjunctions
-/// are referenced by `PatternParenthesesDescriptor.disjunction` indices into
-/// this arena.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConstructedYarrPattern {
-    pub disjunctions: Vec<PatternDisjunction>,
-    pub flags: RegexFlags,
-    pub compile_mode: CompileMode,
-    pub capture_count: u32,
-    pub named_capture_count: u32,
-    pub contains_backreferences: bool,
-    pub contains_bol: bool,
-    pub contains_lookbehinds: bool,
-    pub contains_unsigned_length_pattern: bool,
-    pub has_copied_parentheses: bool,
-    pub save_initial_start_value: bool,
-    pub error: YarrErrorCode,
-}
-
-impl ConstructedYarrPattern {
-    /// Body disjunction (YarrPattern.h:769 `m_body`).
-    #[allow(dead_code)] // consumed by B3 wiring / tests until the matcher adopts this.
-    pub fn body(&self) -> &PatternDisjunction {
-        &self.disjunctions[0]
-    }
-}
-
 fn make_term(kind: PatternTermKind, flags: RegexFlags) -> PatternTerm {
     PatternTerm {
         kind,
@@ -1154,6 +1122,13 @@ fn make_term(kind: PatternTermKind, flags: RegexFlags) -> PatternTerm {
         subpattern_id: None,
         name: None,
         flags,
+        // C++ PatternTerm ctor defaults: FixedCount, quantity 1, frame 0, Forward
+        // (YarrPattern.h:255-262).
+        quantity_type: QuantifierType::FixedCount,
+        quantity_min_count: 1,
+        quantity_max_count: 1,
+        frame_location: 0,
+        match_direction: MatchDirection::Forward,
     }
 }
 
@@ -1165,14 +1140,12 @@ fn character_range(begin: char, end: char) -> CharacterRange {
 /// (YarrParser.h:84). The C++ Parser is a template parameterized by a delegate;
 /// in Rust the parser borrows the constructor and the two are co-located, with
 /// method names kept 1:1 with the C++ callbacks. The constructor owns the
-/// disjunction arena and the side `term_info` arena.
+/// disjunction arena.
 struct YarrPatternConstructor {
     flags: RegexFlags,
     compile_mode: CompileMode,
     // C++ YarrPattern.m_disjunctions arena (index 0 == body).
     disjunctions: Vec<PatternDisjunction>,
-    // Side arena parallel to disjunctions[d].alternatives[a].terms (see module note).
-    term_info: Vec<Vec<Vec<TermInfo>>>,
     // Navigation stack of (disjunction, alternative); top == current.
     // Models C++ `m_alternative` pointer chasing without parent back-pointers.
     nav: Vec<(usize, usize)>,
@@ -1200,7 +1173,6 @@ impl YarrPatternConstructor {
             flags,
             compile_mode,
             disjunctions: Vec::new(),
-            term_info: Vec::new(),
             nav: Vec::new(),
             paren_current: ParenthesisContextFrame::default(),
             paren_backing: Vec::new(),
@@ -1227,7 +1199,6 @@ impl YarrPatternConstructor {
     // YarrPattern.cpp:1155 resetForReparsing.
     fn reset_for_reparsing(&mut self) {
         self.disjunctions.clear();
-        self.term_info.clear();
         self.nav.clear();
         self.paren_current = ParenthesisContextFrame::default();
         self.paren_backing.clear();
@@ -1265,7 +1236,6 @@ impl YarrPatternConstructor {
             call_frame_size: 0,
             has_fixed_size: false,
         });
-        self.term_info.push(Vec::new());
         idx
     }
 
@@ -1291,20 +1261,17 @@ impl YarrPatternConstructor {
                 is_last_alternative: false,
                 contains_captures: false,
             });
-        self.term_info[disjunction].push(Vec::new());
         alt
     }
 
-    fn append_term(&mut self, term: PatternTerm, info: TermInfo) {
+    fn append_term(&mut self, term: PatternTerm) {
         let (d, a) = self.cur();
         self.disjunctions[d].alternatives[a].terms.push(term);
-        self.term_info[d][a].push(info);
     }
 
     fn remove_last_term(&mut self) {
         let (d, a) = self.cur();
         self.disjunctions[d].alternatives[a].terms.pop();
-        self.term_info[d][a].pop();
     }
 
     // ParenthesisContext push/pop (YarrPattern.cpp:2516/2527).
@@ -1356,7 +1323,7 @@ impl YarrPatternConstructor {
             PatternTermKind::Assertion(PatternAssertion::Bol),
             self.flags,
         );
-        self.append_term(term, TermInfo::fixed_one());
+        self.append_term(term);
     }
 
     fn assertion_eol(&mut self) {
@@ -1364,7 +1331,7 @@ impl YarrPatternConstructor {
             PatternTermKind::Assertion(PatternAssertion::Eol),
             self.flags,
         );
-        self.append_term(term, TermInfo::fixed_one());
+        self.append_term(term);
     }
 
     fn assertion_word_boundary(&mut self, invert: bool) {
@@ -1375,7 +1342,7 @@ impl YarrPatternConstructor {
         };
         let mut term = make_term(PatternTermKind::Assertion(kind), self.flags);
         term.invert = invert;
-        self.append_term(term, TermInfo::fixed_one());
+        self.append_term(term);
     }
 
     fn atom_pattern_character(&mut self, ch: char) {
@@ -1385,7 +1352,7 @@ impl YarrPatternConstructor {
         // (YarrPattern.cpp:1253) is out of this unit.
         let mut term = make_term(PatternTermKind::PatternCharacter, self.flags);
         term.character = Some(ch);
-        self.append_term(term, TermInfo::fixed_one());
+        self.append_term(term);
     }
 
     fn atom_built_in_character_class(&mut self, class_id: BuiltInCharacterClassId, invert: bool) {
@@ -1413,7 +1380,7 @@ impl YarrPatternConstructor {
         let mut term = make_term(PatternTermKind::CharacterClass, self.flags);
         term.character_class = Some(descriptor);
         term.invert = term_invert;
-        self.append_term(term, TermInfo::fixed_one());
+        self.append_term(term);
     }
 
     // Character class `[...]` construction (YarrPattern.cpp:1402 atomCharacterClassEnd).
@@ -1460,7 +1427,7 @@ impl YarrPatternConstructor {
         let mut term = make_term(PatternTermKind::CharacterClass, self.flags);
         term.character_class = Some(descriptor);
         term.invert = term_invert;
-        self.append_term(term, TermInfo::fixed_one());
+        self.append_term(term);
     }
 
     fn parentheses_descriptor(
@@ -1493,9 +1460,9 @@ impl YarrPatternConstructor {
         let (d, a) = self.cur();
         let mut term = make_term(PatternTermKind::ParenthesesSubpattern, self.flags);
         term.capture = capture;
+        term.match_direction = self.parenthesis_match_direction();
         term.parentheses = Some(Self::parentheses_descriptor(child, subpattern_id));
         self.disjunctions[d].alternatives[a].terms.push(term);
-        self.term_info[d][a].push(TermInfo::fixed_one());
         if capture {
             self.disjunctions[d].alternatives[a].contains_captures = true;
         }
@@ -1523,9 +1490,9 @@ impl YarrPatternConstructor {
         let (d, a) = self.cur();
         let mut term = make_term(PatternTermKind::Assertion(kind), self.flags);
         term.invert = invert;
+        term.match_direction = direction;
         term.parentheses = Some(Self::parentheses_descriptor(child, subpattern_id));
         self.disjunctions[d].alternatives[a].terms.push(term);
-        self.term_info[d][a].push(TermInfo::fixed_one());
         let child_alt = self.add_alternative(child, self.num_subpatterns, direction);
         self.nav.push((child, child_alt));
         self.push_parenthesis_context();
@@ -1598,12 +1565,12 @@ impl YarrPatternConstructor {
         {
             let mut term = make_term(PatternTermKind::NumberedForwardReference, self.flags);
             term.subpattern_id = Some(0);
-            self.append_term(term, TermInfo::fixed_one());
+            self.append_term(term);
             return;
         }
         let mut term = make_term(PatternTermKind::NumberedBackReference, self.flags);
         term.subpattern_id = Some(subpattern_id);
-        self.append_term(term, TermInfo::fixed_one());
+        self.append_term(term);
         self.contains_backreferences = true;
     }
 
@@ -1618,13 +1585,13 @@ impl YarrPatternConstructor {
             Some(id) => {
                 let mut term = make_term(PatternTermKind::NamedBackReference, self.flags);
                 term.subpattern_id = Some(id);
-                self.append_term(term, TermInfo::fixed_one());
+                self.append_term(term);
                 self.contains_backreferences = true;
             }
             None => {
                 let mut term = make_term(PatternTermKind::NamedForwardReference, self.flags);
                 term.subpattern_id = Some(0);
-                self.append_term(term, TermInfo::fixed_one());
+                self.append_term(term);
             }
         }
     }
@@ -1633,7 +1600,7 @@ impl YarrPatternConstructor {
         // YarrPattern.cpp:1630 atomNamedForwardReference (forward-matching path).
         let mut term = make_term(PatternTermKind::NamedForwardReference, self.flags);
         term.subpattern_id = Some(0);
-        self.append_term(term, TermInfo::fixed_one());
+        self.append_term(term);
     }
 
     fn disjunction(&mut self, purpose: CreateDisjunctionPurpose) {
@@ -1670,54 +1637,31 @@ impl YarrPatternConstructor {
             return;
         }
 
+        let greedy_type = if greedy {
+            QuantifierType::Greedy
+        } else {
+            QuantifierType::NonGreedy
+        };
         if min == max {
-            self.term_info[d][a][t] = TermInfo {
-                quantity_type: QuantifierType::FixedCount,
-                min_count: min,
-                max_count: max,
-                frame_location: 0,
-            };
+            self.set_term_quantity(d, a, t, QuantifierType::FixedCount, min, max);
         } else if min == 0
             || (kind == PatternTermKind::ParenthesesSubpattern && self.has_copied_parentheses)
         {
-            self.term_info[d][a][t] = TermInfo {
-                quantity_type: if greedy {
-                    QuantifierType::Greedy
-                } else {
-                    QuantifierType::NonGreedy
-                },
-                min_count: min,
-                max_count: max,
-                frame_location: 0,
-            };
+            self.set_term_quantity(d, a, t, greedy_type, min, max);
         } else {
             // YarrPattern.cpp:1746 (forward-direction split): a {min} fixed copy
             // followed by a greedy/lazy {0, max-min} copy. Backward-direction split
             // (lookbehind bodies) is out of this unit.
-            self.term_info[d][a][t] = TermInfo {
-                quantity_type: QuantifierType::FixedCount,
-                min_count: min,
-                max_count: min,
-                frame_location: 0,
-            };
+            self.set_term_quantity(d, a, t, QuantifierType::FixedCount, min, min);
             let copied = self.copy_term(d, a, t);
-            self.append_term(copied.0, copied.1);
+            self.append_term(copied);
             let new_t = self.disjunctions[d].alternatives[a].terms.len() - 1;
             let new_max = if max == QUANTIFY_INFINITE {
                 QUANTIFY_INFINITE
             } else {
                 max - min
             };
-            self.term_info[d][a][new_t] = TermInfo {
-                quantity_type: if greedy {
-                    QuantifierType::Greedy
-                } else {
-                    QuantifierType::NonGreedy
-                },
-                min_count: 0,
-                max_count: new_max,
-                frame_location: 0,
-            };
+            self.set_term_quantity(d, a, new_t, greedy_type, 0, new_max);
             if self.disjunctions[d].alternatives[a].terms[new_t].kind
                 == PatternTermKind::ParenthesesSubpattern
             {
@@ -1729,6 +1673,21 @@ impl YarrPatternConstructor {
                 }
             }
         }
+    }
+
+    fn set_term_quantity(
+        &mut self,
+        d: usize,
+        a: usize,
+        t: usize,
+        quantity_type: QuantifierType,
+        min: u32,
+        max: u32,
+    ) {
+        let term = &mut self.disjunctions[d].alternatives[a].terms[t];
+        term.quantity_type = quantity_type;
+        term.quantity_min_count = min;
+        term.quantity_max_count = max;
     }
 
     fn is_parenthetical_assertion(kind: PatternTermKind) -> bool {
@@ -1743,9 +1702,8 @@ impl YarrPatternConstructor {
     }
 
     // YarrPattern.cpp:1681 copyTerm / :1643 copyDisjunction.
-    fn copy_term(&mut self, d: usize, a: usize, t: usize) -> (PatternTerm, TermInfo) {
+    fn copy_term(&mut self, d: usize, a: usize, t: usize) -> PatternTerm {
         let mut term = self.disjunctions[d].alternatives[a].terms[t].clone();
-        let info = self.term_info[d][a][t];
         let is_paren = matches!(
             term.kind,
             PatternTermKind::ParenthesesSubpattern | PatternTermKind::ParentheticalAssertion
@@ -1759,7 +1717,7 @@ impl YarrPatternConstructor {
                 self.has_copied_parentheses = true;
             }
         }
-        (term, info)
+        term
     }
 
     fn copy_disjunction(&mut self, src: usize) -> usize {
@@ -1775,11 +1733,10 @@ impl YarrPatternConstructor {
             self.disjunctions[new_d].alternatives[new_a].last_subpattern_id = last;
             let nterms = self.disjunctions[src].alternatives[alt].terms.len();
             for t in 0..nterms {
-                let (term, info) = self.copy_term(src, alt, t);
+                let term = self.copy_term(src, alt, t);
                 self.disjunctions[new_d].alternatives[new_a]
                     .terms
                     .push(term);
-                self.term_info[new_d][new_a].push(info);
             }
         }
         new_d
@@ -1803,13 +1760,13 @@ impl YarrPatternConstructor {
                 continue;
             }
             let t = nterms - 1;
-            let kind = self.disjunctions[body].alternatives[alt].terms[t].kind;
-            let info = self.term_info[body][alt][t];
-            let captures = self.disjunctions[body].alternatives[alt].terms[t].capture;
+            let term = &self.disjunctions[body].alternatives[alt].terms[t];
+            let kind = term.kind;
+            let captures = term.capture;
             if kind == PatternTermKind::ParenthesesSubpattern
-                && info.quantity_type == QuantifierType::Greedy
-                && info.min_count == 0
-                && info.max_count == QUANTIFY_INFINITE
+                && term.quantity_type == QuantifierType::Greedy
+                && term.quantity_min_count == 0
+                && term.quantity_max_count == QUANTIFY_INFINITE
                 && !captures
             {
                 if let Some(p) = self.disjunctions[body].alternatives[alt].terms[t]
@@ -1886,7 +1843,8 @@ impl YarrPatternConstructor {
         let nterms = self.disjunctions[d].alternatives[a].terms.len();
         for t in 0..nterms {
             let kind = self.disjunctions[d].alternatives[a].terms[t].kind;
-            let info = self.term_info[d][a][t];
+            let term_quantity_type = self.disjunctions[d].alternatives[a].terms[t].quantity_type;
+            let term_max_count = self.disjunctions[d].alternatives[a].terms[t].quantity_max_count;
             match kind {
                 PatternTermKind::Assertion(PatternAssertion::Bol)
                 | PatternTermKind::Assertion(PatternAssertion::Eol)
@@ -1897,7 +1855,8 @@ impl YarrPatternConstructor {
 
                 PatternTermKind::NumberedBackReference | PatternTermKind::NamedBackReference => {
                     self.disjunctions[d].alternatives[a].terms[t].input_position = current_input;
-                    self.term_info[d][a][t].frame_location = current_call_frame;
+                    self.disjunctions[d].alternatives[a].terms[t].frame_location =
+                        current_call_frame;
                     current_call_frame = current_call_frame
                         .checked_add(YARR_STACK_BACK_REFERENCE)
                         .ok_or(YarrErrorCode::FrameTooLarge)?;
@@ -1909,8 +1868,9 @@ impl YarrPatternConstructor {
 
                 PatternTermKind::PatternCharacter => {
                     self.disjunctions[d].alternatives[a].terms[t].input_position = current_input;
-                    if info.quantity_type != QuantifierType::FixedCount {
-                        self.term_info[d][a][t].frame_location = current_call_frame;
+                    if term_quantity_type != QuantifierType::FixedCount {
+                        self.disjunctions[d].alternatives[a].terms[t].frame_location =
+                            current_call_frame;
                         current_call_frame = current_call_frame
                             .checked_add(YARR_STACK_PATTERN_CHARACTER)
                             .ok_or(YarrErrorCode::FrameTooLarge)?;
@@ -1919,15 +1879,16 @@ impl YarrPatternConstructor {
                         // Unicode multi-unit advance (YarrPattern.cpp:1833) is out of
                         // this unit; the legacy subset advances by max_count.
                         current_input = current_input
-                            .checked_add(info.max_count)
+                            .checked_add(term_max_count)
                             .ok_or(YarrErrorCode::OffsetTooLarge)?;
                     }
                 }
 
                 PatternTermKind::CharacterClass => {
                     self.disjunctions[d].alternatives[a].terms[t].input_position = current_input;
-                    if info.quantity_type != QuantifierType::FixedCount {
-                        self.term_info[d][a][t].frame_location = current_call_frame;
+                    if term_quantity_type != QuantifierType::FixedCount {
+                        self.disjunctions[d].alternatives[a].terms[t].frame_location =
+                            current_call_frame;
                         current_call_frame = current_call_frame
                             .checked_add(YARR_STACK_CHARACTER_CLASS)
                             .ok_or(YarrErrorCode::FrameTooLarge)?;
@@ -1936,13 +1897,14 @@ impl YarrPatternConstructor {
                         // Unicode fixed-count class frame (YarrPattern.cpp:1851) is
                         // out of this unit; the legacy subset advances by max_count.
                         current_input = current_input
-                            .checked_add(info.max_count)
+                            .checked_add(term_max_count)
                             .ok_or(YarrErrorCode::OffsetTooLarge)?;
                     }
                 }
 
                 PatternTermKind::ParenthesesSubpattern => {
-                    self.term_info[d][a][t].frame_location = current_call_frame;
+                    self.disjunctions[d].alternatives[a].terms[t].frame_location =
+                        current_call_frame;
                     let child = self.disjunctions[d].alternatives[a].terms[t]
                         .parentheses
                         .as_ref()
@@ -1960,7 +1922,7 @@ impl YarrPatternConstructor {
                         .map(|p| p.is_terminal)
                         .unwrap_or(false);
 
-                    if info.max_count == 1 && !is_copy {
+                    if term_max_count == 1 && !is_copy {
                         current_call_frame = current_call_frame
                             .checked_add(YARR_STACK_PARENTHESES_ONCE)
                             .ok_or(YarrErrorCode::FrameTooLarge)?;
@@ -1969,7 +1931,7 @@ impl YarrPatternConstructor {
                             current_call_frame,
                             current_input,
                         )?;
-                        if info.quantity_type == QuantifierType::FixedCount {
+                        if term_quantity_type == QuantifierType::FixedCount {
                             let child_min = self.disjunctions[child].minimum_size.unwrap_or(0);
                             current_input = current_input
                                 .checked_add(child_min)
@@ -2023,7 +1985,8 @@ impl YarrPatternConstructor {
                         .expect("parenthetical assertion has a child disjunction")
                         as usize;
                     self.disjunctions[d].alternatives[a].terms[t].input_position = current_input;
-                    self.term_info[d][a][t].frame_location = current_call_frame;
+                    self.disjunctions[d].alternatives[a].terms[t].frame_location =
+                        current_call_frame;
                     current_call_frame = current_call_frame
                         .checked_add(YARR_STACK_PARENTHETICAL_ASSERTION)
                         .ok_or(YarrErrorCode::FrameTooLarge)?;
@@ -2046,13 +2009,17 @@ impl YarrPatternConstructor {
         Ok(current_call_frame)
     }
 
-    fn into_constructed(self) -> ConstructedYarrPattern {
-        ConstructedYarrPattern {
-            disjunctions: self.disjunctions,
+    fn into_pattern(self, id: YarrPatternId, source: StringId) -> YarrPattern {
+        YarrPattern {
+            id,
+            source,
             flags: self.flags,
             compile_mode: self.compile_mode,
+            disjunctions: self.disjunctions,
             capture_count: self.num_subpatterns,
             named_capture_count: self.named_capture_count,
+            // Duplicate named-capture groups are out of this unit (see module note).
+            duplicate_named_capture_count: 0,
             contains_backreferences: self.contains_backreferences,
             contains_bol: self.contains_bol,
             contains_lookbehinds: self.contains_lookbehinds,
@@ -3067,15 +3034,15 @@ struct ClassDelegate<'b> {
 }
 
 /// Public entry: faithfully parse `source_text` into a nested PatternDisjunction
-/// tree and run setupOffsets (YarrPattern.cpp:2665 YarrPattern::compile order).
-// Not yet wired into the interpreter/bytecode (that is a later B3 unit); the
-// `dead_code` allowance covers the as-yet-unused construction surface and is
-// removed when the matcher/bytecode adopt this constructor.
-#[allow(dead_code)]
+/// tree and run setupOffsets (YarrPattern.cpp:2665 YarrPattern::compile order),
+/// returning a `YarrPattern` whose `disjunctions` arena the ByteCompiler lowers.
+/// `id`/`source` identify the pattern for the bytecode/runtime layers.
 pub fn construct_yarr_pattern(
     source_text: &str,
     flags: RegexFlags,
-) -> Result<ConstructedYarrPattern, YarrParseError> {
+    id: YarrPatternId,
+    source: StringId,
+) -> Result<YarrPattern, YarrParseError> {
     let compile_mode = compile_mode_for_flags(flags);
     let mut constructor = YarrPatternConstructor::new(flags, compile_mode);
     let chars: Vec<char> = source_text.chars().collect();
@@ -3111,7 +3078,7 @@ pub fn construct_yarr_pattern(
         return Err(YarrParseError { code, offset: 0 });
     }
 
-    Ok(constructor.into_constructed())
+    Ok(constructor.into_pattern(id, source))
 }
 
 #[cfg(test)]
@@ -3227,7 +3194,7 @@ mod tests {
 
     // ---- YarrPatternConstructor + setupOffsets (Yarr B1) ----
 
-    fn child_of(p: &ConstructedYarrPattern, term: &PatternTerm) -> usize {
+    fn child_of(p: &YarrPattern, term: &PatternTerm) -> usize {
         term.parentheses
             .as_ref()
             .unwrap()
@@ -3247,7 +3214,13 @@ mod tests {
             ignore_case: true,
             ..RegexFlags::default()
         };
-        let p = construct_yarr_pattern("HF(?=;)", flags).unwrap();
+        let p = construct_yarr_pattern(
+            "HF(?=;)",
+            flags,
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         assert_eq!(p.error, YarrErrorCode::NoError);
         assert_eq!(p.capture_count, 0);
 
@@ -3285,7 +3258,13 @@ mod tests {
     fn constructs_word_boundary_offsets() {
         // Pins YarrParser.h:918 \b -> assertionWordBoundary and the assertion offset
         // rule YarrPattern.cpp:1805 (inputPosition = currentInputPosition, no advance).
-        let p = construct_yarr_pattern("\\bfoo", RegexFlags::default()).unwrap();
+        let p = construct_yarr_pattern(
+            "\\bfoo",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         let body = p.body();
         let terms = &body.alternatives[0].terms;
         assert_eq!(terms.len(), 4);
@@ -3303,7 +3282,13 @@ mod tests {
         assert_eq!(body.call_frame_size, 0);
 
         // \B sets the inverted word-boundary assertion (YarrParser.h:927).
-        let neg = construct_yarr_pattern("\\Bx", RegexFlags::default()).unwrap();
+        let neg = construct_yarr_pattern(
+            "\\Bx",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         assert_eq!(
             neg.body().alternatives[0].terms[0].kind,
             PatternTermKind::Assertion(PatternAssertion::NotWordBoundary)
@@ -3316,7 +3301,13 @@ mod tests {
         // Pins YarrPattern.cpp:1457 atomParenthesesSubpatternBegin and the fixed-once
         // parentheses offset rule YarrPattern.cpp:1870 (ParenthesesOnce frame; fixed
         // count pre-advances currentInputPosition by the nested minimumSize).
-        let p = construct_yarr_pattern("(ab)c", RegexFlags::default()).unwrap();
+        let p = construct_yarr_pattern(
+            "(ab)c",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         assert_eq!(p.capture_count, 1);
         let body = p.body();
         let terms = &body.alternatives[0].terms;
@@ -3345,7 +3336,13 @@ mod tests {
         // Pins YarrParser.h:1528 (?:) and the greedy quantifier (YarrPattern.cpp:1744)
         // plus the unbounded-parentheses offset rule (YarrPattern.cpp:1892): a non-fixed
         // parens does NOT advance currentInputPosition, so 'c' stays at position 0.
-        let p = construct_yarr_pattern("(?:ab)*c", RegexFlags::default()).unwrap();
+        let p = construct_yarr_pattern(
+            "(?:ab)*c",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         assert_eq!(p.capture_count, 0);
         let body = p.body();
         let terms = &body.alternatives[0].terms;
@@ -3370,7 +3367,13 @@ mod tests {
         // Pins quantifyAtom min!=max forward split (YarrPattern.cpp:1746): a{2,4}
         // becomes a{2} (fixed) followed by a copy a{0,2} (greedy). Fixed prefix
         // advances currentInputPosition by 2, the greedy copy by 0.
-        let p = construct_yarr_pattern("a{2,4}", RegexFlags::default()).unwrap();
+        let p = construct_yarr_pattern(
+            "a{2,4}",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         let body = p.body();
         let terms = &body.alternatives[0].terms;
         assert_eq!(terms.len(), 2);
@@ -3385,7 +3388,13 @@ mod tests {
         // Pins YarrParser.h:251 range state machine -> YarrPattern.cpp:1337
         // atomCharacterClassRange. Negation is carried on the term (atomCharacterClassEnd
         // YarrPattern.cpp:1419 PatternTerm m_invert), not on the descriptor.
-        let p = construct_yarr_pattern("[a-c]x", RegexFlags::default()).unwrap();
+        let p = construct_yarr_pattern(
+            "[a-c]x",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         let terms = &p.body().alternatives[0].terms;
         assert_eq!(terms[0].kind, PatternTermKind::CharacterClass);
         let cc = terms[0].character_class.as_ref().unwrap();
@@ -3403,7 +3412,13 @@ mod tests {
         assert_eq!(terms[1].input_position, 1);
 
         // [^\d] keeps the built-in identity with the negation folded onto the term.
-        let neg = construct_yarr_pattern("[^\\d]", RegexFlags::default()).unwrap();
+        let neg = construct_yarr_pattern(
+            "[^\\d]",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         let neg_cc = neg.body().alternatives[0].terms[0]
             .character_class
             .as_ref()
@@ -3415,7 +3430,13 @@ mod tests {
     #[test]
     fn constructs_dot_and_builtin_classes() {
         // Pins YarrParser.h:1754 '.' and YarrParser.h:941 \d -> atomBuiltInCharacterClass.
-        let p = construct_yarr_pattern("\\d.", RegexFlags::default()).unwrap();
+        let p = construct_yarr_pattern(
+            "\\d.",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         let terms = &p.body().alternatives[0].terms;
         assert_eq!(
             terms[0].character_class.as_ref().unwrap().built_in,
@@ -3433,7 +3454,13 @@ mod tests {
     #[test]
     fn constructs_alternation() {
         // Pins YarrParser.h:1726 '|' -> disjunction (ForNextAlternative).
-        let p = construct_yarr_pattern("ab|cde", RegexFlags::default()).unwrap();
+        let p = construct_yarr_pattern(
+            "ab|cde",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         let body = p.body();
         assert_eq!(body.alternatives.len(), 2);
         assert_eq!(body.alternatives[0].terms.len(), 2);
@@ -3445,7 +3472,13 @@ mod tests {
     #[test]
     fn constructs_backreference() {
         // Pins YarrParser.h:1008 decimal escape -> atomBackReference (YarrPattern.cpp:1550).
-        let p = construct_yarr_pattern("(a)\\1", RegexFlags::default()).unwrap();
+        let p = construct_yarr_pattern(
+            "(a)\\1",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         assert!(p.contains_backreferences);
         let terms = &p.body().alternatives[0].terms;
         assert_eq!(terms.len(), 2);
@@ -3460,7 +3493,13 @@ mod tests {
         // Pins YarrParser.h:1546 (?<name>) and (?<=) lookbehind (YarrParser.h:1565),
         // plus the backward ParentheticalAssertion offset rule (YarrPattern.cpp:1906:
         // disjunctionInitialInputPosition = 0 for Backward).
-        let named = construct_yarr_pattern("(?<word>\\w+)", RegexFlags::default()).unwrap();
+        let named = construct_yarr_pattern(
+            "(?<word>\\w+)",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         assert_eq!(named.capture_count, 1);
         assert_eq!(named.named_capture_count, 1);
         let child = &named.disjunctions[child_of(&named, &named.body().alternatives[0].terms[0])];
@@ -3471,7 +3510,13 @@ mod tests {
             .iter()
             .all(|t| t.kind == PatternTermKind::CharacterClass));
 
-        let lb = construct_yarr_pattern("(?<=ab)c", RegexFlags::default()).unwrap();
+        let lb = construct_yarr_pattern(
+            "(?<=ab)c",
+            RegexFlags::default(),
+            YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .unwrap();
         assert!(lb.contains_lookbehinds);
         let terms = &lb.body().alternatives[0].terms;
         assert_eq!(
@@ -3492,15 +3537,25 @@ mod tests {
         // Pins YarrParser.h:1850 MissingParentheses and YarrParser.h:1708
         // QuantifierWithoutAtom.
         assert_eq!(
-            construct_yarr_pattern("(ab", RegexFlags::default())
-                .unwrap_err()
-                .code,
+            construct_yarr_pattern(
+                "(ab",
+                RegexFlags::default(),
+                YarrPatternId(0),
+                crate::strings::StringId(0)
+            )
+            .unwrap_err()
+            .code,
             YarrErrorCode::MissingParentheses
         );
         assert_eq!(
-            construct_yarr_pattern("*a", RegexFlags::default())
-                .unwrap_err()
-                .code,
+            construct_yarr_pattern(
+                "*a",
+                RegexFlags::default(),
+                YarrPatternId(0),
+                crate::strings::StringId(0)
+            )
+            .unwrap_err()
+            .code,
             YarrErrorCode::QuantifierWithoutAtom
         );
     }

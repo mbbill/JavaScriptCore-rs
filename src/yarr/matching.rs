@@ -379,6 +379,38 @@ fn test_character_class(class: &CharacterClassDescriptor, ch: u32) -> bool {
     }
 }
 
+/// ignoreCase membership: C++ pre-folds the `CharacterClass` at construction
+/// (`Yarr::CharacterClassConstructor` adds each member's canonical equivalents
+/// when `ignoreCase`). We fold at the membership test instead, for the legacy/BMP
+/// single-char-fold subset (a-z<->A-Z and the Latin-1 case pairs). Full UCS2/
+/// Unicode canonicalization-table fidelity (multi-char folds like `ß`, and the
+/// Unicode-mode `k`/Kelvin, `s`/`ſ` groups) is deferred to the Unicode unit;
+/// JSC legacy does not fold `ß`, matching the single-char guard below.
+fn test_character_class_ci(class: &CharacterClassDescriptor, ch: u32, ignore_case: bool) -> bool {
+    if test_character_class(class, ch) {
+        return true;
+    }
+    if !ignore_case {
+        return false;
+    }
+    let Some(c) = char::from_u32(ch) else {
+        return false;
+    };
+    let mut upper = c.to_uppercase();
+    if let (Some(u), None) = (upper.next(), upper.next()) {
+        if u != c && test_character_class(class, u as u32) {
+            return true;
+        }
+    }
+    let mut lower = c.to_lowercase();
+    if let (Some(l), None) = (lower.next(), lower.next()) {
+        if l != c && test_character_class(class, l as u32) {
+            return true;
+        }
+    }
+    false
+}
+
 /// `InputStream` — YarrInterpreter.cpp:273. Code-unit cursor over the subject.
 struct InputStream {
     input: Vec<u16>,
@@ -598,6 +630,17 @@ impl InputStream {
 
     fn is_valid_negative_input_offset(&self, offset: u32) -> bool {
         self.pos >= offset && (self.pos - offset) < self.length
+    }
+}
+
+/// C++ `toASCIIUpper` (YarrInterpreter.cpp:678): uppercases an ASCII letter,
+/// leaving every other code point unchanged.
+#[inline]
+fn ascii_upper(ch: u32) -> u32 {
+    if (0x61..=0x7A).contains(&ch) {
+        ch - 0x20
+    } else {
+        ch
     }
 }
 
@@ -848,7 +891,7 @@ impl<'a> Interpreter<'a> {
             Some(c) => c,
             None => return false,
         };
-        let m = test_character_class(class, ch);
+        let m = test_character_class_ci(class, ch, term.flags.ignore_case);
         if term.invert {
             !m
         } else {
@@ -877,7 +920,7 @@ impl<'a> Interpreter<'a> {
             return false;
         }
         let class = term.character_class.as_ref().unwrap();
-        test_character_class(class, read)
+        test_character_class_ci(class, read, term.flags.ignore_case)
     }
 
     fn match_assertion_bol(&self, term: &BytecodeTerm) -> bool {
@@ -920,15 +963,23 @@ impl<'a> Interpreter<'a> {
 
     /// tryConsumeBackReference — YarrInterpreter.cpp:640. Forward-only path
     /// (lookbehind back-references are deferred with the rest of the Backward
-    /// machinery; see serial-coupling notes). Note: this Forward port does not
-    /// yet apply ignoreCase canonical equivalence (C++:675-684); see notes.
-    fn try_consume_back_reference(&mut self, match_begin: u32, match_end: u32) -> bool {
+    /// machinery; see serial-coupling notes).
+    fn try_consume_back_reference(
+        &mut self,
+        match_begin: u32,
+        match_end: u32,
+        term: &BytecodeTerm,
+    ) -> bool {
         let match_size = match_end - match_begin;
         if !self.input.check_input(match_size) {
             return false;
         }
         for i in 0..match_size {
-            let neg = match_size - i;
+            // YarrInterpreter.cpp:651: the read offset includes the term's
+            // inputPosition (the negative distance of the back-reference END from
+            // the current cursor). Omitting it mis-positions a back-reference that
+            // is followed by further fixed terms (e.g. `(a)\1b`).
+            let neg = term.input_position + match_size - i;
             let old_ch = self.input.reread(match_begin + i);
             let ch = self.input.read_checked_dont_advance(neg);
             if old_ch == ERROR_CODE_POINT || ch == ERROR_CODE_POINT {
@@ -936,6 +987,15 @@ impl<'a> Interpreter<'a> {
                 return false;
             }
             if old_ch == ch {
+                continue;
+            }
+            // YarrInterpreter.cpp:674 ignoreCase canonicalization. The legacy
+            // (non-Unicode) ASCII path is faithful; full Unicode canonical
+            // equivalence for non-ASCII back-references is deferred (Unicode unit).
+            if term.flags.ignore_case
+                && (old_ch < 0x80 || ch < 0x80)
+                && ascii_upper(old_ch) == ascii_upper(ch)
+            {
                 continue;
             }
             self.input.uncheck_input(match_size);
@@ -1148,7 +1208,7 @@ impl<'a> Interpreter<'a> {
         match quantity_type(term) {
             QType::FixedCount => {
                 for _ in 0..quantity_max(term) {
-                    if !self.try_consume_back_reference(match_begin, match_end) {
+                    if !self.try_consume_back_reference(match_begin, match_end, term) {
                         self.input.set_pos(ctx.num(loc));
                         return false;
                     }
@@ -1158,7 +1218,7 @@ impl<'a> Interpreter<'a> {
             QType::Greedy => {
                 let mut match_amount = 0;
                 while match_amount < quantity_max(term)
-                    && self.try_consume_back_reference(match_begin, match_end)
+                    && self.try_consume_back_reference(match_begin, match_end, term)
                 {
                     match_amount += 1;
                 }
@@ -1204,7 +1264,7 @@ impl<'a> Interpreter<'a> {
             QType::NonGreedy => {
                 let amount = ctx.num(loc + 1);
                 if amount < quantity_max(term)
-                    && self.try_consume_back_reference(match_begin, match_end)
+                    && self.try_consume_back_reference(match_begin, match_end, term)
                 {
                     ctx.set_num(loc + 1, amount + 1);
                     return true;
@@ -2818,6 +2878,11 @@ mod interp_tests {
             subpattern_id: None,
             name: None,
             flags: flags(),
+            quantity_type: crate::yarr::QuantifierType::FixedCount,
+            quantity_min_count: 1,
+            quantity_max_count: 1,
+            frame_location: 0,
+            match_direction: MatchDirection::Forward,
         }
     }
 
@@ -2847,14 +2912,14 @@ mod interp_tests {
             source: crate::strings::StringId(1),
             flags: flags(),
             compile_mode: CompileMode::Legacy,
-            body: PatternDisjunction {
+            disjunctions: vec![PatternDisjunction {
                 alternatives: alts,
                 parent_subpattern: None,
                 is_body: true,
                 minimum_size: Some(minimum_size),
                 call_frame_size: 0,
                 has_fixed_size: true,
-            },
+            }],
             capture_count: 0,
             named_capture_count: 0,
             duplicate_named_capture_count: 0,

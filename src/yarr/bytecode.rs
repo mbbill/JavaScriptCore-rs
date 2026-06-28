@@ -5,8 +5,8 @@
 
 use crate::strings::StringId;
 use crate::yarr::{
-    CharacterClassDescriptor, MatchDirection, PatternAssertion, PatternDisjunction, PatternTerm,
-    PatternTermKind, RegexFlags, YarrPattern, YarrPatternId,
+    CharacterClassDescriptor, MatchDirection, PatternAssertion, PatternTermKind, QuantifierType,
+    RegexFlags, YarrPattern, YarrPatternId,
 };
 
 /// Stable identity for a bytecode pattern.
@@ -830,37 +830,98 @@ pub fn validate_yarr_bytecode_program(
     validate_bytecode_pattern(&program.pattern)
 }
 
-/// Faithful port of `class ByteCompiler` (YarrInterpreter.cpp:2276) for the
-/// subset of the parse tree the current `PatternTerm` descriptor can express:
-/// flat alternatives of FixedCount-1 atoms (characters, character classes,
-/// anchors, word boundaries, dot-star enclosures). It performs the real
-/// structural lowering — `regexBegin` wraps the body in
-/// `BodyAlternativeBegin/Disjunction/End`, `emitDisjunction` emits a per-
-/// alternative `CheckInput(minimumSize)` then the atoms, and
-/// `closeBodyAlternative` links the alternative `next`/`end` offsets
-/// (YarrInterpreter.cpp:2294-2534, :2683-2768).
-///
-/// SERIAL COUPLING (B1): the Rust `PatternTerm` does not yet carry
-/// `quantityType/quantityMinCount/quantityMaxCount`, a per-term `frameLocation`,
-/// or a disjunction pool to resolve nested `parentheses.disjunction`. Until B1
-/// supplies them, quantified atoms, back-references with frames, capturing/
-/// non-capturing groups, and lookaround cannot be lowered FROM THE TREE and are
-/// reported as `UnsupportedTerm`. The interpreter exercises those paths via
-/// hand-built `BytecodeTerm` fixtures, which fully express quantifiers and
-/// frames.
-struct ByteCompiler {
-    terms: Vec<BytecodeTerm>,
-    current_alternative_index: usize,
+// Yarr backtrack stack-space constants (Yarr.h:35-45), needed by the ByteCompiler
+// to derive each parentheses' `alternativeFrameLocation`.
+const YARR_STACK_PARENTHESES_ONCE: u32 = 2;
+const YARR_STACK_PARENTHESES_TERMINAL: u32 = 1;
+const YARR_STACK_PARENTHETICAL_ASSERTION: u32 = 1;
+/// Yarr.h:45 `quantifyInfinite == UINT_MAX`.
+const QUANTIFY_INFINITE: u32 = u32::MAX;
+
+fn quantifier_kind(qtype: QuantifierType) -> QuantifierKind {
+    match qtype {
+        QuantifierType::FixedCount => QuantifierKind::FixedCount,
+        QuantifierType::Greedy => QuantifierKind::Greedy,
+        QuantifierType::NonGreedy => QuantifierKind::NonGreedy,
+    }
+}
+
+fn make_quantifier(qtype: QuantifierType, min: u32, max: u32) -> Quantifier {
+    Quantifier {
+        kind: quantifier_kind(qtype),
+        min,
+        max: if max == QUANTIFY_INFINITE {
+            None
+        } else {
+            Some(max)
+        },
+    }
+}
+
+/// C++ `ByteTerm(char32_t, ...)` selects the term kind from the quantifier
+/// (YarrInterpreter.h:125-150).
+fn pattern_character_kind(qtype: QuantifierType, max: u32) -> BytecodeTermKind {
+    match qtype {
+        QuantifierType::FixedCount => {
+            if max == 1 {
+                BytecodeTermKind::PatternCharacterOnce
+            } else {
+                BytecodeTermKind::PatternCharacterFixed
+            }
+        }
+        QuantifierType::Greedy => BytecodeTermKind::PatternCharacterGreedy,
+        QuantifierType::NonGreedy => BytecodeTermKind::PatternCharacterNonGreedy,
+    }
+}
+
+/// C++ `ByteTerm(char32_t lo, char32_t hi, ...)` (YarrInterpreter.h:153-180).
+fn cased_character_kind(qtype: QuantifierType, max: u32) -> BytecodeTermKind {
+    match qtype {
+        QuantifierType::FixedCount => {
+            if max == 1 {
+                BytecodeTermKind::PatternCasedCharacterOnce
+            } else {
+                BytecodeTermKind::PatternCasedCharacterFixed
+            }
+        }
+        QuantifierType::Greedy => BytecodeTermKind::PatternCasedCharacterGreedy,
+        QuantifierType::NonGreedy => BytecodeTermKind::PatternCasedCharacterNonGreedy,
+    }
+}
+
+/// Parentheses stack entry — YarrInterpreter.cpp:2277 `ParenthesesStackEntry`.
+struct ParenthesesStackEntry {
+    begin_term: usize,
+    saved_alternative_index: usize,
+}
+
+/// Faithful port of `class ByteCompiler` (YarrInterpreter.cpp:2276). Lowers the
+/// parsed `YarrPattern` disjunction tree into a flat `BytecodePattern` the
+/// interpreter (`matchDisjunction`) executes. `terms` is the in-progress body
+/// buffer (`m_bodyDisjunction->terms`); `all_parentheses` holds the extracted
+/// variable-count sub-disjunctions (`m_allParenthesesInfo`), referenced by the
+/// `ParenthesesSubpattern` term's `parentheses_disjunction` index (C++ raw
+/// `ByteDisjunction*`). The parentheses/alternative jump linking
+/// (`closeAlternative`/`closeBodyAlternative`) is ported 1:1.
+struct ByteCompiler<'a> {
+    parsed: &'a YarrPattern,
     flags: RegexFlags,
+    terms: Vec<BytecodeTerm>,
+    all_parentheses: Vec<ByteDisjunction>,
+    current_alternative_index: usize,
+    parentheses_stack: Vec<ParenthesesStackEntry>,
     contains_eol: bool,
 }
 
-impl ByteCompiler {
-    fn new(flags: RegexFlags) -> Self {
+impl<'a> ByteCompiler<'a> {
+    fn new(parsed: &'a YarrPattern) -> Self {
         Self {
+            parsed,
+            flags: parsed.flags,
             terms: Vec::new(),
+            all_parentheses: Vec::new(),
             current_alternative_index: 0,
-            flags,
+            parentheses_stack: Vec::new(),
             contains_eol: false,
         }
     }
@@ -873,90 +934,36 @@ impl ByteCompiler {
         index
     }
 
-    fn set_alt_jump(&mut self, index: usize, next: i32, end: i32, once_through: bool) {
-        self.terms[index].alternative_jump = Some(BytecodeAlternativeJump {
-            next,
-            end,
-            once_through,
+    /// Sets `frameLocation` on a term (Rust bundles it into the optional
+    /// backtrack-frame reservation; `stack_slots` is left 0 because the
+    /// authoritative frame size is the disjunction `call_frame_size` from
+    /// setupOffsets — the interpreter only reads `frame_location`).
+    fn set_frame(&mut self, idx: usize, frame_location: u32) {
+        self.terms[idx].frame = Some(YarrBacktrackFrame {
+            frame_location,
+            stack_slots: 0,
+            captures_begin: None,
+            captures_end: None,
         });
     }
 
-    /// regexBegin — YarrInterpreter.cpp:2652.
-    fn regex_begin(&mut self, once_through: bool) {
-        let idx = self.push(BytecodeTermKind::BodyAlternativeBegin);
-        self.set_alt_jump(idx, 0, 0, once_through);
-        self.current_alternative_index = 0;
+    fn set_alt_jump(&mut self, idx: usize, jump: BytecodeAlternativeJump) {
+        self.terms[idx].alternative_jump = Some(jump);
     }
 
-    /// regexEnd — YarrInterpreter.cpp:2660.
-    fn regex_end(&mut self) {
-        self.close_body_alternative();
+    fn alt_jump(&self, idx: usize) -> BytecodeAlternativeJump {
+        self.terms[idx].alternative_jump.unwrap_or(EMPTY_ALT_JUMP)
     }
 
-    /// alternativeBodyDisjunction — YarrInterpreter.cpp:2665.
-    fn alternative_body_disjunction(&mut self, once_through: bool) {
-        let new_index = self.terms.len();
-        let current = self.current_alternative_index;
-        // terms[current].alternative.next = newIndex - current
-        let cur_jump = self.terms[current]
-            .alternative_jump
-            .unwrap_or(EMPTY_ALT_JUMP);
-        self.set_alt_jump(
-            current,
-            (new_index - current) as i32,
-            cur_jump.end,
-            cur_jump.once_through,
-        );
-        let idx = self.push(BytecodeTermKind::BodyAlternativeDisjunction);
-        self.set_alt_jump(idx, 0, 0, once_through);
-        self.current_alternative_index = new_index;
+    fn frame_location_of(&self, idx: usize) -> u32 {
+        self.terms[idx]
+            .frame
+            .as_ref()
+            .map(|f| f.frame_location)
+            .unwrap_or(0)
     }
 
-    /// closeBodyAlternative — YarrInterpreter.cpp:2514.
-    fn close_body_alternative(&mut self) {
-        let mut begin_term = 0usize;
-        let orig_begin_term = 0usize;
-        let end_index = self.terms.len();
-        while self.terms[begin_term]
-            .alternative_jump
-            .unwrap_or(EMPTY_ALT_JUMP)
-            .next
-            != 0
-        {
-            let next = self.terms[begin_term]
-                .alternative_jump
-                .unwrap_or(EMPTY_ALT_JUMP)
-                .next;
-            begin_term = (begin_term as i32 + next) as usize;
-            // C++ sets only `.end` here; the walked term's existing `.next`
-            // (0 for the last disjunction, the chain link otherwise) is preserved.
-            let existing = self.terms[begin_term]
-                .alternative_jump
-                .unwrap_or(EMPTY_ALT_JUMP);
-            self.set_alt_jump(
-                begin_term,
-                existing.next,
-                (end_index - begin_term) as i32,
-                existing.once_through,
-            );
-        }
-        let once = self.terms[begin_term]
-            .alternative_jump
-            .unwrap_or(EMPTY_ALT_JUMP)
-            .once_through;
-        let end = self.terms[begin_term]
-            .alternative_jump
-            .unwrap_or(EMPTY_ALT_JUMP)
-            .end;
-        self.set_alt_jump(
-            begin_term,
-            orig_begin_term as i32 - begin_term as i32,
-            end,
-            once,
-        );
-        let end_idx = self.push(BytecodeTermKind::BodyAlternativeEnd);
-        self.set_alt_jump(end_idx, 0, 0, false);
-    }
+    // ---- input checks (YarrInterpreter.cpp:2316-2329) ----
 
     fn check_input(&mut self, count: u32) {
         let idx = self.push(BytecodeTermKind::CheckInput);
@@ -964,6 +971,22 @@ impl ByteCompiler {
             checked_count: count,
         });
     }
+
+    fn uncheck_input(&mut self, count: u32) {
+        let idx = self.push(BytecodeTermKind::UncheckInput);
+        self.terms[idx].input_check = Some(BytecodeInputCheck {
+            checked_count: count,
+        });
+    }
+
+    fn have_checked_input(&mut self, count: u32) {
+        let idx = self.push(BytecodeTermKind::HaveCheckedInput);
+        self.terms[idx].input_check = Some(BytecodeInputCheck {
+            checked_count: count,
+        });
+    }
+
+    // ---- assertions (YarrInterpreter.cpp:2331-2344) ----
 
     fn assertion_bol(&mut self, input_position: u32, flags: RegexFlags) {
         let idx = self.push(BytecodeTermKind::AssertionBol);
@@ -978,84 +1001,533 @@ impl ByteCompiler {
         self.contains_eol = true;
     }
 
-    fn assertion_word_boundary(&mut self, invert: bool, input_position: u32, flags: RegexFlags) {
+    fn assertion_word_boundary(
+        &mut self,
+        invert: bool,
+        direction: MatchDirection,
+        input_position: u32,
+        flags: RegexFlags,
+    ) {
         let idx = self.push(BytecodeTermKind::AssertionWordBoundary);
         self.terms[idx].input_position = input_position;
         self.terms[idx].invert = invert;
+        self.terms[idx].direction = direction;
         self.terms[idx].flags = flags;
     }
 
-    /// atomPatternCharacter — YarrInterpreter.cpp:2346. FixedCount-1 only;
-    /// ignoreCase emits a cased-character term when lower != upper.
-    fn atom_pattern_character(&mut self, ch: char, input_position: u32, flags: RegexFlags) {
+    // ---- atoms (YarrInterpreter.cpp:2346-2389) ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn atom_pattern_character(
+        &mut self,
+        ch: char,
+        direction: MatchDirection,
+        input_position: u32,
+        frame_location: u32,
+        quantity_max_count: u32,
+        quantity_type: QuantifierType,
+        flags: RegexFlags,
+    ) {
         if flags.ignore_case {
             let lo = simple_lower(ch);
             let hi = simple_upper(ch);
             if lo != hi {
-                let idx = self.push(BytecodeTermKind::PatternCasedCharacterOnce);
-                self.terms[idx].cased_range = Some((lo, hi));
+                let kind = cased_character_kind(quantity_type, quantity_max_count);
+                let idx = self.push(kind);
+                self.terms[idx].cased_range = Some((lo.min(hi), lo.max(hi)));
                 self.terms[idx].input_position = input_position;
+                self.terms[idx].direction = direction;
                 self.terms[idx].flags = flags;
+                self.set_frame(idx, frame_location);
+                let min = if quantity_type == QuantifierType::FixedCount {
+                    quantity_max_count
+                } else {
+                    0
+                };
+                self.terms[idx].quantifier =
+                    make_quantifier(quantity_type, min, quantity_max_count);
                 return;
             }
         }
-        let idx = self.push(BytecodeTermKind::PatternCharacterOnce);
+        let kind = pattern_character_kind(quantity_type, quantity_max_count);
+        let idx = self.push(kind);
         self.terms[idx].character = Some(ch);
         self.terms[idx].input_position = input_position;
+        self.terms[idx].direction = direction;
         self.terms[idx].flags = flags;
+        self.set_frame(idx, frame_location);
+        let min = if quantity_type == QuantifierType::FixedCount {
+            quantity_max_count
+        } else {
+            0
+        };
+        self.terms[idx].quantifier = make_quantifier(quantity_type, min, quantity_max_count);
     }
 
-    /// atomCharacterClass — YarrInterpreter.cpp:2363. FixedCount-1 only.
+    #[allow(clippy::too_many_arguments)]
     fn atom_character_class(
         &mut self,
         class: CharacterClassDescriptor,
         invert: bool,
+        direction: MatchDirection,
         input_position: u32,
+        frame_location: u32,
+        quantity_max_count: u32,
+        quantity_type: QuantifierType,
         flags: RegexFlags,
     ) {
         let idx = self.push(BytecodeTermKind::CharacterClass);
         self.terms[idx].character_class = Some(class);
         self.terms[idx].invert = invert;
+        self.terms[idx].direction = direction;
         self.terms[idx].input_position = input_position;
         self.terms[idx].flags = flags;
+        self.set_frame(idx, frame_location);
+        // C++ ByteTerm class ctor defaults min=1; atomCharacterClass resets to 0
+        // only for non-fixed quantifiers (YarrInterpreter.cpp:2363).
+        let min = if quantity_type == QuantifierType::FixedCount {
+            1
+        } else {
+            0
+        };
+        self.terms[idx].quantifier = make_quantifier(quantity_type, min, quantity_max_count);
     }
 
-    /// assertionDotStarEnclosure — YarrInterpreter.cpp:2471.
+    #[allow(clippy::too_many_arguments)]
+    fn atom_back_reference(
+        &mut self,
+        subpattern_id: u32,
+        direction: MatchDirection,
+        input_position: u32,
+        frame_location: u32,
+        quantity_min_count: u32,
+        quantity_max_count: u32,
+        quantity_type: QuantifierType,
+        flags: RegexFlags,
+    ) {
+        let idx = self.push(BytecodeTermKind::BackReference);
+        self.terms[idx].subpattern_id = Some(subpattern_id);
+        self.terms[idx].direction = direction;
+        self.terms[idx].input_position = input_position;
+        self.terms[idx].flags = flags;
+        self.set_frame(idx, frame_location);
+        // Duplicate named-capture groups are out of this unit (no duplicateNamedGroupId).
+        self.terms[idx].quantifier =
+            make_quantifier(quantity_type, quantity_min_count, quantity_max_count);
+    }
+
     fn assertion_dot_star_enclosure(&mut self, bol: bool, eol: bool) {
         let idx = self.push(BytecodeTermKind::DotStarEnclosure);
         self.terms[idx].dot_star_anchors = Some((bol, eol));
     }
 
-    /// emitDisjunction — YarrInterpreter.cpp:2683 (Forward, flat subset).
+    // ---- parentheses begins (YarrInterpreter.cpp:2392-2447) ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn parentheses_begin(
+        &mut self,
+        kind: BytecodeTermKind,
+        subpattern_id: u32,
+        match_direction: MatchDirection,
+        capture: bool,
+        input_position: u32,
+        frame_location: u32,
+        alternative_frame_location: u32,
+    ) {
+        let begin_term = self.terms.len();
+        let idx = self.push(kind);
+        self.terms[idx].subpattern_id = Some(subpattern_id);
+        self.terms[idx].capture = capture;
+        self.terms[idx].direction = match_direction;
+        self.terms[idx].input_position = input_position;
+        self.terms[idx].subpattern_range = Some(BytecodeSubpatternRange {
+            first_subpattern_id: subpattern_id,
+            last_subpattern_id: subpattern_id,
+        });
+        self.set_frame(idx, frame_location);
+        let ab = self.push(BytecodeTermKind::AlternativeBegin);
+        self.set_alt_jump(ab, EMPTY_ALT_JUMP);
+        self.set_frame(ab, alternative_frame_location);
+        self.parentheses_stack.push(ParenthesesStackEntry {
+            begin_term,
+            saved_alternative_index: self.current_alternative_index,
+        });
+        self.current_alternative_index = begin_term + 1;
+    }
+
+    fn atom_parenthetical_assertion_begin(
+        &mut self,
+        subpattern_id: u32,
+        invert: bool,
+        match_direction: MatchDirection,
+        frame_location: u32,
+        alternative_frame_location: u32,
+    ) {
+        let begin_term = self.terms.len();
+        let idx = self.push(BytecodeTermKind::ParentheticalAssertionBegin);
+        self.terms[idx].subpattern_id = Some(subpattern_id);
+        self.terms[idx].invert = invert;
+        self.terms[idx].direction = match_direction;
+        self.terms[idx].subpattern_range = Some(BytecodeSubpatternRange {
+            first_subpattern_id: subpattern_id,
+            last_subpattern_id: subpattern_id,
+        });
+        self.set_frame(idx, frame_location);
+        let ab = self.push(BytecodeTermKind::AlternativeBegin);
+        self.set_alt_jump(ab, EMPTY_ALT_JUMP);
+        self.set_frame(ab, alternative_frame_location);
+        self.parentheses_stack.push(ParenthesesStackEntry {
+            begin_term,
+            saved_alternative_index: self.current_alternative_index,
+        });
+        self.current_alternative_index = begin_term + 1;
+    }
+
+    // ---- parentheses ends (YarrInterpreter.cpp:2448-2650) ----
+
+    fn pop_parentheses_stack(&mut self) -> usize {
+        let entry = self
+            .parentheses_stack
+            .pop()
+            .expect("parentheses stack non-empty");
+        self.current_alternative_index = entry.saved_alternative_index;
+        entry.begin_term
+    }
+
+    fn atom_parenthetical_assertion_end(&mut self, last_subpattern_id: u32, frame_location: u32) {
+        let begin_term = self.pop_parentheses_stack();
+        self.close_alternative(begin_term + 1);
+        let end_term = self.terms.len();
+        let invert = self.terms[begin_term].invert;
+        let direction = self.terms[begin_term].direction;
+        let subpattern_id = self.terms[begin_term].subpattern_id.unwrap_or(0);
+
+        let idx = self.push(BytecodeTermKind::ParentheticalAssertionEnd);
+        self.terms[idx].subpattern_id = Some(subpattern_id);
+        self.terms[idx].invert = invert;
+        self.terms[idx].direction = direction;
+        // first > last encodes "no captures" (C++ containsAnyCaptures()).
+        self.terms[idx].subpattern_range = Some(BytecodeSubpatternRange {
+            first_subpattern_id: subpattern_id,
+            last_subpattern_id,
+        });
+        let width = (end_term - begin_term) as u32;
+        self.terms[begin_term].parentheses_width = Some(width);
+        self.terms[idx].parentheses_width = Some(width);
+        self.set_frame(idx, frame_location);
+        // Quantity stays FixedCount/1 (assertions match at most once) — the default.
+    }
+
+    fn atom_parentheses_once_end(
+        &mut self,
+        input_position: u32,
+        frame_location: u32,
+        quantity_min_count: u32,
+        quantity_max_count: u32,
+        quantity_type: QuantifierType,
+    ) {
+        let begin_term = self.pop_parentheses_stack();
+        self.close_alternative(begin_term + 1);
+        let end_term = self.terms.len();
+        let capture = self.terms[begin_term].capture;
+        let subpattern_id = self.terms[begin_term].subpattern_id.unwrap_or(0);
+        let begin_direction = self.terms[begin_term].direction;
+
+        let idx = self.push(BytecodeTermKind::ParenthesesSubpatternOnceEnd);
+        self.terms[idx].subpattern_id = Some(subpattern_id);
+        self.terms[idx].capture = capture;
+        self.terms[idx].input_position = input_position;
+        self.terms[idx].subpattern_range = Some(BytecodeSubpatternRange {
+            first_subpattern_id: subpattern_id,
+            last_subpattern_id: subpattern_id,
+        });
+        if begin_direction == MatchDirection::Backward {
+            // Swap input positions for backward captures (YarrInterpreter.cpp:2588).
+            let begin_input = self.terms[begin_term].input_position;
+            self.terms[idx].input_position = begin_input;
+            self.terms[begin_term].input_position = input_position;
+        }
+        let width = (end_term - begin_term) as u32;
+        self.terms[begin_term].parentheses_width = Some(width);
+        self.terms[idx].parentheses_width = Some(width);
+        self.set_frame(idx, frame_location);
+        self.terms[idx].direction = begin_direction;
+        self.terms[begin_term].quantifier =
+            make_quantifier(quantity_type, quantity_min_count, quantity_max_count);
+        self.terms[idx].quantifier =
+            make_quantifier(quantity_type, quantity_min_count, quantity_max_count);
+    }
+
+    fn atom_parentheses_terminal_end(
+        &mut self,
+        input_position: u32,
+        frame_location: u32,
+        quantity_min_count: u32,
+        quantity_max_count: u32,
+        quantity_type: QuantifierType,
+    ) {
+        let begin_term = self.pop_parentheses_stack();
+        self.close_alternative(begin_term + 1);
+        let end_term = self.terms.len();
+        let begin_direction = self.terms[begin_term].direction;
+        let input_position = if begin_direction == MatchDirection::Backward {
+            0
+        } else {
+            input_position
+        };
+        let capture = self.terms[begin_term].capture;
+        let subpattern_id = self.terms[begin_term].subpattern_id.unwrap_or(0);
+
+        let idx = self.push(BytecodeTermKind::ParenthesesSubpatternTerminalEnd);
+        self.terms[idx].subpattern_id = Some(subpattern_id);
+        self.terms[idx].capture = capture;
+        self.terms[idx].input_position = input_position;
+        self.terms[idx].subpattern_range = Some(BytecodeSubpatternRange {
+            first_subpattern_id: subpattern_id,
+            last_subpattern_id: subpattern_id,
+        });
+        let width = (end_term - begin_term) as u32;
+        self.terms[begin_term].parentheses_width = Some(width);
+        self.terms[idx].parentheses_width = Some(width);
+        self.set_frame(idx, frame_location);
+        self.terms[begin_term].quantifier =
+            make_quantifier(quantity_type, quantity_min_count, quantity_max_count);
+        self.terms[idx].quantifier =
+            make_quantifier(quantity_type, quantity_min_count, quantity_max_count);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn atom_parentheses_subpattern_end(
+        &mut self,
+        last_subpattern_id: u32,
+        input_position: u32,
+        frame_location: u32,
+        quantity_min_count: u32,
+        quantity_max_count: u32,
+        quantity_type: QuantifierType,
+        call_frame_size: u32,
+    ) {
+        let begin_term = self.pop_parentheses_stack();
+        self.close_alternative(begin_term + 1);
+        let end_term = self.terms.len();
+        let parentheses_match_direction = self.terms[begin_term].direction;
+        let capture = self.terms[begin_term].capture;
+        let subpattern_id = self.terms[begin_term].subpattern_id.unwrap_or(0);
+        let num_subpatterns = if last_subpattern_id >= subpattern_id {
+            last_subpattern_id - subpattern_id + 1
+        } else {
+            0
+        };
+
+        // Extract begin_term+1 .. end_term into a fresh ByteDisjunction wrapped in
+        // SubpatternBegin/End (YarrInterpreter.cpp:2536-2560).
+        let mut sub_terms: Vec<BytecodeTerm> = Vec::with_capacity(end_term - begin_term + 1);
+        sub_terms
+            .push(self.make_subpattern_marker(BytecodeTermKind::SubpatternBegin, subpattern_id));
+        for i in (begin_term + 1)..end_term {
+            sub_terms.push(self.terms[i].clone());
+        }
+        sub_terms.push(self.make_subpattern_marker(BytecodeTermKind::SubpatternEnd, subpattern_id));
+
+        self.terms.truncate(begin_term);
+
+        let parentheses_index = self.all_parentheses.len() as u32;
+        let pidx = self.push(BytecodeTermKind::ParenthesesSubpattern);
+        self.terms[pidx].subpattern_id = Some(subpattern_id);
+        self.terms[pidx].parentheses_disjunction = Some(parentheses_index);
+        self.terms[pidx].capture = capture;
+        self.terms[pidx].input_position = input_position;
+        self.terms[pidx].direction = parentheses_match_direction;
+        self.terms[pidx].subpattern_range = Some(BytecodeSubpatternRange {
+            first_subpattern_id: subpattern_id,
+            last_subpattern_id,
+        });
+        self.set_frame(pidx, frame_location);
+        self.terms[pidx].quantifier =
+            make_quantifier(quantity_type, quantity_min_count, quantity_max_count);
+
+        self.all_parentheses.push(ByteDisjunction {
+            terms: sub_terms,
+            subpattern_count: num_subpatterns,
+            frame_size: call_frame_size,
+        });
+    }
+
+    fn make_subpattern_marker(&self, kind: BytecodeTermKind, subpattern_id: u32) -> BytecodeTerm {
+        let mut term =
+            BytecodeTermBuilder::new(BytecodeTermId(0), kind, self.flags).build_unchecked();
+        term.subpattern_id = Some(subpattern_id);
+        term
+    }
+
+    // ---- alternative jump linking (YarrInterpreter.cpp:2476-2534) ----
+
+    fn close_alternative(&mut self, begin_term: usize) {
+        let orig_begin_term = begin_term;
+        let end_index = self.terms.len();
+        let frame_location = self.frame_location_of(begin_term);
+        if self.alt_jump(begin_term).next == 0 {
+            self.terms.remove(begin_term);
+        } else {
+            let mut bt = begin_term;
+            while self.alt_jump(bt).next != 0 {
+                bt = (bt as i32 + self.alt_jump(bt).next) as usize;
+                let mut j = self.alt_jump(bt);
+                j.end = end_index as i32 - bt as i32;
+                self.set_alt_jump(bt, j);
+                self.set_frame(bt, frame_location);
+            }
+            let mut j = self.alt_jump(bt);
+            j.next = orig_begin_term as i32 - bt as i32;
+            self.set_alt_jump(bt, j);
+            let end_idx = self.push(BytecodeTermKind::AlternativeEnd);
+            self.set_alt_jump(end_idx, EMPTY_ALT_JUMP);
+            self.set_frame(end_idx, frame_location);
+        }
+    }
+
+    fn close_body_alternative(&mut self) {
+        let begin_term = 0usize;
+        let orig_begin_term = 0usize;
+        let end_index = self.terms.len();
+        let frame_location = self.frame_location_of(begin_term);
+        let mut bt = begin_term;
+        while self.alt_jump(bt).next != 0 {
+            bt = (bt as i32 + self.alt_jump(bt).next) as usize;
+            let mut j = self.alt_jump(bt);
+            j.end = end_index as i32 - bt as i32;
+            self.set_alt_jump(bt, j);
+            self.set_frame(bt, frame_location);
+        }
+        let mut j = self.alt_jump(bt);
+        j.next = orig_begin_term as i32 - bt as i32;
+        self.set_alt_jump(bt, j);
+        let end_idx = self.push(BytecodeTermKind::BodyAlternativeEnd);
+        self.set_alt_jump(end_idx, EMPTY_ALT_JUMP);
+        self.set_frame(end_idx, frame_location);
+    }
+
+    fn regex_begin(&mut self, once_through: bool) {
+        let idx = self.push(BytecodeTermKind::BodyAlternativeBegin);
+        self.set_alt_jump(
+            idx,
+            BytecodeAlternativeJump {
+                next: 0,
+                end: 0,
+                once_through,
+            },
+        );
+        self.set_frame(idx, 0);
+        self.current_alternative_index = 0;
+    }
+
+    fn regex_end(&mut self) {
+        self.close_body_alternative();
+    }
+
+    fn alternative_body_disjunction(&mut self, once_through: bool) {
+        let new_index = self.terms.len();
+        let cur = self.current_alternative_index;
+        let mut j = self.alt_jump(cur);
+        j.next = new_index as i32 - cur as i32;
+        self.set_alt_jump(cur, j);
+        let idx = self.push(BytecodeTermKind::BodyAlternativeDisjunction);
+        self.set_alt_jump(
+            idx,
+            BytecodeAlternativeJump {
+                next: 0,
+                end: 0,
+                once_through,
+            },
+        );
+        self.current_alternative_index = new_index;
+    }
+
+    fn alternative_disjunction(&mut self) {
+        let new_index = self.terms.len();
+        let cur = self.current_alternative_index;
+        let mut j = self.alt_jump(cur);
+        j.next = new_index as i32 - cur as i32;
+        self.set_alt_jump(cur, j);
+        let idx = self.push(BytecodeTermKind::AlternativeDisjunction);
+        self.set_alt_jump(idx, EMPTY_ALT_JUMP);
+        self.current_alternative_index = new_index;
+    }
+
+    // ---- emitDisjunction (YarrInterpreter.cpp:2670-2890) ----
+
     fn emit_disjunction(
         &mut self,
-        disjunction: &PatternDisjunction,
-        parentheses_already_checked: u32,
+        d: usize,
+        input_count_already_checked: u32,
+        parentheses_input_count_already_checked: u32,
+        match_direction: MatchDirection,
     ) -> Result<(), YarrBytecodeAssemblyError> {
-        for (alt_index, alternative) in disjunction.alternatives.iter().enumerate() {
-            if alt_index != 0 {
-                if disjunction.is_body {
-                    self.alternative_body_disjunction(alternative.once_through);
+        let parsed = self.parsed;
+        let is_body = parsed.disjunctions[d].is_body;
+        let disjunction_minimum_size = parsed.disjunctions[d].minimum_size.unwrap_or(0);
+        let nalt = parsed.disjunctions[d].alternatives.len();
+        for alt in 0..nalt {
+            let mut current_count_already_checked = input_count_already_checked;
+            let once_through = parsed.disjunctions[d].alternatives[alt].once_through;
+            let minimum_size = parsed.disjunctions[d].alternatives[alt]
+                .minimum_size
+                .unwrap_or(0);
+
+            if alt != 0 {
+                if is_body {
+                    self.alternative_body_disjunction(once_through);
                 } else {
-                    // Nested (non-body) disjunctions need the full alternative
-                    // machinery + frame allocation; deferred to B1 (see struct doc).
-                    return Err(YarrBytecodeAssemblyError::UnsupportedTerm {
-                        index: self.terms.len(),
-                        kind: PatternTermKind::ParenthesesSubpattern,
-                    });
+                    self.alternative_disjunction();
                 }
             }
 
-            let minimum_size = alternative.minimum_size.unwrap_or(0);
-            let count_to_check = minimum_size.saturating_sub(parentheses_already_checked);
-            if count_to_check != 0 {
-                self.check_input(count_to_check);
+            let mut count_to_check = 0u32;
+            let mut backward_uncheck_amount = 0u32;
+            if match_direction == MatchDirection::Forward {
+                count_to_check =
+                    minimum_size.saturating_sub(parentheses_input_count_already_checked);
+            } else {
+                let min_already_checked =
+                    disjunction_minimum_size.min(parentheses_input_count_already_checked);
+                if minimum_size > min_already_checked {
+                    count_to_check = minimum_size - min_already_checked;
+                    let checked_input =
+                        count_to_check.saturating_add(current_count_already_checked);
+                    self.have_checked_input(checked_input);
+                    backward_uncheck_amount = if minimum_size > disjunction_minimum_size {
+                        count_to_check
+                    } else {
+                        minimum_size
+                    };
+                }
             }
-            let current_count = count_to_check + parentheses_already_checked;
+            if count_to_check != 0 {
+                if match_direction == MatchDirection::Forward {
+                    self.check_input(count_to_check);
+                }
+                current_count_already_checked =
+                    current_count_already_checked.saturating_add(count_to_check);
+            }
 
-            for (term_index, term) in alternative.terms.iter().enumerate() {
-                let input_position = current_count.saturating_sub(term.input_position);
-                self.emit_term(term, term_index, input_position)?;
+            let term_count = parsed.disjunctions[d].alternatives[alt].terms.len();
+            for i in 0..term_count {
+                let term_index = if match_direction == MatchDirection::Forward {
+                    i
+                } else {
+                    term_count - 1 - i
+                };
+                self.emit_term(
+                    d,
+                    alt,
+                    term_index,
+                    current_count_already_checked,
+                    match_direction,
+                )?;
+            }
+
+            if match_direction == MatchDirection::Backward && backward_uncheck_amount != 0 {
+                self.uncheck_input(backward_uncheck_amount);
             }
         }
         Ok(())
@@ -1063,40 +1535,108 @@ impl ByteCompiler {
 
     fn emit_term(
         &mut self,
-        term: &PatternTerm,
-        index: usize,
-        input_position: u32,
+        d: usize,
+        alt: usize,
+        t: usize,
+        current_count_already_checked: u32,
+        match_direction: MatchDirection,
     ) -> Result<(), YarrBytecodeAssemblyError> {
+        let parsed = self.parsed;
+        let term = &parsed.disjunctions[d].alternatives[alt].terms[t];
+        let current_input_position =
+            current_count_already_checked.saturating_sub(term.input_position);
         match term.kind {
             PatternTermKind::Assertion(PatternAssertion::Bol) => {
-                self.assertion_bol(input_position, term.flags)
+                self.assertion_bol(current_input_position, term.flags);
             }
             PatternTermKind::Assertion(PatternAssertion::Eol) => {
-                self.assertion_eol(input_position, term.flags)
+                self.assertion_eol(current_input_position, term.flags);
             }
             PatternTermKind::Assertion(PatternAssertion::WordBoundary) => {
-                self.assertion_word_boundary(term.invert, input_position, term.flags)
+                self.assertion_word_boundary(
+                    term.invert,
+                    match_direction,
+                    current_input_position,
+                    term.flags,
+                );
             }
             PatternTermKind::Assertion(PatternAssertion::NotWordBoundary) => {
-                self.assertion_word_boundary(true, input_position, term.flags)
+                self.assertion_word_boundary(
+                    true,
+                    match_direction,
+                    current_input_position,
+                    term.flags,
+                );
             }
             PatternTermKind::PatternCharacter => {
                 let ch = term
                     .character
                     .ok_or(YarrBytecodeAssemblyError::MissingPayload {
-                        index,
+                        index: t,
                         kind: term.kind,
                     })?;
-                self.atom_pattern_character(ch, input_position, term.flags);
+                self.atom_pattern_character(
+                    ch,
+                    match_direction,
+                    current_input_position,
+                    term.frame_location,
+                    term.quantity_max_count,
+                    term.quantity_type,
+                    term.flags,
+                );
             }
             PatternTermKind::CharacterClass => {
                 let class = term.character_class.clone().ok_or(
                     YarrBytecodeAssemblyError::MissingPayload {
-                        index,
+                        index: t,
                         kind: term.kind,
                     },
                 )?;
-                self.atom_character_class(class, term.invert, input_position, term.flags);
+                self.atom_character_class(
+                    class,
+                    term.invert,
+                    match_direction,
+                    current_input_position,
+                    term.frame_location,
+                    term.quantity_max_count,
+                    term.quantity_type,
+                    term.flags,
+                );
+            }
+            PatternTermKind::NumberedBackReference | PatternTermKind::NamedBackReference => {
+                let sub = term
+                    .subpattern_id
+                    .ok_or(YarrBytecodeAssemblyError::MissingPayload {
+                        index: t,
+                        kind: term.kind,
+                    })?;
+                self.atom_back_reference(
+                    sub,
+                    match_direction,
+                    current_input_position,
+                    term.frame_location,
+                    term.quantity_min_count,
+                    term.quantity_max_count,
+                    term.quantity_type,
+                    term.flags,
+                );
+            }
+            PatternTermKind::NumberedForwardReference | PatternTermKind::NamedForwardReference => {}
+            PatternTermKind::ParenthesesSubpattern => {
+                self.emit_parentheses_subpattern(
+                    d,
+                    alt,
+                    t,
+                    current_count_already_checked,
+                    match_direction,
+                )?;
+            }
+            PatternTermKind::ParentheticalAssertion
+            | PatternTermKind::Assertion(PatternAssertion::LookAhead)
+            | PatternTermKind::Assertion(PatternAssertion::NegativeLookAhead)
+            | PatternTermKind::Assertion(PatternAssertion::LookBehind)
+            | PatternTermKind::Assertion(PatternAssertion::NegativeLookBehind) => {
+                self.emit_parenthetical_assertion(d, alt, t, current_count_already_checked)?;
             }
             PatternTermKind::DotStarEnclosure => {
                 let (bol, eol) = term
@@ -1105,23 +1645,199 @@ impl ByteCompiler {
                     .unwrap_or((false, false));
                 self.assertion_dot_star_enclosure(bol, eol);
             }
-            // The remaining kinds require B1's quantifier/frame/disjunction-pool
-            // support (see ByteCompiler doc). Reported, not silently mis-lowered.
-            PatternTermKind::NumberedBackReference
-            | PatternTermKind::NamedBackReference
-            | PatternTermKind::NumberedForwardReference
-            | PatternTermKind::NamedForwardReference
-            | PatternTermKind::ParenthesesSubpattern
-            | PatternTermKind::ParentheticalAssertion
-            | PatternTermKind::Assertion(PatternAssertion::LookAhead)
-            | PatternTermKind::Assertion(PatternAssertion::NegativeLookAhead)
-            | PatternTermKind::Assertion(PatternAssertion::LookBehind)
-            | PatternTermKind::Assertion(PatternAssertion::NegativeLookBehind) => {
-                return Err(YarrBytecodeAssemblyError::UnsupportedTerm {
-                    index,
+        }
+        Ok(())
+    }
+
+    fn emit_parentheses_subpattern(
+        &mut self,
+        d: usize,
+        alt: usize,
+        t: usize,
+        current_count_already_checked: u32,
+        match_direction: MatchDirection,
+    ) -> Result<(), YarrBytecodeAssemblyError> {
+        let parsed = self.parsed;
+        let term = &parsed.disjunctions[d].alternatives[alt].terms[t];
+        let parens =
+            term.parentheses
+                .as_ref()
+                .ok_or(YarrBytecodeAssemblyError::MissingPayload {
+                    index: t,
                     kind: term.kind,
-                });
+                })?;
+        let child = parens
+            .disjunction
+            .ok_or(YarrBytecodeAssemblyError::MissingPayload {
+                index: t,
+                kind: term.kind,
+            })? as usize;
+        let subpattern_id = parens.subpattern_id;
+        let last_subpattern_id = parens.last_subpattern_id;
+        let is_copy = parens.is_copy;
+        let is_terminal = parens.is_terminal;
+        let capture = term.capture;
+        let frame_location = term.frame_location;
+        let input_position = term.input_position;
+        let qmin = term.quantity_min_count;
+        let qmax = term.quantity_max_count;
+        let qtype = term.quantity_type;
+        let delegate_end_input_offset =
+            current_count_already_checked.saturating_sub(input_position);
+        let child_minimum_size = parsed.disjunctions[child].minimum_size.unwrap_or(0);
+        let child_call_frame_size = parsed.disjunctions[child].call_frame_size;
+
+        if qmax == 1 && !is_copy {
+            let mut alternative_frame_location = frame_location;
+            let disjunction_already_checked_count = if qtype == QuantifierType::FixedCount {
+                child_minimum_size
+            } else {
+                alternative_frame_location += YARR_STACK_PARENTHESES_ONCE;
+                0
+            };
+            self.parentheses_begin(
+                BytecodeTermKind::ParenthesesSubpatternOnceBegin,
+                subpattern_id,
+                match_direction,
+                capture,
+                disjunction_already_checked_count.saturating_add(delegate_end_input_offset),
+                frame_location,
+                alternative_frame_location,
+            );
+            self.emit_disjunction(
+                child,
+                current_count_already_checked,
+                disjunction_already_checked_count,
+                match_direction,
+            )?;
+            self.atom_parentheses_once_end(
+                delegate_end_input_offset,
+                frame_location,
+                qmin,
+                qmax,
+                qtype,
+            );
+        } else if is_terminal {
+            self.parentheses_begin(
+                BytecodeTermKind::ParenthesesSubpatternTerminalBegin,
+                subpattern_id,
+                match_direction,
+                capture,
+                delegate_end_input_offset,
+                frame_location,
+                frame_location + YARR_STACK_PARENTHESES_TERMINAL,
+            );
+            self.emit_disjunction(child, current_count_already_checked, 0, match_direction)?;
+            self.atom_parentheses_terminal_end(
+                delegate_end_input_offset,
+                frame_location,
+                qmin,
+                qmax,
+                qtype,
+            );
+        } else {
+            self.parentheses_begin(
+                BytecodeTermKind::ParenthesesSubpatternOnceBegin,
+                subpattern_id,
+                match_direction,
+                capture,
+                delegate_end_input_offset,
+                frame_location,
+                0,
+            );
+            self.emit_disjunction(child, current_count_already_checked, 0, match_direction)?;
+            self.atom_parentheses_subpattern_end(
+                last_subpattern_id,
+                delegate_end_input_offset,
+                frame_location,
+                qmin,
+                qmax,
+                qtype,
+                child_call_frame_size,
+            );
+        }
+        Ok(())
+    }
+
+    fn emit_parenthetical_assertion(
+        &mut self,
+        d: usize,
+        alt: usize,
+        t: usize,
+        current_count_already_checked: u32,
+    ) -> Result<(), YarrBytecodeAssemblyError> {
+        let parsed = self.parsed;
+        let term = &parsed.disjunctions[d].alternatives[alt].terms[t];
+        let parens =
+            term.parentheses
+                .as_ref()
+                .ok_or(YarrBytecodeAssemblyError::MissingPayload {
+                    index: t,
+                    kind: term.kind,
+                })?;
+        let child = parens
+            .disjunction
+            .ok_or(YarrBytecodeAssemblyError::MissingPayload {
+                index: t,
+                kind: term.kind,
+            })? as usize;
+        let subpattern_id = parens.subpattern_id;
+        let last_subpattern_id = parens.last_subpattern_id;
+        let invert = term.invert;
+        let direction = term.match_direction;
+        let frame_location = term.frame_location;
+        let alternative_frame_location = frame_location + YARR_STACK_PARENTHETICAL_ASSERTION;
+        let positive_input_offset =
+            current_count_already_checked.saturating_sub(term.input_position);
+        let child_minimum_size = parsed.disjunctions[child].minimum_size.unwrap_or(0);
+
+        if direction == MatchDirection::Forward {
+            let mut current = current_count_already_checked;
+            let mut uncheck_amount = 0u32;
+            if positive_input_offset > child_minimum_size {
+                uncheck_amount = positive_input_offset - child_minimum_size;
+                self.uncheck_input(uncheck_amount);
+                current = current.saturating_sub(uncheck_amount);
             }
+            self.atom_parenthetical_assertion_begin(
+                subpattern_id,
+                invert,
+                direction,
+                frame_location,
+                alternative_frame_location,
+            );
+            self.emit_disjunction(
+                child,
+                current,
+                positive_input_offset - uncheck_amount,
+                direction,
+            )?;
+            self.atom_parenthetical_assertion_end(last_subpattern_id, frame_location);
+            if uncheck_amount != 0 {
+                self.check_input(uncheck_amount);
+            }
+        } else {
+            let mut checked = positive_input_offset;
+            if child_minimum_size != 0 {
+                checked = checked.saturating_add(child_minimum_size);
+                if checked > current_count_already_checked && !invert {
+                    self.have_checked_input(checked);
+                }
+            }
+            self.atom_parenthetical_assertion_begin(
+                subpattern_id,
+                invert,
+                direction,
+                frame_location,
+                alternative_frame_location,
+            );
+            self.emit_disjunction(
+                child,
+                checked,
+                positive_input_offset + child_minimum_size,
+                direction,
+            )?;
+            self.atom_parenthetical_assertion_end(last_subpattern_id, frame_location);
         }
         Ok(())
     }
@@ -1143,8 +1859,9 @@ fn simple_upper(ch: char) -> char {
     ch.to_uppercase().next().unwrap_or(ch)
 }
 
-/// byteCompile — YarrInterpreter.cpp:2294 / :562. Faithful flat-subset compile of
-/// a parsed pattern into a `BytecodePattern` ready for `interpret_bytecode`.
+/// byteCompile — YarrInterpreter.cpp:2294 / :3218 `ByteCompiler::compile`. Lowers
+/// a fully constructed `YarrPattern` (nested disjunction tree + setupOffsets) into
+/// a `BytecodePattern` ready for `interpret_bytecode`.
 pub fn assemble_yarr_bytecode_plan(
     parsed: &YarrPattern,
     id: BytecodePatternId,
@@ -1157,26 +1874,40 @@ pub fn assemble_yarr_bytecode_plan(
     }
 
     let once_through = parsed
-        .body
+        .body()
         .alternatives
         .first()
         .map(|alt| alt.once_through)
         .unwrap_or(false);
 
-    let mut compiler = ByteCompiler::new(parsed.flags);
+    let mut compiler = ByteCompiler::new(parsed);
     compiler.regex_begin(once_through);
-    compiler.emit_disjunction(&parsed.body, 0)?;
+    compiler.emit_disjunction(0, 0, 0, MatchDirection::Forward)?;
     compiler.regex_end();
 
-    let terms = compiler.terms;
+    let mut body_terms = compiler.terms;
     let contains_eol = compiler.contains_eol;
-    validate_term_sequence(&terms)?;
+    let mut parentheses = compiler.all_parentheses;
 
-    // No frame users in the flat fixed-count-1 subset (only non-body Alternative
-    // and quantified/back-reference/parentheses terms reserve frame slots).
-    let frame_size = required_frame_size(&terms);
+    // The C++ ByteTerm has no identity; the begin/extract/shrink churn desyncs the
+    // Rust `BytecodeTermId`s, so renumber each disjunction's terms to 0..len before
+    // validating (the interpreter dispatches on term index, not id).
+    renumber_terms(&mut body_terms);
+    for disjunction in &mut parentheses {
+        renumber_terms(&mut disjunction.terms);
+    }
+
+    validate_term_sequence(&body_terms)?;
+    for disjunction in &parentheses {
+        validate_byte_disjunction(disjunction)?;
+    }
+
+    // Frame size is the body disjunction's call frame from setupOffsets (the global
+    // maximum), NOT the per-term frame reservations (YarrPattern.cpp:1981;
+    // ByteDisjunction::m_frameSize = m_callFrameSize).
+    let frame_size = parsed.body().call_frame_size;
     let body = ByteDisjunction {
-        terms: terms.clone(),
+        terms: body_terms.clone(),
         subpattern_count: parsed.capture_count,
         frame_size,
     };
@@ -1186,25 +1917,26 @@ pub fn assemble_yarr_bytecode_plan(
         .contains_eol(contains_eol)
         .offset_vector(BytecodeOffsetVectorLayout {
             // C++ `offsetVectorBaseForNamedCaptures` == (numSubpatterns + 1) * 2:
-            // duplicate-named-group slots live AFTER the numbered-capture slots
-            // (overall + each group). The prior stub used `capture_count * 2`,
-            // which overlapped group N's slots and zeroed them on init.
+            // duplicate-named-group slots live AFTER the numbered-capture slots.
             base_for_named_captures: (parsed.capture_count + 1).saturating_mul(2),
             offsets_size: (parsed.capture_count + 1).saturating_mul(2)
                 + parsed.duplicate_named_capture_count,
             duplicate_named_group_count: parsed.duplicate_named_capture_count,
         });
 
-    if let Some(minimum_size) = parsed.body.minimum_size {
+    for disjunction in parentheses {
+        builder = builder.parentheses(disjunction);
+    }
+    if let Some(minimum_size) = parsed.body().minimum_size {
         builder = builder.minimum_size(minimum_size);
     }
     for duplicate in 0..parsed.duplicate_named_capture_count {
         builder = builder.duplicate_named_group_for_subpattern(duplicate);
     }
-    if !terms.is_empty() {
+    if !body_terms.is_empty() {
         builder = builder.alternative(BytecodeAlternative {
             begin: BytecodeTermId(0),
-            end: BytecodeTermId(terms.len() as u32 - 1),
+            end: BytecodeTermId(body_terms.len() as u32 - 1),
             once_through,
         });
     }
@@ -1217,13 +1949,10 @@ pub fn assemble_yarr_bytecode_plan(
         .map_err(Into::into)
 }
 
-fn required_frame_size(terms: &[BytecodeTerm]) -> u32 {
-    terms
-        .iter()
-        .filter_map(|term| term.frame.as_ref())
-        .map(|frame| frame.frame_location.saturating_add(frame.stack_slots))
-        .max()
-        .unwrap_or(0)
+fn renumber_terms(terms: &mut [BytecodeTerm]) {
+    for (index, term) in terms.iter_mut().enumerate() {
+        term.id = BytecodeTermId(index as u32);
+    }
 }
 
 pub fn validate_bytecode_pattern(
@@ -1394,8 +2123,13 @@ pub fn validate_bytecode_term(term: &BytecodeTerm) -> Result<(), YarrBytecodeVal
                 });
             }
         }
+        // C++ encodes "no captures" as lastSubpatternId < firstSubpatternId
+        // (ByteTerm::containsAnyCaptures(): last >= first). A parenthesised group
+        // or assertion that wraps no capturing groups therefore carries an empty
+        // (first > last) range, so we accept any present range and only reject an
+        // absent one.
         BytecodeTermPayloadKind::SubpatternRange => match term.subpattern_range {
-            Some(range) if range.first_subpattern_id <= range.last_subpattern_id => {
+            Some(_range) => {
                 if term.character.is_some()
                     || term.cased_range.is_some()
                     || term.character_class.is_some()
@@ -1408,7 +2142,6 @@ pub fn validate_bytecode_term(term: &BytecodeTerm) -> Result<(), YarrBytecodeVal
                     });
                 }
             }
-            Some(_) => return Err(YarrBytecodeValidationError::InvalidSubpatternRange(term.id)),
             None => {
                 return Err(YarrBytecodeValidationError::PayloadMismatch {
                     term: term.id,
@@ -1588,9 +2321,9 @@ mod tests {
             source: StringId(1),
             flags: RegexFlags::default(),
             compile_mode: crate::yarr::CompileMode::Legacy,
-            body: crate::yarr::PatternDisjunction {
+            disjunctions: vec![crate::yarr::PatternDisjunction {
                 alternatives: vec![crate::yarr::PatternAlternative {
-                    terms: vec![PatternTerm {
+                    terms: vec![crate::yarr::PatternTerm {
                         kind: PatternTermKind::PatternCharacter,
                         input_position: 0,
                         character: Some('a'),
@@ -1602,6 +2335,11 @@ mod tests {
                         subpattern_id: None,
                         name: None,
                         flags: RegexFlags::default(),
+                        quantity_type: QuantifierType::FixedCount,
+                        quantity_min_count: 1,
+                        quantity_max_count: 1,
+                        frame_location: 0,
+                        match_direction: MatchDirection::Forward,
                     }],
                     minimum_size: Some(1),
                     first_subpattern_id: 0,
@@ -1619,7 +2357,7 @@ mod tests {
                 minimum_size: Some(1),
                 call_frame_size: 0,
                 has_fixed_size: true,
-            },
+            }],
             capture_count: 0,
             named_capture_count: 0,
             duplicate_named_capture_count: 0,
@@ -1665,14 +2403,14 @@ mod tests {
             source: StringId(1),
             flags: RegexFlags::default(),
             compile_mode: crate::yarr::CompileMode::Legacy,
-            body: crate::yarr::PatternDisjunction {
+            disjunctions: vec![crate::yarr::PatternDisjunction {
                 alternatives: Vec::new(),
                 parent_subpattern: None,
                 is_body: true,
                 minimum_size: Some(0),
                 call_frame_size: 0,
                 has_fixed_size: true,
-            },
+            }],
             capture_count: 0,
             named_capture_count: 0,
             duplicate_named_capture_count: 0,

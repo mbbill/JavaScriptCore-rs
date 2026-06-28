@@ -94,7 +94,7 @@ use crate::vm::{
     ExceptionState, ExceptionUnwindState, PendingException, TerminationReason, UnwindHandler,
 };
 use crate::yarr::{
-    execute_simple_yarr, parse_regex_flags, plan_yarr_parse, RegexFlags, YarrSimpleMatchRange,
+    construct_yarr_pattern, execute_regexp_match, parse_regex_flags, RegExpByteRange, RegexFlags,
 };
 
 const FRAME_ROOT_ID_BASE: u64 = 1_000_000_000_000;
@@ -5442,7 +5442,7 @@ struct CoreRegExpMatch {
     input: String,
     start: usize,
     end: usize,
-    captures: Vec<Option<YarrSimpleMatchRange>>,
+    captures: Vec<Option<RegExpByteRange>>,
 }
 
 impl DispatchHost for CoreOpcodeDispatchHost {
@@ -15676,7 +15676,7 @@ impl CoreOpcodeDispatchHost {
         } else {
             0
         };
-        let result = execute_simple_yarr(&source, flags, &input, start).map_err(|_| {
+        let result = execute_regexp_match(&source, flags, &input, start).map_err(|_| {
             self.type_error_outcome_with_heap(heap, "Unsupported regular expression execution")
         })?;
         if flags.global || flags.sticky {
@@ -15758,9 +15758,16 @@ impl CoreOpcodeDispatchHost {
         pattern: &str,
         flags: RegexFlags,
     ) -> Result<(), DispatchOutcome> {
-        plan_yarr_parse(pattern, flags).map(|_| ()).map_err(|_| {
-            self.type_error_outcome_with_heap(heap, "Invalid regular expression pattern")
-        })
+        // Validate with the faithful constructor (the same parser the executor
+        // runs), so any pattern that compiles also executes — and vice versa.
+        construct_yarr_pattern(
+            pattern,
+            flags,
+            crate::yarr::YarrPatternId(0),
+            crate::strings::StringId(0),
+        )
+        .map(|_| ())
+        .map_err(|_| self.type_error_outcome_with_heap(heap, "Invalid regular expression pattern"))
     }
 
     fn collection_initializer_length(
@@ -18194,7 +18201,7 @@ impl CoreOpcodeDispatchHost {
         let mut count = 0usize;
         while count < limit {
             let matched =
-                execute_simple_yarr(&source, flags, text, search_index).map_err(|_| {
+                execute_regexp_match(&source, flags, text, search_index).map_err(|_| {
                     self.type_error_outcome_with_heap(
                         heap,
                         "Unsupported regular expression execution",
@@ -18284,7 +18291,7 @@ impl CoreOpcodeDispatchHost {
             // For a non-RegExp coerced argument lastIndex is 0; for a RegExp
             // argument with neither global nor sticky, execute_simple_yarr
             // always searches from 0 (mirroring native_regexp_exec).
-            let matched = execute_simple_yarr(&source, flags, &text, 0).map_err(|_| {
+            let matched = execute_regexp_match(&source, flags, &text, 0).map_err(|_| {
                 self.type_error_outcome_with_heap(heap, "Unsupported regular expression execution")
             })?;
             let Some(matched) = matched else {
@@ -18309,7 +18316,7 @@ impl CoreOpcodeDispatchHost {
         let mut search_index = 0usize;
         loop {
             let matched =
-                execute_simple_yarr(&source, flags, &text, search_index).map_err(|_| {
+                execute_regexp_match(&source, flags, &text, search_index).map_err(|_| {
                     self.type_error_outcome_with_heap(
                         heap,
                         "Unsupported regular expression execution",
@@ -18363,7 +18370,7 @@ impl CoreOpcodeDispatchHost {
         input: &str,
         start: usize,
         end: usize,
-        captures: &[Option<YarrSimpleMatchRange>],
+        captures: &[Option<RegExpByteRange>],
     ) -> Result<RuntimeValue, DispatchOutcome> {
         let array = self.objects.allocate_array();
         let matched = self
@@ -18480,7 +18487,7 @@ impl CoreOpcodeDispatchHost {
         let mut search_index = 0usize;
         loop {
             let matched =
-                execute_simple_yarr(&source, flags, text, search_index).map_err(|_| {
+                execute_regexp_match(&source, flags, text, search_index).map_err(|_| {
                     self.type_error_outcome_with_heap(
                         heap,
                         "Unsupported regular expression execution",
@@ -18560,7 +18567,7 @@ impl CoreOpcodeDispatchHost {
         let mut last_end = 0usize;
         let mut search_index = 0usize;
         loop {
-            let matched = execute_simple_yarr(&source, flags, &original_text, search_index)
+            let matched = execute_regexp_match(&source, flags, &original_text, search_index)
                 .map_err(|_| {
                     self.type_error_outcome_with_heap(
                         state.heap,
@@ -20811,7 +20818,7 @@ fn expand_replace_string(
     input: &str,
     matched_start: usize,
     matched_end: usize,
-    captures: &[Option<YarrSimpleMatchRange>],
+    captures: &[Option<RegExpByteRange>],
 ) -> String {
     let mut result = String::new();
     let mut chars = replacement.chars().peekable();

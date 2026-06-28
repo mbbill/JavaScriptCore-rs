@@ -10,7 +10,6 @@ pub(crate) mod execution;
 pub(crate) mod jit;
 pub(crate) mod matching;
 pub(crate) mod parse;
-pub(crate) mod simple_exec;
 pub(crate) mod unicode;
 
 pub use bytecode::{
@@ -26,6 +25,7 @@ pub use bytecode::{
 };
 pub use execution::{
     describe_regexp_program_invocation, describe_regexp_program_result, execute_regexp_bytecode,
+    execute_regexp_match, RegExpByteMatch, RegExpByteRange, RegExpExecError,
     RegExpExecutionBoundaryError, RegExpProgramBody, RegExpProgramInvocationDescriptor,
     RegExpProgramInvocationRecord, RegExpProgramResultDescriptor, RegExpProgramResultRecord,
     RegExpRootBoundaryKind, RegExpRootBoundaryRecord,
@@ -45,19 +45,16 @@ pub use matching::{
     YARR_OFFSET_NO_MATCH,
 };
 pub use parse::{
-    compile_mode_for_flags, describe_regex_flag_semantics, describe_yarr_parse_semantics,
-    parse_regex_flags, plan_yarr_parse, validate_regex_flag_semantics,
-    CharacterClassConstructionState, CharacterClassDescriptor, CharacterClassSetOperation,
-    CharacterClassWidth, CompileMode, CreateDisjunctionPurpose, DotStarEnclosureAnchors,
-    NamedCaptureGroupState, ParseEscapeMode, ParserTokenKind, PatternAlternative, PatternAssertion,
-    PatternDisjunction, PatternParenthesesDescriptor, PatternTerm, PatternTermKind,
-    RegExpParseSemanticDescriptor, RegexFlagKind, RegexFlagSemanticDescriptor,
-    RegexFlagSemanticError, RegexFlags, RegexModifierFlagKind, UnicodeParseContext, YarrErrorCode,
-    YarrParseError, YarrParsePlan, YarrParsePlanAtom, YarrParsePlanAtomKind, YarrPattern,
-    YarrPatternId, YarrSyntaxDelegate,
-};
-pub use simple_exec::{
-    execute_simple_yarr, YarrSimpleExecError, YarrSimpleMatch, YarrSimpleMatchRange,
+    compile_mode_for_flags, construct_yarr_pattern, describe_regex_flag_semantics,
+    describe_yarr_parse_semantics, parse_regex_flags, plan_yarr_parse,
+    validate_regex_flag_semantics, CharacterClassConstructionState, CharacterClassDescriptor,
+    CharacterClassSetOperation, CharacterClassWidth, CompileMode, CreateDisjunctionPurpose,
+    DotStarEnclosureAnchors, NamedCaptureGroupState, ParseEscapeMode, ParserTokenKind,
+    PatternAlternative, PatternAssertion, PatternDisjunction, PatternParenthesesDescriptor,
+    PatternTerm, PatternTermKind, QuantifierType, RegExpParseSemanticDescriptor, RegexFlagKind,
+    RegexFlagSemanticDescriptor, RegexFlagSemanticError, RegexFlags, RegexModifierFlagKind,
+    UnicodeParseContext, YarrErrorCode, YarrParseError, YarrParsePlan, YarrParsePlanAtom,
+    YarrParsePlanAtomKind, YarrPattern, YarrPatternId, YarrSyntaxDelegate,
 };
 pub use unicode::{
     built_in_character_class_descriptor, canonicalization_mode_for_flags,
