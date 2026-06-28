@@ -59,19 +59,24 @@ ACTIVE ROADMAP (validated, profiling-earned; default path = InterpreterOnly; sta
 [wip] JetStream 3 Octane parity
   [done] Runner/benchmark contract: JetStreamDriver load order, shell globals, iteration,
          validation, scoring, telemetry, probe command surface
-  [wip]  Run-state (2026-06-28, interpreter): 12 SCORE / 3 too-slow / 0 THROW. ALL THROWERS CLOSED;
-         earley-boyer + Box2D now SCORE (call-link O(N^2)->O(1) fix). Remaining gate to a valid suite
-         geomean is PERFORMANCE (3 too-slow completing). Geomean None until all 15 Succeed (octane.rs:1996).
-  [done] SCORES (12): octane-code-load 89, navier 5.3, crypto 3.5, regexp 1.06, splay 1.0, richards
-         0.91, pdfjs 0.88 (slow), earley-boyer 0.63, delta-blue 0.62, Box2D 0.56, raytrace 0.23, gbemu 0.03
-  [wip]  TOO-SLOW/perf-gated (>90s under the interpreter): typescript (string-op bound + a latent
-         generated-direct-call THROW exposed once sped up -- separate bug), mandreel (asm.js), octane-zlib
-         (asm.js). mandreel/zlib need the JIT. call-link per-site rewire (B2+B3) DONE (6c29a30: earley-boyer
-         >31min-DNF -> 34s/0.63, Box2D lands); B4 Vec-retirement + the ~1.2% native-call leak deferred.
-  [done] THROWERS (all 0): regexp -- faithful Yarr engine (parser+ByteCompiler+backtracking interpreter)
-         wired + simple_exec deleted, regexp bench validates checksum, scores 1.06, byte-identical to
-         jsc across 24650 ops (7c56113; deferred: lookbehind/full-Unicode/dup-named-groups, not in the
-         bench). Box2D (Number/Math constants 1983a63). gbemu (new Function 6e542ee). pdfjs (ToPrimitive).
+  [wip]  R SCOREBOARD (2026-06-28, both engines through tools/octane-parity/{run_cpp_baseline,run_rust_
+         baseline}.sh, IDENTICAL harness, iters=2/wc=1): R is UNDEFINED -- the completion+validation gate
+         is NOT met, so the suite yields no geomean and parity MUST NOT be claimed. 12/15 Rust complete+
+         validate; 3 FAIL: mandreel + octane-zlib (asm.js, DNF/timeout under the interpreter), typescript
+         (completes ~202s but THROWS the latent generated-direct-call bug -> a correctness failure, NOT
+         "0 throwers"). C++ jsc baseline re-measured all 15 (crypto 1611, richards 1240, ... typescript 36,
+         zlib 38). Per-bench r_i = Rust/C++ on the 12 completing: 5e-4..0.06; compute-bound 5e-4..2e-3
+         (500-6000x slower) -> QUANTIFIED proof parity is JIT-gated. The gate ITSELF is JIT-gated (asm.js).
+  [done] Rust per-bench scores (12 complete, iters=2): code-load 57.9, navier 2.37, crypto 2.07, regexp
+         1.77, richards 0.92, pdfjs 0.85, splay 0.65, delta-blue 0.55, earley-boyer 0.36, Box2D 0.31,
+         gbemu 0.13, raytrace 0.12. (vs C++ jsc: code-load 962, crypto 1612, ... raytrace 690.)
+  [missing] GATE-BLOCKING (3): mandreel + octane-zlib (asm.js -- DNF/timeout under the interpreter, need
+         the JIT to COMPLETE); typescript (string-op bound AND a latent generated-direct-call THROW exposed
+         once sped up to ~202s -- a correctness bug to fix + speed). The completion gate is JIT-gated.
+  [done] THROWERS fixed (the original 3, via faithful C++-verified corrections): regexp -- faithful Yarr
+         engine wired + simple_exec deleted, bench checksum validates, byte-identical to jsc across 24650
+         ops (7c56113). Box2D (Number/Math constants 1983a63). gbemu (new Function 6e542ee). pdfjs (ToPrim).
+         call-link per-site rewire (B2+B3, 6c29a30) landed earley-boyer (>31min-DNF -> 34s) + Box2D.
   [done] feature breadth: non-ASCII strings, replace-with-fn, String.match,
          __defineGetter__/Setter__, global Function, Math, apply/bind, globals
   [missing] Octane score parity with local C++ JSC (needs Phases C-F)
