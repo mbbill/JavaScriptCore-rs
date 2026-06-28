@@ -25,6 +25,13 @@ mod free_list;
 mod marked_block;
 mod marked_space;
 mod precise_allocation;
+// S4 collector Batch 2: the faithful SlotVisitor marking core (mark stack,
+// visitChildren edge walk, testAndSetMarked via the per-block mark bitmap,
+// mark-from-roots drain to fixpoint). Pure additive dead code: NOT WIRED — the
+// collector cannot run until R3/R4 put typed cells in the arena and wire the
+// safepoint root gather. (Map: heap/SlotVisitor.{h,cpp}, heap/SlotVisitorInlines.h,
+// heap/AbstractSlotVisitor.h.) No `pub use` this batch.
+mod slot_visitor;
 
 #[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use conservative_scan::HeapConservativeScanAppendReceipt;
