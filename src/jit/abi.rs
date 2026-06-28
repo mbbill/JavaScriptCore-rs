@@ -148,12 +148,26 @@ pub struct PatchpointDescriptor {
 }
 
 /// Header slots shared by the interpreter-compatible baseline frame.
+///
+/// The faithful JSC call-frame header is exactly five slots — callerFrame@0,
+/// returnPC@1, codeBlock@2, callee@3, argumentCountIncludingThis@4
+/// (`interpreter/CallFrame.h:176-191`, `headerSizeInRegisters` == 5). Slot 3 is
+/// `CallFrameSlot::callee` (a `CalleeBits`), NOT a callee-save area: callee-saves
+/// are spilled BELOW the locals, not in the call-frame header. The remaining
+/// roles below (`ThisValue` and the baseline metadata carriers) are a Rust-only
+/// baseline apparatus, not JSC call-frame header slots (in JSC slot 5 is
+/// `thisArgument` and slots 6+ are arguments); see
+/// `BASELINE_FRAME_HEADER_SLOTS`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BaselineFrameHeaderSlotRole {
     CallerFrame,
     ReturnAddress,
     CodeBlock,
-    CalleeSaveArea,
+    // C++ JSC `CallFrameSlot::callee` (CallFrame.h:178): the boxed callee
+    // (`CalleeBits`). Previously modeled (incorrectly) as `CalleeSaveArea`, which
+    // omitted the callee slot entirely; corrected to `Callee` to match the
+    // faithful 5-slot header.
+    Callee,
     ArgumentCount,
     ThisValue,
     BytecodeIndex,
@@ -167,7 +181,8 @@ impl BaselineFrameHeaderSlotRole {
             BaselineFrameHeaderSlotRole::CallerFrame
             | BaselineFrameHeaderSlotRole::ReturnAddress
             | BaselineFrameHeaderSlotRole::CodeBlock
-            | BaselineFrameHeaderSlotRole::CalleeSaveArea
+            // `callee` holds a boxed `CalleeBits` pointer (CallFrame.h:202).
+            | BaselineFrameHeaderSlotRole::Callee
             | BaselineFrameHeaderSlotRole::ExceptionHandler => AbiValue::Pointer,
             BaselineFrameHeaderSlotRole::ArgumentCount
             | BaselineFrameHeaderSlotRole::BytecodeIndex
@@ -576,7 +591,8 @@ pub const BASELINE_REQUIRED_FRAME_HEADER_SLOTS: &[BaselineFrameHeaderSlotRole] =
     BaselineFrameHeaderSlotRole::CallerFrame,
     BaselineFrameHeaderSlotRole::ReturnAddress,
     BaselineFrameHeaderSlotRole::CodeBlock,
-    BaselineFrameHeaderSlotRole::CalleeSaveArea,
+    // CallFrameSlot::callee @ slot 3 (CallFrame.h:178), not a callee-save area.
+    BaselineFrameHeaderSlotRole::Callee,
     BaselineFrameHeaderSlotRole::ArgumentCount,
     BaselineFrameHeaderSlotRole::ThisValue,
     BaselineFrameHeaderSlotRole::BytecodeIndex,
@@ -600,8 +616,11 @@ pub const BASELINE_FRAME_HEADER_SLOTS: &[BaselineFrameHeaderSlot] = &[
         slot_index: 2,
         value: AbiValue::Pointer,
     },
+    // C++ JSC `CallFrameSlot::callee` (CallFrame.h:178): the boxed callee at slot
+    // 3. The previous `CalleeSaveArea` here was a defect — it omitted the callee
+    // slot, and callee-saves are spilled below the locals, not in the header.
     BaselineFrameHeaderSlot {
-        role: BaselineFrameHeaderSlotRole::CalleeSaveArea,
+        role: BaselineFrameHeaderSlotRole::Callee,
         slot_index: 3,
         value: AbiValue::Pointer,
     },
@@ -746,7 +765,7 @@ mod tests {
                 value: AbiValue::Pointer,
             },
             BaselineFrameHeaderSlot {
-                role: BaselineFrameHeaderSlotRole::CalleeSaveArea,
+                role: BaselineFrameHeaderSlotRole::Callee,
                 slot_index: 3,
                 value: AbiValue::Pointer,
             },
