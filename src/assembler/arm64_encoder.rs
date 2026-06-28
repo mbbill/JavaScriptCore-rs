@@ -24,7 +24,7 @@
 #![allow(dead_code)]
 
 use super::operands::Scale;
-use super::registers::RegisterID;
+use super::registers::{FPRegisterID, RegisterID};
 
 // ----------------------------------------------------------------------------
 // Encoding enums — faithful mirrors of the ARM64Assembler.h field enums.
@@ -165,6 +165,34 @@ pub enum Condition {
     /// `LinkRecord` for non-conditional branches. Never reaches an encoded
     /// instruction field.
     Invalid = 15,
+}
+
+/// `ARM64Assembler::DataOp2Source` (ARM64Assembler.h:620-627), restricted to the
+/// register-shift opcodes the baseline composite layer needs (`lslv`/`lsrv`/
+/// `asrv`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum DataOp2Source {
+    Lslv = 8,
+    Lsrv = 9,
+    Asrv = 10,
+}
+
+/// `ARM64Assembler::BitfieldOp` (ARM64Assembler.h:605-609), restricted to the
+/// `sbfm`/`ubfm` forms that back the immediate shifts (`lsl`/`lsr`/`asr` by an
+/// immediate).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum BitfieldOp {
+    Sbfm = 0,
+    Ubfm = 2,
+}
+
+/// `ARM64Assembler::FPDataOp1Source` (ARM64Assembler.h:659-660), `FMOV` only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum FpDataOp1Source {
+    Fmov = 0,
 }
 
 // ----------------------------------------------------------------------------
@@ -492,6 +520,98 @@ const fn hint_pseudo(imm: u32) -> u32 {
 #[inline]
 const fn nop_pseudo() -> u32 {
     hint_pseudo(0)
+}
+
+/// `dataProcessing2Source` (ARM64Assembler.h, the `0x1ac00000` packer): the
+/// register-register shift/divide family. `S` is always 0 in the forms this
+/// subset emits.
+#[inline]
+const fn data_processing_2_source(
+    sf: Datasize,
+    rm: RegisterID,
+    opcode: DataOp2Source,
+    rn: RegisterID,
+    rd: RegisterID,
+) -> u32 {
+    0x1ac0_0000
+        | (sf as u32) << 31
+        | x_or_zr(rm) << 16
+        | (opcode as u32) << 10
+        | x_or_zr(rn) << 5
+        | x_or_zr(rd)
+}
+
+/// `dataProcessing3Source` (ARM64Assembler.h, the `0x1b000000` packer) for the
+/// `MADD` opcode (so `mul = madd(rd, rn, rm, zr)`). For `DataOp_MADD == 0` the
+/// `op54`/`op31`/`op0` sub-fields are all zero.
+#[inline]
+const fn data_processing_3_source_madd(
+    sf: Datasize,
+    rm: RegisterID,
+    ra: RegisterID,
+    rn: RegisterID,
+    rd: RegisterID,
+) -> u32 {
+    0x1b00_0000
+        | (sf as u32) << 31
+        | x_or_zr(rm) << 16
+        | x_or_zr(ra) << 10
+        | x_or_zr(rn) << 5
+        | x_or_zr(rd)
+}
+
+/// `bitfield` (ARM64Assembler.h, the `0x13000000` packer). `N` is tied to `sf`
+/// (the 64-bit bitfield variant sets `N`).
+#[inline]
+const fn bitfield(
+    sf: Datasize,
+    opc: BitfieldOp,
+    immr: u32,
+    imms: u32,
+    rn: RegisterID,
+    rd: RegisterID,
+) -> u32 {
+    let n = sf as u32;
+    0x1300_0000
+        | (sf as u32) << 31
+        | (opc as u32) << 29
+        | n << 22
+        | (immr & 0x3f) << 16
+        | (imms & 0x3f) << 10
+        | x_or_zr(rn) << 5
+        | x_or_zr(rd)
+}
+
+/// `floatingPointDataProcessing1Source` (ARM64Assembler.h, the `0x1e204000`
+/// packer). `M`/`S` are 0; `type` is the FP `Datasize` (`D64` -> double).
+#[inline]
+const fn floating_point_data_processing_1_source(
+    type_: Datasize,
+    opcode: FpDataOp1Source,
+    rn: FPRegisterID,
+    rd: FPRegisterID,
+) -> u32 {
+    0x1e20_4000 | (type_ as u32) << 22 | (opcode as u32) << 15 | rn.value() << 5 | rd.value()
+}
+
+/// `loadStoreRegisterUnscaledImmediate` (ARM64Assembler.h:4831-4842), GPR form
+/// (`ldur`/`stur`). `imm9` is a signed byte displacement (no scaling).
+#[inline]
+const fn load_store_register_unscaled_immediate(
+    size: MemOpSize,
+    v: bool,
+    opc: MemOp,
+    imm9: i32,
+    rn: RegisterID,
+    rt: RegisterID,
+) -> u32 {
+    0x3800_0000
+        | (size as u32) << 30
+        | (v as u32) << 26
+        | (opc as u32) << 22
+        | ((imm9 & 0x1ff) as u32) << 12
+        | x_or_sp(rn) << 5
+        | x_or_zr(rt)
 }
 
 // ----------------------------------------------------------------------------
@@ -986,6 +1106,292 @@ impl<'a> Arm64Encoder<'a> {
     pub fn emit_nop(&mut self) {
         self.insn(nop_pseudo());
     }
+
+    // ------------------------------------------------------------------------
+    // Datasize-generic ARM64Assembler public methods consumed by the
+    // MacroAssemblerARM64 composite layer (`macro_assembler_arm64.rs`). These
+    // mirror ARM64Assembler's `template<int datasize[, SetFlags]>` mnemonics;
+    // the datasize/set-flags template parameters become runtime arguments. They
+    // append the same instruction words the existing D64-only helpers above do
+    // for their fixed datasize, and are byte-tested in the tests module.
+    // ------------------------------------------------------------------------
+
+    /// `add<datasize, S>(rd, rn, imm12, shift)` / `sub<datasize, S>(...)`
+    /// (ARM64Assembler.h add/sub immediate). `shift12` is the `shift == 12`
+    /// boolean. With `SetFlags::S` and `rd == zr` this is `cmp`/`cmn` immediate.
+    #[inline]
+    pub fn emit_add_sub_imm(
+        &mut self,
+        sf: Datasize,
+        op: AddOp,
+        s: SetFlags,
+        rd: RegisterID,
+        rn: RegisterID,
+        imm12: u32,
+        shift12: bool,
+    ) {
+        self.insn(add_subtract_immediate(sf, op, s, shift12, imm12, rn, rd));
+    }
+
+    /// `add<datasize, S>(rd, rn, rm)` / `sub<datasize, S>(...)` shifted-register
+    /// form (ARM64Assembler.h:812-833 / 3021-3045). When `rd`/`rn` is `sp` JSC
+    /// routes through the extended-register form (`UXTX #0`); this mirrors that.
+    /// With `SetFlags::S` and `rd == zr` this is `cmp`/`cmn` register.
+    #[inline]
+    pub fn emit_add_sub_reg(
+        &mut self,
+        sf: Datasize,
+        op: AddOp,
+        s: SetFlags,
+        rd: RegisterID,
+        rn: RegisterID,
+        rm: RegisterID,
+    ) {
+        if rd.is_sp() || rn.is_sp() {
+            self.insn(add_subtract_extended_register(
+                sf,
+                op,
+                s,
+                rm,
+                ExtendType::Uxtx,
+                0,
+                rn,
+                rd,
+            ));
+        } else {
+            self.insn(add_subtract_shifted_register(
+                sf,
+                op,
+                s,
+                ShiftType::Lsl,
+                rm,
+                0,
+                rn,
+                rd,
+            ));
+        }
+    }
+
+    /// `add<datasize, S>(rd, rn, rm, extend, amount)` extended-register form
+    /// (ARM64Assembler.h add/sub extended). Used to fold a scaled `BaseIndex`
+    /// index into an address (`add x, x, index, UXTX/UXTW/SXTW #scale`).
+    #[inline]
+    pub fn emit_add_sub_extended_reg(
+        &mut self,
+        sf: Datasize,
+        op: AddOp,
+        s: SetFlags,
+        rd: RegisterID,
+        rn: RegisterID,
+        rm: RegisterID,
+        extend: ExtendType,
+        amount: u32,
+    ) {
+        self.insn(add_subtract_extended_register(
+            sf, op, s, rm, extend, amount, rn, rd,
+        ));
+    }
+
+    /// `and_<datasize, S>` / `orr<datasize>` / `eor<datasize>` shifted-register
+    /// form, `LSL #0` (ARM64Assembler.h logical register). `opc` selects the
+    /// operation; `LogicalOp::Ands` with `rd == zr` is `tst`.
+    #[inline]
+    pub fn emit_logical_reg(
+        &mut self,
+        sf: Datasize,
+        opc: LogicalOp,
+        rd: RegisterID,
+        rn: RegisterID,
+        rm: RegisterID,
+    ) {
+        self.insn(logical_shifted_register(
+            sf,
+            opc,
+            ShiftType::Lsl,
+            false,
+            rm,
+            0,
+            rn,
+            rd,
+        ));
+    }
+
+    /// `lslv` / `lsrv` / `asrv` `<datasize>(rd, rn, rm)`
+    /// (ARM64Assembler.h:1523/1543/886): register-amount shift.
+    #[inline]
+    pub fn emit_shift_reg(
+        &mut self,
+        sf: Datasize,
+        op: DataOp2Source,
+        rd: RegisterID,
+        rn: RegisterID,
+        rm: RegisterID,
+    ) {
+        self.insn(data_processing_2_source(sf, rm, op, rn, rd));
+    }
+
+    /// `lsl<datasize>(rd, rn, shift)` (ARM64Assembler.h:1510-1514): immediate
+    /// left shift via `ubfm(rd, rn, (datasize-shift)&(datasize-1), datasize-1-shift)`.
+    #[inline]
+    pub fn emit_lsl_imm(&mut self, sf: Datasize, rd: RegisterID, rn: RegisterID, shift: u32) {
+        let datasize = datasize_bits(sf);
+        let immr = (datasize - shift) & (datasize - 1);
+        let imms = datasize - 1 - shift;
+        self.insn(bitfield(sf, BitfieldOp::Ubfm, immr, imms, rn, rd));
+    }
+
+    /// `lsr<datasize>(rd, rn, shift)` (ARM64Assembler.h:1530-1533): immediate
+    /// logical right shift via `ubfm(rd, rn, shift, datasize-1)`.
+    #[inline]
+    pub fn emit_lsr_imm(&mut self, sf: Datasize, rd: RegisterID, rn: RegisterID, shift: u32) {
+        let imms = datasize_bits(sf) - 1;
+        self.insn(bitfield(sf, BitfieldOp::Ubfm, shift, imms, rn, rd));
+    }
+
+    /// `asr<datasize>(rd, rn, shift)` (ARM64Assembler.h:873-876): immediate
+    /// arithmetic right shift via `sbfm(rd, rn, shift, datasize-1)`.
+    #[inline]
+    pub fn emit_asr_imm(&mut self, sf: Datasize, rd: RegisterID, rn: RegisterID, shift: u32) {
+        let imms = datasize_bits(sf) - 1;
+        self.insn(bitfield(sf, BitfieldOp::Sbfm, shift, imms, rn, rd));
+    }
+
+    /// `mul<datasize>(rd, rn, rm)` (ARM64Assembler.h:2559-2562):
+    /// `madd(rd, rn, rm, zr)`.
+    #[inline]
+    pub fn emit_mul(&mut self, sf: Datasize, rd: RegisterID, rn: RegisterID, rm: RegisterID) {
+        self.insn(data_processing_3_source_madd(
+            sf,
+            rm,
+            RegisterID::Zr,
+            rn,
+            rd,
+        ));
+    }
+
+    /// `movz`/`movk`/`movn` `<datasize>(rd, value, shift)` (ARM64Assembler.h
+    /// move-wide). `shift` is a byte-position multiple of 16.
+    #[inline]
+    pub fn emit_move_wide(
+        &mut self,
+        sf: Datasize,
+        op: MoveWideOp,
+        rd: RegisterID,
+        value: u16,
+        shift: u32,
+    ) {
+        self.insn(move_wide_immediate(sf, op, shift >> 4, value, rd));
+    }
+
+    /// `mov<datasize>(rd, rm)` (ARM64Assembler.h:2375-2382): `add rd, rm, #0`
+    /// when either operand is `sp`, else `orr rd, xzr, rm`.
+    #[inline]
+    pub fn emit_mov_reg(&mut self, sf: Datasize, rd: RegisterID, rm: RegisterID) {
+        if rd.is_sp() || rm.is_sp() {
+            self.emit_add_sub_imm(sf, AddOp::Add, SetFlags::DontSetFlags, rd, rm, 0, false);
+        } else {
+            self.insn(logical_shifted_register(
+                sf,
+                LogicalOp::Orr,
+                ShiftType::Lsl,
+                false,
+                rm,
+                0,
+                RegisterID::Zr,
+                rd,
+            ));
+        }
+    }
+
+    /// `fmov<64>(vd, vn)` (ARM64Assembler.h:3368-3372): double-precision FP
+    /// register-to-register move.
+    #[inline]
+    pub fn emit_fmov_double(&mut self, rd: FPRegisterID, rn: FPRegisterID) {
+        self.insn(floating_point_data_processing_1_source(
+            Datasize::D64,
+            FpDataOp1Source::Fmov,
+            rn,
+            rd,
+        ));
+    }
+
+    /// `ldur`/`stur` (ARM64Assembler.h:1472/2996): unscaled signed-imm9
+    /// load/store. `op`/`size` select the direction and access width.
+    #[inline]
+    pub fn emit_load_store_unscaled(
+        &mut self,
+        size: MemOpSize,
+        op: MemOp,
+        rt: RegisterID,
+        rn: RegisterID,
+        simm9: i32,
+    ) {
+        self.insn(load_store_register_unscaled_immediate(
+            size, false, op, simm9, rn, rt,
+        ));
+    }
+
+    /// `ldr`/`str` (ARM64Assembler.h:1276/2910): unsigned scaled-imm12
+    /// load/store. `byte_offset` is the unscaled byte displacement (a
+    /// non-negative multiple of the access size), scaled here via
+    /// `encodePositiveImmediate`.
+    #[inline]
+    pub fn emit_load_store_unsigned(
+        &mut self,
+        size: MemOpSize,
+        op: MemOp,
+        rt: RegisterID,
+        rn: RegisterID,
+        byte_offset: u32,
+    ) {
+        let access = mem_access_bytes(size);
+        debug_assert!(
+            byte_offset % access == 0,
+            "unsigned-immediate offset must be a multiple of the access size"
+        );
+        self.insn(load_store_register_unsigned_immediate(
+            size,
+            false,
+            op,
+            byte_offset / access,
+            rn,
+            rt,
+        ));
+    }
+
+    /// `ldr`/`str` (ARM64Assembler.h:1270/2914): register-offset load/store.
+    /// `s` is the scaled-index bit (set when the index is shifted by
+    /// `log2(accessSize)`).
+    #[inline]
+    pub fn emit_load_store_register_offset(
+        &mut self,
+        size: MemOpSize,
+        op: MemOp,
+        rt: RegisterID,
+        rn: RegisterID,
+        rm: RegisterID,
+        extend: ExtendType,
+        s: bool,
+    ) {
+        self.insn(load_store_register_register_offset(
+            size, false, op, rm, extend, s, rn, rt,
+        ));
+    }
+}
+
+/// Bit width of a GPR `Datasize` (used by the immediate-shift bitfield math).
+#[inline]
+const fn datasize_bits(sf: Datasize) -> u32 {
+    match sf {
+        Datasize::D64 => 64,
+        _ => 32,
+    }
+}
+
+/// Access size in bytes for a single-register `MemOpSize`.
+#[inline]
+const fn mem_access_bytes(size: MemOpSize) -> u32 {
+    1u32 << (size as u32)
 }
 
 #[cfg(test)]
@@ -1232,5 +1638,268 @@ mod tests {
         assert_eq!(single(|e| e.emit_blr(RegisterID::X0)), 0xd63f_0000);
         assert_eq!(single(|e| e.emit_br(RegisterID::X2)), 0xd61f_0040);
         assert_eq!(single(|e| e.emit_ret()), 0xd65f_03c0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Datasize-generic helpers (the MacroAssembler-facing surface). Every word
+    // below is hand-encoded against the ARM64 ARM and cross-checked with a
+    // disassembler-style derivation.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn datasize_generic_add_sub_logical() {
+        // add w0, w1, w2 : 0x0b020020 ; sub w0, w1, w2 : 0x4b020020.
+        assert_eq!(
+            single(|e| e.emit_add_sub_reg(
+                Datasize::D32,
+                AddOp::Add,
+                SetFlags::DontSetFlags,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+            )),
+            0x0b02_0020
+        );
+        assert_eq!(
+            single(|e| e.emit_add_sub_reg(
+                Datasize::D32,
+                AddOp::Sub,
+                SetFlags::DontSetFlags,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+            )),
+            0x4b02_0020
+        );
+        // add w0, w1, #4 : 0x11001020.
+        assert_eq!(
+            single(|e| e.emit_add_sub_imm(
+                Datasize::D32,
+                AddOp::Add,
+                SetFlags::DontSetFlags,
+                RegisterID::X0,
+                RegisterID::X1,
+                4,
+                false,
+            )),
+            0x1100_1020
+        );
+        // cmp w0, w1 (subs wzr, w0, w1) : 0x6b01001f.
+        assert_eq!(
+            single(|e| e.emit_add_sub_reg(
+                Datasize::D32,
+                AddOp::Sub,
+                SetFlags::S,
+                RegisterID::Zr,
+                RegisterID::X0,
+                RegisterID::X1,
+            )),
+            0x6b01_001f
+        );
+        // cmp w0, #4 (subs wzr, w0, #4) : 0x7100101f.
+        assert_eq!(
+            single(|e| e.emit_add_sub_imm(
+                Datasize::D32,
+                AddOp::Sub,
+                SetFlags::S,
+                RegisterID::Zr,
+                RegisterID::X0,
+                4,
+                false,
+            )),
+            0x7100_101f
+        );
+        // and w0, w1, w2 : 0x0a020020 ; orr : 0x2a020020 ; eor : 0x4a020020.
+        assert_eq!(
+            single(|e| e.emit_logical_reg(
+                Datasize::D32,
+                LogicalOp::And,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+            )),
+            0x0a02_0020
+        );
+        assert_eq!(
+            single(|e| e.emit_logical_reg(
+                Datasize::D32,
+                LogicalOp::Orr,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+            )),
+            0x2a02_0020
+        );
+        assert_eq!(
+            single(|e| e.emit_logical_reg(
+                Datasize::D32,
+                LogicalOp::Eor,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+            )),
+            0x4a02_0020
+        );
+        // tst w0, w1 (ands wzr, w0, w1) : 0x6a01001f.
+        assert_eq!(
+            single(|e| e.emit_logical_reg(
+                Datasize::D32,
+                LogicalOp::Ands,
+                RegisterID::Zr,
+                RegisterID::X0,
+                RegisterID::X1,
+            )),
+            0x6a01_001f
+        );
+    }
+
+    #[test]
+    fn datasize_generic_shifts_and_mul() {
+        // lsl w0, w1, w2 : 0x1ac22020 ; lsr : 0x1ac22420 ; asr : 0x1ac22820.
+        assert_eq!(
+            single(|e| e.emit_shift_reg(
+                Datasize::D32,
+                DataOp2Source::Lslv,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+            )),
+            0x1ac2_2020
+        );
+        assert_eq!(
+            single(|e| e.emit_shift_reg(
+                Datasize::D32,
+                DataOp2Source::Lsrv,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+            )),
+            0x1ac2_2420
+        );
+        assert_eq!(
+            single(|e| e.emit_shift_reg(
+                Datasize::D32,
+                DataOp2Source::Asrv,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+            )),
+            0x1ac2_2820
+        );
+        // lsl w0, w1, #1 : 0x531f7820 ; lsr w0, w1, #1 : 0x53017c20 ;
+        // asr w0, w1, #1 : 0x13017c20.
+        assert_eq!(
+            single(|e| e.emit_lsl_imm(Datasize::D32, RegisterID::X0, RegisterID::X1, 1)),
+            0x531f_7820
+        );
+        assert_eq!(
+            single(|e| e.emit_lsr_imm(Datasize::D32, RegisterID::X0, RegisterID::X1, 1)),
+            0x5301_7c20
+        );
+        assert_eq!(
+            single(|e| e.emit_asr_imm(Datasize::D32, RegisterID::X0, RegisterID::X1, 1)),
+            0x1301_7c20
+        );
+        // mul w0, w1, w2 (madd w0,w1,w2,wzr) : 0x1b027c20.
+        assert_eq!(
+            single(|e| e.emit_mul(
+                Datasize::D32,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2
+            )),
+            0x1b02_7c20
+        );
+    }
+
+    #[test]
+    fn datasize_generic_moves_and_fp() {
+        // movz w0, #0x1234 : 0x52824680 ; mov w0, w1 (orr w0, wzr, w1) : 0x2a0103e0.
+        assert_eq!(
+            single(|e| e.emit_move_wide(Datasize::D32, MoveWideOp::Z, RegisterID::X0, 0x1234, 0)),
+            0x5282_4680
+        );
+        assert_eq!(
+            single(|e| e.emit_mov_reg(Datasize::D32, RegisterID::X0, RegisterID::X1)),
+            0x2a01_03e0
+        );
+        // fmov d0, d1 : 0x1e604020.
+        assert_eq!(
+            single(|e| e.emit_fmov_double(FPRegisterID::Q0, FPRegisterID::Q1)),
+            0x1e60_4020
+        );
+    }
+
+    #[test]
+    fn datasize_generic_memory_forms() {
+        // ldur x0, [x1, #-8] : 0xf85f8020 ; stur w0, [x1, #-4] : 0xb81fc020.
+        assert_eq!(
+            single(|e| e.emit_load_store_unscaled(
+                MemOpSize::Size64,
+                MemOp::Load,
+                RegisterID::X0,
+                RegisterID::X1,
+                -8,
+            )),
+            0xf85f_8020
+        );
+        assert_eq!(
+            single(|e| e.emit_load_store_unscaled(
+                MemOpSize::Size32,
+                MemOp::Store,
+                RegisterID::X0,
+                RegisterID::X1,
+                -4,
+            )),
+            0xb81f_c020
+        );
+        // ldr w0, [x1, #8] : imm12 = 8/4 = 2 -> 0xb9400820.
+        assert_eq!(
+            single(|e| e.emit_load_store_unsigned(
+                MemOpSize::Size32,
+                MemOp::Load,
+                RegisterID::X0,
+                RegisterID::X1,
+                8,
+            )),
+            0xb940_0820
+        );
+        // ldrb w0, [x1, #1] : imm12 = 1 -> 0x39400420.
+        assert_eq!(
+            single(|e| e.emit_load_store_unsigned(
+                MemOpSize::Size8Or128,
+                MemOp::Load,
+                RegisterID::X0,
+                RegisterID::X1,
+                1,
+            )),
+            0x3940_0420
+        );
+        // ldr w0, [x1, x2, lsl #2] : size=32, S=1, UXTX -> 0xb8627820.
+        assert_eq!(
+            single(|e| e.emit_load_store_register_offset(
+                MemOpSize::Size32,
+                MemOp::Load,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+                ExtendType::Uxtx,
+                true,
+            )),
+            0xb862_7820
+        );
+        // ldrb w0, [x1, x2] : size=8, S=0, UXTX -> 0x38626820.
+        assert_eq!(
+            single(|e| e.emit_load_store_register_offset(
+                MemOpSize::Size8Or128,
+                MemOp::Load,
+                RegisterID::X0,
+                RegisterID::X1,
+                RegisterID::X2,
+                ExtendType::Uxtx,
+                false,
+            )),
+            0x3862_6820
+        );
     }
 }

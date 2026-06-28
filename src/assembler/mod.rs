@@ -25,6 +25,14 @@ pub mod registers;
 pub mod labels;
 pub mod link_records;
 
+// Roadmap step 11 (cont.): the MacroAssemblerARM64 COMPOSITE-OP layer — the
+// per-opcode operations a baseline JIT emits (add32/load64/branch32/jump/...),
+// each lowering to one or more raw `arm64_encoder::Arm64Encoder` instruction
+// emits and returning the `labels` Jump/Label/Call offset tokens. Landed
+// UNWIRED (`#![allow(dead_code)]`); wiring `src/jit/arm64_baseline.rs` to emit
+// through it is the later SERIAL integration step (B7).
+pub mod macro_assembler_arm64;
+
 use crate::jit::{CodePatchPlan, ExecutableAllocationId};
 use link_records::{Arm64LinkError, BranchType};
 

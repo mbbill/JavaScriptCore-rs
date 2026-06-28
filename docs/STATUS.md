@@ -28,6 +28,9 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 
 ## Assembler / codegen (PROVEN end-to-end: emit → relocate → execute)
 - [done] AbstractMacroAssembler operands + RegisterID + ARM64 encoder (byte-oracle-proven).
+- [done] MacroAssemblerARM64 composite-op layer (add/sub/logic/shift/mul/move/load/store/branch over
+  RegisterID/Address/BaseIndex; byte-oracle-proven; unwired — B7 emits through it). Deferred: logical-imm
+  bitmask forms, CachedTempRegister, cbz/cbnz folds, extended-register cmp for sp operands.
 - [done] LinkBuffer Label/Jump/Call + byte-exact in-place relocation.
 - [done] W^X executable memory (MAP_JIT + pthread_jit_write_protect; emit→finalize→call returns 42);
   unsafe scoped to jit/unsafe_platform_boundary.rs (forbid→deny).
