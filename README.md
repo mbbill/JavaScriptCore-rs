@@ -49,12 +49,17 @@ ACTIVE ROADMAP (validated, profiling-earned; default path = InterpreterOnly; sta
   [done] StringImpl Stage A (8/16-bit Latin-1/UTF-16, O(1) index)
   [done] profiling fuel: ArithProfile + ExecutionCounter (faithful packed bitfields, profiling.rs) +
          SpeculatedType uint64 bitset (new module) -- counter/speculation canonicalization is serial
-  [done] assembler: AbstractMacroAssembler operands + RegisterID + ARM64 instruction encoder (new
-         src/assembler/*, byte-oracle-proven vs the known-good prologue bytes) -- not yet emitting
+  [done] assembler+codegen: the engine EMITS + RELOCATES + EXECUTES ARM64 machine code under W^X.
+         AbstractMacroAssembler operands/RegisterID + ARM64 encoder (byte-oracle-proven, b1394b6) +
+         LinkBuffer Label/Jump/Call + byte-exact in-place relocation (ff3191b) + W^X exec memory
+         (af822c3: MAP_JIT + pthread_jit_write_protect, emit->finalize->call returns 42, unsafe scoped
+         to jit/unsafe_platform_boundary.rs; forbid->deny). The codegen->execution path is PROVEN.
   [done] bytecode: faithful packed instruction-stream core (Vec<u8>, byte-offset index, Narrow/Wide16/
          Wide32 width, size()-advance) -- replacement-in-waiting for the typed-Vec-by-ordinal divergence
-  [missing] WIRING is gated on Phase E (now unblocked) -> R3/R4 arena cutover -> Structure-wire; the
-         baseline JIT additionally needs arm64_baseline to emit via the encoder + the W^X unsafe keystone
+  [missing] A RUNNING baseline JIT now needs: wire arm64_baseline to emit per-opcode via the encoder+
+         finalize (retire the byte blobs); the bytecode-stream cutover it lowers from; profiling wiring;
+         and the OWNER-GATED keystones -- R4 (arena cell identity / the GC the JIT assumes) + the JSStack
+         execution substrate (native-stack vs Vec<Register> fork). R stays ~0.001 until the JIT runs.
 
 [wip] JetStream 3 Octane parity
   [done] Runner/benchmark contract: JetStreamDriver load order, shell globals, iteration,
