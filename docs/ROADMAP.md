@@ -85,8 +85,19 @@ and substrate tracks, additive in `jit/`+`assembler/` (no megafile conflict):
   analog: branchIfNotInt32/boxInt32/numberTag model — the assembler has ZERO JSValue-tag
   awareness today); (2) ARM64 per-LoweredOperation encoders mirroring `jit/emitter.rs`
   (the bytecode→selection contract already models Move/AddInt32/… ); (3) a slow-path C-call
-  shim (linkSlowCase scaffold exists at arm64_baseline.rs:1607); (4) bytecode→selection→ARM64
-  dispatch + tier-up.
+  shim; (4) bytecode→selection→ARM64 dispatch + tier-up.
+- **Slow-call mechanism (audited 2026-06-28) — mostly ALREADY BUILT, non-gated on B5/B6** (it's a
+  C call returning to the SAME JS frame, not a JS-frame push): the `SlowCaseEntry` linkage
+  (record/link slow cases by bytecode index + fast-path-resume) is faithful in the
+  `arm64_baseline.rs` control-flow builder, and the ABI clobber policy is faithful in `jit/abi.rs`
+  (`BaselineRuntimeCallClobbers`). numberTag x27 / notCellMask x28 are **callee-saved** (preserved
+  across the C call — NO re-materialization; corrects the B7 note). The interpreter ALREADY has the
+  faithful evaluators (arithmetic/bitwise/compare `*_binary_result`). GAP = a thin `jit/operations.rs`
+  (JITOperations analog) with one `extern "C"` shim per op (decode NaN-box u64 → RuntimeValue → call
+  the existing evaluator → re-encode; set VM::exception on throw) + a MacroAssembler far-call
+  (move_imm64+blr, primitives exist) + arg-marshal + exception-check + topCallFrame/CallSiteIndex
+  store. The ONE open design point (R1): the exception-handler jump target — a first cut bails to a
+  generic throw/interpreter stub (int-arith ops only throw via valueOf on object operands, rare).
 - **GATED on R4 + the inline/out-of-line storage split**: get_by_id/put_by_id + get_by_val/
   put_by_val ICs (the IC fast path needs a stable direct cell pointer + StructureID-in-header +
   PropertyInlineCache machinery).
