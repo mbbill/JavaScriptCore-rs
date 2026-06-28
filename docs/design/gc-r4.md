@@ -61,10 +61,23 @@ the struct-def field-deletions + Default/Clone edits all touch object_store.rs:3
   subspace; `HeapCellKind::Auxiliary` gc/cell.rs:108). `needs_drop` assert deferred.
 - **Per-kind units, rank order** (each a vertical slice; all share the struct-def edit
   region so integrate serially):
-  1. **Butterfly-values** — `out_of_line_storage`(385)+`properties` values(360)+`elements`(394)
-     → Butterfly (props left, elements right, IndexingHeader between; Butterfly.h:134-150).
-     De-self-references `storage_ptr`; deletes the custom Clone/Default/refresh. Accessors =
-     2 adjacent slots. The JIT GET/PUT_BY_ID/VAL target. **R3/R4 precondition.**
+  1. **Butterfly-values** (spec'd 2026-06-28) — **FULL FLIP: the butterfly becomes the SOLE value
+     authority; DELETE the per-cell `properties` HashMap** (a divergence — C++ has no per-cell
+     property map; post-Structure-wire attributes live in the Structure `get().1`, presence =
+     `structure_offset.is_some`, kind = the Structure Accessor bit, so only VALUES need a home).
+     Relocate `out_of_line_storage`(361) + the HashMap values + `elements`(370) → a store-owned
+     butterfly slab (props left, elements right; Butterfly.h:134-150). De-self-references
+     `storage_ptr` (point it at the separate slab; **the R4 UB hazard**); deletes the custom
+     Default + `refresh_storage_ptr` + `reset_property_storage_mirror`; Clone allocates a FRESH
+     slab via the store (cell no longer self-clones — thread the store through the snapshot path
+     object_store.rs:193). Accessors = a **GetterSetter in ONE slot** (faithful; PAUSE if it needs
+     a new cell kind beyond a reviewable batch). EXECUTION SPLIT: **B1a** (additive infra — new
+     `object/butterfly_handle.rs` slab+API over RuntimeValue, move `ButterflyHandle` out of
+     storage.rs, scaffold `object/auxiliary.rs`; do NOT re-type storage.rs's NON-LIVE contract
+     types) runs FIRST + disjoint from mod.rs; the **cutover** (~55 mod.rs/object_store.rs sites +
+     delete the HashMap) serializes AFTER the in-flight typescript mod.rs fix to avoid a megafile
+     merge. property_order/deleted_offsets STAY deferred → `needs_drop` does NOT flip here. The JIT
+     GET/PUT_BY_ID/VAL target. **R3/R4 precondition.**
   2. **JSFunction-captures** — `captures`(358)+`instance_fields`(357) → JSLexicalEnvironment
      variables[] / class-field init (JSLexicalEnvironment.h:56-80, JSCallee::m_scope).
   3. **RegExp** — `regexp_source`(397) → RegExp::m_patternString (RegExp.h:219);
