@@ -40,10 +40,10 @@ impl Butterfly {
     }
 }
 
-/// Handle to auxiliary butterfly storage logically owned by one object.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(transparent)]
-pub struct ButterflyHandle(pub usize);
+// gc-r4 B1a: `ButterflyHandle` moved to `object/butterfly_handle.rs` (the home of
+// the LIVE butterfly rep over `RuntimeValue`). It is a value-type-agnostic slab
+// index, so it lives beside the live rep rather than these NON-LIVE contract
+// types (which are over `JsValue` and retired in a later GAP-D cleanup).
 
 /// Butterfly allocation layout. JSC's concrete representation uses property
 /// storage at negative offsets and indexed payload at positive offsets; this

@@ -72,8 +72,9 @@ use crate::jit::{
     WatchpointTarget,
 };
 use crate::object::{
-    offset_for_property_number, PropertyCacheability, PropertyLookupMode, PropertyOffset,
-    PrototypePointer, StructureIdTable, WatchpointKind, WatchpointSet, WatchpointState, NON_ARRAY,
+    offset_for_property_number, ButterflyAllocation, ButterflyHandle, PropertyCacheability,
+    PropertyLookupMode, PropertyOffset, PrototypePointer, StructureIdTable, WatchpointKind,
+    WatchpointSet, WatchpointState, NON_ARRAY,
 };
 use crate::runtime::scope::{BindingAttributes, BindingError, BindingSlot, BindingWriteOutcome};
 use crate::runtime::typed_array::{

@@ -30,6 +30,18 @@ pub(crate) fn can_use_put_by_id_megamorphic_property_name(text: &str) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct CoreObjectStore {
     pub(crate) objects: Vec<Pin<Box<CoreObjectCell>>>,
+    // gc-r4 B1a: the store-owned slab of live butterfly allocations, the home of
+    // each object's out-of-line property+element region over `RuntimeValue`
+    // (object/butterfly_handle.rs `ButterflyAllocation`; C++ `Butterfly`,
+    // Butterfly.h:134-150). A `ButterflyHandle` is an index into this Vec. C++
+    // allocates each butterfly from the GC Auxiliary subspace
+    // (Heap::tryAllocateButterfly); the store-owned slab is the pre-R4 analog
+    // (the raw arena butterfly pointer arrives at R4). ADDITIVE this batch: the
+    // slab + API exist but no cell field or call site uses them yet (the cutover
+    // wires `storage_ptr`/`out_of_line_storage`/`elements` onto this slab and
+    // deletes the per-cell `properties` HashMap in a later batch).
+    #[allow(dead_code)]
+    pub(crate) butterflies: Vec<ButterflyAllocation>,
     // VM-internal payload-bits -> object-slot index; keyed by interpreter pointer-bits,
     // never JS/adversary-controlled, so it needs no SipHash DoS resistance. Use the
     // in-tree FxIntBuildHasher (gc/fast_hash.rs, WTF IntHash/PtrHash family); the swap is
@@ -199,6 +211,11 @@ impl Clone for CoreObjectStore {
     fn clone(&self) -> Self {
         let mut cloned = Self {
             objects: self.objects.clone(),
+            // gc-r4 B1a: deep-clone the whole butterfly slab by index so every
+            // `ButterflyHandle` stays valid across the snapshot (handles are slab
+            // indices; the slab is currently unwired, so this is empty in practice
+            // until the cutover threads butterflies onto cells).
+            butterflies: self.butterflies.clone(),
             object_indices_by_payload: HashMap::default(),
             // structure_table is keyed by StructureId handle (stable Vec slots across
             // clone), so every cloned cell's structure_id stays valid and the offset
@@ -1668,6 +1685,121 @@ pub(crate) enum CorePropertyPut {
 pub(crate) enum PutToPrimitiveOutcome {
     Setter(RuntimeValue),
     NoOp,
+}
+
+/// gc-r4 B1a: the store-level Butterfly slab API over `RuntimeValue`.
+///
+/// Each method keys a `ButterflyAllocation` (object/butterfly_handle.rs; the live
+/// rep of C++ `Butterfly`, Butterfly.h:134-150) by its `ButterflyHandle` index
+/// into the store-owned `butterflies` slab and delegates to the live rep. The
+/// property methods map the structure-assigned `PropertyOffset` to a forward slot
+/// via `offset_storage_index` exactly as `write_data_property_offset_slot` does,
+/// so the later cutover is a faithful swap of the per-cell mirror onto this slab.
+/// ADDITIVE this batch: nothing calls these yet (dead_code).
+#[allow(dead_code)]
+impl CoreObjectStore {
+    /// Allocate a fresh, empty butterfly; return its handle.
+    ///
+    /// C++ JSC `Heap::tryAllocateButterfly` / `Butterfly::create`
+    /// (Butterfly.h:172-179) out of the GC Auxiliary subspace; the real arena
+    /// allocation is deferred to R4. Here: push a default (empty)
+    /// `ButterflyAllocation` and return its slab index.
+    pub(crate) fn allocate_butterfly(&mut self) -> ButterflyHandle {
+        let index = self.butterflies.len();
+        self.butterflies.push(ButterflyAllocation::default());
+        ButterflyHandle(index)
+    }
+
+    /// DEEP-copy an existing butterfly into a fresh slab entry; return the new
+    /// handle. INDEPENDENT storage — never a shared handle.
+    ///
+    /// C++ JSC copies a butterfly's storage when materializing a CopyOnWrite
+    /// region or reallocating (Butterfly.h:226-245, `createOrGrow*`). The Rust
+    /// analog clones the `ButterflyAllocation` (both sides are `Copy`-element
+    /// `Vec`s) into a new index so source and clone never alias.
+    pub(crate) fn clone_butterfly(&mut self, handle: ButterflyHandle) -> ButterflyHandle {
+        let copy = self.butterflies[handle.0].clone();
+        let index = self.butterflies.len();
+        self.butterflies.push(copy);
+        ButterflyHandle(index)
+    }
+
+    /// Read the property slot for `offset` from butterfly `handle` (C++
+    /// `JSObject::getDirect`, JSObject.h:711). `None` for a negative offset.
+    pub(crate) fn butterfly_prop_get(
+        &self,
+        handle: ButterflyHandle,
+        offset: PropertyOffset,
+    ) -> Option<RuntimeValue> {
+        if offset.raw() < 0 {
+            return None;
+        }
+        self.butterflies[handle.0].prop_get(offset_storage_index(offset))
+    }
+
+    /// Write `value` into the property slot for `offset` in butterfly `handle`,
+    /// growing with `undefined` fill (C++ `JSObject::putDirectOffset`,
+    /// JSObject.h:711; mirrors `write_data_property_offset_slot`). No-op for a
+    /// negative offset.
+    pub(crate) fn butterfly_prop_put(
+        &mut self,
+        handle: ButterflyHandle,
+        offset: PropertyOffset,
+        value: RuntimeValue,
+    ) {
+        if offset.raw() < 0 {
+            return;
+        }
+        self.butterflies[handle.0].prop_put(offset_storage_index(offset), value);
+    }
+
+    /// Clear the property slot for `offset` in butterfly `handle` back to
+    /// `undefined` (deletion / data->accessor). No-op for a negative offset.
+    pub(crate) fn butterfly_prop_clear(&mut self, handle: ButterflyHandle, offset: PropertyOffset) {
+        if offset.raw() < 0 {
+            return;
+        }
+        self.butterflies[handle.0].prop_clear(offset_storage_index(offset));
+    }
+
+    /// Read the indexed element at `index` from butterfly `handle` (C++
+    /// `Butterfly::contiguous()`, Butterfly.h:196). Hole/out-of-range -> `None`.
+    pub(crate) fn butterfly_elem_get(
+        &self,
+        handle: ButterflyHandle,
+        index: usize,
+    ) -> Option<RuntimeValue> {
+        self.butterflies[handle.0].elem_get(index)
+    }
+
+    /// Write `value` into the indexed element at `index` in butterfly `handle`,
+    /// hole-filling growth (C++ `Butterfly::contiguous()` store, Butterfly.h:196).
+    pub(crate) fn butterfly_elem_put(
+        &mut self,
+        handle: ButterflyHandle,
+        index: usize,
+        value: RuntimeValue,
+    ) {
+        self.butterflies[handle.0].elem_put(index, value);
+    }
+
+    /// Resize the indexed element side of butterfly `handle` to `len`
+    /// (C++ butterfly vectorLength resize, Butterfly.h:187-189).
+    pub(crate) fn butterfly_elem_resize(&mut self, handle: ButterflyHandle, len: usize) {
+        self.butterflies[handle.0].elem_resize(len);
+    }
+
+    /// Number of indexed element slots in butterfly `handle` (the Butterfly
+    /// vectorLength analog, Butterfly.h:187).
+    pub(crate) fn butterfly_elem_len(&self, handle: ButterflyHandle) -> usize {
+        self.butterflies[handle.0].elem_len()
+    }
+
+    /// Append `value` to the indexed element side of butterfly `handle`
+    /// (C++ contiguous append, Butterfly.h:186-189).
+    pub(crate) fn butterfly_elem_push(&mut self, handle: ButterflyHandle, value: RuntimeValue) {
+        self.butterflies[handle.0].elem_push(value);
+    }
 }
 
 impl CoreObjectStore {

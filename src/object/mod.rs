@@ -6,6 +6,8 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod auxiliary;
+pub mod butterfly_handle;
 mod identity;
 mod indexing_type;
 mod operations;
@@ -53,15 +55,20 @@ pub use property::{
     PutPropertySlotKind, StaticPropertyKind, StaticPropertyTableAnalysis,
     StaticPropertyTableDescriptor,
 };
+// gc-r4 B1a: `ButterflyHandle` (a value-type-agnostic slab index) moved out of
+// `storage.rs` into `butterfly_handle.rs`, the home of the LIVE butterfly rep
+// over `RuntimeValue`. `ButterflyAllocation` is that live rep. storage.rs's
+// `Butterfly`/`OutOfLineStorage`/etc. (re-exported below) remain the NON-LIVE
+// contract/skeleton types over `JsValue`, retired in a later GAP-D cleanup.
+pub use butterfly_handle::{ButterflyAllocation, ButterflyHandle};
 pub use storage::{
     typed_array_content_type, typed_array_element_size, validate_array_storage_metadata,
     validate_butterfly_layout, validate_indexing_header, validate_typed_array_storage_contract,
     ArrayLengthContract, ArrayStorageMetadata, Butterfly, ButterflyGrowth, ButterflyGrowthReason,
-    ButterflyHandle, ButterflyLayout, ButterflyLayoutBuilder, IndexedStorage, IndexedStorageKind,
-    IndexingHeader, IndexingHistory, InlineStorage, OutOfLineStorage, SparseIndexMetadata,
-    StorageValidationError, TypedArrayBufferEdge, TypedArrayContentType, TypedArrayElementType,
-    TypedArrayMode, TypedArrayStorageContract, TypedArrayStorageContractBuilder,
-    TypedArrayViewLength,
+    ButterflyLayout, ButterflyLayoutBuilder, IndexedStorage, IndexedStorageKind, IndexingHeader,
+    IndexingHistory, InlineStorage, OutOfLineStorage, SparseIndexMetadata, StorageValidationError,
+    TypedArrayBufferEdge, TypedArrayContentType, TypedArrayElementType, TypedArrayMode,
+    TypedArrayStorageContract, TypedArrayStorageContractBuilder, TypedArrayViewLength,
 };
 pub use structure::{
     plan_structure_transition, transition_invalidates_watchpoints, validate_structure_descriptor,
