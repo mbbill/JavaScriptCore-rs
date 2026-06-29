@@ -83,8 +83,13 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   far_call(operation_value_add) + exception edge + C-ABI trampoline (push_pair prologue, x19=pinned-VM,
   x27/x28 tags). 4 native cases proven (2+3→5; overflow→boxed double; 1.5+2→3.5; throw→bail). TEMPLATE
   conventions: x1=left/x2=right/x0=result (operands pre-placed in op-arg slots → zero slow-path moves);
-  x19=canonical pinned-VM reg. Standalone callable image — NOT yet wired to live tier-up dispatch.
-  NEXT: template sub/mul/bit/shift + branch ops → wire into the per-opcode emitter/tier-up (R moves there).
+  x19=canonical pinned-VM reg (shared const). Standalone callable image — NOT yet wired to live dispatch.
+- [done] int32 ARITH FAMILY (verified; each EXECUTES): sub/mul/bitand/bitor/bitxor/lshift/rshift — the
+  ACTUAL JSVALUE64 generator paths (sub left-right, bitand and64+single-guard-no-box, bitor or64-no-box,
+  bitxor xor32+box, mul negative-zero guard); zero new unsafe (shared reborrow island). op_urshift +
+  mul-−0-double deferred (the latter a pre-existing engine-wide evaluator gap, not a JIT defect).
+  NEXT: dispatch Stage 1 (full-function 3-pass emitter + branch ops, spec'd baseline-dispatch.md) →
+  tier-up trigger + B5-lite handoff → the int-sum-loop milestone (R moves there).
 - [design] dispatch/tier-up wiring DESIGNED (docs/design/baseline-dispatch.md): the tier-up DECISION
   framework already exists (select_interpreter_entry_plan, vm/mod.rs:4926); missing = the faithful
   ExecutionCounter countdown trigger (S1) + a full-function 3-pass emit loop + B5-lite interpreter-seeded

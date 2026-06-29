@@ -2472,6 +2472,47 @@ impl Vm {
         op1: RuntimeValue,
         op2: RuntimeValue,
     ) -> Result<RuntimeValue, EncodedJsValue> {
+        // op_add is the AddInt32 member of the shared int32 arith FAMILY; its slow
+        // path is `operationValueAdd` -> `jsAdd`. The bridge body is identical for
+        // every family op (only the `CoreOpcode` selector differs), so it lives in
+        // the shared `operation_value_binary` below — keeping the family from
+        // drifting apart (each op picking up its own subtly-different boilerplate).
+        self.operation_value_binary(host, op1, op2, CoreOpcode::AddInt32)
+    }
+
+    /// D4+D5 (jit-runtime-bridge.md): the SHARED SAFE wrapper the int32 arith
+    /// FAMILY slow-path shims call (`operationValue{Add,Sub,Mul,BitAnd,BitOr,
+    /// BitXor,LShift,RShift}`, JITOperations.cpp:4860/4978/5225/...). It runs the
+    /// faithful evaluator `CoreOpcodeDispatchHost::arithmetic_binary_result`
+    /// (interpreter/mod.rs:9325) VERBATIM for the requested `opcode`
+    /// (`numeric_binary_result` for add/sub/mul, `bitwise_binary_result` for
+    /// bit/shift) over the REAL host + the `Vm`'s REAL heap/stack/registers/
+    /// exceptions, surfacing either the boxed result or the pending exception's
+    /// `EncodedJsValue`. This is JSC's `unprofiledAdd/Sub/Mul`/`jsBitwise*` shared
+    /// machinery: each `operationValueX` reaches the same value-arithmetic core.
+    ///
+    /// D5 — the host is the REAL one (the live objects/strings/bigints/symbols
+    /// stores), passed in by the shim, NOT a transient empty host. DIVERGENCE
+    /// (framed at the `jit_host` field): JSC's `VM` owns heap+object-space as one
+    /// unit; this engine splits `Vm` (heap/exceptions) from the host (the stores),
+    /// bridged by the D5 raw pointer; the end-state unifies the host INTO the `Vm`.
+    ///
+    /// `code_block`: a placeholder `CodeBlock`, PROVABLY NOT ACCESSED by any
+    /// primitive arith/bitwise path — `arithmetic_binary_result` and its callees
+    /// (`numeric_binary_result`/`bitwise_binary_result`/`concat_primitives`/
+    /// `bigint_binary_result`) never read `state.code_block`; only the OBJECT
+    /// operand path (`object_to_number_hint_primitive`) does, and the primitive
+    /// family fast/slow paths exercised by the lowering never reach it (verified by
+    /// inspection of mod.rs 9325-9371). So this wrapper is sound ONLY for primitive
+    /// operands; object-operand support (which needs the active-frame `CodeBlock`)
+    /// is NOT provided — exactly the op_add deferral, now shared by the whole family.
+    fn operation_value_binary(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+        opcode: CoreOpcode,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
         let code_block = CodeBlock::from_unlinked(
             UnlinkedCodeBlock::new(
                 crate::bytecode::CodeKind::Program,
@@ -2488,20 +2529,93 @@ impl Vm {
             ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
             function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
         };
-        match host.arithmetic_binary_result(&mut state, op1, op2, CoreOpcode::AddInt32) {
+        match host.arithmetic_binary_result(&mut state, op1, op2, opcode) {
             Ok(value) => Ok(value),
             // A materialized JS throw value (e.g. an object operand's valueOf
             // threw) is surfaced FAITHFULLY as its `EncodedJSValue`, exactly what
             // `VM::m_exception` would hold.
             Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
-            // An engine-level `Fail(ExecutionError)` carries no JS value yet
-            // (jsAdd's faithful throw OBJECT — a TypeError cell — is materialized
-            // by the interpreter's ExecutionError->throw path / the op_add
-            // exception stub, the NEXT unit, which bridge-infra does not
-            // implement). Surface the documented non-empty placeholder so the JIT
-            // m_exception mirror is non-zero == "exception pending".
+            // An engine-level `Fail(ExecutionError)` carries no JS value yet (the
+            // faithful throw OBJECT — a TypeError cell — is materialized by the
+            // interpreter's ExecutionError->throw path / the JIT exception stub,
+            // which bridge-infra does not implement). Surface the documented
+            // non-empty placeholder so the JIT m_exception mirror is non-zero ==
+            // "exception pending".
             Err(_) => Err(JIT_PENDING_EXCEPTION_PLACEHOLDER),
         }
+    }
+
+    /// `operationValueSub` -> `jsSub` (JITOperations.cpp:5225). SubInt32 member of
+    /// the shared family bridge.
+    pub fn operation_value_sub(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        self.operation_value_binary(host, op1, op2, CoreOpcode::SubInt32)
+    }
+
+    /// `operationValueMul` -> `jsMul` (JITOperations.cpp:4978). MulInt32 member.
+    pub fn operation_value_mul(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        self.operation_value_binary(host, op1, op2, CoreOpcode::MulInt32)
+    }
+
+    /// `operationValueBitAnd` -> `jsBitwiseAnd` (JITOperations.cpp). BitAndInt32.
+    pub fn operation_value_bitand(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        self.operation_value_binary(host, op1, op2, CoreOpcode::BitAndInt32)
+    }
+
+    /// `operationValueBitOr` -> `jsBitwiseOr` (JITOperations.cpp). BitOrInt32.
+    pub fn operation_value_bitor(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        self.operation_value_binary(host, op1, op2, CoreOpcode::BitOrInt32)
+    }
+
+    /// `operationValueBitXor` -> `jsBitwiseXor` (JITOperations.cpp). BitXorInt32.
+    pub fn operation_value_bitxor(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        self.operation_value_binary(host, op1, op2, CoreOpcode::BitXorInt32)
+    }
+
+    /// `operationValueLShift` -> `jsLShift` (JITOperations.cpp). LeftShiftInt32.
+    pub fn operation_value_lshift(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        self.operation_value_binary(host, op1, op2, CoreOpcode::LeftShiftInt32)
+    }
+
+    /// `operationValueRShift` -> `jsRShift` (JITOperations.cpp). RightShiftInt32
+    /// (arithmetic/signed). UnsignedRightShiftInt32 (urshift) is DEFERRED with the
+    /// lowering (its double-result fallback is unported); no shim is added for it.
+    pub fn operation_value_rshift(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        self.operation_value_binary(host, op1, op2, CoreOpcode::RightShiftInt32)
     }
 
     /// D3: read the JIT m_exception mirror word (`VM::exception()` analog).

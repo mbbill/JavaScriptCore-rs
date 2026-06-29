@@ -79,6 +79,70 @@ const JS_VALUE_EMPTY_BITS: u64 = 0;
 /// (`MacroAssemblerArm64::far_call`); no exported symbol is needed, so this is
 /// deliberately not `#[no_mangle]`.
 pub extern "C" fn operation_value_add(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_binary_operation(vm, op1, op2, Vm::operation_value_add)
+}
+
+/// The int32 arith FAMILY slow-path shims (`operationValue{Sub,Mul,BitAnd,BitOr,
+/// BitXor,LShift,RShift}`, JITOperations.cpp:4978/5225/...). Each mirrors
+/// `operationValueAdd` EXACTLY — the only difference is which value-arithmetic
+/// evaluator it bridges to — so they share [`dispatch_value_binary_operation`]
+/// and add ZERO new `unsafe`: the reborrow island is composed once. The boxed
+/// operands arrive already faithfully tagged from each op's int32 fast path; on
+/// the slow path the operands are still live in `argumentGPR1`/`argumentGPR2`
+/// (the op-arg slots), so the lowering far-calls these with no operand moves.
+pub extern "C" fn operation_value_sub(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_binary_operation(vm, op1, op2, Vm::operation_value_sub)
+}
+
+pub extern "C" fn operation_value_mul(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_binary_operation(vm, op1, op2, Vm::operation_value_mul)
+}
+
+pub extern "C" fn operation_value_bitand(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_binary_operation(vm, op1, op2, Vm::operation_value_bitand)
+}
+
+pub extern "C" fn operation_value_bitor(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_binary_operation(vm, op1, op2, Vm::operation_value_bitor)
+}
+
+pub extern "C" fn operation_value_bitxor(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_binary_operation(vm, op1, op2, Vm::operation_value_bitxor)
+}
+
+pub extern "C" fn operation_value_lshift(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_binary_operation(vm, op1, op2, Vm::operation_value_lshift)
+}
+
+pub extern "C" fn operation_value_rshift(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_binary_operation(vm, op1, op2, Vm::operation_value_rshift)
+}
+
+/// The SHARED body of every int32 arith FAMILY slow-path shim (op_add's original
+/// `operation_value_add` body, now factored so the family cannot drift). `eval`
+/// selects the faithful evaluator (`Vm::operation_value_{add,sub,mul,bitand,...}`,
+/// each a thin wrapper over the same `arithmetic_binary_result` core).
+///
+/// Shape (jit-runtime-bridge.md D3/D4/D5):
+/// 1. reborrow `&mut *vm` (D1) and `&mut *vm.jit_host` (D5) — the only `unsafe`;
+/// 2. decode the two `EncodedJSValue` operands (`JSValue::decode`); the int32 fast
+///    paths already boxed faithfully as `NumberTag | uint32(value)`;
+/// 3. call `eval` (the SAFE split-borrow wrapper) with the REAL host;
+/// 4. `Ok` -> `JSValue::encode(result)`;
+/// 5. `Err(encoded_exception)` -> stamp the fixed `m_exception` mirror word (D3)
+///    and return `JSValue::empty()` bits (the caller ignores the return register on
+///    the throw edge and branches on the exception word instead).
+fn dispatch_value_binary_operation(
+    vm: *mut Vm,
+    op1: u64,
+    op2: u64,
+    eval: fn(
+        &mut Vm,
+        &mut CoreOpcodeDispatchHost,
+        JsValue,
+        JsValue,
+    ) -> Result<JsValue, EncodedJsValue>,
+) -> u64 {
     // D1 reborrow — see the module SAFETY note. Exactly one `&mut *vm`, dropped
     // before this function returns to JIT code.
     let vm = unsafe { &mut *vm };
@@ -95,18 +159,15 @@ pub extern "C" fn operation_value_add(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
     );
     let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
 
-    // JSValue::decode(encodedOp{1,2}) (JITOperations.cpp:4866). The int32 fast
-    // path already boxed faithfully as `NumberTag | uint32(value)`.
+    // JSValue::decode(encodedOp{1,2}).
     let op1 = JsValue::from_encoded(EncodedJsValue(op1));
     let op2 = JsValue::from_encoded(EncodedJsValue(op2));
 
-    match vm.operation_value_add(host, op1, op2) {
-        // JSValue::encode(jsAdd(...)).
+    match eval(vm, host, op1, op2) {
+        // JSValue::encode(result).
         Ok(result) => result.encoded().0,
         // The throw edge: stamp `vm.m_exception` (the JIT mirror word, D3) and
-        // hand back the empty value (JITOperations' `OPERATION_RETURN` returns the
-        // encoded throw scope's value; on ARM64 baseline the caller ignores the
-        // return register and branches on the exception word).
+        // hand back the empty value.
         Err(encoded_exception) => {
             vm.set_jit_pending_exception(encoded_exception);
             JS_VALUE_EMPTY_BITS

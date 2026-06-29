@@ -273,6 +273,7 @@ pub(crate) mod register_contract {
     ];
 }
 
+mod arith;
 mod control_flow;
 mod entry_prologue;
 mod frame_addressing;

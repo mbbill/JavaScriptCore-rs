@@ -57,6 +57,10 @@ use crate::assembler::operands::{Address, TrustedImm64};
 use crate::assembler::registers::RegisterID;
 use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
 use crate::jit::operations::operation_value_add;
+// The canonical pinned-VM physical register (x19), now a SHARED const owned by the
+// int32 arith family scaffold so op_add and the other 7 family ops cannot drift
+// onto different registers (see `super::arith::PINNED_VM_GPR` for the full doc).
+use super::arith::PINNED_VM_GPR;
 
 /// `sizeof(Register)` (JSVALUE64); `addressFor` scales the VirtualRegister by it.
 const REGISTER_SIZE_BYTES: i32 = 8;
@@ -87,13 +91,10 @@ const RIGHT_GPR: RegisterID = RegisterID::X2;
 /// the slow path it is also the operation's arg0 (the Vm) and its return value.
 const RESULT_GPR: RegisterID = RegisterID::X0;
 
-/// The pinned-VM carrier (jit-runtime-bridge.md D2c). JSC's baseline reaches the
-/// VM via `globalObject->vm()` and has no pinned VM register; this port reserves
-/// one (`BASELINE_PINNED_VM_REGISTER`, jit/abi.rs:573) and concretizes it here as
-/// a CALLEE-SAVED GPR (x19 / regCS0) so the `*mut Vm` survives the operation
-/// far-call (AAPCS64 callees preserve x19-x28). The prologue spills/refills it so
-/// the emitted function also honors AAPCS64 toward its own caller.
-const PINNED_VM_GPR: RegisterID = RegisterID::X19;
+// `PINNED_VM_GPR` (x19), the pinned-VM carrier (jit-runtime-bridge.md D2c), is
+// imported above from `super::arith` — the SHARED canonical const for the whole
+// int32 arith family (it concretizes `BASELINE_PINNED_VM_REGISTER`, jit/abi.rs:573,
+// as callee-saved x19 so the `*mut Vm` survives the operation far-call).
 /// Paired with `PINNED_VM_GPR` only to keep `stp`/`ldp` 16-byte aligned; unused.
 const PINNED_VM_PAIR_GPR: RegisterID = RegisterID::X20;
 
