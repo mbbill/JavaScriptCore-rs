@@ -78,6 +78,12 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   conventions: x1=left/x2=right/x0=result (operands pre-placed in op-arg slots → zero slow-path moves);
   x19=canonical pinned-VM reg. Standalone callable image — NOT yet wired to live tier-up dispatch.
   NEXT: template sub/mul/bit/shift + branch ops → wire into the per-opcode emitter/tier-up (R moves there).
+- [design] dispatch/tier-up wiring DESIGNED (docs/design/baseline-dispatch.md): the tier-up DECISION
+  framework already exists (select_interpreter_entry_plan, vm/mod.rs:4926); missing = the faithful
+  ExecutionCounter countdown trigger (S1) + a full-function 3-pass emit loop + B5-lite interpreter-seeded
+  frame handoff (S2) + set_jit_code_block parking (S3) + a can_baseline_compile opcode-allowlist (S4).
+  ARITH/MOV/BRANCH-only first wiring is DOABLE NOW (un-gated) → R first moves; property-access/call
+  coverage stays gated on R4 / B5-B6 and enters via the S4 allowlist.
 - [missing] wire arm64_baseline to emit per-opcode via the encoder/finalize (retire the byte-blob /
   re-interpreter shim) + the bytecode-stream cutover + profiling wiring + tier-up.
 - [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
