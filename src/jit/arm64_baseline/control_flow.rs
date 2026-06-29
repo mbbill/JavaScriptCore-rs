@@ -140,6 +140,18 @@ pub(super) enum Arm64BaselineControlFlowLinkError {
     },
 }
 
+/// SUPERSEDED (ratified design decision S5, docs/design/baseline-dispatch.md):
+/// this builder modeled the bci label table / jump table / slow-case list as a
+/// SECOND, abstract control-flow model with its own byte-displacement arithmetic
+/// (`link_pending_jumps`, `link_all_slow_cases_up_to_bytecode_index`). The live
+/// full-function emitter ([`super::function_emitter`]) instead standardizes on the
+/// op_add-proven assembler-level `Jump`/`Label`/`to_link_record` +
+/// `finalize_arm64_link_buffer` path and lifts the SAME bci bookkeeping
+/// (labels-by-bci, `jumps: Vec<(Jump, target_bci)>`, deferred `SlowCase`s) as a
+/// THIN struct OVER that path — so there is exactly one branch-linking model, the
+/// one the assembler/link layer already executes end-to-end. This type is retained
+/// only as the historical bci-bookkeeping reference (and its unit tests); it is
+/// NOT on the live codegen path and accrues no new dependents.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct Arm64BaselineControlFlowBuilder {
     labels: Vec<Arm64BaselineBytecodeLabel>,

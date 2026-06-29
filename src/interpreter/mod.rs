@@ -8937,6 +8937,15 @@ impl CoreOpcodeDispatchHost {
             .map_or_else(|| value.pure_to_boolean(), |text| !text.is_empty())
     }
 
+    /// `pub(crate)` view of [`Self::truthy`] for the baseline-JIT `op_jtrue`/
+    /// `op_jfalse` slow-path bridge (`jit::operations::operation_jtrue/jfalse`):
+    /// the faithful `ToBoolean` the JIT calls when the condition operand is not a
+    /// statically-known boolean. Infallible (total over every `JSValue`), matching
+    /// JSC's non-throwing `op_jtrue` value-to-boolean conversion.
+    pub(crate) fn value_is_truthy(&self, value: RuntimeValue) -> bool {
+        self.truthy(value)
+    }
+
     fn create_arguments_object(
         &mut self,
         state: &mut DispatchState<'_>,
@@ -9388,7 +9397,7 @@ impl CoreOpcodeDispatchHost {
         result.map_err(DispatchOutcome::Fail)
     }
 
-    fn numeric_compare(
+    pub(crate) fn numeric_compare(
         &mut self,
         state: &mut DispatchState<'_>,
         left: RuntimeValue,

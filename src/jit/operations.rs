@@ -175,6 +175,114 @@ fn dispatch_value_binary_operation(
     }
 }
 
+/// `false`/`true` as the `size_t` 0/1 a baseline relational/branch operation
+/// returns (JSC `operationCompareLess` etc. return `size_t`; the emitted slow
+/// path consumes the result with `branchTest32(Zero/NonZero, returnValueGPR)`).
+const FALSE_RESULT: u64 = 0;
+const TRUE_RESULT: u64 = 1;
+
+/// `operationCompareLess(JSGlobalObject*, EncodedJSValue, EncodedJSValue)`
+/// (JITOperations.cpp; `jsLess<true>`). The baseline FUSED int32 compare-and-branch
+/// slow path (JSC `emitSlow_op_jless`/`op_jnless`, JITArithmetic.cpp:127/359) emits
+/// a C-ABI call to this shim with the two boxed operands; it runs the faithful
+/// relational evaluator and returns the comparison's boolean as 0/1, or — on throw
+/// (e.g. an object operand's `valueOf`, or a `Symbol` operand) — stamps the JIT
+/// `m_exception` mirror and returns 0 (the caller branches on the exception word).
+pub extern "C" fn operation_compare_less(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_compare_operation(vm, op1, op2, Vm::operation_compare_less)
+}
+
+/// `operationCompareLessEq` -> `jsLessEq<true>`. LessEqualInt32 member.
+pub extern "C" fn operation_compare_lesseq(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_compare_operation(vm, op1, op2, Vm::operation_compare_lesseq)
+}
+
+/// `operationCompareGreater` -> `jsLess<false>` (operands swapped). GreaterThanInt32.
+pub extern "C" fn operation_compare_greater(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_compare_operation(vm, op1, op2, Vm::operation_compare_greater)
+}
+
+/// The SHARED body of every baseline relational slow-path shim, mirroring
+/// [`dispatch_value_binary_operation`] but yielding a boolean as 0/1 (JSC's
+/// `operationCompare*` return a `size_t`). `eval` selects the faithful relational
+/// evaluator (`Vm::operation_compare_{less,lesseq,greater}`, each a thin wrapper
+/// over `CoreOpcodeDispatchHost::numeric_compare`).
+fn dispatch_value_compare_operation(
+    vm: *mut Vm,
+    op1: u64,
+    op2: u64,
+    eval: fn(
+        &mut Vm,
+        &mut CoreOpcodeDispatchHost,
+        JsValue,
+        JsValue,
+    ) -> Result<bool, EncodedJsValue>,
+) -> u64 {
+    // D1 + D5 reborrows — see the module SAFETY note. Exactly one `&mut *vm` and
+    // one `&mut *host`, both dropped before returning to JIT code.
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let op1 = JsValue::from_encoded(EncodedJsValue(op1));
+    let op2 = JsValue::from_encoded(EncodedJsValue(op2));
+
+    match eval(vm, host, op1, op2) {
+        Ok(true) => TRUE_RESULT,
+        Ok(false) => FALSE_RESULT,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            FALSE_RESULT
+        }
+    }
+}
+
+/// `operationConvertJSValueToBoolean(JSGlobalObject*, EncodedJSValue)` analog
+/// for the baseline `op_jtrue` slow path (JSC `emitSlow_op_jtrue`,
+/// JITOpcodes.cpp): returns the value's truthiness as 0/1. The boolean conversion
+/// is INFALLIBLE in this engine (`CoreOpcodeDispatchHost::value_is_truthy` is total
+/// over every `JSValue` — strings/symbols/numbers/objects), so there is no throw
+/// edge and `m_exception` is never touched.
+pub extern "C" fn operation_jtrue(vm: *mut Vm, value: u64) -> u64 {
+    dispatch_value_truthy_operation(vm, value, false)
+}
+
+/// `op_jfalse` slow path: the truthiness, inverted (jump-if-FALSE jumps when the
+/// value is NOT truthy). Returns `!truthy` as 0/1 so the lowering tests the SAME
+/// `NonZero -> take the branch` direction the fast path uses.
+pub extern "C" fn operation_jfalse(vm: *mut Vm, value: u64) -> u64 {
+    dispatch_value_truthy_operation(vm, value, true)
+}
+
+/// The SHARED body of the `op_jtrue`/`op_jfalse` slow-path shims. `invert` selects
+/// jfalse (`!truthy`) vs jtrue (`truthy`). Only the host reborrow is needed (the
+/// truthy evaluator reads no `Vm` state); the `&mut *vm` reborrow is taken solely
+/// to reach the parked host pointer (D5) and is dropped immediately.
+fn dispatch_value_truthy_operation(vm: *mut Vm, value: u64, invert: bool) -> u64 {
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let value = JsValue::from_encoded(EncodedJsValue(value));
+    let truthy = host.value_is_truthy(value);
+    let taken = truthy ^ invert;
+    if taken {
+        TRUE_RESULT
+    } else {
+        FALSE_RESULT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

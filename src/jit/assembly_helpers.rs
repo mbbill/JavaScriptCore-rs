@@ -27,7 +27,14 @@ use crate::assembler::labels::Jump;
 use crate::assembler::macro_assembler_arm64::{MacroAssemblerArm64, RelationalCondition};
 use crate::assembler::operands::TrustedImm64;
 use crate::assembler::registers::RegisterID;
-use crate::value::{NOT_CELL_MASK, NUMBER_TAG};
+use crate::value::{JsValue, NOT_CELL_MASK, NUMBER_TAG};
+
+/// `JSValue::ValueFalse` (JSCJSValue.h:483-488, == `OtherTag | BoolTag` == 0x6).
+/// A JS boolean is `ValueFalse`(0x6) or `ValueTrue`(0x7); `value & ~1 == ValueFalse`
+/// identifies a boolean and bit 0 is its truth value. Computed from the SHARED
+/// runtime encoder ([`JsValue::from_bool`]) so the JIT's boolean test agrees
+/// bit-for-bit with the runtime `value` module (never a copied literal).
+const VALUE_FALSE_BITS: u64 = JsValue::from_bool(false).encoded().0;
 
 /// `TagRegistersMode` (GPRInfo.h:430-434): whether the dedicated `numberTag`
 /// (x27) / `notCellMask` (x28) registers are already materialized at this point.
@@ -190,6 +197,39 @@ impl AssemblyHelpers {
     /// 32-bit `mov` that drops the high tag bits), matching `asInt32` exactly.
     pub fn unbox_int32(&mut self, boxed_gpr: RegisterID, result_gpr: RegisterID) {
         self.masm.zero_extend_32_to_word(boxed_gpr, result_gpr);
+    }
+
+    /// `branchIfNotBoolean(GPRReg reg, GPRReg tempGPR)` (AssemblyHelpers.h:828-836,
+    /// JSVALUE64). C++:
+    /// ```cpp
+    /// move(reg, tempGPR);
+    /// and64(TrustedImm32(~1), tempGPR);
+    /// return branch64(NotEqual, tempGPR, TrustedImm64(JSValue::ValueFalse));
+    /// ```
+    /// `reg & ~1 == ValueFalse(0x6)` iff `reg` is a boolean (false 0x6 / true 0x7
+    /// both map to 0x6); any other encoding differs -> `NotEqual` -> not a boolean.
+    ///
+    /// DIVERGENCE (instruction selection only): this macro layer has no
+    /// `and64`-immediate / `branch64`-immediate form yet (deferred, see the
+    /// `MacroAssemblerArm64` module note), so the `~1` mask and `ValueFalse`
+    /// constants are materialized into the two caller-supplied scratch registers
+    /// and compared register-register. Identical result; both constants are derived
+    /// from the SHARED runtime encoding. `scratch_a`/`scratch_b` must be two
+    /// distinct caller-saved temporaries that are not `reg`.
+    pub fn branch_if_not_boolean(
+        &mut self,
+        reg: RegisterID,
+        scratch_a: RegisterID,
+        scratch_b: RegisterID,
+    ) -> Jump {
+        // scratch_a := ~1 (0xFFFF_FFFF_FFFF_FFFE); scratch_b := reg & ~1.
+        self.masm.move_imm64(TrustedImm64::new(!1i64), scratch_a);
+        self.masm.and64(reg, scratch_a, scratch_b);
+        // scratch_a := ValueFalse (0x6); branch64(NotEqual, reg & ~1, ValueFalse).
+        self.masm
+            .move_imm64(TrustedImm64::new(VALUE_FALSE_BITS as i64), scratch_a);
+        self.masm
+            .branch64(RelationalCondition::NotEqual, scratch_b, scratch_a)
     }
 
     /// The `DoNotHaveTagRegisters` arm of `branchIfInt32`/`branchIfNotInt32`:

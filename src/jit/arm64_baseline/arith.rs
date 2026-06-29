@@ -66,8 +66,8 @@ use crate::assembler::operands::{Address, TrustedImm64};
 use crate::assembler::registers::RegisterID;
 use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
 use crate::jit::operations::{
-    operation_value_bitand, operation_value_bitor, operation_value_bitxor, operation_value_lshift,
-    operation_value_mul, operation_value_rshift, operation_value_sub,
+    operation_value_add, operation_value_bitand, operation_value_bitor, operation_value_bitxor,
+    operation_value_lshift, operation_value_mul, operation_value_rshift, operation_value_sub,
 };
 
 /// `sizeof(Register)` (JSVALUE64); `addressFor` scales the VirtualRegister by it.
@@ -117,10 +117,16 @@ const NOT_CELL_MASK_GPR: RegisterID = AssemblyHelpers::NOT_CELL_MASK_REGISTER;
 /// Caller-saved scratch for the post-call `branchTest` exception-word probe.
 const EXC_ADDR_GPR: RegisterID = RegisterID::X3;
 
-/// The int32 arith FAMILY templated here (op_add lives in its own module as the
-/// original; it is the `Add` member of this same family).
+/// The int32 arith FAMILY templated here. `op_add` keeps its OWN standalone
+/// module/proof ([`super::op_add`], the original end-to-end execution test), but
+/// `Add` is also a member of this enum so the CodeBlock-driven full-function
+/// emitter ([`super::function_emitter`]) can drive ALL eight int32 binary ops
+/// through one generator (`emit_arith_fast_path_fallthrough`) without forking the
+/// add fast path. The `Add` arm is byte-identical to `emit_baseline_op_add_int32`'s
+/// inline fast path (branchAdd32 + boxInt32).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArithFamilyOp {
+    Add,
     Sub,
     Mul,
     BitAnd,
@@ -132,8 +138,9 @@ pub(crate) enum ArithFamilyOp {
 
 impl ArithFamilyOp {
     /// The `operationValue*` shim address this op's slow path far-calls.
-    fn operation_shim(self) -> usize {
+    pub(super) fn operation_shim(self) -> usize {
         match self {
+            ArithFamilyOp::Add => operation_value_add as usize,
             ArithFamilyOp::Sub => operation_value_sub as usize,
             ArithFamilyOp::Mul => operation_value_mul as usize,
             ArithFamilyOp::BitAnd => operation_value_bitand as usize,
@@ -177,8 +184,47 @@ fn emit_fast_path(
     dst: i32,
     mode: TagRegistersMode,
 ) -> FastPathJumps {
+    // The standalone-image form: the per-op generator + the fast-path store
+    // (factored into `emit_arith_fast_path_fallthrough`), then the
+    // `endJumpList.append(jump())` that skips the INLINE slow path. The
+    // full-function emitter (S6 3-pass) reuses the fall-through body but defers
+    // the slow case after the epilogue, so it does NOT append this jump.
+    let slow = emit_arith_fast_path_fallthrough(h, op, dst, mode);
+    let fast_to_done = h.masm_mut().jump();
+    FastPathJumps { slow, fast_to_done }
+}
+
+/// The per-op int32 generator + the fast-path `emitPutVirtualRegister(result)`
+/// store, returning ONLY the slow-path guard jumps — WITHOUT the trailing
+/// `jump()` to `done`. The standalone image ([`emit_fast_path`]) appends that
+/// jump because its slow path is inline; the CodeBlock-driven 3-pass emitter
+/// ([`super::function_emitter`], JSC `JIT::privateCompileSlowCases`) instead
+/// FALLS THROUGH to the next bytecode's fast path and links the slow guards to a
+/// deferred slow block emitted after the epilogue (S6). Both share this one
+/// generator so the family fast paths cannot drift between the two emission
+/// shapes.
+pub(super) fn emit_arith_fast_path_fallthrough(
+    h: &mut AssemblyHelpers,
+    op: ArithFamilyOp,
+    dst: i32,
+    mode: TagRegistersMode,
+) -> Vec<Jump> {
     let mut slow = Vec::new();
     match op {
+        // JITAddGenerator (ARM64): guards left, right; branchAdd32(Overflow, RIGHT,
+        // LEFT, RESULT) => RESULT = right + left (commutative); box. Byte-identical
+        // to `emit_baseline_op_add_int32`'s inline fast path (op_add.rs).
+        ArithFamilyOp::Add => {
+            slow.push(h.branch_if_not_int32(LEFT_GPR, mode));
+            slow.push(h.branch_if_not_int32(RIGHT_GPR, mode));
+            slow.push(h.masm_mut().branch_add32(
+                ResultCondition::Overflow,
+                RIGHT_GPR,
+                LEFT_GPR,
+                RESULT_GPR,
+            ));
+            h.box_int32(RESULT_GPR, RESULT_GPR, mode);
+        }
         // JITSubGenerator (ARM64): guards left, right; branchSub32(Overflow, LEFT,
         // RIGHT, RESULT) => RESULT = left - right (operand order is load-bearing —
         // `sub` is non-commutative); box.
@@ -264,10 +310,10 @@ fn emit_fast_path(
             h.box_int32(RESULT_GPR, RESULT_GPR, mode);
         }
     }
-    // emitPutVirtualRegister(result) (fast-path store) + endJumpList.append(jump()).
+    // emitPutVirtualRegister(result) (fast-path store). No trailing jump: the
+    // standalone caller appends `jump()`; the 3-pass emitter falls through.
     h.masm_mut().store64(RESULT_GPR, address_for(dst));
-    let fast_to_done = h.masm_mut().jump();
-    FastPathJumps { slow, fast_to_done }
+    slow
 }
 
 /// Emit the baseline lowering for `dst = op1 <op> op2` (all `VirtualRegister` raw

@@ -277,6 +277,12 @@ mod arith;
 mod control_flow;
 mod entry_prologue;
 mod frame_addressing;
+// The CodeBlock-driven full-function baseline emitter (JSC `JIT::privateCompile`
+// 3 passes): lowers a whole function's bytecode to ONE ARM64 image, generalizing
+// the standalone `op_add`/`arith` per-op proofs into emit -> relocate -> execute
+// over op_enter/mov/LoadInt32/arith/int32 compare-branch/jmp/ret, incl. a native
+// loop with a backward (loop) link.
+mod function_emitter;
 mod op_add;
 // Generated-frame materialization proof submodules: consumed only by the gated
 // ARM64 native-entry/admission proof apparatus (vm/arm64_native_entry.rs proof

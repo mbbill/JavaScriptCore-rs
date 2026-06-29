@@ -2618,6 +2618,85 @@ impl Vm {
         self.operation_value_binary(host, op1, op2, CoreOpcode::RightShiftInt32)
     }
 
+    /// `operationCompareLess` -> `jsLess<true>` (JITOperations.cpp). The
+    /// LessThanInt32 member of the baseline relational slow-path bridge: the
+    /// faithful relational evaluator the FUSED int32 compare-and-branch lowering
+    /// (`function_emitter`'s `emit_compare_and_jump`) far-calls when an operand is
+    /// not int32.
+    pub fn operation_compare_less(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<bool, EncodedJsValue> {
+        self.operation_compare_relational(host, op1, op2, CoreOpcode::LessThanInt32)
+    }
+
+    /// `operationCompareLessEq` -> `jsLessEq<true>`. LessEqualInt32 member.
+    pub fn operation_compare_lesseq(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<bool, EncodedJsValue> {
+        self.operation_compare_relational(host, op1, op2, CoreOpcode::LessEqualInt32)
+    }
+
+    /// `operationCompareGreater` -> `jsLess<false>` (operands swapped).
+    /// GreaterThanInt32 member.
+    pub fn operation_compare_greater(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<bool, EncodedJsValue> {
+        self.operation_compare_relational(host, op1, op2, CoreOpcode::GreaterThanInt32)
+    }
+
+    /// The SHARED SAFE wrapper the baseline relational slow-path shims call,
+    /// mirroring [`Self::operation_value_binary`] but running the faithful
+    /// `CoreOpcodeDispatchHost::numeric_compare` (interpreter/mod.rs) for the
+    /// requested relational `opcode` over the REAL host + the `Vm`'s real heap, and
+    /// surfacing either the comparison's boolean or the pending exception's
+    /// `EncodedJsValue`. Like the arith bridge, the placeholder `CodeBlock` is sound
+    /// ONLY for the primitive relational paths exercised by the int32 lowering
+    /// (`numeric_compare`'s object path reads the active-frame `CodeBlock`); object
+    /// operands are NOT supported here.
+    fn operation_compare_relational(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+        opcode: CoreOpcode,
+    ) -> Result<bool, EncodedJsValue> {
+        let code_block = CodeBlock::from_unlinked(
+            UnlinkedCodeBlock::new(
+                crate::bytecode::CodeKind::Program,
+                PackedInstructionStream::default(),
+            ),
+            LinkContext::default(),
+        );
+        let mut state = DispatchState {
+            stack: &mut self.execution,
+            registers: &mut self.registers,
+            exceptions: &mut self.exceptions,
+            heap: &mut self.heap,
+            code_block: &code_block,
+            ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+            function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+        };
+        match host.numeric_compare(&mut state, op1, op2, opcode) {
+            Ok(result) => Ok(result),
+            // A materialized JS throw value (an object operand's valueOf threw) is
+            // surfaced FAITHFULLY as its `EncodedJSValue`.
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            // An engine-level `Fail` (e.g. a Symbol operand -> TypeError) carries no
+            // materialized JS value yet; surface the documented non-empty placeholder
+            // so the JIT m_exception mirror reads "exception pending".
+            Err(_) => Err(JIT_PENDING_EXCEPTION_PLACEHOLDER),
+        }
+    }
+
     /// D3: read the JIT m_exception mirror word (`VM::exception()` analog).
     pub fn jit_pending_exception(&self) -> EncodedJsValue {
         self.exceptions.jit_pending()

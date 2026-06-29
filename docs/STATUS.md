@@ -95,12 +95,16 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   mul-−0-double deferred (the latter a pre-existing engine-wide evaluator gap, not a JIT defect).
   NEXT: dispatch Stage 1 (full-function 3-pass emitter + branch ops, spec'd baseline-dispatch.md) →
   tier-up trigger + B5-lite handoff → the int-sum-loop milestone (R moves there).
-- [design] dispatch/tier-up wiring DESIGNED (docs/design/baseline-dispatch.md): the tier-up DECISION
-  framework already exists (select_interpreter_entry_plan, vm/mod.rs:4926); missing = the faithful
-  ExecutionCounter countdown trigger (S1) + a full-function 3-pass emit loop + B5-lite interpreter-seeded
-  frame handoff (S2) + set_jit_code_block parking (S3) + a can_baseline_compile opcode-allowlist (S4).
-  ARITH/MOV/BRANCH-only first wiring is DOABLE NOW (un-gated) → R first moves; property-access/call
-  coverage stays gated on R4 / B5-B6 and enters via the S4 allowlist.
+- [done] dispatch Stage 1 (verified): the full-function 3-pass emitter `emit_baseline_function`
+  (MAIN/SLOW/LINK, op_enter/mov/ret + arith family + int32 branches; branch-to-bytecode-index resolved
+  in LINK forward+backward) — WHOLE FUNCTIONS + native LOOPS execute under W^X (int-sum f(5)=10/f(10)=45).
+  S5 one control-flow model; S6 deferred slow cases; fusion deadness-guard + branch bounds-check.
+- [next-JIT] U3/U4 LIVE tier-up wiring (V0-V5, spec'd baseline-dispatch.md; S7 Box<Vm> / S8 sync / S9
+  ExecutionCounter ratified): the trigger + can_baseline_compile allowlist (use the emitter's Err) +
+  JitCode install in select_interpreter_entry_plan + B5-lite frame handoff + set_jit_code_block /
+  real-TypeError prereqs → the SYNTHETIC hot-arith r_i lift (R first moves). HONEST CAVEAT: Octane
+  material R needs the gated property/call ops (R4 / B5-B6) — arith-only tier-up moves Octane R only
+  marginally (Crypto at best).
 - [missing] wire arm64_baseline to emit per-opcode via the encoder/finalize (retire the byte-blob /
   re-interpreter shim) + the bytecode-stream cutover + profiling wiring + tier-up.
 - [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
