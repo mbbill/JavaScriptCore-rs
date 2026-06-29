@@ -4601,7 +4601,7 @@ impl CoreOpcodeDispatchHost {
                 return GeneratedPropertyLoadProbeResult::miss(Miss::StructureMismatch);
             }
 
-            let Some(Some(value)) = cell.elements.get(index).copied() else {
+            let Some(value) = self.objects.butterfly_elem_get(cell.butterfly, index) else {
                 return GeneratedPropertyLoadProbeResult::miss(Miss::MissingProperty);
             };
 
@@ -4660,9 +4660,12 @@ impl CoreOpcodeDispatchHost {
             return GeneratedPropertyLoadProbeResult::miss(Miss::StructureMismatch);
         }
 
-        let Some(value) =
-            generated_property_load_cell_data_property_at_offset(cell, key, expected_offset)
-        else {
+        let Some(value) = generated_property_load_cell_data_property_at_offset(
+            &self.objects,
+            cell,
+            key,
+            expected_offset,
+        ) else {
             let actual_offset = self
                 .objects
                 .structure_offset(cell.structure_id, &key.to_core_property_key());
@@ -4724,9 +4727,12 @@ impl CoreOpcodeDispatchHost {
             );
         }
 
-        let Some(value) =
-            generated_property_load_cell_data_property_at_offset(holder, key, request.offset)
-        else {
+        let Some(value) = generated_property_load_cell_data_property_at_offset(
+            &self.objects,
+            holder,
+            key,
+            request.offset,
+        ) else {
             return GeneratedPropertyLoadProbeResult::miss(
                 generated_property_load_offset_miss_reason(
                     holder,
@@ -4781,10 +4787,10 @@ impl CoreOpcodeDispatchHost {
             if cell.structure_id != plan_hit.base_structure {
                 return GeneratedPropertyStoreProbeResult::miss(Miss::StructureMismatch);
             }
-            if !cell
-                .elements
-                .get(index)
-                .is_some_and(|element| element.is_some())
+            if self
+                .objects
+                .butterfly_elem_get(cell.butterfly, index)
+                .is_none()
             {
                 return GeneratedPropertyStoreProbeResult::miss(Miss::ExistingPropertyMismatch);
             }
@@ -4913,10 +4919,10 @@ impl CoreOpcodeDispatchHost {
             if cell.structure_id != hit.base_structure {
                 return GeneratedPropertyStoreMutationResult::rejected(Miss::StructureMismatch);
             }
-            if !cell
-                .elements
-                .get(index)
-                .is_some_and(|element| element.is_some())
+            if self
+                .objects
+                .butterfly_elem_get(cell.butterfly, index)
+                .is_none()
             {
                 return GeneratedPropertyStoreMutationResult::rejected(
                     Miss::ExistingPropertyMismatch,
@@ -4929,23 +4935,24 @@ impl CoreOpcodeDispatchHost {
             {
                 return GeneratedPropertyStoreMutationResult::rejected(Miss::BarrierRejected);
             }
-            let Some(cell) = self.objects.find_mut(request.base) else {
-                return GeneratedPropertyStoreMutationResult::rejected(Miss::UnknownObject);
+            let handle = {
+                let Some(cell) = self.objects.find_mut(request.base) else {
+                    return GeneratedPropertyStoreMutationResult::rejected(Miss::UnknownObject);
+                };
+                if cell.kind != CoreObjectKind::Array || cell.structure_id != hit.base_structure {
+                    return GeneratedPropertyStoreMutationResult::rejected(Miss::StructureMismatch);
+                }
+                cell.butterfly
             };
-            if cell.kind != CoreObjectKind::Array || cell.structure_id != hit.base_structure {
-                return GeneratedPropertyStoreMutationResult::rejected(Miss::StructureMismatch);
-            }
-            let Some(slot) = cell.elements.get_mut(index) else {
+            // Existing-element guard: a present (non-hole, in-bounds) slot stores; a
+            // hole or out-of-range rejects (butterfly_elem_get flattens both to None).
+            if self.objects.butterfly_elem_get(handle, index).is_none() {
                 return GeneratedPropertyStoreMutationResult::rejected(
                     Miss::ExistingPropertyMismatch,
                 );
-            };
-            if slot.is_none() {
-                return GeneratedPropertyStoreMutationResult::rejected(
-                    Miss::ExistingPropertyMismatch,
-                );
             }
-            *slot = Some(hit.stored_value);
+            self.objects
+                .butterfly_elem_put(handle, index, hit.stored_value);
 
             return GeneratedPropertyStoreMutationResult::committed(
                 GeneratedPropertyStoreMutationCommit::host_confirmed_for_request(&request),
@@ -5068,7 +5075,11 @@ impl CoreOpcodeDispatchHost {
             return GeneratedPropertyStoreMutationResult::rejected(Miss::BarrierRejected);
         }
 
-        let old_structure = {
+        // The match updates the value-authoritative `properties` HashMap + structure
+        // under the cell borrow and returns the deferred butterfly slab write (the
+        // putDirectOffset mirror), which is applied after the borrow releases (the
+        // &mut self slab write cannot coexist with the &mut cell borrow).
+        let (old_structure, slab_write) = {
             let Some(cell) = self.objects.find_mut(request.base) else {
                 return GeneratedPropertyStoreMutationResult::rejected(Miss::UnknownObject);
             };
@@ -5085,11 +5096,10 @@ impl CoreOpcodeDispatchHost {
                         );
                     };
                     *value = hit.stored_value;
-                    // putDirectOffset analog: keep the out-of-line mirror in lockstep
-                    // with the authoritative in-place HashMap update. The offset is the
-                    // validated cached offset for this (already-guarded) shape.
-                    cell.write_data_property_offset_slot(hit.planned_offset, hit.stored_value);
-                    None
+                    (
+                        None,
+                        Some((cell.butterfly, hit.planned_offset, hit.stored_value)),
+                    )
                 }
                 PropertyStoreAccessCasePlanKind::DataOnlyTransition => {
                     let Some(new_structure) = hit.planned_new_structure else {
@@ -5111,9 +5121,11 @@ impl CoreOpcodeDispatchHost {
                     // new_structure already maps mutation_key -> planned_offset in its
                     // Structure::PropertyTable; stamp the structure and write the value
                     // at that offset (putDirectOffset analog). No re-allocation here.
-                    cell.write_data_property_offset_slot(hit.planned_offset, hit.stored_value);
                     cell.structure_id = new_structure;
-                    Some(old_structure)
+                    (
+                        Some(old_structure),
+                        Some((cell.butterfly, hit.planned_offset, hit.stored_value)),
+                    )
                 }
                 PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
                     unreachable!("handled before named store mutation")
@@ -5123,6 +5135,9 @@ impl CoreOpcodeDispatchHost {
                 }
             }
         };
+        if let Some((handle, offset, value)) = slab_write {
+            self.objects.butterfly_prop_put(handle, offset, value);
+        }
         if let Some(old_structure) = old_structure {
             self.objects.finish_structure_transition(old_structure);
         }
@@ -5387,9 +5402,12 @@ impl CoreOpcodeDispatchHost {
                     Some(index),
                 );
             }
-            let Some(value) =
-                generated_property_load_cell_data_property_at_offset(cell, key, offset)
-            else {
+            let Some(value) = generated_property_load_cell_data_property_at_offset(
+                &self.objects,
+                cell,
+                key,
+                offset,
+            ) else {
                 return Self::generated_guarded_property_load_miss(
                     plan,
                     Miss::GuardDataPropertyProofFailed,
@@ -9601,7 +9619,9 @@ impl CoreOpcodeDispatchHost {
         let structure = cell.structure_id;
         let index_usize = usize::try_from(index).ok();
         let out_of_bounds = match (cell.kind, index_usize) {
-            (CoreObjectKind::Array, Some(index)) => index >= cell.elements.len(),
+            (CoreObjectKind::Array, Some(index)) => {
+                index >= self.objects.butterfly_elem_len(cell.butterfly)
+            }
             (CoreObjectKind::Uint8Array, Some(index)) => index >= cell.view_length,
             _ => true,
         };
@@ -16578,10 +16598,9 @@ impl CoreOpcodeDispatchHost {
         let values =
             self.collect_iterable_values_to_array(heap, iterable, "Rest value is not iterable")?;
         let start = usize::try_from(start_index.max(0)).unwrap_or(usize::MAX);
-        let length = self
-            .objects
-            .find(values)
-            .map(|object| object.elements.len())
+        let handle = self.objects.find(values).map(|object| object.butterfly);
+        let length = handle
+            .map(|handle| self.objects.butterfly_elem_len(handle))
             .unwrap_or_default();
         for index in start..length {
             let value = self
@@ -16616,10 +16635,9 @@ impl CoreOpcodeDispatchHost {
         }
 
         if self.objects.is_array(iterable) {
-            let length = self
-                .objects
-                .find(iterable)
-                .map(|object| object.elements.len())
+            let handle = self.objects.find(iterable).map(|object| object.butterfly);
+            let length = handle
+                .map(|handle| self.objects.butterfly_elem_len(handle))
                 .unwrap_or_default();
             for index in 0..length {
                 let value = self
@@ -17857,7 +17875,7 @@ impl CoreOpcodeDispatchHost {
             return Err(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion));
         }
         let is_array = object.kind == CoreObjectKind::Array;
-        let array_len = object.elements.len();
+        let array_len = self.objects.butterfly_elem_len(object.butterfly);
         stack.push(value);
         let result = if is_array {
             let mut elements = Vec::new();
@@ -19890,8 +19908,8 @@ impl CoreOpcodeDispatchHost {
             if excluded.kind != CoreObjectKind::Array {
                 return Err(DispatchOutcome::Fail(ExecutionError::ExpectedObject));
             }
-            excluded
-                .elements
+            self.objects
+                .butterfly_elements(excluded.butterfly)
                 .iter()
                 .flatten()
                 .copied()
@@ -24150,7 +24168,7 @@ mod tests {
         let structure_id = cell.structure_id;
         let properties = cell.properties.clone();
         let property_order = cell.property_order.clone();
-        let elements = cell.elements.clone();
+        let elements = objects.butterfly_elements(cell.butterfly).to_vec();
         // gc-r4 Batch 2: the per-key offset map and the next-offset cursor are no longer
         // per-cell; they are a function of the cell's structure (the offset authority).
         // Rebuild the observable views from the structure_table for the snapshot.
@@ -28007,11 +28025,7 @@ mod tests {
             object_store_mutation_snapshot(&host.objects, array)
         );
 
-        host.objects
-            .find_mut(array)
-            .expect("array")
-            .elements
-            .resize(2, None);
+        host.objects.resize_array_elements(array, 2).expect("array");
         let hole_snapshot = object_store_mutation_snapshot(&host.objects, array);
         assert_eq!(
             store_probe_miss_reason(host.probe_generated_property_store(
@@ -28504,6 +28518,7 @@ mod tests {
                     .property_offset(object, key)
                     .expect("named data offset");
                 let offset_value = generated_property_load_cell_data_property_at_offset(
+                    objects,
                     cell,
                     GeneratedPropertyLoadCoreKey::Identifier(identifier),
                     offset,
@@ -28551,6 +28566,7 @@ mod tests {
             .expect("named data offset");
         assert_eq!(
             generated_property_load_cell_data_property_at_offset(
+                &host.objects,
                 cell,
                 GeneratedPropertyLoadCoreKey::Identifier(100),
                 offset_a,
@@ -28587,6 +28603,7 @@ mod tests {
                 .expect("named data offset");
             assert_eq!(
                 generated_property_load_cell_data_property_at_offset(
+                    &host.objects,
                     cell,
                     GeneratedPropertyLoadCoreKey::Identifier(1000 + i),
                     offset,
@@ -28787,8 +28804,9 @@ mod tests {
             object_store_mutation_snapshot(&host.objects, array)
         );
         assert_eq!(host.objects.get_index(array, 0), Ok(stored_value));
+        let array_handle = host.objects.find(array).expect("array").butterfly;
         assert_eq!(
-            host.objects.find(array).expect("array").elements.len(),
+            host.objects.butterfly_elem_len(array_handle),
             before.elements.len()
         );
         assert_single_value_store_barrier(

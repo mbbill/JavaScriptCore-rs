@@ -60,7 +60,14 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   deleted_offsets → fold to the Structure entry order (small follow-up, before/with Butterfly-values).
 - [done] B1a butterfly infra (additive, dead_code): object/butterfly_handle.rs (ButterflyAllocation
   over RuntimeValue + store slab + allocate/clone/prop/elem API) + object/auxiliary.rs scaffold;
-  ButterflyHandle moved out of storage.rs. NEXT: Butterfly-values cutover (full flip, after typescript).
+  ButterflyHandle moved out of storage.rs.
+- [done] Butterfly-values cutover (verified): storage/elements → the store slab; the offset-8 slot is
+  a ButterflyHandle (separate alloc) — **storage_ptr de-self-referenced (the R4 UB hazard, gone)**;
+  Clone-via-store; ~74 sites flipped (copy-out pattern). KEEPS the HashMap (cell NOT yet POD).
+- [next-GC] GetterSetter prerequisite (blocks the HashMap-deletion flip → POD → R4): the cutover verify
+  found accessor AND Symbol-keyed values have NO Structure offset + no GetterSetter cell + no Accessor
+  attribute bit. Needs: a minimal GetterSetter cell + an Accessor attr bit + Structure offsets for
+  Symbol/accessor keys → THEN delete the HashMap (butterfly = sole value authority) + needs_drop POD assert.
 - [missing] POD object-model rewrite (retire the fat CoreObjectCell) → R3 shadow oracle → R4 flip
   (gate = technical verification: shadow cross-check + miri + adversarial verify) → running collector.
   Audited (gc-r4.md): R4 mostly mechanical (value carries the ptr; copy-out pattern exists), sharp

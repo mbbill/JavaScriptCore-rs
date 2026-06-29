@@ -212,10 +212,12 @@ impl Clone for CoreObjectStore {
     fn clone(&self) -> Self {
         let mut cloned = Self {
             objects: self.objects.clone(),
-            // gc-r4 B1a: deep-clone the whole butterfly slab by index so every
-            // `ButterflyHandle` stays valid across the snapshot (handles are slab
-            // indices; the slab is currently unwired, so this is empty in practice
-            // until the cutover threads butterflies onto cells).
+            // gc-r4 Butterfly-values: deep-clone the whole butterfly slab by index so
+            // every `ButterflyHandle` stays valid across the snapshot AND the cloned
+            // store owns an INDEPENDENT slab. `objects.clone()` copies each cell's
+            // handle shallow; cloning the slab here in lockstep is exactly what makes
+            // that sound (the clone's handle indexes the clone's slab, never the
+            // source's) — the per-cell clone-independence the cell `Clone` relies on.
             butterflies: self.butterflies.clone(),
             object_indices_by_payload: HashMap::default(),
             // structure_table is keyed by StructureId handle (stable Vec slots across
@@ -304,15 +306,24 @@ pub(crate) enum CorePrototypeIdentity {
 // batch-3 machine-code GET_BY_ID must reach those by absolute byte layout, so this
 // cell is `#[repr(C)]` with a front-loaded, layout-asserted header:
 //   - structure_id FIRST  => STRUCTURE_ID_OFFSET == 0 (JSCell::m_structureID).
-//   - storage_ptr SECOND  => STORAGE_PTR_DISP == 8 (the JSObject Butterfly-pointer
-//     slot analog), a cached pointer into out_of_line_storage so the codegen can
-//     load [base + STORAGE_PTR_DISP] then [storage_ptr + offset*8] with no Vec
-//     bookkeeping. The header order is LOAD-BEARING and enforced by the
-//     const offset_of! asserts below.
-// DIVERGENCE: Clone is hand-written (see impl Clone) because storage_ptr is a raw
-// pointer into this cell's own out_of_line_storage and must be RECOMPUTED for a
-// clone, never copied (a copied ptr would dangle/alias into the source cell's Vec).
-// Default is likewise hand-written because *const has no derivable Default.
+//   - butterfly SECOND     => BUTTERFLY_SLOT_DISP == 8 (the JSObject `m_butterfly`
+//     slot, JSObject.h:1167/1572-1577). gc-r4 Butterfly-values: this slot held a
+//     cached self-referential `*const RuntimeValue` into the cell's own
+//     `out_of_line_storage` (the R4 UB hazard under Stacked/Tree Borrows). It is now
+//     a `ButterflyHandle` — an index into the STORE-OWNED `butterflies` slab (a
+//     SEPARATE allocation), so the cell no longer points into itself. The codegen
+//     contract is preserved at offset 8: the JIT GET_BY_ID DataIC loads
+//     [base + BUTTERFLY_SLOT_DISP] then [storage_base + offset*8]. The bits there are
+//     HANDLE bits NOW (R3-reversible, interpreter-resolved — the interpreter maps the
+//     handle to the slab; the machine-code deref of these bits is not yet wired live)
+//     and become the raw machine-dereffable arena butterfly POINTER at R4.
+// DIVERGENCE: Clone is hand-written (see impl Clone) to copy the butterfly HANDLE
+// shallow. That is sound ONLY because the cell's Clone is reached EXCLUSIVELY through
+// `CoreObjectStore::clone()`, which deep-clones the whole `butterflies` slab ALONGSIDE
+// `objects` (so each cloned store owns an independent slab and handles stay valid); no
+// site clones a single cell into the SAME store. Default is hand-written because a
+// `ButterflyHandle` sentinel (INVALID) is installed until `allocate_cell` assigns a
+// real slab handle at the single allocation chokepoint.
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct CoreObjectCell {
@@ -334,15 +345,16 @@ pub(crate) struct CoreObjectCell {
     // across all cell kinds (asserted ==4), not byte-5 parity; exact byte-5 parity is
     // deferred until an m_indexingTypeAndMisc header byte is modeled.
     pub(crate) js_type: JsType,
-    // C++ JSC: the JSObject Butterfly pointer slot (runtime/JSObject.h:1572-1577).
-    // Rust butterfly-pointer analog: a cached `out_of_line_storage.as_ptr()` kept
-    // coherent by refresh_storage_ptr at every Vec mutation. MUST stay the second
-    // declared field; STORAGE_PTR_DISP asserts it is at byte 8 (after the 4-byte
-    // structure_id + 4-byte pad to pointer alignment). NEVER dereferenced without a
-    // prior matching structure guard: for an empty Vec this is a dangling-but-aligned
-    // pointer (Vec::as_ptr on a 0-capacity Vec), and a 0-slot shape has no valid
-    // offset to read, so the guard makes that pointer unreachable.
-    pub(crate) storage_ptr: *const RuntimeValue,
+    // C++ JSC: the JSObject Butterfly pointer slot (`m_butterfly`,
+    // runtime/JSObject.h:1167 / 1572-1577). gc-r4 Butterfly-values: a
+    // `ButterflyHandle` index into the STORE-OWNED `butterflies` slab (a separate
+    // allocation), NOT a self-referential interior pointer. MUST stay the second
+    // declared field; BUTTERFLY_SLOT_DISP asserts it is at byte 8 (after the 4-byte
+    // structure_id + 4-byte pad to pointer alignment). `ButterflyHandle` is a
+    // `#[repr(transparent)] usize`, so it occupies the same 8 bytes the raw butterfly
+    // pointer will occupy at R4. The handle is set in `allocate_cell` via
+    // `allocate_butterfly()`; until then it is `ButterflyHandle::INVALID` (sentinel).
+    pub(crate) butterfly: ButterflyHandle,
     pub(crate) cell_id: CellId,
     pub(crate) kind: CoreObjectKind,
     pub(crate) prototype: Option<RuntimeValue>,
@@ -355,29 +367,21 @@ pub(crate) struct CoreObjectCell {
     pub(crate) instance_fields: Vec<CoreInstanceField>,
     pub(crate) captures: Vec<RuntimeValue>,
     pub(crate) binding_value: RuntimeValue,
+    // C++ JSC has NO per-object property map: a JSObject's named data property VALUE
+    // lives in inline storage or the Butterfly out-of-line region, and the
+    // property->offset/attributes/kind mapping lives PER-SHAPE in
+    // Structure::PropertyTable. gc-r4: the offset/attributes/presence of a NAMED-DATA
+    // property are already a function of `structure_id` via the store's
+    // `structure_table`; only the VALUE needs a per-object home. This HashMap remains
+    // the VALUE AUTHORITY this batch (a divergence still to be removed): the butterfly
+    // slab `props` side (keyed by the structure-assigned offset) is its offset-indexed
+    // MIRROR — written in lockstep at every store, read by the offset/IC path. The
+    // full flip (delete this HashMap, make the butterfly the SOLE value authority) is
+    // PAUSED: accessor + Symbol-keyed properties have NO Structure offset in the
+    // current port (structure_offset returns None; structure_add_property skips them),
+    // so they have no butterfly slot to move to — see the batch report / docs/design/
+    // gc-r4.md. This HashMap stays POD-blocking (Drop) until that flip lands.
     pub(crate) properties: HashMap<CorePropertyKey, CoreProperty>,
-    // C++ JSC: a JSObject's named data properties live in either inline storage
-    // (offset < firstOutOfLineOffset) or the Butterfly out-of-line region
-    // (JSObject.h locationForOffset:711, Butterfly.h), and putDirectOffset writes
-    // the value at offsetInRespectiveStorage(offset). `out_of_line_storage` is the
-    // Rust mirror of that Butterfly property region: a contiguous [RuntimeValue]
-    // (RuntimeValue == EncodedJsValue == 8 bytes), indexable as [base + idx*8], which
-    // is what the batch-3 machine-code GET_BY_ID will mov from. The HashMap
-    // `properties` remains the authoritative VALUE store this batch; this Vec is
-    // written in lockstep (the putDirectOffset analog) and read by the offset path.
-    // The property->OFFSET map is no longer per-cell (gc-r4 Batch 2): the offset is a
-    // function of the cell's `structure_id` via the store's `structure_table`
-    // (Structure::PropertyTable), exactly as C++ JSC keeps it per-shape.
-    //
-    // DIVERGENCE: C++ indexes the out-of-line region with NEGATIVE indices growing
-    // backward from the Butterfly base (offsetInOutOfLineStorage returns
-    // -(offset-firstOutOfLineOffset)-1). The Rust mirror uses a FORWARD-indexed Vec
-    // (slot index = offset_storage_index(offset)); for the batch-3 base register the
-    // sign of the displacement is a codegen detail, and forward indexing is the
-    // natural Rust spill. With INLINE_CAPACITY == 6 (the JSFinalObject default), the
-    // inline band [0,6) and the out-of-line band [64,...) are both packed into this
-    // single forward Vec; the real inline-slot/Butterfly split is deferred to Batch 5.
-    pub(crate) out_of_line_storage: Vec<RuntimeValue>,
     // C++ JSC: PropertyTable::m_deletedOffsets (PropertyTable.h) records offsets
     // freed by deletion so a later addition can reuse them instead of growing
     // storage. The Rust mirror records freed offsets here; reuse is not yet wired
@@ -386,7 +390,11 @@ pub(crate) struct CoreObjectCell {
     // them. Faithful reuse is deferred with the inline-split work.
     pub(crate) deleted_offsets: Vec<PropertyOffset>,
     pub(crate) property_order: Vec<CorePropertyKey>,
-    pub(crate) elements: Vec<Option<RuntimeValue>>,
+    // C++ JSC: indexed elements live on the RIGHT side of the Butterfly
+    // (Butterfly::contiguous(), Butterfly.h:196). gc-r4 Butterfly-values: the indexed
+    // element storage is now the store-owned slab's `elements` side, reached through
+    // `butterfly` (the handle above); the SOLE authority for indexed values (it had no
+    // HashMap mirror). All access routes through the `butterfly_elem_*` store API.
     pub(crate) map_entries: Vec<(RuntimeValue, RuntimeValue)>,
     pub(crate) set_values: Vec<RuntimeValue>,
     pub(crate) regexp_source: String,
@@ -427,25 +435,32 @@ pub(crate) struct CoreObjectCell {
 // value it must be given, and the assert pins the field at byte 0 so a silent
 // field-reorder cannot desynchronize the codegen from the layout.
 const STRUCTURE_ID_OFFSET: usize = std::mem::offset_of!(CoreObjectCell, structure_id);
-// C++ JSC: the JSObject Butterfly pointer slot (runtime/JSObject.h:1572-1577) read
-// at a constant displacement. STORAGE_PTR_DISP is the Rust analog displacement the
-// codegen uses to fetch the storage base before the offset-indexed property load.
-const STORAGE_PTR_DISP: usize = std::mem::offset_of!(CoreObjectCell, storage_ptr);
+// C++ JSC: the JSObject Butterfly pointer slot (`m_butterfly`,
+// runtime/JSObject.h:1167 / 1572-1577) read at a constant displacement.
+// BUTTERFLY_SLOT_DISP is the Rust analog displacement the codegen uses to fetch the
+// storage base before the offset-indexed property load. gc-r4 Butterfly-values: the
+// slot holds a `ButterflyHandle` (interpreter-resolved at R3) at the SAME offset 8 the
+// raw arena butterfly pointer will occupy at R4, so the codegen contract is unchanged.
+const BUTTERFLY_SLOT_DISP: usize = std::mem::offset_of!(CoreObjectCell, butterfly);
 
 // Compile-time layout guards. These fail the build if the #[repr(C)] header order
-// changes, if alignment padding shifts the storage pointer, or if RuntimeValue stops
-// being an 8-byte EncodedJsValue (the [storage_ptr + offset*8] stride assumption).
+// changes, if alignment padding shifts the butterfly slot, or if RuntimeValue stops
+// being an 8-byte EncodedJsValue (the [storage_base + offset*8] stride assumption).
 const _: () = assert!(
     STRUCTURE_ID_OFFSET == 0,
     "CoreObjectCell::structure_id must be at offset 0 (JSCell::structureIDOffset()==0)"
 );
 const _: () = assert!(
-    STORAGE_PTR_DISP == 8,
-    "CoreObjectCell::storage_ptr must be at byte 8 (JSObject Butterfly-pointer slot analog)"
+    BUTTERFLY_SLOT_DISP == 8,
+    "CoreObjectCell::butterfly must be at byte 8 (JSObject m_butterfly slot analog)"
+);
+const _: () = assert!(
+    std::mem::size_of::<ButterflyHandle>() == 8,
+    "ButterflyHandle must be 8 bytes (occupies the raw butterfly-pointer slot at R4)"
 );
 const _: () = assert!(
     std::mem::size_of::<RuntimeValue>() == 8,
-    "RuntimeValue must be 8 bytes (EncodedJsValue) for the [storage_ptr + offset*8] stride"
+    "RuntimeValue must be 8 bytes (EncodedJsValue) for the [storage_base + offset*8] stride"
 );
 // C++ JSC JSCell::m_type analog (runtime/JSCell.h:298). The FIXED, kind-consistent
 // offset of the in-cell JSType tag: it must be identical across every cell kind so a
@@ -459,19 +474,18 @@ const _: () = assert!(
 
 impl Default for CoreObjectCell {
     fn default() -> Self {
-        // Build with a dangling-but-aligned storage_ptr, then point it at this cell's
-        // own (empty) out_of_line_storage. C++ has no exact analog (a fresh JSObject's
-        // Butterfly is null until out-of-line storage is needed); the Rust mirror keeps
-        // storage_ptr always pointing into its own Vec so refresh_storage_ptr has a
-        // single invariant to maintain. The empty-Vec pointer is never read without a
-        // prior matching structure guard (a 0-slot shape has no valid offset).
-        let mut cell = Self {
+        // C++ has no exact analog (a fresh JSObject's Butterfly is null until the
+        // allocator hands it one). The Rust analog installs the INVALID sentinel
+        // handle; `allocate_cell` assigns a real store-owned slab handle via
+        // `allocate_butterfly()` at the single allocation chokepoint, BEFORE the cell
+        // is published and BEFORE its out-of-line storage is filled.
+        Self {
             structure_id: StructureId::default(),
             // Default kind is Ordinary => FinalObject; allocate_cell overwrites this
             // from cell.kind.js_type() for every published cell, so the tag always
             // matches the final kind regardless of how the cell was built.
             js_type: JsType::FinalObject,
-            storage_ptr: core::ptr::null(),
+            butterfly: ButterflyHandle::INVALID,
             cell_id: CellId::default(),
             kind: CoreObjectKind::default(),
             prototype: None,
@@ -485,10 +499,8 @@ impl Default for CoreObjectCell {
             captures: Vec::new(),
             binding_value: RuntimeValue::default(),
             properties: HashMap::new(),
-            out_of_line_storage: Vec::new(),
             deleted_offsets: Vec::new(),
             property_order: Vec::new(),
-            elements: Vec::new(),
             map_entries: Vec::new(),
             set_values: Vec::new(),
             regexp_source: String::new(),
@@ -513,27 +525,24 @@ impl Default for CoreObjectCell {
             bound_target: None,
             bound_this: RuntimeValue::default(),
             bound_args: Vec::new(),
-        };
-        cell.refresh_storage_ptr();
-        cell
+        }
     }
 }
 
 impl Clone for CoreObjectCell {
     fn clone(&self) -> Self {
-        // Clone every field normally, but RECOMPUTE storage_ptr from the CLONE's own
-        // out_of_line_storage. Copying self.storage_ptr would alias/dangle into the
-        // source cell's Vec (a different heap allocation), which the batch-3 codegen
-        // would then dereference. This is the one field that must NOT be a value copy.
-        // Vec's heap buffer pointer is stable across the subsequent move of this struct
-        // (into Box/Pin on the snapshot path), so computing from the new Vec here stays
-        // valid after the cell is re-pinned.
-        let mut cloned = Self {
+        // gc-r4 Butterfly-values: copy the `butterfly` HANDLE shallow (it is a plain
+        // Copy slab index, no longer a self-referential pointer to RECOMPUTE). This is
+        // sound because the cell's Clone is reached ONLY through
+        // `CoreObjectStore::clone()`, which deep-clones the whole `butterflies` slab
+        // ALONGSIDE `objects` — so the cloned store owns an independent slab and the
+        // copied handle indexes the clone's own butterfly, never the source's. No site
+        // clones a single cell into the SAME store (which WOULD alias the slab entry).
+        Self {
             structure_id: self.structure_id,
-            // Copy the type tag normally (unlike storage_ptr, it is layout/identity-
-            // independent); a clone of an object cell is the same JSType.
+            // Copy the type tag normally; a clone of an object cell is the same JSType.
             js_type: self.js_type,
-            storage_ptr: core::ptr::null(),
+            butterfly: self.butterfly,
             cell_id: self.cell_id,
             kind: self.kind,
             prototype: self.prototype,
@@ -547,10 +556,8 @@ impl Clone for CoreObjectCell {
             captures: self.captures.clone(),
             binding_value: self.binding_value,
             properties: self.properties.clone(),
-            out_of_line_storage: self.out_of_line_storage.clone(),
             deleted_offsets: self.deleted_offsets.clone(),
             property_order: self.property_order.clone(),
-            elements: self.elements.clone(),
             map_entries: self.map_entries.clone(),
             set_values: self.set_values.clone(),
             regexp_source: self.regexp_source.clone(),
@@ -575,9 +582,7 @@ impl Clone for CoreObjectCell {
             bound_target: self.bound_target,
             bound_this: self.bound_this,
             bound_args: self.bound_args.clone(),
-        };
-        cloned.refresh_storage_ptr();
-        cloned
+        }
     }
 }
 
@@ -1060,6 +1065,7 @@ pub(crate) fn generated_property_load_cell_has_own_property(
 }
 
 pub(crate) fn generated_property_load_cell_data_property_at_offset(
+    objects: &CoreObjectStore,
     cell: &CoreObjectCell,
     key: GeneratedPropertyLoadCoreKey<'_>,
     expected_offset: PropertyOffset,
@@ -1069,15 +1075,14 @@ pub(crate) fn generated_property_load_cell_data_property_at_offset(
     // entry.structure / base_structure), the value is read directly at the
     // structure-assigned offset with NO key comparison or HashMap scan. This is
     // exactly the offset-indexed load batch 3 will emit as
-    // `mov reg <- [storage_base + offset*8]` from out_of_line_storage.
+    // `mov reg <- [storage_base + offset*8]` from the butterfly.
     //
-    // gc-r4 Batch 2: the offset is now owned by the cell's Structure::PropertyTable
-    // (per-shape), so the structure guard ALONE proves `expected_offset` is the live
-    // own-data slot for this shape (the faithful JSC IC invariant). The former
-    // per-cell offset-map recheck is removed with `property_offsets`; `key` is kept in
-    // the signature for the call shape but is not needed once the shape is guarded.
+    // gc-r4 Butterfly-values: the offset slot lives in the store-owned butterfly slab
+    // reached by `cell.butterfly`; the structure guard ALONE proves `expected_offset`
+    // is the live own-data slot for this shape (the faithful JSC IC invariant). `key`
+    // is kept in the signature for the call shape but is not needed once guarded.
     let _ = key;
-    cell.read_data_property_offset_slot(expected_offset)
+    objects.butterfly_prop_get(cell.butterfly, expected_offset)
 }
 
 pub(crate) fn generated_property_load_offset_miss_reason(
@@ -1570,102 +1575,6 @@ impl CorePropertyLookupRecord {
     }
 }
 
-impl CoreObjectCell {
-    /// Re-point storage_ptr at the current out_of_line_storage buffer.
-    ///
-    /// C++ JSC keeps the JSObject Butterfly pointer (runtime/JSObject.h:1572-1577)
-    /// coherent whenever the Butterfly is (re)allocated. storage_ptr is the Rust
-    /// analog and MUST be refreshed after EVERY out_of_line_storage mutation that can
-    /// move the buffer (clear, resize/realloc); all such sites route through here.
-    /// Vec::as_ptr on an empty Vec yields a dangling-but-aligned pointer that is never
-    /// read without a prior matching structure guard (a 0-slot shape has no offset).
-    pub(crate) fn refresh_storage_ptr(&mut self) {
-        self.storage_ptr = self.out_of_line_storage.as_ptr();
-    }
-
-    /// Reset the out-of-line VALUE mirror to empty before a cell is (re)seeded.
-    ///
-    /// C++ JSC: a cell born with initial own properties reaches its shape by applying
-    /// addPropertyTransition per property; the Butterfly is sized/filled in lockstep.
-    /// gc-r4 Batch 2: the offsets come from the store's structure_table now, so the
-    /// store seeds the structure and then fills this mirror (see
-    /// `CoreObjectStore::fill_initial_property_storage`). This only clears the mirror.
-    pub(crate) fn reset_property_storage_mirror(&mut self) {
-        self.out_of_line_storage.clear();
-        // clear() can leave a non-coherent storage_ptr; refresh so a cell with no data
-        // properties still publishes a coherent Butterfly-pointer analog.
-        self.refresh_storage_ptr();
-        self.deleted_offsets.clear();
-    }
-
-    /// Write a data value into the out-of-line storage mirror at the
-    /// structure-assigned `offset` (the offset is sourced by the caller from the
-    /// store's structure_table — the per-shape Structure::PropertyTable).
-    ///
-    /// C++ JSC JSObject::putDirectOffset / locationForOffset (JSObject.h:711): store
-    /// the value at offsetInRespectiveStorage(offset). The HashMap `properties`
-    /// remains the authoritative VALUE store this batch; this mirror is what the
-    /// offset read path (and batch-3 machine code) consumes. Grows the Vec with
-    /// undefined fill so the slot exists, mirroring Butterfly growth on out-of-line
-    /// property addition. No-op for an invalid offset.
-    pub(crate) fn write_data_property_offset_slot(
-        &mut self,
-        offset: PropertyOffset,
-        value: RuntimeValue,
-    ) {
-        if offset.raw() < 0 {
-            return;
-        }
-        let index = offset_storage_index(offset);
-        if index >= self.out_of_line_storage.len() {
-            self.out_of_line_storage
-                .resize(index + 1, RuntimeValue::undefined());
-            // resize can reallocate (move) the buffer, so the cached Butterfly-pointer
-            // analog must be refreshed; this is the centralized Vec-growth path that
-            // every out-of-line property add routes through.
-            self.refresh_storage_ptr();
-        }
-        self.out_of_line_storage[index] = value;
-    }
-
-    /// Clear the out-of-line storage slot for a freed offset (property deletion or
-    /// data->accessor conversion). C++ JSC: the freed PropertyOffset is recorded in
-    /// PropertyTable::m_deletedOffsets for reuse (handled in the structure_table) and
-    /// the storage slot is cleared. Here we clear the value mirror so a recycled
-    /// offset starts from undefined; no-op for an invalid offset.
-    pub(crate) fn clear_data_property_offset_slot(&mut self, offset: PropertyOffset) {
-        if offset.raw() < 0 {
-            return;
-        }
-        let index = offset_storage_index(offset);
-        if let Some(slot) = self.out_of_line_storage.get_mut(index) {
-            *slot = RuntimeValue::undefined();
-        }
-        // In-place slot clear cannot realloc the Vec, so storage_ptr is already
-        // coherent; refresh defensively (single rule: any Vec touch -> refresh).
-        self.refresh_storage_ptr();
-        self.deleted_offsets.push(offset);
-    }
-
-    /// Read the out-of-line storage mirror at `expected_offset`.
-    ///
-    /// C++ JSC JSObject::getDirect(offset) / locationForOffset: read the value at
-    /// offsetInRespectiveStorage(offset). The structure guard upstream proves the
-    /// offset is valid for this cell's shape; this is the offset-indexed load
-    /// batch-3 will emit as `mov reg <- [storage_base + idx*8]`.
-    pub(crate) fn read_data_property_offset_slot(
-        &self,
-        expected_offset: PropertyOffset,
-    ) -> Option<RuntimeValue> {
-        if expected_offset.raw() < 0 {
-            return None;
-        }
-        self.out_of_line_storage
-            .get(offset_storage_index(expected_offset))
-            .copied()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CorePropertyPut {
     Stored,
@@ -1714,8 +1623,13 @@ pub(crate) enum PutToPrimitiveOutcome {
 /// property methods map the structure-assigned `PropertyOffset` to a forward slot
 /// via `offset_storage_index` exactly as `write_data_property_offset_slot` does,
 /// so the later cutover is a faithful swap of the per-cell mirror onto this slab.
-/// ADDITIVE this batch: nothing calls these yet (dead_code).
-#[allow(dead_code)]
+/// gc-r4 Butterfly-values cutover: these are now LIVE — every object cell carries a
+/// `ButterflyHandle` (at the JSObject `m_butterfly` slot, offset 8) into this slab,
+/// and all out-of-line property VALUE storage + indexed element storage is keyed
+/// through these methods. The per-cell `out_of_line_storage`/`elements` Vecs are
+/// gone; this slab is their store-owned home. (The named-property VALUE AUTHORITY is
+/// still the per-cell `properties` HashMap this batch; the slab `props` side is its
+/// offset-indexed mirror, as `out_of_line_storage` was — see the batch PAUSE note.)
 impl CoreObjectStore {
     /// Allocate a fresh, empty butterfly; return its handle.
     ///
@@ -1736,6 +1650,14 @@ impl CoreObjectStore {
     /// region or reallocating (Butterfly.h:226-245, `createOrGrow*`). The Rust
     /// analog clones the `ButterflyAllocation` (both sides are `Copy`-element
     /// `Vec`s) into a new index so source and clone never alias.
+    ///
+    /// gc-r4 Butterfly-values: NOT used by the store-snapshot path —
+    /// `CoreObjectStore::clone()` deep-clones the WHOLE `butterflies` slab alongside
+    /// `objects`, so each cloned store already owns independent butterflies. This is
+    /// the per-handle CoW/duplication primitive for the future case where a SINGLE
+    /// cell is duplicated within one store (no such path exists yet), kept faithful to
+    /// the B1a API surface.
+    #[allow(dead_code)]
     pub(crate) fn clone_butterfly(&mut self, handle: ButterflyHandle) -> ButterflyHandle {
         let copy = self.butterflies[handle.0].clone();
         let index = self.butterflies.len();
@@ -1818,6 +1740,24 @@ impl CoreObjectStore {
     /// (C++ contiguous append, Butterfly.h:186-189).
     pub(crate) fn butterfly_elem_push(&mut self, handle: ButterflyHandle, value: RuntimeValue) {
         self.butterflies[handle.0].elem_push(value);
+    }
+
+    /// Clear the indexed element at `index` in butterfly `handle` to a hole
+    /// (`delete arr[i]`; C++ indexed deleteProperty). No-op out of range.
+    pub(crate) fn butterfly_elem_clear(&mut self, handle: ButterflyHandle, index: usize) {
+        self.butterflies[handle.0].elem_clear(index);
+    }
+
+    /// Pop the last indexed element of butterfly `handle` (`Array.prototype.pop`
+    /// fast path); flattens a trailing hole to `None`.
+    pub(crate) fn butterfly_elem_pop(&mut self, handle: ButterflyHandle) -> Option<RuntimeValue> {
+        self.butterflies[handle.0].elem_pop()
+    }
+
+    /// Borrow the indexed element side of butterfly `handle` as a slice (for
+    /// enumeration / snapshot reads). C++ `Butterfly::contiguous()` span.
+    pub(crate) fn butterfly_elements(&self, handle: ButterflyHandle) -> &[Option<RuntimeValue>] {
+        self.butterflies[handle.0].elements_slice()
     }
 }
 
@@ -3830,9 +3770,12 @@ impl CoreObjectStore {
         // cell carries a coherent tag without per-call-site edits (covers all
         // `..CoreObjectCell::default()` literals).
         cell.js_type = cell.kind.js_type();
-        // Reset the out-of-line VALUE mirror; the structure (and its offsets) is seeded
-        // below and the mirror is then filled from the structure's PropertyTable.
-        cell.reset_property_storage_mirror();
+        // gc-r4 Butterfly-values: assign a fresh store-owned butterfly at the single
+        // allocation chokepoint (C++ Heap::tryAllocateButterfly out of the Auxiliary
+        // subspace). The cell was built with the INVALID sentinel; this gives it its
+        // own (empty) slab entry BEFORE the structure is seeded and the out-of-line
+        // VALUE mirror + indexed elements are filled below.
+        cell.butterfly = self.allocate_butterfly();
         if cell.structure_id == StructureId::INVALID {
             // C++ JSC: a fresh object adopts the shared empty Structure for its
             // class+prototype instead of a private one, so same-shape siblings can
@@ -3854,10 +3797,10 @@ impl CoreObjectStore {
             // the plain empty seed root.
             cell.structure_id = self.seed_initial_shape_structure_id(&cell);
         }
-        // Fill the out-of-line VALUE mirror at each initial data property's
-        // structure-assigned offset (the putDirectOffset analog), now that the
-        // structure (offset authority) is known.
-        self.fill_initial_property_storage(&mut cell);
+        // Fill the out-of-line VALUE mirror (the slab `props` side) at each initial
+        // data property's structure-assigned offset (the putDirectOffset analog), now
+        // that the structure (offset authority) and the butterfly handle are known.
+        self.fill_initial_property_storage(&cell);
         let mut object = Box::pin(cell);
         let ptr = NonNull::from(object.as_mut().get_mut());
         let payload = ptr.as_ptr() as usize;
@@ -4039,19 +3982,29 @@ impl CoreObjectStore {
             .create_dictionary_from(old, removed_uid)
     }
 
-    /// Fill the out-of-line VALUE mirror at each initial data property's
-    /// structure-assigned offset, after the cell's structure has been seeded.
-    fn fill_initial_property_storage(&self, cell: &mut CoreObjectCell) {
+    /// Fill the out-of-line VALUE mirror (the butterfly slab `props` side) at each
+    /// initial data property's structure-assigned offset, after the cell's structure
+    /// has been seeded and its butterfly handle assigned.
+    fn fill_initial_property_storage(&mut self, cell: &CoreObjectCell) {
         let sid = cell.structure_id;
-        for key in cell.property_order.clone() {
-            let Some(CorePropertyKind::Data(value)) =
-                cell.properties.get(&key).map(|property| property.kind)
-            else {
-                continue;
-            };
-            if let Some(offset) = self.structure_offset(sid, &key) {
-                cell.write_data_property_offset_slot(offset, value);
-            }
+        let handle = cell.butterfly;
+        // Collect (offset, value) under the shared cell borrow, then write the slab via
+        // the &mut self butterfly API (the borrow checker forbids holding the cell read
+        // borrow across the &mut self store write).
+        let writes: Vec<(PropertyOffset, RuntimeValue)> = cell
+            .property_order
+            .iter()
+            .filter_map(
+                |key| match cell.properties.get(key).map(|property| property.kind) {
+                    Some(CorePropertyKind::Data(value)) => self
+                        .structure_offset(sid, key)
+                        .map(|offset| (offset, value)),
+                    _ => None,
+                },
+            )
+            .collect();
+        for (offset, value) in writes {
+            self.butterfly_prop_put(handle, offset, value);
         }
     }
 
@@ -4438,11 +4391,7 @@ impl CoreObjectStore {
                     return Ok(true);
                 }
                 if let Some(index) = key_array_index(key) {
-                    if cell
-                        .elements
-                        .get(index)
-                        .is_some_and(|element| element.is_some())
-                    {
+                    if self.butterfly_elem_get(cell.butterfly, index).is_some() {
                         return Ok(true);
                     }
                 }
@@ -4524,9 +4473,7 @@ impl CoreObjectStore {
                     true
                 } else {
                     key_array_index(key).is_some_and(|index| {
-                        cell.elements
-                            .get(index)
-                            .is_some_and(|element| element.is_some())
+                        self.butterfly_elem_get(cell.butterfly, index).is_some()
                     })
                 };
                 if found {
@@ -4615,10 +4562,7 @@ impl CoreObjectStore {
             matches!(cell.kind, CoreObjectKind::Array) && indexed_key.is_some();
         let has_own_indexed_element = indexed_key.is_some_and(|index| {
             matches!(cell.kind, CoreObjectKind::Array)
-                && cell
-                    .elements
-                    .get(index)
-                    .is_some_and(|element| element.is_some())
+                && self.butterfly_elem_get(cell.butterfly, index).is_some()
         });
         let is_indexed_or_typed_array_store =
             is_dense_array_indexed_store || matches!(cell.kind, CoreObjectKind::Uint8Array);
@@ -4676,10 +4620,11 @@ impl CoreObjectStore {
             return ArrayLengthPut::Invalid;
         }
         let new_length = number as usize;
-        if let Some(object) = self.find_mut(object) {
-            // Truncate (drop tail) or hole-extend (push empty slots), matching
-            // `JSArray::setLength` clearing/`ensureLength` behavior.
-            object.elements.resize(new_length, None);
+        // Truncate (drop tail) or hole-extend (push empty slots), matching
+        // `JSArray::setLength` clearing/`ensureLength` behavior; the indexed storage
+        // is the store-owned butterfly slab, reached by the cell's handle.
+        if let Some(handle) = self.find(object).map(|cell| cell.butterfly) {
+            self.butterfly_elem_resize(handle, new_length);
         }
         ArrayLengthPut::Resized
     }
@@ -4736,12 +4681,8 @@ impl CoreObjectStore {
         let receiver_kind = receiver.kind;
         let receiver_prototype = receiver.prototype;
         let has_own_array_element = if receiver_kind == CoreObjectKind::Array {
-            key_array_index(key).is_some_and(|index| {
-                receiver
-                    .elements
-                    .get(index)
-                    .is_some_and(|element| element.is_some())
-            })
+            key_array_index(key)
+                .is_some_and(|index| self.butterfly_elem_get(receiver.butterfly, index).is_some())
         } else {
             false
         };
@@ -4854,7 +4795,9 @@ impl CoreObjectStore {
         if object.kind == CoreObjectKind::Array && key.is_string("length") {
             return Ok(Some(CoreProperty {
                 kind: CorePropertyKind::Data(RuntimeValue::from_i32(
-                    object.elements.len().try_into().unwrap_or(i32::MAX),
+                    self.butterfly_elem_len(object.butterfly)
+                        .try_into()
+                        .unwrap_or(i32::MAX),
                 )),
                 attributes: CorePropertyAttributes {
                     writable: true,
@@ -4868,7 +4811,7 @@ impl CoreObjectStore {
         }
         if object.kind == CoreObjectKind::Array {
             if let Some(index) = key_array_index(key) {
-                if let Some(Some(value)) = object.elements.get(index).copied() {
+                if let Some(value) = self.butterfly_elem_get(object.butterfly, index) {
                     return Ok(Some(CoreProperty {
                         kind: CorePropertyKind::Data(value),
                         attributes: CorePropertyAttributes::DATA_DEFAULT,
@@ -4944,7 +4887,7 @@ impl CoreObjectStore {
         };
         let mut index_names = BTreeSet::new();
         if object.kind == CoreObjectKind::Array {
-            for (index, value) in object.elements.iter().enumerate() {
+            for (index, value) in self.butterfly_elements(object.butterfly).iter().enumerate() {
                 if value.is_some() {
                     index_names.insert(index);
                 }
@@ -5000,7 +4943,7 @@ impl CoreObjectStore {
         let mut keys = Vec::new();
         let mut seen = HashSet::new();
         if object.kind == CoreObjectKind::Array {
-            for (index, value) in object.elements.iter().enumerate() {
+            for (index, value) in self.butterfly_elements(object.butterfly).iter().enumerate() {
                 if value.is_some() {
                     let key = CorePropertyKey::String(index.to_string());
                     seen.insert(key.clone());
@@ -5070,12 +5013,17 @@ impl CoreObjectStore {
                     .unwrap_or(PropertyOffset::INVALID),
             )
         };
-        if let Some(object_cell) = self.find_mut(object) {
-            // putDirectOffset analog: write the value at the structure-assigned offset.
-            object_cell.write_data_property_offset_slot(offset, value);
+        // putDirectOffset analog: write the value at the structure-assigned offset into
+        // the store-owned butterfly slab (copy the handle out under the cell borrow,
+        // then write the slab via the &mut self butterfly API).
+        let handle = self.find_mut(object).map(|object_cell| {
             if shape_changed {
                 object_cell.structure_id = new_structure;
             }
+            object_cell.butterfly
+        });
+        if let Some(handle) = handle {
+            self.butterfly_prop_put(handle, offset, value);
         }
         if shape_changed {
             self.finish_structure_transition(old_structure);
@@ -5163,12 +5111,15 @@ impl CoreObjectStore {
                 .unwrap_or(PropertyOffset::INVALID);
             (self.fresh_dictionary_structure(old_structure, None), offset)
         };
-        if let Some(object_cell) = self.find_mut(object) {
-            // putDirectOffset analog.
-            object_cell.write_data_property_offset_slot(offset, value);
+        // putDirectOffset analog (into the store-owned butterfly slab).
+        let handle = self.find_mut(object).map(|object_cell| {
             if shape_changed {
                 object_cell.structure_id = new_structure;
             }
+            object_cell.butterfly
+        });
+        if let Some(handle) = handle {
+            self.butterfly_prop_put(handle, offset, value);
         }
         if shape_changed {
             self.finish_structure_transition(old_structure);
@@ -5251,12 +5202,15 @@ impl CoreObjectStore {
                 .unwrap_or(PropertyOffset::INVALID);
             (self.fresh_dictionary_structure(old_structure, None), offset)
         };
-        if let Some(object_cell) = self.find_mut(object) {
-            // putDirectOffset analog.
-            object_cell.write_data_property_offset_slot(offset, value);
+        // putDirectOffset analog (into the store-owned butterfly slab).
+        let handle = self.find_mut(object).map(|object_cell| {
             if shape_changed {
                 object_cell.structure_id = new_structure;
             }
+            object_cell.butterfly
+        });
+        if let Some(handle) = handle {
+            self.butterfly_prop_put(handle, offset, value);
         }
         if shape_changed {
             self.finish_structure_transition(old_structure);
@@ -5287,7 +5241,7 @@ impl CoreObjectStore {
         // preserved. The dictionary transition KINDS are not yet ported, so this takes
         // the conservative fresh per-object dictionary that carries the surviving
         // offsets with the deleted key taken out (offset freed for recycle).
-        let (old_structure, removed) = {
+        let (old_structure, removed, array_clear) = {
             let Some(object_cell) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
@@ -5306,13 +5260,13 @@ impl CoreObjectStore {
                     }
                 }
             }
-            if object_cell.kind == CoreObjectKind::Array {
-                if let Some(index) = key_array_index(key) {
-                    if let Some(slot) = object_cell.elements.get_mut(index) {
-                        *slot = None;
-                    }
-                }
-            }
+            // `delete arr[i]`: punch a hole in the indexed storage (store-owned slab);
+            // capture (handle, index) and clear it after the cell borrow ends.
+            let array_clear = if object_cell.kind == CoreObjectKind::Array {
+                key_array_index(key).map(|index| (object_cell.butterfly, index))
+            } else {
+                None
+            };
             let removed = if object_cell.properties.remove(key).is_some() {
                 object_cell
                     .property_order
@@ -5321,18 +5275,28 @@ impl CoreObjectStore {
             } else {
                 false
             };
-            (old_structure, removed)
+            (old_structure, removed, array_clear)
         };
+        if let Some((handle, index)) = array_clear {
+            self.butterfly_elem_clear(handle, index);
+        }
         if removed {
             // Free the deleted property's storage slot (its offset is read from the OLD
             // structure before the dictionary takes it out, then recycled by the table).
             let removed_offset = self.structure_offset(old_structure, key);
             let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
-            if let Some(object_cell) = self.find_mut(object) {
+            // Record the freed offset (PropertyTable::m_deletedOffsets mirror) and set
+            // the new dictionary structure under the cell borrow; clear the slab slot
+            // after (the &mut self butterfly write needs the borrow released).
+            let handle = self.find_mut(object).map(|object_cell| {
                 if let Some(offset) = removed_offset {
-                    object_cell.clear_data_property_offset_slot(offset);
+                    object_cell.deleted_offsets.push(offset);
                 }
                 object_cell.structure_id = new_structure;
+                object_cell.butterfly
+            });
+            if let (Some(handle), Some(offset)) = (handle, removed_offset) {
+                self.butterfly_prop_clear(handle, offset);
             }
             self.finish_structure_transition(old_structure);
         }
@@ -5422,11 +5386,18 @@ impl CoreObjectStore {
             // are preserved on the fresh per-object dictionary structure.
             let displaced_offset = self.structure_offset(old_structure, key);
             let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
-            if let Some(object_cell) = self.find_mut(object) {
+            // Free the displaced data slot (PropertyTable::m_deletedOffsets mirror) and
+            // set the dictionary structure under the cell borrow; clear the slab slot
+            // after the borrow releases.
+            let handle = self.find_mut(object).map(|object_cell| {
                 if let Some(offset) = displaced_offset {
-                    object_cell.clear_data_property_offset_slot(offset);
+                    object_cell.deleted_offsets.push(offset);
                 }
                 object_cell.structure_id = new_structure;
+                object_cell.butterfly
+            });
+            if let (Some(handle), Some(offset)) = (handle, displaced_offset) {
+                self.butterfly_prop_clear(handle, offset);
             }
             self.finish_structure_transition(old_structure);
         }
@@ -5507,11 +5478,18 @@ impl CoreObjectStore {
         if shape_changed {
             let displaced_offset = self.structure_offset(old_structure, key);
             let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
-            if let Some(object_cell) = self.find_mut(object) {
+            // Free the displaced data slot (PropertyTable::m_deletedOffsets mirror) and
+            // set the dictionary structure under the cell borrow; clear the slab slot
+            // after the borrow releases.
+            let handle = self.find_mut(object).map(|object_cell| {
                 if let Some(offset) = displaced_offset {
-                    object_cell.clear_data_property_offset_slot(offset);
+                    object_cell.deleted_offsets.push(offset);
                 }
                 object_cell.structure_id = new_structure;
+                object_cell.butterfly
+            });
+            if let (Some(handle), Some(offset)) = (handle, displaced_offset) {
+                self.butterfly_prop_clear(handle, offset);
             }
             self.finish_structure_transition(old_structure);
         }
@@ -6088,13 +6066,12 @@ impl CoreObjectStore {
         index: usize,
         value: RuntimeValue,
     ) -> Result<(), ExecutionError> {
-        let Some(object) = self.find_mut(object) else {
+        let Some(handle) = self.find(object).map(|object| object.butterfly) else {
             return Err(ExecutionError::ExpectedObject);
         };
-        if object.elements.len() <= index {
-            object.elements.resize(index.saturating_add(1), None);
-        }
-        object.elements[index] = Some(value);
+        // butterfly_elem_put grows the indexed side with hole fill, then stores —
+        // exactly the old resize-then-set.
+        self.butterfly_elem_put(handle, index, value);
         Ok(())
     }
 
@@ -6114,13 +6091,16 @@ impl CoreObjectStore {
         object: RuntimeValue,
         value: RuntimeValue,
     ) -> Result<(), ExecutionError> {
-        let Some(object) = self.find_mut(object) else {
+        let Some((kind, handle)) = self
+            .find(object)
+            .map(|object| (object.kind, object.butterfly))
+        else {
             return Err(ExecutionError::ExpectedObject);
         };
-        if object.kind != CoreObjectKind::Array {
+        if kind != CoreObjectKind::Array {
             return Err(ExecutionError::ExpectedObject);
         }
-        object.elements.push(Some(value));
+        self.butterfly_elem_push(handle, value);
         Ok(())
     }
 
@@ -6146,15 +6126,16 @@ impl CoreObjectStore {
         index: i32,
     ) -> Result<bool, ExecutionError> {
         let index = usize::try_from(index).map_err(|_| ExecutionError::ExpectedArrayIndex)?;
-        let Some(object) = self.find_mut(object) else {
+        let Some((kind, handle)) = self
+            .find(object)
+            .map(|object| (object.kind, object.butterfly))
+        else {
             return Err(ExecutionError::ExpectedObject);
         };
-        if object.kind != CoreObjectKind::Array {
+        if kind != CoreObjectKind::Array {
             return Err(ExecutionError::ExpectedObject);
         }
-        if let Some(slot) = object.elements.get_mut(index) {
-            *slot = None;
-        }
+        self.butterfly_elem_clear(handle, index);
         Ok(true)
     }
 
@@ -6162,16 +6143,17 @@ impl CoreObjectStore {
         &mut self,
         object: RuntimeValue,
     ) -> Result<RuntimeValue, ExecutionError> {
-        let Some(object) = self.find_mut(object) else {
+        let Some((kind, handle)) = self
+            .find(object)
+            .map(|object| (object.kind, object.butterfly))
+        else {
             return Err(ExecutionError::ExpectedObject);
         };
-        if object.kind != CoreObjectKind::Array {
+        if kind != CoreObjectKind::Array {
             return Err(ExecutionError::ExpectedObject);
         }
-        Ok(object
-            .elements
-            .pop()
-            .flatten()
+        Ok(self
+            .butterfly_elem_pop(handle)
             .unwrap_or_else(RuntimeValue::undefined))
     }
 
@@ -6180,13 +6162,16 @@ impl CoreObjectStore {
         object: RuntimeValue,
         length: usize,
     ) -> Result<(), ExecutionError> {
-        let Some(object) = self.find_mut(object) else {
+        let Some((kind, handle)) = self
+            .find(object)
+            .map(|object| (object.kind, object.butterfly))
+        else {
             return Err(ExecutionError::ExpectedObject);
         };
-        if object.kind != CoreObjectKind::Array {
+        if kind != CoreObjectKind::Array {
             return Err(ExecutionError::ExpectedObject);
         }
-        object.elements.resize(length, None);
+        self.butterfly_elem_resize(handle, length);
         Ok(())
     }
 
@@ -6199,7 +6184,9 @@ impl CoreObjectStore {
         };
         if object.kind == CoreObjectKind::Array {
             return Ok(Some(RuntimeValue::from_i32(
-                object.elements.len().try_into().unwrap_or(i32::MAX),
+                self.butterfly_elem_len(object.butterfly)
+                    .try_into()
+                    .unwrap_or(i32::MAX),
             )));
         }
         if object.kind == CoreObjectKind::Uint8Array {
@@ -6228,8 +6215,7 @@ impl CoreObjectStore {
         if object.kind != CoreObjectKind::Array {
             return Err(ExecutionError::ExpectedObject);
         }
-        object
-            .elements
+        self.butterfly_elements(object.butterfly)
             .iter()
             .map(|slot| {
                 let value = slot.unwrap_or_else(RuntimeValue::undefined);
@@ -6856,7 +6842,7 @@ impl CoreObjectStore {
             }
             if cell.kind == CoreObjectKind::Array {
                 if let Some(index) = key_array_index(key) {
-                    if let Some(Some(value)) = cell.elements.get(index).copied() {
+                    if let Some(value) = self.butterfly_elem_get(cell.butterfly, index) {
                         return Ok(CorePropertyGet::Data(value));
                     }
                 }
@@ -6878,7 +6864,7 @@ impl CoreObjectStore {
                 )
             {
                 let length = if cell.kind == CoreObjectKind::Array {
-                    cell.elements.len()
+                    self.butterfly_elem_len(cell.butterfly)
                 } else {
                     cell.view_length
                 };
@@ -6976,7 +6962,7 @@ impl CoreObjectStore {
             }
             if cell.kind == CoreObjectKind::Array {
                 if let Some(index) = key_array_index(key) {
-                    if let Some(Some(value)) = cell.elements.get(index).copied() {
+                    if let Some(value) = self.butterfly_elem_get(cell.butterfly, index) {
                         let mut record = CorePropertyLookupRecord::from_object_lookup(
                             site,
                             object,
@@ -7025,7 +7011,7 @@ impl CoreObjectStore {
                 )
             {
                 let length = if cell.kind == CoreObjectKind::Array {
-                    cell.elements.len()
+                    self.butterfly_elem_len(cell.butterfly)
                 } else {
                     cell.view_length
                 };
@@ -7077,7 +7063,7 @@ impl CoreObjectStore {
                     .read_typed_element(object, index)
                     .map(|value| value.unwrap_or_else(RuntimeValue::undefined));
             }
-            if let Some(Some(value)) = cell.elements.get(index).copied() {
+            if let Some(value) = self.butterfly_elem_get(cell.butterfly, index) {
                 return Ok(value);
             }
             if let Some(property) = cell.properties.get(&key) {
@@ -7133,7 +7119,7 @@ impl CoreObjectStore {
                 record.chain = chain.clone();
                 return Ok((value, record));
             }
-            if let Some(Some(value)) = cell.elements.get(index).copied() {
+            if let Some(value) = self.butterfly_elem_get(cell.butterfly, index) {
                 let mut record = CorePropertyLookupRecord::from_object_lookup(
                     site,
                     object,
@@ -7243,9 +7229,10 @@ impl CoreObjectStore {
             return None;
         }
         // Structure match => same (kind, prototype, shape) => the cached offset is
-        // a live own-data slot (invariant a/b). Read it directly from the
-        // out-of-line storage mirror with NO key comparison or HashMap scan.
-        cell.read_data_property_offset_slot(cached_offset)
+        // a live own-data slot (invariant a/b). Read it directly from the butterfly
+        // slab `props` mirror (store-owned) with NO key comparison or HashMap scan.
+        let handle = cell.butterfly;
+        self.butterfly_prop_get(handle, cached_offset)
     }
 
     /// LLInt monomorphic PUT replace-existing fast path, mirroring the
@@ -7311,30 +7298,32 @@ impl CoreObjectStore {
         // run on the fast path too: storing a heap value into an object field is a
         // barriered mutator field write regardless of whether an IC served it.
         self.apply_value_store_write_barrier(heap, receiver, value)?;
-        let Some(cell) = self.objects.get_mut(index) else {
-            return Ok(false);
+        // Update the value-authoritative `properties` HashMap + capture the butterfly
+        // handle under the cell borrow; write the slab mirror after the borrow releases
+        // (the &mut self butterfly write cannot coexist with the &mut cell borrow).
+        let handle = {
+            let Some(cell) = self.objects.get_mut(index) else {
+                return Ok(false);
+            };
+            let cell = cell.as_mut().get_mut();
+            // Re-validate after the barrier (the barrier path does not mutate this
+            // cell's shape, but the re-fetch keeps the store self-contained).
+            if cell.structure_id != cached_structure_id {
+                return Ok(false);
+            }
+            let Some(property) = cell.properties.get_mut(cached_key) else {
+                return Ok(false);
+            };
+            let CorePropertyKind::Data(slot) = &mut property.kind else {
+                return Ok(false);
+            };
+            *slot = value;
+            cell.butterfly
         };
-        let cell = cell.as_mut().get_mut();
-        // Re-validate after the barrier (the barrier path does not mutate this
-        // cell's shape, but the re-fetch keeps the store self-contained).
-        if cell.structure_id != cached_structure_id {
-            return Ok(false);
-        }
-        let Some(property) = cell.properties.get_mut(cached_key) else {
-            return Ok(false);
-        };
-        let CorePropertyKind::Data(slot) = &mut property.kind else {
-            return Ok(false);
-        };
-        *slot = value;
-        // Lockstep mirror update (invariant c): write the same value into
-        // out_of_line_storage at the cached offset. The slot already exists (the
-        // structure match proves the shape), so this never grows the Vec and the
-        // cached storage_ptr stays coherent.
-        let storage_index = offset_storage_index(cached_offset);
-        if let Some(mirror) = cell.out_of_line_storage.get_mut(storage_index) {
-            *mirror = value;
-        }
+        // Lockstep mirror update (invariant c): write the same value into the butterfly
+        // slab `props` side at the cached offset. The slot already exists (the structure
+        // match proves the shape), so this is an in-place store.
+        self.butterfly_prop_put(handle, cached_offset, value);
         Ok(true)
     }
 
@@ -7408,4 +7397,203 @@ pub(crate) fn allocate_object_interpreter_cell_id(
         may_trigger_collection: false,
     })?;
     Ok(allocation.cell)
+}
+
+#[cfg(test)]
+mod butterfly_values_cutover_tests {
+    //! gc-r4 Butterfly-values cutover verification.
+    //!
+    //! These prove the de-self-reference is faithful: out-of-line property VALUES
+    //! and indexed ELEMENTS live in the store-owned butterfly slab reached by the
+    //! cell's `ButterflyHandle` (no self-referential interior pointer), the slab
+    //! `props` mirror agrees with the `properties` value authority across the inline
+    //! ->out-of-line offset boundary and across growth/realloc, the element API
+    //! covers put/get/holes/delete/resize/pop, and the snapshot clone path yields an
+    //! INDEPENDENT slab. (Accessor-in-slot is DEFERRED — see the cutover PAUSE.)
+    use super::*;
+
+    fn ident(n: u32) -> CorePropertyKey {
+        CorePropertyKey::Identifier(n)
+    }
+
+    // (a) 6->64 boundary: cross INLINE_CAPACITY (6) into the out-of-line band with
+    // distinct values; read each back BOTH through the offset/butterfly path and the
+    // get_own_property VALUE path, proving no neighbor bleed and mirror==authority.
+    #[test]
+    fn butterfly_values_boundary_inline_to_out_of_line_no_neighbor_bleed() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        const N: u32 = 9; // 0..5 inline, 6..8 out-of-line
+        for i in 0..N {
+            store
+                .put_data_own(obj, &ident(i), RuntimeValue::from_i32(i as i32 * 7 + 1))
+                .unwrap();
+        }
+        let handle = store.find(obj).unwrap().butterfly;
+        let sid = store.find(obj).unwrap().structure_id;
+        for i in 0..N {
+            let expected = RuntimeValue::from_i32(i as i32 * 7 + 1);
+            let offset = store
+                .structure_offset(sid, &ident(i))
+                .expect("named offset");
+            // offset/butterfly mirror path
+            assert_eq!(
+                store.butterfly_prop_get(handle, offset),
+                Some(expected),
+                "butterfly slot for prop {i}"
+            );
+            // value-authority path
+            let prop = store
+                .get_own_property(obj, &ident(i))
+                .unwrap()
+                .expect("own property");
+            assert_eq!(
+                prop.kind,
+                CorePropertyKind::Data(expected),
+                "value path for prop {i}"
+            );
+        }
+    }
+
+    // (b) GROWTH-SURVIVAL (the de-self-reference proof): write V at an early offset,
+    // then add many properties to force the slab `props` Vec to realloc; the SAME
+    // handle + offset still read V. A self-referential `*const` into the cell's own
+    // Vec would dangle across this realloc; a slab handle does not.
+    #[test]
+    fn butterfly_values_growth_survival_offset_stable_across_realloc() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        store
+            .put_data_own(obj, &ident(0), RuntimeValue::from_i32(0x0BEE))
+            .unwrap();
+        let handle = store.find(obj).unwrap().butterfly;
+        let sid0 = store.find(obj).unwrap().structure_id;
+        let off0 = store.structure_offset(sid0, &ident(0)).unwrap();
+        assert_eq!(
+            store.butterfly_prop_get(handle, off0),
+            Some(RuntimeValue::from_i32(0x0BEE))
+        );
+        for i in 1..64 {
+            store
+                .put_data_own(obj, &ident(i), RuntimeValue::from_i32(i as i32))
+                .unwrap();
+        }
+        // same handle, same offset, value preserved through every grow/realloc
+        assert_eq!(
+            store.butterfly_prop_get(handle, off0),
+            Some(RuntimeValue::from_i32(0x0BEE)),
+            "early offset must survive butterfly props realloc"
+        );
+        // and a late property reads back correctly (mirror==authority)
+        let sid_late = store.find(obj).unwrap().structure_id;
+        let off_late = store.structure_offset(sid_late, &ident(63)).unwrap();
+        assert_eq!(
+            store.butterfly_prop_get(handle, off_late),
+            Some(RuntimeValue::from_i32(63))
+        );
+    }
+
+    // (d) elements: put/get/hole/out-of-range/len, then delete (hole), resize (shrink),
+    // push (append), pop — through BOTH the store array methods (which the cutover
+    // re-routed) and the butterfly_elem_* slab API.
+    #[test]
+    fn butterfly_values_elements_put_get_delete_holes_resize_pop() {
+        let mut store = CoreObjectStore::default();
+        let arr = store.allocate_array();
+        let handle = store.find(arr).unwrap().butterfly;
+
+        store
+            .put_array_element(arr, 0, RuntimeValue::from_i32(10))
+            .unwrap();
+        store
+            .put_array_element(arr, 2, RuntimeValue::from_i32(30))
+            .unwrap(); // index 1 = hole
+        assert_eq!(store.get_index(arr, 0).unwrap(), RuntimeValue::from_i32(10));
+        assert_eq!(
+            store.butterfly_elem_get(handle, 0),
+            Some(RuntimeValue::from_i32(10))
+        );
+        assert_eq!(store.butterfly_elem_get(handle, 1), None, "hole");
+        assert_eq!(
+            store.butterfly_elem_get(handle, 2),
+            Some(RuntimeValue::from_i32(30))
+        );
+        assert_eq!(store.butterfly_elem_get(handle, 9), None, "out of range");
+        assert_eq!(store.butterfly_elem_len(handle), 3);
+
+        // delete arr[2] -> hole
+        assert!(store.delete_index(arr, 2).unwrap());
+        assert_eq!(store.butterfly_elem_get(handle, 2), None, "deleted -> hole");
+
+        // push appends on the right
+        store
+            .push_array_element(arr, RuntimeValue::from_i32(40))
+            .unwrap();
+        assert_eq!(
+            store.butterfly_elem_get(handle, 3),
+            Some(RuntimeValue::from_i32(40))
+        );
+        assert_eq!(store.butterfly_elem_len(handle), 4);
+
+        // pop removes the last
+        assert_eq!(
+            store.pop_array_element(arr).unwrap(),
+            RuntimeValue::from_i32(40)
+        );
+        assert_eq!(store.butterfly_elem_len(handle), 3);
+
+        // resize (shrink) drops the tail; offset 0 preserved
+        store.resize_array_elements(arr, 1).unwrap();
+        assert_eq!(store.butterfly_elem_len(handle), 1);
+        assert_eq!(
+            store.butterfly_elem_get(handle, 0),
+            Some(RuntimeValue::from_i32(10))
+        );
+    }
+
+    // (e) CLONE-INDEPENDENCE: the snapshot path is `CoreObjectStore::clone()`, which
+    // deep-clones the WHOLE `butterflies` slab alongside `objects`. Handles are slab
+    // indices preserved across the clone, so the cloned cell's butterfly is the SAME
+    // index into an INDEPENDENT slab. Mutating the ORIGINAL's butterfly must not touch
+    // the clone's. (Proves the shallow per-cell handle copy is sound.)
+    #[test]
+    fn butterfly_values_clone_independence_via_store_snapshot() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        store
+            .put_data_own(obj, &ident(0), RuntimeValue::from_i32(111))
+            .unwrap();
+        let handle = store.find(obj).unwrap().butterfly;
+        let sid = store.find(obj).unwrap().structure_id;
+        let off0 = store.structure_offset(sid, &ident(0)).unwrap();
+        store.butterfly_elem_put(handle, 0, RuntimeValue::from_i32(222));
+
+        // snapshot (deep-clones objects + butterflies slab; handle index preserved)
+        let clone = store.clone();
+
+        // mutate the ORIGINAL's butterfly (both sides)
+        store.butterfly_prop_put(handle, off0, RuntimeValue::from_i32(999));
+        store.butterfly_elem_put(handle, 0, RuntimeValue::from_i32(888));
+
+        // the CLONE's same-index butterfly is an INDEPENDENT allocation -> unchanged
+        assert_eq!(
+            clone.butterfly_prop_get(handle, off0),
+            Some(RuntimeValue::from_i32(111)),
+            "clone prop slot must be independent of the original"
+        );
+        assert_eq!(
+            clone.butterfly_elem_get(handle, 0),
+            Some(RuntimeValue::from_i32(222)),
+            "clone element slot must be independent of the original"
+        );
+        // the ORIGINAL observes its own mutations
+        assert_eq!(
+            store.butterfly_prop_get(handle, off0),
+            Some(RuntimeValue::from_i32(999))
+        );
+        assert_eq!(
+            store.butterfly_elem_get(handle, 0),
+            Some(RuntimeValue::from_i32(888))
+        );
+    }
 }

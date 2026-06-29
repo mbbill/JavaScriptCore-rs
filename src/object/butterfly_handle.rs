@@ -36,6 +36,18 @@ use crate::value::JsValue as RuntimeValue;
 #[repr(transparent)]
 pub struct ButterflyHandle(pub usize);
 
+impl ButterflyHandle {
+    /// Sentinel "no butterfly assigned yet" handle.
+    ///
+    /// C++ JSC: a freshly constructed JSObject's `m_butterfly` is null until the
+    /// allocator hands it an Auxiliary butterfly. The Rust analog: a cell built via
+    /// `CoreObjectCell::default()` carries this sentinel until `allocate_cell`
+    /// assigns a real slab handle via `allocate_butterfly()` at the single object
+    /// allocation chokepoint. Never indexes the slab (allocate_cell overwrites it
+    /// before the cell is published).
+    pub const INVALID: Self = ButterflyHandle(usize::MAX);
+}
+
 /// One object's out-of-line butterfly region, over `RuntimeValue`.
 ///
 /// C++ JSC `Butterfly` (Butterfly.h:134-150): a single allocation with named
@@ -155,5 +167,27 @@ impl ButterflyAllocation {
     /// publicLength and grows vectorLength as needed, Butterfly.h:186-189).
     pub fn elem_push(&mut self, value: RuntimeValue) {
         self.elements.push(Some(value));
+    }
+
+    /// Clear the indexed element at `index` to a hole (`None`); no-op out of range.
+    ///
+    /// C++ JSC indexed `deleteProperty` punches a hole in the contiguous storage
+    /// (the slot becomes empty), mirroring `delete arr[i]`. In-bounds only.
+    pub fn elem_clear(&mut self, index: usize) {
+        if let Some(slot) = self.elements.get_mut(index) {
+            *slot = None;
+        }
+    }
+
+    /// Pop the last indexed element (`Array.prototype.pop` fast path); flattens a
+    /// trailing hole to `None`. C++ JSC `JSArray::pop` shrinks vectorLength by one.
+    pub fn elem_pop(&mut self) -> Option<RuntimeValue> {
+        self.elements.pop().flatten()
+    }
+
+    /// Borrow the indexed element side as a slice (for enumeration / length /
+    /// snapshot reads). C++ JSC `Butterfly::contiguous()` span (Butterfly.h:196).
+    pub fn elements_slice(&self) -> &[Option<RuntimeValue>] {
+        &self.elements
     }
 }
