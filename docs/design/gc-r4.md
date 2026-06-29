@@ -109,6 +109,35 @@ the struct-def field-deletions + Default/Clone edits all touch object_store.rs:3
   arena butterfly pointer (so `storage_ptr@8` is a real `[base+8]→[ptr+off*8]` deref) lands at
   R4. A cross-cutting identity decision, settled this way to keep B1a/Butterfly-values reversible.
 
+## R4 POD-ification phase — integration order + rulings (2026-06-29, post B-iv + live-tier-up)
+
+Strategic-assessment + anti-anchor (HEAD f139350) confirmed the remaining **9 Drop fields** on
+`CoreObjectCell` (object_store.rs): `instance_fields`(376), `captures`(377), `map_entries`(398),
+`set_values`(399), `regexp_source`(400), `regexp_flags_text`(402, delete+recompute),
+`promise_reactions`(405), `array_buffer_data`(413), `bound_args`(429). Each = a vertical slice
+(add aux backing + route sites through a POD handle + delete the Drop field), IMPL-parallel-safe
+in worktrees, INTEGRATED SERIALLY on trunk (all edit the struct-def + Default/Clone/allocate_cell
+region). All others are already Copy/POD.
+
+- **INTEGRATION ORDER (cheapest-first, most-divergent-last)** — supersedes the older rank list's
+  numbering for integration: BoundFunction(`bound_args`) → Promise(`promise_reactions`) →
+  RegExp(`regexp_source` + delete `regexp_flags_text`) → ArrayBuffer(`array_buffer_data`) →
+  Map/Set(`map_entries`+`set_values`) → JSFunction-captures(`captures`+`instance_fields`). The
+  `assert!(!std::mem::needs_drop::<CoreObjectCell>())` flips ON in the FINAL (captures) unit's
+  commit — atomic sweepability proof.
+- **SD-1 (trace value-type):** the collector trace/sweep target `RuntimeValue` (value/repr.rs
+  `as_cell`), NOT the skeleton `JsValue`/`ValueBarrier` path (object/identity.rs stubs are the
+  wrong type) — see GAP D below.
+- **SD-2 (captures/instance_fields expedient):** accept the aux-value-slab POD expedient NOW
+  (documented deviation, mirroring the Map/Set ruling); the faithful JSLexicalEnvironment-cell-
+  via-scope-chain relocation + key interning is a DEFERRED correctness batch. `CoreInstanceField`
+  carries a `String` key → the aux backing MUST store it POD (intern to an atom/Symbol id or a POD
+  key handle), not a Rust `String`, or the field stays Drop-bearing.
+- **SD-4 (R4 design note — NOT the leak fix):** POD-ifying RELOCATES each field's heap into a
+  store-owned aux slab; it does not free anything. At R4 each per-kind aux slab needs its OWN
+  Auxiliary-subspace home with its own trace+sweep, or it leaks exactly as today. The POD units
+  are the sweepability PRECONDITION, not the leak fix.
+
 ## R3 → R4 (refined by the readiness audit 2026-06-28)
 
 R4 is LOW-risk MECHANICALLY — the value ALREADY carries the raw cell pointer
