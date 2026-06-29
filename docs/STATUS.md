@@ -99,14 +99,17 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   (MAIN/SLOW/LINK, op_enter/mov/ret + arith family + int32 branches; branch-to-bytecode-index resolved
   in LINK forward+backward) — WHOLE FUNCTIONS + native LOOPS execute under W^X (int-sum f(5)=10/f(10)=45).
   S5 one control-flow model; S6 deferred slow cases; fusion deadness-guard + branch bounds-check.
-- [next-JIT] U3/U4 LIVE tier-up wiring (V0-V5, spec'd baseline-dispatch.md; S7 Box<Vm> / S8 sync / S9
-  ExecutionCounter ratified): the trigger + can_baseline_compile allowlist (use the emitter's Err) +
-  JitCode install in select_interpreter_entry_plan + B5-lite frame handoff + set_jit_code_block /
-  real-TypeError prereqs → the SYNTHETIC hot-arith r_i lift (R first moves). HONEST CAVEAT: Octane
-  material R needs the gated property/call ops (R4 / B5-B6) — arith-only tier-up moves Octane R only
-  marginally (Crypto at best).
+- [done] U3/U4 LIVE tier-up wiring: hot int-arith functions now tier up on the LIVE entry path
+  (execute_code_block entry hook bumps the ExecutionCounter; loop back-edges counted at LoopHint) →
+  emit_baseline_function (its Err IS the S4 allowlist; only int32 arith/mov/branch admitted) → install to
+  RX → execute NATIVE machine code. Verified in RELEASE (sum(5)==10 native). Faithful to JSC LLInt→Baseline
+  (prologue + loop_osr counter, addressForCall). Divergences commented: synchronous compile (S8 vs async
+  JITWorklist), B5-lite handoff at next entry not mid-loop OSR (S2), entry-only (nested bytecode calls don't
+  re-enter the hook). Unsafe reborrow island adversarially verified sound + HARDENED (nested-park & Vm-pin
+  debug guards; compare/truthy shims Miri-clean; valueOf-reentry test normal-profile-green). HONEST CAVEAT:
+  arith-only allowlist — Octane material R needs property/call ops (R4 / B5-B6); R UNDEFINED until 15-gate.
 - [missing] wire arm64_baseline to emit per-opcode via the encoder/finalize (retire the byte-blob /
-  re-interpreter shim) + the bytecode-stream cutover + profiling wiring + tier-up.
+  re-interpreter shim) + the bytecode-stream cutover + profiling wiring.
 - [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
 
 ## Structural fidelity

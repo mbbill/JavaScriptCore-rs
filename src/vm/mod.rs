@@ -905,6 +905,61 @@ struct GeneratedPropertySidecarProjectionCacheEntry {
 /// edge. Replaced by the real thrown cell when op_add lowering lands.
 const JIT_PENDING_EXCEPTION_PLACEHOLDER: EncodedJsValue = EncodedJsValue(0x8);
 
+/// One per-CodeBlock baseline-JIT install slot — the `Vm`-owned counterpart to
+/// `CodeBlock::m_jitCode` (CodeBlock.h:361). Holds the S9 tier-up trigger plus the
+/// install state; owned in [`Vm::baseline_jit_slots`] at a stable address so an
+/// installed image's RX executable memory + reusable scratch frame outlive every
+/// native call (S7).
+struct BaselineJitSlot {
+    trigger: crate::jit::arm64_baseline::live_dispatch::BaselineTierUpTrigger,
+    state: BaselineJitInstallState,
+}
+
+/// Outcome of [`Vm::observe_baseline_jit_entry_and_maybe_execute`] — the LIVE
+/// baseline-JIT tier-up entry.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BaselineJitEntryOutcome {
+    /// The function has not tiered up (still warming, or DECLINED by the S4
+    /// allowlist): the caller runs the interpreter.
+    NotTieredUp,
+    /// The native image ran and returned this boxed value (op_ret's `x0` result).
+    Returned(RuntimeValue),
+    /// The native image's slow path stamped `m_exception`; this is the thrown value
+    /// for the interpreter unwind path (the mirror has been cleared).
+    Threw(EncodedJsValue),
+}
+
+/// The lifecycle of a CodeBlock's baseline-JIT install.
+enum BaselineJitInstallState {
+    /// Counting toward the tier-up threshold; the interpreter runs the function.
+    Warming,
+    /// The S4 allowlist DECLINED the crossed function (or the platform/finalize
+    /// could not install it); it stays in the interpreter PERMANENTLY (latched so
+    /// the compile is not re-attempted on every later entry).
+    Declined,
+    /// The finalized native image is installed and executes on every entry.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    Installed(crate::jit::arm64_baseline::live_dispatch::InstalledBaselineFunction),
+}
+
+// Hand-written `Debug` (the `Vm` derives `Debug`): does NOT recurse into the
+// installed image's executable handle / scratch arena (which carry raw pointers),
+// printing only the tier-up state.
+impl std::fmt::Debug for BaselineJitSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match &self.state {
+            BaselineJitInstallState::Warming => "Warming",
+            BaselineJitInstallState::Declined => "Declined",
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            BaselineJitInstallState::Installed(_) => "Installed",
+        };
+        f.debug_struct("BaselineJitSlot")
+            .field("crossed", &self.trigger.has_crossed())
+            .field("state", &state)
+            .finish()
+    }
+}
+
 /// Engine instance and owner of heap-wide runtime state.
 #[derive(Debug)]
 pub struct Vm {
@@ -933,6 +988,17 @@ pub struct Vm {
     // field ownership — mirroring the D2(c)->D2(b) `globalObject->vm()`
     // convergence.
     jit_host: *mut CoreOpcodeDispatchHost,
+    // S3 (baseline-dispatch.md): the THIRD parked raw pointer on the SAME audited
+    // reborrow island as `jit_host` (D5) / the `*mut Vm` (D1) — the ACTIVE
+    // `CodeBlock` for a JIT-call region. The driver parks it
+    // (`set_jit_code_block`) immediately BEFORE entering JIT code and clears it
+    // after, dormant for the call. The arith/relational slow-path bridge reborrows
+    // it to build its `DispatchState` with the REAL active CodeBlock so an object
+    // operand's `ToNumber`/`valueOf` reads it (`object_to_number_hint_primitive`
+    // reads `state.code_block`); the int32 fast path never does. `null` ==
+    // not-in-JIT (the bridge then uses a fresh placeholder — the prior behavior,
+    // unchanged for callers that do not park a CodeBlock).
+    jit_code_block: *const CodeBlock,
     structures: RuntimeStructures,
     caches: RuntimeCaches,
     globals: GlobalRuntimeState,
@@ -976,6 +1042,23 @@ pub struct Vm {
     // (LLIntSlowPaths.cpp setUpCall/linkFor), not once per call: once a link is
     // materialized and nothing has changed, the per-call work is gone.
     ic_tiering_safepoint_memo: HashMap<CodeBlockId, (BaselineBytecodeSnapshotFingerprint, u64)>,
+    // U3/U4 (baseline-dispatch.md): the LIVE baseline-JIT install map — the Rust
+    // owner for the Stage-1 `emit_baseline_function` images (== `CodeBlock::m_jitCode`,
+    // CodeBlock.h:361). Per CodeBlock it holds the S9 ExecutionCounter tier-up
+    // trigger and, once the countdown crosses, the finalized ARM64 image whose
+    // RX-sealed executable memory + reusable scratch frame must outlive every
+    // native call — so it is owned HERE at a stable VM address (S7), not on the
+    // transient `CodeBlock`. `BaselineJitSlot::installed == None` after a crossing
+    // means the S4 allowlist DECLINED the function (it stays in the interpreter).
+    // INV-4 (PINNED-VM REQUIREMENT): any entry point that reaches the live baseline
+    // path (`observe_baseline_jit_entry_and_maybe_execute` ->
+    // `run_installed_baseline_jit`) MUST own the `Vm` at a stable address — i.e. a
+    // `Box<Vm>`, never a by-value stack `Vm` that may move. An installed image bakes
+    // the `Vm`'s `jit_pending` address as an `AbsoluteAddress` at install and reuses
+    // it on every later entry; if the `Vm` moved between install and reuse that
+    // address would dangle (a silent release use-after-free). `InstalledBaselineFunction::run`
+    // debug-asserts the install-time vs run-time `Vm` base to catch a move.
+    baseline_jit_slots: HashMap<CodeBlockId, BaselineJitSlot>,
     #[cfg(test)]
     no_gc_execution_depth_observations_for_test: Vec<VmNoGcExecutionDepthObservationForTest>,
 }
@@ -1571,6 +1654,13 @@ impl<H: DispatchHost> DispatchHost for RuntimeHelperRootMapDispatchHost<'_, H> {
 struct VmLoopHintDispatchHost<'host, H> {
     inner: &'host mut H,
     tiering: &'host mut tiering::VmTieringIntegration,
+    // S9 (baseline-dispatch.md): the per-CodeBlock baseline tier-up trigger this
+    // interpreted CodeBlock owns (only while WARMING under a baseline policy), so a
+    // loop back-edge bumps the SAME execution counter as a function entry (JSC
+    // loop_osr). `None` when the CodeBlock has no live install slot (interpreter-only
+    // policy, non-concrete host, or already Installed/Declined).
+    baseline_trigger:
+        Option<&'host mut crate::jit::arm64_baseline::live_dispatch::BaselineTierUpTrigger>,
     owner: CodeBlockId,
     policy: TieringPolicy,
 }
@@ -1579,12 +1669,16 @@ impl<'host, H> VmLoopHintDispatchHost<'host, H> {
     fn new(
         inner: &'host mut H,
         tiering: &'host mut tiering::VmTieringIntegration,
+        baseline_trigger: Option<
+            &'host mut crate::jit::arm64_baseline::live_dispatch::BaselineTierUpTrigger,
+        >,
         owner: CodeBlockId,
         policy: TieringPolicy,
     ) -> Self {
         Self {
             inner,
             tiering,
+            baseline_trigger,
             owner,
             policy,
         }
@@ -1799,6 +1893,16 @@ impl<H: DispatchHost> DispatchHost for VmLoopHintDispatchHost<'_, H> {
         if self.observes_loop_hints()
             && CoreOpcode::from_opcode(instruction.opcode) == Some(CoreOpcode::LoopHint)
         {
+            // S9 (baseline-dispatch.md): JSC's LLInt bumps the SAME per-CodeBlock
+            // execution counter on every loop back-edge (loop_osr,
+            // LLIntSlowPaths.cpp:493), so a function with a hot internal loop tiers up
+            // even when it is entered once. DIVERGENCE: the B5-lite scratch-frame
+            // handoff installs+executes at the NEXT function entry rather than via
+            // mid-loop OSR entry, so the crossing latches here and fires on the next
+            // `observe_baseline_jit_entry_and_maybe_execute`.
+            if let Some(trigger) = self.baseline_trigger.as_mut() {
+                trigger.record_loop_backedge();
+            }
             let selected_plan = self.tiering.observe_loop_backedge(
                 self.owner,
                 self.policy,
@@ -1887,6 +1991,8 @@ impl Vm {
             exceptions: ExceptionState::default(),
             // D5: not-in-JIT until the driver parks a host pointer (set_jit_host).
             jit_host: std::ptr::null_mut(),
+            // S3: not-in-JIT until the driver parks the active CodeBlock.
+            jit_code_block: std::ptr::null(),
             structures: RuntimeStructures::default(),
             caches: RuntimeCaches::default(),
             globals: GlobalRuntimeState::default(),
@@ -1909,6 +2015,7 @@ impl Vm {
             next_p15_auto_baseline_generated_code_id: 0,
             safepoint_pass_full_branch_invocations: 0,
             ic_tiering_safepoint_memo: HashMap::new(),
+            baseline_jit_slots: HashMap::new(),
             #[cfg(test)]
             no_gc_execution_depth_observations_for_test: Vec::new(),
         }
@@ -2421,6 +2528,22 @@ impl Vm {
     /// as the `*mut Vm` (D1). Safe: storing a raw pointer is not `unsafe`; only the
     /// shim's one reborrow (jit/operations.rs) is.
     pub fn set_jit_host(&mut self, host: &mut CoreOpcodeDispatchHost) {
+        // INV-3 (no nested parking): the parked-region depth must stay <= 1. A
+        // JIT-call region MUST be cleared (`clear_jit_host`, in
+        // `run_installed_baseline_jit`'s epilogue) before the next is opened, so the
+        // slot is null here on every legitimate (sequential, non-nested) park. A
+        // non-null slot means an OUTER region is still live and a re-entrant park
+        // would clobber its parked host — a SILENT release use-after-free of the
+        // outer host when the inner region clears. Today this cannot happen because
+        // the S4 baseline allowlist declines `op_call`, so a JIT'd function never
+        // ordinary-calls another and re-enters this path; the assert turns any future
+        // breach of that invariant (e.g. admitting `op_call`) into an immediate debug
+        // failure instead of UB.
+        debug_assert!(
+            self.jit_host.is_null(),
+            "nested JIT-call region would clobber the outer parked host (op_call must \
+             stay off the baseline allowlist, or this needs a save/restore stack)"
+        );
         self.jit_host = host;
     }
 
@@ -2434,6 +2557,40 @@ impl Vm {
     /// plain getter (the deref is the shim's single audited `unsafe`).
     pub fn jit_host_ptr(&self) -> *mut CoreOpcodeDispatchHost {
         self.jit_host
+    }
+
+    /// S3 (baseline-dispatch.md): park the ACTIVE `CodeBlock` raw pointer for a
+    /// JIT-call region — the 3rd parked pointer on the same audited reborrow island
+    /// as [`Vm::set_jit_host`] (D5) / the `*mut Vm` (D1). The driver calls this
+    /// immediately BEFORE entering JIT code and holds the `&CodeBlock` DORMANT (no
+    /// other access) until the matching [`Vm::clear_jit_code_block`] after the call
+    /// returns. Safe: storing a raw pointer is not `unsafe`; only the bridge's one
+    /// reborrow (`operation_value_binary`/`operation_compare_relational`) is.
+    pub fn set_jit_code_block(&mut self, code_block: *const CodeBlock) {
+        // INV-3 (no nested parking), the symmetric guard to `set_jit_host`: the
+        // active-CodeBlock slot must be cleared (`clear_jit_code_block`) before the
+        // next JIT-call region opens, so it is null here on every legitimate
+        // sequential park. A non-null slot means a nested region would clobber the
+        // outer parked CodeBlock (the source `&CodeBlock` the bridge reborrows),
+        // silently dangling it in release. Same load-bearing precondition: `op_call`
+        // stays off the S4 baseline allowlist.
+        debug_assert!(
+            self.jit_code_block.is_null(),
+            "nested JIT-call region would clobber the outer parked CodeBlock (op_call \
+             must stay off the baseline allowlist, or this needs a save/restore stack)"
+        );
+        self.jit_code_block = code_block;
+    }
+
+    /// S3: end the parked-CodeBlock region (back to not-in-JIT).
+    pub fn clear_jit_code_block(&mut self) {
+        self.jit_code_block = std::ptr::null();
+    }
+
+    /// S3: the parked CodeBlock pointer the slow-path bridge reborrows (`null` ==
+    /// not-in-JIT). A plain getter; the deref is the bridge's audited reborrow.
+    pub fn jit_code_block_ptr(&self) -> *const CodeBlock {
+        self.jit_code_block
     }
 
     /// D4+D5 (jit-runtime-bridge.md): the SAFE wrapper the JIT shim calls for
@@ -2513,34 +2670,80 @@ impl Vm {
         op2: RuntimeValue,
         opcode: CoreOpcode,
     ) -> Result<RuntimeValue, EncodedJsValue> {
-        let code_block = CodeBlock::from_unlinked(
-            UnlinkedCodeBlock::new(
-                crate::bytecode::CodeKind::Program,
-                PackedInstructionStream::default(),
-            ),
-            LinkContext::default(),
-        );
-        let mut state = DispatchState {
-            stack: &mut self.execution,
-            registers: &mut self.registers,
-            exceptions: &mut self.exceptions,
-            heap: &mut self.heap,
-            code_block: &code_block,
-            ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
-            function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+        // V1a (S3): build the `DispatchState` with the REAL active CodeBlock the
+        // driver parked (`set_jit_code_block`) so an object operand's
+        // `ToNumber`/`valueOf` reads `state.code_block`. When no CodeBlock is
+        // parked (null) fall back to a fresh placeholder — the int32 fast path
+        // never reads it (the prior, unchanged behavior).
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let outcome = {
+            // SAFETY (S3 — the 3rd parked-pointer reborrow on the audited island):
+            // `self.jit_code_block` is non-null only inside a JIT-call region the
+            // driver opened with `set_jit_code_block`, holding the source
+            // `&CodeBlock` dormant for the call; the reborrow is one shared
+            // `&CodeBlock` that does not outlive this call and aliases no live
+            // `&mut` (the parent borrow is parked). It is disjoint from the
+            // `&mut self.*` field borrows below (a separately-owned CodeBlock).
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            let mut state = DispatchState {
+                stack: &mut self.execution,
+                registers: &mut self.registers,
+                exceptions: &mut self.exceptions,
+                heap: &mut self.heap,
+                code_block,
+                ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+                function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+            };
+            host.arithmetic_binary_result(&mut state, op1, op2, opcode)
         };
-        match host.arithmetic_binary_result(&mut state, op1, op2, opcode) {
+        match outcome {
             Ok(value) => Ok(value),
             // A materialized JS throw value (e.g. an object operand's valueOf
             // threw) is surfaced FAITHFULLY as its `EncodedJSValue`, exactly what
             // `VM::m_exception` would hold.
             Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
-            // An engine-level `Fail(ExecutionError)` carries no JS value yet (the
-            // faithful throw OBJECT — a TypeError cell — is materialized by the
-            // interpreter's ExecutionError->throw path / the JIT exception stub,
-            // which bridge-infra does not implement). Surface the documented
-            // non-empty placeholder so the JIT m_exception mirror is non-zero ==
-            // "exception pending".
+            // V1b: any other engine-level error here (a `Fail` from a `Symbol`
+            // operand, BigInt/Number mixing, ...) IS a JS `TypeError`. Materialize
+            // the FAITHFUL TypeError cell via the host (== what `VM::m_exception`
+            // would hold), REPLACING the 0x8 sentinel, so the JIT exception stub
+            // surfaces a real error. (`arithmetic_binary_result` only ever returns
+            // `Ok`/`Throw`/`Fail`; the control-flow `DispatchOutcome` variants never
+            // arise on a value op, so this catch-all is the `Fail` edge.) `state`'s
+            // borrows are released (the block ended), so the heap is free.
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
+    /// V1a helper: a fresh placeholder `CodeBlock` ONLY when no real one is parked.
+    /// Returns `None` inside a parked JIT-call region (the bridge then reborrows
+    /// the parked `*const CodeBlock`).
+    fn jit_pending_code_block_placeholder(&self) -> Option<CodeBlock> {
+        if self.jit_code_block.is_null() {
+            Some(CodeBlock::from_unlinked(
+                UnlinkedCodeBlock::new(
+                    crate::bytecode::CodeKind::Program,
+                    PackedInstructionStream::default(),
+                ),
+                LinkContext::default(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// V1b helper: materialize the faithful `TypeError` cell the JIT exception stub
+    /// surfaces on a genuine type-error throw, as its `EncodedJSValue`. On an
+    /// allocation failure building the error, keep a non-empty mirror word so
+    /// "exception pending" still holds.
+    fn jit_bridge_materialize_type_error(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        match host.jit_bridge_type_error_value(&mut self.heap) {
+            Ok(error) => Err(error.encoded()),
             Err(_) => Err(JIT_PENDING_EXCEPTION_PLACEHOLDER),
         }
     }
@@ -2669,31 +2872,44 @@ impl Vm {
         op2: RuntimeValue,
         opcode: CoreOpcode,
     ) -> Result<bool, EncodedJsValue> {
-        let code_block = CodeBlock::from_unlinked(
-            UnlinkedCodeBlock::new(
-                crate::bytecode::CodeKind::Program,
-                PackedInstructionStream::default(),
-            ),
-            LinkContext::default(),
-        );
-        let mut state = DispatchState {
-            stack: &mut self.execution,
-            registers: &mut self.registers,
-            exceptions: &mut self.exceptions,
-            heap: &mut self.heap,
-            code_block: &code_block,
-            ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
-            function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+        // V1a (S3): see `operation_value_binary` — use the REAL parked CodeBlock
+        // (object operands' `relational_to_primitive` reads `state.code_block`),
+        // else a fresh placeholder.
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let outcome = {
+            // SAFETY: as `operation_value_binary` — the 3rd parked-pointer reborrow
+            // on the audited island; one dormant-parent `&CodeBlock`, disjoint from
+            // the `&mut self.*` field borrows, not outliving this call.
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            let mut state = DispatchState {
+                stack: &mut self.execution,
+                registers: &mut self.registers,
+                exceptions: &mut self.exceptions,
+                heap: &mut self.heap,
+                code_block,
+                ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+                function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+            };
+            host.numeric_compare(&mut state, op1, op2, opcode)
         };
-        match host.numeric_compare(&mut state, op1, op2, opcode) {
+        match outcome {
             Ok(result) => Ok(result),
             // A materialized JS throw value (an object operand's valueOf threw) is
             // surfaced FAITHFULLY as its `EncodedJSValue`.
             Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
-            // An engine-level `Fail` (e.g. a Symbol operand -> TypeError) carries no
-            // materialized JS value yet; surface the documented non-empty placeholder
-            // so the JIT m_exception mirror reads "exception pending".
-            Err(_) => Err(JIT_PENDING_EXCEPTION_PLACEHOLDER),
+            // V1b: any other engine-level error (a `Fail` from e.g. a Symbol
+            // operand) IS a JS `TypeError`; materialize the faithful cell,
+            // REPLACING the 0x8 sentinel. The compare bridge returns a bool on
+            // success; on the throw edge the boolean is discarded (the caller
+            // branches on the exception word), so the surfaced error passes
+            // straight through the `Err` channel (`.map` only renames the never-hit
+            // `Ok`).
+            Err(_) => self
+                .jit_bridge_materialize_type_error(host)
+                .map(|_unreachable_value| false),
         }
     }
 
@@ -2712,6 +2928,296 @@ impl Vm {
     /// post-call `branchTestPtr(NonZero, ...)` (`VM::addressOfException` analog).
     pub fn jit_pending_exception_address(&self) -> *const EncodedJsValue {
         self.exceptions.jit_pending_address()
+    }
+
+    // ====================================================================
+    // U3/U4 (baseline-dispatch.md): the LIVE baseline-JIT tier-up entry +
+    // the B5-lite native handoff — where measured R lifts off the
+    // interpreter floor for a hot int32-arith function. The S9 ExecutionCounter
+    // drives the crossing, the Stage-1 emitter (`emit_baseline_function`) is the
+    // synchronous compile + S4 allowlist, the install lives on `self`
+    // (`baseline_jit_slots`), and the handoff parks the 3 raw pointers (D1/D5/S3)
+    // and calls the finalized image. The native execute path is macOS/aarch64 only
+    // (it relocates + executes ARM64), exactly like the Stage-1 emitter proofs.
+    // ====================================================================
+
+    /// U3/U4 — the LIVE baseline-JIT tier-up entry. Bumps the per-CodeBlock S9
+    /// `ExecutionCounter` on a function entry; on the FIRST crossing it
+    /// SYNCHRONOUSLY compiles the function via the Stage-1 emitter (whose `Err` IS
+    /// the S4 `can_baseline_compile` allowlist), installs the image, and EXECUTES
+    /// it natively (the B5-lite handoff). Every later entry short-circuits to the
+    /// cached image. Returns the function's result, or `NotTieredUp` (the caller
+    /// runs the interpreter — still warming, or DECLINED).
+    ///
+    /// `arguments_including_this`: the live frame's `this`+arguments as boxed
+    /// `EncodedJSValue` words (the interpreter SEEDS the callee frame from them, S2);
+    /// the emitted `op_enter` zero-fills the locals.
+    ///
+    /// DIVERGENCE (S8, documented): JSC baseline-compiles ASYNCHRONOUSLY via the
+    /// `JITWorklist`/`BaselineJITPlan`; this first cut compiles SYNCHRONOUSLY on the
+    /// crossing (baseline is the cheap tier). DIVERGENCE (integration): JSC drives
+    /// this from `LLIntSlowPaths` jitCompileAndSetHeuristics + `addressForCall` in
+    /// the live interpreter loop; this entry is a `Vm` method the dispatch driver
+    /// calls per function entry (the host-genericity + no-GC-region coupling of the
+    /// generic `execute_code_block` call-site hook converges with unifying the host
+    /// INTO the `Vm` — see the `jit_host` field note).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn observe_baseline_jit_entry_and_maybe_execute(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        code_block_id: CodeBlockId,
+        code_block: &CodeBlock,
+        arguments_including_this: &[u64],
+    ) -> BaselineJitEntryOutcome {
+        use crate::jit::arm64_baseline::live_dispatch::{
+            install_baseline_function, BaselineTierUpTrigger, THRESHOLD_FOR_JIT_AFTER_WARM_UP,
+        };
+
+        enum Step {
+            Interpret,
+            Install,
+            RunInstalled,
+        }
+
+        // Bump the S9 counter on entry and decide what to do THIS entry.
+        let step = {
+            let slot = self
+                .baseline_jit_slots
+                .entry(code_block_id)
+                .or_insert_with(|| BaselineJitSlot {
+                    trigger: BaselineTierUpTrigger::new(THRESHOLD_FOR_JIT_AFTER_WARM_UP),
+                    state: BaselineJitInstallState::Warming,
+                });
+            match &slot.state {
+                BaselineJitInstallState::Installed(_) => Step::RunInstalled,
+                BaselineJitInstallState::Declined => Step::Interpret,
+                BaselineJitInstallState::Warming => {
+                    if slot.trigger.record_entry() {
+                        Step::Install
+                    } else {
+                        Step::Interpret
+                    }
+                }
+            }
+        };
+
+        match step {
+            Step::Interpret => BaselineJitEntryOutcome::NotTieredUp,
+            Step::Install => {
+                // S8 SYNCHRONOUS compile on the crossing. The emitter's `Err` IS the
+                // S4 allowlist: a decline (unsupported opcode/operand) or a finalize
+                // failure latches `Declined` so the compile is not re-attempted, and
+                // the function stays in the interpreter.
+                let jit_pending_address = self.jit_pending_exception_address() as usize;
+                // INV-4 (Vm pinned across install->reuse): capture the install-time
+                // Vm base so the image can assert, on every later reuse, that the Vm
+                // has NOT moved — otherwise the baked `jit_pending` AbsoluteAddress
+                // (an interior pointer of THIS Vm) would silently dangle. Any entry
+                // point reaching this live path MUST own the Vm at a pinned address
+                // (Box<Vm>); see the doc note on `baseline_jit_slots`.
+                let install_vm = self as *const Vm;
+                match install_baseline_function(code_block, jit_pending_address, install_vm) {
+                    Ok(installed) => {
+                        if let Some(slot) = self.baseline_jit_slots.get_mut(&code_block_id) {
+                            slot.state = BaselineJitInstallState::Installed(installed);
+                        }
+                        self.run_installed_baseline_jit(
+                            host,
+                            code_block_id,
+                            code_block,
+                            arguments_including_this,
+                        )
+                    }
+                    Err(_) => {
+                        if let Some(slot) = self.baseline_jit_slots.get_mut(&code_block_id) {
+                            slot.state = BaselineJitInstallState::Declined;
+                        }
+                        BaselineJitEntryOutcome::NotTieredUp
+                    }
+                }
+            }
+            Step::RunInstalled => self.run_installed_baseline_jit(
+                host,
+                code_block_id,
+                code_block,
+                arguments_including_this,
+            ),
+        }
+    }
+
+    /// U4 — the B5-lite native handoff: park the 3 raw pointers (D1 `*mut Vm`, D5
+    /// host, S3 CodeBlock) for the call region, seed the callee frame's arguments,
+    /// call the finalized image, then decode `x0` -> the boxed result OR surface the
+    /// stamped `m_exception` (the throw/unwind edge).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn run_installed_baseline_jit(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        code_block_id: CodeBlockId,
+        code_block: &CodeBlock,
+        arguments_including_this: &[u64],
+    ) -> BaselineJitEntryOutcome {
+        // Take the installed image OUT of the map so NO borrow of
+        // `self.baseline_jit_slots` is held while we re-borrow `&mut self` to park
+        // pointers and call. The image is owned + immovable (its arena/handle do
+        // not move when the value is moved), so taking it is sound. It is restored
+        // after the call. (For an allowlisted — therefore PURE, no-call — function
+        // the image never re-enters this path, so the transient `Warming` window is
+        // never observed.)
+        let mut installed = match self.baseline_jit_slots.get_mut(&code_block_id) {
+            Some(slot) => {
+                match std::mem::replace(&mut slot.state, BaselineJitInstallState::Warming) {
+                    BaselineJitInstallState::Installed(installed) => installed,
+                    other => {
+                        slot.state = other;
+                        return BaselineJitEntryOutcome::NotTieredUp;
+                    }
+                }
+            }
+            None => return BaselineJitEntryOutcome::NotTieredUp,
+        };
+
+        // Park the 3 raw pointers (D1/D5/S3). The `*mut Vm` is passed in x0 (arg0)
+        // and moved into the pinned-VM register x19 by the emitted prologue. Hold
+        // the parked `&mut self` DORMANT for the call (the slow-path shim reborrows
+        // it exactly once); pass the VM as a raw `u64` so Rust sees no `self` borrow
+        // across the call.
+        self.set_jit_host(host);
+        self.set_jit_code_block(code_block as *const CodeBlock);
+        let vm_ptr_bits = self as *mut Vm as u64;
+        let returned_bits = installed.run(vm_ptr_bits, arguments_including_this);
+        let pending = self.jit_pending_exception();
+        self.clear_jit_code_block();
+        self.clear_jit_host();
+
+        // Restore the installed image for the next entry.
+        if let Some(slot) = self.baseline_jit_slots.get_mut(&code_block_id) {
+            slot.state = BaselineJitInstallState::Installed(installed);
+        }
+
+        if pending.0 != 0 {
+            // The throw/unwind edge: the slow path stamped the `m_exception` mirror.
+            // Clear it and surface the thrown value (the caller routes it to the
+            // interpreter throw/unwind path).
+            self.set_jit_pending_exception(EncodedJsValue(0));
+            BaselineJitEntryOutcome::Threw(pending)
+        } else {
+            BaselineJitEntryOutcome::Returned(RuntimeValue::from_encoded(EncodedJsValue(
+                returned_bits,
+            )))
+        }
+    }
+
+    /// Test/inspection: whether a CodeBlock has tiered up to an installed baseline
+    /// image (the `m_jitCode` install flag — the milestone's tier-up assertion).
+    /// Test-only (its sole caller is the U3/U4 milestone test); the live path uses
+    /// the `baseline_jit_slots` state directly.
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn baseline_jit_function_is_installed(&self, code_block_id: CodeBlockId) -> bool {
+        matches!(
+            self.baseline_jit_slots.get(&code_block_id),
+            Some(BaselineJitSlot {
+                state: BaselineJitInstallState::Installed(_),
+                ..
+            })
+        )
+    }
+
+    /// U3/U4 (baseline-dispatch.md): attempt the LIVE baseline-JIT tier-up for this
+    /// function entry from `execute_code_block_with_entry_kind`. Returns
+    /// `Some(completion)` when the function tiered up and ran natively (its `op_ret`
+    /// boxed result — or, unreachably for the pure-int32 S4 allowlist, a throw);
+    /// `None` when it stays interpreted (still warming, DECLINED by the allowlist, no
+    /// concrete host to back the slow-path bridge, or no live frame to read the
+    /// arguments from). `None` is fully behavior-neutral: the caller proceeds to the
+    /// unchanged interpreter/tiering path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn maybe_run_live_baseline_jit_entry<H: DispatchHost>(
+        &mut self,
+        code_block_id: CodeBlockId,
+        code_block: &CodeBlock,
+        host: &mut H,
+    ) -> Option<ExecutionCompletion> {
+        // The B5-lite handoff parks the CONCRETE production host for the slow-path
+        // bridge (S3/D5); only `CoreOpcodeDispatchHost` can back it.
+        let core_host = host.as_core_opcode_dispatch_host()?;
+        // Read the live callee frame's this+arguments as boxed EncodedJSValue words —
+        // the B5-lite scratch frame is seeded from them (S2). The emitted op_enter
+        // zero-fills the locals, so only this+args are read here.
+        let arguments_including_this = self.collect_top_frame_arguments_including_this()?;
+        match self.observe_baseline_jit_entry_and_maybe_execute(
+            core_host,
+            code_block_id,
+            code_block,
+            &arguments_including_this,
+        ) {
+            BaselineJitEntryOutcome::NotTieredUp => None,
+            BaselineJitEntryOutcome::Returned(value) => Some(ExecutionCompletion::Returned(value)),
+            BaselineJitEntryOutcome::Threw(bits) => {
+                // The S4 allowlist admits only pure int32 arith, which cannot throw, so
+                // this edge is effectively unreachable; surface it faithfully anyway —
+                // set the VM pending exception (what the interpreter unwind path reads)
+                // and return a Threw completion.
+                let value = crate::value::JsValue::from_encoded(bits);
+                self.exceptions.throw(value);
+                Some(ExecutionCompletion::Threw(PendingException { value }))
+            }
+        }
+    }
+
+    /// Read the live top frame's `this`+arguments as boxed `EncodedJSValue` words for
+    /// the B5-lite native handoff (`CallFrameSlot` thisArgument then firstArgument..,
+    /// the JSC frame layout the emitted body reads via `addressFor(arg)`).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn collect_top_frame_arguments_including_this(&self) -> Option<Vec<u64>> {
+        let frame = self.execution.top_frame()?;
+        let window = frame.register_window;
+        let count = frame.argument_count_including_this;
+        let mut arguments = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let register = crate::bytecode::register::VirtualRegister::argument_including_this(
+                index,
+                window.this_offset,
+            );
+            let value = self.registers.read(window, register, None).ok()?;
+            arguments.push(value.encoded().0);
+        }
+        Some(arguments)
+    }
+
+    /// Epilogue for the U3/U4 native tier-up short-circuit: run the SAME post-execution
+    /// epilogue as the interpreter path (property-store drain, epilogue IC/tiering
+    /// safepoint, leave the no-GC region, record the tier execution completion) so a
+    /// native return is indistinguishable from an interpreter return to the caller.
+    /// The native completion is terminal (Returned/Threw) — no re-entrant call loop.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn finish_live_baseline_jit_entry<H: DispatchHost>(
+        &mut self,
+        region: VmNoGcRegion,
+        code_block_id: CodeBlockId,
+        code_block: &CodeBlock,
+        top_frame_id: Option<crate::runtime::CallFrameId>,
+        host: &mut H,
+        entry_kind: crate::interpreter::ExecutionEntryKind,
+        completion: ExecutionCompletion,
+    ) -> ExecutionCompletion {
+        self.drain_interpreter_property_store_observations_for_generated_property_plan(
+            code_block_id,
+            top_frame_id,
+            code_block,
+            host,
+        );
+        host.discard_property_store_observations();
+        self.run_ic_tiering_safepoint(code_block_id, code_block, host);
+        let completion = self.leave_no_gc_region_with_completion(region, completion);
+        self.tiering.record_execution_completion(
+            code_block_id,
+            entry_kind,
+            &completion,
+            self.execution.frame_depth(),
+            TierEntryExecutionPath::NativeCode(JitType::Baseline),
+        );
+        completion
     }
 
     pub fn runtime_structures(&self) -> &RuntimeStructures {
@@ -5113,6 +5619,36 @@ impl Vm {
         // the five idempotent passes are skipped when this owner has no
         // registered plans and the drain reported no pending work.
         self.run_ic_tiering_safepoint(code_block_id, code_block, host);
+        // U3/U4 (baseline-dispatch.md): the LIVE baseline-JIT tier-up entry — where
+        // measured R lifts off the interpreter floor. Faithful to JSC's LLInt->Baseline
+        // tier-up: the per-CodeBlock S9 ExecutionCounter is bumped on THIS function
+        // entry (LLIntSlowPaths.cpp jitCompileAndSetHeuristics, the prologue path) and,
+        // on the threshold crossing, the S4-allowlisted CodeBlock is SYNCHRONOUSLY
+        // compiled, installed, and ENTERED as native ARM64 — JSC's addressForCall
+        // enters the baseline JITCode the same way. Gated on the baseline tiering
+        // policy (interpreter-only Vms are byte-for-byte unchanged) and on a concrete
+        // production host (the slow-path bridge requires it). On `NotTieredUp` it falls
+        // through to the EXACT pre-existing interpreter/tiering path below.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if matches!(
+            self.config.tiering_policy(),
+            TieringPolicy::BaselineAllowed | TieringPolicy::OptimizingAllowed
+        ) {
+            if let Some(completion) =
+                self.maybe_run_live_baseline_jit_entry(code_block_id, code_block, host)
+            {
+                let top_frame_id = self.execution.top_frame().map(|frame| frame.id);
+                return self.finish_live_baseline_jit_entry(
+                    region,
+                    code_block_id,
+                    code_block,
+                    top_frame_id,
+                    host,
+                    entry_kind,
+                    completion,
+                );
+            }
+        }
         let top_frame = self.execution.top_frame().cloned();
         let entry_selection = self
             .tiering
@@ -5830,11 +6366,27 @@ impl Vm {
         host: &mut H,
         config: DispatchConfig,
     ) -> ExecutionCompletion {
+        let policy = self.config.tiering_policy();
+        // S9 (baseline-dispatch.md): hand the loop-hint host this CodeBlock's baseline
+        // tier-up trigger (only while WARMING) so loop back-edges bump the SAME counter
+        // as function entries (JSC loop_osr). The slot exists once the live entry path
+        // created it (baseline policy + concrete host); otherwise `None`.
+        let baseline_trigger = self
+            .baseline_jit_slots
+            .get_mut(&code_block_id)
+            .and_then(|slot| {
+                if matches!(slot.state, BaselineJitInstallState::Warming) {
+                    Some(&mut slot.trigger)
+                } else {
+                    None
+                }
+            });
         let mut host = VmLoopHintDispatchHost::new(
             host,
             &mut self.tiering,
+            baseline_trigger,
             code_block_id,
-            self.config.tiering_policy(),
+            policy,
         );
         let mut local_dispatch_budget = DispatchBudget::from_config(config);
         let dispatch_budget = self
@@ -20709,6 +21261,461 @@ mod tests {
         }
         vm.execution.leave(entry).unwrap();
         completion
+    }
+
+    // ========================================================================
+    // U3/U4 MILESTONE (baseline-dispatch.md): a hot int32 arith/loop function
+    // tiers up via the S9 ExecutionCounter, is SYNCHRONOUSLY compiled by the
+    // Stage-1 emitter (S4 allowlist) + installed, and EXECUTES NATIVELY in the
+    // live dispatch — where measured r_i lifts off the interpreter floor. The
+    // function `sum(n){ var s=0; for(var i=0;i<n;i++){ s=s+i; } return s; }`
+    // (op_enter-equiv local zero-fill + LoadInt32 + fused int32 compare-branch +
+    // a backward loop + AddInt32 + op_ret) is driven PAST the tier-up threshold;
+    // the test proves (i) it tiered up (the `m_jitCode` install flag flips),
+    // (ii) the native result == the engine INTERPRETER's result on the SAME
+    // CodeBlock == the closed-form oracle, and (iii) the native (tiered) run is
+    // FASTER than pure interpretation of the same hot function.
+    //
+    // HONEST OCTANE CAVEAT (baseline-dispatch.md): this is the SYNTHETIC hot-arith
+    // milestone; property/call ops stay interpreted (S4) until R4/B5-B6, so this
+    // does NOT claim a material Octane R move.
+    // ========================================================================
+
+    // Ordinals (== BytecodeIndex; the interpreter's `decoded_at` and the emitter
+    // both index by ordinal): s=local0 i=local1 one=local2 cmp=local3 n=arg1.
+    //   0 s=0  1 i=0  2 one=1  3 cmp=(i<n)  4 jfalse cmp -> 8  5 s+=i
+    //   6 i+=one  7 jmp -> 3  8 ret s
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn int_sum_loop_milestone_code_block() -> CodeBlock {
+        let s = local(0);
+        let i = local(1);
+        let one = local(2);
+        let cmp = local(3);
+        let n = argument_including_this(1);
+        let instructions = vec![
+            typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(s), Operand::SignedImmediate(0)],
+            ),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(i), Operand::SignedImmediate(0)],
+            ),
+            typed_core_instruction_with_operands(
+                2,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(one), Operand::SignedImmediate(1)],
+            ),
+            typed_core_instruction_with_operands(
+                3,
+                CoreOpcode::LessThanInt32,
+                vec![
+                    Operand::Register(cmp),
+                    Operand::Register(i),
+                    Operand::Register(n),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                4,
+                CoreOpcode::JumpIfFalse,
+                vec![
+                    Operand::Register(cmp),
+                    Operand::BytecodeIndex(BytecodeIndex::from_offset(8)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                5,
+                CoreOpcode::AddInt32,
+                vec![
+                    Operand::Register(s),
+                    Operand::Register(s),
+                    Operand::Register(i),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                6,
+                CoreOpcode::AddInt32,
+                vec![
+                    Operand::Register(i),
+                    Operand::Register(i),
+                    Operand::Register(one),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                7,
+                CoreOpcode::Jump,
+                vec![Operand::BytecodeIndex(BytecodeIndex::from_offset(3))],
+            ),
+            typed_core_instruction_with_operands(8, CoreOpcode::Return, vec![Operand::Register(s)]),
+        ];
+        CodeBlock::from_unlinked(
+            UnlinkedCodeBlock::new(
+                CodeKind::Function,
+                PackedInstructionStream::from_typed_placeholder(instructions),
+            )
+            .with_frame(RegisterFrameShape {
+                num_parameters_including_this: 2,
+                num_vars: 8,
+                num_callee_locals: 8,
+                num_temporaries: 0,
+                special: Default::default(),
+            }),
+            LinkContext::default(),
+        )
+        .with_entrypoints(CodeBlockEntrypoints {
+            interpreter: Some(InterpreterEntrySlot(0)),
+            ..CodeBlockEntrypoints::default()
+        })
+        .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    // [this, n] as boxed EncodedJSValue words (the live-frame arguments the B5-lite
+    // handoff seeds; argument_including_this(0) == `this`, (1) == n).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn int_sum_args_including_this(n: i32) -> Vec<u64> {
+        vec![
+            RuntimeValue::undefined().encoded().0,
+            RuntimeValue::from_i32(n).encoded().0,
+        ]
+    }
+
+    // The closed-form oracle: sum_{i=0}^{n-1} i = n*(n-1)/2.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn int_sum_oracle(n: i32) -> i32 {
+        (0..n).sum()
+    }
+
+    // Run the SAME CodeBlock through the engine interpreter and extract the boxed
+    // return value (the A/B baseline for the r_i-lift proof).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn run_int_sum_via_interpreter(vm: &mut Vm, code_block: &CodeBlock, n: i32) -> u64 {
+        let owner = CodeBlockId(CellId(7_700));
+        vm.code_blocks.register(owner, code_block.clone());
+        let mut host = CoreOpcodeDispatchHost::new();
+        let completion = execute_registered_code_block_with_host_and_arguments(
+            vm,
+            owner,
+            code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), RuntimeValue::from_i32(n)],
+        );
+        match completion {
+            ExecutionCompletion::Returned(value) => value.encoded().0,
+            other => panic!("interpreter did not return a value: {other:?}"),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_u3_u4_hot_arith_function_tiers_up_executes_natively_and_beats_interpretation() {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+        let code_block = int_sum_loop_milestone_code_block();
+
+        // S7 (pin-stable Vm): own the dispatch-site Vm as `Box<Vm>` so the baked
+        // `jit_pending` AbsoluteAddress + the parked `*mut Vm` stay valid at ONE
+        // heap address for the installed image's lifetime.
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        let mut host = CoreOpcodeDispatchHost::new();
+        let owner = CodeBlockId(CellId(7_701));
+
+        // Cross-check oracle == interpreter for the small driver `n`.
+        let n_small = 5;
+        let expected_small = int_sum_oracle(n_small); // 0+1+2+3+4 = 10
+        {
+            let mut interp_vm = Box::new(Vm::new(VmConfig::interpreter_only()));
+            let interp_bits = run_int_sum_via_interpreter(&mut interp_vm, &code_block, n_small);
+            assert_eq!(
+                interp_bits,
+                RuntimeValue::from_i32(expected_small).encoded().0,
+                "engine interpreter computes sum(5) == 10",
+            );
+        }
+
+        // (i) + (ii): drive entries PAST the S9 tier-up threshold. BEFORE the
+        // crossing the entry stays in the interpreter (NotTieredUp); AT/AFTER it
+        // the native image runs and returns the correct boxed result.
+        let mut tiered_at: Option<u32> = None;
+        let mut entries: u32 = 0;
+        // The default threshold is `thresholdForJITAfterWarmUp` (500); cap well
+        // above it so the crossing is observed without an unbounded loop.
+        let entry_cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 64;
+        while entries < entry_cap {
+            entries += 1;
+            let outcome = vm.observe_baseline_jit_entry_and_maybe_execute(
+                &mut host,
+                owner,
+                &code_block,
+                &int_sum_args_including_this(n_small),
+            );
+            match outcome {
+                BaselineJitEntryOutcome::NotTieredUp => {
+                    assert!(
+                        !vm.baseline_jit_function_is_installed(owner),
+                        "no install before the countdown crosses",
+                    );
+                }
+                BaselineJitEntryOutcome::Returned(value) => {
+                    assert!(
+                        vm.baseline_jit_function_is_installed(owner),
+                        "a returned native result implies an installed image",
+                    );
+                    assert_eq!(
+                        value.encoded().0,
+                        RuntimeValue::from_i32(expected_small).encoded().0,
+                        "native sum(5) == 10 (matches the interpreter + oracle)",
+                    );
+                    if tiered_at.is_none() {
+                        tiered_at = Some(entries);
+                    }
+                }
+                BaselineJitEntryOutcome::Threw(bits) => {
+                    panic!("int32 sum must not throw (m_exception={bits:?})");
+                }
+            }
+            if let Some(at) = tiered_at {
+                if entries >= at + 4 {
+                    break;
+                }
+            }
+        }
+        let tiered_at = tiered_at.expect("the hot function tiered up to a native image");
+        assert!(
+            vm.baseline_jit_function_is_installed(owner),
+            "the CodeBlock has an installed baseline image (m_jitCode)",
+        );
+
+        // (ii) over a HOT `n`: the installed native image returns the same value the
+        // interpreter does on the same CodeBlock, for a large loop count.
+        let n_hot = 10_000;
+        let expected_hot = int_sum_oracle(n_hot);
+        let native_hot = vm.observe_baseline_jit_entry_and_maybe_execute(
+            &mut host,
+            owner,
+            &code_block,
+            &int_sum_args_including_this(n_hot),
+        );
+        let native_hot_bits = match native_hot {
+            BaselineJitEntryOutcome::Returned(value) => value.encoded().0,
+            other => panic!("expected a native return for the installed image: {other:?}"),
+        };
+        {
+            let mut interp_vm = Box::new(Vm::new(VmConfig::interpreter_only()));
+            let interp_hot_bits = run_int_sum_via_interpreter(&mut interp_vm, &code_block, n_hot);
+            assert_eq!(
+                native_hot_bits, interp_hot_bits,
+                "native sum({n_hot}) == interpreter sum({n_hot})",
+            );
+            assert_eq!(
+                native_hot_bits,
+                RuntimeValue::from_i32(expected_hot).encoded().0,
+                "native sum({n_hot}) == closed-form oracle",
+            );
+        }
+
+        // (iii) THE r_i LIFT: time M warm native runs of the hot loop vs M
+        // interpreter runs of the SAME CodeBlock. The JIT removes per-bytecode
+        // dispatch, so for a hot int loop it is solidly faster. (Wall-time deltas
+        // are machine-dependent; the workload is large enough that the inner loop
+        // dominates the per-call setup, giving a robust margin.)
+        let reps = 50u32;
+        let native_start = std::time::Instant::now();
+        for _ in 0..reps {
+            let outcome = vm.observe_baseline_jit_entry_and_maybe_execute(
+                &mut host,
+                owner,
+                &code_block,
+                &int_sum_args_including_this(n_hot),
+            );
+            assert!(matches!(outcome, BaselineJitEntryOutcome::Returned(_)));
+        }
+        let native_elapsed = native_start.elapsed();
+
+        let mut interp_vm = Box::new(Vm::new(VmConfig::interpreter_only()));
+        let interp_owner = CodeBlockId(CellId(7_702));
+        interp_vm
+            .code_blocks
+            .register(interp_owner, code_block.clone());
+        let interp_start = std::time::Instant::now();
+        for _ in 0..reps {
+            // A fresh interpreter execution of the same hot loop.
+            let _ = run_int_sum_via_interpreter(&mut interp_vm, &code_block, n_hot);
+        }
+        let interp_elapsed = interp_start.elapsed();
+
+        eprintln!(
+            "U3/U4 milestone: tiered_at_entry={tiered_at} threshold≈{THRESHOLD_FOR_JIT_AFTER_WARM_UP} \
+             n_hot={n_hot} reps={reps} native={native_elapsed:?} interpreter={interp_elapsed:?} \
+             speedup={:.2}x",
+            interp_elapsed.as_secs_f64() / native_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+        );
+        assert!(
+            native_elapsed < interp_elapsed,
+            "the JIT-tiered hot loop ({native_elapsed:?}) must beat pure interpretation \
+             ({interp_elapsed:?}) — r_i lifts off the interpreter floor",
+        );
+    }
+
+    // JIT runtime-call bridge (jit/operations.rs) — the OBJECT-operand reentry proof,
+    // closing the Miri coverage gap (the existing add-shim Miri test exercises only
+    // PRIMITIVE operands). The add shim's slow path, for an OBJECT operand, reenters
+    // USER JS — the object's bytecode `valueOf` — THROUGH the parked region while the
+    // `&mut *vm` reborrow is live: a deep re-entrant `execute_code_block` runs against
+    // the SAME `Vm` the bridge reborrowed. This is the reachable HIGHEST-RISK reentry.
+    // It proves there is NO aliasing UB: the reentry runs through the host (a DISJOINT
+    // allocation from the `Vm`), and the single `&mut *vm` reborrow plus the
+    // re-entrant interpreter's `&mut Vm`-field borrows never illegally alias. The shim
+    // is called DIRECTLY in Rust (no native code), so this is NOT gated to
+    // macOS/aarch64 and is a Miri target:
+    //   MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-tree-borrows" \
+    //     cargo +nightly miri test --lib \
+    //     vm::tests::operation_value_add_object_operand_reenters_user_bytecode_through_parked_region
+    #[test]
+    fn operation_value_add_object_operand_reenters_user_bytecode_through_parked_region() {
+        use crate::jit::operations::operation_value_add;
+
+        // The user-JS `valueOf`: a bytecode function whose body is `return 42`. As
+        // function_index 0 it resolves against the host's function table.
+        let valueof_body = p6_int32_return_42_code_block();
+        let mut host = CoreOpcodeDispatchHost::with_function_blocks(vec![valueof_body.clone()]);
+
+        // An object with an OWN data property `valueOf` == that bytecode function.
+        let object = host.allocate_null_prototype_object_for_test();
+        let valueof_fn = host.allocate_function_value_for_test(0);
+        host.set_string_data_property_for_test(object, "valueOf", valueof_fn)
+            .expect("install bytecode valueOf");
+
+        // S7: pin the Vm at a stable address (Box), the same discipline the live path
+        // requires. Publish the object cell so the re-entrant interpreter resolves it.
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::interpreter_only()));
+        host.publish_object_to_heap_for_test(&mut vm.heap, object)
+            .expect("publish object cell to the heap");
+
+        // Establish the active entry + caller frame the re-entrant interpreter needs:
+        // in the LIVE path the JIT'd function runs UNDER a top-level VMEntryScope +
+        // CallFrame, so `vm.execution` already has an active entry when the slow path
+        // reenters. Mirror that here (push_frame would `Err(NoActiveEntry)` otherwise).
+        let caller = register_test_code_block(&mut vm, valueof_body.clone());
+        let global_object = vm.allocate_global_object_cell().unwrap();
+        vm.record_source_global_object(global_object).unwrap();
+        let entry = vm
+            .execution
+            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+                code_block: caller,
+                global_object,
+                this_value: RuntimeValue::undefined(),
+            }));
+        let caller_frame = vm
+            .execution
+            .push_frame(
+                &mut vm.registers,
+                FramePushRequest {
+                    code_block: Some(caller),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: valueof_body.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: vec![RuntimeValue::undefined()],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+            )
+            .unwrap();
+
+        // Park the host (D5) and a REAL active CodeBlock (S3): the OBJECT-operand path
+        // (`object_to_number_hint_primitive`) reads `state.code_block`. The `&mut host`
+        // is held DORMANT until `clear_jit_host` — the shim reborrows it once.
+        vm.set_jit_host(&mut host);
+        vm.set_jit_code_block(&valueof_body as *const CodeBlock);
+        let vm_ptr: *mut Vm = &mut *vm;
+
+        // object + 8  ->  ToNumber(object) + 8  ->  valueOf()==42, then 42 + 8 == 50.
+        // The `+ 8` slow path reborrows `&mut *vm`, builds the DispatchState from it,
+        // and RE-ENTERS the interpreter to run `valueOf`; the reborrow stays live
+        // across that entire re-entrant call (the path Miri must clear).
+        let eight = RuntimeValue::from_i32(8).encoded().0;
+        let result_bits = operation_value_add(vm_ptr, object.encoded().0, eight);
+
+        // Parked region over; reading vm/host back directly is sound again.
+        vm.clear_jit_code_block();
+        vm.clear_jit_host();
+        if vm.execution.frame(caller_frame).is_some() {
+            vm.execution
+                .pop_frame(&mut vm.registers, caller_frame)
+                .unwrap();
+        }
+        vm.execution.leave(entry).unwrap();
+
+        assert_eq!(
+            RuntimeValue::from_encoded(EncodedJsValue(result_bits)),
+            RuntimeValue::from_i32(50),
+            "object(valueOf->42) + 8 == 50 via a re-entrant interpreter call through \
+             the parked region",
+        );
+        assert_eq!(
+            vm.jit_pending_exception().0,
+            0,
+            "the object-operand add must not throw",
+        );
+    }
+
+    // U3/U4 (baseline-dispatch.md): prove the LIVE WIRING end-to-end — a hot
+    // allowlisted function driven through the REAL `execute_code_block` entry path
+    // (the `select_interpreter_entry_plan` site), NOT the direct `observe_*` call the
+    // milestone test above uses, tiers up via the S9 ExecutionCounter and thereafter
+    // returns the native `op_ret` result, byte-identical to interpretation. This
+    // exercises the parts the milestone test does not: the entry-path hook, the
+    // live-frame argument marshaling, and the native-completion epilogue.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_u3_u4_live_execute_code_block_entry_tiers_up_and_matches_interpreter() {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+        let code_block = int_sum_loop_milestone_code_block();
+        let owner = CodeBlockId(CellId(7_705));
+        let n = 5;
+        let expected_bits = RuntimeValue::from_i32(int_sum_oracle(n)).encoded().0; // sum(5) == 10
+
+        // S7: own the dispatch-site Vm as `Box<Vm>` (stable address for the installed
+        // image's parked `*mut Vm` + baked `jit_pending` address). Baseline policy so
+        // the live entry hook is active; the SAME code_block_id accumulates the S9
+        // counter across `execute_code_block` entries until it crosses.
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(owner, code_block.clone());
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        // Cap a little past the threshold so the crossing is observed; EVERY entry must
+        // return the correct value — interpreted while warming, native after tier-up.
+        let entry_cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 8;
+        let mut saw_install = false;
+        for _ in 0..entry_cap {
+            let completion = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                owner,
+                &code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), RuntimeValue::from_i32(n)],
+            );
+            let bits = match completion {
+                ExecutionCompletion::Returned(value) => value.encoded().0,
+                other => {
+                    panic!("live execute_code_block entry did not return a value: {other:?}")
+                }
+            };
+            assert_eq!(
+                bits, expected_bits,
+                "live entry sum(5) == 10 whether interpreted (warming) or native (tiered)",
+            );
+            if vm.baseline_jit_function_is_installed(owner) {
+                saw_install = true;
+            }
+        }
+        assert!(
+            saw_install,
+            "the hot function tiered up to a native baseline image via the LIVE \
+             execute_code_block entry path (m_jitCode installed)",
+        );
     }
 
     fn execute_registered_code_block_with_boundary_snapshot_and_arguments<H: DispatchHost>(

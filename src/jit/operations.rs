@@ -356,4 +356,50 @@ mod tests {
         // proof the evaluator ran on the parked host, not a transient one.
         assert_eq!(host.string_text_for_test(concat), Some("abcd"));
     }
+
+    // The compare shim (`dispatch_value_compare_operation`) and the truthy shim
+    // (`dispatch_value_truthy_operation`) take the SAME D1+D5 reborrow island as the
+    // add shim but were previously UNTESTED by Miri. Drive both reborrows directly
+    // (no native code) over PRIMITIVE operands — the int32 relational/truthy fast
+    // paths the baseline lowering far-calls — so this is a Miri target:
+    //   MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-tree-borrows" \
+    //     cargo +nightly miri test --lib \
+    //     jit::operations::tests::compare_and_truthy_shims_reborrow_real_vm_and_host
+    #[test]
+    fn compare_and_truthy_shims_reborrow_real_vm_and_host() {
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+        // Driver parks the host for the JIT-call region (D5), then the `*mut Vm` (D1).
+        // No CodeBlock is parked: the primitive relational path never reaches
+        // `relational_to_primitive` (which reads `state.code_block`), so the bridge's
+        // placeholder CodeBlock is used — exactly the int32 fast path.
+        vm.set_jit_host(&mut host);
+        let vm_ptr: *mut Vm = &mut vm;
+
+        let two = JsValue::from_i32(2).encoded().0;
+        let three = JsValue::from_i32(3).encoded().0;
+
+        // --- compare shim: each call reborrows `&mut *vm` + `&mut *host`. ---
+        assert_eq!(operation_compare_less(vm_ptr, two, three), TRUE_RESULT); // 2 < 3
+        assert_eq!(operation_compare_less(vm_ptr, three, two), FALSE_RESULT); // 3 < 2
+        assert_eq!(operation_compare_lesseq(vm_ptr, three, three), TRUE_RESULT); // 3 <= 3
+        assert_eq!(operation_compare_greater(vm_ptr, three, two), TRUE_RESULT); // 3 > 2
+
+        // --- truthy shim: jtrue returns truthiness, jfalse its inversion. ---
+        let zero = JsValue::from_i32(0).encoded().0;
+        let one = JsValue::from_i32(1).encoded().0;
+        assert_eq!(operation_jtrue(vm_ptr, one), TRUE_RESULT); // 1 is truthy
+        assert_eq!(operation_jtrue(vm_ptr, zero), FALSE_RESULT); // 0 is falsy
+        assert_eq!(operation_jfalse(vm_ptr, zero), TRUE_RESULT); // jfalse branches on falsy
+        assert_eq!(operation_jfalse(vm_ptr, one), FALSE_RESULT);
+
+        // The parked region is dormant until here; reading vm/host back is sound.
+        vm.clear_jit_host();
+        // No primitive compare/truthy path throws, so the mirror stays clear.
+        assert_eq!(
+            vm.jit_pending_exception().0,
+            0,
+            "primitive compare/truthy must not throw"
+        );
+    }
 }

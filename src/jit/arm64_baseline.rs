@@ -283,6 +283,12 @@ mod frame_addressing;
 // over op_enter/mov/LoadInt32/arith/int32 compare-branch/jmp/ret, incl. a native
 // loop with a backward (loop) link.
 mod function_emitter;
+// Live baseline-JIT tier-up dispatch (U3/U4): the per-CodeBlock ExecutionCounter
+// trigger + the S4-allowlist compile/install + the B5-lite native handoff that
+// makes a hot function EXECUTE natively in live dispatch (where measured R lifts
+// off the interpreter floor). `pub(crate)` so the `Vm` driver (vm/mod.rs) owns the
+// install map and drives the trigger/handoff.
+pub(crate) mod live_dispatch;
 mod op_add;
 // Generated-frame materialization proof submodules: consumed only by the gated
 // ARM64 native-entry/admission proof apparatus (vm/arm64_native_entry.rs proof

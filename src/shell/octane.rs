@@ -1824,7 +1824,12 @@ pub fn execute_prepared_octane_benchmark(
     prepared: &OctanePreparedBenchmark,
     config: OctaneExecutionConfig,
 ) -> OctaneBenchmarkExecutionReport {
-    let mut vm = Vm::new(config.vm_config());
+    // S7 (baseline-dispatch.md): own the dispatch-site `Vm` as `Box<Vm>` so the
+    // baked `jit_pending` AbsoluteAddress + the parked `*mut Vm` the baseline JIT
+    // reuses stay valid at ONE heap address for an installed image's lifetime
+    // (JSC's `VM` is heap-allocated). The `&mut *vm` deref hands the helpers the
+    // same `&mut Vm` interface.
+    let mut vm: Box<Vm> = Box::new(Vm::new(config.vm_config()));
     let mut progress = None;
     execute_prepared_octane_benchmark_run_with_vm(&mut vm, prepared, config, &mut progress).report
 }
@@ -1834,7 +1839,8 @@ pub fn execute_prepared_octane_benchmark_with_progress(
     config: OctaneExecutionConfig,
     progress: &mut dyn FnMut(OctaneExecutionProgress),
 ) -> OctaneBenchmarkExecutionReport {
-    let mut vm = Vm::new(config.vm_config());
+    // S7: pin-stable boxed `Vm` (see `execute_prepared_octane_benchmark`).
+    let mut vm: Box<Vm> = Box::new(Vm::new(config.vm_config()));
     let mut progress = Some(progress);
     execute_prepared_octane_benchmark_run_with_vm(&mut vm, prepared, config, &mut progress).report
 }
@@ -2064,7 +2070,8 @@ fn execute_prepared_octane_suite_with_optional_progress(
     progress: Option<&mut dyn FnMut(OctaneExecutionProgress)>,
 ) -> OctanePreparedSuiteExecutionReport {
     let mut progress = progress;
-    let mut vm = Vm::new(config.vm_config());
+    // S7: pin-stable boxed `Vm` (see `execute_prepared_octane_benchmark`).
+    let mut vm: Box<Vm> = Box::new(Vm::new(config.vm_config()));
     let mut retained_sessions = Vec::new();
     let mut benchmarks = Vec::with_capacity(prepared.benchmarks.len());
     let mut stopped_early = false;
@@ -2112,8 +2119,13 @@ pub fn execute_prepared_octane_benchmark_mode_comparison(
     prepared: &OctanePreparedBenchmark,
     failure_policy: OctaneSuiteFailurePolicy,
 ) -> OctaneBenchmarkModeComparisonRecord {
-    let mut interpreter_vm = Vm::new(OctaneExecutionMode::InterpreterOnly.vm_config());
-    let mut baseline_vm = Vm::new(OctaneExecutionMode::BaselineAllowed.vm_config());
+    // S7: both A/B harness Vms are pin-stable boxed homes — the baseline_vm runs
+    // the JIT once the live native path is wired, so its parked `*mut Vm` + baked
+    // `jit_pending` address must not move.
+    let mut interpreter_vm: Box<Vm> =
+        Box::new(Vm::new(OctaneExecutionMode::InterpreterOnly.vm_config()));
+    let mut baseline_vm: Box<Vm> =
+        Box::new(Vm::new(OctaneExecutionMode::BaselineAllowed.vm_config()));
     execute_prepared_octane_benchmark_mode_comparison_run_with_vms(
         &mut interpreter_vm,
         &mut baseline_vm,
@@ -2158,8 +2170,11 @@ pub fn execute_prepared_octane_suite_mode_comparison(
     prepared: &OctanePreparedSuite,
     failure_policy: OctaneSuiteFailurePolicy,
 ) -> OctanePreparedSuiteModeComparisonReport {
-    let mut interpreter_vm = Vm::new(OctaneExecutionMode::InterpreterOnly.vm_config());
-    let mut baseline_vm = Vm::new(OctaneExecutionMode::BaselineAllowed.vm_config());
+    // S7: pin-stable boxed A/B harness Vms (see the per-benchmark comparison).
+    let mut interpreter_vm: Box<Vm> =
+        Box::new(Vm::new(OctaneExecutionMode::InterpreterOnly.vm_config()));
+    let mut baseline_vm: Box<Vm> =
+        Box::new(Vm::new(OctaneExecutionMode::BaselineAllowed.vm_config()));
     let mut interpreter_sessions = Vec::new();
     let mut baseline_sessions = Vec::new();
     let mut benchmarks = Vec::with_capacity(prepared.benchmarks.len());

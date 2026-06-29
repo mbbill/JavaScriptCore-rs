@@ -2853,6 +2853,18 @@ pub struct StructureChainInvalidationEvent {
 }
 
 pub trait DispatchHost {
+    /// Live baseline-JIT tier-up bridge (baseline-dispatch.md S2/S3/D5): the B5-lite
+    /// native handoff parks a `*mut host` that the slow-path shim reborrows during
+    /// the native call, and it MUST be the concrete production host
+    /// (`CoreOpcodeDispatchHost` — the live objects/strings/bigints/symbols stores).
+    /// Generic/test/wrapper hosts cannot back the bridge, so they return `None` and
+    /// the live tier-up entry stays in the interpreter for them. No JSC counterpart:
+    /// a Rust-genericity bridge over `execute_code_block<H: DispatchHost>` (JSC's one
+    /// `VM` owns the host); default `None`, overridden only by the concrete host.
+    fn as_core_opcode_dispatch_host(&mut self) -> Option<&mut CoreOpcodeDispatchHost> {
+        None
+    }
+
     fn targeted_register_roots(
         &mut self,
         _heap: &mut Heap,
@@ -3810,6 +3822,31 @@ impl CoreOpcodeDispatchHost {
         value: RuntimeValue,
     ) -> Result<(), ExecutionError> {
         self.objects.put_array_element(object, index, value)
+    }
+
+    // Cross-module test support for the JIT runtime-call bridge's OBJECT-operand
+    // reentry proof (jit/operations.rs / vm/mod.rs): set an own data property keyed
+    // by STRING name (e.g. "valueOf"), matching the `CorePropertyKey::String` lookup
+    // `object_to_preferred_primitive` performs — the `Identifier`-keyed variant above
+    // would not be found by that string lookup.
+    #[cfg(test)]
+    pub(crate) fn set_string_data_property_for_test(
+        &mut self,
+        object: RuntimeValue,
+        name: &str,
+        value: RuntimeValue,
+    ) -> Result<(), ExecutionError> {
+        self.objects
+            .set_data_own(object, &CorePropertyKey::String(name.into()), value)
+    }
+
+    // Allocate a bytecode Function cell bound to `function_index` (resolved against
+    // this host's `function_blocks`, populated via `with_function_blocks`) so a test
+    // can install a user-JS `valueOf`/`toString` the reentry path actually executes.
+    #[cfg(test)]
+    pub(crate) fn allocate_function_value_for_test(&mut self, function_index: u32) -> RuntimeValue {
+        self.objects
+            .allocate_function(function_index, Vec::new(), None)
     }
 
     #[cfg(test)]
@@ -5955,6 +5992,10 @@ struct CoreRegExpMatch {
 }
 
 impl DispatchHost for CoreOpcodeDispatchHost {
+    fn as_core_opcode_dispatch_host(&mut self) -> Option<&mut CoreOpcodeDispatchHost> {
+        Some(self)
+    }
+
     fn targeted_register_roots(
         &mut self,
         heap: &mut Heap,
@@ -15497,6 +15538,22 @@ impl CoreOpcodeDispatchHost {
             .map_err(DispatchOutcome::Fail)?;
         self.define_non_enumerable_data_field_with_write_barrier(heap, error, "message", message)?;
         Ok(error)
+    }
+
+    /// V1b (baseline-dispatch.md): materialize the FAITHFUL `TypeError` cell the
+    /// baseline-JIT runtime bridge surfaces on a genuine type-error throw (a
+    /// `Symbol` operand, BigInt/Number mixing, ...) — the value `VM::m_exception`
+    /// would hold — REPLACING the meaningless 0x8 sentinel the bridge used while
+    /// the throw object was unmaterialized. Wraps [`Self::type_error_value`] so the
+    /// bridge surfaces a real `EncodedJSValue`. `Err` only on an allocation failure
+    /// while building the error. (The generic message is a documented fidelity gap;
+    /// JSC's per-cause messages are a separate refinement — the load-bearing fix
+    /// here is that the surfaced VALUE is a real TypeError cell, not 0x8.)
+    pub(crate) fn jit_bridge_type_error_value(
+        &mut self,
+        heap: &mut Heap,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        self.type_error_value(heap, "Type error in arithmetic operation")
     }
 
     fn native_map_constructor(
