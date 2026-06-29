@@ -39,9 +39,8 @@ mod slot_visitor;
 // wiring is DEBUG-ONLY (the twin + cross-checks compile out of release, keeping release
 // byte-identical to today), so these re-exports are debug-gated to stay 0-warning when
 // the consumer is absent.
-#[cfg(debug_assertions)]
-pub(crate) use marked_block::CellPtr;
-#[cfg(debug_assertions)]
+// gc-r4 R4a: `MarkedSpace` is the RELEASE object-cell arena (interpreter::object_store);
+// re-exported unconditionally now. `CellPtr` stays internal to gc::heap.
 pub(crate) use marked_space::MarkedSpace;
 
 #[cfg(feature = "arm64_native_entry_proof")]

@@ -66,9 +66,9 @@ pub use heap::{
 #[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use heap::{HeapConservativeScanAppendReceipt, HeapMarkingError, HeapMarkingRecord};
 // gc-r4 R3 (reversible shadow oracle): the S4 arena + carried cell address, surfaced to
-// interpreter::object_store for the byte-twin cross-check. DEBUG-ONLY (see gc/heap.rs).
-#[cfg(debug_assertions)]
-pub(crate) use heap::{CellPtr, MarkedSpace};
+// interpreter::object_store: the RELEASE object-cell arena (gc-r4 R4a — the arena is THE
+// cell store and its address is identity). `CellPtr` is not named outside gc::heap.
+pub(crate) use heap::MarkedSpace;
 pub(crate) use machine_stack_marker::{
     JscMachineStackConservativeRootingProof, JscMachineStackMarker,
 };

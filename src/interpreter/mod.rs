@@ -3213,7 +3213,10 @@ struct CoreGlobalLexicalBinding {
     attributes: BindingAttributes,
 }
 
-#[derive(Clone, Debug)]
+// gc-r4 R4a (decision C): the `Clone` derive is DROPPED — `CoreObjectStore` is no longer
+// `Clone` (the arena holds raw exposed pages and cell identity IS the arena address, which
+// re-pinning would break). The derive had no runtime caller.
+#[derive(Debug)]
 pub struct CoreOpcodeDispatchHost {
     function_blocks: Vec<InterpreterFunctionCodeBlock>,
     objects: CoreObjectStore,
@@ -4976,14 +4979,18 @@ impl CoreOpcodeDispatchHost {
             {
                 return GeneratedPropertyStoreMutationResult::rejected(Miss::BarrierRejected);
             }
-            let handle = {
-                let Some(cell) = self.objects.find_mut(request.base) else {
-                    return GeneratedPropertyStoreMutationResult::rejected(Miss::UnknownObject);
-                };
+            // gc-r4 R4a: read the guarded handle through the `with_cell_mut` island (a
+            // read here, but the call site is in a `&mut self` mutation path). Closure
+            // returns the handle or an `Err` reason; `None` == not a live object cell.
+            let handle = match self.objects.with_cell_mut(request.base, |cell| {
                 if cell.kind != CoreObjectKind::Array || cell.structure_id != hit.base_structure {
-                    return GeneratedPropertyStoreMutationResult::rejected(Miss::StructureMismatch);
+                    return Err(Miss::StructureMismatch);
                 }
-                cell.butterfly
+                Ok(cell.butterfly)
+            }) {
+                None => return GeneratedPropertyStoreMutationResult::rejected(Miss::UnknownObject),
+                Some(Err(reason)) => return GeneratedPropertyStoreMutationResult::rejected(reason),
+                Some(Ok(handle)) => handle,
             };
             // Existing-element guard: a present (non-hole, in-bounds) slot stores; a
             // hole or out-of-range rejects (butterfly_elem_get flattens both to None).
@@ -5118,25 +5125,23 @@ impl CoreOpcodeDispatchHost {
         // under the cell borrow and returns the deferred butterfly slab write (the
         // putDirectOffset mirror), which is applied after the borrow releases (the
         // &mut self slab write cannot coexist with the &mut cell borrow).
-        let (old_structure, slab_write) = {
-            let Some(cell) = self.objects.find_mut(request.base) else {
-                return GeneratedPropertyStoreMutationResult::rejected(Miss::UnknownObject);
-            };
+        // gc-r4 R4a: the cell mutation runs inside the `with_cell_mut` island; the closure
+        // returns the deferred slab write (applied after the borrow releases) or an `Err`
+        // reason. `None` from `with_cell_mut` == not a live object cell.
+        let (old_structure, slab_write) = match self.objects.with_cell_mut(request.base, |cell| {
             match hit.continuation_plan_kind {
                 PropertyStoreAccessCasePlanKind::DataOnlyReplace => {
                     // gc-r4 B-iv: the butterfly slot at planned_offset IS the value
                     // authority; an in-place replace just writes it (the structure +
                     // offset are unchanged — validated above). No HashMap to update.
-                    (
+                    Ok((
                         None,
                         Some((cell.butterfly, hit.planned_offset, hit.stored_value)),
-                    )
+                    ))
                 }
                 PropertyStoreAccessCasePlanKind::DataOnlyTransition => {
                     let Some(new_structure) = hit.planned_new_structure else {
-                        return GeneratedPropertyStoreMutationResult::rejected(
-                            Miss::MissingTransitionStructure,
-                        );
+                        return Err(Miss::MissingTransitionStructure);
                     };
                     let old_structure = cell.structure_id;
                     // The planned (new_structure, planned_offset) came from a real
@@ -5146,10 +5151,10 @@ impl CoreOpcodeDispatchHost {
                     // at that offset (putDirectOffset analog). gc-r4 B-iv: the butterfly
                     // slot is the sole value authority — no per-cell HashMap insert.
                     cell.structure_id = new_structure;
-                    (
+                    Ok((
                         Some(old_structure),
                         Some((cell.butterfly, hit.planned_offset, hit.stored_value)),
-                    )
+                    ))
                 }
                 PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
                     unreachable!("handled before named store mutation")
@@ -5158,6 +5163,10 @@ impl CoreOpcodeDispatchHost {
                     unreachable!("checked before barrier")
                 }
             }
+        }) {
+            None => return GeneratedPropertyStoreMutationResult::rejected(Miss::UnknownObject),
+            Some(Err(reason)) => return GeneratedPropertyStoreMutationResult::rejected(reason),
+            Some(Ok(pair)) => pair,
         };
         if let Some((handle, offset, value)) = slab_write {
             self.objects.butterfly_prop_put(handle, offset, value);
@@ -18007,9 +18016,9 @@ impl CoreOpcodeDispatchHost {
             .objects
             .allocate_with_prototype_with_write_barrier(heap, Some(prototype))
             .map_err(DispatchOutcome::Fail)?;
-        if let Some(cell) = self.objects.find_mut(wrapper) {
+        self.objects.with_cell_mut(wrapper, |cell| {
             cell.primitive_value = Some(numeric_value);
-        }
+        });
         Ok(wrapper)
     }
 
@@ -18026,9 +18035,9 @@ impl CoreOpcodeDispatchHost {
             .objects
             .allocate_with_prototype_with_write_barrier(heap, Some(prototype))
             .map_err(DispatchOutcome::Fail)?;
-        if let Some(cell) = self.objects.find_mut(wrapper) {
+        self.objects.with_cell_mut(wrapper, |cell| {
             cell.primitive_value = Some(bool_value);
-        }
+        });
         Ok(wrapper)
     }
 
@@ -18045,9 +18054,9 @@ impl CoreOpcodeDispatchHost {
             .objects
             .allocate_with_prototype_with_write_barrier(state.heap, Some(prototype))
             .map_err(DispatchOutcome::Fail)?;
-        if let Some(cell) = self.objects.find_mut(wrapper) {
+        self.objects.with_cell_mut(wrapper, |cell| {
             cell.primitive_value = Some(string_value);
-        }
+        });
         Ok(wrapper)
     }
 
@@ -24180,7 +24189,9 @@ mod tests {
             property_order.push(key);
         }
         ObjectStoreMutationSnapshot {
-            object_count: objects.objects.len(),
+            // gc-r4 R4a: the deleted `objects` Vec len is now the arena's monotone allocated
+            // cell count (no sweep pre-R4b, so it tracks total live object cells like the Vec did).
+            object_count: objects.space.allocated_blob_cell_count(),
             next_structure_id: objects.structure_table.peek_next_handle().raw(),
             structure_id,
             properties,
@@ -24684,8 +24695,12 @@ mod tests {
         let this_value = host.objects.allocate();
         let callee_cell = allocate_object_interpreter_cell_id(&mut heap).unwrap();
         let this_cell = allocate_object_interpreter_cell_id(&mut heap).unwrap();
-        host.objects.find_mut(callee_value).unwrap().cell_id = callee_cell;
-        host.objects.find_mut(this_value).unwrap().cell_id = this_cell;
+        host.objects
+            .with_cell_mut(callee_value, |cell| cell.cell_id = callee_cell)
+            .unwrap();
+        host.objects
+            .with_cell_mut(this_value, |cell| cell.cell_id = this_cell)
+            .unwrap();
         let callee_payload = cell_payload(callee_value);
         let this_payload = cell_payload(this_value);
         assert_eq!(heap.cell_for_payload(callee_payload), None);
@@ -24750,40 +24765,11 @@ mod tests {
         assert!(!unknown_cell_result.authorizes_direct_call());
     }
 
-    #[test]
-    fn object_store_indexes_object_payloads_and_rebuilds_clone_index() {
-        let mut objects = CoreObjectStore::default();
-        let first = objects.allocate_with_prototype(None);
-        let second = objects.allocate_with_prototype(None);
-        let first_payload = first.as_cell().unwrap().pointer_payload_bits();
-        let second_payload = second.as_cell().unwrap().pointer_payload_bits();
-
-        assert_eq!(
-            objects.object_indices_by_payload.get(&first_payload),
-            Some(&0)
-        );
-        assert_eq!(
-            objects.object_indices_by_payload.get(&second_payload),
-            Some(&1)
-        );
-        assert!(core::ptr::eq(
-            objects.find(first).unwrap(),
-            objects.objects[0].as_ref().get_ref()
-        ));
-        assert!(core::ptr::eq(
-            objects.find(second).unwrap(),
-            objects.objects[1].as_ref().get_ref()
-        ));
-
-        let cloned = objects.clone();
-        assert!(!cloned
-            .object_indices_by_payload
-            .contains_key(&first_payload));
-        for (index, object) in cloned.objects.iter().enumerate() {
-            let payload = core::ptr::from_ref(object.as_ref().get_ref()) as usize;
-            assert_eq!(cloned.object_indices_by_payload.get(&payload), Some(&index));
-        }
-    }
+    // gc-r4 R4a: `object_store_indexes_object_payloads_and_rebuilds_clone_index` is
+    // REMOVED — it asserted on the deleted `object_indices_by_payload` index, the deleted
+    // `objects` Vec, and `CoreObjectStore::clone()` (all gone with the arena flip). The
+    // arena-address-identity resolution path (`find` -> `MarkedSpace::find`) is covered by
+    // `r4a_arena_flip_tests` in interpreter/object_store.rs.
 
     /// Route B S1 cross-check: the new in-cell JSCell::m_type analog (JsType) must
     /// (i) sit at a fixed, kind-consistent offset on every cell kind, (ii) match the

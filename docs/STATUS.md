@@ -95,12 +95,21 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   SUITE-WIDE (2740 tests, zero fires); release compiles it ALL out (byte-identical to HEAD, zero extra mem).
   First wiring of the S4 arena into the live engine. Caveat: proves ACCEPT+STORE+population, NOT the live
   deref (re-syncs at read) — the self-aliasing live-deref is R4's miri gate.
-- [next-GC] R4 FLIP (IRREVERSIBLE — the final cell-identity cutover): delete the leaking Vec<Pin<Box>> stores
-  + object_indices_by_payload; raw arena addr = sole identity; ~56 find_mut → arena.with_cell_mut closures
-  (the ~3 two-cell self-aliasing families stay copy-out); WIRE the authored trace (GAP A) + sweep (GAP B) +
-  run the collector. Gate = TECHNICAL: miri on the live deref (-Zmiri-tree-borrows, the self-aliasing
-  hotspots R3 doesn't cover) + adversarial grep verifier + 15 benches (runnable once the collector fixes the
-  leak). This permanently fixes the OOM leak (SD-4: each aux slab then needs its own Auxiliary trace+sweep).
+- [done] R4a cell-identity FLIP (IRREVERSIBLE, verified sound-and-complete): CoreObjectCell identity = the
+  raw MarkedSpace arena address; DELETED the leaking Vec<Pin<Box>> object stores + object_indices_by_payload
+  + the R3 shadow. MarkedSpace::find (isPointerGCObjectJSCell port) is the object-vs-foreign TYPE GATE (leaf
+  String/Symbol/BigInt cells stay in their own Vec stores → Box addr ∉ arena block → None → no type-confusion
+  deref); cell_at(&self)/with_cell_mut(&mut self) deref islands; ~30 find_mut → with_cell_mut (find() stays,
+  132 read sites untouched); self-aliasing copy-out is COMPILER-ENFORCED by the safe API. Gate (TECHNICAL,
+  the leak forbids benches pre-R4b): 2750 tests + miri tree-borrows 0 UB (deref/butterfly/self-aliasing/
+  type-gate) + release round-trip + INDEPENDENT adversarial verify = sound-and-complete (7/7 refutations
+  failed). Decision D (ptr<<8 / ptr<2^41) confirmed in release; B: find_by_object_id uses a store-local
+  CellId→addr index (heap unreachable) — **R4b's sweep MUST invalidate stale entries**; C: CoreObjectStore::
+  clone deleted. NIT: vestigial shadow fns + dead CoreObjectCell Clone to prune.
+- [next-GC] R4b — wire+run the collection CYCLE (the LEAK FIX): roots (root snapshot / conservative JSStack
+  span) → mark via trace_cell (GAP A, authored) → sweep via FreeList::sweep_block (GAP B, authored) → reclaim
+  (+ invalidate the CellId→addr index on sweep). THEN the leak is fixed, heavy benches run, and the FULL R4
+  gate (15 Octane) closes → R becomes measurable. Per SD-4 each aux slab also needs its own Auxiliary sweep.
 
 ## Baseline JIT / DFG / FTL (parity lives here; ~0% started)
 - [done] JIT↔runtime bridge-infra (adversarially verified): extern-C operation_value_add shim

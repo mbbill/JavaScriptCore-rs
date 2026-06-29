@@ -325,6 +325,21 @@ impl Default for MarkedSpace {
     }
 }
 
+// gc-r4 R4a: `MarkedSpace` is the RELEASE object-cell arena owned by the interpreter's
+// `CoreObjectStore` (which `#[derive(Debug)]`s, transitively required by the dispatch
+// host's Debug). The space holds raw exposed pages + bitmaps with no meaningful Debug;
+// surface only the population summary (mirrors the retired R3 ShadowOracle Debug).
+impl std::fmt::Debug for MarkedSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarkedSpace")
+            .field("directories", &self.directories.len())
+            .field("blocks", &self.blocks.set.len())
+            .field("precise_cells", &self.precise_set.len())
+            .field("allocated_blob_cells", &self.allocated_blob_cells)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MarkedSpace {
     pub(crate) fn new() -> Self {
         MarkedSpace {
@@ -371,14 +386,16 @@ impl MarkedSpace {
         }
     }
 
-    // ============================ gc-r4 R3 SHADOW ORACLE ============================
-    // The REVERSIBLE bridge to R4 (docs/design/gc-r4.md "R3 (reversible)"): accept a
-    // real POD CELL BLOB (`CoreObjectCell`) into the arena via the SAME routing /
-    // BlockDirectory / FreeList path `allocate` uses, then prove byte-for-byte that the
-    // arena holds it identically and that the populations match. R3 needs the arena to
-    // ACCEPT + STORE a POD blob — NOT sweep (that is R4 / GAP B). The interpreter keeps
-    // its `Vec<Pin<Box<CoreObjectCell>>>` box path as the SOLE authority; these methods
-    // only let it mirror + cross-check a twin, so deleting them reverts to pre-R3.
+    // ===================== gc-r4 R4a: POD CELL BLOB ALLOCATION =====================
+    // `allocate_blob` accepts a real POD CELL BLOB (`CoreObjectCell`) into the arena via
+    // the SAME routing / BlockDirectory / FreeList path `allocate` uses. gc-r4 R4a (the
+    // flip) PROMOTED this from R3's debug-only byte-twin to THE object-cell allocation:
+    // `CoreObjectStore::allocate_cell` calls it and the returned address IS the cell's
+    // identity (the former `Vec<Pin<Box<CoreObjectCell>>>` box path is DELETED). The arena
+    // still does NOT sweep (R4b / GAP B), so cells accumulate. `allocated_blob_cell_count`
+    // is the monotone live-cell count (the post-flip analog of the old `objects.len()`).
+    // NOTE: `shadow_write`/`shadow_bytes_eq` below are R3 twin-resync VESTIGES with no
+    // remaining caller (there is no twin post-flip) — safe to prune in a follow-up.
 
     /// Route a POD cell blob by its byte size and store it via the production allocate
     /// path (a twin of the authoritative box cell). Returns the carried `CellPtr`.

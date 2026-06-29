@@ -1269,7 +1269,11 @@ fn eval_source_execution_error(_error: SourceExecutionError) -> ExecutionError {
     ExecutionError::EvalCompilationFailed
 }
 
-#[derive(Clone, Debug)]
+// gc-r4 R4a (decision C): `Clone` dropped — it embeds `CoreOpcodeDispatchHost`, which is no
+// longer `Clone` (the object arena holds raw exposed pages; cell identity is the arena
+// address). No runtime caller cloned a session handle (the octane run-structs holding it are
+// `Debug`-only).
+#[derive(Debug)]
 pub struct SourceSessionHandle {
     global_object: GlobalObjectId,
     global_object_value: RuntimeValue,

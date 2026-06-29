@@ -19,11 +19,12 @@ use super::*;
 // is not in the `interpreter` glob (`use super::*`), so it is imported here.
 use crate::value::CellValue;
 
-// gc-r4 R3 (reversible shadow oracle): the S4 cell arena + the carried cell address.
-// DEBUG-ONLY wiring (the whole oracle compiles out of release) — see `ShadowOracle`
-// and docs/design/gc-r4.md "R3 (reversible)".
-#[cfg(debug_assertions)]
-use crate::gc::{CellPtr, MarkedSpace};
+// gc-r4 R4a (the IRREVERSIBLE flip): the S4 cell arena is now THE object-cell home
+// (RELEASE), and its address IS the cell's identity (carried by `RuntimeValue::
+// from_cell`). `MarkedSpace::find` is the production OBJECT-vs-foreign type gate (a
+// faithful `HeapUtil::isPointerGCObjectJSCell` port) — see `find`/`with_cell_mut` and
+// docs/design/gc-r4.md "R4a ratified design".
+use crate::gc::MarkedSpace;
 
 pub(crate) fn can_use_get_by_id_megamorphic_property_name(text: &str) -> bool {
     !matches!(text, "length" | "name" | "prototype" | "__proto__")
@@ -39,85 +40,32 @@ pub(crate) fn can_use_put_by_id_megamorphic_property_name(text: &str) -> bool {
     text != "__proto__" && parse_array_index_name(text).is_none()
 }
 
-/// gc-r4 R3 — the REVERSIBLE shadow oracle (docs/design/gc-r4.md "R3 (reversible)").
-///
-/// The authoritative live-cell path stays `CoreObjectStore::objects`
-/// (`Vec<Pin<Box<CoreObjectCell>>>`), COMPLETELY UNCHANGED: it keeps publishing the box
-/// pointer so every `find`/`find_mut`/read site works untouched, and deleting this
-/// oracle reverts the engine to the pre-R3 state (full reversibility). On top of it, R3
-/// mirrors each cell into the real S4 `MarkedSpace` arena as a BYTE-TWIN keyed by the
-/// box-pointer payload, and cross-checks — at real `cargo test` volume, BEFORE the
-/// irreversible R4 flip — that the arena (a) can ACCEPT + STORE a `CoreObjectCell`-sized
-/// POD cell byte-identically through the production routing/FreeList/MarkedBlock path,
-/// and (b) holds a live-cell population matching the store. R3 does NOT sweep (R4 /
-/// gc-r4.md GAP B); twin addresses are distinct by construction (the FreeList bumps and
-/// never re-hands an address pre-sweep), so R4's "arena address == identity" precondition
-/// holds for free.
-///
-/// DEBUG-ONLY: the whole type and its uses are `#[cfg(debug_assertions)]`, so the twin
-/// allocation + cross-checks run across the entire `cargo test --lib` suite yet compile
-/// out of release — keeping release byte-identical to today (zero extra cell memory: the
-/// OOM-safety constraint) and the change fully reversible.
-#[cfg(debug_assertions)]
-struct ShadowOracle {
-    /// The S4 cell arena holding the byte-twins (gc::heap::MarkedSpace). `!Send+!Sync`,
-    /// and neither `Clone` nor `Debug` — so `CoreObjectStore`'s hand-written `Clone`
-    /// DETACHES it and `ShadowOracle`'s `Debug` is hand-written below.
-    space: MarkedSpace,
-    /// box-pointer payload (the `find`/`find_mut` key) -> the twin's arena `CellPtr`.
-    addr_by_payload: HashMap<usize, CellPtr, FxIntBuildHasher>,
-    /// ACTIVE on a primary/default store; DETACHED (inert) on a clone. A clone re-pins
-    /// `objects` to NEW heap addresses, so its cells' payloads differ from this store's
-    /// twins/keys and its population would not align; rather than re-home the arena on
-    /// every snapshot clone, a clone simply runs WITHOUT a shadow (still fully sound —
-    /// `find`/`find_mut` find no twin for the new payloads and skip the oracle).
-    active: bool,
-}
-
-#[cfg(debug_assertions)]
-impl Default for ShadowOracle {
-    fn default() -> Self {
-        // A primary store (built via `CoreObjectStore::default()`) gets an ACTIVE shadow.
-        Self {
-            space: MarkedSpace::new(),
-            addr_by_payload: HashMap::default(),
-            active: true,
-        }
-    }
-}
-
-#[cfg(debug_assertions)]
-impl ShadowOracle {
-    /// An inert shadow for a cloned store (see `active`).
-    fn detached() -> Self {
-        Self {
-            space: MarkedSpace::new(),
-            addr_by_payload: HashMap::default(),
-            active: false,
-        }
-    }
-}
-
-#[cfg(debug_assertions)]
-impl std::fmt::Debug for ShadowOracle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // MarkedSpace is not Debug; surface only the population summary.
-        f.debug_struct("ShadowOracle")
-            .field("active", &self.active)
-            .field("twins", &self.addr_by_payload.len())
-            .finish_non_exhaustive()
-    }
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct CoreObjectStore {
-    pub(crate) objects: Vec<Pin<Box<CoreObjectCell>>>,
-    // gc-r4 R3 (reversible shadow oracle): a DEBUG-ONLY byte-twin of each cell in the
-    // real S4 arena, cross-checked against the authoritative box cell at every
-    // `find`/`find_mut` + a population invariant — the R4-readiness proof. See
-    // `ShadowOracle`. Release builds omit this field entirely (zero cost, reversible).
-    #[cfg(debug_assertions)]
-    shadow: ShadowOracle,
+    // gc-r4 R4a (IRREVERSIBLE flip): the S4 MarkedSpace arena is THE object-cell home
+    // (was a `#[cfg(debug_assertions)]` byte-twin in R3). Every object cell is allocated
+    // into it via `allocate_blob` at the single `allocate_cell` chokepoint, and the cell's
+    // ARENA ADDRESS is its identity (carried by `RuntimeValue::from_cell`). `MarkedSpace::
+    // find` (a faithful `HeapUtil::isPointerGCObjectJSCell` port: bloom rule_out → block
+    // membership → atom-aligned → `is_live_cell`) is the OBJECT-vs-foreign type gate every
+    // `find`/`with_cell_mut` runs BEFORE dereferencing — it admits ONLY a live object-arena
+    // cell and NEVER touches a foreign leaf-cell (string/symbol/bigint) `Box` address, so a
+    // value carrying a leaf-cell address is rejected (None) instead of being misread as a
+    // `CoreObjectCell`. The former leaking `Vec<Pin<Box<CoreObjectCell>>>` + the
+    // `object_indices_by_payload` index + the R3 ShadowOracle are GONE. NOTE: cells still
+    // accumulate (no sweep until R4b) — the arena IS the leak now, by design.
+    pub(crate) space: MarkedSpace,
+    // gc-r4 R4a (decision B): reverse map from a published cell's `CellId` to its arena
+    // address, the post-flip replacement for the former linear `objects` scan in
+    // `find_by_object_id` (the DataIC megamorphic-holder probe's only id->cell path). C++
+    // bakes the raw `JSCell*` in the DataIC; the Rust port bakes an `ObjectId`/`CellId` and
+    // needs this reverse index. The heap already maps `CellId<->payload`
+    // (`heap.payload_for_cell`), but the two `find_by_object_id` call sites are `&self`/`&mut
+    // self` with NO `heap` in scope (the megamorphic probe API carries no heap), so the
+    // store mirrors that one mapping here, populated where a real `CellId` is stamped onto a
+    // cell (`bind_object_to_heap`/`assign_object_heap_cell`). Keyed by interpreter pointer
+    // bits — no DoS surface — so it uses the in-tree int hasher.
+    pub(crate) object_addr_by_cell_id: HashMap<CellId, usize, FxIntBuildHasher>,
     // gc-r4 B1a: the store-owned slab of live butterfly allocations, the home of
     // each object's out-of-line property+element region over `RuntimeValue`
     // (object/butterfly_handle.rs `ButterflyAllocation`; C++ `Butterfly`,
@@ -236,11 +184,8 @@ pub(crate) struct CoreObjectStore {
     // wiring lands in this unit.
     pub(crate) map_entry_lists: Vec<Vec<(RuntimeValue, RuntimeValue)>>,
     pub(crate) set_value_lists: Vec<Vec<RuntimeValue>>,
-    // VM-internal payload-bits -> object-slot index; keyed by interpreter pointer-bits,
-    // never JS/adversary-controlled, so it needs no SipHash DoS resistance. Use the
-    // in-tree FxIntBuildHasher (gc/fast_hash.rs, WTF IntHash/PtrHash family); the swap is
-    // semantically inert (get/insert/contains/clear/len are BuildHasher-independent).
-    pub(crate) object_indices_by_payload: HashMap<usize, usize, FxIntBuildHasher>,
+    // gc-r4 R4a: the former `object_indices_by_payload` (payload->Vec index) is DELETED —
+    // identity is the arena address and `MarkedSpace::find` is the membership/type gate.
     // C++ JSC: the per-VM Structure registry (`VM::structureIDTable`, in C++ implicit
     // in the Structure heap address). gc-r4 Batch 2 mounts the ported faithful
     // `StructureIdTable` (object/structure_cell.rs) as the SINGLE structure-id AND
@@ -410,107 +355,13 @@ const WIRED_TYPED_ARRAY_KINDS: [TypedArrayElementKind; 9] = [
     TypedArrayElementKind::Float64,
 ];
 
-impl Clone for CoreObjectStore {
-    fn clone(&self) -> Self {
-        let mut cloned = Self {
-            objects: self.objects.clone(),
-            // gc-r4 R3 (reversible shadow oracle): a clone re-pins every cell to a NEW
-            // address, so its twins/keys would not match the original arena; a cloned
-            // store runs with a DETACHED (inert) shadow (see ShadowOracle::active). This
-            // keeps the oracle on the primary store only — fully sound and reversible.
-            #[cfg(debug_assertions)]
-            shadow: ShadowOracle::detached(),
-            // gc-r4 Butterfly-values: deep-clone the whole butterfly slab by index so
-            // every `ButterflyHandle` stays valid across the snapshot AND the cloned
-            // store owns an INDEPENDENT slab. `objects.clone()` copies each cell's
-            // handle shallow; cloning the slab here in lockstep is exactly what makes
-            // that sound (the clone's handle indexes the clone's slab, never the
-            // source's) — the per-cell clone-independence the cell `Clone` relies on.
-            butterflies: self.butterflies.clone(),
-            // gc-r4 POD-ification (BoundFunction): deep-clone the bound-args slab in
-            // lockstep with `objects` so every cell's `bound_args` AuxiliaryHandle stays
-            // valid AND the cloned store owns an INDEPENDENT slab — the same soundness
-            // argument as `butterflies` above (the cell `Clone` copies the handle shallow;
-            // cloning the slab here is what makes that sound).
-            bound_args_backings: self.bound_args_backings.clone(),
-            // gc-r4 JSFunction-captures unit: deep-clone the captures + instance-field slabs
-            // in lockstep with `objects`, exactly like `bound_args_backings`, so every
-            // `AuxiliaryHandle` a cloned cell copied shallow indexes the CLONE's own slab
-            // (never the source's) AND the cloned store owns INDEPENDENT slabs — the same
-            // clone-independence invariant the cell's shallow handle-copy in
-            // `CoreObjectCell::clone` relies on.
-            captures_backings: self.captures_backings.clone(),
-            instance_field_lists: self.instance_field_lists.clone(),
-            // gc-r4 R4 POD-ification (Promise unit): deep-clone the reaction-list slab
-            // by index in lockstep with `objects`, exactly like `butterflies`, so every
-            // `PromiseReactionsHandle` a cloned cell copied shallow indexes the CLONE's
-            // own slab (never the source's). This lockstep clone is what makes the
-            // cell's shallow handle-copy in `CoreObjectCell::clone` sound.
-            promise_reaction_lists: self.promise_reaction_lists.clone(),
-            // gc-r4 RegExp unit: deep-clone the pattern-string slab in lockstep with
-            // `objects` (each cell's `AuxiliaryHandle` is copied shallow) so every
-            // handle stays valid AND the cloned store owns an INDEPENDENT slab — the
-            // same clone-independence invariant the butterfly slab relies on.
-            regexp_sources: self.regexp_sources.clone(),
-            // gc-r4 ArrayBuffer unit: deep-clone the byte-backing slab by index in
-            // lockstep with `objects` (each cell's `AuxiliaryHandle` is copied shallow)
-            // so every handle stays valid AND the cloned store owns an INDEPENDENT slab
-            // — the same clone-independence invariant as the butterfly/regexp slabs.
-            array_buffer_backings: self.array_buffer_backings.clone(),
-            // gc-r4 Map/Set unit: deep-clone both ordered-storage slabs in lockstep
-            // with `objects` (each collection cell's `AuxiliaryHandle` is copied
-            // shallow) so every handle stays valid AND the cloned store owns an
-            // INDEPENDENT slab — the same clone-independence invariant the butterfly
-            // slab relies on.
-            map_entry_lists: self.map_entry_lists.clone(),
-            set_value_lists: self.set_value_lists.clone(),
-            object_indices_by_payload: HashMap::default(),
-            // structure_table is keyed by StructureId handle (stable Vec slots across
-            // clone), so every cloned cell's structure_id stays valid and the offset
-            // graph is preserved. property_uids interns CorePropertyKey -> uid; cloning
-            // it keeps interned identities stable. structure_seed_roots is keyed by each
-            // prototype cell's pinned pointer payload (FIX 2); clone re-pins `objects`
-            // to new addresses, so seed lookups for the re-pinned prototypes may miss
-            // and fall back to fresh roots — conservative (IC misses, never wrong reads),
-            // and clone is a snapshot/test path, not the hot path.
-            structure_table: self.structure_table.clone(),
-            property_uids: self.property_uids.clone(),
-            property_keys_by_uid: self.property_keys_by_uid.clone(),
-            next_property_uid: self.next_property_uid,
-            structure_seed_roots: self.structure_seed_roots.clone(),
-            structure_transition_watchpoints: self.structure_transition_watchpoints.clone(),
-            structure_transition_watchpoints_by_structure: self
-                .structure_transition_watchpoints_by_structure
-                .clone(),
-            fired_watchpoint_events: self.fired_watchpoint_events.clone(),
-            structure_chain_invalidation_events: self.structure_chain_invalidation_events.clone(),
-            object_prototype: self.object_prototype,
-            function_prototype: self.function_prototype,
-            array_prototype: self.array_prototype,
-            string_prototype: self.string_prototype,
-            number_prototype: self.number_prototype,
-            boolean_prototype: self.boolean_prototype,
-            error_prototype: self.error_prototype,
-            type_error_prototype: self.type_error_prototype,
-            reference_error_prototype: self.reference_error_prototype,
-            range_error_prototype: self.range_error_prototype,
-            map_prototype: self.map_prototype,
-            set_prototype: self.set_prototype,
-            weak_map_prototype: self.weak_map_prototype,
-            weak_set_prototype: self.weak_set_prototype,
-            regexp_prototype: self.regexp_prototype,
-            promise_prototype: self.promise_prototype,
-            date_prototype: self.date_prototype,
-            bigint_prototype: self.bigint_prototype,
-            symbol_prototype: self.symbol_prototype,
-            array_buffer_prototype: self.array_buffer_prototype,
-            typed_array_prototypes: self.typed_array_prototypes,
-            data_view_prototype: self.data_view_prototype,
-        };
-        cloned.rebuild_object_indices();
-        cloned
-    }
-}
+// gc-r4 R4a (decision C): `impl Clone for CoreObjectStore` is DELETED. It was test-only
+// (the dispatch host's derived `Clone` had no runtime caller) and re-pinned every cell to
+// a NEW `Box` address — fundamentally incompatible with arena-ADDRESS identity (a cloned
+// store's cells would live at fresh arena addresses while every `RuntimeValue` still
+// carried the source addresses). The `MarkedSpace` arena is also `!Clone` by construction
+// (one set of exposed raw pages). The 3 `#[cfg(test)]` clone tests were rewritten/removed,
+// and the host's now-unused `#[derive(Clone)]` was dropped (see interpreter/mod.rs).
 
 #[derive(Clone, Debug)]
 pub(crate) struct CoreStructureTransitionWatchpointRecord {
@@ -3859,10 +3710,11 @@ impl CoreObjectStore {
             ..CoreObjectCell::default()
         });
         self.apply_value_store_write_barrier(heap, promise, result)?;
-        let Some(promise_cell) = self.find_mut(promise) else {
+        let Some(()) = self.with_cell_mut(promise, |promise_cell| {
+            promise_cell.promise_result = result;
+        }) else {
             return Err(ExecutionError::ExpectedObject);
         };
-        promise_cell.promise_result = result;
         Ok(promise)
     }
 
@@ -3882,11 +3734,12 @@ impl CoreObjectStore {
         }
         self.apply_value_store_write_barrier(heap, proxy, target)?;
         self.apply_value_store_write_barrier(heap, proxy, handler)?;
-        let Some(proxy_cell) = self.find_mut(proxy) else {
+        let Some(()) = self.with_cell_mut(proxy, |proxy_cell| {
+            proxy_cell.proxy_target = Some(target);
+            proxy_cell.proxy_handler = Some(handler);
+        }) else {
             return Err(ExecutionError::ExpectedObject);
         };
-        proxy_cell.proxy_target = Some(target);
-        proxy_cell.proxy_handler = Some(handler);
         Ok(proxy)
     }
 
@@ -3903,10 +3756,11 @@ impl CoreObjectStore {
             ..CoreObjectCell::default()
         });
         self.apply_value_store_write_barrier(heap, revoke, proxy)?;
-        let Some(revoke_cell) = self.find_mut(revoke) else {
+        let Some(()) = self.with_cell_mut(revoke, |revoke_cell| {
+            revoke_cell.native_bound_proxy = Some(proxy);
+        }) else {
             return Err(ExecutionError::ExpectedFunction);
         };
-        revoke_cell.native_bound_proxy = Some(proxy);
         Ok(revoke)
     }
 
@@ -3976,10 +3830,11 @@ impl CoreObjectStore {
             ..CoreObjectCell::default()
         });
         self.apply_value_store_write_barrier(heap, view, buffer)?;
-        let Some(view_cell) = self.find_mut(view) else {
+        let Some(()) = self.with_cell_mut(view, |view_cell| {
+            view_cell.view_buffer = Some(buffer);
+        }) else {
             return Err(ExecutionError::ExpectedObject);
         };
-        view_cell.view_buffer = Some(buffer);
         Ok(view)
     }
 
@@ -3999,10 +3854,11 @@ impl CoreObjectStore {
             ..CoreObjectCell::default()
         });
         self.apply_value_store_write_barrier(heap, view, buffer)?;
-        let Some(view_cell) = self.find_mut(view) else {
+        let Some(()) = self.with_cell_mut(view, |view_cell| {
+            view_cell.view_buffer = Some(buffer);
+        }) else {
             return Err(ExecutionError::ExpectedObject);
         };
-        view_cell.view_buffer = Some(buffer);
         Ok(view)
     }
 
@@ -4021,10 +3877,11 @@ impl CoreObjectStore {
             ..CoreObjectCell::default()
         });
         self.apply_value_store_write_barrier(heap, function, promise)?;
-        let Some(function_cell) = self.find_mut(function) else {
+        let Some(()) = self.with_cell_mut(function, |function_cell| {
+            function_cell.native_bound_promise = Some(promise);
+        }) else {
             return Err(ExecutionError::ExpectedFunction);
         };
-        function_cell.native_bound_promise = Some(promise);
         Ok(function)
     }
 
@@ -4725,45 +4582,31 @@ impl CoreObjectStore {
             // initial fill (fill_initial_property_storage) are no longer needed.
             cell.structure_id = self.seed_structure_id(cell.kind, cell.prototype);
         }
-        let mut object = Box::pin(cell);
-        let ptr = NonNull::from(object.as_mut().get_mut());
-        let payload = ptr.as_ptr() as usize;
-        let index = self.objects.len();
-        debug_assert!(
-            !self.object_indices_by_payload.contains_key(&payload),
-            "new interpreter object payload reused while still live"
-        );
-        self.objects.push(object);
-        self.object_indices_by_payload.insert(payload, index);
-        // gc-r4 R3 (reversible shadow oracle): mirror the just-published, fully
-        // initialized POD cell into the S4 arena as a byte-twin keyed by the same
-        // box-pointer payload, then assert the populations stay in lockstep. DEBUG-ONLY
-        // (folds out of release). This is the ACCEPT + STORE half of the R4-readiness
-        // proof: the arena holds a real CoreObjectCell-sized POD cell via the production
-        // routing/FreeList/MarkedBlock path. The box stays the SOLE authority — this is
-        // additive and reversible (delete to revert). See `ShadowOracle`.
-        #[cfg(debug_assertions)]
-        if self.shadow.active {
-            let len = core::mem::size_of::<CoreObjectCell>();
-            // SAFETY: `ptr` is the pinned heap cell (stable across the `objects` push
-            // above — a `Box` allocation never moves), fully initialized, `len` POD bytes.
-            let cp = unsafe {
-                self.shadow
-                    .space
-                    .allocate_blob(ptr.as_ptr() as *const u8, len)
-            };
-            self.shadow.addr_by_payload.insert(payload, cp);
-            // Population cross-check (every allocation, suite-wide): one twin per box
-            // cell, and the arena's live count tracks `objects` exactly (R3 never sweeps,
-            // so the arena count is monotone like the leaking box `Vec`).
-            debug_assert_eq!(self.shadow.addr_by_payload.len(), self.objects.len());
-            debug_assert_eq!(
-                self.shadow.space.allocated_blob_cell_count(),
-                self.objects.len()
-            );
-        }
-        // SAFETY: The host owns the boxed cell for the lifetime of the dispatch
-        // run and never moves the allocation after the value is published.
+        // gc-r4 R4a (THE FLIP): allocate the fully-initialized POD cell into the S4
+        // MarkedSpace arena through the production `allocate_blob` path (size routing ->
+        // BlockDirectory -> FreeList -> MarkedBlock; it sets the newly-allocated liveness
+        // bit so `MarkedSpace::find` admits the cell). The cell's ARENA ADDRESS is now its
+        // sole identity. `cell` is built on the stack and copied in byte-for-byte; the
+        // `needs_drop` assert proves `CoreObjectCell` is POD, so dropping the stack copy
+        // runs no destructor and the arena owns an independent byte copy. NO `Box`/`Vec`/
+        // payload index is retained — the arena IS the object-cell store (it accumulates
+        // until R4b's sweep; that is the leak, by design).
+        let len = core::mem::size_of::<CoreObjectCell>();
+        let src = core::ptr::from_ref(&cell).cast::<u8>();
+        // SAFETY: `src..src+len` is a fully-initialized POD `CoreObjectCell`
+        // (`needs_drop::<CoreObjectCell>() == false`, asserted at the struct def); the
+        // interpreter store is single-threaded (`!Send`/`!Sync`). `allocate_blob` copies
+        // the bytes into a fresh, never-before-handed-out, atom-aligned arena slot.
+        let cp = unsafe { self.space.allocate_blob(src, len) };
+        let addr = cp.addr();
+        // Identity = the arena address. `from_cell` only reads the pointer's integer bits
+        // (JSCJSValue.h asCell encoding — it NEVER dereferences here), so building the
+        // `GcRef` from the page's exposed arena provenance is sound + miri-clean. `addr`
+        // is a just-allocated live arena cell, hence non-null.
+        let ptr = core::ptr::with_exposed_provenance_mut::<CoreObjectCell>(addr);
+        let ptr = NonNull::new(ptr).expect("freshly allocated arena cell address is non-null");
+        // SAFETY: `ptr` addresses the live arena cell just written; no GC runs pre-R4b, so
+        // it is pinned/immovable for the value's lifetime.
         RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
     }
 
@@ -4787,13 +4630,8 @@ impl CoreObjectStore {
         })
     }
 
-    pub(crate) fn rebuild_object_indices(&mut self) {
-        self.object_indices_by_payload.clear();
-        for (index, object) in self.objects.iter().enumerate() {
-            let payload = core::ptr::from_ref(object.as_ref().get_ref()) as usize;
-            self.object_indices_by_payload.insert(payload, index);
-        }
-    }
+    // gc-r4 R4a: `rebuild_object_indices` is DELETED with `object_indices_by_payload`
+    // (its only caller was the now-deleted `Clone`). The arena IS the cell registry.
 
     /// Mint a fresh, EMPTY standalone structure (a new root in the structure_table).
     ///
@@ -5336,24 +5174,32 @@ impl CoreObjectStore {
             .as_cell()
             .map(|cell| cell.pointer_payload_bits())
             .ok_or(ExecutionError::ExpectedObject)?;
-        let Some(cell) = self.find_mut(value) else {
-            return Err(ExecutionError::ExpectedObject);
+        // gc-r4 R4a: the cell mutation runs inside the `with_cell_mut` deref island; the
+        // closure captures `heap` + `payload` (both distinct from `self`). It returns the
+        // resolved `CellId`; a `None` result means `value` is not a live object cell.
+        let cell_id = match self.with_cell_mut(value, |cell| -> Result<CellId, ExecutionError> {
+            if let Some(existing) = heap.cell_for_payload(payload) {
+                heap.publish_cell(existing)?;
+                cell.cell_id = existing;
+                return Ok(existing);
+            }
+            if cell.cell_id != CellId::default() {
+                heap.bind_cell_payload(cell.cell_id, payload)?;
+                heap.publish_cell(cell.cell_id)?;
+                return Ok(cell.cell_id);
+            }
+            let cell_id = allocate_object_interpreter_cell_id(heap)?;
+            heap.bind_cell_payload(cell_id, payload)?;
+            heap.publish_cell(cell_id)?;
+            cell.cell_id = cell_id;
+            Ok(cell_id)
+        }) {
+            None => return Err(ExecutionError::ExpectedObject),
+            Some(result) => result?,
         };
-        if let Some(existing) = heap.cell_for_payload(payload) {
-            heap.publish_cell(existing)?;
-            cell.cell_id = existing;
-            return Ok(existing);
-        }
-        if cell.cell_id != CellId::default() {
-            heap.bind_cell_payload(cell.cell_id, payload)?;
-            heap.publish_cell(cell.cell_id)?;
-            return Ok(cell.cell_id);
-        }
-
-        let cell_id = allocate_object_interpreter_cell_id(heap)?;
-        heap.bind_cell_payload(cell_id, payload)?;
-        heap.publish_cell(cell_id)?;
-        cell.cell_id = cell_id;
+        // gc-r4 R4a (decision B): index the published CellId -> arena address so the DataIC
+        // `find_by_object_id` probe can resolve a baked holder id without a `heap` in scope.
+        self.object_addr_by_cell_id.insert(cell_id, payload);
         Ok(cell_id)
     }
 
@@ -5363,14 +5209,23 @@ impl CoreObjectStore {
         value: RuntimeValue,
         cell_id: CellId,
     ) -> Result<(), ExecutionError> {
-        let Some(cell) = self.find_mut(value) else {
-            return Err(ExecutionError::ExpectedObject);
-        };
-        if cell.cell_id != CellId::default() && cell.cell_id != cell_id {
-            return Err(ExecutionError::UnknownObject);
+        let payload = value
+            .as_cell()
+            .map(|cell| cell.pointer_payload_bits())
+            .ok_or(ExecutionError::ExpectedObject)?;
+        match self.with_cell_mut(value, |cell| -> Result<(), ExecutionError> {
+            if cell.cell_id != CellId::default() && cell.cell_id != cell_id {
+                return Err(ExecutionError::UnknownObject);
+            }
+            heap.publish_cell(cell_id)?;
+            cell.cell_id = cell_id;
+            Ok(())
+        }) {
+            None => return Err(ExecutionError::ExpectedObject),
+            Some(result) => result?,
         }
-        heap.publish_cell(cell_id)?;
-        cell.cell_id = cell_id;
+        // gc-r4 R4a (decision B): index the CellId -> arena address (see bind_object_to_heap).
+        self.object_addr_by_cell_id.insert(cell_id, payload);
         Ok(())
     }
 
@@ -6147,7 +6002,7 @@ impl CoreObjectStore {
         // putDirectOffset analog: write the value at the structure-assigned offset into
         // the store-owned butterfly slab (copy the handle out under the cell borrow,
         // then write the slab via the &mut self butterfly API).
-        let handle = self.find_mut(object).map(|object_cell| {
+        let handle = self.with_cell_mut(object, |object_cell| {
             if shape_changed {
                 object_cell.structure_id = new_structure;
             }
@@ -6244,7 +6099,7 @@ impl CoreObjectStore {
             }
         };
         // putDirectOffset analog (into the store-owned butterfly slab).
-        let handle = self.find_mut(object).map(|object_cell| {
+        let handle = self.with_cell_mut(object, |object_cell| {
             if shape_changed {
                 object_cell.structure_id = new_structure;
             }
@@ -6332,7 +6187,7 @@ impl CoreObjectStore {
             }
         };
         // putDirectOffset analog (into the store-owned butterfly slab).
-        let handle = self.find_mut(object).map(|object_cell| {
+        let handle = self.with_cell_mut(object, |object_cell| {
             if shape_changed {
                 object_cell.structure_id = new_structure;
             }
@@ -6415,7 +6270,7 @@ impl CoreObjectStore {
             // is cleared after the cell borrow releases.
             let removed_offset = self.structure_offset(old_structure, key);
             let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
-            let handle = self.find_mut(object).map(|object_cell| {
+            let handle = self.with_cell_mut(object, |object_cell| {
                 object_cell.structure_id = new_structure;
                 object_cell.butterfly
             });
@@ -6462,7 +6317,7 @@ impl CoreObjectStore {
             self.convert_property_in_place(old_structure, key, attributes, true)
         };
         let getter_setter = self.allocate_getter_setter(getter, setter);
-        let handle = self.find_mut(object).map(|object_cell| {
+        let handle = self.with_cell_mut(object, |object_cell| {
             object_cell.structure_id = new_structure;
             object_cell.butterfly
         });
@@ -6745,10 +6600,8 @@ impl CoreObjectStore {
             // this batch; the faithful ChangePrototype transition is deferred).
             self.fresh_dictionary_structure(current_structure, None)
         };
-        let old_structure = {
-            let Some(object) = self.find_mut(object) else {
-                return Err(ExecutionError::ExpectedObject);
-            };
+        // Outer Option = "is a live object cell?"; inner Option = "did the prototype change?".
+        let old_structure = match self.with_cell_mut(object, |object| {
             if object.prototype != prototype {
                 let old_structure = object.structure_id;
                 object.prototype = prototype;
@@ -6757,6 +6610,9 @@ impl CoreObjectStore {
             } else {
                 None
             }
+        }) {
+            None => return Err(ExecutionError::ExpectedObject),
+            Some(inner) => inner,
         };
         if let Some(old_structure) = old_structure {
             self.finish_structure_transition(old_structure);
@@ -6810,15 +6666,17 @@ impl CoreObjectStore {
         if super_constructor_cell.kind != CoreObjectKind::Function {
             return Err(ExecutionError::ExpectedFunction);
         }
-        let Some(function_cell) = self.find_mut(function) else {
-            return Err(ExecutionError::ExpectedFunction);
-        };
-        if function_cell.kind != CoreObjectKind::Function {
-            return Err(ExecutionError::ExpectedFunction);
+        match self.with_cell_mut(function, |function_cell| {
+            if function_cell.kind != CoreObjectKind::Function {
+                return Err(ExecutionError::ExpectedFunction);
+            }
+            function_cell.super_base = Some(super_base);
+            function_cell.super_constructor = Some(super_constructor);
+            Ok(())
+        }) {
+            None => Err(ExecutionError::ExpectedFunction),
+            Some(result) => result,
         }
-        function_cell.super_base = Some(super_base);
-        function_cell.super_constructor = Some(super_constructor);
-        Ok(())
     }
 
     pub(crate) fn set_function_super_with_write_barrier(
@@ -6867,14 +6725,16 @@ impl CoreObjectStore {
         &mut self,
         function: RuntimeValue,
     ) -> Result<(), ExecutionError> {
-        let Some(function_cell) = self.find_mut(function) else {
-            return Err(ExecutionError::ExpectedFunction);
-        };
-        if function_cell.kind != CoreObjectKind::Function {
-            return Err(ExecutionError::ExpectedFunction);
+        match self.with_cell_mut(function, |function_cell| {
+            if function_cell.kind != CoreObjectKind::Function {
+                return Err(ExecutionError::ExpectedFunction);
+            }
+            function_cell.is_default_derived_constructor = true;
+            Ok(())
+        }) {
+            None => Err(ExecutionError::ExpectedFunction),
+            Some(result) => result,
         }
-        function_cell.is_default_derived_constructor = true;
-        Ok(())
     }
 
     pub(crate) fn is_default_derived_constructor(&self, function: RuntimeValue) -> bool {
@@ -6933,14 +6793,18 @@ impl CoreObjectStore {
         }
         // Cold path (first field on this constructor): lazily allocate its slab slot
         // (mirroring `push_promise_reaction`), record the POD handle on the cell, then
-        // push. The re-`find_mut` is needed because `allocate_instance_fields` borrows the
+        // push. The re-deref is needed because `allocate_instance_fields` borrows the
         // whole store. The slab preserves insertion order, so class-field init order (read
         // back by `instance_fields`) is unchanged.
         let new_handle = self.allocate_instance_fields();
-        let Some(constructor_cell) = self.find_mut(constructor) else {
+        if self
+            .with_cell_mut(constructor, |constructor_cell| {
+                constructor_cell.instance_fields = new_handle;
+            })
+            .is_none()
+        {
             return Err(ExecutionError::ExpectedFunction);
-        };
-        constructor_cell.instance_fields = new_handle;
+        }
         self.instance_field_lists[new_handle.0].push(record);
         Ok(())
     }
@@ -7489,14 +7353,16 @@ impl CoreObjectStore {
         cell: RuntimeValue,
         value: RuntimeValue,
     ) -> Result<(), ExecutionError> {
-        let Some(object) = self.find_mut(cell) else {
-            return Err(ExecutionError::ExpectedObject);
-        };
-        if object.kind != CoreObjectKind::ClosureCell {
-            return Err(ExecutionError::ExpectedObject);
+        match self.with_cell_mut(cell, |object| {
+            if object.kind != CoreObjectKind::ClosureCell {
+                return Err(ExecutionError::ExpectedObject);
+            }
+            object.binding_value = value;
+            Ok(())
+        }) {
+            None => Err(ExecutionError::ExpectedObject),
+            Some(result) => result,
         }
-        object.binding_value = value;
-        Ok(())
     }
 
     pub(crate) fn put_closure_cell_with_write_barrier(
@@ -7867,15 +7733,17 @@ impl CoreObjectStore {
     }
 
     pub(crate) fn revoke_proxy(&mut self, value: RuntimeValue) -> Result<(), ExecutionError> {
-        let Some(object) = self.find_mut(value) else {
-            return Err(ExecutionError::ExpectedObject);
-        };
-        if object.kind != CoreObjectKind::Proxy {
-            return Err(ExecutionError::ExpectedObject);
+        match self.with_cell_mut(value, |object| {
+            if object.kind != CoreObjectKind::Proxy {
+                return Err(ExecutionError::ExpectedObject);
+            }
+            object.proxy_target = None;
+            object.proxy_handler = None;
+            Ok(())
+        }) {
+            None => Err(ExecutionError::ExpectedObject),
+            Some(result) => result,
         }
-        object.proxy_target = None;
-        object.proxy_handler = None;
-        Ok(())
     }
 
     pub(crate) fn regexp_source_and_flags(
@@ -7942,25 +7810,33 @@ impl CoreObjectStore {
         state: PromiseState,
         result: RuntimeValue,
     ) -> Result<Vec<CorePromiseReaction>, ExecutionError> {
-        let Some(object) = self.find_mut(promise) else {
-            return Err(ExecutionError::ExpectedObject);
+        // gc-r4 R4a: the cell mutation runs in the `with_cell_mut` island; the closure
+        // returns `Ok(None)` for an already-settled promise (-> empty list), `Ok(Some(handle))`
+        // for a freshly-settled pending one, or `Err` for a non-promise. The slab drain
+        // runs AFTER the borrow (it needs `&mut self.promise_reaction_lists`).
+        let handle = match self.with_cell_mut(promise, |object| {
+            if object.kind != CoreObjectKind::Promise {
+                return Err(ExecutionError::ExpectedObject);
+            }
+            if object.promise_state != PromiseState::Pending {
+                return Ok(None);
+            }
+            object.promise_state = state;
+            object.promise_result = result;
+            Ok(Some(object.promise_reactions))
+        }) {
+            None => return Err(ExecutionError::ExpectedObject),
+            Some(inner) => inner?,
         };
-        if object.kind != CoreObjectKind::Promise {
-            return Err(ExecutionError::ExpectedObject);
-        }
-        if object.promise_state != PromiseState::Pending {
-            return Ok(Vec::new());
-        }
-        object.promise_state = state;
-        object.promise_result = result;
-        let handle = object.promise_reactions;
         // gc-r4 R4 POD-ification (Promise unit): the pending reaction records live in
-        // the store-owned `promise_reaction_lists` slab now. An INVALID handle == a
-        // pending promise that never had a reaction enqueued (empty
-        // `[[..Reactions]]`); otherwise drain the slot (settling a promise consumes
-        // its reaction list — C++ `JSPromise::reject`/`resolve` clears the fields).
-        // `mem::take` leaves an empty Vec in the slot; the now-settled promise never
-        // enqueues again, so the slot stays empty.
+        // the store-owned `promise_reaction_lists` slab now. `None`/INVALID == a pending
+        // promise that never had a reaction enqueued (empty `[[..Reactions]]`); otherwise
+        // drain the slot (settling a promise consumes its reaction list — C++
+        // `JSPromise::reject`/`resolve` clears the fields). `mem::take` leaves an empty Vec
+        // in the slot; the now-settled promise never enqueues again, so the slot stays empty.
+        let Some(handle) = handle else {
+            return Ok(Vec::new());
+        };
         if handle == PromiseReactionsHandle::INVALID {
             return Ok(Vec::new());
         }
@@ -7997,29 +7873,36 @@ impl CoreObjectStore {
         promise: RuntimeValue,
         reaction: CorePromiseReaction,
     ) -> Result<(), ExecutionError> {
-        let Some(object) = self.find_mut(promise) else {
-            return Err(ExecutionError::ExpectedObject);
-        };
-        if object.kind != CoreObjectKind::Promise {
-            return Err(ExecutionError::ExpectedObject);
-        }
         // gc-r4 R4 POD-ification (Promise unit): the reaction records live in the
-        // store-owned `promise_reaction_lists` slab now. Warm path: the promise
-        // already has a slab slot — push into it (single lookup).
-        let handle = object.promise_reactions;
+        // store-owned `promise_reaction_lists` slab now. Read the current handle (and
+        // validate kind) in the `with_cell_mut` island; the slab push runs after.
+        let handle = match self.with_cell_mut(promise, |object| {
+            if object.kind != CoreObjectKind::Promise {
+                return Err(ExecutionError::ExpectedObject);
+            }
+            Ok(object.promise_reactions)
+        }) {
+            None => return Err(ExecutionError::ExpectedObject),
+            Some(inner) => inner?,
+        };
+        // Warm path: the promise already has a slab slot — push into it (single lookup).
         if handle != PromiseReactionsHandle::INVALID {
             self.promise_reaction_lists[handle.0].push(reaction);
             return Ok(());
         }
         // Cold path (first reaction on this pending promise): lazily allocate its slab
-        // slot (C++ JSPromise's `[[..Reactions]]` records materialize on first
-        // enqueue), record the handle on the cell, then push. The re-`find_mut` is
-        // needed because `allocate_promise_reactions` borrows the whole store.
+        // slot (C++ JSPromise's `[[..Reactions]]` records materialize on first enqueue),
+        // record the handle on the cell, then push. The re-deref is needed because
+        // `allocate_promise_reactions` borrows the whole store.
         let new_handle = self.allocate_promise_reactions();
-        let Some(object) = self.find_mut(promise) else {
+        if self
+            .with_cell_mut(promise, |object| {
+                object.promise_reactions = new_handle;
+            })
+            .is_none()
+        {
             return Err(ExecutionError::ExpectedObject);
-        };
-        object.promise_reactions = new_handle;
+        }
         self.promise_reaction_lists[new_handle.0].push(reaction);
         Ok(())
     }
@@ -8489,27 +8372,63 @@ impl CoreObjectStore {
     }
 
     pub(crate) fn find(&self, value: RuntimeValue) -> Option<&CoreObjectCell> {
-        let payload = value.as_cell()?.pointer_payload_bits();
-        let index = self.object_indices_by_payload.get(&payload).copied()?;
-        let object = self.objects.get(index)?.as_ref().get_ref();
-        debug_assert_eq!(core::ptr::from_ref(object) as usize, payload);
-        // Cross-check the new in-cell JSCell::m_type (runtime/JSCell.h:298) against the
-        // existing object_indices_by_payload type gate: a cell reached through the
-        // object index MUST report an object-range JSType (C++ `m_type >= ObjectType`,
-        // runtime/JSType.h:204). Exercises the header on every object lookup; debug-only
-        // so release behavior is unchanged.
+        let addr = value.as_cell()?.pointer_payload_bits();
+        self.cell_at(addr)
+    }
+
+    /// gc-r4 R4a — the SOLE shared deref island. Resolve an arena address to a
+    /// `&CoreObjectCell` AFTER the `MarkedSpace::find` type/liveness gate (the faithful
+    /// `HeapUtil::isPointerGCObjectJSCell` membership check: bloom rule_out -> block
+    /// membership -> atom-aligned -> `is_live_cell`). The gate admits ONLY a live object-
+    /// arena cell and NEVER dereferences a foreign address, so a leaf-cell (string/symbol/
+    /// bigint) `Box` address — which lies in no arena block — returns `None` here instead
+    /// of being misread as a `CoreObjectCell` (the type-confusion UB the deleted
+    /// `object_indices_by_payload` index used to prevent). `None` for a non-cell value, a
+    /// leaf cell, or a dead address.
+    fn cell_at(&self, addr: usize) -> Option<&CoreObjectCell> {
+        // Type + liveness gate. `space.find` returns a `CellPtr` only for a live arena
+        // object cell; the shared borrow of `self.space` ends here (the result is Copy).
+        self.space.find(addr)?;
+        // SAFETY: the gate proved `addr` is a live `CoreObjectCell` in an arena page whose
+        // provenance was exposed once at `allocate_blob`; the bytes are an initialized POD
+        // cell. No GC runs pre-R4b, so the cell is pinned/immovable. The returned shared
+        // `&CoreObjectCell` is tied to `&self`, and the ONLY writer (`with_cell_mut`) needs
+        // `&mut self`, so no aliasing `&mut` to this cell can exist while this ref lives;
+        // overlapping SHARED refs are sound. This is the single shared-deref island.
+        let cell = unsafe { &*core::ptr::with_exposed_provenance::<CoreObjectCell>(addr) };
         debug_assert!(
-            object.js_type.is_object(),
-            "object reached via object_indices_by_payload must carry an object JSType"
+            cell.js_type.is_object(),
+            "cell admitted by MarkedSpace::find must carry an object JSType"
         );
-        let _ = object.cell_id;
-        // gc-r4 R3 shadow oracle: re-sync the arena twin from the box cell and assert
-        // byte-equality (the R4-readiness proof that the arena holds the cell
-        // byte-identically). Debug-only; skips cells with no twin (a pre-publish read or
-        // a detached clone). See `shadow_oracle_check`.
-        #[cfg(debug_assertions)]
-        self.shadow_oracle_check(payload);
-        Some(object)
+        Some(cell)
+    }
+
+    /// gc-r4 R4a — the SOLE mutable deref island (closure form, never a returned `&mut`;
+    /// the auditable replacement for the deleted `find_mut`). Resolve `value` -> arena
+    /// address, run the same `MarkedSpace::find` type/liveness gate, then hand the closure
+    /// a `&mut CoreObjectCell` for its scope only. Returns `None` (so the caller takes its
+    /// non-object path) when `value` is not a live object cell.
+    ///
+    /// THE SHARP EDGE (self-aliasing): the closure MUST NOT, while holding this `&mut`,
+    /// deref the SAME cell again or any OTHER cell it must read — JS lets `source === target`
+    /// (`Object.assign(o,o)`, `m.set(m,…)`, proto-chain walkers), and a second `&mut`/`&`
+    /// to overlapping arena bytes is INSTANT UB. Every such caller copies out the Copy data
+    /// FIRST, drops the borrow, then re-derefs (see those call sites).
+    pub(crate) fn with_cell_mut<R>(
+        &mut self,
+        value: RuntimeValue,
+        f: impl FnOnce(&mut CoreObjectCell) -> R,
+    ) -> Option<R> {
+        let addr = value.as_cell()?.pointer_payload_bits();
+        // Type + liveness gate (shared borrow of `self.space`, ended before the `&mut`).
+        self.space.find(addr)?;
+        // SAFETY: as `cell_at`, but mutable. The gate proved `addr` is a live arena
+        // `CoreObjectCell`; provenance was exposed once at `allocate_blob`; no GC pre-R4b.
+        // The `&mut CoreObjectCell` lives ONLY for `f`'s scope and is the unique borrow of
+        // this cell for that scope (callers never overlap it — see the self-aliasing note);
+        // `with_cell_mut` holds `&mut self` so no other store access path runs meanwhile.
+        let cell = unsafe { &mut *core::ptr::with_exposed_provenance_mut::<CoreObjectCell>(addr) };
+        Some(f(cell))
     }
 
     /// LLInt monomorphic GET fast path read, mirroring `performGetByIDHelper`'s
@@ -8523,33 +8442,29 @@ impl CoreObjectStore {
     /// so a structure match implies the cached offset is valid (invariant b) and
     /// the slot value equals what the slow path would return (invariant c).
     ///
-    /// This deliberately resolves the cell through `object_indices_by_payload` (an
-    /// integer-keyed probe) as the SOUNDNESS GATE before dereferencing: a payload
-    /// from a non-object cell (string/symbol/bigint, allocated in a different
-    /// `Pin<Box<T>>` store with a different layout) must never be read as a
-    /// `CoreObjectCell`, and the structure-id compare alone cannot prove the
-    /// pointer's type. DIVERGENCE from the frozen "deref the Pin<Box> directly"
-    /// note: the integer-keyed membership probe is kept as the type/liveness gate
-    /// for memory safety; it is far cheaper than the slow path it replaces (no
-    /// `CorePropertyKey` String allocation, no `properties`/`property_offsets`
-    /// key-hash lookups, no proxy/symbol/primitive guards, no observation /
-    /// completion-context build). Returns `None` on any miss so the caller falls
-    /// to the unchanged slow path and refills.
+    /// gc-r4 R4a: the SOUNDNESS GATE before dereferencing is `find` -> `MarkedSpace::find`
+    /// (the `HeapUtil::isPointerGCObjectJSCell` membership/liveness check), NOT the deleted
+    /// `object_indices_by_payload` index: a payload from a non-object cell (string/symbol/
+    /// bigint, allocated in a different `Pin<Box<T>>` store with a different layout) lies in
+    /// no arena block and is rejected (`None`), so it is never read as a `CoreObjectCell`,
+    /// and the structure-id compare alone need not prove the pointer's type. Still far
+    /// cheaper than the slow path it replaces (no `CorePropertyKey` allocation, no key-hash
+    /// lookups, no proxy/symbol/primitive guards, no observation build). `None` on any miss
+    /// so the caller falls to the unchanged slow path and refills.
     pub(crate) fn llint_get_by_id_fast(
         &self,
         receiver: RuntimeValue,
         cached_structure_id: StructureId,
         cached_offset: PropertyOffset,
     ) -> Option<RuntimeValue> {
-        let payload = receiver.as_cell()?.pointer_payload_bits();
-        let index = self.object_indices_by_payload.get(&payload).copied()?;
-        let cell = self.objects.get(index)?.as_ref().get_ref();
+        let cell = self.find(receiver)?;
         if cell.structure_id != cached_structure_id {
             return None;
         }
         // Structure match => same (kind, prototype, shape) => the cached offset is
         // a live own-data slot (invariant a/b). Read it directly from the butterfly
         // slab `props` mirror (store-owned) with NO key comparison or HashMap scan.
+        // `cell` (shared, tied to &self) and `butterfly_prop_get` (&self) coexist.
         let handle = cell.butterfly;
         self.butterfly_prop_get(handle, cached_offset)
     }
@@ -8582,19 +8497,13 @@ impl CoreObjectStore {
         cached_key: &CorePropertyKey,
         value: RuntimeValue,
     ) -> Result<bool, ExecutionError> {
-        let Some(payload) = receiver.as_cell().map(|cell| cell.pointer_payload_bits()) else {
-            return Ok(false);
-        };
-        let Some(index) = self.object_indices_by_payload.get(&payload).copied() else {
-            return Ok(false);
-        };
-        // Read-only structure/writability checks first (immutable borrow), so a
-        // miss bails BEFORE touching the GC write barrier.
+        // Read-only structure/writability checks first (shared borrow), so a miss bails
+        // BEFORE touching the GC write barrier. gc-r4 R4a: `find` (MarkedSpace::find) is the
+        // type/liveness gate; `find` + `structure_property` are both `&self`, so they coexist.
         {
-            let Some(cell) = self.objects.get(index) else {
+            let Some(cell) = self.find(receiver) else {
                 return Ok(false);
             };
-            let cell = cell.as_ref().get_ref();
             if cell.structure_id != cached_structure_id {
                 return Ok(false);
             }
@@ -8621,10 +8530,9 @@ impl CoreObjectStore {
         // this cell's shape, but the re-fetch keeps the store self-contained) and capture
         // the butterfly handle; the butterfly slot IS the value authority post-flip.
         let handle = {
-            let Some(cell) = self.objects.get(index) else {
+            let Some(cell) = self.find(receiver) else {
                 return Ok(false);
             };
-            let cell = cell.as_ref().get_ref();
             if cell.structure_id != cached_structure_id {
                 return Ok(false);
             }
@@ -8641,19 +8549,20 @@ impl CoreObjectStore {
         if object_id == ObjectId::default() {
             return None;
         }
-        self.objects
-            .iter()
-            .map(|object| object.as_ref().get_ref())
-            .find(|object| object.cell_id == object_id.0)
+        // gc-r4 R4a (decision B): resolve the baked `CellId` to its arena address via the
+        // store-local `object_addr_by_cell_id` reverse index, then deref through the SAME
+        // `MarkedSpace::find` gate as `find`. The former O(n) linear scan over the deleted
+        // `objects` Vec is gone.
+        let addr = self.object_addr_by_cell_id.get(&object_id.0).copied()?;
+        self.cell_at(addr)
     }
 
-    // Raw, pinned `CoreObjectCell*` (as `usize` bits) for an object id, the value a
-    // resident prototype DataIC bakes as its holder pointer. The cell is a
-    // `Pin<Box<_>>` and never moves, so this address is stable while the cell is
-    // live. Returns `None` for an unknown id or a Proxy (opaque) holder, which the
-    // resident DataIC must not bake (no fixed structure/offset layout). The address
-    // matches `value.as_cell().pointer_payload_bits()` for the cell's boxed value,
-    // the same equality `find` debug-asserts.
+    // Raw `CoreObjectCell*` (as `usize` bits) for an object id, the value a resident
+    // prototype DataIC bakes as its holder pointer. gc-r4 R4a: the cell now lives in the
+    // arena and never moves (no GC pre-R4b), so this ARENA address is stable while live
+    // and IS the cell's identity (`from_ref(cell)` == `value.as_cell().pointer_payload_bits()`
+    // for the cell's value). `None` for an unknown id or a Proxy (opaque) holder, which the
+    // resident DataIC must not bake (no fixed structure/offset layout).
     pub(crate) fn holder_cell_pointer_for_object_id(&self, object_id: ObjectId) -> Option<u64> {
         let cell = self.find_by_object_id(object_id)?;
         if cell.kind == CoreObjectKind::Proxy {
@@ -8662,67 +8571,9 @@ impl CoreObjectStore {
         Some(core::ptr::from_ref(cell) as usize as u64)
     }
 
-    pub(crate) fn find_mut(&mut self, value: RuntimeValue) -> Option<&mut CoreObjectCell> {
-        let payload = value.as_cell()?.pointer_payload_bits();
-        let index = self.object_indices_by_payload.get(&payload).copied()?;
-        // gc-r4 R3 shadow oracle: re-sync the arena twin from the (about-to-be-mutated)
-        // box cell and assert byte-equality BEFORE handing out the `&mut`. Debug-only;
-        // the `&self` borrow ends before the `&mut` below. See `shadow_oracle_check`.
-        #[cfg(debug_assertions)]
-        self.shadow_oracle_check(payload);
-        let object = self.objects.get_mut(index)?.as_mut().get_mut();
-        debug_assert_eq!(core::ptr::from_ref(object) as usize, payload);
-        Some(object)
-    }
-
-    /// gc-r4 R3 (reversible shadow oracle) per-access cross-check: re-sync the arena
-    /// byte-twin from the authoritative box cell, then assert the arena holds it
-    /// BYTE-IDENTICALLY (the R4-readiness proof). Re-sync is required because `find_mut`
-    /// hands out `&mut` and the mutation lands AFTER the call returns, so the twin is
-    /// brought current at each access (gc-r4.md: "or re-synced at read"), the box staying
-    /// authoritative. Skips payloads with no twin (a pre-publish read, or a detached
-    /// clone). DEBUG-ONLY. A failure here is a REAL divergence to surface, not paper over.
-    #[cfg(debug_assertions)]
-    fn shadow_oracle_check(&self, payload: usize) {
-        if !self.shadow.active {
-            return;
-        }
-        let Some(&cp) = self.shadow.addr_by_payload.get(&payload) else {
-            return;
-        };
-        let Some(index) = self.object_indices_by_payload.get(&payload).copied() else {
-            return;
-        };
-        let Some(boxed) = self.objects.get(index) else {
-            return;
-        };
-        let cell = boxed.as_ref().get_ref();
-        debug_assert_eq!(core::ptr::from_ref(cell) as usize, payload);
-        let src = core::ptr::from_ref::<CoreObjectCell>(cell) as *const u8;
-        let len = core::mem::size_of::<CoreObjectCell>();
-        // SAFETY: `cp` is a live twin this oracle allocated for `payload`; `src..src+len`
-        // is the pinned POD box cell; single-threaded; `shadow_write`/`shadow_bytes_eq`
-        // form no `&mut MarkedSpace`/`&MarkedBlock` (raw place copy/reads — contract C4/C5).
-        unsafe {
-            self.shadow.space.shadow_write(cp, src, len);
-            assert!(
-                self.shadow.space.shadow_bytes_eq(cp, src, len),
-                "gc-r4 R3 shadow oracle: arena twin not byte-equal to the box cell \
-                 (payload {payload:#x}) — the S4 arena did not hold the POD CoreObjectCell \
-                 byte-identically (R4 blocker)"
-            );
-        }
-    }
-
-    /// gc-r4 R3 population cross-check (test helper): the arena holds exactly one live
-    /// twin per box cell, and the arena's `allocate_blob` count tracks `objects`. True
-    /// only on an ACTIVE shadow (a detached clone returns false). DEBUG/TEST only.
-    #[cfg(all(test, debug_assertions))]
-    pub(crate) fn shadow_oracle_population_matches(&self) -> bool {
-        self.shadow.active
-            && self.shadow.addr_by_payload.len() == self.objects.len()
-            && self.shadow.space.allocated_blob_cell_count() == self.objects.len()
-    }
+    // gc-r4 R4a: `find_mut` (returned `&mut`) and the R3 `shadow_oracle_check` /
+    // `shadow_oracle_population_matches` are DELETED. The mutable path is the
+    // `with_cell_mut` closure island above; the arena is the sole authority (no twin).
 
     #[cfg(test)]
     pub(crate) fn cell_id(&self, value: RuntimeValue) -> Option<CellId> {
@@ -8915,51 +8766,11 @@ mod butterfly_values_cutover_tests {
         );
     }
 
-    // (e) CLONE-INDEPENDENCE: the snapshot path is `CoreObjectStore::clone()`, which
-    // deep-clones the WHOLE `butterflies` slab alongside `objects`. Handles are slab
-    // indices preserved across the clone, so the cloned cell's butterfly is the SAME
-    // index into an INDEPENDENT slab. Mutating the ORIGINAL's butterfly must not touch
-    // the clone's. (Proves the shallow per-cell handle copy is sound.)
-    #[test]
-    fn butterfly_values_clone_independence_via_store_snapshot() {
-        let mut store = CoreObjectStore::default();
-        let obj = store.allocate();
-        store
-            .put_data_own(obj, &ident(0), RuntimeValue::from_i32(111))
-            .unwrap();
-        let handle = store.find(obj).unwrap().butterfly;
-        let sid = store.find(obj).unwrap().structure_id;
-        let off0 = store.structure_offset(sid, &ident(0)).unwrap();
-        store.butterfly_elem_put(handle, 0, RuntimeValue::from_i32(222));
-
-        // snapshot (deep-clones objects + butterflies slab; handle index preserved)
-        let clone = store.clone();
-
-        // mutate the ORIGINAL's butterfly (both sides)
-        store.butterfly_prop_put(handle, off0, RuntimeValue::from_i32(999));
-        store.butterfly_elem_put(handle, 0, RuntimeValue::from_i32(888));
-
-        // the CLONE's same-index butterfly is an INDEPENDENT allocation -> unchanged
-        assert_eq!(
-            clone.butterfly_prop_get(handle, off0),
-            Some(RuntimeValue::from_i32(111)),
-            "clone prop slot must be independent of the original"
-        );
-        assert_eq!(
-            clone.butterfly_elem_get(handle, 0),
-            Some(RuntimeValue::from_i32(222)),
-            "clone element slot must be independent of the original"
-        );
-        // the ORIGINAL observes its own mutations
-        assert_eq!(
-            store.butterfly_prop_get(handle, off0),
-            Some(RuntimeValue::from_i32(999))
-        );
-        assert_eq!(
-            store.butterfly_elem_get(handle, 0),
-            Some(RuntimeValue::from_i32(888))
-        );
-    }
+    // gc-r4 R4a (decision C): the former `butterfly_values_clone_independence_via_store_
+    // snapshot` test is REMOVED — it exercised `CoreObjectStore::clone()` (the snapshot
+    // path), which is deleted because arena-ADDRESS identity is incompatible with re-pinning
+    // cells to fresh addresses. Butterfly slab handle/value behavior is covered by the other
+    // tests in this module (growth-survival, boundary, element API).
 }
 
 #[cfg(test)]
@@ -9935,84 +9746,151 @@ mod trace_cell_gap_a_tests {
     }
 }
 
-// gc-r4 R3 (reversible shadow oracle) — the de-risking proof that the S4 arena can
-// ACCEPT + STORE a real `CoreObjectCell`-sized POD cell byte-identically, with a
-// population matching the store, BEFORE the irreversible R4 flip. These run only in
-// debug (the oracle is `#[cfg(debug_assertions)]`); the per-access byte-equal cross-check
-// also runs implicitly across the WHOLE `cargo test --lib` suite via `find`/`find_mut`.
-#[cfg(all(test, debug_assertions))]
-mod shadow_oracle_r3_tests {
+// gc-r4 R4a (THE FLIP) — the deref-island soundness tests. The S4 arena is now THE
+// object-cell home and its ADDRESS is identity; these exercise the live raw-arena deref
+// (`find` shared / `with_cell_mut` mutable, both gated by `MarkedSpace::find`), the
+// butterfly second deref, the type gate's rejection of foreign (string) addresses, and
+// the self-aliasing copy-out shapes (Object.assign(o,o) / Map.set(m,m) / proto-chain).
+// These are the MIRI targets (run under `-Zmiri-permissive-provenance -Zmiri-tree-borrows`
+// to prove 0 UB on the raw arena deref); they run native in `cargo test --lib` too.
+#[cfg(test)]
+mod r4a_arena_flip_tests {
     use super::*;
 
-    /// ACCEPT + STORE + byte-equal across finds + population. Allocate a batch of object
-    /// cells (each gets an arena byte-twin), then drive `find`/`find_mut` (which run the
-    /// re-sync + byte-equal cross-check) and mutate through `find_mut` to exercise the
-    /// lockstep re-sync. A divergence would PANIC inside the oracle; reaching the end
-    /// proves the arena held every twin byte-identically.
+    fn ident(n: u32) -> CorePropertyKey {
+        CorePropertyKey::Identifier(n)
+    }
+
+    /// Round-trip: allocate object cells into the arena (`allocate_cell` -> `allocate_blob`),
+    /// resolve them through the `MarkedSpace::find` gate (`find` shared deref), mutate via
+    /// the `with_cell_mut` island, and grow the butterfly (the second, distinct-provenance
+    /// deref). Exercises the live raw-arena deref + butterfly deref end-to-end.
     #[test]
-    fn arena_accepts_stores_and_holds_cells_byte_identically() {
+    fn arena_round_trip_find_with_cell_mut_and_butterfly() {
         let mut store = CoreObjectStore::default();
         let mut values = Vec::new();
         for _ in 0..64 {
-            values.push(store.allocate()); // plain object cell -> allocate_cell -> twin
+            values.push(store.allocate());
         }
-        // Population: one arena twin per box cell; arena live count == store objects.
-        assert!(
-            store.shadow_oracle_population_matches(),
-            "R3 population cross-check (twins == arena live == objects.len())"
-        );
-        // Reads run the byte-equal cross-check (panic on divergence).
         for &v in &values {
             assert!(store.find(v).is_some());
         }
-        // Mutate through find_mut, then re-read: the twin re-syncs to the new bytes and
-        // stays byte-equal (proves the lockstep sync + arena round-trip under mutation).
+        // Mutate via the with_cell_mut island, then re-read via the find island.
         for (i, &v) in values.iter().enumerate() {
-            store.find_mut(v).unwrap().date_value = i as f64 + 0.5;
+            assert!(store
+                .with_cell_mut(v, |cell| cell.date_value = i as f64 + 0.5)
+                .is_some());
             assert_eq!(store.find(v).unwrap().date_value, i as f64 + 0.5);
         }
-        // Add out-of-line properties (grows the butterfly slab, mutates each cell) and
-        // re-read through find — the twin tracks every mutation.
+        // Grow the butterfly slab (out-of-line property values) and re-read.
         for &v in &values {
             for k in 0..8 {
                 store
                     .put_data_own(v, &ident(k), RuntimeValue::from_i32(k as i32))
                     .unwrap();
             }
-            assert!(store.find(v).is_some());
+            for k in 0..8 {
+                assert_eq!(
+                    store.get_own_property(v, &ident(k)).unwrap().unwrap().kind,
+                    CorePropertyKind::Data(RuntimeValue::from_i32(k as i32))
+                );
+            }
         }
-        assert!(store.shadow_oracle_population_matches());
     }
 
-    /// A cloned store runs with a DETACHED (inert) shadow: its population helper is
-    /// false (active == false) yet `find`/`find_mut` on its (re-pinned) cells stay sound
-    /// (no twin for the new payloads -> the oracle skips them) — full reversibility /
-    /// no false failures on the snapshot/test clone path.
+    /// THE TYPE GATE: a non-object value (and a fabricated foreign/dead address) must NOT
+    /// be admitted by `find`/`with_cell_mut` — proving `MarkedSpace::find` rejects a
+    /// non-arena address WITHOUT dereferencing it (no type-confusion UB on a string-box
+    /// or junk pointer).
     #[test]
-    fn cloned_store_runs_detached_and_finds_stay_sound() {
+    fn type_gate_rejects_non_object_values() {
         let mut store = CoreObjectStore::default();
-        let mut values = Vec::new();
-        for _ in 0..8 {
-            values.push(store.allocate());
-        }
-        assert!(store.shadow_oracle_population_matches());
-
-        let clone = store.clone();
-        assert!(
-            !clone.shadow_oracle_population_matches(),
-            "a clone is detached (inert shadow)"
-        );
-        // The clone's cells are re-pinned to NEW addresses; the original `values` no
-        // longer resolve in the clone (different payloads). The original still does, and
-        // its oracle still holds (the clone did not perturb the primary store).
-        for &v in &values {
-            assert!(store.find(v).is_some());
-        }
-        assert!(store.shadow_oracle_population_matches());
+        let obj = store.allocate();
+        assert!(store.find(obj).is_some());
+        // Primitives are not cells -> as_cell() is None -> rejected.
+        assert!(store.find(RuntimeValue::from_i32(7)).is_none());
+        assert!(store.find(RuntimeValue::undefined()).is_none());
+        assert!(store
+            .with_cell_mut(RuntimeValue::from_i32(7), |_| ())
+            .is_none());
+        // A cell value carrying a fabricated (non-arena) address must be rejected by the
+        // gate, not dereferenced. Build one via from_cell on a stack address; it lies in
+        // no arena block, so MarkedSpace::find rules it out.
+        let mut junk = 0u64;
+        let junk_ptr = core::ptr::NonNull::from(&mut junk).cast::<CoreObjectCell>();
+        // SAFETY: from_cell only reads the pointer's integer bits; it never derefs.
+        let junk_val = RuntimeValue::from_cell(unsafe { GcRef::from_non_null(junk_ptr) });
+        assert!(store.find(junk_val).is_none());
+        assert!(store.with_cell_mut(junk_val, |_| ()).is_none());
     }
 
-    /// helper local to this module (the file's other test mods define their own `ident`).
-    fn ident(n: u32) -> CorePropertyKey {
-        CorePropertyKey::Identifier(n)
+    /// SELF-ALIASING (Object.assign(o,o) shape): read all of `o`'s own data values
+    /// (shared `find`/get), THEN write them back to `o` (mutable `put_data_own` ->
+    /// `with_cell_mut`). Copy-out FIRST, drop the borrow, re-deref — never a `&mut` and
+    /// `&` to the same arena cell at once. Miri proves no double-borrow.
+    #[test]
+    fn self_aliasing_assign_same_object_is_copy_out() {
+        let mut store = CoreObjectStore::default();
+        let o = store.allocate();
+        for k in 0..6 {
+            store
+                .put_data_own(o, &ident(k), RuntimeValue::from_i32(k as i32 * 11))
+                .unwrap();
+        }
+        // assign(o, o): snapshot source==target first (shared reads), then store back.
+        let snapshot: Vec<(CorePropertyKey, RuntimeValue)> = (0..6)
+            .map(|k| {
+                let key = ident(k);
+                let v = match store.get_own_property(o, &key).unwrap().unwrap().kind {
+                    CorePropertyKind::Data(v) => v,
+                    _ => unreachable!(),
+                };
+                (key, v)
+            })
+            .collect();
+        for (key, v) in &snapshot {
+            store.put_data_own(o, key, *v).unwrap();
+        }
+        for k in 0..6 {
+            assert_eq!(
+                store.get_own_property(o, &ident(k)).unwrap().unwrap().kind,
+                CorePropertyKind::Data(RuntimeValue::from_i32(k as i32 * 11))
+            );
+        }
+    }
+
+    /// PROTOTYPE-CHAIN GET (N-cell walk): `o -> p1 -> p2`, a property on `p2`, resolved
+    /// through `get_property` which walks the chain via repeated shared `find` derefs.
+    /// Miri proves the multi-cell shared-deref walk is UB-free.
+    #[test]
+    fn self_aliasing_prototype_chain_get_walks_cells() {
+        let mut store = CoreObjectStore::default();
+        let p2 = store.allocate();
+        let p1 = store.allocate_with_prototype(Some(p2));
+        let o = store.allocate_with_prototype(Some(p1));
+        store
+            .put_data_own(p2, &ident(99), RuntimeValue::from_i32(0xabc))
+            .unwrap();
+        match store.get_property(o, &ident(99)).unwrap() {
+            CorePropertyGet::Data(v) => assert_eq!(v, RuntimeValue::from_i32(0xabc)),
+            other => panic!("expected data property from proto chain, got {other:?}"),
+        }
+    }
+
+    /// SELF-ALIASING (Map.set(m, m) shape): a map that is its OWN key. The receiver `m`
+    /// is resolved by `find` (shared deref) to reach its ordered-entry slab, and the key
+    /// VALUE `m` is stored Copy — never a second deref of `m` while a `&mut` to it is held.
+    /// Miri proves the self-keyed insert is UB-free.
+    #[test]
+    fn self_aliasing_map_set_self_key_is_copy_out() {
+        let mut store = CoreObjectStore::default();
+        let m = store.allocate_map();
+        let v = RuntimeValue::from_i32(0x5e7);
+        store.map_entries_push(m, m, v); // m.set(m, v) — map is its own key
+        assert_eq!(store.map_entries_len(m), 1);
+        let snap = store.map_entries_snapshot(m);
+        assert_eq!(snap[0].0, m, "self key is the map cell itself");
+        assert_eq!(snap[0].1, v);
+        assert_eq!(store.map_entry_value(m, 0), Some(v));
     }
 }
