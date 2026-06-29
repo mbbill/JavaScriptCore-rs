@@ -746,6 +746,23 @@ impl MacroAssemblerArm64 {
         self.asm().emit_nop();
     }
 
+    /// `pushPair(src1, src2)` (MacroAssemblerARM64.h:4221-4224):
+    /// `stp<64>(src1, src2, sp, PairPreIndex(-16))` == `stp src1, src2, [sp, #-16]!`.
+    /// The baseline op_add prologue uses this to spill the callee-saved registers
+    /// it clobbers (the tag pair x27/x28 and the pinned-VM carrier) so the
+    /// emitted function honors AAPCS64 toward its caller.
+    pub fn push_pair(&mut self, src1: RegisterID, src2: RegisterID) {
+        self.asm()
+            .emit_stp_pre_index64(src1, src2, RegisterID::Sp, -16);
+    }
+
+    /// `popPair(dest1, dest2)` (MacroAssemblerARM64.h:4216-4219):
+    /// `ldp<64>(dest1, dest2, sp, PairPostIndex(16))` == `ldp dest1, dest2, [sp], #16`.
+    pub fn pop_pair(&mut self, dest1: RegisterID, dest2: RegisterID) {
+        self.asm()
+            .emit_ldp_post_index64(dest1, dest2, RegisterID::Sp, 16);
+    }
+
     /// Absolute (far) call to a fixed 64-bit code address — JSC's
     /// `MacroAssemblerARM64::call(PtrTag)` (MacroAssemblerARM64.h:5441-5448):
     /// `moveWithFixedWidth(target, dataTempRegister)` then `m_assembler.blr`,

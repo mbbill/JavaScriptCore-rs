@@ -71,7 +71,13 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 - [done] JIT↔runtime bridge-infra (adversarially verified): extern-C operation_value_add shim
   (D1+D5 raw-ptr reborrow of vm+real host, Miri-passed) + Vm::operation_* split-borrow wrappers
   (evaluators verbatim) + D3 jit_pending exception word + far-call. docs/design/jit-runtime-bridge.md.
-  NEXT: op_add lowering (trampoline + fast/slow + execute) — 4 forward prereqs in the design doc.
+- [done] op_add baseline-JIT lowering (verified; EXECUTES native machine code under W^X): fast int32
+  (load64/branchIfNotInt32/branchAdd32 Overflow/boxInt32/store64, JITAddGenerator-faithful) + slow-path
+  far_call(operation_value_add) + exception edge + C-ABI trampoline (push_pair prologue, x19=pinned-VM,
+  x27/x28 tags). 4 native cases proven (2+3→5; overflow→boxed double; 1.5+2→3.5; throw→bail). TEMPLATE
+  conventions: x1=left/x2=right/x0=result (operands pre-placed in op-arg slots → zero slow-path moves);
+  x19=canonical pinned-VM reg. Standalone callable image — NOT yet wired to live tier-up dispatch.
+  NEXT: template sub/mul/bit/shift + branch ops → wire into the per-opcode emitter/tier-up (R moves there).
 - [missing] wire arm64_baseline to emit per-opcode via the encoder/finalize (retire the byte-blob /
   re-interpreter shim) + the bytecode-stream cutover + profiling wiring + tier-up.
 - [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.

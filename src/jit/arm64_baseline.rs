@@ -276,6 +276,7 @@ pub(crate) mod register_contract {
 mod control_flow;
 mod entry_prologue;
 mod frame_addressing;
+mod op_add;
 // Generated-frame materialization proof submodules: consumed only by the gated
 // ARM64 native-entry/admission proof apparatus (vm/arm64_native_entry.rs proof
 // fn + vm/native_reentry cluster). Gated off by default; the live baseline
