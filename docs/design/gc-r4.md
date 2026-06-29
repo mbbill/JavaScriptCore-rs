@@ -179,6 +179,39 @@ mechanical. The SHARP EDGE is below; the REAL work is the collector (next sectio
   preserved, every two-cell site provably copies out, `needs_drop::<CoreObjectCell>()==false`
   compiles; (d) all 15 Octane benches pass. Orchestrator verifies all four, then merges.
 
+### R4a ratified design (2026-06-29 — the flip audit's serial object-model decisions)
+
+The flip audit turned "delete object_indices_by_payload" into THREE object-model
+decisions, now RATIFIED (all in-tree-supported, low-risk):
+- **A — the type gate is MarkedSpace::find, NOT a HashMap to delete.** find/find_mut
+  are called with ARBITRARY values (is_object/is_array/is_map pass string/symbol/bigint
+  cells too). Those leaf cells stay in their OWN `Vec<Pin<Box>>` stores at Box addresses
+  (a pre-existing divergence — C++ keeps ALL cells in one MarkedSpace). So
+  `object_indices_by_payload` is the load-bearing OBJECT-vs-foreign gate (returns None
+  for leaf cells → find never derefs them; derefing a 4-field string box as a ~40-field
+  CoreObjectCell = type-confusion UB). REPLACE it with the already-built+tested
+  `MarkedSpace::find(addr)->Option<CellPtr>` (the HeapUtil::isPointerGCObjectJSCell port:
+  bloom rule_out → blocks.contains → atom-aligned → is_live_cell; NEVER derefs a foreign
+  addr). `space: MarkedSpace` becomes a RELEASE member of CoreObjectStore (promotes R3's
+  debug twin to THE allocation); allocate_cell routes through allocate_blob; identity =
+  arena address via from_cell. Leaf-cell Box addrs ∉ any arena block → MarkedSpace::find
+  returns None → no type confusion.
+- **B — find_by_object_id re-homes** to heap.payload_for_cell(id) → addr →
+  space.find(addr) → deref (the DataIC megamorphic holder probe; callers hold heap).
+- **C — CoreObjectStore::clone() is DELETED** (test-only; re-pins cells to new Box
+  addresses, incompatible with address-identity). Drop the impl + the unused
+  CoreOpcodeDispatchHost derive + rewrite/delete the 3 clone tests.
+- **D — value-encoding must be RELEASE-confirmed** (the orchestrator's job, on the target
+  machine): repr.rs encodes a cell as `ptr<<8` and asserts `ptr<2^41`. The arena uses the
+  same global allocator as Box, so arena addrs should fit like Box addrs do (R3 green),
+  but the encoding is only exercised on arena addrs AFTER the flip — confirm via a release
+  test before the irreversible commit; if it fails, fall back to the s4_raw_cell cfg.
+- **find() STAYS** a returning shared-deref (gated by MarkedSpace::find, tied to &self) —
+  keeps ~132 read sites unchanged; the R4a grep proof requires find_mut / objects.get_mut /
+  object_indices_by_payload / `Vec<Pin<Box>` = ZERO (NOT find=0). Self-aliasing (the SHARP
+  EDGE): the returning-find form makes most cases compile-enforced; the closure
+  with_cell_mut sites copy out Copy data first, drop the borrow, re-deref.
+
 ## The collector — the REAL gap (gated on POD-ness / Batch 1)
 
 The audit found the live cell has neither a trace nor a sweep; the only Trace impls are
