@@ -108,8 +108,19 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   re-enter the hook). Unsafe reborrow island adversarially verified sound + HARDENED (nested-park & Vm-pin
   debug guards; compare/truthy shims Miri-clean; valueOf-reentry test normal-profile-green). HONEST CAVEAT:
   arith-only allowlist — Octane material R needs property/call ops (R4 / B5-B6); R UNDEFINED until 15-gate.
-- [missing] wire arm64_baseline to emit per-opcode via the encoder/finalize (retire the byte-blob /
-  re-interpreter shim) + the bytecode-stream cutover + profiling wiring.
+- [done] the live path emits real per-opcode ARM64 via the MacroAssembler encoder + finalize (f139350);
+  the old P6/P15 byte-blob lane is now DEAD — retiring it (~22k LoC) is a DEFERRED off-gate cleanup
+  (moves neither R nor 15/15; do it in idle integration capacity, never preempting R4/calls).
+- [spec'd] op_call track (2026-06-29 audit; DEFERRED to a dedicated phase — bigger + partly B6-gated):
+  (1) correct divergence #1 — call-frame slot-2 holds CodeBlockId(u32), NOT a real CodeBlock* (the
+  load-bearing unblock for faithful op_call + cfr-relative recovery); (2) B5 real callee-frame seed into
+  the SINGLE live arena (not the leaf scratch) + callee resolve/arity/link; (3) parking correction =
+  per-region recursion-local save/restore of host+CodeBlock — NOT a heap parked-pointer stack
+  (anti-faithful). B4b (drop the dual-write Vec register oracle) entangles the shadow-disabled fallback
+  paths → folds into owner-gated B6 (CallFrameId→CallFrame*). Gates the call-heavy asm.js benches
+  (mandreel/octane-zlib) = the 15/15 other half.
+- [missing] bytecode-stream cutover + baseline profiling emission (ValueProfile/ArithProfile, a DFG
+  prereq downstream of R4/calls broadening the allowlist).
 - [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
 
 ## Structural fidelity
