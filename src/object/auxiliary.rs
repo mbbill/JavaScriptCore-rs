@@ -39,6 +39,31 @@ impl AuxiliaryHandle {
     pub const INVALID: Self = AuxiliaryHandle(usize::MAX);
 }
 
+/// Handle to one promise's store-owned reaction-record backing.
+///
+/// C++ JSC: a `JSPromise` reaches its pending reaction records through its
+/// internal `[[PromiseFulfillReactions]]`/`[[PromiseRejectReactions]]` fields
+/// (JSPromise.h:35); those reaction records are out-of-line, held off the cell.
+/// The Rust analog (pre-R4) is an index into the store-owned
+/// `CoreObjectStore::promise_reaction_lists` slab, exactly like `ButterflyHandle`.
+/// It is POD (`Copy`) so the owning promise cell carries no `Drop` field and stays
+/// sweep-eligible for R4 (gc-r4 R4 POD-ification). The records themselves
+/// (`CorePromiseReaction`) are already `Copy` GC-edge bundles; a later collector
+/// trace visits the slab to mark those edges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct PromiseReactionsHandle(pub usize);
+
+impl PromiseReactionsHandle {
+    /// Sentinel "no reaction backing allocated yet" handle.
+    ///
+    /// C++ JSC: a fresh `JSPromise`'s reaction fields start empty — no out-of-line
+    /// record backing exists until the first reaction is enqueued. The Rust analog:
+    /// a promise cell carries this sentinel until `push_promise_reaction` lazily
+    /// allocates its slab slot at first enqueue. Never indexes the slab.
+    pub const INVALID: Self = PromiseReactionsHandle(usize::MAX);
+}
+
 /// Allocate the byte backing for a typed-array/`ArrayBuffer` view.
 ///
 /// C++ JSC `ArrayBufferContents` (ArrayBuffer.h:126): owns `void* m_data` of

@@ -54,6 +54,18 @@ pub(crate) struct CoreObjectStore {
     // `RuntimeValue` GC edges — a later collector trace MUST visit this backing
     // (gc-r4 GAP A); no trace wiring lands in this unit.
     pub(crate) bound_args_backings: Vec<Vec<RuntimeValue>>,
+    // gc-r4 R4 POD-ification (Promise unit): the store-owned slab of pending
+    // promise reaction-record lists, the home of each pending promise's
+    // out-of-line reaction records (C++ JSPromise `[[PromiseFulfillReactions]]`/
+    // `[[PromiseRejectReactions]]`, JSPromise.h:35). A `PromiseReactionsHandle` is an
+    // index into this Vec; the slot is lazily allocated on first enqueue
+    // (`push_promise_reaction`) and drained on settle (`take_promise_reactions`).
+    // Relocated OUT of the per-cell `promise_reactions: Vec<..>` so `CoreObjectCell`
+    // sheds another `Drop` field (the records are `Copy`, but the `Vec` was not).
+    // C++ allocates these records from the GC heap; the store-owned slab is the
+    // pre-R4 analog (a later collector trace visits the slab to mark the `Copy`
+    // GC-edge bundles it holds).
+    pub(crate) promise_reaction_lists: Vec<Vec<CorePromiseReaction>>,
     // VM-internal payload-bits -> object-slot index; keyed by interpreter pointer-bits,
     // never JS/adversary-controlled, so it needs no SipHash DoS resistance. Use the
     // in-tree FxIntBuildHasher (gc/fast_hash.rs, WTF IntHash/PtrHash family); the swap is
@@ -245,6 +257,12 @@ impl Clone for CoreObjectStore {
             // argument as `butterflies` above (the cell `Clone` copies the handle shallow;
             // cloning the slab here is what makes that sound).
             bound_args_backings: self.bound_args_backings.clone(),
+            // gc-r4 R4 POD-ification (Promise unit): deep-clone the reaction-list slab
+            // by index in lockstep with `objects`, exactly like `butterflies`, so every
+            // `PromiseReactionsHandle` a cloned cell copied shallow indexes the CLONE's
+            // own slab (never the source's). This lockstep clone is what makes the
+            // cell's shallow handle-copy in `CoreObjectCell::clone` sound.
+            promise_reaction_lists: self.promise_reaction_lists.clone(),
             object_indices_by_payload: HashMap::default(),
             // structure_table is keyed by StructureId handle (stable Vec slots across
             // clone), so every cloned cell's structure_id stays valid and the offset
@@ -420,7 +438,15 @@ pub(crate) struct CoreObjectCell {
     pub(crate) regexp_flags_text: String,
     pub(crate) promise_state: PromiseState,
     pub(crate) promise_result: RuntimeValue,
-    pub(crate) promise_reactions: Vec<CorePromiseReaction>,
+    // C++ JSC JSPromise `[[PromiseFulfillReactions]]`/`[[PromiseRejectReactions]]`
+    // (JSPromise.h:35): a pending promise's out-of-line reaction records. gc-r4 R4
+    // POD-ification (Promise unit): the `Vec<CorePromiseReaction>` was RELOCATED into
+    // the store-owned `promise_reaction_lists` slab; this is now a POD (`Copy`)
+    // `PromiseReactionsHandle` index into it (`INVALID` until the first reaction is
+    // enqueued). Dropping the `Vec` here removes a `Drop` field so the cell is one
+    // step closer to sweep-eligible POD. Access routes through the store's
+    // `push_promise_reaction`/`take_promise_reactions`.
+    pub(crate) promise_reactions: PromiseReactionsHandle,
     pub(crate) promise_resolving_kind: Option<CorePromiseResolvingKind>,
     pub(crate) native_bound_promise: Option<RuntimeValue>,
     pub(crate) native_bound_proxy: Option<RuntimeValue>,
@@ -540,7 +566,10 @@ impl Default for CoreObjectCell {
             regexp_flags_text: String::new(),
             promise_state: PromiseState::default(),
             promise_result: RuntimeValue::default(),
-            promise_reactions: Vec::new(),
+            // gc-r4 R4 POD-ification (Promise unit): the INVALID sentinel — no
+            // reaction-list slab slot exists until `push_promise_reaction` lazily
+            // allocates one (C++ JSPromise's reaction fields start empty).
+            promise_reactions: PromiseReactionsHandle::INVALID,
             promise_resolving_kind: None,
             native_bound_promise: None,
             native_bound_proxy: None,
@@ -598,7 +627,12 @@ impl Clone for CoreObjectCell {
             regexp_flags_text: self.regexp_flags_text.clone(),
             promise_state: self.promise_state,
             promise_result: self.promise_result,
-            promise_reactions: self.promise_reactions.clone(),
+            // gc-r4 R4 POD-ification (Promise unit): copy the reaction-list HANDLE
+            // shallow (a plain Copy slab index). Sound for the SAME reason as
+            // `butterfly`: cell Clone is reached ONLY through `CoreObjectStore::clone`,
+            // which deep-clones `promise_reaction_lists` in lockstep, so the copied
+            // handle indexes the clone's own slab, never the source's.
+            promise_reactions: self.promise_reactions,
             promise_resolving_kind: self.promise_resolving_kind,
             native_bound_promise: self.native_bound_promise,
             native_bound_proxy: self.native_bound_proxy,
@@ -7033,7 +7067,18 @@ impl CoreObjectStore {
         }
         object.promise_state = state;
         object.promise_result = result;
-        Ok(std::mem::take(&mut object.promise_reactions))
+        let handle = object.promise_reactions;
+        // gc-r4 R4 POD-ification (Promise unit): the pending reaction records live in
+        // the store-owned `promise_reaction_lists` slab now. An INVALID handle == a
+        // pending promise that never had a reaction enqueued (empty
+        // `[[..Reactions]]`); otherwise drain the slot (settling a promise consumes
+        // its reaction list — C++ `JSPromise::reject`/`resolve` clears the fields).
+        // `mem::take` leaves an empty Vec in the slot; the now-settled promise never
+        // enqueues again, so the slot stays empty.
+        if handle == PromiseReactionsHandle::INVALID {
+            return Ok(Vec::new());
+        }
+        Ok(std::mem::take(&mut self.promise_reaction_lists[handle.0]))
     }
 
     pub(crate) fn take_promise_reactions_with_write_barrier(
@@ -7047,6 +7092,20 @@ impl CoreObjectStore {
         self.take_promise_reactions(promise, state, result)
     }
 
+    /// Allocate a fresh empty reaction-list slab slot and return its handle.
+    ///
+    /// C++ JSC: a pending promise's `[[..Reactions]]` records are GC-heap
+    /// allocations linked off the promise; this is the pre-R4 store-owned-slab
+    /// analog of allocating that out-of-line record backing (mirrors
+    /// `allocate_butterfly`). Lazily called by `push_promise_reaction` on a pending
+    /// promise's FIRST reaction (most promises settle without one, so the slab stays
+    /// small — unlike the butterfly slab, this is per-pending-promise, not per-cell).
+    fn allocate_promise_reactions(&mut self) -> PromiseReactionsHandle {
+        let index = self.promise_reaction_lists.len();
+        self.promise_reaction_lists.push(Vec::new());
+        PromiseReactionsHandle(index)
+    }
+
     pub(crate) fn push_promise_reaction(
         &mut self,
         promise: RuntimeValue,
@@ -7058,7 +7117,24 @@ impl CoreObjectStore {
         if object.kind != CoreObjectKind::Promise {
             return Err(ExecutionError::ExpectedObject);
         }
-        object.promise_reactions.push(reaction);
+        // gc-r4 R4 POD-ification (Promise unit): the reaction records live in the
+        // store-owned `promise_reaction_lists` slab now. Warm path: the promise
+        // already has a slab slot — push into it (single lookup).
+        let handle = object.promise_reactions;
+        if handle != PromiseReactionsHandle::INVALID {
+            self.promise_reaction_lists[handle.0].push(reaction);
+            return Ok(());
+        }
+        // Cold path (first reaction on this pending promise): lazily allocate its slab
+        // slot (C++ JSPromise's `[[..Reactions]]` records materialize on first
+        // enqueue), record the handle on the cell, then push. The re-`find_mut` is
+        // needed because `allocate_promise_reactions` borrows the whole store.
+        let new_handle = self.allocate_promise_reactions();
+        let Some(object) = self.find_mut(promise) else {
+            return Err(ExecutionError::ExpectedObject);
+        };
+        object.promise_reactions = new_handle;
+        self.promise_reaction_lists[new_handle.0].push(reaction);
         Ok(())
     }
 

@@ -60,7 +60,7 @@ pub use property::{
 // over `RuntimeValue`. `ButterflyAllocation` is that live rep. storage.rs's
 // `Butterfly`/`OutOfLineStorage`/etc. (re-exported below) remain the NON-LIVE
 // contract/skeleton types over `JsValue`, retired in a later GAP-D cleanup.
-pub use auxiliary::AuxiliaryHandle;
+pub use auxiliary::{AuxiliaryHandle, PromiseReactionsHandle};
 pub use butterfly_handle::{ButterflyAllocation, ButterflyHandle};
 pub use storage::{
     typed_array_content_type, typed_array_element_size, validate_array_storage_metadata,
