@@ -116,3 +116,34 @@ handoff execute path + **the milestone test**: an int-sum loop function tiers up
 natively, returns correctly, moves its r_i). U5 (parallel: S3 set_jit_code_block + Fail→type_error).
 First smoke target `(a,b)=>a+b` (op_enter/add/ret); milestone target the int-sum loop (proves
 backward-branch LINK + native loop).
+
+## U3/U4 live-wiring spec (2026-06-29) — where R lifts off
+
+Stage 1 (the emitter) is DONE + verified; U3/U4 wire it into LIVE tier-up. Ratified decisions:
+- **S7 (pin-stable Vm) — own the Vm as `Box<Vm>`** at the dispatch site (shell/octane.rs:1827/2115 today
+  a move-fragile stack local). The baked `jit_pending` AbsoluteAddress + the parked `*mut Vm` are reused
+  by every execution of a compiled function, so the Vm must stay at one heap address for the JIT code's
+  lifetime (JSC's VM is heap-allocated). Bake the address only after the Vm is in its boxed home.
+- **S8 — SYNCHRONOUS baseline compile** on the tier-up crossing (async JITWorklist deferred).
+- **S9 — per-CodeBlock ExecutionCounter** (bytecode/profiling.rs:1241, the faithful countdown) bumped at
+  function entry + LoopHint back-edge (JSC loop_osr); fire on crossing ≥0, seed from thresholdForJITAfterWarmUp.
+
+Unit ordering (critical path V0→V3→V4→V5; V1,V2 parallel): **V0** the emitter deadness-guard (HARD
+prereq, in flight — else a `let b=a<c;…;return b` CodeBlock mis-compiles live); **V1** `set_jit_code_block`
+parking (S3 — the real CodeBlock for the slow path's object-operand ToNumber) + route engine `Fail` →
+the existing `type_error_outcome_with_heap` (interpreter/mod.rs:18262, real TypeError, replacing the 0x8
+sentinel) [bridge-local]; **V2** S7 Box<Vm>; **V3** U3 — the ExecutionCounter trigger + `can_baseline_compile`
+S4 allowlist (use the emitter's `Err` as the single source of truth) + emit→finalize→JitCode-slot install
+in select_interpreter_entry_plan (vm/mod.rs:4926, replacing the size heuristic); **V4** U4 — the B5-lite
+execute path (park ×3, seed the callee frame header+args at the JSC CallFrameSlot offsets via the B2
+seeding, `call_finalized_binary_u64(vm,cfr)`, post-call jit_pending→throw / decode x0→dst→resume) + the
+milestone test; **V5** the r_i A/B measurement. LIVE-FEED RISK to verify: the emitter treats BytecodeIndex
+as an instruction ORDINAL — confirm the live bytecompiler emits branch targets as ordinals (else add an
+offset→ordinal map).
+
+**HONEST OCTANE CAVEAT (strategic):** NO Octane bench is int32-arith-ONLY — all 15 are property/call-heavy,
+and those ops STAY interpreted (S4) until R4 (property ICs) + B5/B6 (calls) land. So arith-only tier-up
+moves measured Octane R only MARGINALLY (Crypto — int32 cipher rounds — at best, and it still does
+interpreted array access in-loop). The honest U3/U4 milestone is a **synthetic hot-arith function's r_i
+lift** (proves the tier-up mechanism + R lifts off for arith) + a small Crypto probe; the MATERIAL Octane
+R move requires the gated property/call opcodes. Do NOT claim a big Octane R from arith-only tier-up.
