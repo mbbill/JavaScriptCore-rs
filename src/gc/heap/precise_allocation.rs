@@ -121,6 +121,16 @@ impl PreciseSpace {
         // SAFETY (C3): atomic read through the recovered precise header.
         unsafe { (*ptr::addr_of!((*hp).marked)).load(Ordering::Relaxed) != 0 }
     }
+
+    /// Clear the precise cell's mark bit (gc-r4 R4b-mark `MarkedSpace::clear_all_marks`
+    /// begin-marking step). JSC clears the precise-allocation marks via the
+    /// markingVersion bump at full-collection start (heap/MarkedSpace::beginMarking);
+    /// the single-STW model resets the single `m_isMarked` byte directly.
+    pub(crate) fn clear_mark(cell_addr: usize) {
+        let hp = Self::header_ptr(cell_addr);
+        // SAFETY (C3): atomic store through the recovered precise header.
+        unsafe { (*ptr::addr_of!((*hp).marked)).store(0, Ordering::Relaxed) };
+    }
 }
 
 impl Drop for PreciseSpace {

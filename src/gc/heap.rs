@@ -40,8 +40,17 @@ mod slot_visitor;
 // byte-identical to today), so these re-exports are debug-gated to stay 0-warning when
 // the consumer is absent.
 // gc-r4 R4a: `MarkedSpace` is the RELEASE object-cell arena (interpreter::object_store);
-// re-exported unconditionally now. `CellPtr` stays internal to gc::heap.
+// re-exported unconditionally now.
 pub(crate) use marked_space::MarkedSpace;
+
+// gc-r4 R4b-mark: the collector's MARKING half wires into the live engine. The
+// interpreter's `CoreObjectStore` supplies the per-type `visitChildren` (it owns
+// `trace_cell` over the live `CoreObjectCell`), so the SlotVisitor marking core, the
+// `VisitChildren` method-table boundary trait, and the carried `CellPtr` cell-address
+// type are re-exported to gc::* for it to drive the mark (`mark_live_set`). They stay
+// `pub(crate)` — internal engine wiring, not a public surface.
+pub(crate) use marked_block::CellPtr;
+pub(crate) use slot_visitor::{SlotVisitor, VisitChildren};
 
 #[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use conservative_scan::HeapConservativeScanAppendReceipt;

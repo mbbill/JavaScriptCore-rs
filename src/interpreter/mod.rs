@@ -23282,6 +23282,13 @@ fn poll_frame_header_root_safepoint_on_backedge(
     poll_frame_header_root_safepoint(stack, heap)
 }
 
+// gc-r4 R4b-mark — the COMPLETE precise GC root gather (`Heap::markRoots`) lives as a
+// METHOD `CoreObjectStore::gather_all_gc_roots` (object_store.rs), NOT a free function
+// here: a `pub(crate)` free fn naming `&CoreObjectStore` would raise that type's effective
+// visibility and surface unrelated private-interface lints on its pre-existing members.
+// The method folds these mod.rs Vm-side gathers (`gather_vm_register_roots`,
+// `gather_vm_frame_header_roots`) with the host-side intrinsics + the exception slots.
+
 fn validate_root_records(
     records: impl IntoIterator<Item = RootRecord>,
 ) -> Result<(), RootSetSemanticError> {
@@ -23315,6 +23322,43 @@ mod tests {
     };
     use crate::strings::PropertyIndex;
     use crate::value::EncodedJsValue;
+
+    /// gc-r4 R4b-mark — `gather_all_gc_roots` folds the SPLIT root sources (host
+    /// intrinsics + Vm exception/jit_pending state) into one candidate-address set, and
+    /// the marker marks each gated cell. Exercises the intrinsic (#1), pending-exception,
+    /// and jit_pending (#3) source conversions end-to-end (register/frame sources have
+    /// their own gather tests; an empty RegisterFile/stack contributes none here).
+    #[test]
+    fn gather_all_gc_roots_folds_intrinsic_exception_and_jit_pending() {
+        let mut store = CoreObjectStore::default();
+        let proto = store.allocate();
+        store.object_prototype = Some(proto);
+        let thrown = store.allocate();
+        let jit = store.allocate();
+
+        let registers = RegisterFile::default();
+        let stack = ExecutionContextStack::default();
+        let mut exceptions = ExceptionState::default();
+        exceptions.throw(thrown);
+        exceptions.set_jit_pending(jit.encoded());
+        let heap = Heap::new();
+
+        let roots = store.gather_all_gc_roots(&registers, &stack, &exceptions, &heap);
+        let addr = |v: RuntimeValue| v.as_cell().unwrap().pointer_payload_bits();
+        assert!(
+            roots.contains(&addr(proto)),
+            "intrinsic prototype gathered (#1)"
+        );
+        assert!(roots.contains(&addr(thrown)), "pending exception gathered");
+        assert!(roots.contains(&addr(jit)), "jit_pending gathered (#3)");
+
+        // The marker admits each via the membership gate and marks it.
+        let stats = store.mark_live_set_from_addrs(&roots);
+        assert!(store.is_value_marked(proto));
+        assert!(store.is_value_marked(thrown));
+        assert!(store.is_value_marked(jit));
+        assert!(stats.seeded_roots >= 3);
+    }
 
     // C++ JSC stringifyFunction (runtime/FunctionConstructor.cpp:217-302) for
     // FunctionConstructionMode::Function. These lock the assembled source string

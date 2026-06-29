@@ -106,10 +106,20 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   failed). Decision D (ptr<<8 / ptr<2^41) confirmed in release; B: find_by_object_id uses a store-local
   CellId→addr index (heap unreachable) — **R4b's sweep MUST invalidate stale entries**; C: CoreObjectStore::
   clone deleted. NIT: vestigial shadow fns + dead CoreObjectCell Clone to prune.
-- [next-GC] R4b — wire+run the collection CYCLE (the LEAK FIX): roots (root snapshot / conservative JSStack
-  span) → mark via trace_cell (GAP A, authored) → sweep via FreeList::sweep_block (GAP B, authored) → reclaim
-  (+ invalidate the CellId→addr index on sweep). THEN the leak is fixed, heavy benches run, and the FULL R4
-  gate (15 Octane) closes → R becomes measurable. Per SD-4 each aux slab also needs its own Auxiliary sweep.
+- [done] R4b-mark — the marking half (verified, unwired): the MEMBERSHIP-ONLY gate is_arena_cell (= find
+  MINUS is_live_cell — the #1 UAF landmine; a test proves it admits a post-sweep survivor that liveness-find
+  REJECTS) + clear_all_marks + the CellEdgeVisitor/VisitChildren mark adapter over trace_cell/SlotVisitor +
+  gather_all_gc_roots (register file + frame callee + exceptions + the ~25 CoreObjectStore intrinsic roots +
+  jit_pending; microtask queue not-yet-a-live-source, lexical_scope transitively rooted via the captures
+  slab — both with evidence). 2761 tests + miri TB 0 UB (incl. the ≥2-collection survivor test). MARK-ONLY →
+  nothing freed, no UAF surface yet.
+- [next-GC] R4b-sweep — the reclamation + LIVE DRIVER (the LEAK FIX): MarkedSpace::for_each_object_cell + a
+  store-driven PRE-SWEEP reconciliation (free each DEAD cell's butterfly + aux slab slots via per-slab
+  free-lists + drop its object_addr_by_cell_id entry, BEFORE sweep_block clobbers it with FreeCell links) →
+  FreeList::sweep_block (DoesNotHave) → a Vm-resident cooperative-safepoint driver (back-edge poll; NO inline
+  collection → re-entrancy foreclosed). Verify: ≥2-collection reclaims-dead/retains-live + miri + adversarial
+  + a BOUNDED no-OOM micro-probe → THEN heavy Octane benches run → R becomes measurable. (SD-4: the per-slab
+  aux free-lists ARE the Auxiliary sweep.)
 
 ## Baseline JIT / DFG / FTL (parity lives here; ~0% started)
 - [done] JIT↔runtime bridge-infra (adversarially verified): extern-C operation_value_add shim

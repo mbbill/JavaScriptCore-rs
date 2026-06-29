@@ -412,6 +412,25 @@ pub(crate) fn block_atoms_per_cell(base: usize) -> usize {
     unsafe { ptr::addr_of!((*bp).header.atoms_per_cell).read() as usize }
 }
 
+/// Reset the whole block's mark bitmap (gc-r4 R4b-mark begin-marking step, driven by
+/// `MarkedSpace::clear_all_marks`). JSC bumps `markingVersion` at the start of a full
+/// collection (heap/MarkedSpace::beginMarking) so every stale mark bit reads clear in
+/// O(1); the single-STW model here (no HeapVersion — see `is_live_cell` DIVERGENCE R2)
+/// zeroes the `m_marks` words directly. Mirror of `clear_newly_allocated_block` for the
+/// OTHER liveness bitmap. The mark words are atomic; zeroing them via `addr_of!` forms
+/// no reference (contract C3). After this runs, post-clear liveness for the collector's
+/// MEMBERSHIP gate must come from block membership ALONE, not the mark/alloc bits — see
+/// `MarkedSpace::is_arena_cell`.
+pub(crate) fn clear_marks_block(base: usize) {
+    let bp: *const MarkedBlock = ptr::with_exposed_provenance::<u8>(base).cast();
+    // SAFETY (C3): registered, once-exposed page; atomic stores via addr_of! (no ref).
+    unsafe {
+        for w in 0..MARK_WORDS {
+            (*ptr::addr_of!((*bp).header.marks[w])).store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Reset the whole block's newlyAllocated bitmap. JSC bumps `newlyAllocatedVersion`
 /// at the full-collection transition (heap/MarkedBlock::resetAllocated /
 /// MarkedBlockInlines.h) so stale alloc bits read clear in O(1); the single-STW

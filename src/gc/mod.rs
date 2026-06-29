@@ -67,8 +67,12 @@ pub use heap::{
 pub(crate) use heap::{HeapConservativeScanAppendReceipt, HeapMarkingError, HeapMarkingRecord};
 // gc-r4 R3 (reversible shadow oracle): the S4 arena + carried cell address, surfaced to
 // interpreter::object_store: the RELEASE object-cell arena (gc-r4 R4a — the arena is THE
-// cell store and its address is identity). `CellPtr` is not named outside gc::heap.
+// cell store and its address is identity).
 pub(crate) use heap::MarkedSpace;
+// gc-r4 R4b-mark: the collector marking core + its method-table boundary trait + the
+// carried cell-address type, surfaced so interpreter::object_store can drive the live
+// mark (`CoreObjectStore::mark_live_set`) over its `CoreObjectCell` graph.
+pub(crate) use heap::{CellPtr, SlotVisitor, VisitChildren};
 pub(crate) use machine_stack_marker::{
     JscMachineStackConservativeRootingProof, JscMachineStackMarker,
 };

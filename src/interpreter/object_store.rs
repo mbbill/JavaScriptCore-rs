@@ -24,7 +24,11 @@ use crate::value::CellValue;
 // from_cell`). `MarkedSpace::find` is the production OBJECT-vs-foreign type gate (a
 // faithful `HeapUtil::isPointerGCObjectJSCell` port) — see `find`/`with_cell_mut` and
 // docs/design/gc-r4.md "R4a ratified design".
-use crate::gc::MarkedSpace;
+// gc-r4 R4b-mark: the collector's MARKING half drives a `SlotVisitor` (the STW mark
+// stack + drain-to-fixpoint core) over this store's `CoreObjectCell` graph through the
+// `VisitChildren` method-table boundary; `CellPtr` is the carried arena cell address the
+// membership gate (`MarkedSpace::is_arena_cell`) admits. See `mark_live_set`.
+use crate::gc::{CellPtr, MarkedSpace, SlotVisitor, VisitChildren};
 
 pub(crate) fn can_use_get_by_id_megamorphic_property_name(text: &str) -> bool {
     !matches!(text, "length" | "name" | "prototype" | "__proto__")
@@ -2519,6 +2523,314 @@ impl CoreObjectStore {
         //   become real cells.
         // - `date_value` / `view_*` scalars, `function_index`, `native_function`,
         //   `regexp_flags`, `promise_state` and the other POD tags.
+    }
+}
+
+// ===================== gc-r4 R4b-mark: the live MARKING half =====================
+//
+// This wires the SlotVisitor STW marking core (gc/heap/slot_visitor.rs — mark stack +
+// drain-to-fixpoint) over the live `CoreObjectCell` object graph, computing the live
+// set from a root set. It does NOT sweep / free anything (that is R4b-sweep) and does
+// NOT install a live trigger / safepoint / driver (also R4b-sweep) — `mark_live_set` is
+// callable directly. C++ analog: `Heap::markRoots` → `SlotVisitor::drain` over the cell
+// graph (heap/Heap.cpp:markToFixpoint), with `JSObject::visitChildren` supplied here by
+// `trace_cell` through the `VisitChildren` method-table boundary.
+//
+// THE #1 UAF LANDMINE (gc-r4.md R4b ratified): every root AND every edge is admitted by
+// the MEMBERSHIP gate `MarkedSpace::is_arena_cell` (membership only), NEVER the
+// liveness-bearing `MarkedSpace::find`. See `is_arena_cell` for why gating through
+// `find` would orphan + sweep the entire live old generation on the 2nd+ collection.
+
+/// The marking outcome (gc-r4 R4b-mark). Mirrors the `SlotVisitor` counters JSC tracks
+/// per collection (`visitCount`, `bytesVisited`).
+// gc-r4 R4b-mark authored-but-unwired: the live collection DRIVER / safepoint that calls
+// `mark_live_set` is R4b-sweep (gc-r4.md decision 6), so this whole marking cluster is
+// dead in the non-test lib build today (the tests exercise it). Mirrors the GAP A
+// `trace_cell`/`CellEdgeVisitor` `#[allow(dead_code)]`.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MarkStats {
+    /// Distinct arena object cells marked live this cycle (`SlotVisitor::visitCount`).
+    pub(crate) marked_cells: usize,
+    /// Root candidates the MEMBERSHIP gate admitted as live arena object cells and
+    /// seeded (immediates / foreign leaf cells / dead candidates are excluded).
+    pub(crate) seeded_roots: usize,
+    /// Sum of marked cells' size classes in bytes (`SlotVisitor::bytesVisited`).
+    pub(crate) bytes_visited: usize,
+}
+
+/// The `VisitChildren` method-table stand-in for the live `CoreObjectCell` (gc-r4
+/// R4b-mark). `SlotVisitor::drain` pops a marked cell and calls this to enumerate its
+/// outgoing edges; this derefs the cell (membership-gated) and forwards to `trace_cell`
+/// (the `JSObject::visitChildren` body). It holds only a shared `&CoreObjectStore` — no
+/// new shared-ownership model.
+#[allow(dead_code)] // gc-r4 R4b-mark authored-but-unwired (driver = R4b-sweep); see MarkStats.
+struct ObjectGraphMarker<'a> {
+    store: &'a CoreObjectStore,
+}
+
+impl VisitChildren for ObjectGraphMarker<'_> {
+    fn visit_children(&self, cell: CellPtr, visitor: &mut SlotVisitor) {
+        // The popped cell was admitted by `is_arena_cell` (membership) before being
+        // pushed, so it is an arena object cell; deref it through the MEMBERSHIP gate
+        // (NOT the liveness `find`) — the marker never consults liveness.
+        let Some(cell) = self.store.arena_cell_for_mark(cell) else {
+            return;
+        };
+        let mut edges = ObjectEdgeMarker {
+            visitor,
+            space: &self.store.space,
+        };
+        // JSObject::visitChildren: append every RuntimeValue GC edge (inline slots +
+        // butterfly + per-kind aux slabs). `edges` mutates only the transient SlotVisitor
+        // worklist + reads `space`'s mark bits (atomics) — disjoint from the `&cell` and
+        // `&self.store` shared borrows.
+        self.store.trace_cell(cell, &mut edges);
+    }
+}
+
+/// The `CellEdgeVisitor` (gc-r4 GAP A sink) wired to the live worklist: it applies the
+/// MEMBERSHIP gate to each edge target, then `appendUnbarriered`s the admitted arena
+/// cell onto the SlotVisitor (test-and-set → grey → push on the first white→grey).
+#[allow(dead_code)] // gc-r4 R4b-mark authored-but-unwired (driver = R4b-sweep); see MarkStats.
+struct ObjectEdgeMarker<'a, 'b> {
+    visitor: &'a mut SlotVisitor,
+    space: &'b MarkedSpace,
+}
+
+impl CellEdgeVisitor for ObjectEdgeMarker<'_, '_> {
+    fn visit_cell_edge(&mut self, cell: CellValue) {
+        let addr = cell.pointer_payload_bits();
+        // MEMBERSHIP-ONLY gate (the #1 UAF landmine). Admits a live OR dead-this-cycle
+        // arena object cell; REJECTS a foreign leaf-cell `Box` address (String/Symbol/
+        // BigInt) — it lies in no arena block → skipped. SOUND (gc-r4.md R4b): no leaf
+        // cell has an out-edge back to an object cell, so a skipped leaf cannot strand a
+        // live object; leaf cells leak in their own `Vec` stores (the known residual).
+        if let Some(cp) = self.space.is_arena_cell(addr) {
+            // Object cells are MarkedBlock (size << largeCutoff), never precise, so the
+            // SlotVisitor's MarkedBlock `testAndSetMarked` append IS the faithful
+            // container branch (the precise branch is deferred — slot_visitor.rs R2).
+            debug_assert!(
+                !MarkedSpace::is_precise(addr),
+                "object cells are MarkedBlock; a precise object edge would need precise mark dispatch"
+            );
+            // appendUnbarriered (SlotVisitorInlines.h:43): isMarked fast-path →
+            // testAndSetMarked → grey + push on the first white→grey transition.
+            self.visitor.append_unbarriered(cp);
+        }
+    }
+}
+
+// gc-r4 R4b-mark authored-but-unwired (the live driver/safepoint is R4b-sweep, gc-r4.md
+// decision 6): these methods are exercised by the tests + the future driver, dead in the
+// non-test lib build. `#[allow(dead_code)]` on the impl applies to every method.
+#[allow(dead_code)]
+impl CoreObjectStore {
+    /// gc-r4 R4b-mark — the marker's MEMBERSHIP-gated cell deref (the analog of `cell_at`
+    /// for the COLLECTOR). Admits via `is_arena_cell` (membership), NOT `find` (liveness),
+    /// so it never depends on the mark/alloc bits the mark phase is mid-flight mutating.
+    ///
+    /// SAFETY: identical to `cell_at` — the gate proved `cp` is an arena object cell in a
+    /// page whose provenance was exposed once at `allocate_blob`, holding an initialized
+    /// POD `CoreObjectCell`; no GC moves a cell pre-R4b, so it is pinned. The returned
+    /// `&CoreObjectCell` is tied to `&self`; the only writer needs `&mut self`, so no
+    /// aliasing `&mut` to this cell can coexist (the marker holds `&self` throughout).
+    fn arena_cell_for_mark(&self, cp: CellPtr) -> Option<&CoreObjectCell> {
+        self.space.is_arena_cell(cp.addr())?;
+        // SAFETY: see the method contract above (mirrors `cell_at`'s shared-deref island).
+        let cell = unsafe { &*core::ptr::with_exposed_provenance::<CoreObjectCell>(cp.addr()) };
+        Some(cell)
+    }
+
+    /// gc-r4 R4b-mark ROOT GAP #1 — the intrinsic root set: every `CoreObjectStore`
+    /// intrinsic `Option<RuntimeValue>` (the ~25 prototypes/constructors-holder objects
+    /// + per-kind typed-array prototypes). This is the `JSGlobalObject::visitChildren`
+    /// analog — JSC roots the global object's canonical prototypes/structures so they
+    /// survive every collection; the port keeps them as store fields, so the collector
+    /// gathers them here. A missed intrinsic = a swept prototype = UAF on the next
+    /// property lookup, so this MUST stay exhaustive over the intrinsic fields.
+    pub(crate) fn gather_intrinsic_roots(&self) -> Vec<RuntimeValue> {
+        let mut roots = Vec::new();
+        for slot in [
+            self.object_prototype,
+            self.function_prototype,
+            self.array_prototype,
+            self.string_prototype,
+            self.number_prototype,
+            self.boolean_prototype,
+            self.error_prototype,
+            self.type_error_prototype,
+            self.reference_error_prototype,
+            self.range_error_prototype,
+            self.map_prototype,
+            self.set_prototype,
+            self.weak_map_prototype,
+            self.weak_set_prototype,
+            self.regexp_prototype,
+            self.promise_prototype,
+            self.date_prototype,
+            self.bigint_prototype,
+            self.symbol_prototype,
+            self.array_buffer_prototype,
+            self.data_view_prototype,
+        ] {
+            if let Some(v) = slot {
+                roots.push(v);
+            }
+        }
+        // One prototype object per typed-array element kind (Int8Array.prototype, …).
+        for slot in self.typed_array_prototypes {
+            if let Some(v) = slot {
+                roots.push(v);
+            }
+        }
+        roots
+    }
+
+    /// gc-r4 R4b-mark — compute the live set from a set of RAW root candidate ADDRESSES
+    /// (the universal currency: register-file `CellValue`s, frame-header `CellId`→addr,
+    /// exception `cell_payload`, `jit_pending`, and intrinsic `RuntimeValue`s all reduce
+    /// to a cell address). begin-marking clears every mark, every candidate is admitted
+    /// by the MEMBERSHIP gate (NOT `find`), then the worklist drains to the transitive
+    /// fixpoint. After it returns, exactly the cells reachable from the admitted roots
+    /// carry a set mark bit; every other arena cell is garbage R4b-sweep reclaims.
+    ///
+    /// `&self` (not `&mut`): marking only flips atomic mark bits and grows a local
+    /// worklist — no `&mut CoreObjectStore` is taken, so no cell `&mut` can coexist.
+    pub(crate) fn mark_live_set_from_addrs(&self, root_addrs: &[usize]) -> MarkStats {
+        // begin-marking: clear every mark so the phase computes a FRESH set (the
+        // precondition that makes the membership gate load-bearing — see `is_arena_cell`).
+        self.space.clear_all_marks();
+        // Gate every root candidate through the MEMBERSHIP gate (NOT `find`).
+        let seeds: Vec<CellPtr> = root_addrs
+            .iter()
+            .filter_map(|&addr| {
+                let cp = self.space.is_arena_cell(addr)?;
+                debug_assert!(
+                    !MarkedSpace::is_precise(addr),
+                    "object root cells are MarkedBlock"
+                );
+                Some(cp)
+            })
+            .collect();
+        let seeded_roots = seeds.len();
+        let marker = ObjectGraphMarker { store: self };
+        let mut visitor = SlotVisitor::new();
+        // SlotVisitor::append(ConservativeRoots) then drain (Heap::markToFixpoint).
+        visitor.mark_from_roots(&seeds, &marker);
+        MarkStats {
+            marked_cells: visitor.visit_count(),
+            seeded_roots,
+            bytes_visited: visitor.bytes_visited(),
+        }
+    }
+
+    /// gc-r4 R4b-mark — convenience marker over `RuntimeValue` roots (the natural form
+    /// for tests and a direct driver call): seed the store's own INTRINSIC roots (gap #1)
+    /// plus `extra_roots`, then mark. Equivalent to `mark_live_set_from_addrs` over the
+    /// intrinsic + extra addresses. (The driver-level `gather_all_gc_roots` already folds
+    /// the intrinsics in, so it calls `mark_live_set_from_addrs` directly — not this.)
+    pub(crate) fn mark_live_set(&self, extra_roots: &[RuntimeValue]) -> MarkStats {
+        let addrs: Vec<usize> = self
+            .gather_intrinsic_roots()
+            .iter()
+            .chain(extra_roots.iter())
+            .filter_map(|v| v.as_cell().map(|c| c.pointer_payload_bits()))
+            .collect();
+        self.mark_live_set_from_addrs(&addrs)
+    }
+
+    /// gc-r4 R4b-mark — did the just-completed mark mark `value`'s cell? Membership-gated
+    /// read of its mark bit (for tests + the R4b-sweep reconciliation that retains marked
+    /// cells). `false` for an immediate, a foreign leaf cell, or an unmarked (garbage)
+    /// cell. Uses `is_arena_cell` (membership), never `find` (liveness), for the same
+    /// landmine reason as the marker.
+    pub(crate) fn is_value_marked(&self, value: RuntimeValue) -> bool {
+        let Some(addr) = value.as_cell().map(|c| c.pointer_payload_bits()) else {
+            return false;
+        };
+        match self.space.is_arena_cell(addr) {
+            Some(cp) => self.space.collector_is_marked(cp),
+            None => false,
+        }
+    }
+
+    /// gc-r4 R4b-mark — gather the COMPLETE precise GC root set as raw candidate cell
+    /// ADDRESSES (the root-collection half of `Heap::markRoots`, heap/Heap.cpp:gatherStackRoots
+    /// + `JSGlobalObject::visitChildren` + the VM exception slots). It does NOT trigger a
+    /// collection or stop the world (that is the R4b-sweep driver) — it only READS live
+    /// state and returns candidates. The driver feeds the result to `mark_live_set_from_addrs`,
+    /// which applies the MEMBERSHIP gate to EVERY candidate, so foreign leaf-cell / CodeBlock
+    /// / immediate candidates are dropped without a deref (the #1 UAF landmine lives in that
+    /// gate, not here). Raw `usize` addresses are the common currency the differently-typed
+    /// sources (`CellValue` / `CellId` / `cell_payload` / `RuntimeValue`) all reduce to.
+    ///
+    /// A METHOD (not a free function): a `pub(crate)` free fn naming `&CoreObjectStore` would
+    /// raise that type's effective visibility and surface unrelated private-interface lints.
+    /// The store owns the arena + intrinsics; the Vm-side state (register file / call-frame
+    /// stack / exception state) flows in as borrows — the future R4b-sweep `Vm`-resident
+    /// driver supplies them (no new shared-ownership model; the split state is read in place).
+    ///
+    /// SOURCES (each a UAF gap if missed — gc-r4.md R4b ROOT SET):
+    ///  - INTRINSICS (#1): `gather_intrinsic_roots` (the `JSGlobalObject::visitChildren` analog).
+    ///  - REGISTER FILE: every cell-tagged live slot (`gather_vm_register_roots`); each
+    ///    `CellValue` payload IS the cell address.
+    ///  - FRAME HEADERS: each live frame's `codeBlock`/`callee` (`gather_vm_frame_header_roots`);
+    ///    `CellId` -> address via `heap.payload_for_cell` (a CodeBlock id resolves to a
+    ///    non-arena address the gate drops; the callee resolves to a real arena cell).
+    ///  - EXCEPTIONS: pending / last / unwind values (`ExceptionState::root_descriptors`).
+    ///  - JIT_PENDING (#3): the `VM::m_exception` mirror word, which `root_descriptors` omits.
+    ///
+    /// INVESTIGATED, NOT gathered (gc-r4.md R4b #2/#4): the microtask/promise JOB QUEUE
+    /// (`runtime/jobs.rs`) is design-stage — no live instance is owned by the `Vm`/host/realm,
+    /// and pending promise reactions are held per-cell (`promise_reactions` slab, visited by
+    /// `trace_cell` as edges of the rooted promise cell) — so there is no separate live
+    /// job-queue root today (add a defensive gather when the queue is wired). LEXICAL SCOPE
+    /// (`frame.lexical_scope`) is a `ScopeId(u32)` bytecode handle, NOT a heap cell; closure
+    /// captured values live in the owning function cell's `captures` slab (visited by
+    /// `trace_cell`), so they are rooted TRANSITIVELY via the rooted function cell.
+    pub(crate) fn gather_all_gc_roots(
+        &self,
+        registers: &RegisterFile,
+        stack: &ExecutionContextStack,
+        exceptions: &ExceptionState,
+        heap: &Heap,
+    ) -> Vec<usize> {
+        let payload = |v: RuntimeValue| v.as_cell().map(|c| c.pointer_payload_bits());
+        let mut roots = Vec::new();
+        // (#1) intrinsics — JSGlobalObject::visitChildren analog.
+        roots.extend(
+            self.gather_intrinsic_roots()
+                .into_iter()
+                .filter_map(payload),
+        );
+        // Register file — every cell-tagged live slot.
+        if let Ok(plan) = gather_vm_register_roots(registers, heap.id()) {
+            roots.extend(
+                plan.roots
+                    .iter()
+                    .map(|root| root.cell.pointer_payload_bits()),
+            );
+        }
+        // Frame headers — codeBlock / callee, CellId -> address.
+        for descriptor in gather_vm_frame_header_roots(stack, heap.id()) {
+            if let FrameRootTarget::Known(cell_id) = descriptor.target {
+                if let Some(addr) = heap.payload_for_cell(cell_id) {
+                    roots.push(addr);
+                }
+            }
+        }
+        // Exceptions — pending / last / unwind values.
+        for descriptor in exceptions.root_descriptors(heap.id()) {
+            if let Some(addr) = descriptor.cell_payload {
+                roots.push(addr);
+            }
+        }
+        // (#3) jit_pending — the VM::m_exception mirror word (0/empty => not a cell => skipped).
+        if let Some(addr) = payload(RuntimeValue::from_encoded(exceptions.jit_pending())) {
+            roots.push(addr);
+        }
+        roots
     }
 }
 
@@ -9744,6 +10056,112 @@ mod trace_cell_gap_a_tests {
         // slabs contributed NOTHING (no extra entries appeared).
         assert_eq!(traced(&store, &cell), expected);
     }
+
+    /// gc-r4 R4b-mark TRACE-COMPLETENESS COMPILE GUARD: a missed inline `RuntimeValue`
+    /// edge is a live cell left unmarked → swept → UAF. This (a) EXHAUSTIVELY binds
+    /// every `CoreObjectCell` field by name — adding a new field breaks the destructure,
+    /// forcing the author to classify it (edge → add to `trace_cell` + the `all_edges`
+    /// cell below; non-edge → extend the non-edge arm) — and (b) proves `trace_cell`
+    /// visits EXACTLY the 15 inline `RuntimeValue`/`Option<RuntimeValue>` GC edges.
+    #[test]
+    fn trace_completeness_guard_covers_every_inline_runtime_value_edge() {
+        // (a) COMPILE GUARD — exhaustive, no `..`. The bindings prefixed `e_` are the
+        // 15 inline RuntimeValue GC edges; everything else is a non-edge (header /
+        // identity / POD tag / aux handle / scalar) trace_cell deliberately skips.
+        let probe = CoreObjectCell::default();
+        let CoreObjectCell {
+            structure_id: _,
+            js_type: _,
+            butterfly: _,
+            cell_id: _,
+            kind: _,
+            function_index: _,
+            native_function: _,
+            construct_ability: _,
+            is_default_derived_constructor: _,
+            instance_fields: _,
+            captures: _,
+            map_entries: _,
+            set_values: _,
+            regexp_source: _,
+            regexp_flags: _,
+            promise_state: _,
+            promise_reactions: _,
+            promise_resolving_kind: _,
+            date_value: _,
+            array_buffer_data: _,
+            view_byte_offset: _,
+            view_byte_length: _,
+            view_length: _,
+            view_element_kind: _,
+            bound_args: _,
+            // the 15 inline RuntimeValue / Option<RuntimeValue> GC edges:
+            prototype: e_prototype,
+            super_base: e_super_base,
+            super_constructor: e_super_constructor,
+            native_bound_promise: e_native_bound_promise,
+            native_bound_proxy: e_native_bound_proxy,
+            primitive_value: e_primitive_value,
+            view_buffer: e_view_buffer,
+            proxy_target: e_proxy_target,
+            proxy_handler: e_proxy_handler,
+            bound_target: e_bound_target,
+            getter_value: e_getter_value,
+            setter_value: e_setter_value,
+            binding_value: e_binding_value,
+            promise_result: e_promise_result,
+            bound_this: e_bound_this,
+        } = &probe;
+        // Bind-and-ignore so an added/removed edge name is a compile error here too.
+        let _ = (
+            e_prototype,
+            e_super_base,
+            e_super_constructor,
+            e_native_bound_promise,
+            e_native_bound_proxy,
+            e_primitive_value,
+            e_view_buffer,
+            e_proxy_target,
+            e_proxy_handler,
+            e_bound_target,
+            e_getter_value,
+            e_setter_value,
+            e_binding_value,
+            e_promise_result,
+            e_bound_this,
+        );
+
+        // (b) RUNTIME COVERAGE — every one of the 15 edges set to a DISTINCT fake cell;
+        // trace_cell must visit all 15 and only those (no butterfly / aux slab here).
+        let store = CoreObjectStore::default();
+        let cell = CoreObjectCell {
+            prototype: Some(fake_cell(0x1010)),
+            super_base: Some(fake_cell(0x1020)),
+            super_constructor: Some(fake_cell(0x1030)),
+            native_bound_promise: Some(fake_cell(0x1040)),
+            native_bound_proxy: Some(fake_cell(0x1050)),
+            primitive_value: Some(fake_cell(0x1060)),
+            view_buffer: Some(fake_cell(0x1070)),
+            proxy_target: Some(fake_cell(0x1080)),
+            proxy_handler: Some(fake_cell(0x1090)),
+            bound_target: Some(fake_cell(0x10a0)),
+            getter_value: Some(fake_cell(0x10b0)),
+            setter_value: Some(fake_cell(0x10c0)),
+            binding_value: fake_cell(0x10d0),
+            promise_result: fake_cell(0x10e0),
+            bound_this: fake_cell(0x10f0),
+            ..CoreObjectCell::default()
+        };
+        let expected = sorted(vec![
+            0x1010, 0x1020, 0x1030, 0x1040, 0x1050, 0x1060, 0x1070, 0x1080, 0x1090, 0x10a0, 0x10b0,
+            0x10c0, 0x10d0, 0x10e0, 0x10f0,
+        ]);
+        assert_eq!(
+            traced(&store, &cell),
+            expected,
+            "trace_cell must visit exactly the 15 inline RuntimeValue GC edges"
+        );
+    }
 }
 
 // gc-r4 R4a (THE FLIP) — the deref-island soundness tests. The S4 arena is now THE
@@ -9892,5 +10310,204 @@ mod r4a_arena_flip_tests {
         assert_eq!(snap[0].0, m, "self key is the map cell itself");
         assert_eq!(snap[0].1, v);
         assert_eq!(store.map_entry_value(m, 0), Some(v));
+    }
+}
+
+// gc-r4 R4b-mark — the live MARKING half (compute the live set; no sweep/free). Build
+// REAL arena object cells (`allocate` -> `allocate_blob`), link them through the real
+// property-add path (`put_data_own`, so the edges live in the butterfly `trace_cell`
+// walks), run `mark_live_set`, and assert the mark SET is exactly the reachable closure.
+#[cfg(test)]
+mod mark_live_set_r4b_tests {
+    use super::*;
+    use core::ptr::NonNull;
+
+    fn ident(n: u32) -> CorePropertyKey {
+        CorePropertyKey::Identifier(n)
+    }
+
+    /// A real arena object cell (the production chokepoint; carries the auto
+    /// `object_prototype` like every JSObject).
+    fn obj(store: &mut CoreObjectStore) -> RuntimeValue {
+        store.allocate()
+    }
+
+    /// Make `child` an out-edge of `parent` via the real own-data-property add path, so
+    /// it lands in `parent`'s butterfly out-of-line storage (the channel `trace_cell`
+    /// walks). `key` must be distinct per edge of the same parent.
+    fn link(store: &mut CoreObjectStore, parent: RuntimeValue, key: u32, child: RuntimeValue) {
+        store
+            .put_data_own(parent, &ident(key), child)
+            .expect("put_data_own on a live arena object cell");
+    }
+
+    #[test]
+    fn marks_rooted_graph_and_leaves_unrooted_island_unmarked() {
+        let mut store = CoreObjectStore::default();
+        // Rooted graph: root -> a -> b -> a (cycle); root -> c.
+        let root = obj(&mut store);
+        let a = obj(&mut store);
+        let b = obj(&mut store);
+        let c = obj(&mut store);
+        link(&mut store, root, 0, a);
+        link(&mut store, a, 0, b);
+        link(&mut store, b, 0, a); // cycle: the drain must still terminate
+        link(&mut store, root, 1, c);
+        // Unrooted island: x <-> y (referenced only by each other).
+        let x = obj(&mut store);
+        let y = obj(&mut store);
+        link(&mut store, x, 0, y);
+        link(&mut store, y, 0, x);
+
+        // Seed ONLY `root` (`mark_live_set_from_addrs` does not fold in the intrinsics),
+        // so the seed count is exact and the closure is purely what `root` reaches.
+        let root_addr = root.as_cell().unwrap().pointer_payload_bits();
+        let stats = store.mark_live_set_from_addrs(&[root_addr]);
+
+        for &live in &[root, a, b, c] {
+            assert!(store.is_value_marked(live), "reachable cell must be marked");
+        }
+        for &dead in &[x, y] {
+            assert!(
+                !store.is_value_marked(dead),
+                "island cell must stay unmarked"
+            );
+        }
+        // The cycle did not double-count: each reachable cell is greyed exactly once.
+        assert!(
+            stats.marked_cells >= 4,
+            "the {{root,a,b,c}} closure is marked"
+        );
+        assert_eq!(
+            stats.seeded_roots, 1,
+            "only `root` was a passed-in arena root"
+        );
+    }
+
+    #[test]
+    fn intrinsic_prototype_root_keeps_its_graph_alive() {
+        // ROOT GAP #1: a cell reachable ONLY via an intrinsic store field (here the auto
+        // `object_prototype`) is marked even with NO extra roots; an unreferenced cell is
+        // not.
+        let mut store = CoreObjectStore::default();
+        let anchor = obj(&mut store); // creates `object_prototype`; itself unreferenced
+        let proto = store
+            .object_prototype
+            .expect("allocate() created the intrinsic object_prototype");
+        let only_via_proto = obj(&mut store);
+        link(&mut store, proto, 0, only_via_proto);
+
+        let stats = store.mark_live_set(&[]); // ONLY intrinsics seed the mark
+        assert!(
+            store.is_value_marked(proto),
+            "intrinsic object_prototype is a root"
+        );
+        assert!(
+            store.is_value_marked(only_via_proto),
+            "a cell reachable only via the intrinsic root is marked"
+        );
+        assert!(
+            !store.is_value_marked(anchor),
+            "an unreferenced cell is NOT kept alive by the intrinsics"
+        );
+        assert!(stats.seeded_roots >= 1, "the intrinsic seeded the mark");
+    }
+
+    #[test]
+    fn passed_in_root_keeps_its_graph_alive() {
+        // The register-file / frame-header / exception / jit_pending root sources all
+        // reduce to a passed-in arena address: a cell reachable only via it is marked.
+        let mut store = CoreObjectStore::default();
+        let held = obj(&mut store);
+        let only_via_held = obj(&mut store);
+        link(&mut store, held, 0, only_via_held);
+        let unrelated = obj(&mut store);
+
+        store.mark_live_set(&[held]);
+        assert!(store.is_value_marked(held));
+        assert!(store.is_value_marked(only_via_held));
+        assert!(!store.is_value_marked(unrelated));
+    }
+
+    #[test]
+    fn survivor_stays_marked_across_two_collections_via_membership_not_liveness() {
+        // THE #1 UAF LANDMINE end-to-end (≥2 collections). An old-gen survivor whose
+        // newlyAllocated bit was cleared by the (simulated) prior sweep AND whose mark is
+        // cleared at begin-marking would be REJECTED by the liveness `find`; the marker
+        // gates through MEMBERSHIP, so it is re-marked + retained on collection #2. A
+        // single-collection run cannot exhibit this (survivors keep newlyAllocated on #1).
+        let mut store = CoreObjectStore::default();
+        let root = obj(&mut store);
+        let survivor = obj(&mut store);
+        link(&mut store, root, 0, survivor);
+        let garbage = obj(&mut store); // never reachable
+
+        store.mark_live_set(&[root]); // collection #1
+        assert!(store.is_value_marked(survivor));
+        assert!(!store.is_value_marked(garbage));
+
+        // Simulate the prior full-collection sweep: every cell now has newlyAllocated==0.
+        store.space.simulate_post_sweep_clear_newly_allocated();
+
+        store.mark_live_set(&[root]); // collection #2 (begin-marking clears marks)
+        assert!(
+            store.is_value_marked(survivor),
+            "old-gen survivor (newlyAllocated==0 AND marks cleared) re-marked via membership"
+        );
+        assert!(!store.is_value_marked(garbage));
+    }
+
+    #[test]
+    fn clear_all_marks_recomputes_a_fresh_set_each_collection() {
+        // Cycle 1 marks {root, child}; in cycle 2 the edge is severed, so begin-marking's
+        // clear_all_marks must drop `child` from the live set (no stale mark survives).
+        let mut store = CoreObjectStore::default();
+        let root = obj(&mut store);
+        let child = obj(&mut store);
+        link(&mut store, root, 0, child);
+
+        store.mark_live_set(&[root]);
+        assert!(store.is_value_marked(child));
+
+        // Sever the edge: clear root's butterfly out-of-line storage.
+        let handle = store.find(root).unwrap().butterfly;
+        store.butterflies[handle.0].props.clear();
+
+        store.mark_live_set(&[root]);
+        assert!(store.is_value_marked(root));
+        assert!(
+            !store.is_value_marked(child),
+            "clear_all_marks recomputed the set; the now-unreachable child is unmarked"
+        );
+    }
+
+    #[test]
+    fn foreign_and_immediate_roots_are_skipped_not_type_confused() {
+        // A non-arena address (foreign leaf-cell Box / a fabricated pointer) and an
+        // immediate passed as roots are gated OUT (is_arena_cell -> None), never
+        // dereferenced as a CoreObjectCell.
+        let mut store = CoreObjectStore::default();
+        let real = obj(&mut store);
+        let immediate = RuntimeValue::from_i32(42);
+        // A fabricated non-arena cell address (never allocated in the arena). SAFETY: its
+        // bits are only gated by is_arena_cell, never dereferenced.
+        let foreign = {
+            let p = NonNull::new(0x4000usize as *mut u8).unwrap();
+            RuntimeValue::from_cell(unsafe { GcRef::from_non_null(p) })
+        };
+
+        // Seed the explicit candidates only (no intrinsics), so the seed count is exact:
+        // `real` is gated IN; the foreign 0x4000 address is gated OUT (not in any arena
+        // block); the immediate is filtered at `as_cell` before the gate.
+        let real_addr = real.as_cell().unwrap().pointer_payload_bits();
+        let foreign_addr = foreign.as_cell().unwrap().pointer_payload_bits();
+        let stats = store.mark_live_set_from_addrs(&[real_addr, foreign_addr]);
+        assert!(store.is_value_marked(real));
+        assert!(!store.is_value_marked(immediate));
+        assert!(!store.is_value_marked(foreign));
+        assert_eq!(
+            stats.seeded_roots, 1,
+            "only the real arena address seeded; the foreign address was gated out"
+        );
     }
 }

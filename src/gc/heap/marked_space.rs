@@ -23,9 +23,10 @@ use crate::gc::FxIntBuildHasher;
 
 use super::block_directory::BlockDirectory;
 use super::marked_block::{
-    block_for, cell_ptr, is_atom_aligned, is_live_cell, is_marked as marked_block_is_marked,
-    round_up, test_and_set_marked, Cell, CellPtr, ATOMS_PER_BLOCK, ATOM_SIZE, CELL_BYTES,
-    HALF_ALIGNMENT, MARK_WORDS, PAYLOAD_BYTES, PRECISE_CUTOFF, SIZE_STEP,
+    block_for, cell_ptr, clear_marks_block, is_atom_aligned, is_live_cell,
+    is_marked as marked_block_is_marked, round_up, test_and_set_marked, Cell, CellPtr,
+    ATOMS_PER_BLOCK, ATOM_SIZE, CELL_BYTES, HALF_ALIGNMENT, MARK_WORDS, PAYLOAD_BYTES,
+    PRECISE_CUTOFF, SIZE_STEP,
 };
 use super::precise_allocation::PreciseSpace;
 
@@ -542,6 +543,93 @@ impl MarkedSpace {
         Some(CellPtr::from_addr(addr))
     }
 
+    /// MEMBERSHIP-ONLY admission gate for the COLLECTOR (gc-r4 R4b-mark). This is
+    /// `find` MINUS its final `is_live_cell` check — block bloom `rule_out` →
+    /// `is_atom_aligned` → `blocks.contains` (PATH A), or live `precise_set`
+    /// membership (PATH B). It admits an address iff it lies on an arena object
+    /// cell, REGARDLESS of that cell's mark / newlyAllocated liveness bits.
+    ///
+    /// THE #1 R4b UAF LANDMINE — why the marker MUST gate through THIS, never the
+    /// liveness-bearing `find`: `find` ends in `is_live_cell` = `newlyAllocated OR
+    /// marked`. `clear_all_marks` zeroes every mark at begin-marking, and a prior
+    /// collection's SURVIVOR already had its `newlyAllocated` bit cleared by that
+    /// collection's sweep (R4b-sweep, `DoesNotHave` mode). So at the start of the
+    /// SECOND+ collection an old-gen survivor has `newlyAllocated == 0 AND marks ==
+    /// 0` → `is_live_cell == false` → `find` returns `None`. A marker that gated its
+    /// roots/edges through `find` would REJECT every still-live old-gen cell, leave
+    /// it unmarked, and the sweep would reclaim the WHOLE live old generation → mass
+    /// use-after-free. The membership test does not consult liveness, so the
+    /// survivor is admitted, marked, and retained. (It detonates only on collection
+    /// #2 — survivors keep `newlyAllocated` through #1 — so a single-collection test
+    /// cannot catch it; the reclaim test runs ≥2 collections.)
+    ///
+    /// A foreign LEAF cell (String/Symbol/BigInt `Box`) lies in no arena block, so
+    /// PATH A's `rule_out`/`contains` reject it (and it never carries the +8 precise
+    /// bit / sits in `precise_set`) → `None`, exactly as `find` rejects it: the
+    /// marker never dereferences a non-object cell as a `CoreObjectCell`.
+    ///
+    /// (DIVERGENCE from `find`: this drops the `is_atom` cell-START check that lived
+    /// inside `is_live_cell`. Sound under the PRECISE cooperative root model — every
+    /// admitted root/edge is a `RuntimeValue::from_cell` address, i.e. the exact
+    /// cell-start `allocate_blob` returned, never an interior pointer. A future
+    /// CONSERVATIVE stack scan (gc-r4 GAP C) that admits interior pointers MUST
+    /// re-add an `is_atom` cell-start check here before dereferencing.)
+    pub(crate) fn is_arena_cell(&self, addr: usize) -> Option<CellPtr> {
+        // Dispatch on the halfAlignment bit FIRST (PreciseAllocation.h:68-71). The
+        // precise PATH B is membership-only already (`find` uses no `is_live_cell`
+        // there), so it is identical for the collector.
+        if Self::is_precise(addr) {
+            if self.precise_set.contains(&addr) {
+                return Some(CellPtr::from_addr(addr));
+            }
+            return None;
+        }
+        let candidate = block_for(addr);
+        if self.blocks.rule_out(candidate) {
+            return None;
+        }
+        if !is_atom_aligned(addr) {
+            return None;
+        }
+        if !self.blocks.contains(candidate) {
+            return None;
+        }
+        // NO is_live_cell — see the UAF landmine note above.
+        Some(CellPtr::from_addr(addr))
+    }
+
+    /// COLLECTOR begin-marking: clear EVERY cell's mark bit so the upcoming mark
+    /// phase computes a fresh live set (gc-r4 R4b-mark; the MarkedSpace half of
+    /// `Heap::beginMarking`, heap/MarkedSpace::beginMarking). Walks every registered
+    /// MarkedBlock base (`m_blocks`) zeroing its `m_marks` words, and every live
+    /// precise allocation clearing its single mark byte. `&self` (not `&mut`): the
+    /// mark words are atomic interior-mutable state reached through each page's
+    /// once-exposed provenance (contract C3/C4), exactly like `collector_mark`; the
+    /// block/precise registries are only read. JSC's `markingVersion` bump is
+    /// deferred (same HeapVersion DIVERGENCE as `is_live_cell`); the direct zero has
+    /// the identical observable result.
+    pub(crate) fn clear_all_marks(&self) {
+        for &base in &self.blocks.set {
+            clear_marks_block(base);
+        }
+        for &addr in &self.precise_set {
+            PreciseSpace::clear_mark(addr);
+        }
+    }
+
+    /// TEST-ONLY: simulate a prior FULL-collection sweep's `newlyAllocated` reset
+    /// (heap/MarkedBlock::resetAllocated; R4b-sweep `DoesNotHave` mode) so every surviving
+    /// cell enters the NEXT begin-marking in the OLD-GEN state (`newlyAllocated == 0`).
+    /// R4b-mark performs no real sweep yet (that is R4b-sweep), so a mark-only test uses
+    /// this to reproduce the 2nd-collection survivor state the MEMBERSHIP gate must
+    /// admit — the #1 UAF landmine, which a single-collection run cannot exhibit.
+    #[cfg(test)]
+    pub(crate) fn simulate_post_sweep_clear_newly_allocated(&self) {
+        for &base in &self.blocks.set {
+            super::marked_block::clear_newly_allocated_block(base);
+        }
+    }
+
     // ---- MUTATOR (contract C5: &mut only between safepoints, minimal scope) ----
 
     /// MUTATOR write of field0. Forms `&mut Cell` in MINIMAL scope, between
@@ -662,11 +750,89 @@ impl Drop for MutGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::heap::marked_block::{ATOMS_PER_CELL, BLOCK_MASK, FIRST_PAYLOAD_ATOM};
+    use crate::gc::heap::marked_block::{
+        clear_newly_allocated_block, ATOMS_PER_CELL, BLOCK_MASK, FIRST_PAYLOAD_ATOM,
+    };
 
     /// Cells-per-block for the demo size class (after the header atoms).
     fn cells_per_block() -> usize {
         (ATOMS_PER_BLOCK - FIRST_PAYLOAD_ATOM) / ATOMS_PER_CELL
+    }
+
+    /// gc-r4 R4b-mark THE #1 UAF LANDMINE in miniature: a live old-gen SURVIVOR has
+    /// `newlyAllocated == 0` (cleared by the prior sweep) AND `marks == 0` (cleared at
+    /// begin-marking). The liveness-bearing `find` then returns `None` and would (under
+    /// the later sweep) reclaim it — but the collector's MEMBERSHIP gate `is_arena_cell`
+    /// still admits it, so the marker can mark and retain it. This is the exact
+    /// divergence the marker depends on.
+    #[test]
+    fn is_arena_cell_admits_survivor_that_liveness_find_rejects() {
+        let mut space = MarkedSpace::new();
+        let a = space.allocate(0x10, 0xA11E);
+        let base = a.addr() & BLOCK_MASK;
+
+        // Both liveness sources present right after allocation: BOTH gates admit.
+        assert_eq!(space.find(a.addr()), Some(a));
+        assert_eq!(space.is_arena_cell(a.addr()), Some(a));
+
+        // Simulate the post-sweep + begin-marking survivor state: clear marks
+        // (begin-marking) AND the alloc bitmap (the prior full-collection sweep).
+        space.clear_all_marks();
+        clear_newly_allocated_block(base);
+
+        // `find` now REJECTS the survivor (is_live_cell == false) — gating the marker
+        // through `find` here would orphan + sweep a LIVE cell (mass UAF).
+        assert_eq!(
+            space.find(a.addr()),
+            None,
+            "liveness find drops the survivor"
+        );
+        // The membership gate STILL admits it — the marker can mark + retain it.
+        assert_eq!(
+            space.is_arena_cell(a.addr()),
+            Some(a),
+            "membership gate retains the survivor"
+        );
+
+        // Foreign / non-arena addresses are rejected by BOTH gates (no type confusion).
+        assert!(space.is_arena_cell(0xdead_beef).is_none());
+        assert!(space.is_arena_cell(0).is_none());
+    }
+
+    /// `clear_all_marks` zeroes every block's mark bitmap (begin-marking), across
+    /// multiple blocks, leaving newlyAllocated untouched.
+    #[test]
+    fn clear_all_marks_zeroes_marks_across_blocks() {
+        let mut space = MarkedSpace::new();
+        let n = cells_per_block() + 5; // force a second block
+        let addrs: Vec<_> = (0..n).map(|i| space.allocate(0x10, i as u64)).collect();
+        // Mark every cell, then clear.
+        for &a in &addrs {
+            assert!(space.collector_mark(a));
+            assert!(space.collector_is_marked(a));
+        }
+        space.clear_all_marks();
+        for &a in &addrs {
+            assert!(
+                !space.collector_is_marked(a),
+                "mark cleared at begin-marking"
+            );
+            // newlyAllocated survives clear_all_marks, so the mutator gate still admits.
+            assert_eq!(space.find(a.addr()), Some(a));
+        }
+    }
+
+    /// A precise (large) cell's mark is also cleared by `clear_all_marks`.
+    #[test]
+    fn clear_all_marks_clears_precise_mark() {
+        let mut space = MarkedSpace::new();
+        let p = space.allocate_precise(0x20, 1);
+        assert!(space.collector_mark(p));
+        assert!(space.collector_is_marked(p));
+        space.clear_all_marks();
+        assert!(!space.collector_is_marked(p));
+        // Precise membership is liveness-independent, so both gates still admit it.
+        assert_eq!(space.is_arena_cell(p.addr()), Some(p));
     }
 
     /// THE CRUX TEST (the S2-UB interleaving). The exact sequence that made S2 UB:
