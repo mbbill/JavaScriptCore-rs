@@ -7,14 +7,18 @@
 //! ## Unsafe boundary
 //!
 //! `#![deny(unsafe_code)]` (not `forbid`) holds for the whole `jit/` tree, with
-//! exactly ONE module — [`unsafe_platform_boundary`] — overriding it with
-//! `#![allow(unsafe_code)]`. That module is the only place raw pointers, FFI, the
-//! W^X (`MAP_JIT` / `pthread_jit_write_protect_np` / `sys_icache_invalidate`)
-//! primitives, and the fn-pointer transmute live. Everything else under `jit/`
-//! (including [`executable_allocator`], which copies, relocates, seals, and calls
-//! real machine code) stays safe and reaches execution only through that
-//! boundary's sealed-safe wrappers. `deny` (vs `forbid`) is what lets the single
-//! boundary module re-enable unsafe locally, mirroring `platform/mod.rs`.
+//! exactly TWO modules overriding it with `#![allow(unsafe_code)]`:
+//!   - [`unsafe_platform_boundary`] — the W^X (`MAP_JIT` /
+//!     `pthread_jit_write_protect_np` / `sys_icache_invalidate`) primitives and
+//!     the fn-pointer transmute for executable memory.
+//!   - [`operations`] — the JIT↔runtime-call bridge (`JITOperations` analog); the
+//!     ONLY `unsafe` is the D1 reborrow of the `*mut Vm` an emitted slow path
+//!     passes back into Rust (jit-runtime-bridge.md D1).
+//! These are the only places raw pointers / FFI live. Everything else under
+//! `jit/` (including [`executable_allocator`], which copies, relocates, seals, and
+//! calls real machine code) stays safe and reaches execution only through those
+//! boundaries' sealed-safe wrappers. `deny` (vs `forbid`) is what lets a boundary
+//! module re-enable unsafe locally, mirroring `platform/mod.rs`.
 
 #![deny(unsafe_code)]
 
@@ -36,6 +40,11 @@ pub(crate) mod generated_metrics;
 pub(crate) mod ic;
 pub(crate) mod integration;
 pub(crate) mod machine;
+// The JIT↔runtime-call bridge (`JITOperations` analog): the `extern "C"`
+// slow-path shims emitted code calls back into. The SECOND (and only other)
+// `#![allow(unsafe_code)]` island under `jit/` — see the module note. `pub` so
+// the op_add lowering can take a shim's address as a far-call target.
+pub mod operations;
 pub(crate) mod plan;
 pub(crate) mod semantics;
 // Salvage: GCAwareJITStubRoutine / JITStubRoutineSet tracing, consumed only by

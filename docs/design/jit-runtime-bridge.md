@@ -73,12 +73,39 @@ Result→ExceptionState path stays (a pre-existing divergence from C++'s single 
 word; converge later). Before the call, stamp topCallFrame + CallSiteIndex so a GC/throw
 during the op attributes correctly.
 
+## D5 — host reach (LANDED, ratified 2026-06-28)
+
+D4 wrongly assumed the Vm owns the host. It doesn't: `CoreOpcodeDispatchHost` (the object/
+string/bigint/symbol stores + the evaluators) is a SEPARATE allocation the driver threads in.
+So the Vm carries `jit_host: *mut CoreOpcodeDispatchHost` (vm/mod.rs), a RAW pointer the driver
+parks via `set_jit_host(&mut host)` immediately before the JIT-call region and `clear_jit_host`
+after — same D1 discipline. The shim reborrows BOTH `&mut *vm` and `&mut *vm.jit_host` (DISJOINT
+allocations — Vm owns only the raw ptr, not the host — so the two `&mut` never alias);
+`Vm::operation_value_add` split-borrows the Vm's disjoint fields + the real host and runs the
+evaluator verbatim. Miri-passed (`-Zmiri-tree-borrows`) on the real-host test (`"ab"+"cd"` lands
+in the REAL string store — definitive proof the parked host, not a transient, is reached).
+Faithful-enough bridge; the end-state unifies the host INTO the Vm (a later interpreter refactor)
+and replaces this raw ptr with direct ownership.
+
 ## Build order
 
-1. **Bridge-infra** (this design): the `Vm::operation_*` wrappers (D4) + `jit/operations.rs`
-   shims (D1) + the `pending` exception word (D3) + a MacroAssembler far-call (move_imm64+blr)
-   + a DIRECT test (call `operation_value_add(vm_ptr, a, b)` simulating the JIT call) + Miri on
-   the reborrow. (vm/mod.rs + jit/ + ExceptionState — disjoint from the interpreter op work.)
-2. **op_add lowering**: the entry trampoline (materialize PinnedVm + x29) + the fast+slow
-   op_add in arm64_baseline (box/tag guards + branchAdd32 → slow → the far-call) + emit→
-   relocate→execute test. Then template across sub/mul/bit/shift + branch ops + live dispatch.
+1. **Bridge-infra** — **DONE** (verified ACCEPTABLE): D4 wrappers + `jit/operations.rs` shim
+   (D1+D5 reborrows, the one audited unsafe island) + the D3 `jit_pending` word + the
+   MacroAssembler far-call + the direct real-host test + Miri.
+2. **op_add lowering** (NEXT): the entry trampoline (materialize the PinnedVm `*mut Vm` +
+   `set_jit_host` the active host + x29; `clear_jit_host` after) + the fast+slow op_add in
+   arm64_baseline (box/tag int32 guards + branchAdd32 → slow → `far_call(operation_value_add)` +
+   `branchTestPtr(NonZero, jit_pending_address())`) + emit→relocate→execute test. Then template
+   across sub/mul/bit/shift + branch ops + live dispatch.
+
+   **Hard forward prerequisites the op_add unit MUST satisfy** (from the bridge verify — not
+   bridge defects, but required before real JS flows through the slow path):
+   - **Thread the real active-frame CodeBlock** before OBJECT operands reach the slow path
+     (`{} + 1` → ToNumber needs the live CodeBlock; bridge-infra proved the PRIMITIVE AddInt32
+     path never reads it, so the placeholder is sound only for primitives).
+   - **Materialize a real TypeError** for an engine `Fail(ExecutionError)` (replace the 0x8
+     non-empty sentinel the shim currently writes; a real `Throw(value)` is already faithful).
+   - **Bake `jit_pending_address()` against a pin-stable Vm** (the address must not move after
+     the JIT bakes it as an AbsoluteAddress).
+   - **The trampoline upholds the D1 park-and-don't-touch discipline** (the driver must not read/
+     write the parked `&mut Vm`/`&mut host` while JIT code runs).

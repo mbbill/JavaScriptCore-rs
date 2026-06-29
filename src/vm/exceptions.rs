@@ -6,7 +6,7 @@ use crate::gc::{
     TargetedRootSet,
 };
 use crate::runtime::CallFrameId;
-use crate::value::JsValue;
+use crate::value::{EncodedJsValue, JsValue};
 
 /// Opaque identity for exception scopes used to enforce checking discipline.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -43,11 +43,42 @@ pub struct ExceptionState {
     check_state: ExceptionCheckState,
     scope_depth: usize,
     unwind: ExceptionUnwindState,
+    // D3 (jit-runtime-bridge.md): the JIT's mirror of C++ `VM::m_exception` (a
+    // single fixed-offset `EncodedJSValue` word, VM.h). 0 == VALUE_EMPTY == no
+    // pending exception (JSCJSValue.h:487 `ValueEmpty`). The interpreter keeps its
+    // own `Result`/`pending: Option<PendingException>` path UNTOUCHED (a
+    // pre-existing divergence from C++'s single m_exception word; converge later);
+    // this word is the JIT fast path's bakeable mirror only. After a slow-path
+    // call, emitted code does `branchTestPtr(NonZero, AbsoluteAddress(addr-of
+    // jit_pending))` -> the exception edge. Stable address via
+    // `jit_pending_address()` so the JIT can bake it as an `AbsoluteAddress`.
+    jit_pending: EncodedJsValue,
 }
 
 impl ExceptionState {
     pub fn pending(&self) -> Option<PendingException> {
         self.pending
+    }
+
+    /// D3 (jit-runtime-bridge.md): read the JIT m_exception mirror word. 0 ==
+    /// VALUE_EMPTY == none. Faithful analog of reading `VM::m_exception`.
+    pub fn jit_pending(&self) -> EncodedJsValue {
+        self.jit_pending
+    }
+
+    /// D3: stamp the JIT m_exception mirror word (set on the slow-path shim's
+    /// throw edge). Faithful analog of `VM::setException` writing `m_exception`.
+    pub fn set_jit_pending(&mut self, value: EncodedJsValue) {
+        self.jit_pending = value;
+    }
+
+    /// D3: the stable address of the JIT m_exception mirror word, which the
+    /// baseline JIT bakes as an `AbsoluteAddress` for its post-call
+    /// `branchTestPtr(NonZero, ...)` exception check (`VM::addressOfException`,
+    /// VM.h). A raw `*const` (not a borrow proof) so the emitter can hold it
+    /// across code generation; the word lives in the `Vm`-owned `ExceptionState`.
+    pub fn jit_pending_address(&self) -> *const EncodedJsValue {
+        &self.jit_pending
     }
 
     pub fn throw(&mut self, value: JsValue) {

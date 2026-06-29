@@ -746,6 +746,32 @@ impl MacroAssemblerArm64 {
         self.asm().emit_nop();
     }
 
+    /// Absolute (far) call to a fixed 64-bit code address — JSC's
+    /// `MacroAssemblerARM64::call(PtrTag)` (MacroAssemblerARM64.h:5441-5448):
+    /// `moveWithFixedWidth(target, dataTempRegister)` then `m_assembler.blr`,
+    /// returning `Call(label, Call::None)`. A near `bl` reaches only ±128 MB, so
+    /// a Rust runtime fn pointer (a full 64-bit address) cannot be reached by
+    /// `near_call`; this materializes the address into the data-temp scratch
+    /// (`ip0`) with `move_imm64` (movz/movk) and `blr ip0`.
+    ///
+    /// The returned [`Call`] carries [`CallFlags::NONE`]: a register-target `blr`
+    /// has NO PC-relative displacement to patch at link time (the address lives in
+    /// the immediate, baked by `move_imm64`), so this site is NOT a linkable near
+    /// call — it only marks the call site (mirroring JSC's `Call::None`).
+    ///
+    /// DEFERRED (commented per the module's CachedTempRegister note): JSC uses
+    /// `moveWithFixedWidth` (a fixed 4-instruction movz/movk sequence so the
+    /// address slot is repatchable). This port uses the variable-width
+    /// `move_imm64` (emits only the non-zero halfwords), matching every other
+    /// immediate-move site here; the emitted call is byte-identical for a given
+    /// target. A repatchable fixed-width form is a later need (call relinking).
+    pub fn far_call(&mut self, target: TrustedImm64) -> Call {
+        self.move_imm64(target, Self::DATA_TEMP_REGISTER);
+        let label = self.current_label();
+        self.asm().emit_blr(Self::DATA_TEMP_REGISTER);
+        Call::new(label, CallFlags::NONE)
+    }
+
     // ========================================================================
     // Private helpers — faithful ports of the MacroAssemblerARM64 internals.
     // ========================================================================
@@ -1670,6 +1696,28 @@ mod tests {
         // ret : 0xd65f03c0 ; nop : 0xd503201f.
         assert_eq!(emit(|m| m.ret()), vec![0xd65f_03c0]);
         assert_eq!(emit(|m| m.nop()), vec![0xd503_201f]);
+    }
+
+    #[test]
+    fn far_call_materializes_pointer_and_blrs_data_temp() {
+        // far_call(0x0000_abcd_0000_1234) -> move64 into ip0 (x16) then blr ip0.
+        // move_imm64 into x0 is [movz x0,#0x1234 : 0xd2824680, movk x0,#0xabcd,lsl#32
+        // : 0xf2d579a0]; the dest is ip0/x16, so Rd (bits[4:0]) gains +0x10:
+        //   movz x16,#0x1234        : 0xd2824690
+        //   movk x16,#0xabcd,lsl#32 : 0xf2d579b0
+        // blr ip0 (Rn=x16 in bits[9:5] -> +0x200 over `blr x0`=0xd63f0000):
+        //   blr x16                 : 0xd63f0200
+        let mut masm = MacroAssemblerArm64::new();
+        let c = masm.far_call(TrustedImm64::new(0x0000_abcd_0000_1234));
+        assert_eq!(
+            words(masm.code()),
+            vec![0xd282_4690, 0xf2d5_79b0, 0xd63f_0200]
+        );
+        // The Call token references the `blr` site (after the 2-word move = byte 8),
+        // flagged NONE: a register-target call has no near displacement to relink.
+        assert_eq!(c.label(), AssemblerLabel(8));
+        assert!(!c.is_flag_set(CallFlags::LINKABLE));
+        assert!(!c.is_flag_set(CallFlags::NEAR));
     }
 
     // ------------------------------------------------------------------------

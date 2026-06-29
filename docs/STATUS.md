@@ -68,6 +68,10 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   (GAP A) + NO sweep (GAP B); both gated on POD-ness (Batch 1). Author trace+sweep when Butterfly-values lands.
 
 ## Baseline JIT / DFG / FTL (parity lives here; ~0% started)
+- [done] JIT↔runtime bridge-infra (adversarially verified): extern-C operation_value_add shim
+  (D1+D5 raw-ptr reborrow of vm+real host, Miri-passed) + Vm::operation_* split-borrow wrappers
+  (evaluators verbatim) + D3 jit_pending exception word + far-call. docs/design/jit-runtime-bridge.md.
+  NEXT: op_add lowering (trampoline + fast/slow + execute) — 4 forward prereqs in the design doc.
 - [missing] wire arm64_baseline to emit per-opcode via the encoder/finalize (retire the byte-blob /
   re-interpreter shim) + the bytecode-stream cutover + profiling wiring + tier-up.
 - [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.

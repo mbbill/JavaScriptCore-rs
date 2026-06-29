@@ -891,6 +891,20 @@ struct GeneratedPropertySidecarProjectionCacheEntry {
     projection: GeneratedPropertySidecarProjection,
 }
 
+/// BRIDGE-INFRA placeholder (jit-runtime-bridge.md D3): the NON-EMPTY
+/// `EncodedJSValue` stamped into the JIT `m_exception` mirror when the faithful
+/// op_add evaluator returns an engine-level `DispatchOutcome::Fail(ExecutionError)`
+/// rather than a materialized JS throw value (`DispatchOutcome::Throw`). jsAdd's
+/// faithful throw OBJECT (a TypeError cell) is materialized by the interpreter's
+/// `ExecutionError`->throw path / the op_add exception stub (the NEXT unit,
+/// build-order step 2), which bridge-infra does not implement. `0x8` is a
+/// non-empty, non-number, non-immediate, non-cell `Unknown`-kind bit pattern
+/// (never JS-visible — VALUE_EMPTY is 0x0, JSCJSValue.h:487) chosen ONLY so the
+/// mirror is non-zero == "exception pending"; the JIT's post-call
+/// `branchTestPtr(NonZero, &exceptions.jit_pending)` then takes the exception
+/// edge. Replaced by the real thrown cell when op_add lowering lands.
+const JIT_PENDING_EXCEPTION_PLACEHOLDER: EncodedJsValue = EncodedJsValue(0x8);
+
 /// Engine instance and owner of heap-wide runtime state.
 #[derive(Debug)]
 pub struct Vm {
@@ -903,6 +917,22 @@ pub struct Vm {
     #[allow(dead_code)]
     entry_frame_storage: JscEntryFrameStorage,
     exceptions: ExceptionState,
+    // D5 (jit-runtime-bridge.md): the JIT bridge's raw pointer to the active
+    // `CoreOpcodeDispatchHost`, the SAME raw-pointer discipline as the `*mut Vm`
+    // (D1). JSC's `VM` owns the heap + object-space as one unit; this Rust engine
+    // splits the `Vm` (heap/exceptions/stack/registers) from the
+    // `CoreOpcodeDispatchHost` (the objects/strings/bigints/symbols STORES), which
+    // is threaded as a `&mut H` parameter from the top-level driver, not owned by
+    // the `Vm`. D5 carries it here as a raw pointer the driver PARKS immediately
+    // before a JIT-call region (`set_jit_host`) and CLEARS after (`clear_jit_host`)
+    // — dormant for the call, exactly like the parked `*mut Vm`. The slow-path
+    // shim reborrows it once per op (the single audited unsafe island,
+    // jit/operations.rs). `null` == not-in-JIT. This is the faithful-enough
+    // bridge; the end-state is UNIFYING the host INTO the `Vm` (a later
+    // interpreter refactor), at which point this raw pointer is replaced by direct
+    // field ownership — mirroring the D2(c)->D2(b) `globalObject->vm()`
+    // convergence.
+    jit_host: *mut CoreOpcodeDispatchHost,
     structures: RuntimeStructures,
     caches: RuntimeCaches,
     globals: GlobalRuntimeState,
@@ -1855,6 +1885,8 @@ impl Vm {
             call_frame_storage: JscCallFrameStorage::default(),
             entry_frame_storage: JscEntryFrameStorage::default(),
             exceptions: ExceptionState::default(),
+            // D5: not-in-JIT until the driver parks a host pointer (set_jit_host).
+            jit_host: std::ptr::null_mut(),
             structures: RuntimeStructures::default(),
             caches: RuntimeCaches::default(),
             globals: GlobalRuntimeState::default(),
@@ -2370,6 +2402,123 @@ impl Vm {
 
     pub fn exception_state_mut(&mut self) -> &mut ExceptionState {
         &mut self.exceptions
+    }
+
+    // ====================================================================
+    // JIT runtime-call bridge (jit-runtime-bridge.md). The baseline JIT's
+    // op_add slow path calls `jit::operations::operation_value_add`, the
+    // `extern "C"` shim that reborrows `*mut Vm` -> `&mut Vm` (D1) and the
+    // parked `*mut CoreOpcodeDispatchHost` -> `&mut host` (D5), then calls the
+    // SAFE wrapper below. This is the runtime-call mechanism; the op_add
+    // lowering/trampoline that emits the far-call is the next unit.
+    // ====================================================================
+
+    /// D5: park the active `CoreOpcodeDispatchHost` as a raw pointer for the
+    /// JIT-call region. The driver (the op_add lowering's entry path; the test
+    /// plays this role today) calls this immediately BEFORE entering JIT code and
+    /// must hold the host's `&mut` DORMANT (no other access) until the matching
+    /// [`Vm::clear_jit_host`] after the call returns — the SAME parking discipline
+    /// as the `*mut Vm` (D1). Safe: storing a raw pointer is not `unsafe`; only the
+    /// shim's one reborrow (jit/operations.rs) is.
+    pub fn set_jit_host(&mut self, host: &mut CoreOpcodeDispatchHost) {
+        self.jit_host = host;
+    }
+
+    /// D5: end the parked-host region (back to not-in-JIT). The driver calls this
+    /// after the JIT-call region; reading the host directly is sound again.
+    pub fn clear_jit_host(&mut self) {
+        self.jit_host = std::ptr::null_mut();
+    }
+
+    /// D5: the parked host pointer the shim reborrows (`null` == not-in-JIT). A
+    /// plain getter (the deref is the shim's single audited `unsafe`).
+    pub fn jit_host_ptr(&self) -> *mut CoreOpcodeDispatchHost {
+        self.jit_host
+    }
+
+    /// D4+D5 (jit-runtime-bridge.md): the SAFE wrapper the JIT shim calls for
+    /// `op_add`'s slow path. Mirrors `operationValueAdd` ->
+    /// `jsAdd(globalObject, op1, op2)` (JITOperations.cpp:4860): runs the faithful
+    /// op_add evaluator `CoreOpcodeDispatchHost::arithmetic_binary_result`
+    /// (interpreter/mod.rs:9304) VERBATIM over `CoreOpcode::AddInt32` on the REAL
+    /// host + the `Vm`'s REAL heap/stack/registers/exceptions, surfacing either the
+    /// boxed result or the pending exception's `EncodedJsValue`.
+    ///
+    /// D5 — the host is the REAL one: `host` is the reborrowed parked
+    /// `CoreOpcodeDispatchHost` (the live objects/strings/bigints/symbols stores),
+    /// passed in by the shim, NOT a transient empty host. So the string/bigint
+    /// slow paths reach the actual stores (e.g. `str + str` concatenates in the
+    /// real string store). DIVERGENCE (framed at the `jit_host` field): JSC's `VM`
+    /// owns heap+object-space as one unit; this engine splits `Vm` (heap/exceptions)
+    /// from the host (the stores), bridged by the D5 raw pointer; the end-state
+    /// unifies the host INTO the `Vm`, replacing the pointer with direct ownership.
+    ///
+    /// Borrow shape: `host` is a passed-in `&mut` over a DISJOINT allocation (not
+    /// inside `self`); the four `DispatchState` inputs are disjoint `self` fields
+    /// (`execution`/`registers`/`exceptions`/`heap`) borrowed simultaneously — all
+    /// safe Rust.
+    ///
+    /// `code_block`: a placeholder `CodeBlock`. PROVABLY NOT ACCESSED by the
+    /// arithmetic path — `arithmetic_binary_result` (and its number/string/bigint
+    /// callees `numeric_binary_result`/`bitwise_binary_result`/`concat_primitives`/
+    /// `bigint_binary_result`) never reads `state.code_block`; only the OBJECT
+    /// operand path (`object_to_number_hint_primitive`) does, and AddInt32 with
+    /// primitive operands never reaches it (verified by inspection of mod.rs
+    /// 9304-9460). The active-frame `CodeBlock` is threaded when a store/
+    /// frame-touching op needs it (op_add lowering / the unified-host refactor).
+    pub fn operation_value_add(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        let code_block = CodeBlock::from_unlinked(
+            UnlinkedCodeBlock::new(
+                crate::bytecode::CodeKind::Program,
+                PackedInstructionStream::default(),
+            ),
+            LinkContext::default(),
+        );
+        let mut state = DispatchState {
+            stack: &mut self.execution,
+            registers: &mut self.registers,
+            exceptions: &mut self.exceptions,
+            heap: &mut self.heap,
+            code_block: &code_block,
+            ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+            function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+        };
+        match host.arithmetic_binary_result(&mut state, op1, op2, CoreOpcode::AddInt32) {
+            Ok(value) => Ok(value),
+            // A materialized JS throw value (e.g. an object operand's valueOf
+            // threw) is surfaced FAITHFULLY as its `EncodedJSValue`, exactly what
+            // `VM::m_exception` would hold.
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            // An engine-level `Fail(ExecutionError)` carries no JS value yet
+            // (jsAdd's faithful throw OBJECT — a TypeError cell — is materialized
+            // by the interpreter's ExecutionError->throw path / the op_add
+            // exception stub, the NEXT unit, which bridge-infra does not
+            // implement). Surface the documented non-empty placeholder so the JIT
+            // m_exception mirror is non-zero == "exception pending".
+            Err(_) => Err(JIT_PENDING_EXCEPTION_PLACEHOLDER),
+        }
+    }
+
+    /// D3: read the JIT m_exception mirror word (`VM::exception()` analog).
+    pub fn jit_pending_exception(&self) -> EncodedJsValue {
+        self.exceptions.jit_pending()
+    }
+
+    /// D3: stamp the JIT m_exception mirror word. Called by the slow-path shim on
+    /// the throw edge (the design's `vm.exceptions.pending = exception.encoded()`).
+    pub fn set_jit_pending_exception(&mut self, value: EncodedJsValue) {
+        self.exceptions.set_jit_pending(value);
+    }
+
+    /// D3: the stable address the baseline JIT bakes as `AbsoluteAddress` for its
+    /// post-call `branchTestPtr(NonZero, ...)` (`VM::addressOfException` analog).
+    pub fn jit_pending_exception_address(&self) -> *const EncodedJsValue {
+        self.exceptions.jit_pending_address()
     }
 
     pub fn runtime_structures(&self) -> &RuntimeStructures {

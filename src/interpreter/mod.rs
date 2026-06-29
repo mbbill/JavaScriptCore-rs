@@ -3776,6 +3776,21 @@ impl CoreOpcodeDispatchHost {
         self.objects.allocate_with_prototype(None)
     }
 
+    // Cross-module test support for the JIT runtime-call bridge (jit/operations.rs
+    // D5 proof): allocate a runtime string in THIS host's real string store and
+    // read one back. The store is private; these expose the minimum so a bridge
+    // test can prove the evaluator reached the REAL host's stores (str+str
+    // concatenates in the live store), not a transient empty one.
+    #[cfg(test)]
+    pub(crate) fn allocate_untracked_string_for_test(&mut self, text: &str) -> RuntimeValue {
+        self.strings.allocate_untracked(text)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn string_text_for_test(&self, value: RuntimeValue) -> Option<&str> {
+        self.strings.text(value)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_identifier_data_property_for_test(
         &mut self,
@@ -9301,7 +9316,13 @@ impl CoreOpcodeDispatchHost {
     // call user valueOf/toString (re-entrant) and may THROW a catchable
     // TypeError ("No default value", JSObject.cpp:2589) or a user throw, both
     // propagated as a catchable DispatchOutcome, never a fatal abort.
-    fn arithmetic_binary_result(
+    //
+    // Visibility (pub(crate)): the JIT runtime-call bridge's safe wrapper
+    // `Vm::operation_value_add` calls this evaluator VERBATIM through a transient
+    // `CoreOpcodeDispatchHost` + `DispatchState` (jit-runtime-bridge.md D4). The
+    // bridge does not modify the evaluator; only this visibility is widened so
+    // vm/mod.rs can reach the faithful op_add slow-path result.
+    pub(crate) fn arithmetic_binary_result(
         &mut self,
         state: &mut DispatchState<'_>,
         left: RuntimeValue,
