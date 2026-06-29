@@ -64,10 +64,15 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 - [done] Butterfly-values cutover (verified): storage/elements → the store slab; the offset-8 slot is
   a ButterflyHandle (separate alloc) — **storage_ptr de-self-referenced (the R4 UB hazard, gone)**;
   Clone-via-store; ~74 sites flipped (copy-out pattern). KEEPS the HashMap (cell NOT yet POD).
-- [next-GC] GetterSetter prerequisite (blocks the HashMap-deletion flip → POD → R4): the cutover verify
-  found accessor AND Symbol-keyed values have NO Structure offset + no GetterSetter cell + no Accessor
-  attribute bit. Needs: a minimal GetterSetter cell + an Accessor attr bit + Structure offsets for
-  Symbol/accessor keys → THEN delete the HashMap (butterfly = sole value authority) + needs_drop POD assert.
+- [done] GetterSetter infra B-i/ii/iii (verified; additive/dual-write, reversible): Accessor attribute
+  bit (1<<4, distinct data/accessor transition edges — provably disjoint) + CoreObjectKind::GetterSetter
+  cell (POD Option<RuntimeValue> getter/setter) + Symbol+accessor keys now get REAL Structure offsets +
+  dual-write the butterfly in lockstep with the still-authoritative HashMap. IC data-load probe gated to
+  miss for accessor shapes (required; reads the shape). HashMap still authoritative; needs_drop NOT flipped.
+- [next-GC] B-iv FLIP (irreversible): delete the per-cell properties HashMap (~36 value-authority sites,
+  reads → structure+butterfly; accessor values resolve via the butterfly GetterSetter) + fold property_order
+  → Structure entry order + drop vestigial deleted_offsets + handle the deferred in-place data↔accessor
+  conversion. Removes the PROPERTY Drop fields; needs_drop POD assert still waits for the OTHER per-kind units.
 - [missing] POD object-model rewrite (retire the fat CoreObjectCell) → R3 shadow oracle → R4 flip
   (gate = technical verification: shadow cross-check + miri + adversarial verify) → running collector.
   Audited (gc-r4.md): R4 mostly mechanical (value carries the ptr; copy-out pattern exists), sharp

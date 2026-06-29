@@ -427,6 +427,14 @@ pub(crate) struct CoreObjectCell {
     pub(crate) bound_target: Option<RuntimeValue>,
     pub(crate) bound_this: RuntimeValue,
     pub(crate) bound_args: Vec<RuntimeValue>,
+    /// C++ JSC runtime/GetterSetter.h:132-133: GetterSetter::m_getter / m_setter, an
+    /// accessor's getter and setter functions. Only meaningful when
+    /// kind == CoreObjectKind::GetterSetter; a null getter/setter is `None`
+    /// (GetterSetter.h treats the missing half as the undefined sentinel). These are
+    /// POD (`Copy` `Option<RuntimeValue>`), so they do NOT add a `Drop` field — the
+    /// cell stays sweep-eligible for R4 (gc-r4 B-ii).
+    pub(crate) getter_value: Option<RuntimeValue>,
+    pub(crate) setter_value: Option<RuntimeValue>,
 }
 
 // C++ JSC JSCell::structureIDOffset()==0 (runtime/JSCell.h:293): the StructureID
@@ -525,6 +533,8 @@ impl Default for CoreObjectCell {
             bound_target: None,
             bound_this: RuntimeValue::default(),
             bound_args: Vec::new(),
+            getter_value: None,
+            setter_value: None,
         }
     }
 }
@@ -582,6 +592,8 @@ impl Clone for CoreObjectCell {
             bound_target: self.bound_target,
             bound_this: self.bound_this,
             bound_args: self.bound_args.clone(),
+            getter_value: self.getter_value,
+            setter_value: self.setter_value,
         }
     }
 }
@@ -609,6 +621,15 @@ pub(crate) enum CoreObjectKind {
     Uint8Array,
     DataView,
     Proxy,
+    // C++ JSC runtime/GetterSetter.h:42: a GetterSetter is a fixed cell holding a
+    // property's getter and setter functions (m_getter/m_setter, GetterSetter.h:
+    // 132-133). gc-r4 B-ii: an accessor property's butterfly slot holds
+    // `from_cell(GetterSetter)` exactly as C++ stores a `GetterSetter*`. It is NOT a
+    // JSObject in C++ (GetterSetterType sits below ObjectType in runtime/JSType.h) and
+    // is never a JS-visible value here — it lives only inside accessor butterfly slots
+    // — so the collapse to JsType::Object in js_type() below is internal-only and never
+    // reaches an is_object()/typeof JS check.
+    GetterSetter,
 }
 
 impl CoreObjectKind {
@@ -642,7 +663,12 @@ impl CoreObjectKind {
             | CoreObjectKind::ArrayBuffer
             | CoreObjectKind::Uint8Array
             | CoreObjectKind::DataView
-            | CoreObjectKind::Proxy => JsType::Object,
+            | CoreObjectKind::Proxy
+            // GetterSetter is C++ GetterSetterType (non-object) but is never a
+            // JS-visible value (accessor-slot internal only); folding it into the
+            // Object umbrella keeps the match total without a JsType variant it never
+            // needs on a JS path. See the CoreObjectKind::GetterSetter comment.
+            | CoreObjectKind::GetterSetter => JsType::Object,
         }
     }
 }
@@ -1078,10 +1104,23 @@ pub(crate) fn generated_property_load_cell_data_property_at_offset(
     // `mov reg <- [storage_base + offset*8]` from the butterfly.
     //
     // gc-r4 Butterfly-values: the offset slot lives in the store-owned butterfly slab
-    // reached by `cell.butterfly`; the structure guard ALONE proves `expected_offset`
-    // is the live own-data slot for this shape (the faithful JSC IC invariant). `key`
-    // is kept in the signature for the call shape but is not needed once guarded.
-    let _ = key;
+    // reached by `cell.butterfly`.
+    //
+    // gc-r4 B-iii: accessors now ALSO occupy a real Structure offset (their butterfly
+    // slot holds a `from_cell(GetterSetter)`), so the structure guard ALONE no longer
+    // proves the slot is a DATA value. Gate the data-load fast path on the structure's
+    // attributes NOT carrying `PropertyAttribute::Accessor` — exactly the precondition
+    // C++ checks before emitting an `AccessCase::Load` (an accessor gets an
+    // `AccessCase::Getter` stub instead, never this data load). This reads the SHAPE
+    // (the offset/attribute authority), not the per-cell value HashMap, so it does not
+    // change the VALUE authority this batch.
+    if let Some((_, attributes)) =
+        objects.structure_property(cell.structure_id, &key.to_core_property_key())
+    {
+        if attributes & PROPERTY_ATTRIBUTE_ACCESSOR != 0 {
+            return None;
+        }
+    }
     objects.butterfly_prop_get(cell.butterfly, expected_offset)
 }
 
@@ -1115,21 +1154,40 @@ pub(crate) fn generated_property_load_offset_miss_reason(
 }
 
 pub(crate) fn core_property_key_supports_named_property_offset(key: &CorePropertyKey) -> bool {
+    // gc-r4 B-iii: Symbol keys ALSO get a named-property offset now. C++ keys the
+    // Structure PropertyTable/transition table by a property's uniqued uid, and a
+    // Symbol* is such a uid exactly like a string's UniquedStringImpl*; the Rust port
+    // interns ANY CorePropertyKey (incl. Symbol) to a uid in `intern_property_uid`, so a
+    // symbol-keyed add transitions + converges like a string-keyed one. Array-INDEX
+    // strings stay excluded — they live in the butterfly indexed region, not the
+    // named-property table (`key_array_index` returns None for Symbol/Identifier).
     matches!(
         key,
-        CorePropertyKey::Identifier(_) | CorePropertyKey::String(_)
+        CorePropertyKey::Identifier(_) | CorePropertyKey::String(_) | CorePropertyKey::Symbol(_)
     ) && key_array_index(key).is_none()
 }
 
-/// Encode `CorePropertyAttributes` as the `unsigned attributes` bitfield the ported
-/// Structure transition table + PropertyTable key on (C++ runtime/PropertyAttribute.h:
-/// ReadOnly == 1<<1, DontEnum == 1<<2, DontDelete == 1<<3). Only the writable/
-/// enumerable/configurable trio the interpreter models is encoded; the mapping is
-/// injective over those 8 combinations so distinct attribute sets produce distinct
-/// transition edges (the authoritative attribute VALUES stay in `properties`).
-pub(crate) fn core_attributes_to_u32(attributes: CorePropertyAttributes) -> u32 {
+/// C++ JSC runtime/PropertyAttribute.h: `PropertyAttribute::Accessor == 1 << 4` (also
+/// runtime/PropertySlot.h:50). Set on a property's `unsigned attributes` when it holds
+/// a getter/setter rather than a data value, so a data add and an accessor add of the
+/// SAME key produce DISTINCT attribute bitfields -> DISTINCT transition edges ->
+/// DISTINCT successor structures (without it they would wrongly share one structure).
+pub(crate) const PROPERTY_ATTRIBUTE_ACCESSOR: u32 = 1 << 4;
+
+/// Encode `CorePropertyAttributes` (+ accessor-ness) as the `unsigned attributes`
+/// bitfield the ported Structure transition table + PropertyTable key on (C++
+/// runtime/PropertyAttribute.h: ReadOnly == 1<<1, DontEnum == 1<<2, DontDelete == 1<<3,
+/// Accessor == 1<<4). The writable/enumerable/configurable trio plus the Accessor bit
+/// the interpreter models is encoded; the mapping is injective over those combinations
+/// so distinct attribute sets produce distinct transition edges (the authoritative
+/// attribute VALUES stay in `properties`). gc-r4 B-i threads `is_accessor` from the
+/// `structure_add_property` call sites so an accessor add keys a DIFFERENT edge than a
+/// data add of the same key. C++ never sets the ReadOnly (writable) bit on an accessor —
+/// writability is a DATA-property attribute only — so it is suppressed when `is_accessor`,
+/// leaving an accessor's default attributes as just the Accessor bit.
+pub(crate) fn core_attributes_to_u32(attributes: CorePropertyAttributes, is_accessor: bool) -> u32 {
     let mut bits = 0u32;
-    if !attributes.writable {
+    if !is_accessor && !attributes.writable {
         bits |= 1 << 1; // ReadOnly
     }
     if !attributes.enumerable {
@@ -1137,6 +1195,9 @@ pub(crate) fn core_attributes_to_u32(attributes: CorePropertyAttributes) -> u32 
     }
     if !attributes.configurable {
         bits |= 1 << 3; // DontDelete
+    }
+    if is_accessor {
+        bits |= PROPERTY_ATTRIBUTE_ACCESSOR;
     }
     bits
 }
@@ -3816,6 +3877,26 @@ impl CoreObjectStore {
         RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
     }
 
+    /// Allocate a GetterSetter cell (C++ runtime/GetterSetter.h:42 `GetterSetter::
+    /// create`): a fixed POD cell holding the property's getter and setter functions.
+    /// A null getter/setter maps to `None` (GetterSetter.h:132-133, the missing half is
+    /// the undefined sentinel). The returned value IS `from_cell(getter_setter)` — the
+    /// `RuntimeValue` an accessor's butterfly slot stores, exactly as C++ stores a
+    /// `GetterSetter*` (gc-r4 B-ii). Routed through the single `allocate_cell` chokepoint
+    /// so the cell gets a coherent header + butterfly like every other cell.
+    pub(crate) fn allocate_getter_setter(
+        &mut self,
+        getter: Option<RuntimeValue>,
+        setter: Option<RuntimeValue>,
+    ) -> RuntimeValue {
+        self.allocate_cell(CoreObjectCell {
+            kind: CoreObjectKind::GetterSetter,
+            getter_value: getter,
+            setter_value: setter,
+            ..CoreObjectCell::default()
+        })
+    }
+
     pub(crate) fn rebuild_object_indices(&mut self) {
         self.object_indices_by_payload.clear();
         for (index, object) in self.objects.iter().enumerate() {
@@ -3875,37 +3956,51 @@ impl CoreObjectStore {
         sid != StructureId::INVALID && sid.raw() < self.structure_table.peek_next_handle().raw()
     }
 
-    /// The property offset assigned to `key` by structure `sid` — read straight from
+    /// The (offset, attributes) structure `sid` assigns to `key` — read straight from
     /// the structure's Structure::PropertyTable (owned, or materialized-on-miss by
-    /// replaying the transition chain, Structure.cpp:456). The SINGLE offset authority
-    /// (replacing the deleted per-cell `property_offsets`). Returns `None` for a key
-    /// with no named offset in this shape (symbol/index, never added, deleted, or an
-    /// accessor — those keys are taken out of the table).
+    /// replaying the transition chain, Structure.cpp:456). `PropertyTable::get` returns
+    /// the `(offset, attributes)` tuple (object/property_table.rs:378, PropertyTable.h:
+    /// 344); the attributes carry the PropertyAttribute bits the transition was keyed on,
+    /// INCLUDING `PropertyAttribute::Accessor` (1<<4) for an accessor property — so a
+    /// reader can tell an accessor offset from a data offset WITHOUT consulting the
+    /// per-cell `properties` map. gc-r4 B-i EXPOSES the structure's attributes for the
+    /// dual-write mirror + the eventual flip; the live read sites still resolve VALUES
+    /// through `properties` this batch. Returns `None` for a key with no named offset in
+    /// this shape (array-index strings, never added, or deleted/displaced).
+    pub(crate) fn structure_property(
+        &self,
+        sid: StructureId,
+        key: &CorePropertyKey,
+    ) -> Option<(PropertyOffset, u32)> {
+        if !self.is_live_structure(sid) {
+            return None;
+        }
+        let uid = self.lookup_property_uid(key)?;
+        let (raw, attributes) = match self.structure_table.structure(sid).property_table_or_null() {
+            Some(table) => table.get(uid),
+            // materialize-on-miss: the table was moved to a child via a transition;
+            // rebuild it by replaying the chain (cache-back deferred, gc-r4 B2).
+            None => self
+                .structure_table
+                .materialize_property_table(sid)
+                .get(uid),
+        };
+        if raw < 0 {
+            None
+        } else {
+            Some((PropertyOffset::new(raw), attributes))
+        }
+    }
+
+    /// The property offset assigned to `key` by structure `sid`. The SINGLE offset
+    /// authority (replacing the deleted per-cell `property_offsets`); a thin projection
+    /// of `structure_property` that drops the attributes.
     pub(crate) fn structure_offset(
         &self,
         sid: StructureId,
         key: &CorePropertyKey,
     ) -> Option<PropertyOffset> {
-        if !self.is_live_structure(sid) {
-            return None;
-        }
-        let uid = self.lookup_property_uid(key)?;
-        let raw = match self.structure_table.structure(sid).property_table_or_null() {
-            Some(table) => table.get(uid).0,
-            // materialize-on-miss: the table was moved to a child via a transition;
-            // rebuild it by replaying the chain (cache-back deferred, gc-r4 B2).
-            None => {
-                self.structure_table
-                    .materialize_property_table(sid)
-                    .get(uid)
-                    .0
-            }
-        };
-        if raw < 0 {
-            None
-        } else {
-            Some(PropertyOffset::new(raw))
-        }
+        self.structure_property(sid, key).map(|(offset, _)| offset)
     }
 
     /// The offset the NEXT property added to structure `sid` would take — the analog
@@ -3941,14 +4036,17 @@ impl CoreObjectStore {
     /// ADDITION (a key that does not yet have a named offset in `old`). Two same-shape
     /// objects adding the same `(key, attributes)` from the same `old` converge on ONE
     /// successor (and ONE offset) via the transition table — the monomorphic-IC
-    /// guarantee. Symbol/index keys cannot key the transition table, so they take the
-    /// conservative fresh-dictionary fallback with an invalid offset (the value lives
-    /// only in the authoritative `properties` map; never a wrong slot).
+    /// guarantee. `is_accessor` (gc-r4 B-i) ORs in the `PropertyAttribute::Accessor`
+    /// bit so a data add and an accessor add of the same key key DISTINCT edges.
+    /// Symbol keys now key the table too (gc-r4 B-iii, `intern_property_uid` uniques
+    /// them); only ARRAY-INDEX strings fall back to the conservative fresh-dictionary
+    /// with an invalid offset (their value lives in the butterfly indexed region).
     pub(crate) fn structure_add_property(
         &mut self,
         old: StructureId,
         key: &CorePropertyKey,
         attributes: CorePropertyAttributes,
+        is_accessor: bool,
     ) -> (StructureId, PropertyOffset) {
         if !core_property_key_supports_named_property_offset(key) {
             return (
@@ -3957,7 +4055,7 @@ impl CoreObjectStore {
             );
         }
         let uid = self.intern_property_uid(key);
-        let attributes_u32 = core_attributes_to_u32(attributes);
+        let attributes_u32 = core_attributes_to_u32(attributes, is_accessor);
         let (handle, raw_offset) =
             self.structure_table
                 .add_property_transition(old, uid, attributes_u32);
@@ -4091,7 +4189,7 @@ impl CoreObjectStore {
                 continue;
             }
             let (next_structure, _offset) =
-                self.structure_add_property(structure_id, &key, property.attributes);
+                self.structure_add_property(structure_id, &key, property.attributes, false);
             structure_id = next_structure;
         }
         structure_id
@@ -5005,7 +5103,12 @@ impl CoreObjectStore {
         // Offset authority = structure_table. A shape change adds a new named offset via
         // the transition; a same-shape replace reuses the existing offset.
         let (new_structure, offset) = if shape_changed {
-            self.structure_add_property(old_structure, key, CorePropertyAttributes::DATA_DEFAULT)
+            self.structure_add_property(
+                old_structure,
+                key,
+                CorePropertyAttributes::DATA_DEFAULT,
+                false,
+            )
         } else {
             (
                 old_structure,
@@ -5102,7 +5205,12 @@ impl CoreObjectStore {
             )
         } else if is_addition || was_accessor {
             // New named-data offset via a (shareable) transition.
-            self.structure_add_property(old_structure, key, CorePropertyAttributes::DATA_DEFAULT)
+            self.structure_add_property(
+                old_structure,
+                key,
+                CorePropertyAttributes::DATA_DEFAULT,
+                false,
+            )
         } else {
             // Attribute change on an existing data property: offset preserved, fresh
             // per-object dictionary structure.
@@ -5195,7 +5303,7 @@ impl CoreObjectStore {
                     .unwrap_or(PropertyOffset::INVALID),
             )
         } else if is_addition || was_accessor {
-            self.structure_add_property(old_structure, key, attributes)
+            self.structure_add_property(old_structure, key, attributes, false)
         } else {
             let offset = self
                 .structure_offset(old_structure, key)
@@ -5303,6 +5411,67 @@ impl CoreObjectStore {
         Ok(true)
     }
 
+    /// gc-r4 B-iii dual-write tail for an accessor install, run AFTER the still-
+    /// authoritative `properties` HashMap has been updated (so reads stay correct this
+    /// batch). It MIRRORS the accessor into the Structure + butterfly, in lockstep:
+    ///   - a FRESH-key accessor (`is_addition`) takes a faithful `addPropertyTransition`
+    ///     carrying the `PropertyAttribute::Accessor` bit (so a data add and an accessor
+    ///     add of the same key key DISTINCT transition edges -> distinct structures, and
+    ///     same-shape siblings converge), allocates a GetterSetter cell (B-ii) for the
+    ///     merged getter/setter, and writes `from_cell(getter_setter)` into the
+    ///     structure-assigned butterfly slot — same mechanics as a data `putDirectOffset`;
+    ///   - an existing-key change (the rarer in-place data<->accessor CONVERSION or an
+    ///     accessor getter/setter UPDATE) keeps the conservative fresh-dictionary fallback
+    ///     (ratified decision 2; the faithful `attributeChangeTransition` is deferred to
+    ///     B-iv), freeing + clearing any offset the key held (a fresh-added accessor now
+    ///     HAS a real offset, so this also clears its stale GetterSetter slot).
+    /// Called ONLY when the caller's `shape_changed` holds, so an idempotent redefine does
+    /// no structure churn. REVERSIBLE: nothing here switches a read off the HashMap.
+    fn install_accessor_dual_write(
+        &mut self,
+        object: RuntimeValue,
+        key: &CorePropertyKey,
+        old_structure: StructureId,
+        attributes: CorePropertyAttributes,
+        getter: Option<RuntimeValue>,
+        setter: Option<RuntimeValue>,
+        is_addition: bool,
+    ) {
+        if is_addition {
+            let (new_structure, offset) =
+                self.structure_add_property(old_structure, key, attributes, true);
+            let getter_setter = self.allocate_getter_setter(getter, setter);
+            let handle = self.find_mut(object).map(|object_cell| {
+                object_cell.structure_id = new_structure;
+                object_cell.butterfly
+            });
+            if let Some(handle) = handle {
+                // No-op for a negative offset (an accessor on an array-index key falls
+                // back to a fresh dictionary with no named offset; the value still lives
+                // in the authoritative HashMap).
+                self.butterfly_prop_put(handle, offset, getter_setter);
+            }
+            self.finish_structure_transition(old_structure);
+        } else {
+            // Installing/updating an accessor over an EXISTING key takes any offset the
+            // key held out of the shape and frees it; surviving offsets are preserved on
+            // the fresh per-object dictionary structure.
+            let displaced_offset = self.structure_offset(old_structure, key);
+            let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
+            let handle = self.find_mut(object).map(|object_cell| {
+                if let Some(offset) = displaced_offset {
+                    object_cell.deleted_offsets.push(offset);
+                }
+                object_cell.structure_id = new_structure;
+                object_cell.butterfly
+            });
+            if let (Some(handle), Some(offset)) = (handle, displaced_offset) {
+                self.butterfly_prop_clear(handle, offset);
+            }
+            self.finish_structure_transition(old_structure);
+        }
+    }
+
     pub(crate) fn define_getter_with_write_barrier(
         &mut self,
         heap: &mut Heap,
@@ -5338,12 +5507,13 @@ impl CoreObjectStore {
         if let Some(setter) = setter {
             self.expect_function(setter)?;
         }
-        let (old_structure, shape_changed) = {
+        let (old_structure, shape_changed, is_addition, final_getter, final_setter) = {
             let Some(object_cell) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
             let old_structure = object_cell.structure_id;
             let current = object_cell.properties.get(key).copied();
+            let is_addition = current.is_none();
             let mut property = current.unwrap_or(CoreProperty {
                 kind: CorePropertyKind::Accessor {
                     getter: None,
@@ -5370,6 +5540,12 @@ impl CoreObjectStore {
                     };
                 }
             }
+            // The MERGED getter/setter the GetterSetter cell + butterfly mirror must hold
+            // (define_getter/define_setter merge into an existing accessor's other half).
+            let (final_getter, final_setter) = match property.kind {
+                CorePropertyKind::Accessor { getter, setter } => (getter, setter),
+                CorePropertyKind::Data(_) => (None, None),
+            };
             let shape_changed = match current {
                 Some(current) => current != property,
                 None => {
@@ -5378,28 +5554,24 @@ impl CoreObjectStore {
                 }
             };
             object_cell.properties.insert(key.clone(), property);
-            (old_structure, shape_changed)
+            (
+                old_structure,
+                shape_changed,
+                is_addition,
+                final_getter,
+                final_setter,
+            )
         };
         if shape_changed {
-            // Installing an accessor takes any displaced data offset out of the shape
-            // (the key no longer has a named-data slot) and frees it; surviving offsets
-            // are preserved on the fresh per-object dictionary structure.
-            let displaced_offset = self.structure_offset(old_structure, key);
-            let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
-            // Free the displaced data slot (PropertyTable::m_deletedOffsets mirror) and
-            // set the dictionary structure under the cell borrow; clear the slab slot
-            // after the borrow releases.
-            let handle = self.find_mut(object).map(|object_cell| {
-                if let Some(offset) = displaced_offset {
-                    object_cell.deleted_offsets.push(offset);
-                }
-                object_cell.structure_id = new_structure;
-                object_cell.butterfly
-            });
-            if let (Some(handle), Some(offset)) = (handle, displaced_offset) {
-                self.butterfly_prop_clear(handle, offset);
-            }
-            self.finish_structure_transition(old_structure);
+            self.install_accessor_dual_write(
+                object,
+                key,
+                old_structure,
+                CorePropertyAttributes::ACCESSOR_DEFAULT,
+                final_getter,
+                final_setter,
+                is_addition,
+            );
         }
         Ok(())
     }
@@ -5435,12 +5607,13 @@ impl CoreObjectStore {
         if let Some(setter) = setter {
             self.expect_function(setter)?;
         }
-        let (old_structure, shape_changed) = {
+        let (old_structure, shape_changed, is_addition) = {
             let Some(object_cell) = self.find_mut(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
             let old_structure = object_cell.structure_id;
             let current = object_cell.properties.get(key).copied();
+            let is_addition = current.is_none();
             if let Some(current) = current {
                 if !current.attributes.configurable {
                     if attributes.configurable
@@ -5473,25 +5646,22 @@ impl CoreObjectStore {
                 }
             };
             object_cell.properties.insert(key.clone(), property);
-            (old_structure, shape_changed)
+            (old_structure, shape_changed, is_addition)
         };
         if shape_changed {
-            let displaced_offset = self.structure_offset(old_structure, key);
-            let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
-            // Free the displaced data slot (PropertyTable::m_deletedOffsets mirror) and
-            // set the dictionary structure under the cell borrow; clear the slab slot
-            // after the borrow releases.
-            let handle = self.find_mut(object).map(|object_cell| {
-                if let Some(offset) = displaced_offset {
-                    object_cell.deleted_offsets.push(offset);
-                }
-                object_cell.structure_id = new_structure;
-                object_cell.butterfly
-            });
-            if let (Some(handle), Some(offset)) = (handle, displaced_offset) {
-                self.butterfly_prop_clear(handle, offset);
-            }
-            self.finish_structure_transition(old_structure);
+            // define_accessor_property REPLACES the property, so the getter/setter passed
+            // in ARE the final pair the GetterSetter mirror must hold; `attributes` carry
+            // the explicit enumerable/configurable bits (the Accessor bit is ORed in by
+            // structure_add_property).
+            self.install_accessor_dual_write(
+                object,
+                key,
+                old_structure,
+                attributes,
+                getter,
+                setter,
+                is_addition,
+            );
         }
         Ok(true)
     }
@@ -6317,7 +6487,9 @@ impl CoreObjectStore {
             | CoreObjectKind::Date
             | CoreObjectKind::ArrayBuffer
             | CoreObjectKind::Uint8Array
-            | CoreObjectKind::DataView => Err(ExecutionError::ExpectedFunction),
+            | CoreObjectKind::DataView
+            // GetterSetter is an internal accessor cell, never callable.
+            | CoreObjectKind::GetterSetter => Err(ExecutionError::ExpectedFunction),
             CoreObjectKind::Proxy => {
                 let target = object
                     .proxy_target
@@ -6371,7 +6543,9 @@ impl CoreObjectStore {
             | CoreObjectKind::Date
             | CoreObjectKind::ArrayBuffer
             | CoreObjectKind::Uint8Array
-            | CoreObjectKind::DataView => Err(ExecutionError::ExpectedFunction),
+            | CoreObjectKind::DataView
+            // GetterSetter is an internal accessor cell, never callable.
+            | CoreObjectKind::GetterSetter => Err(ExecutionError::ExpectedFunction),
         }
     }
 
@@ -6451,7 +6625,9 @@ impl CoreObjectStore {
             | CoreObjectKind::Date
             | CoreObjectKind::ArrayBuffer
             | CoreObjectKind::Uint8Array
-            | CoreObjectKind::DataView => Err(ExecutionError::ExpectedFunction),
+            | CoreObjectKind::DataView
+            // GetterSetter is an internal accessor cell, never callable.
+            | CoreObjectKind::GetterSetter => Err(ExecutionError::ExpectedFunction),
         }
     }
 
@@ -7595,5 +7771,198 @@ mod butterfly_values_cutover_tests {
             store.butterfly_elem_get(handle, 0),
             Some(RuntimeValue::from_i32(888))
         );
+    }
+}
+
+#[cfg(test)]
+mod getter_setter_prereq_tests {
+    //! gc-r4 GetterSetter prerequisite (B-i/B-ii/B-iii) verification.
+    //!
+    //! Proves the ADDITIVE/DUAL-WRITE infra that unblocks the later HashMap-deletion
+    //! flip: fresh-key accessor + Symbol-keyed properties now take REAL Structure
+    //! offsets (B-i Accessor bit + B-iii un-gate), an accessor's butterfly slot holds
+    //! `from_cell(GetterSetter)` (B-ii), symbol-keyed siblings converge, and the
+    //! structure+butterfly MIRROR agrees with the still-authoritative `properties`
+    //! HashMap. The HashMap stays the read authority this batch (reversible).
+    use super::*;
+
+    fn func(store: &mut CoreObjectStore, index: u32) -> RuntimeValue {
+        store.allocate_function(index, Vec::new(), None)
+    }
+
+    // (a) A FRESH-key accessor and a Symbol-keyed data property now get REAL Structure
+    // offsets; the accessor's structure attributes carry PropertyAttribute::Accessor
+    // (1<<4), the symbol data property does NOT.
+    #[test]
+    fn accessor_and_symbol_get_real_offsets_with_accessor_bit() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let getter = func(&mut store, 0);
+        let setter = func(&mut store, 1);
+        let akey = CorePropertyKey::Identifier(7);
+        store
+            .define_accessor(obj, &akey, Some(getter), Some(setter))
+            .unwrap();
+
+        let sid = store.find(obj).unwrap().structure_id;
+        let (aoff, aattrs) = store
+            .structure_property(sid, &akey)
+            .expect("fresh accessor must have a real structure offset");
+        assert!(aoff.raw() >= 0, "accessor offset must be a real slot");
+        assert_ne!(
+            aattrs & PROPERTY_ATTRIBUTE_ACCESSOR,
+            0,
+            "structure attributes must carry the Accessor bit for an accessor"
+        );
+
+        // A Symbol-keyed DATA property also gets a real offset, with NO Accessor bit.
+        let skey = CorePropertyKey::Symbol(0xBEEF);
+        store
+            .put_data_own(obj, &skey, RuntimeValue::from_i32(99))
+            .unwrap();
+        let sid2 = store.find(obj).unwrap().structure_id;
+        let (soff, sattrs) = store
+            .structure_property(sid2, &skey)
+            .expect("symbol-keyed property must have a real structure offset");
+        assert!(soff.raw() >= 0, "symbol offset must be a real slot");
+        assert_eq!(
+            sattrs & PROPERTY_ATTRIBUTE_ACCESSOR,
+            0,
+            "a data property (even symbol-keyed) must NOT carry the Accessor bit"
+        );
+    }
+
+    // (b) Sibling convergence: two objects adding the SAME Symbol key from the same
+    // empty shape converge on ONE structure id AND one offset (the monomorphic-IC
+    // guarantee, now extended to symbols).
+    #[test]
+    fn symbol_keyed_siblings_converge_on_one_structure() {
+        let mut store = CoreObjectStore::default();
+        let a = store.allocate();
+        let b = store.allocate();
+        let skey = CorePropertyKey::Symbol(0x1234_5678);
+        store
+            .put_data_own(a, &skey, RuntimeValue::from_i32(1))
+            .unwrap();
+        store
+            .put_data_own(b, &skey, RuntimeValue::from_i32(2))
+            .unwrap();
+        let sid_a = store.find(a).unwrap().structure_id;
+        let sid_b = store.find(b).unwrap().structure_id;
+        assert_eq!(
+            sid_a, sid_b,
+            "same symbol key from the same shape must converge on one structure"
+        );
+        assert_eq!(
+            store.structure_offset(sid_a, &skey),
+            store.structure_offset(sid_b, &skey),
+            "converged siblings must share the symbol's offset"
+        );
+    }
+
+    // (c) The GetterSetter cell stores the getter+setter, and the accessor's butterfly
+    // slot holds `from_cell(getter_setter)` exactly as C++ stores a GetterSetter*.
+    #[test]
+    fn getter_setter_cell_lives_in_the_accessor_butterfly_slot() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let getter = func(&mut store, 0);
+        let setter = func(&mut store, 1);
+        let akey = CorePropertyKey::Identifier(3);
+        store
+            .define_accessor(obj, &akey, Some(getter), Some(setter))
+            .unwrap();
+
+        let handle = store.find(obj).unwrap().butterfly;
+        let sid = store.find(obj).unwrap().structure_id;
+        let (aoff, _) = store.structure_property(sid, &akey).unwrap();
+        let slot = store
+            .butterfly_prop_get(handle, aoff)
+            .expect("accessor butterfly slot must be populated");
+        let gs = store
+            .find(slot)
+            .expect("the butterfly slot value must be a cell ref (the GetterSetter)");
+        assert_eq!(
+            gs.kind,
+            CoreObjectKind::GetterSetter,
+            "the slot must reference a GetterSetter cell"
+        );
+        assert_eq!(gs.getter_value, Some(getter), "GetterSetter.m_getter");
+        assert_eq!(gs.setter_value, Some(setter), "GetterSetter.m_setter");
+    }
+
+    // (d) Dual-write consistency: the structure+butterfly MIRROR agrees with the
+    // `properties` HashMap authority across data, symbol-keyed data, and accessor — and
+    // the structure attributes equal the encoder for each kind.
+    #[test]
+    fn dual_write_mirror_matches_hashmap_authority() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+
+        let dkey = CorePropertyKey::Identifier(1);
+        store
+            .put_data_own(obj, &dkey, RuntimeValue::from_i32(42))
+            .unwrap();
+        let skey = CorePropertyKey::Symbol(0x77);
+        store
+            .put_data_own(obj, &skey, RuntimeValue::from_i32(7))
+            .unwrap();
+        let getter = func(&mut store, 0);
+        let akey = CorePropertyKey::Identifier(2);
+        store
+            .define_accessor(obj, &akey, Some(getter), None)
+            .unwrap();
+
+        let handle = store.find(obj).unwrap().butterfly;
+        let sid = store.find(obj).unwrap().structure_id;
+
+        // DATA: structure attrs == data encoding; butterfly value == HashMap value.
+        let (doff, dattrs) = store.structure_property(sid, &dkey).unwrap();
+        assert_eq!(
+            dattrs,
+            core_attributes_to_u32(CorePropertyAttributes::DATA_DEFAULT, false)
+        );
+        assert_eq!(
+            store.butterfly_prop_get(handle, doff),
+            Some(RuntimeValue::from_i32(42))
+        );
+        assert_eq!(
+            store.get_own_property(obj, &dkey).unwrap().unwrap().kind,
+            CorePropertyKind::Data(RuntimeValue::from_i32(42))
+        );
+
+        // SYMBOL data: same invariants.
+        let (soff, sattrs) = store.structure_property(sid, &skey).unwrap();
+        assert_eq!(
+            sattrs,
+            core_attributes_to_u32(CorePropertyAttributes::DATA_DEFAULT, false)
+        );
+        assert_eq!(
+            store.butterfly_prop_get(handle, soff),
+            Some(RuntimeValue::from_i32(7))
+        );
+        assert_eq!(
+            store.get_own_property(obj, &skey).unwrap().unwrap().kind,
+            CorePropertyKind::Data(RuntimeValue::from_i32(7))
+        );
+
+        // ACCESSOR: structure attrs == accessor encoding (Accessor bit, no ReadOnly);
+        // the butterfly GetterSetter's getter/setter == the HashMap authority's.
+        let (aoff, aattrs) = store.structure_property(sid, &akey).unwrap();
+        assert_eq!(
+            aattrs,
+            core_attributes_to_u32(CorePropertyAttributes::ACCESSOR_DEFAULT, true)
+        );
+        let gs = store
+            .find(store.butterfly_prop_get(handle, aoff).unwrap())
+            .unwrap();
+        assert_eq!(gs.kind, CoreObjectKind::GetterSetter);
+        match store.get_own_property(obj, &akey).unwrap().unwrap().kind {
+            CorePropertyKind::Accessor { getter, setter } => {
+                assert_eq!(gs.getter_value, getter, "mirror getter == authority getter");
+                assert_eq!(gs.setter_value, setter, "mirror setter == authority setter");
+            }
+            CorePropertyKind::Data(_) => panic!("authority must be an accessor"),
+        }
     }
 }

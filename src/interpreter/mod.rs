@@ -28434,6 +28434,7 @@ mod tests {
             old_structure,
             &key,
             CorePropertyAttributes::DATA_DEFAULT,
+            false,
         );
         let plan = generated_property_store_transition_plan(
             object_structure_id(&host.objects, object),
