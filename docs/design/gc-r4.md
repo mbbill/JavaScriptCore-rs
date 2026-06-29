@@ -75,6 +75,22 @@ the struct-def field-deletions + Default/Clone edits all touch object_store.rs:3
      + Structure plumbing, (c) Structure offsets for Symbol + accessor keys — THEN the HashMap
      deletion (the butterfly becomes the sole value authority) + the `needs_drop` POD assert.
      Until then the cell is NOT POD (the HashMap is Drop-bearing) and R4 stays gated on this.
+     **STAGING (spec'd 2026-06-29; B-i/ii/iii additive/dual-write + reversible, B-iv the flip):**
+     B-i Accessor bit in `core_attributes_to_u32` (thread is_accessor) + `structure_property(sid,key)
+     →Option<(offset,attrs)>` plumbing the live PropertyTable.get's attributes (makes data-vs-accessor
+     adds DISTINCT transition edges — bit 1<<4 — so siblings converge correctly); B-ii a
+     `CoreObjectKind::GetterSetter` cell + `getter_value`/`setter_value: Option<RuntimeValue>` (Copy,
+     POD-safe) — the accessor's butterfly slot holds `from_cell(getter_setter)` like C++'s
+     GetterSetter*; B-iii un-gate Symbol+accessor keys to REAL Structure offsets
+     (`core_property_key_supports_named_property_offset` + `define_accessor` route through
+     `structure_add_property`), DUAL-WRITE the butterfly in lockstep with the still-authoritative
+     HashMap; B-iv the FLIP — delete the HashMap (~36 value-authority sites) + property_order (23,
+     →Structure entry order) + vestigial deleted_offsets, reads → structure+butterfly. **DECISIONS:**
+     symbols transition+converge (faithful); fresh-key accessors get real transitions, but in-place
+     data↔accessor CONVERSION keeps the dictionary fallback (defer the faithful attributeChangeTransition);
+     GetterSetter = CoreObjectKind variant. The `needs_drop` POD assert flips only after the OTHER
+     per-kind Drop fields (Map/Set/RegExp/Promise/ArrayBuffer/Bound/captures) ALSO relocate — this
+     batch removes only the PROPERTY Drop fields.
   2. **JSFunction-captures** — `captures`(358)+`instance_fields`(357) → JSLexicalEnvironment
      variables[] / class-field init (JSLexicalEnvironment.h:56-80, JSCallee::m_scope).
   3. **RegExp** — `regexp_source`(397) → RegExp::m_patternString (RegExp.h:219);
