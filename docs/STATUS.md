@@ -56,8 +56,6 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 - [done] Structure-wire: the #1 divergence corrected — per-cell offset map → per-shape
   Structure::PropertyTable (StructureIdTable is the offset authority; offsets flow from
   transitions; inline_cap=6; delete-then-readd recycles faithfully via m_deletedOffsets).
-- [wip] residual: cell still has property_order (per-cell enum order, ~15 sites) + vestigial
-  deleted_offsets → fold to the Structure entry order (small follow-up, before/with Butterfly-values).
 - [done] B1a butterfly infra (additive, dead_code): object/butterfly_handle.rs (ButterflyAllocation
   over RuntimeValue + store slab + allocate/clone/prop/elem API) + object/auxiliary.rs scaffold;
   ButterflyHandle moved out of storage.rs.
@@ -69,10 +67,12 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   cell (POD Option<RuntimeValue> getter/setter) + Symbol+accessor keys now get REAL Structure offsets +
   dual-write the butterfly in lockstep with the still-authoritative HashMap. IC data-load probe gated to
   miss for accessor shapes (required; reads the shape). HashMap still authoritative; needs_drop NOT flipped.
-- [next-GC] B-iv FLIP (irreversible): delete the per-cell properties HashMap (~36 value-authority sites,
-  reads → structure+butterfly; accessor values resolve via the butterfly GetterSetter) + fold property_order
-  → Structure entry order + drop vestigial deleted_offsets + handle the deferred in-place data↔accessor
-  conversion. Removes the PROPERTY Drop fields; needs_drop POD assert still waits for the OTHER per-kind units.
+- [done] B-iv FLIP (irreversible, 66a860a): the per-cell properties HashMap (value authority) DELETED —
+  reads route structure offset → butterfly slot; accessors via the butterfly GetterSetter; property_order
+  folded into PropertyTable entry order; vestigial deleted_offsets dropped (recycle owned by m_deletedOffsets);
+  in-place data↔accessor conversion now offset-stable (corrects a pre-flip offset-vanish defect). Gated by a
+  randomized HashMap-oracle equivalence test (per-op get/enum/accessor diff). needs_drop POD assert still
+  waits for the OTHER per-kind units.
 - [missing] POD object-model rewrite (retire the fat CoreObjectCell) → R3 shadow oracle → R4 flip
   (gate = technical verification: shadow cross-check + miri + adversarial verify) → running collector.
   Audited (gc-r4.md): R4 mostly mechanical (value carries the ptr; copy-out pattern exists), sharp
