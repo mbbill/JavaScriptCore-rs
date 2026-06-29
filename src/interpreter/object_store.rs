@@ -42,6 +42,18 @@ pub(crate) struct CoreObjectStore {
     // deletes the per-cell `properties` HashMap in a later batch).
     #[allow(dead_code)]
     pub(crate) butterflies: Vec<ButterflyAllocation>,
+    // gc-r4 POD-ification (BoundFunction unit): the store-owned slab of bound-function
+    // [[BoundArguments]] value arrays. C++ JSC JSBoundFunction::m_boundArgs is an
+    // out-of-line value array (runtime/JSBoundFunction.h:133); the per-cell
+    // `bound_args: Vec<RuntimeValue>` field is relocated here so the cell carries only a
+    // POD `AuxiliaryHandle` (an index into this Vec) instead of a Drop-bearing Vec —
+    // exactly mirroring the `butterflies` slab + `ButterflyHandle` pattern, but allocated
+    // ONLY by `allocate_bound_function` (not every cell, unlike the butterfly). C++
+    // allocates m_boundArgs from the GC Auxiliary subspace; this slab is the pre-R4
+    // analog (a raw Auxiliary pointer arrives at R4). Each inner array still holds
+    // `RuntimeValue` GC edges — a later collector trace MUST visit this backing
+    // (gc-r4 GAP A); no trace wiring lands in this unit.
+    pub(crate) bound_args_backings: Vec<Vec<RuntimeValue>>,
     // VM-internal payload-bits -> object-slot index; keyed by interpreter pointer-bits,
     // never JS/adversary-controlled, so it needs no SipHash DoS resistance. Use the
     // in-tree FxIntBuildHasher (gc/fast_hash.rs, WTF IntHash/PtrHash family); the swap is
@@ -227,6 +239,12 @@ impl Clone for CoreObjectStore {
             // that sound (the clone's handle indexes the clone's slab, never the
             // source's) — the per-cell clone-independence the cell `Clone` relies on.
             butterflies: self.butterflies.clone(),
+            // gc-r4 POD-ification (BoundFunction): deep-clone the bound-args slab in
+            // lockstep with `objects` so every cell's `bound_args` AuxiliaryHandle stays
+            // valid AND the cloned store owns an INDEPENDENT slab — the same soundness
+            // argument as `butterflies` above (the cell `Clone` copies the handle shallow;
+            // cloning the slab here is what makes that sound).
+            bound_args_backings: self.bound_args_backings.clone(),
             object_indices_by_payload: HashMap::default(),
             // structure_table is keyed by StructureId handle (stable Vec slots across
             // clone), so every cloned cell's structure_id stays valid and the offset
@@ -424,9 +442,18 @@ pub(crate) struct CoreObjectCell {
     pub(crate) proxy_handler: Option<RuntimeValue>,
     /// C++ JSC JSBoundFunction: [[BoundTargetFunction]], [[BoundThis]], and
     /// [[BoundArguments]]. Only populated for CoreObjectKind::BoundFunction.
+    /// `bound_target`/`bound_this` are already POD (`Option<RuntimeValue>`/`RuntimeValue`).
     pub(crate) bound_target: Option<RuntimeValue>,
     pub(crate) bound_this: RuntimeValue,
-    pub(crate) bound_args: Vec<RuntimeValue>,
+    /// C++ JSC JSBoundFunction::m_boundArgs ([[BoundArguments]]) is an out-of-line value
+    /// array (runtime/JSBoundFunction.h:133). gc-r4 POD-ification: the value array is
+    /// relocated to the store-owned `bound_args_backings` slab; this field carries only a
+    /// POD `AuxiliaryHandle` (Copy slab index) into it — mirroring the `butterfly`
+    /// handle, so the cell stays `Drop`-free (sweepable). `INVALID` for any non-bound
+    /// cell; `allocate_bound_function` installs a real handle via `allocate_bound_args`.
+    /// The backing array still holds `RuntimeValue` GC edges (a later collector trace
+    /// visits the slab; no trace wiring in this unit).
+    pub(crate) bound_args: AuxiliaryHandle,
     /// C++ JSC runtime/GetterSetter.h:132-133: GetterSetter::m_getter / m_setter, an
     /// accessor's getter and setter functions. Only meaningful when
     /// kind == CoreObjectKind::GetterSetter; a null getter/setter is `None`
@@ -529,7 +556,9 @@ impl Default for CoreObjectCell {
             proxy_handler: None,
             bound_target: None,
             bound_this: RuntimeValue::default(),
-            bound_args: Vec::new(),
+            // No bound-args backing for a default (non-bound) cell; the sentinel never
+            // indexes the slab. allocate_bound_function overwrites it with a real handle.
+            bound_args: AuxiliaryHandle::INVALID,
             getter_value: None,
             setter_value: None,
         }
@@ -585,7 +614,12 @@ impl Clone for CoreObjectCell {
             proxy_handler: self.proxy_handler,
             bound_target: self.bound_target,
             bound_this: self.bound_this,
-            bound_args: self.bound_args.clone(),
+            // gc-r4 POD-ification: copy the bound-args HANDLE shallow (a plain Copy slab
+            // index). Sound for the SAME reason as the `butterfly` handle above: the cell
+            // Clone is reached ONLY through `CoreObjectStore::clone()`, which deep-clones
+            // the whole `bound_args_backings` slab alongside `objects`, so the copied
+            // handle indexes the clone's own backing, never the source's.
+            bound_args: self.bound_args,
             getter_value: self.getter_value,
             setter_value: self.setter_value,
         }
@@ -1836,6 +1870,35 @@ impl CoreObjectStore {
     }
 }
 
+// gc-r4 POD-ification (BoundFunction unit): the bound-args aux-backing API, the
+// store-owned home of each bound function's [[BoundArguments]] value array. Mirrors the
+// butterfly slab API above (allocate -> handle; index the slab through the handle), but
+// the backing is allocated ONLY for bound functions (not every cell) — C++ JSBoundFunction
+// is the only kind with `m_boundArgs` (runtime/JSBoundFunction.h:133).
+impl CoreObjectStore {
+    /// Push `args` into the store-owned bound-args slab and return its POD handle.
+    ///
+    /// C++ JSC JSBoundFunction::create allocates the out-of-line bound-arguments array
+    /// (m_boundArgs, JSBoundFunction.h:133) from the GC Auxiliary subspace; the real
+    /// arena allocation is deferred to R4. Here: push the value array and return its slab
+    /// index. Mirrors `allocate_butterfly`.
+    pub(crate) fn allocate_bound_args(&mut self, args: Vec<RuntimeValue>) -> AuxiliaryHandle {
+        let index = self.bound_args_backings.len();
+        self.bound_args_backings.push(args);
+        AuxiliaryHandle(index)
+    }
+
+    /// Borrow the bound-args value array for `handle` (C++ JSBoundFunction
+    /// boundArgs()/m_boundArgs read, JSBoundFunction.h:133). Caller is responsible for
+    /// only passing a real handle assigned by `allocate_bound_args` (the `INVALID`
+    /// sentinel never reaches here — `bound_function_data` checks `kind ==
+    /// BoundFunction` first, and every such cell got a real handle at creation), exactly
+    /// as the butterfly accessors assume `allocate_cell` assigned a real handle.
+    pub(crate) fn bound_args_slice(&self, handle: AuxiliaryHandle) -> &[RuntimeValue] {
+        &self.bound_args_backings[handle.0]
+    }
+}
+
 impl CoreObjectStore {
     pub(crate) fn allocate(&mut self) -> RuntimeValue {
         let prototype = self.ensure_object_prototype();
@@ -1982,6 +2045,9 @@ impl CoreObjectStore {
         bound_args: Vec<RuntimeValue>,
     ) -> RuntimeValue {
         let function_prototype = self.ensure_function_prototype();
+        // gc-r4 POD-ification: relocate the [[BoundArguments]] value array out of the cell
+        // into the store-owned slab; the cell carries only the POD handle (m_boundArgs).
+        let bound_args = self.allocate_bound_args(bound_args);
         self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::BoundFunction,
             prototype: Some(function_prototype),
@@ -6848,7 +6914,13 @@ impl CoreObjectStore {
             return None;
         }
         let target = object.bound_target?;
-        Some((target, object.bound_this, object.bound_args.clone()))
+        let bound_this = object.bound_this;
+        // gc-r4 POD-ification: the [[BoundArguments]] array now lives in the store-owned
+        // slab, reached through the cell's POD handle. Copy the handle out, then read the
+        // slab (both shared `&self` borrows). Clone the array because the caller needs it
+        // owned after this borrow ends (it is consumed across a later `&mut self` call).
+        let bound_args = self.bound_args_slice(object.bound_args).to_vec();
+        Some((target, bound_this, bound_args))
     }
 
     pub(crate) fn proxy_target_handler(

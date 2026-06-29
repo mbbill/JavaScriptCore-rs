@@ -73,6 +73,10 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   in-place data↔accessor conversion now offset-stable (corrects a pre-flip offset-vanish defect). Gated by a
   randomized HashMap-oracle equivalence test (per-op get/enum/accessor diff). needs_drop POD assert still
   waits for the OTHER per-kind units.
+- [wip] per-kind POD-ification (retire the 9 remaining Drop fields → POD cell, cheapest-first per gc-r4.md;
+  integrate serially): **BoundFunction(bound_args) DONE (1/6)**; pending Promise/RegExp/ArrayBuffer/Map-Set/
+  captures. Each relocates its Drop field to a store-owned aux slab via a POD Copy handle (lazy alloc where
+  faithful); needs_drop::<CoreObjectCell>() assert flips ON in the final (captures) unit.
 - [missing] POD object-model rewrite (retire the fat CoreObjectCell) → R3 shadow oracle → R4 flip
   (gate = technical verification: shadow cross-check + miri + adversarial verify) → running collector.
   Audited (gc-r4.md): R4 mostly mechanical (value carries the ptr; copy-out pattern exists), sharp

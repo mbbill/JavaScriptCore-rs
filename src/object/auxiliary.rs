@@ -20,10 +20,24 @@ use crate::object::butterfly_handle::ButterflyHandle;
 /// analog (pre-R4) is an index into a per-kind store-owned slab, exactly like
 /// `ButterflyHandle`. Defined here so the per-kind units share one aux-handle
 /// vocabulary.
-#[allow(dead_code)]
+///
+/// POD: `Copy` (a plain slab index), so a cell field of this type adds no `Drop` —
+/// the whole point of the gc-r4 POD-ification relocations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
 pub struct AuxiliaryHandle(pub usize);
+
+impl AuxiliaryHandle {
+    /// Sentinel "no auxiliary backing assigned" handle.
+    ///
+    /// C++ JSC: a per-kind out-of-line pointer (e.g. `JSBoundFunction::m_boundArgs`,
+    /// JSBoundFunction.h:133) is null when the cell has no such payload. Unlike the
+    /// butterfly (every JSObject gets one in `allocate_cell`), a per-kind aux backing
+    /// is allocated ONLY by the kind that owns it — every other cell keeps this
+    /// sentinel and never indexes the slab. The owning kind overwrites it with a real
+    /// handle at its own allocation site (e.g. `allocate_bound_function`).
+    pub const INVALID: Self = AuxiliaryHandle(usize::MAX);
+}
 
 /// Allocate the byte backing for a typed-array/`ArrayBuffer` view.
 ///
