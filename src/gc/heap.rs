@@ -33,6 +33,17 @@ mod precise_allocation;
 // heap/AbstractSlotVisitor.h.) No `pub use` this batch.
 mod slot_visitor;
 
+// gc-r4 R3 (reversible shadow oracle): the FIRST wiring of the S4 arena into the live
+// engine (prior batches: "No `pub use` ... R2/R3/R4 wire it in"). `CoreObjectStore`
+// holds a `MarkedSpace` byte-twin of each cell and cross-checks it via `CellPtr`. The
+// wiring is DEBUG-ONLY (the twin + cross-checks compile out of release, keeping release
+// byte-identical to today), so these re-exports are debug-gated to stay 0-warning when
+// the consumer is absent.
+#[cfg(debug_assertions)]
+pub(crate) use marked_block::CellPtr;
+#[cfg(debug_assertions)]
+pub(crate) use marked_space::MarkedSpace;
+
 #[cfg(feature = "arm64_native_entry_proof")]
 pub(crate) use conservative_scan::HeapConservativeScanAppendReceipt;
 #[cfg(feature = "arm64_native_entry_proof")]

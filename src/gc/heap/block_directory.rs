@@ -180,6 +180,60 @@ impl BlockDirectory {
         set_newly_allocated(cell_addr);
         (CellPtr::from_addr(cell_addr), new_base)
     }
+
+    /// gc-r4 R3 (reversible shadow oracle): identical FreeList/slow-path geometry to
+    /// `allocate`, but writes an arbitrary POD BYTE BLOB into the cell slot instead of
+    /// the fixed demo `Cell`. This is the path the R3 shadow oracle uses to ACCEPT +
+    /// STORE a real `CoreObjectCell`-sized POD cell (the R4 precondition that the arena
+    /// can hold the live cell byte-identically; gc-r4.md "R3 (reversible)"). Only the
+    /// cell-slot write differs (`copy_nonoverlapping` of `len` bytes vs `ptr::write(Cell)`);
+    /// the size class is selected by the caller (`MarkedSpace::allocate_blob`) so this
+    /// directory's `cell_size` already accommodates `len`.
+    ///
+    /// SAFETY (contract C1-C6, marked_block.rs): `src..src+len` is `len` readable bytes
+    /// of an initialized POD value (`needs_drop == false`, no destructor); `len <=
+    /// self.cell_size`; single mutator thread; the fresh slot is atom-aligned, never
+    /// before handed out, and its FreeCell link bytes were decoded (advance) before the
+    /// cell was handed out, so the raw byte copy aliases no live cell and forms no reference.
+    pub(crate) unsafe fn allocate_blob(
+        &mut self,
+        src: *const u8,
+        len: usize,
+    ) -> (CellPtr, Option<usize>) {
+        debug_assert!(
+            len <= self.cell_size,
+            "blob ({len}) exceeds this directory's size class ({})",
+            self.cell_size
+        );
+        let mut new_base = None;
+        // SAFETY: as `allocate` — the FreeList's intervals reference live, exposed pages
+        // this directory owns; single mutator (C5/C6).
+        let cell_addr = match unsafe { self.free_list.allocate() } {
+            Some(addr) => addr,
+            None => {
+                let base = self.add_block();
+                new_base = Some(base);
+                // SAFETY: the freshly-swept block's FreeList always yields one cell.
+                unsafe { self.free_list.allocate() }
+                    .expect("fresh-block FreeList must yield a cell")
+            }
+        };
+        // Recover a raw writable byte pointer with the page's exposed provenance and
+        // copy the blob in. NO `&MarkedBlock`/`&mut Cell` is formed (contract C4/C5);
+        // the raw place copy is the narrowest footprint.
+        let dst = ptr::with_exposed_provenance_mut::<u8>(cell_addr);
+        // SAFETY (C2,C3,C4): `cell_addr` is a fresh, atom-aligned, never-before-handed-out
+        // slot inside a once-exposed page this directory owns; `src` is `len` readable
+        // POD bytes; the regions do not overlap (distinct allocations).
+        unsafe { ptr::copy_nonoverlapping(src, dst, len) };
+        debug_assert_eq!(
+            cell_addr & HALF_ALIGNMENT,
+            0,
+            "MarkedBlock cells are 16-aligned"
+        );
+        set_newly_allocated(cell_addr);
+        (CellPtr::from_addr(cell_addr), new_base)
+    }
 }
 
 impl Drop for BlockDirectory {

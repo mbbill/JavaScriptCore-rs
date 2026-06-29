@@ -69,6 +69,34 @@ impl PreciseSpace {
         CellPtr::from_addr(cell_addr)
     }
 
+    /// gc-r4 R3 (reversible shadow oracle): like `allocate`, but writes an arbitrary
+    /// POD BYTE BLOB into the cell slot instead of the fixed demo `Cell`. The precise
+    /// path for an over-largeCutoff cell; the +8 dispatch / mask-recover core is
+    /// unchanged. SAFETY: `src..src+len` is `len` readable bytes of an initialized POD
+    /// value (`needs_drop == false`); `len <= cell_bytes`; single mutator thread.
+    pub(crate) unsafe fn allocate_blob(
+        &mut self,
+        cell_bytes: usize,
+        src: *const u8,
+        len: usize,
+    ) -> CellPtr {
+        debug_assert!(len <= cell_bytes);
+        let total = HALF_ALIGNMENT + cell_bytes;
+        let layout = Layout::from_size_align(total, ATOM_SIZE).unwrap();
+        // SAFETY (C1): nonzero, atom-aligned layout; fresh zeroed allocation owned as a
+        // bare `*mut u8` (never Box).
+        let raw = unsafe { alloc_zeroed(layout) };
+        assert!(!raw.is_null());
+        let base = raw.expose_provenance(); // expose whole allocation ONCE (C2)
+        let cell_addr = base + HALF_ALIGNMENT; // 8-mod-16
+        let dst = ptr::with_exposed_provenance_mut::<u8>(cell_addr);
+        // SAFETY (C2,C3,C4): `cell_addr` is inside the just-exposed precise allocation;
+        // the raw byte copy forms no reference and aliases no live cell.
+        unsafe { ptr::copy_nonoverlapping(src, dst, len) };
+        self.allocations.push((raw, layout));
+        CellPtr::from_addr(cell_addr)
+    }
+
     /// Recover the precise header (fromCell = cell - headerSize, :58-61,165) by
     /// masking off the +8 bit to reach the 16-aligned base, then recover with
     /// provenance.

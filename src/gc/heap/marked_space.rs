@@ -311,6 +311,11 @@ pub(crate) struct MarkedSpace {
     /// cell's UnsafeCell. Kept from the prototype but demoted: `find()` is the
     /// memory-safety gate; this only catches a careless overlapping `&mut`.
     debug_borrow_flags: HashMap<usize, Box<AtomicU8>, FxIntBuildHasher>,
+    /// gc-r4 R3 (reversible shadow oracle): count of cells handed out via
+    /// `allocate_blob`. The R3 shadow space only ever calls `allocate_blob` and R3
+    /// never sweeps, so this is exactly its LIVE twin count — the population the
+    /// suite-end cross-check compares against `CoreObjectStore::objects.len()`.
+    allocated_blob_cells: usize,
     _not_send_sync: PhantomData<*const ()>, // contract C6
 }
 
@@ -328,6 +333,7 @@ impl MarkedSpace {
             blocks: MarkedBlockSet::new(),
             precise_set: HashSet::default(),
             debug_borrow_flags: HashMap::default(),
+            allocated_blob_cells: 0,
             _not_send_sync: PhantomData,
         }
     }
@@ -363,6 +369,92 @@ impl MarkedSpace {
                 cp
             }
         }
+    }
+
+    // ============================ gc-r4 R3 SHADOW ORACLE ============================
+    // The REVERSIBLE bridge to R4 (docs/design/gc-r4.md "R3 (reversible)"): accept a
+    // real POD CELL BLOB (`CoreObjectCell`) into the arena via the SAME routing /
+    // BlockDirectory / FreeList path `allocate` uses, then prove byte-for-byte that the
+    // arena holds it identically and that the populations match. R3 needs the arena to
+    // ACCEPT + STORE a POD blob — NOT sweep (that is R4 / GAP B). The interpreter keeps
+    // its `Vec<Pin<Box<CoreObjectCell>>>` box path as the SOLE authority; these methods
+    // only let it mirror + cross-check a twin, so deleting them reverts to pre-R3.
+
+    /// Route a POD cell blob by its byte size and store it via the production allocate
+    /// path (a twin of the authoritative box cell). Returns the carried `CellPtr`.
+    ///
+    /// SAFETY: `src..src+len` is `len` readable bytes of an initialized POD value
+    /// (`needs_drop == false`); single mutator thread (contract C5/C6).
+    pub(crate) unsafe fn allocate_blob(&mut self, src: *const u8, len: usize) -> CellPtr {
+        self.allocated_blob_cells += 1;
+        match size_route(len) {
+            SizeRoute::Marked(sz) => {
+                let atoms = sz / ATOM_SIZE;
+                let dir = self
+                    .directories
+                    .entry(atoms)
+                    .or_insert_with(|| BlockDirectory::new(atoms));
+                // SAFETY: forwarded — see the fn contract.
+                let (cp, new_base) = unsafe { dir.allocate_blob(src, len) };
+                if let Some(base) = new_base {
+                    self.blocks.add(base); // didAddBlock -> m_blocks.add
+                }
+                cp
+            }
+            SizeRoute::Precise(sz) => {
+                // SAFETY: forwarded — see the fn contract.
+                let cp = unsafe { self.precise.allocate_blob(sz, src, len) };
+                self.precise_set.insert(cp.addr());
+                cp
+            }
+        }
+    }
+
+    /// Re-sync the arena twin at `cp` from the authoritative box cell (`src..src+len`)
+    /// in lockstep (gc-r4 R3: the box stays authoritative; the twin tracks it). `&self`
+    /// because the cell slot is interior-mutable once-exposed page memory — no `&mut
+    /// MarkedSpace`, no `&MarkedBlock`, only a raw place copy (contract C4/C5).
+    ///
+    /// SAFETY: `cp` is a live cell this space handed out via `allocate_blob`;
+    /// `src..src+len` is `len` readable POD bytes; single mutator thread.
+    pub(crate) unsafe fn shadow_write(&self, cp: CellPtr, src: *const u8, len: usize) {
+        let dst = ptr::with_exposed_provenance_mut::<u8>(cp.addr());
+        // SAFETY (C2,C3,C4): `cp.addr()` is a live cell inside a once-exposed page; the
+        // raw byte copy forms no reference; the box cell and the twin are distinct
+        // allocations (non-overlapping).
+        unsafe { ptr::copy_nonoverlapping(src, dst, len) };
+    }
+
+    /// Prove the arena twin at `cp` is BYTE-EQUAL to the box cell (`src..src+len`) — the
+    /// R4-readiness assert that the arena holds the cell byte-identically. Reads the twin
+    /// back through a FRESH provenance recovery (so a slot-overlap / block-corruption bug
+    /// surfaces) and compares every byte.
+    ///
+    /// The comparison spans the FULL struct width including any `#[repr(C)]` padding.
+    /// That is sound under the R3 gate (native `cargo test`, no miri): the twin is a
+    /// verbatim `copy_nonoverlapping` of the box, so padding bytes match bit-for-bit;
+    /// only a real arena corruption makes them differ. (The R4 gate separately runs miri
+    /// on the live raw-arena deref — gc-r4.md R4 technical gate (b).)
+    ///
+    /// SAFETY: `cp` is a live cell handed out via `allocate_blob`; `src..src+len` is
+    /// `len` readable bytes; single mutator thread; raw place reads form no reference.
+    pub(crate) unsafe fn shadow_bytes_eq(&self, cp: CellPtr, src: *const u8, len: usize) -> bool {
+        let twin = ptr::with_exposed_provenance::<u8>(cp.addr());
+        for i in 0..len {
+            // SAFETY: both `twin+i` and `src+i` are in-bounds readable bytes (twin is a
+            // live `len`-byte arena cell, src a `len`-byte POD value); raw reads only.
+            let (a, b) = unsafe { (ptr::read(twin.add(i)), ptr::read(src.add(i))) };
+            if a != b {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// gc-r4 R3 population cross-check input: how many cells this space handed out via
+    /// `allocate_blob` (== live twins, since R3 never sweeps).
+    pub(crate) fn allocated_blob_cell_count(&self) -> usize {
+        self.allocated_blob_cells
     }
 
     /// Force-route through PreciseAllocation regardless of size (to exercise the

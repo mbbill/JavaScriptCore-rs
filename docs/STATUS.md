@@ -90,11 +90,17 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   the FreeList (legal precisely because needs_drop==false → no destructors), retains marked + newly-allocated,
   rebuilds the interval free-list. MIRI-CLEAN (Stacked + Tree Borrows, 0 UB) over the demo POD cell. R4 drives
   it stopAllocating→sweep→resumeAllocating across the directories.
-- [next-GC] now POD-UNBLOCKED, trace+sweep AUTHORED: R3 shadow oracle (twin POD cell in MarkedSpace,
-  byte-equal cross-check at find/find_mut + suite-end population check, reversible) → R4 flip (raw arena addr
-  = sole identity; ~56 find_mut → with_cell_mut; gate = shadow-green suite-wide + miri on the ~3 self-aliasing
-  families + adversarial + 15 benches) → WIRE the authored trace+sweep to live cells + run the collector. This
-  is what permanently fixes the leak (SD-4: each aux slab still needs its own R4 Auxiliary-subspace trace+sweep).
+- [done] R3 shadow oracle (debug-gated, reversible, **R4-GO**): the arena ACCEPTS+STORES a byte-identical
+  twin CoreObjectCell through allocate_cell; byte-equal cross-check at find/find_mut + population check held
+  SUITE-WIDE (2740 tests, zero fires); release compiles it ALL out (byte-identical to HEAD, zero extra mem).
+  First wiring of the S4 arena into the live engine. Caveat: proves ACCEPT+STORE+population, NOT the live
+  deref (re-syncs at read) — the self-aliasing live-deref is R4's miri gate.
+- [next-GC] R4 FLIP (IRREVERSIBLE — the final cell-identity cutover): delete the leaking Vec<Pin<Box>> stores
+  + object_indices_by_payload; raw arena addr = sole identity; ~56 find_mut → arena.with_cell_mut closures
+  (the ~3 two-cell self-aliasing families stay copy-out); WIRE the authored trace (GAP A) + sweep (GAP B) +
+  run the collector. Gate = TECHNICAL: miri on the live deref (-Zmiri-tree-borrows, the self-aliasing
+  hotspots R3 doesn't cover) + adversarial grep verifier + 15 benches (runnable once the collector fixes the
+  leak). This permanently fixes the OOM leak (SD-4: each aux slab then needs its own Auxiliary trace+sweep).
 
 ## Baseline JIT / DFG / FTL (parity lives here; ~0% started)
 - [done] JIT↔runtime bridge-infra (adversarially verified): extern-C operation_value_add shim

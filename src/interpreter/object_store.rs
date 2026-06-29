@@ -19,6 +19,12 @@ use super::*;
 // is not in the `interpreter` glob (`use super::*`), so it is imported here.
 use crate::value::CellValue;
 
+// gc-r4 R3 (reversible shadow oracle): the S4 cell arena + the carried cell address.
+// DEBUG-ONLY wiring (the whole oracle compiles out of release) — see `ShadowOracle`
+// and docs/design/gc-r4.md "R3 (reversible)".
+#[cfg(debug_assertions)]
+use crate::gc::{CellPtr, MarkedSpace};
+
 pub(crate) fn can_use_get_by_id_megamorphic_property_name(text: &str) -> bool {
     !matches!(text, "length" | "name" | "prototype" | "__proto__")
         && parse_array_index_name(text).is_none()
@@ -33,9 +39,85 @@ pub(crate) fn can_use_put_by_id_megamorphic_property_name(text: &str) -> bool {
     text != "__proto__" && parse_array_index_name(text).is_none()
 }
 
+/// gc-r4 R3 — the REVERSIBLE shadow oracle (docs/design/gc-r4.md "R3 (reversible)").
+///
+/// The authoritative live-cell path stays `CoreObjectStore::objects`
+/// (`Vec<Pin<Box<CoreObjectCell>>>`), COMPLETELY UNCHANGED: it keeps publishing the box
+/// pointer so every `find`/`find_mut`/read site works untouched, and deleting this
+/// oracle reverts the engine to the pre-R3 state (full reversibility). On top of it, R3
+/// mirrors each cell into the real S4 `MarkedSpace` arena as a BYTE-TWIN keyed by the
+/// box-pointer payload, and cross-checks — at real `cargo test` volume, BEFORE the
+/// irreversible R4 flip — that the arena (a) can ACCEPT + STORE a `CoreObjectCell`-sized
+/// POD cell byte-identically through the production routing/FreeList/MarkedBlock path,
+/// and (b) holds a live-cell population matching the store. R3 does NOT sweep (R4 /
+/// gc-r4.md GAP B); twin addresses are distinct by construction (the FreeList bumps and
+/// never re-hands an address pre-sweep), so R4's "arena address == identity" precondition
+/// holds for free.
+///
+/// DEBUG-ONLY: the whole type and its uses are `#[cfg(debug_assertions)]`, so the twin
+/// allocation + cross-checks run across the entire `cargo test --lib` suite yet compile
+/// out of release — keeping release byte-identical to today (zero extra cell memory: the
+/// OOM-safety constraint) and the change fully reversible.
+#[cfg(debug_assertions)]
+struct ShadowOracle {
+    /// The S4 cell arena holding the byte-twins (gc::heap::MarkedSpace). `!Send+!Sync`,
+    /// and neither `Clone` nor `Debug` — so `CoreObjectStore`'s hand-written `Clone`
+    /// DETACHES it and `ShadowOracle`'s `Debug` is hand-written below.
+    space: MarkedSpace,
+    /// box-pointer payload (the `find`/`find_mut` key) -> the twin's arena `CellPtr`.
+    addr_by_payload: HashMap<usize, CellPtr, FxIntBuildHasher>,
+    /// ACTIVE on a primary/default store; DETACHED (inert) on a clone. A clone re-pins
+    /// `objects` to NEW heap addresses, so its cells' payloads differ from this store's
+    /// twins/keys and its population would not align; rather than re-home the arena on
+    /// every snapshot clone, a clone simply runs WITHOUT a shadow (still fully sound —
+    /// `find`/`find_mut` find no twin for the new payloads and skip the oracle).
+    active: bool,
+}
+
+#[cfg(debug_assertions)]
+impl Default for ShadowOracle {
+    fn default() -> Self {
+        // A primary store (built via `CoreObjectStore::default()`) gets an ACTIVE shadow.
+        Self {
+            space: MarkedSpace::new(),
+            addr_by_payload: HashMap::default(),
+            active: true,
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl ShadowOracle {
+    /// An inert shadow for a cloned store (see `active`).
+    fn detached() -> Self {
+        Self {
+            space: MarkedSpace::new(),
+            addr_by_payload: HashMap::default(),
+            active: false,
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl std::fmt::Debug for ShadowOracle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // MarkedSpace is not Debug; surface only the population summary.
+        f.debug_struct("ShadowOracle")
+            .field("active", &self.active)
+            .field("twins", &self.addr_by_payload.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct CoreObjectStore {
     pub(crate) objects: Vec<Pin<Box<CoreObjectCell>>>,
+    // gc-r4 R3 (reversible shadow oracle): a DEBUG-ONLY byte-twin of each cell in the
+    // real S4 arena, cross-checked against the authoritative box cell at every
+    // `find`/`find_mut` + a population invariant — the R4-readiness proof. See
+    // `ShadowOracle`. Release builds omit this field entirely (zero cost, reversible).
+    #[cfg(debug_assertions)]
+    shadow: ShadowOracle,
     // gc-r4 B1a: the store-owned slab of live butterfly allocations, the home of
     // each object's out-of-line property+element region over `RuntimeValue`
     // (object/butterfly_handle.rs `ButterflyAllocation`; C++ `Butterfly`,
@@ -332,6 +414,12 @@ impl Clone for CoreObjectStore {
     fn clone(&self) -> Self {
         let mut cloned = Self {
             objects: self.objects.clone(),
+            // gc-r4 R3 (reversible shadow oracle): a clone re-pins every cell to a NEW
+            // address, so its twins/keys would not match the original arena; a cloned
+            // store runs with a DETACHED (inert) shadow (see ShadowOracle::active). This
+            // keeps the oracle on the primary store only — fully sound and reversible.
+            #[cfg(debug_assertions)]
+            shadow: ShadowOracle::detached(),
             // gc-r4 Butterfly-values: deep-clone the whole butterfly slab by index so
             // every `ButterflyHandle` stays valid across the snapshot AND the cloned
             // store owns an INDEPENDENT slab. `objects.clone()` copies each cell's
@@ -4647,6 +4735,33 @@ impl CoreObjectStore {
         );
         self.objects.push(object);
         self.object_indices_by_payload.insert(payload, index);
+        // gc-r4 R3 (reversible shadow oracle): mirror the just-published, fully
+        // initialized POD cell into the S4 arena as a byte-twin keyed by the same
+        // box-pointer payload, then assert the populations stay in lockstep. DEBUG-ONLY
+        // (folds out of release). This is the ACCEPT + STORE half of the R4-readiness
+        // proof: the arena holds a real CoreObjectCell-sized POD cell via the production
+        // routing/FreeList/MarkedBlock path. The box stays the SOLE authority — this is
+        // additive and reversible (delete to revert). See `ShadowOracle`.
+        #[cfg(debug_assertions)]
+        if self.shadow.active {
+            let len = core::mem::size_of::<CoreObjectCell>();
+            // SAFETY: `ptr` is the pinned heap cell (stable across the `objects` push
+            // above — a `Box` allocation never moves), fully initialized, `len` POD bytes.
+            let cp = unsafe {
+                self.shadow
+                    .space
+                    .allocate_blob(ptr.as_ptr() as *const u8, len)
+            };
+            self.shadow.addr_by_payload.insert(payload, cp);
+            // Population cross-check (every allocation, suite-wide): one twin per box
+            // cell, and the arena's live count tracks `objects` exactly (R3 never sweeps,
+            // so the arena count is monotone like the leaking box `Vec`).
+            debug_assert_eq!(self.shadow.addr_by_payload.len(), self.objects.len());
+            debug_assert_eq!(
+                self.shadow.space.allocated_blob_cell_count(),
+                self.objects.len()
+            );
+        }
         // SAFETY: The host owns the boxed cell for the lifetime of the dispatch
         // run and never moves the allocation after the value is published.
         RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
@@ -8388,6 +8503,12 @@ impl CoreObjectStore {
             "object reached via object_indices_by_payload must carry an object JSType"
         );
         let _ = object.cell_id;
+        // gc-r4 R3 shadow oracle: re-sync the arena twin from the box cell and assert
+        // byte-equality (the R4-readiness proof that the arena holds the cell
+        // byte-identically). Debug-only; skips cells with no twin (a pre-publish read or
+        // a detached clone). See `shadow_oracle_check`.
+        #[cfg(debug_assertions)]
+        self.shadow_oracle_check(payload);
         Some(object)
     }
 
@@ -8544,9 +8665,63 @@ impl CoreObjectStore {
     pub(crate) fn find_mut(&mut self, value: RuntimeValue) -> Option<&mut CoreObjectCell> {
         let payload = value.as_cell()?.pointer_payload_bits();
         let index = self.object_indices_by_payload.get(&payload).copied()?;
+        // gc-r4 R3 shadow oracle: re-sync the arena twin from the (about-to-be-mutated)
+        // box cell and assert byte-equality BEFORE handing out the `&mut`. Debug-only;
+        // the `&self` borrow ends before the `&mut` below. See `shadow_oracle_check`.
+        #[cfg(debug_assertions)]
+        self.shadow_oracle_check(payload);
         let object = self.objects.get_mut(index)?.as_mut().get_mut();
         debug_assert_eq!(core::ptr::from_ref(object) as usize, payload);
         Some(object)
+    }
+
+    /// gc-r4 R3 (reversible shadow oracle) per-access cross-check: re-sync the arena
+    /// byte-twin from the authoritative box cell, then assert the arena holds it
+    /// BYTE-IDENTICALLY (the R4-readiness proof). Re-sync is required because `find_mut`
+    /// hands out `&mut` and the mutation lands AFTER the call returns, so the twin is
+    /// brought current at each access (gc-r4.md: "or re-synced at read"), the box staying
+    /// authoritative. Skips payloads with no twin (a pre-publish read, or a detached
+    /// clone). DEBUG-ONLY. A failure here is a REAL divergence to surface, not paper over.
+    #[cfg(debug_assertions)]
+    fn shadow_oracle_check(&self, payload: usize) {
+        if !self.shadow.active {
+            return;
+        }
+        let Some(&cp) = self.shadow.addr_by_payload.get(&payload) else {
+            return;
+        };
+        let Some(index) = self.object_indices_by_payload.get(&payload).copied() else {
+            return;
+        };
+        let Some(boxed) = self.objects.get(index) else {
+            return;
+        };
+        let cell = boxed.as_ref().get_ref();
+        debug_assert_eq!(core::ptr::from_ref(cell) as usize, payload);
+        let src = core::ptr::from_ref::<CoreObjectCell>(cell) as *const u8;
+        let len = core::mem::size_of::<CoreObjectCell>();
+        // SAFETY: `cp` is a live twin this oracle allocated for `payload`; `src..src+len`
+        // is the pinned POD box cell; single-threaded; `shadow_write`/`shadow_bytes_eq`
+        // form no `&mut MarkedSpace`/`&MarkedBlock` (raw place copy/reads — contract C4/C5).
+        unsafe {
+            self.shadow.space.shadow_write(cp, src, len);
+            assert!(
+                self.shadow.space.shadow_bytes_eq(cp, src, len),
+                "gc-r4 R3 shadow oracle: arena twin not byte-equal to the box cell \
+                 (payload {payload:#x}) — the S4 arena did not hold the POD CoreObjectCell \
+                 byte-identically (R4 blocker)"
+            );
+        }
+    }
+
+    /// gc-r4 R3 population cross-check (test helper): the arena holds exactly one live
+    /// twin per box cell, and the arena's `allocate_blob` count tracks `objects`. True
+    /// only on an ACTIVE shadow (a detached clone returns false). DEBUG/TEST only.
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn shadow_oracle_population_matches(&self) -> bool {
+        self.shadow.active
+            && self.shadow.addr_by_payload.len() == self.objects.len()
+            && self.shadow.space.allocated_blob_cell_count() == self.objects.len()
     }
 
     #[cfg(test)]
@@ -9757,5 +9932,87 @@ mod trace_cell_gap_a_tests {
         // Exact set equality also proves the regexp String + ArrayBuffer bytes
         // slabs contributed NOTHING (no extra entries appeared).
         assert_eq!(traced(&store, &cell), expected);
+    }
+}
+
+// gc-r4 R3 (reversible shadow oracle) — the de-risking proof that the S4 arena can
+// ACCEPT + STORE a real `CoreObjectCell`-sized POD cell byte-identically, with a
+// population matching the store, BEFORE the irreversible R4 flip. These run only in
+// debug (the oracle is `#[cfg(debug_assertions)]`); the per-access byte-equal cross-check
+// also runs implicitly across the WHOLE `cargo test --lib` suite via `find`/`find_mut`.
+#[cfg(all(test, debug_assertions))]
+mod shadow_oracle_r3_tests {
+    use super::*;
+
+    /// ACCEPT + STORE + byte-equal across finds + population. Allocate a batch of object
+    /// cells (each gets an arena byte-twin), then drive `find`/`find_mut` (which run the
+    /// re-sync + byte-equal cross-check) and mutate through `find_mut` to exercise the
+    /// lockstep re-sync. A divergence would PANIC inside the oracle; reaching the end
+    /// proves the arena held every twin byte-identically.
+    #[test]
+    fn arena_accepts_stores_and_holds_cells_byte_identically() {
+        let mut store = CoreObjectStore::default();
+        let mut values = Vec::new();
+        for _ in 0..64 {
+            values.push(store.allocate()); // plain object cell -> allocate_cell -> twin
+        }
+        // Population: one arena twin per box cell; arena live count == store objects.
+        assert!(
+            store.shadow_oracle_population_matches(),
+            "R3 population cross-check (twins == arena live == objects.len())"
+        );
+        // Reads run the byte-equal cross-check (panic on divergence).
+        for &v in &values {
+            assert!(store.find(v).is_some());
+        }
+        // Mutate through find_mut, then re-read: the twin re-syncs to the new bytes and
+        // stays byte-equal (proves the lockstep sync + arena round-trip under mutation).
+        for (i, &v) in values.iter().enumerate() {
+            store.find_mut(v).unwrap().date_value = i as f64 + 0.5;
+            assert_eq!(store.find(v).unwrap().date_value, i as f64 + 0.5);
+        }
+        // Add out-of-line properties (grows the butterfly slab, mutates each cell) and
+        // re-read through find — the twin tracks every mutation.
+        for &v in &values {
+            for k in 0..8 {
+                store
+                    .put_data_own(v, &ident(k), RuntimeValue::from_i32(k as i32))
+                    .unwrap();
+            }
+            assert!(store.find(v).is_some());
+        }
+        assert!(store.shadow_oracle_population_matches());
+    }
+
+    /// A cloned store runs with a DETACHED (inert) shadow: its population helper is
+    /// false (active == false) yet `find`/`find_mut` on its (re-pinned) cells stay sound
+    /// (no twin for the new payloads -> the oracle skips them) — full reversibility /
+    /// no false failures on the snapshot/test clone path.
+    #[test]
+    fn cloned_store_runs_detached_and_finds_stay_sound() {
+        let mut store = CoreObjectStore::default();
+        let mut values = Vec::new();
+        for _ in 0..8 {
+            values.push(store.allocate());
+        }
+        assert!(store.shadow_oracle_population_matches());
+
+        let clone = store.clone();
+        assert!(
+            !clone.shadow_oracle_population_matches(),
+            "a clone is detached (inert shadow)"
+        );
+        // The clone's cells are re-pinned to NEW addresses; the original `values` no
+        // longer resolve in the clone (different payloads). The original still does, and
+        // its oracle still holds (the clone did not perturb the primary store).
+        for &v in &values {
+            assert!(store.find(v).is_some());
+        }
+        assert!(store.shadow_oracle_population_matches());
+    }
+
+    /// helper local to this module (the file's other test mods define their own `ident`).
+    fn ident(n: u32) -> CorePropertyKey {
+        CorePropertyKey::Identifier(n)
     }
 }
