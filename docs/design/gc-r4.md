@@ -242,6 +242,60 @@ relocation-safety):
   impls target the wrong type and can't be reused as-is. Same reconciliation as the
   storage.rs↔butterfly_handle.rs Butterfly consolidation (B1a): consolidate onto `RuntimeValue`.
 
+### R4b ratified design (2026-06-29 — the collector-cycle audit)
+
+R4b wires the live cycle: roots → mark → reconcile (free slabs + drop reverse-index)
+→ sweep. **THE #1 UAF RISK (audit catch, a mass-UAF landmine):** the collector's
+root/edge admission gate MUST be MEMBERSHIP-ONLY, NEVER the liveness-bearing
+`MarkedSpace::find` (which ends in `is_live_cell` = newlyAllocated OR marked). After
+begin-marking clears all marks, a PRIOR-collection survivor has newlyAllocated=0
+(cleared by the last sweep) AND marks cleared → is_live_cell=false → find=None → a
+marker gating through `find` would REJECT every old-gen survivor → mass UAF. It
+detonates only on the 2nd+ collection (survivors keep newlyAllocated on #1) — exactly
+when Octane stops OOMing — so a SINGLE-collection test does NOT catch it; the reclaims
+test MUST run ≥2 collections.
+
+RATIFIED decisions:
+1. MEMBERSHIP-ONLY gate `is_arena_cell(addr)` = find MINUS is_live_cell (block
+   rule_out + atom_aligned + blocks.contains). Marker uses it; mutator keeps
+   liveness-find. Leaf-cell Box addrs still fail membership (∉ arena block) → skipped.
+2. begin-marking adds `MarkedSpace::clear_all_marks` (none exists; HeapVersion staleness
+   is deferred). Sweep stays DoesNotHave (clears newlyAllocated; post-sweep liveness =
+   marks alone).
+3. add `MarkedSpace::for_each_object_cell` (block walk); the STORE drives a pre-sweep
+   reconciliation pass (gc/heap stays ignorant of CoreObjectCell).
+4. AUX + BUTTERFLY reclamation is IN R4b (NOT a deferred R4b-2) — the butterfly slab is
+   the dominant memory, so cell-atom sweep alone still OOMs. Per-slab free-list + slot
+   reuse in allocate_* (Vec<Vec> can't shrink; slot reuse mirrors JSC Auxiliary sweep).
+   The pre-sweep walk reads each cell's handles BEFORE sweep_block clobbers dead cells
+   with FreeCell link records.
+5. COOPERATIVE deferred safepoint ONLY (back-edge / VM-entry poll); NO inline collection
+   in allocate_* — this forecloses re-entrancy by construction (no safepoint inside
+   with_cell_mut/cell_at, so no collection while a cell &mut/& is live). Conservative
+   native-stack scan stays deferred (GAP C). Builtins allocating in long loops must
+   reach a safepoint or run under enter_no_gc_scope with a pre-reserved budget.
+6. Vm-resident driver advances the gc::Heap phase machine + runs MarkedSpace mark+sweep;
+   register_root_safepoint_is_active flips during the STW window.
+
+ROOT SET (precise suffices under the cooperative model). COVERED = VM register file
+(gather_vm_register_roots) + frame-header callee + pending exception. R4b ADDS (each a
+UAF gap if missed, ranked): **#1** the ~25 CoreObjectStore intrinsic Option<RuntimeValue>
+roots (prototypes/constructors/global object — the JSGlobalObject::visitChildren analog;
+NO gather exists); **#2** the microtask/promise job queue (callback + args); **#3** the
+jit_pending exception word (not in root_descriptors); **#4** verify lexical_scope objects
+are transitively rooted via a function cell's captures slab (else add). The reverse-index
+(object_addr_by_cell_id) drop happens in the SAME pre-sweep walk (dead cell → remove
+cell_id BEFORE sweep clobbers it — a reused addr with a stale id else resolves a wrong
+live cell). Leaf-skip is SOUND (verified: no String/Symbol/BigInt leaf has an out-edge to
+an object cell — they leak in their Vec stores, the known residual for a later phase).
+
+VERIFY: reclaims-dead/retains-live RUN ≥2 COLLECTIONS (the membership catch); a per-root
+survival test per gap; a trace-completeness compile guard (fail if a new RuntimeValue
+field is untraced); self-aliasing under forced collection; miri (TB) on mark+sweep; a
+BOUNDED no-OOM micro-probe (NOT heavy benches) asserting arena + butterfly-slab live
+counts return to baseline; THEN the heavy Octane benches become runnable (gate them in via
+the micro-probe FIRST — the leak persists until R4b lands).
+
 ## Dependency / ordering
 
 value-rep NaN-box (done) → Structure-wire (offset map → PropertyTable; in flight) → B1a
