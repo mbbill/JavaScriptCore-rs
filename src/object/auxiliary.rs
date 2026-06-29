@@ -8,11 +8,15 @@
 //! butterfly, these come from store-owned slabs keyed by an index handle until R4
 //! makes cells raw arena addresses.
 //!
-//! This module is the future home for those per-kind relocations (the gc-r4
-//! per-kind vertical slices: ArrayBuffer, Map/Set). B1a lands the module + the
-//! STUB signatures only; the slabs and bodies arrive with each per-kind unit.
-
-use crate::object::butterfly_handle::ButterflyHandle;
+//! This module holds the shared per-kind aux HANDLE vocabulary (`AuxiliaryHandle`,
+//! `PromiseReactionsHandle`). The per-kind store-owned slabs and their `allocate_*`
+//! methods live on `CoreObjectStore` (object_store.rs), mirroring the bound-args /
+//! promise-reaction / regexp-source relocations. gc-r4 Map/Set unit: the Map/WeakMap
+//! ordered entries and Set/WeakSet ordered values relocated to the `map_entry_lists`
+//! / `set_value_lists` store slabs (keyed by `AuxiliaryHandle`), so the former
+//! `allocate_ordered_hash_storage` scaffold (which would have been a SECOND, divergent
+//! mechanism over a `ButterflyHandle`) is removed. The ArrayBuffer byte backing is the
+//! one remaining scaffolded relocation, landing with the ArrayBuffer per-kind unit.
 
 /// Handle to a store-owned auxiliary backing allocation.
 ///
@@ -73,19 +77,12 @@ impl PromiseReactionsHandle {
 // there is ONE mechanism, not two. Raw bytes are not GC edges: no write barrier, and the
 // R4 collector trace need not visit that slab.
 
-/// Allocate the insertion-ordered backing for a Map/Set.
-///
-/// C++ JSC `JSOrderedHashTable::Storage` (JSOrderedHashTable.h:164, a
-/// `JSCellButterfly` held by `m_storage`): the insertion-ordered entry table
-/// backing `JSOrderedHashMap`/`Set`. The per-kind Map/Set slice relocates
-/// `map_entries`/`set_values` to an aux backing for POD-ness now; the faithful
-/// `JSOrderedHashTable` is a deferred correctness/perf batch (gc-r4 rank-5).
-///
-/// SCAFFOLD: signature only. Body lands with the Map/Set per-kind unit. Returns a
-/// `ButterflyHandle` because the C++ Storage IS a `JSCellButterfly`.
-#[allow(dead_code, unused_variables)]
-pub fn allocate_ordered_hash_storage() -> ButterflyHandle {
-    // TODO(gc-r4 Map/Set unit): allocate the ordered-hash entry backing and
-    // return its handle.
-    unimplemented!("ordered-hash storage lands with the Map/Set per-kind unit")
-}
+// gc-r4 Map/Set unit (LANDED): the former `allocate_ordered_hash_storage` scaffold —
+// which returned a `ButterflyHandle` because the C++ `JSOrderedHashTable::Storage` IS a
+// JSCellButterfly (JSOrderedHashTable.h:164) — is REMOVED. Map/WeakMap entries and
+// Set/WeakSet values now relocate to the `CoreObjectStore::map_entry_lists` /
+// `set_value_lists` store slabs keyed by `AuxiliaryHandle`, allocated via
+// `CoreObjectStore::allocate_map_entries` / `allocate_set_values` (object_store.rs),
+// mirroring the bound-args / promise / regexp relocations. Keeping the scaffold would
+// have left a SECOND, divergent backing mechanism; the faithful JSOrderedHashTable port
+// remains a deferred correctness/perf batch (gc-r4 rank-5).

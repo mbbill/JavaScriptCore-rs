@@ -15613,8 +15613,7 @@ impl CoreOpcodeDispatchHost {
         };
         let value = self
             .objects
-            .find(this_value)
-            .and_then(|map| map.map_entries.get(index).map(|(_, value)| *value))
+            .map_entry_value(this_value, index)
             .unwrap_or_else(RuntimeValue::undefined);
         Ok(value)
     }
@@ -15665,11 +15664,11 @@ impl CoreOpcodeDispatchHost {
         let Some(index) = self.map_entry_index(heap, this_value, key)? else {
             return Ok(RuntimeValue::from_bool(false));
         };
-        let Some(map) = self.objects.find_mut(this_value) else {
-            return Err(self
-                .type_error_outcome_with_heap(heap, "Map method called on incompatible receiver"));
-        };
-        map.map_entries.remove(index);
+        // gc-r4 Map/Set unit: route through the store-owned ordered-entry slab. The
+        // receiver was already validated by `map_entry_index` (it calls
+        // `ensure_map_receiver` and returned a live index), so no separate find_mut
+        // guard is needed here.
+        self.objects.map_entries_remove(this_value, index);
         Ok(RuntimeValue::from_bool(true))
     }
 
@@ -15679,11 +15678,9 @@ impl CoreOpcodeDispatchHost {
         this_value: RuntimeValue,
     ) -> Result<RuntimeValue, DispatchOutcome> {
         self.ensure_map_receiver(heap, this_value)?;
-        let Some(map) = self.objects.find_mut(this_value) else {
-            return Err(self
-                .type_error_outcome_with_heap(heap, "Map method called on incompatible receiver"));
-        };
-        map.map_entries.clear();
+        // gc-r4 Map/Set unit: clear the store-owned ordered-entry slab; the receiver
+        // was already validated by `ensure_map_receiver`.
+        self.objects.map_entries_clear(this_value);
         Ok(RuntimeValue::undefined())
     }
 
@@ -15693,11 +15690,8 @@ impl CoreOpcodeDispatchHost {
         this_value: RuntimeValue,
     ) -> Result<RuntimeValue, DispatchOutcome> {
         self.ensure_map_receiver(heap, this_value)?;
-        let length = self
-            .objects
-            .find(this_value)
-            .map(|map| map.map_entries.len())
-            .unwrap_or_default();
+        // gc-r4 Map/Set unit: size reads the store-owned ordered-entry slab length.
+        let length = self.objects.map_entries_len(this_value);
         Ok(RuntimeValue::from_i32(
             length.try_into().unwrap_or(i32::MAX),
         ))
@@ -15774,11 +15768,9 @@ impl CoreOpcodeDispatchHost {
         let Some(index) = self.set_value_index(heap, this_value, value)? else {
             return Ok(RuntimeValue::from_bool(false));
         };
-        let Some(set) = self.objects.find_mut(this_value) else {
-            return Err(self
-                .type_error_outcome_with_heap(heap, "Set method called on incompatible receiver"));
-        };
-        set.set_values.remove(index);
+        // gc-r4 Map/Set unit: route through the store-owned ordered-value slab; the
+        // receiver was already validated by `set_value_index`.
+        self.objects.set_values_remove(this_value, index);
         Ok(RuntimeValue::from_bool(true))
     }
 
@@ -15788,11 +15780,9 @@ impl CoreOpcodeDispatchHost {
         this_value: RuntimeValue,
     ) -> Result<RuntimeValue, DispatchOutcome> {
         self.ensure_set_receiver(heap, this_value)?;
-        let Some(set) = self.objects.find_mut(this_value) else {
-            return Err(self
-                .type_error_outcome_with_heap(heap, "Set method called on incompatible receiver"));
-        };
-        set.set_values.clear();
+        // gc-r4 Map/Set unit: clear the store-owned ordered-value slab; the receiver
+        // was already validated by `ensure_set_receiver`.
+        self.objects.set_values_clear(this_value);
         Ok(RuntimeValue::undefined())
     }
 
@@ -15802,11 +15792,8 @@ impl CoreOpcodeDispatchHost {
         this_value: RuntimeValue,
     ) -> Result<RuntimeValue, DispatchOutcome> {
         self.ensure_set_receiver(heap, this_value)?;
-        let length = self
-            .objects
-            .find(this_value)
-            .map(|set| set.set_values.len())
-            .unwrap_or_default();
+        // gc-r4 Map/Set unit: size reads the store-owned ordered-value slab length.
+        let length = self.objects.set_values_len(this_value);
         Ok(RuntimeValue::from_i32(
             length.try_into().unwrap_or(i32::MAX),
         ))
@@ -15873,8 +15860,7 @@ impl CoreOpcodeDispatchHost {
         };
         let value = self
             .objects
-            .find(this_value)
-            .and_then(|map| map.map_entries.get(index).map(|(_, value)| *value))
+            .map_entry_value(this_value, index)
             .unwrap_or_else(RuntimeValue::undefined);
         Ok(value)
     }
@@ -15925,13 +15911,9 @@ impl CoreOpcodeDispatchHost {
         let Some(index) = self.weak_map_entry_index(heap, this_value, key)? else {
             return Ok(RuntimeValue::from_bool(false));
         };
-        let Some(map) = self.objects.find_mut(this_value) else {
-            return Err(self.type_error_outcome_with_heap(
-                heap,
-                "WeakMap method called on incompatible receiver",
-            ));
-        };
-        map.map_entries.remove(index);
+        // gc-r4 Map/Set unit: route through the store-owned ordered-entry slab; the
+        // receiver was already validated by `weak_map_entry_index`.
+        self.objects.map_entries_remove(this_value, index);
         Ok(RuntimeValue::from_bool(true))
     }
 
@@ -16010,13 +15992,9 @@ impl CoreOpcodeDispatchHost {
         let Some(index) = self.weak_set_value_index(heap, this_value, value)? else {
             return Ok(RuntimeValue::from_bool(false));
         };
-        let Some(set) = self.objects.find_mut(this_value) else {
-            return Err(self.type_error_outcome_with_heap(
-                heap,
-                "WeakSet method called on incompatible receiver",
-            ));
-        };
-        set.set_values.remove(index);
+        // gc-r4 Map/Set unit: route through the store-owned ordered-value slab; the
+        // receiver was already validated by `weak_set_value_index`.
+        self.objects.set_values_remove(this_value, index);
         Ok(RuntimeValue::from_bool(true))
     }
 
@@ -16388,13 +16366,10 @@ impl CoreOpcodeDispatchHost {
             self.objects
                 .apply_value_store_write_barrier(heap, map_value, value)
                 .map_err(DispatchOutcome::Fail)?;
-            let Some(map) = self.objects.find_mut(map_value) else {
-                return Err(self.type_error_outcome_with_heap(
-                    heap,
-                    "Map method called on incompatible receiver",
-                ));
-            };
-            map.map_entries[index].1 = value;
+            // gc-r4 Map/Set unit: overwrite the existing entry's value in the store-owned
+            // ordered-entry slab (barrier applied above, before the store). The receiver
+            // was validated by `map_entry_index`, so no find_mut guard is needed.
+            self.objects.map_entry_set_value(map_value, index, value);
             return Ok(());
         }
         self.objects
@@ -16403,11 +16378,9 @@ impl CoreOpcodeDispatchHost {
         self.objects
             .apply_value_store_write_barrier(heap, map_value, value)
             .map_err(DispatchOutcome::Fail)?;
-        let Some(map) = self.objects.find_mut(map_value) else {
-            return Err(self
-                .type_error_outcome_with_heap(heap, "Map method called on incompatible receiver"));
-        };
-        map.map_entries.push((key, value));
+        // gc-r4 Map/Set unit: append the fresh (key,value) entry to the store-owned
+        // ordered-entry slab (barriers applied above, before the store).
+        self.objects.map_entries_push(map_value, key, value);
         Ok(())
     }
 
@@ -16418,11 +16391,9 @@ impl CoreOpcodeDispatchHost {
         key: RuntimeValue,
     ) -> Result<Option<usize>, DispatchOutcome> {
         self.ensure_map_receiver(heap, map_value)?;
-        let entries = self
-            .objects
-            .find(map_value)
-            .map(|map| map.map_entries.clone())
-            .unwrap_or_default();
+        // gc-r4 Map/Set unit: snapshot the store-owned ordered entries, then linear-scan
+        // by SameValueZero at the call site (the interpreter's equality needs `&self`).
+        let entries = self.objects.map_entries_snapshot(map_value);
         Ok(entries
             .iter()
             .position(|(candidate, _)| self.same_value_zero(*candidate, key)))
@@ -16440,11 +16411,9 @@ impl CoreOpcodeDispatchHost {
         self.objects
             .apply_value_store_write_barrier(heap, set_value, value)
             .map_err(DispatchOutcome::Fail)?;
-        let Some(set) = self.objects.find_mut(set_value) else {
-            return Err(self
-                .type_error_outcome_with_heap(heap, "Set method called on incompatible receiver"));
-        };
-        set.set_values.push(value);
+        // gc-r4 Map/Set unit: append to the store-owned ordered-value slab (barrier
+        // applied above). The receiver was validated by `set_value_index`.
+        self.objects.set_values_push(set_value, value);
         Ok(())
     }
 
@@ -16455,11 +16424,9 @@ impl CoreOpcodeDispatchHost {
         value: RuntimeValue,
     ) -> Result<Option<usize>, DispatchOutcome> {
         self.ensure_set_receiver(heap, set_value)?;
-        let values = self
-            .objects
-            .find(set_value)
-            .map(|set| set.set_values.clone())
-            .unwrap_or_default();
+        // gc-r4 Map/Set unit: snapshot the store-owned ordered values, then linear-scan
+        // by SameValueZero at the call site (the interpreter's equality needs `&self`).
+        let values = self.objects.set_values_snapshot(set_value);
         Ok(values
             .iter()
             .position(|candidate| self.same_value_zero(*candidate, value)))
@@ -16475,22 +16442,14 @@ impl CoreOpcodeDispatchHost {
         self.ensure_weak_map_receiver(heap, map_value)?;
         self.ensure_weak_collection_key(heap, key)?;
         if let Some(index) = self.weak_map_entry_index(heap, map_value, key)? {
-            let Some(map) = self.objects.find_mut(map_value) else {
-                return Err(self.type_error_outcome_with_heap(
-                    heap,
-                    "WeakMap method called on incompatible receiver",
-                ));
-            };
-            map.map_entries[index].1 = value;
+            // gc-r4 Map/Set unit: overwrite the existing entry's value in the store-owned
+            // ordered-entry slab; the receiver was validated by `weak_map_entry_index`.
+            self.objects.map_entry_set_value(map_value, index, value);
             return Ok(());
         }
-        let Some(map) = self.objects.find_mut(map_value) else {
-            return Err(self.type_error_outcome_with_heap(
-                heap,
-                "WeakMap method called on incompatible receiver",
-            ));
-        };
-        map.map_entries.push((key, value));
+        // gc-r4 Map/Set unit: append the fresh (key,value) entry to the store-owned
+        // ordered-entry slab.
+        self.objects.map_entries_push(map_value, key, value);
         Ok(())
     }
 
@@ -16504,11 +16463,9 @@ impl CoreOpcodeDispatchHost {
         if !self.is_weak_collection_key(key) {
             return Ok(None);
         }
-        let entries = self
-            .objects
-            .find(map_value)
-            .map(|map| map.map_entries.clone())
-            .unwrap_or_default();
+        // gc-r4 Map/Set unit: snapshot the store-owned ordered entries, then linear-scan
+        // by strict equality at the call site (WeakMap key compare).
+        let entries = self.objects.map_entries_snapshot(map_value);
         Ok(entries
             .iter()
             .position(|(candidate, _)| self.strict_same_value(*candidate, key)))
@@ -16525,13 +16482,9 @@ impl CoreOpcodeDispatchHost {
         if self.weak_set_value_index(heap, set_value, value)?.is_some() {
             return Ok(());
         }
-        let Some(set) = self.objects.find_mut(set_value) else {
-            return Err(self.type_error_outcome_with_heap(
-                heap,
-                "WeakSet method called on incompatible receiver",
-            ));
-        };
-        set.set_values.push(value);
+        // gc-r4 Map/Set unit: append to the store-owned ordered-value slab; the receiver
+        // was validated by `ensure_weak_set_receiver`/`weak_set_value_index`.
+        self.objects.set_values_push(set_value, value);
         Ok(())
     }
 
@@ -16545,11 +16498,9 @@ impl CoreOpcodeDispatchHost {
         if !self.is_weak_collection_key(value) {
             return Ok(None);
         }
-        let values = self
-            .objects
-            .find(set_value)
-            .map(|set| set.set_values.clone())
-            .unwrap_or_default();
+        // gc-r4 Map/Set unit: snapshot the store-owned ordered values, then linear-scan
+        // by strict equality at the call site (WeakSet value compare).
+        let values = self.objects.set_values_snapshot(set_value);
         Ok(values
             .iter()
             .position(|candidate| self.strict_same_value(*candidate, value)))
@@ -16706,11 +16657,8 @@ impl CoreOpcodeDispatchHost {
         }
 
         if self.objects.is_map(iterable) {
-            let entries = self
-                .objects
-                .find(iterable)
-                .map(|map| map.map_entries.clone())
-                .unwrap_or_default();
+            // gc-r4 Map/Set unit: snapshot the store-owned ordered entries for iteration.
+            let entries = self.objects.map_entries_snapshot(iterable);
             for (key, value) in entries {
                 let pair = self.objects.allocate_array();
                 self.objects
@@ -16727,11 +16675,8 @@ impl CoreOpcodeDispatchHost {
         }
 
         if self.objects.is_set(iterable) {
-            let values = self
-                .objects
-                .find(iterable)
-                .map(|set| set.set_values.clone())
-                .unwrap_or_default();
+            // gc-r4 Map/Set unit: snapshot the store-owned ordered values for iteration.
+            let values = self.objects.set_values_snapshot(iterable);
             for value in values {
                 self.objects
                     .push_array_element_with_write_barrier(heap, array, value)

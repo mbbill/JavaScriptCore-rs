@@ -74,10 +74,11 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   randomized HashMap-oracle equivalence test (per-op get/enum/accessor diff). needs_drop POD assert still
   waits for the OTHER per-kind units.
 - [wip] per-kind POD-ification (retire the 9 remaining Drop fields → POD cell, cheapest-first per gc-r4.md;
-  integrate serially): **BoundFunction + Promise + RegExp + ArrayBuffer DONE (4/6)** (RegExp also deleted
-  regexp_flags_text → recompute canonical from bits, fixed a toString flag-order divergence; ArrayBuffer bytes
-  carry NO GC edge so need no trace); pending Map-Set + captures. Each relocates its Drop field to a
-  store-owned aux slab via a POD Copy handle (lazy alloc where
+  integrate serially): **BoundFunction + Promise + RegExp + ArrayBuffer + Map/Set DONE (5/6)** (RegExp also
+  deleted regexp_flags_text → recompute canonical from bits, fixed a toString flag-order divergence;
+  ArrayBuffer bytes carry NO GC edge so need no trace; Map/Set = POD-expedient Vec slabs, faithful
+  JSOrderedHashTable deferred); pending captures (6/6, then the needs_drop POD-proof flips). Each relocates
+  its Drop field to a store-owned aux slab via a POD Copy handle (lazy alloc where
   faithful); needs_drop::<CoreObjectCell>() assert flips ON in the final (captures) unit.
 - [missing] POD object-model rewrite (retire the fat CoreObjectCell) → R3 shadow oracle → R4 flip
   (gate = technical verification: shadow cross-check + miri + adversarial verify) → running collector.

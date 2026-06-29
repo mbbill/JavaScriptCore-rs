@@ -93,6 +93,32 @@ pub(crate) struct CoreObjectStore {
     // visit this slab (it still needs its own Auxiliary-subspace sweep, like
     // `regexp_sources`).
     pub(crate) array_buffer_backings: Vec<Vec<u8>>,
+    // gc-r4 R4 POD-ification (Map/Set unit): the store-owned slabs of Map/WeakMap
+    // insertion-ordered (key,value) entries and Set/WeakSet insertion-ordered values.
+    // C++ JSC keeps these in a `JSOrderedHashTable::Storage` (a `JSCellButterfly`
+    // held by `m_storage`, JSOrderedHashTable.h:164) hanging off the collection cell;
+    // relocating the per-cell `map_entries: Vec<..>` / `set_values: Vec<..>` into these
+    // store-owned slabs keyed by a Copy `AuxiliaryHandle` makes the cell's collection
+    // field POD (no `Drop`), so the cell stays sweep-eligible. An `AuxiliaryHandle` is
+    // an index into the matching Vec; only Map/WeakMap cells hold a `map_entries`
+    // handle and only Set/WeakSet cells hold a `set_values` handle (every other cell
+    // carries `AuxiliaryHandle::INVALID`). Allocated eagerly at the collection's
+    // `allocate_*` site (an empty backing, like every JSObject gets a butterfly), not
+    // lazily — the handle is valid for the cell's whole life.
+    //
+    // DIVERGENCE (POD expedient, gc-r4 rank-5): these are PLAIN insertion-ordered Vecs,
+    // NOT the faithful `JSOrderedHashTable` (which gives O(1) keyed lookup via a hash
+    // index over a JSCellButterfly-backed ordered table). The semantics preserved here
+    // are EXACTLY the prior per-cell Vec behavior (insertion order, linear SameValueZero
+    // / strict-equality keyed lookup, has/get/set/delete/forEach/size/clear); only the
+    // storage moved off the cell. The faithful ordered-hash port is a DEFERRED
+    // correctness/perf batch (Map/Set is not Octane-hot).
+    //
+    // Each entry/value still holds `RuntimeValue` GC edges (Map keys+values, Set
+    // values) — a later collector trace MUST visit BOTH slabs (gc-r4 GAP A); no trace
+    // wiring lands in this unit.
+    pub(crate) map_entry_lists: Vec<Vec<(RuntimeValue, RuntimeValue)>>,
+    pub(crate) set_value_lists: Vec<Vec<RuntimeValue>>,
     // VM-internal payload-bits -> object-slot index; keyed by interpreter pointer-bits,
     // never JS/adversary-controlled, so it needs no SipHash DoS resistance. Use the
     // in-tree FxIntBuildHasher (gc/fast_hash.rs, WTF IntHash/PtrHash family); the swap is
@@ -300,6 +326,13 @@ impl Clone for CoreObjectStore {
             // so every handle stays valid AND the cloned store owns an INDEPENDENT slab
             // — the same clone-independence invariant as the butterfly/regexp slabs.
             array_buffer_backings: self.array_buffer_backings.clone(),
+            // gc-r4 Map/Set unit: deep-clone both ordered-storage slabs in lockstep
+            // with `objects` (each collection cell's `AuxiliaryHandle` is copied
+            // shallow) so every handle stays valid AND the cloned store owns an
+            // INDEPENDENT slab — the same clone-independence invariant the butterfly
+            // slab relies on.
+            map_entry_lists: self.map_entry_lists.clone(),
+            set_value_lists: self.set_value_lists.clone(),
             object_indices_by_payload: HashMap::default(),
             // structure_table is keyed by StructureId handle (stable Vec slots across
             // clone), so every cloned cell's structure_id stays valid and the offset
@@ -468,8 +501,19 @@ pub(crate) struct CoreObjectCell {
     // element storage is now the store-owned slab's `elements` side, reached through
     // `butterfly` (the handle above); the SOLE authority for indexed values (it had no
     // HashMap mirror). All access routes through the `butterfly_elem_*` store API.
-    pub(crate) map_entries: Vec<(RuntimeValue, RuntimeValue)>,
-    pub(crate) set_values: Vec<RuntimeValue>,
+    // C++ JSC `JSOrderedHashMap`/`JSOrderedHashSet` reach their insertion-ordered
+    // entries through `m_storage` (a `JSOrderedHashTable::Storage` JSCellButterfly,
+    // JSOrderedHashTable.h:164). gc-r4 R4 POD-ification (Map/Set unit): the per-cell
+    // `map_entries: Vec<..>` / `set_values: Vec<..>` were RELOCATED to the store-owned
+    // `map_entry_lists` / `set_value_lists` slabs; the cell holds only these POD `Copy`
+    // `AuxiliaryHandle` indexes (so the fields are no longer `Drop`), exactly as the
+    // `butterfly` slot holds a `ButterflyHandle`. `AuxiliaryHandle::INVALID` until the
+    // owning collection's `allocate_*` site installs a real handle; a Map/WeakMap cell
+    // carries `map_entries` and a Set/WeakSet cell carries `set_values`. Access routes
+    // through the store's `map_entries_*` / `set_values_*` API.
+    // POD expedient (NOT the faithful JSOrderedHashTable) — see the slab field comment.
+    pub(crate) map_entries: AuxiliaryHandle,
+    pub(crate) set_values: AuxiliaryHandle,
     // C++ JSC `RegExp::m_patternString` (runtime/RegExp.h:219), the out-of-line
     // pattern string. gc-r4 R4 POD-ification: the `String` is relocated to the
     // store-owned `regexp_sources` slab; the cell holds only this POD `Copy`
@@ -616,8 +660,11 @@ impl Default for CoreObjectCell {
             instance_fields: Vec::new(),
             captures: Vec::new(),
             binding_value: RuntimeValue::default(),
-            map_entries: Vec::new(),
-            set_values: Vec::new(),
+            // gc-r4 Map/Set unit: the INVALID sentinel — a non-collection cell never
+            // indexes the ordered-storage slabs. The owning collection's `allocate_*`
+            // site overwrites the relevant field with a real handle.
+            map_entries: AuxiliaryHandle::INVALID,
+            set_values: AuxiliaryHandle::INVALID,
             regexp_source: AuxiliaryHandle::INVALID,
             regexp_flags: RegexFlags::default(),
             promise_state: PromiseState::default(),
@@ -678,8 +725,13 @@ impl Clone for CoreObjectCell {
             instance_fields: self.instance_fields.clone(),
             captures: self.captures.clone(),
             binding_value: self.binding_value,
-            map_entries: self.map_entries.clone(),
-            set_values: self.set_values.clone(),
+            // gc-r4 Map/Set unit: copy the ordered-storage HANDLES shallow (POD `Copy`
+            // slab indexes). Sound for the SAME reason as `butterfly`: the cell Clone is
+            // reached ONLY through `CoreObjectStore::clone()`, which deep-clones both
+            // `map_entry_lists`/`set_value_lists` slabs in lockstep, so a copied handle
+            // indexes the clone's own slab, never the source's.
+            map_entries: self.map_entries,
+            set_values: self.set_values,
             // Copy the pattern-string HANDLE shallow (POD `AuxiliaryHandle`); sound
             // for the same reason as `butterfly` — the cell's Clone is reached only
             // via `CoreObjectStore::clone()`, which deep-clones `regexp_sources`
@@ -2057,6 +2109,166 @@ impl CoreObjectStore {
     }
 }
 
+// gc-r4 R4 POD-ification (Map/Set unit): the ordered-storage aux-backing API — the
+// store-owned home of each Map/WeakMap's insertion-ordered (key,value) entries and each
+// Set/WeakSet's insertion-ordered values. Mirrors the bound-args slab API above
+// (allocate -> handle; index the slab through the handle), but a backing is allocated
+// ONLY for the four collection kinds. C++ JSC reaches these through `m_storage` (a
+// `JSOrderedHashTable::Storage` JSCellButterfly, JSOrderedHashTable.h:164).
+//
+// POD expedient (NOT the faithful JSOrderedHashTable): these methods preserve EXACTLY
+// the prior per-cell Vec semantics — insertion order, and linear keyed lookup done at
+// the call site over a snapshot (the interpreter's SameValueZero / strict equality
+// needs `&self` on the interpreter, so lookup stays there). Only the storage moved off
+// the cell; the faithful ordered-hash port is a deferred batch (see the slab comment).
+impl CoreObjectStore {
+    /// Allocate a fresh empty map-entry-list slab slot and return its POD handle.
+    /// Mirrors `allocate_bound_args`; called eagerly at `allocate_map`/`allocate_weak_map`.
+    fn allocate_map_entries(&mut self) -> AuxiliaryHandle {
+        let index = self.map_entry_lists.len();
+        self.map_entry_lists.push(Vec::new());
+        AuxiliaryHandle(index)
+    }
+
+    /// Allocate a fresh empty set-value-list slab slot and return its POD handle.
+    /// Mirrors `allocate_bound_args`; called eagerly at `allocate_set`/`allocate_weak_set`.
+    fn allocate_set_values(&mut self) -> AuxiliaryHandle {
+        let index = self.set_value_lists.len();
+        self.set_value_lists.push(Vec::new());
+        AuxiliaryHandle(index)
+    }
+
+    /// Resolve `map`'s ordered-entry slab handle (`None` if not a live map-like cell or
+    /// carrying the INVALID sentinel). Returns an owned `Copy` handle so the cell borrow
+    /// is released before the caller indexes the slab.
+    fn map_entries_handle(&self, map: RuntimeValue) -> Option<AuxiliaryHandle> {
+        match self.find(map).map(|cell| cell.map_entries) {
+            Some(handle) if handle != AuxiliaryHandle::INVALID => Some(handle),
+            _ => None,
+        }
+    }
+
+    /// Resolve `set`'s ordered-value slab handle (`None` if not a live set-like cell or
+    /// carrying the INVALID sentinel).
+    fn set_values_handle(&self, set: RuntimeValue) -> Option<AuxiliaryHandle> {
+        match self.find(set).map(|cell| cell.set_values) {
+            Some(handle) if handle != AuxiliaryHandle::INVALID => Some(handle),
+            _ => None,
+        }
+    }
+
+    /// Clone of `map`'s insertion-ordered entries (for linear keyed lookup at the call
+    /// site and for forEach/iteration). Empty if `map` has no ordered backing.
+    pub(crate) fn map_entries_snapshot(
+        &self,
+        map: RuntimeValue,
+    ) -> Vec<(RuntimeValue, RuntimeValue)> {
+        match self.map_entries_handle(map) {
+            Some(handle) => self.map_entry_lists[handle.0].clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Value of the entry at insertion index `index`, or `None`.
+    pub(crate) fn map_entry_value(&self, map: RuntimeValue, index: usize) -> Option<RuntimeValue> {
+        let handle = self.map_entries_handle(map)?;
+        self.map_entry_lists[handle.0]
+            .get(index)
+            .map(|(_, value)| *value)
+    }
+
+    /// Number of entries (Map/WeakMap `size`).
+    pub(crate) fn map_entries_len(&self, map: RuntimeValue) -> usize {
+        match self.map_entries_handle(map) {
+            Some(handle) => self.map_entry_lists[handle.0].len(),
+            None => 0,
+        }
+    }
+
+    /// Append `(key, value)` at the end (insertion order; a fresh-key add).
+    pub(crate) fn map_entries_push(
+        &mut self,
+        map: RuntimeValue,
+        key: RuntimeValue,
+        value: RuntimeValue,
+    ) {
+        if let Some(handle) = self.map_entries_handle(map) {
+            self.map_entry_lists[handle.0].push((key, value));
+        }
+    }
+
+    /// Overwrite the value of the entry at `index` (an existing-key set; key unchanged).
+    pub(crate) fn map_entry_set_value(
+        &mut self,
+        map: RuntimeValue,
+        index: usize,
+        value: RuntimeValue,
+    ) {
+        if let Some(handle) = self.map_entries_handle(map) {
+            if let Some(entry) = self.map_entry_lists[handle.0].get_mut(index) {
+                entry.1 = value;
+            }
+        }
+    }
+
+    /// Remove the entry at `index` (Map/WeakMap `delete`, preserving insertion order).
+    pub(crate) fn map_entries_remove(&mut self, map: RuntimeValue, index: usize) {
+        if let Some(handle) = self.map_entries_handle(map) {
+            let list = &mut self.map_entry_lists[handle.0];
+            if index < list.len() {
+                list.remove(index);
+            }
+        }
+    }
+
+    /// Drop all entries (Map `clear`).
+    pub(crate) fn map_entries_clear(&mut self, map: RuntimeValue) {
+        if let Some(handle) = self.map_entries_handle(map) {
+            self.map_entry_lists[handle.0].clear();
+        }
+    }
+
+    /// Clone of `set`'s insertion-ordered values (for linear lookup / iteration).
+    pub(crate) fn set_values_snapshot(&self, set: RuntimeValue) -> Vec<RuntimeValue> {
+        match self.set_values_handle(set) {
+            Some(handle) => self.set_value_lists[handle.0].clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Number of values (Set/WeakSet `size`).
+    pub(crate) fn set_values_len(&self, set: RuntimeValue) -> usize {
+        match self.set_values_handle(set) {
+            Some(handle) => self.set_value_lists[handle.0].len(),
+            None => 0,
+        }
+    }
+
+    /// Append `value` at the end (insertion order; a fresh-value add).
+    pub(crate) fn set_values_push(&mut self, set: RuntimeValue, value: RuntimeValue) {
+        if let Some(handle) = self.set_values_handle(set) {
+            self.set_value_lists[handle.0].push(value);
+        }
+    }
+
+    /// Remove the value at `index` (Set/WeakSet `delete`, preserving insertion order).
+    pub(crate) fn set_values_remove(&mut self, set: RuntimeValue, index: usize) {
+        if let Some(handle) = self.set_values_handle(set) {
+            let list = &mut self.set_value_lists[handle.0];
+            if index < list.len() {
+                list.remove(index);
+            }
+        }
+    }
+
+    /// Drop all values (Set `clear`).
+    pub(crate) fn set_values_clear(&mut self, set: RuntimeValue) {
+        if let Some(handle) = self.set_values_handle(set) {
+            self.set_value_lists[handle.0].clear();
+        }
+    }
+}
+
 impl CoreObjectStore {
     pub(crate) fn allocate(&mut self) -> RuntimeValue {
         let prototype = self.ensure_object_prototype();
@@ -3179,9 +3391,14 @@ impl CoreObjectStore {
 
     pub(crate) fn allocate_map(&mut self) -> RuntimeValue {
         let prototype = self.ensure_map_prototype();
+        // gc-r4 Map/Set unit: eagerly allocate this Map's empty ordered-entry backing
+        // (like every JSObject gets a butterfly at `allocate_cell`) so its handle is
+        // valid for the cell's whole life and no read path sees the INVALID sentinel.
+        let entries = self.allocate_map_entries();
         self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::Map,
             prototype: Some(prototype),
+            map_entries: entries,
             ..CoreObjectCell::default()
         })
     }
@@ -3405,27 +3622,39 @@ impl CoreObjectStore {
 
     pub(crate) fn allocate_set(&mut self) -> RuntimeValue {
         let prototype = self.ensure_set_prototype();
+        // gc-r4 Map/Set unit: eagerly allocate this Set's empty ordered-value backing
+        // (see `allocate_map`).
+        let values = self.allocate_set_values();
         self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::Set,
             prototype: Some(prototype),
+            set_values: values,
             ..CoreObjectCell::default()
         })
     }
 
     pub(crate) fn allocate_weak_map(&mut self) -> RuntimeValue {
         let prototype = self.ensure_weak_map_prototype();
+        // gc-r4 Map/Set unit: a WeakMap stores (key,value) entries like a Map, so it
+        // eagerly gets a map-entry backing (see `allocate_map`).
+        let entries = self.allocate_map_entries();
         self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::WeakMap,
             prototype: Some(prototype),
+            map_entries: entries,
             ..CoreObjectCell::default()
         })
     }
 
     pub(crate) fn allocate_weak_set(&mut self) -> RuntimeValue {
         let prototype = self.ensure_weak_set_prototype();
+        // gc-r4 Map/Set unit: a WeakSet stores values like a Set, so it eagerly gets a
+        // set-value backing (see `allocate_map`).
+        let values = self.allocate_set_values();
         self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::WeakSet,
             prototype: Some(prototype),
+            set_values: values,
             ..CoreObjectCell::default()
         })
     }
