@@ -6,9 +6,10 @@ on JetStream 3 Octane — `R = geomean(Rust)/geomean(C++ jsc) ≥ 1.0`, same mac
 
 ## Where we are
 
-**R = UNDEFINED.** 12 of 15 Octane benches pass; 3 don't yet — so the suite produces no
-geomean and parity can't be measured or claimed until all 15 complete and validate. The
-remaining gap is the **optimizing JIT**, and the measured scoreboard proves it (below).
+**R = UNDEFINED.** 13 of 15 Octane benches now complete+validate; 2 don't yet (mandreel,
+octane-zlib — asm.js, can't finish under the interpreter) — so the suite still produces no
+geomean and parity can't be measured or claimed until all 15 pass. The remaining gap is the
+**optimizing JIT**, and the measured scoreboard proves it (below).
 
 ```
 Overall: ~40% by effort  ███████▌░░░░░░░░░░░░░  (but ~0% of the parity-bearing JIT tiers)
@@ -39,8 +40,8 @@ need it just to finish). So: **~40% by code, but near the start by measured R.**
 
 | | benches | detail |
 |---|---|---|
-| ✅ pass | 12/15 | per-bench `r_i = Rust/C++`: **5e-4 … 0.06** (partial geomean ≈ 1.3e-3) |
-| ❌ fail | 3/15 | mandreel, octane-zlib (asm.js — don't finish under the interpreter); typescript (value-divergence fixed → now completes zero-throw, parseErrors==jsc; suite score JIT-gated) |
+| ✅ pass | 13/15 | the 12 + **typescript** (Array-`length` fix → now `ok`, score 0.0075, interpreter-slow/JIT-gated; merged-main verified). Compute-bound `r_i = Rust/C++`: **5e-4 … 0.06** (full r_i re-measure pending) |
+| ❌ fail | 2/15 | mandreel, octane-zlib (asm.js — don't finish under the interpreter; JIT-gated) |
 
 Compute-bound benches run **~500–6000× slower** than C++; only parse-bound code-load reaches
 0.06. The gap concentrates exactly where the JIT dominates — **parity is JIT-gated, with data,
