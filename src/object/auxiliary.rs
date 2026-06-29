@@ -64,20 +64,14 @@ impl PromiseReactionsHandle {
     pub const INVALID: Self = PromiseReactionsHandle(usize::MAX);
 }
 
-/// Allocate the byte backing for a typed-array/`ArrayBuffer` view.
-///
-/// C++ JSC `ArrayBufferContents` (ArrayBuffer.h:126): owns `void* m_data` of
-/// `sizeInBytes`. The per-kind ArrayBuffer slice relocates the cell's
-/// `array_buffer_data` here (gc-r4 rank-4 unit); no write barrier (raw bytes,
-/// not GC edges).
-///
-/// SCAFFOLD: signature only. Body lands with the ArrayBuffer per-kind unit.
-#[allow(dead_code, unused_variables)]
-pub fn allocate_array_buffer_backing(byte_length: usize) -> AuxiliaryHandle {
-    // TODO(gc-r4 ArrayBuffer unit): push a zeroed `Vec<u8>` of `byte_length`
-    // into the store's array-buffer aux slab and return its handle.
-    unimplemented!("ArrayBuffer aux backing lands with the ArrayBuffer per-kind unit")
-}
+// gc-r4 ArrayBuffer unit (LANDED): the ArrayBuffer byte-backing relocation
+// (`ArrayBufferContents::m_data`, ArrayBuffer.h:126) shipped as the store-owned
+// `CoreObjectStore::array_buffer_backings` slab + `allocate_array_buffer_backing` /
+// `array_buffer_bytes` / `array_buffer_bytes_mut` methods (interpreter/object_store.rs),
+// mirroring the landed BoundFunction/Promise/RegExp slabs which ALSO live on the store
+// (not as free functions here). The former free-function SCAFFOLD stub was removed so
+// there is ONE mechanism, not two. Raw bytes are not GC edges: no write barrier, and the
+// R4 collector trace need not visit that slab.
 
 /// Allocate the insertion-ordered backing for a Map/Set.
 ///

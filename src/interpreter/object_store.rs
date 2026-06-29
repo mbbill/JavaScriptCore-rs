@@ -78,6 +78,21 @@ pub(crate) struct CoreObjectStore {
     // `m_patternString` is). NOT the R4 leak fix — like `butterflies`, this slab
     // still needs its own Auxiliary-subspace trace+sweep at R4 (gc-r4 SD-4).
     pub(crate) regexp_sources: Vec<String>,
+    // gc-r4 R4 POD-ification (ArrayBuffer unit): the store-owned slab of
+    // ArrayBuffer/typed-array byte backings. C++ JSC `ArrayBufferContents::m_data`
+    // (runtime/ArrayBuffer.h:126) is a raw `void*` byte buffer of `sizeInBytes`
+    // hanging off the ArrayBuffer; relocating the per-cell `array_buffer_data:
+    // Vec<u8>` into this store-owned slab keyed by a Copy `AuxiliaryHandle`
+    // (object/auxiliary.rs) makes the cell's backing field POD (no `Drop`), so the
+    // cell stays sweep-eligible. An `AuxiliaryHandle` is an index into this Vec;
+    // only ArrayBuffer cells hold a real one (every other cell carries
+    // `AuxiliaryHandle::INVALID`). Allocated at `allocate_array_buffer`; the bytes
+    // are mutated in place by typed-array/DataView stores. UNLIKE the bound_args /
+    // promise-reaction / butterfly slabs, these are raw bytes, NOT `RuntimeValue`
+    // GC edges — so NO write barrier on store, and the R4 collector trace need NOT
+    // visit this slab (it still needs its own Auxiliary-subspace sweep, like
+    // `regexp_sources`).
+    pub(crate) array_buffer_backings: Vec<Vec<u8>>,
     // VM-internal payload-bits -> object-slot index; keyed by interpreter pointer-bits,
     // never JS/adversary-controlled, so it needs no SipHash DoS resistance. Use the
     // in-tree FxIntBuildHasher (gc/fast_hash.rs, WTF IntHash/PtrHash family); the swap is
@@ -280,6 +295,11 @@ impl Clone for CoreObjectStore {
             // handle stays valid AND the cloned store owns an INDEPENDENT slab — the
             // same clone-independence invariant the butterfly slab relies on.
             regexp_sources: self.regexp_sources.clone(),
+            // gc-r4 ArrayBuffer unit: deep-clone the byte-backing slab by index in
+            // lockstep with `objects` (each cell's `AuxiliaryHandle` is copied shallow)
+            // so every handle stays valid AND the cloned store owns an INDEPENDENT slab
+            // — the same clone-independence invariant as the butterfly/regexp slabs.
+            array_buffer_backings: self.array_buffer_backings.clone(),
             object_indices_by_payload: HashMap::default(),
             // structure_table is keyed by StructureId handle (stable Vec slots across
             // clone), so every cloned cell's structure_id stays valid and the offset
@@ -482,7 +502,16 @@ pub(crate) struct CoreObjectCell {
     /// Mirrors JSC's NumberObject::internalValue() / BooleanObject::internalValue().
     pub(crate) primitive_value: Option<RuntimeValue>,
     pub(crate) date_value: f64,
-    pub(crate) array_buffer_data: Vec<u8>,
+    // C++ JSC `ArrayBufferContents::m_data` (runtime/ArrayBuffer.h:126), the raw
+    // byte buffer backing an ArrayBuffer. gc-r4 R4 POD-ification: the `Vec<u8>` is
+    // relocated to the store-owned `array_buffer_backings` slab; the cell holds only
+    // this POD `Copy` `AuxiliaryHandle` index (so the field is no longer `Drop`),
+    // exactly as the `butterfly` slot holds a `ButterflyHandle`. `AuxiliaryHandle::
+    // INVALID` until `allocate_array_buffer` installs a real slab handle; only
+    // ArrayBuffer cells carry one. The bytes are raw (NOT GC edges), so reads/writes
+    // route through the store's `array_buffer_bytes`/`array_buffer_bytes_mut` with no
+    // write barrier.
+    pub(crate) array_buffer_data: AuxiliaryHandle,
     pub(crate) view_buffer: Option<RuntimeValue>,
     pub(crate) view_byte_offset: usize,
     pub(crate) view_byte_length: usize,
@@ -602,7 +631,9 @@ impl Default for CoreObjectCell {
             native_bound_proxy: None,
             primitive_value: None,
             date_value: 0.0,
-            array_buffer_data: Vec::new(),
+            // No byte backing for a default (non-ArrayBuffer) cell; the sentinel never
+            // indexes the slab. allocate_array_buffer overwrites it with a real handle.
+            array_buffer_data: AuxiliaryHandle::INVALID,
             view_buffer: None,
             view_byte_offset: 0,
             view_byte_length: 0,
@@ -668,7 +699,12 @@ impl Clone for CoreObjectCell {
             native_bound_proxy: self.native_bound_proxy,
             primitive_value: self.primitive_value,
             date_value: self.date_value,
-            array_buffer_data: self.array_buffer_data.clone(),
+            // gc-r4 ArrayBuffer unit: copy the byte-backing HANDLE shallow (a plain
+            // Copy slab index). Sound for the SAME reason as `butterfly`: cell Clone is
+            // reached ONLY through `CoreObjectStore::clone`, which deep-clones
+            // `array_buffer_backings` in lockstep, so the copied handle indexes the
+            // clone's own slab, never the source's.
+            array_buffer_data: self.array_buffer_data,
             view_buffer: self.view_buffer,
             view_byte_offset: self.view_byte_offset,
             view_byte_length: self.view_byte_length,
@@ -1983,6 +2019,44 @@ impl CoreObjectStore {
     }
 }
 
+// gc-r4 R4 POD-ification (ArrayBuffer unit): the byte-backing aux API, the store-owned
+// home of each ArrayBuffer's raw bytes. Mirrors the bound-args/butterfly slab API
+// (allocate -> handle; index the slab through the handle), but the backing is allocated
+// ONLY for ArrayBuffer cells (not every cell) — C++ JSC `ArrayBufferContents::m_data`
+// (runtime/ArrayBuffer.h:126) is the only such payload, a raw `void*` byte buffer. The
+// bytes are NOT GC edges (raw integers), so unlike `bound_args_backings` no collector
+// trace needs to visit them.
+impl CoreObjectStore {
+    /// Allocate a zero-filled byte backing of `byte_length` in the store-owned
+    /// `array_buffer_backings` slab and return its POD handle.
+    ///
+    /// C++ JSC `ArrayBufferContents::tryAllocate` (ArrayBuffer.cpp) zero-initializes
+    /// `m_data` of `sizeInBytes` (ArrayBuffer.h:126). The Rust analog (pre-R4) is a
+    /// store-owned slab index, like `allocate_bound_args`; the raw arena allocation
+    /// arrives at R4.
+    pub(crate) fn allocate_array_buffer_backing(&mut self, byte_length: usize) -> AuxiliaryHandle {
+        let index = self.array_buffer_backings.len();
+        self.array_buffer_backings.push(vec![0u8; byte_length]);
+        AuxiliaryHandle(index)
+    }
+
+    /// Borrow the byte backing behind `handle` (C++ `ArrayBuffer::data()`,
+    /// ArrayBuffer.h:88 reading `m_contents.data()`). Caller passes a real handle
+    /// assigned by `allocate_array_buffer_backing` (every reader checks `kind ==
+    /// ArrayBuffer` first, so the `INVALID` sentinel never reaches here), exactly as
+    /// the butterfly accessors assume `allocate_cell` assigned a real handle.
+    pub(crate) fn array_buffer_bytes(&self, handle: AuxiliaryHandle) -> &[u8] {
+        &self.array_buffer_backings[handle.0]
+    }
+
+    /// Mutably borrow the byte backing behind `handle` (typed-array/DataView in-place
+    /// stores; C++ writes through the `m_data` pointer). No write barrier — raw bytes
+    /// are not GC edges.
+    pub(crate) fn array_buffer_bytes_mut(&mut self, handle: AuxiliaryHandle) -> &mut [u8] {
+        &mut self.array_buffer_backings[handle.0]
+    }
+}
+
 impl CoreObjectStore {
     pub(crate) fn allocate(&mut self) -> RuntimeValue {
         let prototype = self.ensure_object_prototype();
@@ -3223,10 +3297,13 @@ impl CoreObjectStore {
 
     pub(crate) fn allocate_array_buffer(&mut self, byte_length: usize) -> RuntimeValue {
         let prototype = self.ensure_array_buffer_prototype();
+        // gc-r4 ArrayBuffer unit: the backing bytes live in the store-owned slab; the
+        // cell carries only the POD handle (C++ ArrayBufferContents::m_data relocation).
+        let backing = self.allocate_array_buffer_backing(byte_length);
         self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::ArrayBuffer,
             prototype: Some(prototype),
-            array_buffer_data: vec![0; byte_length],
+            array_buffer_data: backing,
             ..CoreObjectCell::default()
         })
     }
@@ -6215,7 +6292,9 @@ impl CoreObjectStore {
         if buffer.kind != CoreObjectKind::ArrayBuffer {
             return Err(ExecutionError::ExpectedObject);
         }
-        Ok(buffer.array_buffer_data.len())
+        // gc-r4 ArrayBuffer unit: read the byte length from the store-owned backing via
+        // the cell's POD handle (was the inline `Vec<u8>::len()`).
+        Ok(self.array_buffer_bytes(buffer.array_buffer_data).len())
     }
 
     pub(crate) fn array_buffer_slice(
@@ -6231,15 +6310,24 @@ impl CoreObjectStore {
             if buffer.kind != CoreObjectKind::ArrayBuffer {
                 return Err(ExecutionError::ExpectedObject);
             }
-            let start = start.min(buffer.array_buffer_data.len());
-            let end = end.min(buffer.array_buffer_data.len()).max(start);
-            buffer.array_buffer_data[start..end].to_vec()
+            // gc-r4 ArrayBuffer unit: read the source bytes from the store-owned backing
+            // via the cell's POD handle (the cell `&self` borrow ends at the handle copy,
+            // so the second shared `array_buffer_bytes` borrow is sound).
+            let data = self.array_buffer_bytes(buffer.array_buffer_data);
+            let start = start.min(data.len());
+            let end = end.min(data.len()).max(start);
+            data[start..end].to_vec()
         };
         let result = self.allocate_array_buffer(bytes.len());
-        let Some(result_buffer) = self.find_mut(result) else {
+        // Write the sliced bytes into the result's freshly zero-allocated backing (same
+        // length), reached through its POD handle — the relocation of the former
+        // `result_buffer.array_buffer_data = bytes` assignment.
+        let Some(result_buffer) = self.find(result) else {
             return Err(ExecutionError::ExpectedObject);
         };
-        result_buffer.array_buffer_data = bytes;
+        let result_handle = result_buffer.array_buffer_data;
+        self.array_buffer_bytes_mut(result_handle)
+            .copy_from_slice(&bytes);
         Ok(result)
     }
 
@@ -6308,11 +6396,11 @@ impl CoreObjectStore {
         let Some(buffer) = self.find(buffer) else {
             return Err(ExecutionError::ExpectedObject);
         };
+        // gc-r4 ArrayBuffer unit: the bytes live in the store-owned backing; fetch the
+        // POD handle off the cell (its `&self` borrow ends here) then read the slab.
+        let data = self.array_buffer_bytes(buffer.array_buffer_data);
         let start = byte_offset.saturating_add(index.saturating_mul(element_size));
-        let Some(bytes) = buffer
-            .array_buffer_data
-            .get(start..start.saturating_add(element_size))
-        else {
+        let Some(bytes) = data.get(start..start.saturating_add(element_size)) else {
             return Ok(None);
         };
         let number = typed_array_load_value_f64(element_kind, bytes);
@@ -6337,12 +6425,18 @@ impl CoreObjectStore {
         let element_kind = self.typed_array_element_kind(value)?;
         let element_size = usize::from(typed_array_element_size(element_kind));
         let native = typed_array_store_native_bytes(element_kind, number);
-        let Some(buffer) = self.find_mut(buffer) else {
-            return Err(ExecutionError::ExpectedObject);
+        // gc-r4 ArrayBuffer unit: read the POD backing handle off the cell (a single
+        // `find`, no extra hashmap lookup), then mutate the store-owned slab in place —
+        // raw bytes, so no write barrier.
+        let handle = {
+            let Some(buffer) = self.find(buffer) else {
+                return Err(ExecutionError::ExpectedObject);
+            };
+            buffer.array_buffer_data
         };
         let start = byte_offset.saturating_add(index.saturating_mul(element_size));
-        let Some(slot) = buffer
-            .array_buffer_data
+        let Some(slot) = self
+            .array_buffer_bytes_mut(handle)
             .get_mut(start..start.saturating_add(element_size))
         else {
             return Ok(false);
@@ -6363,8 +6457,9 @@ impl CoreObjectStore {
         let Some(buffer) = self.find(buffer) else {
             return Err(ExecutionError::ExpectedObject);
         };
-        buffer
-            .array_buffer_data
+        // gc-r4 ArrayBuffer unit: read the byte from the store-owned backing via the
+        // cell's POD handle (was the inline `Vec<u8>` indexing).
+        self.array_buffer_bytes(buffer.array_buffer_data)
             .get(view_offset.saturating_add(byte_offset))
             .copied()
             .ok_or(ExecutionError::ExpectedArrayIndex)
@@ -6380,11 +6475,16 @@ impl CoreObjectStore {
         if byte_offset >= byte_length {
             return Err(ExecutionError::ExpectedArrayIndex);
         }
-        let Some(buffer) = self.find_mut(buffer) else {
-            return Err(ExecutionError::ExpectedObject);
+        // gc-r4 ArrayBuffer unit: fetch the POD backing handle off the cell, then mutate
+        // the store-owned slab byte in place (raw bytes, no write barrier).
+        let handle = {
+            let Some(buffer) = self.find(buffer) else {
+                return Err(ExecutionError::ExpectedObject);
+            };
+            buffer.array_buffer_data
         };
-        let Some(slot) = buffer
-            .array_buffer_data
+        let Some(slot) = self
+            .array_buffer_bytes_mut(handle)
             .get_mut(view_offset.saturating_add(byte_offset))
         else {
             return Err(ExecutionError::ExpectedArrayIndex);
