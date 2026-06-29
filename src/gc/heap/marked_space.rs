@@ -22,11 +22,12 @@ use std::sync::OnceLock;
 use crate::gc::FxIntBuildHasher;
 
 use super::block_directory::BlockDirectory;
+use super::free_list::SweepResult;
 use super::marked_block::{
-    block_for, cell_ptr, clear_marks_block, is_atom_aligned, is_live_cell,
-    is_marked as marked_block_is_marked, round_up, test_and_set_marked, Cell, CellPtr,
-    ATOMS_PER_BLOCK, ATOM_SIZE, CELL_BYTES, HALF_ALIGNMENT, MARK_WORDS, PAYLOAD_BYTES,
-    PRECISE_CUTOFF, SIZE_STEP,
+    block_atoms_per_cell, block_for, block_start_atom, cell_ptr, clear_marks_block,
+    is_atom_aligned, is_live_cell, is_marked as marked_block_is_marked, round_up,
+    test_and_set_marked, Cell, CellPtr, ATOMS_PER_BLOCK, ATOM_SIZE, CELL_BYTES, END_ATOM,
+    HALF_ALIGNMENT, MARK_WORDS, PAYLOAD_BYTES, PRECISE_CUTOFF, SIZE_STEP,
 };
 use super::precise_allocation::PreciseSpace;
 
@@ -708,6 +709,61 @@ impl MarkedSpace {
             return PreciseSpace::is_marked(addr);
         }
         marked_block_is_marked(addr)
+    }
+
+    /// gc-r4 R4b-sweep — is `addr` a MARKED arena object cell? The collector's post-mark
+    /// liveness query the store's pre-sweep reconciliation uses to retain live cells: the
+    /// MEMBERSHIP gate (`is_arena_cell`, NOT the liveness `find`) then the mark bit. Returns
+    /// `false` for a non-arena address or for an unmarked (dead-this-cycle) cell. The
+    /// membership gate, not liveness, is load-bearing (see `is_arena_cell`'s UAF note).
+    pub(crate) fn is_addr_marked(&self, addr: usize) -> bool {
+        match self.is_arena_cell(addr) {
+            Some(cp) => self.collector_is_marked(cp),
+            None => false,
+        }
+    }
+
+    /// gc-r4 R4b-sweep — visit EVERY object-cell slot of every registered MarkedBlock,
+    /// yielding each cell-START address (the per-block stride the sweep walks:
+    /// `[start_atom, END_ATOM)` step `atoms_per_cell`). This is R4b decision 3: the block
+    /// walk the STORE drives its pre-sweep reconciliation over (gc/heap stays ignorant of
+    /// `CoreObjectCell`).
+    ///
+    /// YIELDS EVERY SLOT — live, dead-this-cycle, AND never-allocated/free. A never-
+    /// allocated slot is zeroed (fresh `alloc_zeroed` page); a swept slot holds a `FreeCell`
+    /// link record (its bytes 8..16 clobbered). NEITHER is a valid `CoreObjectCell`, so the
+    /// caller MUST decide which yielded slots are real, byte-intact cells (the store's
+    /// authoritative live-address set) BEFORE dereferencing one. This walk only ENUMERATES
+    /// addresses by arithmetic; it never dereferences a slot.
+    ///
+    /// Only MarkedBlocks are walked: object cells are < `largeCutoff` so none is a precise
+    /// allocation (a precise object cell would need a separate walk; none is produced).
+    pub(crate) fn for_each_object_cell(&self, mut f: impl FnMut(usize)) {
+        for &base in &self.blocks.set {
+            let start_atom = block_start_atom(base);
+            let atoms_per_cell = block_atoms_per_cell(base);
+            let mut atom = start_atom;
+            while atom < END_ATOM {
+                f(base + atom * ATOM_SIZE);
+                atom += atoms_per_cell;
+            }
+        }
+    }
+
+    /// gc-r4 R4b-sweep — sweep EVERY object-cell directory: reclaim each unmarked cell's
+    /// atoms into that directory's combined FreeList (DoesNotHave full-collection mode) so
+    /// re-allocation reuses them. MUST run AFTER the store's pre-sweep reconciliation, which
+    /// reads dead cells' out-of-line handles BEFORE this clobbers them with FreeCell records
+    /// (the gc-r4 R4b ordering invariant). Returns the aggregate `SweepResult`.
+    pub(crate) fn sweep_all_object_blocks(&mut self) -> SweepResult {
+        let mut total = SweepResult::default();
+        for dir in self.directories.values_mut() {
+            let r = dir.sweep_all_blocks();
+            total.freed_cells += r.freed_cells;
+            total.freed_bytes += r.freed_bytes;
+            total.retained_cells += r.retained_cells;
+        }
+        total
     }
 
     // ---- DEBUG borrow flag (contract C: #[cfg(debug_assertions)] overlap check) ----

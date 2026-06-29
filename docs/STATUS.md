@@ -113,13 +113,20 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   jit_pending; microtask queue not-yet-a-live-source, lexical_scope transitively rooted via the captures
   slab — both with evidence). 2761 tests + miri TB 0 UB (incl. the ≥2-collection survivor test). MARK-ONLY →
   nothing freed, no UAF surface yet.
-- [next-GC] R4b-sweep — the reclamation + LIVE DRIVER (the LEAK FIX): MarkedSpace::for_each_object_cell + a
-  store-driven PRE-SWEEP reconciliation (free each DEAD cell's butterfly + aux slab slots via per-slab
-  free-lists + drop its object_addr_by_cell_id entry, BEFORE sweep_block clobbers it with FreeCell links) →
-  FreeList::sweep_block (DoesNotHave) → a Vm-resident cooperative-safepoint driver (back-edge poll; NO inline
-  collection → re-entrancy foreclosed). Verify: ≥2-collection reclaims-dead/retains-live + miri + adversarial
-  + a BOUNDED no-OOM micro-probe → THEN heavy Octane benches run → R becomes measurable. (SD-4: the per-slab
-  aux free-lists ARE the Auxiliary sweep.)
+- [done] R4b-sweep MECHANISM (force_collect, verified, NOT yet live-wired): for_each_object_cell + a
+  store-driven PRE-SWEEP reconcile (reads each DEAD cell's handles via an AUTHORITATIVE live-set — needed
+  because a never-allocated zeroed slot decodes Handle(0) aliasing a LIVE slab — frees its butterfly+aux slots
+  via 9 per-slab free-lists [allocate_* reuse them], drops the reverse-index, BEFORE sweep_block clobbers it)
+  → FreeList::sweep_block (multi-block). force_collect = mark → reconcile → sweep. PROVEN: the bounded no-OOM
+  micro-probe returns to EXACTLY baseline (43 cells/43 slots) after every collection with the slab bounded
+  (the LEAK IS FIXED); ≥2-collection landmine (s2.reclaimed==0); free-list reuse; self-aliasing under
+  collection; miri TB 0 UB; whole suite 2766 green (force_collect explicit/unwired).
+- [next-GC] R4b live DRIVER (TINY — wires it live → R MEASURABLE): a byte-counter trigger in allocate_blob
+  (arm a request at threshold; NO inline collection) + call force_collect (via gather_all_gc_roots, not the
+  test entry) at the back-edge / VM-entry safepoint poll, flipping register_root_safepoint_is_active during
+  STW. THEN the leak is fixed live → the heavy Octane benches RUN (gate via the micro-probe first) → the full
+  R4 15-bench gate closes → R becomes measurable. (Leaf String/Symbol/BigInt cells still leak in their Vec
+  stores — a separate later leaf-migration phase.)
 
 ## Baseline JIT / DFG / FTL (parity lives here; ~0% started)
 - [done] JIT↔runtime bridge-infra (adversarially verified): extern-C operation_value_add shim

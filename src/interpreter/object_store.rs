@@ -44,6 +44,48 @@ pub(crate) fn can_use_put_by_id_megamorphic_property_name(text: &str) -> bool {
     text != "__proto__" && parse_array_index_name(text).is_none()
 }
 
+// gc-r4 R4b-sweep — store-owned auxiliary-slab slot allocator/reclaimer with FREE-LIST
+// REUSE. The per-kind aux slabs (`butterflies` + the 8 aux `Vec<Vec<..>>` / `Vec<String>`)
+// are the POD relocation of each cell's out-of-line state (gc-r4 SD-4). A `Vec<Vec<..>>`
+// can never shrink a hole in its middle, so reclaiming a dead cell's slot can only return
+// the inner allocation (drop it) and remember the now-free INDEX for reuse — exactly the
+// C++ Auxiliary-subspace sweep (free the backing; the slot index is recyclable). The handle
+// rep is UNCHANGED (still an index); only the index SOURCE gains a free list.
+//
+// SAFETY of reuse (no live-handle aliasing): a slot index is pushed to its free list ONLY
+// by `reconcile_dead_cells_before_sweep` for a cell proven DEAD (membership gate + unmarked
+// + in the authoritative live set), whose handle no live cell shares — every live cell owns
+// a DISTINCT slab index (each allocate hands out a fresh-or-recycled-from-a-dead-cell index,
+// never a live one; the cell `Clone` path that would alias a slab entry is deleted at R4a).
+// So a recycled index aliases no live handle.
+
+/// Allocate a slab slot, REUSING a freed index if one exists (else append). Returns the
+/// slot index (the handle's inner value).
+fn slab_alloc<T>(slab: &mut Vec<T>, free: &mut Vec<usize>, value: T) -> usize {
+    if let Some(index) = free.pop() {
+        slab[index] = value; // drops the empty placeholder `slab_free` left behind
+        index
+    } else {
+        let index = slab.len();
+        slab.push(value);
+        index
+    }
+}
+
+/// Reclaim a DEAD cell's slab slot: drop its inner backing (`mem::take` -> empty
+/// placeholder; the slot stays present because `Vec<Vec<..>>` cannot shrink a middle hole)
+/// and remember the index for reuse. Single-free is the caller's invariant (a dead cell's
+/// handle is freed exactly once — see the module note); the `debug_assert` catches a slip.
+#[allow(dead_code)] // gc-r4 R4b-sweep authored-but-unwired (driver = live-collect follow-up).
+fn slab_free<T: Default>(slab: &mut Vec<T>, free: &mut Vec<usize>, index: usize) {
+    debug_assert!(
+        !free.contains(&index),
+        "slab slot {index} double-freed (a dead cell's handle was reclaimed twice)"
+    );
+    let _ = std::mem::take(&mut slab[index]); // drop the backing heap
+    free.push(index);
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct CoreObjectStore {
     // gc-r4 R4a (IRREVERSIBLE flip): the S4 MarkedSpace arena is THE object-cell home
@@ -188,6 +230,33 @@ pub(crate) struct CoreObjectStore {
     // wiring lands in this unit.
     pub(crate) map_entry_lists: Vec<Vec<(RuntimeValue, RuntimeValue)>>,
     pub(crate) set_value_lists: Vec<Vec<RuntimeValue>>,
+    // gc-r4 R4b-sweep: per-slab FREE LISTS of reclaimable slot indices. A `Vec<Vec<..>>`
+    // can never shrink a hole in its middle, so reclaiming a DEAD cell's slab slot returns
+    // the inner backing (drop it via `mem::take`) and remembers the now-free INDEX here for
+    // reuse — exactly the C++ Auxiliary-subspace sweep (free the backing; the slot index is
+    // recyclable). The handle reps are UNCHANGED (still an index). `reconcile_dead_cells_
+    // before_sweep` PUSHES freed indices; `allocate_butterfly`/`allocate_*` POP one before
+    // appending (`slab_alloc`/`slab_free`). One free list PER slab (butterfly + the 8 aux).
+    pub(crate) butterfly_free_list: Vec<usize>,
+    pub(crate) bound_args_free_list: Vec<usize>,
+    pub(crate) captures_free_list: Vec<usize>,
+    pub(crate) instance_field_free_list: Vec<usize>,
+    pub(crate) promise_reaction_free_list: Vec<usize>,
+    pub(crate) regexp_source_free_list: Vec<usize>,
+    pub(crate) array_buffer_free_list: Vec<usize>,
+    pub(crate) map_entry_free_list: Vec<usize>,
+    pub(crate) set_value_free_list: Vec<usize>,
+    // gc-r4 R4b-sweep: the AUTHORITATIVE live-object-cell ADDRESS set — the post-R4-flip
+    // analog of the deleted `objects: Vec<Pin<Box<CoreObjectCell>>>` as the ENUMERABLE,
+    // byte-intact live-cell registry the store-driven pre-sweep reconciliation walks.
+    // `allocate_cell` inserts every cell; `reconcile_dead_cells_before_sweep` removes each
+    // dead one. WHY a set (not the arena bitmaps): on the 2nd+ collection an old-gen
+    // survivor (newlyAllocated cleared by the prior sweep) and a never-allocated slot are
+    // bitmap-INDISTINGUISHABLE, and a swept slot's bytes are FreeCell-clobbered — so the
+    // reconcile (which READS each dead cell's handle bytes, a consequence of the off-cell
+    // aux-slab POD expedient, gc-r4 SD-4) must dereference ONLY an address this set vouches
+    // for. Keyed by interpreter pointer bits — no DoS surface — so the int hasher.
+    pub(crate) live_object_addrs: HashSet<usize, FxIntBuildHasher>,
     // gc-r4 R4a: the former `object_indices_by_payload` (payload->Vec index) is DELETED —
     // identity is the arena address and `MarkedSpace::find` is the membership/type gate.
     // C++ JSC: the per-VM Structure registry (`VM::structureIDTable`, in C++ implicit
@@ -1942,9 +2011,12 @@ impl CoreObjectStore {
     /// allocation is deferred to R4. Here: push a default (empty)
     /// `ButterflyAllocation` and return its slab index.
     pub(crate) fn allocate_butterfly(&mut self) -> ButterflyHandle {
-        let index = self.butterflies.len();
-        self.butterflies.push(ButterflyAllocation::default());
-        ButterflyHandle(index)
+        // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
+        ButterflyHandle(slab_alloc(
+            &mut self.butterflies,
+            &mut self.butterfly_free_list,
+            ButterflyAllocation::default(),
+        ))
     }
 
     /// DEEP-copy an existing butterfly into a fresh slab entry; return the new
@@ -1978,9 +2050,12 @@ impl CoreObjectStore {
     /// arrives at R4. Append-only (a RegExp pattern is immutable), so the index is
     /// stable for the slab's lifetime.
     pub(crate) fn allocate_regexp_source(&mut self, source: String) -> AuxiliaryHandle {
-        let index = self.regexp_sources.len();
-        self.regexp_sources.push(source);
-        AuxiliaryHandle(index)
+        // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
+        AuxiliaryHandle(slab_alloc(
+            &mut self.regexp_sources,
+            &mut self.regexp_source_free_list,
+            source,
+        ))
     }
 
     /// Borrow the RegExp pattern string behind `handle` (C++ `RegExp::pattern()`,
@@ -2098,9 +2173,12 @@ impl CoreObjectStore {
     /// arena allocation is deferred to R4. Here: push the value array and return its slab
     /// index. Mirrors `allocate_butterfly`.
     pub(crate) fn allocate_bound_args(&mut self, args: Vec<RuntimeValue>) -> AuxiliaryHandle {
-        let index = self.bound_args_backings.len();
-        self.bound_args_backings.push(args);
-        AuxiliaryHandle(index)
+        // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
+        AuxiliaryHandle(slab_alloc(
+            &mut self.bound_args_backings,
+            &mut self.bound_args_free_list,
+            args,
+        ))
     }
 
     /// Borrow the bound-args value array for `handle` (C++ JSBoundFunction
@@ -2122,9 +2200,12 @@ impl CoreObjectStore {
     /// is deferred); this mirrors `allocate_bound_args`. Called for EVERY function at
     /// creation (even an empty capture set) so a Function cell's handle is always real.
     pub(crate) fn allocate_captures(&mut self, captures: Vec<RuntimeValue>) -> AuxiliaryHandle {
-        let index = self.captures_backings.len();
-        self.captures_backings.push(captures);
-        AuxiliaryHandle(index)
+        // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
+        AuxiliaryHandle(slab_alloc(
+            &mut self.captures_backings,
+            &mut self.captures_free_list,
+            captures,
+        ))
     }
 
     /// Borrow the captured-variable value array for `handle` (the closure's captures,
@@ -2152,9 +2233,12 @@ impl CoreObjectStore {
     /// store-owned slab index, like `allocate_bound_args`; the raw arena allocation
     /// arrives at R4.
     pub(crate) fn allocate_array_buffer_backing(&mut self, byte_length: usize) -> AuxiliaryHandle {
-        let index = self.array_buffer_backings.len();
-        self.array_buffer_backings.push(vec![0u8; byte_length]);
-        AuxiliaryHandle(index)
+        // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
+        AuxiliaryHandle(slab_alloc(
+            &mut self.array_buffer_backings,
+            &mut self.array_buffer_free_list,
+            vec![0u8; byte_length],
+        ))
     }
 
     /// Borrow the byte backing behind `handle` (C++ `ArrayBuffer::data()`,
@@ -2190,17 +2274,23 @@ impl CoreObjectStore {
     /// Allocate a fresh empty map-entry-list slab slot and return its POD handle.
     /// Mirrors `allocate_bound_args`; called eagerly at `allocate_map`/`allocate_weak_map`.
     fn allocate_map_entries(&mut self) -> AuxiliaryHandle {
-        let index = self.map_entry_lists.len();
-        self.map_entry_lists.push(Vec::new());
-        AuxiliaryHandle(index)
+        // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
+        AuxiliaryHandle(slab_alloc(
+            &mut self.map_entry_lists,
+            &mut self.map_entry_free_list,
+            Vec::new(),
+        ))
     }
 
     /// Allocate a fresh empty set-value-list slab slot and return its POD handle.
     /// Mirrors `allocate_bound_args`; called eagerly at `allocate_set`/`allocate_weak_set`.
     fn allocate_set_values(&mut self) -> AuxiliaryHandle {
-        let index = self.set_value_lists.len();
-        self.set_value_lists.push(Vec::new());
-        AuxiliaryHandle(index)
+        // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
+        AuxiliaryHandle(slab_alloc(
+            &mut self.set_value_lists,
+            &mut self.set_value_free_list,
+            Vec::new(),
+        ))
     }
 
     /// Resolve `map`'s ordered-entry slab handle (`None` if not a live map-like cell or
@@ -2831,6 +2921,283 @@ impl CoreObjectStore {
             roots.push(addr);
         }
         roots
+    }
+}
+
+// ===================== gc-r4 R4b-sweep: the live RECLAMATION half =====================
+//
+// This wires the SWEEP half of the collector cycle on top of the landed MARKING half:
+// roots -> mark -> RECONCILE (free dead cells' slabs + drop their reverse-index, while
+// their bytes are intact) -> SWEEP (reclaim dead cells' atoms into the directories' free
+// lists). The entry point is an EXPLICIT `force_collect` — NOT wired to the allocation
+// trigger / back-edge safepoint (that is the follow-up live-driver unit, gc-r4.md R4b
+// decision 5/6), so the normal suite never auto-collects and live behavior is UNCHANGED
+// except where a test calls it. C++ analog: the second half of `Heap::collectInThread`
+// (`Heap::sweep` / `MarkedSpace::sweep`), here split so gc/heap stays ignorant of
+// `CoreObjectCell` and the STORE drives the off-cell aux-slab reconciliation (R4b
+// decision 3/4).
+//
+// THE LOAD-BEARING ORDERING INVARIANT (R4b decision 4): RECONCILE MUST run BEFORE SWEEP.
+// The sweep writes `FreeCell` link records over dead cells (clobbering the butterfly slot
+// at offset 8), so a dead cell's out-of-line handles are recoverable ONLY in the
+// pre-sweep reconcile. `force_collect` enforces the order.
+
+/// One dead cell's reclaimable out-of-line state, READ from the still-intact cell bytes
+/// during the pre-sweep walk (BEFORE `sweep_all_object_blocks` clobbers it). Carries the
+/// butterfly + 8 aux POD handles + the `cell_id` (for the reverse-index drop).
+#[allow(dead_code)] // gc-r4 R4b-sweep authored-but-unwired; constructed only in the reconcile.
+struct DeadCellRecord {
+    addr: usize,
+    butterfly: ButterflyHandle,
+    bound_args: AuxiliaryHandle,
+    captures: AuxiliaryHandle,
+    instance_fields: AuxiliaryHandle,
+    map_entries: AuxiliaryHandle,
+    set_values: AuxiliaryHandle,
+    regexp_source: AuxiliaryHandle,
+    array_buffer_data: AuxiliaryHandle,
+    promise_reactions: PromiseReactionsHandle,
+    cell_id: CellId,
+}
+
+/// gc-r4 R4b-sweep — the reconciliation outcome (dead cells found + slab slots freed).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReconcileStats {
+    pub(crate) cells_reclaimed: usize,
+    pub(crate) slab_slots_freed: usize,
+}
+
+/// gc-r4 R4b-sweep — the outcome of an explicit `force_collect` (gc-r4.md R4b VERIFY).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CollectStats {
+    /// Live arena object cells marked this cycle (`SlotVisitor::visitCount`).
+    pub(crate) marked_cells: usize,
+    /// DEAD object cells reconciled (their slabs + reverse-index reclaimed).
+    pub(crate) cells_reclaimed: usize,
+    /// Out-of-line slab slots freed (butterfly + aux) across all reconciled dead cells.
+    pub(crate) slab_slots_freed: usize,
+    /// Arena cell ATOMS the sweep reclaimed into the directories' free lists (includes
+    /// already-free cells re-threaded, so generally >= `cells_reclaimed`).
+    pub(crate) atoms_reclaimed: usize,
+}
+
+// gc-r4 R4b-sweep authored-but-unwired (the live driver/safepoint is the follow-up unit):
+// these methods are exercised by the tests + the future driver, dead in the non-test lib
+// build. `#[allow(dead_code)]` on the impl applies to every method (mirrors R4b-mark).
+#[allow(dead_code)]
+impl CoreObjectStore {
+    /// gc-r4 R4b-sweep — STORE-DRIVEN PRE-SWEEP RECONCILIATION (R4b decision 3+4). For every
+    /// DEAD (unmarked) arena object cell: free its out-of-line slab slots (butterfly + the 8
+    /// aux backings — the DOMINANT memory) and drop its reverse-index entry, reading the
+    /// cell's handles from its STILL-INTACT bytes. LIVE (marked) cells + their slabs are
+    /// UNTOUCHED.
+    ///
+    /// ORDERING: MUST run BEFORE `MarkedSpace::sweep_all_object_blocks` (which clobbers dead
+    /// cells with `FreeCell` records) — `force_collect` enforces it.
+    ///
+    /// READ-SAFETY: a slot is dereferenced ONLY if it is in the authoritative
+    /// `live_object_addrs` set — the sole proof its bytes are an initialized POD cell. A
+    /// never-allocated slot is zeroed (its handle bits 0 -> a VALID index aliasing a LIVE
+    /// cell's slab; freeing it would corrupt a live cell) and a swept slot is FreeCell-
+    /// clobbered; neither is in the set, so neither is ever read.
+    fn reconcile_dead_cells_before_sweep(&mut self) -> ReconcileStats {
+        // ---- Phase 1 (READ-ONLY): collect each dead cell's reclaimable handles from its
+        // intact bytes. Drive off `for_each_object_cell` (R4b decision 3), gated by the
+        // live-set membership + the mark bit. Shared borrows only; no cell `&mut` exists.
+        let mut dead: Vec<DeadCellRecord> = Vec::new();
+        {
+            let space = &self.space;
+            let live = &self.live_object_addrs;
+            space.for_each_object_cell(|addr| {
+                if !live.contains(&addr) {
+                    return; // not a byte-intact allocated cell -> never deref it
+                }
+                if space.is_addr_marked(addr) {
+                    return; // LIVE (marked) -> retain, untouched
+                }
+                // DEAD: bytes still intact (pre-sweep). SAFETY: `addr` is in the authoritative
+                // live set => a once-exposed, atom-aligned, initialized POD `CoreObjectCell`
+                // not yet swept; only `&self.space` / `&self.live_object_addrs` are borrowed,
+                // so no `&mut` to this cell coexists; this raw shared read forms no lasting
+                // reference (the `&` is dropped at the closure-body end, before Phase 2 mutates
+                // any slab and before the sweep clobbers the cell).
+                let cell = unsafe { &*core::ptr::with_exposed_provenance::<CoreObjectCell>(addr) };
+                dead.push(DeadCellRecord {
+                    addr,
+                    butterfly: cell.butterfly,
+                    bound_args: cell.bound_args,
+                    captures: cell.captures,
+                    instance_fields: cell.instance_fields,
+                    map_entries: cell.map_entries,
+                    set_values: cell.set_values,
+                    regexp_source: cell.regexp_source,
+                    array_buffer_data: cell.array_buffer_data,
+                    promise_reactions: cell.promise_reactions,
+                    cell_id: cell.cell_id,
+                });
+            });
+        }
+        // ---- Phase 2 (MUTATE): free slabs + drop reverse-index + drop the live-set entry.
+        let cells_reclaimed = dead.len();
+        let mut slab_slots_freed = 0usize;
+        for d in &dead {
+            slab_slots_freed += self.free_dead_cell_slabs(d);
+            // Drop the reverse-index BEFORE the sweep recycles this address: a recycled
+            // address must not resolve a STALE `cell_id` to a wrong live cell (R4b ROOT SET).
+            // Only bound cells carry a non-default id / a reverse-index entry.
+            if d.cell_id != CellId::default() {
+                self.object_addr_by_cell_id.remove(&d.cell_id);
+            }
+            self.live_object_addrs.remove(&d.addr);
+        }
+        ReconcileStats {
+            cells_reclaimed,
+            slab_slots_freed,
+        }
+    }
+
+    /// Free every non-INVALID out-of-line slab slot a DEAD cell owned (butterfly + the 8 aux
+    /// backings), returning the count freed. Each free drops the inner backing and recycles
+    /// the slot index (`slab_free`). An INVALID handle (a cell of another kind never owned
+    /// that slab) is skipped.
+    fn free_dead_cell_slabs(&mut self, d: &DeadCellRecord) -> usize {
+        let mut freed = 0usize;
+        // Every object cell owns a butterfly (assigned at `allocate_cell`); guard anyway.
+        if d.butterfly != ButterflyHandle::INVALID {
+            slab_free(
+                &mut self.butterflies,
+                &mut self.butterfly_free_list,
+                d.butterfly.0,
+            );
+            freed += 1;
+        }
+        if d.bound_args != AuxiliaryHandle::INVALID {
+            slab_free(
+                &mut self.bound_args_backings,
+                &mut self.bound_args_free_list,
+                d.bound_args.0,
+            );
+            freed += 1;
+        }
+        if d.captures != AuxiliaryHandle::INVALID {
+            slab_free(
+                &mut self.captures_backings,
+                &mut self.captures_free_list,
+                d.captures.0,
+            );
+            freed += 1;
+        }
+        if d.instance_fields != AuxiliaryHandle::INVALID {
+            slab_free(
+                &mut self.instance_field_lists,
+                &mut self.instance_field_free_list,
+                d.instance_fields.0,
+            );
+            freed += 1;
+        }
+        if d.map_entries != AuxiliaryHandle::INVALID {
+            slab_free(
+                &mut self.map_entry_lists,
+                &mut self.map_entry_free_list,
+                d.map_entries.0,
+            );
+            freed += 1;
+        }
+        if d.set_values != AuxiliaryHandle::INVALID {
+            slab_free(
+                &mut self.set_value_lists,
+                &mut self.set_value_free_list,
+                d.set_values.0,
+            );
+            freed += 1;
+        }
+        if d.regexp_source != AuxiliaryHandle::INVALID {
+            slab_free(
+                &mut self.regexp_sources,
+                &mut self.regexp_source_free_list,
+                d.regexp_source.0,
+            );
+            freed += 1;
+        }
+        if d.array_buffer_data != AuxiliaryHandle::INVALID {
+            slab_free(
+                &mut self.array_buffer_backings,
+                &mut self.array_buffer_free_list,
+                d.array_buffer_data.0,
+            );
+            freed += 1;
+        }
+        if d.promise_reactions != PromiseReactionsHandle::INVALID {
+            slab_free(
+                &mut self.promise_reaction_lists,
+                &mut self.promise_reaction_free_list,
+                d.promise_reactions.0,
+            );
+            freed += 1;
+        }
+        freed
+    }
+
+    /// gc-r4 R4b-sweep — EXPLICIT full collection (clear marks -> mark -> reconcile ->
+    /// sweep). NOT wired to the allocation trigger / back-edge safepoint (the follow-up
+    /// live-driver unit, R4b decision 5/6). `root_addrs` is the PRECISE root set as raw
+    /// candidate cell addresses (see `gather_all_gc_roots`); each is membership-gated by the
+    /// marker (the #1 UAF landmine lives in that gate). Returns `CollectStats`.
+    ///
+    /// PHASE ORDER IS LOAD-BEARING:
+    ///   1. `mark_live_set_from_addrs` clears all marks (begin-marking) then marks the live
+    ///      closure (membership-gated; survives ≥2 collections — the landmine).
+    ///   2. `reconcile_dead_cells_before_sweep` frees dead cells' slabs + reverse-index
+    ///      while their bytes are still intact — BEFORE step 3 clobbers them.
+    ///   3. `sweep_all_object_blocks` reclaims dead cells' atoms into the directories'
+    ///      combined FreeLists (DoesNotHave; post-sweep liveness == marks alone).
+    pub(crate) fn force_collect(&mut self, root_addrs: &[usize]) -> CollectStats {
+        let mark = self.mark_live_set_from_addrs(root_addrs);
+        let reconcile = self.reconcile_dead_cells_before_sweep();
+        let sweep = self.space.sweep_all_object_blocks();
+        // Post-reconcile, the authoritative live set must be EXACTLY the marked survivors
+        // (every dead entry was dropped). The side-effect-free check runs in debug only.
+        debug_assert!(
+            self.live_object_addrs
+                .iter()
+                .all(|&addr| self.space.is_addr_marked(addr)),
+            "post-reconcile: every remaining live-set address must be a marked survivor"
+        );
+        CollectStats {
+            marked_cells: mark.marked_cells,
+            cells_reclaimed: reconcile.cells_reclaimed,
+            slab_slots_freed: reconcile.slab_slots_freed,
+            atoms_reclaimed: sweep.freed_cells,
+        }
+    }
+
+    /// Convenience: `force_collect` over `RuntimeValue` roots, folding in the store's own
+    /// intrinsic roots (like `mark_live_set`). The natural form for tests + a direct driver.
+    pub(crate) fn force_collect_values(&mut self, extra_roots: &[RuntimeValue]) -> CollectStats {
+        let addrs: Vec<usize> = self
+            .gather_intrinsic_roots()
+            .iter()
+            .chain(extra_roots.iter())
+            .filter_map(|v| v.as_cell().map(|c| c.pointer_payload_bits()))
+            .collect();
+        self.force_collect(&addrs)
+    }
+
+    /// gc-r4 R4b-sweep — LOGICAL live arena object-cell count (the authoritative set size;
+    /// reconcile decrements it). The micro-probe's "arena live-cell count": after a
+    /// collection frees an unrooted island it returns to baseline, proving reclamation (not
+    /// the monotone `allocated_blob_cell_count`, which never drops).
+    pub(crate) fn live_object_cell_count(&self) -> usize {
+        self.live_object_addrs.len()
+    }
+
+    /// gc-r4 R4b-sweep — LIVE butterfly-slab slots (allocated minus recycled-free). The
+    /// micro-probe's "butterfly-slab live-slot count": returns to baseline via free-list
+    /// reuse, proving the dominant (slab) memory is reclaimed, not leaked.
+    pub(crate) fn live_butterfly_slot_count(&self) -> usize {
+        self.butterflies.len() - self.butterfly_free_list.len()
     }
 }
 
@@ -4911,6 +5278,17 @@ impl CoreObjectStore {
         // the bytes into a fresh, never-before-handed-out, atom-aligned arena slot.
         let cp = unsafe { self.space.allocate_blob(src, len) };
         let addr = cp.addr();
+        // gc-r4 R4b-sweep: register the cell in the AUTHORITATIVE live-object-cell address
+        // set (the post-flip analog of the deleted `objects` Vec as the enumerable, byte-
+        // intact live-cell registry the pre-sweep reconciliation walks). A reused (post-
+        // sweep) address was removed from the set at its prior owner's reconcile, so this
+        // insert is always fresh — the debug_assert pins that invariant (the side-effecting
+        // `insert` runs in BOTH builds; only the assert is debug-gated).
+        let _inserted = self.live_object_addrs.insert(addr);
+        debug_assert!(
+            _inserted,
+            "arena address re-handed-out while still registered live (reconcile failed to drop it)"
+        );
         // Identity = the arena address. `from_cell` only reads the pointer's integer bits
         // (JSCJSValue.h asCell encoding — it NEVER dereferences here), so building the
         // `GcRef` from the page's exposed arena provenance is sound + miri-clean. `addr`
@@ -7128,9 +7506,12 @@ impl CoreObjectStore {
     /// `add_instance_field` on a constructor's FIRST field (most cells never have one), so
     /// the slab stays small — mirroring `allocate_promise_reactions`.
     fn allocate_instance_fields(&mut self) -> AuxiliaryHandle {
-        let index = self.instance_field_lists.len();
-        self.instance_field_lists.push(Vec::new());
-        AuxiliaryHandle(index)
+        // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
+        AuxiliaryHandle(slab_alloc(
+            &mut self.instance_field_lists,
+            &mut self.instance_field_free_list,
+            Vec::new(),
+        ))
     }
 
     pub(crate) fn add_instance_field_with_write_barrier(
@@ -8175,9 +8556,12 @@ impl CoreObjectStore {
     /// promise's FIRST reaction (most promises settle without one, so the slab stays
     /// small — unlike the butterfly slab, this is per-pending-promise, not per-cell).
     fn allocate_promise_reactions(&mut self) -> PromiseReactionsHandle {
-        let index = self.promise_reaction_lists.len();
-        self.promise_reaction_lists.push(Vec::new());
-        PromiseReactionsHandle(index)
+        // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
+        PromiseReactionsHandle(slab_alloc(
+            &mut self.promise_reaction_lists,
+            &mut self.promise_reaction_free_list,
+            Vec::new(),
+        ))
     }
 
     pub(crate) fn push_promise_reaction(
@@ -10508,6 +10892,267 @@ mod mark_live_set_r4b_tests {
         assert_eq!(
             stats.seeded_roots, 1,
             "only the real arena address seeded; the foreign address was gated out"
+        );
+    }
+}
+
+// gc-r4 R4b-sweep: the RECLAMATION (sweep) half end-to-end on the live store. Each test
+// builds a real object graph through the production chokepoint, force_collects, and asserts
+// dead cells AND their slab slots are reclaimed while live cells + their slabs are retained.
+#[cfg(test)]
+mod r4b_sweep_tests {
+    use super::*;
+
+    fn ident(n: u32) -> CorePropertyKey {
+        CorePropertyKey::Identifier(n)
+    }
+    fn obj(store: &mut CoreObjectStore) -> RuntimeValue {
+        store.allocate()
+    }
+    fn put(store: &mut CoreObjectStore, parent: RuntimeValue, key: u32, value: RuntimeValue) {
+        store
+            .put_data_own(parent, &ident(key), value)
+            .expect("put_data_own on a live arena object cell");
+    }
+    fn addr(v: RuntimeValue) -> usize {
+        v.as_cell().unwrap().pointer_payload_bits()
+    }
+    fn reads_to(store: &CoreObjectStore, owner: RuntimeValue, key: u32, expected: RuntimeValue) {
+        let property = store
+            .get_own_property(owner, &ident(key))
+            .expect("readable own property")
+            .expect("present own property");
+        match property.kind {
+            CorePropertyKind::Data(v) => assert_eq!(v, expected, "own data property round-trips"),
+            other => panic!("expected a data property, got {other:?}"),
+        }
+    }
+
+    /// THE HEADLINE TEST (gc-r4.md R4b VERIFY, ≥2 collections): an unrooted island (objects
+    /// with butterflies + Map/RegExp aux payloads) is reclaimed — its cell atoms AND its
+    /// butterfly+aux slab slots AND its reverse-index entries — while the rooted graph stays
+    /// intact + readable. Then a former survivor is collected a SECOND time: the membership
+    /// gate (not liveness) re-marks it, so it survives (a liveness-gated marker would sweep
+    /// the whole old generation on #2 — the #1 UAF landmine).
+    #[test]
+    fn reclaims_dead_island_and_slabs_retains_rooted_graph_across_two_collections() {
+        let mut store = CoreObjectStore::default();
+
+        // Rooted graph: root -> a -> b (cell edges) + root.x = 123 (primitive data prop).
+        let root = obj(&mut store);
+        let a = obj(&mut store);
+        let b = obj(&mut store);
+        put(&mut store, root, 0, a);
+        put(&mut store, a, 0, b);
+        store
+            .put_data_own(root, &ident(1), RuntimeValue::from_i32(123))
+            .unwrap();
+
+        // UNROOTED island with butterfly + AUX payloads (all must be reclaimed):
+        let island_obj = obj(&mut store);
+        let island_child = obj(&mut store);
+        put(&mut store, island_obj, 0, island_child);
+        let island_map = store.allocate_map(); // map_entries aux slab
+        store.map_entries_push(
+            island_map,
+            RuntimeValue::from_i32(7),
+            RuntimeValue::from_i32(8),
+        );
+        let island_re = store.allocate_regexp("abc".to_string(), RegexFlags::default()); // regexp_source aux slab
+
+        // Capture the island's slab handles BEFORE collection (assert they are freed after).
+        let island_obj_bfly = store.find(island_obj).unwrap().butterfly;
+        let island_map_entries = store.find(island_map).unwrap().map_entries;
+        let island_re_source = store.find(island_re).unwrap().regexp_source;
+        assert_ne!(island_map_entries, AuxiliaryHandle::INVALID);
+        assert_ne!(island_re_source, AuxiliaryHandle::INVALID);
+
+        let live_before = store.live_object_cell_count();
+        let bfly_live_before = store.live_butterfly_slot_count();
+        let bfly_free_before = store.butterfly_free_list.len();
+        let map_free_before = store.map_entry_free_list.len();
+        let re_free_before = store.regexp_source_free_list.len();
+
+        // ---- Collection #1: root ONLY the rooted graph (intrinsics folded in). Island dead.
+        let s1 = store.force_collect_values(&[root]);
+
+        // The island's cells are reclaimed (find -> None: unmarked + swept) ...
+        for dead in [island_obj, island_child, island_map, island_re] {
+            assert!(store.find(dead).is_none(), "dead island cell reclaimed");
+            assert!(!store.is_value_marked(dead), "dead island cell unmarked");
+        }
+        // ... AND their slab slots were freed onto the per-slab free lists ...
+        assert!(
+            store.butterfly_free_list.contains(&island_obj_bfly.0),
+            "island butterfly slot freed"
+        );
+        assert!(
+            store.map_entry_free_list.contains(&island_map_entries.0),
+            "island map-entries slot freed"
+        );
+        assert!(
+            store.regexp_source_free_list.contains(&island_re_source.0),
+            "island regexp-source slot freed"
+        );
+        assert!(store.butterfly_free_list.len() > bfly_free_before);
+        assert!(store.map_entry_free_list.len() > map_free_before);
+        assert!(store.regexp_source_free_list.len() > re_free_before);
+        // ... and the live counts dropped (logical reclamation) ...
+        assert!(store.live_object_cell_count() < live_before);
+        assert!(store.live_butterfly_slot_count() < bfly_live_before);
+        assert!(s1.cells_reclaimed >= 4, "the 4 island cells were reclaimed");
+        assert!(
+            s1.slab_slots_freed >= 6,
+            "4 butterflies + map-entries + regexp-source freed"
+        );
+
+        // The ROOTED graph is intact + READABLE.
+        for live in [root, a, b] {
+            assert!(store.find(live).is_some(), "rooted cell retained");
+            assert!(store.is_value_marked(live), "rooted cell marked");
+        }
+        reads_to(&store, root, 1, RuntimeValue::from_i32(123)); // primitive prop survived
+        let edge = store.get_own_property(root, &ident(0)).unwrap().unwrap();
+        match edge.kind {
+            CorePropertyKind::Data(v) => assert_eq!(addr(v), addr(a), "cell edge survived"),
+            other => panic!("expected the root->a edge, got {other:?}"),
+        }
+
+        // ---- Collection #2 (the LANDMINE): `b`'s newlyAllocated was cleared by #1's sweep
+        // and its mark is cleared at begin-marking, so a LIVENESS-gated marker would reject
+        // it. Keep it rooted (root->a->b) — the MEMBERSHIP gate must re-mark + retain it.
+        let s2 = store.force_collect_values(&[root]);
+        for live in [root, a, b] {
+            assert!(
+                store.find(live).is_some() && store.is_value_marked(live),
+                "old-gen survivor retained on collection #2 (membership, not liveness)"
+            );
+        }
+        reads_to(&store, root, 1, RuntimeValue::from_i32(123));
+        assert_eq!(
+            s2.cells_reclaimed, 0,
+            "nothing new died between #1 and #2 (the landmine would have falsely reclaimed survivors)"
+        );
+    }
+
+    /// FREE-LIST REUSE: after a collection frees a slot, a new allocation REUSES that freed
+    /// slot index — the slab Vec does not grow (the faithful Auxiliary-subspace slot reuse;
+    /// a `Vec<Vec<..>>` cannot shrink a middle hole, so the index is recycled).
+    #[test]
+    fn freed_slab_slot_is_reused_without_slab_growth() {
+        let mut store = CoreObjectStore::default();
+        let keep = obj(&mut store);
+        let dead = obj(&mut store);
+        let dead_bfly = store.find(dead).unwrap().butterfly;
+        let slab_len_before = store.butterflies.len();
+
+        // Collect with only `keep` rooted -> `dead` reclaimed, its butterfly slot freed.
+        store.force_collect_values(&[keep]);
+        assert!(store.butterfly_free_list.contains(&dead_bfly.0));
+        assert_eq!(
+            store.butterflies.len(),
+            slab_len_before,
+            "the slab Vec did not shrink (POD hole left behind)"
+        );
+
+        // A NEW object REUSES the freed slot index -> the slab Vec does NOT grow.
+        let fresh = obj(&mut store);
+        let fresh_bfly = store.find(fresh).unwrap().butterfly;
+        assert_eq!(
+            fresh_bfly.0, dead_bfly.0,
+            "the new allocation reused the freed slot index"
+        );
+        assert_eq!(
+            store.butterflies.len(),
+            slab_len_before,
+            "the slab Vec did not grow (slot reused, not appended)"
+        );
+        assert!(
+            !store.butterfly_free_list.contains(&dead_bfly.0),
+            "the reused index left the free list"
+        );
+        assert!(store.find(keep).is_some(), "the rooted cell survived");
+    }
+
+    /// SELF-ALIASING UNDER COLLECTION (gc-r4.md R4b VERIFY): an Object.assign(o,o) analog
+    /// (o.self = o) and a self-keyed Map (m.set(m,m)) survive a forced collection with no
+    /// UAF — the collector only READS cells during mark/reconcile/sweep, never takes a cell
+    /// `&mut`, so a self-edge is never an overlapping borrow.
+    #[test]
+    fn self_aliasing_survives_forced_collection() {
+        let mut store = CoreObjectStore::default();
+        let o = obj(&mut store);
+        put(&mut store, o, 0, o); // o.0 = o
+        let m = store.allocate_map();
+        store.map_entries_push(m, m, m); // m contains (m, m)
+
+        let _ = store.force_collect_values(&[o, m]);
+        assert!(store.find(o).is_some() && store.is_value_marked(o));
+        assert!(store.find(m).is_some() && store.is_value_marked(m));
+        let edge = store.get_own_property(o, &ident(0)).unwrap().unwrap();
+        match edge.kind {
+            CorePropertyKind::Data(v) => assert_eq!(addr(v), addr(o), "self-edge still resolves"),
+            other => panic!("expected the self-edge, got {other:?}"),
+        }
+    }
+
+    /// THE BOUNDED NO-OOM MICRO-PROBE (the OOM proxy — NOT a heavy bench). Several rounds
+    /// each allocate a bounded population of objects-with-butterflies-and-aux, drop them
+    /// (unrooted), and force_collect. The logical live-cell count AND the butterfly-slab
+    /// live-slot count return EXACTLY to baseline every round — proving the leak driver is
+    /// actually reclaimed (bounded, not monotonically growing) and re-allocation reuses the
+    /// swept cells/slots. Small (hundreds of cells, a few collections); no heavy bench.
+    #[test]
+    fn bounded_no_oom_micro_probe() {
+        let mut store = CoreObjectStore::default();
+        let anchor = obj(&mut store);
+        let anchor_addr = addr(anchor);
+        // Warm up the intrinsics the loop touches (map_prototype, regexp_prototype, ...) so
+        // the baseline is stable, then reclaim the warm-up temporaries.
+        {
+            let m = store.allocate_map();
+            store.map_entries_push(m, RuntimeValue::from_i32(1), RuntimeValue::from_i32(2));
+            let _ = store.allocate_regexp("warm".to_string(), RegexFlags::default());
+        }
+        store.force_collect_values(&[anchor]);
+
+        let base_live = store.live_object_cell_count();
+        let base_bfly = store.live_butterfly_slot_count();
+
+        const ROUNDS: usize = 4;
+        const PER_ROUND: usize = 300;
+        for _ in 0..ROUNDS {
+            for i in 0..PER_ROUND {
+                let o = obj(&mut store);
+                store
+                    .put_data_own(o, &ident(0), RuntimeValue::from_i32(i as i32))
+                    .unwrap();
+                if i % 4 == 0 {
+                    let m = store.allocate_map(); // map_entries aux payload
+                    store.map_entries_push(m, RuntimeValue::from_i32(i as i32), o);
+                }
+            }
+            // Collect with ONLY the anchor rooted -> the whole round's population is dead.
+            store.force_collect_values(&[anchor]);
+            assert_eq!(
+                store.live_object_cell_count(),
+                base_live,
+                "live cell count returned to baseline (no cell leak across the round)"
+            );
+            assert_eq!(
+                store.live_butterfly_slot_count(),
+                base_bfly,
+                "butterfly-slab live-slot count returned to baseline (no slab leak)"
+            );
+        }
+        assert!(
+            store.find(anchor).is_some(),
+            "the rooted anchor survived every collection"
+        );
+        assert_eq!(
+            addr(anchor),
+            anchor_addr,
+            "the rooted anchor never moved (no compaction)"
         );
     }
 }

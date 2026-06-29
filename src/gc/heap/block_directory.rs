@@ -19,7 +19,7 @@
 use core::ptr;
 use std::alloc::{alloc_zeroed, dealloc};
 
-use super::free_list::FreeList;
+use super::free_list::{FreeList, NewlyAllocatedMode, SweepResult};
 use super::marked_block::{
     block_layout, cell_ptr, set_newly_allocated, Cell, CellPtr, MarkedBlock, ATOM_SIZE, END_ATOM,
     FIRST_PAYLOAD_ATOM, HALF_ALIGNMENT,
@@ -233,6 +233,35 @@ impl BlockDirectory {
         );
         set_newly_allocated(cell_addr);
         (CellPtr::from_addr(cell_addr), new_base)
+    }
+
+    /// gc-r4 R4b-sweep — sweep EVERY block in this directory into ONE combined FreeList
+    /// (`DoesNotHave`: a full collection, so post-sweep liveness == marks alone and the
+    /// newlyAllocated bitmap is reset). Blocks are swept in DESCENDING base order so every
+    /// threaded interval links low->high (a positive offset), matching the single-block
+    /// invariant. After this returns, the directory's `allocate`/`allocate_blob` fast path
+    /// reuses every reclaimed cell across all blocks before adding a fresh one — so the
+    /// arena stays bounded by the live working set (faithful to JSC reusing swept blocks,
+    /// BlockDirectory::findBlockForAllocation, without the per-block lazy-sweep machinery).
+    ///
+    /// CALLER CONTRACT (gc-r4 R4b ORDERING): the store's pre-sweep reconciliation
+    /// (`reconcile_dead_cells_before_sweep`) MUST have already read every dead cell's
+    /// out-of-line slab handles, because this writes `FreeCell` link records over those
+    /// dead cells (clobbering the butterfly slot at offset 8) — see `MarkedSpace::
+    /// sweep_all_object_blocks`.
+    pub(crate) fn sweep_all_blocks(&mut self) -> SweepResult {
+        // Descending base order keeps every cross-block link offset positive (see
+        // `FreeList::sweep_blocks`). Clone the bases so `&mut self.free_list` is free.
+        let mut bases = self.block_base_addr.clone();
+        bases.sort_unstable_by(|a, b| b.cmp(a));
+        // SAFETY (contract C1-C6): each base is a registered, once-exposed, directory-owned
+        // block; the collector is stopped (single mutator); FreeCell records land only in
+        // dead cells. FREELIST_SECRET keys the rebuild — the SAME constant the directory
+        // always uses (`add_block`), so the FreeList descrambles its own records.
+        unsafe {
+            self.free_list
+                .sweep_blocks(&bases, FREELIST_SECRET, NewlyAllocatedMode::DoesNotHave)
+        }
     }
 }
 
@@ -529,6 +558,100 @@ mod tests {
                 is_newly_allocated(a),
                 "eden sweep preserves the alloc bitmap"
             );
+        }
+    }
+
+    /// gc-r4 R4b-sweep — `sweep_all_blocks` reclaims dead cells across MANY blocks into ONE
+    /// combined FreeList, so re-allocation reuses them (spanning blocks) before adding a
+    /// fresh block. Fill TWO blocks, mark a scattered subset in BOTH, sweep all blocks, then
+    /// prove every dead cell (in either block) is re-allocatable with NO new block created —
+    /// the multi-block generalization the single-block sweep cannot show.
+    #[test]
+    fn sweep_all_blocks_reclaims_across_blocks_into_one_free_list() {
+        let mut dir = BlockDirectory::new(ATOMS_PER_CELL);
+        let per_block = per_block_cells();
+        // Fill EXACTLY two full blocks so every walked slot is an allocated cell (no
+        // never-allocated tail), keeping the retained/freed counts exact against my marks.
+        let total = 2 * per_block;
+        let mut cells = Vec::with_capacity(total);
+        for i in 0..total {
+            let (cp, _n) = dir.allocate(Cell::new(0x10, 0xD000 + i as u64));
+            cells.push(cp.addr());
+        }
+        assert_eq!(
+            dir.block_base_addr.len(),
+            2,
+            "the population fills exactly two blocks"
+        );
+
+        // Mark every 3rd cell live (scattered across BOTH blocks); the rest are dead.
+        let mut marked = HashSet::new();
+        let mut unmarked = HashSet::new();
+        for (i, &a) in cells.iter().enumerate() {
+            if i % 3 == 0 {
+                assert!(test_and_set_marked(a));
+                marked.insert(a);
+            } else {
+                unmarked.insert(a);
+            }
+        }
+
+        let res = dir.sweep_all_blocks();
+        assert_eq!(
+            res.retained_cells,
+            marked.len(),
+            "only marked cells retained"
+        );
+        assert_eq!(res.freed_cells, unmarked.len(), "every unmarked cell freed");
+
+        // Re-allocate exactly freed_cells cells: each MUST be a reclaimed (unmarked) cell
+        // from EITHER block, never a retained one, and NO new block is created (the combined
+        // free list spans both blocks).
+        let blocks_before = dir.block_base_addr.len();
+        let mut reclaimed = HashSet::new();
+        let mut blocks_touched = HashSet::new();
+        for _ in 0..res.freed_cells {
+            let (cp, new_base) = dir.allocate(Cell::new(0x11, 0));
+            assert!(
+                new_base.is_none(),
+                "reclaimed cells satisfy alloc — no new block"
+            );
+            let a = cp.addr();
+            assert!(
+                unmarked.contains(&a),
+                "re-allocated a reclaimed (unmarked) cell"
+            );
+            assert!(!marked.contains(&a), "never re-allocated a retained cell");
+            assert!(reclaimed.insert(a), "each reclaimed cell handed out once");
+            blocks_touched.insert(a & BLOCK_MASK);
+        }
+        assert_eq!(
+            reclaimed, unmarked,
+            "every unmarked cell reclaimed exactly once"
+        );
+        assert!(
+            blocks_touched.len() >= 2,
+            "reclaimed cells span both blocks (one combined free list)"
+        );
+        assert_eq!(
+            dir.block_base_addr.len(),
+            blocks_before,
+            "no new block was added during reclaim reuse"
+        );
+        assert!(
+            dir.free_list.allocation_will_fail(),
+            "the combined free list is fully re-consumed"
+        );
+
+        // Retained cells kept their marks and had newlyAllocated cleared by the flip.
+        for (i, &a) in cells.iter().enumerate() {
+            if i % 3 == 0 {
+                assert!(is_marked(a), "retained cell keeps its mark");
+                assert!(
+                    !is_newly_allocated(a),
+                    "full-collection flip cleared newlyAllocated"
+                );
+            }
         }
     }
 }

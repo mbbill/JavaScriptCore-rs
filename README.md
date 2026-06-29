@@ -24,7 +24,7 @@ Overall: ~40% by effort  ███████▌░░░░░░░░░░�
 | Assembler codegen — **emit → relocate → execute machine code** | 3% | 100% | ██████████ |
 | Scoreboard / measurement harness | 1% | 100% | ██████████ |
 | JSStack execution substrate (frame model the JIT runs on) | 5% | 55% | ██████░░░░ |
-| GC / cell-identity cutover (the GC the JIT assumes) | 7% | 65% | ██████▌░░░ |
+| GC / cell-identity cutover (the GC the JIT assumes) | 7% | 70% | ███████░░░ |
 | **Baseline JIT** — per-opcode machine code *(R first moves here)* | 10% | 15% | █▌░░░░░░░░ |
 | **DFG** optimizing tier | 18% | 0% | ░░░░░░░░░░ |
 | **FTL + B3 + Air** top tier | 15% | 0% | ░░░░░░░░░░ |
