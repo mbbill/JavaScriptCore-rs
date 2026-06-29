@@ -131,6 +131,11 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   re-enter the hook). Unsafe reborrow island adversarially verified sound + HARDENED (nested-park & Vm-pin
   debug guards; compare/truthy shims Miri-clean; valueOf-reentry test normal-profile-green). HONEST CAVEAT:
   arith-only allowlist — Octane material R needs property/call ops (R4 / B5-B6); R UNDEFINED until 15-gate.
+- [done] double/float ARITH baseline (verified, EXECUTES native FP in release): FP encoding added to the
+  ARM64 encoder (fadd/fsub/fmul/fdiv/scvtf/fmov, byte-oracle-proven) + double fast paths add/sub/mul/div
+  (JIT{Add,Sub,Mul,Div}Generator-faithful: int32 fast / branchIfNotNumber→slow / double path) + DivNumber
+  allowlisted → double-arith functions tier up. Deferred: LoadDouble (double LITERALS — needed for the asm.js
+  mandreel/octane-zlib to tier up), div int32-result fold, NaN significand (faithful, same number).
 - [done] the live path emits real per-opcode ARM64 via the MacroAssembler encoder + finalize (f139350);
   the old P6/P15 byte-blob lane is now DEAD — retiring it (~22k LoC) is a DEFERRED off-gate cleanup
   (moves neither R nor 15/15; do it in idle integration capacity, never preempting R4/calls).

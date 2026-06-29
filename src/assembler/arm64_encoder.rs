@@ -212,6 +212,41 @@ pub enum FpDataOp1Source {
     Fmov = 0,
 }
 
+/// `ARM64Assembler::FPDataOp2Source` (ARM64Assembler.h:662-672): the FP
+/// two-source data-processing opcodes (bits[15:12] of the `0x1e200800` packer).
+/// Only the four arithmetic forms (`fmul`/`fdiv`/`fadd`/`fsub`) are emitted by the
+/// baseline double fast paths; the rest are ported for fidelity and unused
+/// (module `#![allow(dead_code)]`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum FpDataOp2Source {
+    FMul = 0,
+    FDiv = 1,
+    FAdd = 2,
+    FSub = 3,
+    FMax = 4,
+    FMin = 5,
+    FMaxnm = 6,
+    FMinnm = 7,
+    FNmul = 8,
+}
+
+/// `ARM64Assembler::FPIntConvOp` (ARM64Assembler.h:674-693): the floating-point
+/// <-> integer conversion op. Its 5-bit value occupies bits[20:16] of the
+/// `0x1e200000` packer as `rmode<<3 | opcode`. Only the three forms the baseline
+/// double paths need are listed (all `rmode == 00`: SCVTF plus the two FMOV
+/// bit-cast forms); the FCVT* rounding-mode variants are deferred.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum FpIntConvOp {
+    /// `SCVTF` (signed int -> FP): rmode=00, opcode=010.
+    Scvtf = 0x02,
+    /// `FMOV` FP -> general register (`Xd <- Dn`, the bit-cast): rmode=00, opcode=110.
+    FmovFpToGpr = 0x06,
+    /// `FMOV` general register -> FP (`Dd <- Xn`, the bit-cast): rmode=00, opcode=111.
+    FmovGprToFp = 0x07,
+}
+
 // ----------------------------------------------------------------------------
 // Register-field helpers — faithful mirrors of ARM64Assembler's xOr* helpers.
 // ----------------------------------------------------------------------------
@@ -618,6 +653,47 @@ const fn floating_point_data_processing_1_source(
     rd: FPRegisterID,
 ) -> u32 {
     0x1e20_4000 | (type_ as u32) << 22 | (opcode as u32) << 15 | rn.value() << 5 | rd.value()
+}
+
+/// `floatingPointDataProcessing2Source` (ARM64Assembler.h, the `0x1e200800`
+/// packer): the FP two-source arithmetic family (`fadd`/`fsub`/`fmul`/`fdiv`).
+/// `type` is the FP `Datasize` (`D64` -> double); `opcode` is bits[15:12].
+#[inline]
+const fn floating_point_data_processing_2_source(
+    type_: Datasize,
+    rm: FPRegisterID,
+    opcode: FpDataOp2Source,
+    rn: FPRegisterID,
+    rd: FPRegisterID,
+) -> u32 {
+    0x1e20_0800
+        | (type_ as u32) << 22
+        | rm.value() << 16
+        | (opcode as u32) << 12
+        | rn.value() << 5
+        | rd.value()
+}
+
+/// `floatingPointIntegerConversions` (ARM64Assembler.h, the `0x1e200000`
+/// packer): FP <-> integer conversion (`scvtf`, FMOV bit-casts). `sf` is the GPR
+/// datasize, `type` the FP datasize; `rmode_opcode` occupies bits[20:16]. `rn`/`rd`
+/// are raw 5-bit register fields — one side is a GPR and the other an FP register
+/// per the conversion direction, so this takes the already-extracted fields (each
+/// caller passes `.value()`, masked to 5 bits like `xOrZr`).
+#[inline]
+const fn floating_point_integer_conversions(
+    sf: Datasize,
+    type_: Datasize,
+    rmode_opcode: FpIntConvOp,
+    rn: u32,
+    rd: u32,
+) -> u32 {
+    0x1e20_0000
+        | (sf as u32) << 31
+        | (type_ as u32) << 22
+        | (rmode_opcode as u32) << 16
+        | (rn & 31) << 5
+        | (rd & 31)
 }
 
 /// `loadStoreRegisterUnscaledImmediate` (ARM64Assembler.h:4831-4842), GPR form
@@ -1358,6 +1434,96 @@ impl<'a> Arm64Encoder<'a> {
         ));
     }
 
+    /// `fadd<64>(rd, rn, rm)` (ARM64Assembler.h:3300-3304): `rd = rn + rm`,
+    /// double-precision.
+    #[inline]
+    pub fn emit_fadd_double(&mut self, rd: FPRegisterID, rn: FPRegisterID, rm: FPRegisterID) {
+        self.insn(floating_point_data_processing_2_source(
+            Datasize::D64,
+            rm,
+            FpDataOp2Source::FAdd,
+            rn,
+            rd,
+        ));
+    }
+
+    /// `fsub<64>(rd, rn, rm)` (ARM64Assembler.h:3306-3310): `rd = rn - rm`.
+    #[inline]
+    pub fn emit_fsub_double(&mut self, rd: FPRegisterID, rn: FPRegisterID, rm: FPRegisterID) {
+        self.insn(floating_point_data_processing_2_source(
+            Datasize::D64,
+            rm,
+            FpDataOp2Source::FSub,
+            rn,
+            rd,
+        ));
+    }
+
+    /// `fmul<64>(rd, rn, rm)` (ARM64Assembler.h:3312-3316): `rd = rn * rm`.
+    #[inline]
+    pub fn emit_fmul_double(&mut self, rd: FPRegisterID, rn: FPRegisterID, rm: FPRegisterID) {
+        self.insn(floating_point_data_processing_2_source(
+            Datasize::D64,
+            rm,
+            FpDataOp2Source::FMul,
+            rn,
+            rd,
+        ));
+    }
+
+    /// `fdiv<64>(rd, rn, rm)` (ARM64Assembler.h:3318-3322): `rd = rn / rm`.
+    #[inline]
+    pub fn emit_fdiv_double(&mut self, rd: FPRegisterID, rn: FPRegisterID, rm: FPRegisterID) {
+        self.insn(floating_point_data_processing_2_source(
+            Datasize::D64,
+            rm,
+            FpDataOp2Source::FDiv,
+            rn,
+            rd,
+        ));
+    }
+
+    /// `scvtf<64, 32>(vd, rn)` (ARM64Assembler.h:3441-3445, `convertInt32ToDouble`):
+    /// signed 32-bit integer (W-register source) -> double FP register. `sf == D32`
+    /// (the integer source is the 32-bit W view), `type == D64` (double result).
+    #[inline]
+    pub fn emit_scvtf_int32_to_double(&mut self, vd: FPRegisterID, rn: RegisterID) {
+        self.insn(floating_point_integer_conversions(
+            Datasize::D32,
+            Datasize::D64,
+            FpIntConvOp::Scvtf,
+            rn.value(),
+            vd.value(),
+        ));
+    }
+
+    /// `fmov<64>(rd, vn)` (ARM64Assembler.h:3380-3384, `moveDoubleTo64`): bit-cast
+    /// a double FP register to a 64-bit GPR (`Xd <- Dn`). No numeric conversion —
+    /// the raw 64 bits are copied.
+    #[inline]
+    pub fn emit_fmov_double_to_gpr(&mut self, rd: RegisterID, vn: FPRegisterID) {
+        self.insn(floating_point_integer_conversions(
+            Datasize::D64,
+            Datasize::D64,
+            FpIntConvOp::FmovFpToGpr,
+            vn.value(),
+            rd.value(),
+        ));
+    }
+
+    /// `fmov<64>(vd, rn)` (ARM64Assembler.h:3374-3378, `move64ToDouble`): bit-cast
+    /// a 64-bit GPR to a double FP register (`Dd <- Xn`). No numeric conversion.
+    #[inline]
+    pub fn emit_fmov_gpr_to_double(&mut self, vd: FPRegisterID, rn: RegisterID) {
+        self.insn(floating_point_integer_conversions(
+            Datasize::D64,
+            Datasize::D64,
+            FpIntConvOp::FmovGprToFp,
+            rn.value(),
+            vd.value(),
+        ));
+    }
+
     /// `ldur`/`stur` (ARM64Assembler.h:1472/2996): unscaled signed-imm9
     /// load/store. `op`/`size` select the direction and access width.
     #[inline]
@@ -1901,6 +2067,57 @@ mod tests {
         assert_eq!(
             single(|e| e.emit_fmov_double(FPRegisterID::Q0, FPRegisterID::Q1)),
             0x1e60_4020
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // FP scalar-double arithmetic + FP<->integer conversions (the baseline
+    // double fast-path primitives). Byte oracle: real assembled words for the
+    // double forms (`<64>`), cross-checked against the ARM ARM encodings.
+    // ------------------------------------------------------------------------
+    #[test]
+    fn fp_scalar_double_arith() {
+        // fadd d0, d1, d2 : 0x1e622820 ; fsub d0, d1, d2 : 0x1e623820 ;
+        // fmul d0, d1, d2 : 0x1e620820 ; fdiv d0, d1, d2 : 0x1e621820.
+        assert_eq!(
+            single(|e| e.emit_fadd_double(FPRegisterID::Q0, FPRegisterID::Q1, FPRegisterID::Q2)),
+            0x1e62_2820
+        );
+        assert_eq!(
+            single(|e| e.emit_fsub_double(FPRegisterID::Q0, FPRegisterID::Q1, FPRegisterID::Q2)),
+            0x1e62_3820
+        );
+        assert_eq!(
+            single(|e| e.emit_fmul_double(FPRegisterID::Q0, FPRegisterID::Q1, FPRegisterID::Q2)),
+            0x1e62_0820
+        );
+        assert_eq!(
+            single(|e| e.emit_fdiv_double(FPRegisterID::Q0, FPRegisterID::Q1, FPRegisterID::Q2)),
+            0x1e62_1820
+        );
+        // Field-placement check: fadd d3, d4, d5 : 0x1e652883.
+        assert_eq!(
+            single(|e| e.emit_fadd_double(FPRegisterID::Q3, FPRegisterID::Q4, FPRegisterID::Q5)),
+            0x1e65_2883
+        );
+    }
+
+    #[test]
+    fn fp_integer_conversions() {
+        // scvtf d0, w1 : 0x1e620020 (signed W -> double).
+        assert_eq!(
+            single(|e| e.emit_scvtf_int32_to_double(FPRegisterID::Q0, RegisterID::X1)),
+            0x1e62_0020
+        );
+        // fmov x0, d1 : 0x9e660020 (moveDoubleTo64, Xd <- Dn bit-cast).
+        assert_eq!(
+            single(|e| e.emit_fmov_double_to_gpr(RegisterID::X0, FPRegisterID::Q1)),
+            0x9e66_0020
+        );
+        // fmov d0, x1 : 0x9e670020 (move64ToDouble, Dd <- Xn bit-cast).
+        assert_eq!(
+            single(|e| e.emit_fmov_gpr_to_double(FPRegisterID::Q0, RegisterID::X1)),
+            0x9e67_0020
         );
     }
 

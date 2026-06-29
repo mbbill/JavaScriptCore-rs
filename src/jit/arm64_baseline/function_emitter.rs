@@ -19,9 +19,10 @@
 //!   * op_enter (`jit/JITOpcodes.cpp` `emit_op_enter` :1475): zero-fill the callee
 //!     locals with `jsUndefined()` at `addressFor(local)`.
 //!   * op_mov (`emit_op_mov`): `load64(src) ; store64(dst)`.
-//!   * the int32 arith family (`jit/JITArithmetic.cpp` generators): reused from
-//!     [`super::arith::emit_arith_fast_path_fallthrough`] (the SAME generator the
-//!     standalone images use), with the slow guards deferred into a `SlowCase`.
+//!   * the arith family (`jit/JITArithmetic.cpp` generators): reused from
+//!     [`super::arith::emit_arith_fast_path`] (the SAME generator the standalone
+//!     images use — int32 fast path plus the JSVALUE64 double fast path for
+//!     add/sub/mul/div), with the slow guards deferred into a `SlowCase`.
 //!   * the FUSED int32 compare-and-branch (`emit_op_jless`/`emitSlow_op_jless`,
 //!     `JIT::emit_compareAndJump` JITArithmetic.cpp:215-227 / slow :127/:359): the
 //!     genuinely-new control-flow piece — `branch32(cond, lhs, rhs)` straight to a
@@ -81,7 +82,7 @@ use crate::jit::operations::{
 };
 use crate::value::{JsValue, NUMBER_TAG};
 
-use super::arith::{emit_arith_fast_path_fallthrough, ArithFamilyOp, PINNED_VM_GPR};
+use super::arith::{emit_arith_fast_path, ArithFamilyOp, PINNED_VM_GPR};
 
 /// `sizeof(Register)` (JSVALUE64); `addressFor` scales the VirtualRegister by it.
 const REGISTER_SIZE_BYTES: i32 = 8;
@@ -295,10 +296,14 @@ impl FunctionEmitter {
         self.h.masm_mut().store64(SCRATCH_GPR, address_for(dst));
     }
 
-    /// The int32 arith family fast path (`emit_op_add`/`_sub`/...): load both
-    /// operands into `argumentGPR1`/`argumentGPR2`, run the SHARED generator (which
-    /// boxes + stores the result and returns the slow guards), and DEFER the slow
-    /// case after the epilogue (S6). Falls through to the next bytecode.
+    /// The arith family fast path (`emit_op_add`/`_sub`/`_mul`/`_div`/...): load
+    /// both operands into `argumentGPR1`/`argumentGPR2`, run the SHARED generator
+    /// (which boxes + stores the result, emits the JSVALUE64 double fast path for
+    /// add/sub/mul/div, and returns the slow guards), and DEFER the slow case after
+    /// the epilogue (S6). The int32 path's skip-over jumps (`fast.end`, present for
+    /// add/sub/mul) target the next bytecode; the path that falls through the
+    /// generator continues into it. The double path's own control-flow branches
+    /// (`fast.internal_links`) are already resolved in place.
     fn emit_op_arith(
         &mut self,
         op: ArithFamilyOp,
@@ -310,9 +315,13 @@ impl FunctionEmitter {
         // emitGetVirtualRegister(lhs, leftRegs) / (rhs, rightRegs).
         self.h.masm_mut().load64(address_for(lhs), LEFT_GPR);
         self.h.masm_mut().load64(address_for(rhs), RIGHT_GPR);
-        let fast_jumps = emit_arith_fast_path_fallthrough(&mut self.h, op, dst, MODE);
+        let fast = emit_arith_fast_path(&mut self.h, op, dst, MODE);
+        for end_jump in fast.end {
+            self.jumps.push((end_jump, resume_bci));
+        }
+        self.label_link_records.extend(fast.internal_links);
         self.slow.push(SlowCase {
-            fast_jumps,
+            fast_jumps: fast.slow,
             resume_bci,
             kind: SlowKind::BinaryOp {
                 shim: op.operation_shim(),
@@ -531,13 +540,16 @@ fn is_fusible_relational(op: CoreOpcode) -> bool {
     )
 }
 
-/// Map an int32 binary `CoreOpcode` to its [`ArithFamilyOp`], or `None` if it is not
-/// a Stage-1 int32 arith op.
+/// Map a binary arith `CoreOpcode` to its [`ArithFamilyOp`], or `None` if it is
+/// not a Stage-1 arith op. `AddInt32`/`SubInt32`/`MulInt32` (== JSC op_add/sub/mul)
+/// carry the int32+double fast path; `DivNumber` (== op_div) the double-only path;
+/// the bitwise/shift ops stay int32-only.
 fn arith_family_of(op: CoreOpcode) -> Option<ArithFamilyOp> {
     Some(match op {
         CoreOpcode::AddInt32 => ArithFamilyOp::Add,
         CoreOpcode::SubInt32 => ArithFamilyOp::Sub,
         CoreOpcode::MulInt32 => ArithFamilyOp::Mul,
+        CoreOpcode::DivNumber => ArithFamilyOp::Div,
         CoreOpcode::BitAndInt32 => ArithFamilyOp::BitAnd,
         CoreOpcode::BitOrInt32 => ArithFamilyOp::BitOr,
         CoreOpcode::BitXorInt32 => ArithFamilyOp::BitXor,
@@ -691,6 +703,7 @@ pub(crate) fn emit_baseline_function(
             CoreOpcode::AddInt32
             | CoreOpcode::SubInt32
             | CoreOpcode::MulInt32
+            | CoreOpcode::DivNumber
             | CoreOpcode::BitAndInt32
             | CoreOpcode::BitOrInt32
             | CoreOpcode::BitXorInt32
@@ -912,15 +925,20 @@ mod tests {
         // last two words; the very last is the exception stub's unconditional branch.
         assert!(w.contains(&0xd65f_03c0), "image contains the epilogue ret");
 
-        // Every recorded branch is linked. Breakdown across the 4 control-flow ops
-        // (the fused compare at 3-4, the two AddInt32 at 5/6, the op_jmp at 7) plus
-        // op_ret (8) and the exception stub:
+        // Every recorded branch is linked. Each AddInt32 now also emits the JSVALUE64
+        // double fast path (JITAddGenerator), so its links grow: the int32 path's
+        // end-jump SKIPPING the double path (+1, bci-targeted to resume), 3
+        // branchIfNotNumber slow guards (so the slow-guard count is overflow+3=4 not
+        // 1), and 4 internal double-path control-flow links. Breakdown across the 4
+        // control-flow ops (the fused compare at 3-4, the two AddInt32 at 5/6, the
+        // op_jmp at 7) plus op_ret (8) and the exception stub:
         //   bci-targeted jumps: compare{fastTarget,slowTarget,slowResume}=3,
-        //                       add5 slowResume=1, add6 slowResume=1, jmp->3 =1  -> 6
-        //   label jumps (guard -> slow label): compare 2, add5 3, add6 3        -> 8
+        //       add5{end,slowResume}=2, add6{end,slowResume}=2, jmp->3 =1        -> 8
+        //   label jumps (guard -> slow label): compare 2, add5{overflow+3}=4,
+        //       add6=4, plus the 4+4 double-path internal links                 -> 18
         //   exception jumps (slow exception probe): compare 1, add5 1, add6 1   -> 3
         //   done jumps: op_ret 1, exception stub 1                              -> 2
-        assert_eq!(image.link_records.len(), 19, "every branch is linked");
+        assert_eq!(image.link_records.len(), 31, "every branch is linked");
     }
 
     #[test]
@@ -1179,6 +1197,61 @@ mod tests {
 
             let (r, _) = run_function(if_else_instructions(), &[(ARG0, i32_bits(0))]);
             assert_eq!(r.ret, i32_bits(2), "if(0) is falsy -> 2 (slow path)");
+        }
+
+        // --- THE DOUBLE MILESTONE (full CodeBlock): a whole function whose
+        // arithmetic runs through the JSVALUE64 DOUBLE fast path natively. The
+        // straight-line `(a,b)=>{ var tmp=a; return tmp+b; }` add, and a
+        // `(a,b)=>a/b` op_div, both compute their results with in-register FP
+        // (unbox/scvtf -> fadd/fdiv -> boxDouble) and return the boxed double. Runs
+        // under debug AND release.
+        #[test]
+        fn double_arith_function_tiers_up_and_runs_native_fp() {
+            let d = |x: f64| JsValue::from_double(x).encoded().0;
+
+            // op_add via the double fast path: 2.5 + 0.25 = 2.75 (non-integral, so
+            // the native boxDouble matches the runtime from_double bit-for-bit).
+            let (r, frame) = run_function(smoke_instructions(), &[(ARG0, d(2.5)), (ARG1, d(0.25))]);
+            assert_eq!(r.ret, d(2.75), "(2.5)+(0.25) returns boxed double 2.75");
+            assert_eq!(frame.read(LOCAL1), d(2.75), "result slot holds 2.75");
+            assert_eq!(r.pending, 0, "no exception");
+            assert!(
+                JsValue::from_encoded(EncodedJsValue(r.ret)).is_double(),
+                "the add result is a double (FP fast path)"
+            );
+
+            // Mixed int/double through the SAME add: 2 + 0.5 = 2.5.
+            let (r, _) = run_function(smoke_instructions(), &[(ARG0, i32_bits(2)), (ARG1, d(0.5))]);
+            assert_eq!(
+                r.ret,
+                d(2.5),
+                "(int 2)+(0.5) -> 2.5 via the double fast path"
+            );
+
+            // op_div: `(a,b)=>a/b`. The double-only JITDivGenerator path.
+            let div = vec![
+                instr(
+                    CoreOpcode::DivNumber,
+                    vec![reg(LOCAL0), reg(ARG0), reg(ARG1)],
+                    0,
+                ),
+                instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+            ];
+            // double / double = 3.5.
+            let (r, _) = run_function(div.clone(), &[(ARG0, d(7.0)), (ARG1, d(2.0))]);
+            assert_eq!(r.ret, d(3.5), "7.0 / 2.0 -> 3.5 (native fdiv)");
+            assert_eq!(r.pending, 0, "no exception");
+            // int / int divides via double too: 15 / 4 = 3.75.
+            let (r, _) = run_function(div.clone(), &[(ARG0, i32_bits(15)), (ARG1, i32_bits(4))]);
+            assert_eq!(
+                r.ret,
+                d(3.75),
+                "15 / 4 -> 3.75 (int operands, double divide)"
+            );
+            // div by zero -> +Infinity (no throw).
+            let (r, _) = run_function(div, &[(ARG0, d(1.0)), (ARG1, i32_bits(0))]);
+            assert_eq!(r.ret, d(f64::INFINITY), "1.0 / 0 -> +Infinity");
+            assert_eq!(r.pending, 0, "div by zero raises no exception");
         }
     }
 }

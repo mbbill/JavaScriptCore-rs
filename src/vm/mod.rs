@@ -2821,6 +2821,20 @@ impl Vm {
         self.operation_value_binary(host, op1, op2, CoreOpcode::RightShiftInt32)
     }
 
+    /// `operationValueDiv` -> `jsNumber(left / right)` (JITOperations.cpp). The
+    /// DivNumber member: the baseline op_div double fast path far-calls this when
+    /// an operand is not a number (`branchIfNotNumber` -> slow). `DivNumber` runs
+    /// the faithful numeric evaluator (`numeric_binary_result`'s f64 `left / right`
+    /// path).
+    pub fn operation_value_div(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        self.operation_value_binary(host, op1, op2, CoreOpcode::DivNumber)
+    }
+
     /// `operationCompareLess` -> `jsLess<true>` (JITOperations.cpp). The
     /// LessThanInt32 member of the baseline relational slow-path bridge: the
     /// faithful relational evaluator the FUSED int32 compare-and-branch lowering

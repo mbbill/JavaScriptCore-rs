@@ -24,9 +24,11 @@
 #![allow(dead_code)]
 
 use crate::assembler::labels::Jump;
-use crate::assembler::macro_assembler_arm64::{MacroAssemblerArm64, RelationalCondition};
+use crate::assembler::macro_assembler_arm64::{
+    MacroAssemblerArm64, RelationalCondition, ResultCondition,
+};
 use crate::assembler::operands::TrustedImm64;
-use crate::assembler::registers::RegisterID;
+use crate::assembler::registers::{FPRegisterID, RegisterID};
 use crate::value::{JsValue, NOT_CELL_MASK, NUMBER_TAG};
 
 /// `JSValue::ValueFalse` (JSCJSValue.h:483-488, == `OtherTag | BoolTag` == 0x6).
@@ -199,6 +201,99 @@ impl AssemblyHelpers {
         self.masm.zero_extend_32_to_word(boxed_gpr, result_gpr);
     }
 
+    /// `branchIfNotNumber(GPRReg reg, GPRReg tempGPR, mode)`
+    /// (AssemblyHelpers.h:806-818, JSVALUE64). A value is a number iff it carries
+    /// any `NumberTag` bit (`isNumber() == (bits & NumberTag) != 0`,
+    /// JSCJSValue.h:1034-1037). So `branchTest64(Zero, reg, numberTag)` is taken
+    /// exactly when `reg` is NOT a number. `HaveTagRegisters` tests against the
+    /// live `numberTagRegister` (x27); `DoNotHaveTagRegisters` materializes
+    /// NumberTag into `temp` first. `temp` may be untouched in the fast mode.
+    pub fn branch_if_not_number(
+        &mut self,
+        reg: RegisterID,
+        temp: RegisterID,
+        mode: TagRegistersMode,
+    ) -> Jump {
+        match mode {
+            TagRegistersMode::HaveTagRegisters => {
+                self.masm
+                    .branch_test64(ResultCondition::Zero, reg, Self::NUMBER_TAG_REGISTER)
+            }
+            TagRegistersMode::DoNotHaveTagRegisters => {
+                self.masm
+                    .move_imm64(TrustedImm64::new(NUMBER_TAG as i64), temp);
+                self.masm.branch_test64(ResultCondition::Zero, reg, temp)
+            }
+        }
+    }
+
+    /// `unboxDouble(GPRReg gpr, GPRReg resultGPR, FPRReg destFPR, mode)`
+    /// (AssemblyHelpers.h:626-636, JSVALUE64). A boxed double is
+    /// `doubleBits - NumberTag` (== `doubleBits + DoubleEncodeOffset`, since
+    /// `-NumberTag == 2^49 (mod 2^64)`), so recovering the raw bits is
+    /// `add64(numberTag, gpr, resultGPR)`; `move64ToDouble(resultGPR, destFPR)`
+    /// then bit-casts them into the FP register. This is the machine mirror of the
+    /// runtime `JsValue::as_double` (`encoded - DoubleEncodeOffset`, repr.rs:876).
+    /// NON-DESTRUCTIVE: `gpr` is preserved (the boxed operand stays live for the
+    /// slow path); `resultGPR` is a scratch distinct from `gpr`.
+    pub fn unbox_double(
+        &mut self,
+        gpr: RegisterID,
+        result_gpr: RegisterID,
+        dest_fpr: FPRegisterID,
+        mode: TagRegistersMode,
+    ) {
+        match mode {
+            TagRegistersMode::HaveTagRegisters => {
+                self.masm.add64(Self::NUMBER_TAG_REGISTER, gpr, result_gpr);
+            }
+            TagRegistersMode::DoNotHaveTagRegisters => {
+                // NumberTag is not an add/sub immediate; materialize it into the
+                // data temp then register-add (mirrors the int32 helpers' fallback).
+                self.masm.move_imm64(
+                    TrustedImm64::new(NUMBER_TAG as i64),
+                    MacroAssemblerArm64::DATA_TEMP_REGISTER,
+                );
+                self.masm
+                    .add64(MacroAssemblerArm64::DATA_TEMP_REGISTER, gpr, result_gpr);
+            }
+        }
+        self.masm.move_64_to_double(result_gpr, dest_fpr);
+    }
+
+    /// `boxDouble(FPRReg fpr, GPRReg gpr, mode)` (AssemblyHelpers.h:649-657,
+    /// JSVALUE64). `moveDoubleTo64(fpr, gpr)` bit-casts the FP value to its raw
+    /// 64-bit pattern, then `sub64(numberTag, gpr)` biases it into the JSValue
+    /// double window (`bits - NumberTag == bits + DoubleEncodeOffset`). This is
+    /// the exact inverse of [`Self::unbox_double`] and the machine mirror of the
+    /// runtime `JsValue::from_double` EncodeAsDouble encoding
+    /// (`bits + DoubleEncodeOffset`, repr.rs:618-621).
+    ///
+    /// DIVERGENCE (faithful to JSC, noted because it is observable): JSC's
+    /// `boxDouble` does NOT purify NaN — a NaN result is encoded with its raw
+    /// significand, whereas the runtime `JsValue::from_double` purifies to PNAN.
+    /// Both encode the SAME JS number (NaN); they differ only in the NaN bit
+    /// pattern, exactly as JSC's own JIT and slow path differ. (-0.0 and finite
+    /// integral results likewise box as doubles here without int32
+    /// canonicalization — again matching JSC's `boxDouble`, not the runtime
+    /// `from_double` strict-int fold.)
+    pub fn box_double(&mut self, fpr: FPRegisterID, gpr: RegisterID, mode: TagRegistersMode) {
+        self.masm.move_double_to_64(fpr, gpr);
+        match mode {
+            TagRegistersMode::HaveTagRegisters => {
+                self.masm.sub64(gpr, Self::NUMBER_TAG_REGISTER, gpr);
+            }
+            TagRegistersMode::DoNotHaveTagRegisters => {
+                self.masm.move_imm64(
+                    TrustedImm64::new(NUMBER_TAG as i64),
+                    MacroAssemblerArm64::DATA_TEMP_REGISTER,
+                );
+                self.masm
+                    .sub64(gpr, MacroAssemblerArm64::DATA_TEMP_REGISTER, gpr);
+            }
+        }
+    }
+
     /// `branchIfNotBoolean(GPRReg reg, GPRReg tempGPR)` (AssemblyHelpers.h:828-836,
     /// JSVALUE64). C++:
     /// ```cpp
@@ -365,5 +460,60 @@ mod tests {
         h.unbox_int32(RegisterID::X0, RegisterID::X2);
         // orr x0, x27, x1 ; mov w2, w0.
         assert_eq!(words(h.code()), vec![0xaa01_0360, 0x2a00_03e2]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Double box/unbox + branchIfNotNumber (JSVALUE64 double fast-path helpers).
+    // ------------------------------------------------------------------------
+
+    /// The box/unbox double encoding identity: subtracting NumberTag is the same
+    /// 64-bit bias as adding `DoubleEncodeOffset` (2^49). This is WHY `box_double`
+    /// (`sub numberTag`) and the runtime `from_double` (`+ DoubleEncodeOffset`)
+    /// agree, and `unbox_double` (`add numberTag`) inverts both. If this drifts,
+    /// every boxed double silently corrupts.
+    #[test]
+    fn double_box_bias_equals_double_encode_offset() {
+        assert_eq!(NUMBER_TAG.wrapping_neg(), 1u64 << 49);
+        assert_eq!(NUMBER_TAG.wrapping_add(1u64 << 49), 0);
+    }
+
+    #[test]
+    fn branch_if_not_number_have_tag_registers() {
+        // branchTest64(Zero, x0, x27) -> tst x0, x27 (ands xzr) : 0xea1b001f ;
+        // b.eq #0 : 0x54000000 ; nop.
+        let mut h = AssemblyHelpers::new();
+        let j = h.branch_if_not_number(
+            RegisterID::X0,
+            RegisterID::X3,
+            TagRegistersMode::HaveTagRegisters,
+        );
+        assert_eq!(words(h.code()), vec![0xea1b_001f, 0x5400_0000, 0xd503_201f]);
+        assert_eq!(j.condition(), Condition::Eq);
+    }
+
+    #[test]
+    fn box_double_have_tag_registers() {
+        // boxDouble(q0 -> x0): fmov x0, d0 : 0x9e660000 ; sub x0, x0, x27 : 0xcb1b0000.
+        let mut h = AssemblyHelpers::new();
+        h.box_double(
+            FPRegisterID::Q0,
+            RegisterID::X0,
+            TagRegistersMode::HaveTagRegisters,
+        );
+        assert_eq!(words(h.code()), vec![0x9e66_0000, 0xcb1b_0000]);
+    }
+
+    #[test]
+    fn unbox_double_have_tag_registers() {
+        // unboxDouble(x0, scratch=x1, dest=q2): add x1, x27, x0 : 0x8b000361 ;
+        // fmov d2, x1 : 0x9e670022. `x0` (the boxed operand) is untouched.
+        let mut h = AssemblyHelpers::new();
+        h.unbox_double(
+            RegisterID::X0,
+            RegisterID::X1,
+            FPRegisterID::Q2,
+            TagRegistersMode::HaveTagRegisters,
+        );
+        assert_eq!(words(h.code()), vec![0x8b00_0361, 0x9e67_0022]);
     }
 }

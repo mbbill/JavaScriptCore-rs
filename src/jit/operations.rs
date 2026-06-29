@@ -118,6 +118,16 @@ pub extern "C" fn operation_value_rshift(vm: *mut Vm, op1: u64, op2: u64) -> u64
     dispatch_value_binary_operation(vm, op1, op2, Vm::operation_value_rshift)
 }
 
+/// `operationValueDiv(JSGlobalObject*, EncodedJSValue, EncodedJSValue)`
+/// (JITOperations.cpp). The baseline op_div slow path: a non-number operand (the
+/// double fast path's `branchIfNotNumber` guard) far-calls this shim, which runs
+/// the faithful `jsNumber(left / right)` evaluator (`arithmetic_binary_result`
+/// with `DivNumber`) and returns the boxed result, or stamps `m_exception` and
+/// returns `JSValue::empty()` bits on throw. Shares [`dispatch_value_binary_operation`].
+pub extern "C" fn operation_value_div(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_binary_operation(vm, op1, op2, Vm::operation_value_div)
+}
+
 /// The SHARED body of every int32 arith FAMILY slow-path shim (op_add's original
 /// `operation_value_add` body, now factored so the family cannot drift). `eval`
 /// selects the faithful evaluator (`Vm::operation_value_{add,sub,mul,bitand,...}`,

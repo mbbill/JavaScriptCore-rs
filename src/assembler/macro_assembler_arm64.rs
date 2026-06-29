@@ -434,6 +434,57 @@ impl MacroAssemblerArm64 {
         }
     }
 
+    // ========================================================================
+    // Scalar double FP arithmetic + GPR<->FP transfer (the baseline double
+    // fast-path primitives). Faithful ports of the MacroAssemblerARM64 `fadd`/
+    // `fsub`/`fmul`/`fdiv` / `scvtf` / `fmov` wrappers; each lowers to one
+    // [`Arm64Encoder`] FP instruction word.
+    // ========================================================================
+
+    /// `addDouble(op1, op2, dest)` (MacroAssemblerARM64.h:3008-3011):
+    /// `fadd<64>(dest, op1, op2)` -> `dest = op1 + op2`.
+    pub fn add_double(&mut self, op1: FPRegisterID, op2: FPRegisterID, dest: FPRegisterID) {
+        self.asm().emit_fadd_double(dest, op1, op2);
+    }
+
+    /// `subDouble(op1, op2, dest)` (MacroAssemblerARM64.h:3128-3131):
+    /// `fsub<64>(dest, op1, op2)` -> `dest = op1 - op2`. Operand order is
+    /// load-bearing (`fsub` is non-commutative).
+    pub fn sub_double(&mut self, op1: FPRegisterID, op2: FPRegisterID, dest: FPRegisterID) {
+        self.asm().emit_fsub_double(dest, op1, op2);
+    }
+
+    /// `mulDouble(op1, op2, dest)` (MacroAssemblerARM64.h:3074-3077):
+    /// `fmul<64>(dest, op1, op2)` -> `dest = op1 * op2`.
+    pub fn mul_double(&mut self, op1: FPRegisterID, op2: FPRegisterID, dest: FPRegisterID) {
+        self.asm().emit_fmul_double(dest, op1, op2);
+    }
+
+    /// `divDouble(op1, op2, dest)` (MacroAssemblerARM64.h:3041-3044):
+    /// `fdiv<64>(dest, op1, op2)` -> `dest = op1 / op2`. Non-commutative; order
+    /// load-bearing.
+    pub fn div_double(&mut self, op1: FPRegisterID, op2: FPRegisterID, dest: FPRegisterID) {
+        self.asm().emit_fdiv_double(dest, op1, op2);
+    }
+
+    /// `convertInt32ToDouble(src, dest)` (MacroAssemblerARM64.h:3543-3546):
+    /// `scvtf<64, 32>(dest, src)` — signed 32-bit GPR -> double.
+    pub fn convert_int32_to_double(&mut self, src: RegisterID, dest: FPRegisterID) {
+        self.asm().emit_scvtf_int32_to_double(dest, src);
+    }
+
+    /// `move64ToDouble(src, dest)` (MacroAssemblerARM64.h:3567-3570):
+    /// `fmov<64>(dest, src)` — bit-cast a 64-bit GPR into a double FP register.
+    pub fn move_64_to_double(&mut self, src: RegisterID, dest: FPRegisterID) {
+        self.asm().emit_fmov_gpr_to_double(dest, src);
+    }
+
+    /// `moveDoubleTo64(src, dest)` (MacroAssemblerARM64.h:3557-3560):
+    /// `fmov<64>(dest, src)` — bit-cast a double FP register into a 64-bit GPR.
+    pub fn move_double_to_64(&mut self, src: FPRegisterID, dest: RegisterID) {
+        self.asm().emit_fmov_double_to_gpr(dest, src);
+    }
+
     /// `zeroExtend32ToWord(src, dest)` (MacroAssemblerARM64.h:4340-4346): clear
     /// the upper 32 bits by re-materializing the low word — `movz<32> #0` for the
     /// `zr` source, else `mov<32>(dest, src)`. A non-flag-setting move, so it is
@@ -1376,6 +1427,48 @@ mod tests {
         assert_eq!(
             emit(|m| m.swap(RegisterID::X0, RegisterID::X1)),
             vec![0xaa00_03f0, 0xaa01_03e0, 0xaa10_03e1]
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Scalar double FP arithmetic + GPR<->FP transfer composites.
+    // ------------------------------------------------------------------------
+    #[test]
+    fn double_fp_arith_and_transfer() {
+        // addDouble(q1, q2, q0) -> fadd d0, d1, d2 : 0x1e622820.
+        assert_eq!(
+            emit(|m| m.add_double(FPRegisterID::Q1, FPRegisterID::Q2, FPRegisterID::Q0)),
+            vec![0x1e62_2820]
+        );
+        // subDouble(q1, q2, q0) -> fsub d0, d1, d2 : 0x1e623820 (d0 = d1 - d2).
+        assert_eq!(
+            emit(|m| m.sub_double(FPRegisterID::Q1, FPRegisterID::Q2, FPRegisterID::Q0)),
+            vec![0x1e62_3820]
+        );
+        // mulDouble(q1, q2, q0) -> fmul d0, d1, d2 : 0x1e620820.
+        assert_eq!(
+            emit(|m| m.mul_double(FPRegisterID::Q1, FPRegisterID::Q2, FPRegisterID::Q0)),
+            vec![0x1e62_0820]
+        );
+        // divDouble(q1, q2, q0) -> fdiv d0, d1, d2 : 0x1e621820 (d0 = d1 / d2).
+        assert_eq!(
+            emit(|m| m.div_double(FPRegisterID::Q1, FPRegisterID::Q2, FPRegisterID::Q0)),
+            vec![0x1e62_1820]
+        );
+        // convertInt32ToDouble(x1, q0) -> scvtf d0, w1 : 0x1e620020.
+        assert_eq!(
+            emit(|m| m.convert_int32_to_double(RegisterID::X1, FPRegisterID::Q0)),
+            vec![0x1e62_0020]
+        );
+        // move64ToDouble(x1, q0) -> fmov d0, x1 : 0x9e670020.
+        assert_eq!(
+            emit(|m| m.move_64_to_double(RegisterID::X1, FPRegisterID::Q0)),
+            vec![0x9e67_0020]
+        );
+        // moveDoubleTo64(q1, x0) -> fmov x0, d1 : 0x9e660020.
+        assert_eq!(
+            emit(|m| m.move_double_to_64(FPRegisterID::Q1, RegisterID::X0)),
+            vec![0x9e66_0020]
         );
     }
 
