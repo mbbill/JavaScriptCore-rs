@@ -54,6 +54,35 @@ pub(crate) struct CoreObjectStore {
     // `RuntimeValue` GC edges — a later collector trace MUST visit this backing
     // (gc-r4 GAP A); no trace wiring lands in this unit.
     pub(crate) bound_args_backings: Vec<Vec<RuntimeValue>>,
+    // gc-r4 R4 POD-ification (JSFunction-captures unit): the store-owned slab of
+    // closure captured-variable value arrays. A JSFunction's captured variables are the
+    // closure's free-variable values (faithfully a JSLexicalEnvironment reached via the
+    // scope chain, JSLexicalEnvironment.h:56-80 / JSCallee::m_scope). gc-r4 SD-2 accepts
+    // the aux-value-slab POD EXPEDIENT now (the faithful scope-chain relocation is a
+    // DEFERRED correctness batch): the per-cell `captures: Vec<RuntimeValue>` is relocated
+    // here so the cell carries only a POD `AuxiliaryHandle` (an index into this Vec)
+    // instead of a Drop-bearing Vec — exactly mirroring the `bound_args_backings` slab.
+    // Allocated for EVERY function at `allocate_function_with_construct_ability` (even an
+    // empty capture set, like `allocate_bound_args`), so a Function cell's handle is always
+    // real. The arrays are immutable after creation (closure-variable WRITES mutate the
+    // separate closure CELL the value points at, not this Vec), so this is write-once like
+    // bound_args. Each array holds `RuntimeValue` GC edges — a later collector trace MUST
+    // visit this backing (gc-r4 GAP A); no trace wiring lands in this unit.
+    pub(crate) captures_backings: Vec<Vec<RuntimeValue>>,
+    // gc-r4 R4 POD-ification (JSFunction-captures unit): the store-owned slab of a class
+    // constructor's instance-field-initializer records (the `[[Fields]]` a `class { x = e }`
+    // installs on each instance). gc-r4 SD-2 accepts the aux-slab POD expedient now (the
+    // faithful class-field init is a DEFERRED correctness batch). The per-cell
+    // `instance_fields: Vec<CoreInstanceField>` is relocated here; crucially `CoreInstanceField`
+    // carries a `CorePropertyKey` whose `String` variant is Drop-bearing, so the slab stores
+    // the POD `CoreInstanceFieldRecord` instead — the key is interned to a `Copy` `AtomId`
+    // uid via `intern_property_uid` (the SAME `UniquedStringImpl*`-identity uniquing C++ keys
+    // PropertyTable on) and recovered through `property_keys_by_uid` on read, so NO Rust
+    // `String` lives on the cell path. Lazily allocated on the first `add_instance_field`
+    // (most cells never call it) like `promise_reaction_lists`; the cell holds a POD
+    // `AuxiliaryHandle` (`INVALID` until first field). The records hold `RuntimeValue`
+    // initializer GC edges — a later collector trace MUST visit this backing (gc-r4 GAP A).
+    pub(crate) instance_field_lists: Vec<Vec<CoreInstanceFieldRecord>>,
     // gc-r4 R4 POD-ification (Promise unit): the store-owned slab of pending
     // promise reaction-record lists, the home of each pending promise's
     // out-of-line reaction records (C++ JSPromise `[[PromiseFulfillReactions]]`/
@@ -310,6 +339,14 @@ impl Clone for CoreObjectStore {
             // argument as `butterflies` above (the cell `Clone` copies the handle shallow;
             // cloning the slab here is what makes that sound).
             bound_args_backings: self.bound_args_backings.clone(),
+            // gc-r4 JSFunction-captures unit: deep-clone the captures + instance-field slabs
+            // in lockstep with `objects`, exactly like `bound_args_backings`, so every
+            // `AuxiliaryHandle` a cloned cell copied shallow indexes the CLONE's own slab
+            // (never the source's) AND the cloned store owns INDEPENDENT slabs — the same
+            // clone-independence invariant the cell's shallow handle-copy in
+            // `CoreObjectCell::clone` relies on.
+            captures_backings: self.captures_backings.clone(),
+            instance_field_lists: self.instance_field_lists.clone(),
             // gc-r4 R4 POD-ification (Promise unit): deep-clone the reaction-list slab
             // by index in lockstep with `objects`, exactly like `butterflies`, so every
             // `PromiseReactionsHandle` a cloned cell copied shallow indexes the CLONE's
@@ -479,8 +516,25 @@ pub(crate) struct CoreObjectCell {
     pub(crate) super_base: Option<RuntimeValue>,
     pub(crate) super_constructor: Option<RuntimeValue>,
     pub(crate) is_default_derived_constructor: bool,
-    pub(crate) instance_fields: Vec<CoreInstanceField>,
-    pub(crate) captures: Vec<RuntimeValue>,
+    // C++ JSC: a class constructor's instance-field initializers (`[[Fields]]`, the
+    // `class { x = e }` per-instance fields installed by ClassExprNode / `op_..._field`).
+    // gc-r4 R4 POD-ification (SD-2 expedient): the `Vec<CoreInstanceField>` — whose
+    // `CorePropertyKey::String` key made it Drop-bearing — is relocated to the store-owned
+    // `instance_field_lists` slab as POD `CoreInstanceFieldRecord`s (the key interned to a
+    // `Copy` `AtomId`). This field is now a POD `Copy` `AuxiliaryHandle` index, lazily
+    // assigned by `add_instance_field` (`INVALID` until the first field). The faithful
+    // class-field init is a DEFERRED correctness batch; only the storage moved.
+    pub(crate) instance_fields: AuxiliaryHandle,
+    // C++ JSC: a closure's captured free-variable values (faithfully the variables of a
+    // JSLexicalEnvironment reached through the scope chain, JSLexicalEnvironment.h:56-80 /
+    // JSCallee::m_scope). gc-r4 R4 POD-ification (SD-2 expedient): the
+    // `Vec<RuntimeValue>` is relocated to the store-owned `captures_backings` slab; this
+    // field is now a POD `Copy` `AuxiliaryHandle` index into it (so the cell sheds a Drop
+    // field), exactly like the `bound_args` handle. Every Function cell gets a real handle
+    // at `allocate_function_with_construct_ability` (even an empty set). The faithful
+    // scope-chain relocation is a DEFERRED correctness batch; only the storage moved. The
+    // backing holds `RuntimeValue` GC edges — a later collector trace visits the slab.
+    pub(crate) captures: AuxiliaryHandle,
     pub(crate) binding_value: RuntimeValue,
     // C++ JSC has NO per-object property map: a JSObject's named property VALUE lives in
     // inline storage or the Butterfly out-of-line region, and the
@@ -591,6 +645,21 @@ pub(crate) struct CoreObjectCell {
     pub(crate) setter_value: Option<RuntimeValue>,
 }
 
+// gc-r4 R4 POD-ification COMPLETE (final per-kind unit): every variable-size /
+// Drop-bearing field — the property HashMap (B-iv), bound_args, promise_reactions,
+// regexp_source, regexp_flags_text, array_buffer_data, map_entries, set_values,
+// captures, instance_fields — has been relocated off the cell into store-owned
+// auxiliary slabs reached by POD `Copy` handles (or deleted/recomputed). So
+// CoreObjectCell is now POD. This compile-time assert is the ATOMIC sweepability
+// proof: a MarkedBlock sweep for DestructionMode::DoesNotNeedDestruction
+// (runtime/JSCell.h:105) runs NO destructors, so the cell MUST have none.
+// Reintroducing ANY Drop-bearing field (String/Vec/Box/HashMap/...) fails the build
+// HERE, before R3/R4 (arena cell identity) and the collector sweep rely on it.
+const _: () = assert!(
+    !std::mem::needs_drop::<CoreObjectCell>(),
+    "CoreObjectCell must be POD (no Drop) for the R4 MarkedBlock sweep — a Drop field was reintroduced"
+);
+
 // C++ JSC JSCell::structureIDOffset()==0 (runtime/JSCell.h:293): the StructureID
 // (a 4-byte id) is the first header word so a guard can `load32 [base+0]; cmp32`.
 // The batch-3 assembler takes structure_id_offset as a parameter; this const is the
@@ -657,8 +726,11 @@ impl Default for CoreObjectCell {
             super_base: None,
             super_constructor: None,
             is_default_derived_constructor: false,
-            instance_fields: Vec::new(),
-            captures: Vec::new(),
+            // gc-r4 R4 POD-ification (captures unit): INVALID sentinels — a default cell
+            // has no instance-field slab slot until `add_instance_field` lazily allocates
+            // one, and no captures slab slot until `allocate_function_*` assigns one.
+            instance_fields: AuxiliaryHandle::INVALID,
+            captures: AuxiliaryHandle::INVALID,
             binding_value: RuntimeValue::default(),
             // gc-r4 Map/Set unit: the INVALID sentinel — a non-collection cell never
             // indexes the ordered-storage slabs. The owning collection's `allocate_*`
@@ -722,8 +794,14 @@ impl Clone for CoreObjectCell {
             super_base: self.super_base,
             super_constructor: self.super_constructor,
             is_default_derived_constructor: self.is_default_derived_constructor,
-            instance_fields: self.instance_fields.clone(),
-            captures: self.captures.clone(),
+            // gc-r4 R4 POD-ification (captures unit): copy the instance-field + captures
+            // HANDLES shallow (plain Copy slab indices). Sound for the SAME reason as
+            // `butterfly`/`bound_args`: cell Clone is reached ONLY through
+            // `CoreObjectStore::clone`, which deep-clones `instance_field_lists` and
+            // `captures_backings` in lockstep, so the copied handles index the clone's own
+            // slabs, never the source's.
+            instance_fields: self.instance_fields,
+            captures: self.captures,
             binding_value: self.binding_value,
             // gc-r4 Map/Set unit: copy the ordered-storage HANDLES shallow (POD `Copy`
             // slab indexes). Sound for the SAME reason as `butterfly`: the cell Clone is
@@ -1213,6 +1291,22 @@ impl CoreNativeFunction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CoreInstanceField {
     pub(crate) key: CorePropertyKey,
+    pub(crate) initializer: Option<RuntimeValue>,
+}
+
+/// POD storage form of a `CoreInstanceField` for the store-owned `instance_field_lists`
+/// slab (gc-r4 R4 POD-ification, JSFunction-captures unit / SD-2).
+///
+/// C++ JSC keys a class field by its `UniquedStringImpl*`/Symbol identity. `CoreInstanceField`
+/// keeps a `CorePropertyKey`, whose `String` variant is `Drop`-bearing — storing it on the
+/// cell path (even via the slab) would keep the cell from being POD in the faithful sense.
+/// This record stores the key as a `Copy` `AtomId` uid instead (interned via
+/// `intern_property_uid`, recovered via `property_keys_by_uid`), so the whole record is POD
+/// (`Copy`): `AtomId` is `Copy` and `Option<RuntimeValue>` is `Copy`. The initializer is a
+/// `RuntimeValue` GC edge a later collector trace MUST visit (gc-r4 GAP A).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CoreInstanceFieldRecord {
+    pub(crate) key_uid: AtomId,
     pub(crate) initializer: Option<RuntimeValue>,
 }
 
@@ -2069,6 +2163,28 @@ impl CoreObjectStore {
     pub(crate) fn bound_args_slice(&self, handle: AuxiliaryHandle) -> &[RuntimeValue] {
         &self.bound_args_backings[handle.0]
     }
+
+    /// Push a closure's captured-variable value array into the store-owned
+    /// `captures_backings` slab and return its POD handle.
+    ///
+    /// C++ JSC: a closure's captured variables live in a JSLexicalEnvironment reached
+    /// through the scope chain (JSLexicalEnvironment.h:56-80, JSCallee::m_scope). gc-r4
+    /// SD-2 accepts the aux-value-slab POD EXPEDIENT (the faithful scope-chain relocation
+    /// is deferred); this mirrors `allocate_bound_args`. Called for EVERY function at
+    /// creation (even an empty capture set) so a Function cell's handle is always real.
+    pub(crate) fn allocate_captures(&mut self, captures: Vec<RuntimeValue>) -> AuxiliaryHandle {
+        let index = self.captures_backings.len();
+        self.captures_backings.push(captures);
+        AuxiliaryHandle(index)
+    }
+
+    /// Borrow the captured-variable value array for `handle` (the closure's captures,
+    /// read by `function_capture` / `function_call_target`). Every Function cell got a
+    /// real handle at `allocate_function_with_construct_ability`, so the `INVALID`
+    /// sentinel never reaches here, exactly as `bound_args_slice` assumes.
+    pub(crate) fn captures_slice(&self, handle: AuxiliaryHandle) -> &[RuntimeValue] {
+        &self.captures_backings[handle.0]
+    }
 }
 
 // gc-r4 R4 POD-ification (ArrayBuffer unit): the byte-backing aux API, the store-owned
@@ -2327,6 +2443,12 @@ impl CoreObjectStore {
         construct_ability: ConstructAbility,
     ) -> RuntimeValue {
         let function_prototype = self.ensure_function_prototype();
+        // gc-r4 R4 POD-ification (captures unit): relocate the captured-variable values out
+        // of the cell into the store-owned `captures_backings` slab; the cell carries only
+        // the POD `AuxiliaryHandle`. Done for every function (even an empty set), mirroring
+        // `allocate_bound_function`'s `allocate_bound_args`, so the read sites always see a
+        // real handle.
+        let captures = self.allocate_captures(captures);
         let function = self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::Function,
             prototype: Some(function_prototype),
@@ -6473,16 +6595,53 @@ impl CoreObjectStore {
             }
             Some(initializer)
         };
-        let Some(constructor_cell) = self.find_mut(constructor) else {
+        // Validate the constructor is a function (immutable find) BEFORE interning or
+        // mutating, so the error path has no side effects — as in the original.
+        let Some(constructor_cell) = self.find(constructor) else {
             return Err(ExecutionError::ExpectedFunction);
         };
         if constructor_cell.kind != CoreObjectKind::Function {
             return Err(ExecutionError::ExpectedFunction);
         }
-        constructor_cell
-            .instance_fields
-            .push(CoreInstanceField { key, initializer });
+        let handle = constructor_cell.instance_fields;
+        // gc-r4 R4 POD-ification (captures unit, SD-2): store the key as a POD `AtomId`
+        // uid (interned via the SAME `intern_property_uid` the Structure graph uses) so the
+        // relocated record is POD — no Drop-bearing `String` on the cell path. The reverse
+        // map (`property_keys_by_uid`) reconstructs the `CorePropertyKey` on read.
+        let key_uid = self.intern_property_uid(&key);
+        let record = CoreInstanceFieldRecord {
+            key_uid,
+            initializer,
+        };
+        // Warm path: this constructor already has an instance-field slab slot — push.
+        if handle != AuxiliaryHandle::INVALID {
+            self.instance_field_lists[handle.0].push(record);
+            return Ok(());
+        }
+        // Cold path (first field on this constructor): lazily allocate its slab slot
+        // (mirroring `push_promise_reaction`), record the POD handle on the cell, then
+        // push. The re-`find_mut` is needed because `allocate_instance_fields` borrows the
+        // whole store. The slab preserves insertion order, so class-field init order (read
+        // back by `instance_fields`) is unchanged.
+        let new_handle = self.allocate_instance_fields();
+        let Some(constructor_cell) = self.find_mut(constructor) else {
+            return Err(ExecutionError::ExpectedFunction);
+        };
+        constructor_cell.instance_fields = new_handle;
+        self.instance_field_lists[new_handle.0].push(record);
         Ok(())
+    }
+
+    /// Allocate a fresh empty instance-field-record slab slot and return its POD handle.
+    ///
+    /// gc-r4 R4 POD-ification (captures unit): the pre-R4 store-owned-slab analog of
+    /// allocating a class constructor's out-of-line `[[Fields]]` backing. Lazily called by
+    /// `add_instance_field` on a constructor's FIRST field (most cells never have one), so
+    /// the slab stays small — mirroring `allocate_promise_reactions`.
+    fn allocate_instance_fields(&mut self) -> AuxiliaryHandle {
+        let index = self.instance_field_lists.len();
+        self.instance_field_lists.push(Vec::new());
+        AuxiliaryHandle(index)
     }
 
     pub(crate) fn add_instance_field_with_write_barrier(
@@ -6508,7 +6667,30 @@ impl CoreObjectStore {
         if constructor_cell.kind != CoreObjectKind::Function {
             return Err(ExecutionError::ExpectedFunction);
         }
-        Ok(constructor_cell.instance_fields.clone())
+        let handle = constructor_cell.instance_fields;
+        // gc-r4 R4 POD-ification (captures unit): no slab slot == no instance fields.
+        if handle == AuxiliaryHandle::INVALID {
+            return Ok(Vec::new());
+        }
+        // Reconstruct each `CoreInstanceField` from its POD slab record: map the interned
+        // key uid back to its `CorePropertyKey` via `property_keys_by_uid` (the same reverse
+        // map `structure_property_keys` uses). The slab preserves insertion order, so the
+        // returned class-field init order is identical to the old per-cell Vec.
+        let fields = self.instance_field_lists[handle.0]
+            .iter()
+            .map(|record| CoreInstanceField {
+                // Invariant: every uid stored here was just interned by `add_instance_field`,
+                // which inserts into `property_keys_by_uid` in lockstep, so the reverse
+                // lookup always hits (a miss would mean a corrupted intern table).
+                key: self
+                    .property_keys_by_uid
+                    .get(&record.key_uid)
+                    .cloned()
+                    .expect("instance-field key uid must be interned by add_instance_field"),
+                initializer: record.initializer,
+            })
+            .collect();
+        Ok(fields)
     }
 
     pub(crate) fn array_buffer_byte_length(
@@ -7034,7 +7216,11 @@ impl CoreObjectStore {
                     .ok_or(ExecutionError::ExpectedFunction)?;
                 Ok(CoreFunctionCallTarget::Bytecode {
                     function_index,
-                    captures: object.captures.clone(),
+                    // gc-r4 R4 POD-ification (captures unit): the captured values live in
+                    // the store-owned `captures_backings` slab now; read them through the
+                    // cell's POD handle (always real for a Function cell) and snapshot the
+                    // dispatch-local Vec exactly as before.
+                    captures: self.captures_slice(object.captures).to_vec(),
                 })
             }
             CoreObjectKind::NativeFunction => object
@@ -7139,8 +7325,10 @@ impl CoreObjectStore {
         if object.kind != CoreObjectKind::Function {
             return Err(ExecutionError::ExpectedFunction);
         }
-        object
-            .captures
+        // gc-r4 R4 POD-ification (captures unit): the captured values live in the
+        // store-owned `captures_backings` slab now; index it through the cell's POD handle
+        // (always real for a Function cell). Same out-of-range -> MissingCapture as before.
+        self.captures_slice(object.captures)
             .get(usize::try_from(index).unwrap_or(usize::MAX))
             .copied()
             .ok_or(ExecutionError::MissingCapture(index))

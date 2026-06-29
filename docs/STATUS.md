@@ -73,18 +73,19 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   in-place data↔accessor conversion now offset-stable (corrects a pre-flip offset-vanish defect). Gated by a
   randomized HashMap-oracle equivalence test (per-op get/enum/accessor diff). needs_drop POD assert still
   waits for the OTHER per-kind units.
-- [wip] per-kind POD-ification (retire the 9 remaining Drop fields → POD cell, cheapest-first per gc-r4.md;
-  integrate serially): **BoundFunction + Promise + RegExp + ArrayBuffer + Map/Set DONE (5/6)** (RegExp also
-  deleted regexp_flags_text → recompute canonical from bits, fixed a toString flag-order divergence;
-  ArrayBuffer bytes carry NO GC edge so need no trace; Map/Set = POD-expedient Vec slabs, faithful
-  JSOrderedHashTable deferred); pending captures (6/6, then the needs_drop POD-proof flips). Each relocates
-  its Drop field to a store-owned aux slab via a POD Copy handle (lazy alloc where
-  faithful); needs_drop::<CoreObjectCell>() assert flips ON in the final (captures) unit.
-- [missing] POD object-model rewrite (retire the fat CoreObjectCell) → R3 shadow oracle → R4 flip
-  (gate = technical verification: shadow cross-check + miri + adversarial verify) → running collector.
-  Audited (gc-r4.md): R4 mostly mechanical (value carries the ptr; copy-out pattern exists), sharp
-  edge = ~3 two-cell self-aliasing families. REAL gap = the collector: CoreObjectCell has NO trace
-  (GAP A) + NO sweep (GAP B); both gated on POD-ness (Batch 1). Author trace+sweep when Butterfly-values lands.
+- [done] per-kind POD-ification COMPLETE (all 6 units, cheapest-first, serial): bound_args /
+  promise_reactions / regexp_source / array_buffer_data / map_entries / set_values / captures /
+  instance_fields all relocated to store-owned aux slabs via POD Copy handles, regexp_flags_text deleted
+  (recompute from bits). **CoreObjectCell is now POD — `const _ = assert!(!needs_drop::<CoreObjectCell>())`
+  COMPILES (atomic sweepability proof).** Documented deferred-faithful deviations: Map/Set JSOrderedHashTable
+  (O(1)), captures JSLexicalEnvironment; instance_fields key interned to a POD AtomId. Each aux slab still
+  holds GC edges (except ArrayBuffer raw bytes) → the collector trace must visit them.
+- [next-GC] now POD-UNBLOCKED: R3 shadow oracle (twin POD cell in MarkedSpace, byte-equal cross-check at
+  find/find_mut + suite-end population check, reversible) → R4 flip (raw arena addr = sole identity; ~56
+  find_mut → with_cell_mut; gate = shadow-green suite-wide + miri on the ~3 self-aliasing families +
+  adversarial + 15 benches) + wire the collector trace (GAP A: inline RuntimeValue edges + butterfly + the
+  value aux slabs) + sweep (GAP B: MarkedBlock free-list rebuild, legal now that needs_drop==false). This is
+  what permanently fixes the leak (SD-4: each aux slab needs its own R4 Auxiliary-subspace trace+sweep).
 
 ## Baseline JIT / DFG / FTL (parity lives here; ~0% started)
 - [done] JIT↔runtime bridge-infra (adversarially verified): extern-C operation_value_add shim
