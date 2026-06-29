@@ -10743,6 +10743,9 @@ impl CoreOpcodeDispatchHost {
             CorePropertyPut::IgnoredGetterOnly | CorePropertyPut::IgnoredReadOnly => {
                 Ok(PropertyStoreObservationOutcome::Ignored)
             }
+            CorePropertyPut::InvalidArrayLength => {
+                Err(self.range_error_outcome_with_heap(state.heap, "Invalid array length"))
+            }
             CorePropertyPut::Setter(setter) => {
                 let completion = completion_context.map(|context| {
                     context.completion(observation_context.observation(
@@ -10818,6 +10821,9 @@ impl CoreOpcodeDispatchHost {
             CorePropertyPut::Stored
             | CorePropertyPut::IgnoredGetterOnly
             | CorePropertyPut::IgnoredReadOnly => Ok(()),
+            CorePropertyPut::InvalidArrayLength => {
+                Err(self.range_error_outcome_with_heap(state.heap, "Invalid array length"))
+            }
             CorePropertyPut::Setter(setter) => {
                 let completion = completion_context
                     .map(|context| context.completion(FunctionValuePropertyObservation::none()));
@@ -18308,6 +18314,44 @@ impl CoreOpcodeDispatchHost {
         }
     }
 
+    // C++ JSC createRangeError (runtime/ExceptionHelpers / ErrorInstance): a
+    // catchable RangeError, used by `JSArray::put`'s "Invalid array length" throw
+    // (runtime/JSArray.cpp:321). Mirrors `reference_error_outcome_with_heap`.
+    fn range_error_outcome_with_heap(&mut self, heap: &mut Heap, message: &str) -> DispatchOutcome {
+        let error_name = match self.strings.allocate_with_heap(heap, "Error") {
+            Ok(value) => value,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        let range_error_name = match self.strings.allocate_with_heap(heap, "RangeError") {
+            Ok(value) => value,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        let empty_message = match self.strings.allocate_with_heap(heap, "") {
+            Ok(value) => value,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        let message = match self.strings.allocate_with_heap(heap, message) {
+            Ok(value) => value,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        let prototype =
+            self.objects
+                .ensure_range_error_prototype(error_name, range_error_name, empty_message);
+        let error = match self
+            .objects
+            .allocate_with_prototype_with_write_barrier(heap, Some(prototype))
+        {
+            Ok(error) => error,
+            Err(error) => return DispatchOutcome::Fail(error),
+        };
+        match self
+            .define_non_enumerable_data_field_with_write_barrier(heap, error, "message", message)
+        {
+            Ok(()) => DispatchOutcome::Throw(error),
+            Err(outcome) => outcome,
+        }
+    }
+
     // C++ JSC errorDescriptionForValue (runtime/ExceptionHelpers.cpp:57): produce
     // the short value description that prefixes "is not a function" / "is not an
     // object" TypeError messages. We faithfully reproduce the common, cheap cases
@@ -19290,6 +19334,9 @@ impl CoreOpcodeDispatchHost {
             CorePropertyPut::Stored => Ok(RuntimeValue::from_bool(true)),
             CorePropertyPut::IgnoredGetterOnly | CorePropertyPut::IgnoredReadOnly => {
                 Ok(RuntimeValue::from_bool(false))
+            }
+            CorePropertyPut::InvalidArrayLength => {
+                Err(self.range_error_outcome_with_heap(state.heap, "Invalid array length"))
             }
             CorePropertyPut::Setter(setter) => {
                 let completion = self

@@ -14,8 +14,12 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 - [done] All 3 original throwers fixed (faithful, C++-verified): regexp (full Yarr engine wired,
   simple_exec deleted, checksum validates), Box2D (Number/Math constants), gbemu (`new Function`),
   pdfjs (abstract-equality ToPrimitive). call-link per-site rewire landed earley-boyer + Box2D.
-- [missing] typescript pure-interpreter value-divergence throw (`undefined is not an object` in the
-  TS compiler); differential-trace vs jsc to localize the op that returns undefined.
+- [done] typescript value-divergence FIXED (faithful, jsc-verified): Array `length` get + set.
+  `arr.length=N` was a no-op (length isn't stored) and `get_by_id "length"` (used by
+  `arr.length++/--`) returned undefined; together they broke the ResolutionDataCache
+  `.length=0` clear -> spurious overload candidates -> `params[-1].getType()` throw. Now
+  setLength resizes (+RangeError) and get_by_id sees exotic Array/TypedArray length.
+  runIteration completes zero-throw, parseErrors=192 == jsc. (Suite score still JIT-gated.)
 
 ## Faithful foundation (built; mostly unwired behind dead_code)
 - [done] value → JSVALUE64 NaN-boxing (lossless double + immediates).

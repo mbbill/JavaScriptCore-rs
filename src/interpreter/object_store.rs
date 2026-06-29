@@ -88,6 +88,7 @@ pub(crate) struct CoreObjectStore {
     pub(crate) error_prototype: Option<RuntimeValue>,
     pub(crate) type_error_prototype: Option<RuntimeValue>,
     pub(crate) reference_error_prototype: Option<RuntimeValue>,
+    pub(crate) range_error_prototype: Option<RuntimeValue>,
     pub(crate) map_prototype: Option<RuntimeValue>,
     pub(crate) set_prototype: Option<RuntimeValue>,
     pub(crate) weak_map_prototype: Option<RuntimeValue>,
@@ -244,6 +245,7 @@ impl Clone for CoreObjectStore {
             error_prototype: self.error_prototype,
             type_error_prototype: self.type_error_prototype,
             reference_error_prototype: self.reference_error_prototype,
+            range_error_prototype: self.range_error_prototype,
             map_prototype: self.map_prototype,
             set_prototype: self.set_prototype,
             weak_map_prototype: self.weak_map_prototype,
@@ -1670,6 +1672,23 @@ pub(crate) enum CorePropertyPut {
     Setter(RuntimeValue),
     IgnoredGetterOnly,
     IgnoredReadOnly,
+    /// `array.length = v` where `ToNumber(v) != ToUint32(v)` — C++ JSC
+    /// `JSArray::put` throws a catchable `RangeError("Invalid array length")`
+    /// (runtime/JSArray.cpp:321). The interpreter maps this to that throw.
+    InvalidArrayLength,
+}
+
+/// Disposition of an `array.length = v` assignment, mirroring the C++ JSC
+/// `JSArray::put` -> `setLength` path (runtime/JSArray.cpp:307-325, 1237).
+enum ArrayLengthPut {
+    /// `v` is a valid Uint32 length; the element vector was resized.
+    Resized,
+    /// `ToNumber(v) != ToUint32(v)` — RangeError("Invalid array length").
+    Invalid,
+    /// `v` needs the full ToNumber/ToPrimitive machinery (string/object/symbol/
+    /// bigint) that lives in the interpreter, not the object store; fall through
+    /// to the generic property put.
+    NeedsGenericPut,
 }
 
 /// Result of a put on a primitive base, mirroring C++ JSC
@@ -3386,6 +3405,26 @@ impl CoreObjectStore {
         prototype
     }
 
+    // C++ JSC: RangeError.prototype, a native error subclass whose [[Prototype]] is
+    // Error.prototype (ErrorConstructor / NativeErrorPrototype). Built lazily and
+    // identically to ReferenceError.prototype above; used by the catchable
+    // `RangeError("Invalid array length")` that `JSArray::put` throws.
+    pub(crate) fn ensure_range_error_prototype(
+        &mut self,
+        error_name_value: RuntimeValue,
+        range_error_name_value: RuntimeValue,
+        message_value: RuntimeValue,
+    ) -> RuntimeValue {
+        if let Some(prototype) = self.range_error_prototype {
+            return prototype;
+        }
+        let error_prototype = self.ensure_error_prototype(error_name_value, message_value);
+        let prototype = self.allocate_with_prototype(Some(error_prototype));
+        self.range_error_prototype = Some(prototype);
+        self.install_error_prototype_fields(prototype, range_error_name_value, message_value);
+        prototype
+    }
+
     pub(crate) fn ensure_map_prototype(&mut self) -> RuntimeValue {
         if let Some(prototype) = self.map_prototype {
             return prototype;
@@ -4599,6 +4638,52 @@ impl CoreObjectStore {
         }
     }
 
+    /// C++ JSC `JSArray::put` -> `setLength` (runtime/JSArray.cpp:317-325, 1237).
+    /// `array.length = v` computes `newLength = ToUint32(v)`, throws a catchable
+    /// `RangeError("Invalid array length")` when `ToNumber(v) != newLength`, and
+    /// otherwise resizes the element vector — truncating elements at or above
+    /// `newLength`, or hole-extending with empty slots. Since the Rust array model
+    /// stores `length == elements.len()`, that resize IS the setLength.
+    fn set_array_length(&mut self, object: RuntimeValue, value: RuntimeValue) -> ArrayLengthPut {
+        // ToNumber for the value kinds the engine's `to_number_value` supports
+        // (number/boolean/null/undefined). String/object/symbol/bigint need the
+        // full ToNumber/ToPrimitive path that lives in the interpreter; defer them.
+        let number = match value.as_number() {
+            Some(NumberValue::Int32(value)) => f64::from(value),
+            Some(NumberValue::DoubleBits(bits)) => bits.to_f64(),
+            None => match value.kind() {
+                ValueKind::Boolean => {
+                    if value.as_bool() == Some(true) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                ValueKind::Null => 0.0,
+                ValueKind::Undefined => f64::NAN,
+                _ => return ArrayLengthPut::NeedsGenericPut,
+            },
+        };
+        // `ToUint32(number) == number` exactly when `number` is a non-negative
+        // integer in [0, 2^32 - 1]; every other value (NaN, negative, fractional,
+        // >= 2^32) is the `createRangeError("Invalid array length")` case.
+        const MAX_ARRAY_LENGTH: f64 = 4_294_967_295.0;
+        if !(number.is_finite()
+            && number >= 0.0
+            && number <= MAX_ARRAY_LENGTH
+            && number.fract() == 0.0)
+        {
+            return ArrayLengthPut::Invalid;
+        }
+        let new_length = number as usize;
+        if let Some(object) = self.find_mut(object) {
+            // Truncate (drop tail) or hole-extend (push empty slots), matching
+            // `JSArray::setLength` clearing/`ensureLength` behavior.
+            object.elements.resize(new_length, None);
+        }
+        ArrayLengthPut::Resized
+    }
+
     pub(crate) fn put(
         &mut self,
         heap: &mut Heap,
@@ -4606,6 +4691,26 @@ impl CoreObjectStore {
         key: &CorePropertyKey,
         value: RuntimeValue,
     ) -> Result<CorePropertyPut, ExecutionError> {
+        // C++ JSC `JSArray::put` (runtime/JSArray.cpp:307): `array.length = v` is
+        // the dedicated setLength path, NOT an ordinary named-property store. The
+        // Rust array model keeps `length == elements.len()` (see `get_own_property`
+        // / `array_length`), so without this the assignment fell through to
+        // `define_data_property` and stored a *shadowed* "length" data property
+        // that `get_own_property` then ignored — making `arr.length = N` (and the
+        // common `arr.length = 0` clear / `arr[arr.length] = x` regrow idiom) a
+        // silent no-op. This runs before the generic own/prototype property
+        // machinery so a length write is always the setLength semantics.
+        if key.is_string("length")
+            && self
+                .find(object)
+                .is_some_and(|cell| cell.kind == CoreObjectKind::Array)
+        {
+            match self.set_array_length(object, value) {
+                ArrayLengthPut::Resized => return Ok(CorePropertyPut::Stored),
+                ArrayLengthPut::Invalid => return Ok(CorePropertyPut::InvalidArrayLength),
+                ArrayLengthPut::NeedsGenericPut => {}
+            }
+        }
         let Some(receiver) = self.find(object) else {
             return Err(ExecutionError::ExpectedObject);
         };
@@ -6763,6 +6868,24 @@ impl CoreObjectStore {
                     }
                 }
             }
+            // C++ JSC: exotic OWN `length` of Array / TypedArray, held outside the
+            // property table; get_by_id-lowered reads (e.g. `arr.length++/--`) must
+            // see it instead of walking off the end of the chain to undefined.
+            if key.is_string("length")
+                && matches!(
+                    cell.kind,
+                    CoreObjectKind::Array | CoreObjectKind::Uint8Array
+                )
+            {
+                let length = if cell.kind == CoreObjectKind::Array {
+                    cell.elements.len()
+                } else {
+                    cell.view_length
+                };
+                return Ok(CorePropertyGet::Data(RuntimeValue::from_i32(
+                    length.try_into().unwrap_or(i32::MAX),
+                )));
+            }
             let Some(prototype) = cell.prototype else {
                 return Ok(CorePropertyGet::Missing);
             };
@@ -6886,6 +7009,39 @@ impl CoreObjectStore {
                         return Ok((CorePropertyGet::Data(value), record));
                     }
                 }
+            }
+            // C++ JSC: `length` is an exotic OWN value property of Array /
+            // TypedArray (JSArray::m_butterfly publicLength, JSArrayBufferView
+            // length), NOT a property-table entry. The dedicated `op_get_length`
+            // opcode special-cases it, but `obj.length++/--` (and other
+            // get_by_id-lowered reads) funnel through here; without this they walk
+            // the length-less property chain and return undefined -> ToNumber NaN.
+            // OpaqueOrUncacheable so the get_by_id IC never arms a bogus monomorphic
+            // property-offset load for it.
+            if key.is_string("length")
+                && matches!(
+                    cell.kind,
+                    CoreObjectKind::Array | CoreObjectKind::Uint8Array
+                )
+            {
+                let length = if cell.kind == CoreObjectKind::Array {
+                    cell.elements.len()
+                } else {
+                    cell.view_length
+                };
+                let value = RuntimeValue::from_i32(length.try_into().unwrap_or(i32::MAX));
+                let mut record = CorePropertyLookupRecord::from_object_lookup(
+                    site,
+                    object,
+                    key,
+                    Some(current),
+                    prototype_depth,
+                    CorePropertyLookupClassification::OpaqueOrUncacheable,
+                );
+                record.base_structure = base_structure;
+                record.returned_value = Some(value);
+                record.chain = chain.clone();
+                return Ok((CorePropertyGet::Data(value), record));
             }
             let Some(prototype) = cell.prototype else {
                 let mut record = CorePropertyLookupRecord::from_object_lookup(

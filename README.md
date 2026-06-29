@@ -40,7 +40,7 @@ need it just to finish). So: **~40% by code, but near the start by measured R.**
 | | benches | detail |
 |---|---|---|
 | ✅ pass | 12/15 | per-bench `r_i = Rust/C++`: **5e-4 … 0.06** (partial geomean ≈ 1.3e-3) |
-| ❌ fail | 3/15 | mandreel, octane-zlib (asm.js — don't finish under the interpreter); typescript (a correctness bug) |
+| ❌ fail | 3/15 | mandreel, octane-zlib (asm.js — don't finish under the interpreter); typescript (value-divergence fixed → now completes zero-throw, parseErrors==jsc; suite score JIT-gated) |
 
 Compute-bound benches run **~500–6000× slower** than C++; only parse-bound code-load reaches
 0.06. The gap concentrates exactly where the JIT dominates — **parity is JIT-gated, with data,
@@ -51,7 +51,8 @@ not by assertion.** (Re-measure with `tools/octane-parity/run_{cpp,rust}_baselin
 A running **baseline JIT** is the next milestone that moves R. It needs, in order:
 **JSStack substrate** (B1–B4 done: arena is the live register window; B5–B7 next) → **GC / R4 cell identity** → **wire per-opcode
 codegen** through the proven encoder. Then **DFG → FTL** take R to ≥ 1.0. In parallel, two
-correctness items protect the gate: the **typescript** value-divergence and **StringImpl**.
+correctness items protect the gate: **StringImpl** (and the now-fixed **typescript**
+Array-`length` value-divergence).
 
 ## For more detail
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — the plan: critical path, full % breakdown, settled decisions.
