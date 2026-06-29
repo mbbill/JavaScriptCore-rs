@@ -13,6 +13,12 @@
 
 use super::*;
 
+// gc-r4 GAP A: the live-path marking sink consumes `RuntimeValue`'s cell
+// projection (`value/repr.rs CellValue`), the SD-1 / GAP-D value type — NOT the
+// skeleton `gc::Tracer`/`GcRef<JsCell>` path (the wrong value type). `CellValue`
+// is not in the `interpreter` glob (`use super::*`), so it is imported here.
+use crate::value::CellValue;
+
 pub(crate) fn can_use_get_by_id_megamorphic_property_name(text: &str) -> bool {
     !matches!(text, "length" | "name" | "prototype" | "__proto__")
         && parse_array_index_name(text).is_none()
@@ -2382,6 +2388,198 @@ impl CoreObjectStore {
         if let Some(handle) = self.set_values_handle(set) {
             self.set_value_lists[handle.0].clear();
         }
+    }
+}
+
+// gc-r4 GAP A — the live `CoreObjectCell` trace (`visitChildren`).
+//
+// C++ source of truth: `JSObject::visitChildren(JSCell*, SlotVisitor&)`
+// (runtime/JSObject.cpp): visit the object's inline value slots + its Structure/
+// prototype, then `visitButterfly` (out-of-line property storage + contiguous
+// indexed elements); each subclass (JSBoundFunction, JSPromise, JSMap/JSSet,
+// GetterSetter, ...) appends its own out-of-line value edges. The Rust port keeps
+// those per-kind value backings in store-owned auxiliary slabs reached by POD
+// handles (gc-r4 SD-4), so the faithful trace is hosted on the STORE.
+
+/// Live-path marking sink for a `CoreObjectCell`'s strong GC edges.
+///
+/// C++ analog: `SlotVisitor`, the consumer of the edges a cell's `visitChildren`
+/// appends (`heap/SlotVisitor.h` `append`/`appendToMarkStack`). Each edge here is
+/// the cell projection of a live `RuntimeValue` (`value/repr.rs CellValue`) — the
+/// gc-r4 SD-1 / GAP-D value type. This trait deliberately does NOT reuse the
+/// skeleton `gc::Tracer`, whose `visit_cell(GcRef<JsCell>)` is over the wrong
+/// value-type path (`object/identity.rs` + `object/storage.rs JsValue`, retired in
+/// the GAP-D reconciliation).
+///
+/// It lives in the interpreter layer, not `gc`: `gc` is value-type-agnostic by
+/// design (`gc/mod.rs:3` — "no local dependencies"; its `Tracer` is over
+/// `GcRef<JsCell>` for exactly this reason) and may not name a value type. At R4
+/// the collector driver (which owns both the store and the heap) supplies an
+/// adapter that implements this trait by decoding `CellValue::pointer_payload_bits`
+/// to the arena cell address and forwarding to `gc`'s `Tracer::visit_cell`.
+//
+// gc-r4 GAP A is authored but UNWIRED: no live collection calls `trace_cell` yet
+// (the marking RUN is R4-gated). Only the unit test exercises it today, so the
+// non-test build sees these as dead — `#[allow(dead_code)]` until the R4 collector
+// driver wires them, mirroring the other unwired R4 foundation (e.g. the
+// `butterflies` slab / `clone_butterfly`).
+#[allow(dead_code)]
+pub(crate) trait CellEdgeVisitor {
+    /// Append one strong cell edge. Immediates never reach here — the trace
+    /// filters them with `RuntimeValue::as_cell` first (see `trace_value_edge`).
+    fn visit_cell_edge(&mut self, cell: CellValue);
+}
+
+/// Append one value-slot edge to the visitor, skipping non-cell immediates.
+///
+/// C++ analog: `SlotVisitor::appendUnbarriered(JSValue)` — a number/bool/
+/// undefined/null/empty value is not a heap cell and is not a GC edge, so only
+/// `value.asCell()` is appended (gc-r4 GAP A: filter with `RuntimeValue::as_cell`,
+/// the SD-1 live value type). Centralizing the filter here keeps every edge site
+/// (inline slot, butterfly, aux slab) uniform.
+#[allow(dead_code)] // gc-r4 GAP A authored-but-unwired (R4-gated; see CellEdgeVisitor).
+fn trace_value_edge(value: RuntimeValue, visitor: &mut dyn CellEdgeVisitor) {
+    if let Some(cell) = value.as_cell() {
+        visitor.visit_cell_edge(cell);
+    }
+}
+
+impl CoreObjectStore {
+    /// Visit every GC edge of `cell` (gc-r4 GAP A; the faithful analog of
+    /// `JSObject::visitChildren`). The edges are `RuntimeValue`s (SD-1); their
+    /// cell projections are appended via `visitor`. The trace is total and
+    /// read-only: it never dereferences an edge and never mutates the store.
+    ///
+    /// DESIGN POINT (gc-r4 GAP A): `JSObject::visitChildren` reaches the butterfly
+    /// and per-kind out-of-line state through the cell's OWN pointers. Pre-R4 those
+    /// live in store-owned slabs reached by POD handles, so the trace needs the
+    /// store (`&self`) to resolve `handle -> slab slot -> values`. Hosting it as a
+    /// store method `(cell, visitor)` mirrors the C++ static `(cell, visitor)`
+    /// shape, with the store standing in as the out-of-line-storage owner the raw
+    /// cell pointer becomes at R4. No new shared-ownership model: `&self` and
+    /// `&CoreObjectCell` are both shared borrows.
+    #[allow(dead_code)] // gc-r4 GAP A authored-but-unwired (R4-gated; see CellEdgeVisitor).
+    pub(crate) fn trace_cell(&self, cell: &CoreObjectCell, visitor: &mut dyn CellEdgeVisitor) {
+        // ---- inline RuntimeValue header slots (C++ JSObject inline value slots
+        // + the prototype edge, which C++ visits via Structure::m_prototype; the
+        // port stores `prototype` on the cell). `Option::None` == an absent slot
+        // (no edge). Order is immaterial to the mark set.
+        let inline_optional = [
+            cell.prototype,
+            cell.super_base,
+            cell.super_constructor,
+            cell.native_bound_promise,
+            cell.native_bound_proxy,
+            cell.primitive_value,
+            cell.view_buffer,
+            cell.proxy_target,
+            cell.proxy_handler,
+            cell.bound_target,
+            // GetterSetter::m_getter / m_setter (runtime/GetterSetter.h:132-133).
+            cell.getter_value,
+            cell.setter_value,
+        ];
+        for value in inline_optional.into_iter().flatten() {
+            trace_value_edge(value, visitor);
+        }
+        // Non-`Option` inline slots: a default cell carries the Empty sentinel
+        // here, which `as_cell` rejects, so an unset slot is naturally skipped.
+        trace_value_edge(cell.binding_value, visitor);
+        trace_value_edge(cell.promise_result, visitor);
+        trace_value_edge(cell.bound_this, visitor);
+
+        // ---- butterfly: out-of-line property storage + contiguous indexed
+        // elements (C++ JSObject::visitButterfly). A null/INVALID butterfly is
+        // skipped, exactly as C++ null-checks `m_butterfly`; `.get` also makes a
+        // stale index a no-op so the trace stays total.
+        if cell.butterfly != ButterflyHandle::INVALID {
+            if let Some(butterfly) = self.butterflies.get(cell.butterfly.0) {
+                for &value in &butterfly.props {
+                    trace_value_edge(value, visitor);
+                }
+                // `None` is a hole (no element), not an edge.
+                for value in butterfly.elements.iter().copied().flatten() {
+                    trace_value_edge(value, visitor);
+                }
+            }
+        }
+
+        // ---- per-kind out-of-line value backings (store-owned aux slabs). Each
+        // holds `RuntimeValue` GC edges relocated off the cell (gc-r4 SD-4); the
+        // trace resolves the cell's POD handle against its slab. An `INVALID`
+        // handle (a cell of another kind) carries no such slab and is skipped.
+
+        // JSBoundFunction::m_boundArgs / [[BoundArguments]] (JSBoundFunction.h:133).
+        if cell.bound_args != AuxiliaryHandle::INVALID {
+            if let Some(args) = self.bound_args_backings.get(cell.bound_args.0) {
+                for &value in args {
+                    trace_value_edge(value, visitor);
+                }
+            }
+        }
+        // Closure captured-variable values (faithfully a JSLexicalEnvironment's
+        // variables; SD-2 aux-slab expedient).
+        if cell.captures != AuxiliaryHandle::INVALID {
+            if let Some(values) = self.captures_backings.get(cell.captures.0) {
+                for &value in values {
+                    trace_value_edge(value, visitor);
+                }
+            }
+        }
+        // Class instance-field initializers ([[Fields]]); the interned `key_uid`
+        // (an `AtomId`) is not a GC edge — only each `initializer` is.
+        if cell.instance_fields != AuxiliaryHandle::INVALID {
+            if let Some(fields) = self.instance_field_lists.get(cell.instance_fields.0) {
+                for value in fields.iter().filter_map(|field| field.initializer) {
+                    trace_value_edge(value, visitor);
+                }
+            }
+        }
+        // Map/WeakMap insertion-ordered entries: visit BOTH the key and the value.
+        if cell.map_entries != AuxiliaryHandle::INVALID {
+            if let Some(entries) = self.map_entry_lists.get(cell.map_entries.0) {
+                for &(key, value) in entries {
+                    trace_value_edge(key, visitor);
+                    trace_value_edge(value, visitor);
+                }
+            }
+        }
+        // Set/WeakSet insertion-ordered values.
+        if cell.set_values != AuxiliaryHandle::INVALID {
+            if let Some(values) = self.set_value_lists.get(cell.set_values.0) {
+                for &value in values {
+                    trace_value_edge(value, visitor);
+                }
+            }
+        }
+        // Pending JSPromise reaction records (JSPromise.h:35). Each record's
+        // `result_promise`/`on_fulfilled`/`on_rejected` are GC edges (the same
+        // three the store's write-barrier path already barriers); `kind` is not.
+        if cell.promise_reactions != PromiseReactionsHandle::INVALID {
+            if let Some(reactions) = self.promise_reaction_lists.get(cell.promise_reactions.0) {
+                for reaction in reactions {
+                    trace_value_edge(reaction.result_promise, visitor);
+                    trace_value_edge(reaction.on_fulfilled, visitor);
+                    trace_value_edge(reaction.on_rejected, visitor);
+                }
+            }
+        }
+
+        // ---- DELIBERATELY NOT VISITED (not GC edges):
+        // - `regexp_source` -> `regexp_sources` slab: a pattern `String` (text),
+        //   not a cell pointer. C++ `RegExp::m_patternString` is a `StringImpl`
+        //   swept by its own subspace, never an outgoing edge from the RegExp.
+        // - `array_buffer_data` -> `array_buffer_backings` slab: raw `Vec<u8>`
+        //   bytes, not `RuntimeValue` edges (C++ `ArrayBufferContents::m_data` is
+        //   a `void*`).
+        // Also not RuntimeValue edges, so out of scope here:
+        // - `structure_id`: a `StructureIdTable` handle, not a live `RuntimeValue`
+        //   cell. C++ visits the Structure cell; the port's Structure lives in the
+        //   `structure_table` registry (not yet a heap cell), so it is not a
+        //   RuntimeValue edge — a known divergence to revisit when Structures
+        //   become real cells.
+        // - `date_value` / `view_*` scalars, `function_index`, `native_function`,
+        //   `regexp_flags`, `promise_state` and the other POD tags.
     }
 }
 
@@ -9371,5 +9569,193 @@ mod b_iv_flip_tests {
         // Bounded, deterministic exercise volume (offset recycling + convert-in-place) with
         // no allocation explosion — a fast unit test, not a fuzzer.
         assert_eq!(total_ops, SHAPES * OPS_PER_SHAPE);
+    }
+}
+
+#[cfg(test)]
+mod trace_cell_gap_a_tests {
+    //! gc-r4 GAP A — `CoreObjectStore::trace_cell` (the live `CoreObjectCell`
+    //! `visitChildren`) fidelity. These prove the trace visits EVERY `RuntimeValue`
+    //! GC edge (inline slots + the butterfly + the per-kind store-owned aux slabs)
+    //! and ONLY those: non-cell immediates, butterfly holes, and the non-edge slabs
+    //! (`regexp_sources` text, `array_buffer_backings` bytes) contribute nothing.
+    //! No collection is run (R4-gated); a RECORDING visitor stands in for the real
+    //! SlotVisitor and never dereferences an edge.
+    use super::*;
+    use core::ptr::NonNull;
+
+    /// Records the cell-payload bits of every edge the trace appends.
+    #[derive(Default)]
+    struct RecordingEdgeVisitor {
+        visited: Vec<usize>,
+    }
+
+    impl CellEdgeVisitor for RecordingEdgeVisitor {
+        fn visit_cell_edge(&mut self, cell: CellValue) {
+            self.visited.push(cell.pointer_payload_bits());
+        }
+    }
+
+    /// A recognizable cell-tagged `RuntimeValue` whose `pointer_payload_bits()`
+    /// round-trips to `addr` under both the transitional and `s4_raw_cell`
+    /// encodings.
+    fn fake_cell(addr: usize) -> RuntimeValue {
+        // SAFETY: `from_cell`/`pointer_payload_bits` only encode and round-trip the
+        // bits; the trace and the recording visitor NEVER dereference the edge, so
+        // the live/pinned-cell precondition of `GcRef::from_non_null` is vacuous.
+        let ptr = NonNull::new(addr as *mut u8).expect("non-null fake cell address");
+        RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
+    }
+
+    fn traced(store: &CoreObjectStore, cell: &CoreObjectCell) -> Vec<usize> {
+        let mut visitor = RecordingEdgeVisitor::default();
+        store.trace_cell(cell, &mut visitor);
+        let mut visited = visitor.visited;
+        visited.sort_unstable();
+        visited
+    }
+
+    fn sorted(mut v: Vec<usize>) -> Vec<usize> {
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn default_cell_has_no_edges() {
+        // INVALID handles (every aux slab) + Empty-sentinel inline slots + None
+        // optionals => zero edges. Proves no spurious edge and that INVALID-handle
+        // slabs and the Empty sentinel are all skipped.
+        let store = CoreObjectStore::default();
+        let cell = CoreObjectCell::default();
+        assert!(traced(&store, &cell).is_empty());
+    }
+
+    #[test]
+    fn object_prototype_and_butterfly_edges_visited_holes_and_immediates_skipped() {
+        let mut store = CoreObjectStore::default();
+        let butterfly = store.allocate_butterfly();
+        // Out-of-line property storage (left side): two cell values.
+        store.butterflies[butterfly.0].props = vec![fake_cell(0x1000), fake_cell(0x2000)];
+        // Indexed elements (right side): a cell, a hole (None), an immediate.
+        store.butterflies[butterfly.0].elements = vec![
+            Some(fake_cell(0x3000)),
+            None,
+            Some(RuntimeValue::from_i32(7)),
+        ];
+
+        let cell = CoreObjectCell {
+            butterfly,
+            prototype: Some(fake_cell(0x10)),
+            getter_value: Some(fake_cell(0x11)),
+            // A non-Option inline slot holding an immediate must be filtered out.
+            binding_value: RuntimeValue::from_i32(99),
+            ..CoreObjectCell::default()
+        };
+
+        // 0x3000 element (cell) visited; the hole and the immediate element are not.
+        let expected = sorted(vec![0x10, 0x11, 0x1000, 0x2000, 0x3000]);
+        assert_eq!(traced(&store, &cell), expected);
+    }
+
+    #[test]
+    fn per_kind_aux_slab_edges_visited_and_non_edge_slabs_skipped() {
+        let mut store = CoreObjectStore::default();
+
+        // Map entries: both sides are edges; a cell key with an immediate value,
+        // and an immediate key with a cell value, prove BOTH sides are filtered.
+        store.map_entry_lists.push(vec![
+            (fake_cell(0x20), fake_cell(0x21)),
+            (fake_cell(0x22), RuntimeValue::from_i32(5)),
+            (RuntimeValue::from_i32(50), fake_cell(0x34)),
+        ]);
+        let map_entries = AuxiliaryHandle(store.map_entry_lists.len() - 1);
+
+        // Set values: one cell, one immediate (skipped).
+        store
+            .set_value_lists
+            .push(vec![fake_cell(0x23), RuntimeValue::from_i32(6)]);
+        let set_values = AuxiliaryHandle(store.set_value_lists.len() - 1);
+
+        // Bound-function [[BoundArguments]]: one cell, one immediate.
+        store
+            .bound_args_backings
+            .push(vec![fake_cell(0x24), RuntimeValue::from_i32(8)]);
+        let bound_args = AuxiliaryHandle(store.bound_args_backings.len() - 1);
+
+        // Closure captures.
+        store.captures_backings.push(vec![fake_cell(0x25)]);
+        let captures = AuxiliaryHandle(store.captures_backings.len() - 1);
+
+        // Class instance fields: the interned key uid is NOT an edge; the present
+        // initializer is; a `None` initializer is skipped.
+        store.instance_field_lists.push(vec![
+            CoreInstanceFieldRecord {
+                key_uid: AtomId::from_table_slot(1),
+                initializer: Some(fake_cell(0x26)),
+            },
+            CoreInstanceFieldRecord {
+                key_uid: AtomId::from_table_slot(2),
+                initializer: None,
+            },
+        ]);
+        let instance_fields = AuxiliaryHandle(store.instance_field_lists.len() - 1);
+
+        // Pending promise reaction: result_promise + on_fulfilled are edges;
+        // on_rejected here is an immediate (skipped); `kind` is not an edge.
+        store.promise_reaction_lists.push(vec![CorePromiseReaction {
+            kind: CorePromiseReactionKind::Then,
+            result_promise: fake_cell(0x27),
+            on_fulfilled: fake_cell(0x28),
+            on_rejected: RuntimeValue::from_i32(9),
+        }]);
+        let promise_reactions = PromiseReactionsHandle(store.promise_reaction_lists.len() - 1);
+
+        // NON-EDGE slabs that MUST be skipped: a RegExp pattern String and raw
+        // ArrayBuffer bytes. Planted with real handles so the test proves the trace
+        // ignores them (they contribute zero edges), not that the handles are absent.
+        store.regexp_sources.push("ab+".to_string());
+        let regexp_source = AuxiliaryHandle(store.regexp_sources.len() - 1);
+        store.array_buffer_backings.push(vec![1_u8, 2, 3]);
+        let array_buffer_data = AuxiliaryHandle(store.array_buffer_backings.len() - 1);
+
+        let cell = CoreObjectCell {
+            map_entries,
+            set_values,
+            bound_args,
+            captures,
+            instance_fields,
+            promise_reactions,
+            regexp_source,
+            array_buffer_data,
+            // A spread of inline RuntimeValue edges across kinds.
+            super_base: Some(fake_cell(0x31)),
+            super_constructor: Some(fake_cell(0x32)),
+            native_bound_promise: Some(fake_cell(0x2e)),
+            primitive_value: Some(fake_cell(0x2f)),
+            view_buffer: Some(fake_cell(0x30)),
+            proxy_target: Some(fake_cell(0x2b)),
+            proxy_handler: Some(fake_cell(0x2c)),
+            bound_target: Some(fake_cell(0x29)),
+            bound_this: fake_cell(0x2a),
+            promise_result: fake_cell(0x2d),
+            setter_value: Some(fake_cell(0x33)),
+            ..CoreObjectCell::default()
+        };
+
+        let expected = sorted(vec![
+            // map: keys + values (immediate value of entry 2 and immediate key of
+            // entry 3 skipped)
+            0x20, 0x21, 0x22, 0x34, //
+            0x23, // set value (immediate skipped)
+            0x24, // bound arg (immediate skipped)
+            0x25, // capture
+            0x26, // instance-field initializer (None skipped)
+            0x27, 0x28, // promise result_promise + on_fulfilled (on_rejected skipped)
+            // inline slots
+            0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33,
+        ]);
+        // Exact set equality also proves the regexp String + ArrayBuffer bytes
+        // slabs contributed NOTHING (no extra entries appeared).
+        assert_eq!(traced(&store, &cell), expected);
     }
 }

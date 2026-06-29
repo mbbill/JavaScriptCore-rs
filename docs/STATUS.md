@@ -80,6 +80,11 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   COMPILES (atomic sweepability proof).** Documented deferred-faithful deviations: Map/Set JSOrderedHashTable
   (O(1)), captures JSLexicalEnvironment; instance_fields key interned to a POD AtomId. Each aux slab still
   holds GC edges (except ArrayBuffer raw bytes) → the collector trace must visit them.
+- [done] collector TRACE (GAP A) authored (unwired, R4-gated): CoreObjectStore::trace_cell visits the 15
+  inline RuntimeValue edges + butterfly (props+elements) + the value aux slabs (bound_args/captures/
+  instance_fields/map/set/promise_reactions), skips the non-edge slabs (regexp String, ArrayBuffer bytes);
+  targets RuntimeValue via as_cell (GAP D honored, NOT the skeleton JsValue path), through a minimal
+  CellEdgeVisitor trait. R4's collector driver supplies the adapter (CellValue bits → arena addr → Tracer).
 - [next-GC] now POD-UNBLOCKED: R3 shadow oracle (twin POD cell in MarkedSpace, byte-equal cross-check at
   find/find_mut + suite-end population check, reversible) → R4 flip (raw arena addr = sole identity; ~56
   find_mut → with_cell_mut; gate = shadow-green suite-wide + miri on the ~3 self-aliasing families +
