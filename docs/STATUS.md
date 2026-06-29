@@ -85,12 +85,16 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   instance_fields/map/set/promise_reactions), skips the non-edge slabs (regexp String, ArrayBuffer bytes);
   targets RuntimeValue via as_cell (GAP D honored, NOT the skeleton JsValue path), through a minimal
   CellEdgeVisitor trait. R4's collector driver supplies the adapter (CellValue bits → arena addr → Tracer).
-- [next-GC] now POD-UNBLOCKED: R3 shadow oracle (twin POD cell in MarkedSpace, byte-equal cross-check at
-  find/find_mut + suite-end population check, reversible) → R4 flip (raw arena addr = sole identity; ~56
-  find_mut → with_cell_mut; gate = shadow-green suite-wide + miri on the ~3 self-aliasing families +
-  adversarial + 15 benches) + wire the collector trace (GAP A: inline RuntimeValue edges + butterfly + the
-  value aux slabs) + sweep (GAP B: MarkedBlock free-list rebuild, legal now that needs_drop==false). This is
-  what permanently fixes the leak (SD-4: each aux slab needs its own R4 Auxiliary-subspace trace+sweep).
+- [done] collector SWEEP (GAP B) authored (unwired, R4-gated): FreeList::sweep_block mirrors
+  MarkedBlock::specializedSweep<DoesNotNeedDestruction> — scans the mark bitmap, threads unmarked atoms into
+  the FreeList (legal precisely because needs_drop==false → no destructors), retains marked + newly-allocated,
+  rebuilds the interval free-list. MIRI-CLEAN (Stacked + Tree Borrows, 0 UB) over the demo POD cell. R4 drives
+  it stopAllocating→sweep→resumeAllocating across the directories.
+- [next-GC] now POD-UNBLOCKED, trace+sweep AUTHORED: R3 shadow oracle (twin POD cell in MarkedSpace,
+  byte-equal cross-check at find/find_mut + suite-end population check, reversible) → R4 flip (raw arena addr
+  = sole identity; ~56 find_mut → with_cell_mut; gate = shadow-green suite-wide + miri on the ~3 self-aliasing
+  families + adversarial + 15 benches) → WIRE the authored trace+sweep to live cells + run the collector. This
+  is what permanently fixes the leak (SD-4: each aux slab still needs its own R4 Auxiliary-subspace trace+sweep).
 
 ## Baseline JIT / DFG / FTL (parity lives here; ~0% started)
 - [done] JIT↔runtime bridge-infra (adversarially verified): extern-C operation_value_add shim

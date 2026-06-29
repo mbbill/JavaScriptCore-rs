@@ -195,7 +195,43 @@ impl Drop for BlockDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::heap::marked_block::{ATOMS_PER_BLOCK, ATOMS_PER_CELL, BLOCK_MASK};
+    use crate::gc::heap::free_list::NewlyAllocatedMode;
+    use crate::gc::heap::marked_block::{
+        cell_ptr, is_marked, is_newly_allocated, test_and_set_marked, ATOMS_PER_BLOCK,
+        ATOMS_PER_CELL, BLOCK_MASK,
+    };
+    use std::collections::HashSet;
+
+    /// The demo cell IS POD (gc-r4.md): `needs_drop == false` is exactly what makes
+    /// the `DoesNotNeedDestruction` sweep legal — no destructor to run on reclaim.
+    const _: () = assert!(!core::mem::needs_drop::<Cell>());
+
+    /// Cells that fit in one block of the 80B demo size class (after the front slop).
+    fn per_block_cells() -> usize {
+        (ATOMS_PER_BLOCK - start_atom_for(ATOMS_PER_CELL)) / ATOMS_PER_CELL
+    }
+
+    /// Fill EXACTLY one block (block 0) of `dir` with demo cells; return their
+    /// addresses by allocation index. Asserts only the first alloc grows the
+    /// directory (the rest land in block 0).
+    fn fill_one_block(dir: &mut BlockDirectory) -> Vec<usize> {
+        let per_block = per_block_cells();
+        let mut cells = Vec::with_capacity(per_block);
+        for i in 0..per_block {
+            let (cp, new_base) = dir.allocate(Cell::new(0x10, 0xC000 + i as u64));
+            assert_eq!(
+                new_base.is_some(),
+                i == 0,
+                "exactly one block holds per_block cells"
+            );
+            cells.push(cp.addr());
+        }
+        let base = dir.block_base_addr[0];
+        for &a in &cells {
+            assert_eq!(a & BLOCK_MASK, base, "all demo cells live in block 0");
+        }
+        cells
+    }
 
     /// The FreeList interval fast path fills one block, then the LocalAllocator
     /// slow path adds a SECOND block and continues — allocation spans blocks. The
@@ -247,6 +283,198 @@ mod tests {
             }
             assert_eq!(base, first_base.unwrap(), "all in the first block");
             prev = Some(cp.addr());
+        }
+    }
+
+    /// GAP B (gc-r4.md) — the MarkedBlock SWEEP, end to end. Fill one block, mark a
+    /// subset, sweep the FreeList over it, and prove the faithful specializedSweep
+    /// contract for `DoesNotNeedDestruction`: every UNMARKED cell is reclaimed to the
+    /// FreeList and re-allocatable; every MARKED cell is retained untouched and never
+    /// re-handed-out; the counts are exact; the state flip cleared newlyAllocated.
+    /// The even/odd mark pattern isolates each dead cell between two live ones, so the
+    /// sweep threads MANY single-cell intervals (exercises `setNext` chaining).
+    #[test]
+    fn sweep_reclaims_unmarked_rebuilds_free_list_and_re_allocates() {
+        let mut dir = BlockDirectory::new(ATOMS_PER_CELL); // 80B demo class
+        let cells = fill_one_block(&mut dir);
+        let base = dir.block_base_addr[0];
+
+        // Mark even-indexed cells (live); odd-indexed are dead.
+        let mut marked = HashSet::new();
+        let mut unmarked = HashSet::new();
+        for (i, &a) in cells.iter().enumerate() {
+            if i % 2 == 0 {
+                assert!(test_and_set_marked(a), "fresh mark sets the bit");
+                marked.insert(a);
+            } else {
+                unmarked.insert(a);
+            }
+        }
+
+        // Full-collection sweep. A fresh per-sweep secret (distinct from the block-
+        // creation secret) proves the sweep's interval encoding is self-consistent.
+        let sweep_secret = 0x0F0F_0F0F_5A5A_5A5A;
+        // SAFETY: block 0 is a registered, once-exposed page this directory owns; no
+        // mutator &mut is live; dead cells alias no live Cell.
+        let res = unsafe {
+            dir.free_list
+                .sweep_block(base, sweep_secret, NewlyAllocatedMode::DoesNotHave)
+        };
+        assert_eq!(res.retained_cells, marked.len());
+        assert_eq!(res.freed_cells, unmarked.len());
+        assert_eq!(
+            res.freed_bytes as usize,
+            unmarked.len() * (ATOMS_PER_CELL * ATOM_SIZE)
+        );
+
+        // STATE FLIP + retention: newlyAllocated cleared block-wide; marks kept; marked
+        // cells' bytes preserved (the sweep never touched a live cell).
+        for (i, &a) in cells.iter().enumerate() {
+            assert!(!is_newly_allocated(a), "newlyAllocated cleared by the flip");
+            if i % 2 == 0 {
+                assert!(is_marked(a), "marked (retained) cell keeps its mark bit");
+                // SAFETY: `a` is a live, retained cell in the once-exposed block.
+                let f = unsafe { ptr::addr_of!((*cell_ptr(a)).field0).read() };
+                assert_eq!(f, 0xC000 + i as u64, "marked cell bytes survive the sweep");
+            }
+        }
+
+        // Re-allocate exactly freed_cells cells: each MUST be a reclaimed (unmarked)
+        // cell, never a retained (marked) one, and NO new block is created.
+        let mut reclaimed = HashSet::new();
+        for _ in 0..res.freed_cells {
+            let (cp, new_base) = dir.allocate(Cell::new(0x11, 0));
+            assert!(
+                new_base.is_none(),
+                "reclaimed cells satisfy alloc — no new block"
+            );
+            let a = cp.addr();
+            assert!(
+                unmarked.contains(&a),
+                "re-allocated an unmarked (reclaimed) cell"
+            );
+            assert!(
+                !marked.contains(&a),
+                "never re-allocated a marked (retained) cell"
+            );
+            assert!(reclaimed.insert(a), "each reclaimed cell handed out once");
+        }
+        assert_eq!(
+            reclaimed, unmarked,
+            "every unmarked cell reclaimed exactly once"
+        );
+        assert!(
+            dir.free_list.allocation_will_fail(),
+            "block fully re-consumed after reclaim"
+        );
+    }
+
+    /// Sweep edge cases: a CONTIGUOUS dead run (one multi-cell interval), a FULLY-LIVE
+    /// block (frees nothing -> always-fail FreeList), and a FULLY-DEAD block (one
+    /// whole-payload interval -> every cell reclaimed).
+    #[test]
+    fn sweep_contiguous_run_fully_live_and_fully_dead() {
+        // (a) Mark a PREFIX; the dead suffix is ONE contiguous interval.
+        {
+            let mut dir = BlockDirectory::new(ATOMS_PER_CELL);
+            let cells = fill_one_block(&mut dir);
+            let base = dir.block_base_addr[0];
+            let live_prefix = cells.len() / 3;
+            for &a in &cells[..live_prefix] {
+                test_and_set_marked(a);
+            }
+            // SAFETY: registered once-exposed block; no live mutator &mut.
+            let res = unsafe {
+                dir.free_list
+                    .sweep_block(base, 0x1234_5678, NewlyAllocatedMode::DoesNotHave)
+            };
+            assert_eq!(res.retained_cells, live_prefix);
+            assert_eq!(res.freed_cells, cells.len() - live_prefix);
+            let dead_suffix: HashSet<_> = cells[live_prefix..].iter().copied().collect();
+            for _ in 0..res.freed_cells {
+                let (cp, n) = dir.allocate(Cell::new(0x11, 0));
+                assert!(n.is_none());
+                assert!(
+                    dead_suffix.contains(&cp.addr()),
+                    "reclaimed from the dead suffix"
+                );
+            }
+            assert!(dir.free_list.allocation_will_fail());
+        }
+
+        // (b) Fully-live block: sweep frees nothing, FreeList is always-fail.
+        {
+            let mut dir = BlockDirectory::new(ATOMS_PER_CELL);
+            let cells = fill_one_block(&mut dir);
+            let base = dir.block_base_addr[0];
+            for &a in &cells {
+                test_and_set_marked(a);
+            }
+            // SAFETY: as above.
+            let res = unsafe {
+                dir.free_list
+                    .sweep_block(base, 0x5678_1234, NewlyAllocatedMode::DoesNotHave)
+            };
+            assert_eq!(res.freed_cells, 0);
+            assert_eq!(res.retained_cells, cells.len());
+            assert!(
+                dir.free_list.allocation_will_fail(),
+                "fully-live block yields the always-fail FreeList"
+            );
+        }
+
+        // (c) Fully-dead block (nothing marked): every cell reclaimed, one interval.
+        {
+            let mut dir = BlockDirectory::new(ATOMS_PER_CELL);
+            let cells: HashSet<_> = fill_one_block(&mut dir).into_iter().collect();
+            let base = dir.block_base_addr[0];
+            // SAFETY: as above.
+            let res = unsafe {
+                dir.free_list
+                    .sweep_block(base, 0x9ABC_DEF0, NewlyAllocatedMode::DoesNotHave)
+            };
+            assert_eq!(res.freed_cells, cells.len());
+            assert_eq!(res.retained_cells, 0);
+            let mut reclaimed = HashSet::new();
+            for _ in 0..res.freed_cells {
+                let (cp, n) = dir.allocate(Cell::new(0x11, 0));
+                assert!(n.is_none());
+                reclaimed.insert(cp.addr());
+            }
+            assert_eq!(
+                reclaimed, cells,
+                "every cell reclaimed after a full-dead sweep"
+            );
+        }
+    }
+
+    /// Eden-mode sweep (`NewlyAllocatedMode::Has`): newlyAllocated cells are live even
+    /// when unmarked, so an eden sweep retains them all and keeps the alloc bitmap.
+    #[test]
+    fn sweep_eden_mode_retains_newly_allocated() {
+        let mut dir = BlockDirectory::new(ATOMS_PER_CELL);
+        let cells = fill_one_block(&mut dir);
+        let base = dir.block_base_addr[0];
+        for &a in &cells {
+            assert!(is_newly_allocated(a), "alloc set the newlyAllocated bit");
+        }
+        // SAFETY: registered once-exposed block; no live mutator &mut.
+        let res = unsafe {
+            dir.free_list
+                .sweep_block(base, 0x0EDE_0EDE, NewlyAllocatedMode::Has)
+        };
+        assert_eq!(
+            res.retained_cells,
+            cells.len(),
+            "eden retains every newlyAllocated cell"
+        );
+        assert_eq!(res.freed_cells, 0);
+        assert!(dir.free_list.allocation_will_fail());
+        for &a in &cells {
+            assert!(
+                is_newly_allocated(a),
+                "eden sweep preserves the alloc bitmap"
+            );
         }
     }
 }

@@ -30,7 +30,10 @@
 
 use core::ptr;
 
-use super::marked_block::ATOM_SIZE;
+use super::marked_block::{
+    block_atoms_per_cell, block_start_atom, clear_newly_allocated_block, is_marked,
+    is_newly_allocated, ATOM_SIZE, END_ATOM,
+};
 
 // ===================== FreeCell (heap/FreeList.h:39-80) =====================
 
@@ -306,6 +309,170 @@ impl FreeList {
     pub(crate) fn original_size(&self) -> u32 {
         self.original_size
     }
+
+    /// `MarkedBlock::Handle::specializedSweep<.., SweepToFreeList, BlockHasNoDestructors, ..>`
+    /// (heap/MarkedBlockInlines.h, the sweep-to-free-list specialization), specialized
+    /// to `DestructionMode::DoesNotNeedDestruction` (JSCell.h:105). This rebuilds
+    /// `self` (the FreeList the LocalAllocator drives) for ONE block, reclaiming every
+    /// dead cell and retaining every live (marked / newlyAllocated) one.
+    ///
+    /// THE POD GUARANTEE IS WHAT MAKES THIS LEGAL: gc-r4.md proves
+    /// `needs_drop::<CoreObjectCell>() == false`, so there is NO destructor to run.
+    /// JSC's per-dead-cell `handleDeadCell` calls `destroyFunc` only when
+    /// `destructionMode == BlockHasDestructors`; for DoesNotNeedDestruction that call
+    /// is compiled out, leaving JUST the free-list threading this function performs —
+    /// scan the mark / newlyAllocated bits, thread dead cells onto the free list,
+    /// never touch a live cell's bytes.
+    ///
+    /// FREE-LIST REBUILD (the interval encoding `allocate`/`advance` consume,
+    /// heap/FreeList.h:39-80; heap/FreeListInlines.h:35-55): maximal runs of
+    /// contiguous dead cells become intervals; the lowest-address interval is the
+    /// FreeList head and each links low->high to the next (the highest is `makeLast`).
+    /// Degenerate cases match the existing fast paths: a fully-LIVE block yields the
+    /// always-fail FreeList (`initialize(0)`, == the slow-path-only list JSC hands a
+    /// full block); a fully-DEAD block yields one whole-payload interval (==
+    /// `initialize_empty_block`, heap/MarkedBlockInlines.h:313-318).
+    ///
+    /// STATE FLIP: on a full-collection sweep (`DoesNotHave`) the newlyAllocated
+    /// bitmap is reset (heap/MarkedBlock::resetAllocated) so post-sweep liveness is the
+    /// mark bits alone; the block is now "FreeListed" — described by `self`. The full
+    /// MarkedBlock::Handle state enum (Allocated/FreeListed/Marked/Empty) is deferred
+    /// (R2), matching the marked_block.rs Header DIVERGENCE.
+    ///
+    /// NOT WIRED: the live collection RUN is gated on R4 (real typed cells in the
+    /// arena, gc-r4.md GAP B); this authors only the MECHANISM.
+    ///
+    /// SAFETY (contract C1-C6, marked_block.rs): `block_base` is a registered,
+    /// once-exposed MarkedBlock the caller's directory solely owns; the collector is
+    /// stopped (single mutator, single-STW — C5/C6); `FreeCell` link records are
+    /// written ONLY into dead cells, which alias no live `Cell` (C1/C4). `secret`
+    /// keys this sweep's encoding (JSC draws a fresh `vm.heapRandom()` per sweep,
+    /// heap/MarkedBlockInlines.h:263; supplied by the caller until the VM RNG lands).
+    pub(crate) unsafe fn sweep_block(
+        &mut self,
+        block_base: usize,
+        secret: u64,
+        na_mode: NewlyAllocatedMode,
+    ) -> SweepResult {
+        let start_atom = block_start_atom(block_base);
+        let atoms_per_cell = block_atoms_per_cell(block_base);
+        let cell_size = atoms_per_cell * ATOM_SIZE;
+
+        // The higher, already-encoded interval head (None == the next interval encoded
+        // is the highest one -> `makeLast`).
+        let mut next_head: Option<usize> = None;
+        // The dead run currently being grown downward: [run_low, run_end).
+        let mut run_low: Option<usize> = None;
+        let mut run_end: usize = 0;
+        let mut result = SweepResult::default();
+
+        // Iterate cells HIGH -> LOW (heap/MarkedBlockInlines.h sweeps cell by cell):
+        // doing so lets each finished (higher) interval be the `next` of the next-lower
+        // one, producing the low->high forward list `FreeList::allocate` walks. Cells
+        // tile [startAtom, endAtom) with no gaps (start_atom_for guarantees an integer
+        // number of cells), so consecutive dead cells are always contiguous and only a
+        // live cell breaks a run.
+        let mut atom = END_ATOM;
+        while atom > start_atom {
+            atom -= atoms_per_cell;
+            let cell_addr = block_base + atom * ATOM_SIZE;
+
+            // isLive (heap/MarkedBlockInlines.h specializedSweep): a cell is retained
+            // if it is marked, or — when the block still carries a live alloc bitmap
+            // (`HasNewlyAllocated`) — newly allocated. Everything else is dead.
+            let retained = is_marked(cell_addr)
+                || (na_mode == NewlyAllocatedMode::Has && is_newly_allocated(cell_addr));
+
+            if retained {
+                result.retained_cells += 1;
+                // A live cell closes the current dead run (breaks contiguity).
+                if let Some(low) = run_low.take() {
+                    let len = (run_end - low) as u32;
+                    // SAFETY: `low` is a dead-cell head in the once-exposed, directory-
+                    // owned block; see `finalize_interval`.
+                    unsafe { finalize_interval(low, len, &mut next_head, secret) };
+                }
+            } else {
+                result.freed_cells += 1;
+                result.freed_bytes += cell_size as u32;
+                match run_low {
+                    // Extend the current run downward. `cell_addr + cell_size` == the
+                    // prior run low (we step contiguously and the run is unbroken).
+                    Some(_) => run_low = Some(cell_addr),
+                    None => {
+                        run_low = Some(cell_addr);
+                        run_end = cell_addr + cell_size;
+                    }
+                }
+            }
+        }
+        // Close the trailing (lowest-address) run.
+        if let Some(low) = run_low.take() {
+            let len = (run_end - low) as u32;
+            // SAFETY: as above.
+            unsafe { finalize_interval(low, len, &mut next_head, secret) };
+        }
+
+        // Adopt the lowest interval head as the FreeList head (or clear to the
+        // always-fail state when the block has no dead cell — a fully-live block).
+        // SAFETY: `next_head` (if Some) is an interval head just encoded in this
+        // once-exposed block; `initialize` reads its scrambled bits via `advance`.
+        unsafe {
+            match next_head {
+                Some(head) => self.initialize(head, secret, result.freed_bytes),
+                None => self.initialize(0, secret, 0),
+            }
+        }
+
+        // STATE FLIP: a full-collection sweep clears newlyAllocated so post-sweep
+        // liveness is the marks alone. The eden (`Has`) path keeps the bitmap (those
+        // bits ARE the surviving cells' liveness).
+        if na_mode == NewlyAllocatedMode::DoesNotHave {
+            clear_newly_allocated_block(block_base);
+        }
+
+        result
+    }
+}
+
+/// `MarkedBlock::Handle::NewlyAllocatedMode` (heap/MarkedBlockInlines.h): whether the
+/// swept block still carries a live newlyAllocated bitmap the sweep must honor as a
+/// liveness source. A full collection sweeps `DoesNotHave` (liveness == marks; the
+/// alloc bitmap is reset); an eden / freshly-allocated block sweeps `Has`
+/// (newlyAllocated OR marked cells survive).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NewlyAllocatedMode {
+    DoesNotHave,
+    Has,
+}
+
+/// The sweep bookkeeping `MarkedBlock::Handle::sweep` exposes to its directory: how
+/// many cells were reclaimed (and their byte total) vs retained. The rebuilt free
+/// list is the swept `FreeList` itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SweepResult {
+    pub freed_cells: usize,
+    pub freed_bytes: u32,
+    pub retained_cells: usize,
+}
+
+/// Encode one dead-cell interval `[head, head+len)` as a `FreeCell` and link it
+/// before the already-encoded higher interval (`*next_head`): the highest interval is
+/// `makeLast`, each lower one `setNext`s up to it. Updates `*next_head` to this (now
+/// lowest) head. This is the interval threading inside `specializedSweep`.
+///
+/// SAFETY: `head` is a dead-cell head in a once-exposed, directory-owned block; the
+/// `FreeCell` write aliases no live `Cell` (contract C1/C4).
+#[inline]
+unsafe fn finalize_interval(head: usize, len: u32, next_head: &mut Option<usize>, secret: u64) {
+    // SAFETY: per fn contract — `head` is a free cell head in a once-exposed page.
+    unsafe {
+        match *next_head {
+            None => FreeCell::make_last(head, len, secret),
+            Some(nh) => FreeCell::set_next(head, nh, len, secret),
+        }
+    }
+    *next_head = Some(head);
 }
 
 // DEFERRED: `FreeList::forEach` (heap/FreeListInlines.h:57-76) iterates every free

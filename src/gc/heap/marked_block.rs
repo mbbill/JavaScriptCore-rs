@@ -377,3 +377,53 @@ pub(crate) fn is_marked(cell_addr: usize) -> bool {
     let cur = unsafe { (*ptr::addr_of!((*bp).header.marks[word])).load(Ordering::Relaxed) };
     (cur & mask) != 0
 }
+
+/// MarkedBlock::isNewlyAllocated (heap/MarkedBlock.h:357-363): the per-block alloc
+/// bitmap bit for this cell — the mutator-phase liveness `is_live_cell` also reads.
+/// The sweep consults it as one of the two liveness sources (heap/MarkedBlockInlines
+/// .h specializedSweep `newlyAllocatedMode == HasNewlyAllocated`).
+pub(crate) fn is_newly_allocated(cell_addr: usize) -> bool {
+    let base = block_for(cell_addr);
+    let atom = candidate_atom_number(base, cell_addr);
+    let bp: *const MarkedBlock = ptr::with_exposed_provenance::<u8>(base).cast();
+    let word = atom / 64;
+    let bit = 1u64 << (atom % 64);
+    // SAFETY (C3): registered, once-exposed page; atomic read via addr_of! (no ref).
+    unsafe {
+        (*ptr::addr_of!((*bp).header.newly_allocated[word])).load(Ordering::Relaxed) & bit != 0
+    }
+}
+
+/// Read this block's `m_startAtom` (firstPayloadRegionAtom, MarkedBlock.h:339; set by
+/// the MarkedBlock::Handle ctor, MarkedBlock.cpp:414-422). The first cell-aligned
+/// payload atom the sweep starts iterating from.
+pub(crate) fn block_start_atom(base: usize) -> usize {
+    let bp: *const MarkedBlock = ptr::with_exposed_provenance::<u8>(base).cast();
+    // SAFETY (C3): `base` is a registered, once-exposed page base; addr_of! read forms
+    // no reference.
+    unsafe { ptr::addr_of!((*bp).header.start_atom).read() as usize }
+}
+
+/// Read this block's per-size-class `cellSize/atomSize` (the sweep/allocate step,
+/// heap/MarkedBlock.h cellSize / LocalAllocator.h:48).
+pub(crate) fn block_atoms_per_cell(base: usize) -> usize {
+    let bp: *const MarkedBlock = ptr::with_exposed_provenance::<u8>(base).cast();
+    // SAFETY (C3): `base` is a registered, once-exposed page base.
+    unsafe { ptr::addr_of!((*bp).header.atoms_per_cell).read() as usize }
+}
+
+/// Reset the whole block's newlyAllocated bitmap. JSC bumps `newlyAllocatedVersion`
+/// at the full-collection transition (heap/MarkedBlock::resetAllocated /
+/// MarkedBlockInlines.h) so stale alloc bits read clear in O(1); the single-STW
+/// model here (no HeapVersion — see is_live_cell DIVERGENCE R2) zeroes the words
+/// directly. Same observable result: after a full-collection sweep no cell reads as
+/// newlyAllocated, so post-sweep liveness is the mark bits alone.
+pub(crate) fn clear_newly_allocated_block(base: usize) {
+    let bp: *const MarkedBlock = ptr::with_exposed_provenance::<u8>(base).cast();
+    // SAFETY (C3): registered, once-exposed page; atomic stores via addr_of! (no ref).
+    unsafe {
+        for w in 0..MARK_WORDS {
+            (*ptr::addr_of!((*bp).header.newly_allocated[w])).store(0, Ordering::Relaxed);
+        }
+    }
+}
