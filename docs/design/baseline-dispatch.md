@@ -77,3 +77,42 @@ MATERIALLY (Octane is property/call-heavy); the arith-only milestone is the prov
 Needs op_add (done) + the arith family (in flight) before Stage 1's emitter has its opcode set.
 Stages 1-4 are otherwise un-gated (no R4/B5/B6). The opcodes that MOVE R materially (property
 access, calls) stay gated on R4 / B5-B6 and enter via the S4 allowlist as those land.
+
+## Stage 1 implementer spec (2026-06-29) — the full-function emitter
+
+- **S5 (RATIFIED) — one control-flow model.** Standardize on the assembler-level
+  `Jump`/`Label`/`to_link_record` + `finalize_arm64_link_buffer` path (op_add-proven end-to-end),
+  NOT a second abstract model. Retire/demote `Arm64BaselineControlFlowBuilder`
+  (arm64_baseline.rs ~:1532/:1607) — lift its bci-bookkeeping as a thin struct OVER the assembler
+  path. Decide before the branch unit so the family doesn't fork.
+- **S6 (RATIFIED) — 3-pass slow-case deferral.** Collect each op's slow `Jump`s into a
+  `SlowCaseRecord` during MAIN; emit the slow cases AFTER the epilogue (JSC privateCompileSlowCases,
+  contiguous fast paths) — the family pattern, vs op_add's single-op inline slow path.
+
+**`emit_baseline_function(code_block) -> OpAddImage`** mirrors JIT.cpp's 3 passes (:813-815):
+state `labels: Vec<Label>` (one per bytecode index == m_labels, :200), `jumps: Vec<(Jump,
+target_bci)>` (== m_jmpTable), `slow: Vec<SlowCaseRecord{fast_jumps, resume_bci, kind}>` (==
+m_slowCases). PROLOGUE = op_add's verbatim (push_pair fp/lr, x19=vm, x27/x28 tags). MAIN pass:
+per-bytecode, `labels[bci]=masm.label()` then dispatch the per-op fast path (arith = op_add's
+body but COLLECTING its slow jumps; branches push `(branch32(cond,x1,x2), target_bci)`; op_ret
+loads x0 + jumps to the shared `done`). Inline epilogue at `done` (pop_pair×3 + ret). SLOW pass:
+per record, link its fast jumps to a slow label, emit the bridge slow-call, jump to
+`labels[resume_bci]`. LINK pass: `jump.to_link_record(labels[target_bci])` — forward + backward
+(loop) uniformly (every bci has a Label). The branch-to-BYTECODE-INDEX target is the genuinely
+new piece: `target_bci = bci + instr.branch_offset`, resolved in LINK.
+
+New per-op lowerings: **op_enter** (zero-fill locals with undefined bits at addressFor(local)),
+**op_mov** (load64 src → store64 dst), **op_ret** (load64 ret-vreg → x0 → jump `done`), **int32
+branches** jless/jgreater/jlesseq (emit_compareAndJump: guards → slow; branch32(cond,x1,x2) →
+target; slow = operationCompareLess via the bridge, then branchTest32(NonZero,x0) → target),
+**jtrue/jfalse** (branch_test64(cond, x1, mask=1) / branch_test32 → target — needs the Imm(1)
+mask in a reg, the box/tag-flagged overload), **op_jmp** (unconditional → target).
+
+**Unit ordering:** U1 (3-pass skeleton + op_enter/mov/ret; needs the arith family) ∥ U2 (the int32
+branch lowerings + the label/jump-table bci resolution + the operationCompareLess/jtrue bridge
+shims — the new control-flow piece) → U3 (the `can_baseline_compile` allowlist + the S1
+ExecutionCounter trigger in select_interpreter_entry_plan + JitCode install) → U4 (the S2 B5-lite
+handoff execute path + **the milestone test**: an int-sum loop function tiers up, executes
+natively, returns correctly, moves its r_i). U5 (parallel: S3 set_jit_code_block + Fail→type_error).
+First smoke target `(a,b)=>a+b` (op_enter/add/ret); milestone target the int-sum loop (proves
+backward-branch LINK + native loop).
