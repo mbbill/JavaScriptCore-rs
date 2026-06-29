@@ -89,4 +89,5 @@ pub use indexing_type::NON_ARRAY;
 pub use property_offset::{
     offset_for_property_number, FIRST_OUT_OF_LINE_OFFSET as STRUCTURE_FIRST_OUT_OF_LINE_OFFSET,
 };
+pub use property_table::PropertyTable as StructurePropertyTable;
 pub use structure_cell::{PrototypePointer, Structure as StructureCell, StructureIdTable};

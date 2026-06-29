@@ -66,6 +66,14 @@ pub(crate) struct CoreObjectStore {
     // PropertyTable/transition table key on). Injective over the named-offset key set
     // (Identifier + non-index String), so the structure graph keys by JSC identity.
     pub(crate) property_uids: HashMap<CorePropertyKey, AtomId>,
+    // Reverse of `property_uids`: the uniqued uid -> the `CorePropertyKey` it interns.
+    // C++ keys a Structure::PropertyTable entry by `UniquedStringImpl*`, and recovering
+    // the name from an entry is just dereferencing that pointer; the Rust port keeps an
+    // explicit reverse map so enumeration over a structure's PropertyTable entries
+    // (`structure_property_keys`, the post-flip replacement for the per-cell
+    // `property_order`) can map each entry's uid back to its key. Injective with
+    // `property_uids` (both updated in lockstep by `intern_property_uid`).
+    pub(crate) property_keys_by_uid: HashMap<AtomId, CorePropertyKey>,
     // Monotonic allocator for fresh property uids (slot 0 reserved == AtomId::UNASSIGNED).
     pub(crate) next_property_uid: u32,
     // Per-(kind, prototype) empty-shape ROOT structure handle, the analog of the empty
@@ -230,6 +238,7 @@ impl Clone for CoreObjectStore {
             // and clone is a snapshot/test path, not the hot path.
             structure_table: self.structure_table.clone(),
             property_uids: self.property_uids.clone(),
+            property_keys_by_uid: self.property_keys_by_uid.clone(),
             next_property_uid: self.next_property_uid,
             structure_seed_roots: self.structure_seed_roots.clone(),
             structure_transition_watchpoints: self.structure_transition_watchpoints.clone(),
@@ -367,29 +376,20 @@ pub(crate) struct CoreObjectCell {
     pub(crate) instance_fields: Vec<CoreInstanceField>,
     pub(crate) captures: Vec<RuntimeValue>,
     pub(crate) binding_value: RuntimeValue,
-    // C++ JSC has NO per-object property map: a JSObject's named data property VALUE
-    // lives in inline storage or the Butterfly out-of-line region, and the
-    // property->offset/attributes/kind mapping lives PER-SHAPE in
-    // Structure::PropertyTable. gc-r4: the offset/attributes/presence of a NAMED-DATA
-    // property are already a function of `structure_id` via the store's
-    // `structure_table`; only the VALUE needs a per-object home. This HashMap remains
-    // the VALUE AUTHORITY this batch (a divergence still to be removed): the butterfly
-    // slab `props` side (keyed by the structure-assigned offset) is its offset-indexed
-    // MIRROR — written in lockstep at every store, read by the offset/IC path. The
-    // full flip (delete this HashMap, make the butterfly the SOLE value authority) is
-    // PAUSED: accessor + Symbol-keyed properties have NO Structure offset in the
-    // current port (structure_offset returns None; structure_add_property skips them),
-    // so they have no butterfly slot to move to — see the batch report / docs/design/
-    // gc-r4.md. This HashMap stays POD-blocking (Drop) until that flip lands.
-    pub(crate) properties: HashMap<CorePropertyKey, CoreProperty>,
-    // C++ JSC: PropertyTable::m_deletedOffsets (PropertyTable.h) records offsets
-    // freed by deletion so a later addition can reuse them instead of growing
-    // storage. The Rust mirror records freed offsets here; reuse is not yet wired
-    // into the offset allocator (the allocator still monotonically increments
-    // next_property_offset), so this currently only tracks freed slots and clears
-    // them. Faithful reuse is deferred with the inline-split work.
-    pub(crate) deleted_offsets: Vec<PropertyOffset>,
-    pub(crate) property_order: Vec<CorePropertyKey>,
+    // C++ JSC has NO per-object property map: a JSObject's named property VALUE lives in
+    // inline storage or the Butterfly out-of-line region, and the
+    // property->offset/attributes/kind mapping lives PER-SHAPE in Structure::PropertyTable.
+    // gc-r4 B-iv (DONE): the per-cell `properties` HashMap (named-property VALUE authority),
+    // `property_order` (enumeration order), and the vestigial `deleted_offsets` are DELETED.
+    // The Structure (offset + attributes, via `structure_table`) is the offset/attribute/
+    // presence authority; the butterfly slab `props` side (keyed by the structure-assigned
+    // offset) is the SOLE VALUE authority — a data slot holds the value, an accessor slot
+    // holds `from_cell(GetterSetter)` (mirroring C++ `getDirect(offset)`). Reads
+    // reconstruct a `CoreProperty` via `own_property_from_shape`; enumeration order comes
+    // from `structure_property_keys` (the PropertyTable entry order); freed-offset recycling
+    // is owned by `PropertyTable::m_deletedOffsets`. (The cell is still NOT POD — Map/Set/
+    // RegExp/Promise/ArrayBuffer/Bound Drop fields remain; the `needs_drop` assert flips
+    // only after those relocate, so it is NOT added here.)
     // C++ JSC: indexed elements live on the RIGHT side of the Butterfly
     // (Butterfly::contiguous(), Butterfly.h:196). gc-r4 Butterfly-values: the indexed
     // element storage is now the store-owned slab's `elements` side, reached through
@@ -506,9 +506,6 @@ impl Default for CoreObjectCell {
             instance_fields: Vec::new(),
             captures: Vec::new(),
             binding_value: RuntimeValue::default(),
-            properties: HashMap::new(),
-            deleted_offsets: Vec::new(),
-            property_order: Vec::new(),
             map_entries: Vec::new(),
             set_values: Vec::new(),
             regexp_source: String::new(),
@@ -565,9 +562,6 @@ impl Clone for CoreObjectCell {
             instance_fields: self.instance_fields.clone(),
             captures: self.captures.clone(),
             binding_value: self.binding_value,
-            properties: self.properties.clone(),
-            deleted_offsets: self.deleted_offsets.clone(),
-            property_order: self.property_order.clone(),
             map_entries: self.map_entries.clone(),
             set_values: self.set_values.clone(),
             regexp_source: self.regexp_source.clone(),
@@ -1056,16 +1050,6 @@ pub(crate) enum GeneratedPropertyLoadCoreKey<'a> {
 }
 
 impl<'a> GeneratedPropertyLoadCoreKey<'a> {
-    pub(crate) fn matches(self, key: &CorePropertyKey) -> bool {
-        match (self, key) {
-            (Self::Identifier(expected), CorePropertyKey::Identifier(actual)) => {
-                expected == *actual
-            }
-            (Self::String(expected), CorePropertyKey::String(actual)) => expected == actual,
-            _ => false,
-        }
-    }
-
     pub(crate) fn supports_named_property_offset(self) -> bool {
         match self {
             Self::Identifier(_) => true,
@@ -1082,12 +1066,17 @@ impl<'a> GeneratedPropertyLoadCoreKey<'a> {
 }
 
 pub(crate) fn generated_property_load_cell_has_own_property(
+    objects: &CoreObjectStore,
     cell: &CoreObjectCell,
     key: GeneratedPropertyLoadCoreKey<'_>,
 ) -> bool {
-    cell.properties
-        .keys()
-        .any(|stored_key| key.matches(stored_key))
+    // gc-r4 B-iv: own-named-property presence is a function of the cell's Structure
+    // (the offset authority), not a per-cell HashMap. `key` is a named load key (the
+    // caller already gated `supports_named_property_offset`), so presence == the shape
+    // assigning it an offset (C++ `structure->get(...)` returning a valid offset).
+    objects
+        .structure_property(cell.structure_id, &key.to_core_property_key())
+        .is_some()
 }
 
 pub(crate) fn generated_property_load_cell_data_property_at_offset(
@@ -1125,6 +1114,7 @@ pub(crate) fn generated_property_load_cell_data_property_at_offset(
 }
 
 pub(crate) fn generated_property_load_offset_miss_reason(
+    objects: &CoreObjectStore,
     cell: &CoreObjectCell,
     key: GeneratedPropertyLoadCoreKey<'_>,
     expected_offset: PropertyOffset,
@@ -1132,19 +1122,17 @@ pub(crate) fn generated_property_load_offset_miss_reason(
 ) -> GeneratedPropertyLoadProbeMissReason {
     use GeneratedPropertyLoadProbeMissReason as Miss;
 
-    // Diagnostic-only classification when the offset-indexed read returned None.
-    // `properties` (the authoritative VALUE store, kept this batch) localizes whether
-    // the key is absent or non-data; `actual_offset` is the key's real offset in the
-    // cell's Structure::PropertyTable (the offset authority), supplied by the caller so
-    // a cached offset that disagrees with the structure is reported as KeyOffsetMismatch.
-    let Some((_stored_key, property)) = cell
-        .properties
-        .iter()
-        .find(|(stored_key, _)| key.matches(stored_key))
+    // Diagnostic-only classification when the offset-indexed read returned None. gc-r4
+    // B-iv: presence + data-vs-accessor come from the cell's Structure::PropertyTable
+    // (the offset/attribute authority), not the deleted per-cell HashMap; `actual_offset`
+    // is the key's real offset in that table, supplied by the caller so a cached offset
+    // that disagrees with the structure is reported as KeyOffsetMismatch.
+    let Some((_, attributes)) =
+        objects.structure_property(cell.structure_id, &key.to_core_property_key())
     else {
         return Miss::MissingProperty;
     };
-    if !matches!(property.kind, CorePropertyKind::Data(_)) {
+    if attributes & PROPERTY_ATTRIBUTE_ACCESSOR != 0 {
         return Miss::NonDataProperty;
     }
     match actual_offset {
@@ -1154,13 +1142,17 @@ pub(crate) fn generated_property_load_offset_miss_reason(
 }
 
 pub(crate) fn core_property_key_supports_named_property_offset(key: &CorePropertyKey) -> bool {
-    // gc-r4 B-iii: Symbol keys ALSO get a named-property offset now. C++ keys the
-    // Structure PropertyTable/transition table by a property's uniqued uid, and a
-    // Symbol* is such a uid exactly like a string's UniquedStringImpl*; the Rust port
-    // interns ANY CorePropertyKey (incl. Symbol) to a uid in `intern_property_uid`, so a
-    // symbol-keyed add transitions + converges like a string-keyed one. Array-INDEX
-    // strings stay excluded — they live in the butterfly indexed region, not the
-    // named-property table (`key_array_index` returns None for Symbol/Identifier).
+    // gc-r4 B-iii/B-iv: Identifier, non-index String, and Symbol keys get a real named
+    // Structure offset (so they have a butterfly slot home once the per-cell `properties`
+    // HashMap is gone). C++ keys the Structure PropertyTable/transition table by a
+    // property's uniqued uid, and `intern_property_uid` uniques any such key.
+    //
+    // ARRAY-INDEX strings are EXCLUDED: C++ stores integer-index-named properties in the
+    // object's INDEXED butterfly storage (contiguous/ArrayStorage), NOT the named
+    // PropertyTable — they have no named offset (so the named-property IC never arms for
+    // them). The write paths route an array-index key to the butterfly `elements` side for
+    // EVERY object kind (`route_array_index_to_elements`), and the read/enumerate/delete
+    // paths serve it from there, so its value still has a POD home after the flip.
     matches!(
         key,
         CorePropertyKey::Identifier(_) | CorePropertyKey::String(_) | CorePropertyKey::Symbol(_)
@@ -1200,6 +1192,28 @@ pub(crate) fn core_attributes_to_u32(attributes: CorePropertyAttributes, is_acce
         bits |= PROPERTY_ATTRIBUTE_ACCESSOR;
     }
     bits
+}
+
+/// Decode the Structure's `unsigned attributes` bitfield back into the interpreter's
+/// `CorePropertyAttributes` (the inverse of `core_attributes_to_u32`). The faithful
+/// reader side of the gc-r4 B-iv flip: `get_own_property`/`own_property_from_shape`
+/// reconstruct a `CoreProperty` from the SHAPE (Structure offset+attributes) + the
+/// butterfly value, so the per-cell `properties` HashMap is no longer the attribute
+/// authority. C++ stores the bits directly on the property slot
+/// (runtime/PropertyAttribute.h: ReadOnly == 1<<1, DontEnum == 1<<2, DontDelete == 1<<3,
+/// Accessor == 1<<4) and reads writable/enumerable/configurable off them; an accessor
+/// never carries ReadOnly (writability is a data-only attribute), so `writable` is the
+/// data-property predicate `!accessor && !ReadOnly`.
+pub(crate) fn core_attributes_from_u32(bits: u32) -> CorePropertyAttributes {
+    let is_accessor = bits & PROPERTY_ATTRIBUTE_ACCESSOR != 0;
+    let read_only = bits & (1 << 1) != 0;
+    let dont_enum = bits & (1 << 2) != 0;
+    let dont_delete = bits & (1 << 3) != 0;
+    CorePropertyAttributes {
+        writable: !is_accessor && !read_only,
+        enumerable: !dont_enum,
+        configurable: !dont_delete,
+    }
 }
 
 // C++ JSC PropertyOffset.h mirror. firstOutOfLineOffset == 64 is the boundary
@@ -1880,36 +1894,31 @@ impl CoreObjectStore {
         construct_ability: ConstructAbility,
     ) -> RuntimeValue {
         let function_prototype = self.ensure_function_prototype();
-        let mut properties = HashMap::new();
-        let mut property_order = Vec::new();
-        let mut instance_prototype = None;
-        if let Some(key) = prototype_property_key {
-            let prototype = self.allocate();
-            instance_prototype = Some(prototype);
-            property_order.push(key.clone());
-            properties.insert(
-                key,
-                CoreProperty {
-                    kind: CorePropertyKind::Data(prototype),
-                    attributes: CorePropertyAttributes {
-                        writable: true,
-                        enumerable: false,
-                        configurable: false,
-                    },
-                },
-            );
-        }
         let function = self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::Function,
             prototype: Some(function_prototype),
             function_index: Some(function_index),
             captures,
-            properties,
-            property_order,
             construct_ability,
             ..CoreObjectCell::default()
         });
-        if let Some(prototype) = instance_prototype {
+        if let Some(key) = prototype_property_key {
+            // gc-r4 B-iv: a function is born EMPTY then installs its own `.prototype`
+            // through the normal define path (the per-cell `properties` initial-property
+            // channel is gone), so the initial shape == the runtime shape and same-shape
+            // siblings converge under one add-property transition. C++ JSFunction installs
+            // `prototype` writable, DontEnum | DontDelete.
+            let prototype = self.allocate();
+            let _ = self.define_data_property(
+                function,
+                &key,
+                prototype,
+                CorePropertyAttributes {
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
             self.install_prototype_constructor(prototype, function);
         }
         function
@@ -3844,24 +3853,15 @@ impl CoreObjectStore {
             // reconstructs that shared root (see its comment); the prior behavior
             // here minted a private id per object, defeating cross-instance ICs.
             //
-            // FIX 3: some cells are born with initial own properties already
-            // installed (e.g. allocate_function_with_construct_ability builds the
-            // `.prototype` own-property BEFORE allocate_cell). C++ JSC reaches such
-            // a non-empty shape by applying addPropertyTransition once per initial
-            // property from the empty (class, prototype) Structure, so the resulting
-            // Structure reflects the real shape and same-shape siblings converge.
-            // Taking the empty seed root would instead make a 0-property object and
-            // a 1-property function share a structure id (different shapes, same id),
-            // corrupting cross-instance ICs. seed_initial_shape_structure_id mirrors
-            // C++ by chaining add_property_transition from the empty root over the
-            // recorded initial-property order; for a 0-property cell it degenerates to
-            // the plain empty seed root.
-            cell.structure_id = self.seed_initial_shape_structure_id(&cell);
+            // gc-r4 B-iv: cells are no longer born carrying initial own properties (the
+            // per-cell `properties` channel is gone). The one prior user,
+            // allocate_function_with_construct_ability, now allocates EMPTY here and
+            // installs `.prototype` afterward through `define_data_property`, so the
+            // initial shape is always the empty (class, prototype) seed root and the
+            // initial-shape replay (seed_initial_shape_structure_id) + the out-of-line
+            // initial fill (fill_initial_property_storage) are no longer needed.
+            cell.structure_id = self.seed_structure_id(cell.kind, cell.prototype);
         }
-        // Fill the out-of-line VALUE mirror (the slab `props` side) at each initial
-        // data property's structure-assigned offset (the putDirectOffset analog), now
-        // that the structure (offset authority) and the butterfly handle are known.
-        self.fill_initial_property_storage(&cell);
         let mut object = Box::pin(cell);
         let ptr = NonNull::from(object.as_mut().get_mut());
         let payload = ptr.as_ptr() as usize;
@@ -3943,6 +3943,7 @@ impl CoreObjectStore {
         self.next_property_uid += 1;
         let uid = AtomId::from_table_slot(self.next_property_uid);
         self.property_uids.insert(key.clone(), uid);
+        self.property_keys_by_uid.insert(uid, key.clone());
         uid
     }
 
@@ -4001,6 +4002,140 @@ impl CoreObjectStore {
         key: &CorePropertyKey,
     ) -> Option<PropertyOffset> {
         self.structure_property(sid, key).map(|(offset, _)| offset)
+    }
+
+    /// Reconstruct the own named property `key` of `cell` from its SHAPE (the Structure
+    /// offset + attributes) and the butterfly slot value — the gc-r4 B-iv post-flip
+    /// replacement for the per-cell `properties` HashMap, which is now DELETED.
+    ///
+    /// Faithful to `JSObject::getOwnNonIndexPropertySlot` (runtime/JSObject.h:1394-1428):
+    ///   `offset = structure->get(vm, key, attributes)` (here `structure_property`);
+    ///   if no valid offset -> the key is absent (`None`);
+    ///   `JSValue value = getDirect(offset)` (here `butterfly_prop_get`);
+    ///   if `attributes & PropertyAttribute::Accessor` the slot holds a `GetterSetter*`
+    ///     (`fillGetterPropertySlot`) -> reconstruct an Accessor from the GetterSetter
+    ///     cell's getter/setter (gc-r4 B-ii: the slot is `from_cell(GetterSetter)`);
+    ///   else `slot.setValue(attributes, value)` -> a Data property.
+    /// Returns `None` for a key with no named offset in this shape (absent, deleted, or
+    /// an array-index key served from the indexed butterfly region instead).
+    pub(crate) fn own_property_from_shape(
+        &self,
+        cell: &CoreObjectCell,
+        key: &CorePropertyKey,
+    ) -> Option<CoreProperty> {
+        let (offset, attrs) = self.structure_property(cell.structure_id, key)?;
+        let attributes = core_attributes_from_u32(attrs);
+        if attrs & PROPERTY_ATTRIBUTE_ACCESSOR != 0 {
+            // The butterfly slot holds `from_cell(GetterSetter)`; read the getter/setter
+            // off that cell (C++ GetterSetter::getter()/setter(), GetterSetter.h:132-133).
+            let getter_setter = self.butterfly_prop_get(cell.butterfly, offset)?;
+            let gs = self.find(getter_setter)?;
+            Some(CoreProperty {
+                kind: CorePropertyKind::Accessor {
+                    getter: gs.getter_value,
+                    setter: gs.setter_value,
+                },
+                attributes,
+            })
+        } else {
+            // A data slot in the structure ALWAYS has a butterfly home (every add does a
+            // lockstep `putDirectOffset`); a present-in-shape key whose slot read misses
+            // is the `undefined` data value (C++ getDirect returns JSValue() == undefined
+            // for a never-written valid offset), never "absent".
+            let value = self
+                .butterfly_prop_get(cell.butterfly, offset)
+                .unwrap_or_else(RuntimeValue::undefined);
+            Some(CoreProperty {
+                kind: CorePropertyKind::Data(value),
+                attributes,
+            })
+        }
+    }
+
+    /// The own named properties of structure `sid`, in PropertyTable ENTRY (insertion)
+    /// order, as `(key, offset, attributes)`. The gc-r4 B-iv replacement for the per-cell
+    /// `property_order` Vec: C++ keeps enumeration order in the Structure's PropertyTable
+    /// entry vector (`Structure::forEachProperty` / `getPropertyNamesFromStructure`,
+    /// Structure.cpp:1326), never per-object. Visits live entries via
+    /// `PropertyTable::forEachProperty` (PropertyTable.h:609) and maps each entry's uid
+    /// back to its `CorePropertyKey` through `property_keys_by_uid`. Indexed (array)
+    /// elements are NOT here — they live in the butterfly indexed region and are
+    /// enumerated separately by the array/typed-array paths.
+    pub(crate) fn structure_property_keys(
+        &self,
+        sid: StructureId,
+    ) -> Vec<(CorePropertyKey, PropertyOffset, u32)> {
+        if !self.is_live_structure(sid) {
+            return Vec::new();
+        }
+        // `PropertyTableEntry::offset()` is the raw `i32` PropertyOffset; wrap into the
+        // interpreter `PropertyOffset` newtype when projecting out.
+        let mut raw: Vec<(AtomId, i32, u32)> = Vec::new();
+        let collect = |table: &StructurePropertyTable, out: &mut Vec<(AtomId, i32, u32)>| {
+            table.for_each_property(|entry| {
+                if let Some(uid) = entry.key() {
+                    out.push((uid, entry.offset(), entry.attributes()));
+                }
+            });
+        };
+        match self.structure_table.structure(sid).property_table_or_null() {
+            Some(table) => collect(table, &mut raw),
+            None => collect(
+                &self.structure_table.materialize_property_table(sid),
+                &mut raw,
+            ),
+        }
+        raw.into_iter()
+            .filter_map(|(uid, offset, attrs)| {
+                self.property_keys_by_uid
+                    .get(&uid)
+                    .map(|key| (key.clone(), PropertyOffset::new(offset), attrs))
+            })
+            .collect()
+    }
+
+    /// Faithful `Structure::attributeChangeTransition` on a per-object dictionary
+    /// (runtime/Structure.cpp:806): an OFFSET-STABLE kind/attribute change of an EXISTING
+    /// property. Used for in-place data<->accessor conversion, accessor getter/setter
+    /// update, and data attribute changes. Mints a fresh per-object dictionary that
+    /// PRESERVES every offset (incl. `key`'s — `removed: None`), then rewrites `key`'s
+    /// attributes in that dictionary's PropertyTable keeping its offset. The caller then
+    /// OVERWRITES the butterfly slot at the returned offset with the new value (the data
+    /// value, or `from_cell(GetterSetter)` for an accessor). Returns
+    /// `(new_dictionary, preserved_offset)`.
+    ///
+    /// Pre-B-iv this path called `fresh_dictionary_structure(old, Some(key))`, which
+    /// REMOVED the key from the shape — harmless while the HashMap was authoritative, but
+    /// after the flip it would make the property VANISH. Keeping the offset is the fix.
+    fn convert_property_in_place(
+        &mut self,
+        old_structure: StructureId,
+        key: &CorePropertyKey,
+        attributes: CorePropertyAttributes,
+        is_accessor: bool,
+    ) -> (StructureId, PropertyOffset) {
+        let new_structure = self.fresh_dictionary_structure(old_structure, None);
+        let offset = self
+            .structure_offset(new_structure, key)
+            .unwrap_or(PropertyOffset::INVALID);
+        let attrs_u32 = core_attributes_to_u32(attributes, is_accessor);
+        self.change_attributes_in_dictionary(new_structure, key, attrs_u32);
+        (new_structure, offset)
+    }
+
+    /// Set the `unsigned attributes` of `key` in dictionary structure `sid`'s owned
+    /// PropertyTable in place, keeping its offset (the `Structure::attributeChange` core
+    /// over `PropertyTable::updateAttributeIfExists`, Structure.cpp:1317 /
+    /// PropertyTable.h:444). No-op if `key` was never interned or `sid` has no owned table.
+    fn change_attributes_in_dictionary(
+        &mut self,
+        sid: StructureId,
+        key: &CorePropertyKey,
+        attrs: u32,
+    ) {
+        if let Some(uid) = self.lookup_property_uid(key) {
+            self.structure_table.update_attributes(sid, uid, attrs);
+        }
     }
 
     /// The offset the NEXT property added to structure `sid` would take — the analog
@@ -4080,32 +4215,6 @@ impl CoreObjectStore {
             .create_dictionary_from(old, removed_uid)
     }
 
-    /// Fill the out-of-line VALUE mirror (the butterfly slab `props` side) at each
-    /// initial data property's structure-assigned offset, after the cell's structure
-    /// has been seeded and its butterfly handle assigned.
-    fn fill_initial_property_storage(&mut self, cell: &CoreObjectCell) {
-        let sid = cell.structure_id;
-        let handle = cell.butterfly;
-        // Collect (offset, value) under the shared cell borrow, then write the slab via
-        // the &mut self butterfly API (the borrow checker forbids holding the cell read
-        // borrow across the &mut self store write).
-        let writes: Vec<(PropertyOffset, RuntimeValue)> = cell
-            .property_order
-            .iter()
-            .filter_map(
-                |key| match cell.properties.get(key).map(|property| property.kind) {
-                    Some(CorePropertyKind::Data(value)) => self
-                        .structure_offset(sid, key)
-                        .map(|offset| (offset, value)),
-                    _ => None,
-                },
-            )
-            .collect();
-        for (offset, value) in writes {
-            self.butterfly_prop_put(handle, offset, value);
-        }
-    }
-
     /// Stable seed-key identity of a stored prototype.
     ///
     /// C++ JSC: the structure's stored prototype is part of structure identity, so
@@ -4159,40 +4268,6 @@ impl CoreObjectStore {
         );
         self.structure_seed_roots.insert((kind, identity), id);
         id
-    }
-
-    /// Structure id for a cell that may be born with initial own properties.
-    ///
-    /// C++ JSC: an object with N initial own properties has the Structure reached by
-    /// applying addPropertyTransition N times from the empty (class, prototype)
-    /// Structure (Structure.cpp:561), so its Structure encodes the full shape. The Rust
-    /// interpreter installs some initial properties before allocate_cell (e.g. a
-    /// function's `.prototype`), so we mirror that by seeding the empty root and then
-    /// chaining structure_add_property over the recorded initial-property order. The
-    /// offsets COME FROM the transition (Structure::PropertyTable), so same-shape
-    /// siblings converge on one structure id AND one offset set. For a 0-property cell
-    /// this degenerates to the plain empty seed root.
-    ///
-    /// Symbol/indexed initial keys: structure_add_property folds them onto a fresh
-    /// per-object dictionary (preserving the named offsets, never a wrong slot); their
-    /// value lives only in the authoritative `properties` map. Fidelity gap deferred
-    /// (no Octane consumer builds Symbol-keyed initial shapes on the hot path).
-    pub(crate) fn seed_initial_shape_structure_id(&mut self, cell: &CoreObjectCell) -> StructureId {
-        let mut structure_id = self.seed_structure_id(cell.kind, cell.prototype);
-        for key in cell.property_order.clone() {
-            let Some(property) = cell.properties.get(&key).copied() else {
-                continue;
-            };
-            if !matches!(property.kind, CorePropertyKind::Data(_)) {
-                // Accessors do not occupy a named-data offset; skip without disturbing
-                // the shared shape chain.
-                continue;
-            }
-            let (next_structure, _offset) =
-                self.structure_add_property(structure_id, &key, property.attributes, false);
-            structure_id = next_structure;
-        }
-        structure_id
     }
 
     pub(crate) fn snapshot_structure_transition_watchpoints(
@@ -4481,13 +4556,15 @@ impl CoreObjectStore {
             let Some(cell) = self.find(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            if cell.properties.contains_key(key) {
+            if self.own_property_from_shape(cell, key).is_some() {
                 return Ok(true);
             }
-            if cell.kind == CoreObjectKind::Array {
-                if key.is_string("length") {
-                    return Ok(true);
-                }
+            if cell.kind == CoreObjectKind::Array && key.is_string("length") {
+                return Ok(true);
+            }
+            // gc-r4 B-iv: array-index-named data properties live in indexed butterfly
+            // storage for EVERY object kind (not just arrays).
+            if cell.kind != CoreObjectKind::Uint8Array {
                 if let Some(index) = key_array_index(key) {
                     if self.butterfly_elem_get(cell.butterfly, index).is_some() {
                         return Ok(true);
@@ -4530,7 +4607,7 @@ impl CoreObjectStore {
                 object: current,
                 structure: cell.structure_id,
             });
-            if let Some(property) = cell.properties.get(key).copied() {
+            if let Some(property) = self.own_property_from_shape(cell, key) {
                 let classification = match property.kind {
                     CorePropertyKind::Data(_) if prototype_depth == 0 => {
                         CorePropertyLookupClassification::OwnData
@@ -4609,6 +4686,27 @@ impl CoreObjectStore {
                     return Ok((true, record));
                 }
             }
+            // gc-r4 B-iv: a NON-array object's array-index data property also lives in
+            // indexed butterfly storage (arrays handled above, typed arrays excluded).
+            if cell.kind != CoreObjectKind::Array && cell.kind != CoreObjectKind::Uint8Array {
+                if key_array_index(key)
+                    .is_some_and(|index| self.butterfly_elem_get(cell.butterfly, index).is_some())
+                {
+                    let mut record = CorePropertyLookupRecord::from_has_property_lookup(
+                        site,
+                        object,
+                        key,
+                        Some(current),
+                        prototype_depth,
+                        CorePropertyLookupClassification::IndexedOrTypedArray,
+                        true,
+                    );
+                    record.base_structure = base_structure;
+                    record.chain = chain.clone();
+                    record.access_case_kind = Some(AccessCaseKind::IndexedArrayStorageInHit);
+                    return Ok((true, record));
+                }
+            }
             let Some(prototype) = cell.prototype else {
                 let mut record = CorePropertyLookupRecord::from_has_property_lookup(
                     site,
@@ -4651,7 +4749,7 @@ impl CoreObjectStore {
                 offset: None,
             };
         };
-        let own_property = cell.properties.get(key);
+        let own_property = self.own_property_from_shape(cell, key);
         let has_own_property = own_property.is_some();
         let has_own_data_property =
             own_property.is_some_and(|property| matches!(property.kind, CorePropertyKind::Data(_)));
@@ -4757,7 +4855,7 @@ impl CoreObjectStore {
         let Some(receiver) = self.find(object) else {
             return Err(ExecutionError::ExpectedObject);
         };
-        if let Some(property) = receiver.properties.get(key).copied() {
+        if let Some(property) = self.own_property_from_shape(receiver, key) {
             return match property.kind {
                 CorePropertyKind::Accessor {
                     setter: Some(setter),
@@ -4805,7 +4903,7 @@ impl CoreObjectStore {
             let Some(cell) = self.find(prototype) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            if let Some(property) = cell.properties.get(key).copied() {
+            if let Some(property) = self.own_property_from_shape(cell, key) {
                 match property.kind {
                     CorePropertyKind::Accessor {
                         setter: Some(setter),
@@ -4861,7 +4959,7 @@ impl CoreObjectStore {
             let Some(cell) = self.find(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            if let Some(property) = cell.properties.get(key).copied() {
+            if let Some(property) = self.own_property_from_shape(cell, key) {
                 return Ok(match property.kind {
                     CorePropertyKind::Accessor {
                         setter: Some(setter),
@@ -4904,10 +5002,13 @@ impl CoreObjectStore {
                 },
             }));
         }
-        if let Some(property) = object.properties.get(key).copied() {
+        if let Some(property) = self.own_property_from_shape(object, key) {
             return Ok(Some(property));
         }
-        if object.kind == CoreObjectKind::Array {
+        // gc-r4 B-iv: an array-index-named data property is served from the INDEXED
+        // butterfly region for EVERY object kind (any JS object may carry indexed data
+        // properties). Typed arrays use their own typed-element path below.
+        if object.kind != CoreObjectKind::Uint8Array {
             if let Some(index) = key_array_index(key) {
                 if let Some(value) = self.butterfly_elem_get(object.butterfly, index) {
                     return Ok(Some(CoreProperty {
@@ -4984,13 +5085,15 @@ impl CoreObjectStore {
             return Err(ExecutionError::ExpectedObject);
         };
         let mut index_names = BTreeSet::new();
-        if object.kind == CoreObjectKind::Array {
+        // gc-r4 B-iv: indexed-butterfly elements enumerate (numeric order, first) for EVERY
+        // object kind, not just arrays (any object may carry indexed data properties).
+        if object.kind != CoreObjectKind::Uint8Array {
             for (index, value) in self.butterfly_elements(object.butterfly).iter().enumerate() {
                 if value.is_some() {
                     index_names.insert(index);
                 }
             }
-        } else if object.kind == CoreObjectKind::Uint8Array {
+        } else {
             for index in 0..object.view_length {
                 index_names.insert(index);
             }
@@ -4998,15 +5101,16 @@ impl CoreObjectStore {
 
         let mut string_names = Vec::new();
         let mut hidden_index_names = BTreeSet::new();
-        for key in &object.property_order {
-            let Some(name) = key_string_name(key) else {
+        // gc-r4 B-iv: enumeration order + attributes come from the Structure's
+        // PropertyTable entry order (Structure::getPropertyNamesFromStructure,
+        // Structure.cpp:1326), not the deleted per-cell `property_order`.
+        for (key, _offset, attrs) in self.structure_property_keys(object.structure_id) {
+            let Some(name) = key_string_name(&key) else {
                 continue;
             };
-            let Some(property) = object.properties.get(key) else {
-                continue;
-            };
+            let enumerable = core_attributes_from_u32(attrs).enumerable;
             if let Some(index) = parse_array_index_name(name) {
-                if property.attributes.enumerable {
+                if enumerable {
                     index_names.insert(index);
                     hidden_index_names.remove(&index);
                 } else {
@@ -5014,7 +5118,7 @@ impl CoreObjectStore {
                     hidden_index_names.insert(index);
                 }
             } else {
-                string_names.push((name.to_owned(), property.attributes.enumerable));
+                string_names.push((name.to_owned(), enumerable));
             }
         }
 
@@ -5040,14 +5144,19 @@ impl CoreObjectStore {
         };
         let mut keys = Vec::new();
         let mut seen = HashSet::new();
-        if object.kind == CoreObjectKind::Array {
+        // gc-r4 B-iv: indexed-butterfly elements (numeric order, first) enumerate for EVERY
+        // object kind, not just arrays. Arrays then append the exotic `length`.
+        if object.kind != CoreObjectKind::Uint8Array {
             for (index, value) in self.butterfly_elements(object.butterfly).iter().enumerate() {
                 if value.is_some() {
                     let key = CorePropertyKey::String(index.to_string());
-                    seen.insert(key.clone());
-                    keys.push(key);
+                    if seen.insert(key.clone()) {
+                        keys.push(key);
+                    }
                 }
             }
+        }
+        if object.kind == CoreObjectKind::Array {
             let length = CorePropertyKey::String("length".into());
             seen.insert(length.clone());
             keys.push(length);
@@ -5059,12 +5168,41 @@ impl CoreObjectStore {
                 keys.push(key);
             }
         }
-        for key in &object.property_order {
-            if object.properties.contains_key(key) && seen.insert(key.clone()) {
-                keys.push(key.clone());
+        // gc-r4 B-iv: named own-key order comes from the Structure's PropertyTable entry
+        // order (the deleted per-cell `property_order` was a redundant mirror of it).
+        for (key, _offset, _attrs) in self.structure_property_keys(object.structure_id) {
+            if seen.insert(key.clone()) {
+                keys.push(key);
             }
         }
         Ok(keys)
+    }
+
+    /// Faithful indexed-storage routing (gc-r4 B-iv): an array-index-named property lives
+    /// in the object's INDEXED butterfly storage (C++ contiguous/ArrayStorage), NOT the
+    /// named PropertyTable — it has no named offset, so the named-property IC never arms
+    /// for it. If `key` is an array index, write `value` into the butterfly `elements`
+    /// side and return `Some(())`; otherwise `None` (the caller takes the named path).
+    /// Applies to EVERY object kind (any JS object may carry indexed data properties);
+    /// typed arrays use their own typed-element store and are routed earlier by callers,
+    /// so they are excluded here.
+    ///
+    /// DIVERGENCE: a data index property always takes DATA_DEFAULT element semantics here;
+    /// custom attributes / accessors on integer keys (JSC's ArrayStorage descriptors) are
+    /// not modeled — vanishingly rare and absent from Octane.
+    fn route_array_index_to_elements(
+        &mut self,
+        object: RuntimeValue,
+        key: &CorePropertyKey,
+        value: RuntimeValue,
+    ) -> Option<()> {
+        let (kind, handle) = self.find(object).map(|cell| (cell.kind, cell.butterfly))?;
+        if kind == CoreObjectKind::Uint8Array {
+            return None;
+        }
+        let index = key_array_index(key)?;
+        self.butterfly_elem_put(handle, index, value);
+        Some(())
     }
 
     pub(crate) fn set_data_own(
@@ -5073,48 +5211,48 @@ impl CoreObjectStore {
         key: &CorePropertyKey,
         value: RuntimeValue,
     ) -> Result<(), ExecutionError> {
-        // C++ JSC: a pure property addition (or an accessor->data kind change, which
-        // adds a fresh named-data offset) routes through Structure::addPropertyTransition
+        if self
+            .route_array_index_to_elements(object, key, value)
+            .is_some()
+        {
+            return Ok(());
+        }
+        // C++ JSC: a pure property addition routes through Structure::addPropertyTransition
         // so the offset comes from the per-shape Structure::PropertyTable and same-shape
-        // siblings share one successor structure + offset. A same-shape value replace
-        // keeps the structure and rewrites the existing offset slot.
-        let (old_structure, shape_changed) = {
-            let Some(object_cell) = self.find_mut(object) else {
+        // siblings share one successor structure + offset. An accessor->data kind change is
+        // an offset-stable attributeChangeTransition (Structure.cpp:806). A same-shape value
+        // replace keeps the structure and rewrites the existing offset slot. gc-r4 B-iv:
+        // the offset+attributes (the value authority alongside the butterfly) come from the
+        // Structure; the per-cell `properties` HashMap is gone.
+        let (old_structure, current) = {
+            let Some(cell) = self.find(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object_cell.structure_id;
-            let shape_changed = if let Some(property) = object_cell.properties.get_mut(key) {
-                let was_data = matches!(property.kind, CorePropertyKind::Data(_));
-                property.kind = CorePropertyKind::Data(value);
-                !was_data // accessor -> data is a (offset-adding) shape change
-            } else {
-                object_cell.property_order.push(key.clone());
-                object_cell.properties.insert(
-                    key.clone(),
-                    CoreProperty {
-                        kind: CorePropertyKind::Data(value),
-                        attributes: CorePropertyAttributes::DATA_DEFAULT,
-                    },
-                );
-                true
-            };
-            (old_structure, shape_changed)
+            (cell.structure_id, self.own_property_from_shape(cell, key))
         };
-        // Offset authority = structure_table. A shape change adds a new named offset via
-        // the transition; a same-shape replace reuses the existing offset.
-        let (new_structure, offset) = if shape_changed {
-            self.structure_add_property(
-                old_structure,
-                key,
-                CorePropertyAttributes::DATA_DEFAULT,
-                false,
-            )
-        } else {
-            (
+        let (new_structure, offset, shape_changed) = match current {
+            None => {
+                let (ns, off) = self.structure_add_property(
+                    old_structure,
+                    key,
+                    CorePropertyAttributes::DATA_DEFAULT,
+                    false,
+                );
+                (ns, off, true)
+            }
+            Some(current) if matches!(current.kind, CorePropertyKind::Accessor { .. }) => {
+                // accessor -> data: keep the prior attributes (the pre-flip code rewrote
+                // only the kind to Data), offset preserved.
+                let (ns, off) =
+                    self.convert_property_in_place(old_structure, key, current.attributes, false);
+                (ns, off, true)
+            }
+            Some(_) => (
                 old_structure,
                 self.structure_offset(old_structure, key)
                     .unwrap_or(PropertyOffset::INVALID),
-            )
+                false,
+            ),
         };
         // putDirectOffset analog: write the value at the structure-assigned offset into
         // the store-owned butterfly slab (copy the handle out under the cell borrow,
@@ -5162,62 +5300,58 @@ impl CoreObjectStore {
         key: &CorePropertyKey,
         value: RuntimeValue,
     ) -> Result<(), ExecutionError> {
-        // C++ JSC: a property ADDITION (or accessor->data conversion, which adds a fresh
-        // named-data offset) routes through Structure::addPropertyTransition so the
-        // offset comes from the per-shape PropertyTable and siblings converge. An
-        // attribute change on an existing data property keeps that property's offset but
-        // is not a shareable transition, so it takes a fresh per-object dictionary
-        // (preserving the surviving offsets). A same-shape value replace keeps both.
-        let (old_structure, shape_changed, is_addition, was_accessor) = {
-            let Some(object_cell) = self.find_mut(object) else {
+        if self
+            .route_array_index_to_elements(object, key, value)
+            .is_some()
+        {
+            return Ok(());
+        }
+        // C++ JSC: a property ADDITION routes through Structure::addPropertyTransition so
+        // the offset comes from the per-shape PropertyTable and siblings converge. An
+        // accessor->data conversion or an attribute change on an existing data property
+        // keeps the property's offset and is an offset-stable attributeChangeTransition
+        // (Structure.cpp:806), not a shareable add. A same-shape value replace keeps both.
+        // gc-r4 B-iv: the shape (offset+attributes) is the value authority alongside the
+        // butterfly; the per-cell `properties` HashMap is gone.
+        let (old_structure, current) = {
+            let Some(cell) = self.find(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object_cell.structure_id;
-            let current = object_cell.properties.get(key).copied();
-            let is_addition = current.is_none();
-            let was_accessor = current
-                .is_some_and(|current| matches!(current.kind, CorePropertyKind::Accessor { .. }));
-            let shape_changed = match current {
-                Some(current) => {
-                    !matches!(current.kind, CorePropertyKind::Data(_))
-                        || current.attributes != CorePropertyAttributes::DATA_DEFAULT
-                }
-                None => {
-                    object_cell.property_order.push(key.clone());
-                    true
-                }
-            };
-            object_cell.properties.insert(
-                key.clone(),
-                CoreProperty {
-                    kind: CorePropertyKind::Data(value),
-                    attributes: CorePropertyAttributes::DATA_DEFAULT,
-                },
-            );
-            (old_structure, shape_changed, is_addition, was_accessor)
+            (cell.structure_id, self.own_property_from_shape(cell, key))
         };
-        let (new_structure, offset) = if !shape_changed {
-            // Value-only replace: same structure, existing offset.
-            (
-                old_structure,
-                self.structure_offset(old_structure, key)
-                    .unwrap_or(PropertyOffset::INVALID),
-            )
-        } else if is_addition || was_accessor {
-            // New named-data offset via a (shareable) transition.
-            self.structure_add_property(
-                old_structure,
-                key,
-                CorePropertyAttributes::DATA_DEFAULT,
-                false,
-            )
-        } else {
-            // Attribute change on an existing data property: offset preserved, fresh
-            // per-object dictionary structure.
-            let offset = self
-                .structure_offset(old_structure, key)
-                .unwrap_or(PropertyOffset::INVALID);
-            (self.fresh_dictionary_structure(old_structure, None), offset)
+        let (new_structure, offset, shape_changed) = match current {
+            None => {
+                let (ns, off) = self.structure_add_property(
+                    old_structure,
+                    key,
+                    CorePropertyAttributes::DATA_DEFAULT,
+                    false,
+                );
+                (ns, off, true)
+            }
+            Some(current)
+                if matches!(current.kind, CorePropertyKind::Data(_))
+                    && current.attributes == CorePropertyAttributes::DATA_DEFAULT =>
+            {
+                // Same-shape value replace: keep structure + offset.
+                (
+                    old_structure,
+                    self.structure_offset(old_structure, key)
+                        .unwrap_or(PropertyOffset::INVALID),
+                    false,
+                )
+            }
+            Some(_) => {
+                // accessor->data, or data attribute change to DATA_DEFAULT: offset-stable
+                // attributeChange on a per-object dictionary.
+                let (ns, off) = self.convert_property_in_place(
+                    old_structure,
+                    key,
+                    CorePropertyAttributes::DATA_DEFAULT,
+                    false,
+                );
+                (ns, off, true)
+            }
         };
         // putDirectOffset analog (into the store-owned butterfly slab).
         let handle = self.find_mut(object).map(|object_cell| {
@@ -5242,73 +5376,70 @@ impl CoreObjectStore {
         value: RuntimeValue,
         attributes: CorePropertyAttributes,
     ) -> Result<bool, ExecutionError> {
+        // gc-r4 B-iv: an array-index-named data property lives in indexed butterfly
+        // storage (DATA_DEFAULT semantics), never the named table — route it there. Custom
+        // attributes on integer keys are not modeled (see route_array_index_to_elements).
+        if self
+            .route_array_index_to_elements(object, key, value)
+            .is_some()
+        {
+            return Ok(true);
+        }
         // C++ JSC: defining a brand-new property is a property-addition transition
         // keyed by (uid, attributes) (StructureTransitionTable), so siblings defined
         // with the same key+attributes share a structure id. Redefining an existing
-        // property (kind or attribute change) is out of scope and keeps a fresh id.
-        let (old_structure, shape_changed, is_addition, was_accessor) = {
-            let Some(object_cell) = self.find_mut(object) else {
+        // property (kind or attribute change) is an offset-stable attributeChangeTransition
+        // (Structure.cpp:806). gc-r4 B-iv: the existing property + its attributes come from
+        // the Structure (the offset/attribute authority), not the deleted HashMap.
+        let (old_structure, current) = {
+            let Some(cell) = self.find(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object_cell.structure_id;
-            let current = object_cell.properties.get(key).copied();
-            let is_addition = current.is_none();
-            if let Some(current) = current {
-                if !current.attributes.configurable {
-                    if attributes.configurable
-                        || attributes.enumerable != current.attributes.enumerable
-                    {
-                        return Ok(false);
-                    }
-                    match current.kind {
-                        CorePropertyKind::Accessor { .. } => return Ok(false),
-                        CorePropertyKind::Data(current_value) => {
-                            if !current.attributes.writable
-                                && (attributes.writable || current_value != value)
-                            {
-                                return Ok(false);
-                            }
+            (cell.structure_id, self.own_property_from_shape(cell, key))
+        };
+        if let Some(current) = current {
+            if !current.attributes.configurable {
+                if attributes.configurable || attributes.enumerable != current.attributes.enumerable
+                {
+                    return Ok(false);
+                }
+                match current.kind {
+                    CorePropertyKind::Accessor { .. } => return Ok(false),
+                    CorePropertyKind::Data(current_value) => {
+                        if !current.attributes.writable
+                            && (attributes.writable || current_value != value)
+                        {
+                            return Ok(false);
                         }
                     }
                 }
             }
-            let was_accessor = current
-                .is_some_and(|current| matches!(current.kind, CorePropertyKind::Accessor { .. }));
-            let shape_changed = match current {
-                Some(current) => {
-                    !matches!(current.kind, CorePropertyKind::Data(_))
-                        || current.attributes != attributes
-                }
-                None => {
-                    object_cell.property_order.push(key.clone());
-                    true
-                }
-            };
-            object_cell.properties.insert(
-                key.clone(),
-                CoreProperty {
-                    kind: CorePropertyKind::Data(value),
-                    attributes,
-                },
-            );
-            (old_structure, shape_changed, is_addition, was_accessor)
-        };
-        // Offset authority = structure_table. A brand-new property (or accessor->data)
-        // gets a fresh offset via the (uid, attributes)-keyed transition; an attribute
-        // change on an existing data property keeps its offset under a fresh dictionary.
-        let (new_structure, offset) = if !shape_changed {
-            (
-                old_structure,
-                self.structure_offset(old_structure, key)
-                    .unwrap_or(PropertyOffset::INVALID),
-            )
-        } else if is_addition || was_accessor {
-            self.structure_add_property(old_structure, key, attributes, false)
-        } else {
-            let offset = self
-                .structure_offset(old_structure, key)
-                .unwrap_or(PropertyOffset::INVALID);
-            (self.fresh_dictionary_structure(old_structure, None), offset)
+        }
+        let (new_structure, offset, shape_changed) = match current {
+            None => {
+                // Brand-new property: a fresh offset via the (uid, attributes)-keyed
+                // (shareable) add-property transition.
+                let (ns, off) = self.structure_add_property(old_structure, key, attributes, false);
+                (ns, off, true)
+            }
+            Some(current)
+                if matches!(current.kind, CorePropertyKind::Data(_))
+                    && current.attributes == attributes =>
+            {
+                // Same data kind + attributes: value-only replace, keep structure + offset.
+                (
+                    old_structure,
+                    self.structure_offset(old_structure, key)
+                        .unwrap_or(PropertyOffset::INVALID),
+                    false,
+                )
+            }
+            Some(_) => {
+                // accessor->data, or data attribute change: offset-stable attributeChange.
+                let (ns, off) =
+                    self.convert_property_in_place(old_structure, key, attributes, false);
+                (ns, off, true)
+            }
         };
         // putDirectOffset analog (into the store-owned butterfly slab).
         let handle = self.find_mut(object).map(|object_cell| {
@@ -5349,57 +5480,52 @@ impl CoreObjectStore {
         // preserved. The dictionary transition KINDS are not yet ported, so this takes
         // the conservative fresh per-object dictionary that carries the surviving
         // offsets with the deleted key taken out (offset freed for recycle).
-        let (old_structure, removed, array_clear) = {
-            let Some(object_cell) = self.find_mut(object) else {
+        // gc-r4 B-iv: presence + configurability come from the Structure (offset/attribute
+        // authority); the per-cell `properties` HashMap is gone. Indexed (array) element
+        // keys are not named-table entries — they are served from the indexed butterfly
+        // region and cleared separately below.
+        let (old_structure, current, kind, butterfly, view_length) = {
+            let Some(cell) = self.find(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object_cell.structure_id;
-            if object_cell
-                .properties
-                .get(key)
-                .is_some_and(|property| !property.attributes.configurable)
-            {
-                return Ok(false);
-            }
-            if object_cell.kind == CoreObjectKind::Uint8Array {
-                if let Some(index) = key_array_index(key) {
-                    if index < object_cell.view_length {
-                        return Ok(false);
-                    }
+            (
+                cell.structure_id,
+                self.own_property_from_shape(cell, key),
+                cell.kind,
+                cell.butterfly,
+                cell.view_length,
+            )
+        };
+        if current.is_some_and(|property| !property.attributes.configurable) {
+            return Ok(false);
+        }
+        if kind == CoreObjectKind::Uint8Array {
+            if let Some(index) = key_array_index(key) {
+                if index < view_length {
+                    return Ok(false);
                 }
             }
-            // `delete arr[i]`: punch a hole in the indexed storage (store-owned slab);
-            // capture (handle, index) and clear it after the cell borrow ends.
-            let array_clear = if object_cell.kind == CoreObjectKind::Array {
-                key_array_index(key).map(|index| (object_cell.butterfly, index))
-            } else {
-                None
-            };
-            let removed = if object_cell.properties.remove(key).is_some() {
-                object_cell
-                    .property_order
-                    .retain(|ordered_key| ordered_key != key);
-                true
-            } else {
-                false
-            };
-            (old_structure, removed, array_clear)
+        }
+        // `delete obj[i]`: punch a hole in the indexed butterfly storage. gc-r4 B-iv:
+        // applies to EVERY object kind (typed arrays handled/rejected above).
+        let array_clear = if kind != CoreObjectKind::Uint8Array {
+            key_array_index(key).map(|index| (butterfly, index))
+        } else {
+            None
         };
+        let removed = current.is_some();
         if let Some((handle, index)) = array_clear {
             self.butterfly_elem_clear(handle, index);
         }
         if removed {
-            // Free the deleted property's storage slot (its offset is read from the OLD
-            // structure before the dictionary takes it out, then recycled by the table).
+            // Free the deleted property's storage slot: `fresh_dictionary_structure` takes
+            // the key out of the new dictionary's PropertyTable and pushes its offset onto
+            // the table's own `m_deletedOffsets` recycle stack (the faithful owner of
+            // recycling — the vestigial per-cell `deleted_offsets` is gone). The slab slot
+            // is cleared after the cell borrow releases.
             let removed_offset = self.structure_offset(old_structure, key);
             let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
-            // Record the freed offset (PropertyTable::m_deletedOffsets mirror) and set
-            // the new dictionary structure under the cell borrow; clear the slab slot
-            // after (the &mut self butterfly write needs the borrow released).
             let handle = self.find_mut(object).map(|object_cell| {
-                if let Some(offset) = removed_offset {
-                    object_cell.deleted_offsets.push(offset);
-                }
                 object_cell.structure_id = new_structure;
                 object_cell.butterfly
             });
@@ -5411,22 +5537,22 @@ impl CoreObjectStore {
         Ok(true)
     }
 
-    /// gc-r4 B-iii dual-write tail for an accessor install, run AFTER the still-
-    /// authoritative `properties` HashMap has been updated (so reads stay correct this
-    /// batch). It MIRRORS the accessor into the Structure + butterfly, in lockstep:
+    /// Install an accessor into the Structure + butterfly — the gc-r4 B-iv single value
+    /// authority (the per-cell `properties` HashMap is gone):
     ///   - a FRESH-key accessor (`is_addition`) takes a faithful `addPropertyTransition`
     ///     carrying the `PropertyAttribute::Accessor` bit (so a data add and an accessor
     ///     add of the same key key DISTINCT transition edges -> distinct structures, and
-    ///     same-shape siblings converge), allocates a GetterSetter cell (B-ii) for the
-    ///     merged getter/setter, and writes `from_cell(getter_setter)` into the
-    ///     structure-assigned butterfly slot — same mechanics as a data `putDirectOffset`;
-    ///   - an existing-key change (the rarer in-place data<->accessor CONVERSION or an
-    ///     accessor getter/setter UPDATE) keeps the conservative fresh-dictionary fallback
-    ///     (ratified decision 2; the faithful `attributeChangeTransition` is deferred to
-    ///     B-iv), freeing + clearing any offset the key held (a fresh-added accessor now
-    ///     HAS a real offset, so this also clears its stale GetterSetter slot).
-    /// Called ONLY when the caller's `shape_changed` holds, so an idempotent redefine does
-    /// no structure churn. REVERSIBLE: nothing here switches a read off the HashMap.
+    ///     same-shape siblings converge);
+    ///   - an EXISTING-key change (in-place data<->accessor CONVERSION or an accessor
+    ///     getter/setter UPDATE) is an offset-STABLE `attributeChangeTransition`
+    ///     (Structure.cpp:806) via `convert_property_in_place`, which KEEPS the property's
+    ///     offset and just stamps the Accessor attributes — pre-B-iv this freed/removed the
+    ///     offset (`fresh_dictionary_structure(old, Some(key))`), which after the flip would
+    ///     make the property VANISH.
+    /// In BOTH cases a fresh GetterSetter cell (B-ii) holds the merged getter/setter and
+    /// `from_cell(getter_setter)` is written into the structure-assigned butterfly slot,
+    /// exactly as C++ stores a `GetterSetter*` at the property's offset. Called ONLY when
+    /// the caller's `shape_changed` holds, so an idempotent redefine does no churn.
     fn install_accessor_dual_write(
         &mut self,
         object: RuntimeValue,
@@ -5437,39 +5563,25 @@ impl CoreObjectStore {
         setter: Option<RuntimeValue>,
         is_addition: bool,
     ) {
-        if is_addition {
-            let (new_structure, offset) =
-                self.structure_add_property(old_structure, key, attributes, true);
-            let getter_setter = self.allocate_getter_setter(getter, setter);
-            let handle = self.find_mut(object).map(|object_cell| {
-                object_cell.structure_id = new_structure;
-                object_cell.butterfly
-            });
-            if let Some(handle) = handle {
-                // No-op for a negative offset (an accessor on an array-index key falls
-                // back to a fresh dictionary with no named offset; the value still lives
-                // in the authoritative HashMap).
-                self.butterfly_prop_put(handle, offset, getter_setter);
-            }
-            self.finish_structure_transition(old_structure);
+        let (new_structure, offset) = if is_addition {
+            self.structure_add_property(old_structure, key, attributes, true)
         } else {
-            // Installing/updating an accessor over an EXISTING key takes any offset the
-            // key held out of the shape and frees it; surviving offsets are preserved on
-            // the fresh per-object dictionary structure.
-            let displaced_offset = self.structure_offset(old_structure, key);
-            let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
-            let handle = self.find_mut(object).map(|object_cell| {
-                if let Some(offset) = displaced_offset {
-                    object_cell.deleted_offsets.push(offset);
-                }
-                object_cell.structure_id = new_structure;
-                object_cell.butterfly
-            });
-            if let (Some(handle), Some(offset)) = (handle, displaced_offset) {
-                self.butterfly_prop_clear(handle, offset);
-            }
-            self.finish_structure_transition(old_structure);
+            // Offset-stable attributeChange: data<->accessor conversion or getter/setter
+            // update on an existing key. The GetterSetter slot below overwrites the prior
+            // value (data value or old GetterSetter) at the preserved offset.
+            self.convert_property_in_place(old_structure, key, attributes, true)
+        };
+        let getter_setter = self.allocate_getter_setter(getter, setter);
+        let handle = self.find_mut(object).map(|object_cell| {
+            object_cell.structure_id = new_structure;
+            object_cell.butterfly
+        });
+        if let Some(handle) = handle {
+            // No-op for a negative offset (should not happen — every key now gets a real
+            // named offset).
+            self.butterfly_prop_put(handle, offset, getter_setter);
         }
+        self.finish_structure_transition(old_structure);
     }
 
     pub(crate) fn define_getter_with_write_barrier(
@@ -5507,60 +5619,51 @@ impl CoreObjectStore {
         if let Some(setter) = setter {
             self.expect_function(setter)?;
         }
-        let (old_structure, shape_changed, is_addition, final_getter, final_setter) = {
-            let Some(object_cell) = self.find_mut(object) else {
+        // gc-r4 B-iv: the existing property + its getter/setter come from the Structure +
+        // butterfly (the value authority), reconstructed via own_property_from_shape; the
+        // per-cell `properties` HashMap is gone. define_getter/define_setter MERGE into an
+        // existing accessor's other half.
+        let (old_structure, current) = {
+            let Some(cell) = self.find(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object_cell.structure_id;
-            let current = object_cell.properties.get(key).copied();
-            let is_addition = current.is_none();
-            let mut property = current.unwrap_or(CoreProperty {
-                kind: CorePropertyKind::Accessor {
-                    getter: None,
-                    setter: None,
-                },
-                attributes: CorePropertyAttributes::ACCESSOR_DEFAULT,
-            });
-            match &mut property.kind {
-                CorePropertyKind::Accessor {
-                    getter: existing_getter,
-                    setter: existing_setter,
-                } => {
-                    if let Some(getter) = getter {
-                        *existing_getter = Some(getter);
-                    }
-                    if let Some(setter) = setter {
-                        *existing_setter = Some(setter);
-                    }
+            (cell.structure_id, self.own_property_from_shape(cell, key))
+        };
+        let is_addition = current.is_none();
+        let mut property = current.unwrap_or(CoreProperty {
+            kind: CorePropertyKind::Accessor {
+                getter: None,
+                setter: None,
+            },
+            attributes: CorePropertyAttributes::ACCESSOR_DEFAULT,
+        });
+        match &mut property.kind {
+            CorePropertyKind::Accessor {
+                getter: existing_getter,
+                setter: existing_setter,
+            } => {
+                if let Some(getter) = getter {
+                    *existing_getter = Some(getter);
                 }
-                CorePropertyKind::Data(_) => {
-                    property = CoreProperty {
-                        kind: CorePropertyKind::Accessor { getter, setter },
-                        attributes: CorePropertyAttributes::ACCESSOR_DEFAULT,
-                    };
+                if let Some(setter) = setter {
+                    *existing_setter = Some(setter);
                 }
             }
-            // The MERGED getter/setter the GetterSetter cell + butterfly mirror must hold
-            // (define_getter/define_setter merge into an existing accessor's other half).
-            let (final_getter, final_setter) = match property.kind {
-                CorePropertyKind::Accessor { getter, setter } => (getter, setter),
-                CorePropertyKind::Data(_) => (None, None),
-            };
-            let shape_changed = match current {
-                Some(current) => current != property,
-                None => {
-                    object_cell.property_order.push(key.clone());
-                    true
-                }
-            };
-            object_cell.properties.insert(key.clone(), property);
-            (
-                old_structure,
-                shape_changed,
-                is_addition,
-                final_getter,
-                final_setter,
-            )
+            CorePropertyKind::Data(_) => {
+                property = CoreProperty {
+                    kind: CorePropertyKind::Accessor { getter, setter },
+                    attributes: CorePropertyAttributes::ACCESSOR_DEFAULT,
+                };
+            }
+        }
+        // The MERGED getter/setter the GetterSetter cell + butterfly slot must hold.
+        let (final_getter, final_setter) = match property.kind {
+            CorePropertyKind::Accessor { getter, setter } => (getter, setter),
+            CorePropertyKind::Data(_) => (None, None),
+        };
+        let shape_changed = match current {
+            Some(current) => current != property,
+            None => true,
         };
         if shape_changed {
             self.install_accessor_dual_write(
@@ -5607,46 +5710,41 @@ impl CoreObjectStore {
         if let Some(setter) = setter {
             self.expect_function(setter)?;
         }
-        let (old_structure, shape_changed, is_addition) = {
-            let Some(object_cell) = self.find_mut(object) else {
+        // gc-r4 B-iv: the existing property comes from the Structure + butterfly (the
+        // value authority), not the deleted per-cell HashMap.
+        let (old_structure, current) = {
+            let Some(cell) = self.find(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            let old_structure = object_cell.structure_id;
-            let current = object_cell.properties.get(key).copied();
-            let is_addition = current.is_none();
-            if let Some(current) = current {
-                if !current.attributes.configurable {
-                    if attributes.configurable
-                        || attributes.enumerable != current.attributes.enumerable
-                    {
-                        return Ok(false);
-                    }
-                    match current.kind {
-                        CorePropertyKind::Data(_) => return Ok(false),
-                        CorePropertyKind::Accessor {
-                            getter: current_getter,
-                            setter: current_setter,
-                        } => {
-                            if getter != current_getter || setter != current_setter {
-                                return Ok(false);
-                            }
+            (cell.structure_id, self.own_property_from_shape(cell, key))
+        };
+        let is_addition = current.is_none();
+        if let Some(current) = current {
+            if !current.attributes.configurable {
+                if attributes.configurable || attributes.enumerable != current.attributes.enumerable
+                {
+                    return Ok(false);
+                }
+                match current.kind {
+                    CorePropertyKind::Data(_) => return Ok(false),
+                    CorePropertyKind::Accessor {
+                        getter: current_getter,
+                        setter: current_setter,
+                    } => {
+                        if getter != current_getter || setter != current_setter {
+                            return Ok(false);
                         }
                     }
                 }
             }
-            let property = CoreProperty {
-                kind: CorePropertyKind::Accessor { getter, setter },
-                attributes,
-            };
-            let shape_changed = match current {
-                Some(current) => current != property,
-                None => {
-                    object_cell.property_order.push(key.clone());
-                    true
-                }
-            };
-            object_cell.properties.insert(key.clone(), property);
-            (old_structure, shape_changed, is_addition)
+        }
+        let property = CoreProperty {
+            kind: CorePropertyKind::Accessor { getter, setter },
+            attributes,
+        };
+        let shape_changed = match current {
+            Some(current) => current != property,
+            None => true,
         };
         if shape_changed {
             // define_accessor_property REPLACES the property, so the getter/setter passed
@@ -5735,11 +5833,14 @@ impl CoreObjectStore {
         // fresh-id fallback: that is a real prototype-change structure transition,
         // out of scope for the add-property transition table.
         let (kind, is_empty_object, current_structure) = match self.find(object) {
-            Some(cell) => (
-                cell.kind,
-                cell.properties.is_empty() && cell.property_order.is_empty(),
-                cell.structure_id,
-            ),
+            Some(cell) => {
+                let sid = cell.structure_id;
+                // gc-r4 B-iv: "empty" == no own NAMED properties (the just-allocated
+                // construct receiver), read from the Structure, not the deleted HashMap /
+                // property_order. Array indexed elements are unaffected (a fresh receiver
+                // has none); a real later setPrototypeOf takes the fresh-id fallback.
+                (cell.kind, self.structure_property_keys(sid).is_empty(), sid)
+            }
             None => return Err(ExecutionError::ExpectedObject),
         };
         let new_structure = if is_empty_object {
@@ -6916,11 +7017,9 @@ impl CoreObjectStore {
         constructor: RuntimeValue,
         prototype_property_key: &CorePropertyKey,
     ) -> Option<RuntimeValue> {
+        let cell = self.find(constructor)?;
         let prototype = match self
-            .find(constructor)?
-            .properties
-            .get(prototype_property_key)
-            .copied()?
+            .own_property_from_shape(cell, prototype_property_key)?
             .kind
         {
             CorePropertyKind::Data(value) => value,
@@ -7004,7 +7103,7 @@ impl CoreObjectStore {
             let Some(cell) = self.find(object) else {
                 return Err(ExecutionError::ExpectedObject);
             };
-            if let Some(property) = cell.properties.get(key).copied() {
+            if let Some(property) = self.own_property_from_shape(cell, key) {
                 return Ok(match property.kind {
                     CorePropertyKind::Data(value) => CorePropertyGet::Data(value),
                     CorePropertyKind::Accessor {
@@ -7016,7 +7115,9 @@ impl CoreObjectStore {
                     }
                 });
             }
-            if cell.kind == CoreObjectKind::Array {
+            // gc-r4 B-iv: array-index-named data properties live in indexed butterfly
+            // storage for EVERY object kind (not just arrays).
+            if cell.kind != CoreObjectKind::Uint8Array {
                 if let Some(index) = key_array_index(key) {
                     if let Some(value) = self.butterfly_elem_get(cell.butterfly, index) {
                         return Ok(CorePropertyGet::Data(value));
@@ -7077,7 +7178,7 @@ impl CoreObjectStore {
                 object: current,
                 structure: cell.structure_id,
             });
-            if let Some(property) = cell.properties.get(key).copied() {
+            if let Some(property) = self.own_property_from_shape(cell, key) {
                 let found_structure = cell.structure_id;
                 return Ok(match property.kind {
                     CorePropertyKind::Data(value) => {
@@ -7136,7 +7237,9 @@ impl CoreObjectStore {
                     }
                 });
             }
-            if cell.kind == CoreObjectKind::Array {
+            // gc-r4 B-iv: array-index-named data properties live in indexed butterfly
+            // storage for EVERY object kind (not just arrays).
+            if cell.kind != CoreObjectKind::Uint8Array {
                 if let Some(index) = key_array_index(key) {
                     if let Some(value) = self.butterfly_elem_get(cell.butterfly, index) {
                         let mut record = CorePropertyLookupRecord::from_object_lookup(
@@ -7242,7 +7345,7 @@ impl CoreObjectStore {
             if let Some(value) = self.butterfly_elem_get(cell.butterfly, index) {
                 return Ok(value);
             }
-            if let Some(property) = cell.properties.get(&key) {
+            if let Some(property) = self.own_property_from_shape(cell, &key) {
                 if let CorePropertyKind::Data(value) = property.kind {
                     return Ok(value);
                 }
@@ -7309,7 +7412,7 @@ impl CoreObjectStore {
                 record.chain = chain.clone();
                 return Ok((value, record));
             }
-            if let Some(property) = cell.properties.get(&key) {
+            if let Some(property) = self.own_property_from_shape(cell, &key) {
                 if let CorePropertyKind::Data(value) = property.kind {
                     let found_structure = cell.structure_id;
                     let mut record = CorePropertyLookupRecord::from_object_lookup(
@@ -7460,12 +7563,12 @@ impl CoreObjectStore {
             // the structure invariant already implies this, but the explicit check
             // guards a read-only/accessor target (which the slow put would leave
             // untouched / route to a setter) and keeps the fast path from diverging
-            // from slow-path semantics. One HashMap probe on the already-built key,
-            // no allocation.
-            match cell.properties.get(cached_key) {
-                Some(property)
-                    if property.attributes.writable
-                        && matches!(property.kind, CorePropertyKind::Data(_)) => {}
+            // from slow-path semantics. gc-r4 B-iv: read the SHAPE (offset/attribute
+            // authority), not the deleted per-cell HashMap.
+            match self.structure_property(cell.structure_id, cached_key) {
+                Some((_, attributes))
+                    if attributes & PROPERTY_ATTRIBUTE_ACCESSOR == 0
+                        && core_attributes_from_u32(attributes).writable => {}
                 _ => return Ok(false),
             }
         }
@@ -7474,31 +7577,22 @@ impl CoreObjectStore {
         // run on the fast path too: storing a heap value into an object field is a
         // barriered mutator field write regardless of whether an IC served it.
         self.apply_value_store_write_barrier(heap, receiver, value)?;
-        // Update the value-authoritative `properties` HashMap + capture the butterfly
-        // handle under the cell borrow; write the slab mirror after the borrow releases
-        // (the &mut self butterfly write cannot coexist with the &mut cell borrow).
+        // Re-validate the structure after the barrier (the barrier path does not mutate
+        // this cell's shape, but the re-fetch keeps the store self-contained) and capture
+        // the butterfly handle; the butterfly slot IS the value authority post-flip.
         let handle = {
-            let Some(cell) = self.objects.get_mut(index) else {
+            let Some(cell) = self.objects.get(index) else {
                 return Ok(false);
             };
-            let cell = cell.as_mut().get_mut();
-            // Re-validate after the barrier (the barrier path does not mutate this
-            // cell's shape, but the re-fetch keeps the store self-contained).
+            let cell = cell.as_ref().get_ref();
             if cell.structure_id != cached_structure_id {
                 return Ok(false);
             }
-            let Some(property) = cell.properties.get_mut(cached_key) else {
-                return Ok(false);
-            };
-            let CorePropertyKind::Data(slot) = &mut property.kind else {
-                return Ok(false);
-            };
-            *slot = value;
             cell.butterfly
         };
-        // Lockstep mirror update (invariant c): write the same value into the butterfly
-        // slab `props` side at the cached offset. The slot already exists (the structure
-        // match proves the shape), so this is an in-place store.
+        // putDirectOffset analog (invariant c): write the value into the butterfly slab
+        // `props` side at the cached offset. The slot already exists (the structure match
+        // proves the shape), so this is an in-place store.
         self.butterfly_prop_put(handle, cached_offset, value);
         Ok(true)
     }
@@ -7776,14 +7870,15 @@ mod butterfly_values_cutover_tests {
 
 #[cfg(test)]
 mod getter_setter_prereq_tests {
-    //! gc-r4 GetterSetter prerequisite (B-i/B-ii/B-iii) verification.
+    //! gc-r4 GetterSetter (B-i/B-ii/B-iii) verification.
     //!
-    //! Proves the ADDITIVE/DUAL-WRITE infra that unblocks the later HashMap-deletion
-    //! flip: fresh-key accessor + Symbol-keyed properties now take REAL Structure
-    //! offsets (B-i Accessor bit + B-iii un-gate), an accessor's butterfly slot holds
+    //! Proves the Structure+butterfly value model that the B-iv flip made authoritative:
+    //! fresh-key accessor + Symbol-keyed properties take REAL Structure offsets (B-i
+    //! Accessor bit + B-iii un-gate), an accessor's butterfly slot holds
     //! `from_cell(GetterSetter)` (B-ii), symbol-keyed siblings converge, and the
-    //! structure+butterfly MIRROR agrees with the still-authoritative `properties`
-    //! HashMap. The HashMap stays the read authority this batch (reversible).
+    //! Structure+butterfly value (now read back via `own_property_from_shape`, the per-cell
+    //! `properties` HashMap being deleted) is internally consistent across data,
+    //! symbol-keyed data, and accessor.
     use super::*;
 
     fn func(store: &mut CoreObjectStore, index: u32) -> RuntimeValue {
@@ -7964,5 +8059,596 @@ mod getter_setter_prereq_tests {
             }
             CorePropertyKind::Data(_) => panic!("authority must be an accessor"),
         }
+    }
+}
+
+#[cfg(test)]
+mod b_iv_flip_tests {
+    //! gc-r4 B-iv: the per-cell `properties` HashMap is DELETED — the Structure
+    //! (offset + attributes) plus the butterfly (data value, or `from_cell(GetterSetter)`
+    //! for an accessor) is the SOLE value authority. These prove reads reconstruct from
+    //! the shape (own_property_from_shape), the in-place data<->accessor CONVERSION keeps
+    //! the offset (the property does NOT vanish), symbol keys round-trip, enumeration
+    //! order comes from the PropertyTable entry order, and non-configurable delete is
+    //! still rejected.
+    use super::*;
+
+    fn func(store: &mut CoreObjectStore, index: u32) -> RuntimeValue {
+        store.allocate_function(index, Vec::new(), None)
+    }
+
+    // (a) accessor get returns the getter; put routes to the setter — shape-driven.
+    #[test]
+    fn accessor_get_returns_getter_and_put_routes_to_setter() {
+        let mut store = CoreObjectStore::default();
+        let mut heap = Heap::new();
+        let obj = store.allocate();
+        let getter = func(&mut store, 0);
+        let setter = func(&mut store, 1);
+        let key = CorePropertyKey::Identifier(5);
+        store
+            .define_accessor(obj, &key, Some(getter), Some(setter))
+            .unwrap();
+
+        assert_eq!(
+            store.get_property_from_prototype_chain(obj, &key).unwrap(),
+            CorePropertyGet::Getter(getter),
+            "own accessor get must surface the getter"
+        );
+        assert_eq!(
+            store
+                .put(&mut heap, obj, &key, RuntimeValue::from_i32(9))
+                .unwrap(),
+            CorePropertyPut::Setter(setter),
+            "own accessor put must route to the setter"
+        );
+    }
+
+    // (b) define_getter THEN define_setter on one key -> both halves readable.
+    #[test]
+    fn define_getter_then_setter_merges_both_halves() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let getter = func(&mut store, 0);
+        let setter = func(&mut store, 1);
+        let key = CorePropertyKey::Identifier(6);
+        store
+            .define_accessor(obj, &key, Some(getter), None)
+            .unwrap();
+        store
+            .define_accessor(obj, &key, None, Some(setter))
+            .unwrap();
+        match store.get_own_property(obj, &key).unwrap().unwrap().kind {
+            CorePropertyKind::Accessor {
+                getter: g,
+                setter: s,
+            } => {
+                assert_eq!(g, Some(getter), "getter half preserved across the merge");
+                assert_eq!(s, Some(setter), "setter half merged in");
+            }
+            CorePropertyKind::Data(_) => panic!("expected accessor"),
+        }
+    }
+
+    // (c) symbol-keyed data get/set round-trips through the butterfly.
+    #[test]
+    fn symbol_keyed_get_set_round_trips() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let skey = CorePropertyKey::Symbol(0xABCD);
+        store
+            .put_data_own(obj, &skey, RuntimeValue::from_i32(123))
+            .unwrap();
+        assert_eq!(
+            store.get_own_property(obj, &skey).unwrap().unwrap().kind,
+            CorePropertyKind::Data(RuntimeValue::from_i32(123))
+        );
+        store
+            .put_data_own(obj, &skey, RuntimeValue::from_i32(456))
+            .unwrap();
+        assert_eq!(
+            store.get_own_property(obj, &skey).unwrap().unwrap().kind,
+            CorePropertyKind::Data(RuntimeValue::from_i32(456)),
+            "overwrite must update the butterfly slot at the same offset"
+        );
+    }
+
+    // (d) Object.keys order == PropertyTable insertion order over string + symbol +
+    // deleted + re-added keys (a re-added key moves to the END, a fresh entry).
+    #[test]
+    fn own_property_keys_follow_property_table_insertion_order() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let a = CorePropertyKey::String("alpha".into());
+        let b = CorePropertyKey::String("beta".into());
+        let sym = CorePropertyKey::Symbol(0x9);
+        let c = CorePropertyKey::String("gamma".into());
+        for (k, v) in [(&a, 1), (&b, 2), (&sym, 3), (&c, 4)] {
+            store
+                .put_data_own(obj, k, RuntimeValue::from_i32(v))
+                .unwrap();
+        }
+        assert!(store.delete_property(obj, &b).unwrap());
+        store
+            .put_data_own(obj, &b, RuntimeValue::from_i32(5))
+            .unwrap();
+        assert_eq!(
+            store.own_property_keys(obj).unwrap(),
+            vec![a.clone(), sym.clone(), c.clone(), b.clone()],
+            "deleted+re-added key moves to the end of the entry order"
+        );
+    }
+
+    // (e) THE CONVERSION TEST: data -> accessor get returns the getter (NOT None, the
+    // property must not vanish), offset preserved; accessor -> data get returns the data
+    // value. The load-bearing offset-stable attributeChange.
+    #[test]
+    fn data_accessor_conversion_keeps_property_visible_and_offset_stable() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let key = CorePropertyKey::Identifier(7);
+        store
+            .put_data_own(obj, &key, RuntimeValue::from_i32(10))
+            .unwrap();
+        let sid_data = store.find(obj).unwrap().structure_id;
+        let off_data = store.structure_offset(sid_data, &key).expect("data offset");
+
+        // data -> accessor
+        let getter = func(&mut store, 0);
+        store
+            .define_accessor(obj, &key, Some(getter), None)
+            .unwrap();
+        match store.get_own_property(obj, &key).unwrap() {
+            Some(property) => match property.kind {
+                CorePropertyKind::Accessor { getter: g, .. } => {
+                    assert_eq!(g, Some(getter), "conversion must surface the getter")
+                }
+                CorePropertyKind::Data(_) => panic!("expected accessor after conversion"),
+            },
+            None => panic!("data->accessor conversion made the property VANISH"),
+        }
+        let sid_acc = store.find(obj).unwrap().structure_id;
+        assert_eq!(
+            store.structure_offset(sid_acc, &key),
+            Some(off_data),
+            "accessor conversion must keep the property's offset (attributeChange)"
+        );
+
+        // accessor -> data
+        store
+            .put_data_own(obj, &key, RuntimeValue::from_i32(20))
+            .unwrap();
+        assert_eq!(
+            store.get_own_property(obj, &key).unwrap().unwrap().kind,
+            CorePropertyKind::Data(RuntimeValue::from_i32(20)),
+            "accessor->data conversion must surface the data value"
+        );
+        let sid_back = store.find(obj).unwrap().structure_id;
+        assert_eq!(
+            store.structure_offset(sid_back, &key),
+            Some(off_data),
+            "accessor->data conversion must keep the offset"
+        );
+    }
+
+    // (f) non-configurable delete still rejected; the property stays visible.
+    #[test]
+    fn non_configurable_property_delete_rejected() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let key = CorePropertyKey::Identifier(8);
+        store
+            .define_data_property(
+                obj,
+                &key,
+                RuntimeValue::from_i32(1),
+                CorePropertyAttributes {
+                    writable: true,
+                    enumerable: true,
+                    configurable: false,
+                },
+            )
+            .unwrap();
+        assert!(
+            !store.delete_property(obj, &key).unwrap(),
+            "non-configurable delete must return false"
+        );
+        assert!(
+            store.get_own_property(obj, &key).unwrap().is_some(),
+            "the property must remain after a rejected delete"
+        );
+    }
+
+    // Integer-string keys on an ORDINARY object route to INDEXED butterfly storage (the
+    // faithful JSC model): NO named offset (so the named-property IC never arms), but the
+    // value round-trips through get_own_property and enumerates numeric-first. Pre-flip
+    // these were HashMap-only and would orphan once the HashMap is deleted.
+    #[test]
+    fn integer_string_key_on_ordinary_object_routes_to_indexed_storage() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let s = CorePropertyKey::String("name".into());
+        let i = CorePropertyKey::String("5".into());
+        store
+            .put_data_own(obj, &s, RuntimeValue::from_i32(1))
+            .unwrap();
+        store
+            .put_data_own(obj, &i, RuntimeValue::from_i32(2))
+            .unwrap();
+        let sid = store.find(obj).unwrap().structure_id;
+        assert!(
+            store.structure_offset(sid, &i).is_none(),
+            "an integer-string key must NOT take a named offset (it is indexed)"
+        );
+        assert_eq!(
+            store.get_own_property(obj, &i).unwrap().unwrap().kind,
+            CorePropertyKind::Data(RuntimeValue::from_i32(2)),
+            "the indexed value must round-trip through get_own_property"
+        );
+        // numeric index enumerates first (numeric order), then string keys.
+        assert_eq!(
+            store.own_enumerable_string_property_names(obj).unwrap(),
+            vec!["5".to_string(), "name".to_string()]
+        );
+    }
+
+    // (g) THE FLIP GATE: a randomized, fixed-seed property-based EQUIVALENCE oracle.
+    //
+    // Deleting the per-cell `properties` HashMap (the named-property VALUE authority) is
+    // IRREVERSIBLE, so it must be gated by a technical refutation attempt, not a handful of
+    // hand-picked cases. A deterministic PRNG drives a long sequence of own-property
+    // mutations on a REAL object cell across MANY distinct shapes, using Identifier, String,
+    // Symbol, AND integer-string keys. An in-test reference ORACLE (a plain `HashMap`
+    // key->entry + an ordered live-key `Vec`) is advanced in lockstep by mirroring each
+    // store PRIMITIVE's exact observable semantics. After EVERY op we assert the store
+    // reconstructs the SAME observable own-property behavior from the Structure
+    // (offset+attributes) + butterfly slot (the data value, or `from_cell(GetterSetter)` for
+    // an accessor) that the oracle records:
+    //   (a) every own get matches — accessor gets route to the getter
+    //       (`get_property_from_prototype_chain`), sets route to the setter (`put`);
+    //   (b) `own_property_keys` order == the oracle's ordered key list (indexed
+    //       numeric-first, then named PropertyTable entry order; a re-added key moves to the
+    //       END);
+    //   (c) deleted / never-present keys read as ABSENT.
+    // The sequence forces deletes+re-adds (offset recycling via
+    // `PropertyTable::m_deletedOffsets`) and data<->accessor / attribute changes (the
+    // offset-stable `convert_property_in_place` attributeChange path).
+    //
+    // FAITHFULNESS: offsets are an internal detail — the oracle models only JSC's OBSERVABLE
+    // own-property semantics (JSObject [[Get]] / [[OwnPropertyKeys]] / [[DefineOwnProperty]],
+    // runtime/JSObject.cpp), mirroring each store primitive: `put_data_own` == putDirect
+    // (forces a DATA_DEFAULT data slot); `define_data_property` == a full-descriptor data
+    // [[DefineOwnProperty]] (incl. the non-configurable ValidateAndApply rejection rules);
+    // `define_accessor` == __defineGetter__/__defineSetter__ (ACCESSOR_DEFAULT attrs, merges
+    // into an existing accessor's other half); integer-string keys route to indexed butterfly
+    // storage (DATA_DEFAULT, numeric-first enumeration).
+    #[test]
+    fn randomized_shape_oracle_equivalence_after_each_op() {
+        use std::collections::BTreeMap;
+
+        // Deterministic xorshift64 — NOT rand/thread_rng — so the run is fully reproducible.
+        struct Xorshift64(u64);
+        impl Xorshift64 {
+            fn next_u64(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next_u64() % n
+            }
+        }
+        const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+        enum OracleKind {
+            Data(RuntimeValue),
+            Accessor {
+                getter: Option<RuntimeValue>,
+                setter: Option<RuntimeValue>,
+            },
+        }
+        struct OracleEntry {
+            kind: OracleKind,
+            attrs: CorePropertyAttributes,
+        }
+
+        let mut store = CoreObjectStore::default();
+        let mut heap = Heap::new();
+        let mut rng = Xorshift64(SEED);
+
+        // A tiny fixed function pool reused as getters/setters (cells never free — keep the
+        // count small). Identity (RuntimeValue equality) is what accessor get-routing checks.
+        let fns: Vec<RuntimeValue> = (0u32..4).map(|i| func(&mut store, i)).collect();
+
+        // Key pool, partitioned by storage region:
+        //   named -> PropertyTable named offset (Identifier / Symbol / non-index String)
+        //   index -> indexed butterfly storage (integer-string keys; DATA_DEFAULT only)
+        let named_keys: Vec<CorePropertyKey> = vec![
+            CorePropertyKey::Identifier(101),
+            CorePropertyKey::Identifier(102),
+            CorePropertyKey::String("foo".into()),
+            CorePropertyKey::String("bar".into()),
+            CorePropertyKey::Symbol(0x5001),
+            CorePropertyKey::Symbol(0x5002),
+        ];
+        let index_keys: Vec<CorePropertyKey> = vec![
+            CorePropertyKey::String("0".into()),
+            CorePropertyKey::String("2".into()),
+            CorePropertyKey::String("5".into()),
+        ];
+        let all_keys: Vec<CorePropertyKey> = named_keys
+            .iter()
+            .chain(index_keys.iter())
+            .cloned()
+            .collect();
+
+        // Mirrors the store's array-index routing (`parse_array_index_name`) for THIS pool:
+        // only the integer-string keys parse, and they carry no leading zeros / huge values,
+        // so a plain parse agrees exactly with `key_array_index` on every pool member.
+        let index_of = |k: &CorePropertyKey| -> Option<usize> {
+            match k {
+                CorePropertyKey::String(s) => s.parse::<usize>().ok(),
+                _ => None,
+            }
+        };
+
+        const SHAPES: u32 = 20;
+        const OPS_PER_SHAPE: u32 = 50;
+        let mut total_ops = 0u32;
+
+        for _shape in 0..SHAPES {
+            let obj = store.allocate();
+            // Oracle state for this shape's object.
+            let mut entries: HashMap<CorePropertyKey, OracleEntry> = HashMap::new();
+            let mut named_order: Vec<CorePropertyKey> = Vec::new();
+            let mut index_live: BTreeMap<usize, RuntimeValue> = BTreeMap::new();
+
+            for _op in 0..OPS_PER_SHAPE {
+                total_ops += 1;
+                let key = all_keys[rng.below(all_keys.len() as u64) as usize].clone();
+                let index = index_of(&key);
+                // Op selection. `define_accessor` on an integer-string key is a faithful
+                // no-op in the store (it has no named offset), so index keys only see the
+                // data-put / define-data / delete primitives.
+                let op = if index.is_some() {
+                    rng.below(3)
+                } else {
+                    rng.below(4)
+                };
+                match op {
+                    0 => {
+                        // putDirect: force key -> Data(value) with DATA_DEFAULT attributes.
+                        let v = RuntimeValue::from_i32(rng.below(1000) as i32);
+                        store.put_data_own(obj, &key, v).unwrap();
+                        if let Some(i) = index {
+                            index_live.insert(i, v);
+                        } else {
+                            if !entries.contains_key(&key) {
+                                named_order.push(key.clone());
+                            }
+                            entries.insert(
+                                key.clone(),
+                                OracleEntry {
+                                    kind: OracleKind::Data(v),
+                                    attrs: CorePropertyAttributes::DATA_DEFAULT,
+                                },
+                            );
+                        }
+                    }
+                    1 => {
+                        // [[DefineOwnProperty]] with a full data descriptor.
+                        let v = RuntimeValue::from_i32(rng.below(1000) as i32);
+                        let attrs = CorePropertyAttributes {
+                            writable: rng.below(2) == 1,
+                            enumerable: rng.below(2) == 1,
+                            configurable: rng.below(2) == 1,
+                        };
+                        let store_ok = store.define_data_property(obj, &key, v, attrs).unwrap();
+                        if let Some(i) = index {
+                            // Index keys route to indexed storage (DATA_DEFAULT); the
+                            // requested attributes are ignored and the define always succeeds.
+                            assert!(store_ok, "define_data on an index key always succeeds");
+                            index_live.insert(i, v);
+                        } else {
+                            // Mirror the store's non-configurable ValidateAndApply rejection.
+                            let oracle_ok = match entries.get(&key) {
+                                Some(cur) if !cur.attrs.configurable => {
+                                    if attrs.configurable
+                                        || attrs.enumerable != cur.attrs.enumerable
+                                    {
+                                        false
+                                    } else {
+                                        match &cur.kind {
+                                            OracleKind::Accessor { .. } => false,
+                                            OracleKind::Data(cur_v) => {
+                                                !(!cur.attrs.writable
+                                                    && (attrs.writable || *cur_v != v))
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => true,
+                            };
+                            assert_eq!(
+                                store_ok, oracle_ok,
+                                "define_data_property accept/reject must match the oracle"
+                            );
+                            if oracle_ok {
+                                if !entries.contains_key(&key) {
+                                    named_order.push(key.clone());
+                                }
+                                entries.insert(
+                                    key.clone(),
+                                    OracleEntry {
+                                        kind: OracleKind::Data(v),
+                                        attrs,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    2 => {
+                        // delete.
+                        let store_ok = store.delete_property(obj, &key).unwrap();
+                        if let Some(i) = index {
+                            assert!(store_ok, "index delete always succeeds (hole punch)");
+                            index_live.remove(&i);
+                        } else {
+                            let non_conf =
+                                matches!(entries.get(&key), Some(cur) if !cur.attrs.configurable);
+                            assert_eq!(
+                                store_ok, !non_conf,
+                                "delete returns false iff the property is non-configurable"
+                            );
+                            if store_ok && entries.remove(&key).is_some() {
+                                named_order.retain(|k| k != &key);
+                            }
+                        }
+                    }
+                    _ => {
+                        // __defineGetter__/__defineSetter__: ACCESSOR_DEFAULT attrs; merges
+                        // into an existing accessor's other half, else replaces. (named keys
+                        // only — guaranteed by the op-selection branch above.)
+                        let pick = rng.below(3); // 0 getter-only, 1 setter-only, 2 both
+                        let getter = (pick != 1).then(|| fns[rng.below(fns.len() as u64) as usize]);
+                        let setter = (pick != 0).then(|| fns[rng.below(fns.len() as u64) as usize]);
+                        store.define_accessor(obj, &key, getter, setter).unwrap();
+                        let (mut g, mut s) = match entries.get(&key) {
+                            Some(OracleEntry {
+                                kind: OracleKind::Accessor { getter, setter },
+                                ..
+                            }) => (*getter, *setter),
+                            _ => (None, None),
+                        };
+                        if getter.is_some() {
+                            g = getter;
+                        }
+                        if setter.is_some() {
+                            s = setter;
+                        }
+                        if !entries.contains_key(&key) {
+                            named_order.push(key.clone());
+                        }
+                        entries.insert(
+                            key.clone(),
+                            OracleEntry {
+                                kind: OracleKind::Accessor {
+                                    getter: g,
+                                    setter: s,
+                                },
+                                attrs: CorePropertyAttributes::ACCESSOR_DEFAULT,
+                            },
+                        );
+                    }
+                }
+
+                // ---- Equivalence assertions after EVERY op ----
+
+                // (a) + (c): probe EVERY pool key — live -> Some(matching kind+attrs),
+                // deleted/never-present -> None.
+                for probe in &all_keys {
+                    let got = store.get_own_property(obj, probe).unwrap();
+                    if let Some(i) = index_of(probe) {
+                        match index_live.get(&i) {
+                            Some(v) => {
+                                let p = got.expect("live index key must be present");
+                                assert_eq!(
+                                    p.kind,
+                                    CorePropertyKind::Data(*v),
+                                    "index value mismatch"
+                                );
+                                assert_eq!(
+                                    p.attributes,
+                                    CorePropertyAttributes::DATA_DEFAULT,
+                                    "index key attributes must be DATA_DEFAULT"
+                                );
+                            }
+                            None => {
+                                assert!(got.is_none(), "deleted index key must read absent")
+                            }
+                        }
+                        continue;
+                    }
+                    match entries.get(probe) {
+                        None => assert!(
+                            got.is_none(),
+                            "deleted / never-present named key must read absent"
+                        ),
+                        Some(entry) => {
+                            let p = got.expect("live named key must be present");
+                            assert_eq!(p.attributes, entry.attrs, "attributes mismatch");
+                            match &entry.kind {
+                                OracleKind::Data(v) => assert_eq!(
+                                    p.kind,
+                                    CorePropertyKind::Data(*v),
+                                    "data value mismatch"
+                                ),
+                                OracleKind::Accessor { getter, setter } => {
+                                    assert_eq!(
+                                        p.kind,
+                                        CorePropertyKind::Accessor {
+                                            getter: *getter,
+                                            setter: *setter,
+                                        },
+                                        "accessor halves mismatch"
+                                    );
+                                    // (a) get routes to the getter; put routes to the setter.
+                                    // Both calls are non-mutating for an accessor slot.
+                                    let read = store
+                                        .get_property_from_prototype_chain(obj, probe)
+                                        .unwrap();
+                                    match getter {
+                                        Some(g) => assert_eq!(
+                                            read,
+                                            CorePropertyGet::Getter(*g),
+                                            "accessor get must surface the getter"
+                                        ),
+                                        None => assert_eq!(
+                                            read,
+                                            CorePropertyGet::AccessorWithoutGetter,
+                                            "getter-less accessor get"
+                                        ),
+                                    }
+                                    let put = store
+                                        .put(&mut heap, obj, probe, RuntimeValue::from_i32(7))
+                                        .unwrap();
+                                    match setter {
+                                        Some(st) => assert_eq!(
+                                            put,
+                                            CorePropertyPut::Setter(*st),
+                                            "accessor put must route to the setter"
+                                        ),
+                                        None => assert_eq!(
+                                            put,
+                                            CorePropertyPut::IgnoredGetterOnly,
+                                            "setter-less accessor put is ignored"
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // (b): own enumeration order == indexed (numeric order) ++ named (entry order).
+                let mut expected: Vec<CorePropertyKey> = index_live
+                    .keys()
+                    .map(|i| CorePropertyKey::String(i.to_string()))
+                    .collect();
+                expected.extend(named_order.iter().cloned());
+                assert_eq!(
+                    store.own_property_keys(obj).unwrap(),
+                    expected,
+                    "own enumeration order must match the oracle's ordered key list"
+                );
+            }
+        }
+
+        // Bounded, deterministic exercise volume (offset recycling + convert-in-place) with
+        // no allocation explosion — a fast unit test, not a fuzzer.
+        assert_eq!(total_ops, SHAPES * OPS_PER_SHAPE);
     }
 }

@@ -73,8 +73,8 @@ use crate::jit::{
 };
 use crate::object::{
     offset_for_property_number, ButterflyAllocation, ButterflyHandle, PropertyCacheability,
-    PropertyLookupMode, PropertyOffset, PrototypePointer, StructureIdTable, WatchpointKind,
-    WatchpointSet, WatchpointState, NON_ARRAY,
+    PropertyLookupMode, PropertyOffset, PrototypePointer, StructureIdTable, StructurePropertyTable,
+    WatchpointKind, WatchpointSet, WatchpointState, NON_ARRAY,
 };
 use crate::runtime::scope::{BindingAttributes, BindingError, BindingSlot, BindingWriteOutcome};
 use crate::runtime::typed_array::{
@@ -4671,6 +4671,7 @@ impl CoreOpcodeDispatchHost {
                 .structure_offset(cell.structure_id, &key.to_core_property_key());
             return GeneratedPropertyLoadProbeResult::miss(
                 generated_property_load_offset_miss_reason(
+                    &self.objects,
                     cell,
                     key,
                     expected_offset,
@@ -4719,6 +4720,7 @@ impl CoreOpcodeDispatchHost {
         if actual_offset != Some(request.offset) {
             return GeneratedPropertyLoadProbeResult::miss(
                 generated_property_load_offset_miss_reason(
+                    &self.objects,
                     holder,
                     key,
                     request.offset,
@@ -4735,6 +4737,7 @@ impl CoreOpcodeDispatchHost {
         ) else {
             return GeneratedPropertyLoadProbeResult::miss(
                 generated_property_load_offset_miss_reason(
+                    &self.objects,
                     holder,
                     key,
                     request.offset,
@@ -4818,22 +4821,22 @@ impl CoreOpcodeDispatchHost {
             return GeneratedPropertyStoreProbeResult::miss(Miss::StructureMismatch);
         }
 
+        // gc-r4 B-iv: existing-property presence + data-vs-accessor + offset come from the
+        // cell's Structure (the offset/attribute authority), not the deleted per-cell
+        // HashMap.
+        let core_key = key.to_core_property_key();
         match plan.plan_kind {
             PropertyStoreAccessCasePlanKind::DataOnlyReplace => {
-                let Some((stored_key, property)) = cell
-                    .properties
-                    .iter()
-                    .find(|(stored_key, _)| key.matches(stored_key))
-                    .map(|(stored_key, property)| (stored_key, *property))
+                let Some((offset, attributes)) = self
+                    .objects
+                    .structure_property(cell.structure_id, &core_key)
                 else {
                     return GeneratedPropertyStoreProbeResult::miss(Miss::ExistingPropertyMismatch);
                 };
-                if !matches!(property.kind, CorePropertyKind::Data(_)) {
+                if attributes & PROPERTY_ATTRIBUTE_ACCESSOR != 0 {
                     return GeneratedPropertyStoreProbeResult::miss(Miss::ExistingPropertyMismatch);
                 }
-                if self.objects.structure_offset(cell.structure_id, stored_key)
-                    != Some(plan_hit.planned_offset)
-                {
+                if offset != plan_hit.planned_offset {
                     return GeneratedPropertyStoreProbeResult::miss(Miss::ExistingPropertyMismatch);
                 }
                 if plan_hit.planned_new_structure.is_some() {
@@ -4843,10 +4846,10 @@ impl CoreOpcodeDispatchHost {
                 }
             }
             PropertyStoreAccessCasePlanKind::DataOnlyTransition => {
-                if cell
-                    .properties
-                    .keys()
-                    .any(|stored_key| key.matches(stored_key))
+                if self
+                    .objects
+                    .structure_property(cell.structure_id, &core_key)
+                    .is_some()
                 {
                     return GeneratedPropertyStoreProbeResult::miss(Miss::ExistingPropertyMismatch);
                 }
@@ -4959,7 +4962,10 @@ impl CoreOpcodeDispatchHost {
             );
         }
 
-        let mutation_key = {
+        // gc-r4 B-iv: this block now only VALIDATES (presence/data/offset/transition) via
+        // the Structure; the value lands in the butterfly slot below, so the resolved key
+        // itself is no longer needed (the block produces no value — it is validate-only).
+        {
             let Some(key) = self.generated_property_load_core_key(hit.key) else {
                 return match hit.key {
                     CacheKey::Property(property_key) if property_key.as_index().is_some() => {
@@ -4998,37 +5004,33 @@ impl CoreOpcodeDispatchHost {
                             Miss::TransitionStructureMismatch,
                         );
                     }
-                    let Some((stored_key, property)) = cell
-                        .properties
-                        .iter()
-                        .find(|(stored_key, _)| key.matches(stored_key))
-                        .map(|(stored_key, property)| (stored_key.clone(), *property))
+                    // gc-r4 B-iv: existing-property presence + data-vs-accessor + offset
+                    // come from the Structure (offset/attribute authority).
+                    let core_key = key.to_core_property_key();
+                    let Some((offset, attributes)) = self
+                        .objects
+                        .structure_property(cell.structure_id, &core_key)
                     else {
                         return GeneratedPropertyStoreMutationResult::rejected(
                             Miss::ExistingPropertyMismatch,
                         );
                     };
-                    if !matches!(property.kind, CorePropertyKind::Data(_)) {
+                    if attributes & PROPERTY_ATTRIBUTE_ACCESSOR != 0 {
                         return GeneratedPropertyStoreMutationResult::rejected(
                             Miss::ExistingPropertyMismatch,
                         );
                     }
-                    if self
-                        .objects
-                        .structure_offset(cell.structure_id, &stored_key)
-                        != Some(hit.planned_offset)
-                    {
+                    if offset != hit.planned_offset {
                         return GeneratedPropertyStoreMutationResult::rejected(
                             Miss::ExistingPropertyMismatch,
                         );
                     }
-                    stored_key
                 }
                 PropertyStoreAccessCasePlanKind::DataOnlyTransition => {
-                    if cell
-                        .properties
-                        .keys()
-                        .any(|stored_key| key.matches(stored_key))
+                    if self
+                        .objects
+                        .structure_property(cell.structure_id, &key.to_core_property_key())
+                        .is_some()
                     {
                         return GeneratedPropertyStoreMutationResult::rejected(
                             Miss::ExistingPropertyMismatch,
@@ -5054,7 +5056,6 @@ impl CoreOpcodeDispatchHost {
                             Miss::ExistingPropertyMismatch,
                         );
                     }
-                    key.to_core_property_key()
                 }
                 PropertyStoreAccessCasePlanKind::DataOnlyIndexedStore => {
                     unreachable!("handled before named store commit")
@@ -5065,7 +5066,7 @@ impl CoreOpcodeDispatchHost {
                     );
                 }
             }
-        };
+        }
 
         if self
             .objects
@@ -5085,17 +5086,9 @@ impl CoreOpcodeDispatchHost {
             };
             match hit.continuation_plan_kind {
                 PropertyStoreAccessCasePlanKind::DataOnlyReplace => {
-                    let Some(property) = cell.properties.get_mut(&mutation_key) else {
-                        return GeneratedPropertyStoreMutationResult::rejected(
-                            Miss::ExistingPropertyMismatch,
-                        );
-                    };
-                    let CorePropertyKind::Data(value) = &mut property.kind else {
-                        return GeneratedPropertyStoreMutationResult::rejected(
-                            Miss::ExistingPropertyMismatch,
-                        );
-                    };
-                    *value = hit.stored_value;
+                    // gc-r4 B-iv: the butterfly slot at planned_offset IS the value
+                    // authority; an in-place replace just writes it (the structure +
+                    // offset are unchanged — validated above). No HashMap to update.
                     (
                         None,
                         Some((cell.butterfly, hit.planned_offset, hit.stored_value)),
@@ -5108,19 +5101,12 @@ impl CoreOpcodeDispatchHost {
                         );
                     };
                     let old_structure = cell.structure_id;
-                    cell.property_order.push(mutation_key.clone());
-                    cell.properties.insert(
-                        mutation_key.clone(),
-                        CoreProperty {
-                            kind: CorePropertyKind::Data(hit.stored_value),
-                            attributes: CorePropertyAttributes::DATA_DEFAULT,
-                        },
-                    );
                     // The planned (new_structure, planned_offset) came from a real
                     // add-property transition recorded into this access case, so
                     // new_structure already maps mutation_key -> planned_offset in its
                     // Structure::PropertyTable; stamp the structure and write the value
-                    // at that offset (putDirectOffset analog). No re-allocation here.
+                    // at that offset (putDirectOffset analog). gc-r4 B-iv: the butterfly
+                    // slot is the sole value authority — no per-cell HashMap insert.
                     cell.structure_id = new_structure;
                     (
                         Some(old_structure),
@@ -5361,7 +5347,7 @@ impl CoreOpcodeDispatchHost {
                         Some(index),
                     );
                 }
-                if generated_property_load_cell_has_own_property(cell, key) {
+                if generated_property_load_cell_has_own_property(&self.objects, cell, key) {
                     return Self::generated_guarded_property_load_miss(
                         plan,
                         Miss::GuardNoOwnPropertyProofFailed,
@@ -5521,7 +5507,7 @@ impl CoreOpcodeDispatchHost {
                     Some(index),
                 );
             }
-            if generated_property_load_cell_has_own_property(cell, key) {
+            if generated_property_load_cell_has_own_property(&self.objects, cell, key) {
                 return Self::generated_guarded_property_load_miss(
                     plan,
                     Miss::GuardNoOwnPropertyProofFailed,
@@ -10146,7 +10132,8 @@ impl CoreOpcodeDispatchHost {
         let string_prototype = self.objects.ensure_string_prototype();
         let own_property = self.objects.find(string_prototype).and_then(|cell| {
             let structure = cell.structure_id;
-            let property = cell.properties.get(key).copied()?;
+            // gc-r4 B-iv: reconstruct the own property from the shape + butterfly.
+            let property = self.objects.own_property_from_shape(cell, key)?;
             Some((structure, property))
         });
         if let Some((structure, property)) = own_property {
@@ -24175,17 +24162,19 @@ mod tests {
     ) -> ObjectStoreMutationSnapshot {
         let cell = objects.find(object).expect("object cell");
         let structure_id = cell.structure_id;
-        let properties = cell.properties.clone();
-        let property_order = cell.property_order.clone();
         let elements = objects.butterfly_elements(cell.butterfly).to_vec();
-        // gc-r4 Batch 2: the per-key offset map and the next-offset cursor are no longer
-        // per-cell; they are a function of the cell's structure (the offset authority).
-        // Rebuild the observable views from the structure_table for the snapshot.
+        // gc-r4 B-iv: the per-cell `properties` HashMap + `property_order` are gone; rebuild
+        // the observable views from the cell's Structure (offset/attribute authority) +
+        // butterfly (value authority), in PropertyTable entry order.
+        let mut properties = HashMap::new();
         let mut property_offsets = HashMap::new();
-        for key in &property_order {
-            if let Some(offset) = objects.structure_offset(structure_id, key) {
-                property_offsets.insert(key.clone(), offset);
+        let mut property_order = Vec::new();
+        for (key, offset, _attrs) in objects.structure_property_keys(structure_id) {
+            if let Some(property) = objects.own_property_from_shape(cell, &key) {
+                properties.insert(key.clone(), property);
             }
+            property_offsets.insert(key.clone(), offset);
+            property_order.push(key);
         }
         ObjectStoreMutationSnapshot {
             object_count: objects.objects.len(),
@@ -24918,7 +24907,14 @@ mod tests {
             .unwrap();
         let after_accessor = object_structure_id(&objects, object);
         assert_ne!(after_accessor, after_attribute_change);
-        assert_eq!(object_property_offset(&objects, object, &first), None);
+        // gc-r4 B-iv: a data->accessor conversion is an offset-stable attributeChange
+        // (Structure.cpp:806) — the GetterSetter occupies the SAME offset the data value
+        // held (C++ getDirect(offset) reads the GetterSetter*). The pre-flip dictionary
+        // path freed the offset (returning None); keeping it is the faithful correction.
+        assert_eq!(
+            object_property_offset(&objects, object, &first),
+            Some(PropertyOffset::new(0))
+        );
 
         assert_eq!(objects.delete_property(object, &missing), Ok(true));
         assert_eq!(object_structure_id(&objects, object), after_accessor);
@@ -25225,14 +25221,20 @@ mod tests {
             .get_property_with_lookup_record(object, &canonical, property_lookup_site(8))
             .unwrap();
 
+        // gc-r4 B-iv: a canonical array-index string ("0") is an INDEXED property (served
+        // from the butterfly element region), NOT a named own-data property — it has no
+        // named offset and is an IndexedLoad (uncacheable for the named-data IC). The
+        // pre-flip path stored it as a named HashMap property with a missing offset; the
+        // indexed routing is the faithful JSC model.
         assert_eq!(outcome, CorePropertyGet::Data(canonical_value));
         assert_eq!(object_property_offset(&objects, object, &canonical), None);
         assert_eq!(record.offset, None);
         assert_eq!(
             record.classification,
-            CorePropertyLookupClassification::OwnData
+            CorePropertyLookupClassification::IndexedOrTypedArray
         );
-        assert_eq!(record.access_case_kind, Some(AccessCaseKind::Load));
+        assert_eq!(record.access_case_kind, Some(AccessCaseKind::IndexedLoad));
+        assert_eq!(record.cacheability, PropertyCacheability::Disallowed);
 
         for (name, value, expected_offset, site) in [
             ("00", RuntimeValue::from_i32(11), PropertyOffset::new(0), 9),
@@ -27913,8 +27915,8 @@ mod tests {
         );
         assert_eq!(
             host.objects
-                .find(object)
-                .and_then(|cell| cell.properties.get(&key))
+                .get_own_property(object, &key)
+                .unwrap()
                 .map(|property| property.kind),
             Some(CorePropertyKind::Data(original_value))
         );
@@ -27951,12 +27953,11 @@ mod tests {
             object_store_mutation_snapshot(&host.objects, object)
         );
         assert_eq!(object_property_offset(&host.objects, object, &key), None);
-        assert!(!host
+        assert!(host
             .objects
-            .find(object)
+            .get_own_property(object, &key)
             .unwrap()
-            .properties
-            .contains_key(&key));
+            .is_none());
         match result {
             GeneratedPropertyStoreProbeResult::Hit(hit) => {
                 assert_eq!(hit.planned_new_structure, Some(planned_new_structure));
@@ -28520,7 +28521,8 @@ mod tests {
         let structure_before = object_structure_id(&host.objects, object);
 
         // Helper: read a key via the offset-indexed Vec path and assert it equals the
-        // authoritative HashMap value.
+        // shape-reconstructed authoritative value (gc-r4 B-iv: the HashMap is gone; the
+        // Structure+butterfly is the value authority via own_property_from_shape).
         let assert_offset_read_matches_hashmap =
             |objects: &CoreObjectStore, key: &CorePropertyKey, identifier: u32| {
                 let cell = objects.find(object).expect("object cell");
@@ -28533,15 +28535,17 @@ mod tests {
                     GeneratedPropertyLoadCoreKey::Identifier(identifier),
                     offset,
                 );
-                let CorePropertyKind::Data(hashmap_value) =
-                    cell.properties.get(key).expect("hashmap property").kind
+                let CorePropertyKind::Data(shape_value) = objects
+                    .own_property_from_shape(cell, key)
+                    .expect("shape property")
+                    .kind
                 else {
-                    panic!("expected data property in authoritative HashMap");
+                    panic!("expected data property in the shape authority");
                 };
                 assert_eq!(
                     offset_value,
-                    Some(hashmap_value),
-                    "offset-indexed read must equal HashMap value"
+                    Some(shape_value),
+                    "offset-indexed read must equal the shape value"
                 );
             };
 
@@ -29683,6 +29687,12 @@ mod tests {
         host.objects.set_data_own(object, &key, value).unwrap();
         assert_eq!(object_property_offset(&host.objects, object, &key), None);
 
+        // gc-r4 B-iv: "0" is a canonical array index -> INDEXED property (butterfly
+        // element), retrievable but with NO named offset and classified IndexedLoad.
+        // Under a NAMED (non-ElementLoad) cache slot an indexed access is uncacheable, so
+        // it blocks the data-only plan (faithful: numeric strings never arm a named-data
+        // IC). The pre-flip path stored it as a named own-data property with a missing
+        // offset (MissingOffset blocker); the indexed routing is the corrected model.
         let (outcome, record) = host
             .objects
             .get_property_with_lookup_record(object, &key, property_lookup_site(18))
@@ -29691,7 +29701,7 @@ mod tests {
         assert_eq!(record.offset, None);
         assert_eq!(
             record.classification,
-            CorePropertyLookupClassification::OwnData
+            CorePropertyLookupClassification::IndexedOrTypedArray
         );
         host.record_property_lookup(record);
 
@@ -29701,22 +29711,16 @@ mod tests {
                 property_load_observation_request(owner, 18, 11),
             )
             .unwrap()
-            .expect("numeric-string own data observation");
+            .expect("numeric-string indexed observation");
 
-        assert_eq!(
-            descriptor.observed_access_case_kind,
-            Some(AccessCaseKind::Load)
-        );
-        assert_eq!(
-            descriptor.base_structure,
-            Some(object_structure_id(&host.objects, object))
-        );
+        assert_eq!(descriptor.observed_access_case_kind, None);
+        assert_eq!(descriptor.base_structure, None);
         assert_eq!(descriptor.offset, None);
-        assert_eq!(descriptor.cacheability, PropertyCacheability::Allowed);
+        assert_eq!(descriptor.cacheability, PropertyCacheability::Disallowed);
         assert!(descriptor
             .readiness
             .blockers()
-            .contains(PropertyLoadObservationBlocker::MissingOffset));
+            .contains(PropertyLoadObservationBlocker::UncacheableResult));
         assert_eq!(descriptor.validate(), Ok(()));
         assert_eq!(
             plan_property_load_access_case_from_observation(&descriptor),

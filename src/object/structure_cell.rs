@@ -917,6 +917,19 @@ impl StructureIdTable {
         dictionary.max_offset = max_offset;
         self.register(dictionary)
     }
+
+    /// `Structure::attributeChange` core (Structure.cpp:1317 ->
+    /// `PropertyTable::updateAttributeIfExists`, PropertyTable.h:444): update `uid`'s
+    /// attributes IN PLACE in `handle`'s OWNED (pinned dictionary) PropertyTable,
+    /// KEEPING its offset. The faithful `attributeChangeTransition` (Structure.cpp:806)
+    /// on a per-object dictionary: an offset-stable kind/attribute change (data<->
+    /// accessor, accessor getter/setter update, data attribute change). No-op if the
+    /// structure carries no owned table or the key is absent.
+    pub fn update_attributes(&mut self, handle: StructureHandle, uid: AtomId, attributes: u32) {
+        if let Some(table) = self.structure_mut(handle).property_table.as_mut() {
+            table.update_attribute_if_exists(uid, attributes);
+        }
+    }
 }
 
 /// `PropertyTable* PropertyTable::copy(VM&, unsigned newCapacity)` /
