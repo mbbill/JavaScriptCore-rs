@@ -7329,7 +7329,7 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 {
                     return outcome;
                 }
-                let regexp = self.objects.allocate_regexp(pattern, flags, flags_text);
+                let regexp = self.objects.allocate_regexp(pattern, flags);
                 write_register(state, window, destination, regexp)
             }
             CoreOpcode::ArrayAppend => {
@@ -16064,7 +16064,7 @@ impl CoreOpcodeDispatchHost {
         };
         let flags = self.parse_regexp_flags_or_throw(heap, &flags_text)?;
         self.validate_regexp_pattern_or_throw(heap, &source, flags)?;
-        Ok(self.objects.allocate_regexp(source, flags, flags_text))
+        Ok(self.objects.allocate_regexp(source, flags))
     }
 
     fn native_regexp_test(

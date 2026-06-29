@@ -66,6 +66,18 @@ pub(crate) struct CoreObjectStore {
     // pre-R4 analog (a later collector trace visits the slab to mark the `Copy`
     // GC-edge bundles it holds).
     pub(crate) promise_reaction_lists: Vec<Vec<CorePromiseReaction>>,
+    // gc-r4 R4 POD-ification (RegExp unit): the store-owned slab of RegExp pattern
+    // strings. C++ JSC `RegExp::m_patternString` (runtime/RegExp.h:219) is an
+    // out-of-line `String` (a ref-counted `StringImpl*`) hanging off the RegExp
+    // cell; relocating it OUT of `CoreObjectCell` into this store-owned slab keyed
+    // by a Copy `AuxiliaryHandle` (object/auxiliary.rs) makes the cell's RegExp
+    // source field POD (no `Drop`), so the cell stays sweep-eligible. An
+    // `AuxiliaryHandle` is an index into this Vec; only RegExp cells hold a real
+    // one (every other cell carries `AuxiliaryHandle::INVALID`). Write-once at
+    // `allocate_regexp` (a RegExp's pattern is immutable after creation, exactly as
+    // `m_patternString` is). NOT the R4 leak fix — like `butterflies`, this slab
+    // still needs its own Auxiliary-subspace trace+sweep at R4 (gc-r4 SD-4).
+    pub(crate) regexp_sources: Vec<String>,
     // VM-internal payload-bits -> object-slot index; keyed by interpreter pointer-bits,
     // never JS/adversary-controlled, so it needs no SipHash DoS resistance. Use the
     // in-tree FxIntBuildHasher (gc/fast_hash.rs, WTF IntHash/PtrHash family); the swap is
@@ -263,6 +275,11 @@ impl Clone for CoreObjectStore {
             // own slab (never the source's). This lockstep clone is what makes the
             // cell's shallow handle-copy in `CoreObjectCell::clone` sound.
             promise_reaction_lists: self.promise_reaction_lists.clone(),
+            // gc-r4 RegExp unit: deep-clone the pattern-string slab in lockstep with
+            // `objects` (each cell's `AuxiliaryHandle` is copied shallow) so every
+            // handle stays valid AND the cloned store owns an INDEPENDENT slab — the
+            // same clone-independence invariant the butterfly slab relies on.
+            regexp_sources: self.regexp_sources.clone(),
             object_indices_by_payload: HashMap::default(),
             // structure_table is keyed by StructureId handle (stable Vec slots across
             // clone), so every cloned cell's structure_id stays valid and the offset
@@ -433,9 +450,20 @@ pub(crate) struct CoreObjectCell {
     // HashMap mirror). All access routes through the `butterfly_elem_*` store API.
     pub(crate) map_entries: Vec<(RuntimeValue, RuntimeValue)>,
     pub(crate) set_values: Vec<RuntimeValue>,
-    pub(crate) regexp_source: String,
+    // C++ JSC `RegExp::m_patternString` (runtime/RegExp.h:219), the out-of-line
+    // pattern string. gc-r4 R4 POD-ification: the `String` is relocated to the
+    // store-owned `regexp_sources` slab; the cell holds only this POD `Copy`
+    // `AuxiliaryHandle` index (so the field is no longer `Drop`), exactly as the
+    // `butterfly` slot holds a `ButterflyHandle`. `AuxiliaryHandle::INVALID` until
+    // `allocate_regexp` installs a real slab handle; only RegExp cells carry one.
+    pub(crate) regexp_source: AuxiliaryHandle,
     pub(crate) regexp_flags: RegexFlags,
-    pub(crate) regexp_flags_text: String,
+    // C++ JSC stores NO flags string on the RegExp: the flags text is DERIVED on
+    // demand from the flag bits via `Yarr::flagsString` (yarr/YarrFlags.cpp:62),
+    // which backs `regExpProtoGetterFlags`. gc-r4 R4 POD-ification: the formerly
+    // stored `regexp_flags_text: String` (a Drop field) is DELETED; every reader
+    // recomputes the canonical-order text from the POD `regexp_flags` bits via
+    // `regexp_canonical_flags_string` (the single canonical-order helper).
     pub(crate) promise_state: PromiseState,
     pub(crate) promise_result: RuntimeValue,
     // C++ JSC JSPromise `[[PromiseFulfillReactions]]`/`[[PromiseRejectReactions]]`
@@ -561,9 +589,8 @@ impl Default for CoreObjectCell {
             binding_value: RuntimeValue::default(),
             map_entries: Vec::new(),
             set_values: Vec::new(),
-            regexp_source: String::new(),
+            regexp_source: AuxiliaryHandle::INVALID,
             regexp_flags: RegexFlags::default(),
-            regexp_flags_text: String::new(),
             promise_state: PromiseState::default(),
             promise_result: RuntimeValue::default(),
             // gc-r4 R4 POD-ification (Promise unit): the INVALID sentinel — no
@@ -622,9 +649,12 @@ impl Clone for CoreObjectCell {
             binding_value: self.binding_value,
             map_entries: self.map_entries.clone(),
             set_values: self.set_values.clone(),
-            regexp_source: self.regexp_source.clone(),
+            // Copy the pattern-string HANDLE shallow (POD `AuxiliaryHandle`); sound
+            // for the same reason as `butterfly` — the cell's Clone is reached only
+            // via `CoreObjectStore::clone()`, which deep-clones `regexp_sources`
+            // alongside `objects`, so the copied handle indexes the clone's own slab.
+            regexp_source: self.regexp_source,
             regexp_flags: self.regexp_flags,
-            regexp_flags_text: self.regexp_flags_text.clone(),
             promise_state: self.promise_state,
             promise_result: self.promise_result,
             // gc-r4 R4 POD-ification (Promise unit): copy the reaction-list HANDLE
@@ -1806,6 +1836,26 @@ impl CoreObjectStore {
         let index = self.butterflies.len();
         self.butterflies.push(copy);
         ButterflyHandle(index)
+    }
+
+    /// Store a RegExp's pattern string in the store-owned `regexp_sources` slab and
+    /// return its handle.
+    ///
+    /// C++ JSC `RegExp::m_patternString` (runtime/RegExp.h:219) is the out-of-line
+    /// pattern `String` set once at `RegExp::create`. The Rust analog (pre-R4) is a
+    /// store-owned slab index, like `allocate_butterfly`; the raw arena allocation
+    /// arrives at R4. Append-only (a RegExp pattern is immutable), so the index is
+    /// stable for the slab's lifetime.
+    pub(crate) fn allocate_regexp_source(&mut self, source: String) -> AuxiliaryHandle {
+        let index = self.regexp_sources.len();
+        self.regexp_sources.push(source);
+        AuxiliaryHandle(index)
+    }
+
+    /// Borrow the RegExp pattern string behind `handle` (C++ `RegExp::pattern()`,
+    /// runtime/RegExp.h:67).
+    pub(crate) fn regexp_source_str(&self, handle: AuxiliaryHandle) -> &str {
+        &self.regexp_sources[handle.0]
     }
 
     /// Read the property slot for `offset` from butterfly `handle` (C++
@@ -3062,19 +3112,18 @@ impl CoreObjectStore {
         })
     }
 
-    pub(crate) fn allocate_regexp(
-        &mut self,
-        source: String,
-        flags: RegexFlags,
-        flags_text: String,
-    ) -> RuntimeValue {
+    pub(crate) fn allocate_regexp(&mut self, source: String, flags: RegexFlags) -> RuntimeValue {
         let prototype = self.ensure_regexp_prototype();
+        // Relocate the pattern string into the store-owned slab first (C++
+        // RegExp::m_patternString); the cell carries only the POD handle. The flags
+        // text is NOT stored — it is recomputed from `flags` on demand (JSC has no
+        // stored flags string; see the `regexp_flags` field comment).
+        let source_handle = self.allocate_regexp_source(source);
         let object = self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::RegExp,
             prototype: Some(prototype),
-            regexp_source: source,
+            regexp_source: source_handle,
             regexp_flags: flags,
-            regexp_flags_text: flags_text,
             ..CoreObjectCell::default()
         });
         let _ = self.put_data_own(
@@ -7009,10 +7058,17 @@ impl CoreObjectStore {
         if object.kind != CoreObjectKind::RegExp {
             return Err(ExecutionError::ExpectedObject);
         }
+        // Copy out the POD handle + flag bits, then resolve the pattern string from
+        // the store-owned slab and recompute the canonical-order flags text from the
+        // bits (C++ derives the flags string via `Yarr::flagsString`; there is no
+        // stored flags text). Both `self.find` and `self.regexp_source_str` are
+        // shared borrows, so they coexist.
+        let source_handle = object.regexp_source;
+        let flags = object.regexp_flags;
         Ok((
-            object.regexp_source.clone(),
-            object.regexp_flags,
-            object.regexp_flags_text.clone(),
+            self.regexp_source_str(source_handle).to_string(),
+            flags,
+            regexp_canonical_flags_string(flags),
         ))
     }
 
