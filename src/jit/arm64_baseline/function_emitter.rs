@@ -84,8 +84,9 @@ use crate::jit::operations::{
     operation_get_closure_cell, operation_get_global_lexical, operation_get_global_object_property,
     operation_jfalse, operation_put_by_id_optimize, operation_put_by_val,
     operation_put_closure_cell, operation_put_global_object_property,
-    operation_resolve_baseline_native_entry, operation_strict_equal,
-    operation_throw_stack_overflow, MAX_REGISTER_CALL_ARGS, MAX_REGISTER_CALL_WITH_THIS_ARGS,
+    operation_resolve_baseline_native_code_block, operation_resolve_baseline_native_entry,
+    operation_strict_equal, operation_throw_stack_overflow, MAX_REGISTER_CALL_ARGS,
+    MAX_REGISTER_CALL_WITH_THIS_ARGS,
 };
 use crate::value::{JsValue, CELL_TAG, NUMBER_TAG, VALUE_TAG_MASK};
 use crate::vm::jsstack::CallFrameSlot;
@@ -129,7 +130,8 @@ const RIGHT_GPR: RegisterID = RegisterID::X2;
 /// `resultRegs == returnValueGPR` (x0): the scratch/result; the slow path's arg0
 /// (the Vm) and its return value; op_ret's return register.
 const RESULT_GPR: RegisterID = RegisterID::X0;
-/// Paired with `PINNED_VM_GPR` (x19) only to keep `stp`/`ldp` 16-byte aligned.
+/// Paired with `PINNED_VM_GPR` (x19) to keep `stp`/`ldp` 16-byte aligned; also used
+/// as this emitter's one local callee-saved scratch for the native-call entry word.
 const PINNED_VM_PAIR_GPR: RegisterID = RegisterID::X20;
 /// `numberTagRegister` (x27) / `notCellMaskRegister` (x28), the `HaveTagRegisters`
 /// pair the int32 guards/box rely on. Spilled in the prologue, refilled in the
@@ -147,13 +149,15 @@ const SCRATCH_GPR_B: RegisterID = RegisterID::X4;
 const BOOL_MASK_GPR: RegisterID = RegisterID::X5;
 
 /// A1.x broad native-call engagement: holds the runtime-RESOLVED callee entry between
-/// the resolver far-call (which returns it in `x0`) and the native `blr` that jumps to
-/// it, surviving the callee-frame setup (which clobbers `x0`/`x3`/`x4`/`sp`). `x6`
-/// (`CALL_ARG_GPRS[3]`) is caller-saved and is used ONLY by the slow path's register
-/// argument lane — never by the native fast path's frame setup — so it is free to
-/// carry the entry across the native setup. The native setup contains NO call before
-/// its terminal `blr`, so the entry is never clobbered by an intervening callee.
-const NATIVE_ENTRY_GPR: RegisterID = RegisterID::X6;
+/// resolver far-calls and the native `blr` that jumps to it. `x20` is already spilled
+/// as the otherwise-unused pair for the pinned VM register, so it is the one local
+/// callee-saved scratch this emitter may use; unlike caller-saved x0-x18, it survives
+/// the companion CodeBlock resolver far-call and the terminal callee call.
+const NATIVE_ENTRY_GPR: RegisterID = PINNED_VM_PAIR_GPR;
+/// Holds the resolved callee `CodeBlock*` just long enough to write CallFrame slot 2
+/// before the terminal native call. Caller-saved is sufficient because no external
+/// call occurs between the CodeBlock resolver and the slot store.
+const NATIVE_CODE_BLOCK_GPR: RegisterID = RegisterID::X6;
 
 /// Caller-saved scratch registers (AAPCS64 x9-x14, none of them the assembler's
 /// internal `DATA_TEMP`/`MEMORY_TEMP` = x16/x17) for the `get_by_id`/`put_by_id`
@@ -279,19 +283,18 @@ pub(crate) struct FunctionImage {
 }
 
 /// A1.3 (first cut): a resolved native call target for ONE op_call site — the
-/// absolute entry address of the callee's installed baseline image. This is the
-/// emit-time analog of a LINKED monomorphic `CallLinkInfo`'s
-/// `m_monomorphicCallDestination` (`bytecode/CallLinkInfo.cpp:312,338`): JSC LOADS
-/// that destination from the patchable `CallLinkInfo` data IC at runtime and
-/// `jit.call`s it (`emitFastPathImpl` :338,363). This FIRST CUT instead BAKES the
-/// absolute callee entry as a `blr` immediate, because a near `bl` reaches only
-/// ±128 MB and two separately-`mmap`'d RX images can sit farther apart; the
-/// repatchable load-from-`CallLinkInfo` (a real data IC) is the deferred follow-up.
-/// Keyed by the op_call's bytecode index.
+/// absolute entry address and owning `CodeBlock*` of the callee's installed baseline
+/// image. This is the emit-time analog of a LINKED monomorphic `CallLinkInfo`'s
+/// `m_monomorphicCallDestination` + `m_codeBlock` (`bytecode/CallLinkInfo.cpp`): JSC
+/// patches the callee frame's slot-2 CodeBlock store and the call target together.
+/// This FIRST CUT instead BAKES both words, because a real patchable
+/// load-from-`CallLinkInfo` data IC is the deferred follow-up. Keyed by the op_call's
+/// bytecode index.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LinkedCallTarget {
     pub(crate) bytecode_index: usize,
     pub(crate) entry: usize,
+    pub(crate) code_block: usize,
 }
 
 /// The geometry of one emitted native JIT->JIT call edge, recorded so the call's
@@ -308,16 +311,20 @@ pub(crate) struct LinkedCallSite {
     pub(crate) callee_frame_offset_from_fp: i32,
 }
 
-/// Where the native `op_call` fast path's terminal call instruction jumps.
+/// Where the native `op_call` fast path's terminal call instruction jumps, plus the
+/// callee `CodeBlock*` that must be written into the in-construction callee frame.
 #[derive(Clone, Copy)]
 enum NativeCallTarget {
     /// `far_call(imm)`: an ABSOLUTE callee entry materialized into the data-temp and
-    /// `blr`'d — the A1.3 pre-seeded [`LinkedCallTarget`] proof (the entry is known at
-    /// emit time).
-    Absolute(usize),
-    /// `call_register(reg)`: the callee entry is already in `reg`, RESOLVED at runtime
-    /// by the per-call resolver (A1.x broad engagement). A single `blr reg`.
-    Register(RegisterID),
+    /// `blr`'d — the A1.3 pre-seeded [`LinkedCallTarget`] proof (the entry and
+    /// CodeBlock are known at emit time).
+    Absolute { entry: usize, code_block: usize },
+    /// `call_register(reg)`: the callee entry and CodeBlock were RESOLVED at runtime by
+    /// the per-call resolvers (A1.x broad engagement).
+    Register {
+        entry: RegisterID,
+        code_block: RegisterID,
+    },
 }
 
 /// The source of the callee frame's `this` (receiver) slot — the ONLY delta between
@@ -613,7 +620,7 @@ impl FunctionEmitter {
         self.stack_overflow_jumps.push(overflow);
         self.h
             .masm_mut()
-            .push_pair(PINNED_VM_GPR, PINNED_VM_PAIR_GPR); // spill x19(+x20)
+            .push_pair(PINNED_VM_GPR, PINNED_VM_PAIR_GPR); // spill x19(+x20 native-call scratch)
         self.h
             .masm_mut()
             .push_pair(NUMBER_TAG_GPR, NOT_CELL_MASK_GPR); // spill x27/x28
@@ -1557,20 +1564,19 @@ impl FunctionEmitter {
     /// op_calls here once the callee is resolved to an installed baseline image.
     ///
     /// DIVERGENCE from JSC (first cut): the [`LinkedCallTarget`] pre-seed variant bakes
-    /// an ABSOLUTE `blr` immediate at emit time (the A1.3 proof); the live
-    /// [`Self::emit_op_call_dynamic`] variant RE-RESOLVES the callee entry into a
-    /// register every call (the unlinked->linked `CallLinkInfo` analog) and `blr`s the
+    /// ABSOLUTE entry+CodeBlock immediates at emit time (the A1.3 proof); the live
+    /// [`Self::emit_op_call_dynamic`] variant RE-RESOLVES the callee entry+CodeBlock
+    /// every call (the unlinked->linked `CallLinkInfo` analog) and `blr`s the entry
     /// register. Neither yet caches a patchable `CallLinkInfo::m_monomorphicCallDestination`
     /// (the data-IC link-on-first-exec + callee-identity guard + arity stub are the
-    /// follow-up). The callee-frame `codeBlock`@2 slot is left unwritten (the callee's
-    /// emitted image never consults it; it is needed only when a callee slow path
-    /// re-enters the interpreter and reads the CURRENT frame's CodeBlock — a follow-up).
+    /// follow-up).
     fn emit_op_call_native_linked(
         &mut self,
         dst: i32,
         callee: i32,
         args: &[i32],
         entry: usize,
+        code_block: usize,
         bytecode_index: usize,
     ) {
         // The A1.3 pre-seeded LINKED proof is plain op_call only: `this`=undefined.
@@ -1579,7 +1585,7 @@ impl FunctionEmitter {
             args,
             bytecode_index,
             ThisSource::Undefined,
-            NativeCallTarget::Absolute(entry),
+            NativeCallTarget::Absolute { entry, code_block },
         );
         // D3 throw edge (a callee slow path stamped the mirror), then store x0 -> dst.
         self.emit_exception_probe();
@@ -1594,14 +1600,18 @@ impl FunctionEmitter {
     ///
     /// Emitted shape (one op_call site):
     /// ```text
-    ///   ; RESOLVE: operation_resolve_baseline_native_entry(vm, callee, argc) -> x0
+    ///   ; RESOLVE entry: operation_resolve_baseline_native_entry(vm, callee, argc) -> x0
     ///   load   x1, [cfr, callee]      ; boxed callee value
     ///   mov    x2, #argc              ; argument count (excl. this)
     ///   mov    x0, x19                ; pinned *mut Vm
-    ///   blr    resolver               ; x0 = entry | 0
-    ///   mov    x6, x0                 ; keep entry across frame setup (NATIVE_ENTRY_GPR)
-    ///   cbz    x6, .Lslow             ; not native-callable -> slow path
-    ///   ; NATIVE FAST PATH (build callee frame, blr x6) — result in x0
+    ///   blr    entryResolver          ; x0 = entry | 0
+    ///   mov    x20, x0                ; keep entry across CodeBlock resolver + call
+    ///   cbz    x20, .Lslow            ; not native-callable -> slow path
+    ///   ; RESOLVE CodeBlock: operation_resolve_baseline_native_code_block(...) -> x0
+    ///   blr    codeBlockResolver      ; x0 = callee CodeBlock* | 0
+    ///   mov    x6, x0                 ; keep CodeBlock for frame setup
+    ///   cbz    x6, .Lslow             ; missing header word -> slow path
+    ///   ; NATIVE FAST PATH (build callee frame incl. codeBlock@2, blr x20) — result in x0
     ///   b      .Ltail
     /// .Lslow:
     ///   ; SLOW PATH (operation_call) — result in x0
@@ -1627,10 +1637,11 @@ impl FunctionEmitter {
                 },
             "call arity must be gated to the form's register bound before lowering"
         );
-        // === RESOLVE: operation_resolve_baseline_native_entry(vm, callee, argc) ======
-        // The resolver matches the callee's installed entry by callee VALUE + explicit
-        // arg count (EXCLUDING `this`); it is `this`-agnostic, so both call forms share
-        // this step unchanged.
+        // === RESOLVE: installed callee entry + callee CodeBlock* =====================
+        // The resolvers match by callee VALUE + explicit arg count (EXCLUDING `this`);
+        // they are `this`-agnostic, so both call forms share this step unchanged. JSC's
+        // linked path patches both the call target and the callee-frame CodeBlock store;
+        // this dynamic first cut re-resolves both words every call.
         self.h.masm_mut().load64(address_for(callee), LEFT_GPR); // x1 = callee (boxed)
         self.h
             .masm_mut()
@@ -1639,14 +1650,27 @@ impl FunctionEmitter {
         self.h.masm_mut().far_call(TrustedImm64::new(
             operation_resolve_baseline_native_entry as usize as i64,
         ));
-        // Preserve the resolved entry (x0) in NATIVE_ENTRY_GPR (x6) across the frame
-        // setup, which clobbers x0. `cbz`-equivalent: branch to the slow path on a
-        // zero (not-native-callable) result.
+        // Preserve the resolved entry across the companion CodeBlock resolver far-call.
         self.h.masm_mut().move_rr(RESULT_GPR, NATIVE_ENTRY_GPR);
-        let to_slow = self.h.masm_mut().branch_test64(
+        let to_slow_entry = self.h.masm_mut().branch_test64(
             ResultCondition::Zero,
             NATIVE_ENTRY_GPR,
             NATIVE_ENTRY_GPR,
+        );
+
+        self.h.masm_mut().load64(address_for(callee), LEFT_GPR); // x1 = callee (boxed)
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(args.len() as i32), RIGHT_GPR); // x2 = argc
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+        self.h.masm_mut().far_call(TrustedImm64::new(
+            operation_resolve_baseline_native_code_block as usize as i64,
+        ));
+        self.h.masm_mut().move_rr(RESULT_GPR, NATIVE_CODE_BLOCK_GPR);
+        let to_slow_code_block = self.h.masm_mut().branch_test64(
+            ResultCondition::Zero,
+            NATIVE_CODE_BLOCK_GPR,
+            NATIVE_CODE_BLOCK_GPR,
         );
 
         // === NATIVE FAST PATH: build the callee frame and `blr` the resolved entry. ==
@@ -1655,7 +1679,10 @@ impl FunctionEmitter {
             args,
             bytecode_index,
             this_source,
-            NativeCallTarget::Register(NATIVE_ENTRY_GPR),
+            NativeCallTarget::Register {
+                entry: NATIVE_ENTRY_GPR,
+                code_block: NATIVE_CODE_BLOCK_GPR,
+            },
         );
         // Jump OVER the slow path to the shared probe+store tail.
         let to_tail = self.h.masm_mut().jump();
@@ -1664,7 +1691,7 @@ impl FunctionEmitter {
         //     re-resolves its own sub-calls). Reached when the callee is not an
         //     installed baseline image at this arity. =============================
         let slow_label = self.h.masm().label();
-        self.link_fast_jumps_to(&[to_slow], slow_label);
+        self.link_fast_jumps_to(&[to_slow_entry, to_slow_code_block], slow_label);
         self.emit_slow_call_body(callee, args, this_source);
 
         // === SHARED TAIL: D3 throw probe + store the boxed result. Both paths leave
@@ -1679,10 +1706,10 @@ impl FunctionEmitter {
     /// `CallLinkInfo::emitFastPathImpl`), WITHOUT the trailing exception probe / result
     /// store (so the static [`Self::emit_op_call_native_linked`] and the dynamic
     /// [`Self::emit_op_call_dynamic`] share the probe+store). Leaves the boxed result
-    /// in `x0` (`RESULT_GPR`). `target` selects the terminal call: an absolute baked
-    /// entry (`far_call`) or a runtime-resolved register (`blr reg`). `this_source`
-    /// selects what lands in the callee frame's `thisArgument` slot (the only delta
-    /// between op_call and op_call_with_this).
+    /// in `x0` (`RESULT_GPR`). `target` selects the terminal call and supplies the
+    /// callee `CodeBlock*` for slot 2: absolute baked words or runtime-resolved
+    /// registers. `this_source` selects what lands in the callee frame's `thisArgument`
+    /// slot (the only delta between op_call and op_call_with_this).
     fn emit_native_call_frame_setup_and_call(
         &mut self,
         callee: i32,
@@ -1710,6 +1737,21 @@ impl FunctionEmitter {
             CALL_FRAME_GPR,
             SCRATCH_GPR_B,
         );
+        // Initialize CodeBlock (CallFrame.h:177). JSC's linked calls patch/store the
+        // callee target's CodeBlock before the call (`calleeFrameCodeBlockBeforeCall`),
+        // so slow paths and future OSR read the entered callee's owner, not the caller's
+        // parked CodeBlock.
+        match target {
+            NativeCallTarget::Absolute { code_block, .. } => {
+                self.h
+                    .masm_mut()
+                    .move_imm64(TrustedImm64::new(code_block as i64), SCRATCH_GPR);
+            }
+            NativeCallTarget::Register { code_block, .. } => {
+                self.h.masm_mut().move_rr(code_block, SCRATCH_GPR);
+            }
+        }
+        self.store_callee_frame_slot(CallFrameSlot::CODE_BLOCK, SCRATCH_GPR);
         // Initialize Callee (CallFrame.h:178). The boxed callee value is laid into
         // the header for faithfulness/StackVisitor; dispatch uses the resolved entry.
         self.h.masm_mut().load64(address_for(callee), SCRATCH_GPR);
@@ -1766,11 +1808,11 @@ impl FunctionEmitter {
         // an ABSOLUTE `blr` to a baked entry (the pre-seeded proof) or a `blr reg` to
         // the runtime-resolved entry (broad engagement).
         match target {
-            NativeCallTarget::Absolute(entry) => {
+            NativeCallTarget::Absolute { entry, .. } => {
                 self.h.masm_mut().far_call(TrustedImm64::new(entry as i64));
             }
-            NativeCallTarget::Register(reg) => {
-                self.h.masm_mut().call_register(reg);
+            NativeCallTarget::Register { entry, .. } => {
+                self.h.masm_mut().call_register(entry);
             }
         }
         // returnPC == the address of the instruction AFTER the blr.
@@ -2140,7 +2182,7 @@ impl FunctionEmitter {
             .pop_pair(NUMBER_TAG_GPR, NOT_CELL_MASK_GPR); // refill x27/x28
         self.h
             .masm_mut()
-            .pop_pair(PINNED_VM_GPR, PINNED_VM_PAIR_GPR); // refill x19/x20
+            .pop_pair(PINNED_VM_GPR, PINNED_VM_PAIR_GPR); // refill x19/x20 native-call scratch
         self.h.masm_mut().move_rr(CALL_FRAME_GPR, RegisterID::Sp); // mov sp, fp
         self.h.masm_mut().pop_pair(CALL_FRAME_GPR, LINK_GPR); // ldp fp,lr,[sp],#16
         self.h.masm_mut().ret();
@@ -2521,10 +2563,10 @@ fn count_callee_locals(code_block: &CodeBlock) -> Result<u32, EmitFunctionError>
 /// interpreter rather than being mis-lowered).
 ///
 /// Each op_call is lowered by [`FunctionEmitter::emit_op_call_dynamic`]: a per-call
-/// RE-RESOLVE of the callee's installed baseline entry that takes the native JIT->JIT
-/// fast path when the callee is itself baseline-JIT'd (the R-lever) and falls to the
-/// `operation_call` slow path otherwise. Cell-carrying calls are rooted by the A1.5
-/// JIT-frame conservative scan (see [`FunctionEmitter::emit_op_call_native_linked`]).
+/// RE-RESOLVE of the callee's installed baseline entry + CodeBlock pointer that takes
+/// the native JIT->JIT fast path when the callee is itself baseline-JIT'd (the R-lever)
+/// and falls to the `operation_call` slow path otherwise. Cell-carrying calls are rooted
+/// by the A1.5 JIT-frame conservative scan (see [`FunctionEmitter::emit_op_call_native_linked`]).
 pub(crate) fn emit_baseline_function(
     code_block: &CodeBlock,
     jit_pending_address: usize,
@@ -2540,9 +2582,10 @@ pub(crate) fn emit_baseline_function(
 
 /// As [`emit_baseline_function`], but resolves the op_call sites named in
 /// `linked_calls` to the A1.2 native JIT->JIT fast path (a direct `blr` to the
-/// callee's installed-image entry) instead of the `operation_call` slow path. An
-/// op_call NOT named here keeps the slow path. This is the A1.3 first-cut linker:
-/// the proof harness pre-seeds ONE monomorphic target; the live path passes `&[]`.
+/// callee's installed-image entry, with the callee CodeBlock* written to slot 2)
+/// instead of the `operation_call` slow path. An op_call NOT named here keeps the slow
+/// path. This is the A1.3 first-cut linker: the proof harness pre-seeds ONE
+/// monomorphic target; the live path passes `&[]`.
 pub(crate) fn emit_baseline_function_with_linked_calls(
     code_block: &CodeBlock,
     jit_pending_address: usize,
@@ -2845,9 +2888,14 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                 // the `operation_call` slow path. Cell-carrying calls are now allowed
                 // (A1.5 roots the native JIT frames — see `emit_op_call_native_linked`).
                 match linked_calls.iter().find(|t| t.bytecode_index == bci) {
-                    Some(target) => {
-                        emitter.emit_op_call_native_linked(dst, callee, &args, target.entry, bci)
-                    }
+                    Some(target) => emitter.emit_op_call_native_linked(
+                        dst,
+                        callee,
+                        &args,
+                        target.entry,
+                        target.code_block,
+                        bci,
+                    ),
                     None => {
                         emitter.emit_op_call_dynamic(dst, callee, &args, ThisSource::Undefined, bci)
                     }
@@ -5004,7 +5052,7 @@ mod tests {
             emit_baseline_function_with_linked_calls, LinkedCallSite, LinkedCallTarget,
         };
         use super::{build_code_block, imm, instr, reg, ARG0, ARG1, LOCAL0, LOCAL1, LOCAL2};
-        use crate::bytecode::{CoreOpcode, Operand, TypedInstruction};
+        use crate::bytecode::{CodeBlock, CoreOpcode, Operand, TypedInstruction};
         use crate::interpreter::CoreOpcodeDispatchHost;
         use crate::jit::executable_allocator::{
             finalize_arm64_link_buffer, ExecutableMemoryHandle, MapJitExecutableAllocator,
@@ -5020,7 +5068,7 @@ mod tests {
             jit_pending_address: usize,
             soft_stack_limit_address: usize,
             linked_calls: &[LinkedCallTarget],
-        ) -> (ExecutableMemoryHandle, Vec<LinkedCallSite>) {
+        ) -> (ExecutableMemoryHandle, Vec<LinkedCallSite>, CodeBlock) {
             let code_block = build_code_block(instructions);
             let image = emit_baseline_function_with_linked_calls(
                 &code_block,
@@ -5034,7 +5082,7 @@ mod tests {
             let handle =
                 finalize_arm64_link_buffer(&MapJitExecutableAllocator, &image.code, &mut records)
                     .expect("finalize image");
-            (handle, sites)
+            (handle, sites, code_block)
         }
 
         /// Byte address of frame slot `slot_index` within the frame at `fp`.
@@ -5066,18 +5114,20 @@ mod tests {
                 ),
                 instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
             ];
-            let (callee_handle, _) = finalize_image(
+            let (callee_handle, _, callee_code_block) = finalize_image(
                 callee_instructions,
                 jit_pending_address,
                 soft_stack_limit_address,
                 &[],
             );
             let callee_entry = callee_handle.entry_address();
+            let callee_code_block_ptr = &callee_code_block as *const CodeBlock as usize;
 
             // (2) Compile the CALLER `caller(x){ return callee(x, 1) }`, pre-seeding
-            //     its op_call (bci 1) as the LINKED monomorphic target = callee entry.
-            //     LOCAL2 is the callee operand slot (undefined; dispatch uses the
-            //     resolved entry). arg0 = x (ARG0), arg1 = 1 (LOCAL1, from LoadInt32).
+            //     its op_call (bci 1) as the LINKED monomorphic target = callee entry +
+            //     callee CodeBlock*. LOCAL2 is the callee operand slot (undefined;
+            //     dispatch uses the linked target). arg0 = x (ARG0), arg1 = 1 (LOCAL1,
+            //     from LoadInt32).
             let caller_instructions = vec![
                 instr(CoreOpcode::LoadInt32, vec![reg(LOCAL1), imm(1)], 0),
                 instr(
@@ -5096,8 +5146,9 @@ mod tests {
             let linked = [LinkedCallTarget {
                 bytecode_index: 1,
                 entry: callee_entry,
+                code_block: callee_code_block_ptr,
             }];
-            let (caller_handle, sites) = finalize_image(
+            let (caller_handle, sites, _caller_code_block) = finalize_image(
                 caller_instructions,
                 jit_pending_address,
                 soft_stack_limit_address,
@@ -5170,6 +5221,11 @@ mod tests {
                     "returnPC@1 == bl-site + 4",
                 );
                 // The caller laid out the callee header + args at the callee frame.
+                assert_eq!(
+                    read(CallFrameSlot::CODE_BLOCK),
+                    callee_code_block_ptr as u64,
+                    "codeBlock@2 == linked callee CodeBlock*",
+                );
                 assert_eq!(
                     read(CallFrameSlot::CALLEE),
                     undefined_bits,

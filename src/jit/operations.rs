@@ -1058,6 +1058,31 @@ pub extern "C" fn operation_resolve_baseline_native_entry(
     vm.resolve_baseline_native_entry(host, callee, argc as usize) as u64
 }
 
+/// Companion to [`operation_resolve_baseline_native_entry`] for CallFrame header
+/// fidelity: returns the resolved callee's owning `CodeBlock*` (slot 2), or `0` on
+/// the same non-native-callable cases. JSC's linked call path patches BOTH the entry
+/// call target and the callee-frame CodeBlock store (`CallLinkInfo.cpp`), so the Rust
+/// dynamic first cut re-resolves both words before building the native callee frame.
+/// Same D1+D5 reborrow island; infallible and never touches the exception mirror.
+pub extern "C" fn operation_resolve_baseline_native_code_block(
+    vm: *mut Vm,
+    callee: u64,
+    argc: u64,
+) -> u64 {
+    // D1 + D5 reborrows — see the module SAFETY note. Exactly one `&mut *vm` and one
+    // `&mut *host`, both dropped before returning to JIT code.
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the resolver ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    vm.resolve_baseline_native_code_block(host, callee, argc as usize) as u64
+}
+
 /// `operationThrowStackOverflowError(CodeBlock*)` (JITOperations.cpp:120-129): the
 /// baseline prologue's `softStackLimit` overflow path (JIT.cpp:781) far-calls this
 /// shim when a new frame's top would drop below the soft stack limit. It reborrows

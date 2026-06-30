@@ -929,6 +929,14 @@ pub(crate) enum BaselineJitEntryOutcome {
     Threw(EncodedJsValue),
 }
 
+/// The installed native-call target facts needed by a baseline `op_call` fast path:
+/// the callee entry address and the callee frame's slot-2 `CodeBlock*`.
+#[derive(Clone, Copy, Debug)]
+struct BaselineNativeTarget {
+    entry: usize,
+    code_block: *const CodeBlock,
+}
+
 /// The lifecycle of a CodeBlock's baseline-JIT install.
 enum BaselineJitInstallState {
     /// Counting toward the tier-up threshold; the interpreter runs the function.
@@ -1164,19 +1172,20 @@ pub struct Vm {
     // debug-asserts the install-time vs run-time `Vm` base to catch a move.
     baseline_jit_slots: HashMap<CodeBlockId, BaselineJitSlot>,
     // A1.x broad native-call engagement: the registry of installed baseline native
-    // ENTRY addresses, keyed by `CodeBlockId` — the faithful analog of an executable's
-    // `generatedJITCodeFor(kind)->addressForCall(arity)` (ExecutableBase), the callee
-    // entry a linked `op_call` jumps to. The per-`op_call` resolver
-    // (`resolve_baseline_native_entry`) maps a callee VALUE -> its `CodeBlockId` (via
-    // the host) -> this entry, returning it to the baseline JIT's native fast path.
+    // targets, keyed by `CodeBlockId` — the faithful analog of an executable's
+    // `generatedJITCodeFor(kind)->addressForCall(arity)` (ExecutableBase) PLUS the
+    // callee `CodeBlock*` a linked `CallLinkInfo` patches into the callee frame before
+    // the call (`CallLinkInfo.cpp::setCallTarget`). The per-`op_call` resolver maps a
+    // callee VALUE -> its `CodeBlockId` (via the host) -> this target, returning both
+    // words to the baseline JIT's native fast path.
     //
     // SEPARATE FROM `baseline_jit_slots` deliberately: `run_installed_baseline_jit`
     // CHECKS OUT the `InstalledBaselineFunction` (replacing the slot state with
     // `Warming`) for the duration of its own execution, so a SELF-RECURSIVE callee's
-    // entry would be unreachable from the slot mid-run. The entry address is a stable
-    // property of the finalized RX image (it does not move when the image is checked
-    // out), so it lives in this always-readable registry instead. NOT cleared on run.
-    baseline_native_entries: HashMap<CodeBlockId, usize>,
+    // target would be unreachable from the slot mid-run. The entry address is a stable
+    // property of the finalized RX image and the `CodeBlock*` is the registry's stable
+    // `Rc` allocation, so both live in this always-readable registry. NOT cleared on run.
+    baseline_native_targets: HashMap<CodeBlockId, BaselineNativeTarget>,
     // A1.x broad native-call engagement — test-only runtime evidence that the native
     // op_call fast path was TAKEN (not silently fell to the slow path): bumped each
     // time `resolve_baseline_native_entry` returns a non-zero entry (the emitted site
@@ -2179,7 +2188,7 @@ impl Vm {
             safepoint_pass_full_branch_invocations: 0,
             ic_tiering_safepoint_memo: HashMap::new(),
             baseline_jit_slots: HashMap::new(),
-            baseline_native_entries: HashMap::new(),
+            baseline_native_targets: HashMap::new(),
             #[cfg(test)]
             baseline_native_engagement_count: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -3845,9 +3854,10 @@ impl Vm {
     /// JIT's native fast path performs (the unlinked->linked `CallLinkInfo` analog,
     /// `jit/Repatch.cpp` `linkFor`): given the runtime callee VALUE and the call's
     /// argument count (EXCLUDING `this`), return the callee's installed baseline native
-    /// ENTRY address, or `0` if the callee is not directly native-callable at this
-    /// arity. The emitted op_call site tests the result: non-zero -> the native
-    /// `blr`-to-entry fast path; zero -> the `operation_call` slow path.
+    /// ENTRY address plus the callee's stable `CodeBlock*`, or `None` if the callee is
+    /// not directly native-callable at this arity. The emitted op_call site tests the
+    /// entry: non-zero -> the native `blr`-to-entry fast path; zero -> the
+    /// `operation_call` slow path.
     ///
     /// `0` (slow path) is returned when: the callee is not a bytecode function / is a
     /// class constructor (host `resolve_baseline_call_target`), the arity does NOT
@@ -3864,25 +3874,33 @@ impl Vm {
     /// callee CELL identity and so requires the R4 `visitWeak` weak-processing phase to
     /// clear a collected callee; this re-resolve-every-call first cut caches NOTHING
     /// (GC-safe, no weak reference) at the cost of the per-call lookup.
+    fn resolve_baseline_native_target(
+        &self,
+        host: &CoreOpcodeDispatchHost,
+        callee_bits: u64,
+        argc: usize,
+    ) -> Option<BaselineNativeTarget> {
+        let callee = RuntimeValue::from_encoded(EncodedJsValue(callee_bits));
+        let (code_block_id, formal_parameter_count) = host.resolve_baseline_call_target(callee)?;
+        if argc != formal_parameter_count as usize {
+            return None;
+        }
+        let target = self.baseline_native_targets.get(&code_block_id).copied()?;
+        if target.entry == 0 || target.code_block.is_null() {
+            return None;
+        }
+        Some(target)
+    }
+
     pub(crate) fn resolve_baseline_native_entry(
         &self,
         host: &CoreOpcodeDispatchHost,
         callee_bits: u64,
         argc: usize,
     ) -> usize {
-        let callee = RuntimeValue::from_encoded(EncodedJsValue(callee_bits));
-        let Some((code_block_id, formal_parameter_count)) =
-            host.resolve_baseline_call_target(callee)
-        else {
-            return 0;
-        };
-        if argc != formal_parameter_count as usize {
-            return 0;
-        }
         let entry = self
-            .baseline_native_entries
-            .get(&code_block_id)
-            .copied()
+            .resolve_baseline_native_target(host, callee_bits, argc)
+            .map(|target| target.entry)
             .unwrap_or(0);
         // Runtime evidence the native fast path engaged (the site takes the `blr` on a
         // non-zero entry); test-only, see the field doc.
@@ -3892,6 +3910,17 @@ impl Vm {
                 .set(self.baseline_native_engagement_count.get() + 1);
         }
         entry
+    }
+
+    pub(crate) fn resolve_baseline_native_code_block(
+        &self,
+        host: &CoreOpcodeDispatchHost,
+        callee_bits: u64,
+        argc: usize,
+    ) -> usize {
+        self.resolve_baseline_native_target(host, callee_bits, argc)
+            .map(|target| target.code_block as usize)
+            .unwrap_or(0)
     }
 
     /// Test-only: how many times the native op_call fast path was taken at runtime
@@ -4015,6 +4044,13 @@ impl Vm {
             RunInstalled,
         }
 
+        let callee_bits = self
+            .execution
+            .top_frame()
+            .and_then(|frame| frame.callee_value)
+            .map(|callee| callee.encoded().0)
+            .unwrap_or_else(|| RuntimeValue::undefined().encoded().0);
+
         // Bump the S9 counter on entry and decide what to do THIS entry.
         let step = {
             let slot = self
@@ -4057,20 +4093,30 @@ impl Vm {
                 // point reaching this live path MUST own the Vm at a pinned address
                 // (Box<Vm>); see the doc note on `baseline_jit_slots`.
                 let install_vm = self as *const Vm;
+                let code_block_ptr = self
+                    .code_block_arena_pointer(Some(code_block_id))
+                    .unwrap_or(code_block as *const CodeBlock);
                 match install_baseline_function(
                     code_block,
+                    code_block_ptr,
                     jit_pending_address,
                     soft_stack_limit_address,
                     install_vm,
                 ) {
                     Ok(installed) => {
                         // A1.x broad native-call engagement: record this image's native
-                        // entry in the always-readable registry (== an executable's
-                        // `addressForCall`) BEFORE the slot's image is checked out by a
-                        // run, so a self-recursive callee's op_call resolver can reach
-                        // it. Captured once at install; the RX entry is immovable.
-                        self.baseline_native_entries
-                            .insert(code_block_id, installed.native_entry_address());
+                        // entry + target `CodeBlock*` in the always-readable registry
+                        // BEFORE the slot's image is checked out by a run, so a
+                        // self-recursive callee's op_call resolver can reach both words.
+                        // Captured once at install; the RX entry and registry CodeBlock box
+                        // are immovable for the image's lifetime.
+                        self.baseline_native_targets.insert(
+                            code_block_id,
+                            BaselineNativeTarget {
+                                entry: installed.native_entry_address(),
+                                code_block: code_block_ptr,
+                            },
+                        );
                         if let Some(slot) = self.baseline_jit_slots.get_mut(&code_block_id) {
                             slot.state = BaselineJitInstallState::Installed(installed);
                         }
@@ -4078,6 +4124,7 @@ impl Vm {
                             host,
                             code_block_id,
                             code_block,
+                            callee_bits,
                             arguments_including_this,
                         )
                     }
@@ -4093,6 +4140,7 @@ impl Vm {
                 host,
                 code_block_id,
                 code_block,
+                callee_bits,
                 arguments_including_this,
             ),
         }
@@ -4108,6 +4156,7 @@ impl Vm {
         host: &mut CoreOpcodeDispatchHost,
         code_block_id: CodeBlockId,
         code_block: &CodeBlock,
+        callee_bits: u64,
         arguments_including_this: &[u64],
     ) -> BaselineJitEntryOutcome {
         // Take the installed image OUT of the map so NO borrow of
@@ -4164,7 +4213,7 @@ impl Vm {
             let mut region = ParkedJitCallRegion::enter(self, host, code_block);
             region.vm().set_jit_soft_stack_limit(soft_stack_limit);
             let vm_ptr_bits = region.vm() as *mut Vm as u64;
-            let returned_bits = installed.run(vm_ptr_bits, arguments_including_this);
+            let returned_bits = installed.run(vm_ptr_bits, callee_bits, arguments_including_this);
             let pending = region.vm().jit_pending_exception();
             (returned_bits, pending)
         }; // `region` drops here: restores the caller's parked host/CodeBlock.
@@ -4223,7 +4272,9 @@ impl Vm {
         let core_host = host.as_core_opcode_dispatch_host()?;
         // Read the live callee frame's this+arguments as boxed EncodedJSValue words —
         // the B5-lite scratch frame is seeded from them (S2). The emitted op_enter
-        // zero-fills the locals, so only this+args are read here.
+        // zero-fills the locals, so only this+args are read here; the header callee is
+        // read inside `observe_baseline_jit_entry_and_maybe_execute` from the SAME live
+        // top frame for CallFrame slot 3.
         let arguments_including_this = self.collect_top_frame_arguments_including_this()?;
         match self.observe_baseline_jit_entry_and_maybe_execute(
             core_host,
@@ -24965,7 +25016,7 @@ mod tests {
     // sum(n, self) { if (n <= 0) return 0; return n + self(n-1, self); }
     //   => n*(n+1)/2. SELF-RECURSIVE: the callee IS this function (passed as `self`,
     //   arg2), so each native call resolves THIS image's entry from the
-    //   `baseline_native_entries` registry while the slot's image is checked out by the
+    //   `baseline_native_targets` registry while the slot's image is checked out by the
     //   running frame — the reason that registry is separate from `baseline_jit_slots`.
     // zero=local0 one=local1 cmp=local2 nm1=local3 callret=local4 n=arg1 self=arg2.
     //   0 zero=0  1 one=1  2 cmp=(n<=zero)  3 jfalse cmp->5  4 ret zero
@@ -25046,7 +25097,7 @@ mod tests {
     }
 
     // Warm a function past the S9 tier-up threshold so its native image installs (and
-    // its `baseline_native_entries` entry is recorded). Panics if it never tiers up.
+    // its `baseline_native_targets` entry is recorded). Panics if it never tiers up.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn a1x_install_until_tiered(
         vm: &mut Vm,
@@ -26065,7 +26116,7 @@ mod tests {
     }
 
     // ENGAGEMENT BREADTH — a SELF-RECURSIVE native call chain. `sum(n, self)` recurses
-    // by native `blr` to ITS OWN installed entry (resolved from `baseline_native_entries`
+    // by native `blr` to ITS OWN installed entry (resolved from `baseline_native_targets`
     // while the slot's image is checked out by the running frame). Proves native
     // recursion engages, matches the interpreter + oracle, and the engagement counter
     // equals the recursion depth.

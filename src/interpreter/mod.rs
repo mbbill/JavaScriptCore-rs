@@ -9110,7 +9110,7 @@ impl CoreOpcodeDispatchHost {
     /// resolves the callee `executable` and its `generatedJITCodeFor(kind)` entry; here
     /// the callee value -> `function_call_target` (the object store) -> `function_index`
     /// -> the shared `CodeBlock` in `function_blocks` (the same instance the registry
-    /// holds), whose `id` keys the `Vm`'s `baseline_native_entries` registry.
+    /// holds), whose `id` keys the `Vm`'s `baseline_native_targets` registry.
     ///
     /// Returns `None` (the caller falls to the `operation_call` slow path) for a
     /// native function, a non-callable value, a missing function block, OR a class

@@ -189,6 +189,7 @@ pub(crate) use platform::{install_baseline_function, InstalledBaselineFunction};
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) fn install_baseline_function(
     _code_block: &CodeBlock,
+    _code_block_ptr: *const CodeBlock,
     _jit_pending_address: usize,
     _soft_stack_limit_address: usize,
     _install_vm: *const crate::vm::Vm,
@@ -220,6 +221,14 @@ mod platform {
     /// image's lifetime (S7).
     pub(crate) struct InstalledBaselineFunction {
         handle: ExecutableMemoryHandle,
+        /// The registered `CodeBlock*` for this image, written to CallFrame slot 2 on
+        /// VM entry. JSC's `doVMEntry` / JS-call path seeds `CallFrameSlot::codeBlock`
+        /// with the entered callee CodeBlock (`CallFrame.h:177`; linked calls patch the
+        /// callee-frame CodeBlock before the call via `CallLinkInfo.cpp`). Store the raw
+        /// address only; the VM's `CodeBlockRegistry` owns the shared `CodeBlock` and keeps
+        /// it stable for the image's lifetime (or the caller supplies the direct borrowed
+        /// pointer for standalone/tests where no registry entry exists).
+        code_block: *const CodeBlock,
         /// The native JS stack this function's entry CallFrame is `doVMEntry`-seeded
         /// into and the flipped prologue runs on (A1, retiring the pre-A1 hand-placed
         /// scratch arena). Default-sized (`Options::maxPerThreadStackUsage`, 5 MiB)
@@ -259,7 +268,7 @@ mod platform {
         /// installed image (the finalized prologue). Faithful analog of
         /// `executable->generatedJITCodeFor(kind)->addressForCall(arity)`
         /// (ExecutableBase) — the callee entry a linked `op_call` jumps to. The
-        /// install path records it in the `Vm`'s `baseline_native_entries` registry
+        /// install path records it in the `Vm`'s `baseline_native_targets` registry
         /// keyed by `CodeBlockId` so the per-call resolver can reach it even while the
         /// image is checked out of `baseline_jit_slots` during its own execution (a
         /// self-recursive callee). The RX memory the handle owns does not move when the
@@ -288,7 +297,12 @@ mod platform {
         ///
         /// `arguments_including_this[0]` is `this`; `[1..]` are the real arguments
         /// (`argumentCountIncludingThis - 1`).
-        pub(crate) fn run(&mut self, vm_ptr_bits: u64, arguments_including_this: &[u64]) -> u64 {
+        pub(crate) fn run(
+            &mut self,
+            vm_ptr_bits: u64,
+            callee_bits: u64,
+            arguments_including_this: &[u64],
+        ) -> u64 {
             // INV-4 (Vm pinned across install->reuse): the `jit_pending`
             // AbsoluteAddress baked into this image is an interior pointer of the
             // install-time `Vm`; reusing it here is sound ONLY while that `Vm` has not
@@ -331,8 +345,8 @@ mod platform {
                 // re-stamps slots 0/1 on entry; not stack-walked in this unit.
                 caller_frame_or_entry: Register::from_bits(0),
                 return_pc: Register::from_bits(0),
-                code_block: Register::from_bits(0),
-                callee: Register::from_bits(0),
+                code_block: Register::from_bits(self.code_block as u64),
+                callee: Register::from_bits(callee_bits),
                 argument_count_including_this: Register::from_bits(count_including_this as u64),
                 this_value: Register::from_bits(this_bits),
                 arguments: &arg_regs,
@@ -368,6 +382,7 @@ mod platform {
     /// flow.
     pub(crate) fn install_baseline_function(
         code_block: &CodeBlock,
+        code_block_ptr: *const CodeBlock,
         jit_pending_address: usize,
         soft_stack_limit_address: usize,
         install_vm: *const Vm,
@@ -402,6 +417,7 @@ mod platform {
         let stack = JsStack::new_default().map_err(BaselineInstallError::Stack)?;
         Ok(InstalledBaselineFunction {
             handle,
+            code_block: code_block_ptr,
             stack,
             num_locals,
             // INV-4: capture the install-time Vm base; `run` asserts the reuse-time
