@@ -26,13 +26,16 @@ full set of `r_i = Rust_i / C++_i` — never a single bench or a partial suite.
 
 ## Latest measurement (2026-06-28, iters=2/wc=1) — R UNDEFINED
 
-Gate not met: 3/15 fail (mandreel + octane-zlib asm.js DNF; typescript value-divergence
-throw). C++ jsc baseline (all 15 complete): crypto 1611.6, richards 1240.1, navier 1184.5,
+Gate not met: 2/15 fail — mandreel + octane-zlib (asm.js DNF/too-slow, JIT-gated; NOT throw,
+NOT OOM). typescript value-divergence FIXED SINCE this snapshot (Array-length; now completes,
+interpreter-slow ~0.0075), so 13/15 complete. C++ jsc baseline (all 15 complete): crypto
+1611.6, richards 1240.1, navier 1184.5,
 delta-blue 1072.3, code-load 962.0, regexp 750.0, splay 699.5, raytrace 689.9, earley-boyer
 662.8, Box2D 462.2, pdfjs 261.0, mandreel 198.9, gbemu 136.5, octane-zlib 37.6, typescript
 36.4.
 
-Rust per-bench `r_i` (12 completing): code-load 0.060 (parse-bound, the only one above
+Rust per-bench `r_i` (the 12 completing in this 2026-06-28 snapshot; typescript is now the
+13th completer at ~0.0075, not re-measured here): code-load 0.060 (parse-bound, the only one above
 ~3e-3), pdfjs 3.3e-3, regexp 2.4e-3, navier 2.0e-3, crypto 1.3e-3, gbemu 9.7e-4, splay
 9.2e-4, richards 7.4e-4, Box2D 6.8e-4, earley-boyer 5.4e-4, delta-blue 5.2e-4, raytrace
 1.7e-4. Partial geomean over the completing benches ≈ 1.3e-3.
