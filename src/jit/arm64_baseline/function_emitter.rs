@@ -19,6 +19,8 @@
 //!   * op_enter (`jit/JITOpcodes.cpp` `emit_op_enter` :1475): zero-fill the callee
 //!     locals with `jsUndefined()` at `addressFor(local)`.
 //!   * op_mov (`emit_op_mov`): `load64(src) ; store64(dst)`.
+//!   * op_get_callee (`emit_load_callee`, JSC `emit_op_get_callee`): `load64 [cfr +
+//!     CALLEE*8] ; store64(dst)` — the `Callee` header slot the entry seed stamps.
 //!   * the arith family (`jit/JITArithmetic.cpp` generators): reused from
 //!     [`super::arith::emit_arith_fast_path`] (the SAME generator the standalone
 //!     images use — int32 fast path plus the JSVALUE64 double fast path for
@@ -641,6 +643,22 @@ impl FunctionEmitter {
     /// op_mov (`emit_op_mov`): `load64(src) ; store64(dst)`. Falls through.
     fn emit_op_mov(&mut self, dst: i32, src: i32) {
         self.h.masm_mut().load64(address_for(src), SCRATCH_GPR);
+        self.h.masm_mut().store64(SCRATCH_GPR, address_for(dst));
+    }
+
+    /// LoadCallee (`op_get_callee`): load the boxed callee cell from the CallFrame
+    /// `Callee` header slot and store it to `dst`. JSC's baseline `emit_op_get_callee`
+    /// (`jit/JITOpcodes.cpp`) is `emitGetFromCallFrameHeaderPtr(CallFrameSlot::callee,
+    /// regT0)` (`load64 [cfr + callee*8]`) then `emitPutVirtualRegister(dst)` — exactly
+    /// the `emit_op_mov` shape, but the source is the fixed `Callee` header slot rather
+    /// than a VirtualRegister. `address_for(CallFrameSlot::CALLEE)` is
+    /// `Address(cfr, CALLEE*8)` — the same slot the entry-frame seed stamps with the
+    /// real callee cell (live_dispatch.rs `VmEntryFrameSeed.callee`), so the loaded
+    /// value is bit-identical to the interpreter's LoadCallee handler. Falls through.
+    fn emit_load_callee(&mut self, dst: i32) {
+        self.h
+            .masm_mut()
+            .load64(address_for(CallFrameSlot::CALLEE), SCRATCH_GPR);
         self.h.masm_mut().store64(SCRATCH_GPR, address_for(dst));
     }
 
@@ -2631,17 +2649,18 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                 let value = decoded.unsigned_immediate_operand(1)? != 0;
                 emitter.emit_load_immediate_value(dst, JsValue::from_bool(value).encoded().0);
             }
-            // LoadCallee is DEFERRED (falls to `other => UnsupportedOpcode`): the native
-            // entry-frame seed sets the `Callee` header slot to ZERO (live_dispatch.rs:335,
-            // `callee: Register::from_bits(0)`), and the live path reaches EVERY tiered
-            // function through that outer seed (the native JIT->JIT direct-call edge is not
-            // taken under `--disable-generated-direct-call-generated-entry`), so a native
-            // `load64 [fp+CALLEE*8]` would read 0 instead of the real callee cell — a
-            // wrong-answer (measured: crypto/delta-blue threw). The faithful lowering needs
-            // the live dispatch to seed the real `active_frame.callee_value` into the entry
-            // frame (the SAME value the generated p6 path threads via
-            // `p6_code_block_uses_load_callee`, vm/mod.rs:7960) — a serial entry-frame-seed
-            // change tracked as a follow-up. Until then LoadCallee declines the function.
+            // LoadCallee (`op_get_callee`): load the boxed callee cell from the
+            // CallFrame `Callee` header slot into `dst`. The entry-frame seed now
+            // threads the REAL `active_frame.callee_value` into that slot
+            // (live_dispatch.rs `VmEntryFrameSeed.callee`; run_installed_baseline_jit
+            // reads it off the live top frame — the SAME value the generated p6 path
+            // threads via `p6_code_block_uses_load_callee`, vm/mod.rs), so the loaded
+            // value matches the interpreter's LoadCallee handler
+            // (interpreter/mod.rs `CoreOpcode::LoadCallee`).
+            CoreOpcode::LoadCallee => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                emitter.emit_load_callee(dst);
+            }
             CoreOpcode::Jump => {
                 let target_bci = decoded.bytecode_index_operand(0)?.offset() as usize;
                 emitter.emit_op_jmp(target_bci);
@@ -3404,8 +3423,8 @@ mod tests {
     // standalone relationals `<`/`>`/`>=`, and the global-scope `GetGlobalLexical`/
     // `GetGlobalObjectProperty`/`PutGlobalObjectProperty` (the richards/delta-blue blocker).
     // Before this batch each was an `UnsupportedOpcode`/`StandaloneRelational` decline.
-    // (LoadCallee is DEFERRED — see the dispatch note; it needs the entry-frame seed to
-    // carry the real callee.)
+    // (LoadCallee is now ADMITTED too — see the dispatch case + `emit_load_callee`; the
+    // entry-frame seed carries the real callee, so the lowering reads it, not 0.)
     #[test]
     fn call_heavy_decline_set_opcodes_are_admitted_by_the_allowlist() {
         let ident = |idx: u32| Operand::IdentifierIndex(idx);
@@ -4048,7 +4067,8 @@ mod tests {
 
         // --- PRIMITIVE CONSTANT LOADS native == oracle. ---
         // LoadUndefined/LoadNull/LoadBool materialize the boxed constant. Each was DECLINED
-        // before this batch. (LoadCallee is deferred — see the dispatch note.)
+        // before this batch. (LoadCallee native == seeded callee is proved separately by
+        // `load_callee_native_returns_seeded_callee_not_zero`.)
         #[test]
         fn primitive_constant_loads_native() {
             let load_then_return =
@@ -4096,6 +4116,38 @@ mod tests {
                 JsValue::from_bool(false).encoded().0,
                 "LoadBool 0 -> boxed false"
             );
+        }
+
+        // --- LoadCallee native == the seeded callee (NOT 0). ---
+        // `function f(){ return f; }` lowers to `LoadCallee dst; Return dst`. The
+        // entry-frame seed stamps the `Callee` header slot with the real callee cell;
+        // the native lowering is the trivial `load64 [fp + CALLEE*8] ; store64(dst)`,
+        // so the returned value is the seeded callee, bit-for-bit. This is the
+        // regression guard for the fixed bug: before the seed carried the real callee,
+        // the slot held 0 and a native LoadCallee returned 0 (a wrong answer that made
+        // crypto/delta-blue throw). `run_function` seeds the callee via the CALLEE
+        // header-slot operand exactly as the live `VmEntryFrameSeed.callee` does.
+        #[test]
+        fn load_callee_native_returns_seeded_callee_not_zero() {
+            // A distinctive non-zero boxed value standing in for the callee cell
+            // (LoadCallee is a pure frame move; it never interprets the bits).
+            let callee_bits = i32_bits(0x0CA1_1EE);
+            assert_ne!(callee_bits, 0, "the sentinel callee is non-zero");
+            let (r, _) = run_function(
+                vec![
+                    instr(CoreOpcode::LoadCallee, vec![reg(LOCAL0)], 0),
+                    instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+                ],
+                // Seed the `Callee` header slot (the same slot the entry seed stamps
+                // and the lowering reads), not a VirtualRegister local/arg.
+                &[(crate::vm::jsstack::CallFrameSlot::CALLEE, callee_bits)],
+            );
+            assert_eq!(
+                r.ret, callee_bits,
+                "native LoadCallee returns the seeded callee cell",
+            );
+            assert_ne!(r.ret, 0, "regression guard: LoadCallee must NOT read 0");
+            assert_eq!(r.pending, 0, "no exception");
         }
 
         // --- THE DOUBLE MILESTONE (full CodeBlock): a whole function whose

@@ -288,7 +288,19 @@ mod platform {
         ///
         /// `arguments_including_this[0]` is `this`; `[1..]` are the real arguments
         /// (`argumentCountIncludingThis - 1`).
-        pub(crate) fn run(&mut self, vm_ptr_bits: u64, arguments_including_this: &[u64]) -> u64 {
+        ///
+        /// `callee_bits` is the boxed callee cell (`ProtoCallFrame::calleeValue`,
+        /// `ProtoCallFrame.h:49`) — the live frame's `callee_value` the caller read
+        /// off the interpreter's top frame. It is seeded into the entry frame's
+        /// `Callee` header slot so a native `op_get_callee`/`LoadCallee` (the trivial
+        /// `load64 [fp + CALLEE*8]`) reads the REAL callee, matching the interpreter's
+        /// LoadCallee oracle (`interpreter/mod.rs` `CoreOpcode::LoadCallee`).
+        pub(crate) fn run(
+            &mut self,
+            vm_ptr_bits: u64,
+            arguments_including_this: &[u64],
+            callee_bits: u64,
+        ) -> u64 {
             // INV-4 (Vm pinned across install->reuse): the `jit_pending`
             // AbsoluteAddress baked into this image is an interior pointer of the
             // install-time `Vm`; reusing it here is sound ONLY while that `Vm` has not
@@ -332,7 +344,13 @@ mod platform {
                 caller_frame_or_entry: Register::from_bits(0),
                 return_pc: Register::from_bits(0),
                 code_block: Register::from_bits(0),
-                callee: Register::from_bits(0),
+                // `Callee` header slot (`ProtoCallFrame::calleeValue`,
+                // `ProtoCallFrame.h:49`; `CallFrameSlot::callee`, `CallFrame.h:178`):
+                // the REAL boxed callee cell, threaded in from the live interpreter
+                // frame's `callee_value` so a native `LoadCallee` reads it rather than
+                // 0. The prologue's `pushPair(fp,lr)` re-stamps only slots 0/1, so this
+                // slot survives into the body for the `load64 [fp + CALLEE*8]` lowering.
+                callee: Register::from_bits(callee_bits),
                 argument_count_including_this: Register::from_bits(count_including_this as u64),
                 this_value: Register::from_bits(this_bits),
                 arguments: &arg_regs,
