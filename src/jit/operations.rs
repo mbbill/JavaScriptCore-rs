@@ -746,6 +746,67 @@ pub extern "C" fn operation_call(
     }
 }
 
+/// `operationConstruct` analog (JITOperations.cpp): the baseline `op_construct`
+/// slow-path shim. The emitted lowering (`arm64_baseline/function_emitter.rs::
+/// emit_op_construct`) reads the boxed callee (the constructor) + each boxed argument
+/// cfr-relative from the JIT caller's frame (in the op_construct operand order), loads
+/// `x1`=callee, `x2`=argc, `x3..x7`=arg0..arg4 (the SAME register layout as
+/// [`operation_call`] — op_construct's `this` is the receiver the construct ALLOCATES,
+/// not a passed value), sets `x0`=the pinned `*mut Vm`, and far-calls this shim. It
+/// reborrows `&mut *vm` (D1) and `&mut *host` (D5) — the SAME reborrow island the
+/// arith/call families compose (see the module SAFETY note) — and runs the WHOLE
+/// `new callee(args)` (`Vm::operation_construct` -> `host.jit_construct_function_value`:
+/// `this` allocation + the constructor body + the return-override), returning the boxed
+/// constructed value, or — on throw (the constructor threw, or a non-constructor
+/// callee's TypeError) — stamping the JIT `m_exception` mirror (D3) and returning
+/// `JSValue::empty()` bits (the caller's post-construct exception probe branches on the
+/// mirror word).
+///
+/// `extern "C"` is load-bearing (the C-ABI the far-call expects). `argc` is the
+/// op_construct argument count EXCLUDING `this`; the receiver is `jsUndefined()` at the
+/// JSC call site and is allocated by `jit_construct_function_value`, not passed here.
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn operation_construct(
+    vm: *mut Vm,
+    callee: u64,
+    argc: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+) -> u64 {
+    // D1 + D5 reborrows — see the module SAFETY note. Exactly one `&mut *vm` and one
+    // `&mut *host`, both dropped before returning to JIT code.
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let callee = JsValue::from_encoded(EncodedJsValue(callee));
+    // The emitter never emits a far-call to this shim with argc > MAX_REGISTER_CALL_ARGS
+    // (the S4 arity gate declines such a CodeBlock). Clamp defensively so a malformed
+    // argc can never index past the register slots.
+    let argc = (argc as usize).min(MAX_REGISTER_CALL_ARGS);
+    let raw_args = [arg0, arg1, arg2, arg3, arg4];
+    let mut arguments = [JsValue::undefined(); MAX_REGISTER_CALL_ARGS];
+    for (slot, &bits) in arguments.iter_mut().zip(raw_args.iter()).take(argc) {
+        *slot = JsValue::from_encoded(EncodedJsValue(bits));
+    }
+
+    match vm.operation_construct(host, callee, &arguments[..argc]) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
 /// `operationVirtualCall`-family analog for the METHOD-call form (op_call_with_this):
 /// identical to [`operation_call`] except the explicit `this_value` RECEIVER is passed
 /// to the call machinery instead of `undefined`. The emitted method-call lowering

@@ -3614,6 +3614,66 @@ impl Vm {
         }
     }
 
+    /// `operationConstruct` analog (jit/JITOperations.cpp) — the SAFE wrapper the
+    /// baseline `op_construct` slow-path shim (`jit::operations::operation_construct`)
+    /// calls. The boxed `callee` (the constructor) and the boxed `arguments` (EXCLUDING
+    /// `this`) were read cfr-relative from the JIT caller's frame by the emitted
+    /// `emit_op_construct` lowering, in the op_construct operand order. Runs the WHOLE
+    /// `new callee(arguments)` via the host's faithful construct (`jit_construct_function_value`:
+    /// construct-ability check, native-constructor dispatch, `this` allocation from
+    /// `callee.prototype`, instance-field init, the constructor body, and the
+    /// return-override), returning the boxed constructed value or — on throw — the
+    /// pending exception's `EncodedJsValue`.
+    ///
+    /// Borrow/region shape is identical to [`Self::operation_call_with_this`]: the
+    /// parked active `CodeBlock` (S3) backs the caller-context `DispatchState`, `host`
+    /// is the reborrowed parked dispatch host (D5), and the four `DispatchState` inputs
+    /// are disjoint `self` fields. The constructor frame is pushed onto `self.execution`
+    /// (the live arena) ON TOP of the JIT caller's live frame, so it requires an active
+    /// VM entry, exactly as the interpreter's nested constructs do.
+    ///
+    /// DIVERGENCE (construct far-call first cut): the constructor runs INTERPRETED (see
+    /// `jit_construct_function_value`); the native direct-link construct fast path is the
+    /// deferred follow-up.
+    pub fn operation_construct(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        callee: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        // V1a (S3): build the caller-context `DispatchState` over the REAL active
+        // CodeBlock the driver parked (`set_jit_code_block`); a fresh placeholder only
+        // if none is parked (the direct unit-test driver). See `operation_call_with_this`.
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let outcome = {
+            // SAFETY: as `operation_call_with_this` — one dormant-parent `&CodeBlock`,
+            // disjoint from the `&mut self.*` field borrows, not outliving this call.
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            let mut state = DispatchState {
+                stack: &mut self.execution,
+                registers: &mut self.registers,
+                exceptions: &mut self.exceptions,
+                heap: &mut self.heap,
+                code_block,
+                ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+                function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+            };
+            host.jit_construct_function_value(&mut state, callee, arguments)
+        };
+        match outcome {
+            Ok(value) => Ok(value),
+            // A materialized JS throw value (the constructor threw, or a non-constructor
+            // callee's TypeError) is surfaced FAITHFULLY as its `EncodedJSValue`.
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            // Any other engine-level error IS a JS error: materialize the faithful
+            // error cell (== what `VM::m_exception` would hold).
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
     /// A1.x broad native-call engagement — the per-`op_call` RE-RESOLVE the baseline
     /// JIT's native fast path performs (the unlinked->linked `CallLinkInfo` analog,
     /// `jit/Repatch.cpp` `linkFor`): given the runtime callee VALUE and the call's
@@ -23470,6 +23530,174 @@ mod tests {
         });
     }
 
+    // ====================================================================
+    // op_construct FIRST-CUT (the FAR-CALL CONSTRUCT): `Vm::operation_construct` +
+    // the `operation_construct` shim + `host.jit_construct_function_value` + the
+    // `emit_op_construct` lowering. The constructor runs INTERPRETED (the native
+    // construct fast path is the deferred follow-up); these tests prove the CORRECT
+    // construct semantics — `this` allocation, the constructor body, and the
+    // return-override.
+    // ====================================================================
+
+    // A constructor `Ctor(a, b) { this.x = a; this.y = b }` (implicit `return undefined`
+    // -> the construct caller's return-override substitutes the allocated `this`).
+    // this=arg0 a=arg1 b=arg2; num_params_incl_this = 3. Two PutByName sites
+    // (identifiers 0="x", 1="y").
+    fn construct_ctor_set_xy() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::PutByName,
+                    vec![
+                        Operand::Register(argument_including_this(0)),
+                        Operand::IdentifierIndex(0),
+                        Operand::Register(argument_including_this(1)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::PutByName,
+                    vec![
+                        Operand::Register(argument_including_this(0)),
+                        Operand::IdentifierIndex(1),
+                        Operand::Register(argument_including_this(2)),
+                    ],
+                ),
+                // local(0) is undefined-filled by the frame push (jsstack.rs) -> the
+                // implicit constructor return; the return-override yields `this`.
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(0))],
+                ),
+            ],
+            3,
+        )
+    }
+
+    // A constructor that EXPLICITLY returns its (object) argument: `CtorRet(o) { return o }`.
+    // When `o` is an object, the return-override keeps `o` (NOT the allocated `this`).
+    // this=arg0 o=arg1; num_params_incl_this = 2.
+    fn construct_ctor_return_arg() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::Return,
+                vec![Operand::Register(argument_including_this(1))],
+            )],
+            2,
+        )
+    }
+
+    // The construct semantics PROVEN by calling `operation_construct` DIRECTLY in Rust
+    // (no native code) -> portable + a Miri target (the D1/D5 reborrow island composes
+    // with the re-entrant interpreter constructor with 0 UB):
+    //   MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-tree-borrows" \
+    //     cargo +nightly miri test --lib \
+    //     vm::tests::operation_construct_runs_new_with_this_alloc_and_return_override
+    #[test]
+    fn operation_construct_runs_new_with_this_alloc_and_return_override() {
+        use crate::interpreter::CorePropertyKey;
+        use crate::jit::operations::operation_construct;
+
+        // function_index 0 = Ctor(a,b){this.x=a;this.y=b}, 1 = CtorRet(o){return o}.
+        let ctor = construct_ctor_set_xy();
+        let ctor_ret = construct_ctor_return_arg();
+        let mut host =
+            CoreOpcodeDispatchHost::with_function_blocks(vec![ctor.clone(), ctor_ret.clone()]);
+        host.jit_test_register_identifier(0, "x");
+        host.jit_test_register_identifier(1, "y");
+        let ctor_value = host.allocate_function_value_for_test(0);
+        let ctor_ret_value = host.allocate_function_value_for_test(1);
+        // A pre-allocated OBJECT to hand the return-override constructor.
+        let override_object = host.jit_test_allocate_object();
+        let override_bits = override_object.encoded().0;
+        let key_x = CorePropertyKey::String("x".into());
+        let key_y = CorePropertyKey::String("y".into());
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::interpreter_only()));
+        let owner = register_test_code_block(&mut vm, ctor.clone());
+
+        with_active_op_call_entry(&mut vm, owner, &ctor, |vm| {
+            // Park the host (D5) + a real CodeBlock (S3), exactly as
+            // `run_installed_baseline_jit` does for the construct region.
+            vm.set_jit_host(&mut host);
+            vm.set_jit_code_block(&ctor as *const CodeBlock);
+            let vm_ptr: *mut Vm = &mut *vm;
+
+            // (a) new Ctor(10, 20) -> a FRESH object with x=10, y=20 (this-alloc + the
+            // constructor's field stores + the implicit-undefined return-override yielding
+            // the allocated `this`).
+            let ten = RuntimeValue::from_i32(10).encoded().0;
+            let twenty = RuntimeValue::from_i32(20).encoded().0;
+            let obj_bits =
+                operation_construct(vm_ptr, ctor_value.encoded().0, 2, ten, twenty, 0, 0, 0);
+            assert_eq!(
+                vm.jit_pending_exception().0,
+                0,
+                "no throw on the construct ok path"
+            );
+            assert_ne!(
+                obj_bits, 0,
+                "operation_construct returned a real constructed cell"
+            );
+            let obj = RuntimeValue::from_encoded(EncodedJsValue(obj_bits));
+            assert_eq!(
+                host.jit_test_get_own_data(obj, &key_x)
+                    .map(|v| v.encoded().0),
+                Some(ten),
+                "new Ctor(10,20).x == 10 (the constructor stored a onto the allocated this)",
+            );
+            assert_eq!(
+                host.jit_test_get_own_data(obj, &key_y)
+                    .map(|v| v.encoded().0),
+                Some(twenty),
+                "new Ctor(10,20).y == 20",
+            );
+
+            // (b) RETURN-OVERRIDE: `CtorRet(o) { return o }` with an OBJECT `o` yields
+            // exactly `o` (the explicit object return wins over the allocated `this`).
+            let ret_bits = operation_construct(
+                vm_ptr,
+                ctor_ret_value.encoded().0,
+                1,
+                override_bits,
+                0,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(
+                vm.jit_pending_exception().0,
+                0,
+                "no throw on the return-override path"
+            );
+            assert_eq!(
+                ret_bits, override_bits,
+                "the constructor's explicit object return overrides the allocated this",
+            );
+
+            // (c) NON-CONSTRUCTOR callee -> a faithful TypeError is materialized + stamped
+            // (the construct throw edge returns JSValue::empty() bits).
+            let bad_callee = RuntimeValue::from_i32(99).encoded().0;
+            let nbits = operation_construct(vm_ptr, bad_callee, 0, 0, 0, 0, 0, 0);
+            assert_eq!(
+                nbits, 0,
+                "the not-a-constructor edge returns JSValue::empty() bits"
+            );
+            assert_ne!(
+                vm.jit_pending_exception().0,
+                0,
+                "a non-constructor callee stamps a pending TypeError",
+            );
+            vm.set_jit_pending_exception(EncodedJsValue(0));
+
+            vm.clear_jit_code_block();
+            vm.clear_jit_host();
+        });
+    }
+
     // f(callee, x) { return callee(x) + 1 } — the milestone caller. op_call dst=local1,
     // callee=arg1, argc=1, arg0=arg2; then AddInt32 callresult + 1.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -24883,6 +25111,185 @@ mod tests {
              pure interpretation ({interp_elapsed:?}) — the R-lever. If this fails, the \
              per-call resolve/trampoline overhead is dominating (a critical finding).",
         );
+    }
+
+    // caller(C, a, b) { return new C(a, b) } — op_construct dst=local0, callee=arg1(C),
+    // argc=2, arg0=arg2(a), arg1=arg3(b). num_params_incl_this = 4. The ONLY opcodes are
+    // Construct + Return, so the caller tiers up (Construct admitted) and its op_construct
+    // far-calls `operation_construct`.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn construct_caller_new_ctor() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::Construct,
+                    vec![
+                        Operand::Register(local(0)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::UnsignedImmediate(2),
+                        Operand::Register(argument_including_this(2)),
+                        Operand::Register(argument_including_this(3)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(0))],
+                ),
+            ],
+            4,
+        )
+    }
+
+    // Run a construct CALLER through the engine INTERPRETER (the DeferToVm trampoline) on
+    // a fresh interpreter-only Vm whose host carries `Ctor` (with a CONSTRUCT block, so
+    // the DeferToVm `dispatch_construct` takes the same construct-block oracle the native
+    // shim mirrors). Returns the constructed object's (x, y) own-data, read from THAT host.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn run_construct_caller_via_interpreter(
+        caller: &CodeBlock,
+        ctor: &CodeBlock,
+        ctor_construct_id: CodeBlockId,
+        a: i32,
+        b: i32,
+    ) -> (Option<u64>, Option<u64>) {
+        use crate::interpreter::CorePropertyKey;
+        let key_x = CorePropertyKey::String("x".into());
+        let key_y = CorePropertyKey::String("y".into());
+        let ctor_id = CodeBlockId(CellId(8_895));
+        let mut interp_vm: Box<Vm> = Box::new(Vm::new(VmConfig::interpreter_only()));
+        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks(vec![
+            InterpreterFunctionCodeBlock::new(ctor_id, ctor.clone())
+                .with_construct(ctor_construct_id, ctor.clone()),
+        ]);
+        host.jit_test_register_identifier(0, "x");
+        host.jit_test_register_identifier(1, "y");
+        let ctor_value = host.allocate_function_value_for_test(0);
+        let owner = CodeBlockId(CellId(9_930));
+        interp_vm.code_blocks.register(owner, caller.clone());
+        let completion = execute_registered_code_block_with_host_and_arguments(
+            &mut interp_vm,
+            owner,
+            caller,
+            &mut host,
+            vec![
+                RuntimeValue::undefined(),
+                ctor_value,
+                RuntimeValue::from_i32(a),
+                RuntimeValue::from_i32(b),
+            ],
+        );
+        let object = match completion {
+            ExecutionCompletion::Returned(value) => value,
+            other => panic!("interpreter construct caller did not return: {other:?}"),
+        };
+        let ox = host
+            .jit_test_get_own_data(object, &key_x)
+            .map(|v| v.encoded().0);
+        let oy = host
+            .jit_test_get_own_data(object, &key_y)
+            .map(|v| v.encoded().0);
+        (ox, oy)
+    }
+
+    // op_construct NATIVE MILESTONE: a construct-heavy `caller(C, a, b) { return new C(a,b) }`
+    // tiers up and EXECUTES NATIVELY; its emitted op_construct far-calls
+    // `operation_construct`, which runs `Ctor(a,b){ this.x=a; this.y=b }` (the constructor,
+    // INTERPRETED), allocates `this`, stores the fields, and applies the return-override.
+    // native == interpreter == the closed-form oracle ({x:a, y:b}) over a range of inputs.
+    // The tier-up itself PROVES the S4 allowlist admission (the caller was DECLINED with
+    // `UnsupportedOpcode(Construct)` before this batch).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_op_construct_native_caller_constructs_matches_interpreter_and_oracle() {
+        use crate::interpreter::CorePropertyKey;
+
+        let ctor = construct_ctor_set_xy();
+        let caller = construct_caller_new_ctor();
+        let ctor_id = CodeBlockId(CellId(8_893));
+        let ctor_construct_id = CodeBlockId(CellId(8_894));
+        let caller_id = CodeBlockId(CellId(8_896));
+        let key_x = CorePropertyKey::String("x".into());
+        let key_y = CorePropertyKey::String("y".into());
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(caller_id, caller.clone());
+        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks(vec![
+            InterpreterFunctionCodeBlock::new(ctor_id, ctor.clone())
+                .with_construct(ctor_construct_id, ctor.clone()),
+        ]);
+        host.jit_test_register_identifier(0, "x");
+        host.jit_test_register_identifier(1, "y");
+        let ctor_value = host.allocate_function_value_for_test(0);
+
+        // The caller's op_construct far-calls `operation_construct`, which pushes the
+        // constructor frame onto the LIVE arena — so the whole sequence (warm-up tier-up
+        // AND the measured native runs) must run UNDER an active VM entry + caller frame,
+        // exactly as the op_call B5 native milestone test does (`run_installed_baseline_jit`
+        // establishes this entry in production).
+        with_active_op_call_entry(&mut vm, caller_id, &caller, |vm| {
+            // Warm the caller PAST the tier-up threshold; `a1x_install_until_tiered` PANICS
+            // if it never tiers up — so reaching the assertion proves Construct was admitted.
+            a1x_install_until_tiered(
+                vm,
+                &mut host,
+                caller_id,
+                &caller,
+                &op_call_args_including_this(&[
+                    ctor_value,
+                    RuntimeValue::from_i32(10),
+                    RuntimeValue::from_i32(20),
+                ]),
+            );
+            assert!(
+                vm.baseline_jit_function_is_installed(caller_id),
+                "the construct-heavy caller tiered up to a native image (Construct admitted)",
+            );
+
+            for &(a, b) in &[(10_i32, 20_i32), (-3, 7), (0, 0), (123_456, -1)] {
+                let args = op_call_args_including_this(&[
+                    ctor_value,
+                    RuntimeValue::from_i32(a),
+                    RuntimeValue::from_i32(b),
+                ]);
+                let native_obj = match vm.observe_baseline_jit_entry_and_maybe_execute(
+                    &mut host, caller_id, &caller, &args,
+                ) {
+                    BaselineJitEntryOutcome::Returned(value) => value,
+                    other => panic!("native construct caller({a},{b}) did not return: {other:?}"),
+                };
+                let native_x = host
+                    .jit_test_get_own_data(native_obj, &key_x)
+                    .map(|v| v.encoded().0);
+                let native_y = host
+                    .jit_test_get_own_data(native_obj, &key_y)
+                    .map(|v| v.encoded().0);
+                // ORACLE: new Ctor(a,b) => { x: a, y: b }.
+                assert_eq!(
+                    native_x,
+                    Some(RuntimeValue::from_i32(a).encoded().0),
+                    "native new Ctor({a},{b}).x == {a}",
+                );
+                assert_eq!(
+                    native_y,
+                    Some(RuntimeValue::from_i32(b).encoded().0),
+                    "native new Ctor({a},{b}).y == {b}",
+                );
+                // native == interpreter: the SAME construct via the engine interpreter
+                // (a separate interpreter-only Vm, so its arena entry is self-contained).
+                let (interp_x, interp_y) =
+                    run_construct_caller_via_interpreter(&caller, &ctor, ctor_construct_id, a, b);
+                assert_eq!(
+                    native_x, interp_x,
+                    "native == interpreter for new Ctor({a},{b}).x"
+                );
+                assert_eq!(
+                    native_y, interp_y,
+                    "native == interpreter for new Ctor({a},{b}).y"
+                );
+            }
+        });
     }
 
     // The METHOD `inc() { this.x = this.x + 1; return this.x }` — get_by_id + put_by_id

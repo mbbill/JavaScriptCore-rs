@@ -80,10 +80,10 @@ use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
 use crate::jit::operations::{
     operation_call, operation_call_with_this, operation_compare_greater,
     operation_compare_greatereq, operation_compare_less, operation_compare_lesseq,
-    operation_get_by_id_optimize, operation_get_by_id_with_cached_offset, operation_get_by_val,
-    operation_get_closure_cell, operation_jfalse, operation_put_by_id_optimize,
-    operation_put_by_id_with_cached_offset, operation_put_by_val, operation_put_closure_cell,
-    operation_resolve_baseline_native_entry, operation_strict_equal,
+    operation_construct, operation_get_by_id_optimize, operation_get_by_id_with_cached_offset,
+    operation_get_by_val, operation_get_closure_cell, operation_jfalse,
+    operation_put_by_id_optimize, operation_put_by_id_with_cached_offset, operation_put_by_val,
+    operation_put_closure_cell, operation_resolve_baseline_native_entry, operation_strict_equal,
     operation_throw_stack_overflow, MAX_REGISTER_CALL_ARGS, MAX_REGISTER_CALL_WITH_THIS_ARGS,
 };
 use crate::value::{JsValue, CELL_TAG, NUMBER_TAG, VALUE_TAG_MASK};
@@ -1079,6 +1079,59 @@ impl FunctionEmitter {
         // D3 throw edge: the callee threw (or a non-callable callee's TypeError)
         // stamps the mirror; branch to the shared exception stub BEFORE storing the
         // empty result. The probe reuses SCRATCH_GPR; x0 (the boxed result) is intact.
+        self.emit_exception_probe();
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst)); // dst = x0 (boxed result)
+    }
+
+    /// op_construct (`JIT::compileOpCall<OpConstruct>`, jit/JITCall.cpp:341-343) — the
+    /// construct FAR-CALL first cut (no native construct fast path yet). Reads the boxed
+    /// callee (the constructor) + each boxed argument cfr-relative from the JIT caller's
+    /// frame (op_construct operands `3..3+argc`, EXCLUDING `this` — the receiver is
+    /// ALLOCATED by the construct, not passed) into the C-ABI argument registers
+    /// (`x1`=callee, `x2`=argc, `x3..x7`=arg0..arg4, `x0`=vm) and far-calls
+    /// `operation_construct`, which runs the WHOLE `new callee(args)` through the
+    /// interpreter's own construct (`Vm::operation_construct` ->
+    /// `host.jit_construct_function_value`). Probes the `m_exception` mirror (D3) for the
+    /// throw edge, then stores the boxed constructed result to `dst`. Falls through to
+    /// the next bytecode.
+    ///
+    /// The register ABI + arity bound are IDENTICAL to plain `op_call`
+    /// (`operation_construct` has the same `(vm, callee, argc, arg0..arg4)` signature as
+    /// `operation_call` — op_construct's `this` is the receiver the construct ALLOCATES,
+    /// not a passed value); the caller has verified `args.len() <= MAX_REGISTER_CALL_ARGS`.
+    ///
+    /// DIVERGENCE from JSC (construct first cut): JSC sets up the callee construct frame
+    /// on the stack and emits a LINKED `bl` (the constructor's `op_create_this` allocates
+    /// `this`); this first cut emits only the unlinked far-call to `operation_construct`
+    /// (the constructor runs INTERPRETED, `this` allocated in the shim), passing the
+    /// already-boxed arguments by value in registers rather than building a stack callee
+    /// frame. The native direct-link construct fast path is the deferred follow-up.
+    fn emit_op_construct(&mut self, dst: i32, callee: i32, args: &[i32]) {
+        debug_assert!(
+            args.len() <= MAX_REGISTER_CALL_ARGS,
+            "op_construct arity must be gated to MAX_REGISTER_CALL_ARGS before lowering"
+        );
+        // Load each boxed argument cfr-relative into its argument register (x3..). Done
+        // BEFORE materializing x0/x1/x2 so no argument source is clobbered (the sources
+        // are all cfr-relative memory; the destinations x3..x7 are distinct from the
+        // callee/argc/vm registers x1/x2/x0). The SAME register layout as the op_call
+        // slow path (`emit_slow_call_body`, ThisSource::Undefined).
+        for (arg_index, &arg_slot) in args.iter().enumerate() {
+            self.h
+                .masm_mut()
+                .load64(address_for(arg_slot), CALL_ARG_GPRS[arg_index]);
+        }
+        self.h.masm_mut().load64(address_for(callee), LEFT_GPR); // x1 = callee (boxed constructor)
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(args.len() as i32), RIGHT_GPR); // x2 = argc
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+        self.h
+            .masm_mut()
+            .far_call(TrustedImm64::new(operation_construct as usize as i64));
+        // D3 throw edge: the constructor threw (or a non-constructor callee's TypeError)
+        // stamps the mirror; branch to the shared exception stub BEFORE storing the empty
+        // result. The probe reuses SCRATCH_GPR; x0 (the boxed result) is intact.
         self.emit_exception_probe();
         self.h.masm_mut().store64(RESULT_GPR, address_for(dst)); // dst = x0 (boxed result)
     }
@@ -2337,6 +2390,29 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                     bci,
                 );
             }
+            // op_construct (`new callee(args)`). Operand order matches the interpreter's
+            // `dispatch_construct` (interpreter/mod.rs): operand 0 = dst, operand 1 =
+            // callee (the constructor), operand 2 = argc (UnsignedImmediate, EXCLUDING
+            // `this` — the receiver is ALLOCATED by the construct, not passed), operands
+            // 3..3+argc = the explicit-argument registers — the SAME layout as plain
+            // `Call`. The FIRST-CUT lowering always FAR-CALLS `operation_construct` (the
+            // construct runs through the interpreter's own `new` resolution: `this`
+            // allocation + the constructor body + the return-override); the native
+            // construct fast path is the deferred follow-up. Arity beyond the register
+            // ABI is DECLINED (S4 gate) so the function stays interpreted.
+            CoreOpcode::Construct => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let callee = frame_slot(decoded.register_operand(1)?)?;
+                let argc = decoded.unsigned_immediate_operand(2)?;
+                if argc as usize > MAX_REGISTER_CALL_ARGS {
+                    return Err(EmitFunctionError::UnsupportedCallArity { argc });
+                }
+                let mut args = Vec::with_capacity(argc as usize);
+                for arg_index in 0..argc as usize {
+                    args.push(frame_slot(decoded.register_operand(3 + arg_index)?)?);
+                }
+                emitter.emit_op_construct(dst, callee, &args);
+            }
             // op_loop_hint is a tier-up/OSR marker with no value effect (the
             // interpreter treats it as Continue); emit nothing, fall through.
             CoreOpcode::LoopHint => {}
@@ -2824,6 +2900,56 @@ mod tests {
         assert!(
             emit_baseline_function(&neq, 0x1000, 0x2000).is_ok(),
             "`a !== b` (StrictNotEqual value form) tiers up"
+        );
+    }
+
+    // ALLOWLIST EXTENSION (structural oracle, every platform): `op_construct`
+    // (`new C(args)`) is now ADMITTED by the S4 gate — the remaining blocker for
+    // richards/deltablue/crypto/raytrace/earley-boyer (each does `new Ctor(...)`).
+    // Before this batch the `match op` had no arm, so any function containing a construct
+    // was REJECTED with `UnsupportedOpcode(Construct)` and stayed interpreted.
+    //   f(C, x) { return new C(x) }
+    //   0 Construct dst=LOCAL0, callee=ARG0, argc=1, arg0=ARG1   1 ret LOCAL0
+    #[test]
+    fn construct_is_admitted_by_the_allowlist() {
+        let code_block = build_code_block(vec![
+            instr(
+                CoreOpcode::Construct,
+                vec![
+                    reg(LOCAL0),
+                    reg(ARG0),
+                    Operand::UnsignedImmediate(1),
+                    reg(ARG1),
+                ],
+                0,
+            ),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+        ]);
+        assert!(
+            emit_baseline_function(&code_block, 0x1000, 0x2000).is_ok(),
+            "`new C(x)` (op_construct) tiers up (Construct admitted)"
+        );
+    }
+
+    // op_construct arity beyond the register ABI (MAX_REGISTER_CALL_ARGS == 5) is DECLINED
+    // (the SAME bound plain op_call uses) so the function stays interpreted, mirroring the
+    // `operation_construct` shim's 5-register argument limit.
+    #[test]
+    fn construct_with_too_many_args_is_declined() {
+        let mut operands = vec![reg(LOCAL0), reg(ARG0), Operand::UnsignedImmediate(6)];
+        for _ in 0..6 {
+            operands.push(reg(ARG1));
+        }
+        let code_block = build_code_block(vec![
+            instr(CoreOpcode::Construct, operands, 0),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+        ]);
+        assert!(
+            matches!(
+                emit_baseline_function(&code_block, 0x1000, 0x2000),
+                Err(EmitFunctionError::UnsupportedCallArity { argc: 6 })
+            ),
+            "a 6-arg construct exceeds MAX_REGISTER_CALL_ARGS and is declined (stays interpreted)"
         );
     }
 

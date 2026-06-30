@@ -12663,6 +12663,287 @@ impl CoreOpcodeDispatchHost {
         outcome
     }
 
+    /// The native-constructor dispatch shared by [`Self::dispatch_construct`] (the
+    /// `op_construct` opcode) and [`Self::jit_construct_function_value`] (the baseline
+    /// JIT construct far-call): given a resolved [`CoreNativeFunction`] constructor, the
+    /// native callee value, and the boxed argument slice, run the faithful native
+    /// `[[Construct]]` (Object/Array/Error/typed-array/Map/Set/... — each delegating to
+    /// the SAME `native_*_construct` helper the interpreter uses) and return the boxed
+    /// constructed value, or the throwing [`DispatchOutcome`]. Factored out (not
+    /// duplicated) so the opcode path and the far-call shim cannot drift.
+    fn construct_native_function(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        native: CoreNativeFunction,
+        callee: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        match native {
+            CoreNativeFunction::ObjectConstructor
+            | CoreNativeFunction::ArrayConstructor
+            | CoreNativeFunction::ErrorConstructor
+            | CoreNativeFunction::TypeErrorConstructor
+            | CoreNativeFunction::ReferenceErrorConstructor
+            | CoreNativeFunction::RegExpConstructor => self.call_native_function(
+                state,
+                callee,
+                native,
+                RuntimeValue::undefined(),
+                arguments,
+                None,
+            ),
+            CoreNativeFunction::NumberConstructor => {
+                self.native_number_construct(state.heap, arguments)
+            }
+            CoreNativeFunction::BooleanConstructor => {
+                self.native_boolean_construct(state.heap, arguments)
+            }
+            CoreNativeFunction::StringConstructor => self.native_string_construct(state, arguments),
+            CoreNativeFunction::PromiseConstructor => {
+                self.native_promise_constructor(state, arguments)
+            }
+            CoreNativeFunction::DateConstructor => self.native_date_constructor(arguments),
+            CoreNativeFunction::BigIntConstructor => {
+                Err(self.type_error_outcome_with_heap(state.heap, "BigInt is not a constructor"))
+            }
+            CoreNativeFunction::ArrayBufferConstructor => {
+                self.native_array_buffer_constructor(arguments)
+            }
+            CoreNativeFunction::Uint8ArrayConstructor
+            | CoreNativeFunction::Int8ArrayConstructor
+            | CoreNativeFunction::Uint8ClampedArrayConstructor
+            | CoreNativeFunction::Int16ArrayConstructor
+            | CoreNativeFunction::Uint16ArrayConstructor
+            | CoreNativeFunction::Int32ArrayConstructor
+            | CoreNativeFunction::Uint32ArrayConstructor
+            | CoreNativeFunction::Float32ArrayConstructor
+            | CoreNativeFunction::Float64ArrayConstructor => {
+                let kind =
+                    typed_array_constructor_kind(native).unwrap_or(TypedArrayElementKind::Uint8);
+                self.native_typed_array_constructor(state.heap, kind, arguments)
+            }
+            CoreNativeFunction::DataViewConstructor => {
+                self.native_data_view_constructor(state.heap, arguments)
+            }
+            CoreNativeFunction::ProxyConstructor => {
+                self.native_proxy_constructor(state.heap, arguments)
+            }
+            CoreNativeFunction::SymbolConstructor => {
+                Err(self.type_error_outcome_with_heap(state.heap, "Symbol is not a constructor"))
+            }
+            CoreNativeFunction::MapConstructor => {
+                self.native_map_constructor(state.heap, arguments)
+            }
+            CoreNativeFunction::SetConstructor => {
+                self.native_set_constructor(state.heap, arguments)
+            }
+            CoreNativeFunction::WeakMapConstructor => {
+                self.native_weak_map_constructor(state.heap, arguments)
+            }
+            CoreNativeFunction::WeakSetConstructor => {
+                self.native_weak_set_constructor(state.heap, arguments)
+            }
+            _ => Err(DispatchOutcome::Fail(ExecutionError::ExpectedFunction)),
+        }
+    }
+
+    /// Far-call CONSTRUCT entry — the baseline JIT `op_construct` slow-path analog and
+    /// the construct counterpart of [`Self::jit_call_function_value`]. The emitted
+    /// `op_construct` lowering (arm64_baseline/function_emitter.rs `emit_op_construct`)
+    /// reads the boxed callee + each boxed argument cfr-relative from the JIT caller's
+    /// frame and far-calls `operation_construct`, which reborrows the VM + host and
+    /// calls this. It performs the WHOLE `new callee(args)` SYNCHRONOUSLY — the same
+    /// steps [`Self::dispatch_construct`] performs, reusing the SAME leaf operations
+    /// (construct-ability check, [`Self::construct_native_function`], `this` allocation
+    /// from `callee.prototype`, instance-field init, the constructor body via a nested
+    /// `execute_code_block`, and the return-override) — returning the boxed constructed
+    /// value, or a [`DispatchOutcome`] on throw.
+    ///
+    /// C++ JSC: `JIT::compileOpCall<OpConstruct>` (jit/JITCall.cpp:341-343) sets up the
+    /// callee frame exactly like op_call (callee = the constructor) and the construct
+    /// slow path is `operationConstruct`; JSC allocates the receiver in the
+    /// constructor's own `op_create_this` (jit/JITOpcodes.cpp:1633), whereas this engine
+    /// allocates it in the Construct CALLER and passes it as the `this` argument (there
+    /// is no `op_create_this` opcode — see [`Self::dispatch_construct`]), so admitting
+    /// `op_construct` needs no `create_this` lowering.
+    ///
+    /// DIVERGENCE (construct far-call first cut, mirroring the op_call shim): the
+    /// constructor runs INTERPRETED through the nested `execute_code_block` (the native
+    /// direct-link construct fast path is the deferred follow-up). The
+    /// continuation/trampoline the VM-driven (`DeferToVm`) `dispatch_construct` uses to
+    /// run the constructor frame is collapsed here to a SYNCHRONOUS nested loop, exactly
+    /// as [`Self::execute_function_value_with_completion`] does for op_call; the result
+    /// is identical for native + non-proxy/non-default-derived bytecode constructors
+    /// (the construct-block oracle), which covers every ordinary-function and class
+    /// constructor in Octane. The default-derived super-synthesis
+    /// (`dispatch_function_index_call`) is NOT mirrored in this first cut (such
+    /// constructors are absent from Octane); a proxy / construct-block-less callee falls
+    /// back to the call-kind block (the `dispatch_function_index_call` synchronous
+    /// oracle).
+    pub(crate) fn jit_construct_function_value(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        callee: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        // ConstructAbility (dispatch_construct: the `function_construct_ability` gate).
+        let is_proxy_callee = self.objects.is_proxy(callee);
+        match self.objects.function_construct_ability(callee) {
+            Ok(ConstructAbility::CanConstruct) => {}
+            Ok(ConstructAbility::CannotConstruct) => {
+                let message = self.objects.function_not_constructor_message(callee);
+                return Err(self.type_error_outcome_with_heap(state.heap, message));
+            }
+            Err(_) => {
+                return Err(
+                    self.type_error_outcome_with_heap(state.heap, "Value is not a constructor")
+                );
+            }
+        }
+        let target = self
+            .objects
+            .function_call_target(callee)
+            .map_err(DispatchOutcome::Fail)?;
+        // NATIVE constructor: the shared native dispatch (the SAME helper the opcode
+        // path calls).
+        if let CoreFunctionCallTarget::Native { native, callee } = target {
+            return self.construct_native_function(state, native, callee, arguments);
+        }
+        // The receiver-allocation constructor (the proxy target, else the callee) —
+        // dispatch_construct's `constructor_callee`.
+        let constructor_callee = if is_proxy_callee {
+            self.objects
+                .function_call_target_value(callee)
+                .map_err(DispatchOutcome::Fail)?
+        } else {
+            callee
+        };
+        // Allocate `this` from `constructor.prototype` + initialize instance fields,
+        // exactly as `dispatch_construct` does BEFORE running the constructor body.
+        let prototype = self
+            .objects
+            .constructor_instance_prototype(constructor_callee, &self.prototype_key());
+        let this_value = self
+            .objects
+            .allocate_with_prototype_with_write_barrier(state.heap, prototype)
+            .map_err(DispatchOutcome::Fail)?;
+        if !self.objects.has_super_constructor(constructor_callee) {
+            self.initialize_instance_fields(state, constructor_callee, this_value)?;
+        }
+        let CoreFunctionCallTarget::Bytecode { function_index, .. } = target else {
+            return Err(DispatchOutcome::Fail(ExecutionError::ExpectedFunction));
+        };
+        let Some(function_entry) = self
+            .function_blocks
+            .get(usize::try_from(function_index).unwrap_or(usize::MAX))
+            .cloned()
+        else {
+            return Err(DispatchOutcome::Fail(ExecutionError::MissingFunctionCode(
+                function_index,
+            )));
+        };
+        // Select the construct-kind CodeBlock when present (the `DeferToVm`
+        // `dispatch_construct` oracle for non-proxy/non-default-derived constructors);
+        // else the call-kind block (the `dispatch_function_index_call` synchronous
+        // oracle, reached by proxy / construct-block-less callees).
+        let (code_block_id, code_block) = match (
+            function_entry.construct_id,
+            function_entry.construct_code_block.clone(),
+        ) {
+            (Some(construct_id), Some(construct_code_block))
+                if !is_proxy_callee
+                    && !self
+                        .objects
+                        .is_default_derived_constructor(constructor_callee) =>
+            {
+                (construct_id, construct_code_block)
+            }
+            _ => (function_entry.id, function_entry.code_block),
+        };
+        let formal_parameter_count = code_block
+            .unlinked()
+            .frame()
+            .num_parameters_including_this
+            .saturating_sub(1);
+        // argument_values == [this, args..., undefined-fill to the formal arity], the
+        // SAME layout `dispatch_construct`/`dispatch_function_index_call` build.
+        let mut argument_values = Vec::with_capacity(arguments.len().saturating_add(1));
+        argument_values.push(this_value);
+        argument_values.extend(arguments.iter().copied());
+        while argument_values.len()
+            < usize::try_from(formal_parameter_count.saturating_add(1)).unwrap_or(usize::MAX)
+        {
+            argument_values.push(RuntimeValue::undefined());
+        }
+        // Push the constructor frame + run it to completion in a nested interpreter
+        // loop (the op_call shim's `execute_function_value_with_completion` shape).
+        let frame = state
+            .stack
+            .push_frame(
+                state.registers,
+                FramePushRequest {
+                    code_block: Some(code_block_id),
+                    callee: None,
+                    callee_value: Some(constructor_callee),
+                    lexical_scope: None,
+                    shape: code_block.unlinked().frame(),
+                    argument_count_including_this: argument_values
+                        .len()
+                        .try_into()
+                        .unwrap_or(u32::MAX),
+                    argument_values,
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+                // K1: the shared `Rc<CodeBlock>` — `Rc::as_ptr` matches the registry's
+                // `code_block_pointer` and is stable; seeds slot 2 with a real
+                // `CodeBlock*` (the SAME seed `execute_function_value` uses).
+                Some(Rc::as_ptr(&code_block) as *const CodeBlock),
+            )
+            .map_err(DispatchOutcome::Fail)?;
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut *state.stack,
+                registers: &mut *state.registers,
+                exceptions: &mut *state.exceptions,
+                heap: &mut *state.heap,
+            },
+            code_block_id,
+            &code_block,
+            self,
+            DispatchConfig::default(),
+        );
+        if state.stack.frame(frame).is_some() {
+            state
+                .stack
+                .pop_frame(state.registers, frame)
+                .map_err(DispatchOutcome::Fail)?;
+        }
+        match completion {
+            ExecutionCompletion::Returned(value) => {
+                // Return-override: keep the constructor's value only if it is an object,
+                // else the allocated `this` — `normalize_constructor_return` (==
+                // `is_constructor_return_value`), the SAME rule
+                // `finish_ordinary_js_construct_return` applies (vm/mod.rs).
+                let value = self.normalize_constructor_return(value, this_value);
+                self.initialize_construct_return_fields(state, &[], value)?;
+                Ok(value)
+            }
+            ExecutionCompletion::Threw(pending) => Err(DispatchOutcome::Throw(pending.value)),
+            ExecutionCompletion::Failed(error) => Err(DispatchOutcome::Fail(error)),
+            ExecutionCompletion::OrdinaryBytecodeCall(_)
+            | ExecutionCompletion::OrdinaryBytecodeConstruct(_)
+            | ExecutionCompletion::BaselineLoopHandoff(_)
+            | ExecutionCompletion::FunctionValueCall(_)
+            | ExecutionCompletion::EvalRequest(_)
+            | ExecutionCompletion::CompileFunctionRequest(_)
+            | ExecutionCompletion::Terminated(_)
+            | ExecutionCompletion::Suspended(_) => {
+                Err(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))
+            }
+        }
+    }
+
     fn dispatch_construct(
         &mut self,
         state: &mut DispatchState<'_>,
@@ -12733,75 +13014,7 @@ impl CoreOpcodeDispatchHost {
                 };
                 arguments.push(value);
             }
-            let value =
-                match native {
-                    CoreNativeFunction::ObjectConstructor
-                    | CoreNativeFunction::ArrayConstructor
-                    | CoreNativeFunction::ErrorConstructor
-                    | CoreNativeFunction::TypeErrorConstructor
-                    | CoreNativeFunction::ReferenceErrorConstructor
-                    | CoreNativeFunction::RegExpConstructor => self.call_native_function(
-                        state,
-                        callee,
-                        native,
-                        RuntimeValue::undefined(),
-                        &arguments,
-                        None,
-                    ),
-                    CoreNativeFunction::NumberConstructor => {
-                        self.native_number_construct(state.heap, &arguments)
-                    }
-                    CoreNativeFunction::BooleanConstructor => {
-                        self.native_boolean_construct(state.heap, &arguments)
-                    }
-                    CoreNativeFunction::StringConstructor => {
-                        self.native_string_construct(state, &arguments)
-                    }
-                    CoreNativeFunction::PromiseConstructor => {
-                        self.native_promise_constructor(state, &arguments)
-                    }
-                    CoreNativeFunction::DateConstructor => self.native_date_constructor(&arguments),
-                    CoreNativeFunction::BigIntConstructor => Err(self
-                        .type_error_outcome_with_heap(state.heap, "BigInt is not a constructor")),
-                    CoreNativeFunction::ArrayBufferConstructor => {
-                        self.native_array_buffer_constructor(&arguments)
-                    }
-                    CoreNativeFunction::Uint8ArrayConstructor
-                    | CoreNativeFunction::Int8ArrayConstructor
-                    | CoreNativeFunction::Uint8ClampedArrayConstructor
-                    | CoreNativeFunction::Int16ArrayConstructor
-                    | CoreNativeFunction::Uint16ArrayConstructor
-                    | CoreNativeFunction::Int32ArrayConstructor
-                    | CoreNativeFunction::Uint32ArrayConstructor
-                    | CoreNativeFunction::Float32ArrayConstructor
-                    | CoreNativeFunction::Float64ArrayConstructor => {
-                        let kind = typed_array_constructor_kind(native)
-                            .unwrap_or(TypedArrayElementKind::Uint8);
-                        self.native_typed_array_constructor(state.heap, kind, &arguments)
-                    }
-                    CoreNativeFunction::DataViewConstructor => {
-                        self.native_data_view_constructor(state.heap, &arguments)
-                    }
-                    CoreNativeFunction::ProxyConstructor => {
-                        self.native_proxy_constructor(state.heap, &arguments)
-                    }
-                    CoreNativeFunction::SymbolConstructor => Err(self
-                        .type_error_outcome_with_heap(state.heap, "Symbol is not a constructor")),
-                    CoreNativeFunction::MapConstructor => {
-                        self.native_map_constructor(state.heap, &arguments)
-                    }
-                    CoreNativeFunction::SetConstructor => {
-                        self.native_set_constructor(state.heap, &arguments)
-                    }
-                    CoreNativeFunction::WeakMapConstructor => {
-                        self.native_weak_map_constructor(state.heap, &arguments)
-                    }
-                    CoreNativeFunction::WeakSetConstructor => {
-                        self.native_weak_set_constructor(state.heap, &arguments)
-                    }
-                    _ => Err(DispatchOutcome::Fail(ExecutionError::ExpectedFunction)),
-                };
-            return match value {
+            return match self.construct_native_function(state, native, callee, &arguments) {
                 Ok(value) => write_register(state, caller_window, destination, value),
                 Err(outcome) => outcome,
             };
