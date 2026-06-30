@@ -139,3 +139,36 @@ tier-up (the octane path) to the ARM64 `emit_baseline_function` + native-call pa
 the property/method/comparison/closure breadth), replacing the generated-* machinery** -- the STEP 2/3
 cutover of docs/design/baseline-call-tier-divergence.md, now confirmed as the gate to R. Diagnostic in
 flight to map the dispatch (BaselineAllowed -> which emitter) + the wiring.
+
+## 2026-06-30 LATE-2 — the R-gate, measured: FAR-CALLS regress property/call-heavy benches (Batch 5 / Increment 2)
+
+Two findings from the real-bench measurement (octane_probe, bounded, memory-safe ~0.8GB RSS):
+
+(1) **The 10x navier "regression" was ENTIRELY the generated EXECUTOR** (the byte-blob re-interpreter
+that declined functions fall to). The wiring is CORRECT: execute_code_block_with_entry_kind (vm/mod.rs:6496)
+tries the ARM64 maybe_run_live_baseline_jit_entry FIRST per entry (the same path the unit tests use), and
+only falls to the generated executor when emit_baseline_function DECLINES (it bails on the FIRST unsupported
+opcode, and Octane functions are large). Disabling the generated executor (--disable-baseline-generated-
+executor) -> declined functions INTERPRET instead of running the slow shim.
+
+(2) **With the executor OFF, the native JIT WINS on numeric benches but REGRESSES on property/call-heavy:**
+navier 4.27->4.77 (+12%), crypto 2.70->2.90 (+7.6%); BUT richards 0.96->~0.31 (-68%), delta-blue 0.67->0.30
+(-55%). Both validate ok -- purely perf. CAUSE (confirmed: richards baseline_generated_executions=0 yet still
+0.28, far below the 0.96 a decline-to-interpreter would give, so its functions tier up NATIVE but run slow):
+**Increment-1 FAR-CALLS every property load (get_by_id/get_by_val), closure read, and per-call callee
+resolve.** Numeric benches (navier/crypto) have few of these -> win; property/call-heavy benches (richards/
+delta-blue, and most of Octane) far-call on every field access + method call -> the far-calls dominate ->
+~2-3x slower than the interpreter's inline dispatch.
+
+THE R-GATE (measurement-confirmed, NOT more breadth): the INLINE versions.
+- **Increment 2 = inline machine-code property load** (replace the get_by_id/put_by_id/get_by_val/closure
+  far-calls with an inline structure-guarded load), GATED on **gc-r4 Batch 5** (the object-storage model:
+  real inline slots on the cell + a machine-ADDRESSABLE butterfly pointer; today butterfly is a slab INDEX).
+- **CallLinkInfo monomorphic cache** = a direct bl + callee-identity guard, skipping the per-call resolve
+  far-call (needs the R4 visitWeak weak-processing, U7).
+Then property/call-heavy benches win -> the JIT is a net speedup across -> flip the default (held) -> R moves.
+
+LEVER A (disable the generated executor) is a correct hygiene win (it's the confirmed generated-* re-interp
+divergence; STEP 5 deletes it) but NOT a net R-win alone (property/call-heavy regress). The breadth (Inc 1)
+was necessary (functions tier up) but the FAR-CALLS make it perf-negative for property/call code until the
+inline versions land. Batch 5 -> Increment 2 + the call cache is the evidence-backed path to R.
