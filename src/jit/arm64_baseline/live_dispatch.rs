@@ -188,6 +188,7 @@ pub(crate) use platform::{install_baseline_function, InstalledBaselineFunction};
 pub(crate) fn install_baseline_function(
     _code_block: &CodeBlock,
     _jit_pending_address: usize,
+    _soft_stack_limit_address: usize,
     _install_vm: *const crate::vm::Vm,
 ) -> Result<(), BaselineInstallError> {
     Err(BaselineInstallError::UnsupportedPlatform)
@@ -250,6 +251,14 @@ mod platform {
         /// store's active-span stack around `run`.
         pub(crate) fn frame_scan_bounds(&self) -> (usize, usize) {
             (self.stack.low_address(), self.stack.high_address())
+        }
+        /// A1.4: the soft stack limit for THIS function's native stack — its
+        /// `JsStack::stack_limit()` (low bound + soft-reserved zone). The driver
+        /// writes this into `Vm::set_jit_soft_stack_limit` immediately before `run`
+        /// so the emitted prologue's overflow check (which loads the VM's baked
+        /// `addressOfSoftStackLimit`) compares against the stack the frame runs on.
+        pub(crate) fn soft_stack_limit(&self) -> usize {
+            self.stack.stack_limit()
         }
 
         /// `doVMEntry`-seed the callee `CallFrame` on the native JS stack (header +
@@ -317,9 +326,12 @@ mod platform {
 
             let callee_frame = match self.stack.try_seed_entry_frame(&seed) {
                 Ok(frame) => frame.registers().as_ptr() as usize,
-                // A bounded allowlisted frame in a 5 MiB stack cannot overflow the
-                // single-frame seed; a hard stack-overflow THROW is A1.4 (deferred).
-                // Never corrupt memory: bail to boxed `undefined`.
+                // A bounded allowlisted ENTRY frame in a 5 MiB stack cannot overflow
+                // the single-frame seed. Deep NATIVE JIT->JIT recursion overflow is
+                // now caught faithfully inside the emitted prologue (A1.4: the
+                // softStackLimit check throws a RangeError); this entry-seed guard
+                // remains a belt-and-suspenders bail to boxed `undefined` so a seed
+                // failure never corrupts memory.
                 Err(_) => {
                     debug_assert!(false, "entry frame seed must fit the native JS stack");
                     return undefined_bits;
@@ -341,10 +353,12 @@ mod platform {
     pub(crate) fn install_baseline_function(
         code_block: &CodeBlock,
         jit_pending_address: usize,
+        soft_stack_limit_address: usize,
         install_vm: *const Vm,
     ) -> Result<InstalledBaselineFunction, BaselineInstallError> {
-        let image = emit_baseline_function(code_block, jit_pending_address)
-            .map_err(BaselineInstallError::Declined)?;
+        let image =
+            emit_baseline_function(code_block, jit_pending_address, soft_stack_limit_address)
+                .map_err(BaselineInstallError::Declined)?;
         let mut records = image.link_records;
         let handle =
             finalize_arm64_link_buffer(&MapJitExecutableAllocator, &image.code, &mut records)

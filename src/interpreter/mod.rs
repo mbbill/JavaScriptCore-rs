@@ -15934,6 +15934,70 @@ impl CoreOpcodeDispatchHost {
         self.type_error_value(heap, "Type error in arithmetic operation")
     }
 
+    /// Build a `RangeError(message)` cell (the value form of
+    /// [`Self::range_error_outcome_with_heap`]; identical to [`Self::type_error_value`]
+    /// but with the `RangeError.prototype` chain). `Err` only on an allocation
+    /// failure while building the error.
+    fn range_error_value(
+        &mut self,
+        heap: &mut Heap,
+        message: &str,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let error_name = self
+            .strings
+            .allocate_with_heap(&mut self.objects, heap, "Error")
+            .map_err(DispatchOutcome::Fail)?;
+        let range_error_name = self
+            .strings
+            .allocate_with_heap(&mut self.objects, heap, "RangeError")
+            .map_err(DispatchOutcome::Fail)?;
+        let empty_message = self
+            .strings
+            .allocate_with_heap(&mut self.objects, heap, "")
+            .map_err(DispatchOutcome::Fail)?;
+        let message = self
+            .strings
+            .allocate_with_heap(&mut self.objects, heap, message)
+            .map_err(DispatchOutcome::Fail)?;
+        let prototype =
+            self.objects
+                .ensure_range_error_prototype(error_name, range_error_name, empty_message);
+        let error = self
+            .objects
+            .allocate_with_prototype_with_write_barrier(heap, Some(prototype))
+            .map_err(DispatchOutcome::Fail)?;
+        self.define_non_enumerable_data_field_with_write_barrier(heap, error, "message", message)?;
+        Ok(error)
+    }
+
+    /// A1.4 (`createStackOverflowError`, ExceptionHelpers.cpp:43-46): materialize the
+    /// FAITHFUL stack-overflow error cell the baseline-JIT prologue's `softStackLimit`
+    /// overflow path surfaces — a `RangeError("Maximum call stack size exceeded.")`.
+    /// `Err` only on an allocation failure while building the error.
+    ///
+    /// DIVERGENCE (documented): JSC additionally marks the cell via
+    /// `ErrorInstance::setStackOverflowError()` (the `stack_overflow` flag); this
+    /// engine's materialized error cell does not yet carry that flag — a fidelity
+    /// gap. The load-bearing fact is that the surfaced VALUE is a real `RangeError`
+    /// with the faithful message, not a sentinel.
+    pub(crate) fn jit_bridge_stack_overflow_error_value(
+        &mut self,
+        heap: &mut Heap,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        self.range_error_value(heap, "Maximum call stack size exceeded.")
+    }
+
+    /// A1.4 test-only: is `value` a `RangeError` instance (its `[[Prototype]]` is the
+    /// realm's `RangeError.prototype`)? The baseline prologue stack-overflow test uses
+    /// this to confirm the surfaced cell is a faithful `RangeError`, not merely "some
+    /// value threw".
+    #[cfg(test)]
+    pub(crate) fn jit_bridge_value_is_range_error(&self, value: RuntimeValue) -> bool {
+        self.objects.range_error_prototype.is_some()
+            && self.objects.get_prototype(value).ok().flatten()
+                == self.objects.range_error_prototype
+    }
+
     fn native_map_constructor(
         &mut self,
         heap: &mut Heap,

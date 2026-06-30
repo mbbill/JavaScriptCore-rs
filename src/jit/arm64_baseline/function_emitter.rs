@@ -79,7 +79,8 @@ use crate::bytecode::{CodeBlock, CoreOpcode, InstructionDecodeError, OperandAcce
 use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
 use crate::jit::operations::{
     operation_call, operation_compare_greater, operation_compare_less, operation_compare_lesseq,
-    operation_get_by_val, operation_jfalse, operation_put_by_val, MAX_REGISTER_CALL_ARGS,
+    operation_get_by_val, operation_jfalse, operation_put_by_val, operation_throw_stack_overflow,
+    MAX_REGISTER_CALL_ARGS,
 };
 use crate::value::{JsValue, NUMBER_TAG};
 use crate::vm::jsstack::CallFrameSlot;
@@ -311,6 +312,15 @@ struct FunctionEmitter {
     label_link_records: Vec<Arm64LinkRecord>,
     /// The baked `AbsoluteAddress` of `Vm::m_exception` (D3); see op_add prereq #3.
     jit_pending_address: usize,
+    /// A1.4: the baked `AbsoluteAddress` of `Vm::jit_soft_stack_limit`
+    /// (`VM::addressOfSoftStackLimit`, VM.h:919). The prologue stack-overflow check
+    /// LOADs `*soft_stack_limit_address` and compares the new frame top against it
+    /// (JIT.cpp:781). Like `jit_pending_address`, it must stay valid for the call's
+    /// duration (a pin-stable `Vm`).
+    soft_stack_limit_address: usize,
+    /// A1.4: the prologue's stack-overflow guard jump(s) to the overflow stub
+    /// (emitted after the exception stub, like `done_jumps`/`exception_jumps`).
+    stack_overflow_jumps: Vec<Jump>,
     /// Bytes the prologue reserved below `fp` for this function's callee locals
     /// (`reserved_locals_bytes(num_locals)`), captured in [`Self::emit_prologue`].
     /// The native op_call edge (A1.2) needs it to place the callee frame BELOW the
@@ -324,7 +334,11 @@ struct FunctionEmitter {
 const MODE: TagRegistersMode = TagRegistersMode::HaveTagRegisters;
 
 impl FunctionEmitter {
-    fn new(instruction_count: usize, jit_pending_address: usize) -> Self {
+    fn new(
+        instruction_count: usize,
+        jit_pending_address: usize,
+        soft_stack_limit_address: usize,
+    ) -> Self {
         Self {
             h: AssemblyHelpers::new(),
             labels: vec![None; instruction_count],
@@ -334,6 +348,8 @@ impl FunctionEmitter {
             slow: Vec::new(),
             label_link_records: Vec::new(),
             jit_pending_address,
+            soft_stack_limit_address,
+            stack_overflow_jumps: Vec::new(),
             reserved_locals_bytes: 0,
             linked_call_sites: Vec::new(),
         }
@@ -377,6 +393,51 @@ impl FunctionEmitter {
                 RegisterID::Sp,
             );
         }
+        // A1.4 STACK-OVERFLOW CHECK (JIT.cpp:773-783): after `emitFunctionPrologue`
+        // + the locals reservation, JSC computes the frame top into `regT1` and
+        // `branchPtr(GreaterThan, AbsoluteAddress(vm.addressOfSoftStackLimit()),
+        // regT1)` to the stack-overflow thunk BEFORE `move(regT1, sp)` /
+        // emitSaveCalleeSaves. Emitted HERE — before the callee-save spills descend
+        // `sp` and WRITE — so an over-deep frame is caught with nothing written below
+        // `fp` and `sp` still at `fp - localsBytes`; the overflow stub then needs no
+        // callee-save refill. `x0` still holds the raw `*mut Vm`;
+        // `SCRATCH_GPR`/`SCRATCH_GPR_B` (caller-saved x3/x4) are free here (the tag /
+        // pinned-VM registers are materialized only after this point).
+        //
+        // The frame top is `fp - localsBytes - calleeSaveSpillBytes` (the lowest slot
+        // the prologue+body will write). DIVERGENCE (first cut, documented): JSC's
+        // `frameTopOffset` (`stackPointerOffsetFor`) ALSO reserves the maximal
+        // OUTGOING-call argument area; this checks the locals + callee-save frame top
+        // only. The bounded op_call outgoing area and the throw shim's own C frame are
+        // absorbed by the generous soft-reserved zone above the guard page, and a
+        // native JIT->JIT callee re-checks in its OWN prologue, so deep recursion is
+        // still caught frame-by-frame.
+        let frame_top_bytes = reserved + CALLEE_SAVE_SPILL_BYTES;
+        // regT1 := fp - frameTopBytes (the new frame's lowest address). The negative
+        // immediate folds to a `sub`; a large one sign-extends into the assembler's
+        // own data temp, not SCRATCH_GPR/_B.
+        self.h.masm_mut().add64_imm(
+            TrustedImm32::new(-frame_top_bytes),
+            CALL_FRAME_GPR,
+            SCRATCH_GPR,
+        );
+        // SCRATCH_GPR_B := *softStackLimit (the `AbsoluteAddress` value LOAD).
+        self.h.masm_mut().move_imm64(
+            TrustedImm64::new(self.soft_stack_limit_address as i64),
+            SCRATCH_GPR_B,
+        );
+        self.h
+            .masm_mut()
+            .load64(Address::new(SCRATCH_GPR_B, 0), SCRATCH_GPR_B);
+        // branch if softStackLimit > frameTop -> overflow stub (signed GreaterThan ==
+        // JSC's `branchPtr(GreaterThan, ...)`; stack addresses are positive in the
+        // signed i64 range, so signed pointer comparison is faithful).
+        let overflow = self.h.masm_mut().branch64(
+            RelationalCondition::GreaterThan,
+            SCRATCH_GPR_B,
+            SCRATCH_GPR,
+        );
+        self.stack_overflow_jumps.push(overflow);
         self.h
             .masm_mut()
             .push_pair(PINNED_VM_GPR, PINNED_VM_PAIR_GPR); // spill x19(+x20)
@@ -835,6 +896,34 @@ impl FunctionEmitter {
         done
     }
 
+    /// A1.4 STACK-OVERFLOW STUB (== JSC's `ThrowStackOverflowAtPrologue` thunk
+    /// target, JIT.cpp:864): the prologue's `softStackLimit` guard branches here. At
+    /// entry the frame is HALF-built — `pushPair(fp,lr)` + `mov fp,sp` ran and
+    /// `sp == fp - localsBytes`, but the callee-save spills did NOT (the check fired
+    /// before them), so this CANNOT route through the normal epilogue (which would
+    /// `popPair` never-pushed spills). `x0` still holds the raw `*mut Vm`. Far-call
+    /// the throw shim — which materializes a faithful stack-overflow `RangeError` and
+    /// STAMPS the `m_exception` mirror (D3) — then run the MINIMAL prologue teardown
+    /// `mov sp,fp; ldp fp,lr; ret` (no callee-save refill) to return cleanly to the
+    /// trampoline/caller, which branches on the stamped mirror (the throw edge).
+    fn emit_stack_overflow_stub(&mut self) -> Label {
+        let stub = self.h.masm().label();
+        // operation_throw_stack_overflow(vm): x0 is already the raw `*mut Vm` (the
+        // prologue has not yet moved it into the pinned-VM register). The far-call
+        // clobbers lr; it is refilled below from the [fp,lr] header pushPair wrote.
+        self.h.masm_mut().far_call(TrustedImm64::new(
+            operation_throw_stack_overflow as usize as i64,
+        ));
+        // Minimal teardown (callee-saves were NOT spilled): `mov sp,fp` discards the
+        // locals reservation, `ldp fp,lr,[sp],#16` refills the frame-header pair,
+        // `ret` returns. x0 holds the shim's `JSValue::empty()` bits (the throw edge's
+        // discarded result; the caller reads the stamped mirror instead).
+        self.h.masm_mut().move_rr(CALL_FRAME_GPR, RegisterID::Sp); // mov sp, fp
+        self.h.masm_mut().pop_pair(CALL_FRAME_GPR, LINK_GPR); // ldp fp,lr,[sp],#16
+        self.h.masm_mut().ret();
+        stub
+    }
+
     /// The post-far-call pending-exception probe (D3), shared by the throwing slow
     /// kinds: `branchTestPtr(NonZero, AbsoluteAddress(&vm.m_exception))` -> the shared
     /// exception stub. Materialize the baked address, load the word, test it.
@@ -1047,6 +1136,9 @@ fn count_callee_locals(code_block: &CodeBlock) -> Result<u32, EmitFunctionError>
 ///
 /// `jit_pending_address` is the baked `AbsoluteAddress` of `Vm::m_exception` (D3);
 /// it must remain stable for the call's duration (a pin-stable `Vm`, op_add prereq #3).
+/// `soft_stack_limit_address` is the baked `AbsoluteAddress` of the VM's soft stack
+/// limit (`VM::addressOfSoftStackLimit`, A1.4) the prologue's overflow check loads;
+/// same pin-stability requirement.
 ///
 /// Returns `Err` (REJECTS the function) for any opcode/operand outside the Stage-1
 /// int32/control-flow allowlist — the S4 gate behavior (the function stays in the
@@ -1059,8 +1151,14 @@ fn count_callee_locals(code_block: &CodeBlock) -> Result<u32, EmitFunctionError>
 pub(crate) fn emit_baseline_function(
     code_block: &CodeBlock,
     jit_pending_address: usize,
+    soft_stack_limit_address: usize,
 ) -> Result<FunctionImage, EmitFunctionError> {
-    emit_baseline_function_with_linked_calls(code_block, jit_pending_address, &[])
+    emit_baseline_function_with_linked_calls(
+        code_block,
+        jit_pending_address,
+        soft_stack_limit_address,
+        &[],
+    )
 }
 
 /// As [`emit_baseline_function`], but resolves the op_call sites named in
@@ -1071,6 +1169,7 @@ pub(crate) fn emit_baseline_function(
 pub(crate) fn emit_baseline_function_with_linked_calls(
     code_block: &CodeBlock,
     jit_pending_address: usize,
+    soft_stack_limit_address: usize,
     linked_calls: &[LinkedCallTarget],
 ) -> Result<FunctionImage, EmitFunctionError> {
     let count = code_block.unlinked().instructions().instruction_count();
@@ -1079,7 +1178,7 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
     }
 
     let num_locals = count_callee_locals(code_block)?;
-    let mut emitter = FunctionEmitter::new(count, jit_pending_address);
+    let mut emitter = FunctionEmitter::new(count, jit_pending_address, soft_stack_limit_address);
 
     // === PROLOGUE + op_enter ===============================================
     emitter.emit_prologue(num_locals);
@@ -1250,6 +1349,11 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
     let exception_to_done = emitter.h.masm_mut().jump();
     emitter.done_jumps.push(exception_to_done);
 
+    // === A1.4 STACK-OVERFLOW stub (== `ThrowStackOverflowAtPrologue`): throw a
+    //     faithful RangeError + minimal prologue teardown (no callee-save refill,
+    //     since the prologue check fires before the spills). ==================
+    let stack_overflow_label = emitter.emit_stack_overflow_stub();
+
     // === LINK pass (privateCompileLinkPass): resolve every recorded branch ==
     let mut link_records = emitter.label_link_records;
     for (jump, target_bci) in &emitter.jumps {
@@ -1269,6 +1373,9 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
     }
     for jump in &emitter.exception_jumps {
         link_records.push(jump.to_link_record(exception_label));
+    }
+    for jump in &emitter.stack_overflow_jumps {
+        link_records.push(jump.to_link_record(stack_overflow_label));
     }
 
     Ok(FunctionImage {
@@ -1332,7 +1439,7 @@ mod tests {
 
         // num_locals == 0 omits the `sub sp` reservation, so bytes 0..8 are exactly
         // the `stp fp,lr,[sp,#-16]!; mov fp,sp` head.
-        let mut prologue = FunctionEmitter::new(1, 0);
+        let mut prologue = FunctionEmitter::new(1, 0, 0);
         prologue.emit_prologue(0);
         assert_eq!(
             &prologue.h.code()[0..8],
@@ -1342,7 +1449,7 @@ mod tests {
 
         // The epilogue ends with `mov sp,fp; ldp fp,lr,[sp],#16; ret` (12 bytes)
         // after the callee-save refills.
-        let mut epilogue = FunctionEmitter::new(1, 0);
+        let mut epilogue = FunctionEmitter::new(1, 0, 0);
         epilogue.emit_epilogue();
         let code = epilogue.h.code();
         assert_eq!(
@@ -1480,7 +1587,7 @@ mod tests {
     #[test]
     fn int_sum_loop_emits_three_pass_image() {
         let code_block = build_code_block(int_sum_loop_instructions());
-        let image = emit_baseline_function(&code_block, 0x1000).expect("emit loop");
+        let image = emit_baseline_function(&code_block, 0x1000, 0x2000).expect("emit loop");
         let w = words(&image.code);
 
         // Prologue: the faithful Option-A `emitFunctionPrologue` (A1) building the
@@ -1510,7 +1617,8 @@ mod tests {
         //       add6=4, plus the 4+4 double-path internal links                 -> 18
         //   exception jumps (slow exception probe): compare 1, add5 1, add6 1   -> 3
         //   done jumps: op_ret 1, exception stub 1                              -> 2
-        assert_eq!(image.link_records.len(), 31, "every branch is linked");
+        //   A1.4 stack-overflow guard: prologue softStackLimit -> overflow stub -> 1
+        assert_eq!(image.link_records.len(), 32, "every branch is linked");
     }
 
     #[test]
@@ -1523,13 +1631,13 @@ mod tests {
             0,
         )]);
         assert!(matches!(
-            emit_baseline_function(&code_block, 0x1000),
+            emit_baseline_function(&code_block, 0x1000, 0x2000),
             Err(EmitFunctionError::ConstantOperand)
         ));
 
         let empty = build_code_block(Vec::new());
         assert!(matches!(
-            emit_baseline_function(&empty, 0x1000),
+            emit_baseline_function(&empty, 0x1000, 0x2000),
             Err(EmitFunctionError::EmptyFunction)
         ));
     }
@@ -1562,7 +1670,7 @@ mod tests {
         ]);
         assert!(
             matches!(
-                emit_baseline_function(&live_after, 0x1000),
+                emit_baseline_function(&live_after, 0x1000, 0x2000),
                 Err(EmitFunctionError::StandaloneRelational(
                     CoreOpcode::LessThanInt32
                 ))
@@ -1588,7 +1696,7 @@ mod tests {
             instr(CoreOpcode::Return, vec![reg(LOCAL1)], 3),
         ]);
         assert!(
-            emit_baseline_function(&dead_after, 0x1000).is_ok(),
+            emit_baseline_function(&dead_after, 0x1000, 0x2000).is_ok(),
             "a dead comparison result fuses cleanly"
         );
     }
@@ -1601,7 +1709,7 @@ mod tests {
     fn rejects_out_of_range_branch_target() {
         let bad_jump = build_code_block(vec![instr(CoreOpcode::Jump, vec![jump_target(5)], 0)]);
         assert!(matches!(
-            emit_baseline_function(&bad_jump, 0x1000),
+            emit_baseline_function(&bad_jump, 0x1000, 0x2000),
             Err(EmitFunctionError::InvalidBranchTarget { target_bci: 5 })
         ));
     }
@@ -1616,7 +1724,7 @@ mod tests {
     fn load_double_function_is_admitted_by_the_allowlist() {
         let code_block = build_code_block(double_literal_arith_instructions());
         assert!(
-            emit_baseline_function(&code_block, 0x1000).is_ok(),
+            emit_baseline_function(&code_block, 0x1000, 0x2000).is_ok(),
             "a double-literal arith function tiers up (LoadDouble admitted)"
         );
     }
@@ -1643,7 +1751,7 @@ mod tests {
             ),
             instr(CoreOpcode::Return, vec![reg(LOCAL0)], 2),
         ]);
-        let image = emit_baseline_function(&code_block, 0x1000)
+        let image = emit_baseline_function(&code_block, 0x1000, 0x2000)
             .expect("get_by_val/put_by_val are admitted (S4 allowlist extension)");
         let w = words(&image.code);
         assert_eq!(
@@ -1719,6 +1827,9 @@ mod tests {
         }
 
         /// Finalize + execute a function image, seeding the argument slots first.
+        /// Sets the A1.4 soft stack limit to the frame's native stack low bound, so
+        /// the prologue overflow check is ARMED but never fires for these
+        /// normal-depth frames (the limit sits far below `fp`).
         fn run_function(
             instructions: Vec<TypedInstruction>,
             args: &[(i32, u64)],
@@ -1727,15 +1838,20 @@ mod tests {
             let mut vm = Vm::new(VmConfig::interpreter_only());
             vm.set_jit_host(&mut host); // D5: park the host before entering JIT code.
             let jit_pending_address = vm.jit_pending_exception_address() as usize;
+            let soft_stack_limit_address = vm.jit_soft_stack_limit_address() as usize;
 
             let frame = Frame::new();
             for &(operand, bits) in args {
                 frame.write(operand, bits);
             }
+            // A1.4: arm the prologue overflow check with this stack's real low bound;
+            // `fp` is near the high end, so a normal frame top stays well above it.
+            vm.set_jit_soft_stack_limit(frame.stack.stack_limit());
 
             let code_block = build_code_block(instructions);
             let image =
-                emit_baseline_function(&code_block, jit_pending_address).expect("emit function");
+                emit_baseline_function(&code_block, jit_pending_address, soft_stack_limit_address)
+                    .expect("emit function");
             let mut records = image.link_records;
             let handle =
                 finalize_arm64_link_buffer(&MapJitExecutableAllocator, &image.code, &mut records)
@@ -1768,6 +1884,102 @@ mod tests {
             assert_eq!(frame.read(LOCAL1), i32_bits(5), "result slot holds 5");
             assert_eq!(r.pending, 0, "no exception");
             assert!(JsValue::from_encoded(EncodedJsValue(r.ret)).is_int32());
+        }
+
+        // --- A1.4: the baseline prologue's softStackLimit check (JIT.cpp:773-783).
+        // A frame whose top would drop below the soft stack limit throws a FAITHFUL
+        // stack-overflow RangeError from the PROLOGUE (createStackOverflowError),
+        // bailing cleanly — NOT a SIGSEGV/guard-page fault, NOT silent corruption,
+        // and WITHOUT running op_enter or the body. Driven synthetically by setting
+        // the limit AT `fp` (modeling "no stack left below this frame", the deep-
+        // recursion limit): a real self-recursive native bl would hit the SAME
+        // per-frame prologue check, frame by frame. The SAME image with the real
+        // (low) limit does NOT trip the check — proving it is the limit, not the
+        // code, that decides.
+        #[test]
+        fn prologue_softstacklimit_throws_stack_overflow_rangeerror() {
+            let mut host = CoreOpcodeDispatchHost::new();
+            let mut vm = Vm::new(VmConfig::interpreter_only());
+            vm.set_jit_host(&mut host); // D5: park the host before entering JIT code.
+            let jit_pending_address = vm.jit_pending_exception_address() as usize;
+            let soft_stack_limit_address = vm.jit_soft_stack_limit_address() as usize;
+
+            // The straight-line smoke add `(a,b)=>{ var tmp=a; return tmp+b }`.
+            let code_block = build_code_block(smoke_instructions());
+            let image =
+                emit_baseline_function(&code_block, jit_pending_address, soft_stack_limit_address)
+                    .expect("emit smoke function");
+            let mut records = image.link_records;
+            let handle =
+                finalize_arm64_link_buffer(&MapJitExecutableAllocator, &image.code, &mut records)
+                    .expect("finalize function image");
+
+            // A distinctive sentinel pre-seeded into the result slot LOCAL1: if the
+            // throw is truly from the prologue, NEITHER op_enter's local zero-fill NOR
+            // the body runs, so LOCAL1 keeps the sentinel.
+            let sentinel = i32_bits(0x5EED);
+
+            // (1) ARMED-BUT-SAFE: with the stack's real low bound the frame top stays
+            //     well above the limit -> the check does NOT fire; 2 + 3 == 5.
+            let ok_frame = Frame::new();
+            ok_frame.write(ARG0, i32_bits(2));
+            ok_frame.write(ARG1, i32_bits(3));
+            ok_frame.write(LOCAL1, sentinel);
+            vm.set_jit_soft_stack_limit(ok_frame.stack.stack_limit());
+            let ok_ret = {
+                let vm_ptr: *mut Vm = &mut vm;
+                handle.call_baseline_jit_entry(ok_frame.fp + 16, vm_ptr as u64)
+            };
+            assert_eq!(
+                ok_ret,
+                i32_bits(5),
+                "a normal frame does not trip the check"
+            );
+            assert_eq!(
+                vm.jit_pending_exception().0,
+                0,
+                "no overflow for a normal frame"
+            );
+            assert_eq!(
+                ok_frame.read(LOCAL1),
+                i32_bits(5),
+                "the body ran (slot == 5)"
+            );
+
+            // (2) OVERFLOW: set the soft limit AT `fp`, so the frame top `fp -
+            //     frameSize` (< fp) trips the prologue check before op_enter/body.
+            let of_frame = Frame::new();
+            of_frame.write(ARG0, i32_bits(2));
+            of_frame.write(ARG1, i32_bits(3));
+            of_frame.write(LOCAL1, sentinel);
+            vm.set_jit_soft_stack_limit(of_frame.fp);
+            let of_ret = {
+                let vm_ptr: *mut Vm = &mut vm;
+                handle.call_baseline_jit_entry(of_frame.fp + 16, vm_ptr as u64)
+            };
+            // Reaching here proves NO SIGSEGV/guard-page fault: the throw was a clean
+            // JS bail through the overflow stub's minimal teardown, not a hard crash.
+            let pending = vm.jit_pending_exception();
+            assert_ne!(pending.0, 0, "the prologue stamped m_exception (it threw)");
+            assert_eq!(of_ret, 0, "the throw edge returns JSValue::empty() bits");
+            assert_eq!(
+                of_frame.read(LOCAL1),
+                sentinel,
+                "neither op_enter nor the body ran (LOCAL1 keeps its sentinel): the \
+                 throw is from the PROLOGUE",
+            );
+            let thrown = JsValue::from_encoded(pending);
+            assert!(
+                thrown.is_cell(),
+                "the thrown value is a heap cell (the error)"
+            );
+
+            // Confirm the thrown cell is specifically a faithful RangeError.
+            vm.clear_jit_host();
+            assert!(
+                host.jit_bridge_value_is_range_error(thrown),
+                "the stack-overflow throw is a RangeError (createStackOverflowError)",
+            );
         }
 
         // --- THE MILESTONE: the int-sum loop runs NATIVELY, the backward branch
@@ -2004,12 +2216,14 @@ mod tests {
         fn finalize_image(
             instructions: Vec<TypedInstruction>,
             jit_pending_address: usize,
+            soft_stack_limit_address: usize,
             linked_calls: &[LinkedCallTarget],
         ) -> (ExecutableMemoryHandle, Vec<LinkedCallSite>) {
             let code_block = build_code_block(instructions);
             let image = emit_baseline_function_with_linked_calls(
                 &code_block,
                 jit_pending_address,
+                soft_stack_limit_address,
                 linked_calls,
             )
             .expect("emit baseline function");
@@ -2036,6 +2250,10 @@ mod tests {
             let mut vm = Vm::new(VmConfig::interpreter_only());
             vm.set_jit_host(&mut host);
             let jit_pending_address = vm.jit_pending_exception_address() as usize;
+            // A1.4: bake the prologue soft-limit address; the VALUE is set per-run
+            // below to the current stack's low bound so the arith-only frames (well
+            // above it) never trip the check.
+            let soft_stack_limit_address = vm.jit_soft_stack_limit_address() as usize;
 
             // (1) Pre-compile the CALLEE `callee(a,b){ return a+b }`; resolve its entry.
             let callee_instructions = vec![
@@ -2046,7 +2264,12 @@ mod tests {
                 ),
                 instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
             ];
-            let (callee_handle, _) = finalize_image(callee_instructions, jit_pending_address, &[]);
+            let (callee_handle, _) = finalize_image(
+                callee_instructions,
+                jit_pending_address,
+                soft_stack_limit_address,
+                &[],
+            );
             let callee_entry = callee_handle.entry_address();
 
             // (2) Compile the CALLER `caller(x){ return callee(x, 1) }`, pre-seeding
@@ -2072,8 +2295,12 @@ mod tests {
                 bytecode_index: 1,
                 entry: callee_entry,
             }];
-            let (caller_handle, sites) =
-                finalize_image(caller_instructions, jit_pending_address, &linked);
+            let (caller_handle, sites) = finalize_image(
+                caller_instructions,
+                jit_pending_address,
+                soft_stack_limit_address,
+                &linked,
+            );
             assert_eq!(sites.len(), 1, "the caller emitted one native call edge");
             let site = sites[0];
             assert_eq!(site.bytecode_index, 1, "the native edge is op_call@bci 1");
@@ -2086,6 +2313,11 @@ mod tests {
                 // positive arg/header slots above it, frames descend below it.
                 let stack = JsStack::new(1 << 20).expect("native js stack");
                 let caller_fp = stack.high_address() - 256;
+                // A1.4: arm the prologue soft-limit check with THIS stack's low bound
+                // (both caller + callee frames sit near the high end, far above it, so
+                // neither prologue trips). Set before entry (the callee runs on the
+                // same stack via the native bl).
+                vm.set_jit_soft_stack_limit(stack.stack_limit());
                 // Seed the caller's argument x at ARG0 (untouched by op_enter).
                 assert!(
                     stack.write_slot(

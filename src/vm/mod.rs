@@ -1091,6 +1091,18 @@ pub struct Vm {
     // not-in-JIT (the bridge then uses a fresh placeholder — the prior behavior,
     // unchanged for callers that do not park a CodeBlock).
     jit_code_block: *const CodeBlock,
+    // A1.4 (JIT.cpp:773-783): the baseline prologue's `softStackLimit` mirror — the
+    // LOW bound of the active native `JsStack` (the stack grows DOWN; this is the
+    // highest address a NEW frame's top may NOT drop below) under which a frame
+    // push signals stack overflow. The emitted prologue bakes this word's STABLE
+    // ADDRESS as an `AbsoluteAddress` (JSC `VM::addressOfSoftStackLimit`, VM.h:919)
+    // and LOADs `*addr` to compare the frame top against it (`branchPtr(GreaterThan,
+    // AbsoluteAddress(softStackLimit), frameTop)`); the driver writes the VALUE to
+    // the entered stack's `JsStack::stack_limit()` before each native entry (the
+    // analog of JSC refreshing the soft limit on VM entry). 0 == not-set, in which
+    // case the prologue check never fires (`0 > frameTop` is false for any real
+    // positive stack address) — a fail-safe default, never a false overflow.
+    jit_soft_stack_limit: usize,
     structures: RuntimeStructures,
     caches: RuntimeCaches,
     globals: GlobalRuntimeState,
@@ -2119,6 +2131,10 @@ impl Vm {
             jit_host: std::ptr::null_mut(),
             // S3: not-in-JIT until the driver parks the active CodeBlock.
             jit_code_block: std::ptr::null(),
+            // A1.4: the soft stack limit the baseline prologue checks; 0 == not-set
+            // (the prologue guard never fires until the driver writes the entered
+            // stack's `stack_limit()`).
+            jit_soft_stack_limit: 0,
             structures: RuntimeStructures::default(),
             caches: RuntimeCaches::default(),
             globals: GlobalRuntimeState::default(),
@@ -3221,6 +3237,46 @@ impl Vm {
         self.exceptions.jit_pending_address()
     }
 
+    /// A1.4: set the baseline prologue's soft stack limit to `limit` — the entered
+    /// native `JsStack`'s `stack_limit()` (its low bound plus the soft-reserved
+    /// zone). The driver writes this immediately before entering an installed image
+    /// so the prologue's `branchPtr(GreaterThan, AbsoluteAddress(addr), frameTop)`
+    /// (JIT.cpp:781) compares the new frame top against the correct stack. Faithful
+    /// analog of JSC refreshing `VM::m_softStackLimit` on VM entry.
+    pub fn set_jit_soft_stack_limit(&mut self, limit: usize) {
+        self.jit_soft_stack_limit = limit;
+    }
+
+    /// A1.4: the current soft stack limit value (test/inspection).
+    pub fn jit_soft_stack_limit(&self) -> usize {
+        self.jit_soft_stack_limit
+    }
+
+    /// A1.4: the stable address the baseline prologue bakes as the `AbsoluteAddress`
+    /// of its `softStackLimit` check (`VM::addressOfSoftStackLimit`, VM.h:919). A raw
+    /// `*const` so the emitter can hold it across code generation; the word lives in
+    /// the `Vm`-owned field and stays valid while the `Vm` is pinned (INV-4).
+    pub fn jit_soft_stack_limit_address(&self) -> *const usize {
+        &self.jit_soft_stack_limit
+    }
+
+    /// A1.4 (`operationThrowStackOverflowError`, JITOperations.cpp:120-129): the
+    /// baseline prologue's `softStackLimit` overflow path materializes the FAITHFUL
+    /// stack-overflow `RangeError` (`createStackOverflowError`, ExceptionHelpers.cpp:
+    /// 43-46) and returns it as the value to stamp on the JIT `m_exception` mirror
+    /// (the emitted overflow stub does the stamp + bail). On an allocation failure
+    /// while building the error, return a non-empty placeholder so "exception
+    /// pending" still holds. Mirrors [`Vm::jit_bridge_materialize_type_error`].
+    pub fn operation_throw_stack_overflow(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+    ) -> EncodedJsValue {
+        match host.jit_bridge_stack_overflow_error_value(&mut self.heap) {
+            Ok(error) => error.encoded(),
+            Err(_) => JIT_PENDING_EXCEPTION_PLACEHOLDER,
+        }
+    }
+
     // ====================================================================
     // U3/U4 (baseline-dispatch.md): the LIVE baseline-JIT tier-up entry +
     // the B5-lite native handoff — where measured R lifts off the
@@ -3300,6 +3356,11 @@ impl Vm {
                 // failure latches `Declined` so the compile is not re-attempted, and
                 // the function stays in the interpreter.
                 let jit_pending_address = self.jit_pending_exception_address() as usize;
+                // A1.4: the baked `addressOfSoftStackLimit` the prologue overflow
+                // check loads. Another interior pointer of THIS pinned Vm (same INV-4
+                // pinning requirement as `jit_pending_address`); the VALUE at it is
+                // refreshed per-run in `run_installed_baseline_jit`.
+                let soft_stack_limit_address = self.jit_soft_stack_limit_address() as usize;
                 // INV-4 (Vm pinned across install->reuse): capture the install-time
                 // Vm base so the image can assert, on every later reuse, that the Vm
                 // has NOT moved — otherwise the baked `jit_pending` AbsoluteAddress
@@ -3307,7 +3368,12 @@ impl Vm {
                 // point reaching this live path MUST own the Vm at a pinned address
                 // (Box<Vm>); see the doc note on `baseline_jit_slots`.
                 let install_vm = self as *const Vm;
-                match install_baseline_function(code_block, jit_pending_address, install_vm) {
+                match install_baseline_function(
+                    code_block,
+                    jit_pending_address,
+                    soft_stack_limit_address,
+                    install_vm,
+                ) {
                     Ok(installed) => {
                         if let Some(slot) = self.baseline_jit_slots.get_mut(&code_block_id) {
                             slot.state = BaselineJitInstallState::Installed(installed);
@@ -3393,8 +3459,14 @@ impl Vm {
         // not an unwind, so the pop below always runs on it.
         let (region_low, entry_anchor) = installed.frame_scan_bounds();
         host.push_active_jit_frame_span(region_low, entry_anchor);
+        // A1.4: refresh the soft stack limit to THIS function's native stack before
+        // entering, so the emitted prologue's overflow check (loading the VM's baked
+        // `addressOfSoftStackLimit`) compares the new frame top against the stack it
+        // actually runs on. Read before the `region` borrow (ends immediately).
+        let soft_stack_limit = installed.soft_stack_limit();
         let (returned_bits, pending) = {
             let mut region = ParkedJitCallRegion::enter(self, host, code_block);
+            region.vm().set_jit_soft_stack_limit(soft_stack_limit);
             let vm_ptr_bits = region.vm() as *mut Vm as u64;
             let returned_bits = installed.run(vm_ptr_bits, arguments_including_this);
             let pending = region.vm().jit_pending_exception();

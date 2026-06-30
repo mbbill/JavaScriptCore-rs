@@ -429,6 +429,37 @@ pub extern "C" fn operation_call(
     }
 }
 
+/// `operationThrowStackOverflowError(CodeBlock*)` (JITOperations.cpp:120-129): the
+/// baseline prologue's `softStackLimit` overflow path (JIT.cpp:781) far-calls this
+/// shim when a new frame's top would drop below the soft stack limit. It reborrows
+/// `&mut *vm` (D1) and `&mut *host` (D5) — the SAME reborrow island the arith/call
+/// families compose (see the module SAFETY note) — materializes the faithful
+/// stack-overflow `RangeError` (`createStackOverflowError`, ExceptionHelpers.cpp:43),
+/// STAMPS the JIT `m_exception` mirror (D3), and returns `JSValue::empty()` bits
+/// (the overflow stub then bails to the function's clean prologue teardown; the
+/// driver branches on the stamped mirror — the throw/unwind edge).
+///
+/// `extern "C"` is load-bearing (the C-ABI the prologue far-call expects). Unlike
+/// JSC's signature it takes the pinned `*mut Vm` in x0 (the engine's D2(c) reach
+/// mechanism), not a `CodeBlock*`; the error-building reaches the realm through the
+/// `Vm`/host, not through `codeBlock->globalObject()`.
+pub extern "C" fn operation_throw_stack_overflow(vm: *mut Vm) -> u64 {
+    // D1 + D5 reborrows — see the module SAFETY note. Exactly one `&mut *vm` and one
+    // `&mut *host`, both dropped before returning to JIT code.
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the prologue ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let exception = vm.operation_throw_stack_overflow(host);
+    vm.set_jit_pending_exception(exception);
+    JS_VALUE_EMPTY_BITS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
