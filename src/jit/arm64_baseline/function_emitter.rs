@@ -72,7 +72,7 @@
 use crate::assembler::labels::{Jump, Label};
 use crate::assembler::link_records::Arm64LinkRecord;
 use crate::assembler::macro_assembler_arm64::{RelationalCondition, ResultCondition};
-use crate::assembler::operands::{Address, TrustedImm32, TrustedImm64};
+use crate::assembler::operands::{Address, BaseIndex, Extend, Scale, TrustedImm32, TrustedImm64};
 use crate::assembler::registers::RegisterID;
 use crate::bytecode::BytecodeIndex;
 use crate::bytecode::{CodeBlock, CoreOpcode, InstructionDecodeError, OperandAccessError};
@@ -80,11 +80,11 @@ use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
 use crate::jit::operations::{
     operation_call, operation_call_with_this, operation_compare_greater,
     operation_compare_greatereq, operation_compare_less, operation_compare_lesseq,
-    operation_construct, operation_get_by_id_optimize, operation_get_by_id_with_cached_offset,
-    operation_get_by_val, operation_get_closure_cell, operation_jfalse,
-    operation_put_by_id_optimize, operation_put_by_id_with_cached_offset, operation_put_by_val,
-    operation_put_closure_cell, operation_resolve_baseline_native_entry, operation_strict_equal,
-    operation_throw_stack_overflow, MAX_REGISTER_CALL_ARGS, MAX_REGISTER_CALL_WITH_THIS_ARGS,
+    operation_construct, operation_get_by_id_optimize, operation_get_by_val,
+    operation_get_closure_cell, operation_jfalse, operation_put_by_id_optimize,
+    operation_put_by_val, operation_put_closure_cell, operation_resolve_baseline_native_entry,
+    operation_strict_equal, operation_throw_stack_overflow, MAX_REGISTER_CALL_ARGS,
+    MAX_REGISTER_CALL_WITH_THIS_ARGS,
 };
 use crate::value::{JsValue, CELL_TAG, NUMBER_TAG, VALUE_TAG_MASK};
 use crate::vm::jsstack::CallFrameSlot;
@@ -167,6 +167,41 @@ const PROPERTY_CELL_GPR: RegisterID = RegisterID::X11;
 const PROPERTY_STRUCTURE_ID_GPR: RegisterID = RegisterID::X12;
 const PROPERTY_RECORD_GPR: RegisterID = RegisterID::X13;
 const PROPERTY_CACHED_STRUCTURE_GPR: RegisterID = RegisterID::X14;
+
+/// Increment 2 inline-load/store scratch — aliases of the structure guard's
+/// now-dead scratch registers (x9/x10/x12/x14), reused on the HIT fall-through where
+/// the guard's boxed-base/tag/structure-id values are no longer live. `x11`
+/// (`PROPERTY_CELL_GPR`, the unboxed receiver) and `x13` (`PROPERTY_RECORD_GPR`, the
+/// baked record address) STAY live from the guard. None alias the assembler's
+/// `DATA_TEMP`/`MEMORY_TEMP` (x16/x17, used internally by the indexed load/store fold).
+const PROPERTY_OFFSET_GPR: RegisterID = RegisterID::X12; // cached `PropertyOffset` (load32 [record+4])
+const PROPERTY_ADDR_GPR: RegisterID = RegisterID::X9; // out-of-line butterfly base (load64 [cell+8])
+const PROPERTY_INDEX_GPR: RegisterID = RegisterID::X14; // negated out-of-line scaled index
+const PROPERTY_VALUE_GPR: RegisterID = RegisterID::X10; // put: boxed value to store
+
+/// `HandlerPropertyInlineCacheRecord.offset` byte displacement (`#[repr(C)]`
+/// `{structure_id: u32@+0, offset: i32@+4, holder_ptr: u64@+8}`, ic.rs:1529): the
+/// cached `PropertyOffset` the inline load/store reads as a RUNTIME field.
+const PROPERTY_IC_OFFSET_FIELD_DISP: i32 = 4;
+/// C++ JSC `firstOutOfLineOffset` (runtime/PropertyOffset.h:35 == 64): a
+/// `PropertyOffset` below it lives in the cell's inline slots, at/above it in the
+/// out-of-line butterfly. The `AssemblyHelpers::loadProperty` runtime branch.
+const FIRST_OUT_OF_LINE_OFFSET_IMM: i32 = 64;
+/// C++ JSC `JSObject::offsetOfInlineStorage()` (== 16; CoreObjectCell.inline_storage
+/// layout assert, object_store.rs:800): inline offset `o` reads `[cell + 16 + o*8]`.
+const INLINE_STORAGE_DISP: i32 = 16;
+/// `CoreObjectCell.butterfly_base` byte displacement (== 8; the raw machine-dereffable
+/// out-of-line base pointer, BUTTERFLY_SLOT_DISP assert, object_store.rs:775).
+const BUTTERFLY_BASE_DISP: i32 = 8;
+/// Unified out-of-line load/store displacement for the negated, sign-extended,
+/// scale-8 index form. C++ `loadProperty` uses `(firstOutOfLineOffset - 2) * 8`
+/// because its `m_butterfly` points one IndexingHeader slot ABOVE the property
+/// storage; the Rust `butterfly_base` (cell+8) IS the property-storage base (=
+/// C++ `Butterfly::propertyStorage()` = `m_butterfly - 8`, object/butterfly_handle.rs
+/// `base_addr`), so the constant is `(firstOutOfLineOffset - 1) * 8 == 504`. Then
+/// `[base + 504 + sext(-offset)*8] == base + (63 - offset)*8 == base +
+/// offsetInOutOfLineStorage(offset)*8` (PropertyOffset.h:106, `-(offset-64)-1`).
+const OOL_STORAGE_LOAD_DISP: i32 = (FIRST_OUT_OF_LINE_OFFSET_IMM - 1) * 8;
 
 /// `StructureID::CELL_STRUCTURE_ID_OFFSET` (structure_cell.rs:105): `JSCell`'s
 /// `m_structureID` is the first field, so the shape guard reads `[cell + 0]`.
@@ -854,21 +889,19 @@ impl FunctionEmitter {
 
     /// op_get_by_id (`emit_op_get_by_id` + the baseline DataIC, JITPropertyAccess.cpp
     /// / JITInlineCacheGenerator.cpp) — the named-property READ. The structure guard
-    /// (above) routes a HIT to a cheap cached-offset far-call
-    /// (`operation_get_by_id_with_cached_offset`: the own-data load at the cached
-    /// offset) and a MISS to the optimize far-call (`operation_get_by_id_optimize`:
-    /// re-resolve + FILL the record). Both far-calls take `(vm, boxed base,
-    /// key_index, record_index, bytecode_index)`, probe the `m_exception` mirror (D3),
-    /// store the boxed result to `dst`, and converge at a shared tail.
+    /// (above) routes a HIT to the Increment-2 INLINE machine-code load
+    /// ([`Self::emit_get_by_id_inline_load`]: the verbatim `AssemblyHelpers::
+    /// loadProperty`, no far-call) and a MISS to the optimize far-call
+    /// (`operation_get_by_id_optimize`: re-resolve + FILL the record). The MISS path
+    /// is UNCHANGED — `(vm, boxed base, key_index, record_index, bytecode_index,
+    /// owning_code_block)`, probe the `m_exception` mirror (D3), store the boxed result
+    /// to `dst`; both paths converge at a shared tail.
     ///
-    /// DIVERGENCE from JSC (Increment 1, the inline-load follow-up, mirrors the
-    /// `emit_get_by_val` decision): JSC's DataIC HIT path emits the inline
-    /// `loadProperty` machine code (offset<64 inline vs negative-butterfly OOL,
-    /// AssemblyHelpers.cpp:442-465). This engine's R4 cell carries a butterfly
-    /// HANDLE (a slab index, object_store.rs:507-511), not a machine-addressable
-    /// storage pointer, so the cached-offset LOAD is a leaf far-call until the
-    /// Batch-5 object-storage model lands a raw butterfly pointer (Increment 2). The
-    /// generated structure guard + record fill are unchanged across the increment.
+    /// Increment 2 (gc-r4 Batch 5): the cached-offset own-data LOAD that was an
+    /// Increment-1 far-call (`operation_get_by_id_with_cached_offset`) is now the
+    /// inline `loadProperty` machine code — the per-property far-call (the measured
+    /// richards/delta-blue regressor) is gone. The structure guard + record fill are
+    /// unchanged across the increment.
     #[allow(clippy::too_many_arguments)]
     fn emit_get_by_id(
         &mut self,
@@ -882,21 +915,8 @@ impl FunctionEmitter {
     ) {
         let miss = self.emit_property_ic_structure_guard(base, record_addr);
 
-        // === HIT: cheap cached-offset own-data load. ==========================
-        self.emit_get_by_id_call_args(
-            base,
-            key_index,
-            record_index,
-            bytecode_index,
-            owning_code_block,
-        );
-        self.h.masm_mut().far_call(TrustedImm64::new(
-            operation_get_by_id_with_cached_offset as usize as i64,
-        ));
-        // An own-data load cannot throw, but the shim falls back to the optimize
-        // path on a SENTINEL/drift, which can; probe the mirror for that edge.
-        self.emit_exception_probe();
-        self.h.masm_mut().store64(RESULT_GPR, address_for(dst));
+        // === HIT: Increment 2 inline machine-code load (no far-call). =========
+        self.emit_get_by_id_inline_load(dst);
         let to_tail = self.h.masm_mut().jump();
 
         // === SLOW: full optimize (re-resolve + fill the record). ==============
@@ -918,6 +938,93 @@ impl FunctionEmitter {
         // === TAIL: both paths converge here (the HIT jump over the slow block). =
         let tail_label = self.h.masm().label();
         self.link_fast_jumps_to(&[to_tail], tail_label);
+    }
+
+    /// Increment 2 — the INLINE machine-code property LOAD on a DataIC HIT: the
+    /// verbatim `AssemblyHelpers::loadProperty` (jit/AssemblyHelpers.cpp:441-465)
+    /// under the gc-r4 Batch-5 machine-addressable object storage. The structure
+    /// guard has already unboxed the receiver into `PROPERTY_CELL_GPR` (x11) and
+    /// left the baked record address in `PROPERTY_RECORD_GPR` (x13); both stay live
+    /// on the HIT fall-through.
+    ///
+    /// Loads the cached `PropertyOffset` from `[record+4]` as a RUNTIME field, then
+    /// runs the `offset < firstOutOfLineOffset(64)` branch (loadProperty's
+    /// `branch32(LessThan, offset, firstOutOfLineOffset)`):
+    /// - INLINE (`offset < 64`): the value is the cell's own inline slot
+    ///   `[cell + offsetOfInlineStorage(16) + offset*8]` — a single scale-8 indexed
+    ///   load (`offsetInInlineStorage(offset) == offset`, PropertyOffset.h:99).
+    /// - OUT-OF-LINE (`offset >= 64`): load the raw butterfly base `bptr := [cell+8]`
+    ///   (`CoreObjectCell.butterfly_base`, the `m_butterfly` analog) then read
+    ///   `[bptr + offsetInOutOfLineStorage(offset)*8]` — a NEGATIVE byte index, emitted
+    ///   as `neg32(offset)` + a sign-extended scale-8 index with the
+    ///   `(firstOutOfLineOffset-1)*8` displacement (see `OOL_STORAGE_LOAD_DISP`), the
+    ///   `signExtend32ToPtr` + unified `loadValue(BaseIndex(...))` C++ form adapted to
+    ///   the Rust base-pointer convention.
+    ///
+    /// The loaded 8-byte word IS the boxed `RuntimeValue` (the cell stores raw
+    /// `EncodedJSValue` bits in both bands), stored straight to `dst` with no re-box.
+    /// A pure load cannot throw, so there is NO exception probe. This is the verbatim
+    /// machine-code form of `llint_get_by_id_fast` / `butterfly_prop_get`
+    /// (interpreter/object_store.rs:9957 / :2220) — the SAME oracle the Increment-1
+    /// far-call ran, so native == interpreter == oracle, just inline.
+    ///
+    /// holder_ptr (`[record+8]`, the prototype-load holder) is NOT consulted here: the
+    /// get fill only arms own-data SELF loads (`jit_get_by_id_cacheable_load`,
+    /// `prototype_depth == 0`, mod.rs:10191), so a filled record's storage base is
+    /// always the receiver — exactly as the Increment-1 far-call's
+    /// `jit_get_by_id_cached_read` ignored holder_ptr.
+    fn emit_get_by_id_inline_load(&mut self, dst: i32) {
+        // offset := load32 [record + 4]  (the cached runtime `PropertyOffset`).
+        self.h.masm_mut().load32(
+            Address::new(PROPERTY_RECORD_GPR, PROPERTY_IC_OFFSET_FIELD_DISP),
+            PROPERTY_OFFSET_GPR,
+        );
+        // branch32(LessThan, offset, firstOutOfLineOffset) -> INLINE arm; else (fall
+        // through) the OUT-OF-LINE arm.
+        let is_inline = self.h.masm_mut().branch32_imm(
+            RelationalCondition::LessThan,
+            PROPERTY_OFFSET_GPR,
+            TrustedImm32::new(FIRST_OUT_OF_LINE_OFFSET_IMM),
+        );
+
+        // === OUT-OF-LINE: bptr := [cell+8]; result := [bptr + ool(offset)*8]. =====
+        self.h.masm_mut().load64(
+            Address::new(PROPERTY_CELL_GPR, BUTTERFLY_BASE_DISP),
+            PROPERTY_ADDR_GPR,
+        );
+        self.h
+            .masm_mut()
+            .neg32(PROPERTY_OFFSET_GPR, PROPERTY_INDEX_GPR);
+        self.h.masm_mut().load64_indexed(
+            BaseIndex::with_extend(
+                PROPERTY_ADDR_GPR,
+                PROPERTY_INDEX_GPR,
+                Scale::TimesEight,
+                OOL_STORAGE_LOAD_DISP,
+                Extend::SExt32,
+            ),
+            RESULT_GPR,
+        );
+        let to_store = self.h.masm_mut().jump();
+
+        // === INLINE: result := [cell + offsetOfInlineStorage(16) + offset*8]. ======
+        let inline_label = self.h.masm().label();
+        self.link_fast_jumps_to(&[is_inline], inline_label);
+        self.h.masm_mut().load64_indexed(
+            BaseIndex::with_extend(
+                PROPERTY_CELL_GPR,
+                PROPERTY_OFFSET_GPR,
+                Scale::TimesEight,
+                INLINE_STORAGE_DISP,
+                Extend::SExt32,
+            ),
+            RESULT_GPR,
+        );
+
+        // === converge: store the boxed value to `dst`. ============================
+        let store_label = self.h.masm().label();
+        self.link_fast_jumps_to(&[to_store], store_label);
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst));
     }
 
     /// Load the `get_by_id` DataIC far-call arguments: `x0`=vm, `x1`=boxed base
@@ -953,20 +1060,30 @@ impl FunctionEmitter {
     }
 
     /// op_put_by_id (`emit_op_put_by_id` + the baseline DataIC) — the named-property
-    /// WRITE. Same structure guard: a HIT routes to the cheap in-place replace store
-    /// (`operation_put_by_id_with_cached_offset`, which applies the faithful write
-    /// barrier inside the store — the `emitWriteBarrier(base)` analog,
-    /// JITPropertyAccess.cpp:771); a MISS routes to the optimize far-call
-    /// (`operation_put_by_id_optimize`: the faithful put, which handles a property-add
-    /// TRANSITION via the slow path and NEVER caches it). put yields no observable
-    /// value, so there is no `dst` store. Far-calls take `(vm, boxed base, boxed
-    /// value, key_index, record_index, bytecode_index)`.
+    /// WRITE. Same structure guard: a HIT routes to the Increment-2 INLINE in-place
+    /// replace store ([`Self::emit_put_by_id_inline_store`]: the verbatim
+    /// `AssemblyHelpers::storeProperty`, no far-call); a MISS routes to the optimize
+    /// far-call (`operation_put_by_id_optimize`: the faithful put, which handles a
+    /// property-add TRANSITION via the slow path and NEVER caches it). put yields no
+    /// observable value, so there is no `dst` store. The MISS far-call takes `(vm,
+    /// boxed base, boxed value, key_index, record_index, bytecode_index,
+    /// owning_code_block)`.
     ///
-    /// DIVERGENCE (Increment 1): the cached store + its write barrier are a far-call
-    /// into the host (which applies `apply_value_store_write_barrier`), so NO separate
-    /// generated-code barrier is emitted yet — the inline store + inline barrier are
-    /// Increment 2 (gated on the Batch-5 object-storage model), exactly the
-    /// `emit_put_by_val` deferral.
+    /// Increment 2 (gc-r4 Batch 5): the cached-offset replace STORE that was an
+    /// Increment-1 far-call (`operation_put_by_id_with_cached_offset`) is now the
+    /// inline `storeProperty` machine code. WRITE BARRIER: C++ emits
+    /// `emitWriteBarrier(base)` after the store (JITPropertyAccess.cpp:771). Here it
+    /// stays DEFERRED — the value-store barrier classifies as NotRequired for a
+    /// never-collected (white) owner with no remembered set
+    /// (`apply_value_store_write_barrier`, object_store.rs:6668) and there is no
+    /// generated-code barrier infrastructure yet, so it is a runtime no-op exactly as
+    /// `sync_butterfly_base`/`emit_put_closure_cell` document. When the generational
+    /// collector lands, an inline `emitWriteBarrier(base)` (store-buffer push) MUST be
+    /// added here. The inline store is a REPLACE only: the put fill arms ONLY a
+    /// writable own-data replace with the structure UNCHANGED
+    /// (`jit_put_by_id_cacheable_replace`, mod.rs:10266 — accessors/read-only/
+    /// transitions stay SENTINEL), so a structure-guard HIT proves the cached offset
+    /// is a live writable own-data slot and the store is a pure in-place write.
     #[allow(clippy::too_many_arguments)]
     fn emit_put_by_id(
         &mut self,
@@ -980,19 +1097,8 @@ impl FunctionEmitter {
     ) {
         let miss = self.emit_property_ic_structure_guard(base, record_addr);
 
-        // === HIT: cheap in-place replace store (barriered inside the host). =====
-        self.emit_put_by_id_call_args(
-            base,
-            value,
-            key_index,
-            record_index,
-            bytecode_index,
-            owning_code_block,
-        );
-        self.h.masm_mut().far_call(TrustedImm64::new(
-            operation_put_by_id_with_cached_offset as usize as i64,
-        ));
-        self.emit_exception_probe();
+        // === HIT: Increment 2 inline machine-code replace store (no far-call). ==
+        self.emit_put_by_id_inline_store(value);
         let to_tail = self.h.masm_mut().jump();
 
         // === SLOW: full optimize (replace-fill / transition -> slow path). ======
@@ -1014,6 +1120,80 @@ impl FunctionEmitter {
         // === TAIL. ============================================================
         let tail_label = self.h.masm().label();
         self.link_fast_jumps_to(&[to_tail], tail_label);
+    }
+
+    /// Increment 2 — the INLINE machine-code property STORE on a put DataIC HIT: the
+    /// verbatim `AssemblyHelpers::storeProperty` (jit/AssemblyHelpers.cpp:467-489),
+    /// the write-mirror of [`Self::emit_get_by_id_inline_load`] under the Batch-5
+    /// machine-addressable storage. The structure guard left the unboxed receiver in
+    /// `PROPERTY_CELL_GPR` (x11), still live on the HIT fall-through.
+    ///
+    /// Loads the boxed `value` into a register, the cached `PropertyOffset` from
+    /// `[record+4]`, then runs the `offset < firstOutOfLineOffset(64)` branch:
+    /// - INLINE: `[cell + offsetOfInlineStorage(16) + offset*8] = value`.
+    /// - OUT-OF-LINE: `bptr := [cell+8]; [bptr + offsetInOutOfLineStorage(offset)*8] =
+    ///   value` (the negated, sign-extended scale-8 index, see
+    ///   `OOL_STORAGE_LOAD_DISP`).
+    ///
+    /// The verbatim machine-code form of `llint_put_by_id_replace_fast`'s
+    /// `put_direct_offset_inline` + `butterfly_prop_put` REPLACE arms
+    /// (interpreter/object_store.rs:9994 / object_store.rs:815/2260). A REPLACE never
+    /// reallocates (the slot already exists for the cached shape), so `cell+8` is
+    /// unchanged and never re-synced. A pure store cannot throw — NO exception probe.
+    /// The write barrier is deferred (a runtime no-op today); see [`Self::emit_put_by_id`].
+    fn emit_put_by_id_inline_store(&mut self, value: i32) {
+        // value := load64 [cfr + value]  (the boxed value to store, used by both arms).
+        self.h
+            .masm_mut()
+            .load64(address_for(value), PROPERTY_VALUE_GPR);
+        // offset := load32 [record + 4]  (the cached runtime `PropertyOffset`).
+        self.h.masm_mut().load32(
+            Address::new(PROPERTY_RECORD_GPR, PROPERTY_IC_OFFSET_FIELD_DISP),
+            PROPERTY_OFFSET_GPR,
+        );
+        let is_inline = self.h.masm_mut().branch32_imm(
+            RelationalCondition::LessThan,
+            PROPERTY_OFFSET_GPR,
+            TrustedImm32::new(FIRST_OUT_OF_LINE_OFFSET_IMM),
+        );
+
+        // === OUT-OF-LINE: bptr := [cell+8]; [bptr + ool(offset)*8] := value. ======
+        self.h.masm_mut().load64(
+            Address::new(PROPERTY_CELL_GPR, BUTTERFLY_BASE_DISP),
+            PROPERTY_ADDR_GPR,
+        );
+        self.h
+            .masm_mut()
+            .neg32(PROPERTY_OFFSET_GPR, PROPERTY_INDEX_GPR);
+        self.h.masm_mut().store64_indexed(
+            PROPERTY_VALUE_GPR,
+            BaseIndex::with_extend(
+                PROPERTY_ADDR_GPR,
+                PROPERTY_INDEX_GPR,
+                Scale::TimesEight,
+                OOL_STORAGE_LOAD_DISP,
+                Extend::SExt32,
+            ),
+        );
+        let to_done = self.h.masm_mut().jump();
+
+        // === INLINE: [cell + offsetOfInlineStorage(16) + offset*8] := value. ======
+        let inline_label = self.h.masm().label();
+        self.link_fast_jumps_to(&[is_inline], inline_label);
+        self.h.masm_mut().store64_indexed(
+            PROPERTY_VALUE_GPR,
+            BaseIndex::with_extend(
+                PROPERTY_CELL_GPR,
+                PROPERTY_OFFSET_GPR,
+                Scale::TimesEight,
+                INLINE_STORAGE_DISP,
+                Extend::SExt32,
+            ),
+        );
+
+        // === converge (put has no observable result, so nothing is stored). =======
+        let done_label = self.h.masm().label();
+        self.link_fast_jumps_to(&[to_done], done_label);
     }
 
     /// Load the `put_by_id` DataIC far-call arguments: `x0`=vm, `x1`=boxed base,
@@ -3767,6 +3947,241 @@ mod tests {
 
             vm.clear_jit_code_block();
             vm.clear_jit_host();
+        }
+
+        /// A plain object `{ p0:0, p1:1, ..., p5:5, p6:<p6> }` — seven own data
+        /// properties added in a fixed order, so the Structure assigns offsets 0..5
+        /// to the INLINE band (`INLINE_CAPACITY == 6`) and JUMPS `p6` (property
+        /// number 6) to `firstOutOfLineOffset == 64`, the OUT-OF-LINE band
+        /// (`offsetForPropertyNumber`, the inline-then-jump rule). Two objects built
+        /// this way share one Structure (the HIT setup). Reading/writing `p6`
+        /// exercises the `[cell+8] -> bptr; [bptr + ool*8]` machine path.
+        fn object_with_seven_props(host: &mut CoreOpcodeDispatchHost, p6: i32) -> u64 {
+            let object = host.jit_test_allocate_object();
+            for i in 0..7i32 {
+                let v = if i == 6 { p6 } else { i };
+                host.jit_test_set_own_data(
+                    object,
+                    &CorePropertyKey::String(format!("p{i}").into()),
+                    JsValue::from_i32(v),
+                );
+            }
+            object.encoded().0
+        }
+
+        // gc-r4 Batch 5 Increment 2 — the INLINE machine-code get_by_id load. A
+        // structure-guard HIT reads the property via the inline `loadProperty` machine
+        // code (NO far-call), across BOTH an INLINE-band offset (`o.x`, offset 0 < 64,
+        // read from the cell's own inline slot `[cell+16+0*8]`) and an OUT-OF-LINE
+        // offset (`o.p6`, offset 64, read via `[cell+8] -> bptr; [bptr-8]`). native ==
+        // interpreter == oracle (the asserted value is the interpreter's own store
+        // read), AND the no-far-call regression guard: the `_with_cached_offset` HIT
+        // shim counter stays 0 across the HIT (Increment 1 would have far-called it).
+        #[test]
+        fn get_by_id_inline_load_hits_inline_and_ool_offsets_without_far_call() {
+            use crate::jit::operations::data_ic_hit_call_counters as hit_calls;
+
+            // --- INLINE offset (o.x, offset 0): fill then HIT a same-structure sibling.
+            {
+                let mut host = CoreOpcodeDispatchHost::new();
+                host.jit_test_register_identifier(0, "x");
+                let o1 = object_with_x(&mut host, 41);
+                let o2 = object_with_x(&mut host, 99); // same single-prop structure.
+
+                let mut vm = Vm::new(VmConfig::interpreter_only());
+                let code_block = build_code_block(get_x_instructions());
+                let handle = install_property_image(&mut vm, &mut host, &code_block);
+
+                let r1 = run_property_once(&mut vm, &handle, o1); // MISS -> optimize fills.
+                assert_eq!(r1.pending, 0, "no throw");
+                assert_eq!(
+                    r1.ret,
+                    JsValue::from_i32(41).encoded().0,
+                    "native o1.x == 41"
+                );
+                let rec = code_block.baseline_property_ic_record(0).expect("record 0");
+                assert!(
+                    rec.offset >= 0 && rec.offset < 64,
+                    "x is an INLINE-band offset (< firstOutOfLineOffset), got {}",
+                    rec.offset
+                );
+
+                hit_calls::reset(); // isolate the HIT run.
+                let r2 = run_property_once(&mut vm, &handle, o2); // structure HIT -> inline load.
+                assert_eq!(
+                    r2.ret,
+                    JsValue::from_i32(99).encoded().0,
+                    "native o2.x == 99 via the INLINE machine-code load"
+                );
+                assert_eq!(
+                    hit_calls::get_calls(),
+                    0,
+                    "the INLINE-offset get HIT must NOT far-call operation_get_by_id_with_cached_offset"
+                );
+
+                vm.clear_jit_code_block();
+                vm.clear_jit_host();
+            }
+
+            // --- OUT-OF-LINE offset (o.p6, offset 64): fill then HIT a sibling.
+            {
+                let mut host = CoreOpcodeDispatchHost::new();
+                host.jit_test_register_identifier(0, "p6"); // get_x reads identifier 0 == "p6".
+                let o1 = object_with_seven_props(&mut host, 77);
+                let o2 = object_with_seven_props(&mut host, 88); // same 7-prop structure.
+                assert_eq!(
+                    structure_of(&host, o1),
+                    structure_of(&host, o2),
+                    "the two 7-prop siblings share one structure (HIT setup)"
+                );
+
+                let mut vm = Vm::new(VmConfig::interpreter_only());
+                let code_block = build_code_block(get_x_instructions());
+                let handle = install_property_image(&mut vm, &mut host, &code_block);
+
+                let r1 = run_property_once(&mut vm, &handle, o1); // MISS -> optimize fills.
+                assert_eq!(r1.pending, 0, "no throw");
+                assert_eq!(
+                    r1.ret,
+                    JsValue::from_i32(77).encoded().0,
+                    "native o1.p6 == 77"
+                );
+                let rec = code_block.baseline_property_ic_record(0).expect("record 0");
+                assert_eq!(
+                    rec.offset, 64,
+                    "p6 is the first OUT-OF-LINE offset (firstOutOfLineOffset == 64)"
+                );
+
+                hit_calls::reset();
+                let r2 = run_property_once(&mut vm, &handle, o2); // structure HIT -> inline OOL load.
+                assert_eq!(
+                    r2.ret,
+                    JsValue::from_i32(88).encoded().0,
+                    "native o2.p6 == 88 via the OUT-OF-LINE machine-code load ([cell+8] -> bptr; [bptr-8])"
+                );
+                assert_eq!(
+                    hit_calls::get_calls(),
+                    0,
+                    "the OUT-OF-LINE-offset get HIT must NOT far-call operation_get_by_id_with_cached_offset"
+                );
+
+                vm.clear_jit_code_block();
+                vm.clear_jit_host();
+            }
+        }
+
+        // gc-r4 Batch 5 Increment 2 — the INLINE machine-code put_by_id replace store.
+        // `inc(o) { o.p = o.p + 1; return o.p }` tiers up and runs the inline
+        // `storeProperty` machine code (NO far-call) for the REPLACE, across an INLINE
+        // offset (`o.x`, offset 0 -> `[cell+16] = value`) and an OUT-OF-LINE offset
+        // (`o.p6`, offset 64 -> `[cell+8] -> bptr; [bptr-8] = value`). The returned
+        // `o.p` is read AFTER the put, so a correct return PROVES the inline store
+        // actually mutated the slot in place; native == interpreter == oracle (the
+        // interpreter store read confirms the mutation), AND the put HIT shim counter
+        // stays 0 (no far-call).
+        #[test]
+        fn put_by_id_inline_store_replaces_inline_and_ool_offsets_without_far_call() {
+            use crate::jit::operations::data_ic_hit_call_counters as hit_calls;
+
+            // --- INLINE offset (o.x = o.x + 1).
+            {
+                let mut host = CoreOpcodeDispatchHost::new();
+                host.jit_test_register_identifier(0, "x");
+                let o1 = object_with_x(&mut host, 41);
+                let o2 = object_with_x(&mut host, 99); // same structure.
+
+                let mut vm = Vm::new(VmConfig::interpreter_only());
+                let code_block = build_code_block(inc_x_instructions());
+                let handle = install_property_image(&mut vm, &mut host, &code_block);
+
+                let r1 = run_property_once(&mut vm, &handle, o1); // fills get@0/put@1/get@2.
+                assert_eq!(r1.pending, 0, "no throw");
+                assert_eq!(
+                    r1.ret,
+                    JsValue::from_i32(42).encoded().0,
+                    "native (o1.x+1) == 42"
+                );
+                let put_rec = code_block
+                    .baseline_property_ic_record(1)
+                    .expect("put record 1");
+                assert!(
+                    put_rec.offset >= 0 && put_rec.offset < 64,
+                    "x put record is an INLINE offset, got {}",
+                    put_rec.offset
+                );
+
+                hit_calls::reset();
+                let r2 = run_property_once(&mut vm, &handle, o2); // all sites HIT.
+                assert_eq!(
+                    r2.ret,
+                    JsValue::from_i32(100).encoded().0,
+                    "native (o2.x+1) == 100 via the INLINE machine-code replace store"
+                );
+                assert_eq!(
+                    host.jit_test_get_own_data(JsValue::from_encoded(EncodedJsValue(o2)), &key_x()),
+                    Some(JsValue::from_i32(100)),
+                    "the inline store mutated o2.x in place to 100 (interpreter store read)"
+                );
+                assert_eq!(
+                    hit_calls::put_calls(),
+                    0,
+                    "the INLINE-offset put HIT must NOT far-call operation_put_by_id_with_cached_offset"
+                );
+                assert_eq!(hit_calls::get_calls(), 0, "the get HITs are inline too");
+
+                vm.clear_jit_code_block();
+                vm.clear_jit_host();
+            }
+
+            // --- OUT-OF-LINE offset (o.p6 = o.p6 + 1).
+            {
+                let mut host = CoreOpcodeDispatchHost::new();
+                host.jit_test_register_identifier(0, "p6");
+                let o1 = object_with_seven_props(&mut host, 50);
+                let o2 = object_with_seven_props(&mut host, 50); // same structure.
+                let p6 = CorePropertyKey::String("p6".into());
+
+                let mut vm = Vm::new(VmConfig::interpreter_only());
+                let code_block = build_code_block(inc_x_instructions());
+                let handle = install_property_image(&mut vm, &mut host, &code_block);
+
+                let r1 = run_property_once(&mut vm, &handle, o1); // fills the OOL records.
+                assert_eq!(r1.pending, 0, "no throw");
+                assert_eq!(
+                    r1.ret,
+                    JsValue::from_i32(51).encoded().0,
+                    "native (o1.p6+1) == 51"
+                );
+                let put_rec = code_block
+                    .baseline_property_ic_record(1)
+                    .expect("put record 1");
+                assert_eq!(
+                    put_rec.offset, 64,
+                    "p6 put record is the OUT-OF-LINE offset 64"
+                );
+
+                hit_calls::reset();
+                let r2 = run_property_once(&mut vm, &handle, o2); // all OOL sites HIT.
+                assert_eq!(
+                    r2.ret,
+                    JsValue::from_i32(51).encoded().0,
+                    "native (o2.p6+1) == 51 via the OUT-OF-LINE machine-code replace store"
+                );
+                assert_eq!(
+                    host.jit_test_get_own_data(JsValue::from_encoded(EncodedJsValue(o2)), &p6),
+                    Some(JsValue::from_i32(51)),
+                    "the inline OOL store mutated o2.p6 in place to 51 (interpreter store read)"
+                );
+                assert_eq!(
+                    hit_calls::put_calls(),
+                    0,
+                    "the OUT-OF-LINE-offset put HIT must NOT far-call operation_put_by_id_with_cached_offset"
+                );
+                assert_eq!(hit_calls::get_calls(), 0, "the OOL get HITs are inline too");
+
+                vm.clear_jit_code_block();
+                vm.clear_jit_host();
+            }
         }
 
         /// Park host + code block, emit + finalize a closure-cell function image. A

@@ -534,6 +534,32 @@ pub extern "C" fn operation_get_by_id_optimize(
     }
 }
 
+/// Test-only DataIC HIT far-call counters. gc-r4 Batch 5 Increment 2 replaced the
+/// `get_by_id`/`put_by_id` HIT far-calls to the `_with_cached_offset` shims below
+/// with INLINE machine code, so a HIT no longer enters these shims. The native
+/// inline-load test asserts these counters stay 0 across a structure-guard HIT — the
+/// regression guard that proves the HIT does NOT far-call (re-introducing the
+/// Increment-1 emission would make a HIT increment one of these). The shims are
+/// retained as the canonical HIT semantics the inline code mirrors.
+#[cfg(test)]
+pub(crate) mod data_ic_hit_call_counters {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) static GET_WITH_CACHED_OFFSET_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static PUT_WITH_CACHED_OFFSET_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn reset() {
+        GET_WITH_CACHED_OFFSET_CALLS.store(0, Ordering::SeqCst);
+        PUT_WITH_CACHED_OFFSET_CALLS.store(0, Ordering::SeqCst);
+    }
+    pub(crate) fn get_calls() -> u64 {
+        GET_WITH_CACHED_OFFSET_CALLS.load(Ordering::SeqCst)
+    }
+    pub(crate) fn put_calls() -> u64 {
+        PUT_WITH_CACHED_OFFSET_CALLS.load(Ordering::SeqCst)
+    }
+}
+
 /// `operationGetById` (cached) analog: the `get_by_id` DataIC HIT slow-call. The
 /// generated structure guard already matched the cached record, so this does the
 /// cheap own-data load at the cached offset (`Vm::operation_get_by_id_with_cached_offset`,
@@ -543,6 +569,11 @@ pub extern "C" fn operation_get_by_id_optimize(
 /// is the get_by_id's OWN `*const CodeBlock` (the `StructureStubInfo*` analog — see
 /// `operation_get_by_id_optimize`): the cached-offset READ and any optimize fallback
 /// FILL target the SAME store the structure guard matched, never `vm.jit_code_block`.
+///
+/// gc-r4 Batch 5 Increment 2: the `get_by_id` HIT emits the inline `loadProperty`
+/// machine code ([`super::arm64_baseline::function_emitter`] `emit_get_by_id_inline_load`)
+/// and NO LONGER far-calls this shim; it is retained as the reference semantics + the
+/// no-far-call test instrument (`data_ic_hit_call_counters`).
 pub extern "C" fn operation_get_by_id_with_cached_offset(
     vm: *mut Vm,
     base: u64,
@@ -551,6 +582,9 @@ pub extern "C" fn operation_get_by_id_with_cached_offset(
     bytecode_index: u64,
     owning_code_block: u64,
 ) -> u64 {
+    #[cfg(test)]
+    data_ic_hit_call_counters::GET_WITH_CACHED_OFFSET_CALLS
+        .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let vm = unsafe { &mut *vm };
     let host_ptr = vm.jit_host_ptr();
     debug_assert!(!host_ptr.is_null(), "parked dispatch host required");
@@ -634,6 +668,9 @@ pub extern "C" fn operation_put_by_id_with_cached_offset(
     bytecode_index: u64,
     owning_code_block: u64,
 ) -> u64 {
+    #[cfg(test)]
+    data_ic_hit_call_counters::PUT_WITH_CACHED_OFFSET_CALLS
+        .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let vm = unsafe { &mut *vm };
     let host_ptr = vm.jit_host_ptr();
     debug_assert!(!host_ptr.is_null(), "parked dispatch host required");
