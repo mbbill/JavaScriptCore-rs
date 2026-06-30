@@ -32,7 +32,7 @@ effort, engine-from-scratch to R ≥ 1.0.
 | 4 | R scoreboard / measurement harness | 1% | 100% | both engines, identical harness |
 | 5 | JSStack execution substrate (stack model + entry + frames) | 5% | ~70% | stack model DECIDED (Option A = native stack); B1–B4 + A1.0/A1.1 native-stack entry LANDED; A2 interp-migration + arity/varargs remain |
 | 6 | GC/value cutover: POD object model + R4 + running collector | 7% | ~65% | object + string R4a GC LIVE (arena/swept/auto-triggered); symbol/bigint leaf GC + visitWeak + conservative-scan remain |
-| 7 | **Baseline JIT** (per-opcode machine code + native calls + profiling + tier-up) | 10% | ~25% | arith/double/typed-array/op_call EXECUTE native on the native-stack; first JIT→JIT native call in flight; native-lowering breadth + profiling remain |
+| 7 | **Baseline JIT** (per-opcode machine code + native calls + profiling + tier-up) | 10% | ~30% | arith/double/typed-array/op_call execute native; **native JS→JS calls LANDED + beat the interpreter** (~39× probe); native-lowering BREADTH (property ICs = K2) + profiling remain → then flip default → R moves |
 | 8 | **DFG** (bytecode→SSA→speculation→SpeculativeJIT+OSR) | 18% | 0% | — |
 | 9 | **FTL + B3 + Air** (top tier + optimizer + register allocation) | 15% | 0% | — |
 | 10 | Final correctness + perf tuning to hit R ≥ 1.0 | 1% | 0% | the last mile |
@@ -65,8 +65,13 @@ A running baseline JIT — the first thing that moves R — needs, in dependency
    JIT lowers from it) + freeze the type-specialized `CoreOpcode`.
 4. **Profiling wiring** — per-CodeBlock ValueProfile/ArithProfile (the DFG's speculation
    fuel), retiring the VM-global observation logs.
-5. **Baseline JIT** (row 7) — emit per-opcode machine code via the proven encoder/LinkBuffer/
-   W^X path, against the JSStack + real cells. **R lifts off the interpreter floor here.**
+5. **Baseline JIT** (row 7) — per-opcode machine code on the native stack + native JS→JS calls
+   are DONE and beat the interpreter on allowlist-covered code (~39× synthetic probe; native ≪
+   interpreter). **R lifts off the interpreter floor here, but is GATED on COVERAGE:** the native
+   path engages only for functions that tier up, and the allowlist lacks property ICs, so real
+   property-heavy Octane hot functions stay interpreted. **NEXT R-LEVER = native-lowering BREADTH:
+   the baseline property-access ICs `get_by_id`/`put_by_id` (the deferred K2) + more opcodes**, so
+   real hot functions tier up and run native; then re-measure → flip the default (held) → R moves.
 6. **DFG → FTL/B3** (rows 8–9) — the optimizing tiers that take R to ≥ 1.0.
 
 These can fan out where independent (the JSStack substrate and the GC/POD-cell work are

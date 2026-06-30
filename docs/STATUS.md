@@ -146,15 +146,9 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   (MAIN/SLOW/LINK, op_enter/mov/ret + arith family + int32 branches; branch-to-bytecode-index resolved
   in LINK forward+backward) — WHOLE FUNCTIONS + native LOOPS execute under W^X (int-sum f(5)=10/f(10)=45).
   S5 one control-flow model; S6 deferred slow cases; fusion deadness-guard + branch bounds-check.
-- [done] U3/U4 LIVE tier-up wiring: hot int-arith functions now tier up on the LIVE entry path
-  (execute_code_block entry hook bumps the ExecutionCounter; loop back-edges counted at LoopHint) →
-  emit_baseline_function (its Err IS the S4 allowlist; only int32 arith/mov/branch admitted) → install to
-  RX → execute NATIVE machine code. Verified in RELEASE (sum(5)==10 native). Faithful to JSC LLInt→Baseline
-  (prologue + loop_osr counter, addressForCall). Divergences commented: synchronous compile (S8 vs async
-  JITWorklist), B5-lite handoff at next entry not mid-loop OSR (S2), entry-only (nested bytecode calls don't
-  re-enter the hook). Unsafe reborrow island adversarially verified sound + HARDENED (nested-park & Vm-pin
-  debug guards; compare/truthy shims Miri-clean; valueOf-reentry test normal-profile-green). HONEST CAVEAT:
-  arith-only allowlist — Octane material R needs property/call ops (R4 / B5-B6); R UNDEFINED until 15-gate.
+- [done] U3/U4 LIVE tier-up wiring: hot functions tier up on the live entry path (ExecutionCounter bumped at
+  entry + loop back-edge → emit_baseline_function [its Err IS the S4 allowlist] → install RX → execute native).
+  Faithful LLInt→Baseline (sync-compile S8 + B5-lite-handoff S2 divergences commented); reborrow island miri-clean.
 - [done] double/float ARITH baseline (verified, EXECUTES native FP in release): FP encoding added to the
   ARM64 encoder (fadd/fsub/fmul/fdiv/scvtf/fmov, byte-oracle-proven) + double fast paths add/sub/mul/div
   (JIT{Add,Sub,Mul,Div}Generator-faithful: int32 fast / branchIfNotNumber→slow / double path) + DivNumber
@@ -171,10 +165,17 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   A1.0/A1.1: prologue flipped to `push_pair(fp,lr); mov fp,sp`, entry seeded on the native stack via the sibling
   sp-switch trampoline (no B-fallback; existing tests byte-identical). A1.2/A1.3: native op_call fast path
   (calleeFrame on the native stack, sp=calleeFrame+16, blr to the resolved entry; CallLinkInfo→entry resolution)
-  — proof passes (callerFrame@0/returnPC@1 adjacent, contiguous callee frame). GATED to cell-free pre-seeded
-  calls; every dynamic op_call stays on the slow path until A1.5. IN FLIGHT: A1.5 scoped JIT-frame GC scan (cells)
-  + A1.4 prologue stack check. NEXT: broad engagement (route real calls native) → JIT beats interp on call-heavy
-  code → flip default → R moves.
+  — proof passes (callerFrame@0/returnPC@1 adjacent, contiguous callee frame). A1.4 (prologue stack-overflow
+  check → RangeError) + A1.5 (scoped conservative GC scan of native-stack JIT frames → cells) LANDED.
+- [done] **BROAD ENGAGEMENT — real op_calls run NATIVE + beat the interpreter**: live op_call resolves the
+  callee's installed native entry per call (the registry addressForCall analog) + blr's it when the callee is
+  JIT'd (else operation_call slow path; resolver returns 0 for host/constructor/arity-mismatch — faithful). The
+  cell-free gate is LIFTED (A1.5 roots native frames). MEASURED ~39× vs interp on a call probe (native ≪ interp;
+  the 39× is pre-GC-interp-inflated, not steady-state); native==interp==oracle. BYPASSES the generated-* arbiter.
+  **NEXT R-LEVER: native-lowering BREADTH (property ICs get_by_id/put_by_id = K2 + more opcodes)** so real
+  property-heavy Octane hot functions tier up + run native → re-measure → flip default (held) → R moves.
+  Follow-ups: CallLinkInfo monomorphic cache (skips the per-call resolve; needs visitWeak/U7); write codeBlock@2
+  / re-park per native frame before a callee slow path reads the current CodeBlock.
 - [measured 06-29 / CONFIRMED DIVERGENCE — docs/design/baseline-call-tier-divergence.md] the OLD generated-*
   call/tier layer (generated_executor RE-INTERPRETER + VmGeneratedDirectCallTransactionRoute arbiter + P6X86_64
   entry) is a NET REGRESSION (geomean ~0.64x opt-in, default flip HELD) with NO JSC counterpart (C++ grep = 0).
