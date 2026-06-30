@@ -135,21 +135,11 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   benches can run → R becomes measurable. (Per-slab aux already reclaimed via the free-lists; SD-4 done.)
 
 ## Baseline JIT / DFG / FTL (parity lives here; ~0% started)
-- [done] JIT↔runtime bridge-infra (adversarially verified): extern-C operation_value_add shim
-  (D1+D5 raw-ptr reborrow of vm+real host, Miri-passed) + Vm::operation_* split-borrow wrappers
-  (evaluators verbatim) + D3 jit_pending exception word + far-call. docs/design/jit-runtime-bridge.md.
-- [done] op_add baseline-JIT lowering (verified; EXECUTES native machine code under W^X): fast int32
-  (load64/branchIfNotInt32/branchAdd32 Overflow/boxInt32/store64, JITAddGenerator-faithful) + slow-path
-  far_call(operation_value_add) + exception edge + C-ABI trampoline (push_pair prologue, x19=pinned-VM,
-  x27/x28 tags). 4 native cases proven (2+3→5; overflow→boxed double; 1.5+2→3.5; throw→bail). TEMPLATE
-  conventions: x1=left/x2=right/x0=result (operands pre-placed in op-arg slots → zero slow-path moves);
-  x19=canonical pinned-VM reg (shared const). Standalone callable image — NOT yet wired to live dispatch.
-- [done] int32 ARITH FAMILY (verified; each EXECUTES): sub/mul/bitand/bitor/bitxor/lshift/rshift — the
-  ACTUAL JSVALUE64 generator paths (sub left-right, bitand and64+single-guard-no-box, bitor or64-no-box,
-  bitxor xor32+box, mul negative-zero guard); zero new unsafe (shared reborrow island). op_urshift +
-  mul-−0-double deferred (the latter a pre-existing engine-wide evaluator gap, not a JIT defect).
-  NEXT: dispatch Stage 1 (full-function 3-pass emitter + branch ops, spec'd baseline-dispatch.md) →
-  tier-up trigger + B5-lite handoff → the int-sum-loop milestone (R moves there).
+- [done] JIT↔runtime bridge (D1+D5 reborrow shim, Miri-passed; Vm::operation_* split-borrow wrappers; D3
+  jit_pending exception word + far-call; docs/design/jit-runtime-bridge.md).
+- [done] per-opcode ARITH lowering (each EXECUTES native under W^X, generator-faithful): op_add int32 fast +
+  slow far_call + C-ABI trampoline; int32 family sub/mul/bitand/bitor/bitxor/lshift/rshift; op_urshift +
+  mul-−0-double deferred (pre-existing evaluator gap, not a JIT defect).
 - [done] dispatch Stage 1 (verified): the full-function 3-pass emitter `emit_baseline_function`
   (MAIN/SLOW/LINK, op_enter/mov/ret + arith family + int32 branches; branch-to-bytecode-index resolved
   in LINK forward+backward) — WHOLE FUNCTIONS + native LOOPS execute under W^X (int-sum f(5)=10/f(10)=45).
@@ -180,11 +170,15 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   + 2-deep nesting (DEBUG+RELEASE); suite 2781. op_call tests are FFI-blocked under miri (mmap arena) — the
   reborrow miri proof rides the analogous add-shim test. B5-full native bl-chain/direct-link DEFERRED
   (slow-call now). RESIDUAL: a native callee tier-up under op_call needs its own sibling-aliasing re-verify FIRST.
-- [done] **GATE-CAPABILITY SET COMPLETE**: int+double arith + LoadDouble + typed-array element get/put_by_val
-  (K2-free slow-call IC) + op_call all EXECUTE → asm.js functions can now tier up WHOLE. NEXT for the 15/15
-  gate = SPEED (the inline fast paths — op_call direct-link/B5-full + the inline typed-array stub, both gated
-  on a stable backing pointer) + MEASURE whether mandreel/octane-zlib complete (capped). Then R becomes
-  definable. (op_call + typed-array are slow-call today — functions tier up, but calls/HEAP far-call the runtime.)
+- [done] **GATE-CAPABILITY SET**: int+double arith + LoadDouble + typed-array get/put_by_val (slow-call IC)
+  + op_call all EXECUTE native → asm.js functions can tier up WHOLE.
+- [BLOCKED — measured 06-29] the baseline JIT is a NET REGRESSION on arm64 (geomean ~0.64x; richards/delta-blue
+  ~3x slower; raytrace/earley DNF). DEFAULT FLIP HELD (would move R DOWN). Cause = the CALL path: callee "native
+  entries" are x86_64 byte-seqs (HostBlockedX86_64), so ~3.6M generated-direct-call transactions fall back to a
+  nested interpreter while paying per-call route/accounting. SUSPECTED LOAD-BEARING DIVERGENCE: the generated-*
+  call/tier layer (route/transaction/native-entry-kind — NO JSC counterpart vs CallLinkInfo+thunks). Strategic
+  divergence-assessment in flight (CORRECT it, don't build B5-full on it). Faithful fix → arm64-callable
+  CallLinkInfo entry + delete route/transaction layer → native breadth → THEN flip default → R moves.
 - [missing] bytecode-stream cutover + baseline profiling emission (ValueProfile/ArithProfile, a DFG
   prereq downstream of R4/calls broadening the allowlist).
 - [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
