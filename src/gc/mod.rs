@@ -30,13 +30,14 @@ mod visitor;
 mod weak;
 
 pub use barrier::{
-    static_barrier_schema_registry, static_barrier_schemas, BarrierAction, BarrierDecision,
-    BarrierDecisionError, BarrierEdge, BarrierFieldKind, BarrierKind, BarrierMutationAuthority,
-    BarrierNotRequiredReason, BarrierRegistryAuthority, BarrierRequirementOutcome,
-    BarrierRequirementRequest, BarrierSchemaDescriptor, BarrierSchemaDescriptorBuilder,
-    BarrierSchemaOwner, BarrierSchemaRegistry, BarrierSchemaValidationError, BarrierThreshold,
-    BarrierWriteContext, RememberedSetEntry, ValueBarrier, WriteBarrier, WriteBarrierCounterSet,
-    WriteBarrierPlan, WriteBarrierUseKind, STATIC_BARRIER_SCHEMAS, STATIC_BARRIER_SCHEMA_REGISTRY,
+    butterfly_reallocation_barrier, static_barrier_schema_registry, static_barrier_schemas,
+    BarrierAction, BarrierDecision, BarrierDecisionError, BarrierEdge, BarrierFieldKind,
+    BarrierKind, BarrierMutationAuthority, BarrierNotRequiredReason, BarrierRegistryAuthority,
+    BarrierRequirementOutcome, BarrierRequirementRequest, BarrierSchemaDescriptor,
+    BarrierSchemaDescriptorBuilder, BarrierSchemaOwner, BarrierSchemaRegistry,
+    BarrierSchemaValidationError, BarrierThreshold, BarrierWriteContext, RememberedSetEntry,
+    ValueBarrier, WriteBarrier, WriteBarrierCounterSet, WriteBarrierPlan, WriteBarrierUseKind,
+    STATIC_BARRIER_SCHEMAS, STATIC_BARRIER_SCHEMA_REGISTRY,
 };
 pub use cell::{
     static_cell_metadata_descriptors, static_cell_metadata_registry, static_type_info_descriptors,

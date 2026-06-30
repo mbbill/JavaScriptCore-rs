@@ -516,6 +516,21 @@ pub(crate) enum CorePrototypeIdentity {
 // site clones a single cell into the SAME store. Default is hand-written because a
 // `ButterflyHandle` sentinel (INVALID) is installed until `allocate_cell` assigns a
 // real slab handle at the single allocation chokepoint.
+/// The raw, machine-dereffable butterfly base pointer stored at the cell's offset 8
+/// (C++ `JSObject::m_butterfly`, JSObject.h:1167). gc-r4 Batch 5 Step 2: a POD `usize`
+/// holding the EXPOSED base address of the store-owned butterfly `Box<[RuntimeValue]>`
+/// (the `fromBase` position); recovered with `with_exposed_provenance` for the
+/// out-of-line property machine-load. `0` == NULL (no addressable out-of-line storage
+/// yet). 8 bytes / `Copy` (POD) so the cell stays sweepable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct ButterflyBase(pub(crate) usize);
+
+impl ButterflyBase {
+    /// A null `m_butterfly` (no addressable out-of-line storage yet).
+    pub(crate) const NULL: Self = ButterflyBase(0);
+}
+
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct CoreObjectCell {
@@ -538,15 +553,23 @@ pub(crate) struct CoreObjectCell {
     // deferred until an m_indexingTypeAndMisc header byte is modeled.
     pub(crate) js_type: JsType,
     // C++ JSC: the JSObject Butterfly pointer slot (`m_butterfly`,
-    // runtime/JSObject.h:1167 / 1572-1577). gc-r4 Butterfly-values: a
-    // `ButterflyHandle` index into the STORE-OWNED `butterflies` slab (a separate
-    // allocation), NOT a self-referential interior pointer. MUST stay the second
-    // declared field; BUTTERFLY_SLOT_DISP asserts it is at byte 8 (after the 4-byte
-    // structure_id + 4-byte pad to pointer alignment). `ButterflyHandle` is a
-    // `#[repr(transparent)] usize`, so it occupies the same 8 bytes the raw butterfly
-    // pointer will occupy at R4. The handle is set in `allocate_cell` via
-    // `allocate_butterfly()`; until then it is `ButterflyHandle::INVALID` (sentinel).
-    pub(crate) butterfly: ButterflyHandle,
+    // runtime/JSObject.h:1167 / 1572-1577) — the raw, machine-dereffable base
+    // pointer into the out-of-line butterfly buffer. gc-r4 Batch 5 Step 2: this slot
+    // now holds the EXPOSED BASE ADDRESS (`ButterflyBase`, a POD `usize`) of the
+    // store-owned `Box<[RuntimeValue]>` butterfly buffer (object/butterfly_handle.rs),
+    // at the C++ `fromBase`/`m_butterfly` position, so an emitted machine-code
+    // out-of-line load is `load [cell+8] -> bptr; load [bptr + offsetInOutOfLineStorage
+    // (offset)*8]` (Increment 2). MUST stay the second declared field;
+    // BUTTERFLY_SLOT_DISP asserts it is at byte 8 (after the 4-byte structure_id +
+    // 4-byte pad to pointer alignment). The store OWNS the buffer (via the separate
+    // `butterfly` slab handle below); this slot is the read-only address recovered
+    // with `with_exposed_provenance`. `0` (NULL) until the first OOL property /
+    // element grows the buffer (a fresh object's `m_butterfly` is empty); REWRITTEN
+    // by `sync_butterfly_base` under the object generational barrier on every
+    // butterfly REALLOCATION (createOrGrowPropertyStorage -> setButterfly). The
+    // non-moving R4a/R4b collector never relocates the buffer, so a stored base
+    // pointer is valid for the butterfly's whole lifetime (only a realloc changes it).
+    pub(crate) butterfly_base: ButterflyBase,
     // C++ JSC: the JSObject INLINE property storage (`inlineStorage()`,
     // runtime/JSObject.h:1167 / 1572-1577), the first `defaultInlineCapacity` (==6,
     // JSObject.h:1229) property slots laid out IN the object cell immediately after the
@@ -561,6 +584,18 @@ pub(crate) struct CoreObjectCell {
     // offsets (offset < firstOutOfLineOffset, in practice 0..INLINE_CAPACITY) read/write
     // HERE; out-of-line offsets (>= firstOutOfLineOffset == 64) use the butterfly slab.
     pub(crate) inline_storage: [RuntimeValue; INLINE_CAPACITY as usize],
+    // C++ JSC has NO separate butterfly handle — `m_butterfly` (above, `butterfly_base`)
+    // both ADDRESSES and (via the GC Auxiliary subspace) OWNS the butterfly. gc-r4 Batch 5
+    // Step 2 BRIDGE rep: safe Rust cannot own a heap buffer through a raw address, so the
+    // store OWNS each buffer in the `butterflies` slab and the cell carries this POD `Copy`
+    // index alongside the raw base pointer. The interpreter/trace/free/growth reach the
+    // owned buffer through this handle; `butterfly_base` is the machine-addressable view of
+    // the SAME buffer, kept in lockstep. NOT at offset 8 (the raw pointer holds that), so it
+    // is placed here after the inline storage. Set in `allocate_cell` via
+    // `allocate_butterfly()`; `ButterflyHandle::INVALID` until then. Retired when R4's
+    // collector owns the arena Auxiliary directly (the raw base pointer becomes the sole
+    // handle, as in C++).
+    pub(crate) butterfly: ButterflyHandle,
     pub(crate) cell_id: CellId,
     pub(crate) kind: CoreObjectKind,
     pub(crate) prototype: Option<RuntimeValue>,
@@ -723,10 +758,11 @@ const STRUCTURE_ID_OFFSET: usize = std::mem::offset_of!(CoreObjectCell, structur
 // C++ JSC: the JSObject Butterfly pointer slot (`m_butterfly`,
 // runtime/JSObject.h:1167 / 1572-1577) read at a constant displacement.
 // BUTTERFLY_SLOT_DISP is the Rust analog displacement the codegen uses to fetch the
-// storage base before the offset-indexed property load. gc-r4 Butterfly-values: the
-// slot holds a `ButterflyHandle` (interpreter-resolved at R3) at the SAME offset 8 the
-// raw arena butterfly pointer will occupy at R4, so the codegen contract is unchanged.
-const BUTTERFLY_SLOT_DISP: usize = std::mem::offset_of!(CoreObjectCell, butterfly);
+// storage base before the offset-indexed property load. gc-r4 Batch 5 Step 2: the slot
+// holds the RAW machine-dereffable butterfly base pointer (`ButterflyBase`, the exposed
+// `fromBase` address) at offset 8, so the emitted out-of-line load `load [cell+8] ->
+// bptr; load [bptr + offsetInOutOfLineStorage(offset)*8]` reads the right bytes.
+const BUTTERFLY_SLOT_DISP: usize = std::mem::offset_of!(CoreObjectCell, butterfly_base);
 
 // Compile-time layout guards. These fail the build if the #[repr(C)] header order
 // changes, if alignment padding shifts the butterfly slot, or if RuntimeValue stops
@@ -737,11 +773,11 @@ const _: () = assert!(
 );
 const _: () = assert!(
     BUTTERFLY_SLOT_DISP == 8,
-    "CoreObjectCell::butterfly must be at byte 8 (JSObject m_butterfly slot analog)"
+    "CoreObjectCell::butterfly_base must be at byte 8 (JSObject m_butterfly slot analog)"
 );
 const _: () = assert!(
-    std::mem::size_of::<ButterflyHandle>() == 8,
-    "ButterflyHandle must be 8 bytes (occupies the raw butterfly-pointer slot at R4)"
+    std::mem::size_of::<ButterflyBase>() == 8,
+    "ButterflyBase must be 8 bytes (the raw machine-dereffable butterfly-pointer slot)"
 );
 const _: () = assert!(
     std::mem::size_of::<RuntimeValue>() == 8,
@@ -810,6 +846,10 @@ impl Default for CoreObjectCell {
             // from cell.kind.js_type() for every published cell, so the tag always
             // matches the final kind regardless of how the cell was built.
             js_type: JsType::FinalObject,
+            // gc-r4 Batch 5 Step 2: a fresh/empty butterfly has no addressable storage
+            // (null `m_butterfly`); `sync_butterfly_base` writes the real exposed base
+            // address on the first OOL property / element growth.
+            butterfly_base: ButterflyBase::NULL,
             butterfly: ButterflyHandle::INVALID,
             // C++ JSC: a fresh JSObject's inline slots start empty; `allocate_cell` also
             // resets these to the `undefined` sentinel at the allocation chokepoint.
@@ -881,6 +921,13 @@ impl Clone for CoreObjectCell {
             structure_id: self.structure_id,
             // Copy the type tag normally; a clone of an object cell is the same JSType.
             js_type: self.js_type,
+            // gc-r4 Batch 5 Step 2: copy the raw butterfly base address shallow (POD
+            // `usize`). Sound for the SAME reason as the `butterfly` handle below: cell
+            // Clone is reached ONLY via `CoreObjectStore::clone` (deleted at R4a) — no
+            // live site clones a cell into the SAME store, so the copied address is never
+            // dereferenced through the clone; `allocate_cell` resets it (NULL) for any
+            // re-published cell, and the next growth re-syncs it.
+            butterfly_base: self.butterfly_base,
             butterfly: self.butterfly,
             // Copy the inline value slots ([RuntimeValue; INLINE_CAPACITY] is POD `Copy`).
             inline_storage: self.inline_storage,
@@ -1660,6 +1707,13 @@ pub(crate) fn is_out_of_line_offset(offset: PropertyOffset) -> bool {
 /// so offsets 0,1,2,3,4,5,64,65,... map to indices 0,1,2,3,4,5,6,7,..., exactly the
 /// allocation order. This must mirror Structure::PropertyTable's offsetForPropertyNumber
 /// (the offset source) or a property would read a wrong slot.
+///
+/// gc-r4 Batch 5 Step 2: the out-of-line band is now negative-indexed C++-faithfully
+/// (ButterflyAllocation addresses named props at `base[-(offset-64)-1]`), so the butterfly
+/// dispatch no longer routes through this forward-packing function. It is RETAINED for the
+/// Step 3 retirement (which formally deletes it and unifies the `PropertyOffset` newtype);
+/// `#[allow(dead_code)]` documents the awaiting-Step-3 state.
+#[allow(dead_code)]
 pub(crate) fn offset_storage_index(offset: PropertyOffset) -> usize {
     let raw = offset.raw();
     debug_assert!(raw >= 0, "negative property offset has no slot");
@@ -2189,48 +2243,69 @@ impl CoreObjectStore {
             // longer reads or asserts against the slab for an inline offset.
             return Some(cell.inline_storage[idx]);
         }
-        // OUT-OF-LINE band: the butterfly slab slot (Step 2 makes this the negative-indexed
-        // raw buffer; `offset_storage_index` is unchanged this step).
-        self.butterflies[cell.butterfly.0].prop_get(offset_storage_index(offset))
+        // OUT-OF-LINE band: read the negative-indexed named slot from the single
+        // butterfly buffer (C++ `outOfLineStorage()[offsetInOutOfLineStorage(offset)]`,
+        // JSObject.h:711-723; ButterflyAllocation maps the raw OOL `offset` to its
+        // base-relative slot). gc-r4 Batch 5 Step 2: this is the SAME slot the raw
+        // cell+8 machine-load would read (proven by `butterfly_load_out_of_line_raw`).
+        self.butterflies[cell.butterfly.0].prop_get(offset.raw())
     }
 
-    /// Write `value` into the property slot for `offset` in butterfly `handle`,
-    /// growing with `undefined` fill (C++ `JSObject::putDirectOffset`,
-    /// JSObject.h:711; mirrors `write_data_property_offset_slot`). No-op for a
-    /// negative offset.
+    /// Write `value` into the property slot for out-of-line `offset` in butterfly
+    /// `handle`, growing the named side (C++ `JSObject::putDirectOffset` OOL arm,
+    /// JSObject.h:711). Returns `true` if the butterfly REALLOCATED (the base moved):
+    /// the caller MUST then `sync_butterfly_base` to rewrite cell+8 under the barrier.
+    /// No-op (returns `false`) for a negative or inline offset.
+    #[must_use]
     pub(crate) fn butterfly_prop_put(
         &mut self,
         handle: ButterflyHandle,
         offset: PropertyOffset,
         value: RuntimeValue,
-    ) {
+    ) -> bool {
         if offset.raw() < 0 {
-            return;
+            return false;
         }
         // gc-r4 Batch 5 Step 1: inline-band offsets are written to the cell's OWN inline
         // storage by the putDirectOffset inline arm (`put_direct_offset_inline`, run at the
         // call sites under the cell borrow); only OUT-OF-LINE offsets land in the butterfly
-        // slab here. (Step 2 reworks the OOL band into the negative-indexed raw buffer;
-        // `offset_storage_index` is unchanged this step.)
+        // buffer here.
         if crate::object::property_offset::is_inline_offset(offset.raw()) {
-            return;
+            return false;
         }
-        self.butterflies[handle.0].prop_put(offset_storage_index(offset), value);
+        self.butterflies[handle.0].prop_put(offset.raw(), value)
     }
 
     /// Clear the property slot for `offset` in butterfly `handle` back to
-    /// `undefined` (deletion / data->accessor). No-op for a negative offset.
+    /// `undefined` (deletion / data->accessor). No-op for a negative/inline offset.
+    /// A clear never reallocates (the slot already exists), so cell+8 is unchanged.
     pub(crate) fn butterfly_prop_clear(&mut self, handle: ButterflyHandle, offset: PropertyOffset) {
         if offset.raw() < 0 {
             return;
         }
         // gc-r4 Batch 5 Step 1: inline-band offsets are cleared on the cell (the
         // putDirectOffset inline arm with the `undefined` sentinel); only OUT-OF-LINE
-        // offsets are cleared in the butterfly slab here.
+        // offsets are cleared in the butterfly buffer here.
         if crate::object::property_offset::is_inline_offset(offset.raw()) {
             return;
         }
-        self.butterflies[handle.0].prop_clear(offset_storage_index(offset));
+        self.butterflies[handle.0].prop_clear(offset.raw());
+    }
+
+    /// gc-r4 Batch 5 Step 2 — rewrite the cell's raw butterfly base pointer (cell+8)
+    /// to the butterfly's current base after a REALLOCATION, under the object
+    /// generational write barrier. C++ `createOrGrowPropertyStorage` reallocates the
+    /// butterfly and `setButterfly` rewrites `m_butterfly` AND runs
+    /// `Heap::writeBarrier(this)` (the object now points at a new butterfly the
+    /// collector must rescan). The barrier is a NO-OP while no collector is wired
+    /// (force_collect re-marks from roots each cycle; there is no remembered set yet —
+    /// mirroring `apply_value_store_write_barrier` classifying a white owner as
+    /// NotRequired), so the structural pointer rewrite is the only effect today. The
+    /// rewrite runs through the sanctioned `with_cell_mut` deref island.
+    pub(crate) fn sync_butterfly_base(&mut self, object: RuntimeValue, handle: ButterflyHandle) {
+        let base = ButterflyBase(self.butterflies[handle.0].base_addr());
+        crate::gc::butterfly_reallocation_barrier();
+        self.with_cell_mut(object, |cell| cell.butterfly_base = base);
     }
 
     /// Read the indexed element at `index` from butterfly `handle` (C++
@@ -2245,49 +2320,121 @@ impl CoreObjectStore {
 
     /// Write `value` into the indexed element at `index` in butterfly `handle`,
     /// hole-filling growth (C++ `Butterfly::contiguous()` store, Butterfly.h:196).
+    /// Returns `true` if the butterfly REALLOCATED (the caller must `sync_butterfly_base`).
+    #[must_use]
     pub(crate) fn butterfly_elem_put(
         &mut self,
         handle: ButterflyHandle,
         index: usize,
         value: RuntimeValue,
-    ) {
-        self.butterflies[handle.0].elem_put(index, value);
+    ) -> bool {
+        self.butterflies[handle.0].elem_put(index, value)
     }
 
     /// Resize the indexed element side of butterfly `handle` to `len`
-    /// (C++ butterfly vectorLength resize, Butterfly.h:187-189).
-    pub(crate) fn butterfly_elem_resize(&mut self, handle: ButterflyHandle, len: usize) {
-        self.butterflies[handle.0].elem_resize(len);
+    /// (C++ butterfly vectorLength resize, Butterfly.h:187-189). Returns `true` if the
+    /// butterfly REALLOCATED (growth past capacity; the caller must `sync_butterfly_base`).
+    #[must_use]
+    pub(crate) fn butterfly_elem_resize(&mut self, handle: ButterflyHandle, len: usize) -> bool {
+        self.butterflies[handle.0].elem_resize(len)
     }
 
     /// Number of indexed element slots in butterfly `handle` (the Butterfly
-    /// vectorLength analog, Butterfly.h:187).
+    /// publicLength analog, Butterfly.h:186).
     pub(crate) fn butterfly_elem_len(&self, handle: ButterflyHandle) -> usize {
         self.butterflies[handle.0].elem_len()
     }
 
     /// Append `value` to the indexed element side of butterfly `handle`
-    /// (C++ contiguous append, Butterfly.h:186-189).
-    pub(crate) fn butterfly_elem_push(&mut self, handle: ButterflyHandle, value: RuntimeValue) {
-        self.butterflies[handle.0].elem_push(value);
+    /// (C++ contiguous append, Butterfly.h:186-189). Returns `true` if the butterfly
+    /// REALLOCATED (the caller must `sync_butterfly_base`).
+    #[must_use]
+    pub(crate) fn butterfly_elem_push(
+        &mut self,
+        handle: ButterflyHandle,
+        value: RuntimeValue,
+    ) -> bool {
+        self.butterflies[handle.0].elem_push(value)
     }
 
     /// Clear the indexed element at `index` in butterfly `handle` to a hole
-    /// (`delete arr[i]`; C++ indexed deleteProperty). No-op out of range.
+    /// (`delete arr[i]`; C++ indexed deleteProperty). No-op out of range. Never
+    /// reallocates, so cell+8 is unchanged.
     pub(crate) fn butterfly_elem_clear(&mut self, handle: ButterflyHandle, index: usize) {
         self.butterflies[handle.0].elem_clear(index);
     }
 
     /// Pop the last indexed element of butterfly `handle` (`Array.prototype.pop`
-    /// fast path); flattens a trailing hole to `None`.
+    /// fast path); flattens a trailing hole to `None`. Shrinks publicLength WITHOUT
+    /// reallocating (keeps vectorLength, like C++), so cell+8 is unchanged.
     pub(crate) fn butterfly_elem_pop(&mut self, handle: ButterflyHandle) -> Option<RuntimeValue> {
         self.butterflies[handle.0].elem_pop()
     }
 
-    /// Borrow the indexed element side of butterfly `handle` as a slice (for
-    /// enumeration / snapshot reads). C++ `Butterfly::contiguous()` span.
-    pub(crate) fn butterfly_elements(&self, handle: ButterflyHandle) -> &[Option<RuntimeValue>] {
-        self.butterflies[handle.0].elements_slice()
+    /// Materialize the indexed element side of butterfly `handle` (hole -> `None`) for
+    /// enumeration / snapshot reads. C++ `Butterfly::contiguous()` span. (Owned `Vec`
+    /// now that holes are an in-band sentinel rather than `Option` slots.)
+    pub(crate) fn butterfly_elements(&self, handle: ButterflyHandle) -> Vec<Option<RuntimeValue>> {
+        self.butterflies[handle.0].elements_vec()
+    }
+
+    /// gc-r4 Batch 5 Step 2 — the MACHINE-CODE out-of-line property LOAD analog:
+    /// read the property at `offset` by DEREFERENCING the cell's raw butterfly base
+    /// pointer (cell+8), exactly as Increment 2's emitted ARM64 will (`load [cell+8] ->
+    /// bptr; load [bptr + offsetInOutOfLineStorage(offset)*8]`, AssemblyHelpers::
+    /// loadProperty, AssemblyHelpers.cpp:442-465). The interpreter path
+    /// (`butterfly_prop_get`) is the ORACLE; this proves the raw pointer in cell+8 is
+    /// valid and addresses the SAME slot. Takes `base` (the cell's `butterfly_base.0`,
+    /// a `Copy` `usize`) by value so it holds NO borrow aliasing the store-owned buffer.
+    /// Out-of-line offsets only; `None` for a null base or inline/invalid offset.
+    // gc-r4 Batch 5 Step 2 authored-but-unwired: the LIVE interpreter reads through the
+    // `butterfly` handle (the oracle); this raw-deref proof is exercised by the Step-2
+    // tests and adopted by Increment 2 (the emitted machine load). `#[allow(dead_code)]`
+    // until Increment 2 wires it, mirroring the other unwired R4 foundation.
+    #[allow(dead_code)]
+    pub(crate) fn butterfly_load_out_of_line_raw(
+        base: ButterflyBase,
+        offset: PropertyOffset,
+    ) -> Option<RuntimeValue> {
+        if offset.raw() < FIRST_OUT_OF_LINE_OFFSET || base.0 == 0 {
+            return None;
+        }
+        let neg = crate::object::property_offset::offset_in_out_of_line_storage(offset.raw());
+        // SAFETY: `base` was exposed from the store-owned butterfly `Box` at its last
+        // (re)allocation and kept current under the growth barrier; `neg` is in
+        // `[-named_len, -1]` for a live OOL slot (the caller only reads an offset the
+        // structure proves exists), so `base.offset(neg)` is an interior `RuntimeValue`
+        // element of that Box. Single mutator thread; the non-moving collector never
+        // relocates the buffer; no `&mut`/`&` to this buffer is held here (base is a
+        // `Copy` usize), so the exposed-provenance read does not alias a live borrow.
+        let slot =
+            unsafe { core::ptr::with_exposed_provenance::<RuntimeValue>(base.0).offset(neg) };
+        Some(unsafe { slot.read() })
+    }
+
+    /// gc-r4 Batch 5 Step 2 — the MACHINE-CODE out-of-line property STORE analog (the
+    /// Increment-2 `storeProperty` write-through-cell+8 counterpart of
+    /// `butterfly_load_out_of_line_raw`). Writes `value` into the slot the raw cell+8
+    /// pointer addresses, proving the same pointer is writable. The slot MUST already
+    /// exist (the caller writes only an offset the structure grew); never grows.
+    // gc-r4 Batch 5 Step 2 authored-but-unwired (see `butterfly_load_out_of_line_raw`).
+    #[allow(dead_code)]
+    pub(crate) fn butterfly_store_out_of_line_raw(
+        base: ButterflyBase,
+        offset: PropertyOffset,
+        value: RuntimeValue,
+    ) {
+        if offset.raw() < FIRST_OUT_OF_LINE_OFFSET || base.0 == 0 {
+            return;
+        }
+        let neg = crate::object::property_offset::offset_in_out_of_line_storage(offset.raw());
+        // SAFETY: as `butterfly_load_out_of_line_raw`, but a write. `base` exposes the
+        // buffer's MUTABLE provenance (recomputed from `Box::as_mut_ptr`), so the
+        // write-through is valid; `base` is a `Copy` usize holding no aliasing borrow of
+        // the store-owned buffer, so no `&`/`&mut` to it is frozen during the write.
+        let slot =
+            unsafe { core::ptr::with_exposed_provenance_mut::<RuntimeValue>(base.0).offset(neg) };
+        unsafe { slot.write(value) };
     }
 }
 
@@ -2666,15 +2813,18 @@ impl CoreObjectStore {
         // elements (C++ JSObject::visitButterfly). A null/INVALID butterfly is
         // skipped, exactly as C++ null-checks `m_butterfly`; `.get` also makes a
         // stale index a no-op so the trace stays total.
+        // gc-r4 Batch 5 Step 2: the butterfly is a single buffer; `for_each_value`
+        // yields every out-of-line property slot + every live indexed element (the
+        // `markAuxiliaryAndVisitOutOfLineProperties` value-append + element visit,
+        // JSObject.cpp:108-111). Holes/`undefined` fillers are the Empty/undefined
+        // sentinels, which `as_cell` (in `trace_value_edge`) rejects, so they are not
+        // edges. The buffer needs no separate mark bit: one owner => owner liveness ==
+        // butterfly liveness. The interpreter reaches the store-owned buffer through the
+        // `butterfly` handle (the raw cell+8 `butterfly_base` is the machine-code view of
+        // the SAME buffer).
         if cell.butterfly != ButterflyHandle::INVALID {
             if let Some(butterfly) = self.butterflies.get(cell.butterfly.0) {
-                for &value in &butterfly.props {
-                    trace_value_edge(value, visitor);
-                }
-                // `None` is a hole (no element), not an edge.
-                for value in butterfly.elements.iter().copied().flatten() {
-                    trace_value_edge(value, visitor);
-                }
+                butterfly.for_each_value(|value| trace_value_edge(value, visitor));
             }
         }
 
@@ -5771,6 +5921,12 @@ impl CoreObjectStore {
         // own (empty) slab entry BEFORE the structure is seeded and the out-of-line
         // VALUE mirror + indexed elements are filled below.
         cell.butterfly = self.allocate_butterfly();
+        // gc-r4 Batch 5 Step 2: seed the raw butterfly base pointer (cell+8) from the
+        // freshly allocated (empty) butterfly — NULL until the first OOL property /
+        // element grows the buffer, after which `sync_butterfly_base` rewrites it. This
+        // is set on the stack `cell` BEFORE the byte-copy into the arena, so the
+        // published cell carries the coherent (empty) base.
+        cell.butterfly_base = ButterflyBase(self.butterflies[cell.butterfly.0].base_addr());
         // gc-r4 Batch 5 Step 1: a freshly allocated object's INLINE property slots start
         // EMPTY (the `undefined` sentinel) — C++ `JSObject::finishCreation` zero-inits
         // inline storage before any property is added. Reset here at the single allocation
@@ -6827,7 +6983,11 @@ impl CoreObjectStore {
         // `JSArray::setLength` clearing/`ensureLength` behavior; the indexed storage
         // is the store-owned butterfly slab, reached by the cell's handle.
         if let Some(handle) = self.find(object).map(|cell| cell.butterfly) {
-            self.butterfly_elem_resize(handle, new_length);
+            // gc-r4 Batch 5 Step 2: growth past vectorLength reallocates the buffer;
+            // rewrite cell+8 under the barrier when the base moved.
+            if self.butterfly_elem_resize(handle, new_length) {
+                self.sync_butterfly_base(object, handle);
+            }
         }
         ArrayLengthPut::Resized
     }
@@ -7208,7 +7368,11 @@ impl CoreObjectStore {
             return None;
         }
         let index = key_array_index(key)?;
-        self.butterfly_elem_put(handle, index, value);
+        // gc-r4 Batch 5 Step 2: an indexed store past vectorLength reallocates the
+        // buffer; rewrite cell+8 under the barrier when the base moved.
+        if self.butterfly_elem_put(handle, index, value) {
+            self.sync_butterfly_base(object, handle);
+        }
         Some(())
     }
 
@@ -7274,7 +7438,12 @@ impl CoreObjectStore {
             object_cell.butterfly
         });
         if let Some(handle) = handle {
-            self.butterfly_prop_put(handle, offset, value);
+            // gc-r4 Batch 5 Step 2: an OOL property add reallocates the butterfly buffer,
+            // moving its base; rewrite cell+8 under the barrier (createOrGrowPropertyStorage
+            // -> setButterfly). A same-offset replace does not move (returns false).
+            if self.butterfly_prop_put(handle, offset, value) {
+                self.sync_butterfly_base(object, handle);
+            }
         }
         if shape_changed {
             self.finish_structure_transition(old_structure);
@@ -7374,7 +7543,12 @@ impl CoreObjectStore {
             object_cell.butterfly
         });
         if let Some(handle) = handle {
-            self.butterfly_prop_put(handle, offset, value);
+            // gc-r4 Batch 5 Step 2: an OOL property add reallocates the butterfly buffer,
+            // moving its base; rewrite cell+8 under the barrier (createOrGrowPropertyStorage
+            // -> setButterfly). A same-offset replace does not move (returns false).
+            if self.butterfly_prop_put(handle, offset, value) {
+                self.sync_butterfly_base(object, handle);
+            }
         }
         if shape_changed {
             self.finish_structure_transition(old_structure);
@@ -7465,7 +7639,12 @@ impl CoreObjectStore {
             object_cell.butterfly
         });
         if let Some(handle) = handle {
-            self.butterfly_prop_put(handle, offset, value);
+            // gc-r4 Batch 5 Step 2: an OOL property add reallocates the butterfly buffer,
+            // moving its base; rewrite cell+8 under the barrier (createOrGrowPropertyStorage
+            // -> setButterfly). A same-offset replace does not move (returns false).
+            if self.butterfly_prop_put(handle, offset, value) {
+                self.sync_butterfly_base(object, handle);
+            }
         }
         if shape_changed {
             self.finish_structure_transition(old_structure);
@@ -7602,8 +7781,11 @@ impl CoreObjectStore {
         });
         if let Some(handle) = handle {
             // No-op for a negative offset (should not happen — every key now gets a real
-            // named offset).
-            self.butterfly_prop_put(handle, offset, getter_setter);
+            // named offset). gc-r4 Batch 5 Step 2: a fresh-key accessor add reallocates the
+            // butterfly; rewrite cell+8 under the barrier when the base moved.
+            if self.butterfly_prop_put(handle, offset, getter_setter) {
+                self.sync_butterfly_base(object, handle);
+            }
         }
         self.finish_structure_transition(old_structure);
     }
@@ -8460,8 +8642,11 @@ impl CoreObjectStore {
             return Err(ExecutionError::ExpectedObject);
         };
         // butterfly_elem_put grows the indexed side with hole fill, then stores —
-        // exactly the old resize-then-set.
-        self.butterfly_elem_put(handle, index, value);
+        // exactly the old resize-then-set. gc-r4 Batch 5 Step 2: growth past vectorLength
+        // reallocates; rewrite cell+8 under the barrier when the base moved.
+        if self.butterfly_elem_put(handle, index, value) {
+            self.sync_butterfly_base(object, handle);
+        }
         Ok(())
     }
 
@@ -8490,7 +8675,11 @@ impl CoreObjectStore {
         if kind != CoreObjectKind::Array {
             return Err(ExecutionError::ExpectedObject);
         }
-        self.butterfly_elem_push(handle, value);
+        // gc-r4 Batch 5 Step 2: a push past vectorLength reallocates; rewrite cell+8
+        // under the barrier when the base moved.
+        if self.butterfly_elem_push(handle, value) {
+            self.sync_butterfly_base(object, handle);
+        }
         Ok(())
     }
 
@@ -8561,7 +8750,11 @@ impl CoreObjectStore {
         if kind != CoreObjectKind::Array {
             return Err(ExecutionError::ExpectedObject);
         }
-        self.butterfly_elem_resize(handle, length);
+        // gc-r4 Batch 5 Step 2: growth past vectorLength reallocates; rewrite cell+8
+        // under the barrier when the base moved.
+        if self.butterfly_elem_resize(handle, length) {
+            self.sync_butterfly_base(object, handle);
+        }
         Ok(())
     }
 
@@ -9853,9 +10046,13 @@ impl CoreObjectStore {
             return Ok(false);
         };
         // putDirectOffset OUT-OF-LINE arm (invariant c): write the value into the butterfly
-        // slab `props` side at the cached offset. The slot already exists (the structure
-        // match proves the shape), so this is an in-place store.
-        self.butterfly_prop_put(handle, cached_offset, value);
+        // buffer's named side at the cached offset. The slot already exists (the structure
+        // match proves the shape), so this is an in-place store that never reallocates
+        // (returns false); the `sync_butterfly_base` guard is defensive — a replace cannot
+        // move the base.
+        if self.butterfly_prop_put(handle, cached_offset, value) {
+            self.sync_butterfly_base(receiver, handle);
+        }
         Ok(true)
     }
 
@@ -10073,9 +10270,10 @@ mod butterfly_values_cutover_tests {
         }
         // The forward-Vec inline band is RETIRED: an inline-only object writes NO slab slot.
         let handle = store.find(obj).unwrap().butterfly;
-        assert!(
-            store.butterflies[handle.0].props.is_empty(),
-            "inline band retired: an inline-only object writes no out-of-line slab slots"
+        assert_eq!(
+            store.butterflies[handle.0].named_len(),
+            0,
+            "inline band retired: an inline-only object grows no out-of-line named slots"
         );
 
         // (iii) the 7th property (property number == INLINE_CAPACITY) crosses the boundary
@@ -10105,9 +10303,9 @@ mod butterfly_values_cutover_tests {
         // it lives in the out-of-line slab, NOT in inline storage...
         let handle = store.find(obj).unwrap().butterfly;
         assert_eq!(
-            store.butterflies[handle.0].prop_get(offset_storage_index(ool_offset)),
+            store.butterflies[handle.0].prop_get(ool_offset.raw()),
             Some(RuntimeValue::from_i32(777)),
-            "the 7th property's value lives in the out-of-line slab"
+            "the 7th property's value lives in the out-of-line buffer (negative-indexed)"
         );
         // ...and the inline slots still hold ONLY the first 6 values (no OOL-add bleed).
         for i in 0..cap {
@@ -10182,6 +10380,152 @@ mod butterfly_values_cutover_tests {
     // path), which is deleted because arena-ADDRESS identity is incompatible with re-pinning
     // cells to fresh addresses. Butterfly slab handle/value behavior is covered by the other
     // tests in this module (growth-survival, boundary, element API).
+
+    // ====================== gc-r4 Batch 5 Step 2 (raw cell+8) ======================
+
+    // (Step 2) An OOL (>6-property) object reads back through the RAW cell+8 butterfly base
+    // pointer (the Increment-2 machine-load analog) EXACTLY what the interpreter oracle
+    // (`butterfly_prop_get`) returns — proving the stored base pointer is valid and addresses
+    // the SAME negative-indexed slot.
+    #[test]
+    fn step2_out_of_line_read_through_raw_butterfly_pointer_equals_oracle() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        const N: u32 = 12; // 0..5 inline, 6..11 out-of-line
+        for i in 0..N {
+            store
+                .put_data_own(obj, &ident(i), RuntimeValue::from_i32(i as i32 * 13 + 5))
+                .unwrap();
+        }
+        let sid = store.find(obj).unwrap().structure_id;
+        let base = store.find(obj).unwrap().butterfly_base;
+        assert_ne!(base.0, 0, "an OOL object has an addressable butterfly base");
+        for i in 6..N {
+            let offset = store.structure_offset(sid, &ident(i)).unwrap();
+            assert!(
+                offset.raw() >= FIRST_OUT_OF_LINE_OFFSET,
+                "property {i} is OOL"
+            );
+            let oracle = store
+                .butterfly_prop_get(store.find(obj).unwrap(), offset)
+                .unwrap();
+            let raw = CoreObjectStore::butterfly_load_out_of_line_raw(base, offset)
+                .expect("raw OOL load through cell+8");
+            assert_eq!(
+                raw, oracle,
+                "raw cell+8 load == interpreter oracle for prop {i}"
+            );
+            assert_eq!(oracle, RuntimeValue::from_i32(i as i32 * 13 + 5));
+        }
+    }
+
+    // (Step 2) A WRITE through the raw cell+8 pointer is observed by the interpreter oracle
+    // (the Increment-2 `storeProperty` analog) — proving the base pointer is WRITABLE and
+    // both paths address the same slot.
+    #[test]
+    fn step2_out_of_line_write_through_raw_butterfly_pointer_equals_oracle() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        for i in 0..8u32 {
+            store
+                .put_data_own(obj, &ident(i), RuntimeValue::from_i32(i as i32))
+                .unwrap();
+        }
+        let sid = store.find(obj).unwrap().structure_id;
+        let offset = store.structure_offset(sid, &ident(7)).unwrap(); // an OOL slot
+        assert!(offset.raw() >= FIRST_OUT_OF_LINE_OFFSET);
+        let base = store.find(obj).unwrap().butterfly_base;
+        // Write through cell+8 (no store borrow held — `base` is a Copy address).
+        CoreObjectStore::butterfly_store_out_of_line_raw(base, offset, RuntimeValue::from_i32(999));
+        // The interpreter oracle (both the butterfly read and the shape value read) sees it.
+        assert_eq!(
+            store.butterfly_prop_get(store.find(obj).unwrap(), offset),
+            Some(RuntimeValue::from_i32(999)),
+            "raw cell+8 store observed by butterfly_prop_get"
+        );
+        assert_eq!(
+            store
+                .get_own_property(obj, &ident(7))
+                .unwrap()
+                .unwrap()
+                .kind,
+            CorePropertyKind::Data(RuntimeValue::from_i32(999)),
+            "raw cell+8 store observed by the shape value read"
+        );
+    }
+
+    // (Step 2) Adding the 7th, 8th, ... properties REALLOCATES the butterfly and REWRITES
+    // cell+8; after each growth ALL out-of-line props (old + new) still read correctly
+    // through the CURRENT raw pointer (no dangling pointer to a freed old buffer), and the
+    // base address actually MOVES across growths.
+    #[test]
+    fn step2_butterfly_growth_rewrites_cell_plus_8_no_dangling() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        // First 6 inline (no butterfly growth), then OOL adds force reallocations.
+        for i in 0..6u32 {
+            store
+                .put_data_own(obj, &ident(i), RuntimeValue::from_i32(i as i32))
+                .unwrap();
+        }
+        let mut prev_base = store.find(obj).unwrap().butterfly_base.0;
+        let mut moved_count = 0;
+        for i in 6..14u32 {
+            store
+                .put_data_own(obj, &ident(i), RuntimeValue::from_i32(i as i32))
+                .unwrap();
+            let base = store.find(obj).unwrap().butterfly_base;
+            assert_ne!(base.0, 0, "OOL object has an addressable base after growth");
+            if base.0 != prev_base {
+                moved_count += 1;
+            }
+            prev_base = base.0;
+            let sid = store.find(obj).unwrap().structure_id;
+            // EVERY OOL prop added so far reads correctly through the CURRENT cell+8 — proving
+            // the rewrite tracked the realloc and no read dangles to a freed old buffer.
+            for j in 6..=i {
+                let offset = store.structure_offset(sid, &ident(j)).unwrap();
+                assert_eq!(
+                    CoreObjectStore::butterfly_load_out_of_line_raw(base, offset),
+                    Some(RuntimeValue::from_i32(j as i32)),
+                    "prop {j} read through cell+8 after growing to {i}"
+                );
+            }
+        }
+        assert!(
+            moved_count >= 2,
+            "the butterfly base address moved across growths (createOrGrowPropertyStorage)"
+        );
+    }
+
+    // (Step 2) Array elements live in the SAME buffer at non-negative indices above the base;
+    // reading element `i` through the raw cell+8 pointer (`base[i]`) equals the oracle
+    // (`get_index`). Proves the single-buffer layout is machine-addressable for elements too.
+    #[test]
+    fn step2_array_elements_through_raw_buffer_equal_oracle() {
+        let mut store = CoreObjectStore::default();
+        let arr = store.allocate_array();
+        for i in 0..10usize {
+            store
+                .put_array_element(arr, i, RuntimeValue::from_i32(i as i32 * 3))
+                .unwrap();
+        }
+        let base = store.find(arr).unwrap().butterfly_base;
+        assert_ne!(base.0, 0, "an array with elements has an addressable base");
+        for i in 0..10usize {
+            let oracle = store.get_index(arr, i as i32).unwrap();
+            // base[i] (element i at a non-negative index above the base).
+            // SAFETY: `base` was exposed from the store-owned butterfly buffer; `i <
+            // publicLength <= vectorLength`, so `base.add(i)` is an interior element slot.
+            let raw = unsafe {
+                core::ptr::with_exposed_provenance::<RuntimeValue>(base.0)
+                    .add(i)
+                    .read()
+            };
+            assert_eq!(raw, oracle, "raw cell+8 element[{i}] == get_index oracle");
+            assert_eq!(oracle, RuntimeValue::from_i32(i as i32 * 3));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -11033,14 +11377,16 @@ mod trace_cell_gap_a_tests {
     fn object_prototype_and_butterfly_edges_visited_holes_and_immediates_skipped() {
         let mut store = CoreObjectStore::default();
         let butterfly = store.allocate_butterfly();
-        // Out-of-line property storage (left side): two cell values.
-        store.butterflies[butterfly.0].props = vec![fake_cell(0x1000), fake_cell(0x2000)];
-        // Indexed elements (right side): a cell, a hole (None), an immediate.
-        store.butterflies[butterfly.0].elements = vec![
-            Some(fake_cell(0x3000)),
-            None,
-            Some(RuntimeValue::from_i32(7)),
-        ];
+        // Out-of-line property storage (negative-indexed named side): two cell values at
+        // the first two out-of-line offsets (64, 65).
+        let _ =
+            store.butterflies[butterfly.0].prop_put(FIRST_OUT_OF_LINE_OFFSET, fake_cell(0x1000));
+        let _ = store.butterflies[butterfly.0]
+            .prop_put(FIRST_OUT_OF_LINE_OFFSET + 1, fake_cell(0x2000));
+        // Indexed elements (positive side): a cell at 0, a HOLE at 1 (left unwritten), an
+        // immediate at 2.
+        let _ = store.butterflies[butterfly.0].elem_put(0, fake_cell(0x3000));
+        let _ = store.butterflies[butterfly.0].elem_put(2, RuntimeValue::from_i32(7));
 
         let cell = CoreObjectCell {
             butterfly,
@@ -11173,6 +11519,11 @@ mod trace_cell_gap_a_tests {
         let CoreObjectCell {
             structure_id: _,
             js_type: _,
+            // gc-r4 Batch 5 Step 2: the raw butterfly base address (cell+8) is a POD `usize`,
+            // NOT a RuntimeValue edge — the butterfly's out-of-line property + element VALUE
+            // edges are traced through the `butterfly` handle (the store-owned buffer), not
+            // through this machine-code address. Non-edge.
+            butterfly_base: _,
             butterfly: _,
             cell_id: _,
             kind: _,
@@ -11585,10 +11936,10 @@ mod mark_live_set_r4b_tests {
         assert!(store.is_value_marked(child));
 
         // Sever the edge: the child was stored at inline offset 0 (key 0 -> offset 0), so
-        // clear BOTH the cell's inline storage AND the out-of-line slab (gc-r4 Batch 5
-        // Step 1: inline-band property values live on the cell now, not just the slab).
+        // clear BOTH the cell's inline storage AND the out-of-line buffer (gc-r4 Batch 5
+        // Step 1: inline-band property values live on the cell now, not just the buffer).
         let handle = store.find(root).unwrap().butterfly;
-        store.butterflies[handle.0].props.clear();
+        store.butterflies[handle.0] = ButterflyAllocation::default();
         store.with_cell_mut(root, |c| {
             c.inline_storage = [RuntimeValue::undefined(); INLINE_CAPACITY as usize];
         });
@@ -12117,6 +12468,105 @@ mod r4b_sweep_tests {
             anchor_addr,
             "the rooted anchor never moved (no compaction)"
         );
+    }
+
+    // ====================== gc-r4 Batch 5 Step 2 (raw cell+8) ======================
+
+    // (Step 2) An out-of-line property GRAPH survives >=2 collections: a rooted holder with
+    // >6 properties carries a CELL-valued OOL property pointing at a child; the child is
+    // reached only through the holder's butterfly, so the trace must deref the butterfly and
+    // append the OOL value edge. The membership gate (not liveness) re-marks the old-gen
+    // survivors on collection #2 (the #1 UAF landmine).
+    #[test]
+    fn step2_out_of_line_property_graph_survives_two_collections() {
+        let mut store = CoreObjectStore::default();
+        let holder = obj(&mut store);
+        let child = obj(&mut store);
+        // 0..5 inline; the 7th property (key 6 -> offset 64) is the OOL CELL edge to `child`.
+        for i in 0..6u32 {
+            store
+                .put_data_own(holder, &ident(i), RuntimeValue::from_i32(i as i32))
+                .unwrap();
+        }
+        store.put_data_own(holder, &ident(6), child).unwrap();
+        // A couple more OOL primitives so the butterfly really has out-of-line storage.
+        store
+            .put_data_own(holder, &ident(7), RuntimeValue::from_i32(700))
+            .unwrap();
+
+        for round in 1..=2 {
+            let s = store.force_collect_values(&[holder]);
+            assert!(
+                store.find(holder).is_some() && store.is_value_marked(holder),
+                "rooted holder retained on collection #{round}"
+            );
+            assert!(
+                store.find(child).is_some() && store.is_value_marked(child),
+                "OOL-property child retained via the butterfly value edge on collection #{round}"
+            );
+            if round == 2 {
+                assert_eq!(
+                    s.cells_reclaimed, 0,
+                    "nothing new died between #1 and #2 (the old-gen survivors were re-marked)"
+                );
+            }
+            // The OOL edge + OOL primitive still read correct after the collection.
+            let edge = store.get_own_property(holder, &ident(6)).unwrap().unwrap();
+            match edge.kind {
+                CorePropertyKind::Data(v) => {
+                    assert_eq!(addr(v), addr(child), "OOL cell edge survived")
+                }
+                other => panic!("expected the holder->child OOL edge, got {other:?}"),
+            }
+            reads_to(&store, holder, 7, RuntimeValue::from_i32(700));
+        }
+    }
+
+    // (Step 2) A DEAD out-of-line object's butterfly buffer is FREED before sweep: its slab
+    // slot returns to the free list and the live-butterfly-slot count returns to baseline
+    // (the micro-probe), proving the single owned `Box` buffer is dropped — not leaked.
+    #[test]
+    fn step2_dead_out_of_line_object_butterfly_freed_returns_to_baseline() {
+        let mut store = CoreObjectStore::default();
+        let keep = obj(&mut store);
+
+        let baseline_slots = store.live_butterfly_slot_count();
+        let baseline_free = store.butterfly_free_list.len();
+
+        // An UNROOTED object with a grown (out-of-line) butterfly.
+        let dead = obj(&mut store);
+        for i in 0..10u32 {
+            store
+                .put_data_own(dead, &ident(i), RuntimeValue::from_i32(i as i32))
+                .unwrap();
+        }
+        let dead_bfly = store.find(dead).unwrap().butterfly;
+        assert!(
+            store.live_butterfly_slot_count() > baseline_slots,
+            "the dead object's grown butterfly is live before collection"
+        );
+
+        // Collect with only `keep` rooted -> `dead` reclaimed, its butterfly buffer freed.
+        store.force_collect_values(&[keep]);
+
+        assert!(
+            store.find(dead).is_none(),
+            "the dead OOL object was reclaimed"
+        );
+        assert!(
+            store.butterfly_free_list.contains(&dead_bfly.0),
+            "the dead object's butterfly slot was freed (buffer dropped)"
+        );
+        assert_eq!(
+            store.live_butterfly_slot_count(),
+            baseline_slots,
+            "live butterfly slot count returned to baseline (no leak)"
+        );
+        assert!(
+            store.butterfly_free_list.len() > baseline_free,
+            "the freed butterfly slot is on the free list"
+        );
+        assert!(store.find(keep).is_some(), "the rooted object survived");
     }
 }
 

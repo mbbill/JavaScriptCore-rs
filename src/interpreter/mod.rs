@@ -5136,8 +5136,15 @@ impl CoreOpcodeDispatchHost {
                     Miss::ExistingPropertyMismatch,
                 );
             }
-            self.objects
-                .butterfly_elem_put(handle, index, hit.stored_value);
+            // gc-r4 Batch 5 Step 2: an EXISTING-element store never reallocates (the slot
+            // was just proven present), so this returns false; the guard is defensive —
+            // rewrite cell+8 only if the base moved.
+            if self
+                .objects
+                .butterfly_elem_put(handle, index, hit.stored_value)
+            {
+                self.objects.sync_butterfly_base(request.base, handle);
+            }
 
             return GeneratedPropertyStoreMutationResult::committed(
                 GeneratedPropertyStoreMutationCommit::host_confirmed_for_request(&request),
@@ -5313,7 +5320,11 @@ impl CoreOpcodeDispatchHost {
             Some(Ok(pair)) => pair,
         };
         if let Some((handle, offset, value)) = slab_write {
-            self.objects.butterfly_prop_put(handle, offset, value);
+            // gc-r4 Batch 5 Step 2: an OOL property add reallocates the butterfly buffer;
+            // rewrite cell+8 under the barrier when the base moved.
+            if self.objects.butterfly_prop_put(handle, offset, value) {
+                self.objects.sync_butterfly_base(request.base, handle);
+            }
         }
         if let Some(old_structure) = old_structure {
             self.objects.finish_structure_transition(old_structure);
@@ -25606,7 +25617,7 @@ mod tests {
     ) -> ObjectStoreMutationSnapshot {
         let cell = objects.find(object).expect("object cell");
         let structure_id = cell.structure_id;
-        let elements = objects.butterfly_elements(cell.butterfly).to_vec();
+        let elements = objects.butterfly_elements(cell.butterfly);
         // gc-r4 B-iv: the per-cell `properties` HashMap + `property_order` are gone; rebuild
         // the observable views from the cell's Structure (offset/attribute authority) +
         // butterfly (value authority), in PropertyTable entry order.

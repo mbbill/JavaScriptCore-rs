@@ -754,6 +754,22 @@ impl<V: Copy> ValueBarrier<V> {
     }
 }
 
+/// gc-r4 Batch 5 Step 2 — the object generational barrier for a butterfly
+/// REALLOCATION. C++ `JSObject::setButterfly` (after `createOrGrowPropertyStorage`
+/// reallocates the butterfly) runs `vm.heap.writeBarrier(this)`: the object now
+/// points at a NEW butterfly, so a generational/incremental collector must remember
+/// the object and rescan its out-of-line storage. This reserves that mutation
+/// boundary at every butterfly-pointer (cell+8) rewrite site (`sync_butterfly_base`).
+///
+/// NO-OP today: the live collector is not wired (`force_collect` re-marks the whole
+/// live closure from roots each cycle, so there is no remembered set to update), and
+/// `apply_value_store_write_barrier` likewise classifies a white owner as NotRequired
+/// while not fenced. The faithful remembered-set update lands with the live
+/// incremental collector (gc-r4 follow-up); this marker keeps the barrier intent at
+/// the code site so the rewrite is not silently un-barriered when that lands.
+#[inline]
+pub fn butterfly_reallocation_barrier() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
