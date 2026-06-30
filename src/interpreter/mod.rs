@@ -7441,6 +7441,7 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 };
                 if let Some(index) = self.value_uint32_index(key_value) {
                     self.record_in_by_val_array_profile_indexed_read(
+                        state.code_block,
                         instruction.bytecode_index,
                         base,
                         index,
@@ -9969,6 +9970,7 @@ impl CoreOpcodeDispatchHost {
 
     fn record_in_by_val_array_profile_indexed_read(
         &mut self,
+        code_block: &CodeBlock,
         bytecode_index: BytecodeIndex,
         base: RuntimeValue,
         index: u32,
@@ -9985,8 +9987,18 @@ impl CoreOpcodeDispatchHost {
             (CoreObjectKind::Uint8Array, Some(index)) => index >= cell.view_length,
             _ => true,
         };
-        let mut profile = ArrayProfile::for_bytecode_index(bytecode_index);
-        profile.observe_indexed_read(structure, out_of_bounds);
+        let Some(profile) = code_block
+            .record_array_profile_indexed_read(
+                crate::bytecode::code_block::CodeBlockMutationAuthority::default(),
+                bytecode_index,
+                structure,
+                out_of_bounds,
+            )
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
         self.last_array_profile_observation = Some(CoreArrayProfileObservationRecord {
             bytecode_index,
             opcode: CoreOpcode::InByVal,
@@ -27749,7 +27761,8 @@ mod tests {
                 ],
             ),
             core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
-        ]);
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
         let owner = CodeBlockId(CellId(196));
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
@@ -27813,6 +27826,17 @@ mod tests {
             )
             .unwrap()
             .expect("InByVal indexed has observation");
+        let linked_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked InByVal array profile");
+        assert_eq!(
+            linked_profile.last_seen_structure,
+            array_profile.profile.last_seen_structure
+        );
+        assert_eq!(
+            linked_profile.flags.out_of_bounds,
+            array_profile.profile.flags.out_of_bounds
+        );
 
         assert_eq!(
             descriptor.key,
@@ -27891,7 +27915,8 @@ mod tests {
                 ],
             ),
             core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
-        ]);
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
         let owner = CodeBlockId(CellId(199));
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
@@ -27937,6 +27962,73 @@ mod tests {
         );
         assert!(array_profile.profile.flags.out_of_bounds);
         assert!(!array_profile.profile.flags.may_be_large_typed_array);
+    }
+
+    #[test]
+    fn in_by_val_indexed_populates_linked_code_block_array_profile() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let destination = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::InByVal,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(203));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(9))
+            .unwrap();
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(4))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_bool(false))
+        );
+        let host_observation = host
+            .last_array_profile_observation
+            .expect("debug telemetry still records last InByVal array profile observation");
+        assert_eq!(host_observation.index, 4);
+        let linked_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked CodeBlock ArrayProfile for InByVal bytecode index");
+        assert_eq!(
+            linked_profile.last_seen_structure,
+            Some(object_structure_id(&host.objects, array))
+        );
+        assert!(linked_profile.flags.out_of_bounds);
+        assert_eq!(host_observation.profile, linked_profile);
     }
 
     #[test]

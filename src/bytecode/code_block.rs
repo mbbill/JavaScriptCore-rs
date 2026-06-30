@@ -686,11 +686,13 @@ impl CodeBlock {
     pub fn array_profile_for_bytecode_index(
         &self,
         bytecode_index: BytecodeIndex,
-    ) -> Option<&ArrayProfile> {
+    ) -> Option<ArrayProfile> {
         self.side_tables
             .array_profiles
+            .borrow()
             .iter()
             .find(|profile| profile.bytecode_index == bytecode_index)
+            .copied()
     }
 
     /// Read the monomorphic GET inline cache for a GetByName site, if filled.
@@ -1117,8 +1119,14 @@ impl CodeBlock {
             .map_err(CodeBlockMutationError::ValueProfileSample)
     }
 
+    // C++ JSC: `op_in_by_val` passes `&metadata.m_arrayProfile` to
+    // `opInByVal`, which calls `ArrayProfile::observeIndexedRead` in-place
+    // through the shared `CodeBlock*` metadata (CommonSlowPaths.h:105-119;
+    // CodeBlock::getArrayProfile returns that same per-bytecode metadata slot,
+    // CodeBlock.cpp:2911-2932). Rust shares one `Rc<CodeBlock>`, so this mirrors
+    // value-profile feedback and mutates the linked metadata table through `&self`.
     pub fn record_array_profile_indexed_read(
-        &mut self,
+        &self,
         authority: CodeBlockMutationAuthority,
         bytecode_index: BytecodeIndex,
         structure: StructureId,
@@ -1149,9 +1157,8 @@ impl CodeBlock {
             }
         }
 
-        let Some(profile) = self
-            .side_tables
-            .array_profiles
+        let mut array_profiles = self.side_tables.array_profiles.borrow_mut();
+        let Some(profile) = array_profiles
             .iter_mut()
             .find(|profile| profile.bytecode_index == bytecode_index)
         else {
@@ -3178,7 +3185,7 @@ fn linked_side_tables_from_unlinked(unlinked: &UnlinkedCodeBlock) -> LinkedSideT
             calls: derive_call_link_inline_caches(unlinked),
             ..InlineCacheTable::default()
         }),
-        array_profiles: derive_simple_array_profiles(unlinked),
+        array_profiles: RefCell::new(derive_simple_array_profiles(unlinked)),
         value_profiles: RefCell::new(derive_call_result_value_profiles(
             unlinked,
             ValueProfileEmissionPolicy::default(),
@@ -3839,19 +3846,18 @@ pub struct LinkedSideTables {
     pub code_origins: CodeOriginTable,
     pub exception_handlers: ExceptionHandlerTable,
     pub bytecode_hooks: BytecodeHookTable,
-    // C++ JSC divergence: in C++ the inline-cache state and value profiles live in
-    // the metadata of the single stable CodeBlock heap object and are mutated in
-    // place through a shared `CodeBlock*` (under the VM lock) on the runtime
-    // feedback path -- there is no per-call copy. Rust now shares one stable
-    // `Rc<CodeBlock>` per (executable, specialization) (see the
-    // `CodeBlockRecord`/`InterpreterFunctionCodeBlock` divergence comments), so the
-    // feedback path can no longer take `&mut CodeBlock`. These two tables -- the only
-    // post-link, per-call-mutated side tables -- are therefore interior-mutable so
-    // the IC attach/clear and value-profile writes go through `&CodeBlock`, exactly
-    // as C++ mutates `m_metadata`/IC state through `CodeBlock*`. All other side
-    // tables are link-fixed and stay plain.
+    // C++ JSC divergence: in C++ the inline-cache state and live feedback profiles
+    // live in the metadata of the single stable CodeBlock heap object and are
+    // mutated in place through a shared `CodeBlock*` on the runtime feedback path --
+    // there is no per-call copy. Rust now shares one stable `Rc<CodeBlock>` per
+    // (executable, specialization) (see the `CodeBlockRecord`/
+    // `InterpreterFunctionCodeBlock` divergence comments), so the feedback path can
+    // no longer take `&mut CodeBlock`. These tables are therefore interior-mutable so
+    // the IC attach/clear, ArrayProfile, and ValueProfile writes go through
+    // `&CodeBlock`, exactly as C++ mutates `m_metadata`/IC state through
+    // `CodeBlock*`. All other side tables are link-fixed and stay plain.
     pub inline_caches: RefCell<InlineCacheTable>,
-    pub array_profiles: Vec<ArrayProfile>,
+    pub array_profiles: RefCell<Vec<ArrayProfile>>,
     pub value_profiles: RefCell<ValueProfileTable>,
     pub root_maps: Vec<BytecodeRootMap>,
     pub direct_eval_cache: Option<DirectEvalCacheRef>,
@@ -3882,7 +3888,7 @@ impl PartialEq for LinkedSideTables {
             && self.exception_handlers == other.exception_handlers
             && self.bytecode_hooks == other.bytecode_hooks
             && *self.inline_caches.borrow() == *other.inline_caches.borrow()
-            && self.array_profiles == other.array_profiles
+            && *self.array_profiles.borrow() == *other.array_profiles.borrow()
             && *self.value_profiles.borrow() == *other.value_profiles.borrow()
             && self.root_maps == other.root_maps
             && self.direct_eval_cache == other.direct_eval_cache
@@ -3903,6 +3909,16 @@ impl LinkedSideTables {
     /// Exclusive borrow of the interior-mutable inline-cache table.
     pub fn inline_caches_mut(&self) -> std::cell::RefMut<'_, InlineCacheTable> {
         self.inline_caches.borrow_mut()
+    }
+
+    /// Shared read borrow of the interior-mutable array-profile table.
+    pub fn array_profiles(&self) -> std::cell::Ref<'_, Vec<ArrayProfile>> {
+        self.array_profiles.borrow()
+    }
+
+    /// Exclusive borrow of the interior-mutable array-profile table.
+    pub fn array_profiles_mut(&self) -> std::cell::RefMut<'_, Vec<ArrayProfile>> {
+        self.array_profiles.borrow_mut()
     }
 
     /// Shared read borrow of the interior-mutable value-profile table.
@@ -4948,7 +4964,7 @@ mod tests {
 
     #[test]
     fn code_block_records_in_by_value_indexed_array_profile_read() {
-        let mut code_block = linked_property_ic_code_block(vec![in_by_value_instruction(
+        let code_block = linked_property_ic_code_block(vec![in_by_value_instruction(
             0,
             VirtualRegister::local(0),
             VirtualRegister::local(1),
