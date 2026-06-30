@@ -211,7 +211,7 @@ mod platform {
     };
     use crate::vm::Vm;
 
-    use super::super::function_emitter::emit_baseline_function;
+    use super::super::function_emitter::{count_property_ic_sites, emit_baseline_function};
 
     /// One installed Stage-1 baseline image (== `CodeBlock::m_jitCode`): the
     /// finalized, RX-sealed ARM64 code plus the NATIVE JS stack its CallFrames are
@@ -372,6 +372,17 @@ mod platform {
         soft_stack_limit_address: usize,
         install_vm: *const Vm,
     ) -> Result<InstalledBaselineFunction, BaselineInstallError> {
+        // Allocate the baseline data-IC record store BEFORE emit (CodeBlock.cpp:802
+        // `setupWithUnlinkedBaselineCode` allocates `BaselineJITData` with
+        // `propertyCacheSize` in the same install step): the `get_by_id`/`put_by_id`
+        // structure guard bakes this store's STABLE base + record_index*16, so it
+        // must exist and be sized to the property-site count before the emitter walks
+        // the bytecode and reads `baseline_jit_data_record_store_base()`. The `Box`
+        // is never reallocated, so the baked address stays valid for the image's life.
+        let property_site_count =
+            count_property_ic_sites(code_block).map_err(BaselineInstallError::Declined)?;
+        code_block.install_baseline_jit_data(property_site_count);
+
         let image =
             emit_baseline_function(code_block, jit_pending_address, soft_stack_limit_address)
                 .map_err(BaselineInstallError::Declined)?;

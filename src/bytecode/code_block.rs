@@ -1041,6 +1041,37 @@ impl CodeBlock {
         self.reset_prototype_load_data_ic_record(record_index)
     }
 
+    // Read a resident data-IC record by index (a COPY of the 16-byte
+    // `{structure_id, offset, holder_ptr}`), or `None` before baseline install /
+    // out of range. The DataIC slow-path bridge reads this on the HIT far-call to
+    // recover the cached `PropertyOffset` for the cheap own-data load
+    // (`operation_get_by_id_with_cached_offset`); the generated structure guard
+    // has already proven the receiver's structure matches `record.structure_id`.
+    pub fn baseline_property_ic_record(
+        &self,
+        record_index: usize,
+    ) -> Option<crate::bytecode::ic::HandlerPropertyInlineCacheRecord> {
+        self.baseline_jit_data
+            .borrow()
+            .as_ref()
+            .and_then(|data| data.property_caches.get(record_index).copied())
+    }
+
+    // SQ4 churn cap: record one slow-path miss on a property IC site and return
+    // whether it is STILL eligible to cache (count below
+    // `BASELINE_PROPERTY_IC_CHURN_CAP`). The DataIC slow-path bridge calls this on
+    // every optimize miss; once it returns `false` the bridge stops re-filling the
+    // record (leaving/forcing SENTINEL) so a polymorphic/uncacheable site routes
+    // to the slow path every time instead of thrashing the cached structure. The
+    // faithful `StructureStubInfo` countdown -> give-up analog (Repatch.cpp).
+    pub fn note_baseline_property_ic_slow_path(&self, record_index: usize) -> bool {
+        let mut slot = self.baseline_jit_data.borrow_mut();
+        let Some(data) = slot.as_mut() else {
+            return false;
+        };
+        data.note_slow_path_and_should_cache(record_index)
+    }
+
     // C++ JSC divergence: value-profile sampling mutates `m_metadata` through the
     // shared `CodeBlock*` on the hot return path, with no per-call copy. Rust shares
     // one `Rc<CodeBlock>`, so this takes `&self` and writes through the

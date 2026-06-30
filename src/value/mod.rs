@@ -27,6 +27,6 @@ pub use self::repr::{
     ValueEncodingError, ValueKind, ValueRepresentationAuthority, ValueRepresentationLayout,
     ValueRepresentationLayoutBuilder, ValueRepresentationOwner, ValueRepresentationValidationError,
     ValueStackConversionError, ValueStackRootDescriptor, ValueStackRootError, ValueStackRootPlan,
-    ValueStackSlot, ValueStackSnapshot, NOT_CELL_MASK, NUMBER_TAG,
-    STATIC_IMMEDIATE_TAG_DESCRIPTORS, STATIC_VALUE_REPRESENTATION_LAYOUT,
+    ValueStackSlot, ValueStackSnapshot, CELL_TAG, NOT_CELL_MASK, NUMBER_TAG,
+    STATIC_IMMEDIATE_TAG_DESCRIPTORS, STATIC_VALUE_REPRESENTATION_LAYOUT, VALUE_TAG_MASK,
 };

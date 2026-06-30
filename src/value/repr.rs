@@ -89,6 +89,15 @@ const TAG_CELL: u64 = 0x20;
 const TAG_DOUBLE: u64 = 0x30;
 const TAG_MASK: u64 = 0xff;
 
+/// `pub` for the baseline-JIT property DataIC is-cell guard, which classifies the
+/// boxed base by `!isNumber() && (bits & TAG_MASK) == CELL_TAG` (the SAME
+/// transitional cell test [`JsValue::is_cell`] runs, repr.rs:684). The JIT MUST
+/// reference these shared symbols, never copied literals, so a future encoding
+/// change updates the guard and the decoder in lockstep.
+pub const CELL_TAG: u64 = TAG_CELL;
+/// The low-byte tag mask (`bits & VALUE_TAG_MASK` isolates the immediate tag).
+pub const VALUE_TAG_MASK: u64 = TAG_MASK;
+
 /// Static owner for value representation schema.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ValueRepresentationOwner {

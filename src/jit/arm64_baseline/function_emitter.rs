@@ -79,11 +79,12 @@ use crate::bytecode::{CodeBlock, CoreOpcode, InstructionDecodeError, OperandAcce
 use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
 use crate::jit::operations::{
     operation_call, operation_compare_greater, operation_compare_less, operation_compare_lesseq,
-    operation_get_by_val, operation_jfalse, operation_put_by_val,
-    operation_resolve_baseline_native_entry, operation_throw_stack_overflow,
+    operation_get_by_id_optimize, operation_get_by_id_with_cached_offset, operation_get_by_val,
+    operation_jfalse, operation_put_by_id_optimize, operation_put_by_id_with_cached_offset,
+    operation_put_by_val, operation_resolve_baseline_native_entry, operation_throw_stack_overflow,
     MAX_REGISTER_CALL_ARGS,
 };
-use crate::value::{JsValue, NUMBER_TAG};
+use crate::value::{JsValue, CELL_TAG, NUMBER_TAG, VALUE_TAG_MASK};
 use crate::vm::jsstack::CallFrameSlot;
 
 use super::arith::{emit_arith_fast_path, ArithFamilyOp, PINNED_VM_GPR};
@@ -150,6 +151,30 @@ const BOOL_MASK_GPR: RegisterID = RegisterID::X5;
 /// carry the entry across the native setup. The native setup contains NO call before
 /// its terminal `blr`, so the entry is never clobbered by an intervening callee.
 const NATIVE_ENTRY_GPR: RegisterID = RegisterID::X6;
+
+/// Caller-saved scratch registers (AAPCS64 x9-x14, none of them the assembler's
+/// internal `DATA_TEMP`/`MEMORY_TEMP` = x16/x17) for the `get_by_id`/`put_by_id`
+/// DataIC structure-guard fast path: the boxed-base load, the is-cell guard, the
+/// pointer unbox, the cell + cached structure-id loads, and the baked record
+/// address. All are dead after the site (the slow/hit far-call clobbers them
+/// anyway), so they need no spill; none aliases the live tag (`x27`) / pinned-VM
+/// (`x19`) / cfr (`x29`) callee-saved registers.
+const PROPERTY_BASE_GPR: RegisterID = RegisterID::X9;
+const PROPERTY_TMP_GPR: RegisterID = RegisterID::X10;
+const PROPERTY_CELL_GPR: RegisterID = RegisterID::X11;
+const PROPERTY_STRUCTURE_ID_GPR: RegisterID = RegisterID::X12;
+const PROPERTY_RECORD_GPR: RegisterID = RegisterID::X13;
+const PROPERTY_CACHED_STRUCTURE_GPR: RegisterID = RegisterID::X14;
+
+/// `StructureID::CELL_STRUCTURE_ID_OFFSET` (structure_cell.rs:105): `JSCell`'s
+/// `m_structureID` is the first field, so the shape guard reads `[cell + 0]`.
+const CELL_STRUCTURE_ID_OFFSET: i32 = 0;
+/// `sizeof(HandlerPropertyInlineCacheRecord)` (`#[repr(C)]`
+/// `{structure_id: u32@+0, offset: i32@+4, holder_ptr: u64@+8}`, ic.rs:1529): the
+/// per-site record stride the generated guard indexes (`record_base +
+/// record_index * 16`), the ARM64 analog of the x86-64 emitter's `record_index*16`
+/// (jit/emitter.rs:6961).
+const PROPERTY_IC_RECORD_STRIDE: usize = 16;
 
 /// The AAPCS64 integer/pointer argument registers `x3..x7` the `op_call` lowering
 /// loads the boxed call arguments into (`x0`=vm, `x1`=callee, `x2`=argc are the
@@ -273,6 +298,14 @@ pub(crate) enum EmitFunctionError {
     /// CodeBlock stays in the interpreter (the S4 gate); the general arity arrives
     /// with the native direct-link (B5-full).
     UnsupportedCallArity { argc: u32 },
+    /// A `get_by_id`/`put_by_id` DataIC site was reached but no baseline data-IC
+    /// record store is installed on the CodeBlock (its stable base is what the
+    /// structure guard bakes). DECLINED (the S4 gate's safe-by-rejection posture):
+    /// the install path (`install_baseline_function`) must allocate the store
+    /// sized to the property-site count BEFORE emitting; a caller that emits
+    /// without installing (e.g. a non-property proof harness) cannot lower
+    /// property access and the function stays in the interpreter.
+    MissingPropertyRecordStore,
     /// The CodeBlock has no instructions.
     EmptyFunction,
 }
@@ -353,6 +386,13 @@ struct FunctionEmitter {
     /// A1.2/A1.3: native JIT->JIT call sites emitted in this image (one per op_call
     /// resolved to a [`LinkedCallTarget`]); surfaced on the [`FunctionImage`].
     linked_call_sites: Vec<LinkedCallSite>,
+    /// The dense per-site `property_site_index` the MAIN pass assigns to each
+    /// `get_by_id`/`put_by_id` DataIC site in bytecode order (the
+    /// `HandlerPropertyInlineCacheRecord` store index the slow-path bridge fills).
+    /// Bumped once per admitted GetByName/PutByName; the install path sizes the
+    /// record store to the SAME bytecode-order count, so every emitted record
+    /// index is in bounds.
+    property_site_index: u32,
 }
 
 const MODE: TagRegistersMode = TagRegistersMode::HaveTagRegisters;
@@ -376,6 +416,7 @@ impl FunctionEmitter {
             stack_overflow_jumps: Vec::new(),
             reserved_locals_bytes: 0,
             linked_call_sites: Vec::new(),
+            property_site_index: 0,
         }
     }
 
@@ -620,6 +661,231 @@ impl FunctionEmitter {
         // throw) stamps the mirror; branch to the shared exception stub. `SCRATCH_GPR`
         // (the value arg, now consumed) is reused by the probe.
         self.emit_exception_probe();
+    }
+
+    /// The baseline `get_by_id`/`put_by_id` DataIC structure guard, shared by both
+    /// (`generateGetByIdInlineAccessBaselineDataIC`, JITInlineCacheGenerator.cpp:
+    /// 140-183; the x86-64 analog jit/emitter.rs:6978-6994). Emits, into the guard
+    /// scratch registers:
+    /// 1. `load64 [cfr+base]` -> the boxed base value;
+    /// 2. `branchIfNotCell` = `!isNumber() && (bits & VALUE_TAG_MASK) == CELL_TAG`
+    ///    (the transitional cell test, value/repr.rs:684) -> two guard-miss jumps;
+    /// 3. `lsr #8` UNBOX to the raw `CoreObjectCell*` (value/repr.rs:645 inverse);
+    /// 4. `load32 [cell+0]` (receiver `StructureID`) vs `load32 [record+0]` (the
+    ///    cached id, from the baked `record_addr`) -> one guard-miss jump on mismatch.
+    /// Returns the guard-miss `Jump`s the caller links to its SLOW (optimize) block;
+    /// on fall-through the receiver structure matched the cached record (a HIT). A
+    /// SENTINEL record (`structure_id == 0`) never equals a real `StructureID`, so an
+    /// unfilled site always misses until the slow-path bridge fills it.
+    fn emit_property_ic_structure_guard(&mut self, base: i32, record_addr: usize) -> Vec<Jump> {
+        let mut miss = Vec::with_capacity(3);
+        // emitGetVirtualRegister(base): the boxed base value.
+        self.h
+            .masm_mut()
+            .load64(address_for(base), PROPERTY_BASE_GPR);
+        // branchIfNotCell part 1: a number (any NumberTag bit set) is not a cell.
+        // x27 == numberTagRegister (materialized in the prologue).
+        miss.push(self.h.masm_mut().branch_test64(
+            ResultCondition::NonZero,
+            PROPERTY_BASE_GPR,
+            NUMBER_TAG_GPR,
+        ));
+        // branchIfNotCell part 2: the transitional cell tag is the low byte ==
+        // CELL_TAG (0x20). Mask the low byte, compare. (After the number test, the
+        // only non-cell low-byte-0x20 value would be a number — already excluded —
+        // so this exactly classifies cells, unlike a low-byte-only test.)
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(VALUE_TAG_MASK as i32), PROPERTY_TMP_GPR);
+        self.h
+            .masm_mut()
+            .and64(PROPERTY_BASE_GPR, PROPERTY_TMP_GPR, PROPERTY_TMP_GPR);
+        miss.push(self.h.masm_mut().branch32_imm(
+            RelationalCondition::NotEqual,
+            PROPERTY_TMP_GPR,
+            TrustedImm32::new(CELL_TAG as i32),
+        ));
+        // UNBOX: cellPtr = boxed >> 8 (the raw, pinned arena CoreObjectCell*).
+        self.h
+            .masm_mut()
+            .urshift64_imm(PROPERTY_BASE_GPR, TrustedImm32::new(8), PROPERTY_CELL_GPR);
+        // receiver structure id := [cell + 0] (load32; the StructureID is a u32).
+        self.h.masm_mut().load32(
+            Address::new(PROPERTY_CELL_GPR, CELL_STRUCTURE_ID_OFFSET),
+            PROPERTY_STRUCTURE_ID_GPR,
+        );
+        // cached structure id := [record + 0]. The record store base is stable (the
+        // `Box` is never reallocated), so its address + record_index*16 is baked as
+        // an absolute immediate, the ARM64 analog of x86-64's `[r13 + disp]` (this
+        // engine has no r13 jitDataRegister seeded; the install path pins the store).
+        self.h
+            .masm_mut()
+            .move_imm64(TrustedImm64::new(record_addr as i64), PROPERTY_RECORD_GPR);
+        self.h.masm_mut().load32(
+            Address::new(PROPERTY_RECORD_GPR, 0),
+            PROPERTY_CACHED_STRUCTURE_GPR,
+        );
+        // branch32(NotEqual, receiverStructID, cachedStructID) -> slow. Catches both
+        // a real structure mismatch and the SENTINEL (cached == 0) unfilled record.
+        miss.push(self.h.masm_mut().branch32(
+            RelationalCondition::NotEqual,
+            PROPERTY_STRUCTURE_ID_GPR,
+            PROPERTY_CACHED_STRUCTURE_GPR,
+        ));
+        miss
+    }
+
+    /// op_get_by_id (`emit_op_get_by_id` + the baseline DataIC, JITPropertyAccess.cpp
+    /// / JITInlineCacheGenerator.cpp) — the named-property READ. The structure guard
+    /// (above) routes a HIT to a cheap cached-offset far-call
+    /// (`operation_get_by_id_with_cached_offset`: the own-data load at the cached
+    /// offset) and a MISS to the optimize far-call (`operation_get_by_id_optimize`:
+    /// re-resolve + FILL the record). Both far-calls take `(vm, boxed base,
+    /// key_index, record_index, bytecode_index)`, probe the `m_exception` mirror (D3),
+    /// store the boxed result to `dst`, and converge at a shared tail.
+    ///
+    /// DIVERGENCE from JSC (Increment 1, the inline-load follow-up, mirrors the
+    /// `emit_get_by_val` decision): JSC's DataIC HIT path emits the inline
+    /// `loadProperty` machine code (offset<64 inline vs negative-butterfly OOL,
+    /// AssemblyHelpers.cpp:442-465). This engine's R4 cell carries a butterfly
+    /// HANDLE (a slab index, object_store.rs:507-511), not a machine-addressable
+    /// storage pointer, so the cached-offset LOAD is a leaf far-call until the
+    /// Batch-5 object-storage model lands a raw butterfly pointer (Increment 2). The
+    /// generated structure guard + record fill are unchanged across the increment.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_get_by_id(
+        &mut self,
+        dst: i32,
+        base: i32,
+        record_addr: usize,
+        record_index: u32,
+        key_index: u32,
+        bytecode_index: u32,
+    ) {
+        let miss = self.emit_property_ic_structure_guard(base, record_addr);
+
+        // === HIT: cheap cached-offset own-data load. ==========================
+        self.emit_get_by_id_call_args(base, key_index, record_index, bytecode_index);
+        self.h.masm_mut().far_call(TrustedImm64::new(
+            operation_get_by_id_with_cached_offset as usize as i64,
+        ));
+        // An own-data load cannot throw, but the shim falls back to the optimize
+        // path on a SENTINEL/drift, which can; probe the mirror for that edge.
+        self.emit_exception_probe();
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst));
+        let to_tail = self.h.masm_mut().jump();
+
+        // === SLOW: full optimize (re-resolve + fill the record). ==============
+        let slow_label = self.h.masm().label();
+        self.link_fast_jumps_to(&miss, slow_label);
+        self.emit_get_by_id_call_args(base, key_index, record_index, bytecode_index);
+        self.h.masm_mut().far_call(TrustedImm64::new(
+            operation_get_by_id_optimize as usize as i64,
+        ));
+        self.emit_exception_probe();
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst));
+
+        // === TAIL: both paths converge here (the HIT jump over the slow block). =
+        let tail_label = self.h.masm().label();
+        self.link_fast_jumps_to(&[to_tail], tail_label);
+    }
+
+    /// Load the `get_by_id` DataIC far-call arguments: `x0`=vm, `x1`=boxed base
+    /// (re-read from the frame so it does not depend on the guard register's
+    /// liveness), `x2`=key_index, `x3`=record_index, `x4`=bytecode_index — matching
+    /// `operation_get_by_id_optimize`/`_with_cached_offset`'s C-ABI.
+    fn emit_get_by_id_call_args(
+        &mut self,
+        base: i32,
+        key_index: u32,
+        record_index: u32,
+        bytecode_index: u32,
+    ) {
+        self.h.masm_mut().load64(address_for(base), LEFT_GPR); // x1 = boxed base
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(key_index as i32), RIGHT_GPR); // x2 = key_index
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(record_index as i32), CALL_ARG_GPRS[0]); // x3 = record_index
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(bytecode_index as i32), CALL_ARG_GPRS[1]); // x4 = bci
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm
+    }
+
+    /// op_put_by_id (`emit_op_put_by_id` + the baseline DataIC) — the named-property
+    /// WRITE. Same structure guard: a HIT routes to the cheap in-place replace store
+    /// (`operation_put_by_id_with_cached_offset`, which applies the faithful write
+    /// barrier inside the store — the `emitWriteBarrier(base)` analog,
+    /// JITPropertyAccess.cpp:771); a MISS routes to the optimize far-call
+    /// (`operation_put_by_id_optimize`: the faithful put, which handles a property-add
+    /// TRANSITION via the slow path and NEVER caches it). put yields no observable
+    /// value, so there is no `dst` store. Far-calls take `(vm, boxed base, boxed
+    /// value, key_index, record_index, bytecode_index)`.
+    ///
+    /// DIVERGENCE (Increment 1): the cached store + its write barrier are a far-call
+    /// into the host (which applies `apply_value_store_write_barrier`), so NO separate
+    /// generated-code barrier is emitted yet — the inline store + inline barrier are
+    /// Increment 2 (gated on the Batch-5 object-storage model), exactly the
+    /// `emit_put_by_val` deferral.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_put_by_id(
+        &mut self,
+        base: i32,
+        value: i32,
+        record_addr: usize,
+        record_index: u32,
+        key_index: u32,
+        bytecode_index: u32,
+    ) {
+        let miss = self.emit_property_ic_structure_guard(base, record_addr);
+
+        // === HIT: cheap in-place replace store (barriered inside the host). =====
+        self.emit_put_by_id_call_args(base, value, key_index, record_index, bytecode_index);
+        self.h.masm_mut().far_call(TrustedImm64::new(
+            operation_put_by_id_with_cached_offset as usize as i64,
+        ));
+        self.emit_exception_probe();
+        let to_tail = self.h.masm_mut().jump();
+
+        // === SLOW: full optimize (replace-fill / transition -> slow path). ======
+        let slow_label = self.h.masm().label();
+        self.link_fast_jumps_to(&miss, slow_label);
+        self.emit_put_by_id_call_args(base, value, key_index, record_index, bytecode_index);
+        self.h.masm_mut().far_call(TrustedImm64::new(
+            operation_put_by_id_optimize as usize as i64,
+        ));
+        self.emit_exception_probe();
+
+        // === TAIL. ============================================================
+        let tail_label = self.h.masm().label();
+        self.link_fast_jumps_to(&[to_tail], tail_label);
+    }
+
+    /// Load the `put_by_id` DataIC far-call arguments: `x0`=vm, `x1`=boxed base,
+    /// `x2`=boxed value, `x3`=key_index, `x4`=record_index, `x5`=bytecode_index —
+    /// matching `operation_put_by_id_optimize`/`_with_cached_offset`'s C-ABI.
+    fn emit_put_by_id_call_args(
+        &mut self,
+        base: i32,
+        value: i32,
+        key_index: u32,
+        record_index: u32,
+        bytecode_index: u32,
+    ) {
+        self.h.masm_mut().load64(address_for(base), LEFT_GPR); // x1 = boxed base
+        self.h.masm_mut().load64(address_for(value), RIGHT_GPR); // x2 = boxed value
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(key_index as i32), CALL_ARG_GPRS[0]); // x3 = key_index
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(record_index as i32), CALL_ARG_GPRS[1]); // x4 = record_index
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(bytecode_index as i32), CALL_ARG_GPRS[2]); // x5 = bci
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm
     }
 
     /// op_call (`JIT::compileOpCall` / `emit_op_call`, jit/JITCall.cpp) — the
@@ -1246,6 +1512,26 @@ fn register_used_from(
     Ok(false)
 }
 
+/// Count the `get_by_id`/`put_by_id` DataIC sites in bytecode order — the size of
+/// the `HandlerPropertyInlineCacheRecord` store the install path allocates before
+/// emit (`BaselineJITData` `propertyCacheSize`, CodeBlock.cpp:802). This MUST equal
+/// the emitter's final `property_site_index` so every baked record index is in
+/// bounds: both walk every instruction once (GetByName/PutByName are never fused
+/// away — only relational+JumpIfFalse pairs fuse), counting the SAME opcodes.
+pub(crate) fn count_property_ic_sites(code_block: &CodeBlock) -> Result<usize, EmitFunctionError> {
+    let count = code_block.unlinked().instructions().instruction_count();
+    let mut sites = 0usize;
+    for bci in 0..count {
+        if matches!(
+            core_opcode_at(code_block, bci)?,
+            CoreOpcode::GetByName | CoreOpcode::PutByName
+        ) {
+            sites += 1;
+        }
+    }
+    Ok(sites)
+}
+
 /// Scan every register operand for the maximum negative-local index used, so
 /// op_enter can zero-fill exactly the callee var slots (DIVERGENCE #1).
 fn count_callee_locals(code_block: &CodeBlock) -> Result<u32, EmitFunctionError> {
@@ -1428,6 +1714,46 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                 let key = frame_slot(decoded.register_operand(1)?)?;
                 let value = frame_slot(decoded.register_operand(2)?)?;
                 emitter.emit_put_by_val(base, key, value);
+            }
+            // op_get_by_id / op_put_by_id — the named-property DataIC. Operand order
+            // matches the dispatch handlers (interpreter/mod.rs:8357,8431): get is
+            // (dst, base, identifier); put is (base, identifier, value). Each site
+            // consumes the next dense `property_site_index` and bakes the stable
+            // record store base + index*16 (the install path sized the store to the
+            // SAME bytecode-order GetByName+PutByName count). A site reached with no
+            // store installed DECLINES the whole function (S4 gate).
+            CoreOpcode::GetByName => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let base = frame_slot(decoded.register_operand(1)?)?;
+                let key_index = decoded.identifier_index_operand(2)?;
+                let record_base = code_block
+                    .baseline_jit_data_record_store_base()
+                    .ok_or(EmitFunctionError::MissingPropertyRecordStore)?;
+                let record_index = emitter.property_site_index;
+                emitter.property_site_index += 1;
+                let record_addr =
+                    record_base as usize + record_index as usize * PROPERTY_IC_RECORD_STRIDE;
+                emitter.emit_get_by_id(dst, base, record_addr, record_index, key_index, bci as u32);
+            }
+            CoreOpcode::PutByName => {
+                let base = frame_slot(decoded.register_operand(0)?)?;
+                let key_index = decoded.identifier_index_operand(1)?;
+                let value = frame_slot(decoded.register_operand(2)?)?;
+                let record_base = code_block
+                    .baseline_jit_data_record_store_base()
+                    .ok_or(EmitFunctionError::MissingPropertyRecordStore)?;
+                let record_index = emitter.property_site_index;
+                emitter.property_site_index += 1;
+                let record_addr =
+                    record_base as usize + record_index as usize * PROPERTY_IC_RECORD_STRIDE;
+                emitter.emit_put_by_id(
+                    base,
+                    value,
+                    record_addr,
+                    record_index,
+                    key_index,
+                    bci as u32,
+                );
             }
             // op_call — the B5-first-cut UNLINKED VIRTUAL CALL. Operand order matches
             // the interpreter's `dispatch_call` and the bytecompiler's `emit_call`
@@ -2315,6 +2641,294 @@ mod tests {
             let (r, _) = run_function(double_literal_arith_instructions(), &[(ARG0, i32_bits(4))]);
             assert_eq!(r.ret, d(11.5), "f(4) = 4*2.5+1.5 = 11.5");
             assert_eq!(r.pending, 0, "no exception");
+        }
+
+        // --- BASELINE PROPERTY DataIC (get_by_id / put_by_id), the K2 R-lever -----
+        // These execute the NATIVE structure-guard + record-fill DataIC: a property
+        // function tiers up (the gate admits GetByName/PutByName), runs native, and
+        // native == interpreter == oracle across object shapes. native == interpreter
+        // is STRUCTURAL: the slow/hit far-calls run the interpreter's OWN resolution
+        // (`Vm::operation_get_by_id_*` -> `host.jit_get_by_id` -> `get_property_value`,
+        // the SAME code the interpreter dispatch runs), so the asserted oracle value
+        // is the interpreter's value too. macOS/aarch64 only (executes native ARM64).
+        use crate::interpreter::CorePropertyKey;
+        use crate::jit::executable_allocator::ExecutableMemoryHandle as PropertyIcHandle;
+
+        fn key_x() -> CorePropertyKey {
+            CorePropertyKey::String("x".into())
+        }
+
+        /// A plain object `{ x: <value> }` allocated in the host's object store (the
+        /// store the DataIC slow-path bridge resolves against). Returns the boxed
+        /// cell value the frame seeds and generated code unboxes.
+        fn object_with_x(host: &mut CoreOpcodeDispatchHost, value: i32) -> u64 {
+            let object = host.jit_test_allocate_object();
+            host.jit_test_set_own_data(object, &key_x(), JsValue::from_i32(value));
+            object.encoded().0
+        }
+
+        fn structure_of(host: &CoreOpcodeDispatchHost, boxed: u64) -> u32 {
+            host.jit_test_structure_id(JsValue::from_encoded(EncodedJsValue(boxed)))
+                .expect("live object cell")
+        }
+
+        /// `f(o) { return o.x }` — get_by_id only (identifier index 0 == "x").
+        fn get_x_instructions() -> Vec<TypedInstruction> {
+            vec![
+                instr(
+                    CoreOpcode::GetByName,
+                    vec![reg(LOCAL0), reg(ARG0), Operand::IdentifierIndex(0)],
+                    0,
+                ),
+                instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+            ]
+        }
+
+        /// `f(o) { o.x = o.x + 1; return o.x }` — get_by_id + put_by_id + arith, no
+        /// method call (tiers up without CallWithThis). Sites in bytecode order:
+        /// GetByName@0 -> record 0, PutByName@3 -> record 1, GetByName@4 -> record 2.
+        fn inc_x_instructions() -> Vec<TypedInstruction> {
+            vec![
+                instr(
+                    CoreOpcode::GetByName,
+                    vec![reg(LOCAL0), reg(ARG0), Operand::IdentifierIndex(0)],
+                    0,
+                ),
+                instr(CoreOpcode::LoadInt32, vec![reg(LOCAL1), imm(1)], 1),
+                instr(
+                    CoreOpcode::AddInt32,
+                    vec![reg(LOCAL2), reg(LOCAL0), reg(LOCAL1)],
+                    2,
+                ),
+                instr(
+                    CoreOpcode::PutByName,
+                    vec![reg(ARG0), Operand::IdentifierIndex(0), reg(LOCAL2)],
+                    3,
+                ),
+                instr(
+                    CoreOpcode::GetByName,
+                    vec![reg(LOCAL3), reg(ARG0), Operand::IdentifierIndex(0)],
+                    4,
+                ),
+                instr(CoreOpcode::Return, vec![reg(LOCAL3)], 5),
+            ]
+        }
+
+        /// Run an already-finalized property image once: seed `arg0_bits` at the
+        /// `o` parameter slot on a fresh native JS stack, arm the prologue overflow
+        /// check, enter via the trampoline, and return the boxed result + pending
+        /// mirror. Host + code block are parked by the caller for the whole sequence.
+        fn run_property_once(vm: &mut Vm, handle: &PropertyIcHandle, arg0_bits: u64) -> RunResult {
+            let frame = Frame::new();
+            frame.write(ARG0, arg0_bits);
+            vm.set_jit_soft_stack_limit(frame.stack.stack_limit());
+            let vm_ptr: *mut Vm = vm;
+            let ret = handle.call_baseline_jit_entry(frame.fp + 16, vm_ptr as u64);
+            let pending = vm.jit_pending_exception().0;
+            RunResult { ret, pending }
+        }
+
+        /// Install the DataIC record store, park host + code block, emit + finalize.
+        fn install_property_image(
+            vm: &mut Vm,
+            host: &mut CoreOpcodeDispatchHost,
+            code_block: &CodeBlock,
+        ) -> PropertyIcHandle {
+            vm.set_jit_host(host); // D5: park the dispatch host.
+            vm.set_jit_code_block(code_block as *const CodeBlock); // S3: park the CodeBlock.
+            let jit_pending_address = vm.jit_pending_exception_address() as usize;
+            let soft_stack_limit_address = vm.jit_soft_stack_limit_address() as usize;
+            // Allocate the record store sized to the property-site count BEFORE emit.
+            let site_count = count_property_ic_sites(code_block).expect("count property sites");
+            code_block.install_baseline_jit_data(site_count);
+            let image =
+                emit_baseline_function(code_block, jit_pending_address, soft_stack_limit_address)
+                    .expect("property function must tier up (gate admits GetByName/PutByName)");
+            let mut records = image.link_records;
+            finalize_arm64_link_buffer(&MapJitExecutableAllocator, &image.code, &mut records)
+                .expect("finalize property image")
+        }
+
+        // The DataIC FILLS on the first miss, HITS a same-structure receiver, and
+        // re-fills on a different-structure receiver — native == oracle each time.
+        #[test]
+        fn get_by_id_native_fills_then_hits_then_refills() {
+            let mut host = CoreOpcodeDispatchHost::new();
+            host.jit_test_register_identifier(0, "x");
+
+            let o1 = object_with_x(&mut host, 41);
+            let o2 = object_with_x(&mut host, 99); // SAME single-prop shape as o1.
+                                                   // o3: a DIFFERENT structure (a `y` property added before `x`).
+            let o3 = {
+                let object = host.jit_test_allocate_object();
+                host.jit_test_set_own_data(
+                    object,
+                    &CorePropertyKey::String("y".into()),
+                    JsValue::from_i32(5),
+                );
+                host.jit_test_set_own_data(object, &key_x(), JsValue::from_i32(7));
+                object.encoded().0
+            };
+            let s1 = structure_of(&host, o1);
+            let s2 = structure_of(&host, o2);
+            let s3 = structure_of(&host, o3);
+            assert_eq!(
+                s1, s2,
+                "same-shape siblings share one structure (HIT setup)"
+            );
+            assert_ne!(s1, s3, "o3's extra `y` gives it a different structure");
+
+            let mut vm = Vm::new(VmConfig::interpreter_only());
+            let code_block = build_code_block(get_x_instructions());
+            let handle = install_property_image(&mut vm, &mut host, &code_block);
+
+            // RUN 1 (o1): SENTINEL guard miss -> optimize fills the record.
+            let r1 = run_property_once(&mut vm, &handle, o1);
+            assert_eq!(r1.pending, 0, "no throw");
+            assert_eq!(
+                r1.ret,
+                JsValue::from_i32(41).encoded().0,
+                "native o1.x == 41"
+            );
+            let rec = code_block.baseline_property_ic_record(0).expect("record 0");
+            assert_eq!(rec.structure_id, s1, "record filled with o1's structure");
+            assert!(rec.offset >= 0, "record filled with a real offset");
+            let cached_offset = rec.offset;
+
+            // RUN 2 (o2 SAME structure): structure guard HITS -> cheap cached load.
+            let r2 = run_property_once(&mut vm, &handle, o2);
+            assert_eq!(
+                r2.ret,
+                JsValue::from_i32(99).encoded().0,
+                "native o2.x == 99 (HIT)"
+            );
+            let rec2 = code_block.baseline_property_ic_record(0).expect("record 0");
+            assert_eq!(
+                rec2.structure_id, s1,
+                "record unchanged after a same-structure HIT"
+            );
+            assert_eq!(
+                rec2.offset, cached_offset,
+                "cached offset unchanged after HIT"
+            );
+
+            // RUN 3 (o3 DIFFERENT structure): guard misses -> optimize re-fills.
+            let r3 = run_property_once(&mut vm, &handle, o3);
+            assert_eq!(
+                r3.ret,
+                JsValue::from_i32(7).encoded().0,
+                "native o3.x == 7 (re-fill)"
+            );
+            let rec3 = code_block.baseline_property_ic_record(0).expect("record 0");
+            assert_eq!(
+                rec3.structure_id, s3,
+                "record re-filled with o3's structure"
+            );
+
+            vm.clear_jit_code_block();
+            vm.clear_jit_host();
+        }
+
+        // put_by_id + get_by_id round-trip: `o.x = o.x + 1; return o.x` tiers up,
+        // runs native, mutates the object in place, and returns the updated value
+        // across several shapes (native == oracle). The put REPLACE record fills.
+        #[test]
+        fn put_and_get_by_id_native_round_trips_and_fills() {
+            let mut host = CoreOpcodeDispatchHost::new();
+            host.jit_test_register_identifier(0, "x");
+
+            let o1 = object_with_x(&mut host, 41);
+            let o2 = object_with_x(&mut host, 99); // same structure as o1.
+            let s1 = structure_of(&host, o1);
+
+            let mut vm = Vm::new(VmConfig::interpreter_only());
+            let code_block = build_code_block(inc_x_instructions());
+            let handle = install_property_image(&mut vm, &mut host, &code_block);
+
+            // RUN 1 (o1): 41 -> 42. Fills all three records (get@0, put@3, get@4).
+            let r1 = run_property_once(&mut vm, &handle, o1);
+            assert_eq!(r1.pending, 0, "no throw");
+            assert_eq!(
+                r1.ret,
+                JsValue::from_i32(42).encoded().0,
+                "native (o1.x=o1.x+1) == 42"
+            );
+            assert_eq!(
+                structure_of(&host, o1),
+                s1,
+                "a replace put keeps the structure (no transition)",
+            );
+            let get0 = code_block
+                .baseline_property_ic_record(0)
+                .expect("get record 0");
+            let put1 = code_block
+                .baseline_property_ic_record(1)
+                .expect("put record 1");
+            let get2 = code_block
+                .baseline_property_ic_record(2)
+                .expect("get record 2");
+            assert_eq!(get0.structure_id, s1, "get_by_id record filled");
+            assert_eq!(put1.structure_id, s1, "put_by_id REPLACE record filled");
+            assert_eq!(get2.structure_id, s1, "second get_by_id record filled");
+
+            // RUN 2 (o2 same structure): all three sites HIT. 99 -> 100. The
+            // returned value is `o.x` read AFTER the put, so == 100 proves the
+            // native put actually stored o2.x = 100 in place.
+            let r2 = run_property_once(&mut vm, &handle, o2);
+            assert_eq!(
+                r2.ret,
+                JsValue::from_i32(100).encoded().0,
+                "native (o2.x=o2.x+1) == 100 (HIT)"
+            );
+
+            vm.clear_jit_code_block();
+            vm.clear_jit_host();
+        }
+
+        // `g(a) { return a.length }` on an array: `arr.length` is exotic /
+        // OpaqueOrUncacheable, so the DataIC must NOT arm — the record stays SENTINEL
+        // and the site always slow-paths, still returning the correct length.
+        #[test]
+        fn arr_length_get_by_id_stays_uncached_but_correct() {
+            let mut host = CoreOpcodeDispatchHost::new();
+            host.jit_test_register_identifier(0, "length");
+            let array = host.jit_test_allocate_array().encoded().0;
+
+            let mut vm = Vm::new(VmConfig::interpreter_only());
+            let code_block = build_code_block(get_x_instructions()); // reads identifier 0 == "length"
+            let handle = install_property_image(&mut vm, &mut host, &code_block);
+
+            let r1 = run_property_once(&mut vm, &handle, array);
+            assert_eq!(r1.pending, 0, "no throw");
+            assert_eq!(
+                r1.ret,
+                JsValue::from_i32(0).encoded().0,
+                "native empty arr.length == 0"
+            );
+            let rec = code_block.baseline_property_ic_record(0).expect("record 0");
+            assert_eq!(
+                rec.structure_id, 0,
+                "arr.length record stays SENTINEL (exotic / uncacheable)",
+            );
+
+            // A second run is still correct (always slow-pathing the uncacheable site).
+            let r2 = run_property_once(&mut vm, &handle, array);
+            assert_eq!(
+                r2.ret,
+                JsValue::from_i32(0).encoded().0,
+                "native arr.length == 0 again"
+            );
+            assert_eq!(
+                code_block
+                    .baseline_property_ic_record(0)
+                    .unwrap()
+                    .structure_id,
+                0,
+                "still SENTINEL after a second uncacheable slow-path",
+            );
+
+            vm.clear_jit_code_block();
+            vm.clear_jit_host();
         }
     }
 

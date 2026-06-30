@@ -290,6 +290,24 @@ impl<'a> DecodedInstruction<'a> {
             })
     }
 
+    /// Read an `IdentifierIndex` operand (a `get_by_id`/`put_by_id` property
+    /// identifier — the index into the host's interned identifier table the
+    /// interpreter resolves with `identifier_property_key`). Mirrors
+    /// `register_operand` etc.; used by the baseline property-IC lowering to bake
+    /// the property name the DataIC slow-path bridge re-resolves.
+    pub fn identifier_index_operand(&self, index: usize) -> Result<u32, OperandAccessError> {
+        let operand = self.operand(index)?;
+        match operand {
+            Operand::IdentifierIndex(value) => Ok(value),
+            _ => Err(OperandAccessError::UnexpectedOperandKind {
+                opcode: self.opcode,
+                index: index as u32,
+                expected: OperandKind::IdentifierIndex,
+                actual: operand.kind(),
+            }),
+        }
+    }
+
     pub fn bytecode_index_operand(
         &self,
         index: usize,

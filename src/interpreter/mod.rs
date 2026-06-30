@@ -10083,6 +10083,245 @@ impl CoreOpcodeDispatchHost {
         self.put_property_value(state, base, &key, value)
     }
 
+    /// General named-property GET slow-path funnel for the baseline `get_by_id`
+    /// DataIC (`operationGetByIdOptimize`, jit/JITOperations.cpp). Mirrors the
+    /// `CoreOpcode::GetByName` dispatch's resolution CORE (mod.rs:8393-8419) minus
+    /// the register/window/completion-context plumbing: resolve the baked
+    /// identifier to a key, run the faithful `get_property_value` (own/prototype
+    /// data, autobox, proxy, the nullish `TypeError`) WHILE RECORDING the lookup,
+    /// and return the value plus — when the resolved load is a cacheable own-data
+    /// hit — the `(StructureID, PropertyOffset)` the bridge writes into the DataIC
+    /// record. Getter re-entry uses the caller's `DirectInterpreter`-configured
+    /// `DispatchState`, exactly as `jit_get_by_val`.
+    pub(crate) fn jit_get_by_id(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        base: RuntimeValue,
+        key_index: u32,
+        bytecode_index: BytecodeIndex,
+    ) -> Result<(RuntimeValue, Option<(StructureId, PropertyOffset)>), DispatchOutcome> {
+        let key = self.identifier_property_key(key_index);
+        let site = CorePropertyLookupSite {
+            bytecode_index: Some(bytecode_index),
+            opcode: Some(CoreOpcode::GetByName),
+            cache_key: None,
+        };
+        self.begin_property_lookup_recording(site);
+        let value = self.get_property_value(state, base, &key, base)?;
+        let cacheable = self.jit_get_by_id_cacheable_load(base, bytecode_index);
+        Ok((value, cacheable))
+    }
+
+    /// Cacheability predicate for the baseline `get_by_id` DataIC fill, mirroring
+    /// `refill_get_by_id_cache` (mod.rs:10770-10823) EXACTLY: arm ONLY an OWN DATA
+    /// load (`classification == OwnData`, `prototype_depth == 0`) with a concrete
+    /// structure id + non-negative offset on a plain-object receiver. Accessors,
+    /// prototype-chain/inherited data, missing, indexed/array-length (the
+    /// `arr.length` exotic returns `OpaqueOrUncacheable`), and proxy/opaque lookups
+    /// return `None`, so the bridge leaves the record SENTINEL and the site always
+    /// slow-paths. There is NO LLInt warmup gate here: a baseline DataIC site is
+    /// already hot (it tiered up), so it arms on the first cacheable own-data hit.
+    fn jit_get_by_id_cacheable_load(
+        &self,
+        base: RuntimeValue,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<(StructureId, PropertyOffset)> {
+        let record = self.last_property_lookup.as_ref()?;
+        let cacheable = record.bytecode_index == Some(bytecode_index)
+            && record.opcode == Some(CoreOpcode::GetByName)
+            && record.lookup_mode == PropertyLookupMode::Get
+            && record.classification == CorePropertyLookupClassification::OwnData
+            && record.prototype_depth == 0;
+        if !cacheable {
+            return None;
+        }
+        let (structure, offset) = match (record.base_structure, record.offset) {
+            (Some(structure), Some(offset))
+                if structure != StructureId::INVALID && offset.raw() >= 0 =>
+            {
+                (structure, offset)
+            }
+            _ => return None,
+        };
+        // Defensive: only cache for a plain object receiver (a string/number/etc.
+        // base routes through autobox prototypes and must never be served by the
+        // own-data fast path), mirroring `refill_get_by_id_cache`.
+        if self.objects.find(base).is_none() {
+            return None;
+        }
+        Some((structure, offset))
+    }
+
+    /// General named-property PUT slow-path funnel for the baseline `put_by_id`
+    /// DataIC (`operationPutByIdOptimize`, jit/JITOperations.cpp). Mirrors the
+    /// `CoreOpcode::PutByName` dispatch's store CORE (mod.rs:8491-8511) minus the
+    /// register/window/completion-context plumbing: run the faithful recording put
+    /// (`put_by_name_property_value_with_observation`: nullish/primitive base,
+    /// proxy, data store, the property-add transition) and return — when the store
+    /// was a cacheable REPLACE-EXISTING own-data write (no transition) — the
+    /// `(StructureID, PropertyOffset, key)` the bridge writes into the DataIC
+    /// record. A property-ADD transition is deliberately NOT cached (returns
+    /// `None`), exactly as `refill_put_by_id_cache` leaves adds on the slow path.
+    pub(crate) fn jit_put_by_id(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        base: RuntimeValue,
+        key_index: u32,
+        value: RuntimeValue,
+        bytecode_index: BytecodeIndex,
+    ) -> Result<Option<(StructureId, PropertyOffset, CorePropertyKey)>, DispatchOutcome> {
+        let key = self.identifier_property_key(key_index);
+        match self.put_by_name_property_value_with_observation(
+            state,
+            bytecode_index,
+            base,
+            &key,
+            value,
+            None,
+        ) {
+            DispatchOutcome::Continue => {}
+            other => return Err(other),
+        }
+        let cacheable = self
+            .jit_put_by_id_cacheable_replace(base, bytecode_index)
+            .map(|(structure, offset)| (structure, offset, key));
+        Ok(cacheable)
+    }
+
+    /// Cacheability predicate for the baseline `put_by_id` DataIC fill, mirroring
+    /// `refill_put_by_id_cache` (mod.rs:10885-10915) EXACTLY: arm ONLY the
+    /// REPLACE-EXISTING own-data store (`outcome == OwnDataStore`, structure
+    /// UNCHANGED across the write) with a concrete structure id + non-negative
+    /// offset on a plain-object receiver. The property-ADD transition
+    /// (`CreatedProperty`, structure changed), setters, read-only, indexed, and
+    /// opaque stores return `None` (the site keeps slow-pathing — the transition
+    /// is handled by the slow path, never cached).
+    fn jit_put_by_id_cacheable_replace(
+        &self,
+        base: RuntimeValue,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<(StructureId, PropertyOffset)> {
+        let record = self.last_property_store.as_ref()?;
+        let replace_existing = record.bytecode_index == Some(bytecode_index)
+            && record.opcode == Some(CoreOpcode::PutByName)
+            && record.outcome == PropertyStoreObservationOutcome::OwnDataStore
+            && record.base_structure_before == record.base_structure_after;
+        if !replace_existing {
+            return None;
+        }
+        let (structure, offset) = match (record.base_structure_after, record.offset_after) {
+            (Some(structure), Some(offset))
+                if structure != StructureId::INVALID && offset.raw() >= 0 =>
+            {
+                (structure, offset)
+            }
+            _ => return None,
+        };
+        if self.objects.find(base).is_none() {
+            return None;
+        }
+        Some((structure, offset))
+    }
+
+    /// The baseline `get_by_id` DataIC HIT cheap read: the structure guard in
+    /// generated code already proved the receiver's structure matches the cached
+    /// `structure_bits`, so this reads the own-data property straight from the
+    /// cached `PropertyOffset` with NO re-resolution (`llint_get_by_id_fast`, which
+    /// re-validates the structure as belt-and-suspenders and reads the butterfly
+    /// slot). Returns `None` on a SENTINEL record or a structure drift, routing the
+    /// caller to the full slow-path resolution. This is a LEAF read (no
+    /// `DispatchState`/re-entry), the named-property analog of
+    /// `jit_typed_array_get_by_index`.
+    pub(crate) fn jit_get_by_id_cached_read(
+        &self,
+        base: RuntimeValue,
+        structure_bits: u32,
+        offset_bits: i32,
+    ) -> Option<RuntimeValue> {
+        if structure_bits == 0 {
+            return None;
+        }
+        self.objects.llint_get_by_id_fast(
+            base,
+            StructureId::new(structure_bits),
+            PropertyOffset::new(offset_bits),
+        )
+    }
+
+    /// The baseline `put_by_id` DataIC HIT cheap store: the structure guard proved
+    /// the receiver matches the cached `structure_bits`, so this writes the value
+    /// in place at the cached `PropertyOffset` via `llint_put_by_id_replace_fast`
+    /// (which re-validates structure + data-kind + writability and applies the SAME
+    /// `apply_value_store_write_barrier` the slow store does — so the field write is
+    /// barriered on the fast path too, the `emitWriteBarrier` analog). Returns
+    /// `true` only when it stored; `false` (SENTINEL / drift / non-replaceable /
+    /// read-only / accessor) routes the caller to the full slow-path put.
+    pub(crate) fn jit_put_by_id_cached_store(
+        &mut self,
+        heap: &mut Heap,
+        base: RuntimeValue,
+        structure_bits: u32,
+        offset_bits: i32,
+        key_index: u32,
+        value: RuntimeValue,
+    ) -> bool {
+        if structure_bits == 0 {
+            return false;
+        }
+        let key = self.identifier_property_key(key_index);
+        matches!(
+            self.objects.llint_put_by_id_replace_fast(
+                heap,
+                base,
+                StructureId::new(structure_bits),
+                PropertyOffset::new(offset_bits),
+                &key,
+                value,
+            ),
+            Ok(true)
+        )
+    }
+
+    /// Test-support (the baseline property-IC native execution tests, jit/
+    /// arm64_baseline/function_emitter.rs): the object store + identifier table are
+    /// private to this module, so these `#[cfg(test)] pub(crate)` shims expose the
+    /// MINIMAL object-creation surface a JIT test needs (allocate a plain object /
+    /// array, set an own data property, intern an identifier, read a cell's
+    /// `StructureID`) without widening the release API.
+    #[cfg(test)]
+    pub(crate) fn jit_test_register_identifier(&mut self, index: u32, text: &str) {
+        self.identifier_texts.insert(index, text.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn jit_test_allocate_object(&mut self) -> RuntimeValue {
+        self.objects.allocate()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn jit_test_allocate_array(&mut self) -> RuntimeValue {
+        self.objects.allocate_array()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn jit_test_set_own_data(
+        &mut self,
+        object: RuntimeValue,
+        key: &CorePropertyKey,
+        value: RuntimeValue,
+    ) {
+        self.objects
+            .set_data_own(object, key, value)
+            .expect("set own data property");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn jit_test_structure_id(&self, object: RuntimeValue) -> Option<u32> {
+        self.objects
+            .find(object)
+            .map(|cell| cell.structure_id.raw())
+    }
+
     /// op_call slow-path funnel — the UNLINKED VIRTUAL CALL (JSC's
     /// `operationVirtualCall` / the unlinked `virtualThunk` path, jit/CallLinkInfo +
     /// jit/ThunkGenerators.cpp `virtualThunkFor`): every baseline call site starts

@@ -357,6 +357,158 @@ pub extern "C" fn operation_put_by_val(vm: *mut Vm, base: u64, prop: u64, value:
     }
 }
 
+/// `operationGetByIdOptimize(JSGlobalObject*, StructureStubInfo*, EncodedJSValue
+/// base, uintptr_t propertyName)` analog (JITOperations.cpp). The baseline
+/// `get_by_id` DataIC MISS slow-call: the emitter loads the boxed base into the
+/// arg slot, bakes the property `key_index`, the per-site `record_index`, and the
+/// site `bytecode_index`, sets arg0 = the pinned `*mut Vm`, and far-calls this
+/// shim. Same D1+D5 reborrow island as the get/put_by_val shims; runs the faithful
+/// resolution + DataIC record FILL (`Vm::operation_get_by_id_optimize`) and returns
+/// the boxed result, or — on throw — stamps `m_exception` (D3) and returns
+/// `JSValue::empty()` bits. The integer args arrive as 64-bit registers
+/// (`move_imm32` zero-extends); they are narrowed to their logical widths here.
+pub extern "C" fn operation_get_by_id_optimize(
+    vm: *mut Vm,
+    base: u64,
+    key_index: u64,
+    record_index: u64,
+    bytecode_index: u64,
+) -> u64 {
+    // D1 + D5 reborrows — see the module SAFETY note.
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let base = JsValue::from_encoded(EncodedJsValue(base));
+    match vm.operation_get_by_id_optimize(
+        host,
+        base,
+        key_index as u32,
+        record_index as usize,
+        bytecode_index as u32,
+    ) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
+/// `operationGetById` (cached) analog: the `get_by_id` DataIC HIT slow-call. The
+/// generated structure guard already matched the cached record, so this does the
+/// cheap own-data load at the cached offset (`Vm::operation_get_by_id_with_cached_offset`,
+/// which falls back to the optimize path on a SENTINEL/drift). Own-data loads
+/// cannot throw, but the shared shim still stamps `m_exception` on the rare
+/// fallback throw edge so the caller's exception convention holds.
+pub extern "C" fn operation_get_by_id_with_cached_offset(
+    vm: *mut Vm,
+    base: u64,
+    key_index: u64,
+    record_index: u64,
+    bytecode_index: u64,
+) -> u64 {
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(!host_ptr.is_null(), "parked dispatch host required");
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let base = JsValue::from_encoded(EncodedJsValue(base));
+    match vm.operation_get_by_id_with_cached_offset(
+        host,
+        base,
+        key_index as u32,
+        record_index as usize,
+        bytecode_index as u32,
+    ) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
+/// `operationPutByIdOptimize` analog (JITOperations.cpp). The baseline `put_by_id`
+/// DataIC MISS slow-call: the emitter loads the boxed base + value into the arg
+/// slots, bakes `key_index`/`record_index`/`bytecode_index`, sets arg0 = the
+/// pinned `*mut Vm`, and far-calls this shim. Runs the faithful recording put +
+/// DataIC record FILL (`Vm::operation_put_by_id_optimize`; transitions handled but
+/// not cached). put produces no observable value, so success returns `undefined`
+/// bits (the lowering discards the result register); on throw it stamps
+/// `m_exception` (D3).
+pub extern "C" fn operation_put_by_id_optimize(
+    vm: *mut Vm,
+    base: u64,
+    value: u64,
+    key_index: u64,
+    record_index: u64,
+    bytecode_index: u64,
+) -> u64 {
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(!host_ptr.is_null(), "parked dispatch host required");
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let base = JsValue::from_encoded(EncodedJsValue(base));
+    let value = JsValue::from_encoded(EncodedJsValue(value));
+    match vm.operation_put_by_id_optimize(
+        host,
+        base,
+        value,
+        key_index as u32,
+        record_index as usize,
+        bytecode_index as u32,
+    ) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
+/// `operationPutById` (cached) analog: the `put_by_id` DataIC HIT slow-call. The
+/// guard matched, so this does the cheap barriered in-place replace store at the
+/// cached offset (`Vm::operation_put_by_id_with_cached_offset`, which falls back to
+/// the optimize path on a SENTINEL/drift/non-replaceable target). Returns
+/// `undefined` on success; stamps `m_exception` on the rare fallback throw edge.
+pub extern "C" fn operation_put_by_id_with_cached_offset(
+    vm: *mut Vm,
+    base: u64,
+    value: u64,
+    key_index: u64,
+    record_index: u64,
+    bytecode_index: u64,
+) -> u64 {
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(!host_ptr.is_null(), "parked dispatch host required");
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let base = JsValue::from_encoded(EncodedJsValue(base));
+    let value = JsValue::from_encoded(EncodedJsValue(value));
+    match vm.operation_put_by_id_with_cached_offset(
+        host,
+        base,
+        value,
+        key_index as u32,
+        record_index as usize,
+        bytecode_index as u32,
+    ) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
 /// The maximum number of explicit call arguments (EXCLUDING `this`) the baseline
 /// `op_call` lowering passes to [`operation_call`] in registers. The AAPCS64
 /// integer/pointer argument registers are `x0..x7` (8 total); this shim consumes

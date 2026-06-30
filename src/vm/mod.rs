@@ -3182,6 +3182,226 @@ impl Vm {
         }
     }
 
+    // === Baseline `get_by_id`/`put_by_id` DataIC slow-path bridges ============
+    // The Stage-1 baseline emitter lowers `get_by_id`/`put_by_id` as a DataIC:
+    // a structure guard in generated code (`load32 [cell+0]` vs `[record+0]`) that
+    // routes a HIT to the cheap cached-offset far-call and a MISS to the optimize
+    // far-call. These SAFE wrappers are the `operationGetById{,Optimize}` /
+    // `operationPutById{,Optimize}` analogs (jit/JITOperations.cpp): the optimize
+    // forms run the faithful interpreter resolution AND FILL the per-site
+    // `HandlerPropertyInlineCacheRecord` (the DataIC slow path is the single
+    // record writer, Repatch.cpp tryCacheGetBy); the cached-offset forms do the
+    // cheap own-data load/store the guarded HIT proved valid. Same parked-CodeBlock
+    // borrow/region shape as `operation_get_by_val`. The property identifier is the
+    // baked `key_index` (JSC passes the `CacheableIdentifier`/propertyName to the
+    // operation); `bytecode_index` is the site's bci (matches the recorded lookup).
+
+    /// `operationGetByIdOptimize` analog: the `get_by_id` DataIC MISS slow path.
+    /// Runs the faithful named-property resolution (recording the lookup), returns
+    /// the value, and — under the SQ4 churn cap — FILLS the record with the cached
+    /// `(StructureID, PropertyOffset)` for an own-data hit (leaving it SENTINEL for
+    /// an uncacheable resolution: `arr.length`, accessor, prototype, megamorphic).
+    pub fn operation_get_by_id_optimize(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        base: RuntimeValue,
+        key_index: u32,
+        record_index: usize,
+        bytecode_index: u32,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let outcome = {
+            // SAFETY: as `operation_get_by_val` — one dormant-parent `&CodeBlock`,
+            // disjoint from the `&mut self.*` field borrows, not outliving this call.
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            let mut state = DispatchState {
+                stack: &mut self.execution,
+                registers: &mut self.registers,
+                exceptions: &mut self.exceptions,
+                heap: &mut self.heap,
+                code_block,
+                ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+                function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+            };
+            host.jit_get_by_id(
+                &mut state,
+                base,
+                key_index,
+                BytecodeIndex::from_offset(bytecode_index),
+            )
+        };
+        match outcome {
+            Ok((value, cacheable)) => {
+                // FILL the record (the DataIC slow path is the single writer). Re-derive
+                // the SAME parked code block whose stable record store the generated
+                // structure guard reads through the baked base address.
+                let code_block: &CodeBlock = match &placeholder {
+                    Some(code_block) => code_block,
+                    None => unsafe { &*self.jit_code_block },
+                };
+                if code_block.note_baseline_property_ic_slow_path(record_index) {
+                    if let Some((structure, offset)) = cacheable {
+                        code_block.mirror_self_load_data_ic_record(
+                            record_index,
+                            structure.raw(),
+                            offset.raw(),
+                        );
+                    }
+                    // Uncacheable: leave the record SENTINEL so the guard always misses.
+                } else {
+                    // SQ4 churn cap exceeded: disable the site permanently (SENTINEL).
+                    code_block.reset_prototype_load_data_ic_record(record_index);
+                }
+                Ok(value)
+            }
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
+    /// `operationGetById` (cached) analog: the `get_by_id` DataIC HIT path. The
+    /// generated structure guard already proved the receiver matches the cached
+    /// record, so this does the cheap own-data load at the cached offset; a SENTINEL
+    /// record or a structure drift (not expected on a guarded HIT) falls back to the
+    /// full optimize slow path.
+    pub fn operation_get_by_id_with_cached_offset(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        base: RuntimeValue,
+        key_index: u32,
+        record_index: usize,
+        bytecode_index: u32,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let record = {
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            code_block.baseline_property_ic_record(record_index)
+        };
+        if let Some(record) = record {
+            if let Some(value) =
+                host.jit_get_by_id_cached_read(base, record.structure_id, record.offset)
+            {
+                return Ok(value);
+            }
+        }
+        self.operation_get_by_id_optimize(host, base, key_index, record_index, bytecode_index)
+    }
+
+    /// `operationPutByIdOptimize` analog: the `put_by_id` DataIC MISS slow path.
+    /// Runs the faithful named-property store (recording it), and — under the SQ4
+    /// churn cap — FILLS the record for a REPLACE-EXISTING own-data write; a
+    /// property-ADD transition is handled by the store but NOT cached (the record
+    /// stays SENTINEL, so the site keeps routing through the slow path). The
+    /// write barrier is applied inside the store (the `emitWriteBarrier` analog),
+    /// so no separate generated-code barrier is emitted in Increment 1 (the inline
+    /// store + inline barrier are Increment 2, gated on the Batch-5 object model).
+    pub fn operation_put_by_id_optimize(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        base: RuntimeValue,
+        value: RuntimeValue,
+        key_index: u32,
+        record_index: usize,
+        bytecode_index: u32,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let outcome = {
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            let mut state = DispatchState {
+                stack: &mut self.execution,
+                registers: &mut self.registers,
+                exceptions: &mut self.exceptions,
+                heap: &mut self.heap,
+                code_block,
+                ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+                function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+            };
+            host.jit_put_by_id(
+                &mut state,
+                base,
+                key_index,
+                value,
+                BytecodeIndex::from_offset(bytecode_index),
+            )
+        };
+        match outcome {
+            Ok(cacheable) => {
+                let code_block: &CodeBlock = match &placeholder {
+                    Some(code_block) => code_block,
+                    None => unsafe { &*self.jit_code_block },
+                };
+                if code_block.note_baseline_property_ic_slow_path(record_index) {
+                    if let Some((structure, offset, _key)) = cacheable {
+                        code_block.mirror_self_load_data_ic_record(
+                            record_index,
+                            structure.raw(),
+                            offset.raw(),
+                        );
+                    }
+                    // Transition/uncacheable: leave SENTINEL (slow path next time).
+                } else {
+                    code_block.reset_prototype_load_data_ic_record(record_index);
+                }
+                Ok(RuntimeValue::undefined())
+            }
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
+    /// `operationPutById` (cached) analog: the `put_by_id` DataIC HIT path. The
+    /// generated structure guard proved the receiver matches the cached record, so
+    /// this does the cheap in-place replace store (barriered) at the cached offset;
+    /// a SENTINEL record, structure drift, or a non-replaceable/read-only target
+    /// falls back to the full optimize slow path (which handles transitions).
+    pub fn operation_put_by_id_with_cached_offset(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        base: RuntimeValue,
+        value: RuntimeValue,
+        key_index: u32,
+        record_index: usize,
+        bytecode_index: u32,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let record = {
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            code_block.baseline_property_ic_record(record_index)
+        };
+        if let Some(record) = record {
+            if host.jit_put_by_id_cached_store(
+                &mut self.heap,
+                base,
+                record.structure_id,
+                record.offset,
+                key_index,
+                value,
+            ) {
+                return Ok(RuntimeValue::undefined());
+            }
+        }
+        self.operation_put_by_id_optimize(
+            host,
+            base,
+            value,
+            key_index,
+            record_index,
+            bytecode_index,
+        )
+    }
+
     /// `operationVirtualCall`-family analog (JITOperations.cpp / the unlinked
     /// `virtualThunk` path): the SAFE wrapper the baseline `op_call` slow-call shim
     /// (`jit::operations::operation_call`) calls. The boxed `callee` and the boxed

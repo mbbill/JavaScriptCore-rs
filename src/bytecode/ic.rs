@@ -1587,10 +1587,29 @@ impl Default for HandlerPropertyInlineCacheRecord {
 /// records are mutated in place on later misses; the `Box` is never reallocated
 /// so its base address stays stable for the lifetime of the baseline code,
 /// matching the C++ allocate-once `m_jitData` contract.
+/// The monomorphic churn cap (SQ4): after this many slow-path misses on one
+/// property IC site, the DataIC slow-path bridge stops re-filling the record and
+/// resets it to SENTINEL permanently, so a polymorphic/uncacheable site routes to
+/// the slow path every time instead of thrashing the record between competing
+/// structures. The faithful analog of `StructureStubInfo` giving up
+/// (`Repatch.cpp` countdown -> `GiveUpOnDirectAccessForOptimizedCode` /
+/// the megamorphic transition); the value mirrors the LLInt monomorphic
+/// give-up budget (a small, fixed number of polymorphic passes).
+pub const BASELINE_PROPERTY_IC_CHURN_CAP: u32 = 100;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaselineJitData {
-    /// Property data-IC records, one per baseline `get_by_id` self-access site.
+    /// Property data-IC records, one per baseline `get_by_id`/`put_by_id`
+    /// self-access site.
     pub property_caches: Box<[HandlerPropertyInlineCacheRecord]>,
+    /// Per-site slow-path miss counter (the SQ4 churn cap; the
+    /// `StructureStubInfo::countdown` analog). Parallel to `property_caches`,
+    /// NOT read by generated code (the fast path only reads the 16-byte record);
+    /// only the slow-path bridge increments it and consults it to decide whether
+    /// to keep caching. Kept as a SEPARATE array rather than a record field so
+    /// the `#[repr(C)]` 16-byte record layout the generated structure guard reads
+    /// (`[record + 0]`/`[record + 4]`) is unchanged.
+    pub slow_path_counts: Box<[u32]>,
 }
 
 impl BaselineJitData {
@@ -1602,12 +1621,27 @@ impl BaselineJitData {
         Self {
             property_caches: vec![HandlerPropertyInlineCacheRecord::SENTINEL; count]
                 .into_boxed_slice(),
+            slow_path_counts: vec![0u32; count].into_boxed_slice(),
         }
     }
 
     /// Number of property IC records in the store (stable after allocation).
     pub fn property_cache_count(&self) -> usize {
         self.property_caches.len()
+    }
+
+    /// Increment the slow-path miss counter for `record_index` and return whether
+    /// the site is STILL eligible to cache (count below the churn cap). Once the
+    /// count reaches [`BASELINE_PROPERTY_IC_CHURN_CAP`] the site is "disabled":
+    /// the bridge stops re-filling and leaves the record SENTINEL so the structure
+    /// guard always misses (permanent slow path). Out-of-range indices return
+    /// `false` (never cache).
+    pub fn note_slow_path_and_should_cache(&mut self, record_index: usize) -> bool {
+        let Some(count) = self.slow_path_counts.get_mut(record_index) else {
+            return false;
+        };
+        *count = count.saturating_add(1);
+        *count < BASELINE_PROPERTY_IC_CHURN_CAP
     }
 
     /// Base address of the record array, the value generated baseline code
@@ -1617,6 +1651,38 @@ impl BaselineJitData {
     /// reads when there are zero sites.
     pub fn record_store_base(&self) -> *const HandlerPropertyInlineCacheRecord {
         self.property_caches.as_ptr()
+    }
+}
+
+#[cfg(test)]
+mod baseline_jit_data_tests {
+    use super::*;
+
+    // SQ4 churn cap: each slow-path miss increments the per-site counter and the
+    // site stays cacheable until the counter reaches BASELINE_PROPERTY_IC_CHURN_CAP,
+    // after which it is "disabled" (the bridge stops re-filling -> permanent slow
+    // path). An out-of-range index never caches.
+    #[test]
+    fn churn_cap_disables_a_site_after_the_cap_is_reached() {
+        let mut data = BaselineJitData::from_property_cache_count(1);
+        // The first (CAP - 1) misses keep the site eligible to cache...
+        for miss in 1..BASELINE_PROPERTY_IC_CHURN_CAP {
+            assert!(
+                data.note_slow_path_and_should_cache(0),
+                "miss {miss} is below the churn cap, still cacheable",
+            );
+        }
+        // ...and the CAP-th miss disables it (and every miss after).
+        assert!(
+            !data.note_slow_path_and_should_cache(0),
+            "the cap-th miss disables the site (count == cap)",
+        );
+        assert!(
+            !data.note_slow_path_and_should_cache(0),
+            "a disabled site stays disabled",
+        );
+        // An out-of-range record index never caches.
+        assert!(!data.note_slow_path_and_should_cache(7));
     }
 }
 

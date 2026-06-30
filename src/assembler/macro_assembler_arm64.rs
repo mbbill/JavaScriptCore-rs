@@ -384,6 +384,19 @@ impl MacroAssemblerArm64 {
             .emit_lsr_imm(Datasize::D32, dest, src, (imm.value as u32) & 0x1f);
     }
 
+    /// `urshift64(src, TrustedImm32 imm, dest)` == `urshiftPtr` on LP64
+    /// (MacroAssemblerARM64.h:1631-1639): `lsr<64> = ubfm<64>(rd, rn, shift, 63)`
+    /// (logical). The baseline property DataIC fast path needs this to UNBOX a
+    /// transitional cell value (`(cellPtr << 8) | 0x20`, value/repr.rs:645) back
+    /// to the raw `CoreObjectCell*` (`>> 8`) before reading the cell header — the
+    /// 64-bit analog of x86-64's `shr rax, 8` in the equivalent self-load emitter
+    /// (jit/emitter.rs:6985). The 32-bit `urshift32` would drop the high pointer
+    /// bits, so the 64-bit form is load-bearing.
+    pub fn urshift64_imm(&mut self, src: RegisterID, imm: TrustedImm32, dest: RegisterID) {
+        self.asm()
+            .emit_lsr_imm(Datasize::D64, dest, src, (imm.value as u32) & 0x3f);
+    }
+
     // ========================================================================
     // Multiply.
     // ========================================================================
