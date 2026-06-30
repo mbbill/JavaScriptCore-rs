@@ -95,8 +95,10 @@ const REGISTER_SIZE_BYTES: i32 = 8;
 const CALL_FRAME_GPR: RegisterID = RegisterID::Fp;
 /// `x30 == lr`. Saved/restored around the operation far-calls.
 const LINK_GPR: RegisterID = RegisterID::Lr;
-/// The frame base arrives in raw C-ABI `x1` (`entry_prologue.rs`); the prologue
-/// moves it into `cfr`.
+/// Raw C-ABI `x1`. Pre-A1 the prologue moved this (the scratch-arena base) into
+/// `cfr`; the faithful Option-A prologue now does `mov fp,sp` instead, so the JIT
+/// CallFrame is built on the native machine stack and `x1` is no longer the frame
+/// source. Kept for the register-map record (`dead_code` at module level).
 const RAW_FRAME_ARG_GPR: RegisterID = RegisterID::X1;
 /// The `*mut Vm` arrives in raw C-ABI `x0` and is the operation shims' arg0.
 const RAW_VM_ARG_GPR: RegisterID = RegisterID::X0;
@@ -141,6 +143,15 @@ const CALL_ARG_GPRS: [RegisterID; MAX_REGISTER_CALL_ARGS] = [
 /// (AssemblyHelpers.h:1290-1298). The operand IS the VirtualRegister's raw value.
 fn address_for(operand: i32) -> Address {
     Address::new(CALL_FRAME_GPR, operand.wrapping_mul(REGISTER_SIZE_BYTES))
+}
+
+/// Bytes the prologue reserves below `fp` for the callee locals (`sub sp, fp,
+/// #localsBytes`). The local count is rounded UP to an even number of registers
+/// so the reservation is a multiple of 16 and keeps `sp` 16-aligned for the
+/// slow-path far-calls (the AAPCS64 / JSC `stackAlignmentRegisters == 2` rule).
+fn reserved_locals_bytes(num_locals: u32) -> i32 {
+    let even = num_locals.checked_add(num_locals & 1).unwrap_or(num_locals);
+    (even as i32).wrapping_mul(REGISTER_SIZE_BYTES)
 }
 
 /// An emitted (not-yet-finalized) full-function image — the assembler bytes plus
@@ -263,12 +274,41 @@ impl FunctionEmitter {
         }
     }
 
-    /// `emitFunctionPrologue` for the raw return-seed C-ABI lane (frame base in x1),
-    /// plus the callee-saved spills this emitter clobbers — byte-identical to
-    /// op_add/arith's prologue.
-    fn emit_prologue(&mut self) {
+    /// The faithful `AssemblyHelpers::emitFunctionPrologue` (AssemblyHelpers.h:
+    /// 558-563): `pushPair(fp,lr); mov fp,sp`, building this function's CallFrame on
+    /// the NATIVE machine stack (`fp/x29 == calleeFrame`). The caller positioned
+    /// `sp = calleeFrame + sizeof(CallerFrameAndPC)` (`LowLevelInterpreter64.asm`
+    /// `makeJavaScriptCall`), so `pushPair` lands the `[callerFrame,returnPC]` pair
+    /// at slots 0/1 and `mov fp,sp` captures the frame base.
+    ///
+    /// DIVERGENCE-CORRECTION (A1, Option A — see docs/design/jsstack.md "B5/STACK
+    /// MODEL"): the prior `mov fp,x1` made `fp` a per-function SCRATCH-ARENA base
+    /// while `sp` stayed on the native stack — the latent Option-D header split
+    /// (fp=arena / sp=native) that optimized AROUND the divergence. This is the
+    /// faithful `mov fp,sp` that UNIFIES them onto the native stack, so `op_ret`'s
+    /// epilogue, a future JIT->JIT `bl`, and a GC stack-walk all see ONE stack with
+    /// `callerFrame`@0/`returnPC`@1 adjacent in the frame header.
+    ///
+    /// After capturing `fp`, reserve `num_locals` (rounded up to keep `sp`
+    /// 16-aligned) slots BELOW `fp` — the prologue's `sub sp, fp, #localsBytes` —
+    /// BEFORE spilling the callee-saved registers, so the callee-save spills land
+    /// below the locals and `emit_op_enter`'s local zero-fill (which writes
+    /// `[fp-8..]`) cannot clobber them. (Pre-flip this was unnecessary: `fp` was a
+    /// separate arena, so the native-stack callee-save spills never overlapped the
+    /// arena locals.)
+    fn emit_prologue(&mut self, num_locals: u32) {
         self.h.masm_mut().push_pair(CALL_FRAME_GPR, LINK_GPR); // stp fp,lr,[sp,#-16]!
-        self.h.masm_mut().move_rr(RAW_FRAME_ARG_GPR, CALL_FRAME_GPR); // mov fp, x1 (cfr)
+        self.h.masm_mut().move_rr(RegisterID::Sp, CALL_FRAME_GPR); // mov fp, sp (cfr)
+        let reserved = reserved_locals_bytes(num_locals);
+        if reserved > 0 {
+            // `sub sp, sp, #reserved` (== `sub sp, fp, #reserved`, fp==sp here):
+            // a negative add immediate folds to a sub immediate.
+            self.h.masm_mut().add64_imm(
+                TrustedImm32::new(-reserved),
+                RegisterID::Sp,
+                RegisterID::Sp,
+            );
+        }
         self.h
             .masm_mut()
             .push_pair(PINNED_VM_GPR, PINNED_VM_PAIR_GPR); // spill x19(+x20)
@@ -562,8 +602,16 @@ impl FunctionEmitter {
         self.done_jumps.push(to_done);
     }
 
-    /// The shared epilogue (`done`): refill the callee-saved spills and `ret`. x0
-    /// (the return value / op_ret result) is preserved across the pops.
+    /// The shared epilogue (`done`): restore the callee-saved spills, then the
+    /// faithful `AssemblyHelpers::emitFunctionEpilogue` (`mov sp,fp; ldp fp,lr;
+    /// ret`). x0 (the return value / op_ret result) is preserved across the pops.
+    ///
+    /// `mov sp,fp` discards the reserved-locals region in ONE step (it is now
+    /// load-bearing, not a no-op: the callee-saves were spilled BELOW the locals,
+    /// so after refilling them `sp` sits at `fp - localsBytes`, and `mov sp,fp`
+    /// skips the locals so `ldp fp,lr` reads slots 0/1 of the frame header). This
+    /// matches JSC's `restoreCalleeSaves` + `emitFunctionEpilogue` and leaves `sp`
+    /// back at `calleeFrame + sizeof(CallerFrameAndPC)` for the trampoline/caller.
     fn emit_epilogue(&mut self) -> Label {
         let done = self.h.masm().label();
         self.h
@@ -572,7 +620,8 @@ impl FunctionEmitter {
         self.h
             .masm_mut()
             .pop_pair(PINNED_VM_GPR, PINNED_VM_PAIR_GPR); // refill x19/x20
-        self.h.masm_mut().pop_pair(CALL_FRAME_GPR, LINK_GPR); // restore caller fp/lr
+        self.h.masm_mut().move_rr(CALL_FRAME_GPR, RegisterID::Sp); // mov sp, fp
+        self.h.masm_mut().pop_pair(CALL_FRAME_GPR, LINK_GPR); // ldp fp,lr,[sp],#16
         self.h.masm_mut().ret();
         done
     }
@@ -806,7 +855,7 @@ pub(crate) fn emit_baseline_function(
     let mut emitter = FunctionEmitter::new(count, jit_pending_address);
 
     // === PROLOGUE + op_enter ===============================================
-    emitter.emit_prologue();
+    emitter.emit_prologue(num_locals);
     emitter.emit_op_enter(num_locals);
 
     // === MAIN pass (privateCompileMainPass) ================================
@@ -1031,6 +1080,40 @@ mod tests {
         }
     }
 
+    // --- A1.0 divergence-correction: the emitter now emits the FAITHFUL JSC
+    // `emitFunctionPrologue` (`pushPair(fp,lr); mov fp,sp`) and `emitFunctionEpilogue`
+    // (`mov sp,fp; ldp fp,lr; ret`), building the CallFrame on the native machine
+    // stack — NOT the prior Option-D `mov fp,x1` (fp=arena / sp=native) split. This
+    // proves the emitted bytes match the byte-validated entry_prologue.rs contract.
+    #[test]
+    fn prologue_and_epilogue_match_jsc_generated_frame_contract() {
+        use super::super::entry_prologue::{
+            ARM64_JSC_BASELINE_GENERATED_EPILOGUE_BYTES,
+            ARM64_JSC_BASELINE_GENERATED_PROLOGUE_BYTES,
+        };
+
+        // num_locals == 0 omits the `sub sp` reservation, so bytes 0..8 are exactly
+        // the `stp fp,lr,[sp,#-16]!; mov fp,sp` head.
+        let mut prologue = FunctionEmitter::new(1, 0);
+        prologue.emit_prologue(0);
+        assert_eq!(
+            &prologue.h.code()[0..8],
+            ARM64_JSC_BASELINE_GENERATED_PROLOGUE_BYTES,
+            "prologue head must be the faithful `stp fp,lr,[sp,#-16]!; mov fp,sp`",
+        );
+
+        // The epilogue ends with `mov sp,fp; ldp fp,lr,[sp],#16; ret` (12 bytes)
+        // after the callee-save refills.
+        let mut epilogue = FunctionEmitter::new(1, 0);
+        epilogue.emit_epilogue();
+        let code = epilogue.h.code();
+        assert_eq!(
+            &code[code.len() - 12..],
+            ARM64_JSC_BASELINE_GENERATED_EPILOGUE_BYTES,
+            "epilogue tail must be the faithful `mov sp,fp; ldp fp,lr; ret`",
+        );
+    }
+
     /// A `CoreOpcode::LoadDouble` for `value` — the raw f64 bits split low/high
     /// across two unsigned-immediate operands, BYTE-IDENTICAL to the bytecompiler's
     /// `emit_load_double` (bytecompiler/mod.rs:6712-6730).
@@ -1162,9 +1245,16 @@ mod tests {
         let image = emit_baseline_function(&code_block, 0x1000).expect("emit loop");
         let w = words(&image.code);
 
-        // Prologue (cross-checked against op_add's proven prologue).
+        // Prologue: the faithful Option-A `emitFunctionPrologue` (A1) building the
+        // CallFrame on the native machine stack, followed by the locals reservation.
         assert_eq!(w[0], 0xa9bf_7bfd, "stp fp,lr,[sp,#-16]!");
-        assert_eq!(w[1], 0xaa01_03fd, "mov fp, x1 (cfr)");
+        assert_eq!(w[1], 0x9100_03fd, "mov fp, sp (cfr)");
+        // `sub sp, sp, #32` reserves the 4 callee locals (LOCAL0..LOCAL3) below fp
+        // so the callee-save spills land below them (no op_enter overlap).
+        assert_eq!(
+            w[2], 0xd100_83ff,
+            "sub sp, sp, #32 (reserve 4 callee locals)"
+        );
         // The epilogue `ret` plus the exception stub's trailing `b -> done` are the
         // last two words; the very last is the exception stub's unconditional branch.
         assert!(w.contains(&0xd65f_03c0), "image contains the epilogue ret");
@@ -1356,10 +1446,14 @@ mod tests {
 
         impl Frame {
             fn new() -> Self {
-                // A roomy immovable backing window: fp sits mid-window so positive
-                // argument slots (above fp) and negative local slots (below fp) are
-                // both in range.
-                let stack = JsStack::with_test_backing(64);
+                // A1: a LIVE mmap JS stack (roomy + low-end PROT_NONE guard page),
+                // because the flipped prologue runs the image on the native machine
+                // `sp` switched INTO this region — the arith slow-path far-calls
+                // (operation_compare/jfalse) descend below `fp` here, so the tiny
+                // `with_test_backing` heap box would overflow. `fp` sits near the
+                // high end: positive arg/header slots above it, locals + far-call
+                // frames descend toward the guard page below it.
+                let stack = JsStack::new(1 << 20).expect("live js stack reservation");
                 let fp = stack.high_address() - 256;
                 Frame { stack, fp }
             }
@@ -1410,7 +1504,11 @@ mod tests {
                     .expect("finalize function image");
 
             let vm_ptr: *mut Vm = &mut vm;
-            let ret = handle.call_finalized_binary_u64(vm_ptr as u64, frame.fp as u64);
+            // A1: enter on the native stack via the baseline-JIT entry trampoline.
+            // `entry_sp = fp + sizeof(CallerFrameAndPC)` (16): the prologue's
+            // `pushPair(fp,lr)` lands sp at `fp` and `mov fp,sp` captures the base,
+            // so `addressFor(operand)` reads the slots the args were seeded into.
+            let ret = handle.call_baseline_jit_entry(frame.fp + 16, vm_ptr as u64);
 
             let pending = vm.jit_pending_exception().0;
             vm.clear_jit_host();

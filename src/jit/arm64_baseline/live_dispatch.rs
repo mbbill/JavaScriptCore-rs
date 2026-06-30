@@ -23,21 +23,25 @@
 //!   The executable memory must outlive every native call, so the
 //!   [`InstalledBaselineFunction`] (handle + reusable scratch frame) is owned at a
 //!   stable address by the `Vm` (`vm/mod.rs` `baseline_jit_slots`).
-//! - HANDOFF (S2, B5-lite): the interpreter SEEDS the callee frame at the JSC
-//!   `CallFrameSlot` offsets (`CallFrame.h:176-191`) and jumps to the compiled
-//!   entry; `op_ret`'s epilogue returns the boxed value in `returnValueGPR`. JSC's
-//!   `addressForCall` enters the JITCode the same way (a seeded CallFrame + a jump
-//!   to the code entry). This first cut seeds a DEDICATED scratch frame rather than
-//!   the live arena window (the full JSStack B5 — emitted prologue/SP-move — is
-//!   deferred): because the S4 allowlist gates out every property/call/global op,
-//!   an allowlisted function is PURE (reads its arguments, returns one value, with
-//!   no observable heap/frame side effects), so running it in a scratch frame
-//!   seeded with the arguments is behavior-identical to running it in the live
-//!   frame. Converging to full B5 revises only the entry/setup, not the lowerings.
+//! - HANDOFF (S2 / A1 native-stack entry): the driver `doVMEntry`-SEEDS the callee
+//!   `CallFrame` on the NATIVE JS stack at the JSC `CallFrameSlot` offsets
+//!   (`CallFrame.h:176-191`) and enters the image through the baseline-JIT entry
+//!   trampoline with `sp = calleeFrame + sizeof(CallerFrameAndPC)`. The flipped
+//!   `emitFunctionPrologue` (`pushPair(fp,lr); mov fp,sp`) makes `fp` the callee
+//!   frame and `op_ret`'s epilogue returns the boxed value in `returnValueGPR` —
+//!   the faithful Option-A model (`LowLevelInterpreter64.asm` `doVMEntry` /
+//!   `makeJavaScriptCall`), retiring the pre-A1 hand-placed scratch arena. Each
+//!   installed function owns a default-sized (5 MiB) native stack so a slow-path
+//!   far-call (op_call's `operation_call` re-entering the interpreter,
+//!   get/put_by_val) runs on it with headroom; a nested JIT entry switches `sp`
+//!   to ITS function's stack via the trampoline (per-function stacks never
+//!   overlap). Native JIT->JIT calls (`bl`) are the NEXT unit (A1.2); op_call
+//!   here stays the `operation_call` slow path.
 //!
 //! Unsafe boundary: this module is SAFE (`jit/mod.rs` is `#![deny(unsafe_code)]`).
-//! The native call goes through the SAFE [`ExecutableMemoryHandle::call_finalized_binary_u64`]
-//! wrapper; the `*mut Vm`/`*mut host`/`*const CodeBlock` parking (the D1/D5/S3
+//! The native entry goes through the SAFE [`ExecutableMemoryHandle::call_baseline_jit_entry`]
+//! wrapper (the entry trampoline lives in the `jit::unsafe_platform_boundary`
+//! island); the `*mut Vm`/`*mut host`/`*const CodeBlock` parking (the D1/D5/S3
 //! reborrow island) is performed by the `Vm` driver in `vm/mod.rs` (the crate's
 //! audited unsafe), exactly as the standalone `op_add`/`function_emitter`
 //! execution proofs do.
@@ -196,30 +200,34 @@ mod platform {
     use crate::jit::executable_allocator::{
         finalize_arm64_link_buffer, ExecutableMemoryHandle, MapJitExecutableAllocator,
     };
+    use crate::value::JsValue;
+    use crate::vm::entry::round_vm_entry_argument_count_to_align_frame;
     use crate::vm::jsstack::{
-        argument_offset_including_this, JsStack, Register, REGISTER_SIZE_IN_BYTES,
+        JsStack, Register, VmEntryFrameSeed, CALLER_FRAME_AND_PC_SIZE_IN_REGISTERS,
+        REGISTER_SIZE_IN_BYTES,
     };
     use crate::vm::Vm;
 
     use super::super::function_emitter::emit_baseline_function;
 
-    /// Slack registers added above the highest argument slot and below the lowest
-    /// local so the seeded header/argument writes and the op_enter local zero-fill
-    /// stay inside the immovable scratch window with margin.
-    const FRAME_SLACK_REGISTERS: usize = 8;
-
     /// One installed Stage-1 baseline image (== `CodeBlock::m_jitCode`): the
-    /// finalized, RX-sealed ARM64 code plus a REUSABLE immovable scratch frame the
-    /// B5-lite handoff seeds and runs against. Owned by the `Vm` at a stable
-    /// address so the baked `jit_pending` AbsoluteAddress and the parked `*mut Vm`
-    /// stay valid for the image's lifetime (S7).
+    /// finalized, RX-sealed ARM64 code plus the NATIVE JS stack its CallFrames are
+    /// built on (A1 / Option A). Owned by the `Vm` at a stable address so the baked
+    /// `jit_pending` AbsoluteAddress and the parked `*mut Vm` stay valid for the
+    /// image's lifetime (S7).
     pub(crate) struct InstalledBaselineFunction {
         handle: ExecutableMemoryHandle,
-        /// Immovable backing for the seeded callee frame (B5-lite scratch).
-        scratch: JsStack,
-        /// `cfr` (x29): the frame base where VirtualRegister 0 lives; positive
-        /// arg/header slots sit at/above it, negative locals below it.
-        fp: usize,
+        /// The native JS stack this function's entry CallFrame is `doVMEntry`-seeded
+        /// into and the flipped prologue runs on (A1, retiring the pre-A1 hand-placed
+        /// scratch arena). Default-sized (`Options::maxPerThreadStackUsage`, 5 MiB)
+        /// with a low-end PROT_NONE guard page, so a JIT->interpreter slow-path
+        /// far-call (`op_call`'s `operation_call`, get/put_by_val) runs on it with
+        /// headroom. A nested JIT entry switches `sp` to its OWN function's stack via
+        /// the entry trampoline, so per-function stacks never overlap.
+        stack: JsStack,
+        /// `CodeBlock::m_numCalleeLocals` (the negative local slots `op_enter`
+        /// zero-fills): the `callee_local_count` the entry seed reserves below `fp`.
+        num_locals: u32,
         /// INV-4 (Vm pinned across install->reuse): the `*const Vm` of the owning
         /// `Vm` captured AT INSTALL. The image bakes `jit_pending` as an
         /// `AbsoluteAddress` that is an INTERIOR pointer of THIS `Vm`
@@ -233,14 +241,17 @@ mod platform {
     }
 
     impl InstalledBaselineFunction {
-        /// Seed the callee frame's `this`+argument slots at the JSC `CallFrameSlot`
-        /// offsets (`argument_offset_including_this`: `thisArgument` then
-        /// `firstArgument..`) from `arguments_including_this` (boxed
-        /// `EncodedJSValue` words; `arguments_including_this[0]` is `this`), then
-        /// call the image as `extern "C" fn(*mut Vm, cfr) -> u64`. Returns the
-        /// op_ret boxed value in `returnValueGPR` (x0); the driver reads the
-        /// `jit_pending` mirror for the throw edge. The emitted `op_enter`
-        /// zero-fills the locals, so only the arguments are seeded here.
+        /// `doVMEntry`-seed the callee `CallFrame` on the native JS stack (header +
+        /// `this` + args + undefined-filled locals), then enter the image through
+        /// the baseline-JIT entry trampoline with `sp = calleeFrame +
+        /// sizeof(CallerFrameAndPC)` and the `*mut Vm` in x0. The flipped
+        /// `emitFunctionPrologue` (`pushPair(fp,lr); mov fp,sp`) makes `fp` the
+        /// callee frame, so `addressFor(operand)` reads the seeded slots. Returns
+        /// the `op_ret` boxed value (`returnValueGPR`/x0); the driver reads the
+        /// `jit_pending` mirror for the throw edge.
+        ///
+        /// `arguments_including_this[0]` is `this`; `[1..]` are the real arguments
+        /// (`argumentCountIncludingThis - 1`).
         pub(crate) fn run(&mut self, vm_ptr_bits: u64, arguments_including_this: &[u64]) -> u64 {
             // INV-4 (Vm pinned across install->reuse): the `jit_pending`
             // AbsoluteAddress baked into this image is an interior pointer of the
@@ -256,36 +267,66 @@ mod platform {
                  AbsoluteAddress now dangles (the live baseline path requires a \
                  pinned-address Vm, e.g. Box<Vm>)"
             );
-            for (argument_index, &boxed) in arguments_including_this.iter().enumerate() {
-                // argument_offset_including_this(0) == thisArgument; (1) == arg0.
-                let vreg = argument_offset_including_this(argument_index as i32);
-                let addr = (self.fp as isize + vreg as isize * 8) as usize;
-                // The seeding write MUST happen in ALL profiles. `write_slot` is
-                // itself the REAL bounds gate (`jsstack.rs` register_ptr ->
-                // contains_address): on an out-of-range/misaligned `addr` it returns
-                // `false` WITHOUT writing, so it can never corrupt memory. Capture the
-                // in-range result and only `debug_assert!` on THAT — never put the
-                // side-effecting call inside the assert, which release builds do not
-                // evaluate (that would leave the args unseeded in release ->
-                // wrong native results). Any argument the emitted body actually reads
-                // is in range by construction: `scan_frame_extent` sized the scratch
-                // to the max referenced argument slot + slack, so a `false` here can
-                // only be a trailing argument the body never reads.
-                let seeded_in_range = self.scratch.write_slot(addr, Register::from_bits(boxed));
-                debug_assert!(
-                    seeded_in_range,
-                    "scratch frame argument slot must be in range",
-                );
-            }
-            self.handle
-                .call_finalized_binary_u64(vm_ptr_bits, self.fp as u64)
+
+            // Reset to an empty stack: this function's entry frame is the BOTTOM of
+            // its own native-stack region (a nested JIT entry runs on its own
+            // function's stack, switched in by the trampoline). Each entry seeds
+            // afresh from the high end; `release_frame` bookkeeping is unnecessary.
+            self.stack
+                .set_current_stack_pointer(self.stack.high_address());
+
+            let undefined_bits = JsValue::undefined().encoded().0;
+            // doVMEntry inputs. `argumentCountIncludingThis` is the full slice len
+            // (slot-0 == `this`); the real args are `[1..]`. Always >= 1 by the JS
+            // calling convention (the driver always supplies `this`).
+            let count_including_this = arguments_including_this.len().max(1) as u32;
+            let this_bits = arguments_including_this
+                .first()
+                .copied()
+                .unwrap_or(undefined_bits);
+            let arg_regs: Vec<Register> = arguments_including_this
+                .iter()
+                .skip(1)
+                .map(|&bits| Register::from_bits(bits))
+                .collect();
+            let padded = round_vm_entry_argument_count_to_align_frame(count_including_this);
+            let seed = VmEntryFrameSeed {
+                // EntryFrame sentinel + return-PC: the prologue's `pushPair(fp,lr)`
+                // re-stamps slots 0/1 on entry; not stack-walked in this unit.
+                caller_frame_or_entry: Register::from_bits(0),
+                return_pc: Register::from_bits(0),
+                code_block: Register::from_bits(0),
+                callee: Register::from_bits(0),
+                argument_count_including_this: Register::from_bits(count_including_this as u64),
+                this_value: Register::from_bits(this_bits),
+                arguments: &arg_regs,
+                padded_argument_count: padded,
+                callee_local_count: self.num_locals,
+            };
+
+            let callee_frame = match self.stack.try_seed_entry_frame(&seed) {
+                Ok(frame) => frame.registers().as_ptr() as usize,
+                // A bounded allowlisted frame in a 5 MiB stack cannot overflow the
+                // single-frame seed; a hard stack-overflow THROW is A1.4 (deferred).
+                // Never corrupt memory: bail to boxed `undefined`.
+                Err(_) => {
+                    debug_assert!(false, "entry frame seed must fit the native JS stack");
+                    return undefined_bits;
+                }
+            };
+            // `sp = calleeFrame + sizeof(CallerFrameAndPC)` (LowLevelInterpreter64
+            // `makeJavaScriptCall`); the prologue lowers it to `calleeFrame`.
+            let entry_sp = callee_frame
+                + (CALLER_FRAME_AND_PC_SIZE_IN_REGISTERS as usize) * REGISTER_SIZE_IN_BYTES;
+            self.handle.call_baseline_jit_entry(entry_sp, vm_ptr_bits)
         }
     }
 
     /// COMPILE (S8 synchronous) + INSTALL: lower the whole CodeBlock to one ARM64
     /// image via the Stage-1 emitter (its `Err` is the S4 allowlist), finalize it
-    /// into RX executable memory, and size+allocate the reusable scratch frame.
-    /// Returns the installed image, or `Declined`/`Finalize` as control flow.
+    /// into RX executable memory, and reserve the native JS stack its CallFrames
+    /// run on. Returns the installed image, or `Declined`/`Finalize` as control
+    /// flow.
     pub(crate) fn install_baseline_function(
         code_block: &CodeBlock,
         jit_pending_address: usize,
@@ -298,26 +339,19 @@ mod platform {
             finalize_arm64_link_buffer(&MapJitExecutableAllocator, &image.code, &mut records)
                 .map_err(BaselineInstallError::Finalize)?;
 
-        let (num_locals, max_argument_slot) =
+        let (num_locals, _max_argument_slot) =
             scan_frame_extent(code_block).map_err(BaselineInstallError::Declined)?;
-        let below = num_locals as usize + FRAME_SLACK_REGISTERS;
-        let above = (max_argument_slot.max(0) as usize + 1) + FRAME_SLACK_REGISTERS;
-        let total = below + above;
-        // B5-lite: a fresh immovable arena window for this function's callee frame
-        // (CLoopStack-style mmap reservation, the same backing the live JSStack
-        // uses). Reused for every native call; the seeded args + op_enter zero-fill
-        // overwrite it each time.
-        let scratch =
-            JsStack::new(total * REGISTER_SIZE_IN_BYTES).map_err(BaselineInstallError::Stack)?;
-        // Place `fp` so `below` registers sit beneath it (locals, negative offsets)
-        // and `above` registers at/above it (header + arguments, positive offsets).
-        // The reservation is page-rounded up (>= total*8), so `fp - below*8` stays
-        // at/above `low_address()`.
-        let fp = scratch.high_address() - above * REGISTER_SIZE_IN_BYTES;
+        // A1 / Option A: a default-sized (5 MiB) native JS stack with a low-end
+        // PROT_NONE guard page. The image runs on the machine `sp` switched into
+        // this region, so the slow-path far-calls (operation_call re-entering the
+        // interpreter, get/put_by_val) descend into it and need real headroom —
+        // unlike the pre-A1 scratch arena, which only held the register window
+        // while the far-calls ran on the host C stack.
+        let stack = JsStack::new_default().map_err(BaselineInstallError::Stack)?;
         Ok(InstalledBaselineFunction {
             handle,
-            scratch,
-            fp,
+            stack,
+            num_locals,
             // INV-4: capture the install-time Vm base; `run` asserts the reuse-time
             // base matches so a Vm move (which would dangle the baked jit_pending
             // AbsoluteAddress) is caught in debug.

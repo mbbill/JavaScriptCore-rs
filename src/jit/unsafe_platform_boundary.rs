@@ -100,6 +100,75 @@ mod apple_silicon {
         fn sys_icache_invalidate(start: *mut c_void, len: usize);
     }
 
+    // === Baseline-JIT native-stack ENTRY trampoline (A1.1) ===
+    //
+    // C++ JSC map: `LowLevelInterpreter64.asm` `doVMEntry`/`makeJavaScriptCall`
+    // positions `sp = CallFrame + sizeof(CallerFrameAndPC)` and enters generated
+    // code; `AssemblyHelpers::emitFunctionPrologue` (`pushPair(fp,lr); mov fp,sp`)
+    // then makes `fp/x29` the callee `CallFrame*`. This trampoline switches the
+    // machine `sp` onto the native JS stack at `entry_sp` (the seeded
+    // `calleeFrame + 16`), hands the `*mut Vm` to the image in `x0` (the flipped
+    // prologue moves it into the pinned-VM register x19), `blr`s the image, then
+    // restores the Rust host `sp` and the ARM64 C-ABI callee-save set on return.
+    //
+    // Why a DEDICATED trampoline rather than the platform proof trampoline
+    // `_jsc_rs_arm64_jsc_stack_trampoline`: that one delivers the call target in
+    // x0 and the frame anchor in x29 (`mov x29,x2`), a shape the proof-layer
+    // tests assert (executable_memory_compartment.rs: `mov x0,x29` returns
+    // entry_frame). The flipped prologue needs `x0 = vm` and sets `fp` itself, so
+    // this sibling does `mov x0, x2` (vm) and DROPS the `mov x29,x2`, letting ONE
+    // prologue serve both entry-from-trampoline and the future JIT->JIT `bl`
+    // (A1.2). The host-save frame is byte-identical to the proof trampoline.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    core::arch::global_asm!(
+        r#"
+    .text
+    .private_extern _jsc_rs_arm64_baseline_jit_entry_trampoline
+    .p2align 2
+_jsc_rs_arm64_baseline_jit_entry_trampoline:
+    sub sp, sp, #160
+    stp x29, x30, [sp, #0]
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+    stp d8, d9, [sp, #96]
+    stp d10, d11, [sp, #112]
+    stp d12, d13, [sp, #128]
+    stp d14, d15, [sp, #144]
+
+    mov x19, sp
+    mov x9, x0
+    mov x0, x2
+    mov sp, x1
+    blr x9
+
+    mov sp, x19
+    ldp d14, d15, [sp, #144]
+    ldp d12, d13, [sp, #128]
+    ldp d10, d11, [sp, #112]
+    ldp d8, d9, [sp, #96]
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp, #0]
+    add sp, sp, #160
+    ret
+"#
+    );
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    unsafe extern "C" {
+        fn jsc_rs_arm64_baseline_jit_entry_trampoline(
+            entry: *const u8,
+            entry_sp: usize,
+            vm: u64,
+        ) -> u64;
+    }
+
     fn map_failed() -> *mut c_void {
         usize::MAX as *mut c_void
     }
@@ -261,6 +330,25 @@ mod apple_silicon {
             // SAFETY: calling generated machine code honoring `Entry`'s C ABI.
             unsafe { entry(a, b) }
         }
+
+        /// Enter a finalized baseline-JIT image on the NATIVE JS stack (A1.1).
+        ///
+        /// The image begins with the flipped `emitFunctionPrologue`
+        /// (`pushPair(fp,lr); mov fp,sp`), so its CallFrame is built on the native
+        /// machine stack. The caller has seeded that frame (`doVMEntry`) and passes
+        /// `entry_sp = calleeFrame + sizeof(CallerFrameAndPC)` plus the `*mut Vm`.
+        /// The trampoline switches `sp` to `entry_sp`, places `vm` in x0, calls the
+        /// image, and restores the host `sp`/callee-saves; the image returns its
+        /// `op_ret` boxed value in x0.
+        pub(crate) fn call_baseline_jit_entry(&self, entry_sp: usize, vm: u64) -> u64 {
+            // SAFETY: the region is sealed RX and holds the baseline image at its
+            // base (the flipped prologue at offset 0), per the same finalize-path
+            // contract as `call_finalized_binary_u64`. `entry_sp` is a 16-aligned
+            // address inside the live JS-stack reservation the caller seeded the
+            // CallFrame into; the trampoline only switches `sp`, sets x0=vm, `blr`s
+            // the image, and restores the host stack + ARM64 C-ABI callee-saves.
+            unsafe { jsc_rs_arm64_baseline_jit_entry_trampoline(self.ptr.as_ptr(), entry_sp, vm) }
+        }
     }
 
     impl Drop for JitRegion {
@@ -301,6 +389,10 @@ impl JitRegion {
     }
 
     pub(crate) fn call_finalized_binary_u64(&self, _a: u64, _b: u64) -> u64 {
+        match self._never {}
+    }
+
+    pub(crate) fn call_baseline_jit_entry(&self, _entry_sp: usize, _vm: u64) -> u64 {
         match self._never {}
     }
 }

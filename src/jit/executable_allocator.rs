@@ -117,6 +117,13 @@ impl ExecutableMemoryHandle {
     pub fn call_finalized_binary_u64(&self, a: u64, b: u64) -> u64 {
         self.region.call_finalized_binary_u64(a, b)
     }
+
+    /// Enter a finalized baseline-JIT image on the native JS stack (A1.1): switch
+    /// `sp` to the seeded `entry_sp` (= `calleeFrame + sizeof(CallerFrameAndPC)`),
+    /// pass the `*mut Vm` in x0, and return the `op_ret` boxed value in x0.
+    pub fn call_baseline_jit_entry(&self, entry_sp: usize, vm: u64) -> u64 {
+        self.region.call_baseline_jit_entry(entry_sp, vm)
+    }
 }
 
 /// Allocator of executable memory. Maps to `class ExecutableAllocator`
