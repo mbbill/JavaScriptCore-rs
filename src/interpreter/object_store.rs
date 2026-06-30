@@ -2649,6 +2649,77 @@ pub(crate) struct MarkStats {
     pub(crate) bytes_visited: usize,
 }
 
+/// gc-r4-completion SD-2/U0 — the `methodTable()->visitChildren` SELECTOR: which
+/// per-TYPE tracer/reconcile body applies to an arena cell, decided from its in-cell
+/// `JSCell::m_type` header tag (`js_type`) WITHOUT first downcasting it. This is the
+/// faithful analog of JSC `cell->methodTable()->visitChildren(cell, visitor)`
+/// (runtime/JSCell.h: the per-cell-TYPE method-table dispatch keyed on the cell's
+/// `JSType`). Kept tiny + local, named for the JSC concept.
+///
+/// The marker AND the pre-sweep reconcile both gate the `CoreObjectCell` downcast
+/// behind this selector so they can NEVER read a leaf cell (String/Symbol/HeapBigInt)
+/// as an object cell — the #1 UAF landmine once U1-U3 admit leaf cells into the arena.
+/// Today only object cells live in the arena, so the header always classifies `Object`
+/// and behavior is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // authored-but-unwired with the R4b marker cluster (see MarkStats).
+enum ArenaCellKind {
+    /// An object-range cell (`JSCell::m_type >= ObjectType`): `JSObject::visitChildren`
+    /// (the existing `trace_cell` body) + the existing object pre-sweep reconcile.
+    Object,
+    /// A leaf cell BELOW ObjectType — flat-String / Symbol / HeapBigInt — whose
+    /// `visitChildren` appends NO outgoing cell edges, and whose pre-sweep reconcile
+    /// frees a store-owned slab (U5 fill point). U1-U3 admit these; U4 splits ROPE
+    /// JSString back out (the one leaf-typed cell WITH an edge — the fiber base string,
+    /// JSString.cpp:113).
+    Leaf,
+}
+
+impl ArenaCellKind {
+    /// Classify a cell by the faithful `JSCell::m_type` object-range predicate
+    /// `type >= ObjectType` (runtime/JSType.h:204, `TypeInfo::isObject`). The object
+    /// kinds are the half-open tail of the `JSType` enum, so a single `>=` against the
+    /// `JsType::Object` umbrella selects `JSObject::visitChildren`; everything below it
+    /// is a leaf cell. Comparing the raw header byte (not a typed `JsType`) keeps the
+    /// read sound for ANY initialized header without an enum-discriminant-validity
+    /// assumption.
+    fn from_header_type_byte(type_byte: u8) -> ArenaCellKind {
+        if type_byte >= JsType::Object as u8 {
+            ArenaCellKind::Object
+        } else {
+            ArenaCellKind::Leaf
+        }
+    }
+}
+
+/// The fixed common-prefix offset of the in-cell `JSCell::m_type` tag (`js_type`).
+/// Const-asserted == 4 on EVERY cell kind (CoreObjectCell here; CoreStringCell /
+/// CoreSymbolCell / CoreBigIntCell at their own struct defs), which is exactly what
+/// lets the marker/reconcile read a cell's kind from a RAW arena address before any
+/// concrete-type downcast — the precondition for type-dispatched visitChildren.
+#[allow(dead_code)] // authored-but-unwired with the R4b marker cluster (see MarkStats).
+const ARENA_CELL_JS_TYPE_OFFSET: usize = std::mem::offset_of!(CoreObjectCell, js_type);
+
+/// Read the `JSCell::m_type` header tag from a raw arena cell address WITHOUT knowing
+/// its concrete type, and classify which `visitChildren`/reconcile body applies (the
+/// `methodTable()->visitChildren` selector).
+///
+/// SAFETY: `addr` MUST be a byte-intact, established arena cell — proved by the
+/// membership gate `MarkedSpace::is_arena_cell` on the mark path, or by the
+/// authoritative `live_object_addrs` set on the reconcile path. `js_type` sits at
+/// `ARENA_CELL_JS_TYPE_OFFSET` on every cell kind (const-asserted at each struct def),
+/// so this one-byte read of the COMMON header prefix is in-bounds and initialized
+/// regardless of the concrete kind; the page provenance was exposed at `allocate_blob`.
+/// The read copies a `u8` and forms no lasting reference.
+#[allow(dead_code)] // authored-but-unwired with the R4b marker cluster (see MarkStats).
+unsafe fn arena_cell_kind_at(addr: usize) -> ArenaCellKind {
+    // SAFETY: see the function contract above.
+    let type_byte = unsafe {
+        core::ptr::with_exposed_provenance::<u8>(addr + ARENA_CELL_JS_TYPE_OFFSET).read()
+    };
+    ArenaCellKind::from_header_type_byte(type_byte)
+}
+
 /// The `VisitChildren` method-table stand-in for the live `CoreObjectCell` (gc-r4
 /// R4b-mark). `SlotVisitor::drain` pops a marked cell and calls this to enumerate its
 /// outgoing edges; this derefs the cell (membership-gated) and forwards to `trace_cell`
@@ -2661,21 +2732,51 @@ struct ObjectGraphMarker<'a> {
 
 impl VisitChildren for ObjectGraphMarker<'_> {
     fn visit_children(&self, cell: CellPtr, visitor: &mut SlotVisitor) {
-        // The popped cell was admitted by `is_arena_cell` (membership) before being
-        // pushed, so it is an arena object cell; deref it through the MEMBERSHIP gate
-        // (NOT the liveness `find`) — the marker never consults liveness.
-        let Some(cell) = self.store.arena_cell_for_mark(cell) else {
-            return;
+        // gc-r4-completion SD-2/U0 — `methodTable()->visitChildren` TYPE DISPATCH. The
+        // popped cell was admitted by `is_arena_cell` (membership) before being pushed,
+        // so it is an arena cell of SOME kind, but its concrete type is unknown here.
+        // Read its header JSType at the fixed common offset (membership-gated, NOT the
+        // liveness `find`) and route to the per-type visitChildren body BEFORE any
+        // concrete-type downcast — the faithful analog of JSC `cell->methodTable()->
+        // visitChildren(cell, visitor)`.
+        //
+        // NO BEHAVIOR CHANGE: only object cells live in the arena today, so the header
+        // always classifies `Object` -> the existing `trace_cell` path runs unchanged.
+        // The `Leaf` branch activates only once U1-U3 admit leaf cells.
+        let Some(kind) = self.store.arena_cell_kind(cell) else {
+            return; // membership gate rejected it (a foreign / non-arena address)
         };
-        let mut edges = ObjectEdgeMarker {
-            visitor,
-            space: &self.store.space,
-        };
-        // JSObject::visitChildren: append every RuntimeValue GC edge (inline slots +
-        // butterfly + per-kind aux slabs). `edges` mutates only the transient SlotVisitor
-        // worklist + reads `space`'s mark bits (atomics) — disjoint from the `&cell` and
-        // `&self.store` shared borrows.
-        self.store.trace_cell(cell, &mut edges);
+        match kind {
+            ArenaCellKind::Object => {
+                // Header proved Object: the `CoreObjectCell` downcast is now type-checked,
+                // so it can never read a leaf cell's bytes as an object cell (the #1 UAF
+                // landmine this dispatch exists to close). Deref through the MEMBERSHIP
+                // gate (NOT the liveness `find`) — the marker never consults liveness.
+                let Some(cell) = self.store.arena_cell_for_mark(cell) else {
+                    return;
+                };
+                let mut edges = ObjectEdgeMarker {
+                    visitor,
+                    space: &self.store.space,
+                };
+                // JSObject::visitChildren: append every RuntimeValue GC edge (inline slots
+                // + butterfly + per-kind aux slabs). `edges` mutates only the transient
+                // SlotVisitor worklist + reads `space`'s mark bits (atomics) — disjoint
+                // from the `&cell` and `&self.store` shared borrows.
+                self.store.trace_cell(cell, &mut edges);
+            }
+            ArenaCellKind::Leaf => {
+                // flat-String / Symbol / HeapBigInt visitChildren append NO outgoing cell
+                // edges. U1-U3 fill point: when leaf cells enter the arena, their trace
+                // stays empty here.
+                //
+                // TODO(U4): a ROPE JSString is the one leaf-typed cell WITH an edge — its
+                // fiber base string (`Substring{base}` -> base, JSString.cpp:113). U4 reads
+                // the string-cell text (sound once the header proved StringType) to split
+                // rope from flat and append that single edge via a `trace_string_cell`.
+                self.store.trace_leaf_cell(cell, visitor);
+            }
+        }
     }
 }
 
@@ -2727,9 +2828,48 @@ impl CoreObjectStore {
     /// aliasing `&mut` to this cell can coexist (the marker holds `&self` throughout).
     fn arena_cell_for_mark(&self, cp: CellPtr) -> Option<&CoreObjectCell> {
         self.space.is_arena_cell(cp.addr())?;
+        // gc-r4-completion SD-2/U0: this `CoreObjectCell` hard-cast is reached ONLY behind
+        // the marker's `ArenaCellKind::Object` header check, so it never sees a leaf cell.
+        // SAFETY: `is_arena_cell` just proved `cp` is a byte-intact arena cell, so reading
+        // its fixed-offset header tag is sound (mirrors `arena_cell_kind`'s read).
+        debug_assert!(
+            matches!(
+                unsafe { arena_cell_kind_at(cp.addr()) },
+                ArenaCellKind::Object
+            ),
+            "arena_cell_for_mark hard-casts to CoreObjectCell; caller must type-check Object first"
+        );
         // SAFETY: see the method contract above (mirrors `cell_at`'s shared-deref island).
         let cell = unsafe { &*core::ptr::with_exposed_provenance::<CoreObjectCell>(cp.addr()) };
         Some(cell)
+    }
+
+    /// gc-r4-completion SD-2/U0 — the `methodTable()->visitChildren` SELECTOR for the
+    /// MARKER: membership-gate `cp` (the #1 UAF gate, NOT the liveness `find`), then read
+    /// its header JSType to decide which per-type visitChildren body runs. Returns `None`
+    /// for a foreign / non-arena address (the gate rejected it). Today every admitted cell
+    /// is an object cell, so this only ever returns `Some(ArenaCellKind::Object)`.
+    fn arena_cell_kind(&self, cp: CellPtr) -> Option<ArenaCellKind> {
+        self.space.is_arena_cell(cp.addr())?;
+        // SAFETY: the membership gate just proved `cp` is a byte-intact arena cell of SOME
+        // kind; js_type is at the fixed common offset on every kind (const-asserted), so
+        // reading the one-byte header tag before any concrete-type downcast is sound.
+        Some(unsafe { arena_cell_kind_at(cp.addr()) })
+    }
+
+    /// gc-r4-completion SD-2/U0 — the LEAF-cell `visitChildren` body (the `Leaf` branch of
+    /// the marker's type dispatch). A flat-String / Symbol / HeapBigInt cell holds NO
+    /// outgoing cell edges, so this appends nothing. It exists so the dispatch is total
+    /// BEFORE U1-U3 admit leaf cells into the arena; once they do, this stays empty for the
+    /// leaf kinds.
+    ///
+    /// TODO(U4): a ROPE JSString (`Substring{base}`) has ONE edge — the fiber base string
+    /// (JSString.cpp:113). U4 routes rope strings to a `trace_string_cell` that appends it.
+    ///
+    /// The `_cp`/`_visitor` params mirror the object branch's `trace_cell(cell, visitor)`
+    /// shape so U4 can fill the rope edge in place without changing the dispatch.
+    fn trace_leaf_cell(&self, _cp: CellPtr, _visitor: &mut SlotVisitor) {
+        // Intentionally empty: leaf cells have no GC edges (see the doc + TODO(U4)).
     }
 
     /// gc-r4 R4b-mark ROOT GAP #1 — the intrinsic root set: every `CoreObjectStore`
@@ -3040,26 +3180,51 @@ impl CoreObjectStore {
                 if space.is_addr_marked(addr) {
                     return; // LIVE (marked) -> retain, untouched
                 }
-                // DEAD: bytes still intact (pre-sweep). SAFETY: `addr` is in the authoritative
-                // live set => a once-exposed, atom-aligned, initialized POD `CoreObjectCell`
-                // not yet swept; only `&self.space` / `&self.live_object_addrs` are borrowed,
-                // so no `&mut` to this cell coexists; this raw shared read forms no lasting
-                // reference (the `&` is dropped at the closure-body end, before Phase 2 mutates
-                // any slab and before the sweep clobbers the cell).
-                let cell = unsafe { &*core::ptr::with_exposed_provenance::<CoreObjectCell>(addr) };
-                dead.push(DeadCellRecord {
-                    addr,
-                    butterfly: cell.butterfly,
-                    bound_args: cell.bound_args,
-                    captures: cell.captures,
-                    instance_fields: cell.instance_fields,
-                    map_entries: cell.map_entries,
-                    set_values: cell.set_values,
-                    regexp_source: cell.regexp_source,
-                    array_buffer_data: cell.array_buffer_data,
-                    promise_reactions: cell.promise_reactions,
-                    cell_id: cell.cell_id,
-                });
+                // DEAD: bytes still intact (pre-sweep). gc-r4-completion SD-2/U0 —
+                // `methodTable()->visitChildren`-style TYPE DISPATCH: read the header JSType
+                // at the fixed common offset BEFORE the `CoreObjectCell` downcast, so a
+                // (future) dead LEAF cell is never reconciled as an object cell — reading
+                // leaf bytes as object handles would free unrelated slab slots (the #1 UAF
+                // landmine). NO BEHAVIOR CHANGE: only object cells are in the arena today, so
+                // this always takes the Object branch.
+                //
+                // SAFETY (kind read): `addr` is in the authoritative `live_object_addrs`
+                // set => a byte-intact arena cell; js_type is at the fixed common offset on
+                // every kind (const-asserted), so the one-byte header read is sound.
+                match unsafe { arena_cell_kind_at(addr) } {
+                    ArenaCellKind::Object => {
+                        // SAFETY: the header proved Object, so the downcast is type-checked.
+                        // `addr` in the live set => a once-exposed, atom-aligned, initialized
+                        // POD `CoreObjectCell` not yet swept; only `&self.space` /
+                        // `&self.live_object_addrs` are borrowed, so no `&mut` to this cell
+                        // coexists; this raw shared read forms no lasting reference (the `&`
+                        // is dropped at the arm end, before Phase 2 mutates any slab and
+                        // before the sweep clobbers the cell).
+                        let cell =
+                            unsafe { &*core::ptr::with_exposed_provenance::<CoreObjectCell>(addr) };
+                        dead.push(DeadCellRecord {
+                            addr,
+                            butterfly: cell.butterfly,
+                            bound_args: cell.bound_args,
+                            captures: cell.captures,
+                            instance_fields: cell.instance_fields,
+                            map_entries: cell.map_entries,
+                            set_values: cell.set_values,
+                            regexp_source: cell.regexp_source,
+                            array_buffer_data: cell.array_buffer_data,
+                            promise_reactions: cell.promise_reactions,
+                            cell_id: cell.cell_id,
+                        });
+                    }
+                    ArenaCellKind::Leaf => {
+                        // U5 fill point — the store-driven LEAF reconcile: free the dead leaf
+                        // cell's store-owned slab (string_texts / symbol description / bigint
+                        // limbs) and remove its interning-map entry by identity (the
+                        // `~StringImpl -> AtomStringImpl::remove` analog, StringImpl.cpp:129),
+                        // BEFORE the sweep clobbers the cell. No-op today: no leaf cell is in
+                        // the arena (U1-U3 admit them first).
+                    }
+                }
             });
         }
         // ---- Phase 2 (MUTATE): free slabs + drop reverse-index + drop the live-set entry.
