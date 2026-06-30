@@ -124,6 +124,14 @@ impl ExecutableMemoryHandle {
     pub fn call_baseline_jit_entry(&self, entry_sp: usize, vm: u64) -> u64 {
         self.region.call_baseline_jit_entry(entry_sp, vm)
     }
+
+    /// The absolute entry address of this sealed image (offset 0): the `blr` target
+    /// a native JIT->JIT call bakes (A1.3), the analog of resolving a linked
+    /// `CallLinkInfo`'s `m_monomorphicCallDestination`.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn entry_address(&self) -> usize {
+        self.region.entry_address()
+    }
 }
 
 /// Allocator of executable memory. Maps to `class ExecutableAllocator`

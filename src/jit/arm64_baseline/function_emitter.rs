@@ -82,11 +82,25 @@ use crate::jit::operations::{
     operation_get_by_val, operation_jfalse, operation_put_by_val, MAX_REGISTER_CALL_ARGS,
 };
 use crate::value::{JsValue, NUMBER_TAG};
+use crate::vm::jsstack::CallFrameSlot;
 
 use super::arith::{emit_arith_fast_path, ArithFamilyOp, PINNED_VM_GPR};
 
 /// `sizeof(Register)` (JSVALUE64); `addressFor` scales the VirtualRegister by it.
 const REGISTER_SIZE_BYTES: i32 = 8;
+
+/// `sizeof(CallerFrameAndPC)` (`CallFrame.h:109-112`; `sizeInRegisters == 2`): the
+/// `[callerFrame, returnPC]` header pair. A call edge leaves `sp = calleeFrame +
+/// sizeof(CallerFrameAndPC)` (JITCall.cpp:246) so the callee prologue's
+/// `pushPair(fp,lr)` lands that pair at slots 0/1.
+const CALLER_FRAME_AND_PC_SIZE_BYTES: i32 = 2 * REGISTER_SIZE_BYTES;
+
+/// Bytes the prologue spills BELOW the reserved locals: two `pushPair`s — the
+/// pinned-VM pair (x19/x20) and the tag-register pair (x27/x28) — at 16 bytes each
+/// (`emit_prologue`). After the prologue `sp == fp - reservedLocalsBytes -
+/// CALLEE_SAVE_SPILL_BYTES`; the native op_call edge restores exactly this so the
+/// epilogue's `popPair`s (`emit_epilogue`) refill the right spill slots.
+const CALLEE_SAVE_SPILL_BYTES: i32 = 32;
 
 // --- Register identity (GPRInfo.h, ARM64 baseline) — the canonical conventions
 //     op_add/arith established, kept identical so this emitter does not drift. ----
@@ -154,6 +168,12 @@ fn reserved_locals_bytes(num_locals: u32) -> i32 {
     (even as i32).wrapping_mul(REGISTER_SIZE_BYTES)
 }
 
+/// Round a positive byte count UP to a 16-byte (2-register) multiple — JSC's
+/// `stackAlignmentBytes()`/`stackAlignmentRegisters == 2` rule for a call edge.
+fn round_up_to_16(bytes: i32) -> i32 {
+    (bytes + 15) & !15
+}
+
 /// An emitted (not-yet-finalized) full-function image — the assembler bytes plus
 /// the branch link records the LinkBuffer pass resolves. Mirrors op_add's
 /// `OpAddImage` (the `(code, jumpsToLink)` a `JIT`/`LinkBuffer` carries before
@@ -161,6 +181,41 @@ fn reserved_locals_bytes(num_locals: u32) -> i32 {
 pub(crate) struct FunctionImage {
     pub(crate) code: Vec<u8>,
     pub(crate) link_records: Vec<Arm64LinkRecord>,
+    /// A1.2/A1.3: the native JIT->JIT call sites this image emitted (one per
+    /// op_call that resolved to a [`LinkedCallTarget`]). Empty for the live install
+    /// path (every dynamic op_call stays on the `operation_call` slow path). Carries
+    /// the call edge's `returnPC`/calleeFrame geometry for the R-lever proof.
+    pub(crate) linked_call_sites: Vec<LinkedCallSite>,
+}
+
+/// A1.3 (first cut): a resolved native call target for ONE op_call site — the
+/// absolute entry address of the callee's installed baseline image. This is the
+/// emit-time analog of a LINKED monomorphic `CallLinkInfo`'s
+/// `m_monomorphicCallDestination` (`bytecode/CallLinkInfo.cpp:312,338`): JSC LOADS
+/// that destination from the patchable `CallLinkInfo` data IC at runtime and
+/// `jit.call`s it (`emitFastPathImpl` :338,363). This FIRST CUT instead BAKES the
+/// absolute callee entry as a `blr` immediate, because a near `bl` reaches only
+/// ±128 MB and two separately-`mmap`'d RX images can sit farther apart; the
+/// repatchable load-from-`CallLinkInfo` (a real data IC) is the deferred follow-up.
+/// Keyed by the op_call's bytecode index.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinkedCallTarget {
+    pub(crate) bytecode_index: usize,
+    pub(crate) entry: usize,
+}
+
+/// The geometry of one emitted native JIT->JIT call edge, recorded so the call's
+/// CallFrame header (`CallFrame.h:109-112`) can be cross-checked against the live
+/// native stack. `return_pc_offset` is the byte offset into [`FunctionImage::code`]
+/// of the instruction AFTER the `blr` (== `returnPC`); after finalize it maps to
+/// `image_base + return_pc_offset`. `callee_frame_offset_from_fp` is the signed
+/// fp-relative byte offset of the callee `CallFrame*` (slot 0), so the callee frame
+/// sits at `caller_fp + callee_frame_offset_from_fp`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinkedCallSite {
+    pub(crate) bytecode_index: usize,
+    pub(crate) return_pc_offset: usize,
+    pub(crate) callee_frame_offset_from_fp: i32,
 }
 
 /// Failure modes of [`emit_baseline_function`]. A real CodeBlock that contains any
@@ -256,6 +311,14 @@ struct FunctionEmitter {
     label_link_records: Vec<Arm64LinkRecord>,
     /// The baked `AbsoluteAddress` of `Vm::m_exception` (D3); see op_add prereq #3.
     jit_pending_address: usize,
+    /// Bytes the prologue reserved below `fp` for this function's callee locals
+    /// (`reserved_locals_bytes(num_locals)`), captured in [`Self::emit_prologue`].
+    /// The native op_call edge (A1.2) needs it to place the callee frame BELOW the
+    /// caller's whole used region and to restore `sp` after the call.
+    reserved_locals_bytes: i32,
+    /// A1.2/A1.3: native JIT->JIT call sites emitted in this image (one per op_call
+    /// resolved to a [`LinkedCallTarget`]); surfaced on the [`FunctionImage`].
+    linked_call_sites: Vec<LinkedCallSite>,
 }
 
 const MODE: TagRegistersMode = TagRegistersMode::HaveTagRegisters;
@@ -271,6 +334,8 @@ impl FunctionEmitter {
             slow: Vec::new(),
             label_link_records: Vec::new(),
             jit_pending_address,
+            reserved_locals_bytes: 0,
+            linked_call_sites: Vec::new(),
         }
     }
 
@@ -300,6 +365,9 @@ impl FunctionEmitter {
         self.h.masm_mut().push_pair(CALL_FRAME_GPR, LINK_GPR); // stp fp,lr,[sp,#-16]!
         self.h.masm_mut().move_rr(RegisterID::Sp, CALL_FRAME_GPR); // mov fp, sp (cfr)
         let reserved = reserved_locals_bytes(num_locals);
+        // Captured for the native op_call edge (A1.2): the callee frame goes BELOW
+        // `fp - reserved - CALLEE_SAVE_SPILL_BYTES` and `sp` is restored to it.
+        self.reserved_locals_bytes = reserved;
         if reserved > 0 {
             // `sub sp, sp, #reserved` (== `sub sp, fp, #reserved`, fp==sp here):
             // a negative add immediate folds to a sub immediate.
@@ -520,6 +588,147 @@ impl FunctionEmitter {
         // empty result. The probe reuses SCRATCH_GPR; x0 (the boxed result) is intact.
         self.emit_exception_probe();
         self.h.masm_mut().store64(RESULT_GPR, address_for(dst)); // dst = x0 (boxed result)
+    }
+
+    /// op_call — the A1.2 native JIT->JIT FAST PATH (the R-lever existence proof):
+    /// a LINKED call whose callee is another baseline-JIT'd image, reached by a
+    /// native `bl`/`blr` on the UNIFIED native stack instead of the `operation_call`
+    /// interpreter re-entry. This is JSC's faithful `compileOpCall`/`compileSetupFrame`
+    /// + `CallLinkInfo::emitFastPathImpl` (`jit/JITCall.cpp:222-251,288-297`;
+    /// `bytecode/CallLinkInfo.cpp:323-365`): the CALLER sets up the callee `CallFrame`
+    /// on the stack (callee/argCount/this/args at the calleeFrame slots), leaves
+    /// `sp = calleeFrame + sizeof(CallerFrameAndPC)`, then `call`s the resolved entry;
+    /// the callee's own `emitFunctionPrologue` (`pushPair(fp,lr); mov fp,sp`) finishes
+    /// the header (writing `callerFrame`@0 = the caller's `fp` and `returnPC`@1 = the
+    /// return address) and `op_ret`'s epilogue restores `fp`/`sp` and returns the
+    /// boxed value in `returnValueGPR`.
+    ///
+    /// Frame placement (faithful to `addPtr(registerOffset*8 + sizeof(CallerFrameAndPC),
+    /// cfr, sp)`, JITCall.cpp:141): the callee frame is placed at
+    /// `fp - reservedLocalsBytes - CALLEE_SAVE_SPILL_BYTES - aboveFpBytes`, i.e.
+    /// CONTIGUOUSLY below the caller's whole used region (locals + callee-save
+    /// spills), where `aboveFpBytes` covers the callee header + `this` + args
+    /// (16-aligned for `stackAlignmentRegisters == 2`). The callee's own locals then
+    /// grow further DOWN from `calleeFrame` (its prologue's `sub sp`), so the two
+    /// frames share ONE descending span — the Option-A unified-stack model
+    /// (docs/design/jsstack.md "B5/STACK MODEL").
+    ///
+    /// ⚠ A1.5 DEPENDENCY — CELL-CARRYING CALLS ARE GATED OUT. A JIT CallFrame on the
+    /// native stack holding a CELL (object/string) across a collection would not be
+    /// rooted: the scoped conservative scan of the native-stack JIT-frame span is
+    /// A1.5 (the UNIFIED FRAME CONTRACT, jsstack.md), NOT YET landed. So this fast
+    /// path is engaged ONLY for a pre-seeded [`LinkedCallTarget`] (the arith/int
+    /// proof), NEVER for a dynamic op_call — the live install path supplies NO linked
+    /// targets, so every cell-carrying op_call (the `vm_op_call_b5_*` cases) stays on
+    /// the `operation_call` slow path ([`Self::emit_op_call`]). Broadly routing real
+    /// op_calls here is UNSAFE until A1.5.
+    ///
+    /// DIVERGENCE from JSC (A1.3 first cut, documented on [`LinkedCallTarget`]): the
+    /// callee entry is an ABSOLUTE `blr` immediate baked at emit time, not a runtime
+    /// load of a patchable `CallLinkInfo::m_monomorphicCallDestination`; the data-IC
+    /// link-on-first-exec + callee-identity guard + arity stub are deferred. The
+    /// callee-frame `codeBlock`@2 slot is left unwritten (the callee's emitted image
+    /// never consults it; it is needed only when a callee slow path re-enters the
+    /// interpreter — a follow-up alongside A1.5).
+    fn emit_op_call_native_linked(
+        &mut self,
+        dst: i32,
+        callee: i32,
+        args: &[i32],
+        entry: usize,
+        bytecode_index: usize,
+    ) {
+        let argc = args.len() as i32;
+        // argumentCountIncludingThis (CallFrame.h:179): the explicit args plus `this`.
+        let count_including_this = argc + 1;
+        // The header + `this` + args sit AT/ABOVE the callee `fp`; the highest slot
+        // is `FIRST_ARGUMENT + argc - 1` (== arg(argc-1)). Round the region to 16 so
+        // `sp = calleeFrame + 16` is 16-aligned (AAPCS64 / stackAlignmentRegisters).
+        let above_fp_bytes =
+            round_up_to_16((CallFrameSlot::FIRST_ARGUMENT + argc) * REGISTER_SIZE_BYTES);
+        // calleeFrame = fp + offset (offset < 0): below the caller's reserved locals
+        // and callee-save spills, with room above for the callee header + args.
+        let callee_frame_offset_from_fp =
+            -(self.reserved_locals_bytes + CALLEE_SAVE_SPILL_BYTES + above_fp_bytes);
+
+        // calleeFrame address -> SCRATCH_GPR_B (held until `sp` is lowered).
+        self.h.masm_mut().add64_imm(
+            TrustedImm32::new(callee_frame_offset_from_fp),
+            CALL_FRAME_GPR,
+            SCRATCH_GPR_B,
+        );
+        // Initialize Callee (CallFrame.h:178). The boxed callee value is laid into
+        // the header for faithfulness/StackVisitor; dispatch uses the resolved entry.
+        self.h.masm_mut().load64(address_for(callee), SCRATCH_GPR);
+        self.store_callee_frame_slot(CallFrameSlot::CALLEE, SCRATCH_GPR);
+        // Initialize ArgumentCount (CallFrame.h:179): payload == count incl. `this`.
+        // (JSC also stamps the CallSiteIndex into the tag half, JITCall.cpp:247-248;
+        // omitted in this first cut — the callee image does not read it.)
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(count_including_this), SCRATCH_GPR);
+        self.store_callee_frame_slot(CallFrameSlot::ARGUMENT_COUNT_INCLUDING_THIS, SCRATCH_GPR);
+        // Initialize `this` = undefined (op_call's implicit receiver, the same value
+        // `operation_call` supplies on the slow path).
+        let undefined_bits = JsValue::undefined().encoded().0;
+        self.h
+            .masm_mut()
+            .move_imm64(TrustedImm64::new(undefined_bits as i64), SCRATCH_GPR);
+        self.store_callee_frame_slot(CallFrameSlot::THIS_ARGUMENT, SCRATCH_GPR);
+        // Copy the explicit arguments into the callee frame's argument slots
+        // (firstArgument + i), the analog of the caller's pre-laid-out arg area.
+        for (arg_index, &arg_slot) in args.iter().enumerate() {
+            self.h.masm_mut().load64(address_for(arg_slot), SCRATCH_GPR);
+            self.store_callee_frame_slot(
+                CallFrameSlot::FIRST_ARGUMENT + arg_index as i32,
+                SCRATCH_GPR,
+            );
+        }
+
+        // Hand the pinned `*mut Vm` to the callee in x0 (its prologue moves x0 into
+        // the pinned-VM register x19, this engine's vm convention) BEFORE switching
+        // `sp`. x0 is the result register, clobbered by the call anyway.
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR);
+        // sp = calleeFrame + sizeof(CallerFrameAndPC) (JITCall.cpp:246). The callee
+        // prologue's `pushPair(fp,lr)` lands [callerFrame, returnPC] at slots 0/1.
+        self.h.masm_mut().add64_imm(
+            TrustedImm32::new(CALLER_FRAME_AND_PC_SIZE_BYTES),
+            SCRATCH_GPR_B,
+            RegisterID::Sp,
+        );
+        // The linked near call (`jit.call(callTargetGPR, ...)`, CallLinkInfo.cpp:363),
+        // here an ABSOLUTE `blr` to the resolved callee entry (A1.3 first cut).
+        self.h.masm_mut().far_call(TrustedImm64::new(entry as i64));
+        // returnPC == the address of the instruction AFTER the blr.
+        let return_pc_offset = self.h.masm().label().label().0 as usize;
+        self.linked_call_sites.push(LinkedCallSite {
+            bytecode_index,
+            return_pc_offset,
+            callee_frame_offset_from_fp,
+        });
+
+        // resetSP (JITCall.cpp:294): the callee restored `fp`; restore `sp` to the
+        // caller's post-prologue position (`fp - reserved - spills`) so the epilogue's
+        // `popPair`s refill the right callee-save spill slots.
+        self.h.masm_mut().add64_imm(
+            TrustedImm32::new(-(self.reserved_locals_bytes + CALLEE_SAVE_SPILL_BYTES)),
+            CALL_FRAME_GPR,
+            RegisterID::Sp,
+        );
+        // D3 throw edge (a callee slow path stamped the mirror), then store x0 -> dst.
+        self.emit_exception_probe();
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst));
+    }
+
+    /// Store `src` into the in-construction callee frame's slot `slot_index`
+    /// (`Address(calleeFrame, slot*sizeof(Register))`, calleeFrame held in
+    /// SCRATCH_GPR_B). Faithful to JSC's `calleeFrameSlot(slot)` stores
+    /// (JITCall.cpp:251).
+    fn store_callee_frame_slot(&mut self, slot_index: i32, src: RegisterID) {
+        self.h.masm_mut().store64(
+            src,
+            Address::new(SCRATCH_GPR_B, slot_index.wrapping_mul(REGISTER_SIZE_BYTES)),
+        );
     }
 
     /// The FUSED int32 compare-and-branch (`emit_op_jless` via `emit_compareAndJump`,
@@ -842,9 +1051,27 @@ fn count_callee_locals(code_block: &CodeBlock) -> Result<u32, EmitFunctionError>
 /// Returns `Err` (REJECTS the function) for any opcode/operand outside the Stage-1
 /// int32/control-flow allowlist — the S4 gate behavior (the function stays in the
 /// interpreter rather than being mis-lowered).
+///
+/// Every op_call is lowered to the `operation_call` slow path: the LIVE install path
+/// supplies NO linked targets, so no dynamic (possibly cell-carrying) op_call is
+/// routed through the A1.2 native fast path until the A1.5 JIT-frame GC scan lands
+/// (see [`FunctionEmitter::emit_op_call_native_linked`]).
 pub(crate) fn emit_baseline_function(
     code_block: &CodeBlock,
     jit_pending_address: usize,
+) -> Result<FunctionImage, EmitFunctionError> {
+    emit_baseline_function_with_linked_calls(code_block, jit_pending_address, &[])
+}
+
+/// As [`emit_baseline_function`], but resolves the op_call sites named in
+/// `linked_calls` to the A1.2 native JIT->JIT fast path (a direct `blr` to the
+/// callee's installed-image entry) instead of the `operation_call` slow path. An
+/// op_call NOT named here keeps the slow path. This is the A1.3 first-cut linker:
+/// the proof harness pre-seeds ONE monomorphic target; the live path passes `&[]`.
+pub(crate) fn emit_baseline_function_with_linked_calls(
+    code_block: &CodeBlock,
+    jit_pending_address: usize,
+    linked_calls: &[LinkedCallTarget],
 ) -> Result<FunctionImage, EmitFunctionError> {
     let count = code_block.unlinked().instructions().instruction_count();
     if count == 0 {
@@ -984,7 +1211,17 @@ pub(crate) fn emit_baseline_function(
                 for arg_index in 0..argc as usize {
                     args.push(frame_slot(decoded.register_operand(3 + arg_index)?)?);
                 }
-                emitter.emit_op_call(dst, callee, &args);
+                // A1.2/A1.3: a pre-seeded LINKED target routes this site through the
+                // native JIT->JIT fast path; otherwise (always, for the live install
+                // path) the `operation_call` slow path. The native path is gated to
+                // pre-seeded targets because cell-carrying calls need the A1.5
+                // JIT-frame GC scan (see `emit_op_call_native_linked`).
+                match linked_calls.iter().find(|t| t.bytecode_index == bci) {
+                    Some(target) => {
+                        emitter.emit_op_call_native_linked(dst, callee, &args, target.entry, bci)
+                    }
+                    None => emitter.emit_op_call(dst, callee, &args),
+                }
             }
             // op_loop_hint is a tier-up/OSR marker with no value effect (the
             // interpreter treats it as Continue); emit nothing, fall through.
@@ -1037,6 +1274,7 @@ pub(crate) fn emit_baseline_function(
     Ok(FunctionImage {
         code: emitter.h.code().to_vec(),
         link_records,
+        linked_call_sites: emitter.linked_call_sites,
     })
 }
 
@@ -1725,6 +1963,215 @@ mod tests {
             let (r, _) = run_function(double_literal_arith_instructions(), &[(ARG0, i32_bits(4))]);
             assert_eq!(r.ret, d(11.5), "f(4) = 4*2.5+1.5 = 11.5");
             assert_eq!(r.pending, 0, "no exception");
+        }
+    }
+
+    // ========================================================================
+    // A1.2 + A1.3 — THE FIRST JIT->JIT NATIVE CALL (the R-lever existence proof).
+    //
+    // Two baseline-compilable INTEGER functions run natively on ONE unified native
+    // stack: `callee(a,b){ return a+b }` and `caller(x){ return callee(x,1) }`. The
+    // callee is pre-compiled; its installed-image entry is pre-seeded as the caller's
+    // op_call LINKED target (A1.3 first cut). Entering `caller` via the A1.1 entry
+    // bridge, its emitted op_call (A1.2) lays out the callee CallFrame CONTIGUOUSLY
+    // below its own and native-`bl`s the callee (replacing the `operation_call`
+    // interpreter re-entry), then `op_ret` returns the boxed result.
+    //
+    // Asserts the R-lever header-adjacency + contiguity contract DIRECTLY off the
+    // live native stack: callerFrame@0 == caller_fp, returnPC@1 == bl-site+4, the
+    // callee frame sits at caller_fp - framesize, the seeded callee header/args are
+    // correct, and jit_pending == 0. NO GC dependency (arith-only -> the JIT frames
+    // hold only numbers, so the A1.5 scoped root-walk is not yet required).
+    // macOS/aarch64 only (executes native ARM64).
+    // ========================================================================
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mod native_jit_to_jit_call {
+        use super::super::{
+            emit_baseline_function_with_linked_calls, LinkedCallSite, LinkedCallTarget,
+        };
+        use super::{build_code_block, imm, instr, reg, ARG0, ARG1, LOCAL0, LOCAL1, LOCAL2};
+        use crate::bytecode::{CoreOpcode, Operand, TypedInstruction};
+        use crate::interpreter::CoreOpcodeDispatchHost;
+        use crate::jit::executable_allocator::{
+            finalize_arm64_link_buffer, ExecutableMemoryHandle, MapJitExecutableAllocator,
+        };
+        use crate::value::JsValue;
+        use crate::vm::jsstack::{CallFrameSlot, JsStack, Register, REGISTER_SIZE_IN_BYTES};
+        use crate::vm::{Vm, VmConfig};
+
+        /// Emit + finalize one CodeBlock into an executable image, resolving the
+        /// op_call sites in `linked_calls` to the native JIT->JIT fast path.
+        fn finalize_image(
+            instructions: Vec<TypedInstruction>,
+            jit_pending_address: usize,
+            linked_calls: &[LinkedCallTarget],
+        ) -> (ExecutableMemoryHandle, Vec<LinkedCallSite>) {
+            let code_block = build_code_block(instructions);
+            let image = emit_baseline_function_with_linked_calls(
+                &code_block,
+                jit_pending_address,
+                linked_calls,
+            )
+            .expect("emit baseline function");
+            let sites = image.linked_call_sites.clone();
+            let mut records = image.link_records;
+            let handle =
+                finalize_arm64_link_buffer(&MapJitExecutableAllocator, &image.code, &mut records)
+                    .expect("finalize image");
+            (handle, sites)
+        }
+
+        /// Byte address of frame slot `slot_index` within the frame at `fp`.
+        fn slot_addr(fp: usize, slot_index: i32) -> usize {
+            (fp as isize + slot_index as isize * REGISTER_SIZE_IN_BYTES as isize) as usize
+        }
+
+        #[test]
+        fn first_jit_to_jit_native_call_proves_header_adjacency_and_contiguity() {
+            // A real Vm supplies the jit_pending mirror (D3) the op_call native fast
+            // path probes and the `*mut Vm` the prologue pins in x19 (the callee
+            // receives it via the caller's `mov x0,x19` before the `bl`). Arith-only
+            // -> no slow path / throw occurs.
+            let mut host = CoreOpcodeDispatchHost::new();
+            let mut vm = Vm::new(VmConfig::interpreter_only());
+            vm.set_jit_host(&mut host);
+            let jit_pending_address = vm.jit_pending_exception_address() as usize;
+
+            // (1) Pre-compile the CALLEE `callee(a,b){ return a+b }`; resolve its entry.
+            let callee_instructions = vec![
+                instr(
+                    CoreOpcode::AddInt32,
+                    vec![reg(LOCAL0), reg(ARG0), reg(ARG1)],
+                    0,
+                ),
+                instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+            ];
+            let (callee_handle, _) = finalize_image(callee_instructions, jit_pending_address, &[]);
+            let callee_entry = callee_handle.entry_address();
+
+            // (2) Compile the CALLER `caller(x){ return callee(x, 1) }`, pre-seeding
+            //     its op_call (bci 1) as the LINKED monomorphic target = callee entry.
+            //     LOCAL2 is the callee operand slot (undefined; dispatch uses the
+            //     resolved entry). arg0 = x (ARG0), arg1 = 1 (LOCAL1, from LoadInt32).
+            let caller_instructions = vec![
+                instr(CoreOpcode::LoadInt32, vec![reg(LOCAL1), imm(1)], 0),
+                instr(
+                    CoreOpcode::Call,
+                    vec![
+                        reg(LOCAL0),
+                        reg(LOCAL2),
+                        Operand::UnsignedImmediate(2),
+                        reg(ARG0),
+                        reg(LOCAL1),
+                    ],
+                    1,
+                ),
+                instr(CoreOpcode::Return, vec![reg(LOCAL0)], 2),
+            ];
+            let linked = [LinkedCallTarget {
+                bytecode_index: 1,
+                entry: callee_entry,
+            }];
+            let (caller_handle, sites) =
+                finalize_image(caller_instructions, jit_pending_address, &linked);
+            assert_eq!(sites.len(), 1, "the caller emitted one native call edge");
+            let site = sites[0];
+            assert_eq!(site.bytecode_index, 1, "the native edge is op_call@bci 1");
+            let caller_base = caller_handle.entry_address();
+
+            let undefined_bits = JsValue::undefined().encoded().0;
+
+            for &x in &[0_i32, 1, 7, -4, 1000, 123_456] {
+                // A fresh native JS stack per run. `caller_fp` near the high end:
+                // positive arg/header slots above it, frames descend below it.
+                let stack = JsStack::new(1 << 20).expect("native js stack");
+                let caller_fp = stack.high_address() - 256;
+                // Seed the caller's argument x at ARG0 (untouched by op_enter).
+                assert!(
+                    stack.write_slot(
+                        slot_addr(caller_fp, ARG0),
+                        Register::from_bits(JsValue::from_i32(x).encoded().0),
+                    ),
+                    "ARG0 slot in range",
+                );
+
+                // Enter `caller` via the A1.1 entry bridge: sp = caller_fp + 16.
+                let vm_ptr: *mut Vm = &mut vm;
+                let ret = caller_handle.call_baseline_jit_entry(caller_fp + 16, vm_ptr as u64);
+
+                // The callee frame the op_call laid out, at caller_fp + offset (<0).
+                let callee_fp =
+                    (caller_fp as isize + site.callee_frame_offset_from_fp as isize) as usize;
+                let read = |slot_index: i32| -> u64 {
+                    stack
+                        .read_slot(slot_addr(callee_fp, slot_index))
+                        .expect("callee frame slot in range")
+                        .bits()
+                };
+
+                // --- The R-lever contract -----------------------------------------
+                // Functional: caller(x) == callee(x, 1) == x + 1.
+                assert_eq!(
+                    ret,
+                    JsValue::from_i32(x + 1).encoded().0,
+                    "caller({x}) native-called callee -> x+1",
+                );
+                // CONTIGUITY: the callee frame sits strictly below the caller frame.
+                assert!(
+                    callee_fp < caller_fp,
+                    "callee frame ({callee_fp:#x}) is below caller_fp ({caller_fp:#x})",
+                );
+                // HEADER ADJACENCY: callerFrame@0 == caller_fp (the callee prologue's
+                // pushPair stored the caller's fp at the callee frame's slot 0).
+                assert_eq!(
+                    read(CallFrameSlot::CALLER_FRAME),
+                    caller_fp as u64,
+                    "callerFrame@0 == caller_fp",
+                );
+                // HEADER ADJACENCY: returnPC@1 == the instruction after the bl
+                // (bl-site + 4), a real return address into the caller image.
+                assert_eq!(
+                    read(CallFrameSlot::RETURN_PC),
+                    (caller_base + site.return_pc_offset) as u64,
+                    "returnPC@1 == bl-site + 4",
+                );
+                // The caller laid out the callee header + args at the callee frame.
+                assert_eq!(
+                    read(CallFrameSlot::CALLEE),
+                    undefined_bits,
+                    "callee slot = the boxed callee operand (undefined here)",
+                );
+                assert_eq!(
+                    read(CallFrameSlot::ARGUMENT_COUNT_INCLUDING_THIS),
+                    3,
+                    "argumentCountIncludingThis == argc(2) + this",
+                );
+                assert_eq!(
+                    read(CallFrameSlot::THIS_ARGUMENT),
+                    undefined_bits,
+                    "this == undefined (op_call's implicit receiver)",
+                );
+                assert_eq!(
+                    read(CallFrameSlot::FIRST_ARGUMENT),
+                    JsValue::from_i32(x).encoded().0,
+                    "arg0 == x",
+                );
+                assert_eq!(
+                    read(CallFrameSlot::FIRST_ARGUMENT + 1),
+                    JsValue::from_i32(1).encoded().0,
+                    "arg1 == 1",
+                );
+                // NO throw: the jit_pending mirror is clean (proves the post-call
+                // exception probe saw 0; native sp was restored so the epilogue read
+                // the right spills and returned cleanly to the host trampoline).
+                assert_eq!(
+                    vm.jit_pending_exception().0,
+                    0,
+                    "jit_pending == 0 (no throw)",
+                );
+            }
+
+            vm.clear_jit_host();
         }
     }
 }

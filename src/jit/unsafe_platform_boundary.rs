@@ -349,6 +349,13 @@ _jsc_rs_arm64_baseline_jit_entry_trampoline:
             // the image, and restores the host stack + ARM64 C-ABI callee-saves.
             unsafe { jsc_rs_arm64_baseline_jit_entry_trampoline(self.ptr.as_ptr(), entry_sp, vm) }
         }
+
+        /// The absolute address of this sealed image's entry (offset 0), as the
+        /// `blr` target for a native JIT->JIT call (A1.3). Address only — never
+        /// dereferenced here; the caller bakes it as a `far_call` immediate.
+        pub(crate) fn entry_address(&self) -> usize {
+            self.ptr.as_ptr() as usize
+        }
     }
 
     impl Drop for JitRegion {
@@ -393,6 +400,10 @@ impl JitRegion {
     }
 
     pub(crate) fn call_baseline_jit_entry(&self, _entry_sp: usize, _vm: u64) -> u64 {
+        match self._never {}
+    }
+
+    pub(crate) fn entry_address(&self) -> usize {
         match self._never {}
     }
 }
