@@ -130,11 +130,13 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   callbacks proven sound by construction (DirectInterpreter-inherited → poll suppressed, tested); #1 baseline
   frames confirmed forward-only (arith-only/cell-free) + documented. 2770 tests + miri TB 0 UB on the live
   cycle. **THE OBJECT-CELL LEAK IS FIXED LIVE** (micro-probe returns to baseline).
-- [next-GC] leaf-cell migration (String/Symbol/BigInt → arena + sweep) = the REMAINING leak (string-heavy
-  benches still OOM); the bounded micro-probe then gates a memory-capped real Octane bench. THEN all 15
-  benches can run → R becomes measurable. (Per-slab aux already reclaimed via the free-lists; SD-4 done.)
+- [done] STRING-cell GC (U0/U0b/U1) — the string leak CLOSED: U0 type-dispatched marker/reconcile by cell
+  js_type; U0b the mutator isObject() gate (the faithful isPointerGCObjectJSCell-then-isObject the port had
+  collapsed); U1 CoreStringCell→POD arena cell + string_texts slab + rope fiber edge + weak interning removal.
+- [missing] U2/U3 symbol+bigint leaf GC (share U0b); U7 visitWeak (CLEAR/RELINK phase); A1.5 scoped native-stack
+  JIT-frame scan (in flight). Heap cell-id table not cleaned for eager-bound strings (follow-up; arena leak fixed).
 
-## Baseline JIT / DFG / FTL (parity lives here; ~0% started)
+## Baseline JIT / DFG / FTL (parity lives here; baseline on the native stack + first native call; DFG/FTL 0%)
 - [done] JIT↔runtime bridge (D1+D5 reborrow shim, Miri-passed; Vm::operation_* split-borrow wrappers; D3
   jit_pending exception word + far-call; docs/design/jit-runtime-bridge.md).
 - [done] per-opcode ARITH lowering (each EXECUTES native under W^X, generator-faithful): op_add int32 fast +
@@ -160,28 +162,25 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   mandreel/octane-zlib to tier up), div int32-result fold, NaN significand (faithful, same number).
 - [done] the live path emits real per-opcode ARM64 via the MacroAssembler encoder + finalize (f139350);
   the old P6/P15 byte-blob re-interpreter lane is DEAD (retirement = STEP 5/6 off-gate hygiene, see design doc).
-- [done] op_call EXECUTES (UNLINKED virtual call; U5 adversarially verified SOUND-AND-FAITHFUL) — the
-  biggest R-mover (no Octane fn tiered up before — all contain calls) + the call-heavy gate half. K1 (slot-2
-  = real CodeBlock* via the registry Rc::as_ptr) + U2 parking (recursion-local RAII save/restore, nesting-safe)
-  + emit_op_call (far_call operation_call; operand mapping faithful vs dispatch_call) + the D1/D5 reborrow
-  shim (callee runs DirectInterpreter → NO 2nd whole-Vm &mut, so the nested re-park is unreachable today;
-  reborrow shape == the miri-clean add-shim). Milestone: f calls g, native==interp incl. boxed-double + throw
-  + 2-deep nesting (DEBUG+RELEASE); suite 2781. op_call tests are FFI-blocked under miri (mmap arena) — the
-  reborrow miri proof rides the analogous add-shim test. B5-full native bl-chain/direct-link DEFERRED
-  (slow-call now). RESIDUAL: a native callee tier-up under op_call needs its own sibling-aliasing re-verify FIRST.
+- [done] op_call SLOW path EXECUTES (far_call operation_call; U5-verified sound; K1 real CodeBlock* + parking;
+  native==interp incl. boxed-double/throw/2-deep). Now the SLOW path beneath A1.2's native fast path (below).
 - [done] **GATE-CAPABILITY SET**: int+double arith + LoadDouble + typed-array get/put_by_val (slow-call IC)
   + op_call all EXECUTE native → asm.js functions can tier up WHOLE.
-- [BLOCKED — measured 06-29] the baseline JIT is a NET REGRESSION on arm64 (geomean ~0.64x opt-in; default
-  flip HELD). Cause = CALL path: callee entries are x86_64 byte-seqs (HostBlockedX86_64) → ~3.6M
-  generated-direct-call transactions fall back to a nested interpreter while paying per-call route/accounting.
-- [CONFIRMED DIVERGENCE — see docs/design/baseline-call-tier-divergence.md] the generated-* call/tier layer
-  (generated_executor RE-INTERPRETER, VmGeneratedDirectCallTransactionRoute arbiter, P6X86_64 entry) has NO
-  JSC counterpart (C++ grep = 0 hits); faithful target = in-site CallLinkInfo (seed at src/bytecode/ic.rs:961)
-  + arm64 emitFunctionPrologue entry + total opcode lowering + BaselineExecutionCounter tier-up. CORRECT it,
-  never build B5-full on it. SEQUENCING: STEP1 (collapse onto CallLinkInfo, delete route/accounting) is
-  R-NEUTRAL divergence-correction, gated on serial Qs #1 (linked=interp-entry?) + #3 (visitWeak/R4 rooting).
-  STEP2/3 (real arm64 native call = the R lever) GATED on JSStack B5-B7 + GC/R4. STEP5/6 (delete cluster +
-  de-megafile 35k tiering.rs) OFF-GATE hygiene. R moves only at native-breadth + flip (the end).
+- [done] **STACK MODEL DECIDED + A1.0–A1.3 LANDED — the baseline JIT runs on the NATIVE machine stack + the
+  FIRST JIT→JIT NATIVE CALL works** (faithful Option A, judge-panel ratified; jsstack.md "B5/STACK MODEL").
+  A1.0/A1.1: prologue flipped to `push_pair(fp,lr); mov fp,sp`, entry seeded on the native stack via the sibling
+  sp-switch trampoline (no B-fallback; existing tests byte-identical). A1.2/A1.3: native op_call fast path
+  (calleeFrame on the native stack, sp=calleeFrame+16, blr to the resolved entry; CallLinkInfo→entry resolution)
+  — proof passes (callerFrame@0/returnPC@1 adjacent, contiguous callee frame). GATED to cell-free pre-seeded
+  calls; every dynamic op_call stays on the slow path until A1.5. IN FLIGHT: A1.5 scoped JIT-frame GC scan (cells)
+  + A1.4 prologue stack check. NEXT: broad engagement (route real calls native) → JIT beats interp on call-heavy
+  code → flip default → R moves.
+- [measured 06-29 / CONFIRMED DIVERGENCE — docs/design/baseline-call-tier-divergence.md] the OLD generated-*
+  call/tier layer (generated_executor RE-INTERPRETER + VmGeneratedDirectCallTransactionRoute arbiter + P6X86_64
+  entry) is a NET REGRESSION (geomean ~0.64x opt-in, default flip HELD) with NO JSC counterpart (C++ grep = 0).
+  The faithful native path (A1.x above: CallLinkInfo + native-stack bl) now BYPASSES it. Plan: broaden the
+  faithful path → beats interp → flip default; then delete the dead generated-* cluster (STEP 5) + de-megafile
+  35k tiering.rs (STEP 6, off-gate). STEP 1 (collapse the slow-path dispatch onto CallLinkInfo) = R-neutral cleanup.
 - [missing] bytecode-stream cutover + baseline profiling emission (ValueProfile/ArithProfile, a DFG
   prereq downstream of R4/calls broadening the allowlist).
 - [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
