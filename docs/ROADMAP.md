@@ -30,7 +30,7 @@ effort, engine-from-scratch to R ≥ 1.0.
 | 1 | Interpreter + parser + bytecompiler + runtime/builtins (run all 15 correctly) | 27% | ~90% | 13/15 validate; 2 asm.js DNF (JIT-gated); correctness tail remains |
 | 2 | Faithful foundation (value/GC-arena/Structure/strings/profiling/bytecode) + Phase E + throwers + call-link | 13% | ~95% | built, mostly unwired |
 | 3 | Assembler codegen (operands→encoder→LinkBuffer→W^X execution) | 3% | 100% | emit→relocate→execute proven |
-| 4 | R scoreboard / measurement harness | 1% | 100% | both engines, identical harness |
+| 4 | R scoreboard / measurement harness | 1% | 100% | local C++ `jsc` release build + Rust release, identical harness; C++ baseline is the measuring instrument and must be re-measured |
 | 5 | JSStack execution substrate (stack model + entry + frames) | 5% | ~70% | stack model DECIDED (Option A = native stack); B1–B4 + A1.0/A1.1 native-stack entry LANDED; A2 interp-migration + arity/varargs remain |
 | 6 | GC/value cutover: POD object model + R4 + running collector | 7% | ~65% | object + string R4a GC LIVE (arena/swept/auto-triggered); symbol/bigint leaf GC + visitWeak + conservative-scan remain |
 | 7 | **Baseline JIT** (per-opcode machine code + native calls + profiling + tier-up) | 10% | ~35% | native path measured net-win over interpreter (LATE-5 geomean execoff/interp ~1.086, mixed); further baseline breadth is now local-win/deferred except bailout soundness |

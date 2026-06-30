@@ -79,5 +79,5 @@ mandreel/octane-zlib still decline on missing opcodes under execoff. See `docs/d
 ## For more detail
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — the plan: critical path, full % breakdown, settled decisions.
 - [`docs/STATUS.md`](docs/STATUS.md) — per-subsystem status (the agent's working tracker).
-- [`docs/design/`](docs/design/) — keystone designs (DFG path, JSStack, the scoreboard, …).
+- [`docs/design/`](docs/design/) — keystone designs (DFG path, JSStack, scoreboard, main-agent principles, …).
 - `CLAUDE.md` — the project contract · `git log` — the decision log.
