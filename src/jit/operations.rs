@@ -293,6 +293,70 @@ fn dispatch_value_truthy_operation(vm: *mut Vm, value: u64, invert: bool) -> u64
     }
 }
 
+/// `operationGetByVal(JSGlobalObject*, EncodedJSValue base, EncodedJSValue prop)`
+/// (JITOperations.cpp). The baseline `op_get_by_val` slow-call: the Stage-1 emitter
+/// (`arm64_baseline/function_emitter.rs`) loads the boxed base/prop into the C-ABI
+/// arg slots and far-calls this shim. It reborrows `&mut *vm` (D1) and `&mut *host`
+/// (D5) — the only `unsafe`, the SAME reborrow island the arith family composes
+/// (see the module SAFETY note) — decodes the operands, runs the faithful get
+/// (`Vm::operation_get_by_val`: the typed-array element shortcut + the general
+/// funnel), and returns the boxed result, or — on throw — stamps the JIT
+/// `m_exception` mirror (D3) and returns `JSValue::empty()` bits.
+pub extern "C" fn operation_get_by_val(vm: *mut Vm, base: u64, prop: u64) -> u64 {
+    // D1 + D5 reborrows — see the module SAFETY note. Exactly one `&mut *vm` and one
+    // `&mut *host`, both dropped before returning to JIT code.
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let base = JsValue::from_encoded(EncodedJsValue(base));
+    let prop = JsValue::from_encoded(EncodedJsValue(prop));
+
+    match vm.operation_get_by_val(host, base, prop) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
+/// `operationPutByVal(JSGlobalObject*, EncodedJSValue base, EncodedJSValue prop,
+/// EncodedJSValue value)` (JITOperations.cpp). The baseline `op_put_by_val`
+/// slow-call: the emitter loads boxed base/prop/value into the C-ABI arg slots and
+/// far-calls this shim. Same D1+D5 reborrow island as the get shim; runs the
+/// faithful put (`Vm::operation_put_by_val`: the typed-array element shortcut + the
+/// general funnel). put_by_val produces no observable value, so on success it
+/// returns `undefined` bits (the lowering discards the result register); on throw
+/// it stamps `m_exception` (D3) and returns `JSValue::empty()` bits.
+pub extern "C" fn operation_put_by_val(vm: *mut Vm, base: u64, prop: u64, value: u64) -> u64 {
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let base = JsValue::from_encoded(EncodedJsValue(base));
+    let prop = JsValue::from_encoded(EncodedJsValue(prop));
+    let value = JsValue::from_encoded(EncodedJsValue(value));
+
+    match vm.operation_put_by_val(host, base, prop, value) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

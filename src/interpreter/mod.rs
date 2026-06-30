@@ -3848,6 +3848,33 @@ impl CoreOpcodeDispatchHost {
         self.strings.text(value)
     }
 
+    // Cross-module test support for the baseline-JIT typed-array get_by_val/put_by_val
+    // bridge (jit/operations.rs + arm64_baseline/function_emitter.rs): allocate a
+    // Uint8Array view in THIS host's real object store (its R4 cell + the store-owned
+    // backing slab), then read an element back, so the live-dispatch test can prove
+    // the emitted native code's far-call reads/writes the SAME store the interpreter
+    // does (not a transient one).
+    #[cfg(test)]
+    pub(crate) fn allocate_uint8_array_for_test(
+        &mut self,
+        heap: &mut Heap,
+        length: usize,
+    ) -> RuntimeValue {
+        let buffer = self.objects.allocate_array_buffer(length);
+        self.objects
+            .allocate_uint8_array_with_write_barrier(heap, buffer, 0, length)
+            .expect("allocate Uint8Array view")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_typed_element_for_test(
+        &self,
+        base: RuntimeValue,
+        index: usize,
+    ) -> Option<RuntimeValue> {
+        self.objects.read_typed_element(base, index).ok().flatten()
+    }
+
     #[cfg(test)]
     pub(crate) fn set_identifier_data_property_for_test(
         &mut self,
@@ -9776,6 +9803,111 @@ impl CoreOpcodeDispatchHost {
         receiver: RuntimeValue,
     ) -> Result<RuntimeValue, DispatchOutcome> {
         self.get_property_value_with_completion(state, object, key, receiver, None)
+    }
+
+    // --- Baseline-JIT get_by_val / put_by_val slow-call bridges (jit/operations.rs)
+    //     ------------------------------------------------------------------------
+    // The Stage-1 baseline emitter lowers `op_get_by_val`/`op_put_by_val` as a C-ABI
+    // far-call to `operation_get_by_val`/`operation_put_by_val` (the SAME
+    // runtime-call discipline the arith family uses). Those shims reborrow this host
+    // and call the two `jit_*` entrypoints below: a leaf TYPED-ARRAY ELEMENT shortcut
+    // (the asm.js HEAP-access path, ArrayMode-dispatched, never the named-property
+    // funnel) and the faithful general value-keyed funnel for everything else. Both
+    // are the interpreter's OWN logic (single source of truth) — no JIT-only copy.
+
+    /// FAST element get: a Uint8Array view + an int32 array index reads the
+    /// store-owned `array_buffer_backings` slab DIRECTLY via `read_typed_element`
+    /// (no `String`-key allocation, no getter, no `DispatchState`). Mirrors C++
+    /// `JIT::emitIntTypedArrayGetByVal` / the interpreter's ArrayMode-dispatched
+    /// integer-indexed get (`CoreObjectStore::get_index`, object_store.rs:7908):
+    /// behavior-identical to the general property funnel for an in-bounds index
+    /// (returns the element) and an OOB index (returns `undefined`, C++
+    /// integer-indexed get). Returns `None` to signal "not the typed-array element
+    /// case" so the caller routes the general funnel — exactly the `ArrayMode`
+    /// fall-through to the generic slow path.
+    pub(crate) fn jit_typed_array_get_by_index(
+        &self,
+        base: RuntimeValue,
+        key: RuntimeValue,
+    ) -> Option<RuntimeValue> {
+        let index = self.value_array_index(key)?;
+        if !self.objects.is_uint8_array(base) {
+            return None;
+        }
+        match self.objects.read_typed_element(base, index as usize) {
+            Ok(Some(value)) => Some(value),
+            Ok(None) => Some(RuntimeValue::undefined()),
+            // A confirmed Uint8Array view never errors here; fall back to the general
+            // funnel defensively rather than inventing a result.
+            Err(_) => None,
+        }
+    }
+
+    /// FAST element put: a Uint8Array view + an int32 index + a PRIMITIVE number
+    /// writes the backing slab DIRECTLY via `write_typed_element` (no barrier — raw
+    /// bytes), mirroring C++ `JIT::emitPutByVal`'s typed-array case +
+    /// `Adaptor::toNativeFromDouble`. Returns `None` (routing the general funnel)
+    /// when the base is not a typed array, the key is not an int32 index, or the
+    /// value is not already a primitive number — the last because a non-number store
+    /// value needs the faithful, possibly RE-ENTRANT `ToNumber` the general put
+    /// performs; the asm.js HEAP-store value is always a primitive number, so the
+    /// shortcut covers the hot path. An OOB index is a silent no-op (C++
+    /// integer-indexed set drops out-of-bounds writes), still `Some(())`.
+    pub(crate) fn jit_typed_array_put_by_index(
+        &mut self,
+        base: RuntimeValue,
+        key: RuntimeValue,
+        value: RuntimeValue,
+    ) -> Option<()> {
+        let index = self.value_array_index(key)?;
+        if !self.objects.is_uint8_array(base) {
+            return None;
+        }
+        let number = number_to_f64(value.as_number()?);
+        match self
+            .objects
+            .write_typed_element(base, index as usize, number)
+        {
+            Ok(_) => Some(()),
+            Err(_) => None,
+        }
+    }
+
+    /// General value-keyed get (the `op_get_by_val` slow-path funnel): convert the
+    /// key value to a property key and run the faithful `get_property_value`
+    /// (proxy/string/number/boolean autobox/array/typed-array/object + prototype
+    /// chain). Mirrors the `CoreOpcode::GetByValue` dispatch handler minus the
+    /// register/instruction plumbing; `get_property_value` itself surfaces the
+    /// nullish-base `TypeError` (`createNotAnObjectError`). Getter re-entry uses the
+    /// caller's `DirectInterpreter`-configured `DispatchState`.
+    pub(crate) fn jit_get_by_val(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        base: RuntimeValue,
+        key: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let key = self
+            .value_property_key(key)
+            .map_err(DispatchOutcome::Fail)?;
+        self.get_property_value(state, base, &key, base)
+    }
+
+    /// General value-keyed put (the `op_put_by_val` slow-path funnel): convert the
+    /// key value to a property key and run the faithful `put_property_value`
+    /// (nullish/primitive base, proxy, data store, setter re-entry). Mirrors the
+    /// `CoreOpcode::PutByValue` dispatch handler minus the register/instruction
+    /// plumbing.
+    pub(crate) fn jit_put_by_val(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        base: RuntimeValue,
+        key: RuntimeValue,
+        value: RuntimeValue,
+    ) -> Result<(), DispatchOutcome> {
+        let key = self
+            .value_property_key(key)
+            .map_err(DispatchOutcome::Fail)?;
+        self.put_property_value(state, base, &key, value)
     }
 
     fn get_property_value_with_completion(

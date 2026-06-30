@@ -78,7 +78,8 @@ use crate::bytecode::BytecodeIndex;
 use crate::bytecode::{CodeBlock, CoreOpcode, InstructionDecodeError, OperandAccessError};
 use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
 use crate::jit::operations::{
-    operation_compare_greater, operation_compare_less, operation_compare_lesseq, operation_jfalse,
+    operation_compare_greater, operation_compare_less, operation_compare_lesseq,
+    operation_get_by_val, operation_jfalse, operation_put_by_val,
 };
 use crate::value::{JsValue, NUMBER_TAG};
 
@@ -358,6 +359,56 @@ impl FunctionEmitter {
                 dst,
             },
         });
+    }
+
+    /// op_get_by_val (`emit_op_get_by_val`, JITPropertyAccess.cpp) — the asm.js HEAP
+    /// element READ. SLOW-CALL lowering: load the boxed base/key into the C-ABI arg
+    /// slots (`argumentGPR1`/`argumentGPR2`), set arg0 = the pinned `*mut Vm`, and
+    /// far-call `operation_get_by_val` (the typed-array element shortcut + the
+    /// general value-keyed funnel); probe the `m_exception` mirror (D3) for the throw
+    /// edge, then store the boxed result to `dst`. Falls through to the next bytecode.
+    ///
+    /// DIVERGENCE from JSC (load-bearing, the inline fast-path follow-up): JSC emits
+    /// an INLINE ArrayMode-dispatched typed-array IC stub that loads the view's raw
+    /// `m_vector` (a `CagedPtr`) off the cell and indexes it. This engine's R4 cell
+    /// carries an `AuxiliaryHandle` into a RELOCATABLE store-owned `Vec<Vec<u8>>`
+    /// slab, NOT a raw backing pointer — so the element load cannot be emitted inline
+    /// (it would have to bake `Vec` field offsets + the slab base, neither a stable
+    /// ABI) until the typed-array cell carries a stable raw backing pointer (the
+    /// inline fast path's prerequisite, a serial cell-representation decision). Until
+    /// then the load is a leaf far-call, exactly the arith slow-call discipline.
+    fn emit_get_by_val(&mut self, dst: i32, base: i32, key: i32) {
+        self.h.masm_mut().load64(address_for(base), LEFT_GPR); // x1 = base (arg1)
+        self.h.masm_mut().load64(address_for(key), RIGHT_GPR); // x2 = key (arg2)
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+        self.h
+            .masm_mut()
+            .far_call(TrustedImm64::new(operation_get_by_val as usize as i64));
+        // D3 throw edge: a thrown get (e.g. a getter, a nullish base) stamps the
+        // mirror; branch to the shared exception stub BEFORE storing the empty result.
+        self.emit_exception_probe();
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst)); // dst = x0 (boxed result)
+    }
+
+    /// op_put_by_val (`emit_op_put_by_val`, JITPropertyAccess.cpp) — the asm.js HEAP
+    /// element STORE. SLOW-CALL lowering: load the boxed base/key/value into the
+    /// C-ABI arg slots (`argumentGPR1`/`GPR2`/`GPR3`), set arg0 = the pinned
+    /// `*mut Vm`, and far-call `operation_put_by_val`; probe the `m_exception` mirror
+    /// (D3). put_by_val yields no observable value, so there is no `dst` store (the
+    /// returned `undefined`/empty register is discarded). Falls through. Same inline
+    /// fast-path follow-up divergence as [`Self::emit_get_by_val`].
+    fn emit_put_by_val(&mut self, base: i32, key: i32, value: i32) {
+        self.h.masm_mut().load64(address_for(base), LEFT_GPR); // x1 = base (arg1)
+        self.h.masm_mut().load64(address_for(key), RIGHT_GPR); // x2 = key (arg2)
+        self.h.masm_mut().load64(address_for(value), SCRATCH_GPR); // x3 = value (arg3)
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+        self.h
+            .masm_mut()
+            .far_call(TrustedImm64::new(operation_put_by_val as usize as i64));
+        // D3 throw edge: a thrown store (e.g. a setter, a nullish base, a ToNumber
+        // throw) stamps the mirror; branch to the shared exception stub. `SCRATCH_GPR`
+        // (the value arg, now consumed) is reused by the probe.
+        self.emit_exception_probe();
     }
 
     /// The FUSED int32 compare-and-branch (`emit_op_jless` via `emit_compareAndJump`,
@@ -778,6 +829,22 @@ pub(crate) fn emit_baseline_function(
                 let value = frame_slot(decoded.register_operand(0)?)?;
                 emitter.emit_op_ret(value);
             }
+            // op_get_by_val / op_put_by_val — the asm.js HEAP element access. Operand
+            // order matches the dispatch handlers (interpreter/mod.rs): get is
+            // (dst, base, key); put is (base, key, value). Lowered as a leaf far-call
+            // to the typed-array element bridge (see `emit_get_by_val`).
+            CoreOpcode::GetByValue => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let base = frame_slot(decoded.register_operand(1)?)?;
+                let key = frame_slot(decoded.register_operand(2)?)?;
+                emitter.emit_get_by_val(dst, base, key);
+            }
+            CoreOpcode::PutByValue => {
+                let base = frame_slot(decoded.register_operand(0)?)?;
+                let key = frame_slot(decoded.register_operand(1)?)?;
+                let value = frame_slot(decoded.register_operand(2)?)?;
+                emitter.emit_put_by_val(base, key, value);
+            }
             // op_loop_hint is a tier-up/OSR marker with no value effect (the
             // interpreter treats it as Continue); emit nothing, fall through.
             CoreOpcode::LoopHint => {}
@@ -1131,6 +1198,44 @@ mod tests {
         assert!(
             emit_baseline_function(&code_block, 0x1000).is_ok(),
             "a double-literal arith function tiers up (LoadDouble admitted)"
+        );
+    }
+
+    // ALLOWLIST EXTENSION (structural oracle, every platform): a function doing
+    // typed-array element access `arr[i] = v; return arr[i]` (op_put_by_val then
+    // op_get_by_val) is now ADMITTED by the S4 allowlist and lowers to a 3-pass
+    // image (prologue byte-identical to op_add's, an epilogue `ret`). Each access is
+    // a leaf far-call to the element bridge; the exception-stub edges are linked.
+    // ------------------------------------------------------------------------
+    #[test]
+    fn get_put_by_val_typed_array_are_admitted_and_lower_to_a_finalizable_image() {
+        // arr=ARG0(6), i=ARG1(7), v=arg2(8), dst=LOCAL0.
+        let code_block = build_code_block(vec![
+            instr(
+                CoreOpcode::PutByValue,
+                vec![reg(ARG0), reg(ARG1), reg(8)],
+                0,
+            ),
+            instr(
+                CoreOpcode::GetByValue,
+                vec![reg(LOCAL0), reg(ARG0), reg(ARG1)],
+                1,
+            ),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 2),
+        ]);
+        let image = emit_baseline_function(&code_block, 0x1000)
+            .expect("get_by_val/put_by_val are admitted (S4 allowlist extension)");
+        let w = words(&image.code);
+        assert_eq!(
+            w[0], 0xa9bf_7bfd,
+            "stp fp,lr,[sp,#-16]! (op_add's prologue)"
+        );
+        assert!(w.contains(&0xd65f_03c0), "image contains the epilogue ret");
+        // Two element accesses, each probing the m_exception mirror -> two exception
+        // edges, plus op_ret + the exception stub reaching the shared epilogue.
+        assert!(
+            !image.link_records.is_empty(),
+            "the far-call exception/epilogue edges are linked",
         );
     }
 

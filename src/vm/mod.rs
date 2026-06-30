@@ -2961,6 +2961,106 @@ impl Vm {
         }
     }
 
+    /// `operationGetByVal(JSGlobalObject*, EncodedJSValue base, EncodedJSValue prop)`
+    /// (JITOperations.cpp). The SAFE wrapper the baseline `op_get_by_val` slow-call
+    /// shim calls. A FAST typed-array element shortcut (the asm.js HEAP read: a
+    /// Uint8Array view + an int32 index reads the store-owned backing slab directly,
+    /// `JIT::emitIntTypedArrayGetByVal`) precedes the faithful general value-keyed
+    /// funnel (`CoreOpcodeDispatchHost::jit_get_by_val` over the parked CodeBlock +
+    /// the `Vm`'s real heap/stack/registers/exceptions), surfacing either the boxed
+    /// result or the pending exception's `EncodedJsValue`.
+    ///
+    /// SCOPE (documented): the shortcut is leaf (no re-entry). The general funnel is
+    /// faithful for array/data-property bases; a getter/setter that demands a
+    /// re-entrant function call needs the live driver to set up an active frame
+    /// (the same prerequisite the arith object-operand path documents) — until that
+    /// B5 frame handoff lands, such an access surfaces a faithful pending-exception
+    /// edge rather than UB. The asm.js typed-array scope (the unit's target) never
+    /// reaches it.
+    pub fn operation_get_by_val(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        base: RuntimeValue,
+        key: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        if let Some(value) = host.jit_typed_array_get_by_index(base, key) {
+            return Ok(value);
+        }
+        // V1a (S3): the general funnel over the parked CodeBlock (see
+        // `operation_value_binary`) — a fresh placeholder only if none is parked.
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let outcome = {
+            // SAFETY: as `operation_value_binary` — one dormant-parent `&CodeBlock`,
+            // disjoint from the `&mut self.*` field borrows, not outliving this call.
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            let mut state = DispatchState {
+                stack: &mut self.execution,
+                registers: &mut self.registers,
+                exceptions: &mut self.exceptions,
+                heap: &mut self.heap,
+                code_block,
+                ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+                function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+            };
+            host.jit_get_by_val(&mut state, base, key)
+        };
+        match outcome {
+            Ok(value) => Ok(value),
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
+    /// `operationPutByVal(JSGlobalObject*, EncodedJSValue base, EncodedJSValue prop,
+    /// EncodedJSValue value)` (JITOperations.cpp). The SAFE wrapper the baseline
+    /// `op_put_by_val` slow-call shim calls. A FAST typed-array element shortcut (the
+    /// asm.js HEAP store: a Uint8Array view + an int32 index + a primitive number
+    /// writes the backing slab directly, `JIT::emitPutByVal`'s typed-array case)
+    /// precedes the faithful general value-keyed put funnel. Returns `undefined` on
+    /// success (the lowering discards the result) or the pending exception's
+    /// `EncodedJsValue` on throw. Same general-funnel scope note as
+    /// [`Self::operation_get_by_val`].
+    pub fn operation_put_by_val(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        base: RuntimeValue,
+        key: RuntimeValue,
+        value: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        if host
+            .jit_typed_array_put_by_index(base, key, value)
+            .is_some()
+        {
+            return Ok(RuntimeValue::undefined());
+        }
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let outcome = {
+            // SAFETY: as `operation_value_binary`.
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            let mut state = DispatchState {
+                stack: &mut self.execution,
+                registers: &mut self.registers,
+                exceptions: &mut self.exceptions,
+                heap: &mut self.heap,
+                code_block,
+                ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+                function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+            };
+            host.jit_put_by_val(&mut state, base, key, value)
+        };
+        match outcome {
+            Ok(()) => Ok(RuntimeValue::undefined()),
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
     /// D3: read the JIT m_exception mirror word (`VM::exception()` analog).
     pub fn jit_pending_exception(&self) -> EncodedJsValue {
         self.exceptions.jit_pending()
@@ -21602,6 +21702,222 @@ mod tests {
             native_elapsed < interp_elapsed,
             "the JIT-tiered hot loop ({native_elapsed:?}) must beat pure interpretation \
              ({interp_elapsed:?}) — r_i lifts off the interpreter floor",
+        );
+    }
+
+    // `function f(arr, i, v) { arr[i] = v; return arr[i]; }` — the asm.js HEAP
+    // element access shape (op_put_by_val then op_get_by_val over a typed-array
+    // base). Ordinals: 0 PutByValue arr,i,v; 1 GetByValue dst,arr,i; 2 ret dst.
+    // arr/i/v are arguments (the live-frame seeds), dst a callee local.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn typed_array_get_put_milestone_code_block() -> CodeBlock {
+        let dst = local(0);
+        let arr = argument_including_this(1);
+        let i = argument_including_this(2);
+        let v = argument_including_this(3);
+        let instructions = vec![
+            typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::PutByValue,
+                vec![
+                    Operand::Register(arr),
+                    Operand::Register(i),
+                    Operand::Register(v),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::GetByValue,
+                vec![
+                    Operand::Register(dst),
+                    Operand::Register(arr),
+                    Operand::Register(i),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                2,
+                CoreOpcode::Return,
+                vec![Operand::Register(dst)],
+            ),
+        ];
+        CodeBlock::from_unlinked(
+            UnlinkedCodeBlock::new(
+                CodeKind::Function,
+                PackedInstructionStream::from_typed_placeholder(instructions),
+            )
+            .with_frame(RegisterFrameShape {
+                num_parameters_including_this: 4,
+                num_vars: 8,
+                num_callee_locals: 8,
+                num_temporaries: 0,
+                special: Default::default(),
+            }),
+            LinkContext::default(),
+        )
+        .with_entrypoints(CodeBlockEntrypoints {
+            interpreter: Some(InterpreterEntrySlot(0)),
+            ..CodeBlockEntrypoints::default()
+        })
+        .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    // The typed-array get_by_val/put_by_val LIVE-DISPATCH proof: a hot function doing
+    // `arr[i] = v; return arr[i]` over a Uint8Array TIERS UP to a native ARM64 image
+    // and EXECUTES it — the emitted far-call reads/writes the SAME store-owned backing
+    // slab the interpreter does (asm.js HEAP access). Asserts native == interpreter
+    // (the loaded/stored bytes match) AND that the native store actually mutated the
+    // real host slab. macOS/aarch64 only (executes native code).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_typed_array_get_put_by_val_tiers_up_and_executes_natively() {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+        let code_block = typed_array_get_put_milestone_code_block();
+
+        // S7 (pin-stable Vm): own the dispatch Vm as `Box<Vm>` so the baked
+        // `jit_pending` AbsoluteAddress + the parked `*mut Vm` stay valid at ONE heap
+        // address for the installed image's lifetime.
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        let mut host = CoreOpcodeDispatchHost::new();
+        let owner = CodeBlockId(CellId(7_733));
+
+        // A Uint8Array(4) in the PARKED host; the far-call resolves it via the R4
+        // arena identity (independent of the B5-lite scratch frame, which holds only
+        // the JS register file — the backing slab lives in the shared host store).
+        let array = host.allocate_uint8_array_for_test(&mut vm.heap, 4);
+        let index = 2i32;
+        let stored = 200i32; // fits in a Uint8 element
+        let args = vec![
+            RuntimeValue::undefined().encoded().0,
+            array.encoded().0,
+            RuntimeValue::from_i32(index).encoded().0,
+            RuntimeValue::from_i32(stored).encoded().0,
+        ];
+
+        // INTERPRETER ORACLE: the SAME CodeBlock over a FRESH host + Uint8Array, run
+        // through the engine interpreter. It stores arr[2]=200 and returns arr[2].
+        let interp_bits = {
+            let mut interp_vm: Box<Vm> = Box::new(Vm::new(VmConfig::interpreter_only()));
+            let mut interp_host = CoreOpcodeDispatchHost::new();
+            let interp_array = interp_host.allocate_uint8_array_for_test(&mut interp_vm.heap, 4);
+            let interp_owner = CodeBlockId(CellId(7_734));
+            interp_vm
+                .code_blocks
+                .register(interp_owner, code_block.clone());
+            let completion = execute_registered_code_block_with_host_and_arguments(
+                &mut interp_vm,
+                interp_owner,
+                &code_block,
+                &mut interp_host,
+                vec![
+                    RuntimeValue::undefined(),
+                    interp_array,
+                    RuntimeValue::from_i32(index),
+                    RuntimeValue::from_i32(stored),
+                ],
+            );
+            let bits = match completion {
+                ExecutionCompletion::Returned(value) => value.encoded().0,
+                other => panic!("interpreter did not return a value: {other:?}"),
+            };
+            assert_eq!(
+                interp_host.read_typed_element_for_test(interp_array, index as usize),
+                Some(RuntimeValue::from_i32(stored)),
+                "interpreter stored arr[2]=200 in its typed-array backing",
+            );
+            bits
+        };
+        assert_eq!(
+            interp_bits,
+            RuntimeValue::from_i32(stored).encoded().0,
+            "interpreter: arr[2]=200; return arr[2] == 200",
+        );
+
+        // Drive entries PAST the S9 tier-up threshold; AT/AFTER the crossing the
+        // native image runs and returns the loaded element.
+        let mut tiered_at: Option<u32> = None;
+        let mut entries: u32 = 0;
+        let entry_cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 64;
+        while entries < entry_cap {
+            entries += 1;
+            let outcome = vm.observe_baseline_jit_entry_and_maybe_execute(
+                &mut host,
+                owner,
+                &code_block,
+                &args,
+            );
+            match outcome {
+                BaselineJitEntryOutcome::NotTieredUp => {
+                    assert!(
+                        !vm.baseline_jit_function_is_installed(owner),
+                        "no install before the countdown crosses",
+                    );
+                }
+                BaselineJitEntryOutcome::Returned(value) => {
+                    assert!(
+                        vm.baseline_jit_function_is_installed(owner),
+                        "a returned native result implies an installed image",
+                    );
+                    assert_eq!(
+                        value.encoded().0,
+                        interp_bits,
+                        "native return == interpreter (arr[2] == 200)",
+                    );
+                    if tiered_at.is_none() {
+                        tiered_at = Some(entries);
+                    }
+                }
+                BaselineJitEntryOutcome::Threw(bits) => {
+                    panic!("typed-array get/put must not throw (m_exception={bits:?})");
+                }
+            }
+            if let Some(at) = tiered_at {
+                if entries >= at + 4 {
+                    break;
+                }
+            }
+        }
+        tiered_at.expect("the typed-array function tiered up to a native image");
+        assert!(
+            vm.baseline_jit_function_is_installed(owner),
+            "the CodeBlock has an installed baseline image (m_jitCode)",
+        );
+
+        // The native far-call WROTE the parked host's backing slab (the asm.js HEAP
+        // store) — definitive proof the emitted code reached the REAL store.
+        assert_eq!(
+            host.read_typed_element_for_test(array, index as usize),
+            Some(RuntimeValue::from_i32(stored)),
+            "native store wrote arr[2]=200 in the real host typed-array slab",
+        );
+
+        // A FRESH (index, value) proves the native code is genuinely (re)running, not
+        // replaying a cached return: store 111 at index 3 and read it back natively.
+        let args2 = vec![
+            RuntimeValue::undefined().encoded().0,
+            array.encoded().0,
+            RuntimeValue::from_i32(3).encoded().0,
+            RuntimeValue::from_i32(111).encoded().0,
+        ];
+        let native2 =
+            vm.observe_baseline_jit_entry_and_maybe_execute(&mut host, owner, &code_block, &args2);
+        let native2_bits = match native2 {
+            BaselineJitEntryOutcome::Returned(value) => value.encoded().0,
+            other => panic!("expected a native return for the installed image: {other:?}"),
+        };
+        assert_eq!(
+            native2_bits,
+            RuntimeValue::from_i32(111).encoded().0,
+            "native: arr[3]=111; return arr[3] == 111",
+        );
+        assert_eq!(
+            host.read_typed_element_for_test(array, 3),
+            Some(RuntimeValue::from_i32(111)),
+            "native store wrote arr[3]=111",
+        );
+        assert_eq!(
+            host.read_typed_element_for_test(array, index as usize),
+            Some(RuntimeValue::from_i32(stored)),
+            "the earlier native store at arr[2] is independent and survives",
         );
     }
 
