@@ -296,6 +296,36 @@ impl FunctionEmitter {
         self.h.masm_mut().store64(SCRATCH_GPR, address_for(dst));
     }
 
+    /// LoadDouble (`op_mov` of a double/number constant): materialize the BOXED
+    /// double immediate and store it. JSC has NO separate LoadDouble opcode — a
+    /// number literal lives in the constant pool and is loaded by `op_mov`, whose
+    /// baseline lowering `emitGetVirtualRegister(constant, dst)` is
+    /// `moveValue(getConstant(src), dst)` == `move(Imm64(JSValue::encode(value)),
+    /// gpr)` then `emitPutVirtualRegister(dst)` == `storeValue` (JITInlines.h:367-374
+    /// / AssemblyHelpers.h:342-346) — exactly the int32 shape above but with a
+    /// double constant.
+    ///
+    /// This engine's bytecode carries the raw f64 bits in two 32-bit immediate
+    /// operands (`CoreOpcode::LoadDouble`, interpreter/mod.rs:6412-6431). The BOXING
+    /// is folded in at emit time via `JsValue::from_double` (value/repr.rs:593) so
+    /// the materialized 64-bit immediate is BIT-IDENTICAL to the interpreter's
+    /// `RuntimeValue::from_double(f64::from_bits(bits))` — INCLUDING the canonical
+    /// representation choice: `from_double` canonicalizes an exactly-representable
+    /// integral double (e.g. `2.0`) to a BOXED INT32, and otherwise offset-encodes
+    /// the double (`bits + DoubleEncodeOffset`). JSC makes the same choice when it
+    /// builds the constant pool (`jsNumber(d)` -> the int32 immediate when in range),
+    /// so computing it here keeps the JIT and interpreter value reps in lockstep.
+    /// DIVERGENCE (instruction selection, identical to `emit_load_int32`): the
+    /// already-boxed immediate is materialized directly rather than loaded from a
+    /// constant-pool slot. Falls through.
+    fn emit_load_double(&mut self, dst: i32, bits: u64) {
+        let boxed = JsValue::from_double(f64::from_bits(bits)).encoded().0;
+        self.h
+            .masm_mut()
+            .move_imm64(TrustedImm64::new(boxed as i64), SCRATCH_GPR);
+        self.h.masm_mut().store64(SCRATCH_GPR, address_for(dst));
+    }
+
     /// The arith family fast path (`emit_op_add`/`_sub`/`_mul`/`_div`/...): load
     /// both operands into `argumentGPR1`/`argumentGPR2`, run the SHARED generator
     /// (which boxes + stores the result, emits the JSVALUE64 double fast path for
@@ -725,6 +755,16 @@ pub(crate) fn emit_baseline_function(
                 let value = decoded.signed_immediate_operand(1)?;
                 emitter.emit_load_int32(dst, value);
             }
+            CoreOpcode::LoadDouble => {
+                // The raw f64 bits are split across two 32-bit immediate operands
+                // (low, high), reconstructed exactly as the interpreter does
+                // (interpreter/mod.rs:6417-6425) before boxing in `emit_load_double`.
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let low = decoded.unsigned_immediate_operand(1)?;
+                let high = decoded.unsigned_immediate_operand(2)?;
+                let bits = u64::from(low) | (u64::from(high) << 32);
+                emitter.emit_load_double(dst, bits);
+            }
             CoreOpcode::Jump => {
                 let target_bci = decoded.bytecode_index_operand(0)?.offset() as usize;
                 emitter.emit_op_jmp(target_bci);
@@ -830,6 +870,51 @@ mod tests {
             schema: None,
             bytecode_index: Some(BytecodeIndex::from_offset(bci as u32)),
         }
+    }
+
+    /// A `CoreOpcode::LoadDouble` for `value` — the raw f64 bits split low/high
+    /// across two unsigned-immediate operands, BYTE-IDENTICAL to the bytecompiler's
+    /// `emit_load_double` (bytecompiler/mod.rs:6712-6730).
+    fn load_double_instr(dst: i32, value: f64, bci: usize) -> TypedInstruction {
+        let bits = value.to_bits();
+        instr(
+            CoreOpcode::LoadDouble,
+            vec![
+                reg(dst),
+                Operand::UnsignedImmediate((bits & u64::from(u32::MAX)) as u32),
+                Operand::UnsignedImmediate((bits >> 32) as u32),
+            ],
+            bci,
+        )
+    }
+
+    // `function f() { return <value>; }` — a single double LITERAL load + return.
+    fn return_double_instructions(value: f64) -> Vec<TypedInstruction> {
+        vec![
+            load_double_instr(LOCAL0, value, 0),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+        ]
+    }
+
+    // `function f(x) { return x * 2.5 + 1.5; }` — double LITERALS (LoadDouble) feed
+    // the JSVALUE64 double fast path. x=ARG0, c0=LOCAL0 (2.5), acc=LOCAL1, c1=LOCAL2
+    // (1.5). Ordinals: 0 c0=2.5  1 acc=x*c0  2 c1=1.5  3 acc=acc+c1  4 ret acc.
+    fn double_literal_arith_instructions() -> Vec<TypedInstruction> {
+        vec![
+            load_double_instr(LOCAL0, 2.5, 0),
+            instr(
+                CoreOpcode::MulInt32,
+                vec![reg(LOCAL1), reg(ARG0), reg(LOCAL0)],
+                1,
+            ),
+            load_double_instr(LOCAL2, 1.5, 2),
+            instr(
+                CoreOpcode::AddInt32,
+                vec![reg(LOCAL1), reg(LOCAL1), reg(LOCAL2)],
+                3,
+            ),
+            instr(CoreOpcode::Return, vec![reg(LOCAL1)], 4),
+        ]
     }
 
     /// Build a linked `CodeBlock` directly from a decoded-instruction sequence (the
@@ -1032,6 +1117,21 @@ mod tests {
             emit_baseline_function(&bad_jump, 0x1000),
             Err(EmitFunctionError::InvalidBranchTarget { target_bci: 5 })
         ));
+    }
+
+    // ------------------------------------------------------------------------
+    // ALLOWLIST EXTENSION: a function using a double LITERAL (LoadDouble) is now
+    // ADMITTED (lowered to an image) rather than REJECTED with
+    // UnsupportedOpcode(LoadDouble) — the S4 gate now lets double-literal asm.js
+    // functions tier up.
+    // ------------------------------------------------------------------------
+    #[test]
+    fn load_double_function_is_admitted_by_the_allowlist() {
+        let code_block = build_code_block(double_literal_arith_instructions());
+        assert!(
+            emit_baseline_function(&code_block, 0x1000).is_ok(),
+            "a double-literal arith function tiers up (LoadDouble admitted)"
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -1252,6 +1352,84 @@ mod tests {
             let (r, _) = run_function(div, &[(ARG0, d(1.0)), (ARG1, i32_bits(0))]);
             assert_eq!(r.ret, d(f64::INFINITY), "1.0 / 0 -> +Infinity");
             assert_eq!(r.pending, 0, "div by zero raises no exception");
+        }
+
+        // --- LoadDouble MATERIALIZATION, bit-for-bit vs the interpreter: the boxed
+        // constant the native image writes must equal the interpreter's
+        // `RuntimeValue::from_double(f64::from_bits(bits))` (interpreter/mod.rs:6426-
+        // 6431) EXACTLY, for both representation classes from_double can produce.
+        #[test]
+        fn load_double_materializes_boxed_constant_bit_for_bit() {
+            // (1) A TRUE (non-integral) double stays an offset-encoded double.
+            let (r, frame) = run_function(return_double_instructions(2.5), &[]);
+            let expected = JsValue::from_double(2.5).encoded().0;
+            assert_eq!(
+                r.ret, expected,
+                "LoadDouble 2.5 == interpreter from_double(2.5)"
+            );
+            assert_eq!(frame.read(LOCAL0), expected, "slot holds the boxed 2.5");
+            assert!(
+                JsValue::from_encoded(EncodedJsValue(r.ret)).is_double(),
+                "2.5 stays a boxed double"
+            );
+            assert_eq!(r.pending, 0, "no exception");
+
+            // (2) An exactly-representable INTEGRAL double CANONICALIZES to a boxed
+            // int32 (the from_double strict-int32 fold) — the JIT must reproduce
+            // this, not emit an offset-encoded double. This is the canonical-int
+            // wrinkle the comment documents.
+            let (r, _) = run_function(return_double_instructions(4.0), &[]);
+            let expected = JsValue::from_double(4.0).encoded().0;
+            assert_eq!(
+                r.ret, expected,
+                "LoadDouble 4.0 == interpreter from_double(4.0)"
+            );
+            assert_eq!(
+                expected,
+                JsValue::from_i32(4).encoded().0,
+                "from_double(4.0) canonicalizes to boxed int32 4"
+            );
+            assert!(
+                JsValue::from_encoded(EncodedJsValue(r.ret)).is_int32(),
+                "4.0 canonicalizes to a boxed int32"
+            );
+            assert_eq!(r.pending, 0, "no exception");
+        }
+
+        // --- THE LoadDouble MILESTONE: a whole function using double LITERALS in
+        // arithmetic — `function f(x){ return x*2.5 + 1.5; }` — TIERS UP and runs
+        // the JSVALUE64 double fast path natively, the literals materialized by
+        // LoadDouble. Inputs are chosen so the result is NON-INTEGRAL (the native
+        // boxDouble then equals the value layer's from_double bit-for-bit, avoiding
+        // the integral int-fold wrinkle). Runs under debug AND release.
+        #[test]
+        fn double_literal_arith_function_tiers_up_native() {
+            let d = |x: f64| JsValue::from_double(x).encoded().0;
+
+            // int arg: 2 * 2.5 + 1.5 = 6.5 (non-integral).
+            let (r, frame) =
+                run_function(double_literal_arith_instructions(), &[(ARG0, i32_bits(2))]);
+            assert_eq!(
+                r.ret,
+                d(6.5),
+                "f(2) = 2*2.5+1.5 = 6.5 (double literals, native FP)"
+            );
+            assert_eq!(frame.read(LOCAL1), d(6.5), "accumulator slot holds 6.5");
+            assert!(
+                JsValue::from_encoded(EncodedJsValue(r.ret)).is_double(),
+                "6.5 is a boxed double"
+            );
+            assert_eq!(r.pending, 0, "no exception");
+
+            // double arg: 2.5 * 2.5 + 1.5 = 7.75.
+            let (r, _) = run_function(double_literal_arith_instructions(), &[(ARG0, d(2.5))]);
+            assert_eq!(r.ret, d(7.75), "f(2.5) = 2.5*2.5+1.5 = 7.75");
+            assert_eq!(r.pending, 0, "no exception");
+
+            // another int arg: 4 * 2.5 + 1.5 = 11.5.
+            let (r, _) = run_function(double_literal_arith_instructions(), &[(ARG0, i32_bits(4))]);
+            assert_eq!(r.ret, d(11.5), "f(4) = 4*2.5+1.5 = 11.5");
+            assert_eq!(r.pending, 0, "no exception");
         }
     }
 }
