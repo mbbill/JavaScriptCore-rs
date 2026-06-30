@@ -74,20 +74,34 @@ emitted-offset change) so it doesn't calcify into the rejected private-register-
   Reversible: the `Vec` is still dual-written; reads fall back to it when the
   shadow is inactive (overflow / mmap fail / non-unix / raw-native bypass, which
   disables the shadow). FOLLOW-UP B4b/B6: drop the `Vec` once green suite-wide.
-- **B5 (RATIFIED 2026-06-29 — Path B, the faithful doVMEntry sp-switch):** the baseline-JIT entry
-  routes through the real SP/FP-switching trampoline (`platform/unix_arm64_jsc_stack_dispatch.rs`,
-  `_jsc_rs_arm64_jsc_stack_trampoline`: `mov sp,x1; mov x29,x2; blr`) so the HARDWARE sp becomes the
-  arena callee `CallFrame` and x29 derives from sp; the emitter prologue flips from the divergent
-  `mov fp,x1` (Path A: x1 = arena fp carried by a plain C-ABI call, hardware sp = the native C stack,
-  unrelated to the register window) to the faithful `emitFunctionPrologue`
-  (`ARM64_JSC_BASELINE_GENERATED_PROLOGUE_BYTES` = `stp fp,lr,[sp,#-16]!; mov fp,sp`, `entry_prologue.rs`)
-  + epilogue (`mov sp,fp; ldp fp,lr; ret`). **RATIONALE:** native JS→JS call/ret chaining (the R-lever,
-  op_call STEP 2) requires the hardware sp = the JS stack; Path A structurally cannot `bl` to a callee
-  entry — which is WHY op_call is a slow-call `far_call(operation_call)` today. The faithful entry is
-  already tested (`validate_jsc_baseline_generated_entry_contract`) but NOT the live path. Cutover is ONE
-  atomic serial unit (trampoline-route + prologue/epilogue flip + arg-seed migration), gated on every
-  existing JIT-execution test staying green + the Vec byte-oracle. First cut = no-arity entry; overlapping
-  outgoing/incoming arg region copy-first until tail-calls/varargs need the CallFrameShuffler.
+- **B5/STACK MODEL (RATIFIED 2026-06-29 by judge panel — Option A: native machine stack = JS stack,
+  phased A1→A2).** SUPERSEDES the earlier "Path-B sp-switch-INTO-the-arena" idea, which a second B5 pause
+  proved would reroute every fat-Rust slow-path far-call onto the tiny arena → overflow. Panel verdict:
+  2/3 vote A now, 3/3 name A the faithful end-state, 3/3 rank D (decoupled FP-arena/SP-native) **fatal**
+  (splits `returnPC` from the CallFrame header → silently corrupts DFG-OSR/StackVisitor/GC/unwind). The
+  DECISIVE axis: the CallFrame header (`callerFrame`@0 + `returnPC`@1 adjacent, FP/SP unified on ONE stack)
+  is what DFG/FTL OSR, stack-walking, GC root-walk, and exception unwind all assume — only an option that
+  keeps it faithful survives. **Option A IS that model on the native machine stack** (the JSC-with-JIT
+  source of truth; `doVMEntry` builds CallFrames below native sp).
+  - **A1 (the R-lever; lands WITHOUT the interpreter rewrite):** flip the JIT prologue to the already-modeled
+    `mov fp,sp` + `pushPair(fp,lr)` (`entry_prologue.rs:29/106`) so JIT CallFrames are built on the NATIVE
+    stack; emit native `bl` for JIT→JIT calls; **REUSE the B1-B4 register-window LAYOUT by RE-POINTING its
+    base from arena-base to native fp** (`frame_register_at`/`try_seed_entry_frame` address native-stack
+    slots — a re-point, NOT a rewrite; the slot-offset proofs transfer); bridge the still-fat interpreter at
+    JSC's own faithful ENTRY/EXIT boundary (`doVMEntry`/`vmEntryToJavaScript`). The interpreter keeps fat-Rust
+    frames on the SAME native stack as pure headroom (NOT a divergence DFG builds on). Retire the per-function
+    scratch arena as the JIT stack.
+  - **A2 (convergence = Option C):** migrate the interpreter to small native-stack CallFrames (LLInt-faithful
+    dispatch loop), retiring the entry/exit bridge → one shared native JS stack.
+  - **REJECTED:** D (fatal header split — Principle-#2 trap, fast-local-win that poisons every optimizing
+    tier); B (arena + sp-switch + native-stack bounce — faithful *layout* but parks on the CLoop/no-JIT arena
+    model and bakes a two-stack bounce whose only exit is completing C, so it calcifies if C slips).
+  - **⚠ KEY RISK TO VALIDATE EARLY:** that the first JIT→JIT native `bl` genuinely lands via the entry/exit
+    bridge WITHOUT the interpreter rewrite (J2's lone dissent assumed it cannot; J1+J3 refute with the
+    modeled prologue + the doVMEntry boundary). If A1 stalls there, fall back to B-as-bridge (reuse the
+    tested `_jsc_rs_arm64_jsc_stack_trampoline`) **but treat completing C as a HARD scheduled commitment**,
+    not optional, so the bounce cannot calcify. Interim mixed-recursion overflow exposure = SAME as today's
+    working Path A far-calls, guarded by softStackLimit, fixed permanently by A2. First cut = no-arity entry.
 - **B6 (megafile, serial):** retire `CallFrameId(u32)` (~401 refs) — Stage A offset-backed
   bridge (all refs compile) → Stage B generation-tagged FrameAddress newtype → Stage C delete
   `Vec<InstalledCallFrame>`. Leaves first, megafiles last.
@@ -103,19 +117,8 @@ emitted-offset change) so it doesn't calcify into the rejected private-register-
   entry request is produced from the SEEDING path (`try_seed_entry_frame` positions the arena `CallFrame`)
   routed through it. The proof layer (`vm/arm64_native_entry/jsc_stack_dispatch.rs`) is subordinated to a test.
 - B5 overlapping-arg timing (copy-first vs true overlap + CallFrameShuffler).
-- **⚠ STACK-OWNERSHIP FORK — B5 Path-B PAUSED 2026-06-29 (foundational; judge-panel in progress).**
-  The B5 Path-B sp-switch (sp = the JS arena) reroutes EVERY slow-path far-call onto that arena, but
-  `operation_call` re-enters the FULL interpreter as FAT Rust recursion (operations.rs:391 → vm/mod.rs:3167
-  → execute_function_value); the arenas are tiny (per-function `JsStack::new(total*8)` ≈ one page;
-  tests use `with_test_backing(64)` = 512 B), so it overflows → breaks the far-calling gate tests
-  (compare/jfalse/get/put/op_call). Path A works ONLY because sp stays the native 8 MB stack. ROOT
-  DIVERGENCE: the Rust interpreter runs on the NATIVE stack with fat frames per JS call, while the JIT
-  register window is a SEPARATE mmap arena — two stacks where JSC has one (native machine stack = JS stack;
-  `doVMEntry` builds frames below native sp). Far-call macro `far_call` (macro_assembler_arm64.rs:836) does
-  NO sp save/switch. OPTIONS under evaluation: (A) native-stack JS frames (JSC-faithful; retire/repurpose
-  the arena; interpreter→native CallFrames; large blast radius); (B) unified full-size (~5MB) arena =
-  the JS stack + sp-switch + a native-stack BOUNCE around fat-Rust far-calls (transition; converge to
-  interpreter-on-arena); (C) rewrite the interpreter as an LLInt-faithful dispatch loop on the arena
-  (deepest; the eventual convergence for A/B); (D) decoupled — sp stays NATIVE (full headroom, no bounce),
-  register windows in the arena (x29), native calls via `bl` + caller-allocated arena window + `mov x29,<win>`
-  prologue (FP-chain arena / SP-chain native split). Decide via judge panel before any prologue flip.
+- **STACK-OWNERSHIP FORK — RESOLVED 2026-06-29 by judge panel → Option A (native stack = JS stack), phased
+  A1→A2. See the B5/STACK MODEL entry above for the full decision, rejected options (B/D), and the early-
+  validation risk.** (The fork arose because B5 Path-B's sp-switch-into-the-arena would reroute fat-Rust
+  slow-path far-calls onto the tiny arena → overflow; root divergence = Rust interpreter on the native stack
+  vs the JIT register window in a separate mmap arena, two stacks where JSC has one.)
