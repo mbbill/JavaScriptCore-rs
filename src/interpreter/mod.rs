@@ -9048,6 +9048,43 @@ impl CoreOpcodeDispatchHost {
         }
     }
 
+    /// A1.x broad native-call engagement: resolve a CALLEE VALUE to its bytecode
+    /// `CodeBlockId` + formal parameter count (EXCLUDING `this`), or `None` if the
+    /// callee is not a directly-native-callable bytecode function. This is the host
+    /// half of the per-`op_call` re-resolve the baseline JIT's native fast path does
+    /// (the unlinked->linked `CallLinkInfo` analog, `jit/Repatch.cpp` `linkFor`): JSC
+    /// resolves the callee `executable` and its `generatedJITCodeFor(kind)` entry; here
+    /// the callee value -> `function_call_target` (the object store) -> `function_index`
+    /// -> the shared `CodeBlock` in `function_blocks` (the same instance the registry
+    /// holds), whose `id` keys the `Vm`'s `baseline_native_entries` registry.
+    ///
+    /// Returns `None` (the caller falls to the `operation_call` slow path) for a
+    /// native function, a non-callable value, a missing function block, OR a class
+    /// constructor (calling one without `new` must throw the faithful TypeError, which
+    /// only the slow path does — the installed image would silently run it).
+    pub(crate) fn resolve_baseline_call_target(
+        &self,
+        callee: RuntimeValue,
+    ) -> Option<(CodeBlockId, u32)> {
+        let function_index = match self.objects.function_call_target(callee).ok()? {
+            CoreFunctionCallTarget::Bytecode { function_index, .. } => function_index,
+            CoreFunctionCallTarget::Native { .. } => return None,
+        };
+        if self.function_index_is_class_constructor(function_index) {
+            return None;
+        }
+        let entry = self
+            .function_blocks
+            .get(usize::try_from(function_index).unwrap_or(usize::MAX))?;
+        let formal_parameter_count = entry
+            .code_block
+            .unlinked()
+            .frame()
+            .num_parameters_including_this
+            .saturating_sub(1);
+        Some((entry.id, formal_parameter_count))
+    }
+
     fn function_index_is_class_constructor(&self, function_index: u32) -> bool {
         self.function_blocks
             .get(usize::try_from(function_index).unwrap_or(usize::MAX))

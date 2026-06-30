@@ -35,8 +35,10 @@
 //!   far-call (op_call's `operation_call` re-entering the interpreter,
 //!   get/put_by_val) runs on it with headroom; a nested JIT entry switches `sp`
 //!   to ITS function's stack via the trampoline (per-function stacks never
-//!   overlap). Native JIT->JIT calls (`bl`) are the NEXT unit (A1.2); op_call
-//!   here stays the `operation_call` slow path.
+//!   overlap). Native JIT->JIT calls (`blr`) LANDED (A1.2 + broad engagement): a live
+//!   op_call resolves the callee's installed native entry per call and `blr`s it when
+//!   JIT'd (else the `operation_call` slow path) — call-heavy code runs native and
+//!   beats the interpreter.
 //!
 //! Unsafe boundary: this module is SAFE (`jit/mod.rs` is `#![deny(unsafe_code)]`).
 //! The native entry goes through the SAFE [`ExecutableMemoryHandle::call_baseline_jit_entry`]
@@ -251,6 +253,20 @@ mod platform {
         /// store's active-span stack around `run`.
         pub(crate) fn frame_scan_bounds(&self) -> (usize, usize) {
             (self.stack.low_address(), self.stack.high_address())
+        }
+
+        /// A1.x broad native-call engagement: the absolute entry address of THIS
+        /// installed image (the finalized prologue). Faithful analog of
+        /// `executable->generatedJITCodeFor(kind)->addressForCall(arity)`
+        /// (ExecutableBase) — the callee entry a linked `op_call` jumps to. The
+        /// install path records it in the `Vm`'s `baseline_native_entries` registry
+        /// keyed by `CodeBlockId` so the per-call resolver can reach it even while the
+        /// image is checked out of `baseline_jit_slots` during its own execution (a
+        /// self-recursive callee). The RX memory the handle owns does not move when the
+        /// `InstalledBaselineFunction` is moved by value, so this address stays valid
+        /// for the image's lifetime.
+        pub(crate) fn native_entry_address(&self) -> usize {
+            self.handle.entry_address()
         }
         /// A1.4: the soft stack limit for THIS function's native stack — its
         /// `JsStack::stack_limit()` (low bound + soft-reserved zone). The driver

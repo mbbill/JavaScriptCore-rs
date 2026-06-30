@@ -840,6 +840,22 @@ impl MacroAssemblerArm64 {
         Call::new(label, CallFlags::NONE)
     }
 
+    /// Register-indirect call — JSC's `MacroAssemblerARM64::call(RegisterID, PtrTag)`
+    /// (MacroAssemblerARM64.h:5450-5456): `m_assembler.blr(target)`, returning
+    /// `Call(label, Call::None)`. The target address is ALREADY in a GPR (no
+    /// `move_imm64` materialization), so unlike [`Self::far_call`] this emits a single
+    /// `blr`. Used by the baseline `op_call` native fast path once the callee entry is
+    /// resolved at runtime into a register (a re-resolve, the unlinked->linked
+    /// `CallLinkInfo` analog): `jit.call(callTargetGPR, ...)`
+    /// (`bytecode/CallLinkInfo.cpp:363`). NO PC-relative displacement to patch (the
+    /// address lives in the register), so the returned [`Call`] carries
+    /// [`CallFlags::NONE`].
+    pub fn call_register(&mut self, target: RegisterID) -> Call {
+        let label = self.current_label();
+        self.asm().emit_blr(target);
+        Call::new(label, CallFlags::NONE)
+    }
+
     // ========================================================================
     // Private helpers — faithful ports of the MacroAssemblerARM64 internals.
     // ========================================================================

@@ -1163,6 +1163,27 @@ pub struct Vm {
     // address would dangle (a silent release use-after-free). `InstalledBaselineFunction::run`
     // debug-asserts the install-time vs run-time `Vm` base to catch a move.
     baseline_jit_slots: HashMap<CodeBlockId, BaselineJitSlot>,
+    // A1.x broad native-call engagement: the registry of installed baseline native
+    // ENTRY addresses, keyed by `CodeBlockId` — the faithful analog of an executable's
+    // `generatedJITCodeFor(kind)->addressForCall(arity)` (ExecutableBase), the callee
+    // entry a linked `op_call` jumps to. The per-`op_call` resolver
+    // (`resolve_baseline_native_entry`) maps a callee VALUE -> its `CodeBlockId` (via
+    // the host) -> this entry, returning it to the baseline JIT's native fast path.
+    //
+    // SEPARATE FROM `baseline_jit_slots` deliberately: `run_installed_baseline_jit`
+    // CHECKS OUT the `InstalledBaselineFunction` (replacing the slot state with
+    // `Warming`) for the duration of its own execution, so a SELF-RECURSIVE callee's
+    // entry would be unreachable from the slot mid-run. The entry address is a stable
+    // property of the finalized RX image (it does not move when the image is checked
+    // out), so it lives in this always-readable registry instead. NOT cleared on run.
+    baseline_native_entries: HashMap<CodeBlockId, usize>,
+    // A1.x broad native-call engagement — test-only runtime evidence that the native
+    // op_call fast path was TAKEN (not silently fell to the slow path): bumped each
+    // time `resolve_baseline_native_entry` returns a non-zero entry (the emitted site
+    // then `cbz`-falls-through to the native `blr`). A `Cell` so the resolver stays
+    // `&self`. Release builds carry no counter.
+    #[cfg(test)]
+    baseline_native_engagement_count: std::cell::Cell<u64>,
     #[cfg(test)]
     no_gc_execution_depth_observations_for_test: Vec<VmNoGcExecutionDepthObservationForTest>,
 }
@@ -2158,6 +2179,9 @@ impl Vm {
             safepoint_pass_full_branch_invocations: 0,
             ic_tiering_safepoint_memo: HashMap::new(),
             baseline_jit_slots: HashMap::new(),
+            baseline_native_entries: HashMap::new(),
+            #[cfg(test)]
+            baseline_native_engagement_count: std::cell::Cell::new(0),
             #[cfg(test)]
             no_gc_execution_depth_observations_for_test: Vec::new(),
         }
@@ -3220,6 +3244,74 @@ impl Vm {
         }
     }
 
+    /// A1.x broad native-call engagement — the per-`op_call` RE-RESOLVE the baseline
+    /// JIT's native fast path performs (the unlinked->linked `CallLinkInfo` analog,
+    /// `jit/Repatch.cpp` `linkFor`): given the runtime callee VALUE and the call's
+    /// argument count (EXCLUDING `this`), return the callee's installed baseline native
+    /// ENTRY address, or `0` if the callee is not directly native-callable at this
+    /// arity. The emitted op_call site tests the result: non-zero -> the native
+    /// `blr`-to-entry fast path; zero -> the `operation_call` slow path.
+    ///
+    /// `0` (slow path) is returned when: the callee is not a bytecode function / is a
+    /// class constructor (host `resolve_baseline_call_target`), the arity does NOT
+    /// match the callee's formal parameter count (the native fast path lays out exactly
+    /// `argc` argument slots with no arity fixup — argc != formal would let the callee
+    /// read unwritten slots, so a mismatch defers to the slow path's faithful
+    /// undefined-fill, mirroring JSC's distinct `addressForCall(MustCheckArity)` entry
+    /// which this first cut does not yet emit), or the callee has no installed image
+    /// (still in the interpreter — the LLInt-tier fallback).
+    ///
+    /// FOLLOW-UP (CallLinkInfo monomorphic cache, needs `visitWeak`/U7): a real
+    /// `CallLinkInfo` LINKS the site on first execution (baking a direct call +
+    /// callee-identity guard) so later calls skip this resolve. That cache caches the
+    /// callee CELL identity and so requires the R4 `visitWeak` weak-processing phase to
+    /// clear a collected callee; this re-resolve-every-call first cut caches NOTHING
+    /// (GC-safe, no weak reference) at the cost of the per-call lookup.
+    pub(crate) fn resolve_baseline_native_entry(
+        &self,
+        host: &CoreOpcodeDispatchHost,
+        callee_bits: u64,
+        argc: usize,
+    ) -> usize {
+        let callee = RuntimeValue::from_encoded(EncodedJsValue(callee_bits));
+        let Some((code_block_id, formal_parameter_count)) =
+            host.resolve_baseline_call_target(callee)
+        else {
+            return 0;
+        };
+        if argc != formal_parameter_count as usize {
+            return 0;
+        }
+        let entry = self
+            .baseline_native_entries
+            .get(&code_block_id)
+            .copied()
+            .unwrap_or(0);
+        // Runtime evidence the native fast path engaged (the site takes the `blr` on a
+        // non-zero entry); test-only, see the field doc.
+        #[cfg(test)]
+        if entry != 0 {
+            self.baseline_native_engagement_count
+                .set(self.baseline_native_engagement_count.get() + 1);
+        }
+        entry
+    }
+
+    /// Test-only: how many times the native op_call fast path was taken at runtime
+    /// (the resolver returned a non-zero entry). Proves broad engagement actually
+    /// routes real op_calls through the native `blr`, not silently the slow path.
+    #[cfg(test)]
+    pub(crate) fn baseline_native_engagement_count(&self) -> u64 {
+        self.baseline_native_engagement_count.get()
+    }
+
+    /// Test-only: clear the native-engagement counter (drop the warm-up engagements
+    /// before a clean measured run).
+    #[cfg(test)]
+    pub(crate) fn reset_baseline_native_engagement_count(&self) {
+        self.baseline_native_engagement_count.set(0);
+    }
+
     /// D3: read the JIT m_exception mirror word (`VM::exception()` analog).
     pub fn jit_pending_exception(&self) -> EncodedJsValue {
         self.exceptions.jit_pending()
@@ -3375,6 +3467,13 @@ impl Vm {
                     install_vm,
                 ) {
                     Ok(installed) => {
+                        // A1.x broad native-call engagement: record this image's native
+                        // entry in the always-readable registry (== an executable's
+                        // `addressForCall`) BEFORE the slot's image is checked out by a
+                        // run, so a self-recursive callee's op_call resolver can reach
+                        // it. Captured once at install; the RX entry is immovable.
+                        self.baseline_native_entries
+                            .insert(code_block_id, installed.native_entry_address());
                         if let Some(slot) = self.baseline_jit_slots.get_mut(&code_block_id) {
                             slot.state = BaselineJitInstallState::Installed(installed);
                         }
@@ -23136,6 +23235,526 @@ mod tests {
             "the hot function tiered up to a native baseline image via the LIVE \
              execute_code_block entry path (m_jitCode installed)",
         );
+    }
+
+    // ========================================================================
+    // A1.x BROAD NATIVE-CALL ENGAGEMENT — route REAL op_calls in a JIT'd function
+    // through the native fast path (a direct `blr` to the callee's installed image)
+    // when the callee is itself baseline-JIT'd. The R-lever: call-heavy code runs
+    // native end-to-end and BEATS the interpreter. The callee is RE-RESOLVED per call
+    // (the unlinked->linked `CallLinkInfo` analog) — no cached identity, so GC-safe
+    // without `visitWeak`.
+    // ========================================================================
+
+    // x => x + 1 (a small leaf callee). num_parameters_including_this = 2.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn a1x_callee_x_plus_one() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(0)), Operand::SignedImmediate(1)],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(1)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::Register(local(0)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(1))],
+                ),
+            ],
+            2,
+        )
+    }
+
+    // x => x (identity — carries its argument straight through the call ABI; used to
+    // prove a CELL flows through the native fast path intact). num_params = 2.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn a1x_identity_callee() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::Return,
+                vec![Operand::Register(argument_including_this(1))],
+            )],
+            2,
+        )
+    }
+
+    // caller(n, callee) { var s=0; for (i=0;i<n;i++) s += callee(i); return s; }
+    //   => sum_{i=0}^{n-1}(i+1) = n*(n+1)/2 when callee(x)=x+1.
+    // s=local0 i=local1 one=local2 cmp=local3 callret=local4 n=arg1 callee=arg2.
+    //   0 s=0  1 i=0  2 one=1  3 cmp=(i<n)  4 jfalse cmp->9  5 callret=callee(i)
+    //   6 s+=callret  7 i+=one  8 jmp->3  9 ret s
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn a1x_loop_caller() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(0)), Operand::SignedImmediate(0)],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(1)), Operand::SignedImmediate(0)],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(2)), Operand::SignedImmediate(1)],
+                ),
+                typed_core_instruction_with_operands(
+                    3,
+                    CoreOpcode::LessThanInt32,
+                    vec![
+                        Operand::Register(local(3)),
+                        Operand::Register(local(1)),
+                        Operand::Register(argument_including_this(1)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    4,
+                    CoreOpcode::JumpIfFalse,
+                    vec![
+                        Operand::Register(local(3)),
+                        Operand::BytecodeIndex(BytecodeIndex::from_offset(9)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    5,
+                    CoreOpcode::Call,
+                    vec![
+                        Operand::Register(local(4)),
+                        Operand::Register(argument_including_this(2)),
+                        Operand::UnsignedImmediate(1),
+                        Operand::Register(local(1)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    6,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(0)),
+                        Operand::Register(local(0)),
+                        Operand::Register(local(4)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    7,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(1)),
+                        Operand::Register(local(1)),
+                        Operand::Register(local(2)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    8,
+                    CoreOpcode::Jump,
+                    vec![Operand::BytecodeIndex(BytecodeIndex::from_offset(3))],
+                ),
+                typed_core_instruction_with_operands(
+                    9,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(0))],
+                ),
+            ],
+            3,
+        )
+    }
+
+    // sum(n, self) { if (n <= 0) return 0; return n + self(n-1, self); }
+    //   => n*(n+1)/2. SELF-RECURSIVE: the callee IS this function (passed as `self`,
+    //   arg2), so each native call resolves THIS image's entry from the
+    //   `baseline_native_entries` registry while the slot's image is checked out by the
+    //   running frame — the reason that registry is separate from `baseline_jit_slots`.
+    // zero=local0 one=local1 cmp=local2 nm1=local3 callret=local4 n=arg1 self=arg2.
+    //   0 zero=0  1 one=1  2 cmp=(n<=zero)  3 jfalse cmp->5  4 ret zero
+    //   5 nm1=n-one  6 callret=self(nm1, self)  7 callret=n+callret  8 ret callret
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn a1x_self_recursive_sum() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(0)), Operand::SignedImmediate(0)],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(1)), Operand::SignedImmediate(1)],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::LessEqualInt32,
+                    vec![
+                        Operand::Register(local(2)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::Register(local(0)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    3,
+                    CoreOpcode::JumpIfFalse,
+                    vec![
+                        Operand::Register(local(2)),
+                        Operand::BytecodeIndex(BytecodeIndex::from_offset(5)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    4,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(0))],
+                ),
+                typed_core_instruction_with_operands(
+                    5,
+                    CoreOpcode::SubInt32,
+                    vec![
+                        Operand::Register(local(3)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::Register(local(1)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    6,
+                    CoreOpcode::Call,
+                    vec![
+                        Operand::Register(local(4)),
+                        Operand::Register(argument_including_this(2)),
+                        Operand::UnsignedImmediate(2),
+                        Operand::Register(local(3)),
+                        Operand::Register(argument_including_this(2)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    7,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(4)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::Register(local(4)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    8,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(4))],
+                ),
+            ],
+            3,
+        )
+    }
+
+    // Warm a function past the S9 tier-up threshold so its native image installs (and
+    // its `baseline_native_entries` entry is recorded). Panics if it never tiers up.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn a1x_install_until_tiered(
+        vm: &mut Vm,
+        host: &mut CoreOpcodeDispatchHost,
+        id: CodeBlockId,
+        code_block: &CodeBlock,
+        warm_args: &[u64],
+    ) {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+        let cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 8;
+        for _ in 0..cap {
+            let _ =
+                vm.observe_baseline_jit_entry_and_maybe_execute(host, id, code_block, warm_args);
+            if vm.baseline_jit_function_is_installed(id) {
+                return;
+            }
+        }
+        panic!("function {id:?} did not tier up to a native image");
+    }
+
+    // PHASE 1 — the cell-free gate is LIFTED (A1.5 roots native JIT frames). Prove a
+    // native call CARRIES a CELL: a JIT'd `holder(mid, c) { return mid(c) }` native-calls
+    // a JIT'd `mid(x) { return x }` passing a string CELL `c`; the returned value is the
+    // SAME cell, bit-identical, with its text intact — the cell's bits flowed through the
+    // native call ABI (caller arg slot -> callee frame arg slot -> return register ->
+    // caller result), no longer gated to cell-free arith. The native fast path is proven
+    // TAKEN by the engagement counter.
+    //
+    // FINDING (reported, not a defect of this unit): a collection cannot SPONTANEOUSLY
+    // fire mid-native-call today — the GC safepoint is gated to `DeferToVm` call handling
+    // (interpreter/mod.rs:23262,23873), and a native call's slow-path re-entry runs
+    // `operation_call` with `DirectInterpreter` handling, which does NOT poll/collect. So
+    // a cell in a native frame cannot be swept mid-call (the window is shut). A1.5's
+    // active-span scan is the pre-positioned rooting NET for when that gate is opened (a
+    // separate, serial GC-safety decision); its survival-across-collection proof lives in
+    // `object_store.rs::jit_frame_cell_survives_collection_via_conservative_scan`.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_a1x_native_op_call_carries_cell_through_engaged_fast_path() {
+        let mid = a1x_identity_callee();
+        let holder = op_call_caller_passthrough(); // holder(mid, c) { return mid(c) }
+        let mid_id = CodeBlockId(CellId(8_840));
+        let holder_id = CodeBlockId(CellId(8_841));
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(holder_id, holder.clone());
+        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks(vec![
+            InterpreterFunctionCodeBlock::new(mid_id, mid.clone()),
+        ]);
+        let mid_value = host.allocate_function_value_for_test(0);
+        let cell = host.allocate_untracked_string_for_test("a-heap-cell");
+        let cell_bits = cell.encoded().0;
+
+        // Install `mid` first so the holder's op_call resolves its native entry.
+        a1x_install_until_tiered(
+            &mut vm,
+            &mut host,
+            mid_id,
+            &mid,
+            &op_call_args_including_this(&[RuntimeValue::from_i32(0)]),
+        );
+        // Install the holder, warmed with the SAME cell argument it will carry.
+        a1x_install_until_tiered(
+            &mut vm,
+            &mut host,
+            holder_id,
+            &holder,
+            &op_call_args_including_this(&[mid_value, cell]),
+        );
+
+        vm.reset_baseline_native_engagement_count();
+        let args = op_call_args_including_this(&[mid_value, cell]);
+        let returned = match vm
+            .observe_baseline_jit_entry_and_maybe_execute(&mut host, holder_id, &holder, &args)
+        {
+            BaselineJitEntryOutcome::Returned(value) => value.encoded().0,
+            other => panic!("native holder(mid, cell) did not return: {other:?}"),
+        };
+
+        assert!(
+            vm.baseline_native_engagement_count() >= 1,
+            "the holder's op_call took the NATIVE fast path (engagement counter bumped)",
+        );
+        assert_eq!(
+            returned, cell_bits,
+            "the CELL flowed through the native call ABI bit-identically (arg slot -> \
+             callee frame -> return register -> caller result)",
+        );
+        assert_eq!(
+            host.string_text_for_test(RuntimeValue::from_encoded(EncodedJsValue(returned))),
+            Some("a-heap-cell"),
+            "the carried cell is the live string cell, text intact (not corrupted bits)",
+        );
+    }
+
+    // PHASE 2 + 3 — the R-LEVER. A call-heavy `caller(n, callee)` loop, with BOTH the
+    // caller and the small `callee(x)=x+1` baseline-JIT'd, runs NATIVE end-to-end: each
+    // iteration's op_call takes the native `blr` fast path. (2) native == interpreter ==
+    // the closed-form oracle over a range of `n`; (3) MEASUREMENT — the native broad-
+    // engagement loop BEATS pure interpretation of the same program (the WIN evidence).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_a1x_broad_engagement_loop_caller_matches_interpreter_and_beats_it() {
+        let callee = a1x_callee_x_plus_one();
+        let caller = a1x_loop_caller();
+        let callee_id = CodeBlockId(CellId(8_850));
+        let caller_id = CodeBlockId(CellId(8_851));
+        // caller(n) = sum_{i=0}^{n-1}(i+1) = n*(n+1)/2.
+        let oracle = |n: i64| -> i64 { n * (n + 1) / 2 };
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(caller_id, caller.clone());
+        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks(vec![
+            InterpreterFunctionCodeBlock::new(callee_id, callee.clone()),
+        ]);
+        let callee_value = host.allocate_function_value_for_test(0);
+
+        a1x_install_until_tiered(
+            &mut vm,
+            &mut host,
+            callee_id,
+            &callee,
+            &op_call_args_including_this(&[RuntimeValue::from_i32(1)]),
+        );
+        a1x_install_until_tiered(
+            &mut vm,
+            &mut host,
+            caller_id,
+            &caller,
+            &op_call_args_including_this(&[RuntimeValue::from_i32(3), callee_value]),
+        );
+
+        // (2) CORRECTNESS over a range: native == interpreter == oracle, with the native
+        // path proven TAKEN exactly `n` times per run.
+        for &n in &[0_i32, 1, 5, 37, 256] {
+            vm.reset_baseline_native_engagement_count();
+            let args = op_call_args_including_this(&[RuntimeValue::from_i32(n), callee_value]);
+            let native = match vm
+                .observe_baseline_jit_entry_and_maybe_execute(&mut host, caller_id, &caller, &args)
+            {
+                BaselineJitEntryOutcome::Returned(value) => value.encoded().0,
+                other => panic!("native caller({n}) did not return: {other:?}"),
+            };
+            assert_eq!(
+                vm.baseline_native_engagement_count(),
+                n.max(0) as u64,
+                "the loop took the native call fast path once per iteration (n={n})",
+            );
+            assert_eq!(
+                native,
+                RuntimeValue::from_i32(oracle(n as i64) as i32).encoded().0,
+                "native caller({n}) == oracle n*(n+1)/2",
+            );
+            let interp =
+                match run_op_call_caller_via_interpreter(&caller, vec![callee.clone()], |h| {
+                    vec![
+                        RuntimeValue::from_i32(n),
+                        h.allocate_function_value_for_test(0),
+                    ]
+                }) {
+                    ExecutionCompletion::Returned(value) => value.encoded().0,
+                    other => panic!("interpreter caller({n}) did not return: {other:?}"),
+                };
+            assert_eq!(
+                native, interp,
+                "native caller({n}) == interpreter caller({n})"
+            );
+        }
+
+        // (3) THE r_i LIFT: M warm native runs of the call-heavy loop vs M interpreter
+        // runs of the SAME program. Native runs the whole loop + every callee as machine
+        // code (no per-bytecode dispatch); the per-call re-resolve is amortized by the
+        // native body.
+        //
+        // FAIRNESS: each native run reuses the installed image and RESETS its native JS
+        // stack (zero cross-run accumulation). The pre-GC interpreter never reclaims (no
+        // GC until R4 — see MEMORY.md), so a single REUSED interpreter Vm accumulates
+        // state across runs and its per-call cost climbs superlinearly. To measure the
+        // per-run cost (not the leak), build a FRESH interpreter Vm per rep so each rep's
+        // accumulation is bounded to one run — the apples-to-apples baseline. The reported
+        // ratio is still large (the pre-GC interpreter call path is heavy); it is NOT a
+        // steady-state parity figure — the load-bearing claim is native < interpreter.
+        let n_hot = 1_000_i32;
+        let reps = 10u32;
+
+        let native_start = std::time::Instant::now();
+        for _ in 0..reps {
+            let args = op_call_args_including_this(&[RuntimeValue::from_i32(n_hot), callee_value]);
+            let outcome = vm
+                .observe_baseline_jit_entry_and_maybe_execute(&mut host, caller_id, &caller, &args);
+            assert!(matches!(outcome, BaselineJitEntryOutcome::Returned(_)));
+        }
+        let native_elapsed = native_start.elapsed();
+
+        let interp_owner = CodeBlockId(CellId(8_852));
+        let interp_start = std::time::Instant::now();
+        for _ in 0..reps {
+            let mut interp_vm: Box<Vm> = Box::new(Vm::new(VmConfig::interpreter_only()));
+            let mut interp_host = CoreOpcodeDispatchHost::with_function_code_blocks(vec![
+                InterpreterFunctionCodeBlock::new(callee_id, callee.clone()),
+            ]);
+            let interp_callee = interp_host.allocate_function_value_for_test(0);
+            interp_vm.code_blocks.register(interp_owner, caller.clone());
+            let completion = execute_registered_code_block_with_host_and_arguments(
+                &mut interp_vm,
+                interp_owner,
+                &caller,
+                &mut interp_host,
+                vec![
+                    RuntimeValue::undefined(),
+                    RuntimeValue::from_i32(n_hot),
+                    interp_callee,
+                ],
+            );
+            assert!(matches!(completion, ExecutionCompletion::Returned(_)));
+        }
+        let interp_elapsed = interp_start.elapsed();
+
+        eprintln!(
+            "A1.x broad-engagement loop-caller: n_hot={n_hot} reps={reps} \
+             native={native_elapsed:?} interpreter={interp_elapsed:?} speedup={:.1}x \
+             (ratio inflated by the pre-GC interpreter call path; load-bearing claim is \
+             native < interpreter)",
+            interp_elapsed.as_secs_f64() / native_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+        );
+        assert!(
+            native_elapsed < interp_elapsed,
+            "the native broad-engagement call-heavy loop ({native_elapsed:?}) must BEAT \
+             pure interpretation ({interp_elapsed:?}) — the R-lever. If this fails, the \
+             per-call resolve/trampoline overhead is dominating (a critical finding).",
+        );
+    }
+
+    // ENGAGEMENT BREADTH — a SELF-RECURSIVE native call chain. `sum(n, self)` recurses
+    // by native `blr` to ITS OWN installed entry (resolved from `baseline_native_entries`
+    // while the slot's image is checked out by the running frame). Proves native
+    // recursion engages, matches the interpreter + oracle, and the engagement counter
+    // equals the recursion depth.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_a1x_self_recursive_native_call_chain_matches_interpreter() {
+        let sum = a1x_self_recursive_sum();
+        let sum_id = CodeBlockId(CellId(8_860));
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(sum_id, sum.clone());
+        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks(vec![
+            InterpreterFunctionCodeBlock::new(sum_id, sum.clone()),
+        ]);
+        let self_value = host.allocate_function_value_for_test(0);
+
+        // Warm with a SMALL n (the crossing entry runs sum(2) natively once); the
+        // measured runs below use larger n.
+        a1x_install_until_tiered(
+            &mut vm,
+            &mut host,
+            sum_id,
+            &sum,
+            &op_call_args_including_this(&[RuntimeValue::from_i32(2), self_value]),
+        );
+
+        // NOTE: the depth is bounded by the INTERPRETER baseline, which recurses on
+        // the Rust thread stack (one nested Rust dispatch per JS frame) — the native
+        // path recurses on its own 5 MiB JS stack and tolerates far deeper. Keep the
+        // equivalence range within the interpreter's thread-stack budget.
+        for &n in &[0_i32, 1, 2, 5, 12] {
+            vm.reset_baseline_native_engagement_count();
+            let args = op_call_args_including_this(&[RuntimeValue::from_i32(n), self_value]);
+            let native = match vm
+                .observe_baseline_jit_entry_and_maybe_execute(&mut host, sum_id, &sum, &args)
+            {
+                BaselineJitEntryOutcome::Returned(value) => value.encoded().0,
+                other => panic!("native sum({n}) did not return: {other:?}"),
+            };
+            // sum(n) recurses n times (n, n-1, ..., 1; the n<=0 base does no call).
+            assert_eq!(
+                vm.baseline_native_engagement_count(),
+                n.max(0) as u64,
+                "native self-recursion took the native call once per level (n={n})",
+            );
+            let oracle = (n as i64 * (n as i64 + 1) / 2) as i32;
+            assert_eq!(
+                native,
+                RuntimeValue::from_i32(oracle).encoded().0,
+                "native sum({n}) == n*(n+1)/2",
+            );
+            let interp = match run_op_call_caller_via_interpreter(&sum, vec![sum.clone()], |h| {
+                vec![
+                    RuntimeValue::from_i32(n),
+                    h.allocate_function_value_for_test(0),
+                ]
+            }) {
+                ExecutionCompletion::Returned(value) => value.encoded().0,
+                other => panic!("interpreter sum({n}) did not return: {other:?}"),
+            };
+            assert_eq!(native, interp, "native sum({n}) == interpreter sum({n})");
+        }
     }
 
     fn execute_registered_code_block_with_boundary_snapshot_and_arguments<H: DispatchHost>(

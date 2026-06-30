@@ -429,6 +429,43 @@ pub extern "C" fn operation_call(
     }
 }
 
+/// A1.x broad native-call engagement — the per-`op_call` callee-entry RESOLVER the
+/// baseline JIT's native fast path far-calls BEFORE deciding its dispatch. The emitted
+/// op_call site loads `x0`=the pinned `*mut Vm`, `x1`=the boxed callee value, `x2`=the
+/// argument count (EXCLUDING `this`), and far-calls this shim; it returns the callee's
+/// installed baseline native ENTRY address, or `0` if the callee is not directly
+/// native-callable at this arity. The site then `cbz`-tests the result: non-zero ->
+/// build the callee frame and `blr` the entry (the native JIT->JIT fast path); zero ->
+/// the `operation_call` slow path.
+///
+/// This is the unlinked->linked `CallLinkInfo` resolution (`jit/Repatch.cpp` `linkFor`:
+/// resolve the callee `executable`'s `generatedJITCodeFor(kind)->addressForCall`),
+/// collapsed to a RE-RESOLVE on every call (the first cut; the in-site monomorphic
+/// cache is the follow-up — see `Vm::resolve_baseline_native_entry`).
+///
+/// Same D1+D5 reborrow island as the arith/call families (see the module SAFETY note):
+/// reborrows `&mut *vm` and `&mut *host`, drops both before returning. INFALLIBLE — a
+/// pure lookup that allocates nothing and cannot throw, so it never touches the
+/// `m_exception` mirror.
+pub extern "C" fn operation_resolve_baseline_native_entry(
+    vm: *mut Vm,
+    callee: u64,
+    argc: u64,
+) -> u64 {
+    // D1 + D5 reborrows — see the module SAFETY note. Exactly one `&mut *vm` and one
+    // `&mut *host`, both dropped before returning to JIT code.
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the resolver ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    vm.resolve_baseline_native_entry(host, callee, argc as usize) as u64
+}
+
 /// `operationThrowStackOverflowError(CodeBlock*)` (JITOperations.cpp:120-129): the
 /// baseline prologue's `softStackLimit` overflow path (JIT.cpp:781) far-calls this
 /// shim when a new frame's top would drop below the soft stack limit. It reborrows
