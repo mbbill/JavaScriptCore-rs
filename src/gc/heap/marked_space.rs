@@ -318,8 +318,33 @@ pub(crate) struct MarkedSpace {
     /// never sweeps, so this is exactly its LIVE twin count — the population the
     /// suite-end cross-check compares against `CoreObjectStore::objects.len()`.
     allocated_blob_cells: usize,
+    /// gc-r4 R4b live trigger — bytes handed out via `allocate_blob` SINCE the last
+    /// collection (JSC `Heap::m_bytesAllocatedThisCycle`, heap/Heap.h:1006). The
+    /// cooperative safepoint driver resets it to 0 at the END of each collection (a
+    /// fresh cycle). NOT a leak counter (`allocated_blob_cells` is monotone); this
+    /// drains every GC.
+    bytes_allocated_this_cycle: usize,
+    /// gc-r4 R4b live trigger — set true once `bytes_allocated_this_cycle` crosses
+    /// `BYTES_ALLOCATED_GC_THRESHOLD`. The cooperative back-edge / VM-entry safepoint
+    /// driver (`CoreObjectStore::poll_collection_at_safepoint`) checks it and runs ONE
+    /// collection when armed. Decision 5: NEVER collect inline in `allocate_blob` —
+    /// that would collect re-entrantly while a cell `&mut`/`&` is live.
+    collection_request_armed: bool,
     _not_send_sync: PhantomData<*const ()>, // contract C6
 }
+
+/// gc-r4 R4b live trigger — bytes-allocated-since-last-GC threshold that arms a
+/// deferred collection request (the JSC `m_bytesAllocatedThisCycle` vs eden-size
+/// trigger, heap/Heap.cpp `Heap::collectIfNecessaryOrDefer`). A DELIBERATELY simple
+/// single threshold (no eden-growth heuristic yet); a few MB mirrors JSC's small
+/// initial eden. Under `cfg(test)` it is small so `cargo test --lib` — the live-driver
+/// stress test — actually trips the trigger on modest allocation and exercises a real
+/// collection at the back-edge safepoint, giving root-completeness coverage across the
+/// suite's JS-running tests instead of never arming.
+#[cfg(not(test))]
+const BYTES_ALLOCATED_GC_THRESHOLD: usize = 4 * 1024 * 1024;
+#[cfg(test)]
+const BYTES_ALLOCATED_GC_THRESHOLD: usize = 16 * 1024;
 
 impl Default for MarkedSpace {
     fn default() -> Self {
@@ -351,6 +376,8 @@ impl MarkedSpace {
             precise_set: HashSet::default(),
             debug_borrow_flags: HashMap::default(),
             allocated_blob_cells: 0,
+            bytes_allocated_this_cycle: 0,
+            collection_request_armed: false,
             _not_send_sync: PhantomData,
         }
     }
@@ -406,6 +433,17 @@ impl MarkedSpace {
     /// (`needs_drop == false`); single mutator thread (contract C5/C6).
     pub(crate) unsafe fn allocate_blob(&mut self, src: *const u8, len: usize) -> CellPtr {
         self.allocated_blob_cells += 1;
+        // gc-r4 R4b live trigger (decision 5): ACCUMULATE bytes-this-cycle and ARM a
+        // DEFERRED collection request when it crosses the threshold. Do NOT collect
+        // here — collection runs ONLY at the cooperative back-edge / VM-entry
+        // safepoint, so no collection can fire while a cell `&mut`/`&` is live in an
+        // `allocate_*` / `with_cell_mut` window (forecloses re-entrancy by
+        // construction). Mirrors JSC bumping `m_bytesAllocatedThisCycle` in the
+        // allocation slow path and deferring the actual collect to a safepoint.
+        self.bytes_allocated_this_cycle = self.bytes_allocated_this_cycle.saturating_add(len);
+        if self.bytes_allocated_this_cycle >= BYTES_ALLOCATED_GC_THRESHOLD {
+            self.collection_request_armed = true;
+        }
         match size_route(len) {
             SizeRoute::Marked(sz) => {
                 let atoms = sz / ATOM_SIZE;
@@ -474,6 +512,27 @@ impl MarkedSpace {
     /// `allocate_blob` (== live twins, since R3 never sweeps).
     pub(crate) fn allocated_blob_cell_count(&self) -> usize {
         self.allocated_blob_cells
+    }
+
+    /// gc-r4 R4b live trigger — is a deferred collection ARMED (the byte counter
+    /// crossed `BYTES_ALLOCATED_GC_THRESHOLD` since the last GC)? The cooperative
+    /// safepoint driver polls this; a disarmed back-edge pays one bool load.
+    pub(crate) fn collection_request_armed(&self) -> bool {
+        self.collection_request_armed
+    }
+
+    /// gc-r4 R4b live trigger — bytes allocated since the last collection (test probe
+    /// + JSC `m_bytesAllocatedThisCycle` mirror).
+    pub(crate) fn bytes_allocated_this_cycle(&self) -> usize {
+        self.bytes_allocated_this_cycle
+    }
+
+    /// gc-r4 R4b live trigger — start a fresh allocation cycle: clear the byte counter
+    /// and DISARM the request. The driver calls this at the END of a collection (JSC
+    /// resets `m_bytesAllocatedThisCycle` after a collection).
+    pub(crate) fn reset_bytes_allocated_this_cycle(&mut self) {
+        self.bytes_allocated_this_cycle = 0;
+        self.collection_request_armed = false;
     }
 
     /// Force-route through PreciseAllocation regardless of size (to exercise the

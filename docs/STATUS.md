@@ -121,12 +121,18 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   micro-probe returns to EXACTLY baseline (43 cells/43 slots) after every collection with the slab bounded
   (the LEAK IS FIXED); ≥2-collection landmine (s2.reclaimed==0); free-list reuse; self-aliasing under
   collection; miri TB 0 UB; whole suite 2766 green (force_collect explicit/unwired).
-- [next-GC] R4b live DRIVER (TINY — wires it live → R MEASURABLE): a byte-counter trigger in allocate_blob
-  (arm a request at threshold; NO inline collection) + call force_collect (via gather_all_gc_roots, not the
-  test entry) at the back-edge / VM-entry safepoint poll, flipping register_root_safepoint_is_active during
-  STW. THEN the leak is fixed live → the heavy Octane benches RUN (gate via the micro-probe first) → the full
-  R4 15-bench gate closes → R becomes measurable. (Leaf String/Symbol/BigInt cells still leak in their Vec
-  stores — a separate later leaf-migration phase.)
+- [done] R4b LIVE DRIVER — **the object-cell collector now RUNS**: byte-counter trigger in allocate_blob
+  (4MB prod / 16KB cfg(test)) arms a request; collected at the back-edge / VM-entry safepoint
+  (DeferToVm-gated; NO inline collection → re-entrancy foreclosed) via gather_all_gc_roots → force_collect,
+  STW-flagged. An adversarial verify caught + we FIXED a REAL mass-UAF: the global object (Program/Eval
+  this_value) + the host global lexical let/const/class bindings were NOT rooted → top-level functions/
+  constructors would be swept on the 2nd collection; now gathered (≥2-collection survival tests). #3 builtin
+  callbacks proven sound by construction (DirectInterpreter-inherited → poll suppressed, tested); #1 baseline
+  frames confirmed forward-only (arith-only/cell-free) + documented. 2770 tests + miri TB 0 UB on the live
+  cycle. **THE OBJECT-CELL LEAK IS FIXED LIVE** (micro-probe returns to baseline).
+- [next-GC] leaf-cell migration (String/Symbol/BigInt → arena + sweep) = the REMAINING leak (string-heavy
+  benches still OOM); the bounded micro-probe then gates a memory-capped real Octane bench. THEN all 15
+  benches can run → R becomes measurable. (Per-slab aux already reclaimed via the free-lists; SD-4 done.)
 
 ## Baseline JIT / DFG / FTL (parity lives here; ~0% started)
 - [done] JIT↔runtime bridge-infra (adversarially verified): extern-C operation_value_add shim

@@ -1569,6 +1569,21 @@ impl<'host, H> RuntimeHelperRootMapDispatchHost<'host, H> {
 }
 
 impl<H: DispatchHost> DispatchHost for RuntimeHelperRootMapDispatchHost<'_, H> {
+    /// gc-r4 R4b LIVE DRIVER — forward the cooperative collection safepoint poll to the
+    /// inner host (this wrapper is transparent to the trigger). Without this, the
+    /// wrapper would inherit the no-op default and the live collector would never fire
+    /// on a wrapped path.
+    fn poll_gc_collection_safepoint(
+        &mut self,
+        registers: &RegisterFile,
+        stack: &ExecutionContextStack,
+        exceptions: &ExceptionState,
+        heap: &mut Heap,
+    ) {
+        self.inner
+            .poll_gc_collection_safepoint(registers, stack, exceptions, heap)
+    }
+
     fn targeted_register_roots(
         &mut self,
         heap: &mut Heap,
@@ -1697,6 +1712,21 @@ impl<'host, H> VmLoopHintDispatchHost<'host, H> {
 }
 
 impl<H: DispatchHost> DispatchHost for VmLoopHintDispatchHost<'_, H> {
+    /// gc-r4 R4b LIVE DRIVER — forward the cooperative collection safepoint poll to the
+    /// inner host. The VM drives the real interpreter loop through THIS wrapper
+    /// (`execute_interpreter_code_block_in_current_region`), so without this forward the
+    /// live collector would never fire on the production execution path.
+    fn poll_gc_collection_safepoint(
+        &mut self,
+        registers: &RegisterFile,
+        stack: &ExecutionContextStack,
+        exceptions: &ExceptionState,
+        heap: &mut Heap,
+    ) {
+        self.inner
+            .poll_gc_collection_safepoint(registers, stack, exceptions, heap)
+    }
+
     fn targeted_register_roots(
         &mut self,
         heap: &mut Heap,

@@ -759,6 +759,28 @@ impl ExecutionContextStack {
         Err(ExecutionError::ExpectedObject)
     }
 
+    /// gc-r4 R4b ROOT GAP #2 — the global object(s) live on this stack as the
+    /// `this` of each Program/Eval entry (`active_global_this_value` resolves the
+    /// active one; the GC must root them ALL). JSC roots `JSGlobalObject` as a
+    /// strong VM reference visited by `Heap::markRoots`; the port stores the global
+    /// object as the program/eval entry `this_value`, so the safepoint gather walks
+    /// the entries here. Rooting the global object transitively roots its butterfly,
+    /// where every top-level `var`/`function` declaration and the builtin
+    /// constructors live — so a missed global object = those swept = UAF on the next
+    /// global property access. A Function entry's `this` is a register-file slot
+    /// (`gather_vm_register_roots`); a Module entry's global `this` is `undefined`
+    /// (the carried `this_value` is gathered regardless, harmlessly if not a cell).
+    pub fn global_object_root_values(&self) -> Vec<RuntimeValue> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.record {
+                ExecutionEntryRecord::Program(program) => Some(program.this_value),
+                ExecutionEntryRecord::Eval(eval) => Some(eval.this_value),
+                ExecutionEntryRecord::Function(_) | ExecutionEntryRecord::Module(_) => None,
+            })
+            .collect()
+    }
+
     pub fn frame(&self, id: CallFrameId) -> Option<&InstalledCallFrame> {
         self.frames.iter().find(|frame| frame.id == id)
     }
@@ -2864,6 +2886,25 @@ pub trait DispatchHost {
     /// `VM` owns the host); default `None`, overridden only by the concrete host.
     fn as_core_opcode_dispatch_host(&mut self) -> Option<&mut CoreOpcodeDispatchHost> {
         None
+    }
+
+    /// gc-r4 R4b LIVE DRIVER (decision 6) — the cooperative collection safepoint poll.
+    /// Called at the interpreter back-edge / VM-entry (next to the register/frame-root
+    /// safepoint polls) ONLY in the VM-driven `DeferToVm` activation. The concrete
+    /// `CoreOpcodeDispatchHost` overrides this to run ONE collection on its
+    /// `CoreObjectStore` arena when the byte-counter trigger is armed
+    /// (`CoreObjectStore::poll_collection_at_safepoint`); the VM host wrappers forward
+    /// to their inner host; all OTHER hosts (test/generic) keep this no-op default and
+    /// never auto-collect. No standalone JSC counterpart — a Rust-genericity bridge over
+    /// the host split (JSC's one `VM` owns the `Heap`+host, so its safepoint just calls
+    /// `Heap::collectIfNecessaryOrDefer`).
+    fn poll_gc_collection_safepoint(
+        &mut self,
+        _registers: &RegisterFile,
+        _stack: &ExecutionContextStack,
+        _exceptions: &ExceptionState,
+        _heap: &mut Heap,
+    ) {
     }
 
     fn targeted_register_roots(
@@ -6006,6 +6047,27 @@ impl DispatchHost for CoreOpcodeDispatchHost {
         Some(self)
     }
 
+    /// gc-r4 R4b LIVE DRIVER (decision 6) — run the cooperative collection on the live
+    /// `CoreObjectStore` arena when armed. The store owns `MarkedSpace` + the aux slabs;
+    /// it gathers the store/Vm precise root set (register file + frame headers + the
+    /// intrinsics + the global object + exceptions + jit_pending) and marks/reconciles/
+    /// sweeps under the STW window. THIS host additionally owns the global LEXICAL
+    /// environment (`let`/`const`/`class`), a map the store cannot reach, so it
+    /// contributes those cell values as `host_roots` (gc-r4.md R4b ROOT GAP #2 —
+    /// JSC's `JSGlobalLexicalEnvironment`, visited by `JSGlobalObject::visitChildren`).
+    /// See `CoreObjectStore::poll_collection_at_safepoint`.
+    fn poll_gc_collection_safepoint(
+        &mut self,
+        registers: &RegisterFile,
+        stack: &ExecutionContextStack,
+        exceptions: &ExceptionState,
+        heap: &mut Heap,
+    ) {
+        let host_roots = self.gather_global_lexical_roots();
+        self.objects
+            .poll_collection_at_safepoint(registers, stack, exceptions, heap, &host_roots);
+    }
+
     fn targeted_register_roots(
         &mut self,
         heap: &mut Heap,
@@ -8963,6 +9025,29 @@ impl CoreOpcodeDispatchHost {
             .slot
             .set_mutable(value, binding.attributes, true)
             .map_err(|error| global_lexical_binding_error(name, error))
+    }
+
+    /// gc-r4 R4b ROOT GAP #2 — the GC roots the host owns directly: every global
+    /// LEXICAL binding's cell value. JSC keeps `let`/`const`/`class` global bindings in
+    /// the `JSGlobalLexicalEnvironment` heap cell (visited by
+    /// `JSGlobalObject::visitChildren`); the port keeps them in a host-side map
+    /// (`global_lexical_bindings`, a structural divergence), so the collector cannot
+    /// reach them through the cell graph. A binding value can be a cell — e.g. a global
+    /// `class C {}` constructor reachable ONLY here — so the host hands these to the
+    /// safepoint driver as precise roots; a missed one = swept = UAF on the next use.
+    /// Over-approximating (a `Deleted`/`Uninitialized` slot's stale `value`) is SAFE for
+    /// a GC root; non-cells (`Empty` sentinel, primitives) drop out of `as_cell`.
+    fn gather_global_lexical_roots(&self) -> Vec<usize> {
+        self.global_lexical_bindings
+            .values()
+            .filter_map(|binding| {
+                binding
+                    .slot
+                    .value()
+                    .as_cell()
+                    .map(|cell| cell.pointer_payload_bits())
+            })
+            .collect()
     }
 
     fn truthy(&self, value: RuntimeValue) -> bool {
@@ -22733,6 +22818,21 @@ fn execute_code_block_with_resume<H: DispatchHost>(
     // the hot loop pays nothing per op.
     let _ = poll_register_root_safepoint(execution.registers, execution.heap);
     let _ = poll_frame_header_root_safepoint(execution.stack, execution.heap);
+    // gc-r4 R4b LIVE DRIVER (decision 6): cooperative collection at VM / loop entry —
+    // ONLY in the VM-driven `DeferToVm` activation. A `DirectInterpreter` activation is
+    // a native-builtin (or coercion / proxy-trap) re-entry that holds cells in Rust
+    // locals not covered by the precise root set (GAP C — native-stack conservative
+    // scan — is DEFERRED), so collecting there could sweep an unrooted local; the
+    // VM-driven loop is fully register / frame / intrinsic rooted. No-op unless the
+    // byte-counter trigger is armed (the concrete host then runs ONE collection).
+    if call_handling.ordinary_bytecode_call == OrdinaryBytecodeCallHandling::DeferToVm {
+        host.poll_gc_collection_safepoint(
+            execution.registers,
+            execution.stack,
+            execution.exceptions,
+            execution.heap,
+        );
+    }
 
     loop {
         if let Some(reason) = execution.exceptions.termination() {
@@ -22819,6 +22919,16 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                     execution.stack,
                     execution.heap,
                 );
+                poll_gc_collection_safepoint_on_backedge(
+                    index,
+                    target,
+                    call_handling,
+                    host,
+                    execution.registers,
+                    execution.stack,
+                    execution.exceptions,
+                    execution.heap,
+                );
                 pc = target;
             }
             DispatchOutcome::Jump(target) => {
@@ -22837,6 +22947,16 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                     index,
                     target,
                     execution.stack,
+                    execution.heap,
+                );
+                poll_gc_collection_safepoint_on_backedge(
+                    index,
+                    target,
+                    call_handling,
+                    host,
+                    execution.registers,
+                    execution.stack,
+                    execution.exceptions,
                     execution.heap,
                 );
                 pc = target;
@@ -23282,6 +23402,49 @@ fn poll_frame_header_root_safepoint_on_backedge(
     poll_frame_header_root_safepoint(stack, heap)
 }
 
+/// gc-r4 R4b LIVE DRIVER (decision 6) — loop back-edge variant of the cooperative
+/// collection poll (the JSC `op_loop_hint` site). Fires ONLY on a backward branch (so
+/// the forward hot path pays nothing) and ONLY in the VM-driven `DeferToVm` activation
+/// — a `DirectInterpreter` activation is a native-builtin (or coercion / proxy-trap)
+/// re-entry holding cells in Rust locals that the precise root set does NOT cover (GAP
+/// C, native-stack conservative scan, is DEFERRED), so a collection there could sweep
+/// an unrooted local. The actual collection runs only when the byte-counter trigger is
+/// armed (`CoreObjectStore::poll_collection_at_safepoint` via the host); otherwise this
+/// is a no-op (one enum compare + one bool load).
+///
+/// FORWARD CONSTRAINT — baseline-JIT native frames (gc-r4.md R4b #1, audited
+/// 2026-06-29). A baseline function executes native machine code and does NOT poll a
+/// collection from there. That is SOUND *only* while the baseline allowlist is
+/// ARITH-ONLY: `jit/arm64_baseline/function_emitter.rs` accepts exactly int32/double
+/// arith + bit/shift, `Move`/`LoadInt32`, the fused int32 compare-and-branch,
+/// `Jump`/`JumpIfFalse`/`Return`/`LoopHint`, and REJECTS everything else (no `op_call`,
+/// no object/property/allocation — `EmitFunctionError::UnsupportedOpcode`). So a baseline
+/// frame holds only NUMBERS (immediates, never cells) in machine registers, never
+/// allocates, and its `operation_*` slow paths are non-polling Rust calls — it cannot
+/// hold a live cell across a collection. BROADENING the allowlist to call/object/property
+/// ops REQUIRES first rooting baseline native frames (spill live cells to the
+/// `RegisterFile` before any path can reach a collection poll, or a precise baseline
+/// stackmap) — exactly as this `DirectInterpreter` suppression protects native-builtin
+/// Rust locals today.
+fn poll_gc_collection_safepoint_on_backedge<H: DispatchHost>(
+    current_index: usize,
+    target: BytecodeIndex,
+    call_handling: InterpreterCallHandling,
+    host: &mut H,
+    registers: &RegisterFile,
+    stack: &ExecutionContextStack,
+    exceptions: &ExceptionState,
+    heap: &mut Heap,
+) {
+    if call_handling.ordinary_bytecode_call != OrdinaryBytecodeCallHandling::DeferToVm {
+        return;
+    }
+    if (target.offset() as usize) > current_index {
+        return;
+    }
+    host.poll_gc_collection_safepoint(registers, stack, exceptions, heap);
+}
+
 // gc-r4 R4b-mark — the COMPLETE precise GC root gather (`Heap::markRoots`) lives as a
 // METHOD `CoreObjectStore::gather_all_gc_roots` (object_store.rs), NOT a free function
 // here: a `pub(crate)` free fn naming `&CoreObjectStore` would raise that type's effective
@@ -23358,6 +23521,198 @@ mod tests {
         assert!(store.is_value_marked(thrown));
         assert!(store.is_value_marked(jit));
         assert!(stats.seeded_roots >= 3);
+    }
+
+    /// gc-r4 R4b ROOT GAP #2 (the load-bearing one) — a top-level `function foo(){}` is
+    /// a property in the GLOBAL OBJECT's butterfly, reachable through NO register /
+    /// intrinsic / exception. The global object lives as the Program entry `this`. Across
+    /// >= 2 collections (the membership-gate landmine — survivors keep `newlyAllocated`
+    /// only on collection #1), the gather must surface the global object so `foo` survives
+    /// TRANSITIVELY; else `foo` is swept and the next call is a UAF.
+    #[test]
+    fn gather_roots_keeps_top_level_function_via_global_object_across_two_collections() {
+        let mut store = CoreObjectStore::default();
+        let global = store.allocate();
+        let foo = store.allocate();
+        // `foo` lands in the global object's butterfly out-of-line storage (the channel
+        // `trace_cell` walks) — reachable ONLY through the global object.
+        store
+            .put_data_own(global, &CorePropertyKey::Identifier(7), foo)
+            .unwrap();
+        let addr = |v: RuntimeValue| v.as_cell().unwrap().pointer_payload_bits();
+        let (foo_addr, global_addr) = (addr(foo), addr(global));
+
+        // A live Program entry whose `this` IS the global object (the JSGlobalObject root).
+        let mut stack = ExecutionContextStack::default();
+        stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+            code_block: CodeBlockId(CellId(1)),
+            global_object: GlobalObjectId(ObjectId(CellId(1))),
+            this_value: global,
+        }));
+        let registers = RegisterFile::default();
+        let exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+
+        // The global object is a gathered root; `foo` is NOT a direct root — only
+        // reachable through the global object's butterfly.
+        let roots = store.gather_all_gc_roots(&registers, &stack, &exceptions, &heap);
+        assert!(
+            roots.contains(&global_addr),
+            "the global object is a gathered root (#2)"
+        );
+        assert!(
+            !roots.contains(&foo_addr),
+            "the top-level function is not a direct root — only reachable via the global"
+        );
+
+        // >= 2 collections; an unrooted dead island each cycle. `foo` must survive BOTH,
+        // transitively through the rooted global object.
+        for _ in 0..2 {
+            let _dead = store.allocate();
+            let roots = store.gather_all_gc_roots(&registers, &stack, &exceptions, &heap);
+            store.force_collect(&roots);
+            assert!(
+                store.find(global).is_some(),
+                "the global object survived collection"
+            );
+            assert!(
+                store.find(foo).is_some(),
+                "the top-level function survived (rooted transitively via the global object)"
+            );
+            assert!(
+                store.is_value_marked(foo),
+                "the function is reachable from a gathered root after collection"
+            );
+        }
+    }
+
+    /// gc-r4 R4b ROOT GAP #2 — a global `class C {}` constructor lives ONLY in the host
+    /// global-lexical map (JSC's `JSGlobalLexicalEnvironment`), reachable through no cell
+    /// edge. The host must contribute it as a precise root (`host_roots`) so it survives
+    /// >= 2 collections; else it is swept and the next `new C` is a UAF.
+    #[test]
+    fn global_lexical_class_binding_survives_two_collections() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        host.install_global_lexical_declarations([CoreGlobalLexicalDeclaration {
+            name: "C".to_string(),
+            kind: CoreGlobalLexicalDeclarationKind::Class,
+        }])
+        .unwrap();
+        let ctor = host.objects.allocate();
+        host.initialize_global_lexical("C", ctor).unwrap();
+
+        let registers = RegisterFile::default();
+        let stack = ExecutionContextStack::default();
+        let exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+
+        for _ in 0..2 {
+            // Arm the trigger with an unrooted dead island (no explicit force_collect).
+            let mut guard = 0usize;
+            while !host.objects.space.collection_request_armed() {
+                let o = host.objects.allocate();
+                host.objects
+                    .put_data_own(
+                        o,
+                        &CorePropertyKey::Identifier(0),
+                        RuntimeValue::from_i32(7),
+                    )
+                    .unwrap();
+                guard += 1;
+                assert!(
+                    guard < 100_000,
+                    "the byte-counter trigger arms within a bound"
+                );
+            }
+            // The host wrapper gathers the global-lexical roots (gap #2) and collects.
+            host.poll_gc_collection_safepoint(&registers, &stack, &exceptions, &mut heap);
+            assert!(
+                host.objects.find(ctor).is_some(),
+                "the global `class` constructor survived (rooted via the global lexical env)"
+            );
+        }
+        assert_eq!(
+            host.read_global_lexical("C").ok(),
+            Some(ctor),
+            "the binding still resolves to the same live constructor"
+        );
+    }
+
+    /// gc-r4 R4b ROOT GAP #3 — a native builtin (e.g. Array.prototype.map) holds a
+    /// Rust-local result cell across a callback. The callback re-enters via the free
+    /// `execute_code_block` (always `direct_interpreter()`), and nested calls inherit that
+    /// mode, so the back-edge collection poll stays SUPPRESSED — no collection can sweep
+    /// the unrooted local. This pins that suppression: an armed trigger does NOT collect
+    /// under DirectInterpreter, but the SAME armed trigger DOES under DeferToVm (proving
+    /// the gate is load-bearing, not vacuous).
+    #[test]
+    fn direct_interpreter_callback_suppresses_collection_poll() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        // The builtin's unrooted Rust-local result cell.
+        let result = host.objects.allocate();
+        // Arm the byte-counter trigger with an unrooted dead island (no force_collect).
+        let mut guard = 0usize;
+        while !host.objects.space.collection_request_armed() {
+            let o = host.objects.allocate();
+            host.objects
+                .put_data_own(
+                    o,
+                    &CorePropertyKey::Identifier(0),
+                    RuntimeValue::from_i32(7),
+                )
+                .unwrap();
+            guard += 1;
+            assert!(
+                guard < 100_000,
+                "the byte-counter trigger arms within a bound"
+            );
+        }
+        let registers = RegisterFile::default();
+        let stack = ExecutionContextStack::default();
+        let exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+
+        // A backward edge (target 0 < current 1) under DirectInterpreter: the poll is
+        // SUPPRESSED — the trigger stays armed and the unrooted result survives.
+        poll_gc_collection_safepoint_on_backedge(
+            1,
+            BytecodeIndex::from_offset(0),
+            InterpreterCallHandling::direct_interpreter(),
+            &mut host,
+            &registers,
+            &stack,
+            &exceptions,
+            &mut heap,
+        );
+        assert!(
+            host.objects.space.collection_request_armed(),
+            "DirectInterpreter back-edge does NOT collect (trigger stays armed)"
+        );
+        assert!(
+            host.objects.find(result).is_some(),
+            "the builtin's unrooted result cell survives under DirectInterpreter"
+        );
+
+        // The SAME armed trigger under DeferToVm DOES collect and sweeps the unrooted
+        // result — proving the suppression above is what keeps the builtin's local alive.
+        poll_gc_collection_safepoint_on_backedge(
+            1,
+            BytecodeIndex::from_offset(0),
+            InterpreterCallHandling::defer_to_vm(),
+            &mut host,
+            &registers,
+            &stack,
+            &exceptions,
+            &mut heap,
+        );
+        assert!(
+            !host.objects.space.collection_request_armed(),
+            "DeferToVm back-edge collected (trigger disarmed)"
+        );
+        assert!(
+            host.objects.find(result).is_none(),
+            "under DeferToVm the unrooted result is swept (the suppression is load-bearing)"
+        );
     }
 
     // C++ JSC stringifyFunction (runtime/FunctionConstructor.cpp:217-302) for

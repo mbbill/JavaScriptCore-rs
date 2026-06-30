@@ -296,6 +296,35 @@ BOUNDED no-OOM micro-probe (NOT heavy benches) asserting arena + butterfly-slab 
 counts return to baseline; THEN the heavy Octane benches become runnable (gate them in via
 the micro-probe FIRST — the leak persists until R4b lands).
 
+### R4b live-driver root-completeness audit (2026-06-29)
+
+Closed three root-completeness risks the green unit suite did not exercise but a real
+Octane bench would (a missed root = a swept live cell = UAF). The intrinsic gather had
+roots ONLY the prototypes, NOT the actual global object / its bindings:
+
+- **GLOBAL OBJECT + global var/function decls (#2, FIXED — was load-bearing).** The global
+  object lives as the Program/Eval entry `this_value` (NOT an intrinsic field); a CodeBlock
+  no longer pins it (CodeBlocks are non-arena), so on the 2nd collection it — and every
+  top-level `var`/`function` binding + builtin constructor in its butterfly — was
+  unreachable. FIX: `gather_all_gc_roots` now gathers
+  `ExecutionContextStack::global_object_root_values` (the `JSGlobalObject` strong root).
+- **Global LEXICAL env (`let`/`const`/`class`) (#2, FIXED).** Held in a host-side map
+  (`global_lexical_bindings`, JSC's `JSGlobalLexicalEnvironment` analog), reachable through
+  no cell edge; a global `class C {}` constructor lived ONLY there. FIX: the host contributes
+  them as `host_roots` to `poll_collection_at_safepoint`
+  (`CoreOpcodeDispatchHost::gather_global_lexical_roots`).
+- **Builtin-callback mode-mixing (#3, SOUND by construction — no fix).** A native builtin's
+  Rust-local result cell is held across a callback, but the callback re-enters via the free
+  `execute_code_block`, which hardcodes `direct_interpreter()`, and nested `op_call`s inherit
+  that mode (they execute inline through the same entry) — so the back-edge collection poll
+  stays suppressed for the entire builtin subtree; no collection can sweep the unrooted local.
+- **Baseline-JIT native frames (#1, FORWARD constraint — not a current UAF).** The baseline
+  allowlist is ARITH-ONLY (no `op_call`/object/property/alloc), so a baseline frame holds only
+  numbers and never polls a collection. Broadening the allowlist REQUIRES first rooting
+  baseline native frames. Documented at `poll_gc_collection_safepoint_on_backedge`.
+- **`allocate_blob` (#4, CONFIRMED).** Only ARMS the deferred request (bumps the byte counter);
+  never collects inline (decision 5) — `gc/heap/marked_space.rs::allocate_blob`.
+
 ## Dependency / ordering
 
 value-rep NaN-box (done) → Structure-wire (offset map → PropertyTable; in flight) → B1a

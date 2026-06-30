@@ -909,6 +909,38 @@ impl Heap {
         self.mutator_should_be_fenced = false;
     }
 
+    /// gc-r4 R4b live driver (decision 6) — ENTER the cooperative stop-the-world
+    /// window for ONE collection at a back-edge / VM-entry safepoint. Drops mutator
+    /// heap access (`mutator_has_heap_access = false`), which flips
+    /// `register_root_safepoint_is_active()` true — the `Heap::worldIsStopped`
+    /// (heap/Heap.cpp:3021) analog — for the duration of the gather + mark + sweep.
+    /// In the single-threaded `InterpreterOnly` configuration there is no other
+    /// thread to fence (`Fixpoint` is not a fenced phase), so this is a bookkeeping
+    /// flip the driver pairs with `end_stop_the_world_for_collection`.
+    pub fn begin_stop_the_world_for_collection(&mut self) {
+        debug_assert!(
+            self.mutator_has_heap_access,
+            "begin_stop_the_world_for_collection: a collection window is already open",
+        );
+        self.enter_phase(
+            GcPhase::Fixpoint,
+            MutatorState::Collecting,
+            GcConductor::Collector,
+        );
+    }
+
+    /// gc-r4 R4b live driver (decision 6) — LEAVE the stop-the-world window opened by
+    /// `begin_stop_the_world_for_collection`, restoring mutator heap access
+    /// (`register_root_safepoint_is_active()` -> false) and `GcPhase::NotRunning`
+    /// (the `Heap::resumeTheWorld` analog).
+    pub fn end_stop_the_world_for_collection(&mut self) {
+        debug_assert!(
+            !self.mutator_has_heap_access,
+            "end_stop_the_world_for_collection: no collection window is open",
+        );
+        self.leave_phase();
+    }
+
     /// Whether the collector has stopped the world at a GC safepoint so that the
     /// live register file must be gathered into the marking plan (D2i).
     ///

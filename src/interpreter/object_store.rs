@@ -2862,16 +2862,26 @@ impl CoreObjectStore {
     /// driver supplies them (no new shared-ownership model; the split state is read in place).
     ///
     /// SOURCES (each a UAF gap if missed — gc-r4.md R4b ROOT SET):
-    ///  - INTRINSICS (#1): `gather_intrinsic_roots` (the `JSGlobalObject::visitChildren` analog).
+    ///  - INTRINSICS (#1): `gather_intrinsic_roots` (the prototype half of the
+    ///    `JSGlobalObject::visitChildren` analog: ~21 named + 12 typed-array prototypes).
     ///  - REGISTER FILE: every cell-tagged live slot (`gather_vm_register_roots`); each
     ///    `CellValue` payload IS the cell address.
     ///  - FRAME HEADERS: each live frame's `codeBlock`/`callee` (`gather_vm_frame_header_roots`);
     ///    `CellId` -> address via `heap.payload_for_cell` (a CodeBlock id resolves to a
     ///    non-arena address the gate drops; the callee resolves to a real arena cell).
+    ///  - GLOBAL OBJECT (#2): each Program/Eval entry `this_value`
+    ///    (`ExecutionContextStack::global_object_root_values`) — the `JSGlobalObject` strong
+    ///    root. Roots every top-level `var`/`function` binding + the builtin constructors
+    ///    TRANSITIVELY through its butterfly.
     ///  - EXCEPTIONS: pending / last / unwind values (`ExceptionState::root_descriptors`).
     ///  - JIT_PENDING (#3): the `VM::m_exception` mirror word, which `root_descriptors` omits.
+    ///  - HOST ROOTS (#2): `host_roots` carries roots the HOST owns but the store cannot
+    ///    reach — today the global LEXICAL environment (`let`/`const`/`class` binding cell
+    ///    values, a host-side map that is JSC's `JSGlobalLexicalEnvironment` analog). The
+    ///    driver (`poll_collection_at_safepoint`) folds them in; the host wrapper supplies
+    ///    them (`CoreOpcodeDispatchHost::gather_global_lexical_roots`).
     ///
-    /// INVESTIGATED, NOT gathered (gc-r4.md R4b #2/#4): the microtask/promise JOB QUEUE
+    /// INVESTIGATED, NOT gathered (gc-r4.md R4b #4): the microtask/promise JOB QUEUE
     /// (`runtime/jobs.rs`) is design-stage — no live instance is owned by the `Vm`/host/realm,
     /// and pending promise reactions are held per-cell (`promise_reactions` slab, visited by
     /// `trace_cell` as edges of the rooted promise cell) — so there is no separate live
@@ -2910,6 +2920,19 @@ impl CoreObjectStore {
                 }
             }
         }
+        // (#2) the global object(s) — the `JSGlobalObject` strong root. The port
+        // stores the global object as the Program/Eval entry `this_value`, NOT in any
+        // intrinsic field, so it is gathered from the stack here. Rooting it
+        // transitively roots its butterfly: every top-level `var`/`function`
+        // declaration and the builtin constructors. A CodeBlock no longer pins it
+        // (CodeBlocks are non-arena here), so without this gather the global object —
+        // and everything reachable only through it — is swept on the 2nd collection.
+        roots.extend(
+            stack
+                .global_object_root_values()
+                .into_iter()
+                .filter_map(payload),
+        );
         // Exceptions — pending / last / unwind values.
         for descriptor in exceptions.root_descriptors(heap.id()) {
             if let Some(addr) = descriptor.cell_payload {
@@ -3183,6 +3206,66 @@ impl CoreObjectStore {
             .filter_map(|v| v.as_cell().map(|c| c.pointer_payload_bits()))
             .collect();
         self.force_collect(&addrs)
+    }
+
+    /// gc-r4 R4b LIVE DRIVER (decision 6) — the cooperative deferred-safepoint
+    /// collection. Called from the interpreter back-edge / VM-entry safepoint poll
+    /// (`poll_register_root_safepoint_on_backedge`'s sibling), and ONLY from the
+    /// VM-driven `DeferToVm` activation, where every live cell is register / frame /
+    /// intrinsic / exception rooted — never inside a native-builtin `direct_interpreter`
+    /// re-entry that holds a cell only in a Rust local (see the dispatch poll site;
+    /// GAP C, native-stack conservative scan, is DEFERRED).
+    ///
+    /// Runs ONE collection IFF the byte-counter trigger is ARMED *and* no
+    /// `enter_no_gc_scope` is held (decisions 3 & 5). Returns the `CollectStats` if it
+    /// collected, `None` if it deferred. PHASE: enter the cooperative STW window
+    /// (flip `register_root_safepoint_is_active`) -> gather the precise root set ->
+    /// `force_collect` (clear marks -> mark -> reconcile -> sweep) -> reset the byte
+    /// counter (fresh cycle) -> leave the STW window.
+    ///
+    /// FAITHFULNESS NOTE (structural divergence, commented per the contract): in C++
+    /// JSC the `VM` owns the `Heap` which owns `MarkedSpace`, so this driver is a `Heap`
+    /// method (`Heap::collectIfNecessaryOrDefer` deciding to run, then the
+    /// stop-the-world `Heap::collectInThread`). This Rust engine SPLITS the cell arena
+    /// (`CoreObjectStore::space`) from the `gc::Heap` phase machine (`Vm::heap`) — the
+    /// same `Vm`/host split as the parked `jit_host` raw pointer (vm/mod.rs) — so the
+    /// driver lives on the arena owner (`CoreObjectStore`) and takes `&mut Heap` for the
+    /// STW phase flip + the register/frame/exception root gather.
+    ///
+    /// `host_roots` are precise roots the HOST owns but the store cannot reach (gc-r4.md
+    /// R4b ROOT GAP #2): today the global LEXICAL environment (`let`/`const`/`class`
+    /// binding cell values), a host-side map that is JSC's `JSGlobalLexicalEnvironment`
+    /// analog. The host wrapper (`CoreOpcodeDispatchHost::poll_gc_collection_safepoint`)
+    /// gathers and passes them; a missed global-lexical cell = swept = UAF on next use.
+    pub(crate) fn poll_collection_at_safepoint(
+        &mut self,
+        registers: &RegisterFile,
+        stack: &ExecutionContextStack,
+        exceptions: &ExceptionState,
+        heap: &mut Heap,
+        host_roots: &[usize],
+    ) -> Option<CollectStats> {
+        // Trigger disarmed -> defer (the common back-edge: one bool load, no work).
+        if !self.space.collection_request_armed() {
+            return None;
+        }
+        // Honor `enter_no_gc_scope` (decision 3): a builtin / region that reserved a
+        // no-gc budget must not be collected through. The request stays ARMED for the
+        // next safepoint outside the scope (we do NOT clear the counter here).
+        if heap.no_gc_scope_depth() != 0 {
+            return None;
+        }
+        // Enter the cooperative STW window (decision 6): `register_root_safepoint_is_active`
+        // flips true for the gather + mark + sweep, then back.
+        heap.begin_stop_the_world_for_collection();
+        let mut roots = self.gather_all_gc_roots(registers, stack, exceptions, heap);
+        // Fold in the host-owned roots (the global lexical environment — gap #2).
+        roots.extend_from_slice(host_roots);
+        let stats = self.force_collect(&roots);
+        // Start a fresh allocation cycle (JSC resets `m_bytesAllocatedThisCycle`).
+        self.space.reset_bytes_allocated_this_cycle();
+        heap.end_stop_the_world_for_collection();
+        Some(stats)
     }
 
     /// gc-r4 R4b-sweep — LOGICAL live arena object-cell count (the authoritative set size;
@@ -11148,6 +11231,124 @@ mod r4b_sweep_tests {
         assert!(
             store.find(anchor).is_some(),
             "the rooted anchor survived every collection"
+        );
+        assert_eq!(
+            addr(anchor),
+            anchor_addr,
+            "the rooted anchor never moved (no compaction)"
+        );
+    }
+
+    /// gc-r4 R4b LIVE DRIVER (decision 6) — the byte-counter TRIGGER auto-collects at a
+    /// safepoint with NO explicit `force_collect`. Allocating past the (cfg(test)-small)
+    /// threshold ARMS the request; the cooperative safepoint driver
+    /// (`poll_collection_at_safepoint`) then runs ONE collection and reclaims the dead
+    /// island, so memory stays BOUNDED across rounds (the live count does not grow
+    /// monotonically). Runs >= 2 collections (the membership-gate landmine) and proves
+    /// the rooted anchor survives. The mirror of the live wiring: the interpreter
+    /// back-edge calls exactly this driver, gated on the armed trigger.
+    #[test]
+    fn byte_counter_trigger_auto_collects_at_safepoint_and_bounds_memory() {
+        let mut store = CoreObjectStore::default();
+        // Root an anchor via an INTRINSIC slot (gathered by `gather_all_gc_roots`);
+        // empty register file / stack / exceptions otherwise (precise root set == the
+        // anchor's reachable graph).
+        let anchor = obj(&mut store);
+        store.object_prototype = Some(anchor);
+        let anchor_addr = addr(anchor);
+
+        let registers = RegisterFile::default();
+        let stack = ExecutionContextStack::default();
+        let exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+
+        // A fresh (disarmed) safepoint DEFERS — the driver returns None and does NOT
+        // collect. This proves the auto-collection below is the TRIGGER firing, not an
+        // unconditional collect.
+        assert!(
+            !store.space.collection_request_armed(),
+            "fresh store is disarmed"
+        );
+        assert!(
+            store
+                .poll_collection_at_safepoint(&registers, &stack, &exceptions, &mut heap, &[])
+                .is_none(),
+            "a disarmed safepoint defers (no auto-collection)"
+        );
+
+        // Allocate an unrooted dead island until the byte counter ARMS the trigger,
+        // then AUTO-collect (no explicit force_collect) to establish a clean baseline.
+        let alloc_until_armed = |store: &mut CoreObjectStore| {
+            let mut guard = 0usize;
+            while !store.space.collection_request_armed() {
+                let o = obj(store);
+                store
+                    .put_data_own(o, &ident(0), RuntimeValue::from_i32(7))
+                    .unwrap();
+                guard += 1;
+                assert!(
+                    guard < 100_000,
+                    "the byte-counter trigger must arm within a bounded allocation"
+                );
+            }
+        };
+
+        alloc_until_armed(&mut store);
+        let mut collections = 0usize;
+        store
+            .poll_collection_at_safepoint(&registers, &stack, &exceptions, &mut heap, &[])
+            .expect("an armed safepoint AUTO-collects (warm-up)");
+        collections += 1;
+        let base_live = store.live_object_cell_count();
+        let base_bfly = store.live_butterfly_slot_count();
+
+        const ROUNDS: usize = 2;
+        for _ in 0..ROUNDS {
+            alloc_until_armed(&mut store);
+            assert!(
+                store.space.collection_request_armed()
+                    && store.space.bytes_allocated_this_cycle() > 0,
+                "the byte counter accumulated and crossed the threshold (armed)"
+            );
+            // The cooperative safepoint AUTO-collects because the trigger is armed —
+            // there is NO explicit force_collect in this loop.
+            let stats = store
+                .poll_collection_at_safepoint(&registers, &stack, &exceptions, &mut heap, &[])
+                .expect("an armed safepoint AUTO-collects (round)");
+            collections += 1;
+            assert!(
+                stats.cells_reclaimed > 0,
+                "the unrooted dead island was reclaimed"
+            );
+            // The driver reset the counter + disarmed; the dead island is gone -> the
+            // live counts are back at baseline (memory bounded, no monotonic growth).
+            assert!(
+                !store.space.collection_request_armed(),
+                "the driver disarmed the trigger after collecting"
+            );
+            assert_eq!(
+                store.space.bytes_allocated_this_cycle(),
+                0,
+                "the driver reset the byte counter (fresh cycle)"
+            );
+            assert_eq!(
+                store.live_object_cell_count(),
+                base_live,
+                "live cell count returned to baseline (no cell leak across the round)"
+            );
+            assert_eq!(
+                store.live_butterfly_slot_count(),
+                base_bfly,
+                "butterfly-slab live-slot count returned to baseline (no slab leak)"
+            );
+        }
+        assert!(
+            collections >= 2,
+            "ran >= 2 AUTO-collections (the 2nd+ is the membership-gate landmine)"
+        );
+        assert!(
+            store.find(anchor).is_some(),
+            "the rooted anchor survived every AUTO-collection"
         );
         assert_eq!(
             addr(anchor),
