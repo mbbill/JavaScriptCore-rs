@@ -3242,6 +3242,52 @@ impl Vm {
         }
     }
 
+    /// `operationGetFromScope` (ClosureVar) analog (JITOperations.cpp:4624). The SAFE
+    /// wrapper the baseline `GetClosureCell` slow-call shim calls. Runs the faithful
+    /// captured-variable read — the interpreter's OWN `CoreObjectStore::get_closure_cell`
+    /// over the host's object store, the SAME resolution the `GetClosureCell` dispatch
+    /// handler uses (interpreter/mod.rs:8056) — and surfaces the boxed value. A
+    /// ClosureVar slot read is a direct load that cannot throw; the only error edge is
+    /// a defensive `ExpectedObject` (a non-cell in the cell operand, never produced by
+    /// correct bytecode), surfaced as a faithful TypeError exactly as
+    /// [`Self::operation_get_by_val`]'s funnel-failure edge. No `DispatchState` is
+    /// needed (the read touches only the object store, not the stack/registers).
+    pub fn operation_get_closure_cell(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        cell: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        match host.jit_get_closure_cell(cell) {
+            Ok(value) => Ok(value),
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
+    /// `operationPutToScope` (ClosureVar) analog (JITOperations.cpp:4666). The SAFE
+    /// wrapper the baseline `PutClosureCell` slow-call shim calls. Runs the faithful
+    /// captured-variable store WITH the write barrier —
+    /// `CoreObjectStore::put_closure_cell_with_write_barrier`, the SAME path the
+    /// `PutClosureCell` dispatch handler uses (interpreter/mod.rs:8081) — so the
+    /// barrier on the cell runs in the host store, faithful to JSC barriering the
+    /// SCOPE cell (`emitWriteBarrier(scope, value)`, JITPropertyAccess.cpp:1654).
+    /// Returns `undefined` on success (the lowering discards the result); a ClosureVar
+    /// store cannot throw, the only error edge is the defensive `ExpectedObject`
+    /// surfaced as a faithful TypeError. The barrier needs the `Vm`'s heap, passed as
+    /// `&mut self.heap` (disjoint from the parked `host`).
+    pub fn operation_put_closure_cell(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        cell: RuntimeValue,
+        value: RuntimeValue,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        match host.jit_put_closure_cell(&mut self.heap, cell, value) {
+            Ok(()) => Ok(RuntimeValue::undefined()),
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
     // === Baseline `get_by_id`/`put_by_id` DataIC slow-path bridges ============
     // The Stage-1 baseline emitter lowers `get_by_id`/`put_by_id` as a DataIC:
     // a structure guard in generated code (`load32 [cell+0]` vs `[record+0]`) that

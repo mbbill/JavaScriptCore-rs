@@ -399,6 +399,86 @@ pub extern "C" fn operation_put_by_val(vm: *mut Vm, base: u64, prop: u64, value:
     }
 }
 
+/// `operationGetFromScope(JSGlobalObject*, const JSInstruction* pc)` analog
+/// (JITOperations.cpp:4624) for the `ClosureVar` resolve type
+/// (`JIT::emit_op_get_from_scope`'s ClosureVar fast path, JITPropertyAccess.cpp:
+/// 1261-1264: load the scope cell, the captured `ScopeOffset`, and read the slot at
+/// `JSLexicalEnvironment::offsetOfVariables() + offset*8`). The baseline
+/// `GetClosureCell` slow-call: the emitter loads the boxed closure-cell into
+/// `argumentGPR1`, sets arg0 = the pinned `*mut Vm`, and far-calls this shim. Same
+/// D1+D5 reborrow island as the get/put_by_val shims; runs the faithful captured
+/// read (`Vm::operation_get_closure_cell` -> the interpreter's OWN
+/// `CoreObjectStore::get_closure_cell`, the SAME resolution the `GetClosureCell`
+/// dispatch handler uses, interpreter/mod.rs:8056) and returns the boxed value.
+/// A faithful ClosureVar read cannot throw (the scope slot is a direct load); the
+/// shared shim still stamps `m_exception` on the defensive `ExpectedObject`
+/// fallback edge so the caller's exception convention holds.
+///
+/// DIVERGENCE (load-bearing, the inline fast-path follow-up — SAME constraint as
+/// `operation_get_by_val`): JSC emits the captured load INLINE off the
+/// machine-addressable `JSLexicalEnvironment` storage. This engine's R4 closure
+/// cell is a store-owned single-slot `ClosureCell` addressed by a `RuntimeValue`
+/// handle into a RELOCATABLE object store, NOT a raw backing pointer — so the slot
+/// load cannot be emitted inline until the cell carries a stable raw pointer (a
+/// serial cell-representation decision). Until then the read is a leaf far-call,
+/// exactly the get_by_val/get_by_id slow-call discipline.
+pub extern "C" fn operation_get_closure_cell(vm: *mut Vm, cell: u64) -> u64 {
+    // D1 + D5 reborrows — see the module SAFETY note.
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let cell = JsValue::from_encoded(EncodedJsValue(cell));
+    match vm.operation_get_closure_cell(host, cell) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
+/// `operationPutToScope(JSGlobalObject*, const JSInstruction* pc)` analog
+/// (JITOperations.cpp:4666) for the `ClosureVar` resolve type
+/// (`JIT::emit_op_put_to_scope`'s ClosureVar case, JITPropertyAccess.cpp:1641-1655:
+/// store the value into the scope slot, then `emitWriteBarrier(scope, value,
+/// ShouldFilterValue)`). The baseline `PutClosureCell` slow-call: the emitter loads
+/// the boxed closure-cell into `argumentGPR1` and the boxed value into
+/// `argumentGPR2`, sets arg0 = the pinned `*mut Vm`, and far-calls this shim. Same
+/// D1+D5 reborrow island; runs the faithful captured store WITH the write barrier
+/// (`Vm::operation_put_closure_cell` -> `CoreObjectStore::put_closure_cell_with_write_barrier`,
+/// the SAME path the `PutClosureCell` dispatch handler uses, interpreter/mod.rs:
+/// 8081). The barrier runs in the host store (faithful to JSC barriering the SCOPE
+/// cell), not emitted inline — SAME constraint as get_by_val. put produces no
+/// observable value, so success returns `undefined` bits (the lowering discards the
+/// result register); a faithful ClosureVar store cannot throw, but the shared shim
+/// still stamps `m_exception` on the defensive fallback edge.
+pub extern "C" fn operation_put_closure_cell(vm: *mut Vm, cell: u64, value: u64) -> u64 {
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let cell = JsValue::from_encoded(EncodedJsValue(cell));
+    let value = JsValue::from_encoded(EncodedJsValue(value));
+    match vm.operation_put_closure_cell(host, cell, value) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
 /// `operationGetByIdOptimize(JSGlobalObject*, StructureStubInfo*, EncodedJSValue
 /// base, uintptr_t propertyName)` analog (JITOperations.cpp). The baseline
 /// `get_by_id` DataIC MISS slow-call: the emitter loads the boxed base into the

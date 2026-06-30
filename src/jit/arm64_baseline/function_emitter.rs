@@ -81,8 +81,9 @@ use crate::jit::operations::{
     operation_call, operation_call_with_this, operation_compare_greater,
     operation_compare_greatereq, operation_compare_less, operation_compare_lesseq,
     operation_get_by_id_optimize, operation_get_by_id_with_cached_offset, operation_get_by_val,
-    operation_jfalse, operation_put_by_id_optimize, operation_put_by_id_with_cached_offset,
-    operation_put_by_val, operation_resolve_baseline_native_entry, operation_strict_equal,
+    operation_get_closure_cell, operation_jfalse, operation_put_by_id_optimize,
+    operation_put_by_id_with_cached_offset, operation_put_by_val, operation_put_closure_cell,
+    operation_resolve_baseline_native_entry, operation_strict_equal,
     operation_throw_stack_overflow, MAX_REGISTER_CALL_ARGS, MAX_REGISTER_CALL_WITH_THIS_ARGS,
 };
 use crate::value::{JsValue, CELL_TAG, NUMBER_TAG, VALUE_TAG_MASK};
@@ -723,6 +724,59 @@ impl FunctionEmitter {
         // D3 throw edge: a thrown store (e.g. a setter, a nullish base, a ToNumber
         // throw) stamps the mirror; branch to the shared exception stub. `SCRATCH_GPR`
         // (the value arg, now consumed) is reused by the probe.
+        self.emit_exception_probe();
+    }
+
+    /// op_get_from_scope ClosureVar (`emit_op_get_from_scope`, JITPropertyAccess.cpp:
+    /// 1261-1264) — the captured-variable READ. SLOW-CALL lowering: load the boxed
+    /// closure-cell into the C-ABI arg slot (`argumentGPR1`), set arg0 = the pinned
+    /// `*mut Vm`, and far-call `operation_get_closure_cell` (the interpreter's own
+    /// captured read); probe the `m_exception` mirror (D3) for the defensive throw
+    /// edge, then store the boxed result to `dst`. Falls through to the next bytecode.
+    ///
+    /// DIVERGENCE from JSC (load-bearing, the inline fast-path follow-up): JSC loads
+    /// the captured value INLINE off the machine-addressable `JSLexicalEnvironment`
+    /// storage (`loadValue(BaseIndex(scope, offset, TimesEight, offsetOfVariables))`).
+    /// This engine's R4 closure cell is a store-owned single-slot `ClosureCell`
+    /// addressed by a `RuntimeValue` handle into a RELOCATABLE object store, NOT a raw
+    /// backing pointer — so the slot load cannot be emitted inline (it would bake
+    /// non-stable store internals) until the cell carries a stable raw pointer (a
+    /// serial cell-representation decision). Until then the read is a leaf far-call,
+    /// exactly the [`Self::emit_get_by_val`] slow-call discipline.
+    fn emit_get_closure_cell(&mut self, dst: i32, cell: i32) {
+        self.h.masm_mut().load64(address_for(cell), LEFT_GPR); // x1 = cell (arg1)
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+        self.h.masm_mut().far_call(TrustedImm64::new(
+            operation_get_closure_cell as usize as i64,
+        ));
+        // D3 throw edge: a faithful ClosureVar read does not throw, but the defensive
+        // `ExpectedObject` fallback stamps the mirror; probe BEFORE storing the result.
+        self.emit_exception_probe();
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst)); // dst = x0 (boxed result)
+    }
+
+    /// op_put_to_scope ClosureVar (`emit_op_put_to_scope`, JITPropertyAccess.cpp:
+    /// 1641-1655) — the captured-variable STORE. SLOW-CALL lowering: load the boxed
+    /// closure-cell into `argumentGPR1` and the boxed value into `argumentGPR2`, set
+    /// arg0 = the pinned `*mut Vm`, and far-call `operation_put_closure_cell` (the
+    /// interpreter's own barriered captured store); probe the `m_exception` mirror
+    /// (D3). put_to_scope yields no observable value, so there is no `dst` store (the
+    /// returned `undefined`/empty register is discarded). Falls through.
+    ///
+    /// WRITE BARRIER: JSC emits `emitWriteBarrier(scope, value, ShouldFilterValue)`
+    /// inline after the slot store (JITPropertyAccess.cpp:1654), barriering the SCOPE
+    /// cell. Here the barrier runs in the host store inside the operation
+    /// (`put_closure_cell_with_write_barrier` -> `apply_value_store_write_barrier`),
+    /// faithful but not emitted inline — SAME store-managed-cell constraint as
+    /// [`Self::emit_put_by_val`].
+    fn emit_put_closure_cell(&mut self, cell: i32, value: i32) {
+        self.h.masm_mut().load64(address_for(cell), LEFT_GPR); // x1 = cell (arg1)
+        self.h.masm_mut().load64(address_for(value), RIGHT_GPR); // x2 = value (arg2)
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+        self.h.masm_mut().far_call(TrustedImm64::new(
+            operation_put_closure_cell as usize as i64,
+        ));
+        // D3 throw edge: defensive (a faithful ClosureVar store does not throw).
         self.emit_exception_probe();
     }
 
@@ -2141,6 +2195,23 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                 let value = frame_slot(decoded.register_operand(2)?)?;
                 emitter.emit_put_by_val(base, key, value);
             }
+            // op_get_from_scope / op_put_to_scope (ClosureVar) — the captured-variable
+            // access. Operand order matches the dispatch handlers (interpreter/mod.rs:
+            // 8043,8062): get is (dst, cell); put is (cell, value). Each is a leaf
+            // far-call to the captured-read/store bridge (see `emit_get_closure_cell` /
+            // `emit_put_closure_cell`). The cell operand holds a store-managed
+            // single-slot `ClosureCell` (the bytecompiler already resolved the
+            // scope/`ScopeOffset` to one cell), so there is no scope-chain walk here.
+            CoreOpcode::GetClosureCell => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let cell = frame_slot(decoded.register_operand(1)?)?;
+                emitter.emit_get_closure_cell(dst, cell);
+            }
+            CoreOpcode::PutClosureCell => {
+                let cell = frame_slot(decoded.register_operand(0)?)?;
+                let value = frame_slot(decoded.register_operand(1)?)?;
+                emitter.emit_put_closure_cell(cell, value);
+            }
             // op_get_by_id / op_put_by_id — the named-property DataIC. Operand order
             // matches the dispatch handlers (interpreter/mod.rs:8357,8431): get is
             // (dst, base, identifier); put is (base, identifier, value). Each site
@@ -2684,6 +2755,43 @@ mod tests {
         assert!(
             emit_baseline_function(&code_block, 0x1000, 0x2000).is_ok(),
             "a double-literal arith function tiers up (LoadDouble admitted)"
+        );
+    }
+
+    // ALLOWLIST EXTENSION (structural oracle, every platform): the captured-variable
+    // access opcodes `GetClosureCell`/`PutClosureCell` (op_get_from_scope /
+    // op_put_to_scope, ClosureVar) are now ADMITTED by the S4 gate — the sole blocker
+    // for navier-stokes, whose numeric kernels read captured width/height/rowSize/size/
+    // iterations. Before this batch the `match op` had no arm for them, so any function
+    // containing either was REJECTED with `UnsupportedOpcode` and stayed interpreted.
+    #[test]
+    fn closure_cell_access_is_admitted_by_the_allowlist() {
+        // `(cell) => *cell` — a pure GetClosureCell read. Operands: (dst, cell).
+        let get = build_code_block(vec![
+            instr(CoreOpcode::GetClosureCell, vec![reg(LOCAL0), reg(ARG0)], 0),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+        ]);
+        assert!(
+            emit_baseline_function(&get, 0x1000, 0x2000).is_ok(),
+            "`GetClosureCell` (captured read) tiers up"
+        );
+
+        // `(cell, v) => { *cell += v; return *cell }` — the captured-accumulator update,
+        // the navier put shape (PutClosureCell admitted). Put operands: (cell, value).
+        let put = build_code_block(vec![
+            instr(CoreOpcode::GetClosureCell, vec![reg(LOCAL0), reg(ARG0)], 0),
+            instr(
+                CoreOpcode::AddInt32,
+                vec![reg(LOCAL1), reg(LOCAL0), reg(ARG1)],
+                1,
+            ),
+            instr(CoreOpcode::PutClosureCell, vec![reg(ARG0), reg(LOCAL1)], 2),
+            instr(CoreOpcode::GetClosureCell, vec![reg(LOCAL2), reg(ARG0)], 3),
+            instr(CoreOpcode::Return, vec![reg(LOCAL2)], 4),
+        ]);
+        assert!(
+            emit_baseline_function(&put, 0x1000, 0x2000).is_ok(),
+            "`PutClosureCell` (captured accumulator update) tiers up"
         );
     }
 
@@ -3533,6 +3641,187 @@ mod tests {
 
             vm.clear_jit_code_block();
             vm.clear_jit_host();
+        }
+
+        /// Park host + code block, emit + finalize a closure-cell function image. A
+        /// captured-variable access is a far-call funnel (not an inline IC), so unlike
+        /// `install_property_image` there is no DataIC record store to size.
+        fn install_closure_image(
+            vm: &mut Vm,
+            host: &mut CoreOpcodeDispatchHost,
+            code_block: &CodeBlock,
+        ) -> PropertyIcHandle {
+            vm.set_jit_host(host); // D5: park the dispatch host.
+            vm.set_jit_code_block(code_block as *const CodeBlock); // S3: park the CodeBlock.
+            let jit_pending_address = vm.jit_pending_exception_address() as usize;
+            let soft_stack_limit_address = vm.jit_soft_stack_limit_address() as usize;
+            let image =
+                emit_baseline_function(code_block, jit_pending_address, soft_stack_limit_address)
+                    .expect("closure-cell function must tier up (gate admits Get/PutClosureCell)");
+            let mut records = image.link_records;
+            finalize_arm64_link_buffer(&MapJitExecutableAllocator, &image.code, &mut records)
+                .expect("finalize closure image")
+        }
+
+        /// Run a finalized closure-cell image once, seeding boxed bits into ARG0/ARG1.
+        fn run_closure_once(
+            vm: &mut Vm,
+            handle: &PropertyIcHandle,
+            arg0: u64,
+            arg1: u64,
+        ) -> RunResult {
+            let frame = Frame::new();
+            frame.write(ARG0, arg0);
+            frame.write(ARG1, arg1);
+            vm.set_jit_soft_stack_limit(frame.stack.stack_limit());
+            let vm_ptr: *mut Vm = vm;
+            let ret = handle.call_baseline_jit_entry(frame.fp + 16, vm_ptr as u64);
+            let pending = vm.jit_pending_exception().0;
+            RunResult { ret, pending }
+        }
+
+        // GetClosureCell native == interpreter == oracle: the captured-variable READ
+        // (op_get_from_scope ClosureVar) far-calls `operation_get_closure_cell`, which
+        // runs the interpreter's OWN `get_closure_cell` over the host store. Two cells
+        // with different captured values prove the read returns the cell's contents
+        // (not a constant); the navier kernel shape `(i) => i * w` (w captured) proves
+        // the boxed result composes with the int32 arith fast path. The same function
+        // was DECLINED (UnsupportedOpcode) before this batch.
+        #[test]
+        fn get_closure_cell_native_reads_captured_value() {
+            let mut host = CoreOpcodeDispatchHost::new();
+            // Two independent captured cells: w = 7 and w = 41.
+            let cell7 = host
+                .jit_test_allocate_closure_cell(JsValue::from_i32(7))
+                .encoded()
+                .0;
+            let cell41 = host
+                .jit_test_allocate_closure_cell(JsValue::from_i32(41))
+                .encoded()
+                .0;
+
+            let mut vm = Vm::new(VmConfig::interpreter_only());
+
+            // `(cell) => *cell` — a pure GetClosureCell read. Operands: (dst, cell).
+            let read = build_code_block(vec![
+                instr(CoreOpcode::GetClosureCell, vec![reg(LOCAL0), reg(ARG0)], 0),
+                instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+            ]);
+            let handle = install_closure_image(&mut vm, &mut host, &read);
+
+            let r7 = run_closure_once(&mut vm, &handle, cell7, 0);
+            assert_eq!(r7.pending, 0, "captured read does not throw");
+            assert_eq!(
+                r7.ret,
+                JsValue::from_i32(7).encoded().0,
+                "native *cell7 == 7"
+            );
+            let r41 = run_closure_once(&mut vm, &handle, cell41, 0);
+            assert_eq!(
+                r41.ret,
+                JsValue::from_i32(41).encoded().0,
+                "native *cell41 == 41 (reads the cell, not a constant)"
+            );
+
+            vm.clear_jit_code_block();
+            vm.clear_jit_host();
+            // Interpreter/store oracle: the SAME store path the dispatch handler uses.
+            assert_eq!(
+                host.jit_test_get_closure_cell(JsValue::from_encoded(EncodedJsValue(cell7)))
+                    .encoded()
+                    .0,
+                JsValue::from_i32(7).encoded().0,
+                "interpreter oracle: cell7 holds 7",
+            );
+
+            // The navier kernel shape `(i, cell) => i * w`: GetClosureCell + MulInt32.
+            // Operands: get is (dst, cell); mul is (dst, lhs, rhs). ARG0 = i, ARG1 = w cell.
+            let mut host2 = CoreOpcodeDispatchHost::new();
+            let wcell = host2
+                .jit_test_allocate_closure_cell(JsValue::from_i32(7))
+                .encoded()
+                .0;
+            let mut vm2 = Vm::new(VmConfig::interpreter_only());
+            let kernel = build_code_block(vec![
+                instr(CoreOpcode::GetClosureCell, vec![reg(LOCAL0), reg(ARG1)], 0),
+                instr(
+                    CoreOpcode::MulInt32,
+                    vec![reg(LOCAL1), reg(ARG0), reg(LOCAL0)],
+                    1,
+                ),
+                instr(CoreOpcode::Return, vec![reg(LOCAL1)], 2),
+            ]);
+            let handle2 = install_closure_image(&mut vm2, &mut host2, &kernel);
+            let r = run_closure_once(&mut vm2, &handle2, JsValue::from_i32(6).encoded().0, wcell);
+            assert_eq!(r.pending, 0, "no throw");
+            assert_eq!(
+                r.ret,
+                JsValue::from_i32(42).encoded().0,
+                "native 6 * w(7) == 42 (captured read feeds int32 arith)"
+            );
+            vm2.clear_jit_code_block();
+            vm2.clear_jit_host();
+        }
+
+        // PutClosureCell native == interpreter == oracle: the captured-accumulator
+        // update `(cell, v) => { *cell += v; return *cell }` (op_put_to_scope
+        // ClosureVar). PutClosureCell far-calls `operation_put_closure_cell`, which runs
+        // the interpreter's barriered `put_closure_cell_with_write_barrier`; the
+        // following GetClosureCell reads the stored value back. native == the computed
+        // answer AND == the host store after the run (proving the put landed through the
+        // far-call, write barrier and all). DECLINED before this batch.
+        #[test]
+        fn put_closure_cell_native_updates_captured_accumulator() {
+            let mut host = CoreOpcodeDispatchHost::new();
+            // acc starts at 10.
+            let acc = host
+                .jit_test_allocate_closure_cell(JsValue::from_i32(10))
+                .encoded()
+                .0;
+
+            let mut vm = Vm::new(VmConfig::interpreter_only());
+            // GetClosureCell(acc) ; AddInt32(+v) ; PutClosureCell(acc, sum) ;
+            // GetClosureCell(acc) ; Return. Put operands: (cell, value).
+            let update = build_code_block(vec![
+                instr(CoreOpcode::GetClosureCell, vec![reg(LOCAL0), reg(ARG0)], 0),
+                instr(
+                    CoreOpcode::AddInt32,
+                    vec![reg(LOCAL1), reg(LOCAL0), reg(ARG1)],
+                    1,
+                ),
+                instr(CoreOpcode::PutClosureCell, vec![reg(ARG0), reg(LOCAL1)], 2),
+                instr(CoreOpcode::GetClosureCell, vec![reg(LOCAL2), reg(ARG0)], 3),
+                instr(CoreOpcode::Return, vec![reg(LOCAL2)], 4),
+            ]);
+            let handle = install_closure_image(&mut vm, &mut host, &update);
+
+            // acc(10) += v(5) -> 15, returned via the read-back.
+            let r = run_closure_once(&mut vm, &handle, acc, JsValue::from_i32(5).encoded().0);
+            assert_eq!(r.pending, 0, "captured store does not throw");
+            assert_eq!(
+                r.ret,
+                JsValue::from_i32(15).encoded().0,
+                "native read-back after *acc += 5 == 15"
+            );
+
+            // A second update accumulates on the persisted cell: 15 += 4 -> 19.
+            let r2 = run_closure_once(&mut vm, &handle, acc, JsValue::from_i32(4).encoded().0);
+            assert_eq!(
+                r2.ret,
+                JsValue::from_i32(19).encoded().0,
+                "native second update *acc(15) += 4 == 19 (cell persists across calls)"
+            );
+
+            vm.clear_jit_code_block();
+            vm.clear_jit_host();
+            // Interpreter/store oracle: the native puts landed in the host store.
+            assert_eq!(
+                host.jit_test_get_closure_cell(JsValue::from_encoded(EncodedJsValue(acc)))
+                    .encoded()
+                    .0,
+                JsValue::from_i32(19).encoded().0,
+                "interpreter oracle: the host store cell holds the accumulated 19",
+            );
         }
     }
 

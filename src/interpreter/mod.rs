@@ -10094,6 +10094,44 @@ impl CoreOpcodeDispatchHost {
         self.put_property_value(state, base, &key, value)
     }
 
+    /// Captured-variable READ slow-path funnel for the baseline `GetClosureCell`
+    /// far-call (`operationGetFromScope` ClosureVar case, jit/JITOperations.cpp). The
+    /// `GetClosureCell` dispatch handler resolves the captured value as
+    /// `self.objects.get_closure_cell(cell)` (mod.rs:8056); this exposes the SAME
+    /// resolution to the JIT bridge without widening the release API or duplicating
+    /// the captured-read logic. No `DispatchState` is needed — a closure-cell read
+    /// touches only the object store. An `ExpectedObject` (the cell operand is not a
+    /// `ClosureCell`, never produced by correct bytecode) maps to `Fail`, which the
+    /// `operation_get_closure_cell` bridge surfaces as a faithful TypeError.
+    pub(crate) fn jit_get_closure_cell(
+        &self,
+        cell: RuntimeValue,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        self.objects
+            .get_closure_cell(cell)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    /// Captured-variable STORE slow-path funnel for the baseline `PutClosureCell`
+    /// far-call (`operationPutToScope` ClosureVar case, jit/JITOperations.cpp). The
+    /// `PutClosureCell` dispatch handler stores as
+    /// `self.objects.put_closure_cell_with_write_barrier(state.heap, cell, value)`
+    /// (mod.rs:8081); this exposes the SAME barriered store to the JIT bridge. The
+    /// write barrier (faithful to JSC barriering the SCOPE cell) runs here in the host
+    /// store, so the cell's reference to `value` is recorded for the collector exactly
+    /// as the interpreter does. An `ExpectedObject` maps to `Fail` (a faithful
+    /// TypeError at the bridge).
+    pub(crate) fn jit_put_closure_cell(
+        &mut self,
+        heap: &mut Heap,
+        cell: RuntimeValue,
+        value: RuntimeValue,
+    ) -> Result<(), DispatchOutcome> {
+        self.objects
+            .put_closure_cell_with_write_barrier(heap, cell, value)
+            .map_err(DispatchOutcome::Fail)
+    }
+
     /// General named-property GET slow-path funnel for the baseline `get_by_id`
     /// DataIC (`operationGetByIdOptimize`, jit/JITOperations.cpp). Mirrors the
     /// `CoreOpcode::GetByName` dispatch's resolution CORE (mod.rs:8393-8419) minus
@@ -10312,6 +10350,24 @@ impl CoreOpcodeDispatchHost {
     #[cfg(test)]
     pub(crate) fn jit_test_allocate_array(&mut self) -> RuntimeValue {
         self.objects.allocate_array()
+    }
+
+    /// Allocate a single-slot `ClosureCell` holding `value` (the captured-variable
+    /// cell `NewClosureCell` mints, interpreter/mod.rs:8034). Test-only seed for the
+    /// baseline `GetClosureCell`/`PutClosureCell` native far-call tests.
+    #[cfg(test)]
+    pub(crate) fn jit_test_allocate_closure_cell(&mut self, value: RuntimeValue) -> RuntimeValue {
+        self.objects.allocate_closure_cell(value)
+    }
+
+    /// Read a `ClosureCell`'s captured value through the SAME store path the
+    /// `GetClosureCell` dispatch handler uses (the interpreter oracle for the native
+    /// closure-cell tests).
+    #[cfg(test)]
+    pub(crate) fn jit_test_get_closure_cell(&self, cell: RuntimeValue) -> RuntimeValue {
+        self.objects
+            .get_closure_cell(cell)
+            .expect("closure cell value")
     }
 
     #[cfg(test)]
