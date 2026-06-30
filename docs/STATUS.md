@@ -159,8 +159,7 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   allowlisted → double-arith functions tier up. Deferred: LoadDouble (double LITERALS — needed for the asm.js
   mandreel/octane-zlib to tier up), div int32-result fold, NaN significand (faithful, same number).
 - [done] the live path emits real per-opcode ARM64 via the MacroAssembler encoder + finalize (f139350);
-  the old P6/P15 byte-blob lane is now DEAD — retiring it (~22k LoC) is a DEFERRED off-gate cleanup
-  (moves neither R nor 15/15; do it in idle integration capacity, never preempting R4/calls).
+  the old P6/P15 byte-blob re-interpreter lane is DEAD (retirement = STEP 5/6 off-gate hygiene, see design doc).
 - [done] op_call EXECUTES (UNLINKED virtual call; U5 adversarially verified SOUND-AND-FAITHFUL) — the
   biggest R-mover (no Octane fn tiered up before — all contain calls) + the call-heavy gate half. K1 (slot-2
   = real CodeBlock* via the registry Rc::as_ptr) + U2 parking (recursion-local RAII save/restore, nesting-safe)
@@ -172,13 +171,17 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   (slow-call now). RESIDUAL: a native callee tier-up under op_call needs its own sibling-aliasing re-verify FIRST.
 - [done] **GATE-CAPABILITY SET**: int+double arith + LoadDouble + typed-array get/put_by_val (slow-call IC)
   + op_call all EXECUTE native → asm.js functions can tier up WHOLE.
-- [BLOCKED — measured 06-29] the baseline JIT is a NET REGRESSION on arm64 (geomean ~0.64x; richards/delta-blue
-  ~3x slower; raytrace/earley DNF). DEFAULT FLIP HELD (would move R DOWN). Cause = the CALL path: callee "native
-  entries" are x86_64 byte-seqs (HostBlockedX86_64), so ~3.6M generated-direct-call transactions fall back to a
-  nested interpreter while paying per-call route/accounting. SUSPECTED LOAD-BEARING DIVERGENCE: the generated-*
-  call/tier layer (route/transaction/native-entry-kind — NO JSC counterpart vs CallLinkInfo+thunks). Strategic
-  divergence-assessment in flight (CORRECT it, don't build B5-full on it). Faithful fix → arm64-callable
-  CallLinkInfo entry + delete route/transaction layer → native breadth → THEN flip default → R moves.
+- [BLOCKED — measured 06-29] the baseline JIT is a NET REGRESSION on arm64 (geomean ~0.64x opt-in; default
+  flip HELD). Cause = CALL path: callee entries are x86_64 byte-seqs (HostBlockedX86_64) → ~3.6M
+  generated-direct-call transactions fall back to a nested interpreter while paying per-call route/accounting.
+- [CONFIRMED DIVERGENCE — see docs/design/baseline-call-tier-divergence.md] the generated-* call/tier layer
+  (generated_executor RE-INTERPRETER, VmGeneratedDirectCallTransactionRoute arbiter, P6X86_64 entry) has NO
+  JSC counterpart (C++ grep = 0 hits); faithful target = in-site CallLinkInfo (seed at src/bytecode/ic.rs:961)
+  + arm64 emitFunctionPrologue entry + total opcode lowering + BaselineExecutionCounter tier-up. CORRECT it,
+  never build B5-full on it. SEQUENCING: STEP1 (collapse onto CallLinkInfo, delete route/accounting) is
+  R-NEUTRAL divergence-correction, gated on serial Qs #1 (linked=interp-entry?) + #3 (visitWeak/R4 rooting).
+  STEP2/3 (real arm64 native call = the R lever) GATED on JSStack B5-B7 + GC/R4. STEP5/6 (delete cluster +
+  de-megafile 35k tiering.rs) OFF-GATE hygiene. R moves only at native-breadth + flip (the end).
 - [missing] bytecode-stream cutover + baseline profiling emission (ValueProfile/ArithProfile, a DFG
   prereq downstream of R4/calls broadening the allowlist).
 - [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
