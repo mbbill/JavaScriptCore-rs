@@ -26,13 +26,13 @@ effort, engine-from-scratch to R ≥ 1.0.
 
 | # | Workstream | % total | Done | Notes |
 |---|---|---|---|---|
-| 1 | Interpreter + parser + bytecompiler + runtime/builtins (run all 15 correctly) | 27% | ~90% | 12/15 validate; typescript value-bug + correctness tail remain |
+| 1 | Interpreter + parser + bytecompiler + runtime/builtins (run all 15 correctly) | 27% | ~90% | 13/15 validate; 2 asm.js DNF (JIT-gated); correctness tail remains |
 | 2 | Faithful foundation (value/GC-arena/Structure/strings/profiling/bytecode) + Phase E + throwers + call-link | 13% | ~95% | built, mostly unwired |
 | 3 | Assembler codegen (operands→encoder→LinkBuffer→W^X execution) | 3% | 100% | emit→relocate→execute proven |
 | 4 | R scoreboard / measurement harness | 1% | 100% | both engines, identical harness |
-| 5 | JSStack execution substrate (B1–B7 migration) | 5% | ~55% | B1–B4 done (arena=live register window); B5–B7 to go |
-| 6 | GC/value cutover: POD object model + R3 → R4 + running collector | 7% | ~10% | arena+SlotVisitor built, not wired |
-| 7 | **Baseline JIT** (per-opcode machine-code codegen + profiling wiring + tier-up) | 10% | ~5% | codegen layer ready, not emitting per-opcode |
+| 5 | JSStack execution substrate (stack model + entry + frames) | 5% | ~70% | stack model DECIDED (Option A = native stack); B1–B4 + A1.0/A1.1 native-stack entry LANDED; A2 interp-migration + arity/varargs remain |
+| 6 | GC/value cutover: POD object model + R4 + running collector | 7% | ~65% | object + string R4a GC LIVE (arena/swept/auto-triggered); symbol/bigint leaf GC + visitWeak + conservative-scan remain |
+| 7 | **Baseline JIT** (per-opcode machine code + native calls + profiling + tier-up) | 10% | ~25% | arith/double/typed-array/op_call EXECUTE native on the native-stack; first JIT→JIT native call in flight; native-lowering breadth + profiling remain |
 | 8 | **DFG** (bytecode→SSA→speculation→SpeculativeJIT+OSR) | 18% | 0% | — |
 | 9 | **FTL + B3 + Air** (top tier + optimizer + register allocation) | 15% | 0% | — |
 | 10 | Final correctness + perf tuning to hit R ≥ 1.0 | 1% | 0% | the last mile |
@@ -47,18 +47,20 @@ are where R *first becomes defined and moves above the interpreter floor*.
 
 A running baseline JIT — the first thing that moves R — needs, in dependency order:
 
-1. **JSStack substrate** (row 5) — the JIT emits FP-relative frame access (`ldr/str
-   [x29,#off]`) at the JSC offsets; this is the immovable Register stack it addresses.
-   `docs/design/jsstack.md`. **Status: B1–B4 done -- the arena IS the live register window
-   (read-flip proven byte-faithful vs the Vec oracle suite-wide; reversible). Next: B4b/B6 drop
-   the Vec + retire CallFrameId → B5 prologue split → B7 wire the encoder per-opcode.**
-2. **GC / cell identity (R4)** (row 6) — the JIT emits raw cell pointers and assumes a
-   real GC. `docs/design/gc-r4.md`. Needs the fat `CoreObjectCell` (HashMaps/Vecs)
-   replaced by a POD inline-slots + Butterfly representation first (a sweep-managed
-   block can't hold a Drop type), then R3 (shadow-oracle arena allocation, reversible),
-   then **R4** (the one irreversible flip: raw address = sole cell identity). R4's gate
-   is *technical* — shadow cross-check arena==old-map green suite-wide + miri on the
-   live deref + adversarial verify + all gates — **not** human sign-off.
+1. **JSStack / stack model** (row 5) — DECIDED + foundation LANDED. Judge panel ratified
+   **Option A: native machine stack = JS stack** (FP/SP unified, callerFrame@0+returnPC@1 adjacent —
+   the layout DFG/FTL OSR + stack-walk + GC assume; Option D split was unanimously fatal).
+   `docs/design/jsstack.md` "B5/STACK MODEL". **A1.0+A1.1 LANDED (5ec4cef): the baseline JIT runs on
+   the native stack (faithful `push_pair(fp,lr); mov fp,sp`; entry via the doVMEntry-analog seed +
+   sp-switch trampoline). A1.2 (first JIT→JIT native call = R-lever existence proof) in flight.** Then
+   A1.4 stack-check, A1.5 scoped JIT-frame GC scan (before native-call args carry cells), A2 (interpreter
+   onto native CallFrames).
+2. **GC / cell identity (R4)** (row 6) — object-cell R4a GC is **LIVE/DONE** (POD `CoreObjectCell` in
+   the arena, raw-address identity, real mark→reconcile→sweep→free-list, auto-triggered at a byte counter
+   polled at interpreter back-edges). **String-cell GC LANDED (U0/U0b/U1, b73d806): strings arena-managed
+   + swept + the string leak closed.** `docs/design/gc-r4.md` + `gc-r4-completion.md`. Remaining: symbol/
+   bigint leaf GC (U2/U3, share the landed U0b gate), `visitWeak` weak-processing (U7 — unblocks GC-safe
+   call-link callee caching), the scoped native-stack conservative scan (GAP C), generational/incremental.
 3. **Bytecode cutover** — wire the live dispatch onto the packed instruction-stream (the
    JIT lowers from it) + freeze the type-specialized `CoreOpcode`.
 4. **Profiling wiring** — per-CodeBlock ValueProfile/ArithProfile (the DFG's speculation
