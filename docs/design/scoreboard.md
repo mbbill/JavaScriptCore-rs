@@ -220,3 +220,36 @@ re-measure (executor off) -- the geomean across all completing benches + whether
 (mandreel/octane-zlib) now COMPLETE with the faster JIT (the R-DEFINED gate); (3) if a net win + all complete,
 make executor-off + BaselineAllowed the DEFAULT (the flip held since 06-29) -> R becomes defined and moves
 above the interpreter floor. Then re-measure C++ jsc + report R + all r_i.
+
+## 2026-06-30 LATE-5 — CLEAN full compute re-measure + LoadCallee REVERTED (regression)
+
+LATE-4's LoadCallee fix (c194d84: thread the real callee into VmEntryFrameSeed, re-admit op_get_callee)
+passed its unit tests + all default gates but THREW on crypto execoff (wrong-answer at order_index=3). The
+agent's re-measurement was cut off (only showed raytrace), so "crypto validates" rested on a unit test. A
+CLEAN full re-measure caught it. Root cause: run_installed_baseline_jit seeded the entry Callee slot from
+top_frame().callee_value (the CURRENT frame's callee) instead of the ENTERED function's callee; in crypto's
+nested calls those differ -> native LoadCallee reads the wrong fn -> throw. REVERTED (10ebd78). Verified:
+crypto execoff @ parent = ok 2.985 vs @ c194d84 = THROW. Lesson: a native-opcode admission must gate on a
+REAL BENCH validating, not a unit test (memory: jit-opcode-realbench-gate).
+
+CLEAN measurement at the known-good reverted state (10ebd78), release octane_probe, --interpreter vs
+--baseline --disable-baseline-generated-executor --disable-generated-direct-call-generated-entry, iters=3
+worst=1, machine quiet, foreground (background jobs get reaped ~5min in). ratio = execoff/interp:
+  raytrace   interp 0.0992  execoff 0.0836  -> 0.843  (LOSE, LoadCallee-gated, now reverted)
+  crypto     interp 2.715   execoff 2.985   -> 1.099  (WIN +10%)
+  richards   interp 0.963   execoff 0.862   -> 0.896  (LOSE -10%)
+  delta-blue interp 0.392   execoff 0.452   -> 1.153  (WIN +15%)
+  navier     interp 3.352   execoff 5.279   -> 1.575  (WIN +58%)
+**Geomean ~= 1.086** -- the native baseline JIT (executor off) is a NET WIN over the interpreter, but MIXED
+(3 win / 2 lose; navier's +58% carries it). This is the honest picture without the reverted LoadCallee.
+
+CAVEAT on R: this geomean is execoff-vs-INTERPRETER, NOT vs C++. The interpreter is ~500-6000x slower than
+C++ on compute, so a 1.086x interpreter is still ~0.001-0.002 of C++. R stays UNDEFINED (only the 5 compute
+benches measured here; the suite needs all 15). The flip to define R requires: (a) all 13 currently-passing
+benches still VALIDATE under execoff (the crypto regression proves the native path can introduce wrong
+answers -- must re-verify the property/string benches), and (b) the 2 asm.js benches (mandreel/octane-zlib)
+COMPLETE under execoff. The real R-lever above the interpreter floor remains the optimizing JIT (DFG/FTL).
+
+NEXT (to re-derive by strategic assessment, not anchor): flip-gate verification (all-13 no-regression +
+asm.js completion under execoff) vs. starting the DFG (the parity-bearing tier). LoadCallee re-do (seed the
+ENTERED fn's callee) is deferred behind a real-bench gate.
