@@ -102,6 +102,31 @@ emitted-offset change) so it doesn't calcify into the rejected private-register-
     tested `_jsc_rs_arm64_jsc_stack_trampoline`) **but treat completing C as a HARD scheduled commitment**,
     not optional, so the bounce cannot calcify. Interim mixed-recursion overflow exposure = SAME as today's
     working Path A far-calls, guarded by softStackLimit, fixed permanently by A2. First cut = no-arity entry.
+  - **A1 PREMISE VALIDATED + PLAN (spike 2026-06-29 — verdict HOLDS-WITH-CAVEATS).** The first JIT→JIT native
+    call lands WITHOUT the interpreter rewrite: the doVMEntry bridge is ~90% built (`try_seed_entry_frame`
+    jsstack.rs:995-1064 does doVMEntry steps 1-5 incl. the softStackLimit guard; the sp-switch+`blr` trampoline
+    `_jsc_rs_arm64_jsc_stack_trampoline` is tested); the prologue flip is ONE already-byte-validated instruction
+    (`mov fp,x1`→`mov fp,sp`, entry_prologue.rs); `address_for(x29,op*8)` is UNCHANGED (the B1-B4 layout transfers
+    by re-point); JIT→interpreter far-calls stay on ONE stack (no bounce, confirmed both sides); JSC roots GC
+    CONSERVATIVELY over the whole native-stack span (MachineStackMarker.cpp:44), so the minimal arith proof needs
+    ZERO new GC code (the arith-only allowlist guarantees JIT frames hold only numbers). Today's `mov fp,x1`
+    (fp=arena, sp=native) is a LATENT Option-D split; A1 corrects it to unified Option A (a divergence-correction).
+  - **UNIFIED FRAME CONTRACT (ratified):** prologue = `push_pair(fp,lr); mov fp,sp` for BOTH entry and JIT→JIT;
+    `sp = calleeFrame + 16` (CallerFrameAndPC) on every call edge; the per-function scratch arena is RETIRED as
+    the JIT stack; JIT-frame rooting = a SCOPED conservative scan of the native-stack JIT-frame span (entry-fp…sp)
+    — a bounded slice of GAP C, faithful (what JSC does), DEFERRED until cells flow through native calls.
+  - **A1 SUB-UNITS (order):** A1.0 prologue flip + A1.1 native-stack entry seed (ONE serial commit; all existing
+    JIT-exec tests stay green, entered via the bridge) → A1.2 op_call native fast path + A1.3 CallLinkInfo→entry
+    resolution = the MINIMAL NATIVE-CALL PROOF (`callee(a,b){return a+b}`, `caller(x){return callee(x,1)}`; assert
+    header adjacency `callerFrame@0==caller_fp` / `returnPC@1==bl+4`, contiguous callee frame, sp restored,
+    jit_pending==0; NO GC dependency) → A1.4 prologue softStackLimit check + A1.5 scoped JIT-frame GC scan
+    (REQUIRED before op_call args may carry CELLS). First cut uses `far_call`/`blr ip0` (absolute — no ±128MB `bl`
+    range limit) to the resolved entry; repatchable relative `bl` is the follow-up.
+  - **B-FALLBACK TRIGGER:** if the entry frame + the JIT→JIT callee frame cannot share ONE contiguous descending
+    span the emitted code addresses through a single provenance gate (observed as failed `callerFrame@0==caller_fp`
+    / non-contiguous callee frame / Miri provenance trap in the minimal test) → fall back to B-as-bridge (reuse the
+    tested trampoline as the interim two-stack bridge) with Option C (A2 interpreter migration) as a HARD scheduled
+    commitment so the bounce cannot calcify.
 - **B6 (megafile, serial):** retire `CallFrameId(u32)` (~401 refs) — Stage A offset-backed
   bridge (all refs compile) → Stage B generation-tagged FrameAddress newtype → Stage C delete
   `Vec<InstalledCallFrame>`. Leaves first, megafiles last.
