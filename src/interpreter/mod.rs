@@ -5268,9 +5268,12 @@ impl CoreOpcodeDispatchHost {
         let (old_structure, slab_write) = match self.objects.with_cell_mut(request.base, |cell| {
             match hit.continuation_plan_kind {
                 PropertyStoreAccessCasePlanKind::DataOnlyReplace => {
-                    // gc-r4 B-iv: the butterfly slot at planned_offset IS the value
-                    // authority; an in-place replace just writes it (the structure +
-                    // offset are unchanged — validated above). No HashMap to update.
+                    // gc-r4 B-iv: the slot at planned_offset IS the value authority; an
+                    // in-place replace just writes it (the structure + offset are unchanged
+                    // — validated above). No HashMap to update. gc-r4 Batch 5 Step 1:
+                    // putDirectOffset INLINE arm — write the cell's inline slot directly for
+                    // an inline offset (no-op for out-of-line, written to the slab below).
+                    cell.put_direct_offset_inline(hit.planned_offset, hit.stored_value);
                     Ok((
                         None,
                         Some((cell.butterfly, hit.planned_offset, hit.stored_value)),
@@ -5288,6 +5291,10 @@ impl CoreOpcodeDispatchHost {
                     // at that offset (putDirectOffset analog). gc-r4 B-iv: the butterfly
                     // slot is the sole value authority — no per-cell HashMap insert.
                     cell.structure_id = new_structure;
+                    // gc-r4 Batch 5 Step 1: putDirectOffset INLINE arm — write the cell's
+                    // inline slot directly for an inline offset (no-op for out-of-line,
+                    // written to the slab below).
+                    cell.put_direct_offset_inline(hit.planned_offset, hit.stored_value);
                     Ok((
                         Some(old_structure),
                         Some((cell.butterfly, hit.planned_offset, hit.stored_value)),

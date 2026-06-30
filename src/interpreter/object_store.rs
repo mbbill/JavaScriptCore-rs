@@ -547,6 +547,20 @@ pub(crate) struct CoreObjectCell {
     // pointer will occupy at R4. The handle is set in `allocate_cell` via
     // `allocate_butterfly()`; until then it is `ButterflyHandle::INVALID` (sentinel).
     pub(crate) butterfly: ButterflyHandle,
+    // C++ JSC: the JSObject INLINE property storage (`inlineStorage()`,
+    // runtime/JSObject.h:1167 / 1572-1577), the first `defaultInlineCapacity` (==6,
+    // JSObject.h:1229) property slots laid out IN the object cell immediately after the
+    // `m_butterfly` pointer. C++ `offsetOfInlineStorage()` (JSObject.h) is exactly 16:
+    // structureID@0 + JSType(+pad)@4 + m_butterfly@8 -> inlineStorage@16, so an inline
+    // property load is `load [cell + 16 + offset*8]` (the verbatim machine-code load
+    // Increment 2 will emit). gc-r4 Batch 5 Step 1: MUST stay immediately after
+    // `butterfly`; the layout assert pins it at byte 16. `[RuntimeValue; INLINE_CAPACITY]`
+    // is POD (RuntimeValue is an 8-byte `Copy` EncodedJsValue), so the cell stays
+    // sweepable (the `needs_drop` assert still holds). Initialized to the `undefined`
+    // sentinel at `allocate_cell` (a fresh object's inline slots are empty). Inline-band
+    // offsets (offset < firstOutOfLineOffset, in practice 0..INLINE_CAPACITY) read/write
+    // HERE; out-of-line offsets (>= firstOutOfLineOffset == 64) use the butterfly slab.
+    pub(crate) inline_storage: [RuntimeValue; INLINE_CAPACITY as usize],
     pub(crate) cell_id: CellId,
     pub(crate) kind: CoreObjectKind,
     pub(crate) prototype: Option<RuntimeValue>,
@@ -742,6 +756,46 @@ const _: () = assert!(
     std::mem::offset_of!(CoreObjectCell, js_type) == 4,
     "CoreObjectCell::js_type must be at offset 4 (fixed kind-consistent JSCell::m_type analog)"
 );
+// C++ JSC JSObject::offsetOfInlineStorage()==16 (runtime/JSObject.h): structureID@0 +
+// JSType(+pad)@4 + m_butterfly@8 -> inlineStorage@16. gc-r4 Batch 5 Step 1: the inline
+// property load Increment 2 emits is `load [cell + 16 + offset*8]`, so this MUST be
+// exactly 16 or the machine code reads the wrong bytes. Pins the field immediately after
+// `butterfly` (a silent field reorder that shifts inline storage off byte 16 fails here).
+const _: () = assert!(
+    std::mem::offset_of!(CoreObjectCell, inline_storage) == 16,
+    "CoreObjectCell::inline_storage must be at offset 16 (JSObject::offsetOfInlineStorage()==16)"
+);
+
+impl CoreObjectCell {
+    /// C++ JSC `JSObject::putDirectOffset` INLINE arm (runtime/JSObject.h:711 via
+    /// `locationForOffset`, JSObject.h:748): an INLINE offset
+    /// (`isInlineOffset(offset)`, offset < firstOutOfLineOffset) addresses the object's
+    /// OWN inline slot `inlineStorage()[offsetInInlineStorage(offset)]` — written here,
+    /// directly on the cell. A no-op for an out-of-line offset (whose slot lives in the
+    /// butterfly slab, written by the store via `butterfly_prop_put`) and for a negative
+    /// (invalid) offset. gc-r4 Batch 5 Step 1: dispatch keys on the FAITHFUL, tested
+    /// `object/property_offset.rs` partition (the single offset-band authority), and
+    /// `offsetInInlineStorage` is the identity so the slot index IS the offset.
+    pub(crate) fn put_direct_offset_inline(&mut self, offset: PropertyOffset, value: RuntimeValue) {
+        if offset.raw() < 0 {
+            return;
+        }
+        if crate::object::property_offset::is_inline_offset(offset.raw()) {
+            let idx =
+                crate::object::property_offset::offset_in_inline_storage(offset.raw()) as usize;
+            // A produced inline offset is always < INLINE_CAPACITY: the Structure's
+            // PropertyTable assigns offsets 0..INLINE_CAPACITY-1 inline then JUMPS the next
+            // property to firstOutOfLineOffset (offsetForPropertyNumber, PropertyOffset.h:136),
+            // so the (INLINE_CAPACITY, firstOutOfLineOffset) gap is never produced.
+            debug_assert!(
+                idx < INLINE_CAPACITY as usize,
+                "inline offset {} must index inline_storage (< INLINE_CAPACITY)",
+                offset.raw()
+            );
+            self.inline_storage[idx] = value;
+        }
+    }
+}
 
 impl Default for CoreObjectCell {
     fn default() -> Self {
@@ -757,6 +811,9 @@ impl Default for CoreObjectCell {
             // matches the final kind regardless of how the cell was built.
             js_type: JsType::FinalObject,
             butterfly: ButterflyHandle::INVALID,
+            // C++ JSC: a fresh JSObject's inline slots start empty; `allocate_cell` also
+            // resets these to the `undefined` sentinel at the allocation chokepoint.
+            inline_storage: [RuntimeValue::undefined(); INLINE_CAPACITY as usize],
             cell_id: CellId::default(),
             kind: CoreObjectKind::default(),
             prototype: None,
@@ -825,6 +882,8 @@ impl Clone for CoreObjectCell {
             // Copy the type tag normally; a clone of an object cell is the same JSType.
             js_type: self.js_type,
             butterfly: self.butterfly,
+            // Copy the inline value slots ([RuntimeValue; INLINE_CAPACITY] is POD `Copy`).
+            inline_storage: self.inline_storage,
             cell_id: self.cell_id,
             kind: self.kind,
             prototype: self.prototype,
@@ -1423,14 +1482,25 @@ pub(crate) fn generated_property_load_cell_data_property_at_offset(
     // `AccessCase::Getter` stub instead, never this data load). This reads the SHAPE
     // (the offset/attribute authority), not the per-cell value HashMap, so it does not
     // change the VALUE authority this batch.
-    if let Some((_, attributes)) =
+    //
+    // gc-r4 Batch 5 Step 1: an INLINE slot ALWAYS physically exists (the inline array is
+    // fixed-size, pre-initialized to `undefined`), so getDirect at an inline offset can no
+    // longer detect an ABSENT property or a STALE cached offset — it would return
+    // `Some(undefined)` from an empty slot (the forward-Vec used to return `None`).
+    // Presence, the data-kind, and the live offset are the STRUCTURE's authority (C++
+    // `structure->get(key)` returning EXACTLY this offset, non-accessor), so gate on the
+    // shape here: an absent key, an accessor, or a cached offset that disagrees with the
+    // table each yields `None` (the caller classifies the miss), preserving the prior
+    // None-for-absent contract the forward-Vec provided incidentally.
+    let Some((actual_offset, attributes)) =
         objects.structure_property(cell.structure_id, &key.to_core_property_key())
-    {
-        if attributes & PROPERTY_ATTRIBUTE_ACCESSOR != 0 {
-            return None;
-        }
+    else {
+        return None;
+    };
+    if attributes & PROPERTY_ATTRIBUTE_ACCESSOR != 0 || actual_offset != expected_offset {
+        return None;
     }
-    objects.butterfly_prop_get(cell.butterfly, expected_offset)
+    objects.butterfly_prop_get(cell, expected_offset)
 }
 
 pub(crate) fn generated_property_load_offset_miss_reason(
@@ -2086,17 +2156,42 @@ impl CoreObjectStore {
         &self.regexp_sources[handle.0]
     }
 
-    /// Read the property slot for `offset` from butterfly `handle` (C++
-    /// `JSObject::getDirect`, JSObject.h:711). `None` for a negative offset.
+    /// Read the property slot for `offset` of `cell` (C++ `JSObject::getDirect` via
+    /// `locationForOffset`, JSObject.h:711/748). gc-r4 Batch 5 Step 1: dispatch on the
+    /// FAITHFUL `object/property_offset.rs` band partition — an INLINE offset
+    /// (`isInlineOffset`, offset < firstOutOfLineOffset) reads the cell's OWN inline slot
+    /// `inlineStorage()[offsetInInlineStorage(offset)]`; an OUT-OF-LINE offset reads the
+    /// butterfly slab. `None` for a negative offset, or for an out-of-line slot the shape
+    /// never grew (a never-written valid offset == `undefined` to the caller).
     pub(crate) fn butterfly_prop_get(
         &self,
-        handle: ButterflyHandle,
+        cell: &CoreObjectCell,
         offset: PropertyOffset,
     ) -> Option<RuntimeValue> {
         if offset.raw() < 0 {
             return None;
         }
-        self.butterflies[handle.0].prop_get(offset_storage_index(offset))
+        if crate::object::property_offset::is_inline_offset(offset.raw()) {
+            // INLINE band: read the cell's own inline slot (the slot ALWAYS exists — the
+            // inline array is fixed-size, pre-initialized to the `undefined` sentinel — so
+            // a valid inline offset returns `Some`, including `Some(undefined)` for a
+            // never-written valid offset, matching C++ getDirect == JSValue()).
+            let idx =
+                crate::object::property_offset::offset_in_inline_storage(offset.raw()) as usize;
+            debug_assert!(
+                idx < INLINE_CAPACITY as usize,
+                "inline offset {} must index inline_storage (< INLINE_CAPACITY)",
+                offset.raw()
+            );
+            // gc-r4 Batch 5 Step 1: the cell's inline storage is the AUTHORITATIVE home of
+            // the inline band — the forward-Vec inline mirror has been retired (proven equal
+            // across the whole suite under the now-removed dual-write oracle), so this no
+            // longer reads or asserts against the slab for an inline offset.
+            return Some(cell.inline_storage[idx]);
+        }
+        // OUT-OF-LINE band: the butterfly slab slot (Step 2 makes this the negative-indexed
+        // raw buffer; `offset_storage_index` is unchanged this step).
+        self.butterflies[cell.butterfly.0].prop_get(offset_storage_index(offset))
     }
 
     /// Write `value` into the property slot for `offset` in butterfly `handle`,
@@ -2112,6 +2207,14 @@ impl CoreObjectStore {
         if offset.raw() < 0 {
             return;
         }
+        // gc-r4 Batch 5 Step 1: inline-band offsets are written to the cell's OWN inline
+        // storage by the putDirectOffset inline arm (`put_direct_offset_inline`, run at the
+        // call sites under the cell borrow); only OUT-OF-LINE offsets land in the butterfly
+        // slab here. (Step 2 reworks the OOL band into the negative-indexed raw buffer;
+        // `offset_storage_index` is unchanged this step.)
+        if crate::object::property_offset::is_inline_offset(offset.raw()) {
+            return;
+        }
         self.butterflies[handle.0].prop_put(offset_storage_index(offset), value);
     }
 
@@ -2119,6 +2222,12 @@ impl CoreObjectStore {
     /// `undefined` (deletion / data->accessor). No-op for a negative offset.
     pub(crate) fn butterfly_prop_clear(&mut self, handle: ButterflyHandle, offset: PropertyOffset) {
         if offset.raw() < 0 {
+            return;
+        }
+        // gc-r4 Batch 5 Step 1: inline-band offsets are cleared on the cell (the
+        // putDirectOffset inline arm with the `undefined` sentinel); only OUT-OF-LINE
+        // offsets are cleared in the butterfly slab here.
+        if crate::object::property_offset::is_inline_offset(offset.raw()) {
             return;
         }
         self.butterflies[handle.0].prop_clear(offset_storage_index(offset));
@@ -2542,6 +2651,16 @@ impl CoreObjectStore {
         trace_value_edge(cell.binding_value, visitor);
         trace_value_edge(cell.promise_result, visitor);
         trace_value_edge(cell.bound_this, visitor);
+
+        // ---- inline property storage (C++ JSObject inline value slots,
+        // `inlineStorage()[0..INLINE_CAPACITY]`, visited by JSObject::visitChildren
+        // alongside the out-of-line butterfly below). gc-r4 Batch 5 Step 1: the first
+        // INLINE_CAPACITY own-property values live on the cell HERE. Each is a GC edge
+        // exactly like an out-of-line property value; an unfilled slot holds the
+        // `undefined` sentinel, which `as_cell` rejects, so it is naturally skipped.
+        for &value in &cell.inline_storage {
+            trace_value_edge(value, visitor);
+        }
 
         // ---- butterfly: out-of-line property storage + contiguous indexed
         // elements (C++ JSObject::visitButterfly). A null/INVALID butterfly is
@@ -5652,6 +5771,13 @@ impl CoreObjectStore {
         // own (empty) slab entry BEFORE the structure is seeded and the out-of-line
         // VALUE mirror + indexed elements are filled below.
         cell.butterfly = self.allocate_butterfly();
+        // gc-r4 Batch 5 Step 1: a freshly allocated object's INLINE property slots start
+        // EMPTY (the `undefined` sentinel) — C++ `JSObject::finishCreation` zero-inits
+        // inline storage before any property is added. Reset here at the single allocation
+        // chokepoint so the published cell's inline band is always the empty sentinel
+        // regardless of how the stack `cell` was built (every property is written AFTER
+        // allocation via the putDirectOffset inline arm, never pre-filled on the cell).
+        cell.inline_storage = [RuntimeValue::undefined(); INLINE_CAPACITY as usize];
         if cell.structure_id == StructureId::INVALID {
             // C++ JSC: a fresh object adopts the shared empty Structure for its
             // class+prototype instead of a private one, so same-shape siblings can
@@ -5892,7 +6018,7 @@ impl CoreObjectStore {
         if attrs & PROPERTY_ATTRIBUTE_ACCESSOR != 0 {
             // The butterfly slot holds `from_cell(GetterSetter)`; read the getter/setter
             // off that cell (C++ GetterSetter::getter()/setter(), GetterSetter.h:132-133).
-            let getter_setter = self.butterfly_prop_get(cell.butterfly, offset)?;
+            let getter_setter = self.butterfly_prop_get(cell, offset)?;
             let gs = self.find(getter_setter)?;
             Some(CoreProperty {
                 kind: CorePropertyKind::Accessor {
@@ -5907,7 +6033,7 @@ impl CoreObjectStore {
             // is the `undefined` data value (C++ getDirect returns JSValue() == undefined
             // for a never-written valid offset), never "absent".
             let value = self
-                .butterfly_prop_get(cell.butterfly, offset)
+                .butterfly_prop_get(cell, offset)
                 .unwrap_or_else(RuntimeValue::undefined);
             Some(CoreProperty {
                 kind: CorePropertyKind::Data(value),
@@ -7142,6 +7268,9 @@ impl CoreObjectStore {
             if shape_changed {
                 object_cell.structure_id = new_structure;
             }
+            // putDirectOffset INLINE arm: an inline offset writes the cell's own inline
+            // slot directly (no-op for an out-of-line offset, written to the slab below).
+            object_cell.put_direct_offset_inline(offset, value);
             object_cell.butterfly
         });
         if let Some(handle) = handle {
@@ -7239,6 +7368,9 @@ impl CoreObjectStore {
             if shape_changed {
                 object_cell.structure_id = new_structure;
             }
+            // putDirectOffset INLINE arm: an inline offset writes the cell's own inline
+            // slot directly (no-op for an out-of-line offset, written to the slab below).
+            object_cell.put_direct_offset_inline(offset, value);
             object_cell.butterfly
         });
         if let Some(handle) = handle {
@@ -7327,6 +7459,9 @@ impl CoreObjectStore {
             if shape_changed {
                 object_cell.structure_id = new_structure;
             }
+            // putDirectOffset INLINE arm: an inline offset writes the cell's own inline
+            // slot directly (no-op for an out-of-line offset, written to the slab below).
+            object_cell.put_direct_offset_inline(offset, value);
             object_cell.butterfly
         });
         if let Some(handle) = handle {
@@ -7408,6 +7543,11 @@ impl CoreObjectStore {
             let new_structure = self.fresh_dictionary_structure(old_structure, Some(key));
             let handle = self.with_cell_mut(object, |object_cell| {
                 object_cell.structure_id = new_structure;
+                // putDirectOffset INLINE arm (clear): reset the freed property's inline slot
+                // to undefined (no-op for an out-of-line offset, cleared in the slab below).
+                if let Some(offset) = removed_offset {
+                    object_cell.put_direct_offset_inline(offset, RuntimeValue::undefined());
+                }
                 object_cell.butterfly
             });
             if let (Some(handle), Some(offset)) = (handle, removed_offset) {
@@ -7455,6 +7595,9 @@ impl CoreObjectStore {
         let getter_setter = self.allocate_getter_setter(getter, setter);
         let handle = self.with_cell_mut(object, |object_cell| {
             object_cell.structure_id = new_structure;
+            // putDirectOffset INLINE arm: an inline accessor slot holds the GetterSetter
+            // cell ref on the cell directly (no-op for an out-of-line offset).
+            object_cell.put_direct_offset_inline(offset, getter_setter);
             object_cell.butterfly
         });
         if let Some(handle) = handle {
@@ -9629,11 +9772,11 @@ impl CoreObjectStore {
             return None;
         }
         // Structure match => same (kind, prototype, shape) => the cached offset is
-        // a live own-data slot (invariant a/b). Read it directly from the butterfly
-        // slab `props` mirror (store-owned) with NO key comparison or HashMap scan.
-        // `cell` (shared, tied to &self) and `butterfly_prop_get` (&self) coexist.
-        let handle = cell.butterfly;
-        self.butterfly_prop_get(handle, cached_offset)
+        // a live own-data slot (invariant a/b). Read it directly (getDirect) with NO key
+        // comparison or HashMap scan — inline slot on the cell for an inline offset, the
+        // butterfly slab otherwise. `cell` (shared, tied to &self) and `butterfly_prop_get`
+        // (&self) coexist.
+        self.butterfly_prop_get(cell, cached_offset)
     }
 
     /// LLInt monomorphic PUT replace-existing fast path, mirroring the
@@ -9696,18 +9839,22 @@ impl CoreObjectStore {
         // Re-validate the structure after the barrier (the barrier path does not mutate
         // this cell's shape, but the re-fetch keeps the store self-contained) and capture
         // the butterfly handle; the butterfly slot IS the value authority post-flip.
-        let handle = {
-            let Some(cell) = self.find(receiver) else {
-                return Ok(false);
-            };
+        // putDirectOffset INLINE arm + handle capture: re-validate the structure under the
+        // mutable borrow (a replace never transitions, so the cached offset stays valid)
+        // and write the inline slot on the cell directly (no-op for an out-of-line offset).
+        let handle = self.with_cell_mut(receiver, |cell| {
             if cell.structure_id != cached_structure_id {
-                return Ok(false);
+                return None;
             }
-            cell.butterfly
+            cell.put_direct_offset_inline(cached_offset, value);
+            Some(cell.butterfly)
+        });
+        let Some(Some(handle)) = handle else {
+            return Ok(false);
         };
-        // putDirectOffset analog (invariant c): write the value into the butterfly slab
-        // `props` side at the cached offset. The slot already exists (the structure match
-        // proves the shape), so this is an in-place store.
+        // putDirectOffset OUT-OF-LINE arm (invariant c): write the value into the butterfly
+        // slab `props` side at the cached offset. The slot already exists (the structure
+        // match proves the shape), so this is an in-place store.
         self.butterfly_prop_put(handle, cached_offset, value);
         Ok(true)
     }
@@ -9811,18 +9958,17 @@ mod butterfly_values_cutover_tests {
                 .put_data_own(obj, &ident(i), RuntimeValue::from_i32(i as i32 * 7 + 1))
                 .unwrap();
         }
-        let handle = store.find(obj).unwrap().butterfly;
         let sid = store.find(obj).unwrap().structure_id;
         for i in 0..N {
             let expected = RuntimeValue::from_i32(i as i32 * 7 + 1);
             let offset = store
                 .structure_offset(sid, &ident(i))
                 .expect("named offset");
-            // offset/butterfly mirror path
+            // getDirect path: inline slot on the cell for 0..5, butterfly slab for 6..8.
             assert_eq!(
-                store.butterfly_prop_get(handle, offset),
+                store.butterfly_prop_get(store.find(obj).unwrap(), offset),
                 Some(expected),
-                "butterfly slot for prop {i}"
+                "getDirect slot for prop {i}"
             );
             // value-authority path
             let prop = store
@@ -9848,11 +9994,10 @@ mod butterfly_values_cutover_tests {
         store
             .put_data_own(obj, &ident(0), RuntimeValue::from_i32(0x0BEE))
             .unwrap();
-        let handle = store.find(obj).unwrap().butterfly;
         let sid0 = store.find(obj).unwrap().structure_id;
         let off0 = store.structure_offset(sid0, &ident(0)).unwrap();
         assert_eq!(
-            store.butterfly_prop_get(handle, off0),
+            store.butterfly_prop_get(store.find(obj).unwrap(), off0),
             Some(RuntimeValue::from_i32(0x0BEE))
         );
         for i in 1..64 {
@@ -9860,19 +10005,118 @@ mod butterfly_values_cutover_tests {
                 .put_data_own(obj, &ident(i), RuntimeValue::from_i32(i as i32))
                 .unwrap();
         }
-        // same handle, same offset, value preserved through every grow/realloc
+        // same offset, value preserved through every grow/realloc (off0 is inline offset 0
+        // — read from the cell's inline storage; off_late is out-of-line, in the slab).
         assert_eq!(
-            store.butterfly_prop_get(handle, off0),
+            store.butterfly_prop_get(store.find(obj).unwrap(), off0),
             Some(RuntimeValue::from_i32(0x0BEE)),
             "early offset must survive butterfly props realloc"
         );
-        // and a late property reads back correctly (mirror==authority)
+        // and a late (out-of-line) property reads back correctly (mirror==authority)
         let sid_late = store.find(obj).unwrap().structure_id;
         let off_late = store.structure_offset(sid_late, &ident(63)).unwrap();
         assert_eq!(
-            store.butterfly_prop_get(handle, off_late),
+            store.butterfly_prop_get(store.find(obj).unwrap(), off_late),
             Some(RuntimeValue::from_i32(63))
         );
+    }
+
+    // (c2) gc-r4 Batch 5 Step 1 — INLINE value slots are AUTHORITATIVE on the cell.
+    // Proves (i) the layout offset == C++ JSObject::offsetOfInlineStorage()==16; (ii) an
+    // object with < INLINE_CAPACITY own data properties stores+reads them through
+    // `inline_storage` (the slab `props` stays EMPTY — the forward-Vec inline band is
+    // retired) and every value == the interpreter authority (`get_own_property`); (iii) the
+    // inline/out-of-line boundary — the 6th property is the last inline offset (5), the 7th
+    // jumps to firstOutOfLineOffset (64) and lands in the out-of-line slab, not inline.
+    #[test]
+    fn inline_storage_is_authoritative_below_capacity_and_out_of_line_above() {
+        // (i) layout: structureID@0 + JSType@4 + butterfly@8 -> inline_storage@16.
+        assert_eq!(std::mem::offset_of!(CoreObjectCell, inline_storage), 16);
+
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+
+        // (ii) Fill exactly INLINE_CAPACITY (6) own data properties -> inline offsets 0..5.
+        let cap = INLINE_CAPACITY as u32;
+        for i in 0..cap {
+            store
+                .put_data_own(obj, &ident(i), RuntimeValue::from_i32(100 + i as i32))
+                .unwrap();
+        }
+        let sid = store.find(obj).unwrap().structure_id;
+        for i in 0..cap {
+            let expected = RuntimeValue::from_i32(100 + i as i32);
+            let offset = store.structure_offset(sid, &ident(i)).unwrap();
+            assert!(
+                offset.raw() < INLINE_CAPACITY,
+                "prop {i} must take an inline offset (< INLINE_CAPACITY)"
+            );
+            // the value is physically in the cell's inline storage at slot index == offset
+            assert_eq!(
+                store.find(obj).unwrap().inline_storage[offset.raw() as usize],
+                expected,
+                "inline_storage holds prop {i}"
+            );
+            // getDirect + the interpreter shape authority both agree with the inline slot
+            assert_eq!(
+                store.butterfly_prop_get(store.find(obj).unwrap(), offset),
+                Some(expected)
+            );
+            assert_eq!(
+                store
+                    .get_own_property(obj, &ident(i))
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                CorePropertyKind::Data(expected)
+            );
+        }
+        // The forward-Vec inline band is RETIRED: an inline-only object writes NO slab slot.
+        let handle = store.find(obj).unwrap().butterfly;
+        assert!(
+            store.butterflies[handle.0].props.is_empty(),
+            "inline band retired: an inline-only object writes no out-of-line slab slots"
+        );
+
+        // (iii) the 7th property (property number == INLINE_CAPACITY) crosses the boundary
+        // to out-of-line offset firstOutOfLineOffset (64).
+        store
+            .put_data_own(obj, &ident(cap), RuntimeValue::from_i32(777))
+            .unwrap();
+        let sid = store.find(obj).unwrap().structure_id;
+        let ool_offset = store.structure_offset(sid, &ident(cap)).unwrap();
+        assert_eq!(
+            ool_offset.raw(),
+            FIRST_OUT_OF_LINE_OFFSET,
+            "the 7th property jumps to firstOutOfLineOffset"
+        );
+        assert_eq!(
+            store.butterfly_prop_get(store.find(obj).unwrap(), ool_offset),
+            Some(RuntimeValue::from_i32(777))
+        );
+        assert_eq!(
+            store
+                .get_own_property(obj, &ident(cap))
+                .unwrap()
+                .unwrap()
+                .kind,
+            CorePropertyKind::Data(RuntimeValue::from_i32(777))
+        );
+        // it lives in the out-of-line slab, NOT in inline storage...
+        let handle = store.find(obj).unwrap().butterfly;
+        assert_eq!(
+            store.butterflies[handle.0].prop_get(offset_storage_index(ool_offset)),
+            Some(RuntimeValue::from_i32(777)),
+            "the 7th property's value lives in the out-of-line slab"
+        );
+        // ...and the inline slots still hold ONLY the first 6 values (no OOL-add bleed).
+        for i in 0..cap {
+            let offset = store.structure_offset(sid, &ident(i)).unwrap();
+            assert_eq!(
+                store.find(obj).unwrap().inline_storage[offset.raw() as usize],
+                RuntimeValue::from_i32(100 + i as i32)
+            );
+        }
     }
 
     // (d) elements: put/get/hole/out-of-range/len, then delete (hole), resize (shrink),
@@ -10040,12 +10284,11 @@ mod getter_setter_prereq_tests {
             .define_accessor(obj, &akey, Some(getter), Some(setter))
             .unwrap();
 
-        let handle = store.find(obj).unwrap().butterfly;
         let sid = store.find(obj).unwrap().structure_id;
         let (aoff, _) = store.structure_property(sid, &akey).unwrap();
         let slot = store
-            .butterfly_prop_get(handle, aoff)
-            .expect("accessor butterfly slot must be populated");
+            .butterfly_prop_get(store.find(obj).unwrap(), aoff)
+            .expect("accessor getDirect slot must be populated");
         let gs = store
             .find(slot)
             .expect("the butterfly slot value must be a cell ref (the GetterSetter)");
@@ -10080,17 +10323,16 @@ mod getter_setter_prereq_tests {
             .define_accessor(obj, &akey, Some(getter), None)
             .unwrap();
 
-        let handle = store.find(obj).unwrap().butterfly;
         let sid = store.find(obj).unwrap().structure_id;
 
-        // DATA: structure attrs == data encoding; butterfly value == HashMap value.
+        // DATA: structure attrs == data encoding; getDirect value == HashMap value.
         let (doff, dattrs) = store.structure_property(sid, &dkey).unwrap();
         assert_eq!(
             dattrs,
             core_attributes_to_u32(CorePropertyAttributes::DATA_DEFAULT, false)
         );
         assert_eq!(
-            store.butterfly_prop_get(handle, doff),
+            store.butterfly_prop_get(store.find(obj).unwrap(), doff),
             Some(RuntimeValue::from_i32(42))
         );
         assert_eq!(
@@ -10105,7 +10347,7 @@ mod getter_setter_prereq_tests {
             core_attributes_to_u32(CorePropertyAttributes::DATA_DEFAULT, false)
         );
         assert_eq!(
-            store.butterfly_prop_get(handle, soff),
+            store.butterfly_prop_get(store.find(obj).unwrap(), soff),
             Some(RuntimeValue::from_i32(7))
         );
         assert_eq!(
@@ -10121,7 +10363,11 @@ mod getter_setter_prereq_tests {
             core_attributes_to_u32(CorePropertyAttributes::ACCESSOR_DEFAULT, true)
         );
         let gs = store
-            .find(store.butterfly_prop_get(handle, aoff).unwrap())
+            .find(
+                store
+                    .butterfly_prop_get(store.find(obj).unwrap(), aoff)
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!(gs.kind, CoreObjectKind::GetterSetter);
         match store.get_own_property(obj, &akey).unwrap().unwrap().kind {
@@ -10950,7 +11196,11 @@ mod trace_cell_gap_a_tests {
             view_length: _,
             view_element_kind: _,
             bound_args: _,
-            // the 15 inline RuntimeValue / Option<RuntimeValue> GC edges:
+            // gc-r4 Batch 5 Step 1: the INLINE_CAPACITY own-property value slots — an array
+            // of direct RuntimeValue GC edges trace_cell visits (the inline analog of the
+            // out-of-line butterfly property values).
+            inline_storage: e_inline_storage,
+            // the 15 single inline RuntimeValue / Option<RuntimeValue> GC edges:
             prototype: e_prototype,
             super_base: e_super_base,
             super_constructor: e_super_constructor,
@@ -10969,6 +11219,7 @@ mod trace_cell_gap_a_tests {
         } = &probe;
         // Bind-and-ignore so an added/removed edge name is a compile error here too.
         let _ = (
+            e_inline_storage,
             e_prototype,
             e_super_base,
             e_super_constructor,
@@ -10986,10 +11237,19 @@ mod trace_cell_gap_a_tests {
             e_bound_this,
         );
 
-        // (b) RUNTIME COVERAGE — every one of the 15 edges set to a DISTINCT fake cell;
-        // trace_cell must visit all 15 and only those (no butterfly / aux slab here).
+        // (b) RUNTIME COVERAGE — every one of the 15 single edges + the 6 inline_storage
+        // slots set to a DISTINCT fake cell; trace_cell must visit all 21 and only those
+        // (no butterfly / aux slab here).
         let store = CoreObjectStore::default();
         let cell = CoreObjectCell {
+            inline_storage: [
+                fake_cell(0x2010),
+                fake_cell(0x2020),
+                fake_cell(0x2030),
+                fake_cell(0x2040),
+                fake_cell(0x2050),
+                fake_cell(0x2060),
+            ],
             prototype: Some(fake_cell(0x1010)),
             super_base: Some(fake_cell(0x1020)),
             super_constructor: Some(fake_cell(0x1030)),
@@ -11009,12 +11269,12 @@ mod trace_cell_gap_a_tests {
         };
         let expected = sorted(vec![
             0x1010, 0x1020, 0x1030, 0x1040, 0x1050, 0x1060, 0x1070, 0x1080, 0x1090, 0x10a0, 0x10b0,
-            0x10c0, 0x10d0, 0x10e0, 0x10f0,
+            0x10c0, 0x10d0, 0x10e0, 0x10f0, 0x2010, 0x2020, 0x2030, 0x2040, 0x2050, 0x2060,
         ]);
         assert_eq!(
             traced(&store, &cell),
             expected,
-            "trace_cell must visit exactly the 15 inline RuntimeValue GC edges"
+            "trace_cell must visit exactly the 15 single + 6 inline_storage RuntimeValue GC edges"
         );
     }
 }
@@ -11324,9 +11584,14 @@ mod mark_live_set_r4b_tests {
         store.mark_live_set(&[root]);
         assert!(store.is_value_marked(child));
 
-        // Sever the edge: clear root's butterfly out-of-line storage.
+        // Sever the edge: the child was stored at inline offset 0 (key 0 -> offset 0), so
+        // clear BOTH the cell's inline storage AND the out-of-line slab (gc-r4 Batch 5
+        // Step 1: inline-band property values live on the cell now, not just the slab).
         let handle = store.find(root).unwrap().butterfly;
         store.butterflies[handle.0].props.clear();
+        store.with_cell_mut(root, |c| {
+            c.inline_storage = [RuntimeValue::undefined(); INLINE_CAPACITY as usize];
+        });
 
         store.mark_live_set(&[root]);
         assert!(store.is_value_marked(root));

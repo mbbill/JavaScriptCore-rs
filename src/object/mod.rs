@@ -12,7 +12,11 @@ mod identity;
 mod indexing_type;
 mod operations;
 mod property;
-mod property_offset;
+// gc-r4 Batch 5 Step 1: the faithful `runtime/PropertyOffset.h` band partition is now
+// the LIVE storage-dispatch authority for `CoreObjectCell` inline vs out-of-line offsets
+// (interpreter/object_store.rs `butterfly_prop_get` / `put_direct_offset_inline`), so the
+// module is crate-visible (its functions are the single offset-band source of truth).
+pub(crate) mod property_offset;
 mod property_table;
 mod storage;
 mod structure;
