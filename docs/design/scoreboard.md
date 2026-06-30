@@ -172,3 +172,32 @@ LEVER A (disable the generated executor) is a correct hygiene win (it's the conf
 divergence; STEP 5 deletes it) but NOT a net R-win alone (property/call-heavy regress). The breadth (Inc 1)
 was necessary (functions tier up) but the FAR-CALLS make it perf-negative for property/call code until the
 inline versions land. Batch 5 -> Increment 2 + the call cache is the evidence-backed path to R.
+
+## 2026-06-30 LATE-3 — Increment 2 (inline load) WINS on numeric; call-heavy gated on the CALL path
+
+Batch 5 (inline slots + machine-addressable butterfly) + Increment 2 (inline machine-code property load,
+verbatim loadProperty, native==interp==oracle, no far-call on HIT) all LANDED + miri-clean (2827 green).
+Re-measure (--baseline --disable-baseline-generated-executor --disable-generated-direct-call-generated-entry):
+- **navier-stokes 4.29 -> 5.69 (+33% WIN)** -- the inline load is on its hot path (call-light arith/closure).
+- richards 1.01 -> 0.36, delta-blue 0.49 -> 0.28 -- STILL ~3x regressions, UNMOVED by the inline load.
+
+CAUSE (--tiering-summary, richards/delta-blue): they are CALL-dominated. ~5M generated_direct_call_transactions,
+~100% NestedInterpreterFallback, native_entry_miss=HostBlockedX86_64, **property_load_observations=0**. Their
+hot CALLER functions do NOT tier up to the ARM64 emit_baseline_function path (an opcode gap declines them) ->
+they fall to the x86-64/generated-direct-call ROUTE ARBITER -> every call re-enters the interpreter (the route
+arbiter's per-call overhead makes BaselineAllowed-mode SLOWER than InterpreterOnly), and the property loads run
+in the interpreted callees where the native inline code never executes (hence property_load_observations=0).
+
+SO THE R-PICTURE SPLITS BY BENCH SHAPE (measured, not assumed):
+- **Numeric/arith-heavy (navier/crypto): WIN now** -- Increment 2 + the native arith path. The inline property
+  load is the right, faithful fix and it works where property loads run native.
+- **Call/property-heavy (richards/delta-blue, ~half of Octane): gated on the CALL PATH** -- their hot functions
+  must tier up to ARM64-native (close the remaining emit_baseline_function opcode gap: the likely set from the
+  scoping is the Load* constants [LoadUndefined/Null/Bool/String], LogicalNot, Equal/NotEqual, NegateNumber,
+  NewObject/NewArray, ModNumber/ToNumber) so their CALLS go native via broad engagement (emit_op_call_dynamic),
+  BYPASSING the generated-direct-call route arbiter; and/or delete that route arbiter (the confirmed divergence,
+  STEP 1) so residual interpreted-mode calls stop paying its per-call overhead. NOT property ICs.
+
+NEXT R-LEVER (evidence-derived): a diagnostic to dump the EXACT ARM64 emit_baseline_function declines for
+richards/delta-blue's hot functions -> a targeted breadth batch of those opcodes -> they fully tier up + native-
+call -> re-measure (do they flip from ~0.3x toward >1.0x?). Plus STEP 1 (route-arbiter deletion) for the residual.
