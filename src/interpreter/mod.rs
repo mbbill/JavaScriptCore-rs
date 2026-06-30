@@ -9162,6 +9162,21 @@ impl CoreOpcodeDispatchHost {
             .collect()
     }
 
+    /// gc-r4 GAP C (A1.5): bracket a baseline-JIT image's execution — push its
+    /// native-stack frame region onto the store's conservative-scan span stack on
+    /// entry, pop on exit. Forwards to the arena owner (`self.objects`), which the
+    /// `Vm` cannot touch directly (the host owns the `CoreObjectStore`).
+    /// `run_installed_baseline_jit` calls these around `InstalledBaselineFunction::run`.
+    pub(crate) fn push_active_jit_frame_span(&mut self, region_low: usize, entry_anchor: usize) {
+        self.objects
+            .push_active_jit_frame_span(region_low, entry_anchor);
+    }
+
+    /// gc-r4 GAP C (A1.5): see [`Self::push_active_jit_frame_span`].
+    pub(crate) fn pop_active_jit_frame_span(&mut self) {
+        self.objects.pop_active_jit_frame_span();
+    }
+
     fn truthy(&self, value: RuntimeValue) -> bool {
         if self.symbols.is_symbol(value) {
             return true;

@@ -101,6 +101,17 @@ pub(crate) struct CoreObjectStore {
     // `object_indices_by_payload` index + the R3 ShadowOracle are GONE. NOTE: cells still
     // accumulate (no sweep until R4b) — the arena IS the leak now, by design.
     pub(crate) space: MarkedSpace,
+    // gc-r4 GAP C (A1.5): the ACTIVE baseline-JIT native-stack frame regions the
+    // conservative GC scan roots. Faithful to JSC's VMEntryRecord / topEntryFrame
+    // chain (`m_prevTopEntryFrame`, VMEntryRecord.h): one entry per executing
+    // `InstalledBaselineFunction`, each running on its OWN native JS-stack
+    // reservation (per-function stacks), so the live span is a STACK of regions
+    // pushed on JIT entry and popped on exit (`run_installed_baseline_jit`). EMPTY
+    // whenever no baseline-JIT image is executing, so the scan is a NO-OP on the
+    // pure-interpreter path (the only path that collects today — the native arith
+    // fast path is cell-free and non-polling, interpreter/mod.rs near the
+    // `poll_gc_collection_safepoint_on_backedge` allowlist note).
+    pub(crate) active_jit_frame_spans: Vec<JitFrameScanSpan>,
     // gc-r4 R4a (decision B): reverse map from a published cell's `CellId` to its arena
     // address, the post-flip replacement for the former linear `objects` scan in
     // `find_by_object_id` (the DataIC megamorphic-holder probe's only id->cell path). C++
@@ -3157,6 +3168,20 @@ pub(crate) struct ReconcileStats {
     pub(crate) slab_slots_freed: usize,
 }
 
+/// gc-r4 GAP C (A1.5) — one ACTIVE baseline-JIT native-stack frame region the
+/// conservative GC scan covers. `region_low` = the JS-stack reservation's lowest
+/// ALLOCATABLE address (`JsStack::low_address`; the PROT_NONE guard page is BELOW
+/// it, so the scan never faults); `entry_anchor` = `JsStack::high_address`, the top
+/// of the JIT-frame span where the entry frame's header/`this`/args sit. The scan
+/// covers `[max(live_sp, region_low) … entry_anchor]`. Faithful to one
+/// VMEntryRecord entry — the conservative scanner's `[stackTop … stackOrigin]`
+/// bound (`heap/MachineStackMarker.cpp:52`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct JitFrameScanSpan {
+    pub(crate) region_low: usize,
+    pub(crate) entry_anchor: usize,
+}
+
 /// gc-r4 R4b-sweep — the outcome of an explicit `force_collect` (gc-r4.md R4b VERIFY).
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3420,6 +3445,79 @@ impl CoreObjectStore {
         self.force_collect(&addrs)
     }
 
+    /// gc-r4 GAP C (A1.5): push the ACTIVE baseline-JIT frame region onto the
+    /// conservative-scan span stack on JIT entry, pop it on exit
+    /// (`run_installed_baseline_jit` brackets `InstalledBaselineFunction::run`).
+    /// Faithful to chaining a VMEntryRecord (`topEntryFrame`): a nested JIT entry
+    /// (which runs on its OWN native JS stack) pushes its own region, so every
+    /// region in the live call chain is scanned, and balanced pop/exit restores the
+    /// caller's view (LIFO).
+    pub(crate) fn push_active_jit_frame_span(&mut self, region_low: usize, entry_anchor: usize) {
+        self.active_jit_frame_spans.push(JitFrameScanSpan {
+            region_low,
+            entry_anchor,
+        });
+    }
+
+    /// gc-r4 GAP C (A1.5): pop the innermost active baseline-JIT frame region on
+    /// JIT exit (see [`Self::push_active_jit_frame_span`]).
+    pub(crate) fn pop_active_jit_frame_span(&mut self) {
+        self.active_jit_frame_spans.pop();
+    }
+
+    /// gc-r4 GAP C (A1.5): the CONSERVATIVE roots held in the ACTIVE baseline-JIT
+    /// native-stack frames. For each active span, scan `[low … entry_anchor]`
+    /// word-by-word ([`crate::vm::jsstack::conservative_scan_jit_frame_span`], the
+    /// `ConservativeRoots::genericAddSpan` analog) and admit every word that
+    /// resolves to an arena CELL START ([`MarkedSpace::is_arena_cell_start`] —
+    /// membership + cell-start, NOT liveness, the `genericAddPointer` half). TWO
+    /// candidate addresses per word — the word DECODED as a JSValue cell payload
+    /// (the boxed frame slots; encoding-agnostic via
+    /// `CellValue::pointer_payload_bits`, since the default build NaN-boxes a cell
+    /// as `(ptr<<8)|0x20`, NOT the raw pointer) and the RAW word (a raw cell
+    /// pointer, e.g. the `callee` slot under `s4_raw_cell`). Both are gated, so the
+    /// over-approximation stays bounded and SAFE (retain-only).
+    ///
+    /// `live_sp` is the current machine stack pointer at the collection safepoint
+    /// (JSC's `stackTop`): for the span that CONTAINS it (the innermost/current JIT
+    /// region) it tightens the low bound to `[live_sp … entry_anchor]`; an OUTER
+    /// region (a caller still live beneath a nested JIT entry on its OWN stack) does
+    /// not contain `live_sp`, so it is scanned in full `[region_low …
+    /// entry_anchor]` (safe over-approximation — its own SP is unknown here).
+    /// Returns ADMITTED arena cell-start addresses (the universal root currency that
+    /// `force_collect`/`mark_live_set_from_addrs` re-gates).
+    ///
+    /// DEFERRED (broad-engagement follow-up): precise per-region SP bounding for
+    /// outer frames, and lifting the cell-free gate on the native `op_call` fast
+    /// path so cells may actually flow through these slots. A1.5 only adds the
+    /// rooting CAPABILITY; today every active span is cell-free.
+    pub(crate) fn conservative_jit_frame_roots(&self, live_sp: usize) -> Vec<usize> {
+        let mut roots = Vec::new();
+        for span in &self.active_jit_frame_spans {
+            let low = if (span.region_low..span.entry_anchor).contains(&live_sp) {
+                live_sp
+            } else {
+                span.region_low
+            };
+            crate::vm::jsstack::conservative_scan_jit_frame_span(low, span.entry_anchor, |word| {
+                // (a) the word DECODED as a boxed JSValue: its cell payload is the
+                // real arena address under either value encoding.
+                if let Some(cell) = RuntimeValue::from_encoded(EncodedJsValue(word)).as_cell() {
+                    if let Some(cp) = self.space.is_arena_cell_start(cell.pointer_payload_bits()) {
+                        roots.push(cp.addr());
+                    }
+                }
+                // (b) the RAW word as a candidate pointer (`genericAddPointer`):
+                // catches a raw cell pointer (e.g. the `callee` slot) under the
+                // faithful `s4_raw_cell` encoding; harmlessly rejected otherwise.
+                if let Some(cp) = self.space.is_arena_cell_start(word as usize) {
+                    roots.push(cp.addr());
+                }
+            });
+        }
+        roots
+    }
+
     /// gc-r4 R4b LIVE DRIVER (decision 6) — the cooperative deferred-safepoint
     /// collection. Called from the interpreter back-edge / VM-entry safepoint poll
     /// (`poll_register_root_safepoint_on_backedge`'s sibling), and ONLY from the
@@ -3473,6 +3571,18 @@ impl CoreObjectStore {
         let mut roots = self.gather_all_gc_roots(registers, stack, exceptions, heap);
         // Fold in the host-owned roots (the global lexical environment — gap #2).
         roots.extend_from_slice(host_roots);
+        // gc-r4 GAP C (A1.5): root cells held in ACTIVE baseline-JIT native-stack
+        // frames (the conservative scan). NO-OP when no JIT image is executing
+        // (`active_jit_frame_spans` empty) — today's only collecting path. `live_sp`
+        // is the machine SP at THIS safepoint: a JIT slow-path far-call (e.g.
+        // `operation_call` re-entering the interpreter) runs ON the JIT's native JS
+        // stack, so a stack local here lies in the current JIT region; it is JSC's
+        // `stackTop` bound for the innermost span (`MachineStackMarker.cpp:52`).
+        if !self.active_jit_frame_spans.is_empty() {
+            let sp_probe: usize = 0;
+            let live_sp = core::ptr::addr_of!(sp_probe) as usize;
+            roots.extend(self.conservative_jit_frame_roots(live_sp));
+        }
         let stats = self.force_collect(&roots);
         // Start a fresh allocation cycle (JSC resets `m_bytesAllocatedThisCycle`).
         self.space.reset_bytes_allocated_this_cycle();
@@ -11287,6 +11397,115 @@ mod r4b_sweep_tests {
             CorePropertyKind::Data(v) => assert_eq!(v, expected, "own data property round-trips"),
             other => panic!("expected a data property, got {other:?}"),
         }
+    }
+
+    /// gc-r4 GAP C (A1.5) THE SURVIVAL PROOF: a CELL held ONLY in a native
+    /// baseline-JIT CallFrame slot (no register-file / frame-header / intrinsic
+    /// precise root reaches it) SURVIVES a collection because the SCOPED
+    /// conservative scan of the active JIT-frame span roots it. The native-frame-
+    /// holds-cell scenario cannot yet be reached end-to-end (the native `op_call`
+    /// fast path is gated to cell-free arith), so this is the smallest SYNTHETIC
+    /// proof: a real JS-stack region with a known cell pointer at a known slot, the
+    /// store's active-span stack pushed (as `run_installed_baseline_jit` does), the
+    /// scan exercised, then collected — asserting survival + re-deref while an
+    /// off-stack control cell is reclaimed. Also proves the scan is a NO-OP with no
+    /// active span, and re-roots across a 2nd collection (the membership landmine).
+    #[test]
+    fn jit_frame_cell_survives_collection_via_conservative_scan() {
+        use crate::vm::jsstack::{JsStack, Register, REGISTER_SIZE_IN_BYTES};
+
+        let mut store = CoreObjectStore::default();
+
+        // A SURVIVOR object cell reachable ONLY through a native JIT frame slot, and
+        // an off-stack CONTROL cell nothing roots.
+        let survivor = obj(&mut store);
+        let control = obj(&mut store);
+        let survivor_addr = addr(survivor);
+        let control_addr = addr(control);
+
+        // Build the image's native JS stack and write the survivor's BOXED JSValue
+        // into the top register word — exactly what a baseline JIT CallFrame slot
+        // holds across a slow-path far-call.
+        let stack = JsStack::with_test_backing(64);
+        let slot = stack.high_address() - REGISTER_SIZE_IN_BYTES;
+        let live_sp = slot; // the machine SP would sit at/below the live slots
+        assert!(stack.write_slot(
+            slot,
+            Register::from_bits(survivor.as_cell().unwrap().encoded().0),
+        ));
+
+        // No active span yet -> the conservative scan is a NO-OP.
+        assert!(
+            store.conservative_jit_frame_roots(live_sp).is_empty(),
+            "scan is dormant with no active JIT span",
+        );
+
+        // Enter the JIT region (push the span, as run_installed_baseline_jit does).
+        store.push_active_jit_frame_span(stack.low_address(), stack.high_address());
+
+        // The scan ADMITS the survivor's cell-start address (membership + cell-
+        // start) and NOTHING off-stack.
+        let scanned = store.conservative_jit_frame_roots(live_sp);
+        assert!(
+            scanned.contains(&survivor_addr),
+            "the JIT-frame cell is admitted by the conservative scan",
+        );
+        assert!(
+            !scanned.contains(&control_addr),
+            "an off-stack cell is NOT admitted by the scan",
+        );
+
+        // Collect rooting the precise set (intrinsic prototypes, exactly as
+        // gather_all_gc_roots folds them) PLUS the conservatively-scanned JIT-frame
+        // roots — the survivor has NO precise root. It must SURVIVE; the control is
+        // swept.
+        let mut roots: Vec<usize> = store
+            .gather_intrinsic_roots()
+            .iter()
+            .filter_map(|v| v.as_cell().map(|c| c.pointer_payload_bits()))
+            .collect();
+        roots.extend(store.conservative_jit_frame_roots(live_sp));
+        let stats = store.force_collect(&roots);
+        assert!(
+            store.find(survivor).is_some() && store.is_value_marked(survivor),
+            "the JIT-frame cell survived the collection via the conservative scan",
+        );
+        assert!(
+            store.find(control).is_none(),
+            "the unrooted off-stack control cell was reclaimed",
+        );
+        assert!(stats.cells_reclaimed >= 1, "the control cell was reclaimed");
+
+        // Re-deref intact: write + read an own property through the survived cell.
+        store
+            .put_data_own(survivor, &ident(7), RuntimeValue::from_i32(99))
+            .unwrap();
+        reads_to(&store, survivor, 7, RuntimeValue::from_i32(99));
+
+        // A SECOND collection (the membership-gate landmine): #1's sweep cleared the
+        // survivor's `newlyAllocated`, so a liveness-gated marker would drop it. The
+        // conservative scan must re-root it via MEMBERSHIP.
+        let mut roots2: Vec<usize> = store
+            .gather_intrinsic_roots()
+            .iter()
+            .filter_map(|v| v.as_cell().map(|c| c.pointer_payload_bits()))
+            .collect();
+        roots2.extend(store.conservative_jit_frame_roots(live_sp));
+        store.force_collect(&roots2);
+        assert!(
+            store.find(survivor).is_some() && store.is_value_marked(survivor),
+            "the JIT-frame cell is retained across a 2nd collection (membership, not liveness)",
+        );
+
+        // Leaving the JIT region clears the span -> scan dormant again.
+        store.pop_active_jit_frame_span();
+        assert!(
+            store.conservative_jit_frame_roots(live_sp).is_empty(),
+            "scan is dormant again after leaving the JIT span",
+        );
+
+        // Keep the stack alive until here — its once-exposed words back the scan.
+        drop(stack);
     }
 
     /// THE HEADLINE TEST (gc-r4.md R4b VERIFY, ≥2 collections): an unrooted island (objects

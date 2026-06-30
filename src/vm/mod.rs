@@ -3382,6 +3382,17 @@ impl Vm {
         // edge handled below, or a panic — so each region restores exactly its
         // caller's view. The D1 `*mut Vm` is a per-call x0 argument, not a parked
         // slot, so it is already nesting-safe and is not carried by the guard.
+        // gc-r4 GAP C (A1.5): publish THIS image's native-stack frame region so a
+        // collection that fires while these JIT frames are live (a slow-path
+        // far-call reaching an interpreter safepoint) roots the cells they hold via
+        // the conservative scan. Pushed BEFORE entry, popped AFTER the call. A
+        // nested JIT entry (reached through the parked host) pushes/pops its own
+        // region (LIFO). The JIT entry trampoline is `extern "C"` — a Rust panic
+        // crossing it aborts — so `run` either returns (pop runs) or aborts (no
+        // stale-span window); the throw edge flows back as a VALUE via `jit_pending`,
+        // not an unwind, so the pop below always runs on it.
+        let (region_low, entry_anchor) = installed.frame_scan_bounds();
+        host.push_active_jit_frame_span(region_low, entry_anchor);
         let (returned_bits, pending) = {
             let mut region = ParkedJitCallRegion::enter(self, host, code_block);
             let vm_ptr_bits = region.vm() as *mut Vm as u64;
@@ -3389,6 +3400,7 @@ impl Vm {
             let pending = region.vm().jit_pending_exception();
             (returned_bits, pending)
         }; // `region` drops here: restores the caller's parked host/CodeBlock.
+        host.pop_active_jit_frame_span();
 
         // Restore the installed image for the next entry.
         if let Some(slot) = self.baseline_jit_slots.get_mut(&code_block_id) {

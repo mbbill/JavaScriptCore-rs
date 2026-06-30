@@ -24,7 +24,7 @@ use crate::gc::FxIntBuildHasher;
 use super::block_directory::BlockDirectory;
 use super::free_list::SweepResult;
 use super::marked_block::{
-    block_atoms_per_cell, block_for, block_start_atom, cell_ptr, clear_marks_block,
+    block_atoms_per_cell, block_for, block_start_atom, cell_ptr, clear_marks_block, is_atom,
     is_atom_aligned, is_live_cell, is_marked as marked_block_is_marked, round_up,
     test_and_set_marked, Cell, CellPtr, ATOMS_PER_BLOCK, ATOM_SIZE, CELL_BYTES, END_ATOM,
     HALF_ALIGNMENT, MARK_WORDS, PAYLOAD_BYTES, PRECISE_CUTOFF, SIZE_STEP,
@@ -656,6 +656,44 @@ impl MarkedSpace {
         }
         // NO is_live_cell — see the UAF landmine note above.
         Some(CellPtr::from_addr(addr))
+    }
+
+    /// MEMBERSHIP + CELL-START admission gate for the CONSERVATIVE native-stack
+    /// scan (gc-r4 GAP C — the A1.5 baseline-JIT-frame scan). This is
+    /// [`Self::is_arena_cell`] (membership, NOT liveness) PLUS the
+    /// `MarkedBlock::isAtom` cell-START check (`marked_block::is_atom`,
+    /// heap/MarkedBlock.h:664-676) that `is_arena_cell` deliberately DROPS for the
+    /// precise root path.
+    ///
+    /// WHY the extra check (the [`Self::is_arena_cell`] note demands it for a
+    /// conservative scanner): an object cell spans `ATOMS_PER_CELL` (=5) atoms, so
+    /// an atom-aligned address can land on an INTERIOR atom of a multi-atom cell.
+    /// `is_arena_cell` admits any atom-aligned in-block address as a cell start; a
+    /// scan that feeds a raw stack word through it could admit an interior atom and
+    /// the marker would deref non-cell-start bytes as a header. `isAtom` rejects
+    /// cell-middle pointers (`(atom - startAtom) % atomsPerCell == 0`), so only a
+    /// true cell start is admitted before any deref. Faithful to
+    /// `ConservativeRoots::genericAddPointer`, which resolves through
+    /// `cellAlign`/`isLiveCell` (cell-start aware) before marking
+    /// (heap/ConservativeRoots.cpp:167-177).
+    ///
+    /// MEMBERSHIP-only, never liveness — same #1 UAF landmine as `is_arena_cell`.
+    /// Conservative over-approximation (a non-cell word that happens to hit a live
+    /// cell start) is SAFE: it can only RETAIN, never free a live cell.
+    pub(crate) fn is_arena_cell_start(&self, addr: usize) -> Option<CellPtr> {
+        let cp = self.is_arena_cell(addr)?;
+        // A precise allocation is a single cell; precise_set membership already
+        // implies `addr` is its exact start (no interior atoms to reject).
+        if Self::is_precise(addr) {
+            return Some(cp);
+        }
+        // Block path: re-add the dropped cell-START check (`is_arena_cell` proved
+        // the block is registered, so the `isAtom` header deref is sound) before
+        // the marker may read this address as a `CoreObjectCell` header.
+        if !is_atom(addr) {
+            return None;
+        }
+        Some(cp)
     }
 
     /// COLLECTOR begin-marking: clear EVERY cell's mark bit so the upcoming mark

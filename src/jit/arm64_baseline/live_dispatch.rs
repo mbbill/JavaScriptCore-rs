@@ -241,6 +241,17 @@ mod platform {
     }
 
     impl InstalledBaselineFunction {
+        /// gc-r4 GAP C (A1.5): the `[region_low, entry_anchor]` bounds of THIS
+        /// image's native JS stack, for the conservative GC scan of its live JIT
+        /// CallFrame slots. `region_low` = the reservation's lowest allocatable
+        /// address (the PROT_NONE guard page is BELOW it, so the scan never faults);
+        /// `entry_anchor` = `highAddress()`, the top of the JIT-frame span where the
+        /// entry frame is seeded. `run_installed_baseline_jit` pushes this onto the
+        /// store's active-span stack around `run`.
+        pub(crate) fn frame_scan_bounds(&self) -> (usize, usize) {
+            (self.stack.low_address(), self.stack.high_address())
+        }
+
         /// `doVMEntry`-seed the callee `CallFrame` on the native JS stack (header +
         /// `this` + args + undefined-filled locals), then enter the image through
         /// the baseline-JIT entry trampoline with `sp = calleeFrame +

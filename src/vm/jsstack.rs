@@ -168,6 +168,56 @@ pub(crate) fn frame_slot_addr(fp: usize, operand: i32) -> Option<usize> {
     Some(addr as usize)
 }
 
+/// CONSERVATIVE native-stack span scan (gc-r4 GAP C — the A1.5 baseline-JIT-frame
+/// scan). Walk a native JS-stack span word-by-word, handing each 8-byte register
+/// word to `visit` UNINTERPRETED. This is the `ConservativeRoots::genericAddSpan`
+/// analog (`heap/ConservativeRoots.cpp:187-216`), reached from
+/// `MachineThreads::gatherFromCurrentThread` (`heap/MachineStackMarker.cpp:52`,
+/// `conservativeRoots.add(stackTop, stackOrigin, ...)`): JSC roots the machine
+/// stack by reading EVERY stack word and testing whether it points into the heap.
+///
+/// The collector (`CoreObjectStore::conservative_jit_frame_roots`) supplies the
+/// membership + cell-start gate (`MarkedSpace::is_arena_cell_start`) that decides
+/// which words are arena cells — the `genericAddPointer` half. Here the caller
+/// bounds `[low, high)` to the ACTIVE baseline-JIT frame region (`entry-anchor …
+/// sp`), so only JIT CallFrame slots are read, never the whole host thread stack
+/// (the deferred full GAP C).
+///
+/// SAFETY: `[low, high)` MUST bound a sub-range of a LIVE, once-exposed JS-stack
+/// reservation (an `InstalledBaselineFunction`'s [`JsStack`], alive for the whole
+/// scan). Reads recover pointers through that region's expose-once provenance gate
+/// (`with_exposed_provenance`, `precise_allocation.rs:77`) exactly like
+/// [`JsStack::read_slot`]. Only 8-aligned words fully inside `[low, high)` are
+/// read; the bounds are swapped if `low > high` (as `genericAddSpan` swaps
+/// `begin > end`) and the low end is aligned UP, so a malformed span reads
+/// nothing rather than touching out-of-range memory.
+pub(crate) fn conservative_scan_jit_frame_span(
+    low: usize,
+    high: usize,
+    mut visit: impl FnMut(u64),
+) {
+    let (lo, hi) = if low <= high {
+        (low, high)
+    } else {
+        (high, low)
+    };
+    // Align the low bound UP to the register grid; iterate `[begin, end)` word
+    // pointers (`genericAddSpan` walks `char** it` over the span).
+    let mut addr = (lo.wrapping_add(REGISTER_SIZE_IN_BYTES - 1)) & !(REGISTER_SIZE_IN_BYTES - 1);
+    while addr
+        .checked_add(REGISTER_SIZE_IN_BYTES)
+        .is_some_and(|end| end <= hi)
+    {
+        // SAFETY: `addr` is 8-aligned and `[addr, addr+8) ⊆ [low, high)`, which the
+        // caller guarantees lies in a live, once-exposed JS-stack reservation;
+        // recovering the pointer through the expose-once gate and reading 8 POD
+        // bytes is sound (identical to `read_slot`). No reference is formed.
+        let word = unsafe { ptr::read(ptr::with_exposed_provenance::<u64>(addr)) };
+        visit(word);
+        addr += REGISTER_SIZE_IN_BYTES;
+    }
+}
+
 // === Register (Register.h:45-106) ===
 
 /// `JSC::Register` (`Register.h:45-106`): one JS stack slot. A `union` over
