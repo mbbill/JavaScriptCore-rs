@@ -960,6 +960,98 @@ impl std::fmt::Debug for BaselineJitSlot {
     }
 }
 
+/// RAII save/restore guard for one baseline JIT-call parked-pointer region: the
+/// D5 `jit_host` + S3 `jit_code_block` slots (the D1 `*mut Vm` is a per-call x0
+/// argument, not a parked slot, so it is already nesting-safe and is NOT carried
+/// here). JSC has no analog — its `VM` owns heap+object-space as one unit, so there
+/// is no host pointer to park; this guard exists only because this engine SPLITS
+/// the host out of the `Vm` (see the `jit_host` field note) and must bridge it by a
+/// parked raw pointer for the call region. The end-state that unifies the host INTO
+/// the `Vm` dissolves both the parked host pointer and this guard.
+///
+/// WHY SAVE/RESTORE, not the former single-slot park: once `op_call` is admitted to
+/// the baseline allowlist a JIT'd function can ordinary-call another that tiers up
+/// and RE-ENTERS [`Vm::run_installed_baseline_jit`] — a NESTED parked region. A
+/// single slot would let the inner region clobber the OUTER region's parked
+/// host/CodeBlock, so on the outer native frame's return the slow-path bridge would
+/// reborrow a stale/null pointer — a silent release use-after-free. This guard makes
+/// nesting sound by construction: [`ParkedJitCallRegion::enter`] SAVES the caller's
+/// parked pointers and installs this region's; `Drop` RESTORES the caller's on
+/// EVERY exit path — normal return, the throw/unwind edge
+/// (`BaselineJitEntryOutcome::Threw`), an early return, or a panic — because `Drop`
+/// runs unconditionally. The outer-most region's saved values are null, so its
+/// restore is exactly the old `clear_jit_host`/`clear_jit_code_block`; a nested
+/// region restores its caller's live pointers instead.
+struct ParkedJitCallRegion<'a> {
+    vm: &'a mut Vm,
+    // The CALLER's parked pointers, restored on drop (null for the outer-most
+    // region). Raw pointers used ONLY for save/compare/restore — never dereferenced
+    // here (the slow-path shim is the single audited reborrow island).
+    saved_host: *mut CoreOpcodeDispatchHost,
+    saved_code_block: *const CodeBlock,
+    // What THIS region installed — the `Drop`-time balance check that any nested
+    // callee region left our parked pointers intact (it must have restored its own
+    // caller's view, i.e. ours, before returning).
+    parked_host: *mut CoreOpcodeDispatchHost,
+    parked_code_block: *const CodeBlock,
+}
+
+impl<'a> ParkedJitCallRegion<'a> {
+    /// Open a parked region: SAVE the caller's `(jit_host, jit_code_block)`, then
+    /// park THIS region's. The matching restore is the guard's `Drop`.
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    fn enter(vm: &'a mut Vm, host: &mut CoreOpcodeDispatchHost, code_block: &CodeBlock) -> Self {
+        let saved_host = vm.jit_host;
+        let saved_code_block = vm.jit_code_block;
+        vm.set_jit_host(host);
+        vm.set_jit_code_block(code_block as *const CodeBlock);
+        let parked_host = vm.jit_host;
+        let parked_code_block = vm.jit_code_block;
+        Self {
+            vm,
+            saved_host,
+            saved_code_block,
+            parked_host,
+            parked_code_block,
+        }
+    }
+
+    /// The parked `Vm`, by `&mut` so the region body threads the SAME `Vm` the guard
+    /// restores on exit (e.g. forms the `*mut Vm` passed in x0, reads the pending
+    /// exception after the call).
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    fn vm(&mut self) -> &mut Vm {
+        self.vm
+    }
+}
+
+impl Drop for ParkedJitCallRegion<'_> {
+    fn drop(&mut self) {
+        // Balance check: any nested callee region must have RESTORED our parked
+        // pointers before returning, so the slots still hold what THIS region
+        // installed. A mismatch means a nested region leaked its park (the very UAF
+        // this guard prevents) — fail loudly in debug. Raw-pointer compares only; no
+        // dereference.
+        debug_assert!(
+            self.vm.jit_host == self.parked_host
+                && self.vm.jit_code_block == self.parked_code_block,
+            "a nested baseline JIT-call region did not restore the outer parked \
+             host/CodeBlock before returning (parked-pointer save/restore imbalance)"
+        );
+        // Restore the CALLER's parked pointers (null for the outer-most region —
+        // equivalent to the old clear_jit_host/clear_jit_code_block epilogue; a live
+        // outer pointer for a nested region).
+        self.vm.jit_host = self.saved_host;
+        self.vm.jit_code_block = self.saved_code_block;
+    }
+}
+
 /// Engine instance and owner of heap-wide runtime state.
 #[derive(Debug)]
 pub struct Vm {
@@ -2555,29 +2647,23 @@ impl Vm {
     // ====================================================================
 
     /// D5: park the active `CoreOpcodeDispatchHost` as a raw pointer for the
-    /// JIT-call region. The driver (the op_add lowering's entry path; the test
-    /// plays this role today) calls this immediately BEFORE entering JIT code and
-    /// must hold the host's `&mut` DORMANT (no other access) until the matching
-    /// [`Vm::clear_jit_host`] after the call returns — the SAME parking discipline
-    /// as the `*mut Vm` (D1). Safe: storing a raw pointer is not `unsafe`; only the
-    /// shim's one reborrow (jit/operations.rs) is.
+    /// JIT-call region. The driver calls this immediately BEFORE entering JIT code
+    /// and must hold the host's `&mut` DORMANT (no other access) until the parked
+    /// region is RESTORED — the SAME parking discipline as the `*mut Vm` (D1). Safe:
+    /// storing a raw pointer is not `unsafe`; only the shim's one reborrow
+    /// (jit/operations.rs) is.
+    ///
+    /// PARKING DISCIPLINE (replaces the former INV-3 "no nesting" assert): the live
+    /// re-entrant path ([`Vm::run_installed_baseline_jit`]) opens every region
+    /// through [`ParkedJitCallRegion`], whose `enter` SAVES the caller's parked host
+    /// and whose `Drop` RESTORES it on EVERY region exit. So a NESTED region (op_call
+    /// -> callee tiers up -> re-enters this path) restores the outer parked host on
+    /// return instead of clobbering it — closing the old single-slot release
+    /// use-after-free. A nested `set` is now SOUND, so the former
+    /// `debug_assert!(jit_host.is_null())` is gone; the guard's `Drop` carries the
+    /// save/restore balance check instead. Direct, non-re-entrant callers (the
+    /// slow-path unit-test drivers) still park a single level and `clear_jit_host` it.
     pub fn set_jit_host(&mut self, host: &mut CoreOpcodeDispatchHost) {
-        // INV-3 (no nested parking): the parked-region depth must stay <= 1. A
-        // JIT-call region MUST be cleared (`clear_jit_host`, in
-        // `run_installed_baseline_jit`'s epilogue) before the next is opened, so the
-        // slot is null here on every legitimate (sequential, non-nested) park. A
-        // non-null slot means an OUTER region is still live and a re-entrant park
-        // would clobber its parked host — a SILENT release use-after-free of the
-        // outer host when the inner region clears. Today this cannot happen because
-        // the S4 baseline allowlist declines `op_call`, so a JIT'd function never
-        // ordinary-calls another and re-enters this path; the assert turns any future
-        // breach of that invariant (e.g. admitting `op_call`) into an immediate debug
-        // failure instead of UB.
-        debug_assert!(
-            self.jit_host.is_null(),
-            "nested JIT-call region would clobber the outer parked host (op_call must \
-             stay off the baseline allowlist, or this needs a save/restore stack)"
-        );
         self.jit_host = host;
     }
 
@@ -2597,22 +2683,17 @@ impl Vm {
     /// JIT-call region — the 3rd parked pointer on the same audited reborrow island
     /// as [`Vm::set_jit_host`] (D5) / the `*mut Vm` (D1). The driver calls this
     /// immediately BEFORE entering JIT code and holds the `&CodeBlock` DORMANT (no
-    /// other access) until the matching [`Vm::clear_jit_code_block`] after the call
-    /// returns. Safe: storing a raw pointer is not `unsafe`; only the bridge's one
-    /// reborrow (`operation_value_binary`/`operation_compare_relational`) is.
+    /// other access) until the parked region is RESTORED. Safe: storing a raw
+    /// pointer is not `unsafe`; only the bridge's one reborrow
+    /// (`operation_value_binary`/`operation_compare_relational`) is.
+    ///
+    /// PARKING DISCIPLINE (symmetric to [`Vm::set_jit_host`]): the live re-entrant
+    /// path opens each region through [`ParkedJitCallRegion`], which SAVES the
+    /// caller's parked CodeBlock and RESTORES it on region exit, so a nested region
+    /// no longer clobbers the outer parked CodeBlock. The former
+    /// `debug_assert!(jit_code_block.is_null())` is gone; the guard's `Drop` carries
+    /// the balance check.
     pub fn set_jit_code_block(&mut self, code_block: *const CodeBlock) {
-        // INV-3 (no nested parking), the symmetric guard to `set_jit_host`: the
-        // active-CodeBlock slot must be cleared (`clear_jit_code_block`) before the
-        // next JIT-call region opens, so it is null here on every legitimate
-        // sequential park. A non-null slot means a nested region would clobber the
-        // outer parked CodeBlock (the source `&CodeBlock` the bridge reborrows),
-        // silently dangling it in release. Same load-bearing precondition: `op_call`
-        // stays off the S4 baseline allowlist.
-        debug_assert!(
-            self.jit_code_block.is_null(),
-            "nested JIT-call region would clobber the outer parked CodeBlock (op_call \
-             must stay off the baseline allowlist, or this needs a save/restore stack)"
-        );
         self.jit_code_block = code_block;
     }
 
@@ -3225,18 +3306,27 @@ impl Vm {
             None => return BaselineJitEntryOutcome::NotTieredUp,
         };
 
-        // Park the 3 raw pointers (D1/D5/S3). The `*mut Vm` is passed in x0 (arg0)
-        // and moved into the pinned-VM register x19 by the emitted prologue. Hold
-        // the parked `&mut self` DORMANT for the call (the slow-path shim reborrows
-        // it exactly once); pass the VM as a raw `u64` so Rust sees no `self` borrow
-        // across the call.
-        self.set_jit_host(host);
-        self.set_jit_code_block(code_block as *const CodeBlock);
-        let vm_ptr_bits = self as *mut Vm as u64;
-        let returned_bits = installed.run(vm_ptr_bits, arguments_including_this);
-        let pending = self.jit_pending_exception();
-        self.clear_jit_code_block();
-        self.clear_jit_host();
+        // Park the D5 host + S3 CodeBlock under a recursion-local SAVE/RESTORE guard,
+        // and pass the D1 `*mut Vm` in x0 (arg0) — moved into the pinned-VM register
+        // x19 by the emitted prologue. Hold the parked `&mut self` DORMANT for the
+        // call (the slow-path shim reborrows it exactly once); pass the VM as a raw
+        // `u64` so Rust sees no `self` borrow across the call.
+        //
+        // SAVE/RESTORE (not the former single-slot park): a NESTED call — op_call ->
+        // callee tiers up -> re-enters here — must not clobber the OUTER region's
+        // parked host/CodeBlock. `ParkedJitCallRegion::enter` SAVES the caller's
+        // parked pointers and installs this region's; its `Drop` (the end of the
+        // block below) RESTORES them on EVERY exit — the normal return, the throw
+        // edge handled below, or a panic — so each region restores exactly its
+        // caller's view. The D1 `*mut Vm` is a per-call x0 argument, not a parked
+        // slot, so it is already nesting-safe and is not carried by the guard.
+        let (returned_bits, pending) = {
+            let mut region = ParkedJitCallRegion::enter(self, host, code_block);
+            let vm_ptr_bits = region.vm() as *mut Vm as u64;
+            let returned_bits = installed.run(vm_ptr_bits, arguments_including_this);
+            let pending = region.vm().jit_pending_exception();
+            (returned_bits, pending)
+        }; // `region` drops here: restores the caller's parked host/CodeBlock.
 
         // Restore the installed image for the next entry.
         if let Some(slot) = self.baseline_jit_slots.get_mut(&code_block_id) {
@@ -22022,6 +22112,86 @@ mod tests {
             vm.jit_pending_exception().0,
             0,
             "the object-operand add must not throw",
+        );
+    }
+
+    // op_call PARKING (vm/mod.rs `ParkedJitCallRegion`): prove the recursion-local
+    // SAVE/RESTORE makes a NESTED baseline JIT-call region sound — the corrected
+    // single-slot UAF. In the live flow an op_call'd callee tiers up and RE-ENTERS
+    // `run_installed_baseline_jit` THROUGH the slow-path shim's `&mut *vm` reborrow
+    // of the parked `*mut Vm`, opening an INNER parked region while the OUTER one is
+    // dormant. This models that exact reborrow chain WITHOUT native code (the guard's
+    // save/restore is pure safe Rust): region A parks, then via a raw-pointer reborrow
+    // of the Vm (the shim's move) region B parks + restores; A's parked host/CodeBlock
+    // must be INTACT after B returns, and not-in-JIT after A returns. A single-slot
+    // park would leave A holding B's (freed) pointers on return — the UAF. Ungated +
+    // a Miri target (no native code), the same lane as the object-operand reentry test:
+    //   MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-tree-borrows" \
+    //     cargo +nightly miri test --lib \
+    //     vm::tests::nested_baseline_jit_call_region_save_restore_preserves_outer_park
+    #[test]
+    fn nested_baseline_jit_call_region_save_restore_preserves_outer_park() {
+        // Two DISTINCT hosts + CodeBlocks so the outer (A) and inner (B) parked
+        // pointers differ — a restore that confused them would be caught by the
+        // address compares below.
+        let mut host_a = CoreOpcodeDispatchHost::new();
+        let mut host_b = CoreOpcodeDispatchHost::new();
+        let cb_a = p6_int32_return_42_code_block();
+        let cb_b = p6_int32_return_42_code_block();
+
+        // S7: pin the Vm at a stable address (Box), the discipline the live path
+        // requires. Not-in-JIT to start — the outer-most region's saved value.
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::interpreter_only()));
+        assert!(vm.jit_host_ptr().is_null());
+        assert!(vm.jit_code_block_ptr().is_null());
+
+        {
+            // Outer region A parks host_a + cb_a.
+            let mut region_a = ParkedJitCallRegion::enter(&mut vm, &mut host_a, &cb_a);
+            let a_host = region_a.vm().jit_host_ptr();
+            let a_code_block = region_a.vm().jit_code_block_ptr();
+            assert!(!a_host.is_null(), "A parked a host");
+            assert!(!a_code_block.is_null(), "A parked a CodeBlock");
+
+            {
+                // The re-entry: the slow-path shim reborrows `&mut *vm` from the
+                // parked `*mut Vm`, and the callee's `run_installed_baseline_jit`
+                // opens region B from THAT borrow. Mirror that exact reborrow chain
+                // (A's `&mut Vm` stays DORMANT across it — the parking discipline).
+                let vm_ptr: *mut Vm = region_a.vm();
+                let vm_reentrant: &mut Vm = unsafe { &mut *vm_ptr };
+                let mut region_b = ParkedJitCallRegion::enter(vm_reentrant, &mut host_b, &cb_b);
+                let b_host = region_b.vm().jit_host_ptr();
+                let b_code_block = region_b.vm().jit_code_block_ptr();
+                assert!(!b_host.is_null(), "B parked its own host");
+                assert_ne!(b_host, a_host, "B's parked host is distinct from A's");
+                assert_ne!(
+                    b_code_block, a_code_block,
+                    "B's parked CodeBlock is distinct from A's",
+                );
+            } // region_b drops -> restores A's parked pointers.
+
+            // Back in A: the inner region restored A's view EXACTLY (not B's, not
+            // null). A single-slot park would have left B's now-dead pointers here.
+            assert_eq!(
+                region_a.vm().jit_host_ptr(),
+                a_host,
+                "B's drop restored A's parked host (no clobber)",
+            );
+            assert_eq!(
+                region_a.vm().jit_code_block_ptr(),
+                a_code_block,
+                "B's drop restored A's parked CodeBlock (no clobber)",
+            );
+        } // region_a drops -> restores the outer-most not-in-JIT (null).
+
+        assert!(
+            vm.jit_host_ptr().is_null(),
+            "the outer-most region restored not-in-JIT (null host)",
+        );
+        assert!(
+            vm.jit_code_block_ptr().is_null(),
+            "the outer-most region restored not-in-JIT (null CodeBlock)",
         );
     }
 
