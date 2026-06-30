@@ -103,3 +103,19 @@ emitted-offset change) so it doesn't calcify into the rejected private-register-
   entry request is produced from the SEEDING path (`try_seed_entry_frame` positions the arena `CallFrame`)
   routed through it. The proof layer (`vm/arm64_native_entry/jsc_stack_dispatch.rs`) is subordinated to a test.
 - B5 overlapping-arg timing (copy-first vs true overlap + CallFrameShuffler).
+- **⚠ STACK-OWNERSHIP FORK — B5 Path-B PAUSED 2026-06-29 (foundational; judge-panel in progress).**
+  The B5 Path-B sp-switch (sp = the JS arena) reroutes EVERY slow-path far-call onto that arena, but
+  `operation_call` re-enters the FULL interpreter as FAT Rust recursion (operations.rs:391 → vm/mod.rs:3167
+  → execute_function_value); the arenas are tiny (per-function `JsStack::new(total*8)` ≈ one page;
+  tests use `with_test_backing(64)` = 512 B), so it overflows → breaks the far-calling gate tests
+  (compare/jfalse/get/put/op_call). Path A works ONLY because sp stays the native 8 MB stack. ROOT
+  DIVERGENCE: the Rust interpreter runs on the NATIVE stack with fat frames per JS call, while the JIT
+  register window is a SEPARATE mmap arena — two stacks where JSC has one (native machine stack = JS stack;
+  `doVMEntry` builds frames below native sp). Far-call macro `far_call` (macro_assembler_arm64.rs:836) does
+  NO sp save/switch. OPTIONS under evaluation: (A) native-stack JS frames (JSC-faithful; retire/repurpose
+  the arena; interpreter→native CallFrames; large blast radius); (B) unified full-size (~5MB) arena =
+  the JS stack + sp-switch + a native-stack BOUNCE around fat-Rust far-calls (transition; converge to
+  interpreter-on-arena); (C) rewrite the interpreter as an LLInt-faithful dispatch loop on the arena
+  (deepest; the eventual convergence for A/B); (D) decoupled — sp stays NATIVE (full headroom, no bounce),
+  register windows in the arena (x29), native calls via `bl` + caller-allocated arena window + `mov x29,<win>`
+  prologue (FP-chain arena / SP-chain native split). Decide via judge panel before any prologue flip.
