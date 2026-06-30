@@ -67,7 +67,24 @@ analog). Drive it with the existing `src/gc/weak.rs` vocabulary (`WeakSlotState`
 
 ## Fan-out (dependency order; parallel-safe vs serial)
 
-- **U0 [SERIAL, gate, no-behavior-change]** — type-dispatched `visitChildren` in marker + reconcile (SD-2).
+- **U0 [SERIAL, gate, no-behavior-change] — LANDED (8c17a9b)** — type-dispatched `visitChildren` in marker
+  + reconcile (SD-2): the COLLECTOR side.
+- **U0b [SERIAL, gate, no-behavior-change] — RATIFIED 2026-06-29 (the MUTATOR side; precondition for ALL
+  leaf cells)** — restore the `isObject()` discriminator on the object-resolution deref islands. Today
+  `cell_at`/`with_cell_mut` (object_store.rs:9332/9361) hard-cast every `MarkedSpace::find`-admitted cell to
+  `CoreObjectCell` with only a DEBUG assert; that is safe ONLY because leaf cells are out-of-arena Boxes.
+  The instant a leaf cell enters `space`, `find(leaf)` returns Some → the ~53 `find(value)`-as-"is-object?"
+  predicate sites in interpreter/mod.rs mass-misclassify it as an object (type-confusion UB). FIX (faithful
+  to JSC `HeapUtil::isPointerGCObjectJSCell` admits ANY JSCell, THEN `JSCell::isObject()` = `type>=ObjectType`,
+  HeapUtil.h:51 + JSCell.h:131 + JSTypeInfo.h:88 — the Rust port COLLAPSED the two): after `space.find`, return
+  `None` unless `js_type.is_object()`, on `cell_at` + `with_cell_mut` (find/find_by_object_id inherit it).
+  No behavior change today (arena is all-object → gate always true); contained to 2 deref islands; U2/U3 share it.
+- **ARENA OWNERSHIP — RATIFIED: ONE shared arena.** Leaf cells allocate into the SAME `MarkedSpace` (faithful
+  to JSC's single-Heap/multi-subspace model; matches U0's on-`CoreObjectStore` dispatch). Each store keeps only
+  its out-of-line payload slab + interning maps; the cell (header) goes in the shared arena (identity = arena
+  address). Reject a per-store second `MarkedSpace` (diverges from single-Heap; duplicates the collector). The
+  `MarkedSpace` is conceptually "the Heap" (currently housed in `CoreObjectStore`); extracting an explicit Heap
+  is a low-entrenchment future structural step, not required now (cell identity is the arena address regardless).
 - After U0, parallel (isolated worktrees): **U1** String cell rep + `string_texts` slab; **U2** Symbol cell
   rep (+ registry/well_known roots); **U3** BigInt cell rep (drop `by_value`); **U4** `trace_string_cell`
   rope edge (coordinate with U0's dispatch hook).
