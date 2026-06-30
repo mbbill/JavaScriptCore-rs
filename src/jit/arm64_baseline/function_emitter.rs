@@ -78,8 +78,8 @@ use crate::bytecode::BytecodeIndex;
 use crate::bytecode::{CodeBlock, CoreOpcode, InstructionDecodeError, OperandAccessError};
 use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
 use crate::jit::operations::{
-    operation_compare_greater, operation_compare_less, operation_compare_lesseq,
-    operation_get_by_val, operation_jfalse, operation_put_by_val,
+    operation_call, operation_compare_greater, operation_compare_less, operation_compare_lesseq,
+    operation_get_by_val, operation_jfalse, operation_put_by_val, MAX_REGISTER_CALL_ARGS,
 };
 use crate::value::{JsValue, NUMBER_TAG};
 
@@ -124,6 +124,19 @@ const SCRATCH_GPR_B: RegisterID = RegisterID::X4;
 /// Holds the `TrustedImm32(1)` LSB mask for the op_jfalse boolean test.
 const BOOL_MASK_GPR: RegisterID = RegisterID::X5;
 
+/// The AAPCS64 integer/pointer argument registers `x3..x7` the `op_call` lowering
+/// loads the boxed call arguments into (`x0`=vm, `x1`=callee, `x2`=argc are the
+/// preceding three; see [`crate::jit::operations::operation_call`]). Indexed by the
+/// op_call argument position (0-based, EXCLUDING `this`); the emitter declines a call
+/// site whose arity exceeds `MAX_REGISTER_CALL_ARGS == CALL_ARG_GPRS.len()`.
+const CALL_ARG_GPRS: [RegisterID; MAX_REGISTER_CALL_ARGS] = [
+    RegisterID::X3,
+    RegisterID::X4,
+    RegisterID::X5,
+    RegisterID::X6,
+    RegisterID::X7,
+];
+
 /// `AssemblyHelpers::addressFor(VirtualRegister) = Address(x29, vreg.offset()*8)`
 /// (AssemblyHelpers.h:1290-1298). The operand IS the VirtualRegister's raw value.
 fn address_for(operand: i32) -> Address {
@@ -164,6 +177,11 @@ pub(crate) enum EmitFunctionError {
     /// stream (or an unlabeled index). A malformed/unsupported stream is REJECTED
     /// (the S4 gate's safe-by-rejection posture), never linked against a panic.
     InvalidBranchTarget { target_bci: usize },
+    /// An `op_call` site has more explicit arguments than the B5-first-cut
+    /// register-passing ABI carries (`MAX_REGISTER_CALL_ARGS`). DECLINED so the
+    /// CodeBlock stays in the interpreter (the S4 gate); the general arity arrives
+    /// with the native direct-link (B5-full).
+    UnsupportedCallArity { argc: u32 },
     /// The CodeBlock has no instructions.
     EmptyFunction,
 }
@@ -409,6 +427,59 @@ impl FunctionEmitter {
         // throw) stamps the mirror; branch to the shared exception stub. `SCRATCH_GPR`
         // (the value arg, now consumed) is reused by the probe.
         self.emit_exception_probe();
+    }
+
+    /// op_call (`JIT::compileOpCall` / `emit_op_call`, jit/JITCall.cpp) — the
+    /// B5-FIRST-CUT UNLINKED VIRTUAL CALL. The boxed callee + each boxed argument live
+    /// in the JIT caller's frame at the op_call operands' VirtualRegister slots; this
+    /// reads them cfr-relative (in operand order) into the C-ABI argument registers
+    /// and far-calls the `operation_call` slow path, which runs the callee through the
+    /// faithful generic dispatch (`Vm::operation_call` -> `execute_function_value`).
+    /// Probes the `m_exception` mirror (D3) for the throw edge, then stores the boxed
+    /// result to `dst`. Falls through to the next bytecode.
+    ///
+    /// `args` are the explicit-argument slots in op_call operand order (operands
+    /// `3..3+argc`, EXCLUDING `this` — op_call's implicit receiver is `undefined`,
+    /// supplied by `operation_call`). The register ABI is `x0`=vm, `x1`=callee,
+    /// `x2`=argc, `x3..x7`=arg0..arg4 (`CALL_ARG_GPRS`); the caller has already
+    /// verified `args.len() <= MAX_REGISTER_CALL_ARGS`.
+    ///
+    /// DIVERGENCE from JSC (B5-first-cut, the native-call follow-up): JSC sets up the
+    /// callee `CallFrame` on the stack (storing callee/argc into its header, the args
+    /// already laid out by the caller) and emits a LINKED `bl` to the callee — every
+    /// site starts as an unlinked `virtualThunk` far-call and is PATCHED to a direct
+    /// `bl` on first execution (`linkFor`). This first cut emits only the unlinked
+    /// far-call to `operation_call` (which runs the callee INTERPRETED), passing the
+    /// already-boxed arguments by value in registers rather than building a stack
+    /// callee frame; the native direct-link / arity stub / bl-chain is the deferred
+    /// B5-full perf follow-up.
+    fn emit_op_call(&mut self, dst: i32, callee: i32, args: &[i32]) {
+        debug_assert!(
+            args.len() <= MAX_REGISTER_CALL_ARGS,
+            "op_call arity must be gated to MAX_REGISTER_CALL_ARGS before lowering"
+        );
+        // Load each boxed argument cfr-relative into its argument register (x3..).
+        // Done BEFORE materializing x0/x1/x2 so no argument source is clobbered (the
+        // sources are all cfr-relative memory; the destinations x3..x7 are distinct
+        // from the callee/argc/vm registers x1/x2/x0).
+        for (arg_index, &arg_slot) in args.iter().enumerate() {
+            self.h
+                .masm_mut()
+                .load64(address_for(arg_slot), CALL_ARG_GPRS[arg_index]);
+        }
+        self.h.masm_mut().load64(address_for(callee), LEFT_GPR); // x1 = callee (boxed)
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(args.len() as i32), RIGHT_GPR); // x2 = argc
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+        self.h
+            .masm_mut()
+            .far_call(TrustedImm64::new(operation_call as usize as i64));
+        // D3 throw edge: the callee threw (or a non-callable callee's TypeError)
+        // stamps the mirror; branch to the shared exception stub BEFORE storing the
+        // empty result. The probe reuses SCRATCH_GPR; x0 (the boxed result) is intact.
+        self.emit_exception_probe();
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst)); // dst = x0 (boxed result)
     }
 
     /// The FUSED int32 compare-and-branch (`emit_op_jless` via `emit_compareAndJump`,
@@ -844,6 +915,27 @@ pub(crate) fn emit_baseline_function(
                 let key = frame_slot(decoded.register_operand(1)?)?;
                 let value = frame_slot(decoded.register_operand(2)?)?;
                 emitter.emit_put_by_val(base, key, value);
+            }
+            // op_call — the B5-first-cut UNLINKED VIRTUAL CALL. Operand order matches
+            // the interpreter's `dispatch_call` and the bytecompiler's `emit_call`
+            // (bytecompiler/mod.rs:5182-5192): operand 0 = dst, operand 1 = callee,
+            // operand 2 = argc (UnsignedImmediate, EXCLUDING `this`), operands
+            // 3..3+argc = the explicit-argument registers. A wrong mapping here would
+            // hand the callee the wrong arguments (a silent wrong-answer), so this
+            // mirrors `dispatch_call` exactly. Arity beyond the register ABI is
+            // DECLINED (S4 gate) so the function stays interpreted.
+            CoreOpcode::Call => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let callee = frame_slot(decoded.register_operand(1)?)?;
+                let argc = decoded.unsigned_immediate_operand(2)?;
+                if argc as usize > MAX_REGISTER_CALL_ARGS {
+                    return Err(EmitFunctionError::UnsupportedCallArity { argc });
+                }
+                let mut args = Vec::with_capacity(argc as usize);
+                for arg_index in 0..argc as usize {
+                    args.push(frame_slot(decoded.register_operand(3 + arg_index)?)?);
+                }
+                emitter.emit_op_call(dst, callee, &args);
             }
             // op_loop_hint is a tier-up/OSR marker with no value effect (the
             // interpreter treats it as Continue); emit nothing, fall through.

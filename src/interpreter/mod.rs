@@ -9941,6 +9941,36 @@ impl CoreOpcodeDispatchHost {
         self.put_property_value(state, base, &key, value)
     }
 
+    /// op_call slow-path funnel — the UNLINKED VIRTUAL CALL (JSC's
+    /// `operationVirtualCall` / the unlinked `virtualThunk` path, jit/CallLinkInfo +
+    /// jit/ThunkGenerators.cpp `virtualThunkFor`): every baseline call site starts
+    /// UNLINKED and routes the callee value through the faithful generic dispatch.
+    /// `execute_function_value` IS that dispatch — it resolves the callee value
+    /// (proxy / bound-function / native / bytecode), runs `this` normalization +
+    /// arity fill, pushes the callee frame into the LIVE register arena, and runs the
+    /// callee to completion — exactly the work the interpreter's `dispatch_call`
+    /// performs, minus the caller-window/instruction plumbing (the boxed
+    /// `callee`/`this`/`arguments` arrive already decoded from the JIT caller's
+    /// frame). `this` is `undefined` (op_call's implicit receiver,
+    /// `CallObservationThisSource::ImplicitUndefined`).
+    ///
+    /// DIVERGENCE (B5-first-cut, also documented at the emitter + the
+    /// `Vm::operation_call` wrapper): the callee runs through its INTERPRETER entry
+    /// here — it does NOT tier-up-from-the-JIT-caller and there is no emitted native
+    /// direct-link / bl-chain / arity stub yet. That native call linking is the
+    /// deferred B5-full perf follow-up; this first cut establishes the CORRECT call
+    /// semantics (faithful to an unlinked site whose first execution enters the
+    /// callee through its lower tier).
+    pub(crate) fn jit_call_function_value(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        callee: RuntimeValue,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        self.execute_function_value(state, callee, this_value, arguments)
+    }
+
     fn get_property_value_with_completion(
         &mut self,
         state: &mut DispatchState<'_>,

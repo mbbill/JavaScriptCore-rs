@@ -357,6 +357,78 @@ pub extern "C" fn operation_put_by_val(vm: *mut Vm, base: u64, prop: u64, value:
     }
 }
 
+/// The maximum number of explicit call arguments (EXCLUDING `this`) the baseline
+/// `op_call` lowering passes to [`operation_call`] in registers. The AAPCS64
+/// integer/pointer argument registers are `x0..x7` (8 total); this shim consumes
+/// `x0`=vm, `x1`=callee, `x2`=argc, leaving `x3..x7` for up to 5 boxed arguments.
+/// A call site with more arguments is DECLINED by the emitter's S4 allowlist gate
+/// (`EmitFunctionError::UnsupportedCallArity`) and stays in the interpreter, so the
+/// shim is only ever reached with `argc <= MAX_REGISTER_CALL_ARGS`.
+///
+/// DIVERGENCE (B5-first-cut): JSC builds the callee frame's argument area on the
+/// stack and passes a `CallFrame*`, supporting any arity. This first cut passes the
+/// already-boxed arguments by value in registers and bounds the arity; the general
+/// stack-built outgoing-argument area arrives with the native direct-link (B5-full).
+pub(crate) const MAX_REGISTER_CALL_ARGS: usize = 5;
+
+/// `operationVirtualCall`-family analog (JITOperations.cpp / the unlinked
+/// `virtualThunk` path): the baseline `op_call` slow-call shim. The emitted lowering
+/// (`arm64_baseline/function_emitter.rs::emit_op_call`) reads the boxed callee +
+/// each boxed argument cfr-relative from the JIT caller's frame (in the op_call
+/// operand order), loads `x1`=callee, `x2`=argc, `x3..x7`=arg0..arg4, sets `x0`=the
+/// pinned `*mut Vm`, and far-calls this shim. It reborrows `&mut *vm` (D1) and
+/// `&mut *host` (D5) — the SAME reborrow island the arith/get/put families compose
+/// (see the module SAFETY note) — and runs the UNLINKED VIRTUAL CALL
+/// (`Vm::operation_call` -> `execute_function_value`), returning the boxed result, or
+/// — on throw (the callee threw, or a non-callable callee's TypeError) — stamping the
+/// JIT `m_exception` mirror (D3) and returning `JSValue::empty()` bits (the caller's
+/// post-call exception probe branches on the mirror word).
+///
+/// `extern "C"` is load-bearing (the C-ABI the far-call expects). `argc` is the
+/// op_call argument count EXCLUDING `this`; `this` is `undefined` (op_call's
+/// implicit receiver) and is supplied by `Vm::operation_call`, not passed here.
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn operation_call(
+    vm: *mut Vm,
+    callee: u64,
+    argc: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+) -> u64 {
+    // D1 + D5 reborrows — see the module SAFETY note. Exactly one `&mut *vm` and one
+    // `&mut *host`, both dropped before returning to JIT code.
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let callee = JsValue::from_encoded(EncodedJsValue(callee));
+    // The emitter never emits a far-call to this shim with argc > MAX_REGISTER_CALL_ARGS
+    // (the S4 arity gate declines such a CodeBlock). Clamp defensively so a malformed
+    // argc can never index past the register slots.
+    let argc = (argc as usize).min(MAX_REGISTER_CALL_ARGS);
+    let raw_args = [arg0, arg1, arg2, arg3, arg4];
+    let mut arguments = [JsValue::undefined(); MAX_REGISTER_CALL_ARGS];
+    for (slot, &bits) in arguments.iter_mut().zip(raw_args.iter()).take(argc) {
+        *slot = JsValue::from_encoded(EncodedJsValue(bits));
+    }
+
+    match vm.operation_call(host, callee, &arguments[..argc]) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

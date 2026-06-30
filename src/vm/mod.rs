@@ -3142,6 +3142,68 @@ impl Vm {
         }
     }
 
+    /// `operationVirtualCall`-family analog (JITOperations.cpp / the unlinked
+    /// `virtualThunk` path): the SAFE wrapper the baseline `op_call` slow-call shim
+    /// (`jit::operations::operation_call`) calls. The boxed `callee` and the boxed
+    /// `arguments` (EXCLUDING `this`) were read cfr-relative from the JIT caller's
+    /// frame by the emitted lowering, in the op_call operand order; `this` is
+    /// `undefined` (op_call's implicit receiver). Runs the UNLINKED VIRTUAL CALL via
+    /// the host's faithful generic dispatch (`jit_call_function_value` ->
+    /// `execute_function_value`: callee resolution, `this`-normalization, arity fill,
+    /// callee-frame push into the LIVE arena, and callee execution), returning the
+    /// boxed result or — on throw — the pending exception's `EncodedJsValue`.
+    ///
+    /// Borrow/region shape is identical to [`Self::operation_get_by_val`]: the parked
+    /// active `CodeBlock` (S3) backs the caller-context `DispatchState`, `host` is the
+    /// reborrowed parked dispatch host (D5, a DISJOINT allocation), and the four
+    /// `DispatchState` inputs are disjoint `self` fields. The callee frame is pushed
+    /// onto `self.execution` (the live arena) ON TOP of the JIT caller's live frame —
+    /// the B4 arena push — so it requires an active VM entry, exactly as the
+    /// interpreter's nested calls do.
+    ///
+    /// DIVERGENCE (B5-first-cut): the callee runs INTERPRETED (see
+    /// `jit_call_function_value`); the native direct-link / bl-chain is the deferred
+    /// B5-full perf follow-up.
+    pub fn operation_call(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        callee: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        // V1a (S3): build the caller-context `DispatchState` over the REAL active
+        // CodeBlock the driver parked (`set_jit_code_block`); a fresh placeholder only
+        // if none is parked (the direct unit-test driver). See `operation_value_binary`.
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let outcome = {
+            // SAFETY: as `operation_value_binary` — one dormant-parent `&CodeBlock`,
+            // disjoint from the `&mut self.*` field borrows, not outliving this call.
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            let mut state = DispatchState {
+                stack: &mut self.execution,
+                registers: &mut self.registers,
+                exceptions: &mut self.exceptions,
+                heap: &mut self.heap,
+                code_block,
+                ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+                function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+            };
+            host.jit_call_function_value(&mut state, callee, RuntimeValue::undefined(), arguments)
+        };
+        match outcome {
+            Ok(value) => Ok(value),
+            // A materialized JS throw value (the callee threw, or a non-callable
+            // callee's TypeError) is surfaced FAITHFULLY as its `EncodedJSValue`.
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            // Any other engine-level error IS a JS error: materialize the faithful
+            // error cell (== what `VM::m_exception` would hold), as in
+            // `operation_value_binary`/`operation_get_by_val`.
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
     /// D3: read the JIT m_exception mirror word (`VM::exception()` analog).
     pub fn jit_pending_exception(&self) -> EncodedJsValue {
         self.exceptions.jit_pending()
@@ -3392,10 +3454,10 @@ impl Vm {
             BaselineJitEntryOutcome::NotTieredUp => None,
             BaselineJitEntryOutcome::Returned(value) => Some(ExecutionCompletion::Returned(value)),
             BaselineJitEntryOutcome::Threw(bits) => {
-                // The S4 allowlist admits only pure int32 arith, which cannot throw, so
-                // this edge is effectively unreachable; surface it faithfully anyway —
-                // set the VM pending exception (what the interpreter unwind path reads)
-                // and return a Threw completion.
+                // The Threw edge is REACHABLE now that the allowlist admits op_call (a
+                // callee can throw) + typed-array get/put_by_val + the slow-call arith
+                // edges. Surface it faithfully: set the VM pending exception (what the
+                // interpreter unwind path reads) and return a Threw completion.
                 let value = crate::value::JsValue::from_encoded(bits);
                 self.exceptions.throw(value);
                 Some(ExecutionCompletion::Threw(PendingException { value }))
@@ -22227,6 +22289,711 @@ mod tests {
         assert!(
             vm.jit_code_block_ptr().is_null(),
             "the outer-most region restored not-in-JIT (null CodeBlock)",
+        );
+    }
+
+    // ====================================================================
+    // op_call B5-FIRST-CUT (the UNLINKED VIRTUAL CALL): `Vm::operation_call` +
+    // the `operation_call` shim + the `emit_op_call` lowering. The callee runs
+    // INTERPRETED through `execute_function_value` (the native direct-link is the
+    // deferred B5-full); these tests prove the CORRECT call semantics.
+    // ====================================================================
+
+    // A CodeKind::Function CodeBlock (generous frame) for an op_call callee/caller in
+    // the tests below, run INTERPRETED via `execute_function_value`.
+    fn op_call_test_function_code_block(
+        instructions: Vec<TypedInstruction>,
+        num_parameters_including_this: u32,
+    ) -> CodeBlock {
+        CodeBlock::from_unlinked(
+            UnlinkedCodeBlock::new(
+                CodeKind::Function,
+                PackedInstructionStream::from_typed_placeholder(instructions),
+            )
+            .with_frame(RegisterFrameShape {
+                num_parameters_including_this,
+                num_vars: 16,
+                num_callee_locals: 16,
+                num_temporaries: 0,
+                special: Default::default(),
+            }),
+            LinkContext::default(),
+        )
+        .with_entrypoints(CodeBlockEntrypoints {
+            interpreter: Some(InterpreterEntrySlot(0)),
+            ..CodeBlockEntrypoints::default()
+        })
+        .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    // g(x) = x * 2 (USES its argument, so a wrong arg→slot mapping is caught).
+    fn op_call_callee_double_x() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(0)), Operand::SignedImmediate(2)],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::MulInt32,
+                    vec![
+                        Operand::Register(local(1)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::Register(local(0)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(1))],
+                ),
+            ],
+            2,
+        )
+    }
+
+    // g(x) = x + 0.5 (a BOXED DOUBLE result — int + double-literal -> double).
+    fn op_call_callee_x_plus_half() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_load_double_instruction(0, local(0), 0.5),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(1)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::Register(local(0)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(1))],
+                ),
+            ],
+            2,
+        )
+    }
+
+    // g(x) = throw x (the genuine THROW edge — DispatchOutcome::Throw(x)).
+    fn op_call_callee_throw_x() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::Throw,
+                vec![Operand::Register(argument_including_this(1))],
+            )],
+            2,
+        )
+    }
+
+    // f(callee, x) { return callee(x) }: op_call dst=local0, callee=arg1, argc=1,
+    // arg0=arg2 — the operand order the bytecompiler/`dispatch_call` use.
+    fn op_call_caller_passthrough() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::Call,
+                    vec![
+                        Operand::Register(local(0)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::UnsignedImmediate(1),
+                        Operand::Register(argument_including_this(2)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(0))],
+                ),
+            ],
+            3,
+        )
+    }
+
+    // Install an active VM entry + a caller frame (so the callee-frame push inside
+    // `operation_call` -> `execute_function_value` has a live entry, exactly as the
+    // live path runs the JIT'd function under a top-level VMEntryScope + CallFrame),
+    // run `body`, then tear them down. `owner` must be registered first.
+    fn with_active_op_call_entry<R>(
+        vm: &mut Vm,
+        owner: CodeBlockId,
+        frame_shape_block: &CodeBlock,
+        body: impl FnOnce(&mut Vm) -> R,
+    ) -> R {
+        let global_object = vm.allocate_global_object_cell().unwrap();
+        vm.record_source_global_object(global_object).unwrap();
+        let entry = vm
+            .execution
+            .enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+                code_block: owner,
+                global_object,
+                this_value: RuntimeValue::undefined(),
+            }));
+        let caller_frame = vm
+            .execution
+            .push_frame(
+                &mut vm.registers,
+                FramePushRequest {
+                    code_block: Some(owner),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: frame_shape_block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: vec![RuntimeValue::undefined()],
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+                None,
+            )
+            .unwrap();
+        let result = body(vm);
+        if vm.execution.frame(caller_frame).is_some() {
+            vm.execution
+                .pop_frame(&mut vm.registers, caller_frame)
+                .unwrap();
+        }
+        vm.execution.leave(entry).unwrap();
+        result
+    }
+
+    // The op_call slow-path shim drives the UNLINKED VIRTUAL CALL: a number result
+    // (PROVING the boxed argument reached the callee), a BOXED-DOUBLE result, the
+    // genuine THROW edge, and the non-callable-callee TypeError edge — all by calling
+    // `operation_call` DIRECTLY in Rust (no native code), so it is NOT gated to
+    // macOS/aarch64 and is a Miri target (the D1/D5 reborrow island composes with the
+    // re-entrant interpreter callee with 0 UB):
+    //   MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-tree-borrows" \
+    //     cargo +nightly miri test --lib \
+    //     vm::tests::operation_call_runs_unlinked_virtual_call_args_double_and_throw
+    #[test]
+    fn operation_call_runs_unlinked_virtual_call_args_double_and_throw() {
+        use crate::jit::operations::operation_call;
+
+        // function_index 0 = x*2, 1 = x+0.5, 2 = throw x.
+        let g_double = op_call_callee_double_x();
+        let g_half = op_call_callee_x_plus_half();
+        let g_throw = op_call_callee_throw_x();
+        let mut host = CoreOpcodeDispatchHost::with_function_blocks(vec![
+            g_double.clone(),
+            g_half.clone(),
+            g_throw.clone(),
+        ]);
+        let double_value = host.allocate_function_value_for_test(0);
+        let half_value = host.allocate_function_value_for_test(1);
+        let throw_value = host.allocate_function_value_for_test(2);
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::interpreter_only()));
+        let owner = register_test_code_block(&mut vm, g_double.clone());
+
+        with_active_op_call_entry(&mut vm, owner, &g_double, |vm| {
+            // Park the host (D5) + a real CodeBlock (S3), exactly as
+            // `run_installed_baseline_jit` does for the call region.
+            vm.set_jit_host(&mut host);
+            vm.set_jit_code_block(&g_double as *const CodeBlock);
+            let vm_ptr: *mut Vm = &mut *vm;
+
+            // (a) NUMBER + ARG-PASSING: operation_call(vm, g, argc=1, [21]) == 42.
+            let twenty_one = RuntimeValue::from_i32(21).encoded().0;
+            let bits = operation_call(vm_ptr, double_value.encoded().0, 1, twenty_one, 0, 0, 0, 0);
+            assert_eq!(
+                RuntimeValue::from_encoded(EncodedJsValue(bits)),
+                RuntimeValue::from_i32(42),
+                "operation_call ran g(21) == 42 (the boxed argument reached the callee)",
+            );
+            assert_eq!(
+                vm.jit_pending_exception().0,
+                0,
+                "no pending exception on the ok path"
+            );
+
+            // (b) BOXED DOUBLE: operation_call(vm, g_half, [5]) == 5.5 (offset-encoded).
+            let five = RuntimeValue::from_i32(5).encoded().0;
+            let dbits = operation_call(vm_ptr, half_value.encoded().0, 1, five, 0, 0, 0, 0);
+            assert_eq!(
+                RuntimeValue::from_encoded(EncodedJsValue(dbits)),
+                RuntimeValue::from_double(5.5),
+                "operation_call carries a boxed double result through x0",
+            );
+            assert_eq!(
+                vm.jit_pending_exception().0,
+                0,
+                "the double path does not throw"
+            );
+
+            // (c) GENUINE THROW: g throws x -> the shim stamps the m_exception mirror
+            // (D3) and returns JSValue::empty() bits (the caller branches on the word).
+            let seven = RuntimeValue::from_i32(7).encoded().0;
+            let tbits = operation_call(vm_ptr, throw_value.encoded().0, 1, seven, 0, 0, 0, 0);
+            assert_eq!(tbits, 0, "the throw edge returns JSValue::empty() bits");
+            assert_eq!(
+                vm.jit_pending_exception(),
+                RuntimeValue::from_i32(7).encoded(),
+                "the thrown value (x == 7) is stamped on the m_exception mirror",
+            );
+            vm.set_jit_pending_exception(EncodedJsValue(0)); // clear for the next call
+
+            // (d) NON-CALLABLE callee -> a faithful TypeError is materialized + stamped.
+            let bad_callee = RuntimeValue::from_i32(99).encoded().0;
+            let nbits = operation_call(vm_ptr, bad_callee, 1, seven, 0, 0, 0, 0);
+            assert_eq!(
+                nbits, 0,
+                "the not-a-function edge returns JSValue::empty() bits"
+            );
+            assert_ne!(
+                vm.jit_pending_exception().0,
+                0,
+                "a non-callable callee stamps a pending TypeError",
+            );
+            vm.set_jit_pending_exception(EncodedJsValue(0));
+
+            vm.clear_jit_code_block();
+            vm.clear_jit_host();
+        });
+    }
+
+    // f(callee, x) { return callee(x) + 1 } — the milestone caller. op_call dst=local1,
+    // callee=arg1, argc=1, arg0=arg2; then AddInt32 callresult + 1.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn op_call_caller_callee_x_plus_one() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(0)), Operand::SignedImmediate(1)],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::Call,
+                    vec![
+                        Operand::Register(local(1)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::UnsignedImmediate(1),
+                        Operand::Register(argument_including_this(2)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(2)),
+                        Operand::Register(local(1)),
+                        Operand::Register(local(0)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    3,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(2))],
+                ),
+            ],
+            3,
+        )
+    }
+
+    // h(x) = x + 100.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn op_call_callee_x_plus_100() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(0)), Operand::SignedImmediate(100)],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(1)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::Register(local(0)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(1))],
+                ),
+            ],
+            2,
+        )
+    }
+
+    // g(hcallee, x) = hcallee(x) * 2 — itself contains an op_call (the MIDDLE of the
+    // f->g->h chain; runs INTERPRETED, so its op_call is the interpreter's dispatch_call).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn op_call_callee_call_h_times_2() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::Call,
+                    vec![
+                        Operand::Register(local(0)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::UnsignedImmediate(1),
+                        Operand::Register(argument_including_this(2)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(1)), Operand::SignedImmediate(2)],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::MulInt32,
+                    vec![
+                        Operand::Register(local(2)),
+                        Operand::Register(local(0)),
+                        Operand::Register(local(1)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    3,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(2))],
+                ),
+            ],
+            3,
+        )
+    }
+
+    // f(gcallee, hcallee, x) = gcallee(hcallee, x) — op_call with argc=2 (two explicit
+    // args). The NATIVE top of the f->g->h chain.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn op_call_caller_two_deep() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::Call,
+                    vec![
+                        Operand::Register(local(0)),
+                        Operand::Register(argument_including_this(1)),
+                        Operand::UnsignedImmediate(2),
+                        Operand::Register(argument_including_this(2)),
+                        Operand::Register(argument_including_this(3)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(0))],
+                ),
+            ],
+            4,
+        )
+    }
+
+    // [this=undefined, explicit args...] as boxed EncodedJSValue words for the seeded
+    // native scratch frame.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn op_call_args_including_this(explicit: &[RuntimeValue]) -> Vec<u64> {
+        let mut args = vec![RuntimeValue::undefined().encoded().0];
+        args.extend(explicit.iter().map(|value| value.encoded().0));
+        args
+    }
+
+    // Run a caller CodeBlock through the engine INTERPRETER on a fresh interpreter-only
+    // Vm whose host carries `function_blocks` (so the callee values resolve), with the
+    // explicit (non-`this`) arguments built against THAT host. Returns the boxed result.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn run_op_call_caller_via_interpreter(
+        caller: &CodeBlock,
+        function_blocks: Vec<CodeBlock>,
+        explicit_args: impl FnOnce(&mut CoreOpcodeDispatchHost) -> Vec<RuntimeValue>,
+    ) -> ExecutionCompletion {
+        let mut interp_vm: Box<Vm> = Box::new(Vm::new(VmConfig::interpreter_only()));
+        let mut host = CoreOpcodeDispatchHost::with_function_blocks(function_blocks);
+        let mut args = vec![RuntimeValue::undefined()];
+        args.extend(explicit_args(&mut host));
+        let owner = CodeBlockId(CellId(9_900));
+        interp_vm.code_blocks.register(owner, caller.clone());
+        execute_registered_code_block_with_host_and_arguments(
+            &mut interp_vm,
+            owner,
+            caller,
+            &mut host,
+            args,
+        )
+    }
+
+    // op_call B5-FIRST-CUT NATIVE MILESTONE: a hot caller `f(g, x) { return g(x) + 1 }`
+    // tiers up and EXECUTES NATIVELY; its emitted op_call far-calls `operation_call`,
+    // which runs `g(x) = x*2` (the UNLINKED VIRTUAL CALL, interpreted), and the native
+    // result == the engine interpreter's result == the closed-form oracle `2x + 1` over
+    // a RANGE of inputs (including a negative and a large value). Proves the op_call
+    // emitter lowering + the shim + the wrapper compose correctly under native ARM64.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_op_call_b5_native_caller_calls_g_matches_interpreter_and_oracle() {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+
+        let g_double = op_call_callee_double_x();
+        let f_caller = op_call_caller_callee_x_plus_one();
+        let owner = CodeBlockId(CellId(8_801));
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(owner, f_caller.clone());
+        let mut host = CoreOpcodeDispatchHost::with_function_blocks(vec![g_double.clone()]);
+        let g_value = host.allocate_function_value_for_test(0);
+
+        let xs = [3_i32, 7, -4, 1000];
+
+        let native = with_active_op_call_entry(&mut vm, owner, &f_caller, |vm| {
+            // Warm f PAST the S9 tier-up threshold; assert the native image installed.
+            let entry_cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 8;
+            let warm = op_call_args_including_this(&[g_value, RuntimeValue::from_i32(xs[0])]);
+            for _ in 0..entry_cap {
+                let _ = vm.observe_baseline_jit_entry_and_maybe_execute(
+                    &mut host, owner, &f_caller, &warm,
+                );
+                if vm.baseline_jit_function_is_installed(owner) {
+                    break;
+                }
+            }
+            assert!(
+                vm.baseline_jit_function_is_installed(owner),
+                "the hot caller tiered up to a native image (m_jitCode installed)",
+            );
+            // Native execution of f for each x: f's op_call far-calls operation_call -> g.
+            xs.iter()
+                .map(|&x| {
+                    let args = op_call_args_including_this(&[g_value, RuntimeValue::from_i32(x)]);
+                    match vm.observe_baseline_jit_entry_and_maybe_execute(
+                        &mut host, owner, &f_caller, &args,
+                    ) {
+                        BaselineJitEntryOutcome::Returned(value) => value.encoded().0,
+                        other => panic!("expected a native return for x={x}: {other:?}"),
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+
+        for (i, &x) in xs.iter().enumerate() {
+            let oracle = RuntimeValue::from_i32(2 * x + 1).encoded().0;
+            assert_eq!(native[i], oracle, "native f(g,{x}) == 2*{x}+1 (oracle)");
+            let interp =
+                match run_op_call_caller_via_interpreter(&f_caller, vec![g_double.clone()], |h| {
+                    vec![
+                        h.allocate_function_value_for_test(0),
+                        RuntimeValue::from_i32(x),
+                    ]
+                }) {
+                    ExecutionCompletion::Returned(value) => value.encoded().0,
+                    other => panic!("interpreter f(g,{x}) did not return: {other:?}"),
+                };
+            assert_eq!(native[i], interp, "native f(g,{x}) == interpreter f(g,{x})");
+        }
+    }
+
+    // op_call carries a BOXED DOUBLE result through the call ABI: native
+    // `f(g, x) { return g(x) }` with `g(x) = x + 0.5` (a double) — native == interpreter
+    // == `x + 0.5` for an input whose result is a non-integral double.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_op_call_b5_native_carries_boxed_double_result() {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+
+        let g_half = op_call_callee_x_plus_half();
+        let f_caller = op_call_caller_passthrough();
+        let owner = CodeBlockId(CellId(8_802));
+        let x = 5_i32;
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(owner, f_caller.clone());
+        let mut host = CoreOpcodeDispatchHost::with_function_blocks(vec![g_half.clone()]);
+        let g_value = host.allocate_function_value_for_test(0);
+
+        let native = with_active_op_call_entry(&mut vm, owner, &f_caller, |vm| {
+            let entry_cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 8;
+            let args = op_call_args_including_this(&[g_value, RuntimeValue::from_i32(x)]);
+            for _ in 0..entry_cap {
+                let _ = vm.observe_baseline_jit_entry_and_maybe_execute(
+                    &mut host, owner, &f_caller, &args,
+                );
+                if vm.baseline_jit_function_is_installed(owner) {
+                    break;
+                }
+            }
+            assert!(
+                vm.baseline_jit_function_is_installed(owner),
+                "the caller tiered up"
+            );
+            match vm
+                .observe_baseline_jit_entry_and_maybe_execute(&mut host, owner, &f_caller, &args)
+            {
+                BaselineJitEntryOutcome::Returned(value) => value.encoded().0,
+                other => panic!("expected a native return: {other:?}"),
+            }
+        });
+
+        assert_eq!(
+            RuntimeValue::from_encoded(EncodedJsValue(native)),
+            RuntimeValue::from_double(f64::from(x) + 0.5),
+            "native f carried the boxed double g({x}) == {x}.5 through op_call",
+        );
+        let interp =
+            match run_op_call_caller_via_interpreter(&f_caller, vec![g_half.clone()], |h| {
+                vec![
+                    h.allocate_function_value_for_test(0),
+                    RuntimeValue::from_i32(x),
+                ]
+            }) {
+                ExecutionCompletion::Returned(value) => value.encoded().0,
+                other => panic!("interpreter did not return: {other:?}"),
+            };
+        assert_eq!(
+            native, interp,
+            "native double result == interpreter double result"
+        );
+    }
+
+    // op_call THROW edge: native `f(g, x) { return g(x) }` with `g(x) { throw x }` — the
+    // callee throw surfaces as a stamped m_exception pending word, f's post-call
+    // exception probe bails, and the entry outcome is `Threw(x)`. Also covers the
+    // non-callable callee (a faithful TypeError).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_op_call_b5_native_callee_throw_bails_to_threw() {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+
+        let g_throw = op_call_callee_throw_x();
+        let f_caller = op_call_caller_passthrough();
+        let owner = CodeBlockId(CellId(8_803));
+        let x = 13_i32;
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(owner, f_caller.clone());
+        let mut host = CoreOpcodeDispatchHost::with_function_blocks(vec![g_throw.clone()]);
+        let throwing_value = host.allocate_function_value_for_test(0);
+        // A non-callable callee (an int) -> the not-a-function TypeError edge.
+        let non_callable = RuntimeValue::from_i32(77);
+
+        let (threw_bits, non_callable_outcome) =
+            with_active_op_call_entry(&mut vm, owner, &f_caller, |vm| {
+                let entry_cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 8;
+                let warm =
+                    op_call_args_including_this(&[throwing_value, RuntimeValue::from_i32(x)]);
+                for _ in 0..entry_cap {
+                    // Tier up via a NON-throwing warm-up callee value is not needed; the
+                    // throwing callee is fine during warm-up because warming does not run
+                    // f (Step::Interpret). Once installed, the native run throws.
+                    let _ = vm.observe_baseline_jit_entry_and_maybe_execute(
+                        &mut host, owner, &f_caller, &warm,
+                    );
+                    if vm.baseline_jit_function_is_installed(owner) {
+                        break;
+                    }
+                }
+                assert!(
+                    vm.baseline_jit_function_is_installed(owner),
+                    "the caller tiered up"
+                );
+                let threw = match vm.observe_baseline_jit_entry_and_maybe_execute(
+                    &mut host, owner, &f_caller, &warm,
+                ) {
+                    BaselineJitEntryOutcome::Threw(bits) => bits,
+                    other => panic!("expected Threw for a throwing callee: {other:?}"),
+                };
+                // The non-callable callee: same op_call site, a non-function callee value.
+                let nc_args =
+                    op_call_args_including_this(&[non_callable, RuntimeValue::from_i32(x)]);
+                let nc = vm.observe_baseline_jit_entry_and_maybe_execute(
+                    &mut host, owner, &f_caller, &nc_args,
+                );
+                (threw, nc)
+            });
+
+        assert_eq!(
+            EncodedJsValue(threw_bits.0),
+            RuntimeValue::from_i32(x).encoded(),
+            "the callee threw x == {x}; the native entry surfaced Threw(x)",
+        );
+        match non_callable_outcome {
+            BaselineJitEntryOutcome::Threw(bits) => {
+                assert_ne!(
+                    bits.0, 0,
+                    "a non-callable callee surfaces a pending TypeError"
+                );
+            }
+            other => panic!("expected Threw for a non-callable callee: {other:?}"),
+        }
+    }
+
+    // op_call >=2-DEEP nested call (f -> g -> h), the native top calling through two
+    // interpreted callees: native `f(g, h, x) = g(h, x)`, `g(h, x) = h(x) * 2`,
+    // `h(x) = x + 100`, so the result is `(x + 100) * 2`. The native f executes, its
+    // op_call (argc=2) far-calls operation_call -> g, whose own op_call (interpreted)
+    // calls h. native == interpreter == oracle.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_op_call_b5_native_two_deep_call_chain_matches_interpreter() {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+
+        let g_mid = op_call_callee_call_h_times_2(); // function_index 0
+        let h_leaf = op_call_callee_x_plus_100(); // function_index 1
+        let f_caller = op_call_caller_two_deep();
+        let owner = CodeBlockId(CellId(8_804));
+        let x = 9_i32;
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(owner, f_caller.clone());
+        let mut host =
+            CoreOpcodeDispatchHost::with_function_blocks(vec![g_mid.clone(), h_leaf.clone()]);
+        let g_value = host.allocate_function_value_for_test(0);
+        let h_value = host.allocate_function_value_for_test(1);
+
+        let native = with_active_op_call_entry(&mut vm, owner, &f_caller, |vm| {
+            let entry_cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 8;
+            let args = op_call_args_including_this(&[g_value, h_value, RuntimeValue::from_i32(x)]);
+            for _ in 0..entry_cap {
+                let _ = vm.observe_baseline_jit_entry_and_maybe_execute(
+                    &mut host, owner, &f_caller, &args,
+                );
+                if vm.baseline_jit_function_is_installed(owner) {
+                    break;
+                }
+            }
+            assert!(
+                vm.baseline_jit_function_is_installed(owner),
+                "the caller tiered up"
+            );
+            match vm
+                .observe_baseline_jit_entry_and_maybe_execute(&mut host, owner, &f_caller, &args)
+            {
+                BaselineJitEntryOutcome::Returned(value) => value.encoded().0,
+                other => panic!("expected a native return: {other:?}"),
+            }
+        });
+
+        let oracle = RuntimeValue::from_i32((x + 100) * 2).encoded().0;
+        assert_eq!(native, oracle, "native f(g,h,{x}) == ({x}+100)*2 (oracle)");
+        let interp = match run_op_call_caller_via_interpreter(
+            &f_caller,
+            vec![g_mid.clone(), h_leaf.clone()],
+            |h| {
+                vec![
+                    h.allocate_function_value_for_test(0),
+                    h.allocate_function_value_for_test(1),
+                    RuntimeValue::from_i32(x),
+                ]
+            },
+        ) {
+            ExecutionCompletion::Returned(value) => value.encoded().0,
+            other => panic!("interpreter f(g,h,{x}) did not return: {other:?}"),
+        };
+        assert_eq!(
+            native, interp,
+            "native 2-deep result == interpreter 2-deep result"
         );
     }
 
