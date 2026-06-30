@@ -257,6 +257,17 @@ pub(crate) struct CoreObjectStore {
     // aux-slab POD expedient, gc-r4 SD-4) must dereference ONLY an address this set vouches
     // for. Keyed by interpreter pointer bits — no DoS surface — so the int hasher.
     pub(crate) live_object_addrs: HashSet<usize, FxIntBuildHasher>,
+    // gc-r4-completion U1 (string-cell GC) — scratch list the pre-sweep reconcile fills with
+    // every DEAD (unmarked) LEAF cell's arena address (String now; Symbol/BigInt at U2/U3).
+    // The shared arena is ONE Heap with multiple subspaces (HeapUtil.h): object AND leaf cells
+    // live here, marked + swept together, but a leaf cell's out-of-line StringImpl payload +
+    // interning live in the LEAF store (`CoreStringStore`), which the collector does not own.
+    // So the reconcile (which owns the arena) records the dead leaf addresses and the HOST
+    // drains them (`take_reclaimed_leaf_addrs`) and drives the leaf store's own reclaim
+    // (`CoreStringStore::reconcile_dead_string`: free its `string_records` slot + weak-remove
+    // its interning entry by identity). Faithful: a dying StringImpl reclaims ITS OWN state
+    // (`~StringImpl`), driven by the collector that found it dead. Cleared at each reconcile.
+    pub(crate) reclaimed_leaf_addrs: Vec<usize>,
     // gc-r4 R4a: the former `object_indices_by_payload` (payload->Vec index) is DELETED —
     // identity is the arena address and `MarkedSpace::find` is the membership/type gate.
     // C++ JSC: the per-VM Structure registry (`VM::structureIDTable`, in C++ implicit
@@ -2857,19 +2868,34 @@ impl CoreObjectStore {
         Some(unsafe { arena_cell_kind_at(cp.addr()) })
     }
 
-    /// gc-r4-completion SD-2/U0 — the LEAF-cell `visitChildren` body (the `Leaf` branch of
-    /// the marker's type dispatch). A flat-String / Symbol / HeapBigInt cell holds NO
-    /// outgoing cell edges, so this appends nothing. It exists so the dispatch is total
-    /// BEFORE U1-U3 admit leaf cells into the arena; once they do, this stays empty for the
-    /// leaf kinds.
+    /// gc-r4-completion SD-2/U0+U1/U4 — the LEAF-cell `visitChildren` body (the `Leaf` branch
+    /// of the marker's type dispatch). A FLAT String / Symbol / HeapBigInt cell holds NO
+    /// outgoing cell edges, so this appends nothing. The ONE leaf-typed cell WITH an edge is a
+    /// ROPE JSString, whose fiber base string MUST be marked so it is not swept under a live
+    /// rope (the #1 UAF landmine). Faithful to `JSRopeString::visitChildrenImpl`
+    /// (runtime/JSString.cpp:104): visit the fiber. The port keeps the rope's base fiber inline
+    /// on the cell (`CoreStringCell::base`, the `JSRopeString::m_fibers` analog); a flat/empty
+    /// string carries the 0 sentinel, so `string_cell_rope_base` returns `None` (no edge).
     ///
-    /// TODO(U4): a ROPE JSString (`Substring{base}`) has ONE edge — the fiber base string
-    /// (JSString.cpp:113). U4 routes rope strings to a `trace_string_cell` that appends it.
-    ///
-    /// The `_cp`/`_visitor` params mirror the object branch's `trace_cell(cell, visitor)`
-    /// shape so U4 can fill the rope edge in place without changing the dispatch.
-    fn trace_leaf_cell(&self, _cp: CellPtr, _visitor: &mut SlotVisitor) {
-        // Intentionally empty: leaf cells have no GC edges (see the doc + TODO(U4)).
+    /// Today EVERY arena leaf cell is a String (U1; Symbol/BigInt are U2/U3), so this reads the
+    /// string-cell layout directly; U2/U3 sub-dispatch by `js_type` before reading a rope edge.
+    fn trace_leaf_cell(&self, cp: CellPtr, visitor: &mut SlotVisitor) {
+        debug_assert!(
+            // SAFETY: `cp` was membership-admitted + classified Leaf by the header read.
+            unsafe { arena_cell_kind_at(cp.addr()) } == ArenaCellKind::Leaf,
+            "trace_leaf_cell entered for a non-leaf cell"
+        );
+        // SAFETY: `cp` is a byte-intact arena leaf cell (membership-gated + Leaf-classified);
+        // U1 admits only String leaf cells, so it is a `CoreStringCell` and its `base` fiber
+        // sits at the const-asserted offset. The read copies a `u64` and forms no reference.
+        let base = unsafe { super::string_store::string_cell_rope_base(cp.addr()) };
+        if let Some(base_addr) = base {
+            // Membership-gate the base fiber (NOT the liveness `find`) and append it — the rope
+            // cell's single outgoing edge. `append_unbarriered` marks white→grey→push.
+            if let Some(base_cp) = self.space.is_arena_cell(base_addr) {
+                visitor.append_unbarriered(base_cp);
+            }
+        }
     }
 
     /// gc-r4 R4b-mark ROOT GAP #1 — the intrinsic root set: every `CoreObjectStore`
@@ -3170,6 +3196,9 @@ impl CoreObjectStore {
         // intact bytes. Drive off `for_each_object_cell` (R4b decision 3), gated by the
         // live-set membership + the mark bit. Shared borrows only; no cell `&mut` exists.
         let mut dead: Vec<DeadCellRecord> = Vec::new();
+        // gc-r4-completion U1 — DEAD LEAF (String) cell addresses, collected here for the HOST
+        // to drive each leaf store's own reclaim post-collection (see `reclaimed_leaf_addrs`).
+        let mut dead_leaf: Vec<usize> = Vec::new();
         {
             let space = &self.space;
             let live = &self.live_object_addrs;
@@ -3217,16 +3246,34 @@ impl CoreObjectStore {
                         });
                     }
                     ArenaCellKind::Leaf => {
-                        // U5 fill point — the store-driven LEAF reconcile: free the dead leaf
-                        // cell's store-owned slab (string_texts / symbol description / bigint
-                        // limbs) and remove its interning-map entry by identity (the
-                        // `~StringImpl -> AtomStringImpl::remove` analog, StringImpl.cpp:129),
-                        // BEFORE the sweep clobbers the cell. No-op today: no leaf cell is in
-                        // the arena (U1-U3 admit them first).
+                        // gc-r4-completion U1 — DEAD LEAF (String) cell. Its reclaimable state
+                        // (the `string_records` slot + the weak interning entry) lives in the
+                        // LEAF store (`CoreStringStore`), which this collector does not own, so
+                        // we only RECORD the dead address here. The HOST drains the list after
+                        // the collection and drives `CoreStringStore::reconcile_dead_string`
+                        // (free the slot + weak-remove the interning entry by identity — the
+                        // `~StringImpl -> AtomStringImpl::remove` analog, WTF/wtf/text/StringImpl
+                        // .cpp:118-129). Unlike the object arm, the leaf reclaim reads ONLY the
+                        // store's own slab (which survives the sweep), never the dead cell's
+                        // soon-clobbered bytes, so it is correct AFTER the sweep too — provided
+                        // it runs before the mutator resumes and recycles the address, which the
+                        // synchronous safepoint guarantees (no allocation between collect+drain).
+                        // U2/U3 sub-dispatch this arm by `js_type` (Symbol / HeapBigInt).
+                        dead_leaf.push(addr);
                     }
                 }
             });
         }
+        // gc-r4-completion U1 — drop each DEAD LEAF cell from the authoritative live set (the
+        // sweep reclaims its atom), mirroring the object arm's `live_object_addrs.remove`, so
+        // the post-reconcile invariant (every remaining live-set address is a marked survivor)
+        // holds for leaf cells too. `dead_leaf` is a local, so this is a disjoint-field borrow.
+        for &addr in &dead_leaf {
+            self.live_object_addrs.remove(&addr);
+        }
+        // Publish the dead-leaf list for the host to drain (`take_reclaimed_leaf_addrs`) and
+        // drive each leaf store's own reclaim. Overwrites the prior cycle's list.
+        self.reclaimed_leaf_addrs = dead_leaf;
         // ---- Phase 2 (MUTATE): free slabs + drop reverse-index + drop the live-set entry.
         let cells_reclaimed = dead.len();
         let mut slab_slots_freed = 0usize;
@@ -4240,10 +4287,12 @@ impl CoreObjectStore {
             boolean,
             standard_attributes,
         )?;
-        let error_name = strings.allocate_untracked("Error");
-        let type_error_name = strings.allocate_untracked("TypeError");
-        let reference_error_name = strings.allocate_untracked("ReferenceError");
-        let empty_message = strings.allocate_untracked("");
+        // gc-r4-completion U1: leaf-cell allocation routes through the object store (the de-facto
+        // Heap) so the string cell enters the SHARED arena; `self` is that store here.
+        let error_name = strings.allocate_untracked(self, "Error");
+        let type_error_name = strings.allocate_untracked(self, "TypeError");
+        let reference_error_name = strings.allocate_untracked(self, "ReferenceError");
+        let empty_message = strings.allocate_untracked(self, "");
         let error =
             self.allocate_error_constructor_with_write_barrier(heap, error_name, empty_message)?;
         self.install_standard_global_data_property(
@@ -5546,6 +5595,45 @@ impl CoreObjectStore {
         // SAFETY: `ptr` addresses the live arena cell just written; no GC runs pre-R4b, so
         // it is pinned/immovable for the value's lifetime.
         RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
+    }
+
+    /// gc-r4-completion U1 — admit a POD LEAF-cell blob (String now; Symbol/BigInt at U2/U3)
+    /// into the SHARED arena and register it in the authoritative live set, returning its arena
+    /// address (= the cell's identity). The faithful analog of `allocate_cell` for a non-object
+    /// JSCell: the SAME `MarkedSpace` (one Heap, multiple subspaces — HeapUtil.h), the SAME
+    /// `live_object_addrs` registry the pre-sweep reconcile enumerates, the SAME arena-address
+    /// identity. Leaf cells carry NO inline value slots and own no butterfly; their variable
+    /// StringImpl payload lives in the LEAF store's own slab (SD-4), so this takes only the raw
+    /// cell bytes and arms the byte counter via `allocate_blob` like every object allocation.
+    ///
+    /// The collector already routes leaf cells correctly: the marker + reconcile type-dispatch
+    /// by header `js_type` (U0); `trace_leaf_cell` appends a rope's fiber edge; the U0b isObject
+    /// gate makes the object deref islands reject leaf cells.
+    ///
+    /// SAFETY: `src..src+len` MUST be a fully-initialized POD cell (`needs_drop == false`) whose
+    /// `js_type` byte sits at `ARENA_CELL_JS_TYPE_OFFSET`; single mutator thread (C5/C6). The
+    /// leaf store guarantees this (its cell type asserts POD at its struct def).
+    pub(crate) unsafe fn admit_leaf_cell_blob(&mut self, src: *const u8, len: usize) -> usize {
+        // SAFETY: forwarded — POD bytes, single mutator (see the fn contract).
+        let cp = unsafe { self.space.allocate_blob(src, len) };
+        let addr = cp.addr();
+        // Register in the AUTHORITATIVE live set (as `allocate_cell` does for objects): a reused
+        // post-sweep address was dropped from the set at its prior owner's reconcile, so this
+        // insert is always fresh.
+        let _inserted = self.live_object_addrs.insert(addr);
+        debug_assert!(
+            _inserted,
+            "arena address re-handed-out while still registered live (reconcile failed to drop it)"
+        );
+        addr
+    }
+
+    /// gc-r4-completion U1 — drain the DEAD LEAF-cell addresses the most recent pre-sweep
+    /// reconcile recorded (see `reclaimed_leaf_addrs`). The HOST calls this right after a
+    /// collection (`force_collect` / `poll_collection_at_safepoint`) and drives each leaf
+    /// store's own reclaim (`CoreStringStore::reconcile_dead_string`). Returns + clears the list.
+    pub(crate) fn take_reclaimed_leaf_addrs(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.reclaimed_leaf_addrs)
     }
 
     /// Allocate a GetterSetter cell (C++ runtime/GetterSetter.h:42 `GetterSetter::
@@ -9331,8 +9419,24 @@ impl CoreObjectStore {
     /// leaf cell, or a dead address.
     fn cell_at(&self, addr: usize) -> Option<&CoreObjectCell> {
         // Type + liveness gate. `space.find` returns a `CellPtr` only for a live arena
-        // object cell; the shared borrow of `self.space` ends here (the result is Copy).
+        // cell; the shared borrow of `self.space` ends here (the result is Copy).
         self.space.find(addr)?;
+        // gc-r4-completion U0b (THE MUTATOR isObject GATE). `MarkedSpace::find` is the faithful
+        // `HeapUtil::isPointerGCObjectJSCell` (heap/HeapUtil.h:51) analog: it admits ANY live
+        // arena JSCell, NOT only objects. The R4a flip relied on "only object cells are in the
+        // arena" and COLLAPSED `find` with `JSCell::isObject()`; once a leaf cell (String, U1)
+        // shares the arena, `find(string)` returns `Some`, so this island would hard-cast a
+        // string's bytes to `CoreObjectCell` and the ~53 `find(value)`-as-"is-object?" sites
+        // would misclassify the string as an object (type-confusion UB). Restore the
+        // discriminator faithfully — admit-then-`isObject()` (`type >= ObjectType`, JSCell.h:131
+        // / JSTypeInfo.h:88): a non-object (leaf) cell returns `None` here, exactly as `find`
+        // returned `None` while leaf cells were out-of-arena Boxes.
+        // SAFETY: `find` proved `addr` is a byte-intact arena cell; `js_type` sits at the fixed
+        // common offset on every cell kind (const-asserted at each struct def), so this one-byte
+        // header read is sound BEFORE any concrete-type downcast (mirrors `arena_cell_kind`).
+        if !matches!(unsafe { arena_cell_kind_at(addr) }, ArenaCellKind::Object) {
+            return None;
+        }
         // SAFETY: the gate proved `addr` is a live `CoreObjectCell` in an arena page whose
         // provenance was exposed once at `allocate_blob`; the bytes are an initialized POD
         // cell. No GC runs pre-R4b, so the cell is pinned/immovable. The returned shared
@@ -9342,7 +9446,7 @@ impl CoreObjectStore {
         let cell = unsafe { &*core::ptr::with_exposed_provenance::<CoreObjectCell>(addr) };
         debug_assert!(
             cell.js_type.is_object(),
-            "cell admitted by MarkedSpace::find must carry an object JSType"
+            "cell admitted by MarkedSpace::find + the U0b isObject gate must carry an object JSType"
         );
         Some(cell)
     }
@@ -9366,6 +9470,15 @@ impl CoreObjectStore {
         let addr = value.as_cell()?.pointer_payload_bits();
         // Type + liveness gate (shared borrow of `self.space`, ended before the `&mut`).
         self.space.find(addr)?;
+        // gc-r4-completion U0b: the same MUTATOR isObject gate as `cell_at` — a leaf (String)
+        // cell admitted by `find` must NOT be handed out as a `&mut CoreObjectCell`. Returning
+        // `None` routes the caller to its non-object path (as it did when strings were
+        // out-of-arena Boxes `find` rejected).
+        // SAFETY: as `cell_at`'s header read — `find` proved a byte-intact arena cell; `js_type`
+        // is at the fixed common offset on every cell kind.
+        if !matches!(unsafe { arena_cell_kind_at(addr) }, ArenaCellKind::Object) {
+            return None;
+        }
         // SAFETY: as `cell_at`, but mutable. The gate proved `addr` is a live arena
         // `CoreObjectCell`; provenance was exposed once at `allocate_blob`; no GC pre-R4b.
         // The `&mut CoreObjectCell` lives ONLY for `f`'s scope and is the unique borrow of
@@ -11520,5 +11633,240 @@ mod r4b_sweep_tests {
             anchor_addr,
             "the rooted anchor never moved (no compaction)"
         );
+    }
+}
+
+// gc-r4-completion U1 — STRING-CELL GC end-to-end on the SHARED arena: strings allocate via
+// the leaf-cell chokepoint (`CoreStringStore::allocate_* -> admit_leaf_cell_blob`), are marked
+// through the object->string edge (and the ROPE fiber edge), and dead strings are swept +
+// reconciled (slab freed + weak interning removed by identity). The `collect` helper replicates
+// the host drain (force_collect -> take_reclaimed_leaf_addrs -> reconcile_dead_string).
+#[cfg(test)]
+mod string_cell_gc_u1_tests {
+    use super::string_store::{CoreStringCellText, CoreStringStore};
+    use super::*;
+
+    fn ident(n: u32) -> CorePropertyKey {
+        CorePropertyKey::Identifier(n)
+    }
+    fn addr(v: RuntimeValue) -> usize {
+        v.as_cell().unwrap().pointer_payload_bits()
+    }
+    /// Run ONE collection then drive the leaf-store reclaim exactly as the host safepoint does.
+    fn collect(
+        objects: &mut CoreObjectStore,
+        strings: &mut CoreStringStore,
+        roots: &[RuntimeValue],
+    ) -> CollectStats {
+        let stats = objects.force_collect_values(roots);
+        for dead in objects.take_reclaimed_leaf_addrs() {
+            strings.reconcile_dead_string(dead);
+        }
+        stats
+    }
+
+    // (a) A string reachable ONLY from a live object SURVIVES >=2 collections (the object->string
+    // mark edge; the 2nd collection is the old-gen-survivor landmine).
+    #[test]
+    fn string_held_by_live_object_survives_two_collections() {
+        let mut objects = CoreObjectStore::default();
+        let mut strings = CoreStringStore::default();
+        let s = strings.allocate_untracked(&mut objects, "held-by-object");
+        let s_addr = addr(s);
+        let holder = objects.allocate();
+        objects.put_data_own(holder, &ident(0), s).unwrap(); // holder -> s (butterfly edge)
+
+        collect(&mut objects, &mut strings, &[holder]);
+        assert!(
+            objects.is_value_marked(s),
+            "string marked via object edge (#1)"
+        );
+        assert!(
+            objects.live_object_addrs.contains(&s_addr),
+            "string retained in the live set (#1)"
+        );
+        assert_eq!(strings.text(s), Some("held-by-object"));
+
+        collect(&mut objects, &mut strings, &[holder]); // #2 — the survivor landmine
+        assert!(
+            objects.is_value_marked(s),
+            "string still marked via object edge (#2)"
+        );
+        assert_eq!(strings.text(s), Some("held-by-object"));
+    }
+
+    // (b) A ROPE's base string survives >=2 collections while the rope is live — the fiber edge
+    // (faithful JSRopeString::visitChildrenImpl). The base is reachable ONLY via the rope.
+    #[test]
+    fn rope_base_survives_two_collections_via_fiber_edge() {
+        let mut objects = CoreObjectStore::default();
+        let mut strings = CoreStringStore::default();
+        let mut heap = Heap::new();
+        let base_text = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let base = strings
+            .allocate_with_heap(&mut objects, &mut heap, base_text)
+            .unwrap();
+        let rope = strings
+            .allocate_substring_with_heap(&mut objects, &mut heap, base, 5, 45)
+            .unwrap();
+        // Confirm it is a real shared substring (a rope with a fiber), not a flat copy.
+        let rope_slot = strings.index_for_value(rope).unwrap();
+        assert!(matches!(
+            strings.string_records[rope_slot].text,
+            CoreStringCellText::Substring { .. }
+        ));
+        // Hold the ROPE via a live object; the base is reachable ONLY through the rope's fiber.
+        let holder = objects.allocate();
+        objects.put_data_own(holder, &ident(0), rope).unwrap();
+
+        collect(&mut objects, &mut strings, &[holder]);
+        assert!(
+            objects.is_value_marked(rope),
+            "rope marked via object edge (#1)"
+        );
+        assert!(
+            objects.is_value_marked(base),
+            "rope base survives via the fiber edge (#1) — the UAF landmine"
+        );
+        assert_eq!(strings.text(rope), Some(&base_text[5..45]));
+
+        collect(&mut objects, &mut strings, &[holder]); // #2
+        assert!(
+            objects.is_value_marked(base),
+            "rope base still survives via the fiber edge (#2)"
+        );
+        assert_eq!(strings.text(rope), Some(&base_text[5..45]));
+    }
+
+    // (c) A DEAD string's slab slot is freed AND its interning entry removed by identity; re-
+    // interning the same text after collection returns a FRESH cell (no dangle to the freed one).
+    #[test]
+    fn dead_string_frees_slab_and_weak_removes_interning() {
+        let mut objects = CoreObjectStore::default();
+        let mut strings = CoreStringStore::default();
+        let keep = objects.allocate(); // a rooted anchor (NOT holding the string)
+        let s = strings.allocate_untracked(&mut objects, "ephemeral");
+        let s_addr = addr(s);
+        let slot = strings.index_for_value(s).unwrap();
+        assert!(strings.by_text.contains_key("ephemeral"));
+        assert_eq!(strings.text(s), Some("ephemeral"));
+
+        collect(&mut objects, &mut strings, &[keep]); // s is unrooted -> dead
+
+        assert!(!objects.is_value_marked(s), "unrooted string is dead");
+        assert!(
+            !objects.live_object_addrs.contains(&s_addr),
+            "dead string dropped from the live set"
+        );
+        assert!(
+            !strings.by_text.contains_key("ephemeral"),
+            "weak interning entry removed on sweep (by identity)"
+        );
+        assert_eq!(
+            strings.text(s),
+            None,
+            "dead string's resolution entry removed (no dangle)"
+        );
+        assert!(
+            strings.string_record_free_list.contains(&slot),
+            "dead string's slab slot freed for reuse"
+        );
+
+        // Re-intern the SAME text -> a FRESH record + fresh interning (not the freed cell).
+        let s2 = strings.allocate_untracked(&mut objects, "ephemeral");
+        assert_eq!(strings.text(s2), Some("ephemeral"));
+        assert!(
+            strings.by_text.contains_key("ephemeral"),
+            "re-interning re-establishes the entry freshly"
+        );
+    }
+
+    // (d) Micro-probe: a batch of unrooted strings returns the live-cell count to BASELINE after
+    // collection (no string leak), and reclaims their slab records.
+    #[test]
+    fn unrooted_string_batch_returns_to_baseline_no_leak() {
+        let mut objects = CoreObjectStore::default();
+        let mut strings = CoreStringStore::default();
+        let keep = objects.allocate();
+        collect(&mut objects, &mut strings, &[keep]); // warm up to a stable baseline
+        let baseline = objects.live_object_addrs.len();
+        let live_records_baseline =
+            strings.string_records.len() - strings.string_record_free_list.len();
+
+        for i in 0..16 {
+            strings.allocate_untracked(&mut objects, &format!("tmp-{i}"));
+        }
+        assert!(
+            objects.live_object_addrs.len() > baseline,
+            "string cells added to the live set"
+        );
+
+        collect(&mut objects, &mut strings, &[keep]); // all 16 unrooted -> reclaimed
+        assert_eq!(
+            objects.live_object_addrs.len(),
+            baseline,
+            "string cells reclaimed back to baseline (no leak)"
+        );
+        let live_records_after =
+            strings.string_records.len() - strings.string_record_free_list.len();
+        assert_eq!(
+            live_records_after, live_records_baseline,
+            "string slab records reclaimed back to baseline"
+        );
+    }
+
+    // (e) A LIVE (rooted) interned string is NOT evicted — only UNMARKED cells are reconciled —
+    // and re-interning returns the SAME cell (identity preserved across collection).
+    #[test]
+    fn live_interned_string_is_not_evicted() {
+        let mut objects = CoreObjectStore::default();
+        let mut strings = CoreStringStore::default();
+        let s = strings.allocate_untracked(&mut objects, "kept-interned");
+
+        // Root the string DIRECTLY (a live register-root analog).
+        collect(&mut objects, &mut strings, &[s]);
+
+        assert!(
+            objects.is_value_marked(s),
+            "rooted interned string is marked"
+        );
+        assert!(
+            strings.by_text.contains_key("kept-interned"),
+            "a live interned string is NOT evicted (only unmarked cells are reconciled)"
+        );
+        assert_eq!(strings.text(s), Some("kept-interned"));
+        let s2 = strings.allocate_untracked(&mut objects, "kept-interned");
+        assert_eq!(
+            s2, s,
+            "interning returns the same live cell (identity preserved)"
+        );
+    }
+
+    // (U0b regression) A string value is NOT misclassified as an object: the mutator deref
+    // islands (`find` / `with_cell_mut`) apply the JSCell::isObject() gate and return None for a
+    // string cell, even though it shares the arena and `MarkedSpace::find` admits it.
+    #[test]
+    fn u0b_string_value_is_not_resolved_as_an_object() {
+        let mut objects = CoreObjectStore::default();
+        let mut strings = CoreStringStore::default();
+        let s = strings.allocate_untracked(&mut objects, "not-an-object");
+
+        assert!(
+            objects.find(s).is_none(),
+            "U0b: a string value is NOT resolved as an object cell"
+        );
+        assert!(
+            objects.with_cell_mut(s, |_| ()).is_none(),
+            "U0b: with_cell_mut rejects a string (leaf) cell"
+        );
+        // The string DID enter the arena (membership admits it) — proving the gate is the
+        // isObject() discriminator, not mere non-membership.
+        assert!(
+            objects.space.is_arena_cell(addr(s)).is_some(),
+            "the string cell IS a member of the shared arena"
+        );
+        // Sanity: a real object cell still resolves.
+        let o = objects.allocate();
+        assert!(objects.find(o).is_some(), "an object value still resolves");
     }
 }

@@ -3871,7 +3871,7 @@ impl CoreOpcodeDispatchHost {
     // concatenates in the live store), not a transient empty one.
     #[cfg(test)]
     pub(crate) fn allocate_untracked_string_for_test(&mut self, text: &str) -> RuntimeValue {
-        self.strings.allocate_untracked(text)
+        self.strings.allocate_untracked(&mut self.objects, text)
     }
 
     #[cfg(test)]
@@ -4664,10 +4664,13 @@ impl CoreOpcodeDispatchHost {
                         usize::try_from(end).unwrap_or(usize::MAX),
                     )
                 };
-                let Ok(value) =
-                    self.strings
-                        .allocate_substring_with_heap(heap, request.this_value, start, end)
-                else {
+                let Ok(value) = self.strings.allocate_substring_with_heap(
+                    &mut self.objects,
+                    heap,
+                    request.this_value,
+                    start,
+                    end,
+                ) else {
                     return GeneratedNativeIntrinsicCallResult::miss(Miss::UnsupportedArgument);
                 };
                 GeneratedNativeIntrinsicCallResult::Hit(GeneratedNativeIntrinsicCallHit {
@@ -6122,8 +6125,23 @@ impl DispatchHost for CoreOpcodeDispatchHost {
         heap: &mut Heap,
     ) {
         let host_roots = self.gather_global_lexical_roots();
-        self.objects
-            .poll_collection_at_safepoint(registers, stack, exceptions, heap, &host_roots);
+        let collected = self.objects.poll_collection_at_safepoint(
+            registers,
+            stack,
+            exceptions,
+            heap,
+            &host_roots,
+        );
+        // gc-r4-completion U1 — if a collection ran, drive each LEAF store's own reclaim over
+        // the dead leaf addresses the reconcile recorded (free its `string_records` slot + weak-
+        // remove its interning entry by identity — the `~StringImpl -> AtomStringImpl::remove`
+        // analog). Runs in the SAME synchronous safepoint, before the mutator resumes and could
+        // recycle a freed arena address, so reading the store's (sweep-surviving) slab is sound.
+        if collected.is_some() {
+            for addr in self.objects.take_reclaimed_leaf_addrs() {
+                self.strings.reconcile_dead_string(addr);
+            }
+        }
     }
 
     fn targeted_register_roots(
@@ -6504,10 +6522,14 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 else {
                     return DispatchOutcome::Fail(ExecutionError::MissingStringLiteral(key));
                 };
-                let value = match self.strings.allocate_with_heap(state.heap, text) {
-                    Ok(value) => value,
-                    Err(error) => return DispatchOutcome::Fail(error),
-                };
+                let value =
+                    match self
+                        .strings
+                        .allocate_with_heap(&mut self.objects, state.heap, text)
+                    {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
                 write_register(state, window, destination, value)
             }
             CoreOpcode::LoadBigInt => {
@@ -6727,14 +6749,22 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(register) => register,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let name = match self.strings.allocate_with_heap(state.heap, "Error") {
-                    Ok(value) => value,
-                    Err(error) => return DispatchOutcome::Fail(error),
-                };
-                let message = match self.strings.allocate_with_heap(state.heap, "") {
-                    Ok(value) => value,
-                    Err(error) => return DispatchOutcome::Fail(error),
-                };
+                let name =
+                    match self
+                        .strings
+                        .allocate_with_heap(&mut self.objects, state.heap, "Error")
+                    {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
+                let message =
+                    match self
+                        .strings
+                        .allocate_with_heap(&mut self.objects, state.heap, "")
+                    {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
                 let function = match self
                     .objects
                     .allocate_error_constructor_with_write_barrier(state.heap, name, message)
@@ -6749,19 +6779,30 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(register) => register,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let error_name = match self.strings.allocate_with_heap(state.heap, "Error") {
+                let error_name =
+                    match self
+                        .strings
+                        .allocate_with_heap(&mut self.objects, state.heap, "Error")
+                    {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
+                let type_error_name = match self.strings.allocate_with_heap(
+                    &mut self.objects,
+                    state.heap,
+                    "TypeError",
+                ) {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let type_error_name = match self.strings.allocate_with_heap(state.heap, "TypeError")
-                {
-                    Ok(value) => value,
-                    Err(error) => return DispatchOutcome::Fail(error),
-                };
-                let message = match self.strings.allocate_with_heap(state.heap, "") {
-                    Ok(value) => value,
-                    Err(error) => return DispatchOutcome::Fail(error),
-                };
+                let message =
+                    match self
+                        .strings
+                        .allocate_with_heap(&mut self.objects, state.heap, "")
+                    {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
                 let function = match self
                     .objects
                     .allocate_type_error_constructor_with_write_barrier(
@@ -6780,21 +6821,30 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(register) => register,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let error_name = match self.strings.allocate_with_heap(state.heap, "Error") {
+                let error_name =
+                    match self
+                        .strings
+                        .allocate_with_heap(&mut self.objects, state.heap, "Error")
+                    {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
+                let reference_error_name = match self.strings.allocate_with_heap(
+                    &mut self.objects,
+                    state.heap,
+                    "ReferenceError",
+                ) {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let reference_error_name = match self
-                    .strings
-                    .allocate_with_heap(state.heap, "ReferenceError")
-                {
-                    Ok(value) => value,
-                    Err(error) => return DispatchOutcome::Fail(error),
-                };
-                let message = match self.strings.allocate_with_heap(state.heap, "") {
-                    Ok(value) => value,
-                    Err(error) => return DispatchOutcome::Fail(error),
-                };
+                let message =
+                    match self
+                        .strings
+                        .allocate_with_heap(&mut self.objects, state.heap, "")
+                    {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
                 let function = match self
                     .objects
                     .allocate_reference_error_constructor_with_write_barrier(
@@ -7091,9 +7141,13 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                         self.bit_not_numeric_value(state.heap, numeric_source)
                     }
                     CoreOpcode::LogicalNot => Ok(RuntimeValue::from_bool(!self.truthy(source))),
-                    CoreOpcode::TypeOf => self
-                        .strings
-                        .allocate_with_heap(state.heap, self.typeof_name(source)),
+                    CoreOpcode::TypeOf => {
+                        // U1: hoist the `&'static str` name out so `&mut self.objects` (the
+                        // leaf-arena owner) does not overlap the `&self` typeof read.
+                        let name = self.typeof_name(source);
+                        self.strings
+                            .allocate_with_heap(&mut self.objects, state.heap, name)
+                    }
                     CoreOpcode::Void => Ok(RuntimeValue::undefined()),
                     _ => Err(ExecutionError::ExpectedInt32),
                 };
@@ -9351,7 +9405,8 @@ impl CoreOpcodeDispatchHost {
             .primitive_to_string(right)
             .ok_or(ExecutionError::ExpectedObject)?;
         text.push_str(&right);
-        self.strings.allocate_with_heap(heap, &text)
+        self.strings
+            .allocate_with_heap(&mut self.objects, heap, &text)
     }
 
     fn coerce_to_string_value(
@@ -9368,7 +9423,7 @@ impl CoreOpcodeDispatchHost {
         if let Some(text) = self.primitive_to_string(value) {
             return self
                 .strings
-                .allocate_with_heap(state.heap, &text)
+                .allocate_with_heap(&mut self.objects, state.heap, &text)
                 .map_err(DispatchOutcome::Fail);
         }
 
@@ -9380,7 +9435,7 @@ impl CoreOpcodeDispatchHost {
             .primitive_to_string(primitive)
             .ok_or(DispatchOutcome::Fail(ExecutionError::ExpectedObject))?;
         self.strings
-            .allocate_with_heap(state.heap, &text)
+            .allocate_with_heap(&mut self.objects, state.heap, &text)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -10447,7 +10502,7 @@ impl CoreOpcodeDispatchHost {
                 Ok(RuntimeValue::undefined())
             } else {
                 self.strings
-                    .allocate_with_heap(state.heap, &character)
+                    .allocate_with_heap(&mut self.objects, state.heap, &character)
                     .map_err(DispatchOutcome::Fail)
             };
             if let Some(site) = lookup_site {
@@ -13741,7 +13796,11 @@ impl CoreOpcodeDispatchHost {
             }
             CoreNativeFunction::DateConstructor => self
                 .strings
-                .allocate_with_heap(state.heap, &format_iso_date_utc(current_time_ms()))
+                .allocate_with_heap(
+                    &mut self.objects,
+                    state.heap,
+                    &format_iso_date_utc(current_time_ms()),
+                )
                 .map_err(DispatchOutcome::Fail),
             CoreNativeFunction::DateNow => Ok(runtime_number_from_f64(current_time_ms())),
             CoreNativeFunction::DateParse => self.native_date_parse(arguments),
@@ -14148,7 +14207,7 @@ impl CoreOpcodeDispatchHost {
         let contents = fs::read_to_string(path)
             .map_err(|_| DispatchOutcome::Fail(ExecutionError::HostReadFile))?;
         self.strings
-            .allocate_with_heap(heap, &contents)
+            .allocate_with_heap(&mut self.objects, heap, &contents)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -14241,7 +14300,11 @@ impl CoreOpcodeDispatchHost {
             if let Ok(kind) = self.objects.typed_array_element_kind(this_value) {
                 return self
                     .strings
-                    .allocate_with_heap(heap, &format!("[object {}]", typed_array_kind_name(kind)))
+                    .allocate_with_heap(
+                        &mut self.objects,
+                        heap,
+                        &format!("[object {}]", typed_array_kind_name(kind)),
+                    )
                     .map_err(DispatchOutcome::Fail);
             }
         }
@@ -14286,7 +14349,7 @@ impl CoreOpcodeDispatchHost {
             }
         };
         self.strings
-            .allocate_with_heap(heap, &format!("[object {tag}]"))
+            .allocate_with_heap(&mut self.objects, heap, &format!("[object {tag}]"))
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -14452,7 +14515,7 @@ impl CoreOpcodeDispatchHost {
             Err(()) => return Err(self.uri_error_outcome(state.heap)),
         };
         self.strings
-            .allocate_with_heap(state.heap, &encoded)
+            .allocate_with_heap(&mut self.objects, state.heap, &encoded)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -14471,7 +14534,7 @@ impl CoreOpcodeDispatchHost {
             Err(()) => return Err(self.uri_error_outcome(state.heap)),
         };
         self.strings
-            .allocate_with_heap(state.heap, &decoded)
+            .allocate_with_heap(&mut self.objects, state.heap, &decoded)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -14484,7 +14547,7 @@ impl CoreOpcodeDispatchHost {
         let units = self.uri_argument_code_units(state, arguments)?;
         let escaped = uri_escape(&units);
         self.strings
-            .allocate_with_heap(state.heap, &escaped)
+            .allocate_with_heap(&mut self.objects, state.heap, &escaped)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -14497,7 +14560,7 @@ impl CoreOpcodeDispatchHost {
         let units = self.uri_argument_code_units(state, arguments)?;
         let unescaped = uri_unescape(&units);
         self.strings
-            .allocate_with_heap(state.heap, &unescaped)
+            .allocate_with_heap(&mut self.objects, state.heap, &unescaped)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -14561,7 +14624,7 @@ impl CoreOpcodeDispatchHost {
             return Err(self.type_error_outcome_with_heap(heap, "Invalid time value"));
         }
         self.strings
-            .allocate_with_heap(heap, &format_iso_date_utc(time_value))
+            .allocate_with_heap(&mut self.objects, heap, &format_iso_date_utc(time_value))
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -14576,11 +14639,11 @@ impl CoreOpcodeDispatchHost {
         if !time_value.is_finite() {
             return self
                 .strings
-                .allocate_with_heap(heap, "Invalid Date")
+                .allocate_with_heap(&mut self.objects, heap, "Invalid Date")
                 .map_err(DispatchOutcome::Fail);
         }
         self.strings
-            .allocate_with_heap(heap, &format_iso_date_utc(time_value))
+            .allocate_with_heap(&mut self.objects, heap, &format_iso_date_utc(time_value))
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -14704,7 +14767,7 @@ impl CoreOpcodeDispatchHost {
             ));
         };
         self.strings
-            .allocate_with_heap(heap, &text)
+            .allocate_with_heap(&mut self.objects, heap, &text)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -15397,7 +15460,7 @@ impl CoreOpcodeDispatchHost {
             return Err(self.type_error_outcome_with_heap(heap, "Symbol.keyFor requires a symbol"));
         };
         self.strings
-            .allocate_with_heap(heap, &key)
+            .allocate_with_heap(&mut self.objects, heap, &key)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -15415,7 +15478,7 @@ impl CoreOpcodeDispatchHost {
         match description {
             Some(description) => self
                 .strings
-                .allocate_with_heap(heap, &description)
+                .allocate_with_heap(&mut self.objects, heap, &description)
                 .map_err(DispatchOutcome::Fail),
             None => Ok(RuntimeValue::undefined()),
         }
@@ -15430,7 +15493,7 @@ impl CoreOpcodeDispatchHost {
             self.type_error_outcome_with_heap(heap, "Symbol method called on incompatible receiver")
         })?;
         self.strings
-            .allocate_with_heap(heap, &text)
+            .allocate_with_heap(&mut self.objects, heap, &text)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -15815,19 +15878,19 @@ impl CoreOpcodeDispatchHost {
     ) -> Result<RuntimeValue, DispatchOutcome> {
         let error_name = self
             .strings
-            .allocate_with_heap(heap, "Error")
+            .allocate_with_heap(&mut self.objects, heap, "Error")
             .map_err(DispatchOutcome::Fail)?;
         let type_error_name = self
             .strings
-            .allocate_with_heap(heap, "TypeError")
+            .allocate_with_heap(&mut self.objects, heap, "TypeError")
             .map_err(DispatchOutcome::Fail)?;
         let empty_message = self
             .strings
-            .allocate_with_heap(heap, "")
+            .allocate_with_heap(&mut self.objects, heap, "")
             .map_err(DispatchOutcome::Fail)?;
         let message = self
             .strings
-            .allocate_with_heap(heap, message)
+            .allocate_with_heap(&mut self.objects, heap, message)
             .map_err(DispatchOutcome::Fail)?;
         let prototype =
             self.objects
@@ -16366,7 +16429,11 @@ impl CoreOpcodeDispatchHost {
         let array = self.objects.allocate_array();
         let matched = self
             .strings
-            .allocate_with_heap(heap, &result.input[result.start..result.end])
+            .allocate_with_heap(
+                &mut self.objects,
+                heap,
+                &result.input[result.start..result.end],
+            )
             .map_err(DispatchOutcome::Fail)?;
         self.objects
             .push_array_element_with_write_barrier(heap, array, matched)
@@ -16374,7 +16441,11 @@ impl CoreOpcodeDispatchHost {
         for capture in &result.captures {
             let value = if let Some(range) = capture {
                 self.strings
-                    .allocate_with_heap(heap, &result.input[range.start..range.end])
+                    .allocate_with_heap(
+                        &mut self.objects,
+                        heap,
+                        &result.input[range.start..range.end],
+                    )
                     .map_err(DispatchOutcome::Fail)?
             } else {
                 RuntimeValue::undefined()
@@ -16393,7 +16464,7 @@ impl CoreOpcodeDispatchHost {
             .map_err(DispatchOutcome::Fail)?;
         let input = self
             .strings
-            .allocate_with_heap(heap, &result.input)
+            .allocate_with_heap(&mut self.objects, heap, &result.input)
             .map_err(DispatchOutcome::Fail)?;
         self.objects
             .put_data_own_with_write_barrier(
@@ -16413,7 +16484,7 @@ impl CoreOpcodeDispatchHost {
     ) -> Result<RuntimeValue, DispatchOutcome> {
         let (source, _, flags_text) = self.regexp_source_and_flags_or_throw(heap, this_value)?;
         self.strings
-            .allocate_with_heap(heap, &format!("/{source}/{flags_text}"))
+            .allocate_with_heap(&mut self.objects, heap, &format!("/{source}/{flags_text}"))
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -16443,12 +16514,12 @@ impl CoreOpcodeDispatchHost {
             RegExpGetterReceiver::RegExp => {
                 let (source, _, _) = self.regexp_source_and_flags_or_throw(heap, this_value)?;
                 self.strings
-                    .allocate_with_heap(heap, &source)
+                    .allocate_with_heap(&mut self.objects, heap, &source)
                     .map_err(DispatchOutcome::Fail)
             }
             RegExpGetterReceiver::Prototype => self
                 .strings
-                .allocate_with_heap(heap, "(?:)")
+                .allocate_with_heap(&mut self.objects, heap, "(?:)")
                 .map_err(DispatchOutcome::Fail),
             RegExpGetterReceiver::Invalid => Err(self.type_error_outcome_with_heap(
                 heap,
@@ -16494,7 +16565,7 @@ impl CoreOpcodeDispatchHost {
         };
         let text = regexp_canonical_flags_string(flags);
         self.strings
-            .allocate_with_heap(heap, &text)
+            .allocate_with_heap(&mut self.objects, heap, &text)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -16929,7 +17000,7 @@ impl CoreOpcodeDispatchHost {
             for character in text.chars() {
                 let value = self
                     .strings
-                    .allocate_with_heap(heap, &character.to_string())
+                    .allocate_with_heap(&mut self.objects, heap, &character.to_string())
                     .map_err(DispatchOutcome::Fail)?;
                 self.objects
                     .push_array_element_with_write_barrier(heap, array, value)
@@ -17181,7 +17252,7 @@ impl CoreOpcodeDispatchHost {
             parts.push(text);
         }
         self.strings
-            .allocate_with_heap(heap, &parts.join(&separator))
+            .allocate_with_heap(&mut self.objects, heap, &parts.join(&separator))
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -18118,7 +18189,7 @@ impl CoreOpcodeDispatchHost {
             return Ok(RuntimeValue::undefined());
         };
         self.strings
-            .allocate_with_heap(state.heap, &text)
+            .allocate_with_heap(&mut self.objects, state.heap, &text)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -18230,7 +18301,7 @@ impl CoreOpcodeDispatchHost {
         let Some(value) = arguments.first().copied() else {
             return self
                 .strings
-                .allocate_with_heap(state.heap, "")
+                .allocate_with_heap(&mut self.objects, state.heap, "")
                 .map_err(DispatchOutcome::Fail);
         };
         if self.symbols.is_symbol(value) {
@@ -18240,7 +18311,7 @@ impl CoreOpcodeDispatchHost {
                 .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
             return self
                 .strings
-                .allocate_with_heap(state.heap, &text)
+                .allocate_with_heap(&mut self.objects, state.heap, &text)
                 .map_err(DispatchOutcome::Fail);
         }
         self.coerce_to_string_value(state, value)
@@ -18257,7 +18328,7 @@ impl CoreOpcodeDispatchHost {
             result.push(char::from_u32(u32::from(code)).unwrap_or('\u{FFFD}'));
         }
         self.strings
-            .allocate_with_heap(heap, &result)
+            .allocate_with_heap(&mut self.objects, heap, &result)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -18370,7 +18441,7 @@ impl CoreOpcodeDispatchHost {
             .map_err(DispatchOutcome::Fail)?;
         let text = number_to_string_with_radix(number, radix);
         self.strings
-            .allocate_with_heap(heap, &text)
+            .allocate_with_heap(&mut self.objects, heap, &text)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -18438,11 +18509,11 @@ impl CoreOpcodeDispatchHost {
     ) -> Result<RuntimeValue, DispatchOutcome> {
         let name = self
             .strings
-            .allocate_with_heap(heap, "Error")
+            .allocate_with_heap(&mut self.objects, heap, "Error")
             .map_err(DispatchOutcome::Fail)?;
         let message = self
             .strings
-            .allocate_with_heap(heap, "")
+            .allocate_with_heap(&mut self.objects, heap, "")
             .map_err(DispatchOutcome::Fail)?;
         let prototype = self.objects.ensure_error_prototype(name, message);
         self.allocate_error_instance(heap, prototype, arguments)
@@ -18455,15 +18526,15 @@ impl CoreOpcodeDispatchHost {
     ) -> Result<RuntimeValue, DispatchOutcome> {
         let error_name = self
             .strings
-            .allocate_with_heap(heap, "Error")
+            .allocate_with_heap(&mut self.objects, heap, "Error")
             .map_err(DispatchOutcome::Fail)?;
         let type_error_name = self
             .strings
-            .allocate_with_heap(heap, "TypeError")
+            .allocate_with_heap(&mut self.objects, heap, "TypeError")
             .map_err(DispatchOutcome::Fail)?;
         let message = self
             .strings
-            .allocate_with_heap(heap, "")
+            .allocate_with_heap(&mut self.objects, heap, "")
             .map_err(DispatchOutcome::Fail)?;
         let prototype =
             self.objects
@@ -18478,15 +18549,15 @@ impl CoreOpcodeDispatchHost {
     ) -> Result<RuntimeValue, DispatchOutcome> {
         let error_name = self
             .strings
-            .allocate_with_heap(heap, "Error")
+            .allocate_with_heap(&mut self.objects, heap, "Error")
             .map_err(DispatchOutcome::Fail)?;
         let reference_error_name = self
             .strings
-            .allocate_with_heap(heap, "ReferenceError")
+            .allocate_with_heap(&mut self.objects, heap, "ReferenceError")
             .map_err(DispatchOutcome::Fail)?;
         let message = self
             .strings
-            .allocate_with_heap(heap, "")
+            .allocate_with_heap(&mut self.objects, heap, "")
             .map_err(DispatchOutcome::Fail)?;
         let prototype = self.objects.ensure_reference_error_prototype(
             error_name,
@@ -18530,7 +18601,7 @@ impl CoreOpcodeDispatchHost {
             .primitive_to_string(value)
             .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
         self.strings
-            .allocate_with_heap(heap, &text)
+            .allocate_with_heap(&mut self.objects, heap, &text)
             .map(Some)
             .map_err(DispatchOutcome::Fail)
     }
@@ -18555,7 +18626,7 @@ impl CoreOpcodeDispatchHost {
             format!("{name}: {message}")
         };
         self.strings
-            .allocate_with_heap(state.heap, &result)
+            .allocate_with_heap(&mut self.objects, state.heap, &result)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -18576,19 +18647,29 @@ impl CoreOpcodeDispatchHost {
     }
 
     fn type_error_outcome_with_heap(&mut self, heap: &mut Heap, message: &str) -> DispatchOutcome {
-        let error_name = match self.strings.allocate_with_heap(heap, "Error") {
+        let error_name = match self
+            .strings
+            .allocate_with_heap(&mut self.objects, heap, "Error")
+        {
             Ok(value) => value,
             Err(error) => return DispatchOutcome::Fail(error),
         };
-        let type_error_name = match self.strings.allocate_with_heap(heap, "TypeError") {
+        let type_error_name =
+            match self
+                .strings
+                .allocate_with_heap(&mut self.objects, heap, "TypeError")
+            {
+                Ok(value) => value,
+                Err(error) => return DispatchOutcome::Fail(error),
+            };
+        let empty_message = match self.strings.allocate_with_heap(&mut self.objects, heap, "") {
             Ok(value) => value,
             Err(error) => return DispatchOutcome::Fail(error),
         };
-        let empty_message = match self.strings.allocate_with_heap(heap, "") {
-            Ok(value) => value,
-            Err(error) => return DispatchOutcome::Fail(error),
-        };
-        let message = match self.strings.allocate_with_heap(heap, message) {
+        let message = match self
+            .strings
+            .allocate_with_heap(&mut self.objects, heap, message)
+        {
             Ok(value) => value,
             Err(error) => return DispatchOutcome::Fail(error),
         };
@@ -18615,19 +18696,29 @@ impl CoreOpcodeDispatchHost {
         heap: &mut Heap,
         message: &str,
     ) -> DispatchOutcome {
-        let error_name = match self.strings.allocate_with_heap(heap, "Error") {
+        let error_name = match self
+            .strings
+            .allocate_with_heap(&mut self.objects, heap, "Error")
+        {
             Ok(value) => value,
             Err(error) => return DispatchOutcome::Fail(error),
         };
-        let reference_error_name = match self.strings.allocate_with_heap(heap, "ReferenceError") {
+        let reference_error_name =
+            match self
+                .strings
+                .allocate_with_heap(&mut self.objects, heap, "ReferenceError")
+            {
+                Ok(value) => value,
+                Err(error) => return DispatchOutcome::Fail(error),
+            };
+        let empty_message = match self.strings.allocate_with_heap(&mut self.objects, heap, "") {
             Ok(value) => value,
             Err(error) => return DispatchOutcome::Fail(error),
         };
-        let empty_message = match self.strings.allocate_with_heap(heap, "") {
-            Ok(value) => value,
-            Err(error) => return DispatchOutcome::Fail(error),
-        };
-        let message = match self.strings.allocate_with_heap(heap, message) {
+        let message = match self
+            .strings
+            .allocate_with_heap(&mut self.objects, heap, message)
+        {
             Ok(value) => value,
             Err(error) => return DispatchOutcome::Fail(error),
         };
@@ -18655,19 +18746,29 @@ impl CoreOpcodeDispatchHost {
     // catchable RangeError, used by `JSArray::put`'s "Invalid array length" throw
     // (runtime/JSArray.cpp:321). Mirrors `reference_error_outcome_with_heap`.
     fn range_error_outcome_with_heap(&mut self, heap: &mut Heap, message: &str) -> DispatchOutcome {
-        let error_name = match self.strings.allocate_with_heap(heap, "Error") {
+        let error_name = match self
+            .strings
+            .allocate_with_heap(&mut self.objects, heap, "Error")
+        {
             Ok(value) => value,
             Err(error) => return DispatchOutcome::Fail(error),
         };
-        let range_error_name = match self.strings.allocate_with_heap(heap, "RangeError") {
+        let range_error_name =
+            match self
+                .strings
+                .allocate_with_heap(&mut self.objects, heap, "RangeError")
+            {
+                Ok(value) => value,
+                Err(error) => return DispatchOutcome::Fail(error),
+            };
+        let empty_message = match self.strings.allocate_with_heap(&mut self.objects, heap, "") {
             Ok(value) => value,
             Err(error) => return DispatchOutcome::Fail(error),
         };
-        let empty_message = match self.strings.allocate_with_heap(heap, "") {
-            Ok(value) => value,
-            Err(error) => return DispatchOutcome::Fail(error),
-        };
-        let message = match self.strings.allocate_with_heap(heap, message) {
+        let message = match self
+            .strings
+            .allocate_with_heap(&mut self.objects, heap, message)
+        {
             Ok(value) => value,
             Err(error) => return DispatchOutcome::Fail(error),
         };
@@ -18778,7 +18879,7 @@ impl CoreOpcodeDispatchHost {
                 .unwrap_or_default()
         };
         self.strings
-            .allocate_with_heap(heap, &result)
+            .allocate_with_heap(&mut self.objects, heap, &result)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -18910,7 +19011,7 @@ impl CoreOpcodeDispatchHost {
             )
         };
         self.strings
-            .allocate_with_heap(heap, &result)
+            .allocate_with_heap(&mut self.objects, heap, &result)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -18959,7 +19060,7 @@ impl CoreOpcodeDispatchHost {
             )
         };
         self.strings
-            .allocate_substring_with_heap(heap, this_value, start, end)
+            .allocate_substring_with_heap(&mut self.objects, heap, this_value, start, end)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -18993,7 +19094,7 @@ impl CoreOpcodeDispatchHost {
             )
         };
         self.strings
-            .allocate_with_heap(heap, &result)
+            .allocate_with_heap(&mut self.objects, heap, &result)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -19019,7 +19120,7 @@ impl CoreOpcodeDispatchHost {
         else {
             let value = self
                 .strings
-                .allocate_with_heap(heap, &text)
+                .allocate_with_heap(&mut self.objects, heap, &text)
                 .map_err(DispatchOutcome::Fail)?;
             self.objects
                 .push_array_element_with_write_barrier(heap, array, value)
@@ -19038,7 +19139,7 @@ impl CoreOpcodeDispatchHost {
                 let part = String::from_utf16_lossy(&[unit]);
                 let value = self
                     .strings
-                    .allocate_with_heap(heap, &part)
+                    .allocate_with_heap(&mut self.objects, heap, &part)
                     .map_err(DispatchOutcome::Fail)?;
                 self.objects
                     .push_array_element_with_write_barrier(heap, array, value)
@@ -19049,7 +19150,7 @@ impl CoreOpcodeDispatchHost {
         for part in text.split(&separator).take(limit) {
             let value = self
                 .strings
-                .allocate_with_heap(heap, part)
+                .allocate_with_heap(&mut self.objects, heap, part)
                 .map_err(DispatchOutcome::Fail)?;
             self.objects
                 .push_array_element_with_write_barrier(heap, array, value)
@@ -19092,7 +19193,7 @@ impl CoreOpcodeDispatchHost {
             let part = text.get(last_end..matched.start).unwrap_or_default();
             let value = self
                 .strings
-                .allocate_with_heap(heap, part)
+                .allocate_with_heap(&mut self.objects, heap, part)
                 .map_err(DispatchOutcome::Fail)?;
             self.objects
                 .push_array_element_with_write_barrier(heap, array, value)
@@ -19108,7 +19209,7 @@ impl CoreOpcodeDispatchHost {
             let part = text.get(last_end..).unwrap_or_default();
             let value = self
                 .strings
-                .allocate_with_heap(heap, part)
+                .allocate_with_heap(&mut self.objects, heap, part)
                 .map_err(DispatchOutcome::Fail)?;
             self.objects
                 .push_array_element_with_write_barrier(heap, array, value)
@@ -19223,7 +19324,7 @@ impl CoreOpcodeDispatchHost {
         for matched_str in &matches {
             let value = self
                 .strings
-                .allocate_with_heap(heap, matched_str)
+                .allocate_with_heap(&mut self.objects, heap, matched_str)
                 .map_err(DispatchOutcome::Fail)?;
             self.objects
                 .push_array_element_with_write_barrier(heap, array, value)
@@ -19247,7 +19348,11 @@ impl CoreOpcodeDispatchHost {
         let array = self.objects.allocate_array();
         let matched = self
             .strings
-            .allocate_with_heap(heap, input.get(start..end).unwrap_or_default())
+            .allocate_with_heap(
+                &mut self.objects,
+                heap,
+                input.get(start..end).unwrap_or_default(),
+            )
             .map_err(DispatchOutcome::Fail)?;
         self.objects
             .push_array_element_with_write_barrier(heap, array, matched)
@@ -19255,7 +19360,11 @@ impl CoreOpcodeDispatchHost {
         for capture in captures {
             let value = if let Some(range) = capture {
                 self.strings
-                    .allocate_with_heap(heap, input.get(range.start..range.end).unwrap_or_default())
+                    .allocate_with_heap(
+                        &mut self.objects,
+                        heap,
+                        input.get(range.start..range.end).unwrap_or_default(),
+                    )
                     .map_err(DispatchOutcome::Fail)?
             } else {
                 RuntimeValue::undefined()
@@ -19274,7 +19383,7 @@ impl CoreOpcodeDispatchHost {
             .map_err(DispatchOutcome::Fail)?;
         let input_value = self
             .strings
-            .allocate_with_heap(heap, input)
+            .allocate_with_heap(&mut self.objects, heap, input)
             .map_err(DispatchOutcome::Fail)?;
         self.objects
             .put_data_own_with_write_barrier(
@@ -19321,7 +19430,7 @@ impl CoreOpcodeDispatchHost {
                 self.string_replace_once_with_function(state, &text, &search, replacement_value)?
             };
             self.strings
-                .allocate_with_heap(state.heap, &result)
+                .allocate_with_heap(&mut self.objects, state.heap, &result)
                 .map_err(DispatchOutcome::Fail)
         } else {
             let replacement = self
@@ -19338,7 +19447,7 @@ impl CoreOpcodeDispatchHost {
                 string_replace_once(&text, &search, &replacement)
             };
             self.strings
-                .allocate_with_heap(state.heap, &result)
+                .allocate_with_heap(&mut self.objects, state.heap, &result)
                 .map_err(DispatchOutcome::Fail)
         }
     }
@@ -19433,7 +19542,7 @@ impl CoreOpcodeDispatchHost {
         let original_text = text.to_owned();
         let original_string = self
             .strings
-            .allocate_with_heap(state.heap, &original_text)
+            .allocate_with_heap(&mut self.objects, state.heap, &original_text)
             .map_err(DispatchOutcome::Fail)?;
         let mut result = String::new();
         let mut last_end = 0usize;
@@ -19468,7 +19577,7 @@ impl CoreOpcodeDispatchHost {
                 .unwrap_or_default();
             let matched_value = self
                 .strings
-                .allocate_with_heap(state.heap, matched_str)
+                .allocate_with_heap(&mut self.objects, state.heap, matched_str)
                 .map_err(DispatchOutcome::Fail)?;
             args.push(matched_value);
             // Capture groups
@@ -19479,7 +19588,7 @@ impl CoreOpcodeDispatchHost {
                         .unwrap_or_default();
                     let capture_value = self
                         .strings
-                        .allocate_with_heap(state.heap, capture_str)
+                        .allocate_with_heap(&mut self.objects, state.heap, capture_str)
                         .map_err(DispatchOutcome::Fail)?;
                     args.push(capture_value);
                 } else {
@@ -19530,11 +19639,11 @@ impl CoreOpcodeDispatchHost {
         };
         let original_string = self
             .strings
-            .allocate_with_heap(state.heap, text)
+            .allocate_with_heap(&mut self.objects, state.heap, text)
             .map_err(DispatchOutcome::Fail)?;
         let matched_value = self
             .strings
-            .allocate_with_heap(state.heap, search)
+            .allocate_with_heap(&mut self.objects, state.heap, search)
             .map_err(DispatchOutcome::Fail)?;
         let args = [
             matched_value,
@@ -19556,7 +19665,7 @@ impl CoreOpcodeDispatchHost {
     ) -> Result<RuntimeValue, DispatchOutcome> {
         let text = self.string_this(this_value)?;
         self.strings
-            .allocate_with_heap(heap, &text.to_lowercase())
+            .allocate_with_heap(&mut self.objects, heap, &text.to_lowercase())
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -19567,7 +19676,7 @@ impl CoreOpcodeDispatchHost {
     ) -> Result<RuntimeValue, DispatchOutcome> {
         let text = self.string_this(this_value)?;
         self.strings
-            .allocate_with_heap(heap, &text.to_uppercase())
+            .allocate_with_heap(&mut self.objects, heap, &text.to_uppercase())
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -19870,7 +19979,10 @@ impl CoreOpcodeDispatchHost {
         key: &CorePropertyKey,
     ) -> Result<RuntimeValue, ExecutionError> {
         match key {
-            CorePropertyKey::String(name) => self.strings.allocate_with_heap(heap, name),
+            CorePropertyKey::String(name) => {
+                self.strings
+                    .allocate_with_heap(&mut self.objects, heap, name)
+            }
             CorePropertyKey::Identifier(identifier) => {
                 let text = self
                     .identifier_texts
@@ -19878,6 +19990,7 @@ impl CoreOpcodeDispatchHost {
                     .cloned()
                     .unwrap_or_else(|| identifier.to_string());
                 self.strings.allocate_atom_with_heap(
+                    &mut self.objects,
                     heap,
                     Identifier::from_atom(AtomId::from_table_slot(*identifier)),
                     &text,
@@ -20278,7 +20391,7 @@ impl CoreOpcodeDispatchHost {
         for (index, key) in keys.iter().enumerate() {
             let value = self
                 .strings
-                .allocate_with_heap(heap, key)
+                .allocate_with_heap(&mut self.objects, heap, key)
                 .map_err(DispatchOutcome::Fail)?;
             self.objects
                 .put_index(heap, result, index.try_into().unwrap_or(i32::MAX), value)
@@ -20304,7 +20417,7 @@ impl CoreOpcodeDispatchHost {
         for (index, key) in keys.iter().enumerate() {
             let value = self
                 .strings
-                .allocate_with_heap(heap, key)
+                .allocate_with_heap(&mut self.objects, heap, key)
                 .map_err(DispatchOutcome::Fail)?;
             self.objects
                 .put_index(heap, result, index.try_into().unwrap_or(i32::MAX), value)
@@ -20360,7 +20473,7 @@ impl CoreOpcodeDispatchHost {
             let key = CorePropertyKey::String(key_name.clone());
             let key_value = self
                 .strings
-                .allocate_with_heap(state.heap, key_name)
+                .allocate_with_heap(&mut self.objects, state.heap, key_name)
                 .map_err(DispatchOutcome::Fail)?;
             let value = self.get_property_value(state, object, &key, object)?;
             let entry = self.objects.allocate_array();
@@ -20580,7 +20693,7 @@ impl<'a> JsonParser<'a> {
             Some(b'"') => {
                 let text = self.parse_string()?;
                 host.strings
-                    .allocate_with_heap(heap, &text)
+                    .allocate_with_heap(&mut host.objects, heap, &text)
                     .map_err(DispatchOutcome::Fail)
             }
             Some(b'[') => self.parse_array(host, heap),
@@ -23987,18 +24100,21 @@ mod tests {
         let identifier = Identifier::from_atom(AtomId::from_table_slot(11));
         let atom_string = host
             .strings
-            .allocate_atom_with_heap(&mut heap, identifier, "field")
+            .allocate_atom_with_heap(&mut host.objects, &mut heap, identifier, "field")
             .unwrap();
-        let plain_string = host.strings.allocate_with_heap(&mut heap, "plain").unwrap();
+        let plain_string = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "plain")
+            .unwrap();
         let index_identifier = Identifier::from_atom(AtomId::from_table_slot(12));
         let index_string = host
             .strings
-            .allocate_atom_with_heap(&mut heap, index_identifier, "0")
+            .allocate_atom_with_heap(&mut host.objects, &mut heap, index_identifier, "0")
             .unwrap();
         let length_identifier = Identifier::from_atom(AtomId::from_table_slot(13));
         let length_string = host
             .strings
-            .allocate_atom_with_heap(&mut heap, length_identifier, "length")
+            .allocate_atom_with_heap(&mut host.objects, &mut heap, length_identifier, "length")
             .unwrap();
 
         assert_eq!(
@@ -24069,7 +24185,10 @@ mod tests {
         let other_callee = host
             .objects
             .allocate_native_function(CoreNativeFunction::ObjectConstructor);
-        let text = host.strings.allocate_with_heap(&mut heap, "core").unwrap();
+        let text = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "core")
+            .unwrap();
         let base_request = GeneratedNativeIntrinsicCallRequest {
             owner: CodeBlockId(CellId(1)),
             bytecode_index: BytecodeIndex::from_offset(7),
@@ -24165,7 +24284,10 @@ mod tests {
         let callee = host
             .objects
             .allocate_native_function(CoreNativeFunction::StringSubstring);
-        let text = host.strings.allocate_with_heap(&mut heap, "core").unwrap();
+        let text = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "core")
+            .unwrap();
         let base_request = GeneratedNativeIntrinsicCallRequest {
             owner: CodeBlockId(CellId(1)),
             bytecode_index: BytecodeIndex::from_offset(7),
@@ -24222,7 +24344,10 @@ mod tests {
         let other_callee = host
             .objects
             .allocate_native_function(CoreNativeFunction::ObjectConstructor);
-        let text = host.strings.allocate_with_heap(&mut heap, "core").unwrap();
+        let text = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "core")
+            .unwrap();
         let base_request = GeneratedNativeIntrinsicCallRequest {
             owner: CodeBlockId(CellId(1)),
             bytecode_index: BytecodeIndex::from_offset(7),
@@ -24327,9 +24452,12 @@ mod tests {
             .allocate_native_function(CoreNativeFunction::StringLastIndexOf);
         let text = host
             .strings
-            .allocate_with_heap(&mut heap, "banana")
+            .allocate_with_heap(&mut host.objects, &mut heap, "banana")
             .unwrap();
-        let search = host.strings.allocate_with_heap(&mut heap, "ana").unwrap();
+        let search = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "ana")
+            .unwrap();
         let base_request = GeneratedNativeIntrinsicCallRequest {
             owner: CodeBlockId(CellId(1)),
             bytecode_index: BytecodeIndex::from_offset(7),
@@ -24401,9 +24529,12 @@ mod tests {
             .allocate_native_function(CoreNativeFunction::StringIndexOf);
         let text = host
             .strings
-            .allocate_with_heap(&mut heap, "banana")
+            .allocate_with_heap(&mut host.objects, &mut heap, "banana")
             .unwrap();
-        let search = host.strings.allocate_with_heap(&mut heap, "ana").unwrap();
+        let search = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "ana")
+            .unwrap();
         let base_request = GeneratedNativeIntrinsicCallRequest {
             owner: CodeBlockId(CellId(1)),
             bytecode_index: BytecodeIndex::from_offset(7),
@@ -25403,14 +25534,16 @@ mod tests {
 
         // String: resolve via CoreStringStore::index_for_value (payload gate).
         let mut strings = CoreStringStore::default();
-        let string_value = strings.allocate_untracked("route-b-s1");
+        let string_value = strings.allocate_untracked(&mut objects, "route-b-s1");
         let string_index = strings
             .index_for_value(string_value)
             .expect("string resolves via gate");
-        let string = strings.strings[string_index].as_ref().get_ref();
-        assert_eq!(string.js_type, JsType::String);
-        assert!(!string.js_type.is_object());
-        assert_eq!(string.js_type.cell_type(), CellType::String);
+        // U1: the cell is now a SHARED-arena String cell (CoreObjectStore::space). It resolves
+        // via the string store's gate, carries its text, and the U0b `isObject()` gate rejects
+        // it as an object (StringType < ObjectType) — proving leaf/object discrimination.
+        let _ = string_index;
+        assert_eq!(strings.text(string_value), Some("route-b-s1"));
+        assert!(objects.find(string_value).is_none());
 
         // Symbol: resolve via CoreSymbolStore::find (payload scan gate).
         let mut symbols = CoreSymbolStore::default();
@@ -26570,7 +26703,10 @@ mod tests {
         host.objects
             .set_data_own(object, &key, RuntimeValue::from_i32(9))
             .unwrap();
-        let key_value = host.strings.allocate_with_heap(&mut heap, "field").unwrap();
+        let key_value = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "field")
+            .unwrap();
         registers.write(window, object_register, object).unwrap();
         registers.write(window, key_register, key_value).unwrap();
 
@@ -27541,7 +27677,10 @@ mod tests {
         let expected_structure = object_structure_id(&host.objects, prototype);
         let expected_offset =
             object_property_offset(&host.objects, prototype, &key).expect("prototype offset");
-        let string = host.strings.allocate_with_heap(&mut heap, "seed").unwrap();
+        let string = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "seed")
+            .unwrap();
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
         let mut exceptions = ExceptionState::default();
@@ -27640,7 +27779,10 @@ mod tests {
         let object_prototype_structure = object_structure_id(&host.objects, object_prototype);
         let expected_offset =
             object_property_offset(&host.objects, object_prototype, &key).expect("holder offset");
-        let string = host.strings.allocate_with_heap(&mut heap, "seed").unwrap();
+        let string = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "seed")
+            .unwrap();
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
         let mut exceptions = ExceptionState::default();
@@ -27744,7 +27886,10 @@ mod tests {
         let key = CorePropertyKey::String("absentExtra".into());
         let string_prototype_structure = object_structure_id(&host.objects, string_prototype);
         let object_prototype_structure = object_structure_id(&host.objects, object_prototype);
-        let string = host.strings.allocate_with_heap(&mut heap, "seed").unwrap();
+        let string = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "seed")
+            .unwrap();
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
         let mut exceptions = ExceptionState::default();
@@ -27814,7 +27959,10 @@ mod tests {
         let owner = CodeBlockId(CellId(79));
         host.identifier_texts.insert(11, "length".into());
         let key = CorePropertyKey::String("length".into());
-        let string = host.strings.allocate_with_heap(&mut heap, "seed").unwrap();
+        let string = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "seed")
+            .unwrap();
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
         let mut exceptions = ExceptionState::default();
@@ -30812,44 +30960,59 @@ mod tests {
 
     #[test]
     fn core_string_store_binds_untracked_string_when_heap_path_reuses_intern() {
+        // gc-r4-completion U1: the string CELL lives in the SHARED arena (CoreObjectStore),
+        // the StringImpl payload + heap-binding id in the store's `string_records` slab.
+        let mut objects = CoreObjectStore::default();
         let mut strings = CoreStringStore::default();
         let mut heap = Heap::new();
-        let untracked = strings.allocate_untracked("seeded");
+        let untracked = strings.allocate_untracked(&mut objects, "seeded");
         let payload = cell_payload(untracked);
         assert_eq!(heap.cell_for_payload(payload), None);
 
-        let rebound = strings.allocate_with_heap(&mut heap, "seeded").unwrap();
+        let rebound = strings
+            .allocate_with_heap(&mut objects, &mut heap, "seeded")
+            .unwrap();
 
         assert_eq!(rebound, untracked);
         let cell = heap_cell_for_value(&heap, rebound);
         assert_ne!(cell, CellId::default());
         assert_eq!(heap.payload_for_cell(cell), Some(payload));
-        assert_eq!(strings.strings[0].as_ref().get_ref().cell_id, cell);
+        let slot = strings.index_for_value(rebound).unwrap();
+        assert_eq!(strings.string_records[slot].cell_id, cell);
     }
 
     #[test]
     fn core_string_store_binds_fresh_heap_string_allocation() {
+        let mut objects = CoreObjectStore::default();
         let mut strings = CoreStringStore::default();
         let mut heap = Heap::new();
 
-        let value = strings.allocate_with_heap(&mut heap, "fresh").unwrap();
+        let value = strings
+            .allocate_with_heap(&mut objects, &mut heap, "fresh")
+            .unwrap();
 
         let payload = cell_payload(value);
         let cell = heap_cell_for_value(&heap, value);
         assert_ne!(cell, CellId::default());
         assert_eq!(heap.payload_for_cell(cell), Some(payload));
-        assert_eq!(strings.strings[0].as_ref().get_ref().cell_id, cell);
+        let slot = strings.index_for_value(value).unwrap();
+        assert_eq!(strings.string_records[slot].cell_id, cell);
     }
 
     #[test]
     fn core_string_store_repeated_heap_string_preserves_identity_and_cell_id() {
+        let mut objects = CoreObjectStore::default();
         let mut strings = CoreStringStore::default();
         let mut heap = Heap::new();
-        let first = strings.allocate_with_heap(&mut heap, "repeat").unwrap();
+        let first = strings
+            .allocate_with_heap(&mut objects, &mut heap, "repeat")
+            .unwrap();
         let first_cell = heap_cell_for_value(&heap, first);
         let allocation_count = heap.allocation_records().len();
 
-        let second = strings.allocate_with_heap(&mut heap, "repeat").unwrap();
+        let second = strings
+            .allocate_with_heap(&mut objects, &mut heap, "repeat")
+            .unwrap();
 
         assert_eq!(second, first);
         assert_eq!(heap_cell_for_value(&heap, second), first_cell);
@@ -30858,63 +31021,71 @@ mod tests {
 
     #[test]
     fn core_string_store_ascii_substring_shares_base_text_without_interning_copy() {
+        let mut objects = CoreObjectStore::default();
         let mut strings = CoreStringStore::default();
         let mut heap = Heap::new();
         let base_text = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        let base = strings.allocate_with_heap(&mut heap, base_text).unwrap();
+        let base = strings
+            .allocate_with_heap(&mut objects, &mut heap, base_text)
+            .unwrap();
+        let base_addr = cell_payload(base);
 
         let substring = strings
-            .allocate_substring_with_heap(&mut heap, base, 5, 45)
+            .allocate_substring_with_heap(&mut objects, &mut heap, base, 5, 45)
             .unwrap();
 
         assert_eq!(strings.text(substring), Some(&base_text[5..45]));
         let substring_index = strings.index_for_value(substring).unwrap();
+        // U1: `Substring.base` is now the base CELL's ARENA ADDRESS (was a Vec index pre-U1),
+        // mirroring the cell's inline rope fiber `base`.
         assert!(matches!(
-            strings.strings[substring_index].as_ref().get_ref().text,
+            strings.string_records[substring_index].text,
             CoreStringCellText::Substring {
-                base: 0,
+                base,
                 start_byte: 5,
                 end_byte: 45,
-            }
+            } if base == base_addr
         ));
         assert!(!strings.by_text.contains_key(&base_text[5..45]));
 
         let flat = strings
-            .allocate_with_heap(&mut heap, &base_text[5..45])
+            .allocate_with_heap(&mut objects, &mut heap, &base_text[5..45])
             .unwrap();
         assert_eq!(strings.strict_equals(substring, flat), Some(true));
 
         let nested = strings
-            .allocate_substring_with_heap(&mut heap, substring, 3, 37)
+            .allocate_substring_with_heap(&mut objects, &mut heap, substring, 3, 37)
             .unwrap();
         assert_eq!(strings.text(nested), Some(&base_text[8..42]));
         let nested_index = strings.index_for_value(nested).unwrap();
+        // Nested substring collapses onto the ULTIMATE flat base cell (depth-1 rope).
         assert!(matches!(
-            strings.strings[nested_index].as_ref().get_ref().text,
+            strings.string_records[nested_index].text,
             CoreStringCellText::Substring {
-                base: 0,
+                base,
                 start_byte: 8,
                 end_byte: 42,
-            }
+            } if base == base_addr
         ));
     }
 
     #[test]
     fn core_string_store_tiny_ascii_substring_copies_like_jsc_small_strings() {
+        let mut objects = CoreObjectStore::default();
         let mut strings = CoreStringStore::default();
         let mut heap = Heap::new();
         let base = strings
-            .allocate_with_heap(&mut heap, "compiler_input")
+            .allocate_with_heap(&mut objects, &mut heap, "compiler_input")
             .unwrap();
 
         let substring = strings
-            .allocate_substring_with_heap(&mut heap, base, 0, 8)
+            .allocate_substring_with_heap(&mut objects, &mut heap, base, 0, 8)
             .unwrap();
 
         assert_eq!(strings.text(substring), Some("compiler"));
         let substring_index = strings.index_for_value(substring).unwrap();
         assert!(matches!(
-            strings.strings[substring_index].as_ref().get_ref().text,
+            strings.string_records[substring_index].text,
             CoreStringCellText::Flat(_),
         ));
         assert!(strings.by_text.contains_key("compiler"));
@@ -30922,20 +31093,21 @@ mod tests {
 
     #[test]
     fn core_string_store_substring_falls_back_for_utf16_boundary_text() {
+        let mut objects = CoreObjectStore::default();
         let mut strings = CoreStringStore::default();
         let mut heap = Heap::new();
         let base = strings
-            .allocate_with_heap(&mut heap, "a\u{1f600}b")
+            .allocate_with_heap(&mut objects, &mut heap, "a\u{1f600}b")
             .unwrap();
 
         let substring = strings
-            .allocate_substring_with_heap(&mut heap, base, 1, 3)
+            .allocate_substring_with_heap(&mut objects, &mut heap, base, 1, 3)
             .unwrap();
 
         assert_eq!(strings.text(substring), Some("\u{1f600}"));
         let substring_index = strings.index_for_value(substring).unwrap();
         assert!(matches!(
-            strings.strings[substring_index].as_ref().get_ref().text,
+            strings.string_records[substring_index].text,
             CoreStringCellText::Flat(_),
         ));
         assert!(strings.by_text.contains_key("\u{1f600}"));
@@ -31348,7 +31520,7 @@ mod tests {
     #[test]
     fn json_stringify_binds_seeded_result_string_with_heap() {
         let mut host = CoreOpcodeDispatchHost::new();
-        let seeded = host.strings.allocate_untracked("true");
+        let seeded = host.strings.allocate_untracked(&mut host.objects, "true");
         let mut stack = ExecutionContextStack::default();
         let mut registers = RegisterFile::default();
         let mut exceptions = ExceptionState::default();
@@ -31375,7 +31547,7 @@ mod tests {
     fn error_constructor_binds_message_string_with_heap() {
         let mut host = CoreOpcodeDispatchHost::new();
         let mut heap = Heap::new();
-        let message_argument = host.strings.allocate_untracked("boom");
+        let message_argument = host.strings.allocate_untracked(&mut host.objects, "boom");
 
         let error = host
             .native_error_constructor(&mut heap, &[message_argument])
@@ -33927,7 +34099,7 @@ mod tests {
     fn targeted_register_roots_bind_unbound_interned_string_without_changing_identity() {
         let mut host = CoreOpcodeDispatchHost::new();
         let mut heap = Heap::new();
-        let string = host.strings.allocate_untracked("seeded");
+        let string = host.strings.allocate_untracked(&mut host.objects, "seeded");
         let payload = cell_payload(string);
         let snapshot = single_register_snapshot(&heap, string);
 
@@ -33943,10 +34115,7 @@ mod tests {
         assert_eq!(host.strings.value_for_index(0), string);
         assert_eq!(heap.cell_for_payload(payload), Some(targeted[0].target));
         assert_eq!(heap.payload_for_cell(targeted[0].target), Some(payload));
-        assert_eq!(
-            host.strings.strings[0].as_ref().get_ref().cell_id,
-            targeted[0].target
-        );
+        assert_eq!(host.strings.string_records[0].cell_id, targeted[0].target);
         assert!(heap.targeted_roots().records().is_empty());
     }
 
