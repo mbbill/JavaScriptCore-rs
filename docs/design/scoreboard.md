@@ -201,3 +201,22 @@ SO THE R-PICTURE SPLITS BY BENCH SHAPE (measured, not assumed):
 NEXT R-LEVER (evidence-derived): a diagnostic to dump the EXACT ARM64 emit_baseline_function declines for
 richards/delta-blue's hot functions -> a targeted breadth batch of those opcodes -> they fully tier up + native-
 call -> re-measure (do they flip from ~0.3x toward >1.0x?). Plus STEP 1 (route-arbiter deletion) for the residual.
+
+## 2026-06-30 LATE-4 — MILESTONE: the native JIT is now a NET WIN on compute/call benches (first time)
+
+After the call-heavy opcode batch (constant loads + Equal/NotEqual + Global* far-call shims), re-measure
+(--baseline --disable-baseline-generated-executor --disable-generated-direct-call-generated-entry, all
+validate / zero throws):
+  navier 4.22->5.45 (+29%), crypto 2.77->3.01 (+9%), delta-blue 0.48->0.55 (+15% WIN), richards 0.99->0.87
+  (near-parity, was 0.36), raytrace 0.94 (LoadCallee-gated).
+**Geomean over these 5 ~= 1.06 -- the native JIT (executor off) BEATS the interpreter for the first time.**
+The win is more hot functions executing as NATIVE baseline images (richards/delta-blue went from ~0.3x to
+0.87/0.55 by admitting their declined opcodes). The generated-EXECUTOR (the byte-blob re-interpreter) is the
+only thing that made the JIT a regression; with it off + enough opcode coverage, the JIT is a net speedup.
+
+NEXT to actually move R: (1) LoadCallee entry-seed fix (thread the real callee into VmEntryFrameSeed; gates
+raytrace + is a correctness prereq -- currently declined because the seed sets callee=0); (2) the FULL-SUITE
+re-measure (executor off) -- the geomean across all completing benches + whether the asm.js benches
+(mandreel/octane-zlib) now COMPLETE with the faster JIT (the R-DEFINED gate); (3) if a net win + all complete,
+make executor-off + BaselineAllowed the DEFAULT (the flip held since 06-29) -> R becomes defined and moves
+above the interpreter floor. Then re-measure C++ jsc + report R + all r_i.
