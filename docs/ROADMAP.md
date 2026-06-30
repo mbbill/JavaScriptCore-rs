@@ -65,13 +65,17 @@ A running baseline JIT — the first thing that moves R — needs, in dependency
    JIT lowers from it) + freeze the type-specialized `CoreOpcode`.
 4. **Profiling wiring** — per-CodeBlock ValueProfile/ArithProfile (the DFG's speculation
    fuel), retiring the VM-global observation logs.
-5. **Baseline JIT** (row 7) — per-opcode machine code on the native stack + native JS→JS calls
-   are DONE and beat the interpreter on allowlist-covered code (~39× synthetic probe; native ≪
-   interpreter). **R lifts off the interpreter floor here, but is GATED on COVERAGE:** the native
-   path engages only for functions that tier up, and the allowlist lacks property ICs, so real
-   property-heavy Octane hot functions stay interpreted. **NEXT R-LEVER = native-lowering BREADTH:
-   the baseline property-access ICs `get_by_id`/`put_by_id` (the deferred K2) + more opcodes**, so
-   real hot functions tier up and run native; then re-measure → flip the default (held) → R moves.
+5. **Baseline JIT** (row 7) — per-opcode machine code on the native stack + native JS→JS calls +
+   property/method/comparison/closure breadth all DONE. **REAL-BENCH MEASURE (2026-06-30, see
+   scoreboard): the native JIT WINS on numeric benches** (navier +12%, crypto +7.6% with the
+   generated executor off) **but REGRESSES on property/call-heavy ones** (richards −68%, delta-blue
+   −55%) — because **Increment-1 FAR-CALLS every property load / closure read / per-call callee
+   resolve**, slower than the interpreter's inline dispatch. So the R-gate is NOT more breadth — it is
+   **the INLINE versions: Increment 2 (inline machine-code property load) gated on gc-r4 Batch 5 (the
+   object-storage model — inline slots + a machine-addressable butterfly, today a slab index) + the
+   `CallLinkInfo` monomorphic cache (skip the per-call resolve; needs R4 `visitWeak`/U7).** Then
+   property/call-heavy benches win → flip the default (held) → R moves. (Also: disable the generated
+   executor — a confirmed re-interpreter divergence, a 10× regression where it runs; STEP 5 deletes it.)
 6. **DFG → FTL/B3** (rows 8–9) — the optimizing tiers that take R to ≥ 1.0.
 
 These can fan out where independent (the JSStack substrate and the GC/POD-cell work are

@@ -60,14 +60,15 @@ not by assertion.** (Re-measure with `tools/octane-parity/run_{cpp,rust}_baselin
 
 ## What's next (the critical path)
 
-The baseline JIT now runs on the native stack and does **native JS→JS calls that beat the interpreter**
-(the R-lever *mechanism* is proven). What remains to actually move R, in order: **native-lowering
-breadth** — the baseline property-access ICs (`get_by_id`/`put_by_id`, the deferred K2) + more opcodes,
-so real property-heavy Octane hot functions tier up and run native → **re-measure and flip the JIT to
-the default** (held since it was opt-in and the *old* path regressed; the faithful native path bypasses
-that — see `docs/design/baseline-call-tier-divergence.md`) → **R lifts off the interpreter floor** →
-**DFG → FTL/B3** take it to ≥ 1.0. The 2 asm.js benches (mandreel, octane-zlib) need native execution
-just to finish.
+The native JIT + property/method/comparison/closure breadth are DONE, and the first **real-bench
+measurement** (2026-06-30) showed the load-bearing truth: the native JIT **wins on numeric benches**
+(navier +12%, crypto +7.6%) but **regresses on property/call-heavy ones** (richards/delta-blue) —
+because Increment-1 **far-calls every property load + per-call callee resolve**, slower than the
+interpreter's inline access. So the R-gate is **the inline versions**: **Increment 2 (inline machine-code
+property load) gated on gc-r4 Batch 5** (the object-storage model: inline slots + a machine-addressable
+butterfly) **+ the `CallLinkInfo` monomorphic cache** (skip the per-call resolve). Then property/call-heavy
+benches win → **flip the JIT to the default** → **R lifts off the interpreter floor** → **DFG → FTL/B3**
+take it to ≥ 1.0. (The 2 asm.js benches still need native execution just to finish.)
 
 ## For more detail
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — the plan: critical path, full % breakdown, settled decisions.
