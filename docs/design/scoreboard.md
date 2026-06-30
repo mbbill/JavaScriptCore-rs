@@ -42,14 +42,30 @@ set landed (op_call/typed-array/LoadDouble all execute). navier-stokes (typed-ar
   deferred (op_call/typed-array are slow-call far-calls). Tiering-up currently ADDS
   overhead without fast native execution.
 
-IMPLICATION (the JIT is machinery-complete but perf-negative): to MOVE R the baseline
-must become a NET SPEEDUP first — (a) native lowering must SUCCEED for hot functions
-(admit StrictEqual + fix the LoadDouble form + broaden per-opcode coverage), (b) do
-NOT tier up to the slow generated fallback (stay interpreted if native fails, to avoid
-the regression), (c) land the INLINE fast paths (op_call direct-link + inline
-typed-array, removing the per-call/HEAP far-call) — THEN make the JIT the default.
-Only then does R move. Broadening what tiers up (more functions on the slow generated
-path) makes it WORSE.
+DEEPER VALIDATION (2026-06-29, full-bench): the "generated executor OFF" win does NOT
+generalize — it holds only for LOW-CALL loop kernels. Full-bench default-vs-interp
+(executor off, JIT default): navier-stokes 1.39x (win), crypto 1.00x, richards 0.33x
+(3x REGRESSION), delta-blue 0.37x, raytrace/earley-boyer/regexp DNF. **Geomean ~0.64x —
+the JIT default is a ~1.5x NET REGRESSION even with the executor off.** ZERO correctness
+failures (every bench validates ok) — purely perf. ROOT CAUSE: this host is **arm64**,
+but the baseline CALL-TARGET native entries are **x86_64 byte sequences** (rejected by
+can_execute_baseline_native_entry_kind → `HostBlockedX86_64`); only a NARROW arm64
+return-seed exists (config.rs:30-36). So ALL ~3.6M generated-direct-call transactions take
+route NestedInterpreterFallback (generated_direct_call_native_entries=0) **while still
+paying the per-call route-selection + per-transaction accounting**. The slow-call op_call
+(B5-first-cut: far_call operation_call → interpreter) + this per-call overhead regress
+call-heavy benches ~3x; only low-call loops net a win.
+
+IMPLICATION (the JIT is machinery-complete + CORRECT but perf-negative on arm64): to MOVE R
+the baseline must become a NET SPEEDUP first. THE LOAD-BEARING BLOCKER (arm64): **B5-full —
+an arm64-callable native baseline CALL entry** (the native bl-chain + direct-link via
+CallLinkInfo, replacing the x86_64-host-blocked entry so a JS→JS call jumps native instead
+of falling back to the nested interpreter) **+ stop paying the per-call route/accounting
+when the route is always interpreter-fallback** (link the site to a cheap direct interpreter
+call). Then: keep the generated-executor-off policy, admit StrictEqual + fix the LoadDouble
+form (native breadth), land the inline typed-array stub — THEN flip the default. HOLD the
+default flip until B5-full lands (it moves R DOWN today). Broadening tier-up before the call
+path is fast makes it WORSE.
 
 ## Latest measurement (2026-06-28, iters=2/wc=1) — R UNDEFINED
 
