@@ -3961,6 +3961,41 @@ impl CoreOpcodeDispatchHost {
         self.objects.get_index(object, index)
     }
 
+    // Cross-module test support for the baseline-JIT PLAIN-array get_by_val/put_by_val
+    // bridge precondition (jit/operations.rs + arm64_baseline/function_emitter.rs):
+    // allocate a plain `Array` (CoreObjectKind::Array, Array.prototype) in THIS host's
+    // real object store and bind it to the heap, so a JIT-bridge test can hand a plain
+    // array to `Vm::operation_get_by_val`/`operation_put_by_val` and prove the general
+    // funnel resolves butterfly elements identically to the interpreter.
+    #[cfg(test)]
+    pub(crate) fn allocate_array_for_test(&mut self, heap: &mut Heap) -> RuntimeValue {
+        let array = self.objects.allocate_array();
+        self.objects
+            .bind_object_to_heap(heap, array)
+            .expect("bind plain array to heap");
+        array
+    }
+
+    // The interpreter's PLAIN-array element STORE fast path (op_put_by_val with an
+    // array base + int32 index -> `CoreObjectStore::put_index` ->
+    // `put_array_element_with_write_barrier`): the oracle the JIT put-funnel must match
+    // element-for-element (in-bounds overwrite, beyond-length extend with hole-fill).
+    #[cfg(test)]
+    pub(crate) fn put_index_for_test(
+        &mut self,
+        heap: &mut Heap,
+        object: RuntimeValue,
+        index: i32,
+        value: RuntimeValue,
+    ) -> Result<(), ExecutionError> {
+        self.objects.put_index(heap, object, index, value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn array_length_for_test(&self, object: RuntimeValue) -> Option<RuntimeValue> {
+        self.objects.array_length(object).ok().flatten()
+    }
+
     fn record_property_lookup(&mut self, record: CorePropertyLookupRecord) {
         self.last_property_lookup = Some(record);
     }

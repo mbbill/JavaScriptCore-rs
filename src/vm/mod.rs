@@ -22290,6 +22290,366 @@ mod tests {
         );
     }
 
+    // U-PRE precondition (docs/design/baseline-property-ic.md RISK #1): the baseline
+    // get_by_val far-call bridge (jit/operations.rs:305 `operation_get_by_val` ->
+    // `Vm::operation_get_by_val`) must resolve PLAIN-array (non-typed-array) elements,
+    // not just typed arrays. The typed-array shortcut (`jit_typed_array_get_by_index`)
+    // returns None for a non-Uint8Array base, so a plain array routes to the GENERAL
+    // funnel (`jit_get_by_val` -> `get_property_value` -> butterfly element lookup) —
+    // the interpreter's OWN logic. This proves the funnel's result equals the
+    // interpreter's plain-array element fast path (`get_index`) for in-bounds, hole,
+    // and out-of-bounds int keys, and `undefined` for negative / non-int keys (which
+    // fall to the named-property path in BOTH the interpreter and the funnel). The
+    // operation is the slow-call funnel (config-independent); a null parked CodeBlock
+    // yields the placeholder branch, so the Vm method is called directly.
+    #[test]
+    fn vm_plain_array_get_by_val_matches_interpreter_oracle() {
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.allocate_array_for_test(&mut vm.heap);
+
+        // [10, 20, 30, <hole>, <hole>, 60] via the interpreter put fast path; length 6.
+        host.put_index_for_test(&mut vm.heap, array, 5, RuntimeValue::from_i32(60))
+            .unwrap();
+        host.put_index_for_test(&mut vm.heap, array, 0, RuntimeValue::from_i32(10))
+            .unwrap();
+        host.put_index_for_test(&mut vm.heap, array, 1, RuntimeValue::from_i32(20))
+            .unwrap();
+        host.put_index_for_test(&mut vm.heap, array, 2, RuntimeValue::from_i32(30))
+            .unwrap();
+
+        // In-bounds (0,1,2,5), holes (3,4) and OOB (6,7,100): the JIT funnel result
+        // MUST equal the interpreter's `get_index` fast path for every int key.
+        for key in [0i32, 1, 2, 3, 4, 5, 6, 7, 100] {
+            let native = vm
+                .operation_get_by_val(&mut host, array, RuntimeValue::from_i32(key))
+                .expect("plain-array get_by_val must not throw");
+            let oracle = host
+                .get_index_for_test(array, key)
+                .expect("interpreter get_index oracle");
+            assert_eq!(
+                native.encoded().0,
+                oracle.encoded().0,
+                "get_by_val funnel != interpreter fast path at index {key}",
+            );
+        }
+
+        // Concrete JS answers so the oracle is not trivially undefined==undefined.
+        let undef = RuntimeValue::undefined().encoded().0;
+        let get = |vm: &mut Vm, host: &mut CoreOpcodeDispatchHost, key: RuntimeValue| {
+            vm.operation_get_by_val(host, array, key)
+                .unwrap()
+                .encoded()
+                .0
+        };
+        assert_eq!(
+            get(&mut vm, &mut host, RuntimeValue::from_i32(0)),
+            RuntimeValue::from_i32(10).encoded().0,
+            "arr[0] == 10 (in-bounds)",
+        );
+        assert_eq!(
+            get(&mut vm, &mut host, RuntimeValue::from_i32(5)),
+            RuntimeValue::from_i32(60).encoded().0,
+            "arr[5] == 60 (in-bounds, past a hole)",
+        );
+        assert_eq!(
+            get(&mut vm, &mut host, RuntimeValue::from_i32(3)),
+            undef,
+            "arr[3] (hole) == undefined",
+        );
+        assert_eq!(
+            get(&mut vm, &mut host, RuntimeValue::from_i32(100)),
+            undef,
+            "arr[100] (out-of-bounds) == undefined",
+        );
+        // Negative and non-int keys are NOT array indices: both the interpreter and
+        // the funnel resolve them as (absent) named properties -> undefined.
+        assert_eq!(
+            get(&mut vm, &mut host, RuntimeValue::from_i32(-1)),
+            undef,
+            "arr[-1] (named) == undefined",
+        );
+        assert_eq!(
+            get(&mut vm, &mut host, RuntimeValue::from_double(1.5)),
+            undef,
+            "arr[1.5] (named) == undefined",
+        );
+    }
+
+    // U-PRE precondition: the baseline put_by_val far-call bridge
+    // (jit/operations.rs:337 `operation_put_by_val` -> `Vm::operation_put_by_val`)
+    // must store into PLAIN-array butterfly elements (in-bounds overwrite,
+    // beyond-length extend with hole-fill), identically to the interpreter's
+    // plain-array put fast path (`put_index`). Twin arrays: A is mutated through the
+    // JIT funnel, B through the interpreter fast path; their element contents and
+    // length MUST match. A negative / non-int key must route to the named-property
+    // path and NOT touch the indexed element storage or the array length.
+    #[test]
+    fn vm_plain_array_put_by_val_matches_interpreter_oracle() {
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        let mut host = CoreOpcodeDispatchHost::new();
+        let a = host.allocate_array_for_test(&mut vm.heap);
+        let b = host.allocate_array_for_test(&mut vm.heap);
+
+        // (1,11) extend-from-empty (hole at 0); (0,10) fill the hole; (4,40) extend
+        // (holes at 2,3); (1,99) in-bounds overwrite. Final A == [10,99,_,_,40], len 5.
+        let stores = [(1i32, 11i32), (0, 10), (4, 40), (1, 99)];
+        for (idx, val) in stores {
+            // A through the JIT funnel:
+            vm.operation_put_by_val(
+                &mut host,
+                a,
+                RuntimeValue::from_i32(idx),
+                RuntimeValue::from_i32(val),
+            )
+            .expect("plain-array put_by_val must not throw");
+            // B through the interpreter fast path:
+            host.put_index_for_test(&mut vm.heap, b, idx, RuntimeValue::from_i32(val))
+                .unwrap();
+        }
+
+        // Element-for-element + length equality across the populated range and beyond.
+        for key in 0i32..8 {
+            let av = host.get_index_for_test(a, key).unwrap().encoded().0;
+            let bv = host.get_index_for_test(b, key).unwrap().encoded().0;
+            assert_eq!(
+                av, bv,
+                "put_by_val funnel != interpreter fast path at index {key}",
+            );
+        }
+        assert_eq!(
+            host.array_length_for_test(a).map(|v| v.encoded().0),
+            host.array_length_for_test(b).map(|v| v.encoded().0),
+            "array length must match the interpreter fast path",
+        );
+
+        // Concrete answers: [10, 99, <hole>, <hole>, 40], length 5.
+        let undef = RuntimeValue::undefined().encoded().0;
+        assert_eq!(
+            host.get_index_for_test(a, 0).unwrap().encoded().0,
+            RuntimeValue::from_i32(10).encoded().0,
+            "A[0] == 10 (hole filled)",
+        );
+        assert_eq!(
+            host.get_index_for_test(a, 1).unwrap().encoded().0,
+            RuntimeValue::from_i32(99).encoded().0,
+            "A[1] == 99 (overwrite)",
+        );
+        assert_eq!(
+            host.get_index_for_test(a, 4).unwrap().encoded().0,
+            RuntimeValue::from_i32(40).encoded().0,
+            "A[4] == 40 (beyond-length extend)",
+        );
+        assert_eq!(
+            host.get_index_for_test(a, 2).unwrap().encoded().0,
+            undef,
+            "A[2] stays a hole",
+        );
+        assert_eq!(
+            host.array_length_for_test(a).unwrap().encoded().0,
+            RuntimeValue::from_i32(5).encoded().0,
+            "A.length == 5 after extend",
+        );
+
+        // Negative / non-int key stores route to the named-property path: they must
+        // NOT change the array length or any indexed element.
+        let len_before = host.array_length_for_test(a).unwrap().encoded().0;
+        vm.operation_put_by_val(
+            &mut host,
+            a,
+            RuntimeValue::from_i32(-1),
+            RuntimeValue::from_i32(7),
+        )
+        .unwrap();
+        vm.operation_put_by_val(
+            &mut host,
+            a,
+            RuntimeValue::from_double(2.5),
+            RuntimeValue::from_i32(8),
+        )
+        .unwrap();
+        assert_eq!(
+            host.array_length_for_test(a).unwrap().encoded().0,
+            len_before,
+            "a negative/non-int key store must not change the array length",
+        );
+        assert_eq!(
+            host.get_index_for_test(a, 0).unwrap().encoded().0,
+            RuntimeValue::from_i32(10).encoded().0,
+            "named-key store leaves A[0] untouched",
+        );
+        assert_eq!(
+            host.get_index_for_test(a, 1).unwrap().encoded().0,
+            RuntimeValue::from_i32(99).encoded().0,
+            "named-key store leaves A[1] untouched",
+        );
+        assert_eq!(
+            host.get_index_for_test(a, 4).unwrap().encoded().0,
+            RuntimeValue::from_i32(40).encoded().0,
+            "named-key store leaves A[4] untouched",
+        );
+    }
+
+    // U-PRE precondition (end-to-end): the SAME native baseline image the typed-array
+    // milestone produces (`arr[i] = v; return arr[i]`, emitted as the get/put_by_val
+    // far-call bridge regardless of receiver type) must run correctly over a PLAIN
+    // Array receiver. The put is a beyond-length extend; the get reads the just-stored
+    // element back. Asserts native == interpreter AND that the native store mutated the
+    // real host plain-array butterfly. macOS/aarch64 only (executes native code).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_plain_array_get_put_by_val_tiers_up_and_executes_natively() {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+        let code_block = typed_array_get_put_milestone_code_block();
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        let mut host = CoreOpcodeDispatchHost::new();
+        let owner = CodeBlockId(CellId(7_741));
+
+        // A PLAIN Array (empty) in the PARKED host; the put extends it (beyond-length
+        // store) and the get reads the just-stored element back — the same far-call
+        // bridge the typed-array milestone uses, now over a non-typed-array receiver.
+        let array = host.allocate_array_for_test(&mut vm.heap);
+        let index = 2i32;
+        let stored = 12345i32; // an ordinary JS number (no Uint8 clamping on a plain array)
+        let args = vec![
+            RuntimeValue::undefined().encoded().0,
+            array.encoded().0,
+            RuntimeValue::from_i32(index).encoded().0,
+            RuntimeValue::from_i32(stored).encoded().0,
+        ];
+
+        // INTERPRETER ORACLE: the SAME CodeBlock over a FRESH host + plain array.
+        let interp_bits = {
+            let mut interp_vm: Box<Vm> = Box::new(Vm::new(VmConfig::interpreter_only()));
+            let mut interp_host = CoreOpcodeDispatchHost::new();
+            let interp_array = interp_host.allocate_array_for_test(&mut interp_vm.heap);
+            let interp_owner = CodeBlockId(CellId(7_742));
+            interp_vm
+                .code_blocks
+                .register(interp_owner, code_block.clone());
+            let completion = execute_registered_code_block_with_host_and_arguments(
+                &mut interp_vm,
+                interp_owner,
+                &code_block,
+                &mut interp_host,
+                vec![
+                    RuntimeValue::undefined(),
+                    interp_array,
+                    RuntimeValue::from_i32(index),
+                    RuntimeValue::from_i32(stored),
+                ],
+            );
+            let bits = match completion {
+                ExecutionCompletion::Returned(value) => value.encoded().0,
+                other => panic!("interpreter did not return a value: {other:?}"),
+            };
+            assert_eq!(
+                interp_host
+                    .get_index_for_test(interp_array, index)
+                    .unwrap()
+                    .encoded()
+                    .0,
+                RuntimeValue::from_i32(stored).encoded().0,
+                "interpreter stored arr[2]=12345 in its plain-array butterfly",
+            );
+            bits
+        };
+        assert_eq!(
+            interp_bits,
+            RuntimeValue::from_i32(stored).encoded().0,
+            "interpreter: arr[2]=12345; return arr[2] == 12345",
+        );
+
+        // Drive entries PAST the S9 tier-up threshold; AT/AFTER the crossing the native
+        // image runs and returns the loaded element.
+        let mut tiered_at: Option<u32> = None;
+        let mut entries: u32 = 0;
+        let entry_cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 64;
+        while entries < entry_cap {
+            entries += 1;
+            let outcome = vm.observe_baseline_jit_entry_and_maybe_execute(
+                &mut host,
+                owner,
+                &code_block,
+                &args,
+            );
+            match outcome {
+                BaselineJitEntryOutcome::NotTieredUp => {
+                    assert!(
+                        !vm.baseline_jit_function_is_installed(owner),
+                        "no install before the countdown crosses",
+                    );
+                }
+                BaselineJitEntryOutcome::Returned(value) => {
+                    assert!(
+                        vm.baseline_jit_function_is_installed(owner),
+                        "a returned native result implies an installed image",
+                    );
+                    assert_eq!(
+                        value.encoded().0,
+                        interp_bits,
+                        "native return == interpreter (arr[2] == 12345)",
+                    );
+                    if tiered_at.is_none() {
+                        tiered_at = Some(entries);
+                    }
+                }
+                BaselineJitEntryOutcome::Threw(bits) => {
+                    panic!("plain-array get/put must not throw (m_exception={bits:?})");
+                }
+            }
+            if let Some(at) = tiered_at {
+                if entries >= at + 4 {
+                    break;
+                }
+            }
+        }
+        tiered_at.expect("the plain-array function tiered up to a native image");
+        assert!(
+            vm.baseline_jit_function_is_installed(owner),
+            "the CodeBlock has an installed baseline image (m_jitCode)",
+        );
+
+        // The native far-call WROTE the parked host's REAL plain-array butterfly
+        // (a beyond-length extend) — proof the emitted code reached the REAL store.
+        assert_eq!(
+            host.get_index_for_test(array, index).unwrap().encoded().0,
+            RuntimeValue::from_i32(stored).encoded().0,
+            "native store wrote arr[2]=12345 in the real host plain-array butterfly",
+        );
+
+        // A FRESH (index, value) proves genuine (re)running: store 678 at index 7
+        // (a further beyond-length extend) and read it back natively.
+        let args2 = vec![
+            RuntimeValue::undefined().encoded().0,
+            array.encoded().0,
+            RuntimeValue::from_i32(7).encoded().0,
+            RuntimeValue::from_i32(678).encoded().0,
+        ];
+        let native2 =
+            vm.observe_baseline_jit_entry_and_maybe_execute(&mut host, owner, &code_block, &args2);
+        let native2_bits = match native2 {
+            BaselineJitEntryOutcome::Returned(value) => value.encoded().0,
+            other => panic!("expected a native return for the installed image: {other:?}"),
+        };
+        assert_eq!(
+            native2_bits,
+            RuntimeValue::from_i32(678).encoded().0,
+            "native: arr[7]=678; return arr[7] == 678",
+        );
+        assert_eq!(
+            host.get_index_for_test(array, 7).unwrap().encoded().0,
+            RuntimeValue::from_i32(678).encoded().0,
+            "native store wrote arr[7]=678",
+        );
+        assert_eq!(
+            host.get_index_for_test(array, index).unwrap().encoded().0,
+            RuntimeValue::from_i32(stored).encoded().0,
+            "the earlier native store at arr[2] is independent and survives",
+        );
+    }
+
     // JIT runtime-call bridge (jit/operations.rs) — the OBJECT-operand reentry proof,
     // closing the Miri coverage gap (the existing add-shim Miri test exercises only
     // PRIMITIVE operands). The add shim's slow path, for an OBJECT operand, reenters
