@@ -8125,6 +8125,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -8467,6 +8468,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 

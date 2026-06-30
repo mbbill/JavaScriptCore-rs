@@ -97,6 +97,32 @@ impl CodeBlockRegistry {
             .map(|record| record.code_block_shared())
     }
 
+    /// The stable machine `*const CodeBlock` of `owner`'s registered instance, or
+    /// `None` if `owner` is not registered. This is the address `Rc::as_ptr`
+    /// yields for the one shared `Rc<CodeBlock>` box; the registry retains that
+    /// `Rc` and the box never moves (a `HashMap` rehash relocates only the 8-byte
+    /// handle, not the heap box), so the pointer is machine-dereferenceable and
+    /// STABLE for as long as `owner` stays registered. K1 seeds call-frame slot 2
+    /// (`codeBlock`, `CallFrame.h:204-205`) with this real `CodeBlock*` in place
+    /// of the old `CellId` placeholder so the JIT/op_call recovery path can
+    /// dereference it (`CallFrame::code_block_ptr`).
+    ///
+    /// SLOT-2 STABILITY INVARIANT: a registered `CodeBlock` instance must NEVER be
+    /// `Rc`-box-replaced while a live call frame may hold its slot-2 pointer. In
+    /// production the only write to a record's `Rc` is full re-registration
+    /// (`register` -> `records.insert`), which runs at install time BEFORE any
+    /// frame for that block exists; runtime feedback mutates the block's side
+    /// tables interior-mutably through `&CodeBlock` (`Cell`s, e.g.
+    /// `record_value_profile_sample`), never swapping the box. Every box-swapping
+    /// path (`code_block_mut_for_test`, the direct `record.code_block = Rc::new(..)`
+    /// rebuilds in this file) is `#[cfg(test)]`. When `CodeBlock` becomes an arena
+    /// GC cell, slot 2 joins `gather_all_gc_roots` as a traced/derived pointer.
+    pub(crate) fn code_block_pointer(&self, owner: CodeBlockId) -> Option<*const CodeBlock> {
+        self.records
+            .get(&owner)
+            .map(|record| Rc::as_ptr(&record.code_block))
+    }
+
     // Test-only `&mut` access to the registered instance via `Rc::get_mut`, which
     // succeeds only while the registry is the sole owner (no live dispatch alias).
     // Tests mutate the block before sharing it, so this holds.

@@ -827,6 +827,13 @@ impl ExecutionContextStack {
         &mut self,
         registers: &mut RegisterFile,
         request: FramePushRequest,
+        // K1: the registry's stable `*const CodeBlock` for `request.code_block`,
+        // pre-resolved by the caller (it owns the `CodeBlockRegistry` / shared
+        // `Rc`, which `ExecutionContextStack` — a sibling field of `Vm` — cannot
+        // reach). Seeds call-frame slot 2 with a real `CodeBlock*`; `None` when
+        // the frame has no code block or the caller has no registry (bare-stack
+        // unit tests pass a synthetic sentinel or `None`).
+        code_block_ptr: Option<*const CodeBlock>,
     ) -> Result<CallFrameId, ExecutionError> {
         if self.entries.is_empty() {
             return Err(ExecutionError::NoActiveEntry);
@@ -867,7 +874,7 @@ impl ExecutionContextStack {
         // cross-check that the two agree. Behavior-neutral (reads stay on the
         // `Vec`); the arena is the substrate B4 flips reads onto. Driven here,
         // not in `allocate_frame`, because the header bits live on this frame.
-        dual_write_shadow_frame(registers, &frame, &request.argument_values);
+        dual_write_shadow_frame(registers, &frame, &request.argument_values, code_block_ptr);
         self.frames.push(frame);
         Ok(id)
     }
@@ -1030,8 +1037,13 @@ fn entry_frame_sentinel_bits(entry: Option<EntryFrameId>) -> u64 {
 ///   genuinely linked frame chain), else the EntryFrame sentinel;
 /// - slot 1 (`returnPC`): the return `BytecodeIndex` bits (real machine returnPC
 ///   is B7/JIT);
-/// - slots 2/3 (`codeBlock`/`callee`): the `CellId` value as placeholder pointer
-///   bits (real `CodeBlock*`/`JSCell*` lands when cells are direct pointers, B6);
+/// - slot 2 (`codeBlock`): the registry's stable `*const CodeBlock` address bits
+///   (K1 — a real machine-dereferenceable `CodeBlock*`, not a `CellId`
+///   placeholder), passed in as `code_block_ptr` resolved from the owning
+///   `CodeBlockId` via `CodeBlockRegistry::code_block_pointer`; null when the
+///   frame has no code block (host frames);
+/// - slot 3 (`callee`): the `CellId` value as placeholder pointer bits (a real
+///   `JSCell*` lands when cells are direct pointers, B6);
 /// - slot 4 payload: `argumentCountIncludingThis`; tag (`CallSiteIndex`): 0;
 /// - slot 5 + args: the `this`/argument values, byte-identical via their
 ///   NaN-boxed encoding.
@@ -1039,6 +1051,7 @@ fn dual_write_shadow_frame(
     registers: &mut RegisterFile,
     frame: &InstalledCallFrame,
     argument_values: &[RuntimeValue],
+    code_block_ptr: Option<*const CodeBlock>,
 ) {
     let count = frame.argument_count_including_this;
     // `this` is window slot 0; `allocate_frame` fills `undefined` for any
@@ -1066,10 +1079,12 @@ fn dual_write_shadow_frame(
         .return_address
         .map(|index| u64::from(index.as_bits()))
         .unwrap_or(0);
-    let code_block_bits = frame
-        .code_block
-        .map(|code_block| u64::from(code_block.0 .0))
-        .unwrap_or(0);
+    // K1: slot 2 holds the registry's stable `*const CodeBlock` (the address bits
+    // of the shared `Rc<CodeBlock>` box), NOT the `CellId` placeholder. The caller
+    // resolves `frame.code_block` -> `CodeBlockRegistry::code_block_pointer` (or,
+    // on the in-dispatch path, the same shared `Rc` the interpreter host holds)
+    // and passes it in; null when the frame has no code block.
+    let code_block_bits = code_block_ptr.map(|ptr| ptr as u64).unwrap_or(0);
     let callee_bits = frame
         .callee
         .map(|callee| u64::from(callee.0 .0))
@@ -1097,7 +1112,7 @@ fn dual_write_shadow_frame(
     let Some(address) = registers.shadow_seed_frame(frame.id, &seed) else {
         return;
     };
-    debug_assert_shadow_frame_matches(registers, frame, argument_values, address);
+    debug_assert_shadow_frame_matches(registers, frame, argument_values, address, code_block_ptr);
 }
 
 /// The B3 safety net (debug builds): assert the arena image read back through
@@ -1109,6 +1124,7 @@ fn debug_assert_shadow_frame_matches(
     frame: &InstalledCallFrame,
     argument_values: &[RuntimeValue],
     address: FrameAddress,
+    code_block_ptr: Option<*const CodeBlock>,
 ) {
     if !cfg!(debug_assertions) {
         return;
@@ -1135,13 +1151,12 @@ fn debug_assert_shadow_frame_matches(
             .unwrap_or(0),
         "B3 shadow returnPC slot disagrees with InstalledCallFrame",
     );
+    // K1: slot 2 now holds the registry's `*const CodeBlock` bits, so cross-check
+    // against the SAME resolved pointer the seed wrote (not the `CellId`).
     debug_assert_eq!(
         image.code_block_bits,
-        frame
-            .code_block
-            .map(|code_block| code_block.0 .0 as usize)
-            .unwrap_or(0),
-        "B3 shadow codeBlock slot disagrees with InstalledCallFrame",
+        code_block_ptr.map(|ptr| ptr as usize).unwrap_or(0),
+        "B3 shadow codeBlock slot disagrees with the resolved CodeBlock*",
     );
     debug_assert_eq!(
         image.callee_bits,
@@ -1759,6 +1774,22 @@ impl RegisterFile {
     ) -> Option<crate::vm::jsstack::ShadowFrameImage> {
         match &self.shadow {
             ShadowState::Active(shadow) => shadow.frame_header_image(address),
+            _ => None,
+        }
+    }
+
+    /// K1: recover a mirrored frame's slot 2 (`codeBlock`) as a real
+    /// `*const CodeBlock` — the cfr-relative `[fp+16]` read the op_call/JIT
+    /// recovery path uses. Additive (no caller yet); see
+    /// [`crate::vm::jsstack::JsStackShadow::frame_code_block_ptr`] for the
+    /// pointer's stability/dereferenceability contract.
+    #[allow(dead_code)]
+    pub(crate) fn shadow_frame_code_block_ptr(
+        &self,
+        address: FrameAddress,
+    ) -> Option<*const CodeBlock> {
+        match &self.shadow {
+            ShadowState::Active(shadow) => shadow.frame_code_block_ptr(address),
             _ => None,
         }
     }
@@ -11674,6 +11705,13 @@ impl CoreOpcodeDispatchHost {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                // K1: in-dispatch resolution. `function_block` is the SAME shared
+                // `Rc<CodeBlock>` instance the `CodeBlockRegistry` holds (the
+                // interpreter host and registry clone one `Rc`), so its
+                // `Rc::as_ptr` is byte-identical to `code_block_pointer(code_block_id)`
+                // and stable for the instance's life. Seeds slot 2 with a real
+                // `CodeBlock*`.
+                Some(Rc::as_ptr(&function_block) as *const CodeBlock),
             )
             .map_err(DispatchOutcome::Fail)?;
 
@@ -13273,6 +13311,11 @@ impl CoreOpcodeDispatchHost {
                 start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                 return_bytecode_index: Some(instruction.bytecode_index),
             },
+            // K1: in-dispatch resolution — `function_block` is the SAME shared
+            // `Rc<CodeBlock>` instance the registry holds, so its `Rc::as_ptr`
+            // matches `code_block_pointer(code_block_id)` and is stable for the
+            // instance's life. Seeds slot 2 with a real `CodeBlock*`.
+            Some(Rc::as_ptr(&function_block) as *const CodeBlock),
         ) {
             Ok(frame) => frame,
             Err(error) => return DispatchOutcome::Fail(error),
@@ -24533,6 +24576,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
     }
@@ -30710,6 +30754,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         stack
@@ -31351,6 +31396,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -31417,6 +31463,13 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                // K1: this bare-stack test has no `CodeBlockRegistry`, so it seeds
+                // slot 2 with a synthetic non-null `CodeBlock*` sentinel (never
+                // dereferenced) whose bits equal the old `CellId` value (101/102/
+                // 103). That preserves the per-frame slot-2 discrimination the
+                // `code_block_bits` assertions below check, now under the K1
+                // "slot 2 holds a real `CodeBlock*`" contract.
+                Some(101_usize as *const CodeBlock),
             )
             .unwrap();
 
@@ -31466,6 +31519,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                Some(102_usize as *const CodeBlock),
             )
             .unwrap();
 
@@ -31516,6 +31570,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                Some(103_usize as *const CodeBlock),
             )
             .unwrap();
 
@@ -31609,6 +31664,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         // The arena is active, so `read` is served from it (not the Vec fallback).
@@ -31679,6 +31735,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         assert_eq!(registers.shadow_depth(), 2);
@@ -31785,6 +31842,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let live_window = stack.frame(frame).unwrap().register_window;
@@ -31849,6 +31907,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let mut host = CountingHost {
@@ -32150,6 +32209,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -32872,6 +32932,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let mut host = HeapObservingHost {
@@ -32936,6 +32997,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -33096,6 +33158,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -33116,6 +33179,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -33308,6 +33372,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         // The safepoint gather emits the CodeBlock cell for this frame, in the
@@ -33379,6 +33444,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -33433,6 +33499,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let mut duplicate = stack.frame(frame).unwrap().clone();
@@ -33504,6 +33571,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let mut duplicate = stack.frame(frame).unwrap().clone();
@@ -33770,6 +33838,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -33999,6 +34068,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let top = non_top_stack.top_frame().unwrap().id;

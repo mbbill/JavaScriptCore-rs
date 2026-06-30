@@ -57,6 +57,7 @@
 
 use core::ptr::{self, NonNull};
 
+use crate::bytecode::CodeBlock;
 use crate::value::{EncodedJsValue, JsValue};
 use crate::vm::FrameAddress;
 
@@ -431,6 +432,26 @@ impl CallFrame {
     pub(crate) unsafe fn code_block_bits(self) -> usize {
         // SAFETY: slot 2 (`CallFrameSlot::codeBlock`) of a live frame.
         unsafe { self.slot(CallFrameSlot::CODE_BLOCK).code_block_bits() }
+    }
+
+    /// `CallFrame::codeBlock()` (`CallFrame.h:204-205`, slot 2) recovered as a real
+    /// `*const CodeBlock` — the cfr-relative read of `[fp+16]` the JIT/op_call
+    /// path uses to reach the callee's `CodeBlock`. After K1 the seed writes the
+    /// registry's stable `CodeBlock*` here (see
+    /// `CodeBlockRegistry::code_block_pointer`), so this is machine-meaningful; a
+    /// null slot (no code block, e.g. host frames) yields a null pointer.
+    ///
+    /// # Safety
+    /// - The frame's slot 2 must be live (see [`Self::slot`]).
+    /// - The returned pointer is only dereferenceable when slot 2 was seeded from
+    ///   a live `CodeBlockRegistry` record's `Rc<CodeBlock>` (the K1 write path);
+    ///   the registry keeps that box alive and unmoved for the instance's life, so
+    ///   the address stays valid as long as the owner is registered. Callers MUST
+    ///   null-check the result before dereferencing.
+    pub(crate) unsafe fn code_block_ptr(self) -> *const CodeBlock {
+        // SAFETY: slot 2 (`CallFrameSlot::codeBlock`) of a live frame; reinterpret
+        // the stored address bits as the `CodeBlock*` the K1 seed wrote.
+        unsafe { self.code_block_bits() as *const CodeBlock }
     }
 
     /// `CallFrame::callee()` (`CallFrame.h:202`): `CalleeBits(slot.unboxedInt64())`,
@@ -1393,6 +1414,23 @@ impl JsStackShadow {
                 this_value: frame.this_value(),
             })
         }
+    }
+
+    /// Recover slot 2 of a frame this shadow seeded as a real `*const CodeBlock`
+    /// (the cfr-relative `[fp+16]` read), for the op_call/JIT path that lands
+    /// later. `None` if `address` is not a frame this shadow currently holds.
+    /// Purely additive: no existing site reads slot 2 as a pointer. The returned
+    /// pointer's dereferenceability follows [`CallFrame::code_block_ptr`] — it is
+    /// the registry's stable `CodeBlock*` only for frames whose slot 2 was K1
+    /// seeded from a registered owner.
+    pub(crate) fn frame_code_block_ptr(&self, address: FrameAddress) -> Option<*const CodeBlock> {
+        if !self.holds(address) {
+            return None;
+        }
+        let frame = self.stack.call_frame_at(address.0)?;
+        // SAFETY: as `frame_header_image`; slot 2 lies inside the live arena
+        // window this shadow seeded and holds POD `Register` bits.
+        Some(unsafe { frame.code_block_ptr() })
     }
 
     /// Read back argument `index` (0-based, EXCLUDING `this`) of a frame this

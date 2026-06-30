@@ -360,6 +360,8 @@ impl Vm {
             rootless_generated_entry_proof: _,
         } = validation;
         let argument_count_including_this = argument_values.len().try_into().unwrap_or(u32::MAX);
+        // K1: pre-resolve the registry's stable `*const CodeBlock` for slot 2.
+        let code_block_ptr = self.code_block_arena_pointer(Some(target_code_block_id));
         let frame = match self.execution.push_frame(
             &mut self.registers,
             FramePushRequest {
@@ -373,6 +375,7 @@ impl Vm {
                 start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                 return_bytecode_index: Some(continuation.call_bytecode_index),
             },
+            code_block_ptr,
         ) {
             Ok(frame) => frame,
             Err(error) => {
@@ -1852,6 +1855,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let window = vm.execution.top_frame().unwrap().register_window;
@@ -1973,6 +1977,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let window = vm.execution.top_frame().unwrap().register_window;
@@ -2091,6 +2096,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let window = vm.execution.top_frame().unwrap().register_window;
@@ -2205,6 +2211,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(1)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let continuation = CallReturnContinuation {
@@ -2234,6 +2241,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: Some(continuation.call_bytecode_index),
                 },
+                None,
             )
             .unwrap();
         let continuation = vm

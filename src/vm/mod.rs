@@ -3486,6 +3486,17 @@ impl Vm {
         &mut self.execution
     }
 
+    /// K1: the registry's stable `*const CodeBlock` for `owner` (the address bits
+    /// the call-frame slot-2 seed writes), or `None` when `owner` is `None` or not
+    /// registered. Resolves through `CodeBlockRegistry::code_block_pointer`, which
+    /// `ExecutionContextStack::push_frame` cannot reach itself (the registry is a
+    /// sibling field of `Vm`). Bind the result to a local BEFORE the
+    /// `self.execution.push_frame(&mut self.registers, ..)` call so the immutable
+    /// `&self.code_blocks` borrow ends before the disjoint mutable borrows.
+    fn code_block_arena_pointer(&self, owner: Option<CodeBlockId>) -> Option<*const CodeBlock> {
+        owner.and_then(|owner| self.code_blocks.code_block_pointer(owner))
+    }
+
     pub fn register_file(&self) -> &RegisterFile {
         &self.registers
     }
@@ -13415,6 +13426,9 @@ impl Vm {
                 // DEFERRED: direct eval (caller-scope visibility). Indirect only.
                 direct: false,
             }));
+        // K1: resolve the registry's stable `*const CodeBlock` before the
+        // mutable `self.execution`/`self.registers` borrows (pre-bound local).
+        let code_block_ptr = self.code_block_arena_pointer(Some(executable_entry.code_block_id));
         let frame = self.execution.push_frame(
             &mut self.registers,
             FramePushRequest {
@@ -13428,6 +13442,7 @@ impl Vm {
                 start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                 return_bytecode_index: None,
             },
+            code_block_ptr,
         )?;
         let completion = self.execute_code_block(
             executable_entry.code_block_id,
@@ -13740,6 +13755,8 @@ impl Vm {
             ..
         } = request;
         let argument_count_including_this = argument_values.len().try_into().unwrap_or(u32::MAX);
+        // K1: pre-resolve the registry's stable `*const CodeBlock` for slot 2.
+        let code_block_ptr = self.code_block_arena_pointer(Some(target_code_block_id));
         let frame = match self.execution.push_frame(
             &mut self.registers,
             FramePushRequest {
@@ -13755,6 +13772,7 @@ impl Vm {
                     Self::function_value_call_resume(&completion).call_bytecode_index,
                 ),
             },
+            code_block_ptr,
         ) {
             Ok(frame) => frame,
             Err(error) => return self.finish_function_value_call_fail(completion, error, host),
@@ -14127,6 +14145,8 @@ impl Vm {
             ..
         } = request;
         let argument_count_including_this = argument_values.len().try_into().unwrap_or(u32::MAX);
+        // K1: pre-resolve the registry's stable `*const CodeBlock` for slot 2.
+        let code_block_ptr = self.code_block_arena_pointer(Some(target_code_block_id));
         let frame = match self.execution.push_frame(
             &mut self.registers,
             FramePushRequest {
@@ -14140,6 +14160,7 @@ impl Vm {
                 start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                 return_bytecode_index: Some(continuation.call_bytecode_index),
             },
+            code_block_ptr,
         ) {
             Ok(frame) => frame,
             Err(error) => {
@@ -14372,6 +14393,8 @@ impl Vm {
             ..
         } = request;
         let argument_count_including_this = argument_values.len().try_into().unwrap_or(u32::MAX);
+        // K1: pre-resolve the registry's stable `*const CodeBlock` for slot 2.
+        let code_block_ptr = self.code_block_arena_pointer(Some(target_code_block_id));
         let frame = match self.execution.push_frame(
             &mut self.registers,
             FramePushRequest {
@@ -14385,6 +14408,7 @@ impl Vm {
                 start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                 return_bytecode_index: Some(continuation.call_bytecode_index),
             },
+            code_block_ptr,
         ) {
             Ok(frame) => frame,
             Err(error) => return SingleDispatchOutcome::Failed(error),
@@ -14610,6 +14634,8 @@ impl Vm {
         let caller_frame = continuation.caller_frame;
         let construct_bytecode_index = continuation.construct_bytecode_index;
         let argument_count_including_this = argument_values.len().try_into().unwrap_or(u32::MAX);
+        // K1: pre-resolve the registry's stable `*const CodeBlock` for slot 2.
+        let code_block_ptr = self.code_block_arena_pointer(Some(target_code_block_id));
         let frame = match self.execution.push_frame(
             &mut self.registers,
             FramePushRequest {
@@ -14623,6 +14649,7 @@ impl Vm {
                 start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                 return_bytecode_index: Some(continuation.construct_bytecode_index),
             },
+            code_block_ptr,
         ) {
             Ok(frame) => frame,
             Err(error) => return SingleDispatchOutcome::Failed(error),
@@ -14674,6 +14701,8 @@ impl Vm {
         let caller_frame = continuation.caller_frame;
         let construct_bytecode_index = continuation.construct_bytecode_index;
         let argument_count_including_this = argument_values.len().try_into().unwrap_or(u32::MAX);
+        // K1: pre-resolve the registry's stable `*const CodeBlock` for slot 2.
+        let code_block_ptr = self.code_block_arena_pointer(Some(target_code_block_id));
         let frame = match self.execution.push_frame(
             &mut self.registers,
             FramePushRequest {
@@ -14687,6 +14716,7 @@ impl Vm {
                 start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                 return_bytecode_index: Some(continuation.construct_bytecode_index),
             },
+            code_block_ptr,
         ) {
             Ok(frame) => frame,
             Err(error) => return SingleDispatchOutcome::Failed(error),
@@ -16378,6 +16408,8 @@ impl Vm {
                 global_object,
                 this_value: global_object_value,
             }));
+        // K1: pre-resolve the registry's stable `*const CodeBlock` for slot 2.
+        let code_block_ptr = self.code_block_arena_pointer(Some(executable_entry.code_block_id));
         let frame = self
             .execution
             .push_frame(
@@ -16393,6 +16425,7 @@ impl Vm {
                     start_bytecode_index: Some(crate::bytecode::BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                code_block_ptr,
             )
             .map_err(SourceExecutionError::FramePush)?;
         let completion = self.execute_code_block(
@@ -21489,6 +21522,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -22075,6 +22109,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -22287,6 +22322,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let boundary_snapshot = HeapMutationSnapshot::capture(vm);
@@ -22375,6 +22411,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let boundary_snapshot = HeapMutationSnapshot::capture(vm);
@@ -30081,6 +30118,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         (entry, frame)
@@ -31042,6 +31080,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -31113,6 +31152,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -33970,6 +34010,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let boundary_snapshot = HeapMutationSnapshot::capture(&vm);
@@ -43463,6 +43504,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let window = vm.execution.frame(frame).unwrap().register_window;
@@ -47450,6 +47492,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(1)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         vm.execution
@@ -48329,6 +48372,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -48457,6 +48501,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(1)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let window = vm.execution.top_frame().unwrap().register_window;
@@ -58568,6 +58613,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
@@ -59866,6 +59912,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let profile_count_before = vm.tiering_integration().profile_records().len();
@@ -59935,6 +59982,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(1)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let window = vm.execution.top_frame().unwrap().register_window;
@@ -60319,6 +60367,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let profile_count_before = vm.tiering_integration().profile_records().len();
@@ -66243,6 +66292,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
         let mut host = InterpreterDispatchMustNotRun;
@@ -66882,6 +66932,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -67053,6 +67104,7 @@ mod tests {
                     start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
                     return_bytecode_index: None,
                 },
+                None,
             )
             .unwrap();
 
