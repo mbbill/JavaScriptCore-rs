@@ -98,10 +98,18 @@ and substrate tracks, additive in `jit/`+`assembler/` (no megafile conflict):
   (move_imm64+blr, primitives exist) + arg-marshal + exception-check + topCallFrame/CallSiteIndex
   store. The ONE open design point (R1): the exception-handler jump target — a first cut bails to a
   generic throw/interpreter stub (int-arith ops only throw via valueOf on object operands, rare).
-- **GATED on R4 + the inline/out-of-line storage split**: get_by_id/put_by_id + get_by_val/
-  put_by_val ICs (the IC fast path needs a stable direct cell pointer + StructureID-in-header +
-  PropertyInlineCache machinery).
-- **GATED on JSStack B5/B6**: op_call (the callee-frame push IS the B5 prologue/SP-in-arena work).
+- **R4 IS DONE** (the live object-cell GC runs; cell identity = raw arena address). **The 15/15 GATE
+  (asm.js mandreel + octane-zlib) is K2-FREE** — decoupling audit 2026-06-29: typed-array element
+  get_by_val/put_by_val (the asm.js HEAP path) is ArrayMode-dispatched over the SEPARATE
+  array_buffer_backings slab, NOT the named-property storage split (K2). **Gate path = typed-array
+  element IC + dense-Array ElementLoad (have it) + LoadDouble + op_call — ALL on R4, no K2.**
+- **op_call** (the call-heavy gate half AND the biggest R-mover — today NO real Octane fn tiers up
+  because all have calls): needs K1 (CodeBlock real pointer, localized `Vec<Pin<Box>>`, NOT the
+  ~1476-ref CodeBlockId cutover) + B5 (native callee-frame seed; B4 arena-window done) + the
+  recursion-local parking save/restore correction. **NOT the owner-gated B6.**
+- **K2 — named-property get_by_id/put_by_id ICs** (the inline/out-of-line storage split:
+  PropertyInlineCache + INLINE_CAPACITY>0 + negative-indexed butterfly) is **DEFERRED PAST the gate**:
+  it is the post-gate R-mover for the property/call-heavy benches, NOT a 15/15 gate item.
 
 So the baseline-JIT arith core is its own parallel track (box/tag layer → per-opcode encoders →
 slow-call shim → dispatch), started now; the property-access ICs and calls plug in once R4 and
@@ -111,10 +119,9 @@ tiers all sit on — pipelining, not a rabbit hole.
 
 ## Parallel, non-blocking correctness work (protects the gate, schedulable any time)
 
-- **typescript throw** — a pure-interpreter value-divergence (`undefined is not an object`
-  in the TS compiler); localize by differential-trace vs C++ jsc. Real correctness bug for
-  the zero-wrong-answer gate, but typescript also needs the JIT to complete, so it's lower
-  priority than the critical path.
+- **typescript throw — RESOLVED**: the Array-`length` get/set value-divergence was fixed;
+  typescript now runs zero-throw (parseErrors=192==jsc) and completes. It's the 13th completer
+  (interpreter-slow). See docs/STATUS.md.
 - **StringImpl-swap** — wire the faithful StringImpl into the live string store (UTF-8→
   Latin-1/UTF-16); a faithful representation correction that helps string-heavy benches.
 - **Structure-wire** — invert property-offset ownership to the Structure (part of the
