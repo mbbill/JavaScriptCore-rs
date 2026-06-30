@@ -89,16 +89,27 @@ Keeps the 13/15 completing benches green throughout; converges to JSC, not aroun
   then measured R is the interpreter (~0.001), and R is **undefined** until mandreel + octane-zlib complete.
 - **STEP 2/3 are downstream of JSStack B5–B7 and GC/R4** — the roadmap's already-sequenced critical path.
   Do not build STEP 2 on the non-faithful arm64 seed (x1 = Rust register-file ptr) before they land.
-- **Open serial decisions to ratify BEFORE STEP 1** (else STEP 1 swaps the route divergence for a new one):
-  - **#1 Linked-target representation:** may a `linked` `CallLinkInfo` point at the callee **interpreter**
-    entry (Rust LLInt-tier analog) until native code exists? Ratify the `CallTarget` enum + code-comment it
-    as a language-mapping, transient. A `linked` state that never holds a code pointer would be a new soft-divergence.
-  - **#3 `visitWeak`/R4 rooting** for cached callee identity + code pointers (`CallLinkInfo.cpp:171`). A
-    faithful `CallLinkInfo` caches callee identity → **STEP 1 is NOT GC-free**; settle the R4 weak-relink
-    contract first. Cross-cutting ownership — main-agent owned, synchronizes with the R4 track.
+- **Serial decisions — RESOLVED 2026-06-29 by the CallLinkInfo-seed + GC/R4 audits:**
+  - **#1 Linked-target representation — RESOLVED: ADMITTED.** The seed's destination (`src/bytecode/ic.rs:1426`
+    `CallTarget`) is typed to IDs/slots, NOT a machine-code pointer, and `EntrypointKind::InterpreterThunk`
+    already exists (`jit/abi.rs:19`). STEP 1 adds ONE explicit `CallTarget` interpreter-entry variant
+    ("linked → callee `CodeBlockId`, entered via the bytecode interpreter"), code-commented as a transient
+    language-mapping, so `linked` never silently means "no code pointer." No machine-code dependency.
+  - **#3 `visitWeak`/R4 rooting — RESOLVED: STEP 1 does NOT cache callee identity.** `visitWeak` does not
+    exist in the live collector (`src/gc/weak.rs` is vocabulary-only, unreferenced by mark/sweep); the seed's
+    cached callee is a raw `ObjectId/CellId`, untraced, no weak-clear — so caching it would dangle. STEP 1's
+    linked target = callee `CodeBlockId` **re-resolved each call** (GC-safe; identical to today's live
+    `function_call_target` path). The monomorphic `m_callee`-weak fast path (the real call speedup) is
+    DEFERRED to synchronize with the **R4 `visitWeak` weak-processing phase** (now in design) — it is a
+    prerequisite of STEP 2's caching, not of STEP 1's de-divergence. Missing `CallLinkMode` transitions to
+    add later: setSeen / →Polymorphic / →Virtual / setLastSeenCallee / visitWeak.
   - **#4 tail-call/construct/varargs + arity** in the 2-state model (farJump tail, distinct arity entries) —
     decide JSStack support before native callee entries; STEP 1 may defer op_tail_call/op_construct to the
-    interpreter fallback.
+    interpreter fallback. (B5 first cut = no-arity entry; arity-check copy-first shuffle deferred — jsstack.md:94.)
+  - **STEP 1 net scope (now unblocked, GC-safe, R-neutral):** collapse `op_call` dispatch onto the in-site
+    `CallLinkInfo` (new interpreter-entry `CallTarget`, callee re-resolved each call), DELETE the
+    `VmGeneratedDirectCallTransactionRoute` arbiter + transaction/route-opportunity/rootless-proof accounting
+    (`call_link.rs:138`, `tiering.rs:7467`). Correctness-identical (callee still runs interpreted); moves R by 0.
 - **Evidence question that outranks this whole campaign for *defining* R:** are mandreel/octane-zlib
   **GC/memory-gated** (→ finishing GC/R4 makes the suite 15/15 → R becomes DEFINED) or **native-speed-gated**
   (→ the JIT)? The tracker says "asm.js, too-slow, JIT-gated, NOT OOM" — verify with evidence before
