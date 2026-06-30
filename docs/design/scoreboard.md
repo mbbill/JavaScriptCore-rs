@@ -24,6 +24,32 @@ full set of `r_i = Rust_i / C++_i` — never a single bench or a partial suite.
 - Both run at the same `iters/wc` (e.g. 2/1 for the slow interpreter) so `r_i` is
   apples-to-apples. Octane benches: `/Users/bytedance/Dev/WebKit/PerformanceTests/JetStream3`.
 
+## 2026-06-30 — the faithful native JIT call path WORKS + beats the interpreter (mechanism validated)
+
+After the native-stack cutover (A1.0–A1.5: the baseline JIT runs on the native machine stack; the
+first JIT→JIT native call; cell rooting; stack-overflow check) + **broad engagement** (live op_calls
+resolve the callee's installed native entry per call and `blr` it when the callee is baseline-JIT'd):
+- **Synthetic call-heavy probe** `caller(n){s=0; for i<n s+=callee(i)} , callee(x)=x+1`, both JIT'd,
+  each op_call taking the native `blr`: **native 4.56ms vs interpreter 178ms ≈ 39×** (engagement
+  counter == n, proven taken). HONEST CAVEAT: the 39× is INFLATED by the pre-GC interpreter's heavy
+  per-call path (fresh interpreter VM per rep to bound the leak) — NOT a steady-state parity figure;
+  the load-bearing result is **native ≪ interpreter, decisively.** native == interpreter == oracle.
+- This is the FAITHFUL path (CallLinkInfo-style per-call resolve → native `blr`); it **bypasses the
+  generated-* route arbiter entirely** — the 06-29 regression source. So the native call mechanism is
+  validated as a real speedup.
+
+**BUT this does NOT yet move R, and re-measuring real Octane would still not, because of COVERAGE:** the
+native path engages only for functions that TIER UP, and the S4 allowlist is narrow (int/double arith,
+typed-array element get/put, op_call, LoadDouble — **NO property `get_by_id`/`put_by_id` ICs**). Real
+Octane hot functions are PROPERTY-heavy, so they fail the allowlist, stay interpreted, and never reach
+the native call path. The mechanism is proven on allowlist-covered code; real benches need breadth.
+
+**NEXT R-LEVER (evidence-derived): native-lowering BREADTH — the baseline property-access ICs
+(`get_by_id`/`put_by_id`, the deferred K2) + more opcodes**, so real Octane hot functions tier up and
+run native. THEN re-measure the JIT-default (now bypassing the route arbiter) → if a net speedup, flip
+the default (held since 06-29) → **R finally moves above the interpreter floor.** Re-measure on the same
+harness; report R + all r_i.
+
 ## 2026-06-29 — the baseline JIT MEASURED: a REGRESSION, not a speedup yet
 
 First apples-to-apples measurement after the GC track + the baseline gate-capability
