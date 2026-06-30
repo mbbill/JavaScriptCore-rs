@@ -24,6 +24,33 @@ full set of `r_i = Rust_i / C++_i` — never a single bench or a partial suite.
 - Both run at the same `iters/wc` (e.g. 2/1 for the slow interpreter) so `r_i` is
   apples-to-apples. Octane benches: `/Users/bytedance/Dev/WebKit/PerformanceTests/JetStream3`.
 
+## 2026-06-29 — the baseline JIT MEASURED: a REGRESSION, not a speedup yet
+
+First apples-to-apples measurement after the GC track + the baseline gate-capability
+set landed (op_call/typed-array/LoadDouble all execute). navier-stokes (typed-array
++ arith, the best fit for the current allowlist), iters=2/wc=1, same release binary:
+- **--interpreter score = 4.26** ; **--baseline (JIT) score = 0.42** → the baseline
+  JIT is **~10× SLOWER than the interpreter**. It VALIDATES (`ok`) and the live GC
+  keeps it memory-bounded (no OOM) — a real CORRECTNESS milestone — but it is a
+  PERFORMANCE REGRESSION, not a speedup.
+- **The DEFAULT config is InterpreterOnly** (the JIT is opt-in via --baseline). So
+  the contract's R is the INTERPRETER score; the JIT regression does NOT corrupt
+  measured R, but the JIT has NOT moved it either.
+- Cause (from --tiering-summary): of 8 hot CodeBlocks only **3 lower to real native;
+  5 FALL BACK to the slow "generated" re-interpreter** — native lowering fails on
+  UnsupportedOpcode (StrictEqual, a LoadDouble form) + the native call route is
+  deferred (op_call/typed-array are slow-call far-calls). Tiering-up currently ADDS
+  overhead without fast native execution.
+
+IMPLICATION (the JIT is machinery-complete but perf-negative): to MOVE R the baseline
+must become a NET SPEEDUP first — (a) native lowering must SUCCEED for hot functions
+(admit StrictEqual + fix the LoadDouble form + broaden per-opcode coverage), (b) do
+NOT tier up to the slow generated fallback (stay interpreted if native fails, to avoid
+the regression), (c) land the INLINE fast paths (op_call direct-link + inline
+typed-array, removing the per-call/HEAP far-call) — THEN make the JIT the default.
+Only then does R move. Broadening what tiers up (more functions on the slow generated
+path) makes it WORSE.
+
 ## Latest measurement (2026-06-28, iters=2/wc=1) — R UNDEFINED
 
 Gate not met: 2/15 fail — mandreel + octane-zlib (asm.js DNF/too-slow, JIT-gated; NOT throw,
