@@ -789,11 +789,18 @@ impl FunctionEmitter {
         record_index: u32,
         key_index: u32,
         bytecode_index: u32,
+        owning_code_block: u64,
     ) {
         let miss = self.emit_property_ic_structure_guard(base, record_addr);
 
         // === HIT: cheap cached-offset own-data load. ==========================
-        self.emit_get_by_id_call_args(base, key_index, record_index, bytecode_index);
+        self.emit_get_by_id_call_args(
+            base,
+            key_index,
+            record_index,
+            bytecode_index,
+            owning_code_block,
+        );
         self.h.masm_mut().far_call(TrustedImm64::new(
             operation_get_by_id_with_cached_offset as usize as i64,
         ));
@@ -806,7 +813,13 @@ impl FunctionEmitter {
         // === SLOW: full optimize (re-resolve + fill the record). ==============
         let slow_label = self.h.masm().label();
         self.link_fast_jumps_to(&miss, slow_label);
-        self.emit_get_by_id_call_args(base, key_index, record_index, bytecode_index);
+        self.emit_get_by_id_call_args(
+            base,
+            key_index,
+            record_index,
+            bytecode_index,
+            owning_code_block,
+        );
         self.h.masm_mut().far_call(TrustedImm64::new(
             operation_get_by_id_optimize as usize as i64,
         ));
@@ -820,7 +833,8 @@ impl FunctionEmitter {
 
     /// Load the `get_by_id` DataIC far-call arguments: `x0`=vm, `x1`=boxed base
     /// (re-read from the frame so it does not depend on the guard register's
-    /// liveness), `x2`=key_index, `x3`=record_index, `x4`=bytecode_index — matching
+    /// liveness), `x2`=key_index, `x3`=record_index, `x4`=bytecode_index, `x5`=the
+    /// owning `*const CodeBlock` (the `StructureStubInfo*` analog) — matching
     /// `operation_get_by_id_optimize`/`_with_cached_offset`'s C-ABI.
     fn emit_get_by_id_call_args(
         &mut self,
@@ -828,6 +842,7 @@ impl FunctionEmitter {
         key_index: u32,
         record_index: u32,
         bytecode_index: u32,
+        owning_code_block: u64,
     ) {
         self.h.masm_mut().load64(address_for(base), LEFT_GPR); // x1 = boxed base
         self.h
@@ -839,6 +854,12 @@ impl FunctionEmitter {
         self.h
             .masm_mut()
             .move_imm32(TrustedImm32::new(bytecode_index as i32), CALL_ARG_GPRS[1]); // x4 = bci
+                                                                                     // x5 = the get_by_id's OWN CodeBlock pointer (a full 64-bit address; the
+                                                                                     // StructureStubInfo* analog — see `operation_get_by_id_optimize`).
+        self.h.masm_mut().move_imm64(
+            TrustedImm64::new(owning_code_block as i64),
+            CALL_ARG_GPRS[2],
+        );
         self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm
     }
 
@@ -866,11 +887,19 @@ impl FunctionEmitter {
         record_index: u32,
         key_index: u32,
         bytecode_index: u32,
+        owning_code_block: u64,
     ) {
         let miss = self.emit_property_ic_structure_guard(base, record_addr);
 
         // === HIT: cheap in-place replace store (barriered inside the host). =====
-        self.emit_put_by_id_call_args(base, value, key_index, record_index, bytecode_index);
+        self.emit_put_by_id_call_args(
+            base,
+            value,
+            key_index,
+            record_index,
+            bytecode_index,
+            owning_code_block,
+        );
         self.h.masm_mut().far_call(TrustedImm64::new(
             operation_put_by_id_with_cached_offset as usize as i64,
         ));
@@ -880,7 +909,14 @@ impl FunctionEmitter {
         // === SLOW: full optimize (replace-fill / transition -> slow path). ======
         let slow_label = self.h.masm().label();
         self.link_fast_jumps_to(&miss, slow_label);
-        self.emit_put_by_id_call_args(base, value, key_index, record_index, bytecode_index);
+        self.emit_put_by_id_call_args(
+            base,
+            value,
+            key_index,
+            record_index,
+            bytecode_index,
+            owning_code_block,
+        );
         self.h.masm_mut().far_call(TrustedImm64::new(
             operation_put_by_id_optimize as usize as i64,
         ));
@@ -892,8 +928,10 @@ impl FunctionEmitter {
     }
 
     /// Load the `put_by_id` DataIC far-call arguments: `x0`=vm, `x1`=boxed base,
-    /// `x2`=boxed value, `x3`=key_index, `x4`=record_index, `x5`=bytecode_index —
+    /// `x2`=boxed value, `x3`=key_index, `x4`=record_index, `x5`=bytecode_index,
+    /// `x6`=the owning `*const CodeBlock` (the `StructureStubInfo*` analog) —
     /// matching `operation_put_by_id_optimize`/`_with_cached_offset`'s C-ABI.
+    #[allow(clippy::too_many_arguments)]
     fn emit_put_by_id_call_args(
         &mut self,
         base: i32,
@@ -901,6 +939,7 @@ impl FunctionEmitter {
         key_index: u32,
         record_index: u32,
         bytecode_index: u32,
+        owning_code_block: u64,
     ) {
         self.h.masm_mut().load64(address_for(base), LEFT_GPR); // x1 = boxed base
         self.h.masm_mut().load64(address_for(value), RIGHT_GPR); // x2 = boxed value
@@ -913,6 +952,12 @@ impl FunctionEmitter {
         self.h
             .masm_mut()
             .move_imm32(TrustedImm32::new(bytecode_index as i32), CALL_ARG_GPRS[2]); // x5 = bci
+                                                                                     // x6 = the put_by_id's OWN CodeBlock pointer (a full 64-bit address; the
+                                                                                     // StructureStubInfo* analog — see `operation_put_by_id_optimize`).
+        self.h.masm_mut().move_imm64(
+            TrustedImm64::new(owning_code_block as i64),
+            CALL_ARG_GPRS[3],
+        );
         self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm
     }
 
@@ -1832,7 +1877,20 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                 emitter.property_site_index += 1;
                 let record_addr =
                     record_base as usize + record_index as usize * PROPERTY_IC_RECORD_STRIDE;
-                emitter.emit_get_by_id(dst, base, record_addr, record_index, key_index, bci as u32);
+                // The get_by_id's OWN CodeBlock pointer (the StructureStubInfo* analog):
+                // the SAME instance whose record-store base is baked above, so the
+                // operation's FILL/READ targets the SAME store the guard reads — never
+                // the parked `jit_code_block` of a nested-call CALLER.
+                let owning_code_block = code_block as *const CodeBlock as u64;
+                emitter.emit_get_by_id(
+                    dst,
+                    base,
+                    record_addr,
+                    record_index,
+                    key_index,
+                    bci as u32,
+                    owning_code_block,
+                );
             }
             CoreOpcode::PutByName => {
                 let base = frame_slot(decoded.register_operand(0)?)?;
@@ -1845,6 +1903,9 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                 emitter.property_site_index += 1;
                 let record_addr =
                     record_base as usize + record_index as usize * PROPERTY_IC_RECORD_STRIDE;
+                // The put_by_id's OWN CodeBlock pointer (the StructureStubInfo* analog) —
+                // see the GetByName note above.
+                let owning_code_block = code_block as *const CodeBlock as u64;
                 emitter.emit_put_by_id(
                     base,
                     value,
@@ -1852,6 +1913,7 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                     record_index,
                     key_index,
                     bci as u32,
+                    owning_code_block,
                 );
             }
             // op_call — the B5-first-cut UNLINKED VIRTUAL CALL. Operand order matches

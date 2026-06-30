@@ -2889,6 +2889,54 @@ impl Vm {
         }
     }
 
+    /// Resolve the `CodeBlock` that OWNS a property-IC site, for the DataIC FILL/READ.
+    ///
+    /// `owning_code_block` is the per-site `*const CodeBlock` (as `u64` bits) the
+    /// baseline emitter bakes into the `get_by_id`/`put_by_id` far-call — the JSC
+    /// `StructureStubInfo*` analog (`jit/JITOperations.cpp`
+    /// `operationGetByIdOptimize(globalObject, StructureStubInfo*, ...)`): the IC is
+    /// identified by its SITE (the function being compiled), DECOUPLED from any
+    /// "current CodeBlock". This is the store the FILL/READ MUST target so it agrees
+    /// with the generated structure guard, which bakes its record-store base from
+    /// the SAME owning image (`emit_property_ic_structure_guard`).
+    ///
+    /// DIVERGENCE-CORRECTION: the FILL/READ must NOT use `self.jit_code_block`. A
+    /// native JIT->JIT call (`blr`) never re-parks the CodeBlock (only
+    /// `run_installed_baseline_jit` does), so on a NESTED native callee
+    /// `self.jit_code_block` is still the CALLER's parked CodeBlock; filling THAT
+    /// store corrupts the caller's IC record at the same index (a wrong-answer for
+    /// the common method+property pattern).
+    ///
+    /// Returns `(placeholder, resolved_ptr)`: when a non-null owning pointer is
+    /// supplied (the only case from emitted code) `resolved_ptr` is it and
+    /// `placeholder` is `None`; with no owning pointer (a non-emitted/direct caller,
+    /// `owning_code_block == 0`) it falls back to the parked `jit_code_block`, or a
+    /// fresh placeholder when neither is present — the prior behavior.
+    ///
+    /// SAFETY: the returned `resolved_ptr`, when non-null, is dereferenced by the
+    /// caller as one shared `&CodeBlock`. It is valid under the SAME invariant the
+    /// structure guard already relies on: the owning `CodeBlock` instance is pinned
+    /// (registry-`Rc` in the live path, a stable local in the emit/run tests) for the
+    /// image's lifetime, so its record-store base — and the instance itself — do not
+    /// move between install and reuse (INV-4 / the K1 slot-2 stability invariant).
+    fn resolve_property_ic_owner(
+        &self,
+        owning_code_block: u64,
+    ) -> (Option<CodeBlock>, *const CodeBlock) {
+        let owning_ptr = owning_code_block as *const CodeBlock;
+        let resolved_ptr: *const CodeBlock = if owning_ptr.is_null() {
+            self.jit_code_block
+        } else {
+            owning_ptr
+        };
+        let placeholder = if resolved_ptr.is_null() {
+            self.jit_pending_code_block_placeholder()
+        } else {
+            None
+        };
+        (placeholder, resolved_ptr)
+    }
+
     /// V1b helper: materialize the faithful `TypeError` cell the JIT exception stub
     /// surfaces on a genuine type-error throw, as its `EncodedJSValue`. On an
     /// allocation failure building the error, keep a non-empty mirror word so
@@ -3208,14 +3256,17 @@ impl Vm {
         key_index: u32,
         record_index: usize,
         bytecode_index: u32,
+        owning_code_block: u64,
     ) -> Result<RuntimeValue, EncodedJsValue> {
-        let placeholder = self.jit_pending_code_block_placeholder();
+        // Target the get_by_id's OWN store (the StructureStubInfo* analog), NOT the
+        // parked `jit_code_block` — see `resolve_property_ic_owner`.
+        let (placeholder, owner_ptr) = self.resolve_property_ic_owner(owning_code_block);
         let outcome = {
             // SAFETY: as `operation_get_by_val` — one dormant-parent `&CodeBlock`,
             // disjoint from the `&mut self.*` field borrows, not outliving this call.
             let code_block: &CodeBlock = match &placeholder {
                 Some(code_block) => code_block,
-                None => unsafe { &*self.jit_code_block },
+                None => unsafe { &*owner_ptr },
             };
             let mut state = DispatchState {
                 stack: &mut self.execution,
@@ -3236,11 +3287,11 @@ impl Vm {
         match outcome {
             Ok((value, cacheable)) => {
                 // FILL the record (the DataIC slow path is the single writer). Re-derive
-                // the SAME parked code block whose stable record store the generated
+                // the SAME owning code block whose stable record store the generated
                 // structure guard reads through the baked base address.
                 let code_block: &CodeBlock = match &placeholder {
                     Some(code_block) => code_block,
-                    None => unsafe { &*self.jit_code_block },
+                    None => unsafe { &*owner_ptr },
                 };
                 if code_block.note_baseline_property_ic_slow_path(record_index) {
                     if let Some((structure, offset)) = cacheable {
@@ -3274,12 +3325,16 @@ impl Vm {
         key_index: u32,
         record_index: usize,
         bytecode_index: u32,
+        owning_code_block: u64,
     ) -> Result<RuntimeValue, EncodedJsValue> {
-        let placeholder = self.jit_pending_code_block_placeholder();
+        // Read the cached record from the get_by_id's OWN store (the same store the
+        // guard matched), NOT the parked `jit_code_block` — see
+        // `resolve_property_ic_owner`.
+        let (placeholder, owner_ptr) = self.resolve_property_ic_owner(owning_code_block);
         let record = {
             let code_block: &CodeBlock = match &placeholder {
                 Some(code_block) => code_block,
-                None => unsafe { &*self.jit_code_block },
+                None => unsafe { &*owner_ptr },
             };
             code_block.baseline_property_ic_record(record_index)
         };
@@ -3290,7 +3345,14 @@ impl Vm {
                 return Ok(value);
             }
         }
-        self.operation_get_by_id_optimize(host, base, key_index, record_index, bytecode_index)
+        self.operation_get_by_id_optimize(
+            host,
+            base,
+            key_index,
+            record_index,
+            bytecode_index,
+            owning_code_block,
+        )
     }
 
     /// `operationPutByIdOptimize` analog: the `put_by_id` DataIC MISS slow path.
@@ -3309,12 +3371,15 @@ impl Vm {
         key_index: u32,
         record_index: usize,
         bytecode_index: u32,
+        owning_code_block: u64,
     ) -> Result<RuntimeValue, EncodedJsValue> {
-        let placeholder = self.jit_pending_code_block_placeholder();
+        // Target the put_by_id's OWN store (the StructureStubInfo* analog), NOT the
+        // parked `jit_code_block` — see `resolve_property_ic_owner`.
+        let (placeholder, owner_ptr) = self.resolve_property_ic_owner(owning_code_block);
         let outcome = {
             let code_block: &CodeBlock = match &placeholder {
                 Some(code_block) => code_block,
-                None => unsafe { &*self.jit_code_block },
+                None => unsafe { &*owner_ptr },
             };
             let mut state = DispatchState {
                 stack: &mut self.execution,
@@ -3337,7 +3402,7 @@ impl Vm {
             Ok(cacheable) => {
                 let code_block: &CodeBlock = match &placeholder {
                     Some(code_block) => code_block,
-                    None => unsafe { &*self.jit_code_block },
+                    None => unsafe { &*owner_ptr },
                 };
                 if code_block.note_baseline_property_ic_slow_path(record_index) {
                     if let Some((structure, offset, _key)) = cacheable {
@@ -3371,12 +3436,16 @@ impl Vm {
         key_index: u32,
         record_index: usize,
         bytecode_index: u32,
+        owning_code_block: u64,
     ) -> Result<RuntimeValue, EncodedJsValue> {
-        let placeholder = self.jit_pending_code_block_placeholder();
+        // Read the cached record from the put_by_id's OWN store (the same store the
+        // guard matched), NOT the parked `jit_code_block` — see
+        // `resolve_property_ic_owner`.
+        let (placeholder, owner_ptr) = self.resolve_property_ic_owner(owning_code_block);
         let record = {
             let code_block: &CodeBlock = match &placeholder {
                 Some(code_block) => code_block,
-                None => unsafe { &*self.jit_code_block },
+                None => unsafe { &*owner_ptr },
             };
             code_block.baseline_property_ic_record(record_index)
         };
@@ -3399,6 +3468,7 @@ impl Vm {
             key_index,
             record_index,
             bytecode_index,
+            owning_code_block,
         )
     }
 
@@ -24622,6 +24692,280 @@ mod tests {
             "the native method-heavy CallWithThis loop ({native_elapsed:?}) must BEAT pure \
              interpretation ({interp_elapsed:?}).",
         );
+    }
+
+    // ------ Reproduction: nested-native-callee property-IC cross-parking bug ------
+    // Regression for the divergence flagged in commit a06bc93. A native JIT->JIT call
+    // (`blr`) never re-parks the CodeBlock (only `run_installed_baseline_jit` does), so a
+    // NESTED native CALLEE's get_by_id/put_by_id slow path USED TO read/fill the CALLER's
+    // PARKED CodeBlock record store instead of the callee's OWN store. With:
+    //   driver(o,n) { s=0; for(i<n) { m = o.inc; s += m.<this=o>() } return s }  // get_by_id(o,"inc") @ record 0
+    //   inc()       { this.x = this.x + 1; return this.x }                       // get_by_id(this,"x") @ record 0
+    // where `inc` is a REAL own method on `o` (NOT passed as an arg, so the driver has its
+    // OWN colliding get_by_id at record index 0) and `this == o` (SAME structure), the
+    // method's slow-path FILL wrote (o-structure, offset-of-"x") into the DRIVER's
+    // record[0], overwriting (o-structure, offset-of-"inc"). The driver's next
+    // get_by_id(o,"inc") guard then HIT (structure matches) and loaded `o.x` instead of
+    // the method -> it `call`ed a NUMBER -> the method-call THREW = WRONG ANSWER.
+    //
+    // The fix targets the get_by_id's OWN CodeBlock store (the StructureStubInfo* analog,
+    // baked per-site into the far-call), so each IC stays uncorrupted. This test FAILS on
+    // the pre-fix code (the native run THROWS / mis-returns) and PASSES with the fix.
+    // macOS/aarch64 only (executes native ARM64).
+
+    // `o` with own "inc" (the method value) then "x" (0). A fixed shape so
+    // offset-of("inc") != offset-of("x") and every object built here shares ONE structure
+    // (the guard-HIT precondition the bug exploits).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn nested_ic_object_with_inc_and_x(
+        host: &mut CoreOpcodeDispatchHost,
+        inc_value: RuntimeValue,
+    ) -> RuntimeValue {
+        use crate::interpreter::CorePropertyKey;
+        let o = host.jit_test_allocate_object();
+        host.jit_test_set_own_data(o, &CorePropertyKey::String("inc".into()), inc_value);
+        host.jit_test_set_own_data(
+            o,
+            &CorePropertyKey::String("x".into()),
+            RuntimeValue::from_i32(0),
+        );
+        o
+    }
+
+    // driver(o, n) { s=0; for(i=0;i<n;i++) { m = o.inc; s += m.<this=o>(); } return s }.
+    // num_params_incl_this = 3 (this, o, n). identifier 1 = "inc" (the method uses 0 = "x"
+    // — distinct identifier indices, SAME record index 0: the collision is the record
+    // index, not the identifier). The single get_by_id(o,"inc") is the driver's ONLY
+    // property site -> record index 0, colliding with the method's get_by_id(this,"x")@0.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn nested_ic_collision_driver() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(0)), Operand::SignedImmediate(0)],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(1)), Operand::SignedImmediate(0)],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(2)), Operand::SignedImmediate(1)],
+                ),
+                typed_core_instruction_with_operands(
+                    3,
+                    CoreOpcode::LessThanInt32,
+                    vec![
+                        Operand::Register(local(3)),
+                        Operand::Register(local(1)),
+                        Operand::Register(argument_including_this(2)), // n
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    4,
+                    CoreOpcode::JumpIfFalse,
+                    vec![
+                        Operand::Register(local(3)),
+                        Operand::BytecodeIndex(BytecodeIndex::from_offset(10)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    5,
+                    CoreOpcode::GetByName,
+                    vec![
+                        Operand::Register(local(4)),
+                        Operand::Register(argument_including_this(1)), // o
+                        Operand::IdentifierIndex(1),                   // "inc"  (record 0)
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    6,
+                    CoreOpcode::CallWithThis,
+                    vec![
+                        Operand::Register(local(5)),
+                        Operand::Register(local(4)), // callee = m = o.inc
+                        Operand::Register(argument_including_this(1)), // this = o (RECEIVER)
+                        Operand::UnsignedImmediate(0), // argc (excl this)
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    7,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(0)),
+                        Operand::Register(local(0)),
+                        Operand::Register(local(5)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    8,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(1)),
+                        Operand::Register(local(1)),
+                        Operand::Register(local(2)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    9,
+                    CoreOpcode::Jump,
+                    vec![Operand::BytecodeIndex(BytecodeIndex::from_offset(3))],
+                ),
+                typed_core_instruction_with_operands(
+                    10,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(0))],
+                ),
+            ],
+            3,
+        )
+    }
+
+    // Oracle: run the driver-loads-o.inc scenario through the engine INTERPRETER on a fresh
+    // Vm with a FRESH `o`. Returns (boxed result if it returned, o.x after the run). The
+    // interpreter is bug-free (the cross-parking defect is JIT-only), so it yields
+    // n*(n+1)/2 and o.x == n.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn run_nested_ic_driver_via_interpreter(
+        driver: &CodeBlock,
+        inc: &CodeBlock,
+        n: i32,
+    ) -> (Option<u64>, Option<u64>) {
+        use crate::interpreter::CorePropertyKey;
+        let key_x = CorePropertyKey::String("x".into());
+        let inc_id = CodeBlockId(CellId(8_870));
+        let mut interp_vm: Box<Vm> = Box::new(Vm::new(VmConfig::interpreter_only()));
+        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks(vec![
+            InterpreterFunctionCodeBlock::new(inc_id, inc.clone()),
+        ]);
+        host.jit_test_register_identifier(0, "x");
+        host.jit_test_register_identifier(1, "inc");
+        let inc_value = host.allocate_function_value_for_test(0);
+        let o = nested_ic_object_with_inc_and_x(&mut host, inc_value);
+        let owner = CodeBlockId(CellId(9_910));
+        interp_vm.code_blocks.register(owner, driver.clone());
+        let completion = execute_registered_code_block_with_host_and_arguments(
+            &mut interp_vm,
+            owner,
+            driver,
+            &mut host,
+            vec![RuntimeValue::undefined(), o, RuntimeValue::from_i32(n)],
+        );
+        let result = match completion {
+            ExecutionCompletion::Returned(value) => Some(value.encoded().0),
+            _ => None,
+        };
+        let ox = host.jit_test_get_own_data(o, &key_x).map(|v| v.encoded().0);
+        (result, ox)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_nested_native_callee_property_ic_does_not_corrupt_caller_ic() {
+        use crate::interpreter::CorePropertyKey;
+        let key_x = || CorePropertyKey::String("x".into());
+
+        let inc = call_with_this_inc_method(); // inc(){ this.x = this.x+1; return this.x }
+        let driver = nested_ic_collision_driver();
+        let inc_id = CodeBlockId(CellId(8_870));
+        let driver_id = CodeBlockId(CellId(8_871));
+        let oracle = |n: i64| -> i64 { n * (n + 1) / 2 };
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(driver_id, driver.clone());
+        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks(vec![
+            InterpreterFunctionCodeBlock::new(inc_id, inc.clone()),
+        ]);
+        host.jit_test_register_identifier(0, "x");
+        host.jit_test_register_identifier(1, "inc");
+        let inc_value = host.allocate_function_value_for_test(0);
+
+        // Warm BOTH to native. `inc` first so the driver's op_call_with_this resolves its
+        // native entry -> the NESTED native `blr` callee whose get_by_id/put_by_id would
+        // (pre-fix) fill the DRIVER's parked record store.
+        let warm_o_inc = nested_ic_object_with_inc_and_x(&mut host, inc_value);
+        a1x_install_until_tiered(&mut vm, &mut host, inc_id, &inc, &[warm_o_inc.encoded().0]);
+        let warm_o_driver = nested_ic_object_with_inc_and_x(&mut host, inc_value);
+        a1x_install_until_tiered(
+            &mut vm,
+            &mut host,
+            driver_id,
+            &driver,
+            &op_call_args_including_this(&[warm_o_driver, RuntimeValue::from_i32(1)]),
+        );
+
+        // CORRECTNESS over a range. Each iteration's get_by_id(o,"inc") MUST keep resolving
+        // to the method, never the property the NESTED native callee cached at the same
+        // record index. n>=2 observes the corruption within a single run; warm corruption
+        // makes even n==1 observe it on the pre-fix code.
+        for &n in &[1_i32, 2, 4, 9, 25] {
+            let o = nested_ic_object_with_inc_and_x(&mut host, inc_value);
+            vm.reset_baseline_native_engagement_count();
+            let args = op_call_args_including_this(&[o, RuntimeValue::from_i32(n)]);
+            let native = match vm
+                .observe_baseline_jit_entry_and_maybe_execute(&mut host, driver_id, &driver, &args)
+            {
+                BaselineJitEntryOutcome::Returned(value) => value.encoded().0,
+                // PRE-FIX edge: the nested callee's FILL corrupted the driver's
+                // get_by_id(o,"inc") record -> the driver loaded `o.x` and `call`ed a
+                // NUMBER -> the method-call THREW.
+                other => panic!(
+                    "native driver({n}) did not return — the nested-native callee's IC FILL \
+                     corrupted the driver's get_by_id(o,\"inc\") record (it loaded o.x and \
+                     called a non-function): {other:?}"
+                ),
+            };
+            assert_eq!(
+                native,
+                RuntimeValue::from_i32(oracle(n as i64) as i32).encoded().0,
+                "native driver({n}) == oracle n*(n+1)/2 — the driver's o.inc IC stayed correct",
+            );
+            assert_eq!(
+                vm.baseline_native_engagement_count(),
+                n as u64,
+                "the method-call native fast path took the `blr` once per iteration (n={n}); a \
+                 corrupted driver IC would stop dispatching to the method",
+            );
+            assert_eq!(
+                host.jit_test_get_own_data(o, &key_x())
+                    .map(|v| v.encoded().0),
+                Some(RuntimeValue::from_i32(n).encoded().0),
+                "the method mutated the RECEIVER o (o.x == n)",
+            );
+
+            // Direct IC-not-corrupted proof: the driver's record[0] resolves to the METHOD
+            // (o.inc), NOT o.x. Pre-fix it held (o-structure, offset-of-"x").
+            if let Some(rec) = driver.baseline_property_ic_record(0) {
+                if rec.structure_id != 0 {
+                    let cached = host
+                        .jit_get_by_id_cached_read(o, rec.structure_id, rec.offset)
+                        .map(|v| v.encoded().0);
+                    assert_eq!(
+                        cached,
+                        Some(inc_value.encoded().0),
+                        "the driver's get_by_id(o,\"inc\") IC record points at the METHOD \
+                         (o.inc), not o.x — the nested callee did not corrupt it (n={n})",
+                    );
+                }
+            }
+
+            // native == interpreter (oracle), and the interpreter mutated o.x == n too.
+            let (interp, interp_ox) = run_nested_ic_driver_via_interpreter(&driver, &inc, n);
+            assert_eq!(
+                interp,
+                Some(native),
+                "native driver({n}) == interpreter driver({n})"
+            );
+            assert_eq!(
+                interp_ox,
+                Some(RuntimeValue::from_i32(n).encoded().0),
+                "interpreter receiver mutated n times too (o.x == n)",
+            );
+        }
     }
 
     // ENGAGEMENT BREADTH — a SELF-RECURSIVE native call chain. `sum(n, self)` recurses

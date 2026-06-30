@@ -360,19 +360,30 @@ pub extern "C" fn operation_put_by_val(vm: *mut Vm, base: u64, prop: u64, value:
 /// `operationGetByIdOptimize(JSGlobalObject*, StructureStubInfo*, EncodedJSValue
 /// base, uintptr_t propertyName)` analog (JITOperations.cpp). The baseline
 /// `get_by_id` DataIC MISS slow-call: the emitter loads the boxed base into the
-/// arg slot, bakes the property `key_index`, the per-site `record_index`, and the
-/// site `bytecode_index`, sets arg0 = the pinned `*mut Vm`, and far-calls this
-/// shim. Same D1+D5 reborrow island as the get/put_by_val shims; runs the faithful
-/// resolution + DataIC record FILL (`Vm::operation_get_by_id_optimize`) and returns
-/// the boxed result, or — on throw — stamps `m_exception` (D3) and returns
-/// `JSValue::empty()` bits. The integer args arrive as 64-bit registers
-/// (`move_imm32` zero-extends); they are narrowed to their logical widths here.
+/// arg slot, bakes the property `key_index`, the per-site `record_index`, the
+/// site `bytecode_index`, and the `owning_code_block` (the per-site `*const
+/// CodeBlock` of the function being compiled — the `StructureStubInfo*` analog),
+/// sets arg0 = the pinned `*mut Vm`, and far-calls this shim. Same D1+D5 reborrow
+/// island as the get/put_by_val shims; runs the faithful resolution + DataIC
+/// record FILL (`Vm::operation_get_by_id_optimize`) and returns the boxed result,
+/// or — on throw — stamps `m_exception` (D3) and returns `JSValue::empty()` bits.
+/// The integer args arrive as 64-bit registers (`move_imm32` zero-extends); they
+/// are narrowed to their logical widths here.
+///
+/// DIVERGENCE-CORRECTION (JSC `StructureStubInfo*` -> the owning-CodeBlock pointer):
+/// JSC passes the per-site `StructureStubInfo*`, identifying the IC by its SITE,
+/// DECOUPLED from any "current CodeBlock". This shim carries the get_by_id's OWN
+/// `*const CodeBlock` (`owning_code_block`) so the record FILL targets the SAME
+/// store the generated structure guard reads — NOT `vm.jit_code_block`, which on a
+/// NESTED native JIT->JIT call (a `blr` never re-parks) is the CALLER's parked
+/// CodeBlock; filling that corrupts the caller's IC (a wrong-answer).
 pub extern "C" fn operation_get_by_id_optimize(
     vm: *mut Vm,
     base: u64,
     key_index: u64,
     record_index: u64,
     bytecode_index: u64,
+    owning_code_block: u64,
 ) -> u64 {
     // D1 + D5 reborrows — see the module SAFETY note.
     let vm = unsafe { &mut *vm };
@@ -391,6 +402,7 @@ pub extern "C" fn operation_get_by_id_optimize(
         key_index as u32,
         record_index as usize,
         bytecode_index as u32,
+        owning_code_block,
     ) {
         Ok(result) => result.encoded().0,
         Err(encoded_exception) => {
@@ -405,13 +417,17 @@ pub extern "C" fn operation_get_by_id_optimize(
 /// cheap own-data load at the cached offset (`Vm::operation_get_by_id_with_cached_offset`,
 /// which falls back to the optimize path on a SENTINEL/drift). Own-data loads
 /// cannot throw, but the shared shim still stamps `m_exception` on the rare
-/// fallback throw edge so the caller's exception convention holds.
+/// fallback throw edge so the caller's exception convention holds. `owning_code_block`
+/// is the get_by_id's OWN `*const CodeBlock` (the `StructureStubInfo*` analog — see
+/// `operation_get_by_id_optimize`): the cached-offset READ and any optimize fallback
+/// FILL target the SAME store the structure guard matched, never `vm.jit_code_block`.
 pub extern "C" fn operation_get_by_id_with_cached_offset(
     vm: *mut Vm,
     base: u64,
     key_index: u64,
     record_index: u64,
     bytecode_index: u64,
+    owning_code_block: u64,
 ) -> u64 {
     let vm = unsafe { &mut *vm };
     let host_ptr = vm.jit_host_ptr();
@@ -425,6 +441,7 @@ pub extern "C" fn operation_get_by_id_with_cached_offset(
         key_index as u32,
         record_index as usize,
         bytecode_index as u32,
+        owning_code_block,
     ) {
         Ok(result) => result.encoded().0,
         Err(encoded_exception) => {
@@ -436,12 +453,14 @@ pub extern "C" fn operation_get_by_id_with_cached_offset(
 
 /// `operationPutByIdOptimize` analog (JITOperations.cpp). The baseline `put_by_id`
 /// DataIC MISS slow-call: the emitter loads the boxed base + value into the arg
-/// slots, bakes `key_index`/`record_index`/`bytecode_index`, sets arg0 = the
-/// pinned `*mut Vm`, and far-calls this shim. Runs the faithful recording put +
-/// DataIC record FILL (`Vm::operation_put_by_id_optimize`; transitions handled but
-/// not cached). put produces no observable value, so success returns `undefined`
-/// bits (the lowering discards the result register); on throw it stamps
-/// `m_exception` (D3).
+/// slots, bakes `key_index`/`record_index`/`bytecode_index` and the
+/// `owning_code_block` (the per-site `*const CodeBlock`, the `StructureStubInfo*`
+/// analog — see `operation_get_by_id_optimize`), sets arg0 = the pinned `*mut Vm`,
+/// and far-calls this shim. Runs the faithful recording put + DataIC record FILL
+/// (`Vm::operation_put_by_id_optimize`; transitions handled but not cached) against
+/// the get_by_id's OWN store, NOT `vm.jit_code_block`. put produces no observable
+/// value, so success returns `undefined` bits (the lowering discards the result
+/// register); on throw it stamps `m_exception` (D3).
 pub extern "C" fn operation_put_by_id_optimize(
     vm: *mut Vm,
     base: u64,
@@ -449,6 +468,7 @@ pub extern "C" fn operation_put_by_id_optimize(
     key_index: u64,
     record_index: u64,
     bytecode_index: u64,
+    owning_code_block: u64,
 ) -> u64 {
     let vm = unsafe { &mut *vm };
     let host_ptr = vm.jit_host_ptr();
@@ -464,6 +484,7 @@ pub extern "C" fn operation_put_by_id_optimize(
         key_index as u32,
         record_index as usize,
         bytecode_index as u32,
+        owning_code_block,
     ) {
         Ok(result) => result.encoded().0,
         Err(encoded_exception) => {
@@ -478,6 +499,10 @@ pub extern "C" fn operation_put_by_id_optimize(
 /// cached offset (`Vm::operation_put_by_id_with_cached_offset`, which falls back to
 /// the optimize path on a SENTINEL/drift/non-replaceable target). Returns
 /// `undefined` on success; stamps `m_exception` on the rare fallback throw edge.
+/// `owning_code_block` is the get_by_id's OWN `*const CodeBlock` (the
+/// `StructureStubInfo*` analog — see `operation_get_by_id_optimize`): the cached
+/// store + any optimize fallback FILL target the SAME store the guard matched,
+/// never `vm.jit_code_block`.
 pub extern "C" fn operation_put_by_id_with_cached_offset(
     vm: *mut Vm,
     base: u64,
@@ -485,6 +510,7 @@ pub extern "C" fn operation_put_by_id_with_cached_offset(
     key_index: u64,
     record_index: u64,
     bytecode_index: u64,
+    owning_code_block: u64,
 ) -> u64 {
     let vm = unsafe { &mut *vm };
     let host_ptr = vm.jit_host_ptr();
@@ -500,6 +526,7 @@ pub extern "C" fn operation_put_by_id_with_cached_offset(
         key_index as u32,
         record_index as usize,
         bytecode_index as u32,
+        owning_code_block,
     ) {
         Ok(result) => result.encoded().0,
         Err(encoded_exception) => {
