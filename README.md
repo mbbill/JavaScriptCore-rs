@@ -11,13 +11,14 @@ octane-zlib — asm.js, can't finish under the interpreter) — so the suite sti
 geomean and parity can't be measured or claimed until all 15 pass. The remaining gap is the
 **optimizing JIT**, and the measured scoreboard proves it (below).
 
-**Latest (2026-06-30):** the baseline JIT's stack model is settled and its foundation has landed.
-A judge panel ratified **Option A — the native machine stack IS the JS stack** (FP/SP unified, the
-faithful JSC-with-JIT model), and the cutover landed: the baseline JIT now runs on the native stack
-with the faithful `push_pair(fp,lr); mov fp,sp` prologue. The **first JIT→JIT native call** (the
-R-lever existence proof) is in flight. On the GC side, **object- and string-cell GC are live** (the
-string leak is closed). None of this has moved measured R yet — it stays the interpreter floor until
-native execution broadens and becomes the default — but it is the direct, faithful path to native code.
+**Latest (2026-06-30):** the baseline JIT now runs on the **native machine stack** (judge-panel-ratified
+Option A — FP/SP unified, the faithful JSC-with-JIT model) and does **native JS→JS calls that beat the
+interpreter** (~39× on a call-heavy probe; native ≪ interpreter). Real op_calls resolve the callee's
+native entry and `blr` it — bypassing the old divergent route arbiter entirely. On the GC side,
+**object- and string-cell GC are live** (the string leak is closed). This validates the native-call
+*mechanism*, but has **not moved measured R yet** — R is gated on *coverage*: the native path engages
+only for functions that tier up, and the allowlist still lacks property ICs, so property-heavy Octane
+hot functions stay interpreted. The next R-lever is native-lowering **breadth**.
 
 ```
 Overall: ~48% by effort  █████████▌░░░░░░░░░░░  (but the parity-bearing JIT tiers are ~0%)
@@ -59,14 +60,14 @@ not by assertion.** (Re-measure with `tools/octane-parity/run_{cpp,rust}_baselin
 
 ## What's next (the critical path)
 
-The baseline JIT is what moves R, and its **stack model + foundation are now settled and landed**
-(native machine stack = JS stack; faithful prologue; GC the JIT assumes is live). Next, in order:
-**first JIT→JIT native call** (in flight — the R-lever existence proof) → **broaden native calls +
-lowering** (a scoped JIT-frame GC scan so native-call args can carry cells; admit more opcodes;
-delete the divergent generated-* call/route layer — see `docs/design/baseline-call-tier-divergence.md`)
-→ **make the JIT a net speedup and flip it to the default** (today it is opt-in and a measured
-regression on call-heavy code; native execution must beat the interpreter first) → **DFG → FTL/B3**
-take R to ≥ 1.0. The 2 asm.js benches (mandreel, octane-zlib) need native execution just to finish.
+The baseline JIT now runs on the native stack and does **native JS→JS calls that beat the interpreter**
+(the R-lever *mechanism* is proven). What remains to actually move R, in order: **native-lowering
+breadth** — the baseline property-access ICs (`get_by_id`/`put_by_id`, the deferred K2) + more opcodes,
+so real property-heavy Octane hot functions tier up and run native → **re-measure and flip the JIT to
+the default** (held since it was opt-in and the *old* path regressed; the faithful native path bypasses
+that — see `docs/design/baseline-call-tier-divergence.md`) → **R lifts off the interpreter floor** →
+**DFG → FTL/B3** take it to ≥ 1.0. The 2 asm.js benches (mandreel, octane-zlib) need native execution
+just to finish.
 
 ## For more detail
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — the plan: critical path, full % breakdown, settled decisions.
