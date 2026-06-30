@@ -117,3 +117,25 @@ runs (and the asm.js benches need it just to complete).
 Re-run both baselines after any change that could move a bench across the
 complete/validate line, and treat the result — R if all 15 pass, else the `r_i` set with
 R explicitly undefined — as the only progress report.
+
+## 2026-06-30 LATE — THE REAL-BENCH RE-MEASURE: the harness uses the WRONG JIT path (load-bearing)
+
+First real-bench re-measure after all the native-stack + broad-engagement + property/method/comparison/
+closure breadth: **navier-stokes --interpreter = 4.27 ; --baseline (JIT) = 0.42 -> the JIT is still ~10x
+SLOWER** (same as 06-29; both validate ok -- purely perf). The synthetic probes (39x call-heavy, 2.3x
+method-heavy) were UNIT TESTS of the ARM64 `emit_baseline_function` path in ISOLATION; they did NOT
+measure the octane harness.
+
+ROOT CAUSE (from navier --baseline --tiering-summary): **`octane_probe --baseline` routes through the OLD
+generated-* divergent machinery, NOT the ARM64 native path where the whole session's work lives.** Evidence:
+3.44M baseline_generated_executions (the byte-blob generated EXECUTOR runs the hot functions); the hot
+CodeBlocks fail "native lowering" on StrictEqual + LoadDouble -- opcodes the ARM64 emit_baseline_function
+ADMITS (unit tests green) -- so the octane lowering is a DIFFERENT emitter (x86-64 P6 / generated-direct-
+call), not emit_baseline_function; native_entry_miss=HostBlockedX86_64 (x86-64 entries can't run on this
+arm64 host -> generated-executor fallback).
+
+So the breadth was necessary but the harness never used it. **THE R-LEVER: wire the live BaselineAllowed
+tier-up (the octane path) to the ARM64 `emit_baseline_function` + native-call path (broad engagement +
+the property/method/comparison/closure breadth), replacing the generated-* machinery** -- the STEP 2/3
+cutover of docs/design/baseline-call-tier-divergence.md, now confirmed as the gate to R. Diagnostic in
+flight to map the dispatch (BaselineAllowed -> which emitter) + the wiring.
