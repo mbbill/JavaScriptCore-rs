@@ -10150,6 +10150,108 @@ impl CoreOpcodeDispatchHost {
             .map_err(DispatchOutcome::Fail)
     }
 
+    /// Loose-equality (`==`/`!=`) slow-path funnel for the baseline `Equal`/`NotEqual`
+    /// far-call (`operationCompareEq`, jit/JITOperations.cpp:2631). The `Equal`/`NotEqual`
+    /// dispatch handler (mod.rs:7314) computes the boolean via `self.loose_equal(state,
+    /// left, right)`; this exposes the SAME fallible oracle to the JIT bridge. Loose
+    /// equality MAY run `ToPrimitive` (a user `valueOf`/`toString` on an object operand,
+    /// re-entrant), so it threads the caller's `DirectInterpreter`-configured
+    /// `DispatchState` (exactly as `jit_get_by_id`) and surfaces a catchable
+    /// `DispatchOutcome` on throw. `!=` is the CALLER's negation of this `==` boolean (the
+    /// emitter inverts the slow result / inline condition), never a second oracle.
+    pub(crate) fn jit_loose_equal(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        left: RuntimeValue,
+        right: RuntimeValue,
+    ) -> Result<bool, DispatchOutcome> {
+        self.loose_equal(state, left, right)
+    }
+
+    /// Global-lexical READ slow-path funnel for the baseline `GetGlobalLexical`
+    /// far-call. The `GetGlobalLexical` dispatch handler (mod.rs:8105) resolves the
+    /// identifier to a name and reads the global lexical binding; this exposes the SAME
+    /// leaf resolution to the JIT bridge. No getter, no re-entry, no `DispatchState` —
+    /// the global lexical environment is reached via `&self` (the host store), so this
+    /// is the global-binding analog of the leaf `jit_get_closure_cell`. A TDZ /
+    /// missing-binding `ExecutionError` maps to a faithful `Fail`.
+    pub(crate) fn jit_get_global_lexical(
+        &self,
+        key_index: u32,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let name = self
+            .global_lexical_name(key_index)
+            .map_err(DispatchOutcome::Fail)?;
+        self.read_global_lexical(&name)
+            .map_err(DispatchOutcome::Fail)
+    }
+
+    /// Global-object property READ slow-path funnel for the baseline
+    /// `GetGlobalObjectProperty` far-call (`operationGetFromScope` GlobalProperty/
+    /// GlobalVar analog, jit/JITOperations.cpp:4624). Mirrors the
+    /// `GetGlobalObjectProperty` dispatch handler's resolution CORE (mod.rs:8168) minus
+    /// the register/window/completion-context plumbing — exactly as `jit_get_by_id`
+    /// mirrors `GetByName`: resolve the global object from `state.stack`
+    /// (`active_global_object_value`), resolve the baked identifier to a key, and run the
+    /// faithful `get_property_value` (own/prototype data, autobox, getter re-entry via the
+    /// caller's `DirectInterpreter` state) WHILE RECORDING the lookup. A getter that throws
+    /// surfaces a catchable `DispatchOutcome`. No DataIC record is filled (global access
+    /// has no inline IC in this cut), so — unlike `jit_get_by_id` — there is no
+    /// `(StructureID, PropertyOffset)` return.
+    pub(crate) fn jit_get_global_object_property(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        key_index: u32,
+        bytecode_index: BytecodeIndex,
+    ) -> Result<RuntimeValue, DispatchOutcome> {
+        let global_object = self
+            .active_global_object_value(state.stack)
+            .map_err(DispatchOutcome::Fail)?;
+        let key = self.identifier_property_key(key_index);
+        let site = CorePropertyLookupSite {
+            bytecode_index: Some(bytecode_index),
+            opcode: Some(CoreOpcode::GetGlobalObjectProperty),
+            cache_key: None,
+        };
+        self.begin_property_lookup_recording(site);
+        self.get_property_value(state, global_object, &key, global_object)
+    }
+
+    /// Global-object property STORE slow-path funnel for the baseline
+    /// `PutGlobalObjectProperty` far-call (`operationPutToScope` GlobalProperty/GlobalVar
+    /// analog, jit/JITOperations.cpp:4666). Mirrors the `PutGlobalObjectProperty` dispatch
+    /// handler's store CORE (mod.rs:8289) minus the register/window/completion-context
+    /// plumbing — exactly as `jit_put_by_id` mirrors `PutByName`: resolve the global object
+    /// from `state.stack`, resolve the baked identifier to a key, and run the faithful
+    /// recording store (`put_property_value_with_store_observation` with the
+    /// `PutGlobalObjectProperty` opcode + `None` completion context, the SAME `None`
+    /// `jit_put_by_id` passes for `PutByName`). A setter that throws surfaces a catchable
+    /// `DispatchOutcome`; the store yields no observable value, so success is `Ok(())`.
+    pub(crate) fn jit_put_global_object_property(
+        &mut self,
+        state: &mut DispatchState<'_>,
+        key_index: u32,
+        value: RuntimeValue,
+        bytecode_index: BytecodeIndex,
+    ) -> Result<(), DispatchOutcome> {
+        let global_object = self
+            .active_global_object_value(state.stack)
+            .map_err(DispatchOutcome::Fail)?;
+        let key = self.identifier_property_key(key_index);
+        match self.put_property_value_with_store_observation(
+            state,
+            bytecode_index,
+            CoreOpcode::PutGlobalObjectProperty,
+            global_object,
+            &key,
+            value,
+            None,
+        ) {
+            DispatchOutcome::Continue => Ok(()),
+            other => Err(other),
+        }
+    }
+
     /// General named-property GET slow-path funnel for the baseline `get_by_id`
     /// DataIC (`operationGetByIdOptimize`, jit/JITOperations.cpp). Mirrors the
     /// `CoreOpcode::GetByName` dispatch's resolution CORE (mod.rs:8393-8419) minus

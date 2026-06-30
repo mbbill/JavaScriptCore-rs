@@ -3142,6 +3142,54 @@ impl Vm {
         }
     }
 
+    /// `operationCompareEq(JSGlobalObject*, EncodedJSValue, EncodedJSValue)`
+    /// (jit/JITOperations.cpp:2631; `JSValue::equalSlowCaseInline`). The SAFE wrapper the
+    /// baseline `Equal`/`NotEqual` slow-path shim calls. The int32 fast path is inline
+    /// (`branch32` + boolean materialization, function_emitter.rs); a non-int32 operand
+    /// far-calls this, which runs the faithful loose-equality oracle (`host.jit_loose_equal`
+    /// -> the interpreter's OWN `loose_equal`, the SAME resolution the `Equal`/`NotEqual`
+    /// dispatch handler uses, interpreter/mod.rs:7314) over the parked CodeBlock + the
+    /// `Vm`'s real heap, and surfaces `==` as a boolean. `!=` is the emitter's negation of
+    /// this `==` boolean (the slow path `xor`s the result before boxing), never a separate
+    /// shim. Loose equality CAN throw (an object operand's `valueOf`/`toString`), surfaced
+    /// as the pending exception's `EncodedJsValue`. Same parked-CodeBlock borrow/region
+    /// shape as [`Self::operation_compare_relational`].
+    pub fn operation_compare_eq(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<bool, EncodedJsValue> {
+        // V1a (S3): the loose-eq object branch reads `state.code_block`, so use the REAL
+        // parked CodeBlock, else a fresh placeholder (as `operation_compare_relational`).
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let outcome = {
+            // SAFETY: as `operation_compare_relational` — one dormant-parent `&CodeBlock`,
+            // disjoint from the `&mut self.*` field borrows, not outliving this call.
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            let mut state = DispatchState {
+                stack: &mut self.execution,
+                registers: &mut self.registers,
+                exceptions: &mut self.exceptions,
+                heap: &mut self.heap,
+                code_block,
+                ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+                function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+            };
+            host.jit_loose_equal(&mut state, op1, op2)
+        };
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            Err(_) => self
+                .jit_bridge_materialize_type_error(host)
+                .map(|_unreachable_value| false),
+        }
+    }
+
     /// `operationGetByVal(JSGlobalObject*, EncodedJSValue base, EncodedJSValue prop)`
     /// (JITOperations.cpp). The SAFE wrapper the baseline `op_get_by_val` slow-call
     /// shim calls. A FAST typed-array element shortcut (the asm.js HEAP read: a
@@ -3282,6 +3330,115 @@ impl Vm {
         value: RuntimeValue,
     ) -> Result<RuntimeValue, EncodedJsValue> {
         match host.jit_put_closure_cell(&mut self.heap, cell, value) {
+            Ok(()) => Ok(RuntimeValue::undefined()),
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
+    /// `operationGetFromScope` GlobalVar/Lexical-bind analog (jit/JITOperations.cpp:4624)
+    /// for the baseline `GetGlobalLexical` far-call. The SAFE wrapper the shim calls.
+    /// Runs the faithful LEAF global-lexical read (`host.jit_get_global_lexical` -> the
+    /// interpreter's OWN `global_lexical_name` + `read_global_lexical`, the SAME resolution
+    /// the `GetGlobalLexical` dispatch handler uses, interpreter/mod.rs:8105) — no
+    /// `DispatchState` (the global lexical environment is reached via the host store), the
+    /// global-binding analog of `operation_get_closure_cell`. A TDZ / missing-binding error
+    /// surfaces as a faithful TypeError at the bridge.
+    pub fn operation_get_global_lexical(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        key_index: u32,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        match host.jit_get_global_lexical(key_index) {
+            Ok(value) => Ok(value),
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
+    /// `operationGetFromScope` GlobalProperty analog (jit/JITOperations.cpp:4624) for the
+    /// baseline `GetGlobalObjectProperty` far-call. The SAFE wrapper the shim calls. Builds
+    /// a `DispatchState` over the parked CodeBlock (the global object is resolved from
+    /// `state.stack` + a getter may re-enter, so this is state-threaded like
+    /// `operation_get_by_val`, NOT the leaf `operation_get_closure_cell`) and runs the
+    /// faithful named-property resolution on the global object
+    /// (`host.jit_get_global_object_property`), surfacing the boxed value or the pending
+    /// exception's `EncodedJsValue`.
+    pub fn operation_get_global_object_property(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        key_index: u32,
+        bytecode_index: u32,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let outcome = {
+            // SAFETY: as `operation_get_by_val` — one dormant-parent `&CodeBlock`,
+            // disjoint from the `&mut self.*` field borrows, not outliving this call.
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            let mut state = DispatchState {
+                stack: &mut self.execution,
+                registers: &mut self.registers,
+                exceptions: &mut self.exceptions,
+                heap: &mut self.heap,
+                code_block,
+                ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+                function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+            };
+            host.jit_get_global_object_property(
+                &mut state,
+                key_index,
+                BytecodeIndex::from_offset(bytecode_index),
+            )
+        };
+        match outcome {
+            Ok(value) => Ok(value),
+            Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
+            Err(_) => self.jit_bridge_materialize_type_error(host),
+        }
+    }
+
+    /// `operationPutToScope` GlobalProperty analog (jit/JITOperations.cpp:4666) for the
+    /// baseline `PutGlobalObjectProperty` far-call. The SAFE wrapper the shim calls. Builds
+    /// a `DispatchState` over the parked CodeBlock (the global object is resolved from
+    /// `state.stack` + a setter may re-enter) and runs the faithful recording store on the
+    /// global object (`host.jit_put_global_object_property`). The store yields no observable
+    /// value, so success returns `undefined` bits (the lowering discards the result); a
+    /// thrown setter surfaces the pending exception's `EncodedJsValue`.
+    pub fn operation_put_global_object_property(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        key_index: u32,
+        value: RuntimeValue,
+        bytecode_index: u32,
+    ) -> Result<RuntimeValue, EncodedJsValue> {
+        let placeholder = self.jit_pending_code_block_placeholder();
+        let outcome = {
+            // SAFETY: as `operation_get_by_val` — one dormant-parent `&CodeBlock`,
+            // disjoint from the `&mut self.*` field borrows, not outliving this call.
+            let code_block: &CodeBlock = match &placeholder {
+                Some(code_block) => code_block,
+                None => unsafe { &*self.jit_code_block },
+            };
+            let mut state = DispatchState {
+                stack: &mut self.execution,
+                registers: &mut self.registers,
+                exceptions: &mut self.exceptions,
+                heap: &mut self.heap,
+                code_block,
+                ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
+                function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
+            };
+            host.jit_put_global_object_property(
+                &mut state,
+                key_index,
+                value,
+                BytecodeIndex::from_offset(bytecode_index),
+            )
+        };
+        match outcome {
             Ok(()) => Ok(RuntimeValue::undefined()),
             Err(DispatchOutcome::Throw(value)) => Err(value.encoded()),
             Err(_) => self.jit_bridge_materialize_type_error(host),

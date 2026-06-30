@@ -220,6 +220,19 @@ pub extern "C" fn operation_compare_greatereq(vm: *mut Vm, op1: u64, op2: u64) -
     dispatch_value_compare_operation(vm, op1, op2, Vm::operation_compare_greatereq)
 }
 
+/// `operationCompareEq(JSGlobalObject*, EncodedJSValue, EncodedJSValue)`
+/// (jit/JITOperations.cpp:2631; `JSValue::equalSlowCaseInline`). The baseline
+/// `Equal`/`NotEqual` slow path far-calls this with the two boxed operands when the
+/// inline int32 fast path declines (a non-int32 operand); it runs the faithful
+/// loose-equality (`==`) oracle and returns the boolean as 0/1, or — on throw (an object
+/// operand's `valueOf`/`toString`) — stamps the JIT `m_exception` mirror and returns 0
+/// (the caller branches on the exception word). `!=` is the emitter's negation of this
+/// `==` result (the `op_neq` slow path `xor`s the boolean before boxing, JITOpcodes.cpp:
+/// 1694-1704), never a separate shim. Shares [`dispatch_value_compare_operation`].
+pub extern "C" fn operation_compare_eq(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_compare_operation(vm, op1, op2, Vm::operation_compare_eq)
+}
+
 /// The SHARED body of every baseline relational slow-path shim, mirroring
 /// [`dispatch_value_binary_operation`] but yielding a boolean as 0/1 (JSC's
 /// `operationCompare*` return a `size_t`). `eval` selects the faithful relational
@@ -471,6 +484,105 @@ pub extern "C" fn operation_put_closure_cell(vm: *mut Vm, cell: u64, value: u64)
     let cell = JsValue::from_encoded(EncodedJsValue(cell));
     let value = JsValue::from_encoded(EncodedJsValue(value));
     match vm.operation_put_closure_cell(host, cell, value) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
+/// `operationGetFromScope` GlobalVar/Lexical analog (jit/JITOperations.cpp:4624) for the
+/// baseline `GetGlobalLexical` far-call. The emitted lowering
+/// (`arm64_baseline/function_emitter.rs::emit_get_global_lexical`) loads `x1`=the baked
+/// identifier index, sets `x0`=the pinned `*mut Vm`, and far-calls this shim. Same D1+D5
+/// reborrow island as the get/put_by_val shims (see the module SAFETY note); runs the
+/// faithful LEAF global-lexical read (`Vm::operation_get_global_lexical`) and returns the
+/// boxed value, or — on a TDZ/missing-binding error — stamps the JIT `m_exception` mirror
+/// (D3) and returns `JSValue::empty()` bits. `key_index` arrives zero-extended in a 64-bit
+/// register (`move_imm32`) and is narrowed to its logical `u32` width here.
+pub extern "C" fn operation_get_global_lexical(vm: *mut Vm, key_index: u64) -> u64 {
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    match vm.operation_get_global_lexical(host, key_index as u32) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
+/// `operationGetFromScope` GlobalProperty analog (jit/JITOperations.cpp:4624) for the
+/// baseline `GetGlobalObjectProperty` far-call. The emitted lowering
+/// (`emit_get_global_object_property`) loads `x1`=the baked identifier index, `x2`=the
+/// site `bytecode_index`, sets `x0`=the pinned `*mut Vm`, and far-calls this shim. Same
+/// D1+D5 reborrow island; builds a `DispatchState` and runs the faithful named-property
+/// resolution on the global object (`Vm::operation_get_global_object_property`), returning
+/// the boxed value, or — on throw (a getter) — stamping `m_exception` (D3) and returning
+/// `JSValue::empty()` bits. The integer args arrive zero-extended (`move_imm32`) and are
+/// narrowed here.
+pub extern "C" fn operation_get_global_object_property(
+    vm: *mut Vm,
+    key_index: u64,
+    bytecode_index: u64,
+) -> u64 {
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    match vm.operation_get_global_object_property(host, key_index as u32, bytecode_index as u32) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
+/// `operationPutToScope` GlobalProperty analog (jit/JITOperations.cpp:4666) for the
+/// baseline `PutGlobalObjectProperty` far-call. The emitted lowering
+/// (`emit_put_global_object_property`) loads `x1`=the baked identifier index, `x2`=the
+/// boxed value, `x3`=the site `bytecode_index`, sets `x0`=the pinned `*mut Vm`, and
+/// far-calls this shim. Same D1+D5 reborrow island; builds a `DispatchState` and runs the
+/// faithful recording store on the global object
+/// (`Vm::operation_put_global_object_property`). The store yields no observable value, so
+/// success returns `undefined` bits (the lowering discards the result register); a thrown
+/// setter stamps `m_exception` (D3) and returns `JSValue::empty()` bits.
+pub extern "C" fn operation_put_global_object_property(
+    vm: *mut Vm,
+    key_index: u64,
+    value: u64,
+    bytecode_index: u64,
+) -> u64 {
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let value = JsValue::from_encoded(EncodedJsValue(value));
+    match vm.operation_put_global_object_property(
+        host,
+        key_index as u32,
+        value,
+        bytecode_index as u32,
+    ) {
         Ok(result) => result.encoded().0,
         Err(encoded_exception) => {
             vm.set_jit_pending_exception(encoded_exception);
@@ -1090,6 +1202,28 @@ mod tests {
         ); // 1.5 === 1.5
         let nan = JsValue::from_double(f64::NAN).encoded().0;
         assert_eq!(operation_strict_equal(vm_ptr, nan, nan), FALSE_RESULT); // NaN !== NaN
+
+        // --- loose-equality shim (operationCompareEq): `==` as 0/1 over primitives —
+        // the non-int32 cases the inline int32 fast path far-calls. `!=` is the emitter's
+        // negation (not a separate shim), so only `==` is bridged here. ---
+        assert_eq!(operation_compare_eq(vm_ptr, two, two), TRUE_RESULT); // 2 == 2
+        assert_eq!(operation_compare_eq(vm_ptr, two, three), FALSE_RESULT); // 2 == 3
+        let true_bits = JsValue::from_bool(true).encoded().0;
+        let one_bits = JsValue::from_i32(1).encoded().0;
+        assert_eq!(
+            operation_compare_eq(vm_ptr, true_bits, one_bits),
+            TRUE_RESULT
+        ); // true == 1
+        let null_bits = JsValue::null().encoded().0;
+        let undef_bits = JsValue::undefined().encoded().0;
+        assert_eq!(
+            operation_compare_eq(vm_ptr, null_bits, undef_bits),
+            TRUE_RESULT
+        ); // null == undefined
+        assert_eq!(
+            operation_compare_eq(vm_ptr, one_bits, undef_bits),
+            FALSE_RESULT
+        ); // 1 == undefined
 
         // --- truthy shim: jtrue returns truthiness, jfalse its inversion. ---
         let zero = JsValue::from_i32(0).encoded().0;

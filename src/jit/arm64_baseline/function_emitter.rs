@@ -78,13 +78,14 @@ use crate::bytecode::BytecodeIndex;
 use crate::bytecode::{CodeBlock, CoreOpcode, InstructionDecodeError, OperandAccessError};
 use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
 use crate::jit::operations::{
-    operation_call, operation_call_with_this, operation_compare_greater,
+    operation_call, operation_call_with_this, operation_compare_eq, operation_compare_greater,
     operation_compare_greatereq, operation_compare_less, operation_compare_lesseq,
     operation_construct, operation_get_by_id_optimize, operation_get_by_val,
-    operation_get_closure_cell, operation_jfalse, operation_put_by_id_optimize,
-    operation_put_by_val, operation_put_closure_cell, operation_resolve_baseline_native_entry,
-    operation_strict_equal, operation_throw_stack_overflow, MAX_REGISTER_CALL_ARGS,
-    MAX_REGISTER_CALL_WITH_THIS_ARGS,
+    operation_get_closure_cell, operation_get_global_lexical, operation_get_global_object_property,
+    operation_jfalse, operation_put_by_id_optimize, operation_put_by_val,
+    operation_put_closure_cell, operation_put_global_object_property,
+    operation_resolve_baseline_native_entry, operation_strict_equal,
+    operation_throw_stack_overflow, MAX_REGISTER_CALL_ARGS, MAX_REGISTER_CALL_WITH_THIS_ARGS,
 };
 use crate::value::{JsValue, CELL_TAG, NUMBER_TAG, VALUE_TAG_MASK};
 use crate::vm::jsstack::CallFrameSlot;
@@ -425,6 +426,14 @@ enum SlowKind {
         target_bci: usize,
         negate: bool,
     },
+    /// Standalone relational (`emitSlow_op_less`/`_lesseq`/...) AND loose-equality
+    /// (`emitSlow_op_eq`/`_op_neq`) VALUE forms: far-call the relational/loose-eq
+    /// operation -> the boolean as 0/1, probe the exception word (these CAN throw — an
+    /// object operand's `valueOf`), then `xor 1` for the `!=` form (`negate`), box the
+    /// boolean (`result | ValueFalse`, JSC `boxBoolean`), store to `dst`, resume. The
+    /// `xor`-negate after `operationCompareEq` is JSC's `emitSlow_op_neq`
+    /// (JITOpcodes.cpp:1694-1704); standalone relationals never negate here.
+    CompareValue { shim: usize, dst: i32, negate: bool },
 }
 
 /// The fast-path jump lists [`FunctionEmitter::emit_strict_eq_fast_path`] leaves for
@@ -678,6 +687,22 @@ impl FunctionEmitter {
         self.h.masm_mut().store64(SCRATCH_GPR, address_for(dst));
     }
 
+    /// LoadUndefined / LoadNull / LoadBool (`op_mov` of the constant
+    /// `undefined`/`null`/`true`/`false`): materialize the BOXED immediate and store it,
+    /// the exact shape of [`Self::emit_load_int32`] for a non-numeric primitive constant.
+    /// JSC's `op_mov` loads the constant from the constant pool; this materializes the
+    /// identical boxed value directly (the constant-pool slot lowering is deferred). The
+    /// caller computes `bits` via `JsValue::{undefined,null,from_bool}().encoded()`, so
+    /// the materialized 64-bit immediate is BIT-IDENTICAL to the interpreter's
+    /// `RuntimeValue::{undefined,null,from_bool}` (interpreter/mod.rs:6505-6528). Falls
+    /// through.
+    fn emit_load_immediate_value(&mut self, dst: i32, bits: u64) {
+        self.h
+            .masm_mut()
+            .move_imm64(TrustedImm64::new(bits as i64), SCRATCH_GPR);
+        self.h.masm_mut().store64(SCRATCH_GPR, address_for(dst));
+    }
+
     /// The arith family fast path (`emit_op_add`/`_sub`/`_mul`/`_div`/...): load
     /// both operands into `argumentGPR1`/`argumentGPR2`, run the SHARED generator
     /// (which boxes + stores the result, emits the JSVALUE64 double fast path for
@@ -812,6 +837,90 @@ impl FunctionEmitter {
             operation_put_closure_cell as usize as i64,
         ));
         // D3 throw edge: defensive (a faithful ClosureVar store does not throw).
+        self.emit_exception_probe();
+    }
+
+    /// op_get_from_scope GlobalLexical (`emit_op_get_from_scope`, JITPropertyAccess.cpp:
+    /// 1295-1300 the GlobalVar/Lexical arm) — the global lexical-binding READ. SLOW-CALL
+    /// lowering: load the baked identifier index into the C-ABI arg slot
+    /// (`argumentGPR1`), set arg0 = the pinned `*mut Vm`, and far-call
+    /// `operation_get_global_lexical` (the interpreter's OWN leaf global-lexical read);
+    /// probe the `m_exception` mirror (D3) for the TDZ/missing-binding throw edge, then
+    /// store the boxed result to `dst`. Falls through.
+    ///
+    /// DIVERGENCE from JSC (load-bearing, the inline fast-path follow-up — SAME constraint
+    /// as [`Self::emit_get_closure_cell`]): JSC loads the global lexical value INLINE off
+    /// the absolute slot address baked into the get_from_scope metadata. This engine's
+    /// global lexical environment is a host-store-owned name-keyed binding map, NOT a raw
+    /// slot pointer, so the read is a leaf far-call until the binding carries a stable raw
+    /// pointer (a serial representation decision).
+    fn emit_get_global_lexical(&mut self, dst: i32, key_index: u32) {
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(key_index as i32), LEFT_GPR); // x1 = key_index (arg1)
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+        self.h.masm_mut().far_call(TrustedImm64::new(
+            operation_get_global_lexical as usize as i64,
+        ));
+        // D3 throw edge: a TDZ / missing-binding read stamps the mirror; probe BEFORE
+        // storing the empty result.
+        self.emit_exception_probe();
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst)); // dst = x0 (boxed result)
+    }
+
+    /// op_get_from_scope GlobalProperty (`emit_op_get_from_scope`, JITPropertyAccess.cpp:
+    /// 1284-1293) — the global-object named-property READ. SLOW-CALL lowering: load the
+    /// baked identifier index into `argumentGPR1` and the site `bytecode_index` into
+    /// `argumentGPR2`, set arg0 = the pinned `*mut Vm`, and far-call
+    /// `operation_get_global_object_property` (the interpreter's OWN named-property
+    /// resolution on the global object); probe the `m_exception` mirror (D3) for the
+    /// getter throw edge, then store the boxed result to `dst`. Falls through.
+    ///
+    /// DIVERGENCE from JSC (load-bearing, the inline fast-path follow-up): JSC emits an
+    /// INLINE structure-guarded butterfly load off the global object (a get_from_scope
+    /// DataIC). This engine has no global-property inline IC yet (the named-property
+    /// DataIC is wired for `get_by_id`, not the global ops), so the read is a leaf
+    /// far-call — exactly the [`Self::emit_get_by_val`] slow-call discipline — until a
+    /// global-property DataIC lands.
+    fn emit_get_global_object_property(&mut self, dst: i32, key_index: u32, bytecode_index: u32) {
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(key_index as i32), LEFT_GPR); // x1 = key_index (arg1)
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(bytecode_index as i32), RIGHT_GPR); // x2 = bci (arg2)
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+        self.h.masm_mut().far_call(TrustedImm64::new(
+            operation_get_global_object_property as usize as i64,
+        ));
+        self.emit_exception_probe();
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst)); // dst = x0 (boxed result)
+    }
+
+    /// op_put_to_scope GlobalProperty (`emit_op_put_to_scope`, JITPropertyAccess.cpp:
+    /// 1589-1614) — the global-object named-property STORE. SLOW-CALL lowering: load the
+    /// baked identifier index into `argumentGPR1`, the boxed value into `argumentGPR2`,
+    /// and the site `bytecode_index` into `argumentGPR3`, set arg0 = the pinned `*mut Vm`,
+    /// and far-call `operation_put_global_object_property` (the interpreter's OWN recording
+    /// store on the global object, WITH the write barrier run in the host store — faithful
+    /// to JSC's `emitWriteBarrier(scope, value)`, JITPropertyAccess.cpp:1614); probe the
+    /// `m_exception` mirror (D3) for the setter throw edge. put yields no observable value,
+    /// so there is no `dst` store. Falls through. Same inline fast-path follow-up
+    /// divergence as [`Self::emit_get_global_object_property`].
+    fn emit_put_global_object_property(&mut self, key_index: u32, value: i32, bytecode_index: u32) {
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(key_index as i32), LEFT_GPR); // x1 = key_index (arg1)
+        self.h.masm_mut().load64(address_for(value), RIGHT_GPR); // x2 = value (arg2)
+        self.h
+            .masm_mut()
+            .move_imm32(TrustedImm32::new(bytecode_index as i32), SCRATCH_GPR); // x3 = bci (arg3)
+        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+        self.h.masm_mut().far_call(TrustedImm64::new(
+            operation_put_global_object_property as usize as i64,
+        ));
+        // D3 throw edge: a thrown setter (or a read-only/strict-mode reject) stamps the
+        // mirror; branch to the shared exception stub.
         self.emit_exception_probe();
     }
 
@@ -1697,6 +1806,69 @@ impl FunctionEmitter {
         });
     }
 
+    /// Standalone relational (`emit_op_less`/`_lesseq`/`_greater`/`_greatereq`, the
+    /// `emitCompare` lambda, JITArithmetic.cpp:201-214) AND loose-equality
+    /// (`emit_op_eq`/`emit_op_neq`, JITOpcodes.cpp:571-665) VALUE forms — materialize the
+    /// boolean RESULT into `dst` (NOT fused with a JumpIfFalse). Load lhs/rhs, guard both
+    /// int32 -> slow, then `branch32(cond, lhs, rhs)` selects the inline boolean and stores
+    /// the boxed `true`/`false` bits; a non-int32 operand far-calls `shim` (the relational
+    /// `operationCompare*` or the `operationCompareEq` oracle). `negate` is consumed ONLY
+    /// by the slow case (the `!=` form's post-call `xor`); the inline fast path already
+    /// encodes `!=` directly as `cond == NotEqual`, exactly as JSC's `emit_op_neq` uses
+    /// `cset NotEqual` (NOT an xor of eq).
+    ///
+    /// JSC materializes the inline boolean with `compare32(cond, ..)` (`cmp`+`cset`) then
+    /// `boxBoolean` (`add32 ValueFalse`). This engine's macro-assembler has no `cset`
+    /// primitive, so it uses the SAME branch-and-store idiom [`Self::emit_strict_eq`] uses
+    /// for its value form (two boxed-constant stores selected by a `branch32`) —
+    /// behavior-identical (the stored bits are `ValueTrue`/`ValueFalse`), reusing the
+    /// established value-boolean pattern instead of adding a new assembler primitive.
+    fn emit_compare_value(
+        &mut self,
+        cond: RelationalCondition,
+        negate: bool,
+        dst: i32,
+        lhs: i32,
+        rhs: i32,
+        resume_bci: usize,
+        shim: usize,
+    ) {
+        self.h.masm_mut().load64(address_for(lhs), LEFT_GPR); // x1 = lhs (kept for the slow call)
+        self.h.masm_mut().load64(address_for(rhs), RIGHT_GPR); // x2 = rhs
+        let mut slow_jumps = Vec::with_capacity(2);
+        slow_jumps.push(self.h.branch_if_not_int32(LEFT_GPR, MODE));
+        slow_jumps.push(self.h.branch_if_not_int32(RIGHT_GPR, MODE));
+        // branch32(cond, lhs, rhs) -> the TRUE block; fall-through == the boolean is FALSE.
+        // Compared 32-bit; the int32 guards prove the low 32 bits ARE the signed payloads.
+        let to_true = self.h.masm_mut().branch32(cond, LEFT_GPR, RIGHT_GPR);
+
+        // FALSE (fall-through): store the boxed `false`, jump past the true block.
+        self.h
+            .masm_mut()
+            .move_imm64(TrustedImm64::new(VALUE_FALSE_BITS as i64), RESULT_GPR);
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst));
+        let to_after = self.h.masm_mut().jump();
+
+        // TRUE block: store the boxed `true`.
+        let true_label = self.h.masm().label();
+        self.link_fast_jumps_to(&[to_true], true_label);
+        self.h
+            .masm_mut()
+            .move_imm64(TrustedImm64::new(VALUE_TRUE_BITS as i64), RESULT_GPR);
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst));
+
+        // Shared continuation after both inline stores.
+        let after_label = self.h.masm().label();
+        self.link_fast_jumps_to(&[to_after], after_label);
+
+        // Slow case: the non-int32 far-call (boxes + stores in the slow block).
+        self.slow.push(SlowCase {
+            fast_jumps: slow_jumps,
+            resume_bci,
+            kind: SlowKind::CompareValue { shim, dst, negate },
+        });
+    }
+
     /// The SHARED strict-equality fast path (`JIT::compileOpStrictEq`,
     /// JITOpcodes.cpp:860-891, the `!USE(BIGINT32)` JSVALUE64 arm), producing the
     /// [`StrictEqFastPath`] jump lists the VALUE and fused-BRANCH forms route. Loads
@@ -2085,6 +2257,32 @@ impl FunctionEmitter {
                     let to_resume = self.h.masm_mut().jump();
                     self.jumps.push((to_resume, case.resume_bci));
                 }
+                SlowKind::CompareValue { shim, dst, negate } => {
+                    // lhs/rhs still in x1/x2 (the fast path never wrote them on a slow
+                    // edge). operationCompare{Less,Greater,GreaterEq,Eq} CAN throw (an
+                    // object operand's `valueOf`) -> probe the exception word BEFORE
+                    // storing. x0 = the comparison/`==` boolean as 0/1.
+                    self.h.masm_mut().far_call(TrustedImm64::new(shim as i64));
+                    self.emit_exception_probe();
+                    // `!=` = the negation of operationCompareEq's `==`: result ^= 1
+                    // (JSC `emitSlow_op_neq`, JITOpcodes.cpp:1694-1704). Standalone
+                    // relationals pass `negate=false` (the operation returns the value).
+                    if negate {
+                        self.h
+                            .masm_mut()
+                            .move_imm32(TrustedImm32::new(1), SCRATCH_GPR);
+                        self.h.masm_mut().xor64(RESULT_GPR, SCRATCH_GPR, RESULT_GPR);
+                    }
+                    // boxBoolean: a JS boolean is `result | ValueFalse` (0 -> 0x6 false,
+                    // 1 -> 0x7 true), the JSVALUE64 `JIT::boxBoolean` (GPRInfo.h).
+                    self.h
+                        .masm_mut()
+                        .move_imm64(TrustedImm64::new(VALUE_FALSE_BITS as i64), SCRATCH_GPR);
+                    self.h.masm_mut().or64(RESULT_GPR, SCRATCH_GPR, RESULT_GPR);
+                    self.h.masm_mut().store64(RESULT_GPR, address_for(dst));
+                    let to_resume = self.h.masm_mut().jump();
+                    self.jumps.push((to_resume, case.resume_bci));
+                }
             }
         }
     }
@@ -2122,6 +2320,22 @@ fn compare_shim(op: CoreOpcode) -> usize {
         CoreOpcode::GreaterThanInt32 => operation_compare_greater as usize,
         CoreOpcode::GreaterEqualInt32 => operation_compare_greatereq as usize,
         _ => unreachable!("compare_shim only handles the fused relational set"),
+    }
+}
+
+/// Map a STANDALONE relational `CoreOpcode` to its NON-inverted branch condition — the
+/// value form's inline `branch32` selects the TRUE boolean (`<` -> `LessThan`, `>` ->
+/// `GreaterThan`, `>=` -> `GreaterThanOrEqual`), the opposite of [`inverted_relational`]
+/// (which inverts for the fused `relational ; JumpIfFalse` pair). Standalone `<=`
+/// (`LessEqualInt32`) is NOT admitted (it stays a fusion-only decline), so it is absent.
+fn standalone_relational_condition(op: CoreOpcode) -> RelationalCondition {
+    match op {
+        CoreOpcode::LessThanInt32 => RelationalCondition::LessThan,
+        CoreOpcode::GreaterThanInt32 => RelationalCondition::GreaterThan,
+        CoreOpcode::GreaterEqualInt32 => RelationalCondition::GreaterThanOrEqual,
+        _ => {
+            unreachable!("standalone_relational_condition only handles the admitted standalone set")
+        }
     }
 }
 
@@ -2399,6 +2613,35 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                 let bits = u64::from(low) | (u64::from(high) << 32);
                 emitter.emit_load_double(dst, bits);
             }
+            // LoadUndefined / LoadNull (`op_mov` of the constant): materialize the boxed
+            // primitive immediate. Operand 0 = dst (interpreter/mod.rs:6505/6512).
+            CoreOpcode::LoadUndefined => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                emitter.emit_load_immediate_value(dst, JsValue::undefined().encoded().0);
+            }
+            CoreOpcode::LoadNull => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                emitter.emit_load_immediate_value(dst, JsValue::null().encoded().0);
+            }
+            // LoadBool (`op_mov` of a boolean constant): operand 0 = dst, operand 1 =
+            // UnsignedImmediate (the bool, `!= 0`) — matches the dispatch handler
+            // (interpreter/mod.rs:6519). Box the boolean immediate directly.
+            CoreOpcode::LoadBool => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let value = decoded.unsigned_immediate_operand(1)? != 0;
+                emitter.emit_load_immediate_value(dst, JsValue::from_bool(value).encoded().0);
+            }
+            // LoadCallee is DEFERRED (falls to `other => UnsupportedOpcode`): the native
+            // entry-frame seed sets the `Callee` header slot to ZERO (live_dispatch.rs:335,
+            // `callee: Register::from_bits(0)`), and the live path reaches EVERY tiered
+            // function through that outer seed (the native JIT->JIT direct-call edge is not
+            // taken under `--disable-generated-direct-call-generated-entry`), so a native
+            // `load64 [fp+CALLEE*8]` would read 0 instead of the real callee cell — a
+            // wrong-answer (measured: crypto/delta-blue threw). The faithful lowering needs
+            // the live dispatch to seed the real `active_frame.callee_value` into the entry
+            // frame (the SAME value the generated p6 path threads via
+            // `p6_code_block_uses_load_callee`, vm/mod.rs:7960) — a serial entry-frame-seed
+            // change tracked as a follow-up. Until then LoadCallee declines the function.
             CoreOpcode::Jump => {
                 let target_bci = decoded.bytecode_index_operand(0)?.offset() as usize;
                 emitter.emit_op_jmp(target_bci);
@@ -2501,6 +2744,35 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                     bci as u32,
                     owning_code_block,
                 );
+            }
+            // op_get_from_scope GlobalLexical (`GetGlobalLexical`): operand 0 = dst,
+            // operand 1 = IdentifierIndex (the binding name) — matches the dispatch
+            // handler (interpreter/mod.rs:8105). A leaf far-call to the global-lexical
+            // read bridge.
+            CoreOpcode::GetGlobalLexical => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let key_index = decoded.identifier_index_operand(1)?;
+                emitter.emit_get_global_lexical(dst, key_index);
+            }
+            // op_get_from_scope GlobalProperty (`GetGlobalObjectProperty`): operand 0 =
+            // dst, operand 1 = IdentifierIndex (the property name) — matches the dispatch
+            // handler (interpreter/mod.rs:8168). A far-call to the global-object
+            // named-property bridge; the site `bci` is baked for the lookup-recording
+            // site (no inline IC in this cut).
+            CoreOpcode::GetGlobalObjectProperty => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let key_index = decoded.identifier_index_operand(1)?;
+                emitter.emit_get_global_object_property(dst, key_index, bci as u32);
+            }
+            // op_put_to_scope GlobalProperty (`PutGlobalObjectProperty`): operand 0 =
+            // IdentifierIndex (the property name), operand 1 = the value register —
+            // matches the dispatch handler (interpreter/mod.rs:8289; note operand 0 is the
+            // IDENTIFIER, not a register). A far-call to the global-object recording-store
+            // bridge.
+            CoreOpcode::PutGlobalObjectProperty => {
+                let key_index = decoded.identifier_index_operand(0)?;
+                let value = frame_slot(decoded.register_operand(1)?)?;
+                emitter.emit_put_global_object_property(key_index, value, bci as u32);
             }
             // op_call — the B5-first-cut UNLINKED VIRTUAL CALL. Operand order matches
             // the interpreter's `dispatch_call` and the bytecompiler's `emit_call`
@@ -2607,14 +2879,58 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                 let rhs = frame_slot(decoded.register_operand(2)?)?;
                 emitter.emit_strict_eq(negate, dst, lhs, rhs, bci + 1);
             }
-            // A relational op NOT fused with a JumpIfFalse needs the deferred
-            // boolean-producing (cset) lowering; reject it (S4 gate). `GreaterEqualInt32`
-            // is fusion-only here too (its fused form lowers above); a STANDALONE `>=`
-            // value is declined like the other standalone relationals.
+            // op_eq / op_neq VALUE form (loose `==`/`!=`, not fused with a JumpIfFalse):
+            // operand order matches the dispatch (interpreter/mod.rs:7289-7308): (dst,
+            // lhs, rhs). The int32 fast path materializes the boolean inline via
+            // `branch32`; a non-int32 operand far-calls `operation_compare_eq` (the
+            // `loose_equal` oracle). `!=` uses the inline `NotEqual` condition and the
+            // slow-path `xor`-negate (JSC `emit_op_neq`, JITOpcodes.cpp:655-665/1694-1704).
+            CoreOpcode::Equal | CoreOpcode::NotEqual => {
+                let negate = matches!(op, CoreOpcode::NotEqual);
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let lhs = frame_slot(decoded.register_operand(1)?)?;
+                let rhs = frame_slot(decoded.register_operand(2)?)?;
+                let cond = if negate {
+                    RelationalCondition::NotEqual
+                } else {
+                    RelationalCondition::Equal
+                };
+                emitter.emit_compare_value(
+                    cond,
+                    negate,
+                    dst,
+                    lhs,
+                    rhs,
+                    bci + 1,
+                    operation_compare_eq as usize,
+                );
+            }
+            // STANDALONE relational VALUE form (`emit_op_less`/`_greater`/`_greatereq`,
+            // not fused with a JumpIfFalse): operand order (dst, lhs, rhs). The int32 fast
+            // path materializes the boolean inline (`branch32` + boxed-constant store); a
+            // non-int32 operand far-calls the SAME `operationCompare*` oracle the fused
+            // form uses. Standalone `<=` (`LessEqualInt32`) is NOT admitted (rarer; stays
+            // a fusion-only decline below) — keeping the change matched to the call-heavy
+            // decline-scan set (`<`, `>`, `>=`).
             CoreOpcode::LessThanInt32
-            | CoreOpcode::LessEqualInt32
             | CoreOpcode::GreaterThanInt32
             | CoreOpcode::GreaterEqualInt32 => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let lhs = frame_slot(decoded.register_operand(1)?)?;
+                let rhs = frame_slot(decoded.register_operand(2)?)?;
+                emitter.emit_compare_value(
+                    standalone_relational_condition(op),
+                    false,
+                    dst,
+                    lhs,
+                    rhs,
+                    bci + 1,
+                    compare_shim(op),
+                );
+            }
+            // A standalone `<=` NOT fused with a JumpIfFalse is still declined (S4 gate);
+            // its fused `a <= b ; JumpIfFalse` form lowers above via `emit_compare_and_jump`.
+            CoreOpcode::LessEqualInt32 => {
                 return Err(EmitFunctionError::StandaloneRelational(op));
             }
             other => return Err(EmitFunctionError::UnsupportedOpcode(other)),
@@ -2931,13 +3247,15 @@ mod tests {
     // FUSION DEADNESS GUARD: a CodeBlock shaped `let b = a<c; if(!b){…}; return b;`
     // reads the comparison's boolean AFTER the JumpIfFalse. The fused compare-branch
     // materializes NO value for `b`, so fusing would make the later `return b` read
-    // the stale op_enter `undefined` slot. The emitter must DECLINE (not fuse, not
-    // silently mis-emit) — falling through to the relational reject arm (S4 gate).
+    // the stale op_enter `undefined` slot. The emitter must NOT fuse — it falls through
+    // to the STANDALONE value arm, which now (admitted) MATERIALIZES the boolean into
+    // `b` (via `emit_compare_value`), so the later read sees the correct value and the
+    // function lowers cleanly instead of declining.
     //   a=ARG0 c=ARG1 b=LOCAL0 r=LOCAL1
     //   0 LessThan b,a,c   1 jfalse b->4   2 r=1   3 ret r   4 ret b   (reads b!)
     // ------------------------------------------------------------------------
     #[test]
-    fn declines_fusion_when_comparison_result_is_read_after_the_jump() {
+    fn comparison_result_read_after_the_jump_does_not_fuse_and_materializes_the_value() {
         let live_after = build_code_block(vec![
             instr(
                 CoreOpcode::LessThanInt32,
@@ -2954,13 +3272,9 @@ mod tests {
             instr(CoreOpcode::Return, vec![reg(LOCAL0)], 4),
         ]);
         assert!(
-            matches!(
-                emit_baseline_function(&live_after, 0x1000, 0x2000),
-                Err(EmitFunctionError::StandaloneRelational(
-                    CoreOpcode::LessThanInt32
-                ))
-            ),
-            "a comparison result read after its JumpIfFalse must NOT fuse (S4 reject)"
+            emit_baseline_function(&live_after, 0x1000, 0x2000).is_ok(),
+            "a comparison result read after its JumpIfFalse must NOT fuse, but the \
+             standalone value form materializes the boolean and lowers cleanly"
         );
 
         // Control: with the trailing `return b` removed (b is DEAD after the jump),
@@ -3083,6 +3397,97 @@ mod tests {
         );
     }
 
+    // ALLOWLIST EXTENSION (structural oracle, every platform): the CALL-HEAVY decline-set
+    // this batch admits so the hot CALLERS of richards/delta-blue/crypto tier up (and their
+    // calls go native, bypassing the route arbiter): the constant loads `LoadUndefined`/
+    // `LoadNull`/`LoadBool`, the loose-equality `Equal`/`NotEqual` value forms, the
+    // standalone relationals `<`/`>`/`>=`, and the global-scope `GetGlobalLexical`/
+    // `GetGlobalObjectProperty`/`PutGlobalObjectProperty` (the richards/delta-blue blocker).
+    // Before this batch each was an `UnsupportedOpcode`/`StandaloneRelational` decline.
+    // (LoadCallee is DEFERRED — see the dispatch note; it needs the entry-frame seed to
+    // carry the real callee.)
+    #[test]
+    fn call_heavy_decline_set_opcodes_are_admitted_by_the_allowlist() {
+        let ident = |idx: u32| Operand::IdentifierIndex(idx);
+        let uimm = |value: u32| Operand::UnsignedImmediate(value);
+
+        // Constant loads.
+        let loads = build_code_block(vec![
+            instr(CoreOpcode::LoadUndefined, vec![reg(LOCAL0)], 0),
+            instr(CoreOpcode::LoadNull, vec![reg(LOCAL1)], 1),
+            instr(CoreOpcode::LoadBool, vec![reg(LOCAL2), uimm(1)], 2),
+            instr(CoreOpcode::Return, vec![reg(LOCAL2)], 3),
+        ]);
+        assert!(
+            emit_baseline_function(&loads, 0x1000, 0x2000).is_ok(),
+            "LoadUndefined/LoadNull/LoadBool tier up",
+        );
+
+        // Loose-equality value forms `(a,b) => a == b` / `a != b`.
+        for op in [CoreOpcode::Equal, CoreOpcode::NotEqual] {
+            let eq = build_code_block(vec![
+                instr(op, vec![reg(LOCAL0), reg(ARG0), reg(ARG1)], 0),
+                instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+            ]);
+            assert!(
+                emit_baseline_function(&eq, 0x1000, 0x2000).is_ok(),
+                "`a == b`/`a != b` (loose-equality value form) tiers up",
+            );
+        }
+
+        // Standalone relationals `(a,b) => a < b` / `a > b` / `a >= b`.
+        for op in [
+            CoreOpcode::LessThanInt32,
+            CoreOpcode::GreaterThanInt32,
+            CoreOpcode::GreaterEqualInt32,
+        ] {
+            let rel = build_code_block(vec![
+                instr(op, vec![reg(LOCAL0), reg(ARG0), reg(ARG1)], 0),
+                instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+            ]);
+            assert!(
+                emit_baseline_function(&rel, 0x1000, 0x2000).is_ok(),
+                "standalone `<`/`>`/`>=` value form tiers up",
+            );
+        }
+
+        // Global-scope: get global lexical, get global object property (operand 1 =
+        // identifier), put global object property (operand 0 = identifier, 1 = value).
+        let get_lex = build_code_block(vec![
+            instr(CoreOpcode::GetGlobalLexical, vec![reg(LOCAL0), ident(0)], 0),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+        ]);
+        assert!(
+            emit_baseline_function(&get_lex, 0x1000, 0x2000).is_ok(),
+            "`GetGlobalLexical` tiers up",
+        );
+        let get_prop = build_code_block(vec![
+            instr(
+                CoreOpcode::GetGlobalObjectProperty,
+                vec![reg(LOCAL0), ident(0)],
+                0,
+            ),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+        ]);
+        assert!(
+            emit_baseline_function(&get_prop, 0x1000, 0x2000).is_ok(),
+            "`GetGlobalObjectProperty` tiers up",
+        );
+        let put_prop = build_code_block(vec![
+            instr(
+                CoreOpcode::PutGlobalObjectProperty,
+                vec![ident(0), reg(ARG0)],
+                0,
+            ),
+            instr(CoreOpcode::LoadUndefined, vec![reg(LOCAL0)], 1),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 2),
+        ]);
+        assert!(
+            emit_baseline_function(&put_prop, 0x1000, 0x2000).is_ok(),
+            "`PutGlobalObjectProperty` tiers up",
+        );
+    }
+
     // ALLOWLIST EXTENSION (structural oracle, every platform): `op_construct`
     // (`new C(args)`) is now ADMITTED by the S4 gate — the remaining blocker for
     // richards/deltablue/crypto/raytrace/earley-boyer (each does `new Ctor(...)`).
@@ -3163,11 +3568,12 @@ mod tests {
     }
 
     // ALLOWLIST EXTENSION: the FUSED `GreaterEqualInt32` + JumpIfFalse (the crypto
-    // bignum `--n >= 0` loop shape) is ADMITTED, but a STANDALONE `>=` value is still
-    // DECLINED like the other standalone relationals (the GE admission is fusion-only).
+    // bignum `--n >= 0` loop shape) is ADMITTED, AND the STANDALONE `>=` value form is now
+    // ALSO ADMITTED (`emit_compare_value`: int32 inline boolean, non-int32 far-call) — the
+    // call-heavy decline-set fix. (Standalone `<=` stays the lone fusion-only relational.)
     //   0 zero=0  1 cmp=(n>=zero)  2 jfalse cmp->6  3 one=1  4 n-=one  5 jmp->1  6 ret n
     #[test]
-    fn greater_equal_int32_fusion_is_admitted_standalone_is_declined() {
+    fn greater_equal_int32_fusion_and_standalone_value_form_are_both_admitted() {
         let loop_block = build_code_block(vec![
             instr(CoreOpcode::LoadInt32, vec![reg(LOCAL0), imm(0)], 0),
             instr(
@@ -3203,13 +3609,28 @@ mod tests {
             instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
         ]);
         assert!(
+            emit_baseline_function(&standalone, 0x1000, 0x2000).is_ok(),
+            "a standalone `>=` value form now lowers cleanly (admitted via emit_compare_value)"
+        );
+
+        // The lone remaining fusion-only relational: a STANDALONE `<=` value is still
+        // declined (not in the call-heavy decline-set this batch admits).
+        let standalone_le = build_code_block(vec![
+            instr(
+                CoreOpcode::LessEqualInt32,
+                vec![reg(LOCAL0), reg(ARG0), reg(ARG1)],
+                0,
+            ),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+        ]);
+        assert!(
             matches!(
-                emit_baseline_function(&standalone, 0x1000, 0x2000),
+                emit_baseline_function(&standalone_le, 0x1000, 0x2000),
                 Err(EmitFunctionError::StandaloneRelational(
-                    CoreOpcode::GreaterEqualInt32
+                    CoreOpcode::LessEqualInt32
                 ))
             ),
-            "a standalone `>=` value is declined (fusion-only admission)"
+            "a standalone `<=` value is still declined (fusion-only)"
         );
     }
 
@@ -3526,6 +3947,155 @@ mod tests {
 
             let (r, _) = run_function(if_else_instructions(), &[(ARG0, i32_bits(0))]);
             assert_eq!(r.ret, i32_bits(2), "if(0) is falsy -> 2 (slow path)");
+        }
+
+        // --- STANDALONE RELATIONAL + LOOSE-EQUALITY VALUE FORMS native == oracle. ---
+        // The int32 fast path materializes the boolean inline (`branch32` + boxed store);
+        // a non-int32 operand far-calls operation_compare_{less,greater,greatereq} /
+        // operation_compare_eq (the interpreter's OWN relational / `loose_equal` oracle).
+        // Each was DECLINED (StandaloneRelational / UnsupportedOpcode) before this batch.
+        #[test]
+        fn value_form_relational_and_equality_native() {
+            let d = |x: f64| JsValue::from_double(x).encoded().0;
+            let t = JsValue::from_bool(true).encoded().0;
+            let f = JsValue::from_bool(false).encoded().0;
+            // `(a,b) => a OP b`.
+            let value_fn = |op: CoreOpcode| -> Vec<TypedInstruction> {
+                vec![
+                    instr(op, vec![reg(LOCAL0), reg(ARG0), reg(ARG1)], 0),
+                    instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+                ]
+            };
+
+            // Standalone relationals, int32 fast path.
+            let (r, _) = run_function(
+                value_fn(CoreOpcode::LessThanInt32),
+                &[(ARG0, i32_bits(3)), (ARG1, i32_bits(7))],
+            );
+            assert_eq!(r.ret, t, "3 < 7 -> true (int32 fast)");
+            assert_eq!(r.pending, 0, "no throw");
+            let (r, _) = run_function(
+                value_fn(CoreOpcode::LessThanInt32),
+                &[(ARG0, i32_bits(7)), (ARG1, i32_bits(3))],
+            );
+            assert_eq!(r.ret, f, "7 < 3 -> false");
+            let (r, _) = run_function(
+                value_fn(CoreOpcode::GreaterThanInt32),
+                &[(ARG0, i32_bits(9)), (ARG1, i32_bits(2))],
+            );
+            assert_eq!(r.ret, t, "9 > 2 -> true");
+            let (r, _) = run_function(
+                value_fn(CoreOpcode::GreaterEqualInt32),
+                &[(ARG0, i32_bits(5)), (ARG1, i32_bits(5))],
+            );
+            assert_eq!(r.ret, t, "5 >= 5 -> true");
+
+            // Standalone `<` slow far-call (a double operand): 2.5 < 7 -> true, via
+            // operation_compare_less (the SAME oracle the fused form uses).
+            let (r, _) = run_function(
+                value_fn(CoreOpcode::LessThanInt32),
+                &[(ARG0, d(2.5)), (ARG1, i32_bits(7))],
+            );
+            assert_eq!(r.ret, t, "2.5 < 7 -> true (slow far-call == oracle)");
+            assert_eq!(r.pending, 0, "relational on primitives does not throw");
+
+            // Loose-equality int32 fast path.
+            let (r, _) = run_function(
+                value_fn(CoreOpcode::Equal),
+                &[(ARG0, i32_bits(4)), (ARG1, i32_bits(4))],
+            );
+            assert_eq!(r.ret, t, "4 == 4 -> true");
+            let (r, _) = run_function(
+                value_fn(CoreOpcode::Equal),
+                &[(ARG0, i32_bits(4)), (ARG1, i32_bits(5))],
+            );
+            assert_eq!(r.ret, f, "4 == 5 -> false");
+            let (r, _) = run_function(
+                value_fn(CoreOpcode::NotEqual),
+                &[(ARG0, i32_bits(4)), (ARG1, i32_bits(5))],
+            );
+            assert_eq!(r.ret, t, "4 != 5 -> true");
+
+            // Loose-equality slow far-call (a non-int32 operand) -> operation_compare_eq
+            // (the interpreter's `loose_equal`): `true == 1` -> true (ToNumber(true)==1);
+            // `null == undefined` -> true; the `!=` form negates the same oracle.
+            let (r, _) = run_function(
+                value_fn(CoreOpcode::Equal),
+                &[(ARG0, t), (ARG1, i32_bits(1))],
+            );
+            assert_eq!(
+                r.ret, t,
+                "true == 1 -> true (loose-eq slow far-call == oracle)"
+            );
+            assert_eq!(r.pending, 0, "loose-eq on primitives does not throw");
+            let (r, _) = run_function(
+                value_fn(CoreOpcode::Equal),
+                &[
+                    (ARG0, JsValue::null().encoded().0),
+                    (ARG1, JsValue::undefined().encoded().0),
+                ],
+            );
+            assert_eq!(
+                r.ret, t,
+                "null == undefined -> true (loose-eq slow far-call)"
+            );
+            let (r, _) = run_function(
+                value_fn(CoreOpcode::NotEqual),
+                &[(ARG0, t), (ARG1, i32_bits(1))],
+            );
+            assert_eq!(r.ret, f, "true != 1 -> false (negated loose-eq)");
+        }
+
+        // --- PRIMITIVE CONSTANT LOADS native == oracle. ---
+        // LoadUndefined/LoadNull/LoadBool materialize the boxed constant. Each was DECLINED
+        // before this batch. (LoadCallee is deferred — see the dispatch note.)
+        #[test]
+        fn primitive_constant_loads_native() {
+            let load_then_return =
+                |op: CoreOpcode, operands: Vec<Operand>| -> Vec<TypedInstruction> {
+                    vec![
+                        instr(op, operands, 0),
+                        instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+                    ]
+                };
+            let (r, _) = run_function(
+                load_then_return(CoreOpcode::LoadUndefined, vec![reg(LOCAL0)]),
+                &[],
+            );
+            assert_eq!(
+                r.ret,
+                JsValue::undefined().encoded().0,
+                "LoadUndefined -> boxed undefined"
+            );
+            let (r, _) = run_function(
+                load_then_return(CoreOpcode::LoadNull, vec![reg(LOCAL0)]),
+                &[],
+            );
+            assert_eq!(r.ret, JsValue::null().encoded().0, "LoadNull -> boxed null");
+            let (r, _) = run_function(
+                load_then_return(
+                    CoreOpcode::LoadBool,
+                    vec![reg(LOCAL0), Operand::UnsignedImmediate(1)],
+                ),
+                &[],
+            );
+            assert_eq!(
+                r.ret,
+                JsValue::from_bool(true).encoded().0,
+                "LoadBool 1 -> boxed true"
+            );
+            let (r, _) = run_function(
+                load_then_return(
+                    CoreOpcode::LoadBool,
+                    vec![reg(LOCAL0), Operand::UnsignedImmediate(0)],
+                ),
+                &[],
+            );
+            assert_eq!(
+                r.ret,
+                JsValue::from_bool(false).encoded().0,
+                "LoadBool 0 -> boxed false"
+            );
         }
 
         // --- THE DOUBLE MILESTONE (full CodeBlock): a whole function whose
