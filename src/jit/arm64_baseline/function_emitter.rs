@@ -870,25 +870,41 @@ impl FunctionEmitter {
 
     /// op_get_from_scope GlobalProperty (`emit_op_get_from_scope`, JITPropertyAccess.cpp:
     /// 1284-1293) — the global-object named-property READ. SLOW-CALL lowering: load the
-    /// baked identifier index into `argumentGPR1` and the site `bytecode_index` into
-    /// `argumentGPR2`, set arg0 = the pinned `*mut Vm`, and far-call
-    /// `operation_get_global_object_property` (the interpreter's OWN named-property
-    /// resolution on the global object); probe the `m_exception` mirror (D3) for the
-    /// getter throw edge, then store the boxed result to `dst`. Falls through.
+    /// baked identifier index into `argumentGPR1`, the site `bytecode_index` into
+    /// `argumentGPR2`, and the owning `*const CodeBlock` into `argumentGPR3`, set arg0 =
+    /// the pinned `*mut Vm`, and far-call `operation_get_global_object_property` (the
+    /// interpreter's OWN named-property resolution on the global object); probe the
+    /// `m_exception` mirror (D3) for the getter throw edge, then store the boxed result
+    /// to `dst`. Falls through.
     ///
     /// DIVERGENCE from JSC (load-bearing, the inline fast-path follow-up): JSC emits an
     /// INLINE structure-guarded butterfly load off the global object (a get_from_scope
     /// DataIC). This engine has no global-property inline IC yet (the named-property
-    /// DataIC is wired for `get_by_id`, not the global ops), so the read is a leaf
-    /// far-call — exactly the [`Self::emit_get_by_val`] slow-call discipline — until a
-    /// global-property DataIC lands.
-    fn emit_get_global_object_property(&mut self, dst: i32, key_index: u32, bytecode_index: u32) {
+    /// DataIC is wired for `get_by_id`, not the global ops), so the read is a far-call
+    /// until a global-property DataIC lands. The far-call still carries the owning
+    /// CodeBlock (the site identity) so a nested native call never resolves the global
+    /// object through the caller's parked CodeBlock.
+    fn emit_get_global_object_property(
+        &mut self,
+        dst: i32,
+        key_index: u32,
+        bytecode_index: u32,
+        owning_code_block: u64,
+    ) {
+        // x1 = key_index (arg1).
         self.h
             .masm_mut()
-            .move_imm32(TrustedImm32::new(key_index as i32), LEFT_GPR); // x1 = key_index (arg1)
+            .move_imm32(TrustedImm32::new(key_index as i32), LEFT_GPR);
+        // x2 = bci (arg2).
         self.h
             .masm_mut()
-            .move_imm32(TrustedImm32::new(bytecode_index as i32), RIGHT_GPR); // x2 = bci (arg2)
+            .move_imm32(TrustedImm32::new(bytecode_index as i32), RIGHT_GPR);
+        // x3 = the get_from_scope site's OWN CodeBlock pointer (full 64-bit address),
+        // the global-property analog of the DataIC `StructureStubInfo*` owner.
+        self.h.masm_mut().move_imm64(
+            TrustedImm64::new(owning_code_block as i64),
+            CALL_ARG_GPRS[0],
+        );
         self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
         self.h.masm_mut().far_call(TrustedImm64::new(
             operation_get_global_object_property as usize as i64,
@@ -900,21 +916,37 @@ impl FunctionEmitter {
     /// op_put_to_scope GlobalProperty (`emit_op_put_to_scope`, JITPropertyAccess.cpp:
     /// 1589-1614) — the global-object named-property STORE. SLOW-CALL lowering: load the
     /// baked identifier index into `argumentGPR1`, the boxed value into `argumentGPR2`,
-    /// and the site `bytecode_index` into `argumentGPR3`, set arg0 = the pinned `*mut Vm`,
-    /// and far-call `operation_put_global_object_property` (the interpreter's OWN recording
-    /// store on the global object, WITH the write barrier run in the host store — faithful
-    /// to JSC's `emitWriteBarrier(scope, value)`, JITPropertyAccess.cpp:1614); probe the
-    /// `m_exception` mirror (D3) for the setter throw edge. put yields no observable value,
-    /// so there is no `dst` store. Falls through. Same inline fast-path follow-up
+    /// the site `bytecode_index` into `argumentGPR3`, and the owning `*const CodeBlock`
+    /// into `argumentGPR4`, set arg0 = the pinned `*mut Vm`, and far-call
+    /// `operation_put_global_object_property` (the interpreter's OWN recording store on
+    /// the global object, WITH the write barrier run in the host store — faithful to JSC's
+    /// `emitWriteBarrier(scope, value)`, JITPropertyAccess.cpp:1614); probe the
+    /// `m_exception` mirror (D3) for the setter throw edge. put yields no observable
+    /// value, so there is no `dst` store. Falls through. Same inline fast-path follow-up
     /// divergence as [`Self::emit_get_global_object_property`].
-    fn emit_put_global_object_property(&mut self, key_index: u32, value: i32, bytecode_index: u32) {
+    fn emit_put_global_object_property(
+        &mut self,
+        key_index: u32,
+        value: i32,
+        bytecode_index: u32,
+        owning_code_block: u64,
+    ) {
+        // x1 = key_index (arg1).
         self.h
             .masm_mut()
-            .move_imm32(TrustedImm32::new(key_index as i32), LEFT_GPR); // x1 = key_index (arg1)
-        self.h.masm_mut().load64(address_for(value), RIGHT_GPR); // x2 = value (arg2)
+            .move_imm32(TrustedImm32::new(key_index as i32), LEFT_GPR);
+        // x2 = value (arg2).
+        self.h.masm_mut().load64(address_for(value), RIGHT_GPR);
+        // x3 = bci (arg3).
         self.h
             .masm_mut()
-            .move_imm32(TrustedImm32::new(bytecode_index as i32), SCRATCH_GPR); // x3 = bci (arg3)
+            .move_imm32(TrustedImm32::new(bytecode_index as i32), SCRATCH_GPR);
+        // x4 = the put_to_scope site's OWN CodeBlock pointer (full 64-bit address),
+        // the global-property analog of the DataIC `StructureStubInfo*` owner.
+        self.h.masm_mut().move_imm64(
+            TrustedImm64::new(owning_code_block as i64),
+            CALL_ARG_GPRS[1],
+        );
         self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
         self.h.masm_mut().far_call(TrustedImm64::new(
             operation_put_global_object_property as usize as i64,
@@ -2762,7 +2794,13 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
             CoreOpcode::GetGlobalObjectProperty => {
                 let dst = frame_slot(decoded.register_operand(0)?)?;
                 let key_index = decoded.identifier_index_operand(1)?;
-                emitter.emit_get_global_object_property(dst, key_index, bci as u32);
+                let owning_code_block = code_block as *const CodeBlock as u64;
+                emitter.emit_get_global_object_property(
+                    dst,
+                    key_index,
+                    bci as u32,
+                    owning_code_block,
+                );
             }
             // op_put_to_scope GlobalProperty (`PutGlobalObjectProperty`): operand 0 =
             // IdentifierIndex (the property name), operand 1 = the value register —
@@ -2772,7 +2810,13 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
             CoreOpcode::PutGlobalObjectProperty => {
                 let key_index = decoded.identifier_index_operand(0)?;
                 let value = frame_slot(decoded.register_operand(1)?)?;
-                emitter.emit_put_global_object_property(key_index, value, bci as u32);
+                let owning_code_block = code_block as *const CodeBlock as u64;
+                emitter.emit_put_global_object_property(
+                    key_index,
+                    value,
+                    bci as u32,
+                    owning_code_block,
+                );
             }
             // op_call — the B5-first-cut UNLINKED VIRTUAL CALL. Operand order matches
             // the interpreter's `dispatch_call` and the bytecompiler's `emit_call`

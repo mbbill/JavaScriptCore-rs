@@ -3358,25 +3358,32 @@ impl Vm {
 
     /// `operationGetFromScope` GlobalProperty analog (jit/JITOperations.cpp:4624) for the
     /// baseline `GetGlobalObjectProperty` far-call. The SAFE wrapper the shim calls. Builds
-    /// a `DispatchState` over the parked CodeBlock (the global object is resolved from
-    /// `state.stack` + a getter may re-enter, so this is state-threaded like
-    /// `operation_get_by_val`, NOT the leaf `operation_get_closure_cell`) and runs the
-    /// faithful named-property resolution on the global object
+    /// a `DispatchState` over the CodeBlock that OWNS the site (not the parked/current
+    /// CodeBlock) and runs the faithful named-property resolution on the global object
     /// (`host.jit_get_global_object_property`), surfacing the boxed value or the pending
     /// exception's `EncodedJsValue`.
+    ///
+    /// DIVERGENCE-CORRECTION: JSC global get_from_scope state is site-owned metadata,
+    /// decoupled from any "current CodeBlock". A nested native JIT->JIT `blr` never
+    /// re-parks `self.jit_code_block`, so using the parked CodeBlock here would resolve
+    /// a callee's global-object op against the caller's CodeBlock. The emitter therefore
+    /// bakes the owning `*const CodeBlock`, mirroring the DataIC `StructureStubInfo*`
+    /// fix for get_by_id/put_by_id.
     pub fn operation_get_global_object_property(
         &mut self,
         host: &mut CoreOpcodeDispatchHost,
         key_index: u32,
         bytecode_index: u32,
+        owning_code_block: u64,
     ) -> Result<RuntimeValue, EncodedJsValue> {
-        let placeholder = self.jit_pending_code_block_placeholder();
+        let (placeholder, owner_ptr) = self.resolve_property_ic_owner(owning_code_block);
         let outcome = {
-            // SAFETY: as `operation_get_by_val` — one dormant-parent `&CodeBlock`,
-            // disjoint from the `&mut self.*` field borrows, not outliving this call.
+            // SAFETY: as `resolve_property_ic_owner` — the owner pointer is the per-site
+            // CodeBlock baked into the image (or the parked fallback for non-emitted callers),
+            // shared-read only, and does not outlive this call.
             let code_block: &CodeBlock = match &placeholder {
                 Some(code_block) => code_block,
-                None => unsafe { &*self.jit_code_block },
+                None => unsafe { &*owner_ptr },
             };
             let mut state = DispatchState {
                 stack: &mut self.execution,
@@ -3402,25 +3409,28 @@ impl Vm {
 
     /// `operationPutToScope` GlobalProperty analog (jit/JITOperations.cpp:4666) for the
     /// baseline `PutGlobalObjectProperty` far-call. The SAFE wrapper the shim calls. Builds
-    /// a `DispatchState` over the parked CodeBlock (the global object is resolved from
-    /// `state.stack` + a setter may re-enter) and runs the faithful recording store on the
-    /// global object (`host.jit_put_global_object_property`). The store yields no observable
-    /// value, so success returns `undefined` bits (the lowering discards the result); a
-    /// thrown setter surfaces the pending exception's `EncodedJsValue`.
+    /// a `DispatchState` over the CodeBlock that OWNS the site (not the parked/current
+    /// CodeBlock) and runs the faithful recording store on the global object
+    /// (`host.jit_put_global_object_property`). The store yields no observable value, so
+    /// success returns `undefined` bits (the lowering discards the result); a thrown setter
+    /// surfaces the pending exception's `EncodedJsValue`. Same owner-pointer correction as
+    /// [`Self::operation_get_global_object_property`].
     pub fn operation_put_global_object_property(
         &mut self,
         host: &mut CoreOpcodeDispatchHost,
         key_index: u32,
         value: RuntimeValue,
         bytecode_index: u32,
+        owning_code_block: u64,
     ) -> Result<RuntimeValue, EncodedJsValue> {
-        let placeholder = self.jit_pending_code_block_placeholder();
+        let (placeholder, owner_ptr) = self.resolve_property_ic_owner(owning_code_block);
         let outcome = {
-            // SAFETY: as `operation_get_by_val` — one dormant-parent `&CodeBlock`,
-            // disjoint from the `&mut self.*` field borrows, not outliving this call.
+            // SAFETY: as `resolve_property_ic_owner` — the owner pointer is the per-site
+            // CodeBlock baked into the image (or the parked fallback for non-emitted callers),
+            // shared-read only, and does not outlive this call.
             let code_block: &CodeBlock = match &placeholder {
                 Some(code_block) => code_block,
-                None => unsafe { &*self.jit_code_block },
+                None => unsafe { &*owner_ptr },
             };
             let mut state = DispatchState {
                 stack: &mut self.execution,

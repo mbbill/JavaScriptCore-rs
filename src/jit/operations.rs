@@ -523,16 +523,18 @@ pub extern "C" fn operation_get_global_lexical(vm: *mut Vm, key_index: u64) -> u
 /// `operationGetFromScope` GlobalProperty analog (jit/JITOperations.cpp:4624) for the
 /// baseline `GetGlobalObjectProperty` far-call. The emitted lowering
 /// (`emit_get_global_object_property`) loads `x1`=the baked identifier index, `x2`=the
-/// site `bytecode_index`, sets `x0`=the pinned `*mut Vm`, and far-calls this shim. Same
-/// D1+D5 reborrow island; builds a `DispatchState` and runs the faithful named-property
-/// resolution on the global object (`Vm::operation_get_global_object_property`), returning
-/// the boxed value, or — on throw (a getter) — stamping `m_exception` (D3) and returning
-/// `JSValue::empty()` bits. The integer args arrive zero-extended (`move_imm32`) and are
-/// narrowed here.
+/// site `bytecode_index`, `x3`=the owning `*const CodeBlock`, sets `x0`=the pinned
+/// `*mut Vm`, and far-calls this shim. Same D1+D5 reborrow island; builds a
+/// `DispatchState` and runs the faithful named-property resolution on the global object
+/// (`Vm::operation_get_global_object_property`), returning the boxed value, or — on throw
+/// (a getter) — stamping `m_exception` (D3) and returning `JSValue::empty()` bits. The
+/// integer args arrive zero-extended (`move_imm32`) and are narrowed here; the CodeBlock
+/// pointer is a full 64-bit address.
 pub extern "C" fn operation_get_global_object_property(
     vm: *mut Vm,
     key_index: u64,
     bytecode_index: u64,
+    owning_code_block: u64,
 ) -> u64 {
     let vm = unsafe { &mut *vm };
     let host_ptr = vm.jit_host_ptr();
@@ -543,7 +545,12 @@ pub extern "C" fn operation_get_global_object_property(
     );
     let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
 
-    match vm.operation_get_global_object_property(host, key_index as u32, bytecode_index as u32) {
+    match vm.operation_get_global_object_property(
+        host,
+        key_index as u32,
+        bytecode_index as u32,
+        owning_code_block,
+    ) {
         Ok(result) => result.encoded().0,
         Err(encoded_exception) => {
             vm.set_jit_pending_exception(encoded_exception);
@@ -555,9 +562,9 @@ pub extern "C" fn operation_get_global_object_property(
 /// `operationPutToScope` GlobalProperty analog (jit/JITOperations.cpp:4666) for the
 /// baseline `PutGlobalObjectProperty` far-call. The emitted lowering
 /// (`emit_put_global_object_property`) loads `x1`=the baked identifier index, `x2`=the
-/// boxed value, `x3`=the site `bytecode_index`, sets `x0`=the pinned `*mut Vm`, and
-/// far-calls this shim. Same D1+D5 reborrow island; builds a `DispatchState` and runs the
-/// faithful recording store on the global object
+/// boxed value, `x3`=the site `bytecode_index`, `x4`=the owning `*const CodeBlock`, sets
+/// `x0`=the pinned `*mut Vm`, and far-calls this shim. Same D1+D5 reborrow island; builds
+/// a `DispatchState` and runs the faithful recording store on the global object
 /// (`Vm::operation_put_global_object_property`). The store yields no observable value, so
 /// success returns `undefined` bits (the lowering discards the result register); a thrown
 /// setter stamps `m_exception` (D3) and returns `JSValue::empty()` bits.
@@ -566,6 +573,7 @@ pub extern "C" fn operation_put_global_object_property(
     key_index: u64,
     value: u64,
     bytecode_index: u64,
+    owning_code_block: u64,
 ) -> u64 {
     let vm = unsafe { &mut *vm };
     let host_ptr = vm.jit_host_ptr();
@@ -582,6 +590,7 @@ pub extern "C" fn operation_put_global_object_property(
         key_index as u32,
         value,
         bytecode_index as u32,
+        owning_code_block,
     ) {
         Ok(result) => result.encoded().0,
         Err(encoded_exception) => {
