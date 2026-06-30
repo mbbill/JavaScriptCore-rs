@@ -9339,6 +9339,17 @@ impl CoreOpcodeDispatchHost {
             .unwrap_or_else(|| left.strict_equals(right))
     }
 
+    /// `JSValue::strictEqual(left, right)` — the `===` Strict Equality Comparison
+    /// (7.2.16) the `op_stricteq`/`op_nstricteq` dispatch already uses. The baseline
+    /// JIT's strict-equality slow-call shim (`operation_strict_equal`,
+    /// jit/operations.rs) far-calls THIS so the native fast path's ambiguous cases
+    /// (doubles, different-pointer cells) resolve through the SAME oracle the
+    /// interpreter uses — never a hand-rolled JIT reimplementation. INFALLIBLE (no
+    /// `valueOf`/`toString`); `op_nstricteq`/`!==` is the caller's negation.
+    pub(crate) fn operation_strict_equal(&self, left: RuntimeValue, right: RuntimeValue) -> bool {
+        self.strict_same_value(left, right)
+    }
+
     // C++ JSC JSValue::equalSlowCaseInline (runtime/JSCJSValueInlines.h:250-376),
     // i.e. ECMAScript IsLooselyEqual / Abstract Equality Comparison (7.2.14).
     //

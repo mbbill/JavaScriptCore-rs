@@ -294,6 +294,62 @@ impl AssemblyHelpers {
         }
     }
 
+    /// `branchIfNumber(GPRReg reg, mode)` (AssemblyHelpers.h:752-763, JSVALUE64):
+    /// the EXACT inverse of [`Self::branch_if_not_number`]. A value is a number iff
+    /// it carries any `NumberTag` bit (`isNumber() == (bits & NumberTag) != 0`,
+    /// JSCJSValue.h:1034-1037), so `branchTest64(NonZero, reg, numberTag)` is taken
+    /// exactly when `reg` IS a number (int32 or double). `HaveTagRegisters` tests the
+    /// live `numberTagRegister` (x27); `DoNotHaveTagRegisters` materializes NumberTag
+    /// into `temp` first. Used by the strict-equality fast path to send DOUBLE
+    /// operands (the only non-cell, non-bitwise-comparable kind) to the slow path,
+    /// exactly as JSC's `compileOpStrictEq` does (`addSlowCase(branchIfNumber(...))`,
+    /// JITOpcodes.cpp:878,881).
+    pub fn branch_if_number(
+        &mut self,
+        reg: RegisterID,
+        temp: RegisterID,
+        mode: TagRegistersMode,
+    ) -> Jump {
+        match mode {
+            TagRegistersMode::HaveTagRegisters => {
+                self.masm
+                    .branch_test64(ResultCondition::NonZero, reg, Self::NUMBER_TAG_REGISTER)
+            }
+            TagRegistersMode::DoNotHaveTagRegisters => {
+                self.masm
+                    .move_imm64(TrustedImm64::new(NUMBER_TAG as i64), temp);
+                self.masm.branch_test64(ResultCondition::NonZero, reg, temp)
+            }
+        }
+    }
+
+    /// `branchIfNotCell(GPRReg reg, mode)` (AssemblyHelpers.h:725-736, JSVALUE64). A
+    /// value is a cell iff none of the `NotCellMask` bits are set (`isCell() ==
+    /// !(bits & NotCellMask)`, JSCJSValue.h:1010-1013), so
+    /// `branchTest64(NonZero, reg, notCellMask)` is taken exactly when `reg` is NOT a
+    /// cell. `HaveTagRegisters` tests the live `notCellMaskRegister` (x28);
+    /// `DoNotHaveTagRegisters` materializes NotCellMask into `temp` first. Used by the
+    /// strict-equality fast path to separate the both-cells case (JSC
+    /// `compileOpStrictEq`'s `branchIfNotCell(or64(...))`, JITOpcodes.cpp:864).
+    pub fn branch_if_not_cell(
+        &mut self,
+        reg: RegisterID,
+        temp: RegisterID,
+        mode: TagRegistersMode,
+    ) -> Jump {
+        match mode {
+            TagRegistersMode::HaveTagRegisters => {
+                self.masm
+                    .branch_test64(ResultCondition::NonZero, reg, Self::NOT_CELL_MASK_REGISTER)
+            }
+            TagRegistersMode::DoNotHaveTagRegisters => {
+                self.masm
+                    .move_imm64(TrustedImm64::new(NOT_CELL_MASK as i64), temp);
+                self.masm.branch_test64(ResultCondition::NonZero, reg, temp)
+            }
+        }
+    }
+
     /// `branchIfNotBoolean(GPRReg reg, GPRReg tempGPR)` (AssemblyHelpers.h:828-836,
     /// JSVALUE64). C++:
     /// ```cpp
@@ -489,6 +545,35 @@ mod tests {
         );
         assert_eq!(words(h.code()), vec![0xea1b_001f, 0x5400_0000, 0xd503_201f]);
         assert_eq!(j.condition(), Condition::Eq);
+    }
+
+    #[test]
+    fn branch_if_number_have_tag_registers() {
+        // branchTest64(NonZero, x0, x27) -> tst x0, x27 (ands xzr) : 0xea1b001f ;
+        // b.ne #0 : 0x54000001 ; nop. The EXACT inverse condition of
+        // branch_if_not_number (Eq -> Ne) against the SAME numberTag register.
+        let mut h = AssemblyHelpers::new();
+        let j = h.branch_if_number(
+            RegisterID::X0,
+            RegisterID::X3,
+            TagRegistersMode::HaveTagRegisters,
+        );
+        assert_eq!(words(h.code()), vec![0xea1b_001f, 0x5400_0001, 0xd503_201f]);
+        assert_eq!(j.condition(), Condition::Ne);
+    }
+
+    #[test]
+    fn branch_if_not_cell_have_tag_registers() {
+        // branchTest64(NonZero, x0, x28) -> tst x0, x28 (ands xzr) : 0xea1c001f ;
+        // b.ne #0 : 0x54000001 ; nop. Tests against the notCellMask register (x28).
+        let mut h = AssemblyHelpers::new();
+        let j = h.branch_if_not_cell(
+            RegisterID::X0,
+            RegisterID::X3,
+            TagRegistersMode::HaveTagRegisters,
+        );
+        assert_eq!(words(h.code()), vec![0xea1c_001f, 0x5400_0001, 0xd503_201f]);
+        assert_eq!(j.condition(), Condition::Ne);
     }
 
     #[test]

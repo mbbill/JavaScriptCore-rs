@@ -3073,6 +3073,18 @@ impl Vm {
         self.operation_compare_relational(host, op1, op2, CoreOpcode::GreaterThanInt32)
     }
 
+    /// `operationCompareGreaterEq` -> `jsLessEq<false>` (operands swapped).
+    /// GreaterEqualInt32 member: the faithful relational evaluator the FUSED int32
+    /// `a >= b` compare-and-branch lowering far-calls when an operand is not int32.
+    pub fn operation_compare_greatereq(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        op1: RuntimeValue,
+        op2: RuntimeValue,
+    ) -> Result<bool, EncodedJsValue> {
+        self.operation_compare_relational(host, op1, op2, CoreOpcode::GreaterEqualInt32)
+    }
+
     /// The SHARED SAFE wrapper the baseline relational slow-path shims call,
     /// mirroring [`Self::operation_value_binary`] but running the faithful
     /// `CoreOpcodeDispatchHost::numeric_compare` (interpreter/mod.rs) for the
@@ -23907,6 +23919,470 @@ mod tests {
             "the hot function tiered up to a native baseline image via the LIVE \
              execute_code_block entry path (m_jitCode installed)",
         );
+    }
+
+    // ========================================================================
+    // NATIVE-LOWERING BREADTH: StrictEqual/StrictNotEqual (`===`/`!==`) + the fused
+    // GreaterEqualInt32 (`>=`) now lower native on the baseline JIT, so comparison-
+    // heavy hot functions tier up instead of being declined by the S4 allowlist.
+    // ========================================================================
+
+    // `function f(a, b) { return a (===|!==) b; }` — the standalone strict-equality
+    // VALUE form. a=arg1 b=arg2 r=local0. Straight-line (no back-edge -> the warm-up
+    // never polls the GC), so object-cell arguments stay live without rooting.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn strict_eq_value_code_block(negate: bool) -> CodeBlock {
+        let r = local(0);
+        let a = argument_including_this(1);
+        let b = argument_including_this(2);
+        let op = if negate {
+            CoreOpcode::StrictNotEqual
+        } else {
+            CoreOpcode::StrictEqual
+        };
+        let instructions = vec![
+            typed_core_instruction_with_operands(
+                0,
+                op,
+                vec![
+                    Operand::Register(r),
+                    Operand::Register(a),
+                    Operand::Register(b),
+                ],
+            ),
+            typed_core_instruction_with_operands(1, CoreOpcode::Return, vec![Operand::Register(r)]),
+        ];
+        CodeBlock::from_unlinked(
+            UnlinkedCodeBlock::new(
+                CodeKind::Function,
+                PackedInstructionStream::from_typed_placeholder(instructions),
+            )
+            .with_frame(RegisterFrameShape {
+                num_parameters_including_this: 3,
+                num_vars: 4,
+                num_callee_locals: 4,
+                num_temporaries: 0,
+                special: Default::default(),
+            }),
+            LinkContext::default(),
+        )
+        .with_entrypoints(CodeBlockEntrypoints {
+            interpreter: Some(InterpreterEntrySlot(0)),
+            ..CodeBlockEntrypoints::default()
+        })
+        .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    // `function f(n) { var s=0; for (var i=n; i>=0; i--) s+=i; return s; }` — the FUSED
+    // GreaterEqualInt32 loop condition (the crypto bignum `--n >= 0` shape).
+    //   s=local0 i=local1 zero=local2 cmp=local3 one=local4 n=arg1
+    //   0 s=0  1 i=n  2 zero=0  3 one=1  4 cmp=(i>=zero)  5 jfalse cmp->9
+    //   6 s+=i  7 i-=one  8 jmp->4  9 ret s
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn ge_loop_sum_code_block() -> CodeBlock {
+        let s = local(0);
+        let i = local(1);
+        let zero = local(2);
+        let cmp = local(3);
+        let one = local(4);
+        let n = argument_including_this(1);
+        let instructions = vec![
+            typed_core_instruction_with_operands(
+                0,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(s), Operand::SignedImmediate(0)],
+            ),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::Move,
+                vec![Operand::Register(i), Operand::Register(n)],
+            ),
+            typed_core_instruction_with_operands(
+                2,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(zero), Operand::SignedImmediate(0)],
+            ),
+            typed_core_instruction_with_operands(
+                3,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(one), Operand::SignedImmediate(1)],
+            ),
+            typed_core_instruction_with_operands(
+                4,
+                CoreOpcode::GreaterEqualInt32,
+                vec![
+                    Operand::Register(cmp),
+                    Operand::Register(i),
+                    Operand::Register(zero),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                5,
+                CoreOpcode::JumpIfFalse,
+                vec![
+                    Operand::Register(cmp),
+                    Operand::BytecodeIndex(BytecodeIndex::from_offset(9)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                6,
+                CoreOpcode::AddInt32,
+                vec![
+                    Operand::Register(s),
+                    Operand::Register(s),
+                    Operand::Register(i),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                7,
+                CoreOpcode::SubInt32,
+                vec![
+                    Operand::Register(i),
+                    Operand::Register(i),
+                    Operand::Register(one),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                8,
+                CoreOpcode::Jump,
+                vec![Operand::BytecodeIndex(BytecodeIndex::from_offset(4))],
+            ),
+            typed_core_instruction_with_operands(9, CoreOpcode::Return, vec![Operand::Register(s)]),
+        ];
+        CodeBlock::from_unlinked(
+            UnlinkedCodeBlock::new(
+                CodeKind::Function,
+                PackedInstructionStream::from_typed_placeholder(instructions),
+            )
+            .with_frame(RegisterFrameShape {
+                num_parameters_including_this: 2,
+                num_vars: 8,
+                num_callee_locals: 8,
+                num_temporaries: 0,
+                special: Default::default(),
+            }),
+            LinkContext::default(),
+        )
+        .with_entrypoints(CodeBlockEntrypoints {
+            interpreter: Some(InterpreterEntrySlot(0)),
+            ..CodeBlockEntrypoints::default()
+        })
+        .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    // The fused `GreaterEqualInt32 ; JumpIfFalse` loop condition tiers up to a native
+    // image and returns the SAME sum the interpreter does (it was DECLINED before the
+    // GE was added to the fusible relational set).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_ge_int32_fusion_loop_tiers_up_and_matches_interpreter() {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+        let code_block = ge_loop_sum_code_block();
+        let owner = CodeBlockId(CellId(7_731));
+        let n = 5;
+        let expected = (n * (n + 1)) / 2; // sum_{i=0}^{5} i == 15
+        let expected_bits = RuntimeValue::from_i32(expected).encoded().0;
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(owner, code_block.clone());
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        let entry_cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 8;
+        let mut saw_install = false;
+        for _ in 0..entry_cap {
+            let completion = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                owner,
+                &code_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), RuntimeValue::from_i32(n)],
+            );
+            let bits = match completion {
+                ExecutionCompletion::Returned(value) => value.encoded().0,
+                other => panic!("ge loop did not return a value: {other:?}"),
+            };
+            assert_eq!(
+                bits, expected_bits,
+                "`i >= 0` loop sum(0..=5) == 15 whether interpreted (warming) or native",
+            );
+            if vm.baseline_jit_function_is_installed(owner) {
+                saw_install = true;
+            }
+        }
+        assert!(
+            saw_install,
+            "the `i >= 0` loop tiered up to a native baseline image (GreaterEqualInt32 fusion)",
+        );
+    }
+
+    // `a === b` / `a !== b` tier up native and match the interpreter==oracle across the
+    // case matrix: int/int and int/cell resolve INLINE; doubles, NaN and different-
+    // pointer cells far-call the strict-equality oracle (the SAME evaluator the
+    // interpreter's StrictEqual dispatch uses). The function is straight-line, so the
+    // warm-up never polls the GC and the object-cell arguments stay live unrooted.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_strict_equality_tiers_up_and_matches_interpreter_and_oracle() {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+        let eq_block = strict_eq_value_code_block(false);
+        let owner = CodeBlockId(CellId(7_733));
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(owner, eq_block.clone());
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        // Two distinct object cells for the cell-identity cases.
+        let obj_a = host.allocate_array_for_test(&mut vm.heap);
+        let obj_b = host.allocate_array_for_test(&mut vm.heap);
+
+        let entry_cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 8;
+        let warm = vec![
+            RuntimeValue::undefined(),
+            RuntimeValue::from_i32(5),
+            RuntimeValue::from_i32(5),
+        ];
+        let mut saw_install = false;
+        for _ in 0..entry_cap {
+            let _ = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                owner,
+                &eq_block,
+                &mut host,
+                warm.clone(),
+            );
+            if vm.baseline_jit_function_is_installed(owner) {
+                saw_install = true;
+            }
+        }
+        assert!(
+            saw_install,
+            "`a === b` tiered up to a native baseline image"
+        );
+
+        let i = RuntimeValue::from_i32;
+        let d = RuntimeValue::from_double;
+        // (a, b, expected `a === b`).
+        let cases: Vec<(RuntimeValue, RuntimeValue, bool)> = vec![
+            (i(5), i(5), true),                // int == int (inline)
+            (i(5), i(7), false),               // int != int (inline)
+            (d(1.5), d(1.5), true),            // double == double (far-call oracle)
+            (d(f64::NAN), d(f64::NAN), false), // NaN !== NaN (far-call oracle)
+            (obj_a, obj_a, true),              // a cell === itself (inline same-pointer)
+            (obj_a, obj_b, false),             // distinct cells (far-call oracle -> false)
+            (i(5), obj_a, false),              // int === object (inline -> false)
+            (i(1), d(1.0), true),              // 1 === 1.0 per JS number semantics
+        ];
+        for (index, (a, b, expected)) in cases.into_iter().enumerate() {
+            // The host's strict-equality evaluator IS the interpreter's StrictEqual
+            // semantics AND the oracle the JIT far-calls; it must match JS semantics.
+            let interp = host.operation_strict_equal(a, b);
+            assert_eq!(
+                interp, expected,
+                "interpreter `===` evaluator must match JS semantics (case {index})",
+            );
+            let completion = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                owner,
+                &eq_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), a, b],
+            );
+            let native_bits = match completion {
+                ExecutionCompletion::Returned(value) => value.encoded().0,
+                other => panic!("`a === b` did not return a value: {other:?}"),
+            };
+            assert_eq!(
+                native_bits,
+                RuntimeValue::from_bool(expected).encoded().0,
+                "native `a === b` must equal interpreter==oracle (case {index})",
+            );
+        }
+
+        // `!==` — the negation. Same shapes, inverted truth.
+        let neq_block = strict_eq_value_code_block(true);
+        let neq_owner = CodeBlockId(CellId(7_734));
+        vm.code_blocks.register(neq_owner, neq_block.clone());
+        for _ in 0..entry_cap {
+            let _ = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                neq_owner,
+                &neq_block,
+                &mut host,
+                warm.clone(),
+            );
+        }
+        assert!(
+            vm.baseline_jit_function_is_installed(neq_owner),
+            "`a !== b` tiered up to a native baseline image",
+        );
+        for (index, (a, b, eq_expected)) in [
+            (i(5), i(5), true),
+            (i(5), i(7), false),
+            (obj_a, obj_a, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let completion = execute_registered_code_block_with_host_and_arguments(
+                &mut vm,
+                neq_owner,
+                &neq_block,
+                &mut host,
+                vec![RuntimeValue::undefined(), a, b],
+            );
+            let native_bits = match completion {
+                ExecutionCompletion::Returned(value) => value.encoded().0,
+                other => panic!("`a !== b` did not return a value: {other:?}"),
+            };
+            assert_eq!(
+                native_bits,
+                RuntimeValue::from_bool(!eq_expected).encoded().0,
+                "native `a !== b` is the negation of `===` (case {index})",
+            );
+        }
+    }
+
+    // `function f(a, b) { if (a (===|!==) b) return 10; return 20; }` — the FUSED
+    // strict-equality + JumpIfFalse form (`op_jstricteq`/`op_jnstricteq`). cmp=local0
+    // (DEAD after the jump -> fuses) r=local1 a=arg1 b=arg2. Forward branches only
+    // (no back-edge -> no GC poll).
+    //   0 (Strict[Not]Equal) cmp,a,b  1 jfalse cmp->4  2 r=10  3 ret r  4 r=20  5 ret r
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn strict_eq_branch_code_block(negate: bool) -> CodeBlock {
+        let cmp = local(0);
+        let r = local(1);
+        let a = argument_including_this(1);
+        let b = argument_including_this(2);
+        let op = if negate {
+            CoreOpcode::StrictNotEqual
+        } else {
+            CoreOpcode::StrictEqual
+        };
+        let instructions = vec![
+            typed_core_instruction_with_operands(
+                0,
+                op,
+                vec![
+                    Operand::Register(cmp),
+                    Operand::Register(a),
+                    Operand::Register(b),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                1,
+                CoreOpcode::JumpIfFalse,
+                vec![
+                    Operand::Register(cmp),
+                    Operand::BytecodeIndex(BytecodeIndex::from_offset(4)),
+                ],
+            ),
+            typed_core_instruction_with_operands(
+                2,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(r), Operand::SignedImmediate(10)],
+            ),
+            typed_core_instruction_with_operands(3, CoreOpcode::Return, vec![Operand::Register(r)]),
+            typed_core_instruction_with_operands(
+                4,
+                CoreOpcode::LoadInt32,
+                vec![Operand::Register(r), Operand::SignedImmediate(20)],
+            ),
+            typed_core_instruction_with_operands(5, CoreOpcode::Return, vec![Operand::Register(r)]),
+        ];
+        CodeBlock::from_unlinked(
+            UnlinkedCodeBlock::new(
+                CodeKind::Function,
+                PackedInstructionStream::from_typed_placeholder(instructions),
+            )
+            .with_frame(RegisterFrameShape {
+                num_parameters_including_this: 3,
+                num_vars: 4,
+                num_callee_locals: 4,
+                num_temporaries: 0,
+                special: Default::default(),
+            }),
+            LinkContext::default(),
+        )
+        .with_entrypoints(CodeBlockEntrypoints {
+            interpreter: Some(InterpreterEntrySlot(0)),
+            ..CodeBlockEntrypoints::default()
+        })
+        .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    // The FUSED `if (a === b)` / `if (a !== b)` forms tier up native and branch the
+    // SAME way the interpreter does — covering the strict-equality fused-branch slow
+    // path (doubles/NaN far-call the oracle) for BOTH the `===` (branch-on-Zero) and
+    // `!==` (branch-on-NonZero) directions, plus the inline int32 fast path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_strict_equality_fused_branch_tiers_up_and_matches_interpreter() {
+        use crate::jit::arm64_baseline::live_dispatch::THRESHOLD_FOR_JIT_AFTER_WARM_UP;
+        let i = RuntimeValue::from_i32;
+        let d = RuntimeValue::from_double;
+        let entry_cap = (THRESHOLD_FOR_JIT_AFTER_WARM_UP as u32) + 8;
+        let warm = vec![
+            RuntimeValue::undefined(),
+            RuntimeValue::from_i32(5),
+            RuntimeValue::from_i32(5),
+        ];
+        // operand pairs spanning the inline int32 path and the double/NaN far-call.
+        let pairs = [
+            (i(5), i(5)),
+            (i(5), i(7)),
+            (d(1.5), d(1.5)),
+            (d(1.5), d(2.5)),
+            (d(f64::NAN), d(f64::NAN)),
+        ];
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        // negate=false -> `if (a === b)`; negate=true -> `if (a !== b)`.
+        for (negate, owner_id) in [(false, 7_741u32), (true, 7_742u32)] {
+            let block = strict_eq_branch_code_block(negate);
+            let owner = CodeBlockId(CellId(owner_id));
+            vm.code_blocks.register(owner, block.clone());
+            let mut saw_install = false;
+            for _ in 0..entry_cap {
+                let _ = execute_registered_code_block_with_host_and_arguments(
+                    &mut vm,
+                    owner,
+                    &block,
+                    &mut host,
+                    warm.clone(),
+                );
+                if vm.baseline_jit_function_is_installed(owner) {
+                    saw_install = true;
+                }
+            }
+            assert!(
+                saw_install,
+                "fused strict-equality branch (negate={negate}) tiered up",
+            );
+
+            for (index, (a, b)) in pairs.into_iter().enumerate() {
+                // The op's condition X = `a === b` (===form) / `a !== b` (!==form); the
+                // bytecode is `if (X) return 10; return 20;`, so the result is 10 iff X.
+                let eq = host.operation_strict_equal(a, b);
+                let x = if negate { !eq } else { eq };
+                let expected_bits = RuntimeValue::from_i32(if x { 10 } else { 20 }).encoded().0;
+                let completion = execute_registered_code_block_with_host_and_arguments(
+                    &mut vm,
+                    owner,
+                    &block,
+                    &mut host,
+                    vec![RuntimeValue::undefined(), a, b],
+                );
+                let native_bits = match completion {
+                    ExecutionCompletion::Returned(value) => value.encoded().0,
+                    other => panic!("fused strict-eq branch did not return: {other:?}"),
+                };
+                assert_eq!(
+                    native_bits, expected_bits,
+                    "native fused branch (negate={negate}) must match interpreter (case {index})",
+                );
+            }
+        }
     }
 
     // ========================================================================

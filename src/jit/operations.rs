@@ -212,6 +212,14 @@ pub extern "C" fn operation_compare_greater(vm: *mut Vm, op1: u64, op2: u64) -> 
     dispatch_value_compare_operation(vm, op1, op2, Vm::operation_compare_greater)
 }
 
+/// `operationCompareGreaterEq` -> `jsLessEq<false>` (operands swapped).
+/// GreaterEqualInt32 member: the FUSED int32 compare-and-branch slow path the
+/// `a >= b` lowering (`emit_compare_and_jump`) far-calls when an operand is not
+/// int32 (the crypto bignum `--n >= 0` loop's non-int32 fallback).
+pub extern "C" fn operation_compare_greatereq(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    dispatch_value_compare_operation(vm, op1, op2, Vm::operation_compare_greatereq)
+}
+
 /// The SHARED body of every baseline relational slow-path shim, mirroring
 /// [`dispatch_value_binary_operation`] but yielding a boolean as 0/1 (JSC's
 /// `operationCompare*` return a `size_t`). `eval` selects the faithful relational
@@ -287,6 +295,40 @@ fn dispatch_value_truthy_operation(vm: *mut Vm, value: u64, invert: bool) -> u64
     let truthy = host.value_is_truthy(value);
     let taken = truthy ^ invert;
     if taken {
+        TRUE_RESULT
+    } else {
+        FALSE_RESULT
+    }
+}
+
+/// `operationCompareStrictEq(JSGlobalObject*, EncodedJSValue, EncodedJSValue)`
+/// (JITOperations.cpp; `JSValue::strictEqual`). The baseline `op_stricteq`/
+/// `op_nstricteq` fast path (JSC `compileOpStrictEq`, JITOpcodes.cpp:726-892)
+/// resolves int32 / non-double-non-cell-bitwise / same-pointer-cell cases inline and
+/// sends ONLY the AMBIGUOUS cases — DOUBLE operands (NaN/±0) and DIFFERENT-pointer
+/// cells (possibly equal Strings/HeapBigInts) — to this shim, which runs the faithful
+/// strict-equality evaluator and returns `===` as 0/1. Strict equality NEVER runs
+/// user code (no `valueOf`/`toString`), so it is INFALLIBLE: it never stamps
+/// `m_exception`. `op_nstricteq`/`!==` is the caller's negation of this `===` boolean
+/// (the emitter inverts the stored value / branch direction, never this shim).
+pub extern "C" fn operation_strict_equal(vm: *mut Vm, op1: u64, op2: u64) -> u64 {
+    // D5 reborrow — see the module SAFETY note. The strict-equality oracle reads
+    // only host state (the strings/symbols/bigints stores + the bitwise primitive
+    // compare); it mutates no `Vm`/heap state and cannot throw, so a SHARED `&host`
+    // reborrow suffices and there is no exception edge.
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &CoreOpcodeDispatchHost = unsafe { &*host_ptr };
+
+    let op1 = JsValue::from_encoded(EncodedJsValue(op1));
+    let op2 = JsValue::from_encoded(EncodedJsValue(op2));
+
+    if host.operation_strict_equal(op1, op2) {
         TRUE_RESULT
     } else {
         FALSE_RESULT
@@ -849,6 +891,27 @@ mod tests {
         assert_eq!(operation_compare_less(vm_ptr, three, two), FALSE_RESULT); // 3 < 2
         assert_eq!(operation_compare_lesseq(vm_ptr, three, three), TRUE_RESULT); // 3 <= 3
         assert_eq!(operation_compare_greater(vm_ptr, three, two), TRUE_RESULT); // 3 > 2
+        assert_eq!(
+            operation_compare_greatereq(vm_ptr, three, three),
+            TRUE_RESULT
+        ); // 3 >= 3
+        assert_eq!(
+            operation_compare_greatereq(vm_ptr, two, three),
+            FALSE_RESULT
+        ); // 2 >= 3
+
+        // --- strict-equal shim: returns `===` as 0/1, INFALLIBLE. The DOUBLE and
+        // NaN cases are exactly what the inline fast path far-calls (it sends every
+        // number operand here), so this proves the oracle the lowering relies on. ---
+        assert_eq!(operation_strict_equal(vm_ptr, two, two), TRUE_RESULT); // 2 === 2
+        assert_eq!(operation_strict_equal(vm_ptr, two, three), FALSE_RESULT); // 2 !== 3
+        let onepointfive = JsValue::from_double(1.5).encoded().0;
+        assert_eq!(
+            operation_strict_equal(vm_ptr, onepointfive, onepointfive),
+            TRUE_RESULT
+        ); // 1.5 === 1.5
+        let nan = JsValue::from_double(f64::NAN).encoded().0;
+        assert_eq!(operation_strict_equal(vm_ptr, nan, nan), FALSE_RESULT); // NaN !== NaN
 
         // --- truthy shim: jtrue returns truthiness, jfalse its inversion. ---
         let zero = JsValue::from_i32(0).encoded().0;

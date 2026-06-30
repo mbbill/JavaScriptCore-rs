@@ -78,12 +78,12 @@ use crate::bytecode::BytecodeIndex;
 use crate::bytecode::{CodeBlock, CoreOpcode, InstructionDecodeError, OperandAccessError};
 use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
 use crate::jit::operations::{
-    operation_call, operation_call_with_this, operation_compare_greater, operation_compare_less,
-    operation_compare_lesseq, operation_get_by_id_optimize, operation_get_by_id_with_cached_offset,
-    operation_get_by_val, operation_jfalse, operation_put_by_id_optimize,
-    operation_put_by_id_with_cached_offset, operation_put_by_val,
-    operation_resolve_baseline_native_entry, operation_throw_stack_overflow,
-    MAX_REGISTER_CALL_ARGS, MAX_REGISTER_CALL_WITH_THIS_ARGS,
+    operation_call, operation_call_with_this, operation_compare_greater,
+    operation_compare_greatereq, operation_compare_less, operation_compare_lesseq,
+    operation_get_by_id_optimize, operation_get_by_id_with_cached_offset, operation_get_by_val,
+    operation_jfalse, operation_put_by_id_optimize, operation_put_by_id_with_cached_offset,
+    operation_put_by_val, operation_resolve_baseline_native_entry, operation_strict_equal,
+    operation_throw_stack_overflow, MAX_REGISTER_CALL_ARGS, MAX_REGISTER_CALL_WITH_THIS_ARGS,
 };
 use crate::value::{JsValue, CELL_TAG, NUMBER_TAG, VALUE_TAG_MASK};
 use crate::vm::jsstack::CallFrameSlot;
@@ -374,6 +374,33 @@ enum SlowKind {
     /// (`ToBoolean`, inverted) -> 0/1, then `branchTest32(NonZero)` to the target,
     /// else resume. Infallible (no exception probe).
     TruthyBranch { shim: usize, target_bci: usize },
+    /// op_stricteq/op_nstricteq VALUE form (`compileOpStrictEq`'s slow case): far-call
+    /// `operation_strict_equal` -> `===` as 0/1, invert for `!==` (`negate`), box the
+    /// boolean (`result | ValueFalse`), store to `dst`, resume. INFALLIBLE (strict
+    /// equality never runs user code), so no exception probe.
+    StrictEqValue { shim: usize, dst: i32, negate: bool },
+    /// FUSED op_stricteq/op_nstricteq + JumpIfFalse (`compileOpStrictEqJump`'s slow
+    /// case): far-call `operation_strict_equal` -> `===` as 0/1, then branch to the
+    /// target when the op's boolean is FALSE — `branchTest32(Zero)` for `===`
+    /// (`negate==false`), `branchTest32(NonZero)` for `!==` (`negate==true`) — else
+    /// resume. INFALLIBLE (no exception probe).
+    StrictEqBranch {
+        shim: usize,
+        target_bci: usize,
+        negate: bool,
+    },
+}
+
+/// The fast-path jump lists [`FunctionEmitter::emit_strict_eq_fast_path`] leaves for
+/// the VALUE / fused-BRANCH forms to route (the analog of JSC `compileOpStrictEq`'s
+/// `equals`/`fallThrough` JumpLists + its `addSlowCase` set). Invariant after the
+/// helper returns: the emitted FALL-THROUGH path means the operands are strictly NOT
+/// equal; `equal_jumps` are taken when they ARE strictly equal; `slow_jumps` are
+/// taken for the AMBIGUOUS cases the inline path cannot decide (double operands,
+/// different-pointer cells) and must far-call the oracle for.
+struct StrictEqFastPath {
+    equal_jumps: Vec<Jump>,
+    slow_jumps: Vec<Jump>,
 }
 
 /// The thin bci-bookkeeping struct OVER the assembler `Jump`/`Label` path (S5): it
@@ -424,6 +451,14 @@ struct FunctionEmitter {
 }
 
 const MODE: TagRegistersMode = TagRegistersMode::HaveTagRegisters;
+
+/// The boxed `JSValue` bits of `true`/`false` (`ValueTrue == 0x7`/`ValueFalse ==
+/// 0x6`, JSCJSValue.h:483-488), materialized by the strict-equality VALUE form when
+/// it resolves the result inline (`moveTrustedValue(jsBoolean(...), dst)` in JSC's
+/// `compileOpStrictEq`). Derived from the SHARED runtime encoder ([`JsValue::from_bool`])
+/// so the JIT's stored boolean is bit-identical to the interpreter's.
+const VALUE_TRUE_BITS: u64 = JsValue::from_bool(true).encoded().0;
+const VALUE_FALSE_BITS: u64 = JsValue::from_bool(false).encoded().0;
 
 impl FunctionEmitter {
     fn new(
@@ -1375,6 +1410,184 @@ impl FunctionEmitter {
         });
     }
 
+    /// The SHARED strict-equality fast path (`JIT::compileOpStrictEq`,
+    /// JITOpcodes.cpp:860-891, the `!USE(BIGINT32)` JSVALUE64 arm), producing the
+    /// [`StrictEqFastPath`] jump lists the VALUE and fused-BRANCH forms route. Loads
+    /// the boxed operands into the slow-call arg registers (`x1`/`x2`, kept intact for
+    /// the far-call), then:
+    ///
+    /// ```text
+    ///   or64(lhs, rhs) -> scratch ; branchIfNotCell(scratch) -> .includesNonCell
+    ///   ; --- BOTH CELLS ---
+    ///   branch64(Equal, lhs, rhs) -> EQUAL          ; a cell is === itself
+    ///   b .slow                                     ; different cells -> oracle
+    /// .includesNonCell:
+    ///   branchIfInt32(lhs) -> .leftOk ; addSlowCase(branchIfNumber(lhs))  ; double -> oracle
+    /// .leftOk:
+    ///   branchIfInt32(rhs) -> .rightOk; addSlowCase(branchIfNumber(rhs))  ; double -> oracle
+    /// .rightOk:
+    ///   branch64(Equal, lhs, rhs) -> EQUAL          ; bitwise compare is exact `===`
+    ///   ; fall through == strictly NOT equal
+    /// ```
+    ///
+    /// FAITHFUL up to ONE documented simplification: JSC discriminates String/
+    /// HeapBigInt from the `JSCell` type-info byte (`branch8(Above, typeInfoType,
+    /// LastValueCompareCellType)`) and POINTER-COMPARES the remaining (object) cell
+    /// pairs inline. This engine does not read the type-info byte here, so it resolves
+    /// only SAME-pointer cells inline (a cell is `===` itself) and far-calls EVERY
+    /// different-pointer cell pair to the oracle — which decides object identity AND
+    /// String/HeapBigInt value equality correctly. The only cost is one extra call for
+    /// a distinct-object `===` (always `false`); correctness is unchanged. Doubles are
+    /// far-called exactly as JSC does (`addSlowCase(branchIfNumber)`): NaN/±0 make a
+    /// bitwise compare wrong, so the oracle resolves them.
+    fn emit_strict_eq_fast_path(&mut self, lhs: i32, rhs: i32) -> StrictEqFastPath {
+        // Load the boxed operands into the slow-call arg registers (x1/x2). The slow
+        // path far-calls operation_strict_equal(vm, x1, x2) with them STILL in place
+        // (nothing below this writes x1/x2 on a path that reaches a slow_jump).
+        self.h.masm_mut().load64(address_for(lhs), LEFT_GPR);
+        self.h.masm_mut().load64(address_for(rhs), RIGHT_GPR);
+        let mut equal_jumps = Vec::new();
+        let mut slow_jumps = Vec::new();
+
+        // or64(lhs, rhs) -> scratch ; branchIfNotCell(scratch): split "both cells"
+        // (fall-through) from "at least one non-cell" (JITOpcodes.cpp:863-864).
+        self.h.masm_mut().or64(LEFT_GPR, RIGHT_GPR, SCRATCH_GPR);
+        let includes_non_cell = self.h.branch_if_not_cell(SCRATCH_GPR, SCRATCH_GPR_B, MODE);
+
+        // === BOTH CELLS ===: same pointer -> a cell is === itself; different
+        // pointers -> AMBIGUOUS (possibly equal Strings/HeapBigInts) -> oracle.
+        equal_jumps.push(self.h.masm_mut().branch64(
+            RelationalCondition::Equal,
+            LEFT_GPR,
+            RIGHT_GPR,
+        ));
+        slow_jumps.push(self.h.masm_mut().jump());
+
+        // === INCLUDES A NON-CELL ===: rule out doubles (the only non-cell encoding
+        // that is not bitwise-comparable — NaN/±0), then a bitwise compare is exact
+        // `===` over the remaining int32/boolean/undefined/null/cell values
+        // (JITOpcodes.cpp:876-887).
+        let non_cell_label = self.h.masm().label();
+        self.link_fast_jumps_to(&[includes_non_cell], non_cell_label);
+
+        let left_ok = self.h.branch_if_int32(LEFT_GPR, MODE);
+        slow_jumps.push(self.h.branch_if_number(LEFT_GPR, SCRATCH_GPR_B, MODE));
+        let after_left = self.h.masm().label();
+        self.link_fast_jumps_to(&[left_ok], after_left);
+
+        let right_ok = self.h.branch_if_int32(RIGHT_GPR, MODE);
+        slow_jumps.push(self.h.branch_if_number(RIGHT_GPR, SCRATCH_GPR_B, MODE));
+        let after_right = self.h.masm().label();
+        self.link_fast_jumps_to(&[right_ok], after_right);
+
+        equal_jumps.push(self.h.masm_mut().branch64(
+            RelationalCondition::Equal,
+            LEFT_GPR,
+            RIGHT_GPR,
+        ));
+        // Fall-through here == the operands are strictly NOT equal.
+        StrictEqFastPath {
+            equal_jumps,
+            slow_jumps,
+        }
+    }
+
+    /// op_stricteq/op_nstricteq VALUE form (`JIT::emit_op_stricteq`/`_op_nstricteq`):
+    /// resolve the fast cases inline and store the boxed boolean to `dst`; far-call
+    /// `operation_strict_equal` for the ambiguous cases. `negate` selects `!==`
+    /// (`op_nstricteq`), the negation of `===`.
+    fn emit_strict_eq(&mut self, negate: bool, dst: i32, lhs: i32, rhs: i32, resume_bci: usize) {
+        let fast = self.emit_strict_eq_fast_path(lhs, rhs);
+        // `===`: equal -> true, not-equal -> false. `!==`: equal -> false, not-equal
+        // -> true.
+        let equal_bits = if negate {
+            VALUE_FALSE_BITS
+        } else {
+            VALUE_TRUE_BITS
+        };
+        let unequal_bits = if negate {
+            VALUE_TRUE_BITS
+        } else {
+            VALUE_FALSE_BITS
+        };
+
+        // Fall-through (strictly NOT equal): store the unequal boolean, jump past the
+        // equal block.
+        self.h
+            .masm_mut()
+            .move_imm64(TrustedImm64::new(unequal_bits as i64), RESULT_GPR);
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst));
+        let to_after = self.h.masm_mut().jump();
+
+        // Equal block: store the equal boolean.
+        let equal_label = self.h.masm().label();
+        self.link_fast_jumps_to(&fast.equal_jumps, equal_label);
+        self.h
+            .masm_mut()
+            .move_imm64(TrustedImm64::new(equal_bits as i64), RESULT_GPR);
+        self.h.masm_mut().store64(RESULT_GPR, address_for(dst));
+
+        // Shared continuation after both inline stores.
+        let after_label = self.h.masm().label();
+        self.link_fast_jumps_to(&[to_after], after_label);
+
+        // Slow case: the ambiguous-operand far-call (boxes + stores in the slow block).
+        self.slow.push(SlowCase {
+            fast_jumps: fast.slow_jumps,
+            resume_bci,
+            kind: SlowKind::StrictEqValue {
+                shim: operation_strict_equal as usize,
+                dst,
+                negate,
+            },
+        });
+    }
+
+    /// FUSED op_stricteq/op_nstricteq + JumpIfFalse (`JIT::emit_op_jstricteq`/
+    /// `_op_jnstricteq` via `compileOpStrictEqJump`): branch to `target_bci` when the
+    /// op's boolean is FALSE (the bytecode is `strict-eq ; JumpIfFalse`), else fall
+    /// through to `resume_bci`. Materializes NO value for the comparison's dst (the
+    /// fusion deadness guard proved it dead). `negate` selects the `!==` form.
+    fn emit_strict_eq_and_jump(
+        &mut self,
+        negate: bool,
+        lhs: i32,
+        rhs: i32,
+        target_bci: usize,
+        resume_bci: usize,
+    ) {
+        let fast = self.emit_strict_eq_fast_path(lhs, rhs);
+        // The branch is taken when the op's boolean is FALSE:
+        //   `===` false  <=> operands strictly NOT equal (the fall-through here),
+        //   `!==` false  <=> operands ARE strictly equal (the `equal_jumps`).
+        let (fallthrough_dest, equal_dest) = if negate {
+            (resume_bci, target_bci) // !==: not-equal -> resume ; equal -> target
+        } else {
+            (target_bci, resume_bci) // ===: not-equal -> target ; equal -> resume
+        };
+
+        // Fall-through (strictly NOT equal).
+        let to_fallthrough = self.h.masm_mut().jump();
+        self.jumps.push((to_fallthrough, fallthrough_dest));
+
+        // Equal block.
+        let equal_label = self.h.masm().label();
+        self.link_fast_jumps_to(&fast.equal_jumps, equal_label);
+        let to_equal = self.h.masm_mut().jump();
+        self.jumps.push((to_equal, equal_dest));
+
+        // Slow case (ambiguous operands): far-call the oracle, branch on its result.
+        self.slow.push(SlowCase {
+            fast_jumps: fast.slow_jumps,
+            resume_bci,
+            kind: SlowKind::StrictEqBranch {
+                shim: operation_strict_equal as usize,
+                target_bci,
+                negate,
+            },
+        });
+    }
+
     /// op_jmp (`emit_op_jmp`): an unconditional `b` to a bytecode-index target.
     fn emit_op_jmp(&mut self, target_bci: usize) {
         let branch = self.h.masm_mut().jump();
@@ -1540,6 +1753,51 @@ impl FunctionEmitter {
                     let to_resume = self.h.masm_mut().jump();
                     self.jumps.push((to_resume, case.resume_bci));
                 }
+                SlowKind::StrictEqValue { shim, dst, negate } => {
+                    // lhs/rhs still in x1/x2 (the fast path never wrote them on a slow
+                    // edge). operation_strict_equal is INFALLIBLE -> no exception probe.
+                    // x0 = `===` as 0/1.
+                    self.h.masm_mut().far_call(TrustedImm64::new(shim as i64));
+                    // `!==` = the negation: result ^= 1 before boxing.
+                    if negate {
+                        self.h
+                            .masm_mut()
+                            .move_imm32(TrustedImm32::new(1), SCRATCH_GPR);
+                        self.h.masm_mut().xor64(RESULT_GPR, SCRATCH_GPR, RESULT_GPR);
+                    }
+                    // boxBoolean: a JS boolean is `result | ValueFalse` (0 -> 0x6 false,
+                    // 1 -> 0x7 true), the JSVALUE64 `JIT::boxBoolean` (GPRInfo.h).
+                    self.h
+                        .masm_mut()
+                        .move_imm64(TrustedImm64::new(VALUE_FALSE_BITS as i64), SCRATCH_GPR);
+                    self.h.masm_mut().or64(RESULT_GPR, SCRATCH_GPR, RESULT_GPR);
+                    self.h.masm_mut().store64(RESULT_GPR, address_for(dst));
+                    let to_resume = self.h.masm_mut().jump();
+                    self.jumps.push((to_resume, case.resume_bci));
+                }
+                SlowKind::StrictEqBranch {
+                    shim,
+                    target_bci,
+                    negate,
+                } => {
+                    // lhs/rhs still in x1/x2. operation_strict_equal is INFALLIBLE -> no
+                    // exception probe. x0 = `===` as 0/1; branch to the target when the
+                    // op's boolean is FALSE: `===` false <=> x0 == 0 (Zero); `!==` false
+                    // <=> `===` true <=> x0 != 0 (NonZero).
+                    self.h.masm_mut().far_call(TrustedImm64::new(shim as i64));
+                    let take_branch_cond = if negate {
+                        ResultCondition::NonZero
+                    } else {
+                        ResultCondition::Zero
+                    };
+                    let to_target =
+                        self.h
+                            .masm_mut()
+                            .branch_test32(take_branch_cond, RESULT_GPR, RESULT_GPR);
+                    self.jumps.push((to_target, target_bci));
+                    let to_resume = self.h.masm_mut().jump();
+                    self.jumps.push((to_resume, case.resume_bci));
+                }
             }
         }
     }
@@ -1556,12 +1814,13 @@ impl FunctionEmitter {
 
 /// Map a relational `CoreOpcode` to the INVERTED branch condition for the fused
 /// `relational ; JumpIfFalse` pair (the branch is taken when the comparison is
-/// false): `<` -> `>=`, `<=` -> `>`, `>` -> `<=`.
+/// false): `<` -> `>=`, `<=` -> `>`, `>` -> `<=`, `>=` -> `<`.
 fn inverted_relational(op: CoreOpcode) -> RelationalCondition {
     match op {
         CoreOpcode::LessThanInt32 => RelationalCondition::GreaterThanOrEqual,
         CoreOpcode::LessEqualInt32 => RelationalCondition::GreaterThan,
         CoreOpcode::GreaterThanInt32 => RelationalCondition::LessThanOrEqual,
+        CoreOpcode::GreaterEqualInt32 => RelationalCondition::LessThan,
         _ => unreachable!("inverted_relational only handles the fused relational set"),
     }
 }
@@ -1574,16 +1833,33 @@ fn compare_shim(op: CoreOpcode) -> usize {
         CoreOpcode::LessThanInt32 => operation_compare_less as usize,
         CoreOpcode::LessEqualInt32 => operation_compare_lesseq as usize,
         CoreOpcode::GreaterThanInt32 => operation_compare_greater as usize,
+        CoreOpcode::GreaterEqualInt32 => operation_compare_greatereq as usize,
         _ => unreachable!("compare_shim only handles the fused relational set"),
     }
 }
 
-/// The Stage-1 fused relational set (== JSC `op_jless`/`op_jlesseq`/`op_jgreater`).
+/// The Stage-1 fused relational set (== JSC `op_jless`/`op_jlesseq`/`op_jgreater`/
+/// `op_jgreatereq`). `GreaterEqualInt32` joins the set so the crypto bignum
+/// `--n >= 0` loop condition lowers to a native `cmp` + branch.
 fn is_fusible_relational(op: CoreOpcode) -> bool {
     matches!(
         op,
-        CoreOpcode::LessThanInt32 | CoreOpcode::LessEqualInt32 | CoreOpcode::GreaterThanInt32
+        CoreOpcode::LessThanInt32
+            | CoreOpcode::LessEqualInt32
+            | CoreOpcode::GreaterThanInt32
+            | CoreOpcode::GreaterEqualInt32
     )
+}
+
+/// The strict-equality opcode set (`op_stricteq`/`op_nstricteq`); `negate` for the
+/// `!==` form. Both lower via the strict-equality fast path; standalone (value) and
+/// fused-with-JumpIfFalse forms are both admitted.
+fn strict_equality_negate(op: CoreOpcode) -> Option<bool> {
+    match op {
+        CoreOpcode::StrictEqual => Some(false),
+        CoreOpcode::StrictNotEqual => Some(true),
+        _ => None,
+    }
 }
 
 /// Map a binary arith `CoreOpcode` to its [`ArithFamilyOp`], or `None` if it is
@@ -1762,14 +2038,15 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
             .decoded_at(BytecodeIndex::from_offset(bci as u32))?;
         let op = CoreOpcode::from_opcode(decoded.opcode).ok_or(EmitFunctionError::UnknownOpcode)?;
 
-        // FUSION: a relational op immediately followed by `JumpIfFalse` reading its
-        // result == JSC's fused `op_jless`/`op_jnless` (DIVERGENCE #2). The fused
-        // branch materializes NO value for the comparison's dst, so it is only sound
-        // when that dst is DEAD after the pair (see `register_used_from`); otherwise
-        // we do NOT fuse and fall through to the relational reject arm so the S4 gate
-        // DECLINES the CodeBlock (a later read of the boolean would otherwise observe
-        // the stale op_enter `undefined` slot — a silent mis-compile).
-        if is_fusible_relational(op) && bci + 1 < count {
+        // FUSION: a relational OR strict-equality op immediately followed by
+        // `JumpIfFalse` reading its result == JSC's fused `op_jless`/`op_jnless`
+        // (DIVERGENCE #2) and `op_jstricteq`/`op_jnstricteq`. The fused branch
+        // materializes NO value for the comparison's dst, so it is only sound when
+        // that dst is DEAD after the pair (see `register_used_from`); otherwise we do
+        // NOT fuse and fall through to the standalone (value) arm — relational reject /
+        // strict-equality value form — so a later read of the boolean observes the
+        // materialized value, never the stale op_enter `undefined` slot.
+        if (is_fusible_relational(op) || strict_equality_negate(op).is_some()) && bci + 1 < count {
             let next_op = core_opcode_at(code_block, bci + 1)?;
             let cmp_dst = decoded.register_operand(0)?;
             if next_op == CoreOpcode::JumpIfFalse {
@@ -1784,7 +2061,12 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                     let lhs = frame_slot(decoded.register_operand(1)?)?;
                     let rhs = frame_slot(decoded.register_operand(2)?)?;
                     let target_bci = next.bytecode_index_operand(1)?.offset() as usize;
-                    emitter.emit_compare_and_jump(op, lhs, rhs, target_bci, bci + 2);
+                    match strict_equality_negate(op) {
+                        Some(negate) => {
+                            emitter.emit_strict_eq_and_jump(negate, lhs, rhs, target_bci, bci + 2)
+                        }
+                        None => emitter.emit_compare_and_jump(op, lhs, rhs, target_bci, bci + 2),
+                    }
                     // The folded JumpIfFalse site: label it just after the fused
                     // branch so the labels-by-bci table stays fully populated.
                     emitter.labels[bci + 1] = Some(emitter.h.masm().label());
@@ -1987,11 +2269,25 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
             // op_loop_hint is a tier-up/OSR marker with no value effect (the
             // interpreter treats it as Continue); emit nothing, fall through.
             CoreOpcode::LoopHint => {}
+            // op_stricteq / op_nstricteq VALUE form (not fused with a JumpIfFalse):
+            // operand order matches the interpreter dispatch (interpreter/mod.rs:
+            // 7271-7290): (dst, lhs, rhs). Produces a boxed boolean in `dst` via the
+            // strict-equality fast path; ambiguous operands far-call the oracle.
+            CoreOpcode::StrictEqual | CoreOpcode::StrictNotEqual => {
+                let negate = strict_equality_negate(op).expect("arm matches strict-equality set");
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let lhs = frame_slot(decoded.register_operand(1)?)?;
+                let rhs = frame_slot(decoded.register_operand(2)?)?;
+                emitter.emit_strict_eq(negate, dst, lhs, rhs, bci + 1);
+            }
             // A relational op NOT fused with a JumpIfFalse needs the deferred
-            // boolean-producing (cset) lowering; reject it (S4 gate).
+            // boolean-producing (cset) lowering; reject it (S4 gate). `GreaterEqualInt32`
+            // is fusion-only here too (its fused form lowers above); a STANDALONE `>=`
+            // value is declined like the other standalone relationals.
             CoreOpcode::LessThanInt32
             | CoreOpcode::LessEqualInt32
-            | CoreOpcode::GreaterThanInt32 => {
+            | CoreOpcode::GreaterThanInt32
+            | CoreOpcode::GreaterEqualInt32 => {
                 return Err(EmitFunctionError::StandaloneRelational(op));
             }
             other => return Err(EmitFunctionError::UnsupportedOpcode(other)),
@@ -2388,6 +2684,118 @@ mod tests {
         assert!(
             emit_baseline_function(&code_block, 0x1000, 0x2000).is_ok(),
             "a double-literal arith function tiers up (LoadDouble admitted)"
+        );
+    }
+
+    // ALLOWLIST EXTENSION (structural oracle, every platform): the strict-equality
+    // VALUE form (`a === b` / `a !== b`) is now ADMITTED by the S4 gate.
+    //   0 StrictEqual r, a, b   1 ret r        a=ARG0 b=ARG1 r=LOCAL0
+    #[test]
+    fn strict_equality_value_form_is_admitted_by_the_allowlist() {
+        let eq = build_code_block(vec![
+            instr(
+                CoreOpcode::StrictEqual,
+                vec![reg(LOCAL0), reg(ARG0), reg(ARG1)],
+                0,
+            ),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+        ]);
+        assert!(
+            emit_baseline_function(&eq, 0x1000, 0x2000).is_ok(),
+            "`a === b` (StrictEqual value form) tiers up"
+        );
+
+        let neq = build_code_block(vec![
+            instr(
+                CoreOpcode::StrictNotEqual,
+                vec![reg(LOCAL0), reg(ARG0), reg(ARG1)],
+                0,
+            ),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+        ]);
+        assert!(
+            emit_baseline_function(&neq, 0x1000, 0x2000).is_ok(),
+            "`a !== b` (StrictNotEqual value form) tiers up"
+        );
+    }
+
+    // ALLOWLIST EXTENSION: the FUSED strict-equality + JumpIfFalse forms
+    // (`op_jstricteq`/`op_jnstricteq`) are ADMITTED. `if (a === b) return 1; return 2;`
+    //   0 StrictEqual r,a,b  1 jfalse r->4  2 t=1  3 ret t  4 t=2  5 ret t  (r DEAD)
+    #[test]
+    fn strict_equality_fused_with_jump_is_admitted_by_the_allowlist() {
+        let make = |op: CoreOpcode| {
+            build_code_block(vec![
+                instr(op, vec![reg(LOCAL0), reg(ARG0), reg(ARG1)], 0),
+                instr(
+                    CoreOpcode::JumpIfFalse,
+                    vec![reg(LOCAL0), jump_target(4)],
+                    1,
+                ),
+                instr(CoreOpcode::LoadInt32, vec![reg(LOCAL1), imm(1)], 2),
+                instr(CoreOpcode::Return, vec![reg(LOCAL1)], 3),
+                instr(CoreOpcode::LoadInt32, vec![reg(LOCAL1), imm(2)], 4),
+                instr(CoreOpcode::Return, vec![reg(LOCAL1)], 5),
+            ])
+        };
+        assert!(
+            emit_baseline_function(&make(CoreOpcode::StrictEqual), 0x1000, 0x2000).is_ok(),
+            "`if (a === b)` (fused op_jstricteq) tiers up"
+        );
+        assert!(
+            emit_baseline_function(&make(CoreOpcode::StrictNotEqual), 0x1000, 0x2000).is_ok(),
+            "`if (a !== b)` (fused op_jnstricteq) tiers up"
+        );
+    }
+
+    // ALLOWLIST EXTENSION: the FUSED `GreaterEqualInt32` + JumpIfFalse (the crypto
+    // bignum `--n >= 0` loop shape) is ADMITTED, but a STANDALONE `>=` value is still
+    // DECLINED like the other standalone relationals (the GE admission is fusion-only).
+    //   0 zero=0  1 cmp=(n>=zero)  2 jfalse cmp->6  3 one=1  4 n-=one  5 jmp->1  6 ret n
+    #[test]
+    fn greater_equal_int32_fusion_is_admitted_standalone_is_declined() {
+        let loop_block = build_code_block(vec![
+            instr(CoreOpcode::LoadInt32, vec![reg(LOCAL0), imm(0)], 0),
+            instr(
+                CoreOpcode::GreaterEqualInt32,
+                vec![reg(LOCAL1), reg(ARG0), reg(LOCAL0)],
+                1,
+            ),
+            instr(
+                CoreOpcode::JumpIfFalse,
+                vec![reg(LOCAL1), jump_target(6)],
+                2,
+            ),
+            instr(CoreOpcode::LoadInt32, vec![reg(LOCAL2), imm(1)], 3),
+            instr(
+                CoreOpcode::SubInt32,
+                vec![reg(ARG0), reg(ARG0), reg(LOCAL2)],
+                4,
+            ),
+            instr(CoreOpcode::Jump, vec![jump_target(1)], 5),
+            instr(CoreOpcode::Return, vec![reg(ARG0)], 6),
+        ]);
+        assert!(
+            emit_baseline_function(&loop_block, 0x1000, 0x2000).is_ok(),
+            "`n >= 0` fused with JumpIfFalse (crypto bignum loop) tiers up"
+        );
+
+        let standalone = build_code_block(vec![
+            instr(
+                CoreOpcode::GreaterEqualInt32,
+                vec![reg(LOCAL0), reg(ARG0), reg(ARG1)],
+                0,
+            ),
+            instr(CoreOpcode::Return, vec![reg(LOCAL0)], 1),
+        ]);
+        assert!(
+            matches!(
+                emit_baseline_function(&standalone, 0x1000, 0x2000),
+                Err(EmitFunctionError::StandaloneRelational(
+                    CoreOpcode::GreaterEqualInt32
+                ))
+            ),
+            "a standalone `>=` value is declined (fusion-only admission)"
         );
     }
 
