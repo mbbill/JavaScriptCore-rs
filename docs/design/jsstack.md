@@ -74,8 +74,20 @@ emitted-offset change) so it doesn't calcify into the rejected private-register-
   Reversible: the `Vec` is still dual-written; reads fall back to it when the
   shadow is inactive (overflow / mmap fail / non-unix / raw-native bypass, which
   disables the shadow). FOLLOW-UP B4b/B6: drop the `Vec` once green suite-wide.
-- **B5:** frame push/pop = prologue/epilogue (move sp in-arena); overlapping outgoing/incoming
-  arg region (copy-first acceptable until tail-calls/varargs need the CallFrameShuffler).
+- **B5 (RATIFIED 2026-06-29 — Path B, the faithful doVMEntry sp-switch):** the baseline-JIT entry
+  routes through the real SP/FP-switching trampoline (`platform/unix_arm64_jsc_stack_dispatch.rs`,
+  `_jsc_rs_arm64_jsc_stack_trampoline`: `mov sp,x1; mov x29,x2; blr`) so the HARDWARE sp becomes the
+  arena callee `CallFrame` and x29 derives from sp; the emitter prologue flips from the divergent
+  `mov fp,x1` (Path A: x1 = arena fp carried by a plain C-ABI call, hardware sp = the native C stack,
+  unrelated to the register window) to the faithful `emitFunctionPrologue`
+  (`ARM64_JSC_BASELINE_GENERATED_PROLOGUE_BYTES` = `stp fp,lr,[sp,#-16]!; mov fp,sp`, `entry_prologue.rs`)
+  + epilogue (`mov sp,fp; ldp fp,lr; ret`). **RATIONALE:** native JS→JS call/ret chaining (the R-lever,
+  op_call STEP 2) requires the hardware sp = the JS stack; Path A structurally cannot `bl` to a callee
+  entry — which is WHY op_call is a slow-call `far_call(operation_call)` today. The faithful entry is
+  already tested (`validate_jsc_baseline_generated_entry_contract`) but NOT the live path. Cutover is ONE
+  atomic serial unit (trampoline-route + prologue/epilogue flip + arg-seed migration), gated on every
+  existing JIT-execution test staying green + the Vec byte-oracle. First cut = no-arity entry; overlapping
+  outgoing/incoming arg region copy-first until tail-calls/varargs need the CallFrameShuffler.
 - **B6 (megafile, serial):** retire `CallFrameId(u32)` (~401 refs) — Stage A offset-backed
   bridge (all refs compile) → Stage B generation-tagged FrameAddress newtype → Stage C delete
   `Vec<InstalledCallFrame>`. Leaves first, megafiles last.
@@ -86,9 +98,8 @@ emitted-offset change) so it doesn't calcify into the rejected private-register-
 - CallFrameId generation-tag scheme vs "id only compared while frame live" (audit
   ShadowChicken/inspector/dfg first).
 - Arena size (CLoopStack uses maxPerThreadStackUsage 5MB + soft-reserved 128KB).
-- **Duplicate-trampoline canonicalization (B4):** `platform/unix_arm64_jsc_stack_dispatch.rs`
-  is the only real SP/FP-switching asm trampoline; `vm/arm64_native_entry/jsc_stack_dispatch.rs`
-  is a complementary request-PROOF layer (NOT a duplicate). Decide whether the proof layer is
-  the canonical request producer or is retired in favor of producing the request from the
-  seeding path.
+- **Duplicate-trampoline canonicalization (B4) — RESOLVED 2026-06-29 (part of the B5 Path-B cutover):**
+  the real SP/FP-switching trampoline (`platform/unix_arm64_jsc_stack_dispatch.rs`) is CANONICAL; the
+  entry request is produced from the SEEDING path (`try_seed_entry_frame` positions the arena `CallFrame`)
+  routed through it. The proof layer (`vm/arm64_native_entry/jsc_stack_dispatch.rs`) is subordinated to a test.
 - B5 overlapping-arg timing (copy-first vs true overlap + CallFrameShuffler).
