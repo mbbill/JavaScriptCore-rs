@@ -335,7 +335,7 @@ mod tests {
                             slot: profile_slot,
                             kind: ValueProfileBucketKind::Sample,
                         }],
-                        prediction: crate::bytecode::SpeculatedTypeSet(0),
+                        prediction: crate::bytecode::SPEC_NONE,
                         update_policy: crate::bytecode::ProfileUpdatePolicy::ConcurrentBuckets,
                     }],
                     root_metadata: vec![ValueProfileRootMetadata::for_profile_slot(

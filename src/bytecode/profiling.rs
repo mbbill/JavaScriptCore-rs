@@ -2,12 +2,13 @@ use crate::bytecode::code_block::{BitVectorRef, BytecodeIndex, Checkpoint, Runti
 use crate::bytecode::gc::{BytecodeRootMapId, BytecodeRootSlotKind};
 use crate::bytecode::origin::CodeOrigin;
 use crate::bytecode::register::VirtualRegister;
+use crate::bytecode::speculated_type::SpeculatedType;
 use crate::gc::{RootKind, RootSetMutationAuthority, StructureId};
 use crate::value::{EncodedJsValue, JsValue};
 
 pub const VALUE_PROFILE_FIRST_OFFSET: u32 = 1;
 pub const VALUE_PROFILE_RAW_BUCKET_BYTES: u32 = core::mem::size_of::<EncodedJsValue>() as u32;
-pub const VALUE_PROFILE_PREDICTION_BYTES: u32 = core::mem::size_of::<SpeculatedTypeSet>() as u32;
+pub const VALUE_PROFILE_PREDICTION_BYTES: u32 = core::mem::size_of::<SpeculatedType>() as u32;
 pub const VALUE_PROFILE_RECORD_BYTES: u32 =
     VALUE_PROFILE_RAW_BUCKET_BYTES + VALUE_PROFILE_PREDICTION_BYTES;
 pub const VALUE_PROFILE_FIRST_BUCKET_OFFSET: i32 = 0;
@@ -20,7 +21,7 @@ pub struct ValueProfile {
     pub checkpoint: Checkpoint,
     pub operand: Option<VirtualRegister>,
     pub buckets: Vec<ValueProfileBucket>,
-    pub prediction: SpeculatedTypeSet,
+    pub prediction: SpeculatedType,
     pub update_policy: ProfileUpdatePolicy,
 }
 
@@ -37,10 +38,6 @@ pub enum ValueProfileBucketKind {
     Argument,
     CatchValue,
 }
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct SpeculatedTypeSet(pub u64);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum ProfileUpdatePolicy {
@@ -143,7 +140,7 @@ pub struct ValueProfileJitStoreTarget {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct UnlinkedValueProfile {
-    pub prediction: SpeculatedTypeSet,
+    pub prediction: SpeculatedType,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1488,7 +1485,7 @@ mod tests {
                     slot,
                     kind: ValueProfileBucketKind::Sample,
                 }],
-                prediction: SpeculatedTypeSet(0),
+                prediction: crate::bytecode::SPEC_NONE,
                 update_policy: ProfileUpdatePolicy::ConcurrentBuckets,
             }],
             root_metadata: vec![ValueProfileRootMetadata::for_profile_slot(
@@ -1539,7 +1536,7 @@ mod tests {
                     slot,
                     kind: ValueProfileBucketKind::Sample,
                 }],
-                prediction: SpeculatedTypeSet(0),
+                prediction: crate::bytecode::SPEC_NONE,
                 update_policy: ProfileUpdatePolicy::ConcurrentBuckets,
             }],
             ..ValueProfileTable::default()
@@ -1619,7 +1616,7 @@ mod tests {
                     slot,
                     kind: ValueProfileBucketKind::Sample,
                 }],
-                prediction: SpeculatedTypeSet(0),
+                prediction: crate::bytecode::SPEC_NONE,
                 update_policy: ProfileUpdatePolicy::ConcurrentBuckets,
             }],
             ..ValueProfileTable::default()
@@ -1656,7 +1653,7 @@ mod tests {
                     slot,
                     kind: ValueProfileBucketKind::Sample,
                 }],
-                prediction: SpeculatedTypeSet(0),
+                prediction: crate::bytecode::SPEC_NONE,
                 update_policy: ProfileUpdatePolicy::ConcurrentBuckets,
             }],
             jit_storage: ValueProfileJitStorage {
@@ -1712,7 +1709,7 @@ mod tests {
                         slot: RuntimeSlot(1),
                         kind: ValueProfileBucketKind::Sample,
                     }],
-                    prediction: SpeculatedTypeSet(0),
+                    prediction: crate::bytecode::SPEC_NONE,
                     update_policy: ProfileUpdatePolicy::ConcurrentBuckets,
                 },
                 ValueProfile {
@@ -1723,7 +1720,7 @@ mod tests {
                         slot: RuntimeSlot(2),
                         kind: ValueProfileBucketKind::Sample,
                     }],
-                    prediction: SpeculatedTypeSet(0),
+                    prediction: crate::bytecode::SPEC_NONE,
                     update_policy: ProfileUpdatePolicy::ConcurrentBuckets,
                 },
             ],
@@ -1805,7 +1802,7 @@ mod tests {
                     slot,
                     kind: ValueProfileBucketKind::Sample,
                 }],
-                prediction: SpeculatedTypeSet(0),
+                prediction: crate::bytecode::SPEC_NONE,
                 update_policy: ProfileUpdatePolicy::ConcurrentBuckets,
             }],
             ..ValueProfileTable::default()

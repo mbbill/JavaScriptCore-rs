@@ -43,12 +43,13 @@ use crate::bytecode::metadata::{InstructionMetadataPlan, MetadataLayout, Metadat
 use crate::bytecode::opcode::{CoreOpcode, MetadataFieldSpec, Opcode, OpcodeSchemaVersion};
 use crate::bytecode::origin::{CodeOrigin, CodeOriginTable, SourceNoteLookup};
 use crate::bytecode::profiling::{
-    ArrayProfile, ProfileUpdatePolicy, ProfilingCounterSet, SpeculatedTypeSet,
-    UnlinkedValueProfile, ValueProfile, ValueProfileBucket, ValueProfileBucketKind,
-    ValueProfileBucketSample, ValueProfileEmissionCapability, ValueProfileEmissionPolicy,
-    ValueProfileSampleError, ValueProfileTable,
+    ArrayProfile, ProfileUpdatePolicy, ProfilingCounterSet, UnlinkedValueProfile, ValueProfile,
+    ValueProfileBucket, ValueProfileBucketKind, ValueProfileBucketSample,
+    ValueProfileEmissionCapability, ValueProfileEmissionPolicy, ValueProfileSampleError,
+    ValueProfileTable,
 };
 use crate::bytecode::register::{RegisterFrameShape, SpecialRegisters, VirtualRegister};
+use crate::bytecode::speculated_type::SPEC_NONE;
 
 pub const BYTECODE_INDEX_CHECKPOINTS: u8 = 4;
 const BYTECODE_INDEX_CHECKPOINT_MASK: u32 = BYTECODE_INDEX_CHECKPOINTS as u32 - 1;
@@ -3384,7 +3385,7 @@ fn derive_call_result_value_profiles(
                 slot,
                 kind: ValueProfileBucketKind::Sample,
             }],
-            prediction: SpeculatedTypeSet(0),
+            prediction: SPEC_NONE,
             update_policy: ProfileUpdatePolicy::ConcurrentBuckets,
         });
         table

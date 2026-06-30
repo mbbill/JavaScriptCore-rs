@@ -128,15 +128,16 @@ pub use origin::{
 pub use profiling::{
     ArithProfile, ArrayModes, ArrayProfile, ArrayProfileFlags, BytecodeExecutionCounter,
     ControlFlowProfileRecord, CountingVariant, ExecutionCounterState, LoopOsrCounter,
-    ObservedResults, ObservedType, ProfileUpdatePolicy, ProfilingCounterSet, SpeculatedTypeSet,
-    TypeProfilerRecord, UnlinkedValueProfile, ValueProfile, ValueProfileBucket,
-    ValueProfileBucketKind, ValueProfileBucketSample, ValueProfileEmissionCapability,
-    ValueProfileEmissionPolicy, ValueProfileJitBucketBinding, ValueProfileJitStorageGeneration,
-    ValueProfileJitStoreTarget, ValueProfileRootMetadata, ValueProfileRootValidationError,
-    ValueProfileSampleError, ValueProfileTable,
+    ObservedResults, ObservedType, ProfileUpdatePolicy, ProfilingCounterSet, TypeProfilerRecord,
+    UnlinkedValueProfile, ValueProfile, ValueProfileBucket, ValueProfileBucketKind,
+    ValueProfileBucketSample, ValueProfileEmissionCapability, ValueProfileEmissionPolicy,
+    ValueProfileJitBucketBinding, ValueProfileJitStorageGeneration, ValueProfileJitStoreTarget,
+    ValueProfileRootMetadata, ValueProfileRootValidationError, ValueProfileSampleError,
+    ValueProfileTable,
 };
 pub use register::{
     RegisterClass, RegisterFrameShape, RegisterOperandEncoding, RegisterOperandWidth,
     SpecialRegisters, TemporaryLifetime, TemporaryRegister, ThisArgumentOffset, VirtualRegister,
     FIRST_CONSTANT_REGISTER_INDEX, INVALID_VIRTUAL_REGISTER,
 };
+pub use speculated_type::{SpeculatedType, SPEC_NONE};

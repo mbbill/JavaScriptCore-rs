@@ -6,12 +6,11 @@
 //! `bytecode/SpeculatedType.cpp` (the producers `speculationFrom{Value,Cell,
 //! Structure,ClassInfoInheritance,JSType}` and `dumpSpeculation`).
 //!
-//! This is an ADDITIVE, UNWIRED module (`#![allow(dead_code)]`). It is the
-//! faithful replacement-in-waiting for the DIVERGENT lattice enum at
-//! `src/dfg/speculation.rs:13` (`SpeculatedType`) and the bare `u64` newtype at
-//! `src/bytecode/profiling.rs:43` (`SpeculatedTypeSet`). Canonicalizing those two
-//! onto this bitset is a SERIAL decision owned by the orchestrator; this module
-//! does not touch `src/dfg/` or `src/bytecode/profiling.rs`.
+//! This is a PARTIALLY WIRED module (`#![allow(dead_code)]`): bytecode
+//! `ValueProfile`/`UnlinkedValueProfile` prediction storage now uses this
+//! canonical `SpeculatedType` alias, matching JSC `ValueProfile::m_prediction`.
+//! The DIVERGENT lattice enum at `src/dfg/speculation.rs:13` (`SpeculatedType`)
+//! and DOMJIT remain intentionally out of scope for this batch.
 //!
 //! C++ `typedef uint64_t SpeculatedType` (SpeculatedType.h:46) is mirrored as a
 //! plain `u64` type alias so the merge protocol stays literal `left | right` and
