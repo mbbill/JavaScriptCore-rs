@@ -158,8 +158,8 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   the old P6/P15 byte-blob re-interpreter lane is DEAD (retirement = STEP 5/6 off-gate hygiene, see design doc).
 - [done] op_call SLOW path EXECUTES (far_call operation_call; U5-verified sound; K1 real CodeBlock* + parking;
   native==interp incl. boxed-double/throw/2-deep). Now the SLOW path beneath A1.2's native fast path (below).
-- [done] **GATE-CAPABILITY SET**: int+double arith + LoadDouble + typed-array get/put_by_val (slow-call IC)
-  + op_call all EXECUTE native → asm.js functions can tier up WHOLE.
+- [partial] GATE-CAPABILITY SET: native arith/LoadDouble/typed-array get/put_by_val/op_call exist, but
+  asm.js still DNF under execoff (5 opcode declines + op_urshift fix); flip deferred (dfg-path.md).
 - [done] **STACK MODEL DECIDED + A1.0–A1.3 LANDED — the baseline JIT runs on the NATIVE machine stack + the
   FIRST JIT→JIT NATIVE CALL works** (faithful Option A, judge-panel ratified; jsstack.md "B5/STACK MODEL").
   A1.0/A1.1: prologue flipped to `push_pair(fp,lr); mov fp,sp`, entry seeded on the native stack via the sibling
@@ -172,19 +172,18 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   JIT'd (else operation_call slow path; resolver returns 0 for host/constructor/arity-mismatch — faithful). The
   cell-free gate is LIFTED (A1.5 roots native frames). MEASURED ~39× vs interp on a call probe (native ≪ interp;
   the 39× is pre-GC-interp-inflated, not steady-state); native==interp==oracle. BYPASSES the generated-* arbiter.
-  **NEXT R-LEVER: native-lowering BREADTH (property ICs get_by_id/put_by_id = K2 + more opcodes)** so real
-  property-heavy Octane hot functions tier up + run native → re-measure → flip default (held) → R moves.
-  Follow-ups: CallLinkInfo monomorphic cache (skips the per-call resolve; needs visitWeak/U7); write codeBlock@2
-  / re-park per native frame before a callee slow path reads the current CodeBlock.
+  LATE-5: execoff/interp geomean ~1.086 (net win, mixed) but still ~1e-3 vs C++; next R-lever is the
+  DFG precursor set, not baseline breadth. Deferred local wins: CallLinkInfo cache/opcode admits; cheap
+  exception = remaining parked-CodeBlock divergence in global get/put shims.
 - [measured 06-29 / CONFIRMED DIVERGENCE — docs/design/baseline-call-tier-divergence.md] the OLD generated-*
   call/tier layer (generated_executor RE-INTERPRETER + VmGeneratedDirectCallTransactionRoute arbiter + P6X86_64
   entry) is a NET REGRESSION (geomean ~0.64x opt-in, default flip HELD) with NO JSC counterpart (C++ grep = 0).
   The faithful native path (A1.x above: CallLinkInfo + native-stack bl) now BYPASSES it. Plan: broaden the
   faithful path → beats interp → flip default; then delete the dead generated-* cluster (STEP 5) + de-megafile
   35k tiering.rs (STEP 6, off-gate). STEP 1 (collapse the slow-path dispatch onto CallLinkInfo) = R-neutral cleanup.
-- [missing] bytecode-stream cutover + baseline profiling emission (ValueProfile/ArithProfile, a DFG
-  prereq downstream of R4/calls broadening the allowlist).
-- [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
+- [wip] DFG precursor set (docs/design/dfg-path.md): live packed-bytecode stream cutover (serial, #1
+  representation divergence), SpeculatedType canonicalization, profile population, and baseline-as-bailout audit.
+- [missing] DFG proper (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
 
 ## Structural fidelity
 - [done] Phase E: interpreter/mod.rs 41k→33k, all 4 runtime-class stores split to interpreter/*_store.rs.

@@ -9,12 +9,13 @@ keep it the plan, not history — history is `git log`). Keystone *designs* live
 on JetStream 3 Octane, same machine/inputs/scoring, **all 15 benches passing first**.
 Until all 15 complete+validate the suite yields no geomean and R is undefined.
 
-**The one load-bearing fact:** the measured scoreboard (README) shows compute-bound
-`r_i` at 5e-4–2e-3 (~500–6000× slower than C++), and the 3 failing benches are asm.js
-(can't complete under the interpreter) + a correctness bug. **Both the parity gap and
-the completion gate are gated on the optimizing JIT.** That is why the priority order
-below is the JIT dependency chain, not "fix more benches" — and any work off that
-chain must justify itself with a hard dependency (Principle #1).
+**The one load-bearing fact:** the native baseline JIT now beats the interpreter on the
+5 compute/call benches (LATE-5 geomean execoff/interp ~1.086), proving native execution
+is real, but the interpreter is still ~500–6000× slower than local C++ `jsc`, so this
+is still around the ~1e-3 floor. **R ≥ 1.0 lives in the optimizing JIT (DFG → FTL/B3).**
+That is why the priority order below is the JIT dependency chain, not "fix more benches"
+or "flip a still-floor default" — and any work off that chain must justify itself with
+a hard dependency (Principle #1).
 
 ---
 
@@ -32,20 +33,21 @@ effort, engine-from-scratch to R ≥ 1.0.
 | 4 | R scoreboard / measurement harness | 1% | 100% | both engines, identical harness |
 | 5 | JSStack execution substrate (stack model + entry + frames) | 5% | ~70% | stack model DECIDED (Option A = native stack); B1–B4 + A1.0/A1.1 native-stack entry LANDED; A2 interp-migration + arity/varargs remain |
 | 6 | GC/value cutover: POD object model + R4 + running collector | 7% | ~65% | object + string R4a GC LIVE (arena/swept/auto-triggered); symbol/bigint leaf GC + visitWeak + conservative-scan remain |
-| 7 | **Baseline JIT** (per-opcode machine code + native calls + profiling + tier-up) | 10% | ~30% | arith/double/typed-array/op_call execute native; **native JS→JS calls LANDED + beat the interpreter** (~39× probe); native-lowering BREADTH (property ICs = K2) + profiling remain → then flip default → R moves |
-| 8 | **DFG** (bytecode→SSA→speculation→SpeculativeJIT+OSR) | 18% | 0% | — |
+| 7 | **Baseline JIT** (per-opcode machine code + native calls + profiling + tier-up) | 10% | ~35% | native path measured net-win over interpreter (LATE-5 geomean execoff/interp ~1.086, mixed); further baseline breadth is now local-win/deferred except bailout soundness |
+| 8 | **DFG** (bytecode→SSA→speculation→SpeculativeJIT+OSR) | 18% | 0% | precursor set is active: packed bytecode stream cutover + SpeculatedType + profiles + bailout audit |
 | 9 | **FTL + B3 + Air** (top tier + optimizer + register allocation) | 15% | 0% | — |
 | 10 | Final correctness + perf tuning to hit R ≥ 1.0 | 1% | 0% | the last mile |
 
 **≈ 40% by effort.** But by *measured R* we are near the start: rows 7–9 (43% of the
-whole project, ~0% done) are the only rows that lift R from ~0.001 to ≥ 1.0. Rows 5–7
-are where R *first becomes defined and moves above the interpreter floor*.
+whole project, still near 0% done for the optimizing tiers) are the only rows that lift R from
+~0.001 to ≥ 1.0. The baseline JIT now proves native execution can beat the interpreter, but
+DFG/FTL are what move R by orders of magnitude.
 
 ---
 
-## Critical path (dependency order to the running baseline JIT)
+## Critical path (dependency order to the optimizing JIT)
 
-A running baseline JIT — the first thing that moves R — needs, in dependency order:
+The baseline JIT now runs and is a net win over the interpreter, but R ≥ 1.0 lives in the DFG/FTL. The next dependency order is:
 
 1. **JSStack / stack model** (row 5) — DECIDED + foundation LANDED. Judge panel ratified
    **Option A: native machine stack = JS stack** (FP/SP unified, callerFrame@0+returnPC@1 adjacent —
@@ -61,22 +63,17 @@ A running baseline JIT — the first thing that moves R — needs, in dependency
    + swept + the string leak closed.** `docs/design/gc-r4.md` + `gc-r4-completion.md`. Remaining: symbol/
    bigint leaf GC (U2/U3, share the landed U0b gate), `visitWeak` weak-processing (U7 — unblocks GC-safe
    call-link callee caching), the scoped native-stack conservative scan (GAP C), generational/incremental.
-3. **Bytecode cutover** — wire the live dispatch onto the packed instruction-stream (the
-   JIT lowers from it) + freeze the type-specialized `CoreOpcode`.
-4. **Profiling wiring** — per-CodeBlock ValueProfile/ArithProfile (the DFG's speculation
-   fuel), retiring the VM-global observation logs.
-5. **Baseline JIT** (row 7) — per-opcode machine code on the native stack + native JS→JS calls +
-   property/method/comparison/closure breadth all DONE. **REAL-BENCH MEASURE (2026-06-30, see
-   scoreboard): the native JIT WINS on numeric benches** (navier +12%, crypto +7.6% with the
-   generated executor off) **but REGRESSES on property/call-heavy ones** (richards −68%, delta-blue
-   −55%) — because **Increment-1 FAR-CALLS every property load / closure read / per-call callee
-   resolve**, slower than the interpreter's inline dispatch. So the R-gate is NOT more breadth — it is
-   **the INLINE versions: Increment 2 (inline machine-code property load) gated on gc-r4 Batch 5 (the
-   object-storage model — inline slots + a machine-addressable butterfly, today a slab index) + the
-   `CallLinkInfo` monomorphic cache (skip the per-call resolve; needs R4 `visitWeak`/U7).** Then
-   property/call-heavy benches win → flip the default (held) → R moves. (Also: disable the generated
-   executor — a confirmed re-interpreter divergence, a 10× regression where it runs; STEP 5 deletes it.)
-6. **DFG → FTL/B3** (rows 8–9) — the optimizing tiers that take R to ≥ 1.0.
+3. **Packed bytecode stream LIVE cutover** (row 2/8 dependency) — JSC has one flat byte stream consumed
+   by LLInt/Baseline/DFG/FTL; Rust still runs a type-specialized Vec-by-ordinal path while the faithful
+   packed stream is additive/unwired. This is the #1 representation divergence and the DFG parser's first
+   hard dependency. See `docs/design/dfg-path.md`.
+4. **Parallel DFG precursor set** — SpeculatedType canonicalization onto the faithful u64 lattice; runtime
+   profile population (ValueProfile/ArithProfile/ArrayProfile) keyed by metadata/BytecodeIndex; and
+   baseline-as-bailout soundness (OSR-exit landing, real frame headers incl. codeBlock@2/callee, no
+   whole-function decline). These are parallel-safe with the cutover.
+5. **First DFG parser** — single-basic-block, non-speculative, fallback-heavy (matching JSC's first DFG
+   scoping), lowering packed bytecode into `DfgGraph`.
+6. **DFG speculation + live OSR exit → FTL/B3** — the optimizing tiers that take R to ≥ 1.0.
 
 These can fan out where independent (the JSStack substrate and the GC/POD-cell work are
 different subsystems), but each touches megafiles serially at its cutover, so integration
@@ -109,11 +106,12 @@ and substrate tracks, additive in `jit/`+`assembler/` (no megafile conflict):
   (move_imm64+blr, primitives exist) + arg-marshal + exception-check + topCallFrame/CallSiteIndex
   store. The ONE open design point (R1): the exception-handler jump target — a first cut bails to a
   generic throw/interpreter stub (int-arith ops only throw via valueOf on object operands, rare).
-- **R4 IS DONE** (the live object-cell GC runs; cell identity = raw arena address). **The 15/15 GATE
-  (asm.js mandreel + octane-zlib) is K2-FREE** — decoupling audit 2026-06-29: typed-array element
-  get_by_val/put_by_val (the asm.js HEAP path) is ArrayMode-dispatched over the SEPARATE
-  array_buffer_backings slab, NOT the named-property storage split (K2). **Gate path = typed-array
-  element IC + dense-Array ElementLoad (have it) + LoadDouble + op_call — ALL on R4, no K2.**
+- **R4 IS DONE** (the live object-cell GC runs; cell identity = raw arena address). CORRECTION
+  (flip-gate survey 2026-06-30): the asm.js 15/15 gate is **not** currently satisfied and the earlier
+  "K2-free → can tier up whole" claim was overbroad. Typed-array HEAP access is separate from K2, but
+  mandreel/octane-zlib hot functions still decline under execoff on UnsignedRightShiftInt32 / ModNumber /
+  LogicalNot / BitNotInt32 / standalone LessEqualInt32 plus an op_urshift evaluator fix. The flip is
+  deferred behind the DFG path because it would only define R at the ~1e-3 floor.
 - **op_call** (the call-heavy gate half AND the biggest R-mover — today NO real Octane fn tiers up
   because all have calls): needs K1 (CodeBlock real pointer, localized `Vec<Pin<Box>>`, NOT the
   ~1476-ref CodeBlockId cutover) + B5 (native callee-frame seed; B4 arena-window done) + the
