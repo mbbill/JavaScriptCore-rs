@@ -523,6 +523,22 @@ pub extern "C" fn operation_put_by_id_with_cached_offset(
 /// stack-built outgoing-argument area arrives with the native direct-link (B5-full).
 pub(crate) const MAX_REGISTER_CALL_ARGS: usize = 5;
 
+/// The maximum number of explicit call arguments (EXCLUDING `this`) the baseline
+/// `op_call_with_this` (method-call) lowering passes to [`operation_call_with_this`]
+/// in registers. One FEWER than [`MAX_REGISTER_CALL_ARGS`] because `this` consumes a
+/// register: this shim spends `x0`=vm, `x1`=callee, `x2`=this, `x3`=argc of the eight
+/// AAPCS64 integer arg registers, leaving `x4..x7` for up to 4 boxed arguments. A
+/// method-call site with more arguments is DECLINED by the emitter's S4 allowlist gate
+/// (`EmitFunctionError::UnsupportedCallArity`) and stays in the interpreter.
+///
+/// DIVERGENCE (B5-first-cut): JSC's slow path reads the constructed callee frame (the
+/// caller laid `this` + args into the registerOffset region) and has NO register-arg
+/// limit; this first cut passes the already-boxed `this` + arguments by value in
+/// registers and bounds the arity. The general stack-built outgoing-argument area
+/// arrives with the native direct-link (B5-full); until then a >4-arg method call
+/// stays interpreted (rare in practice).
+pub(crate) const MAX_REGISTER_CALL_WITH_THIS_ARGS: usize = 4;
+
 /// `operationVirtualCall`-family analog (JITOperations.cpp / the unlinked
 /// `virtualThunk` path): the baseline `op_call` slow-call shim. The emitted lowering
 /// (`arm64_baseline/function_emitter.rs::emit_op_call`) reads the boxed callee +
@@ -573,6 +589,62 @@ pub extern "C" fn operation_call(
     }
 
     match vm.operation_call(host, callee, &arguments[..argc]) {
+        Ok(result) => result.encoded().0,
+        Err(encoded_exception) => {
+            vm.set_jit_pending_exception(encoded_exception);
+            JS_VALUE_EMPTY_BITS
+        }
+    }
+}
+
+/// `operationVirtualCall`-family analog for the METHOD-call form (op_call_with_this):
+/// identical to [`operation_call`] except the explicit `this_value` RECEIVER is passed
+/// to the call machinery instead of `undefined`. The emitted method-call lowering
+/// (`arm64_baseline/function_emitter.rs::emit_op_call_dynamic` with a `ThisSource::
+/// Receiver`) reads the boxed callee + receiver + each boxed argument cfr-relative from
+/// the JIT caller's frame and loads `x1`=callee, `x2`=this, `x3`=argc, `x4..x7`=arg0..arg3
+/// — one fewer arg register than plain `op_call` because `this` occupies `x2`
+/// (see [`MAX_REGISTER_CALL_WITH_THIS_ARGS`]).
+///
+/// `extern "C"` is load-bearing (the C-ABI the far-call expects). `argc` is the
+/// op_call_with_this argument count EXCLUDING `this`; `this_value` is the receiver
+/// operand (faithful to JSC's `compileSetupFrame` storing `thisValue` into the callee
+/// frame's `thisArgument` slot, JITCall.cpp:117-119).
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn operation_call_with_this(
+    vm: *mut Vm,
+    callee: u64,
+    this_value: u64,
+    argc: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> u64 {
+    // D1 + D5 reborrows — see the module SAFETY note. Exactly one `&mut *vm` and one
+    // `&mut *host`, both dropped before returning to JIT code.
+    let vm = unsafe { &mut *vm };
+    let host_ptr = vm.jit_host_ptr();
+    debug_assert!(
+        !host_ptr.is_null(),
+        "the driver must park the dispatch host (Vm::set_jit_host) before the \
+         JIT-call region; a null host means the slow path ran outside a parked region"
+    );
+    let host: &mut CoreOpcodeDispatchHost = unsafe { &mut *host_ptr };
+
+    let callee = JsValue::from_encoded(EncodedJsValue(callee));
+    let this_value = JsValue::from_encoded(EncodedJsValue(this_value));
+    // The emitter never emits a far-call to this shim with argc > MAX_REGISTER_CALL_WITH_THIS_ARGS
+    // (the S4 arity gate declines such a CodeBlock). Clamp defensively so a malformed
+    // argc can never index past the register slots.
+    let argc = (argc as usize).min(MAX_REGISTER_CALL_WITH_THIS_ARGS);
+    let raw_args = [arg0, arg1, arg2, arg3];
+    let mut arguments = [JsValue::undefined(); MAX_REGISTER_CALL_WITH_THIS_ARGS];
+    for (slot, &bits) in arguments.iter_mut().zip(raw_args.iter()).take(argc) {
+        *slot = JsValue::from_encoded(EncodedJsValue(bits));
+    }
+
+    match vm.operation_call_with_this(host, callee, this_value, &arguments[..argc]) {
         Ok(result) => result.encoded().0,
         Err(encoded_exception) => {
             vm.set_jit_pending_exception(encoded_exception);

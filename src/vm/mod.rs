@@ -3430,6 +3430,28 @@ impl Vm {
         callee: RuntimeValue,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, EncodedJsValue> {
+        // op_call's implicit receiver is `undefined` (`CallObservationThisSource::
+        // ImplicitUndefined`); the call machinery is otherwise IDENTICAL to
+        // op_call_with_this (JSC's `compileOpCall` is templated over both opcodes —
+        // only the `thisValue` operand source differs, JITCall.cpp:64-145), so this
+        // delegates to the shared `this`-parameterized impl with `undefined`.
+        self.operation_call_with_this(host, callee, RuntimeValue::undefined(), arguments)
+    }
+
+    /// `operationVirtualCall`-family analog for the METHOD-call form (op_call_with_this):
+    /// the only delta from [`Self::operation_call`] is that the callee's `this` slot
+    /// receives the explicit `this_value` RECEIVER operand instead of `undefined` —
+    /// faithful to JSC's `compileSetupFrame` storing the bytecode `thisValue` into the
+    /// callee frame's `thisArgument` slot (JITCall.cpp:117-119; `CallFrameSlot::
+    /// thisArgument`, CallFrame.h:176-180). Same parked-CodeBlock borrow/region shape
+    /// as `operation_call`/`operation_get_by_val`.
+    pub fn operation_call_with_this(
+        &mut self,
+        host: &mut CoreOpcodeDispatchHost,
+        callee: RuntimeValue,
+        this_value: RuntimeValue,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, EncodedJsValue> {
         // V1a (S3): build the caller-context `DispatchState` over the REAL active
         // CodeBlock the driver parked (`set_jit_code_block`); a fresh placeholder only
         // if none is parked (the direct unit-test driver). See `operation_value_binary`.
@@ -3450,7 +3472,7 @@ impl Vm {
                 ordinary_bytecode_call_handling: OrdinaryBytecodeCallHandling::DirectInterpreter,
                 function_value_call_handling: FunctionValueCallHandling::DirectInterpreter,
             };
-            host.jit_call_function_value(&mut state, callee, RuntimeValue::undefined(), arguments)
+            host.jit_call_function_value(&mut state, callee, this_value, arguments)
         };
         match outcome {
             Ok(value) => Ok(value),
@@ -24268,6 +24290,337 @@ mod tests {
             "the native broad-engagement call-heavy loop ({native_elapsed:?}) must BEAT \
              pure interpretation ({interp_elapsed:?}) — the R-lever. If this fails, the \
              per-call resolve/trampoline overhead is dominating (a critical finding).",
+        );
+    }
+
+    // The METHOD `inc() { this.x = this.x + 1; return this.x }` — get_by_id + put_by_id
+    // + get_by_id on `this` (== argument_including_this(0), the THIS_ARGUMENT slot the
+    // caller's op_call_with_this frame setup writes). num_params_incl_this = 1 (just
+    // `this`, 0 explicit params). Three property-IC sites: GetByName@0, PutByName@3,
+    // GetByName@4. this=arg0  cur=local0  one=local1  newx=local2.
+    //   0 cur = this.x   1 one = 1   2 newx = cur + one   3 this.x = newx
+    //   4 cur = this.x   5 ret cur
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn call_with_this_inc_method() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::GetByName,
+                    vec![
+                        Operand::Register(local(0)),
+                        Operand::Register(argument_including_this(0)),
+                        Operand::IdentifierIndex(0),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(1)), Operand::SignedImmediate(1)],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(2)),
+                        Operand::Register(local(0)),
+                        Operand::Register(local(1)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    3,
+                    CoreOpcode::PutByName,
+                    vec![
+                        Operand::Register(argument_including_this(0)),
+                        Operand::IdentifierIndex(0),
+                        Operand::Register(local(2)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    4,
+                    CoreOpcode::GetByName,
+                    vec![
+                        Operand::Register(local(3)),
+                        Operand::Register(argument_including_this(0)),
+                        Operand::IdentifierIndex(0),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    5,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(3))],
+                ),
+            ],
+            1,
+        )
+    }
+
+    // The DRIVER `driver(o, inc, n) { s=0; for(i=0;i<n;i++) s += inc.<this=o>(); return s }`
+    // — a method-heavy loop using op_call_with_this. num_params_incl_this = 4.
+    // o=arg1 inc=arg2 n=arg3  s=local0 i=local1 one=local2 cmp=local3 callret=local4.
+    //   0 s=0  1 i=0  2 one=1  3 cmp=(i<n)  4 jfalse cmp->9
+    //   5 callret = CallWithThis(callee=inc, this=o, argc=0)
+    //   6 s+=callret  7 i+=one  8 jmp->3  9 ret s
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn call_with_this_driver() -> CodeBlock {
+        op_call_test_function_code_block(
+            vec![
+                typed_core_instruction_with_operands(
+                    0,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(0)), Operand::SignedImmediate(0)],
+                ),
+                typed_core_instruction_with_operands(
+                    1,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(1)), Operand::SignedImmediate(0)],
+                ),
+                typed_core_instruction_with_operands(
+                    2,
+                    CoreOpcode::LoadInt32,
+                    vec![Operand::Register(local(2)), Operand::SignedImmediate(1)],
+                ),
+                typed_core_instruction_with_operands(
+                    3,
+                    CoreOpcode::LessThanInt32,
+                    vec![
+                        Operand::Register(local(3)),
+                        Operand::Register(local(1)),
+                        Operand::Register(argument_including_this(3)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    4,
+                    CoreOpcode::JumpIfFalse,
+                    vec![
+                        Operand::Register(local(3)),
+                        Operand::BytecodeIndex(BytecodeIndex::from_offset(9)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    5,
+                    CoreOpcode::CallWithThis,
+                    vec![
+                        Operand::Register(local(4)),
+                        Operand::Register(argument_including_this(2)), // callee = inc
+                        Operand::Register(argument_including_this(1)), // this = o (RECEIVER)
+                        Operand::UnsignedImmediate(0),                 // argc (excl this)
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    6,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(0)),
+                        Operand::Register(local(0)),
+                        Operand::Register(local(4)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    7,
+                    CoreOpcode::AddInt32,
+                    vec![
+                        Operand::Register(local(1)),
+                        Operand::Register(local(1)),
+                        Operand::Register(local(2)),
+                    ],
+                ),
+                typed_core_instruction_with_operands(
+                    8,
+                    CoreOpcode::Jump,
+                    vec![Operand::BytecodeIndex(BytecodeIndex::from_offset(3))],
+                ),
+                typed_core_instruction_with_operands(
+                    9,
+                    CoreOpcode::Return,
+                    vec![Operand::Register(local(0))],
+                ),
+            ],
+            4,
+        )
+    }
+
+    // Run the method-heavy driver through the engine INTERPRETER on a fresh
+    // interpreter-only Vm with a FRESH receiver object `o` (x=0). Returns (boxed result,
+    // o.x after the run) so the caller can compare native == interpreter AND that BOTH
+    // mutated the receiver n times.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn run_call_with_this_driver_via_interpreter(
+        driver: &CodeBlock,
+        inc: &CodeBlock,
+        n: i32,
+    ) -> (u64, Option<u64>) {
+        use crate::interpreter::CorePropertyKey;
+        let key_x = CorePropertyKey::String("x".into());
+        let inc_id = CodeBlockId(CellId(8_870));
+        let mut interp_vm: Box<Vm> = Box::new(Vm::new(VmConfig::interpreter_only()));
+        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks(vec![
+            InterpreterFunctionCodeBlock::new(inc_id, inc.clone()),
+        ]);
+        host.jit_test_register_identifier(0, "x");
+        let inc_value = host.allocate_function_value_for_test(0);
+        let o = host.jit_test_allocate_object();
+        host.jit_test_set_own_data(o, &key_x, RuntimeValue::from_i32(0));
+        let owner = CodeBlockId(CellId(9_910));
+        interp_vm.code_blocks.register(owner, driver.clone());
+        let completion = execute_registered_code_block_with_host_and_arguments(
+            &mut interp_vm,
+            owner,
+            driver,
+            &mut host,
+            vec![
+                RuntimeValue::undefined(), // this (driver is a top-level function)
+                o,
+                inc_value,
+                RuntimeValue::from_i32(n),
+            ],
+        );
+        let result = match completion {
+            ExecutionCompletion::Returned(value) => value.encoded().0,
+            other => panic!("interpreter driver({n}) did not return: {other:?}"),
+        };
+        let ox = host.jit_test_get_own_data(o, &key_x).map(|v| v.encoded().0);
+        (result, ox)
+    }
+
+    // CALL_WITH_THIS (method-call) NATIVE PATH — the co-dominant breadth unlock that
+    // ships with the get_by_id/put_by_id DataIC (docs/design/baseline-property-ic.md:
+    // "method call = GetByName(callee) + CallWithThis"). A method-heavy
+    //   driver(o, inc, n) { s=0; for(i<n) s += inc.<this=o>(); return s }
+    // calling
+    //   inc() { this.x = this.x + 1; return this.x }
+    // BOTH tier up and run NATIVE. The driver's op_call_with_this writes the RECEIVER
+    // `o` into the callee frame's `this` slot (CallFrameSlot::thisArgument, JITCall.cpp
+    // :117-119), so the method reads/mutates `o.x`. Asserts: (1) the CallWithThis native
+    // fast path is TAKEN once per iteration; (2) native == interpreter == oracle over a
+    // range of n; (3) `this` IS the receiver — `o.x` is mutated exactly n times (a
+    // `this`=undefined bug would THROW on `this.x` instead); (4) MEASUREMENT native vs
+    // interpreter. macOS/aarch64 only (executes native ARM64).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn vm_a1x_call_with_this_method_heavy_matches_interpreter_and_oracle() {
+        use crate::interpreter::CorePropertyKey;
+        let key_x = || CorePropertyKey::String("x".into());
+
+        let inc = call_with_this_inc_method();
+        let driver = call_with_this_driver();
+        let inc_id = CodeBlockId(CellId(8_870));
+        let driver_id = CodeBlockId(CellId(8_871));
+        // driver(o, inc, n) with o.x==0 initially: each iteration o.x++ then returns it,
+        // so s = sum_{k=1}^{n} k = n*(n+1)/2 and the final o.x == n.
+        let oracle = |n: i64| -> i64 { n * (n + 1) / 2 };
+
+        let mut vm: Box<Vm> = Box::new(Vm::new(VmConfig::baseline_allowed()));
+        vm.code_blocks.register(driver_id, driver.clone());
+        let mut host = CoreOpcodeDispatchHost::with_function_code_blocks(vec![
+            InterpreterFunctionCodeBlock::new(inc_id, inc.clone()),
+        ]);
+        host.jit_test_register_identifier(0, "x");
+        let inc_value = host.allocate_function_value_for_test(0);
+
+        // Warm both functions to native with THROWAWAY receivers (the method mutates its
+        // receiver, so the measured runs below use fresh objects). Install `inc` first so
+        // the driver's op_call_with_this resolver finds its native entry.
+        let warm_o_inc = host.jit_test_allocate_object();
+        host.jit_test_set_own_data(warm_o_inc, &key_x(), RuntimeValue::from_i32(0));
+        a1x_install_until_tiered(&mut vm, &mut host, inc_id, &inc, &[warm_o_inc.encoded().0]);
+        let warm_o_driver = host.jit_test_allocate_object();
+        host.jit_test_set_own_data(warm_o_driver, &key_x(), RuntimeValue::from_i32(0));
+        a1x_install_until_tiered(
+            &mut vm,
+            &mut host,
+            driver_id,
+            &driver,
+            &op_call_args_including_this(&[warm_o_driver, inc_value, RuntimeValue::from_i32(2)]),
+        );
+
+        // (1)+(2)+(3) CORRECTNESS over a range: native == interpreter == oracle, the
+        // CallWithThis native fast path TAKEN once per iteration, and the RECEIVER `o`
+        // mutated exactly n times (o.x == n) — proving `this` IS the receiver.
+        for &n in &[0_i32, 1, 4, 9, 50] {
+            let o = host.jit_test_allocate_object();
+            host.jit_test_set_own_data(o, &key_x(), RuntimeValue::from_i32(0));
+            vm.reset_baseline_native_engagement_count();
+            let args = op_call_args_including_this(&[o, inc_value, RuntimeValue::from_i32(n)]);
+            let native = match vm
+                .observe_baseline_jit_entry_and_maybe_execute(&mut host, driver_id, &driver, &args)
+            {
+                BaselineJitEntryOutcome::Returned(value) => value.encoded().0,
+                other => panic!("native driver({n}) did not return: {other:?}"),
+            };
+            assert_eq!(
+                vm.baseline_native_engagement_count(),
+                n.max(0) as u64,
+                "the method-call CallWithThis took the native fast path once per iteration (n={n})",
+            );
+            assert_eq!(
+                native,
+                RuntimeValue::from_i32(oracle(n as i64) as i32).encoded().0,
+                "native driver({n}) == oracle n*(n+1)/2",
+            );
+            // `this` IS the receiver: the method's `this`-relative put_by_id mutated `o`.
+            assert_eq!(
+                host.jit_test_get_own_data(o, &key_x())
+                    .map(|v| v.encoded().0),
+                Some(RuntimeValue::from_i32(n).encoded().0),
+                "the method mutated the RECEIVER o (o.x == n); a `this`=undefined bug would \
+                 have thrown on `this.x` instead (n={n})",
+            );
+
+            let (interp, interp_ox) = run_call_with_this_driver_via_interpreter(&driver, &inc, n);
+            assert_eq!(
+                native, interp,
+                "native driver({n}) == interpreter driver({n})"
+            );
+            assert_eq!(
+                interp_ox,
+                Some(RuntimeValue::from_i32(n).encoded().0),
+                "interpreter receiver mutated n times too (o.x == n)",
+            );
+        }
+
+        // (4) MEASUREMENT — native vs interpreter on the method-heavy probe. Same
+        // fairness as the broad-engagement measurement: native reuses the installed
+        // images + resets its JS stack; the pre-GC interpreter gets a FRESH Vm per rep
+        // (bounding the no-GC leak — MEMORY.md) — the apples-to-apples baseline. NOT a
+        // steady-state parity figure: the method's get_by_id/put_by_id on a NESTED native
+        // callee always far-call the slow-path resolution today (the IC fill/cached-read
+        // follow the caller's parked CodeBlock — a pre-existing property-IC limitation
+        // for native call chains, orthogonal to CallWithThis; correctness is preserved
+        // because the resolution runs against the real receiver). Load-bearing claim:
+        // native < interpreter.
+        let n_hot = 500_i32;
+        let reps = 10u32;
+
+        let native_start = std::time::Instant::now();
+        for _ in 0..reps {
+            let o = host.jit_test_allocate_object();
+            host.jit_test_set_own_data(o, &key_x(), RuntimeValue::from_i32(0));
+            let args = op_call_args_including_this(&[o, inc_value, RuntimeValue::from_i32(n_hot)]);
+            let outcome = vm
+                .observe_baseline_jit_entry_and_maybe_execute(&mut host, driver_id, &driver, &args);
+            assert!(matches!(outcome, BaselineJitEntryOutcome::Returned(_)));
+        }
+        let native_elapsed = native_start.elapsed();
+
+        let interp_start = std::time::Instant::now();
+        for _ in 0..reps {
+            let _ = run_call_with_this_driver_via_interpreter(&driver, &inc, n_hot);
+        }
+        let interp_elapsed = interp_start.elapsed();
+
+        eprintln!(
+            "A1.x CallWithThis method-heavy: n_hot={n_hot} reps={reps} \
+             native={native_elapsed:?} interpreter={interp_elapsed:?} speedup={:.1}x \
+             (the method's property accesses far-call the slow path on the nested native \
+             callee today — see the cross-parking note; load-bearing claim is native < \
+             interpreter)",
+            interp_elapsed.as_secs_f64() / native_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+        );
+        assert!(
+            native_elapsed < interp_elapsed,
+            "the native method-heavy CallWithThis loop ({native_elapsed:?}) must BEAT pure \
+             interpretation ({interp_elapsed:?}).",
         );
     }
 

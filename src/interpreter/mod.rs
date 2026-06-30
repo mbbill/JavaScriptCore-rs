@@ -10315,6 +10315,25 @@ impl CoreOpcodeDispatchHost {
             .expect("set own data property");
     }
 
+    /// Read an own DATA property's value (test-only; mirrors `jit_test_set_own_data`).
+    /// Used by the op_call_with_this method-call test to assert the RECEIVER object was
+    /// mutated by the method's `this`-relative `put_by_id` (proving `this` is the
+    /// receiver, not `undefined`).
+    #[cfg(test)]
+    pub(crate) fn jit_test_get_own_data(
+        &self,
+        object: RuntimeValue,
+        key: &CorePropertyKey,
+    ) -> Option<RuntimeValue> {
+        match self.objects.get_own_property(object, key) {
+            Ok(Some(CoreProperty {
+                kind: CorePropertyKind::Data(value),
+                ..
+            })) => Some(value),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn jit_test_structure_id(&self, object: RuntimeValue) -> Option<u32> {
         self.objects

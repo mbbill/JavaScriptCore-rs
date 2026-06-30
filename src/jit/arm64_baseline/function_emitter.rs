@@ -78,11 +78,12 @@ use crate::bytecode::BytecodeIndex;
 use crate::bytecode::{CodeBlock, CoreOpcode, InstructionDecodeError, OperandAccessError};
 use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
 use crate::jit::operations::{
-    operation_call, operation_compare_greater, operation_compare_less, operation_compare_lesseq,
-    operation_get_by_id_optimize, operation_get_by_id_with_cached_offset, operation_get_by_val,
-    operation_jfalse, operation_put_by_id_optimize, operation_put_by_id_with_cached_offset,
-    operation_put_by_val, operation_resolve_baseline_native_entry, operation_throw_stack_overflow,
-    MAX_REGISTER_CALL_ARGS,
+    operation_call, operation_call_with_this, operation_compare_greater, operation_compare_less,
+    operation_compare_lesseq, operation_get_by_id_optimize, operation_get_by_id_with_cached_offset,
+    operation_get_by_val, operation_jfalse, operation_put_by_id_optimize,
+    operation_put_by_id_with_cached_offset, operation_put_by_val,
+    operation_resolve_baseline_native_entry, operation_throw_stack_overflow,
+    MAX_REGISTER_CALL_ARGS, MAX_REGISTER_CALL_WITH_THIS_ARGS,
 };
 use crate::value::{JsValue, CELL_TAG, NUMBER_TAG, VALUE_TAG_MASK};
 use crate::vm::jsstack::CallFrameSlot;
@@ -189,6 +190,20 @@ const CALL_ARG_GPRS: [RegisterID; MAX_REGISTER_CALL_ARGS] = [
     RegisterID::X7,
 ];
 
+/// op_call_with_this slow-path register assignment (`operation_call_with_this`): the
+/// receiver `this` consumes `x2`, so the layout is `x0`=vm, `x1`=callee, `x2`=this,
+/// `x3`=argc, `x4..x7`=arg0..arg3 — ONE fewer arg register than plain op_call
+/// (`MAX_REGISTER_CALL_WITH_THIS_ARGS == CALL_WITH_THIS_ARG_GPRS.len() == 4`). A
+/// method-call site with more explicit arguments is declined by the S4 gate.
+const CALL_WITH_THIS_THIS_GPR: RegisterID = RegisterID::X2;
+const CALL_WITH_THIS_ARGC_GPR: RegisterID = RegisterID::X3;
+const CALL_WITH_THIS_ARG_GPRS: [RegisterID; MAX_REGISTER_CALL_WITH_THIS_ARGS] = [
+    RegisterID::X4,
+    RegisterID::X5,
+    RegisterID::X6,
+    RegisterID::X7,
+];
+
 /// `AssemblyHelpers::addressFor(VirtualRegister) = Address(x29, vreg.offset()*8)`
 /// (AssemblyHelpers.h:1290-1298). The operand IS the VirtualRegister's raw value.
 fn address_for(operand: i32) -> Address {
@@ -266,6 +281,19 @@ enum NativeCallTarget {
     /// `call_register(reg)`: the callee entry is already in `reg`, RESOLVED at runtime
     /// by the per-call resolver (A1.x broad engagement). A single `blr reg`.
     Register(RegisterID),
+}
+
+/// The source of the callee frame's `this` (receiver) slot — the ONLY delta between
+/// plain `op_call` and the method-call `op_call_with_this` (JSC's `compileOpCall` is
+/// templated over both; only the `thisValue` operand differs, JITCall.cpp:64-145).
+#[derive(Clone, Copy)]
+enum ThisSource {
+    /// `op_call`: the implicit receiver is `jsUndefined()`
+    /// (`CallObservationThisSource::ImplicitUndefined`).
+    Undefined,
+    /// `op_call_with_this`: the receiver is the value in this caller-frame slot (the
+    /// explicit `this` operand), stored into the callee frame's `thisArgument` slot.
+    Receiver(i32),
 }
 
 /// Failure modes of [`emit_baseline_function`]. A real CodeBlock that contains any
@@ -913,7 +941,7 @@ impl FunctionEmitter {
     /// callee frame; the native direct-link / arity stub / bl-chain is the deferred
     /// B5-full perf follow-up.
     fn emit_op_call(&mut self, dst: i32, callee: i32, args: &[i32]) {
-        self.emit_slow_call_body(callee, args);
+        self.emit_slow_call_body(callee, args, ThisSource::Undefined);
         // D3 throw edge: the callee threw (or a non-callable callee's TypeError)
         // stamps the mirror; branch to the shared exception stub BEFORE storing the
         // empty result. The probe reuses SCRATCH_GPR; x0 (the boxed result) is intact.
@@ -921,34 +949,72 @@ impl FunctionEmitter {
         self.h.masm_mut().store64(RESULT_GPR, address_for(dst)); // dst = x0 (boxed result)
     }
 
-    /// The `operation_call` SLOW-CALL register setup + far-call, WITHOUT the trailing
-    /// exception probe / result store (so [`Self::emit_op_call_dynamic`] can SHARE the
-    /// probe+store with the native fast path after the two converge). Leaves the boxed
-    /// result in `x0` (`RESULT_GPR`). The register ABI is `x0`=vm, `x1`=callee,
-    /// `x2`=argc, `x3..x7`=arg0..arg4 (`CALL_ARG_GPRS`); the caller has verified
-    /// `args.len() <= MAX_REGISTER_CALL_ARGS`.
-    fn emit_slow_call_body(&mut self, callee: i32, args: &[i32]) {
-        debug_assert!(
-            args.len() <= MAX_REGISTER_CALL_ARGS,
-            "op_call arity must be gated to MAX_REGISTER_CALL_ARGS before lowering"
-        );
-        // Load each boxed argument cfr-relative into its argument register (x3..).
-        // Done BEFORE materializing x0/x1/x2 so no argument source is clobbered (the
-        // sources are all cfr-relative memory; the destinations x3..x7 are distinct
-        // from the callee/argc/vm registers x1/x2/x0).
-        for (arg_index, &arg_slot) in args.iter().enumerate() {
-            self.h
-                .masm_mut()
-                .load64(address_for(arg_slot), CALL_ARG_GPRS[arg_index]);
+    /// The slow-call register setup + far-call, WITHOUT the trailing exception probe /
+    /// result store (so [`Self::emit_op_call_dynamic`] can SHARE the probe+store with
+    /// the native fast path after the two converge). Leaves the boxed result in `x0`
+    /// (`RESULT_GPR`).
+    ///
+    /// `this_source` selects the slow shim and register layout:
+    /// - `Undefined` (op_call): `operation_call`, `x0`=vm, `x1`=callee, `x2`=argc,
+    ///   `x3..x7`=arg0..arg4 (`CALL_ARG_GPRS`); `this`=undefined is supplied by the shim.
+    /// - `Receiver(slot)` (op_call_with_this): `operation_call_with_this`, `x0`=vm,
+    ///   `x1`=callee, `x2`=this, `x3`=argc, `x4..x7`=arg0..arg3 (`CALL_WITH_THIS_ARG_GPRS`)
+    ///   — one fewer arg register because `this` occupies `x2`.
+    ///
+    /// The caller has verified `args.len()` is within the active form's arity bound.
+    fn emit_slow_call_body(&mut self, callee: i32, args: &[i32], this_source: ThisSource) {
+        match this_source {
+            ThisSource::Undefined => {
+                debug_assert!(
+                    args.len() <= MAX_REGISTER_CALL_ARGS,
+                    "op_call arity must be gated to MAX_REGISTER_CALL_ARGS before lowering"
+                );
+                // Load each boxed argument cfr-relative into its argument register (x3..).
+                // Done BEFORE materializing x0/x1/x2 so no argument source is clobbered (the
+                // sources are all cfr-relative memory; the destinations x3..x7 are distinct
+                // from the callee/argc/vm registers x1/x2/x0).
+                for (arg_index, &arg_slot) in args.iter().enumerate() {
+                    self.h
+                        .masm_mut()
+                        .load64(address_for(arg_slot), CALL_ARG_GPRS[arg_index]);
+                }
+                self.h.masm_mut().load64(address_for(callee), LEFT_GPR); // x1 = callee (boxed)
+                self.h
+                    .masm_mut()
+                    .move_imm32(TrustedImm32::new(args.len() as i32), RIGHT_GPR); // x2 = argc
+                self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+                self.h
+                    .masm_mut()
+                    .far_call(TrustedImm64::new(operation_call as usize as i64));
+            }
+            ThisSource::Receiver(this_slot) => {
+                debug_assert!(
+                    args.len() <= MAX_REGISTER_CALL_WITH_THIS_ARGS,
+                    "op_call_with_this arity must be gated to MAX_REGISTER_CALL_WITH_THIS_ARGS \
+                     before lowering"
+                );
+                // Args -> x4..x7, then callee/this/argc/vm. All sources are cfr-relative
+                // memory (`this`, args, callee) or the pinned-VM register (x19); the
+                // destinations x0..x7 are disjoint from every source, so the order is free.
+                for (arg_index, &arg_slot) in args.iter().enumerate() {
+                    self.h
+                        .masm_mut()
+                        .load64(address_for(arg_slot), CALL_WITH_THIS_ARG_GPRS[arg_index]);
+                }
+                self.h.masm_mut().load64(address_for(callee), LEFT_GPR); // x1 = callee (boxed)
+                self.h
+                    .masm_mut()
+                    .load64(address_for(this_slot), CALL_WITH_THIS_THIS_GPR); // x2 = this (boxed)
+                self.h.masm_mut().move_imm32(
+                    TrustedImm32::new(args.len() as i32),
+                    CALL_WITH_THIS_ARGC_GPR,
+                ); // x3 = argc
+                self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
+                self.h
+                    .masm_mut()
+                    .far_call(TrustedImm64::new(operation_call_with_this as usize as i64));
+            }
         }
-        self.h.masm_mut().load64(address_for(callee), LEFT_GPR); // x1 = callee (boxed)
-        self.h
-            .masm_mut()
-            .move_imm32(TrustedImm32::new(args.len() as i32), RIGHT_GPR); // x2 = argc
-        self.h.masm_mut().move_rr(PINNED_VM_GPR, RAW_VM_ARG_GPR); // x0 = vm (arg0)
-        self.h
-            .masm_mut()
-            .far_call(TrustedImm64::new(operation_call as usize as i64));
     }
 
     /// op_call — the A1.2 native JIT->JIT FAST PATH (the R-lever existence proof):
@@ -999,10 +1065,12 @@ impl FunctionEmitter {
         entry: usize,
         bytecode_index: usize,
     ) {
+        // The A1.3 pre-seeded LINKED proof is plain op_call only: `this`=undefined.
         self.emit_native_call_frame_setup_and_call(
             callee,
             args,
             bytecode_index,
+            ThisSource::Undefined,
             NativeCallTarget::Absolute(entry),
         );
         // D3 throw edge (a callee slow path stamped the mirror), then store x0 -> dst.
@@ -1035,12 +1103,26 @@ impl FunctionEmitter {
     /// The resolver far-call clobbers only caller-saved registers; `cfr` (x29),
     /// the pinned-VM pair (x19/x20) and the tag pair (x27/x28) are callee-saved and
     /// survive it, so the native frame setup and the slow path both run unchanged after.
-    fn emit_op_call_dynamic(&mut self, dst: i32, callee: i32, args: &[i32], bytecode_index: usize) {
+    fn emit_op_call_dynamic(
+        &mut self,
+        dst: i32,
+        callee: i32,
+        args: &[i32],
+        this_source: ThisSource,
+        bytecode_index: usize,
+    ) {
         debug_assert!(
-            args.len() <= MAX_REGISTER_CALL_ARGS,
-            "op_call arity must be gated to MAX_REGISTER_CALL_ARGS before lowering"
+            args.len()
+                <= match this_source {
+                    ThisSource::Undefined => MAX_REGISTER_CALL_ARGS,
+                    ThisSource::Receiver(_) => MAX_REGISTER_CALL_WITH_THIS_ARGS,
+                },
+            "call arity must be gated to the form's register bound before lowering"
         );
         // === RESOLVE: operation_resolve_baseline_native_entry(vm, callee, argc) ======
+        // The resolver matches the callee's installed entry by callee VALUE + explicit
+        // arg count (EXCLUDING `this`); it is `this`-agnostic, so both call forms share
+        // this step unchanged.
         self.h.masm_mut().load64(address_for(callee), LEFT_GPR); // x1 = callee (boxed)
         self.h
             .masm_mut()
@@ -1064,17 +1146,18 @@ impl FunctionEmitter {
             callee,
             args,
             bytecode_index,
+            this_source,
             NativeCallTarget::Register(NATIVE_ENTRY_GPR),
         );
         // Jump OVER the slow path to the shared probe+store tail.
         let to_tail = self.h.masm_mut().jump();
 
-        // === SLOW PATH: operation_call (the callee runs interpreted / re-resolves its
-        //     own sub-calls). Reached when the callee is not an installed baseline
-        //     image at this arity. =================================================
+        // === SLOW PATH: operation_call{,_with_this} (the callee runs interpreted /
+        //     re-resolves its own sub-calls). Reached when the callee is not an
+        //     installed baseline image at this arity. =============================
         let slow_label = self.h.masm().label();
         self.link_fast_jumps_to(&[to_slow], slow_label);
-        self.emit_slow_call_body(callee, args);
+        self.emit_slow_call_body(callee, args, this_source);
 
         // === SHARED TAIL: D3 throw probe + store the boxed result. Both paths leave
         //     the result in x0 and converge here. =================================
@@ -1089,12 +1172,15 @@ impl FunctionEmitter {
     /// store (so the static [`Self::emit_op_call_native_linked`] and the dynamic
     /// [`Self::emit_op_call_dynamic`] share the probe+store). Leaves the boxed result
     /// in `x0` (`RESULT_GPR`). `target` selects the terminal call: an absolute baked
-    /// entry (`far_call`) or a runtime-resolved register (`blr reg`).
+    /// entry (`far_call`) or a runtime-resolved register (`blr reg`). `this_source`
+    /// selects what lands in the callee frame's `thisArgument` slot (the only delta
+    /// between op_call and op_call_with_this).
     fn emit_native_call_frame_setup_and_call(
         &mut self,
         callee: i32,
         args: &[i32],
         bytecode_index: usize,
+        this_source: ThisSource,
         target: NativeCallTarget,
     ) {
         let argc = args.len() as i32;
@@ -1127,12 +1213,25 @@ impl FunctionEmitter {
             .masm_mut()
             .move_imm32(TrustedImm32::new(count_including_this), SCRATCH_GPR);
         self.store_callee_frame_slot(CallFrameSlot::ARGUMENT_COUNT_INCLUDING_THIS, SCRATCH_GPR);
-        // Initialize `this` = undefined (op_call's implicit receiver, the same value
-        // `operation_call` supplies on the slow path).
-        let undefined_bits = JsValue::undefined().encoded().0;
-        self.h
-            .masm_mut()
-            .move_imm64(TrustedImm64::new(undefined_bits as i64), SCRATCH_GPR);
+        // Initialize `this` (CallFrame.h:180 `thisArgument`; JSC `compileSetupFrame`
+        // stores the bytecode `thisValue` here, JITCall.cpp:117-119). op_call's implicit
+        // receiver is `undefined` (the same value `operation_call` supplies on the slow
+        // path); op_call_with_this stores the explicit RECEIVER operand read cfr-relative
+        // from the caller frame (`address_for(this_slot)`, which lies ABOVE the callee
+        // frame being built, so the store never clobbers it).
+        match this_source {
+            ThisSource::Undefined => {
+                let undefined_bits = JsValue::undefined().encoded().0;
+                self.h
+                    .masm_mut()
+                    .move_imm64(TrustedImm64::new(undefined_bits as i64), SCRATCH_GPR);
+            }
+            ThisSource::Receiver(this_slot) => {
+                self.h
+                    .masm_mut()
+                    .load64(address_for(this_slot), SCRATCH_GPR);
+            }
+        }
         self.store_callee_frame_slot(CallFrameSlot::THIS_ARGUMENT, SCRATCH_GPR);
         // Copy the explicit arguments into the callee frame's argument slots
         // (firstArgument + i), the analog of the caller's pre-laid-out arg area.
@@ -1785,8 +1884,43 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
                     Some(target) => {
                         emitter.emit_op_call_native_linked(dst, callee, &args, target.entry, bci)
                     }
-                    None => emitter.emit_op_call_dynamic(dst, callee, &args, bci),
+                    None => {
+                        emitter.emit_op_call_dynamic(dst, callee, &args, ThisSource::Undefined, bci)
+                    }
                 }
+            }
+            // op_call_with_this — the METHOD-call form (`o.m(args)`). Operand order
+            // matches the interpreter's `dispatch_call_with_this` and the bytecompiler's
+            // method-call emit (interpreter/mod.rs:12449-12480; bytecompiler/mod.rs:
+            // 5262-5273): operand 0 = dst, operand 1 = callee, operand 2 = `this`
+            // (the explicit RECEIVER), operand 3 = argc (UnsignedImmediate, EXCLUDING
+            // `this`), operands 4..4+argc = the explicit-argument registers. The ONLY
+            // delta from plain `Call` is that `this` is the receiver operand (not
+            // `undefined`) — faithful to JSC's `compileSetupFrame` storing `thisValue`
+            // into the callee frame's `thisArgument` slot (JITCall.cpp:117-119). The
+            // live install path always RE-RESOLVES via `emit_op_call_dynamic` (no
+            // pre-seeded LINKED proof for the method form). Arity beyond the
+            // method-form register ABI (one fewer than plain Call, `this` consumes a
+            // register) is DECLINED (S4 gate) so the function stays interpreted.
+            CoreOpcode::CallWithThis => {
+                let dst = frame_slot(decoded.register_operand(0)?)?;
+                let callee = frame_slot(decoded.register_operand(1)?)?;
+                let this_slot = frame_slot(decoded.register_operand(2)?)?;
+                let argc = decoded.unsigned_immediate_operand(3)?;
+                if argc as usize > MAX_REGISTER_CALL_WITH_THIS_ARGS {
+                    return Err(EmitFunctionError::UnsupportedCallArity { argc });
+                }
+                let mut args = Vec::with_capacity(argc as usize);
+                for arg_index in 0..argc as usize {
+                    args.push(frame_slot(decoded.register_operand(4 + arg_index)?)?);
+                }
+                emitter.emit_op_call_dynamic(
+                    dst,
+                    callee,
+                    &args,
+                    ThisSource::Receiver(this_slot),
+                    bci,
+                );
             }
             // op_loop_hint is a tier-up/OSR marker with no value effect (the
             // interpreter treats it as Continue); emit nothing, fall through.
