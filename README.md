@@ -25,7 +25,7 @@ Overall: ~40% by effort  ███████▌░░░░░░░░░░�
 | Scoreboard / measurement harness | 1% | 100% | ██████████ |
 | JSStack execution substrate (frame model the JIT runs on) | 5% | 55% | ██████░░░░ |
 | GC / cell-identity cutover (the GC the JIT assumes) | 7% | 80% | ████████░░ |
-| **Baseline JIT** — per-opcode machine code *(R first moves here)* | 10% | 15% | █▌░░░░░░░░ |
+| **Baseline JIT** — per-opcode machine code *(R first moves here)* | 10% | 32% | ███▏░░░░░░ |
 | **DFG** optimizing tier | 18% | 0% | ░░░░░░░░░░ |
 | **FTL + B3 + Air** top tier | 15% | 0% | ░░░░░░░░░░ |
 | Final correctness + perf tuning to reach R ≥ 1.0 | 1% | 0% | ░░░░░░░░░░ |

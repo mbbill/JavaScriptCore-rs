@@ -171,18 +171,20 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 - [done] the live path emits real per-opcode ARM64 via the MacroAssembler encoder + finalize (f139350);
   the old P6/P15 byte-blob lane is now DEAD — retiring it (~22k LoC) is a DEFERRED off-gate cleanup
   (moves neither R nor 15/15; do it in idle integration capacity, never preempting R4/calls).
-- [next-JIT] op_call — RATIFIED design (2026-06-29 design audit), the call-heavy GATE half AND the biggest
-  R-mover (NO Octane fn tiers up today because all contain calls). **K1 (ratified):** frame slot-2 = the
-  registry `Rc<CodeBlock>` stable pointer (Rc::as_ptr — the heap box never moves; NOT a new Vec<Pin<Box>>
-  dup, NOT yet a full arena cell; invariant: never Rc-replace a live-registered instance — audited clean,
-  test-only). Only the slot-2 ENCODING flips (CellId-bits → CodeBlock*-bits); the ~1476 CodeBlockId refs
-  STAY. **B5-first-cut:** op_call far_calls operation_call (the UNLINKED virtual call) reusing B4's existing
-  arena push — callee runs interpreted-or-tier-up; the native bl-chain + direct-link patch = DEFERRED
-  B5-full (perf). **Parking:** recursion-local save/restore of host+CodeBlock (~6 lines, vm/mod.rs:2564-2628
-  +3133). **NO B6, NO B4b.** Units: U0 ratified → U1 K1-port ∥ U2 parking → U3 operation_call shim → U4
-  emitter lowering → U5 adversarial verify. Highest risk: nested-park reborrow UAF (miri-gated). Verify:
-  synthetic 2-fn call milestone (native==interp incl. throw + ≥2-deep nesting) + miri + suite; NO heavy
-  benches (leaf leak). Plus the K2-FREE typed-array IC + LoadDouble = the rest of the gate.
+- [done] op_call EXECUTES (UNLINKED virtual call; U5 adversarially verified SOUND-AND-FAITHFUL) — the
+  biggest R-mover (no Octane fn tiered up before — all contain calls) + the call-heavy gate half. K1 (slot-2
+  = real CodeBlock* via the registry Rc::as_ptr) + U2 parking (recursion-local RAII save/restore, nesting-safe)
+  + emit_op_call (far_call operation_call; operand mapping faithful vs dispatch_call) + the D1/D5 reborrow
+  shim (callee runs DirectInterpreter → NO 2nd whole-Vm &mut, so the nested re-park is unreachable today;
+  reborrow shape == the miri-clean add-shim). Milestone: f calls g, native==interp incl. boxed-double + throw
+  + 2-deep nesting (DEBUG+RELEASE); suite 2781. op_call tests are FFI-blocked under miri (mmap arena) — the
+  reborrow miri proof rides the analogous add-shim test. B5-full native bl-chain/direct-link DEFERRED
+  (slow-call now). RESIDUAL: a native callee tier-up under op_call needs its own sibling-aliasing re-verify FIRST.
+- [done] **GATE-CAPABILITY SET COMPLETE**: int+double arith + LoadDouble + typed-array element get/put_by_val
+  (K2-free slow-call IC) + op_call all EXECUTE → asm.js functions can now tier up WHOLE. NEXT for the 15/15
+  gate = SPEED (the inline fast paths — op_call direct-link/B5-full + the inline typed-array stub, both gated
+  on a stable backing pointer) + MEASURE whether mandreel/octane-zlib complete (capped). Then R becomes
+  definable. (op_call + typed-array are slow-call today — functions tier up, but calls/HEAP far-call the runtime.)
 - [missing] bytecode-stream cutover + baseline profiling emission (ValueProfile/ArithProfile, a DFG
   prereq downstream of R4/calls broadening the allowlist).
 - [missing] DFG (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
