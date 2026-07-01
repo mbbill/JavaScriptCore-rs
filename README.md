@@ -11,17 +11,17 @@ octane-zlib — asm.js, can't finish under the interpreter) — so the suite sti
 geomean and parity can't be measured or claimed until all 15 pass. The remaining gap is the
 **optimizing JIT**, and the measured scoreboard proves it (below).
 
-**Latest:** the native baseline JIT is now a measured **net win over the interpreter** on
-5 compute/call benches with the Rust-only generated shims disabled: geomean execoff/interp ≈ **1.086**
-(crypto, delta-blue, navier win; raytrace/richards still lose). That is a real milestone, but it is
-**not R parity progress yet**: the interpreter is still ~500–6000× slower than local C++ `jsc`, so
-1.086× the interpreter is still around the ~1e-3 floor. The post-win strategic assessment therefore
-pivots the critical path to the **DFG precursor set**. First slices have landed: ValueProfile now uses
-the canonical JSC `SpeculatedType` bitset, live `InByVal` ArrayProfile feedback now mutates linked
-`CodeBlock` storage, baseline frames now seed real `codeBlock@2`/`callee@3`, the first packed-bytecode
-raw `op_mov`/`op_ret` wedge executes by byte-offset PC with JSC `Fits<VirtualRegister>` constant remap,
-and the Octane parity reducer now enforces the 15/15 gate and computes all `r_i` + R. The default flip is deferred: it would
-only define R at the floor, and asm.js still does not tier up whole under execoff.
+**Latest:** the **DFG precursor set** (the pivot after the baseline JIT's measured net win over the
+interpreter — still the ~1e-3 floor vs C++) has landed its core slices: baseline images now persist
+the **JITCodeMap** (the bci→machine-code OSR landing map), the abstract Rust-only DFG node taxonomy
+is **deleted** in favor of faithful `NodeType`/`NodeFlags`/`VariableAccessData` (the graph starts
+`LoadStore`, as JSC's does), the packed mov/ret wedge is correctness-hardened (no mid-instruction
+decode, constants placed by constant index, JSC-derived byte fixtures), and profile-slot derivation
+now covers **all** profile-carrying opcodes plus Binary/Unary `ArithProfile` storage + record APIs.
+Ratified: the first DFG OSR exit lands in the **interpreter** (JSC's `exitToLLInt` analog), so the
+bailout hard gate sits before *speculative* DFG only — the first non-speculative parser is unblocked.
+In flight: profile population (U1–U8, four parallel units) and the first DFG parser slice
+(`src/dfg/parser.rs`, P2). The DFG itself stays 0% until that parser exists.
 
 ```
 Overall: ~48% by effort  █████████▌░░░░░░░░░░░  (but the parity-bearing JIT tiers are ~0%)
@@ -68,13 +68,14 @@ proved that native-opcode unit tests are not enough — REAL benches must valida
 allowlist. The strategic assessment after that milestone re-derived the highest-value next dependency:
 **move toward the optimizing JIT, not more baseline-local wins.** Current critical path:
 
-1. **Packed bytecode stream live cutover** — correct the #1 representation divergence: JSC has one flat
-   byte stream consumed by LLInt/Baseline/DFG/FTL; Rust still runs a type-specialized Vec-by-ordinal path
-   while the faithful packed stream is unwired.
-2. In parallel: **SpeculatedType canonicalization**, **runtime profile population**, and a
-   **baseline-as-bailout soundness audit** (OSR-exit landing, real frame headers, no whole-function decline).
-3. Then the first **single-basic-block non-speculative DFG parser**, followed by DFG speculation + OSR exit,
-   then FTL/B3.
+1. **Packed bytecode stream live cutover** — the #1 representation divergence: first live wedge landed
+   (raw `op_mov`/`op_ret`, byte-offset PC + `Fits<VirtualRegister>` constants) and correctness-hardened;
+   W1 widening **landed** (real generated opcode ids — wide16/32 = 128/130, not 0/1 — + sub/mul rows).
+2. In parallel: **SpeculatedType canonicalization — done**; **profiles — storage + derivation done (F0),
+   population running as 4 parallel units (U1–U8)**; **baseline-as-bailout — JITCodeMap landed, exit-target
+   ratified (the first OSR exit lands in the interpreter), gating speculative DFG only**.
+3. Then the first **single-basic-block non-speculative DFG parser** (`src/dfg/parser.rs`, in flight; the
+   faithful NodeType skeleton is already landed), followed by DFG speculation + OSR exit, then FTL/B3.
 
 The default flip is deferred: it would only define R at the ~1e-3 floor, and the flip-gate survey found
 mandreel/octane-zlib still decline on missing opcodes under execoff. See `docs/design/dfg-path.md`.

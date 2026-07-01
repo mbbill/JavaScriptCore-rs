@@ -110,16 +110,38 @@ one serial XL track (Prime Focus #3).
   RSS cap. Gate all near-term units with cargo test --lib + tiny single-BB probes
   + C++ source comparison, never a full-suite run.
 
-## Open questions (resolve before committing the relevant track)
+## Open questions (all three resolved 2026-07-01 — see the Ratified section)
 
-- The profiling-state survey reader FAILED (returned a placeholder); the picture
-  rests on the dfg-readiness survey. Re-run a focused profiling audit before
-  scoping track (3).
-- Wedge-family choice for the cutover (which metadata-bearing / constant-register
-  opcode family forces a coupling with the smallest blast radius).
-- Does the first non-speculative single-BB parser need populated profiles at all,
-  or can it lower type-agnostically and defer profile consumption to (6)? If
-  type-agnostic, (3) can move after (5), shortening the path to a runnable graph.
+- The profiling-state survey reader FAILED (returned a placeholder). → DONE: the
+  focused profiling audit ran; its hard finding is below, and F0 (profile
+  storage + derivation) landed from it (29d7c40).
+- Wedge-family choice for the cutover. → RESOLVED: the raw mov/ret wedge landed
+  (50c70fa — forces the Fits constant-band coupling) + correctness hardening
+  (e6ae867).
+- Does the first non-speculative single-BB parser need populated profiles? →
+  ANSWERED: no — type-agnostic; see below.
+
+## Ratified 2026-07-01 (serial decisions from the bailout / dfg-parser / profiling audits)
+
+- **U0 exit-target: the first DFG OSR exit lands in the INTERPRETER** — JSC's own
+  exitToLLInt analog (DFGOSRExitCompilerCommon.cpp:461-479: when no baseline code
+  exists, JSC exits to the LLInt). This makes baseline whole-function decline
+  harmless as an exit-target concern. The track-4 hard gate (U0 + JITCodeMap +
+  exit-site frame reification) sits before SPECULATIVE DFG only, NOT before the
+  first non-speculative parser.
+- **Open question 3 ANSWERED with parser-source evidence:** the first single-BB
+  non-speculative parser lowers type-agnostically with SpecNone — none of
+  enter/mov/add/sub/mul/ret calls getPrediction, and makeSafe is a sound no-op on
+  an absent ArithProfile (DFGByteCodeParser.cpp:1126). So profile POPULATION
+  defers behind the parser slice, PROVIDED the slice declines every getPrediction
+  opcode.
+- **New hard finding (profiling audit):** an EMPTY value profile →
+  getPrediction()==SpecNone → addToGraph(ForceOSRExit)
+  (DFGByteCodeParser.cpp:1050-1061), which poisons the whole function —
+  value-profile population hard-gates the DFG on real code the moment the parser
+  widens past the toy slice.
+- **Parser architecture:** faithful NodeType enum (landed d935dde); the parser
+  owns a mutable working graph; MovHint/delayed-SetLocal ported faithfully.
 
 Authority: C++ JSC dfg/ (DFGByteCodeParser.cpp, DFGGraph.h, DFGOSRExit, DFGNodeType.h),
 bytecode/ (InstructionStream.h, Instruction.h, BytecodeIndex.h, Fits.h), profiler/;

@@ -27,8 +27,13 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   + SlotVisitor STW marking core — collector RUN-gated on R3/R4.
 - [done] Structure leaf ports + Structure cell (StructureID/StructureIdTable/TypeInfoBlob/PropertyTable).
 - [done] StringImpl Stage A (8/16-bit Latin-1/UTF-16, O(1) index).
-- [done] profiling: ArithProfile + ExecutionCounter (faithful bitfields) + SpeculatedType u64 bitset.
-- [done] bytecode: faithful packed instruction-stream core (Vec<u8>, byte-offset index, width-aware).
+- [done] profiling: ArithProfile + ExecutionCounter (faithful bitfields) + SpeculatedType u64 bitset (canonical
+  in DFG/DOMJIT); profile-slot derivation for ALL profile-carrying opcodes + Binary/Unary ArithProfile
+  storage/record APIs (F0). [wip] population U1-U8 (4 parallel units: named-loads/scope, by-val+length,
+  binary arith slow-path-only, unary arith).
+- [done] bytecode: faithful packed instruction-stream core (Vec<u8>, byte-offset index, width-aware); mov/ret
+  wedge LIVE + hardened (instruction-start gating, constant-index placement, canonical constant bands, ONE
+  opcode table, JSC byte fixtures). [done] W1: real generated opcode ids + sub/mul rows (5d455f1).
 
 ## Assembler / codegen (PROVEN end-to-end: emit → relocate → execute)
 - [done] AbstractMacroAssembler operands + RegisterID + ARM64 encoder (byte-oracle-proven).
@@ -62,11 +67,8 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 - [done] Butterfly-values cutover (verified): storage/elements → the store slab; the offset-8 slot is
   a ButterflyHandle (separate alloc) — **storage_ptr de-self-referenced (the R4 UB hazard, gone)**;
   Clone-via-store; ~74 sites flipped (copy-out pattern). KEEPS the HashMap (cell NOT yet POD).
-- [done] GetterSetter infra B-i/ii/iii (verified; additive/dual-write, reversible): Accessor attribute
-  bit (1<<4, distinct data/accessor transition edges — provably disjoint) + CoreObjectKind::GetterSetter
-  cell (POD Option<RuntimeValue> getter/setter) + Symbol+accessor keys now get REAL Structure offsets +
-  dual-write the butterfly in lockstep with the still-authoritative HashMap. IC data-load probe gated to
-  miss for accessor shapes (required; reads the shape). HashMap still authoritative; needs_drop NOT flipped.
+- [done] GetterSetter infra B-i/ii/iii (Accessor attribute bit 1<<4, GetterSetter cell, symbol+accessor
+  keys get REAL Structure offsets) — dual-write stage, folded into the B-iv flip below.
 - [done] B-iv FLIP (irreversible, 66a860a): the per-cell properties HashMap (value authority) DELETED —
   reads route structure offset → butterfly slot; accessors via the butterfly GetterSetter; property_order
   folded into PropertyTable entry order; vestigial deleted_offsets dropped (recycle owned by m_deletedOffsets);
@@ -90,11 +92,6 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   the FreeList (legal precisely because needs_drop==false → no destructors), retains marked + newly-allocated,
   rebuilds the interval free-list. MIRI-CLEAN (Stacked + Tree Borrows, 0 UB) over the demo POD cell. R4 drives
   it stopAllocating→sweep→resumeAllocating across the directories.
-- [done] R3 shadow oracle (debug-gated, reversible, **R4-GO**): the arena ACCEPTS+STORES a byte-identical
-  twin CoreObjectCell through allocate_cell; byte-equal cross-check at find/find_mut + population check held
-  SUITE-WIDE (2740 tests, zero fires); release compiles it ALL out (byte-identical to HEAD, zero extra mem).
-  First wiring of the S4 arena into the live engine. Caveat: proves ACCEPT+STORE+population, NOT the live
-  deref (re-syncs at read) — the self-aliasing live-deref is R4's miri gate.
 - [done] R4a cell-identity FLIP (IRREVERSIBLE, verified sound-and-complete): CoreObjectCell identity = the
   raw MarkedSpace arena address; DELETED the leaking Vec<Pin<Box>> object stores + object_indices_by_payload
   + the R3 shadow. MarkedSpace::find (isPointerGCObjectJSCell port) is the object-vs-foreign TYPE GATE (leaf
@@ -181,8 +178,11 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   The faithful native path (A1.x above: CallLinkInfo + native-stack bl) now BYPASSES it. Plan: broaden the
   faithful path → beats interp → flip default; then delete the dead generated-* cluster (STEP 5) + de-megafile
   35k tiering.rs (STEP 6, off-gate). STEP 1 (collapse the slow-path dispatch onto CallLinkInfo) = R-neutral cleanup.
-- [wip] DFG precursor set (docs/design/dfg-path.md): packed-bytecode cutover has first live raw mov/ret wedge
-  (byte-offset PC + Fits<VirtualRegister> constants); SpeculatedType + InByVal profiles + baseline frame headers landed.
+- [wip] DFG precursor set (docs/design/dfg-path.md): packed wedge + SpeculatedType + profile storage/derivation
+  LANDED (foundation section above); JITCodeMap persisted on baseline images (bci→machine-code OSR landing map,
+  U1); faithful NodeType/NodeFlags/VariableAccessData/Operands LANDED — abstract Rust-only DFG taxonomy DELETED,
+  graph starts LoadStore. Ratified: first OSR exit lands in the INTERPRETER (exitToLLInt analog) — bailout hard
+  gate before SPECULATIVE DFG only. [wip] P2 src/dfg/parser.rs (launched).
 - [missing] DFG proper (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
 
 ## Structural fidelity

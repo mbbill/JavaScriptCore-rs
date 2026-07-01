@@ -33,8 +33,8 @@ effort, engine-from-scratch to R ≥ 1.0.
 | 4 | R scoreboard / measurement harness | 1% | 100% | local C++ `jsc` release build + Rust release, identical harness; C++ baseline is the measuring instrument and must be re-measured |
 | 5 | JSStack execution substrate (stack model + entry + frames) | 5% | ~70% | stack model DECIDED (Option A = native stack); B1–B4 + A1.0/A1.1 native-stack entry LANDED; A2 interp-migration + arity/varargs remain |
 | 6 | GC/value cutover: POD object model + R4 + running collector | 7% | ~65% | object + string R4a GC LIVE (arena/swept/auto-triggered); symbol/bigint leaf GC + visitWeak + conservative-scan remain |
-| 7 | **Baseline JIT** (per-opcode machine code + native calls + profiling + tier-up) | 10% | ~35% | native path measured net-win over interpreter (LATE-5 geomean execoff/interp ~1.086, mixed); further baseline breadth is now local-win/deferred except bailout soundness |
-| 8 | **DFG** (bytecode→SSA→speculation→SpeculativeJIT+OSR) | 18% | 0% | precursor set is active: packed bytecode stream cutover + SpeculatedType + profiles + bailout audit |
+| 7 | **Baseline JIT** (per-opcode machine code + native calls + profiling + tier-up) | 10% | ~35% | native path measured net-win over interpreter (LATE-5 geomean execoff/interp ~1.086, mixed); further baseline breadth is now local-win/deferred except bailout soundness (JITCodeMap OSR landing map landed) |
+| 8 | **DFG** (bytecode→SSA→speculation→SpeculativeJIT+OSR) | 18% | 0% | precursors landing: packed wedge live+hardened, SpeculatedType canonical, faithful NodeType/flags/VAD skeleton, profile storage+derivation (F0); W1 ids+sub/mul landed; population in flight; parser (P2) in flight |
 | 9 | **FTL + B3 + Air** (top tier + optimizer + register allocation) | 15% | 0% | — |
 | 10 | Final correctness + perf tuning to hit R ≥ 1.0 | 1% | 0% | the last mile |
 
@@ -64,15 +64,24 @@ The baseline JIT now runs and is a net win over the interpreter, but R ≥ 1.0 l
    bigint leaf GC (U2/U3, share the landed U0b gate), `visitWeak` weak-processing (U7 — unblocks GC-safe
    call-link callee caching), the scoped native-stack conservative scan (GAP C), generational/incremental.
 3. **Packed bytecode stream LIVE cutover** (row 2/8 dependency) — JSC has one flat byte stream consumed
-   by LLInt/Baseline/DFG/FTL; Rust still runs a type-specialized Vec-by-ordinal path while the faithful
-   packed stream is additive/unwired. This is the #1 representation divergence and the DFG parser's first
-   hard dependency. See `docs/design/dfg-path.md`.
-4. **Parallel DFG precursor set** — SpeculatedType canonicalization onto the faithful u64 lattice; runtime
-   profile population (ValueProfile/ArithProfile/ArrayProfile) keyed by metadata/BytecodeIndex; and
-   baseline-as-bailout soundness (OSR-exit landing, real frame headers incl. codeBlock@2/callee, no
-   whole-function decline). These are parallel-safe with the cutover.
+   by LLInt/Baseline/DFG/FTL. First live wedge LANDED (raw mov/ret: byte-offset PC +
+   `Fits<VirtualRegister>` constants) and correctness-HARDENED (instruction-start gating — no
+   mid-instruction decode, constants placed by constant index, canonical constant bands, ONE opcode
+   table, JSC-derived byte fixtures). W1 landed: real generated opcode ids (5d455f1) + sub/mul rows.
+   See `docs/design/dfg-path.md`.
+4. **Parallel DFG precursor set** — SpeculatedType canonicalization DONE (canonical u64 bitset in
+   DFG/DOMJIT descriptors). Profile STORAGE + derivation DONE (F0: slots derived for ALL profile-carrying
+   opcodes in program order + Binary/UnaryArithProfile storage/record APIs); POPULATION in flight as 4
+   parallel units (U1–U8: named-loads/scope, by-val+length, binary arith slow-path-only, unary arith) —
+   it hard-gates the DFG past the toy slice (empty profile → ForceOSRExit). Baseline-as-bailout:
+   JITCodeMap LANDED (bci→machine-code landing map persisted on baseline images, U1); exit-target
+   RATIFIED — the first OSR exit lands in the INTERPRETER (exitToLLInt analog), so the bailout hard gate
+   sits before SPECULATIVE DFG only.
 5. **First DFG parser** — single-basic-block, non-speculative, fallback-heavy (matching JSC's first DFG
-   scoping), lowering packed bytecode into `DfgGraph`.
+   scoping), lowering packed bytecode into `DfgGraph`. Skeleton LANDED: faithful NodeType/NodeFlags/
+   VariableAccessData/Operands (abstract Rust-only taxonomy DELETED; graph starts LoadStore).
+   `src/dfg/parser.rs` (P2) in flight; lowers type-agnostically (SpecNone), declining every
+   getPrediction opcode.
 6. **DFG speculation + live OSR exit → FTL/B3** — the optimizing tiers that take R to ≥ 1.0.
 
 These can fan out where independent (the JSStack substrate and the GC/POD-cell work are
