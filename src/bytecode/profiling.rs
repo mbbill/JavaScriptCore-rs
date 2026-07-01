@@ -4,7 +4,7 @@ use crate::bytecode::origin::CodeOrigin;
 use crate::bytecode::register::VirtualRegister;
 use crate::bytecode::speculated_type::SpeculatedType;
 use crate::gc::{RootKind, RootSetMutationAuthority, StructureId};
-use crate::value::{EncodedJsValue, JsValue};
+use crate::value::{EncodedJsValue, JsValue, NumberValue};
 
 pub const VALUE_PROFILE_FIRST_OFFSET: u32 = 1;
 pub const VALUE_PROFILE_RAW_BUCKET_BYTES: u32 = core::mem::size_of::<EncodedJsValue>() as u32;
@@ -1020,6 +1020,61 @@ impl UnaryArithProfile {
     // ArithProfile.h:257-260.
     pub fn is_observed_type_empty(self) -> bool {
         self.arg_observed_type().is_empty()
+    }
+
+    // C++ JSC `updateArithProfileForUnaryArithOp` (CommonSlowPaths.cpp:396-429),
+    // the combined arg+result recording used only by `slow_path_negate`
+    // (CommonSlowPaths.cpp:434-467): `observeArg(operand)` first, then a FINER
+    // result-shape record than `observe_result` — HeapBigInt for a BigInt
+    // result; otherwise, for a non-int32 number result, Int32Overflow only when
+    // the operand was int32 (:409-411), NegZeroDouble for a -0.0 result
+    // (:414-415), else NonNegZeroDouble plus Int52Overflow once
+    // truncateDoubleToInt64(|result|) reaches 2^51 (:416-425).
+    //
+    // `result_is_heap_big_int` stands in for C++ `result.isHeapBigInt()`
+    // (:401): the transitional Rust value model keeps BigInt identity in the
+    // interpreter's BigIntStore rather than in `JsValue` bits, so the caller
+    // supplies the classification (the same value-model gap documented in
+    // `ArithProfile::observe_result`). The C++ `result.isBigInt32()` branch
+    // (:402-405) is USE(BIGINT32)-only and has no Rust value encoding.
+    pub fn update_for_unary_arith_op(
+        &mut self,
+        result: JsValue,
+        operand: JsValue,
+        result_is_heap_big_int: bool,
+    ) {
+        self.observe_arg(operand);
+        if result_is_heap_big_int {
+            self.base.set_observed_heap_big_int();
+            return;
+        }
+        // C++ ASSERTs result.isNumber() || result.isBigInt() (:398); an int32
+        // result records nothing beyond the arg observation (:407-409), and a
+        // non-number non-BigInt result cannot reach here from negate.
+        let Some(NumberValue::DoubleBits(bits)) = result.as_number() else {
+            return;
+        };
+        if operand.is_int32() {
+            self.base.set_observed_int32_overflow();
+        }
+        let double_val = bits.to_f64();
+        if double_val == 0.0 && double_val.is_sign_negative() {
+            self.base.set_observed_neg_zero_double();
+        } else {
+            self.base.set_observed_non_neg_zero_double();
+            // The Int52 overflow check intentionally omits 1<<51 as a valid
+            // negative Int52 value (CommonSlowPaths.cpp:420-424). WTF
+            // truncateDoubleToInt64 (wtf/MathExtras.h:865-885) on ARM64
+            // (fcvtzs) saturates with NaN -> 0; Rust's `as i64` cast is
+            // bit-identical to that. (The generic C++ fallback instead WRAPS
+            // positive overflow to INT64_MIN, and x86_64 cvttsd2si yields the
+            // INT64_MIN sentinel for NaN/overflow; the local instrument is
+            // ARM64, so we mirror the ARM64 behavior.)
+            const INT52_OVERFLOW_POINT: i64 = 1i64 << 51;
+            if double_val.abs() as i64 >= INT52_OVERFLOW_POINT {
+                self.base.set_observed_int52_overflow();
+            }
+        }
     }
 }
 

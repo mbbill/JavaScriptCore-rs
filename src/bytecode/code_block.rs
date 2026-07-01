@@ -1324,6 +1324,35 @@ impl CodeBlock {
         Ok(Some(slot.profile))
     }
 
+    // C++ JSC: `updateArithProfileForUnaryArithOp(profile, result, operand)`
+    // (CommonSlowPaths.cpp:396-429) as invoked by `slow_path_negate`
+    // (CommonSlowPaths.cpp:434-467) on the shared profile reached through
+    // `CodeBlock*`; the shape logic lives on
+    // `UnaryArithProfile::update_for_unary_arith_op`. `result_is_heap_big_int`
+    // supplies the C++ `result.isHeapBigInt()` classification the transitional
+    // Rust value model cannot derive from `JsValue` bits (BigInt identity lives
+    // in the interpreter's BigIntStore).
+    pub fn record_unary_arith_profile_unary_arith_op(
+        &self,
+        authority: CodeBlockMutationAuthority,
+        bytecode_index: BytecodeIndex,
+        result: JsValue,
+        operand: JsValue,
+        result_is_heap_big_int: bool,
+    ) -> Result<Option<UnaryArithProfile>, CodeBlockMutationError> {
+        self.check_profile_mutation_authority(authority)?;
+        let mut slots = self.side_tables.unary_arith_profiles.borrow_mut();
+        let Some(slot) = slots
+            .iter_mut()
+            .find(|slot| slot.bytecode_index == bytecode_index)
+        else {
+            return Ok(None);
+        };
+        slot.profile
+            .update_for_unary_arith_op(result, operand, result_is_heap_big_int);
+        Ok(Some(slot.profile))
+    }
+
     // C++ JSC divergence: IC attach mutates the shared `CodeBlock`'s metadata
     // through `CodeBlock*`. Rust shares one `Rc<CodeBlock>`, so this takes `&self`
     // and mutates through the interior-mutable `inline_caches` `RefCell`.

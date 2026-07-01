@@ -7207,7 +7207,24 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     _ => Err(ExecutionError::ExpectedInt32),
                 };
                 match value {
-                    Ok(value) => write_register(state, window, destination, value),
+                    Ok(value) => {
+                        // C++ JSC records unary-arith feedback only after the
+                        // op succeeds (LLInt fast paths profile before their
+                        // return; RETURN_WITH_PROFILING runs after
+                        // CHECK_EXCEPTION on the slow paths,
+                        // CommonSlowPaths.cpp:434-467, :508-521, :684-699);
+                        // gating and per-path recording live in the helper.
+                        // Profiling keys off the ORIGINAL `source`, not the
+                        // ToPrimitive'd `numeric_source`, matching GET_C.
+                        self.record_unary_arith_profile_observation(
+                            state.code_block,
+                            instruction.bytecode_index,
+                            opcode,
+                            source,
+                            value,
+                        );
+                        write_register(state, window, destination, value)
+                    }
                     Err(error) => DispatchOutcome::Fail(error),
                 }
             }
@@ -9646,6 +9663,127 @@ impl CoreOpcodeDispatchHost {
         // the BigInt check reduces the primitive via ToNumber (parsing string
         // primitives) before truncation. Mirror the string-aware ToNumber.
         bit_not_value(self.to_number_with_string(value)?)
+    }
+
+    // C++ JSC unary-arith runtime profiling. The LLInt fast paths OR the arg
+    // ObservedType straight into the profile and never record result shape:
+    // op_negate's int fast path records ArithProfileInt and its double fast
+    // path ArithProfileNumber (LowLevelInterpreter64.asm:1188-1201),
+    // op_to_number's non-int32 number path records ArithProfileNumber while
+    // its int32 path writes nothing (:1134-1141), and op_bitnot's int32 fast
+    // path writes nothing (:1447-1455). Only the slow paths record result
+    // shape, after CHECK_EXCEPTION (so a throwing coercion records nothing):
+    // slow_path_negate via updateArithProfileForUnaryArithOp
+    // (CommonSlowPaths.cpp:434-467, :396-429), slow_path_to_number
+    // (argSawNonNumber + observeResult, :508-521) and slow_path_bitnot
+    // (argSawNumber/argSawNonNumber + observeResult, :684-699). The Rust
+    // interpreter runs one unified dispatch arm per opcode, so this helper
+    // re-derives which C++ path the ORIGINAL operand would have taken (the
+    // C++ slow paths profile the raw register operand, not the ToPrimitive'd
+    // value) and records exactly what that path records.
+    fn record_unary_arith_profile_observation(
+        &self,
+        code_block: &CodeBlock,
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+        operand: RuntimeValue,
+        result: RuntimeValue,
+    ) {
+        let authority = crate::bytecode::code_block::CodeBlockMutationAuthority::default();
+        match opcode {
+            CoreOpcode::NegateNumber => {
+                if let Some(NumberValue::Int32(payload)) = operand.as_number() {
+                    // LLInt op_negate sends int32 0 (negation yields -0.0) and
+                    // INT32_MIN (negation overflows int32) to slow_path_negate
+                    // via `btiz t3, 0x7fffffff, .opNegateSlow`
+                    // (LowLevelInterpreter64.asm:1189-1192); every other int32
+                    // stays on the fast path, which ORs ArithProfileInt (arg
+                    // saw int32) and records no result bits (:1193-1196).
+                    if payload & 0x7fff_ffff != 0 {
+                        code_block
+                            .record_unary_arith_profile_arg(authority, bytecode_index, operand)
+                            .ok();
+                        return;
+                    }
+                } else if operand.is_number() {
+                    // Double fast path: sign-bit xor, then OR ArithProfileNumber
+                    // (arg saw number); result shape is NOT recorded even when
+                    // the negation produces -0.0 (LowLevelInterpreter64.asm:
+                    // 1197-1201).
+                    code_block
+                        .record_unary_arith_profile_arg(authority, bytecode_index, operand)
+                        .ok();
+                    return;
+                }
+                // slow_path_negate (CommonSlowPaths.cpp:434-467):
+                // updateArithProfileForUnaryArithOp(profile, result, operand)
+                // with the ORIGINAL operand. BigInt identity lives in the
+                // interpreter's BigIntStore (transitional value-model
+                // divergence), so the C++ `result.isHeapBigInt()` test (:401)
+                // is classified here and passed down.
+                code_block
+                    .record_unary_arith_profile_unary_arith_op(
+                        authority,
+                        bytecode_index,
+                        result,
+                        operand,
+                        self.bigints.value(result).is_some(),
+                    )
+                    .ok();
+            }
+            CoreOpcode::ToNumber => {
+                // Rust divergence (see derive_unary_arith_profiles): JSC
+                // op_inc/op_dec carry their own UnaryArithProfile (preOp ORs
+                // ArithProfileInt on the int fast path,
+                // LowLevelInterpreter64.asm:1114-1132; slow_path_inc/dec
+                // record nothing, CommonSlowPaths.cpp:367-386), but the Rust
+                // bytecompiler pre-lowers ++/-- into ToNumber +
+                // AddInt32/SubInt32 (emit_update, bytecompiler/mod.rs), so
+                // those lowered sites are served by THIS ToNumber recording
+                // plus the binary add/sub profile.
+                if operand.is_int32() {
+                    // LLInt op_to_number int32 path returns without touching
+                    // the profile (LowLevelInterpreter64.asm:1134-1141).
+                    return;
+                }
+                if operand.is_number() {
+                    // Non-int32 number path ORs ArithProfileNumber, no result
+                    // bits (LowLevelInterpreter64.asm:1139).
+                    code_block
+                        .record_unary_arith_profile_arg(authority, bytecode_index, operand)
+                        .ok();
+                    return;
+                }
+                // slow_path_to_number (CommonSlowPaths.cpp:508-521):
+                // argSawNonNumber + observeResult. `observe_arg` on a
+                // non-number operand is exactly argSawNonNumber.
+                code_block
+                    .record_unary_arith_profile_arg(authority, bytecode_index, operand)
+                    .ok();
+                code_block
+                    .record_unary_arith_profile_result(authority, bytecode_index, result)
+                    .ok();
+            }
+            CoreOpcode::BitNotInt32 => {
+                if operand.is_int32() {
+                    // LLInt op_bitnot int32 fast path writes nothing
+                    // (LowLevelInterpreter64.asm:1447-1455).
+                    return;
+                }
+                // slow_path_bitnot (CommonSlowPaths.cpp:684-699): argSawNumber
+                // when the ORIGINAL operand is a number else argSawNonNumber —
+                // `observe_arg` matches both because the operand is never
+                // int32 here — then observeResult (a heap-BigInt result hits
+                // observe_result's documented transitional NonNumeric gap).
+                code_block
+                    .record_unary_arith_profile_arg(authority, bytecode_index, operand)
+                    .ok();
+                code_block
+                    .record_unary_arith_profile_result(authority, bytecode_index, result)
+                    .ok();
+            }
+            _ => {}
+        }
     }
 
     fn bigint_binary_result(
@@ -28138,6 +28276,228 @@ mod tests {
         );
         assert!(linked_profile.flags.out_of_bounds);
         assert_eq!(host_observation.profile, linked_profile);
+    }
+
+    // Shared harness for the unary-arith runtime-profiling tests: run ONE
+    // profiled unary opcode (NegateNumber / ToNumber / BitNotInt32) over
+    // `operand` on a LinkedInterpreter block and return the completion plus
+    // the linked `UnaryArithProfile` at bytecode offset 0.
+    fn run_unary_arith_profile_probe(
+        opcode: CoreOpcode,
+        operand: RuntimeValue,
+    ) -> (ExecutionCompletion, crate::bytecode::UnaryArithProfile) {
+        let source = local(0);
+        let destination = local(1);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                opcode,
+                vec![Operand::Register(destination), Operand::Register(source)],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(205));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        registers.write(window, source, operand).unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+        let profile = block
+            .unary_arith_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("profiled unary arith site has a derived slot");
+        (completion, profile)
+    }
+
+    #[test]
+    fn negate_int32_fast_path_records_arg_int32_and_no_result_bits() {
+        // C++ JSC LLInt op_negate int fast path (LowLevelInterpreter64.asm:
+        // 1188-1196): a non-overflowing, non-zero int32 negation ORs
+        // ArithProfileInt (= UnaryArithProfile::observedIntBits()) into the
+        // profile and records NO result bits. The fast path DOES touch the
+        // arg-observed bits; only result shape is slow-path-only.
+        let (completion, profile) =
+            run_unary_arith_profile_probe(CoreOpcode::NegateNumber, RuntimeValue::from_i32(5));
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(-5))
+        );
+        assert_eq!(
+            profile.bits(),
+            crate::bytecode::UnaryArithProfile::observed_int_bits(),
+            "int32 negate records exactly the arg-saw-int32 observation"
+        );
+    }
+
+    #[test]
+    fn negate_double_fast_path_records_arg_number_and_no_result_bits() {
+        // C++ JSC LLInt op_negate double fast path (LowLevelInterpreter64.asm:
+        // 1197-1201): sign-bit xor plus ArithProfileNumber; result shape is
+        // not recorded on the fast path.
+        let (completion, profile) =
+            run_unary_arith_profile_probe(CoreOpcode::NegateNumber, RuntimeValue::from_double(2.5));
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(-2.5))
+        );
+        assert_eq!(
+            profile.bits(),
+            crate::bytecode::UnaryArithProfile::observed_number_bits(),
+            "double negate records exactly the arg-saw-number observation"
+        );
+    }
+
+    #[test]
+    fn negate_int32_zero_records_neg_zero_double_and_int32_overflow() {
+        // C++ JSC LLInt sends int32 0 to slow_path_negate (`btiz t3,
+        // 0x7fffffff`, LowLevelInterpreter64.asm:1191); the -0.0 result runs
+        // updateArithProfileForUnaryArithOp (CommonSlowPaths.cpp:396-429):
+        // observeArg(int32), Int32Overflow because the operand was int32
+        // (:410-411), and NegZeroDouble because !doubleVal && signbit
+        // (:414-415).
+        let (completion, profile) =
+            run_unary_arith_profile_probe(CoreOpcode::NegateNumber, RuntimeValue::from_i32(0));
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(-0.0))
+        );
+        assert!(profile.arg_observed_type().is_only_int32());
+        assert!(profile.arith().did_observe_int32_overflow());
+        assert!(profile.arith().did_observe_neg_zero_double());
+        assert!(!profile.arith().did_observe_non_neg_zero_double());
+        assert!(!profile.arith().did_observe_int52_overflow());
+        assert!(!profile.arith().did_observe_non_numeric());
+    }
+
+    #[test]
+    fn negate_int32_min_records_int32_overflow_and_non_neg_zero_double() {
+        // The other int32 slow case: INT32_MIN negation overflows to
+        // 2147483648.0 (double), so slow_path_negate records Int32Overflow +
+        // NonNegZeroDouble; 2^31 < 2^51 leaves Int52Overflow clear
+        // (CommonSlowPaths.cpp:416-425).
+        let (completion, profile) = run_unary_arith_profile_probe(
+            CoreOpcode::NegateNumber,
+            RuntimeValue::from_i32(i32::MIN),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(2147483648.0))
+        );
+        assert!(profile.arg_observed_type().is_only_int32());
+        assert!(profile.arith().did_observe_int32_overflow());
+        assert!(profile.arith().did_observe_non_neg_zero_double());
+        assert!(!profile.arith().did_observe_neg_zero_double());
+        assert!(!profile.arith().did_observe_int52_overflow());
+    }
+
+    #[test]
+    fn negate_non_number_records_arg_non_number_via_slow_path() {
+        // slow_path_negate on a boolean: observeArg(true) is argSawNonNumber
+        // (ArithProfile.h:243-255); -true == -1 stays int32 so no result bits
+        // are recorded (CommonSlowPaths.cpp:407-409).
+        let (completion, profile) =
+            run_unary_arith_profile_probe(CoreOpcode::NegateNumber, RuntimeValue::from_bool(true));
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(-1))
+        );
+        assert_eq!(
+            profile.bits(),
+            crate::bytecode::UnaryArithProfile::observed_non_number_bits()
+        );
+    }
+
+    #[test]
+    fn to_number_int32_fast_path_leaves_profile_default() {
+        // C++ JSC LLInt op_to_number int32 path returns WITHOUT touching the
+        // profile (LowLevelInterpreter64.asm:1134-1141, `.opToNumberIsInt`).
+        let (completion, profile) =
+            run_unary_arith_profile_probe(CoreOpcode::ToNumber, RuntimeValue::from_i32(7));
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(7))
+        );
+        assert_eq!(profile.bits(), 0, "int32 ToNumber records nothing");
+    }
+
+    #[test]
+    fn to_number_double_fast_path_records_arg_number_only() {
+        // C++ JSC LLInt op_to_number non-int32 number path ORs
+        // ArithProfileNumber (LowLevelInterpreter64.asm:1139); no result bits.
+        let (completion, profile) =
+            run_unary_arith_profile_probe(CoreOpcode::ToNumber, RuntimeValue::from_double(2.5));
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(2.5))
+        );
+        assert_eq!(
+            profile.bits(),
+            crate::bytecode::UnaryArithProfile::observed_number_bits()
+        );
+    }
+
+    #[test]
+    fn to_number_non_number_records_arg_non_number_and_result() {
+        // slow_path_to_number (CommonSlowPaths.cpp:508-521): argSawNonNumber +
+        // observeResult. ToNumber(undefined) is NaN, a non-int32 number, so
+        // observeResult sets Int32Overflow | Int52Overflow | NonNegZeroDouble
+        // | NegZeroDouble (ArithProfile.h:128-145). This ToNumber recording
+        // also serves the Rust-lowered ++/-- sites (JSC op_inc/op_dec), which
+        // the bytecompiler pre-lowers to ToNumber + AddInt32/SubInt32.
+        let (_completion, profile) =
+            run_unary_arith_profile_probe(CoreOpcode::ToNumber, RuntimeValue::undefined());
+        assert!(profile.arg_observed_type().is_only_non_number());
+        assert!(profile.arith().did_observe_int32_overflow());
+        assert!(profile.arith().did_observe_int52_overflow());
+        assert!(profile.arith().did_observe_non_neg_zero_double());
+        assert!(profile.arith().did_observe_neg_zero_double());
+        assert!(!profile.arith().did_observe_non_numeric());
+    }
+
+    #[test]
+    fn bit_not_int32_fast_path_leaves_profile_default() {
+        // C++ JSC LLInt op_bitnot int32 fast path writes nothing
+        // (LowLevelInterpreter64.asm:1447-1455).
+        let (completion, profile) =
+            run_unary_arith_profile_probe(CoreOpcode::BitNotInt32, RuntimeValue::from_i32(5));
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(!5))
+        );
+        assert_eq!(profile.bits(), 0, "int32 bitnot records nothing");
+    }
+
+    #[test]
+    fn bit_not_double_slow_path_records_arg_number_and_result() {
+        // slow_path_bitnot (CommonSlowPaths.cpp:684-699): the double operand
+        // is a number, so argSawNumber; ~2.5 truncates to ~2 == -3 (int32), so
+        // observeResult records no result bits.
+        let (completion, profile) =
+            run_unary_arith_profile_probe(CoreOpcode::BitNotInt32, RuntimeValue::from_double(2.5));
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(-3))
+        );
+        assert_eq!(
+            profile.bits(),
+            crate::bytecode::UnaryArithProfile::observed_number_bits()
+        );
     }
 
     #[test]
