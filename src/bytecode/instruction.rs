@@ -657,7 +657,7 @@ impl PackedInstructionStream {
                 error,
             }
         })?;
-        let opcode = CoreOpcode::from_representative_packed_opcode_id(decoded.opcode_id)
+        let opcode = CoreOpcode::from_packed_opcode_id(decoded.opcode_id)
             .map(CoreOpcode::opcode)
             .ok_or(InstructionDecodeError::UnsupportedRawOpcode {
                 bytecode_index,
@@ -1501,7 +1501,7 @@ mod tests {
         assert_eq!(ret.operands, vec![Operand::Register(local0)]);
 
         // op_add fixture: [ADD, dst, lhs, rhs, profileIndex, operandTypes]
-        // (BytecodeList.rb:1276-1291) — decodes structurally but the wedge
+        // (BytecodeList.rb:1276-1292) — decodes structurally but the wedge
         // refuses to execute it.
         let unsupported = PackedInstructionStream::from_raw_packed_bytes(vec![
             raw_stream::opcode_id::ADD,
@@ -1521,18 +1521,20 @@ mod tests {
     }
 
     /// CRITICAL: byte offsets that are not instruction STARTS must never
-    /// decode. Offset 1 inside `mov local0, ret-shaped-operand` points at an
-    /// operand byte whose value equals the RET opcode id; C++ can never observe
-    /// such an offset (InstructionStream iteration only advances by size(),
+    /// decode. Offset 2 inside `mov` points at an operand byte whose value
+    /// equals the RET opcode id (104); C++ can never observe such an offset
+    /// (InstructionStream iteration only advances by size(),
     /// InstructionStream.h:154-161), so the safe-Rust surface must reject it
     /// rather than conjure a bogus RET from inside the MOV's operands.
     #[test]
     fn raw_decoder_rejects_mid_instruction_offsets() {
-        // mov local0, argument_or_header(8): src byte 0x08 == RET's opcode id.
+        // mov local0, constant(88): the src byte 104 aliases RET's opcode id;
+        // as a narrow VirtualRegister operand it decodes in the constant band
+        // (104 >= FirstConstantRegisterIndex8 = 16, Fits.h:118-156).
         let bytes = vec![
             raw_stream::opcode_id::MOV,
             0xff,                       // local(0)
-            raw_stream::opcode_id::RET, // register 8 (argument namespace), NOT an opcode
+            raw_stream::opcode_id::RET, // constant(88) operand, NOT an opcode
             raw_stream::opcode_id::RET,
             0xff,
         ];

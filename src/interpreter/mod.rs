@@ -33772,19 +33772,21 @@ mod tests {
 
     /// CRITICAL regression: a dispatch request at a byte offset INSIDE an
     /// instruction must fail with InvalidBytecodeIndex, never decode. The mov's
-    /// src operand byte is 0x08 == RET's opcode id, so a raw decode at offset 2
-    /// would conjure a bogus RET from inside the MOV's operands. C++ can never
-    /// observe such an offset: InstructionStream iteration only advances by
-    /// whole instruction sizes (InstructionStream.h:154-161).
+    /// src operand byte equals RET's opcode id (104), so a raw decode at offset
+    /// 2 would conjure a bogus RET from inside the MOV's operands. C++ can
+    /// never observe such an offset: InstructionStream iteration only advances
+    /// by whole instruction sizes (InstructionStream.h:154-161).
     #[test]
     fn raw_packed_dispatch_rejects_mid_instruction_bytecode_index() {
         let local0 = VirtualRegister::local(0);
-        // mov local0, argument_or_header(8); ret local0 — hand-encoded narrow
-        // form (Instruction.h:181-198): src byte 0x08 aliases RET's opcode id.
+        // mov local0, constant(88); ret local0 — hand-encoded narrow form
+        // (Instruction.h:181-198): the src byte aliases RET's opcode id (104),
+        // which as a narrow VirtualRegister operand decodes in the constant
+        // band (104 >= FirstConstantRegisterIndex8 = 16, Fits.h:118-156).
         let raw_bytes = vec![
             raw_stream::opcode_id::MOV,
             0xff,
-            raw_stream::opcode_id::RET, // register 8, NOT an instruction start
+            raw_stream::opcode_id::RET, // constant(88), NOT an instruction start
             raw_stream::opcode_id::RET,
             0xff,
         ];

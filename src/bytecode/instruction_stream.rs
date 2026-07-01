@@ -100,29 +100,64 @@ impl OpcodeSize {
     }
 }
 
-/// Representative subset of JSC's generated JS opcode IDs.
+/// The DECLARED subset of JSC's generated JS opcode IDs, at their REAL
+/// generated values (`Opcode.h:66` `FOR_EACH_OPCODE_ID(OPCODE_ID_ENUM)`).
 ///
-/// JSC generates the real numeric IDs and their order from `BytecodeList.rb`
-/// (`Opcode.h:66` `FOR_EACH_OPCODE_ID(OPCODE_ID_ENUM)`). This subset assigns its
-/// own representative IDs to prove the packed-stream mechanism end to end; the
-/// full ~240-opcode table is a generator follow-up. `wide16`/`wide32` are real
-/// JSC opcodes (`BytecodeList.rb:1174,1178`) whose narrow 1-byte ID, read at the
-/// instruction's first byte, selects the operand width (`Instruction.h:81-96`).
+/// ID-ASSIGNMENT RULE (derived from the generator, then verified against the
+/// local build artifact): the `:Bytecode` section is declared
+/// `preserve_order: true` (`BytecodeList.rb:79-87`), so `DSL.end_section`
+/// SKIPS `Section#sort!` and only validates the required
+/// [checkpoint ops][metadata ops][plain ops] declaration ordering
+/// (`generator/DSL.rb:43-56`, `generator/Section.rb:72-97`); `create_ids!`
+/// then numbers every opcode sequentially from 0 in EXACT declaration order
+/// (`generator/Section.rb:99-101`; `generator/Opcode.rb:41-47,59-61` class
+/// counter), with `op_group` members appended inline in listed order
+/// (`generator/Section.rb:50-54`). An opcode's ID is therefore fixed by its
+/// position in `BytecodeList.rb` ALONE: later Rust declarations simply take
+/// their declaration-order value, and nothing already declared ever
+/// renumbers.
+///
+/// Verified against the generated header the local C++ `jsc` (the measuring
+/// instrument) was built from:
+/// `WebKitBuild/Release/DerivedSources/JavaScriptCore/Bytecodes.h`
+/// (`NUMBER_OF_BYTECODE_IDS 193`; `op_jmp_value_string "69"` ...
+/// `op_sub_value_string "161"`). A declaration-order recount of the whole
+/// `:Bytecode` section reproduces all 193 generated values exactly.
 pub mod opcode_id {
-    /// Width-prefix opcode. `narrow()->opcodeID() == wide16` => wide16 form.
-    pub const WIDE16: u8 = 0;
-    /// Width-prefix opcode. `narrow()->opcodeID() == wide32` => wide32 form.
-    pub const WIDE32: u8 = 1;
-    pub const ENTER: u8 = 2;
-    pub const MOV: u8 = 3;
-    pub const ADD: u8 = 4;
-    pub const EQ: u8 = 5;
-    pub const JMP: u8 = 6;
-    pub const JTRUE: u8 = 7;
-    pub const RET: u8 = 8;
+    /// `op :jmp` (`BytecodeList.rb:933`).
+    pub const JMP: u8 = 69;
+    /// `op :jtrue` (`BytecodeList.rb:938`).
+    pub const JTRUE: u8 = 70;
+    /// `op :ret` (`BytecodeList.rb:1040`).
+    pub const RET: u8 = 104;
+    /// Width-prefix opcode `op :wide16` (`BytecodeList.rb:1174`):
+    /// `narrow()->opcodeID() == Traits::wide16` selects the wide16 form
+    /// (`Instruction.h:40,81-84`). NOT id 0: the wide prefixes sit LATE in
+    /// declaration order, interleaved with the super-sampler ops
+    /// (`op_nop`=126, `op_super_sampler_begin`=127, wide16=128,
+    /// `op_super_sampler_end`=129, wide32=130).
+    pub const WIDE16: u8 = 128;
+    /// Width-prefix opcode `op :wide32` (`BytecodeList.rb:1178`);
+    /// `Instruction.h:41,86-89`.
+    pub const WIDE32: u8 = 130;
+    /// `op :enter` (`BytecodeList.rb:1180`).
+    pub const ENTER: u8 = 131;
+    /// `op :mov` (`BytecodeList.rb:1248-1252`).
+    pub const MOV: u8 = 144;
+    /// First member `:eq` of `op_group :BinaryOp` (`BytecodeList.rb:1254-1274`).
+    pub const EQ: u8 = 145;
+    /// `op_group :ProfiledBinaryOpWithOperandTypes` members in group order
+    /// `[:add, :mul, :div, :sub, :bitand, :bitor, :bitxor]`
+    /// (`BytecodeList.rb:1276-1292`): add=158, mul=159, (div=160, not yet
+    /// declared here), sub=161.
+    pub const ADD: u8 = 158;
+    /// See [`ADD`]: second ProfiledBinaryOpWithOperandTypes member.
+    pub const MUL: u8 = 159;
+    /// See [`ADD`]: fourth member; `div` (160) sits between `mul` and `sub`.
+    pub const SUB: u8 = 161;
 }
 
-/// Operand classes in the representative subset.
+/// Operand classes in the declared subset.
 ///
 /// Each maps to a `BytecodeList.rb` arg type. The class fixes the operand's
 /// signedness for `Fits` width selection and for sign/zero extension on decode
@@ -150,7 +185,7 @@ impl OperandKind {
     }
 }
 
-/// Faithful descriptor for one opcode in the representative core subset.
+/// Faithful descriptor for one opcode in the declared core subset.
 ///
 /// Mirrors a `BytecodeList.rb` `op :name, args: { ... }` declaration: the
 /// operand schema plus the derived `opcodeLength` that drives
@@ -178,18 +213,64 @@ pub struct OpcodeDescriptor {
 impl OpcodeDescriptor {
     /// `opcodeLengths[id]` = operand-slot count.
     ///
-    /// `generator/Opcode.rb:372` `length = args.length + (metadata ? 1 : 0)` and
-    /// `generator/Section.rb:111` emits `macro(name, length)`. The representative
-    /// subset has no metadata, so this is exactly `operands.len()`.
+    /// `generator/Opcode.rb:372-374` `length = args.length + (metadata ? 1 : 0)`
+    /// and `generator/Section.rb:111` emits `macro(name, length)`. The declared
+    /// subset has no metadata (every declared id is >= the metadata partition
+    /// bound 49 — see the `OPCODE_TABLE` doc), so this is exactly
+    /// `operands.len()`.
     pub const fn opcode_length(&self) -> usize {
         self.operands.len()
     }
 }
 
-/// Representative opcode table. Models JSC's ONE untyped op per operation
-/// (`op_add`, NOT `AddInt32`): type specialization is the JIT's job via the
-/// profile operand (`metadata-table.md` `d1cb45f8`).
+/// Operand shape shared by EVERY `op_group :ProfiledBinaryOpWithOperandTypes`
+/// member — `args: { dst, lhs, rhs, profileIndex, operandTypes }`
+/// (`BytecodeList.rb:1276-1292`). One `const` mirrors the C++ group declaring
+/// its args ONCE for all members (`generator/Section.rb:50-54`).
+const PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS: &[OperandKind] = &[
+    OperandKind::VirtualRegister,
+    OperandKind::VirtualRegister,
+    OperandKind::VirtualRegister,
+    OperandKind::ProfileIndex,
+    OperandKind::OperandTypes,
+];
+
+/// Declared-subset opcode table, in generated-ID order (= `BytecodeList.rb`
+/// declaration order). Models JSC's ONE untyped op per operation (`op_add`,
+/// NOT `AddInt32`): type specialization is the JIT's job via the profile
+/// operand (`metadata-table.md` `d1cb45f8`).
+///
+/// None of the declared opcodes carries metadata: their IDs are all >=
+/// NUMBER_OF_BYTECODE_WITH_METADATA (49 in the generated `Bytecodes.h:290`;
+/// `hasMetadata()` = `opcodeID() < numberOfBytecodesWithMetadata`,
+/// `Instruction.h:38,98-101`), so no row adds the +1 metadataID operand slot
+/// (`generator/Opcode.rb:372-374`) and `opcode_length == operands.len()`
+/// matches the generated `macro(op_*, length)` lines exactly.
 static OPCODE_TABLE: &[OpcodeDescriptor] = &[
+    // op :jmp, args: { targetLabel }  (BytecodeList.rb:933-936).
+    OpcodeDescriptor {
+        id: opcode_id::JMP,
+        name: "jmp",
+        operands: &[OperandKind::BoundLabel],
+        is_wide_prefix: false,
+        core: None,
+    },
+    // op :jtrue, args: { condition, targetLabel }  (BytecodeList.rb:938-942).
+    OpcodeDescriptor {
+        id: opcode_id::JTRUE,
+        name: "jtrue",
+        operands: &[OperandKind::VirtualRegister, OperandKind::BoundLabel],
+        is_wide_prefix: false,
+        core: None,
+    },
+    // op :ret, args: { value }  (BytecodeList.rb:1040-1043).
+    OpcodeDescriptor {
+        id: opcode_id::RET,
+        name: "ret",
+        operands: &[OperandKind::VirtualRegister],
+        is_wide_prefix: false,
+        core: Some(CoreOpcode::Return),
+    },
     OpcodeDescriptor {
         id: opcode_id::WIDE16,
         name: "wide16",
@@ -220,24 +301,8 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         is_wide_prefix: false,
         core: Some(CoreOpcode::Move),
     },
-    // op_group :ProfiledBinaryOpWithOperandTypes [:add, ...],
-    //   args: { dst, lhs, rhs, profileIndex, operandTypes }
-    //   (BytecodeList.rb:1276-1291). UNTYPED op carrying a profile index.
-    OpcodeDescriptor {
-        id: opcode_id::ADD,
-        name: "add",
-        operands: &[
-            OperandKind::VirtualRegister,
-            OperandKind::VirtualRegister,
-            OperandKind::VirtualRegister,
-            OperandKind::ProfileIndex,
-            OperandKind::OperandTypes,
-        ],
-        is_wide_prefix: false,
-        core: None,
-    },
     // op_group :BinaryOp [:eq, ...], args: { dst, lhs, rhs }
-    //   (BytecodeList.rb:1254-1268). Unprofiled binary op.
+    //   (BytecodeList.rb:1254-1274). Unprofiled binary op.
     OpcodeDescriptor {
         id: opcode_id::EQ,
         name: "eq",
@@ -249,34 +314,39 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         is_wide_prefix: false,
         core: None,
     },
-    // op :jmp, args: { targetLabel }  (BytecodeList.rb:933-936).
+    // op_group :ProfiledBinaryOpWithOperandTypes [:add, :mul, :div, :sub, ...]
+    //   (BytecodeList.rb:1276-1292). UNTYPED ops carrying a profile index; the
+    //   whole group shares ONE operand shape. Decode-only until the generated
+    //   dispatch cutover: `core` stays None so the mov/ret wedge refuses to
+    //   execute them (mapping onto the type-specialized `AddInt32`-style arms
+    //   would not be faithful).
     OpcodeDescriptor {
-        id: opcode_id::JMP,
-        name: "jmp",
-        operands: &[OperandKind::BoundLabel],
+        id: opcode_id::ADD,
+        name: "add",
+        operands: PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS,
         is_wide_prefix: false,
         core: None,
     },
-    // op :jtrue, args: { condition, targetLabel }  (BytecodeList.rb:938-942).
     OpcodeDescriptor {
-        id: opcode_id::JTRUE,
-        name: "jtrue",
-        operands: &[OperandKind::VirtualRegister, OperandKind::BoundLabel],
+        id: opcode_id::MUL,
+        name: "mul",
+        operands: PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS,
         is_wide_prefix: false,
         core: None,
     },
-    // op :ret, args: { value }  (BytecodeList.rb:1040-1043).
     OpcodeDescriptor {
-        id: opcode_id::RET,
-        name: "ret",
-        operands: &[OperandKind::VirtualRegister],
+        id: opcode_id::SUB,
+        name: "sub",
+        operands: PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS,
         is_wide_prefix: false,
-        core: Some(CoreOpcode::Return),
+        core: None,
     },
 ];
 
 /// Look up a descriptor by opcode ID. The real engine indexes generated tables
-/// directly by `OpcodeID`; the representative subset scans its small table.
+/// directly by `OpcodeID`; the declared subset scans its small table (IDs are
+/// sparse until the full 193-op table lands, e.g. `div`=160 sits undeclared
+/// between `mul`=159 and `sub`=161).
 pub fn descriptor_for(id: u8) -> Option<&'static OpcodeDescriptor> {
     OPCODE_TABLE.iter().find(|descriptor| descriptor.id == id)
 }
@@ -410,7 +480,7 @@ fn sign_extend(value: u64, width: usize) -> i64 {
     ((value << shift) as i64) >> shift
 }
 
-/// Safe decoded view of one representative packed instruction.
+/// Safe decoded view of one declared-subset packed instruction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawDecodedInstruction {
     pub offset: usize,
@@ -930,16 +1000,62 @@ mod tests {
         assert_eq!(wide32, 1 + 8 + 1); // [pfx][op][aaaa][bbbb]
     }
 
-    /// `opcodeLengths[id]` = operand-slot count (`generator/Opcode.rb:372`).
+    /// `opcodeLengths[id]` = operand-slot count (`generator/Opcode.rb:372-374`),
+    /// matching the generated `macro(op_*, length)` lines
+    /// (`WebKitBuild/.../Bytecodes.h:100-192`).
     #[test]
     fn opcode_lengths_match_bytecode_list() {
         assert_eq!(descriptor_for(ENTER).unwrap().opcode_length(), 0);
         assert_eq!(descriptor_for(MOV).unwrap().opcode_length(), 2);
         assert_eq!(descriptor_for(ADD).unwrap().opcode_length(), 5); // dst,lhs,rhs,profile,types
+        assert_eq!(descriptor_for(MUL).unwrap().opcode_length(), 5); // group shape shared
+        assert_eq!(descriptor_for(SUB).unwrap().opcode_length(), 5); // group shape shared
         assert_eq!(descriptor_for(EQ).unwrap().opcode_length(), 3);
         assert_eq!(descriptor_for(JMP).unwrap().opcode_length(), 1);
         assert_eq!(descriptor_for(JTRUE).unwrap().opcode_length(), 2);
         assert_eq!(descriptor_for(RET).unwrap().opcode_length(), 1);
+    }
+
+    /// FAITHFUL ID PIN: the declared subset carries JSC's REAL generated
+    /// opcode IDs. Expected values come from the generated header the local
+    /// C++ `jsc` was built from —
+    /// `WebKitBuild/Release/DerivedSources/JavaScriptCore/Bytecodes.h`
+    /// (`op_jmp_value_string "69"`, `op_jtrue_value_string "70"`,
+    /// `op_ret_value_string "104"`, `op_wide16_value_string "128"`,
+    /// `op_wide32_value_string "130"`, `op_enter_value_string "131"`,
+    /// `op_mov_value_string "144"`, `op_eq_value_string "145"`,
+    /// `op_add_value_string "158"`, `op_mul_value_string "159"`,
+    /// `op_sub_value_string "161"`) — which the ID-assignment rule reproduces
+    /// from `BytecodeList.rb` declaration order (`preserve_order: true`,
+    /// `BytecodeList.rb:79-87`; `generator/DSL.rb:43-56`;
+    /// `generator/Opcode.rb:41-47,59-61`). Any drift fails loudly here.
+    #[test]
+    fn opcode_ids_match_jsc_generated_values() {
+        let expected: &[(u8, &str)] = &[
+            (69, "jmp"),
+            (70, "jtrue"),
+            (104, "ret"),
+            (128, "wide16"),
+            (130, "wide32"),
+            (131, "enter"),
+            (144, "mov"),
+            (145, "eq"),
+            (158, "add"),
+            (159, "mul"),
+            (161, "sub"),
+        ];
+        assert_eq!(OPCODE_TABLE.len(), expected.len());
+        for (row, &(id, name)) in OPCODE_TABLE.iter().zip(expected) {
+            // Table rows sit in generated-ID (declaration) order.
+            assert_eq!(row.id, id, "op_{name}");
+            assert_eq!(row.name, name, "id {id}");
+            assert_eq!(descriptor_for(id).unwrap().name, name, "id {id}");
+            // Exactly op_wide16/op_wide32 are width prefixes
+            // (Instruction.h:40-41,81-89).
+            assert_eq!(row.is_wide_prefix, id == WIDE16 || id == WIDE32);
+        }
+        // `div` (159+1=160) sits undeclared between mul and sub until ported.
+        assert_eq!(descriptor_for(160), None);
     }
 
     /// `Fits` width selection: one out-of-narrow-range operand widens the WHOLE
@@ -1167,9 +1283,9 @@ mod tests {
         assert_eq!(ret.size, 2);
         assert_eq!(ret.operands[0], -1);
 
-        // Instruction starts are exactly {0, 3}; every other offset — including
-        // offset 3's operand byte 0xff and offset 1 whose byte value 0x10 is NOT
-        // an opcode boundary — must be rejected, never decoded mid-instruction.
+        // Instruction starts are exactly {0, 3}; every other offset — the
+        // operand bytes at 1, 2 (0xff, 0x10) and 4 (0xff) — must be rejected,
+        // never decoded mid-instruction.
         for offset in 0..=bytes.len() + 1 {
             assert_eq!(
                 is_instruction_start(&bytes, offset).expect("well-formed stream walks"),
@@ -1197,6 +1313,175 @@ mod tests {
         }
     }
 
+    /// JSC-derived byte FIXTURE: `[enter][add narrow][ret]` hand-encoded per
+    /// the C++ layout (`Instruction.h:181-198` narrow form
+    /// `[opcode][operands...]`, opcode always one byte per `Opcode.h:86-87`).
+    /// `op_add`'s operands are dst, lhs, rhs, profileIndex, operandTypes
+    /// (`BytecodeList.rb:1276-1292`), one byte each in narrow form:
+    ///   offset 0: enter                          = [ENTER]           (size 1)
+    ///   offset 1: add local0, local1, constant0,
+    ///             profileIndex=7, operandTypes=0x12
+    ///             = [ADD, 0xff, 0xfe, 0x10, 0x07, 0x12]              (size 6)
+    ///   offset 7: ret local0                     = [RET, 0xff]       (size 2)
+    #[test]
+    fn hand_encoded_enter_add_ret_stream_decodes_with_full_operand_shape() {
+        let bytes = [ENTER, ADD, 0xff, 0xfe, 0x10, 0x07, 0x12, RET, 0xff];
+
+        let enter = decode_raw_instruction(&bytes, 0).expect("enter decodes at 0");
+        assert_eq!(enter.opcode_id, ENTER);
+        assert_eq!(enter.name, "enter");
+        assert_eq!(enter.width, OpcodeSize::Narrow);
+        assert_eq!(enter.size, 1);
+        assert!(enter.operands.is_empty());
+
+        let add = decode_raw_instruction(&bytes, 1).expect("add decodes at 1");
+        assert_eq!(add.opcode_id, ADD);
+        assert_eq!(add.width, OpcodeSize::Narrow);
+        assert_eq!(add.size, 6);
+        assert_eq!(add.operands[0], -1); // dst = local(0), two's complement 0xff
+        assert_eq!(add.operands[1], -2); // lhs = local(1)
+        assert_eq!(add.operands[2], i64::from(FIRST_CONSTANT_REGISTER_INDEX)); // rhs = constant(0)
+        assert_eq!(add.operands[3], 7); // profileIndex, unsigned zero-extend
+        assert_eq!(add.operands[4], 0x12); // operandTypes, unsigned
+
+        let ret = decode_raw_instruction(&bytes, 7).expect("ret decodes at 7");
+        assert_eq!(ret.opcode_id, RET);
+        assert_eq!(ret.size, 2);
+        assert_eq!(ret.operands[0], -1);
+
+        // Instruction starts are exactly {0, 1, 7}; every mid-instruction
+        // offset is rejected, never decoded.
+        for offset in 0..=bytes.len() + 1 {
+            assert_eq!(
+                is_instruction_start(&bytes, offset).expect("well-formed stream walks"),
+                matches!(offset, 0 | 1 | 7),
+                "offset {offset}"
+            );
+        }
+    }
+
+    /// The ProfiledBinaryOpWithOperandTypes group shares ONE operand shape
+    /// (`BytecodeList.rb:1276-1292`): `sub`/`mul` decode exactly like `add`
+    /// with only the opcode id/name differing, in every width. Wide fixtures
+    /// are hand-encoded per `Instruction.h:181-198` (`[prefix][opcode]` then
+    /// little-endian operand fields) with the per-width constant bands of
+    /// `Fits<VirtualRegister>` (`Fits.h:118-156`; band starts 16/64/raw per
+    /// `BytecodeConventions.h:35-37`).
+    #[test]
+    fn sub_and_mul_decode_with_adds_group_shape_across_widths() {
+        // (b) Narrow: identical operand bytes, only the opcode byte differs.
+        let operand_bytes = [0xff, 0xfe, 0x10, 0x07, 0x12];
+        let encode = |id: u8| -> Vec<u8> { std::iter::once(id).chain(operand_bytes).collect() };
+        let add = decode_raw_instruction(&encode(ADD), 0).expect("add");
+        let sub = decode_raw_instruction(&encode(SUB), 0).expect("sub");
+        let mul = decode_raw_instruction(&encode(MUL), 0).expect("mul");
+        assert_eq!(sub.opcode_id, SUB);
+        assert_eq!(mul.opcode_id, MUL);
+        assert_eq!(sub.operands, add.operands);
+        assert_eq!(mul.operands, add.operands);
+        assert_eq!(sub.size, add.size);
+        assert_eq!(mul.size, add.size);
+        assert_eq!(sub.width, OpcodeSize::Narrow);
+
+        // Wide16 sub: [op_wide16][sub][dst.le16][lhs.le16][rhs.le16]
+        // [profileIndex.le16][operandTypes.le16]; constant band start 64
+        // (FirstConstantRegisterIndex16). profileIndex 5000 = 0x1388.
+        let sub16 = [
+            WIDE16, SUB, 0xff, 0xff, 0xfe, 0xff, 0x40, 0x00, 0x88, 0x13, 0x02, 0x01,
+        ];
+        let sub16 = decode_raw_instruction(&sub16, 0).expect("wide16 sub decodes");
+        assert_eq!(sub16.opcode_id, SUB);
+        assert_eq!(sub16.width, OpcodeSize::Wide16);
+        assert_eq!(sub16.size, 12); // 1 prefix + 1 opcode + 5*2
+        assert_eq!(sub16.operands[0], -1);
+        assert_eq!(sub16.operands[1], -2);
+        assert_eq!(sub16.operands[2], i64::from(FIRST_CONSTANT_REGISTER_INDEX));
+        assert_eq!(sub16.operands[3], 5000);
+        assert_eq!(sub16.operands[4], 0x0102);
+
+        // Wide32 mul: [op_wide32][mul][5 x le32]; wide32 stores the raw
+        // VirtualRegister namespace (constants at FirstConstantRegisterIndex =
+        // 0x40000000). profileIndex 100000 = 0x000186a0.
+        let mul32 = [
+            WIDE32, MUL, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x40,
+            0xa0, 0x86, 0x01, 0x00, 0x02, 0x01, 0x00, 0x00,
+        ];
+        let mul32 = decode_raw_instruction(&mul32, 0).expect("wide32 mul decodes");
+        assert_eq!(mul32.opcode_id, MUL);
+        assert_eq!(mul32.width, OpcodeSize::Wide32);
+        assert_eq!(mul32.size, 22); // 1 prefix + 1 opcode + 5*4
+        assert_eq!(mul32.operands[0], -1);
+        assert_eq!(mul32.operands[1], -2);
+        assert_eq!(mul32.operands[2], i64::from(FIRST_CONSTANT_REGISTER_INDEX));
+        assert_eq!(mul32.operands[3], 100_000);
+        assert_eq!(mul32.operands[4], 0x0102);
+
+        // (d) Multi-size walk: enter(1) + add narrow(6) + sub wide16(12) +
+        // mul wide32(22) + ret(2) — instruction starts are exactly the
+        // running byte offsets {0, 1, 7, 19, 41}.
+        let mut stream = vec![ENTER, ADD, 0xff, 0xfe, 0x10, 0x07, 0x12];
+        stream.extend_from_slice(&[
+            WIDE16, SUB, 0xff, 0xff, 0xfe, 0xff, 0x40, 0x00, 0x88, 0x13, 0x02, 0x01,
+        ]);
+        stream.extend_from_slice(&[
+            WIDE32, MUL, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x40,
+            0xa0, 0x86, 0x01, 0x00, 0x02, 0x01, 0x00, 0x00,
+        ]);
+        stream.extend_from_slice(&[RET, 0xff]);
+        assert_eq!(stream.len(), 43);
+        for offset in 0..=stream.len() + 1 {
+            assert_eq!(
+                is_instruction_start(&stream, offset).expect("well-formed stream walks"),
+                matches!(offset, 0 | 1 | 7 | 19 | 41),
+                "offset {offset}"
+            );
+        }
+        // The writer agrees with the hand encoding for the widened rows.
+        let mut writer = InstructionStreamWriter::new();
+        assert_eq!(writer.emit(ENTER, &[]), 0);
+        assert_eq!(
+            writer.emit(
+                ADD,
+                &[
+                    OperandValue::VirtualRegister(-1),
+                    OperandValue::VirtualRegister(-2),
+                    OperandValue::VirtualRegister(FIRST_CONSTANT_REGISTER_INDEX),
+                    OperandValue::ProfileIndex(7),
+                    OperandValue::OperandTypes(0x12),
+                ],
+            ),
+            1
+        );
+        assert_eq!(
+            writer.emit(
+                SUB,
+                &[
+                    OperandValue::VirtualRegister(-1),
+                    OperandValue::VirtualRegister(-2),
+                    OperandValue::VirtualRegister(FIRST_CONSTANT_REGISTER_INDEX),
+                    OperandValue::ProfileIndex(5000),
+                    OperandValue::OperandTypes(0x0102),
+                ],
+            ),
+            7
+        );
+        assert_eq!(
+            writer.emit(
+                MUL,
+                &[
+                    OperandValue::VirtualRegister(-1),
+                    OperandValue::VirtualRegister(-2),
+                    OperandValue::VirtualRegister(FIRST_CONSTANT_REGISTER_INDEX),
+                    OperandValue::ProfileIndex(100_000),
+                    OperandValue::OperandTypes(0x0102),
+                ],
+            ),
+            19
+        );
+        assert_eq!(writer.emit(RET, &[OperandValue::VirtualRegister(-1)]), 41);
+        assert_eq!(writer.finalize().bytes(), stream.as_slice());
+    }
+
     /// The id->CoreOpcode dispatch bridge lives in the ONE canonical opcode
     /// table: exactly mov/ret are executable from raw packed bytes, and their
     /// `CoreOpcode` identities match the wedge contract.
@@ -1210,7 +1495,7 @@ mod tests {
             };
             assert_eq!(descriptor.core, expected, "opcode {}", descriptor.name);
             assert_eq!(
-                CoreOpcode::from_representative_packed_opcode_id(descriptor.id),
+                CoreOpcode::from_packed_opcode_id(descriptor.id),
                 expected,
                 "opcode {}",
                 descriptor.name
