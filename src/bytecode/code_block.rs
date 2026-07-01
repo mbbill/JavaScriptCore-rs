@@ -43,10 +43,10 @@ use crate::bytecode::metadata::{InstructionMetadataPlan, MetadataLayout, Metadat
 use crate::bytecode::opcode::{CoreOpcode, MetadataFieldSpec, Opcode, OpcodeSchemaVersion};
 use crate::bytecode::origin::{CodeOrigin, CodeOriginTable, SourceNoteLookup};
 use crate::bytecode::profiling::{
-    ArrayProfile, ProfileUpdatePolicy, ProfilingCounterSet, UnlinkedValueProfile, ValueProfile,
-    ValueProfileBucket, ValueProfileBucketKind, ValueProfileBucketSample,
-    ValueProfileEmissionCapability, ValueProfileEmissionPolicy, ValueProfileSampleError,
-    ValueProfileTable,
+    ArrayProfile, BinaryArithProfile, ProfileUpdatePolicy, ProfilingCounterSet, UnaryArithProfile,
+    UnlinkedValueProfile, ValueProfile, ValueProfileBucket, ValueProfileBucketKind,
+    ValueProfileBucketSample, ValueProfileEmissionCapability, ValueProfileEmissionPolicy,
+    ValueProfileSampleError, ValueProfileTable,
 };
 use crate::bytecode::register::{RegisterFrameShape, SpecialRegisters, VirtualRegister};
 use crate::bytecode::speculated_type::SPEC_NONE;
@@ -696,6 +696,38 @@ impl CodeBlock {
             .copied()
     }
 
+    /// The analog of `CodeBlock::binaryArithProfileForBytecodeIndex`
+    /// (CodeBlock.cpp:3500-3503): C++ resolves the instruction's
+    /// `m_profileIndex` argument into `UnlinkedCodeBlock::m_binaryArithProfiles`
+    /// (CodeBlock.cpp:3510-3527); the Rust slots key by `BytecodeIndex`
+    /// directly (see `BinaryArithProfileSlot`).
+    pub fn binary_arith_profile_for_bytecode_index(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<BinaryArithProfile> {
+        self.side_tables
+            .binary_arith_profiles
+            .borrow()
+            .iter()
+            .find(|slot| slot.bytecode_index == bytecode_index)
+            .map(|slot| slot.profile)
+    }
+
+    /// The analog of `CodeBlock::unaryArithProfileForBytecodeIndex`
+    /// (CodeBlock.cpp:3505-3508, resolving through
+    /// `unaryArithProfileForPC`, CodeBlock.cpp:3529-3545).
+    pub fn unary_arith_profile_for_bytecode_index(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Option<UnaryArithProfile> {
+        self.side_tables
+            .unary_arith_profiles
+            .borrow()
+            .iter()
+            .find(|slot| slot.bytecode_index == bytecode_index)
+            .map(|slot| slot.profile)
+    }
+
     /// Read the monomorphic GET inline cache for a GetByName site, if filled.
     ///
     /// Mirrors loading `OpGetById::Metadata::m_modeMetadata` before
@@ -1167,6 +1199,129 @@ impl CodeBlock {
         };
         profile.observe_indexed_read(structure, out_of_bounds);
         Ok(Some(*profile))
+    }
+
+    // Shared authority/lifecycle gate for the runtime feedback-profile writes
+    // (the checks every `record_*` profile mutation performs; see
+    // `record_array_profile_indexed_read` for the C++ mutation-through-
+    // `CodeBlock*` mapping).
+    fn check_profile_mutation_authority(
+        &self,
+        authority: CodeBlockMutationAuthority,
+    ) -> Result<(), CodeBlockMutationError> {
+        let expected_authority = CodeBlockMutationAuthority::VmMainThread;
+        if authority != expected_authority {
+            return Err(CodeBlockMutationError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: authority,
+            });
+        }
+        if self.mutation_authority != expected_authority {
+            return Err(CodeBlockMutationError::InvalidMutationAuthority {
+                expected: expected_authority,
+                actual: self.mutation_authority,
+            });
+        }
+        match self.lifecycle.get() {
+            CodeBlockLifecycleState::LinkedInterpreter
+            | CodeBlockLifecycleState::BaselineInstalled => Ok(()),
+            actual => Err(CodeBlockMutationError::InvalidLifecycle {
+                expected: CodeBlockLifecycleState::LinkedInterpreter,
+                actual,
+            }),
+        }
+    }
+
+    // C++ JSC: the binary arith slow paths fetch the site's profile through the
+    // instruction's `m_profileIndex` and mutate it in place through the shared
+    // `CodeBlock*` (`updateArithProfileForBinaryArithOp` calls
+    // `profile.observeLHSAndRHS(left, right)` before setting the result bits,
+    // CommonSlowPaths.cpp:470-530; `BinaryArithProfile::observeLHSAndRHS`,
+    // ArithProfile.h:366-380). Rust shares one `Rc<CodeBlock>`, so this mirrors
+    // `record_array_profile_indexed_read` and mutates the linked slot through
+    // `&self`. Storage/derivation unit only: no interpreter caller yet.
+    pub fn record_binary_arith_profile_operands(
+        &self,
+        authority: CodeBlockMutationAuthority,
+        bytecode_index: BytecodeIndex,
+        lhs: JsValue,
+        rhs: JsValue,
+    ) -> Result<Option<BinaryArithProfile>, CodeBlockMutationError> {
+        self.check_profile_mutation_authority(authority)?;
+        let mut slots = self.side_tables.binary_arith_profiles.borrow_mut();
+        let Some(slot) = slots
+            .iter_mut()
+            .find(|slot| slot.bytecode_index == bytecode_index)
+        else {
+            return Ok(None);
+        };
+        slot.profile.observe_lhs_and_rhs(lhs, rhs);
+        Ok(Some(slot.profile))
+    }
+
+    // C++ JSC: the result half of binary arith profiling
+    // (`ArithProfile::observeResult`, ArithProfile.h:128-145, reached through
+    // the same shared-`CodeBlock*` profile as
+    // `record_binary_arith_profile_operands`).
+    pub fn record_binary_arith_profile_result(
+        &self,
+        authority: CodeBlockMutationAuthority,
+        bytecode_index: BytecodeIndex,
+        result: JsValue,
+    ) -> Result<Option<BinaryArithProfile>, CodeBlockMutationError> {
+        self.check_profile_mutation_authority(authority)?;
+        let mut slots = self.side_tables.binary_arith_profiles.borrow_mut();
+        let Some(slot) = slots
+            .iter_mut()
+            .find(|slot| slot.bytecode_index == bytecode_index)
+        else {
+            return Ok(None);
+        };
+        slot.profile.arith_mut().observe_result(result);
+        Ok(Some(slot.profile))
+    }
+
+    // C++ JSC: `updateArithProfileForUnaryArithOp` starts with
+    // `profile.observeArg(operand)` (CommonSlowPaths.cpp:396-428;
+    // `UnaryArithProfile::observeArg`, ArithProfile.h:243-255), mutating the
+    // shared profile in place through `CodeBlock*`.
+    pub fn record_unary_arith_profile_arg(
+        &self,
+        authority: CodeBlockMutationAuthority,
+        bytecode_index: BytecodeIndex,
+        arg: JsValue,
+    ) -> Result<Option<UnaryArithProfile>, CodeBlockMutationError> {
+        self.check_profile_mutation_authority(authority)?;
+        let mut slots = self.side_tables.unary_arith_profiles.borrow_mut();
+        let Some(slot) = slots
+            .iter_mut()
+            .find(|slot| slot.bytecode_index == bytecode_index)
+        else {
+            return Ok(None);
+        };
+        slot.profile.observe_arg(arg);
+        Ok(Some(slot.profile))
+    }
+
+    // C++ JSC: the result half of unary arith profiling
+    // (`ArithProfile::observeResult`, ArithProfile.h:128-145, via the shared
+    // profile reached in `record_unary_arith_profile_arg`).
+    pub fn record_unary_arith_profile_result(
+        &self,
+        authority: CodeBlockMutationAuthority,
+        bytecode_index: BytecodeIndex,
+        result: JsValue,
+    ) -> Result<Option<UnaryArithProfile>, CodeBlockMutationError> {
+        self.check_profile_mutation_authority(authority)?;
+        let mut slots = self.side_tables.unary_arith_profiles.borrow_mut();
+        let Some(slot) = slots
+            .iter_mut()
+            .find(|slot| slot.bytecode_index == bytecode_index)
+        else {
+            return Ok(None);
+        };
+        slot.profile.arith_mut().observe_result(result);
+        Ok(Some(slot.profile))
     }
 
     // C++ JSC divergence: IC attach mutates the shared `CodeBlock`'s metadata
@@ -3253,11 +3408,13 @@ fn linked_side_tables_from_unlinked(unlinked: &UnlinkedCodeBlock) -> LinkedSideT
             calls: derive_call_link_inline_caches(unlinked),
             ..InlineCacheTable::default()
         }),
-        array_profiles: RefCell::new(derive_simple_array_profiles(unlinked)),
-        value_profiles: RefCell::new(derive_call_result_value_profiles(
+        array_profiles: RefCell::new(derive_array_profiles(unlinked)),
+        value_profiles: RefCell::new(derive_value_profiles(
             unlinked,
             ValueProfileEmissionPolicy::default(),
         )),
+        binary_arith_profiles: RefCell::new(derive_binary_arith_profiles(unlinked)),
+        unary_arith_profiles: RefCell::new(derive_unary_arith_profiles(unlinked)),
         ..LinkedSideTables::default()
     }
 }
@@ -3399,10 +3556,32 @@ fn derive_property_inline_caches(unlinked: &UnlinkedCodeBlock) -> Vec<PropertyIn
     caches
 }
 
-fn derive_simple_array_profiles(unlinked: &UnlinkedCodeBlock) -> Vec<ArrayProfile> {
+/// One derived `ArrayProfile` per array-profiled bytecode site, in program
+/// order, mirroring C++ JSC's per-opcode `ArrayProfile` metadata slots
+/// (bytecode/BytecodeList.rb: `get_by_val`:617, `get_length`:406,
+/// `put_by_val`:628 / `put_by_val_direct`:639, `in_by_val`:649, `call`:452 /
+/// `call_ignore_result`:463). `GetByIndex`/`PutByIndex` are the Rust
+/// constant-index lowerings of `op_get_by_val`/`op_put_by_val` and inherit
+/// those slots. JSC's remaining array-profiled opcodes (`iterator_open`:221,
+/// `tail_call`:319, `new_array_with_species`:438, the `enumerator_*`
+/// family:664-733) have no Rust opcode yet and derive nothing.
+fn derive_array_profiles(unlinked: &UnlinkedCodeBlock) -> Vec<ArrayProfile> {
     let mut profiles = Vec::new();
     for decoded in unlinked.instructions().decoded_instructions().flatten() {
-        if CoreOpcode::from_opcode(decoded.opcode) == Some(CoreOpcode::InByVal) {
+        let Some(opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
+            continue;
+        };
+        if matches!(
+            opcode,
+            CoreOpcode::GetByValue
+                | CoreOpcode::GetByIndex
+                | CoreOpcode::GetLength
+                | CoreOpcode::PutByValue
+                | CoreOpcode::PutByIndex
+                | CoreOpcode::InByVal
+                | CoreOpcode::Call
+                | CoreOpcode::CallWithThis
+        ) {
             profiles.push(ArrayProfile::for_bytecode_index(decoded.bytecode_index));
         }
     }
@@ -3435,27 +3614,67 @@ fn derive_call_link_inline_caches(unlinked: &UnlinkedCodeBlock) -> Vec<CallLinkI
     calls
 }
 
-fn derive_call_result_value_profiles(
+// C++ JSC `op_instanceof` checkpoint ordinals (bytecode/BytecodeList.rb:230-249
+// declares `checkpoints: getHasInstance, getPrototype, instanceof`; the
+// generated `OpInstanceof::Checkpoints` enum numbers them 0, 1, 2). The two
+// profiled intermediate loads key the derived slots below.
+const INSTANCEOF_CHECKPOINT_GET_HAS_INSTANCE: Checkpoint = Checkpoint(0);
+const INSTANCEOF_CHECKPOINT_GET_PROTOTYPE: Checkpoint = Checkpoint(1);
+
+/// One derived `ValueProfile` slot per value-profiled bytecode site, in
+/// program order.
+///
+/// C++ JSC hands each value-profiled op the next profile index at emission
+/// time (the `valueProfile: unsigned` argument in bytecode/BytecodeList.rb)
+/// and stores the profiles in a single program-order vector
+/// (`UnlinkedCodeBlock::m_valueProfiles`, UnlinkedCodeBlock.h:380-382). This
+/// walk mirrors that numbering, so `value_profile_offset` and the
+/// metadata-table displacement math match the C++ layout.
+///
+/// Rust opcode coverage of JSC's value-profiled set:
+/// - `GetByName` / `GetSuperByName` <-> `op_get_by_id`:387 /
+///   `op_get_by_id_with_this`:803 (super property loads).
+/// - `GetLength` <-> `op_get_length`:398.
+/// - `GetByValue` / `GetByIndex` <-> `op_get_by_val`:609 (GetByIndex is the
+///   Rust constant-index lowering).
+/// - `GetClosureCell` / `GetGlobalLexical` / `GetGlobalObjectProperty` <->
+///   the three Rust lowerings of `op_get_from_scope`:494.
+/// - `EnsureThis` <-> `op_to_this`:711.
+/// - `InstanceOf` <-> `op_instanceof`:230 (two slots, see below).
+/// - `Call` / `CallWithThis` <-> `op_call`:442.
+///
+/// `Construct`/`ConstructSuper` intentionally stay unprofiled although
+/// `op_construct`:285/`op_super_construct`:297 carry a valueProfile in JSC:
+/// deriving a slot before `normalize_constructor_return` feeds a profiling
+/// hook would record UN-normalized construct results (the consumer-side
+/// Call|CallWithThis filter in `baseline_generated_owner_call_result_profile_
+/// site` and the `construct.result_profile == None` assertion in jit/plan.rs
+/// pin the exclusion). `CallDirect` (Rust-only call-by-constant-index
+/// lowering, not `op_call_direct_eval`) is likewise excluded until its
+/// profiling story settles; the bytecompiler does not emit it today. JSC's
+/// remaining value-profiled opcodes (`try_get_by_id`:749, `get_by_id_direct`:737,
+/// `get_private_name`:583, `get_argument`:773, `get_from_arguments`:780,
+/// `get_prototype_of`:788, `get_internal_field`:795, `to_object`:812,
+/// `new_array_with_species`:429, the varargs call family:110-205,
+/// `call_direct_eval`:322, `iterator_open`:207 / `iterator_next`:132,
+/// `enumerator_get_by_val`:722) have no Rust opcode yet and derive nothing.
+fn derive_value_profiles(
     unlinked: &UnlinkedCodeBlock,
     emission_policy: ValueProfileEmissionPolicy,
 ) -> ValueProfileTable {
     let mut table = ValueProfileTable::default();
     table.emission_policy = emission_policy;
-    for decoded in unlinked.instructions().decoded_instructions().flatten() {
-        let Some(opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
-            continue;
-        };
-        if !matches!(opcode, CoreOpcode::Call | CoreOpcode::CallWithThis) {
-            continue;
-        }
-        let Ok(destination) = decoded.register_operand(0) else {
-            continue;
-        };
+    fn push_profile(
+        table: &mut ValueProfileTable,
+        bytecode_index: BytecodeIndex,
+        checkpoint: Checkpoint,
+        operand: Option<VirtualRegister>,
+    ) {
         let slot = RuntimeSlot(table.profiles.len().saturating_add(1) as u32);
         table.profiles.push(ValueProfile {
-            bytecode_index: decoded.bytecode_index,
-            checkpoint: Checkpoint::NONE,
-            operand: Some(destination),
+            bytecode_index,
+            checkpoint,
+            operand,
             buckets: vec![ValueProfileBucket {
                 slot,
                 kind: ValueProfileBucketKind::Sample,
@@ -3467,8 +3686,129 @@ fn derive_call_result_value_profiles(
             .unlinked_predictions
             .push(UnlinkedValueProfile::default());
     }
+    for decoded in unlinked.instructions().decoded_instructions().flatten() {
+        let Some(opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
+            continue;
+        };
+        match opcode {
+            // Destination-profiled sites: the profile samples the value written
+            // to the instruction's dst register (operand 0 in every Rust
+            // lowering, matching JSC's profiled `dst`/`srcDst`).
+            CoreOpcode::GetByName
+            | CoreOpcode::GetSuperByName
+            | CoreOpcode::GetLength
+            | CoreOpcode::GetByValue
+            | CoreOpcode::GetByIndex
+            | CoreOpcode::GetClosureCell
+            | CoreOpcode::GetGlobalLexical
+            | CoreOpcode::GetGlobalObjectProperty
+            | CoreOpcode::EnsureThis
+            | CoreOpcode::Call
+            | CoreOpcode::CallWithThis => {
+                let Ok(destination) = decoded.register_operand(0) else {
+                    continue;
+                };
+                push_profile(
+                    &mut table,
+                    decoded.bytecode_index,
+                    Checkpoint::NONE,
+                    Some(destination),
+                );
+            }
+            // C++ JSC `op_instanceof` profiles its two intermediate property
+            // loads, not the boolean result: `hasInstanceValueProfile` then
+            // `prototypeValueProfile` (BytecodeList.rb:230-249), written at the
+            // `getHasInstance`/`getPrototype` checkpoints into the shared
+            // `m_hasInstanceOrPrototype` register. The Rust `InstanceOf`
+            // lowering is fused (dst, value, constructor) and materializes no
+            // such register, so the slots carry `operand: None`; they keep
+            // JSC's checkpoint keying and per-site slot count.
+            CoreOpcode::InstanceOf => {
+                push_profile(
+                    &mut table,
+                    decoded.bytecode_index,
+                    INSTANCEOF_CHECKPOINT_GET_HAS_INSTANCE,
+                    None,
+                );
+                push_profile(
+                    &mut table,
+                    decoded.bytecode_index,
+                    INSTANCEOF_CHECKPOINT_GET_PROTOTYPE,
+                    None,
+                );
+            }
+            _ => {}
+        }
+    }
     table.materialize_jit_storage_from_profiles();
     table
+}
+
+/// One derived `BinaryArithProfile` per binary-arith-profiled bytecode site,
+/// in program order.
+///
+/// C++ JSC's profiled binary arith set is FOR_EACH_OPCODE_WITH_BINARY_ARITH_PROFILE
+/// (bytecode/Opcode.h:158-167): `op_add`, `op_mul`, `op_div`, `op_sub`,
+/// `op_bitand`, `op_bitor`, `op_bitxor` (BytecodeList.rb:1276-1292) plus
+/// `op_lshift`, `op_rshift` (BytecodeList.rb:1294-1304). `op_mod`, `op_pow`,
+/// and `op_urshift` sit in the unprofiled `BinaryOp` group
+/// (BytecodeList.rb:1254-1274), so `ModNumber`/`PowNumber`/
+/// `UnsignedRightShiftInt32` derive nothing.
+fn derive_binary_arith_profiles(unlinked: &UnlinkedCodeBlock) -> Vec<BinaryArithProfileSlot> {
+    let mut slots = Vec::new();
+    for decoded in unlinked.instructions().decoded_instructions().flatten() {
+        let Some(opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
+            continue;
+        };
+        if matches!(
+            opcode,
+            CoreOpcode::AddInt32
+                | CoreOpcode::SubInt32
+                | CoreOpcode::MulInt32
+                | CoreOpcode::DivNumber
+                | CoreOpcode::BitAndInt32
+                | CoreOpcode::BitOrInt32
+                | CoreOpcode::BitXorInt32
+                | CoreOpcode::LeftShiftInt32
+                | CoreOpcode::RightShiftInt32
+        ) {
+            slots.push(BinaryArithProfileSlot {
+                bytecode_index: decoded.bytecode_index,
+                profile: BinaryArithProfile::default(),
+            });
+        }
+    }
+    slots
+}
+
+/// One derived `UnaryArithProfile` per unary-arith-profiled bytecode site, in
+/// program order.
+///
+/// C++ JSC's profiled unary arith set is FOR_EACH_OPCODE_WITH_UNARY_ARITH_PROFILE
+/// (bytecode/Opcode.h:169-175): `op_bitnot`, `op_inc`, `op_dec`, `op_negate`,
+/// `op_to_number`, `op_to_numeric` (BytecodeList.rb:1329-1345, 1381-1391).
+/// Rust divergence: the bytecompiler pre-lowers `++`/`--` (JSC
+/// `op_inc`/`op_dec`) into `ToNumber` + `AddInt32`/`SubInt32` with a constant
+/// 1 (`emit_update`, bytecompiler/mod.rs), so an inc/dec site surfaces here as
+/// a `ToNumber` unary profile plus an Add/Sub binary profile instead of JSC's
+/// single `UnaryArithProfile`. `op_to_numeric` has no Rust opcode yet.
+fn derive_unary_arith_profiles(unlinked: &UnlinkedCodeBlock) -> Vec<UnaryArithProfileSlot> {
+    let mut slots = Vec::new();
+    for decoded in unlinked.instructions().decoded_instructions().flatten() {
+        let Some(opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
+            continue;
+        };
+        if matches!(
+            opcode,
+            CoreOpcode::ToNumber | CoreOpcode::NegateNumber | CoreOpcode::BitNotInt32
+        ) {
+            slots.push(UnaryArithProfileSlot {
+                bytecode_index: decoded.bytecode_index,
+                profile: UnaryArithProfile::default(),
+            });
+        }
+    }
+    slots
 }
 
 const fn call_link_descriptor_shape_for_opcode(
@@ -3907,6 +4247,33 @@ pub struct LLIntPutByIdCache {
     pub(crate) cached_key: Option<crate::interpreter::CorePropertyKey>,
 }
 
+/// Per-bytecode-site `BinaryArithProfile` storage slot.
+///
+/// C++ JSC stores one `BinaryArithProfile` per profiled arith instruction in
+/// `UnlinkedCodeBlock::m_binaryArithProfiles` (UnlinkedCodeBlock.h:514,528),
+/// keyed by the instruction's `m_profileIndex` argument
+/// (`CodeBlock::binaryArithProfileForPC`, CodeBlock.cpp:3510-3527). The Rust
+/// instruction stream carries no `profileIndex` operand, so the derived slot
+/// carries its owning `BytecodeIndex` instead — the same keying the derived
+/// `array_profiles` (`ArrayProfile::bytecode_index`) and value-profile tables
+/// use. The wrapper exists so the faithful 16-bit `BinaryArithProfile` port
+/// (ArithProfile.h) does not grow a non-JSC field.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BinaryArithProfileSlot {
+    pub bytecode_index: BytecodeIndex,
+    pub profile: BinaryArithProfile,
+}
+
+/// Per-bytecode-site `UnaryArithProfile` storage slot; see
+/// `BinaryArithProfileSlot` (C++ `UnlinkedCodeBlock::m_unaryArithProfiles`,
+/// UnlinkedCodeBlock.h:515,529; `CodeBlock::unaryArithProfileForPC`,
+/// CodeBlock.cpp:3529-3545).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UnaryArithProfileSlot {
+    pub bytecode_index: BytecodeIndex,
+    pub profile: UnaryArithProfile,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LinkedSideTables {
     pub handlers: Vec<HandlerInfo>,
@@ -3927,6 +4294,14 @@ pub struct LinkedSideTables {
     pub inline_caches: RefCell<InlineCacheTable>,
     pub array_profiles: RefCell<Vec<ArrayProfile>>,
     pub value_profiles: RefCell<ValueProfileTable>,
+    // C++ JSC keeps the arith profiles in `UnlinkedCodeBlock`
+    // (`m_binaryArithProfiles`/`m_unaryArithProfiles`, UnlinkedCodeBlock.h:528-529)
+    // because they are shared across re-links of the same unlinked block. The
+    // Rust port derives them into the linked side tables like the other
+    // feedback profiles; interior-mutable for the same shared-`Rc<CodeBlock>`
+    // reason as `array_profiles`/`value_profiles` above.
+    pub binary_arith_profiles: RefCell<Vec<BinaryArithProfileSlot>>,
+    pub unary_arith_profiles: RefCell<Vec<UnaryArithProfileSlot>>,
     pub root_maps: Vec<BytecodeRootMap>,
     pub direct_eval_cache: Option<DirectEvalCacheRef>,
     pub catch_liveness: Vec<CatchLivenessRecord>,
@@ -3958,6 +4333,8 @@ impl PartialEq for LinkedSideTables {
             && *self.inline_caches.borrow() == *other.inline_caches.borrow()
             && *self.array_profiles.borrow() == *other.array_profiles.borrow()
             && *self.value_profiles.borrow() == *other.value_profiles.borrow()
+            && *self.binary_arith_profiles.borrow() == *other.binary_arith_profiles.borrow()
+            && *self.unary_arith_profiles.borrow() == *other.unary_arith_profiles.borrow()
             && self.root_maps == other.root_maps
             && self.direct_eval_cache == other.direct_eval_cache
             && self.catch_liveness == other.catch_liveness
@@ -3997,6 +4374,26 @@ impl LinkedSideTables {
     /// Exclusive borrow of the interior-mutable value-profile table.
     pub fn value_profiles_mut(&self) -> std::cell::RefMut<'_, ValueProfileTable> {
         self.value_profiles.borrow_mut()
+    }
+
+    /// Shared read borrow of the interior-mutable binary-arith-profile table.
+    pub fn binary_arith_profiles(&self) -> std::cell::Ref<'_, Vec<BinaryArithProfileSlot>> {
+        self.binary_arith_profiles.borrow()
+    }
+
+    /// Exclusive borrow of the interior-mutable binary-arith-profile table.
+    pub fn binary_arith_profiles_mut(&self) -> std::cell::RefMut<'_, Vec<BinaryArithProfileSlot>> {
+        self.binary_arith_profiles.borrow_mut()
+    }
+
+    /// Shared read borrow of the interior-mutable unary-arith-profile table.
+    pub fn unary_arith_profiles(&self) -> std::cell::Ref<'_, Vec<UnaryArithProfileSlot>> {
+        self.unary_arith_profiles.borrow()
+    }
+
+    /// Exclusive borrow of the interior-mutable unary-arith-profile table.
+    pub fn unary_arith_profiles_mut(&self) -> std::cell::RefMut<'_, Vec<UnaryArithProfileSlot>> {
+        self.unary_arith_profiles.borrow_mut()
     }
 }
 
@@ -4580,6 +4977,74 @@ mod tests {
                 Operand::Register(base),
                 Operand::Register(property),
             ],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn ensure_this_instruction(
+        offset: u32,
+        result: VirtualRegister,
+        source: VirtualRegister,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: CoreOpcode::EnsureThis.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![Operand::Register(result), Operand::Register(source)],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn instance_of_instruction(
+        offset: u32,
+        result: VirtualRegister,
+        value: VirtualRegister,
+        constructor: VirtualRegister,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: CoreOpcode::InstanceOf.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![
+                Operand::Register(result),
+                Operand::Register(value),
+                Operand::Register(constructor),
+            ],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn binary_arith_instruction(
+        opcode: CoreOpcode,
+        offset: u32,
+        result: VirtualRegister,
+        lhs: VirtualRegister,
+        rhs: VirtualRegister,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: opcode.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![
+                Operand::Register(result),
+                Operand::Register(lhs),
+                Operand::Register(rhs),
+            ],
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(offset)),
+        }
+    }
+
+    fn unary_arith_instruction(
+        opcode: CoreOpcode,
+        offset: u32,
+        result: VirtualRegister,
+        source: VirtualRegister,
+    ) -> TypedInstruction {
+        TypedInstruction {
+            opcode: opcode.opcode(),
+            width: OperandWidth::Narrow,
+            operands: vec![Operand::Register(result), Operand::Register(source)],
             schema: None,
             bytecode_index: Some(BytecodeIndex::from_offset(offset)),
         }
@@ -5323,6 +5788,276 @@ mod tests {
                 .all(|profile| profile.bytecode_index != BytecodeIndex::from_offset(30)),
             "construct result profiling stays explicit pending until construct normalization is wired"
         );
+    }
+
+    #[test]
+    fn linked_code_block_derives_value_profiles_in_program_order() {
+        // Program-order allocation across profile-carrying opcode families,
+        // mirroring the C++ `m_valueProfiles` index handed out at emission
+        // time (UnlinkedCodeBlock.h:380-382).
+        let code_block = linked_call_link_code_block(vec![
+            get_by_name_instruction(0, VirtualRegister::local(0), VirtualRegister::local(1), 7),
+            get_by_value_instruction(
+                10,
+                VirtualRegister::local(2),
+                VirtualRegister::local(3),
+                VirtualRegister::local(4),
+            ),
+            instance_of_instruction(
+                20,
+                VirtualRegister::local(5),
+                VirtualRegister::local(6),
+                VirtualRegister::local(7),
+            ),
+            call_instruction(
+                30,
+                VirtualRegister::local(8),
+                VirtualRegister::local(9),
+                vec![VirtualRegister::local(10)],
+            ),
+            ensure_this_instruction(40, VirtualRegister::local(11), VirtualRegister::local(12)),
+        ]);
+
+        let profiles = code_block.side_tables().value_profiles().clone();
+        assert_eq!(profiles.profiles.len(), 6);
+        assert_eq!(profiles.unlinked_predictions.len(), 6);
+
+        // (bytecode offset, checkpoint, profiled destination operand), in
+        // program order. InstanceOf derives two operand-less slots at JSC's
+        // getHasInstance/getPrototype checkpoints (BytecodeList.rb:230-249).
+        let expected = [
+            (0, Checkpoint::NONE, Some(VirtualRegister::local(0))),
+            (10, Checkpoint::NONE, Some(VirtualRegister::local(2))),
+            (20, Checkpoint(0), None),
+            (20, Checkpoint(1), None),
+            (30, Checkpoint::NONE, Some(VirtualRegister::local(8))),
+            (40, Checkpoint::NONE, Some(VirtualRegister::local(11))),
+        ];
+        for (index, (offset, checkpoint, operand)) in expected.iter().enumerate() {
+            let profile = &profiles.profiles[index];
+            assert_eq!(profile.bytecode_index, BytecodeIndex::from_offset(*offset));
+            assert_eq!(profile.checkpoint, *checkpoint);
+            assert_eq!(profile.operand, *operand);
+            assert_eq!(
+                profile.buckets,
+                vec![ValueProfileBucket {
+                    slot: RuntimeSlot(index as u32 + 1),
+                    kind: ValueProfileBucketKind::Sample,
+                }]
+            );
+        }
+
+        // Per-kind (bytecode_index, checkpoint) lookup resolves the right slot
+        // and the metadata displacement math stays consistent with the
+        // program-order offset: -(offset + 1) * VALUE_PROFILE_RECORD_BYTES.
+        for (index, (offset, checkpoint, _)) in expected.iter().enumerate() {
+            let target = profiles
+                .jit_store_target(
+                    BytecodeIndex::from_offset(*offset),
+                    *checkpoint,
+                    ValueProfileBucketKind::Sample,
+                )
+                .expect("derived value profile store target");
+            let value_profile_offset = index as u32 + 1;
+            assert_eq!(
+                target.binding.profile_slot,
+                RuntimeSlot(value_profile_offset)
+            );
+            assert_eq!(target.binding.value_profile_offset, value_profile_offset);
+            assert_eq!(
+                target.binding.metadata_table_displacement,
+                -((value_profile_offset as i32 + 1) * 16)
+            );
+            assert_ne!(target.raw_bucket_address, 0);
+        }
+    }
+
+    #[test]
+    fn linked_code_block_derives_array_profiles_for_get_put_call_sites() {
+        let code_block = linked_property_ic_code_block(vec![
+            get_by_value_instruction(
+                0,
+                VirtualRegister::local(0),
+                VirtualRegister::local(1),
+                VirtualRegister::local(2),
+            ),
+            put_by_value_instruction(
+                10,
+                VirtualRegister::local(3),
+                VirtualRegister::local(4),
+                VirtualRegister::local(5),
+            ),
+            in_by_value_instruction(
+                20,
+                VirtualRegister::local(6),
+                VirtualRegister::local(7),
+                VirtualRegister::local(8),
+            ),
+            call_instruction(
+                30,
+                VirtualRegister::local(9),
+                VirtualRegister::local(10),
+                Vec::new(),
+            ),
+            // op_get_by_id carries no ArrayProfile (BytecodeList.rb:387-397).
+            get_by_name_instruction(
+                40,
+                VirtualRegister::local(11),
+                VirtualRegister::local(12),
+                7,
+            ),
+        ]);
+
+        let profiles = code_block.side_tables().array_profiles().clone();
+        assert_eq!(profiles.len(), 4);
+        for (index, offset) in [0u32, 10, 20, 30].iter().enumerate() {
+            assert_eq!(
+                profiles[index].bytecode_index,
+                BytecodeIndex::from_offset(*offset)
+            );
+        }
+        assert!(code_block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(40))
+            .is_none());
+
+        // The wired InByVal runtime write keys by bytecode_index and must keep
+        // working over the generalized table; a get_by_val slot records too.
+        let structure = StructureId::new(31);
+        for offset in [0u32, 20] {
+            let profile = code_block
+                .record_array_profile_indexed_read(
+                    CodeBlockMutationAuthority::VmMainThread,
+                    BytecodeIndex::from_offset(offset),
+                    structure,
+                    false,
+                )
+                .expect("array profile mutation succeeds")
+                .expect("derived array profile exists");
+            assert_eq!(profile.bytecode_index, BytecodeIndex::from_offset(offset));
+            assert_eq!(profile.last_seen_structure, Some(structure));
+        }
+    }
+
+    #[test]
+    fn linked_code_block_derives_arith_profiles_and_records_observations() {
+        let code_block = linked_property_ic_code_block(vec![
+            binary_arith_instruction(
+                CoreOpcode::AddInt32,
+                0,
+                VirtualRegister::local(0),
+                VirtualRegister::local(1),
+                VirtualRegister::local(2),
+            ),
+            unary_arith_instruction(
+                CoreOpcode::NegateNumber,
+                10,
+                VirtualRegister::local(3),
+                VirtualRegister::local(4),
+            ),
+            // op_mod sits in the unprofiled BinaryOp group
+            // (BytecodeList.rb:1254-1274): no arith profile slot.
+            binary_arith_instruction(
+                CoreOpcode::ModNumber,
+                20,
+                VirtualRegister::local(5),
+                VirtualRegister::local(6),
+                VirtualRegister::local(7),
+            ),
+        ]);
+
+        let binary = code_block.side_tables().binary_arith_profiles().clone();
+        assert_eq!(binary.len(), 1);
+        assert_eq!(binary[0].bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(binary[0].profile.bits(), 0);
+
+        let unary = code_block.side_tables().unary_arith_profiles().clone();
+        assert_eq!(unary.len(), 1);
+        assert_eq!(unary[0].bytecode_index, BytecodeIndex::from_offset(10));
+        assert_eq!(unary[0].profile.bits(), 0);
+
+        assert!(code_block
+            .binary_arith_profile_for_bytecode_index(BytecodeIndex::from_offset(20))
+            .is_none());
+        assert!(code_block
+            .unary_arith_profile_for_bytecode_index(BytecodeIndex::from_offset(20))
+            .is_none());
+
+        // Binary record round-trip: observeLHSAndRHS then observeResult
+        // (ArithProfile.h:366-380, :128-145).
+        let observed = code_block
+            .record_binary_arith_profile_operands(
+                CodeBlockMutationAuthority::VmMainThread,
+                BytecodeIndex::from_offset(0),
+                JsValue::from_i32(1),
+                JsValue::from_double(1.5),
+            )
+            .expect("binary arith mutation succeeds")
+            .expect("binary arith profile exists");
+        assert!(observed.lhs_observed_type().is_only_int32());
+        assert!(observed.rhs_observed_type().is_only_number());
+
+        let observed = code_block
+            .record_binary_arith_profile_result(
+                CodeBlockMutationAuthority::VmMainThread,
+                BytecodeIndex::from_offset(0),
+                JsValue::from_double(2.5),
+            )
+            .expect("binary arith mutation succeeds")
+            .expect("binary arith profile exists");
+        assert!(observed.arith().did_observe_double());
+        assert_eq!(
+            code_block.binary_arith_profile_for_bytecode_index(BytecodeIndex::from_offset(0)),
+            Some(observed),
+            "record API round-trips through the stored slot"
+        );
+
+        // Unary record round-trip: observeArg then observeResult
+        // (ArithProfile.h:243-255, :128-145).
+        let observed = code_block
+            .record_unary_arith_profile_arg(
+                CodeBlockMutationAuthority::VmMainThread,
+                BytecodeIndex::from_offset(10),
+                JsValue::from_i32(3),
+            )
+            .expect("unary arith mutation succeeds")
+            .expect("unary arith profile exists");
+        assert!(observed.arg_observed_type().is_only_int32());
+
+        let observed = code_block
+            .record_unary_arith_profile_result(
+                CodeBlockMutationAuthority::VmMainThread,
+                BytecodeIndex::from_offset(10),
+                JsValue::from_double(0.5),
+            )
+            .expect("unary arith mutation succeeds")
+            .expect("unary arith profile exists");
+        assert!(observed.arith().did_observe_double());
+        assert_eq!(
+            code_block.unary_arith_profile_for_bytecode_index(BytecodeIndex::from_offset(10)),
+            Some(observed)
+        );
+
+        // No slot at an unprofiled site: Ok(None), matching
+        // record_array_profile_indexed_read's missing-profile contract.
+        assert_eq!(
+            code_block.record_binary_arith_profile_operands(
+                CodeBlockMutationAuthority::VmMainThread,
+                BytecodeIndex::from_offset(20),
+                JsValue::from_i32(1),
+                JsValue::from_i32(2),
+            ),
+            Ok(None)
+        );
+
+        // Wrong mutation authority is rejected before any lookup.
+        assert!(matches!(
+            code_block.record_unary_arith_profile_arg(
+                CodeBlockMutationAuthority::GcVisitor,
+                BytecodeIndex::from_offset(10),
+                JsValue::from_i32(3),
+            ),
+            Err(CodeBlockMutationError::InvalidMutationAuthority { .. })
+        ));
     }
 
     #[test]
