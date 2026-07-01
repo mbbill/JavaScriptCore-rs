@@ -4,31 +4,15 @@
 //! and what recovery data an OSR exit would need. It does not evaluate types or
 //! decide whether a speculation is profitable.
 
+pub use crate::bytecode::speculated_type::SpeculatedType;
 use crate::dfg::{DfgEdgeId, DfgNodeId, DfgValueRep, OsrExitKind};
 use crate::gc::StructureId;
 use crate::runtime::{CodeBlockId, ObjectId};
 
-/// Compact type lattice name used by graph descriptors.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SpeculatedType {
-    Unknown,
-    Empty,
-    Boolean,
-    Int32,
-    Int52,
-    Double,
-    Number,
-    String,
-    Symbol,
-    BigInt,
-    Cell,
-    Object,
-    Array,
-    Function,
-    FinalObject,
-    RegExpObject,
-    Other,
-}
+// Representation canonicalization only: C++ JSC's DFG consumes the uint64_t
+// SpeculatedType bitset from bytecode/SpeculatedType.h, while UseKind remains a
+// separate edge contract. This module still only records DFG speculation/check
+// descriptors; it does not implement DFG speculation semantics.
 
 /// Where a prediction came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,7 +230,7 @@ mod tests {
             site: site(),
             kind: SpeculationCheckKind::Structure,
             direction: SpeculationDirection::GuardHeapState,
-            predicted: SpeculatedType::Object,
+            predicted: crate::bytecode::speculated_type::SPEC_OBJECT,
             representation: DfgValueRep::Object,
             source: PredictionSource::Watchpoint,
             structure: None,
@@ -270,7 +254,7 @@ mod tests {
             site: site(),
             kind: SpeculationCheckKind::Int32Overflow,
             direction: SpeculationDirection::ProveOutput,
-            predicted: SpeculatedType::Int32,
+            predicted: crate::bytecode::speculated_type::SPEC_INT32_ONLY,
             representation: DfgValueRep::Int32,
             source: PredictionSource::AbstractInterpreter,
             structure: None,

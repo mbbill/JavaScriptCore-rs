@@ -4,7 +4,7 @@
 //! knowledge to optimizing tiers. This module records that trust boundary
 //! without embedding WebCore or generating host stubs.
 
-use crate::dfg::SpeculatedType;
+use crate::bytecode::speculated_type::{SpeculatedType, SPEC_BYTECODE_TOP};
 use crate::jit::{CallBoundaryId, EffectSummary};
 use crate::runtime::{HostHookId, ObjectId};
 
@@ -407,7 +407,9 @@ impl StaticDomJitSignatureSchema {
 }
 
 const DOMJIT_NO_ARGUMENTS: &[SpeculatedType] = &[];
-const DOMJIT_VALUE_ARGUMENTS: &[SpeculatedType] = &[SpeculatedType::Unknown];
+// Representation canonicalization only: DOMJIT signatures now store JSC's
+// uint64_t SpeculatedType bitsets; DFG/DOMJIT semantics are unchanged here.
+const DOMJIT_VALUE_ARGUMENTS: &[SpeculatedType] = &[SPEC_BYTECODE_TOP];
 
 pub const STATIC_DOMJIT_EFFECT_SCHEMAS: &[StaticDomJitEffectSchema] = &[
     StaticDomJitEffectSchema {
@@ -442,7 +444,7 @@ pub const STATIC_DOMJIT_EFFECT_SCHEMAS: &[StaticDomJitEffectSchema] = &[
 pub const STATIC_DOMJIT_SIGNATURE_SCHEMAS: &[StaticDomJitSignatureSchema] = &[
     StaticDomJitSignatureSchema {
         name: "dom-getter",
-        result: SpeculatedType::Unknown,
+        result: SPEC_BYTECODE_TOP,
         arguments: DOMJIT_NO_ARGUMENTS,
         effect: DomJitEffect::ReadsWorld,
         may_use_host_hook: true,
@@ -452,7 +454,7 @@ pub const STATIC_DOMJIT_SIGNATURE_SCHEMAS: &[StaticDomJitSignatureSchema] = &[
     },
     StaticDomJitSignatureSchema {
         name: "dom-setter",
-        result: SpeculatedType::Unknown,
+        result: SPEC_BYTECODE_TOP,
         arguments: DOMJIT_VALUE_ARGUMENTS,
         effect: DomJitEffect::WritesWorld,
         may_use_host_hook: true,
@@ -483,8 +485,8 @@ mod tests {
             hook: HostHookId(1),
             receiver: None,
             class_info_ordinal: None,
-            result: SpeculatedType::Unknown,
-            arguments: vec![SpeculatedType::Int32],
+            result: SPEC_BYTECODE_TOP,
+            arguments: vec![crate::bytecode::speculated_type::SPEC_INT32_ONLY],
             effect: DomJitEffectSet {
                 reads: DomJitHeapRange::None,
                 writes: DomJitHeapRange::None,

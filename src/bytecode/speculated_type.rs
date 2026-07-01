@@ -7,10 +7,10 @@
 //! Structure,ClassInfoInheritance,JSType}` and `dumpSpeculation`).
 //!
 //! This is a PARTIALLY WIRED module (`#![allow(dead_code)]`): bytecode
-//! `ValueProfile`/`UnlinkedValueProfile` prediction storage now uses this
-//! canonical `SpeculatedType` alias, matching JSC `ValueProfile::m_prediction`.
-//! The DIVERGENT lattice enum at `src/dfg/speculation.rs:13` (`SpeculatedType`)
-//! and DOMJIT remain intentionally out of scope for this batch.
+//! `ValueProfile`/`UnlinkedValueProfile` prediction storage and DFG/DOMJIT
+//! descriptors now use this canonical `SpeculatedType` alias, matching JSC's
+//! shared bitset representation. This is representation canonicalization only;
+//! DFG speculation semantics are wired separately.
 //!
 //! C++ `typedef uint64_t SpeculatedType` (SpeculatedType.h:46) is mirrored as a
 //! plain `u64` type alias so the merge protocol stays literal `left | right` and
