@@ -33,6 +33,10 @@
 #![allow(dead_code)]
 
 use crate::bytecode::code_block::BytecodeIndex;
+use crate::bytecode::opcode::CoreOpcode;
+use crate::bytecode::register::{
+    VirtualRegister, FIRST_CONSTANT_REGISTER_INDEX16, FIRST_CONSTANT_REGISTER_INDEX8,
+};
 
 /// Opcode-ID width in bytes. For JS bytecode the opcode is ALWAYS one byte,
 /// even inside wide16/wide32 instructions: `Opcode.h:86-87`
@@ -158,6 +162,17 @@ pub struct OpcodeDescriptor {
     pub operands: &'static [OperandKind],
     /// True for the width-prefix opcodes (`op_wide16`/`op_wide32`).
     pub is_wide_prefix: bool,
+    /// Rust-only bridge to the pre-generated `CoreOpcode` dispatch surface.
+    ///
+    /// C++ has no such field: the generated opcode structs ARE the dispatch
+    /// identities. Until the generated table replaces `CoreOpcode`, the wedge
+    /// executes raw packed opcodes through the existing `CoreOpcode` arms, and
+    /// keeping the id->CoreOpcode mapping HERE — in the one canonical opcode
+    /// table — makes drift against `opcode_id` impossible (there is no second
+    /// mapping table to fall out of sync). `None` = not executable from raw
+    /// packed bytes yet (the wedge admits only mov/ret; `op_add` etc. must NOT
+    /// map onto the type-specialized `AddInt32`-style arms).
+    pub core: Option<CoreOpcode>,
 }
 
 impl OpcodeDescriptor {
@@ -180,12 +195,14 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         name: "wide16",
         operands: &[],
         is_wide_prefix: true,
+        core: None,
     },
     OpcodeDescriptor {
         id: opcode_id::WIDE32,
         name: "wide32",
         operands: &[],
         is_wide_prefix: true,
+        core: None,
     },
     // op :enter  (BytecodeList.rb:1180) — no operands.
     OpcodeDescriptor {
@@ -193,6 +210,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         name: "enter",
         operands: &[],
         is_wide_prefix: false,
+        core: None,
     },
     // op :mov, args: { dst, src }  (BytecodeList.rb:1248-1252).
     OpcodeDescriptor {
@@ -200,6 +218,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         name: "mov",
         operands: &[OperandKind::VirtualRegister, OperandKind::VirtualRegister],
         is_wide_prefix: false,
+        core: Some(CoreOpcode::Move),
     },
     // op_group :ProfiledBinaryOpWithOperandTypes [:add, ...],
     //   args: { dst, lhs, rhs, profileIndex, operandTypes }
@@ -215,6 +234,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
             OperandKind::OperandTypes,
         ],
         is_wide_prefix: false,
+        core: None,
     },
     // op_group :BinaryOp [:eq, ...], args: { dst, lhs, rhs }
     //   (BytecodeList.rb:1254-1268). Unprofiled binary op.
@@ -227,6 +247,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
             OperandKind::VirtualRegister,
         ],
         is_wide_prefix: false,
+        core: None,
     },
     // op :jmp, args: { targetLabel }  (BytecodeList.rb:933-936).
     OpcodeDescriptor {
@@ -234,6 +255,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         name: "jmp",
         operands: &[OperandKind::BoundLabel],
         is_wide_prefix: false,
+        core: None,
     },
     // op :jtrue, args: { condition, targetLabel }  (BytecodeList.rb:938-942).
     OpcodeDescriptor {
@@ -241,6 +263,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         name: "jtrue",
         operands: &[OperandKind::VirtualRegister, OperandKind::BoundLabel],
         is_wide_prefix: false,
+        core: None,
     },
     // op :ret, args: { value }  (BytecodeList.rb:1040-1043).
     OpcodeDescriptor {
@@ -248,6 +271,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         name: "ret",
         operands: &[OperandKind::VirtualRegister],
         is_wide_prefix: false,
+        core: Some(CoreOpcode::Return),
     },
 ];
 
@@ -318,22 +342,11 @@ impl OperandValue {
     }
 }
 
-/// JSC `FirstConstantRegisterIndex` used by `VirtualRegister::constant(0)`.
-/// Mirrors `bytecode/register.rs`; kept local to avoid coupling this packed core
-/// to the staging register module while it remains additive.
-pub const FIRST_CONSTANT_REGISTER_INDEX: i32 = 0x4000_0000;
-/// `Fits<VirtualRegister, Narrow>::s_firstConstantIndex` (`Fits.h:121-125`).
-pub const FIRST_CONSTANT_REGISTER_INDEX8: i32 = 16;
-/// `Fits<VirtualRegister, Wide16>::s_firstConstantIndex` (`Fits.h:126-129`).
-pub const FIRST_CONSTANT_REGISTER_INDEX16: i32 = 64;
-
-const fn is_constant_virtual_register(register: i32) -> bool {
-    register >= FIRST_CONSTANT_REGISTER_INDEX
-}
-
-const fn virtual_register_constant_index(register: i32) -> i32 {
-    register - FIRST_CONSTANT_REGISTER_INDEX
-}
+// The `VirtualRegister` namespace constants (`FirstConstantRegisterIndex` and
+// the per-width `Fits` band starts `FirstConstantRegisterIndex8/16`) live in
+// `bytecode/register.rs`, the mirror of `BytecodeConventions.h:33-37` /
+// `VirtualRegister.h`. JSC has exactly ONE such named-constant scheme, so this
+// packed core imports it instead of duplicating it.
 
 const fn first_constant_for_width(width: OpcodeSize) -> Option<i32> {
     match width {
@@ -347,30 +360,32 @@ const fn first_constant_for_width(width: OpcodeSize) -> Option<i32> {
 }
 
 fn virtual_register_fits_check(register: i32, width: OpcodeSize) -> bool {
+    let register = VirtualRegister::from_raw(register);
     if let Some(first_constant) = first_constant_for_width(width) {
-        if is_constant_virtual_register(register) {
-            return first_constant.saturating_add(virtual_register_constant_index(register))
+        if let Some(constant_index) = register.to_constant_index() {
+            return first_constant.saturating_add(constant_index as i32)
                 <= width.signed_max() as i32;
         }
-        return (register as i64) >= width.signed_min() && register < first_constant;
+        return (register.raw() as i64) >= width.signed_min() && register.raw() < first_constant;
     }
-    (register as i64) >= width.signed_min() && (register as i64) <= width.signed_max()
+    (register.raw() as i64) >= width.signed_min() && (register.raw() as i64) <= width.signed_max()
 }
 
 fn virtual_register_fits_convert(register: i32, width: OpcodeSize) -> i64 {
+    let register = VirtualRegister::from_raw(register);
     if let Some(first_constant) = first_constant_for_width(width) {
-        if is_constant_virtual_register(register) {
-            return i64::from(first_constant + virtual_register_constant_index(register));
+        if let Some(constant_index) = register.to_constant_index() {
+            return i64::from(first_constant + constant_index as i32);
         }
     }
-    i64::from(register)
+    i64::from(register.raw())
 }
 
 fn virtual_register_fits_decode(encoded: i64, width: OpcodeSize) -> i32 {
     if let Some(first_constant) = first_constant_for_width(width) {
         let encoded = encoded as i32;
         if encoded >= first_constant {
-            return FIRST_CONSTANT_REGISTER_INDEX + (encoded - first_constant);
+            return VirtualRegister::constant((encoded - first_constant) as u32).raw();
         }
         return encoded;
     }
@@ -470,6 +485,51 @@ fn try_decode_header(
 
 fn decode_header(bytes: &[u8], offset: usize) -> (OpcodeSize, &'static OpcodeDescriptor, usize) {
     try_decode_header(bytes, offset).expect("invalid opcode header in stream")
+}
+
+/// `BaseInstruction::size()` at `offset` (`Instruction.h:138-145`):
+/// `opcodeIDBytes + opcodeLengths[id]*operandSize + prefixSize`, validated
+/// against the buffer end. Decodes the header only — no operand values.
+pub fn raw_instruction_size(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<usize, RawInstructionDecodeError> {
+    let (width, descriptor, _) = try_decode_header(bytes, offset)?;
+    let size =
+        OPCODE_ID_BYTES + descriptor.opcode_length() * width.operand_bytes() + width.prefix_bytes();
+    if offset.saturating_add(size) > bytes.len() {
+        return Err(RawInstructionDecodeError::TruncatedInstruction {
+            offset,
+            size,
+            len: bytes.len(),
+        });
+    }
+    Ok(size)
+}
+
+/// Is `offset` the START of an instruction in this stream?
+///
+/// C++ `InstructionStream` never needs this check: every `BytecodeIndex` it
+/// hands out originates from iteration, which only ever advances by whole
+/// instruction sizes (`InstructionStream.h:154-161` `operator++ += size()`),
+/// and `at(Offset)` merely ASSERTs the bounds of a trusted offset
+/// (`InstructionStream.h:177-181`). The safe-Rust dispatch surface accepts
+/// arbitrary `BytecodeIndex` values from requests and jump operands, so it must
+/// re-derive the instruction-start property the C++ type system gets from
+/// provenance: walk from 0 by `size()` and require landing exactly on `offset`.
+/// Returns `Err` only if the stream itself is malformed before `offset`.
+pub fn is_instruction_start(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<bool, RawInstructionDecodeError> {
+    if offset >= bytes.len() {
+        return Ok(false);
+    }
+    let mut walk = 0usize;
+    while walk < offset {
+        walk = walk.saturating_add(raw_instruction_size(bytes, walk)?);
+    }
+    Ok(walk == offset)
 }
 
 pub fn decode_raw_instruction(
@@ -850,6 +910,7 @@ impl<'a> Iterator for InstructionCursor<'a> {
 mod tests {
     use super::opcode_id::*;
     use super::*;
+    use crate::bytecode::register::FIRST_CONSTANT_REGISTER_INDEX;
 
     /// `size()` matches the `Instruction.h:138-145` formula for each width.
     #[test]
@@ -1076,6 +1137,85 @@ mod tests {
         // The neighbouring ret is untouched.
         assert!(stream.at_offset(ret_at).is(RET));
         assert_eq!(stream.at_offset(ret_at).operand(0), -1);
+    }
+
+    /// JSC-derived byte FIXTURE (not writer output): decode hand-encoded bytes
+    /// laid out exactly per the C++ layout so the test proves JSC's encoding,
+    /// not the Rust writer's.
+    ///
+    /// Layout per `Instruction.h:181-198` narrow form `[opcode][operands...]`,
+    /// one byte per narrow operand, opcode always one byte (`Opcode.h:86-87`);
+    /// `Fits<VirtualRegister, Narrow>::convert` (`Fits.h:118-156` /
+    /// `BytecodeConventions.h:35`): local(0) = -1 -> 0xff (two's complement),
+    /// constant(0) -> s_firstConstantIndex(16) + 0 = 0x10.
+    ///
+    ///   mov local0, constant0   = [MOV, 0xff, 0x10]   (size 3)
+    ///   ret local0              = [RET, 0xff]         (size 2)
+    #[test]
+    fn hand_encoded_jsc_layout_fixture_decodes_and_gates_instruction_starts() {
+        let bytes = [MOV, 0xff, 0x10, RET, 0xff];
+
+        let mov = decode_raw_instruction(&bytes, 0).expect("mov decodes at start 0");
+        assert_eq!(mov.opcode_id, MOV);
+        assert_eq!(mov.width, OpcodeSize::Narrow);
+        assert_eq!(mov.size, 3);
+        assert_eq!(mov.operands[0], -1); // local(0)
+        assert_eq!(mov.operands[1], i64::from(FIRST_CONSTANT_REGISTER_INDEX)); // constant(0)
+
+        let ret = decode_raw_instruction(&bytes, 3).expect("ret decodes at start 3");
+        assert_eq!(ret.opcode_id, RET);
+        assert_eq!(ret.size, 2);
+        assert_eq!(ret.operands[0], -1);
+
+        // Instruction starts are exactly {0, 3}; every other offset — including
+        // offset 3's operand byte 0xff and offset 1 whose byte value 0x10 is NOT
+        // an opcode boundary — must be rejected, never decoded mid-instruction.
+        for offset in 0..=bytes.len() + 1 {
+            assert_eq!(
+                is_instruction_start(&bytes, offset).expect("well-formed stream walks"),
+                offset == 0 || offset == 3,
+                "offset {offset}"
+            );
+        }
+
+        // Wide16 fixture: `[op_wide16][MOV][dst.le16][src.le16]`
+        // (`Instruction.h:181-198`, prefix per `OpcodeSize.h:63-76`).
+        // local(128) = -129 -> 0xff7f LE [0x7f, 0xff];
+        // constant(0) -> Fits<VirtualRegister, Wide16> band start 64 = 0x0040 LE
+        // [0x40, 0x00] (`BytecodeConventions.h:36`).
+        let wide16 = [WIDE16, MOV, 0x7f, 0xff, 0x40, 0x00];
+        let mov16 = decode_raw_instruction(&wide16, 0).expect("wide16 mov decodes");
+        assert_eq!(mov16.opcode_id, MOV);
+        assert_eq!(mov16.width, OpcodeSize::Wide16);
+        assert_eq!(mov16.size, 6);
+        assert_eq!(mov16.operands[0], -129);
+        assert_eq!(mov16.operands[1], i64::from(FIRST_CONSTANT_REGISTER_INDEX));
+        // The prefix byte and the interior opcode byte are NOT starts.
+        assert!(is_instruction_start(&wide16, 0).unwrap());
+        for offset in 1..wide16.len() {
+            assert!(!is_instruction_start(&wide16, offset).unwrap());
+        }
+    }
+
+    /// The id->CoreOpcode dispatch bridge lives in the ONE canonical opcode
+    /// table: exactly mov/ret are executable from raw packed bytes, and their
+    /// `CoreOpcode` identities match the wedge contract.
+    #[test]
+    fn opcode_table_core_bridge_is_mov_and_ret_only() {
+        for descriptor in OPCODE_TABLE {
+            let expected = match descriptor.id {
+                MOV => Some(CoreOpcode::Move),
+                RET => Some(CoreOpcode::Return),
+                _ => None,
+            };
+            assert_eq!(descriptor.core, expected, "opcode {}", descriptor.name);
+            assert_eq!(
+                CoreOpcode::from_representative_packed_opcode_id(descriptor.id),
+                expected,
+                "opcode {}",
+                descriptor.name
+            );
+        }
     }
 
     #[test]

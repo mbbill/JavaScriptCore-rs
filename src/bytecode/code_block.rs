@@ -3166,20 +3166,70 @@ fn structure_stub_info_for_property_inline_cache_request(
     }
 }
 
+/// Link the unlinked constant pool into the `CodeBlock`, mirroring
+/// `CodeBlock::setConstantRegisters` (CodeBlock.cpp:1044-1101): C++ writes
+/// `constants[i]` into `m_constantRegisters[i]` because the unlinked vector
+/// POSITION is the constant index — `UnlinkedCodeBlockGenerator::addConstant`
+/// (UnlinkedCodeBlockGenerator.h:135-152) appends and hands out
+/// `FirstConstantRegisterIndex + position` as the register. Readers then index
+/// by `VirtualRegister::toConstantIndex()` (CodeBlock.h:203-206
+/// `constantRegister`/`getConstant`). Rust's `UnlinkedConstant` carries its
+/// `register` explicitly, so linking places each value at ITS constant index,
+/// never at its incidental vector position.
 fn linked_constants_from_unlinked(unlinked: &UnlinkedCodeBlock) -> LinkedConstantPool {
+    let pool = unlinked.constants();
+    let len = pool
+        .constants
+        .iter()
+        .filter_map(|constant| constant.register.to_constant_index())
+        .map(|index| index as usize + 1)
+        .max()
+        .unwrap_or(0);
+    // Slots not claimed by any unlinked constant hold the EMPTY JSValue,
+    // exactly what an unwritten `WriteBarrier<Unknown>` slot in
+    // `m_constantRegisters` holds in C++ (a default WriteBarrier is JSValue(),
+    // the empty encoding 0). JSC's dense generator layout never produces such
+    // holes; they can only appear if a Rust unlinked pool is sparse.
+    let mut constants: Vec<LinkedConstant> = (0..len)
+        .map(|index| LinkedConstant {
+            register: VirtualRegister::constant(index as u32),
+            value: ConstantValue::Encoded(JsValue::default()),
+            owner: ConstantOwner::SharedUnlinked,
+        })
+        .collect();
+    for constant in &pool.constants {
+        let Some(index) = constant.register.to_constant_index() else {
+            // No C++ counterpart: an unlinked constant's register is always in
+            // the constant namespace (VirtualRegister::toConstantIndex ASSERTs
+            // isConstant, VirtualRegister.h). Mirror the ASSERT.
+            debug_assert!(
+                false,
+                "unlinked constant register outside the constant namespace"
+            );
+            continue;
+        };
+        constants[index as usize] = LinkedConstant {
+            register: constant.register,
+            value: constant.value,
+            owner: ConstantOwner::SharedUnlinked,
+        };
+    }
     LinkedConstantPool {
-        constants: unlinked
-            .constants()
-            .constants
+        constants,
+        // C++ links function decls/exprs POSITIONALLY at CodeBlock creation:
+        // `m_functionDecls[i]` links `unlinkedCodeBlock->functionDecl(i)` and
+        // `m_functionExprs[i]` links `functionExpr(i)` (CodeBlock.cpp:425-440).
+        // The Rust executable-link step is the index-preserving handle map.
+        function_declarations: pool
+            .function_declarations
             .iter()
-            .map(|constant| LinkedConstant {
-                register: constant.register,
-                value: constant.value,
-                owner: ConstantOwner::SharedUnlinked,
-            })
+            .map(|unlinked_ref| LinkedFunctionRef(unlinked_ref.0))
             .collect(),
-        function_declarations: Vec::new(),
-        function_expressions: Vec::new(),
+        function_expressions: pool
+            .function_expressions
+            .iter()
+            .map(|unlinked_ref| LinkedFunctionRef(unlinked_ref.0))
+            .collect(),
     }
 }
 
@@ -6824,5 +6874,49 @@ mod tests {
             code_block.lifecycle(),
             CodeBlockLifecycleState::BaselineInstalled
         );
+    }
+
+    /// `CodeBlock::setConstantRegisters` (CodeBlock.cpp:1044-1101) places
+    /// `constants[i]` at `m_constantRegisters[i]`, and readers index by
+    /// `VirtualRegister::toConstantIndex()` (CodeBlock.h:203-206). Linking must
+    /// therefore place each constant at ITS constant index, not at its
+    /// incidental unlinked vector position; unclaimed slots hold the empty
+    /// value (a default `WriteBarrier<Unknown>` is the empty JSValue), and
+    /// function decls/exprs link positionally (CodeBlock.cpp:425-440).
+    #[test]
+    fn linked_constants_are_placed_at_their_constant_index() {
+        let value = JsValue::from_encoded(crate::value::EncodedJsValue(0x1234));
+        let mut pool = UnlinkedConstantPool::default();
+        // The ONLY entry claims constant index 1: vector position (0) and
+        // constant index (1) intentionally disagree.
+        pool.constants.push(UnlinkedConstant {
+            register: VirtualRegister::constant(1),
+            value: ConstantValue::Encoded(value),
+            source_representation: SourceCodeRepresentation::IntegerLiteral,
+        });
+        pool.function_declarations.push(UnlinkedFunctionRef(4));
+        pool.function_expressions.push(UnlinkedFunctionRef(9));
+        let unlinked =
+            UnlinkedCodeBlock::new(CodeKind::Program, PackedInstructionStream::default())
+                .with_constants(pool);
+
+        let linked = linked_constants_from_unlinked(&unlinked);
+
+        assert_eq!(linked.constants.len(), 2);
+        // constant(1) is served at index 1 — where op_mov's decoded constant
+        // index points.
+        assert_eq!(linked.constants[1].register, VirtualRegister::constant(1));
+        assert_eq!(linked.constants[1].value, ConstantValue::Encoded(value));
+        // The unclaimed slot 0 holds the empty JSValue, like an unwritten
+        // WriteBarrier<Unknown>.
+        assert_eq!(linked.constants[0].register, VirtualRegister::constant(0));
+        assert_eq!(
+            linked.constants[0].value,
+            ConstantValue::Encoded(JsValue::default())
+        );
+        // Function declarations/expressions are linked positionally, not
+        // dropped.
+        assert_eq!(linked.function_declarations, vec![LinkedFunctionRef(4)]);
+        assert_eq!(linked.function_expressions, vec![LinkedFunctionRef(9)]);
     }
 }

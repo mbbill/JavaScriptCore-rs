@@ -1,5 +1,21 @@
 /// First constant register in JSC's wide32 virtual-register namespace.
+/// `BytecodeConventions.h:33` `FirstConstantRegisterIndex = 0x40000000`.
 pub const FIRST_CONSTANT_REGISTER_INDEX: i32 = 0x4000_0000;
+
+/// `BytecodeConventions.h:35` `FirstConstantRegisterIndex8 = 16`: where the
+/// constant band starts inside a NARROW operand byte
+/// (`Fits<VirtualRegister, Narrow>::s_firstConstantIndex`, Fits.h:108-133).
+pub const FIRST_CONSTANT_REGISTER_INDEX8: i32 = 16;
+
+/// `BytecodeConventions.h:36` `FirstConstantRegisterIndex16 = 64`: where the
+/// constant band starts inside a WIDE16 operand
+/// (`Fits<VirtualRegister, Wide16>::s_firstConstantIndex`, Fits.h:113-133).
+pub const FIRST_CONSTANT_REGISTER_INDEX16: i32 = 64;
+
+/// `BytecodeConventions.h:37` `FirstConstantRegisterIndex32`: the wide32 form
+/// stores the raw `VirtualRegister` namespace, so its band start is
+/// `FirstConstantRegisterIndex` itself.
+pub const FIRST_CONSTANT_REGISTER_INDEX32: i32 = FIRST_CONSTANT_REGISTER_INDEX;
 
 /// JSC's invalid virtual register sentinel.
 pub const INVALID_VIRTUAL_REGISTER: i32 = 0x3fff_ffff;

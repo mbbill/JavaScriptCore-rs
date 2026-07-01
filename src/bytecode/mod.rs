@@ -140,6 +140,7 @@ pub use profiling::{
 pub use register::{
     RegisterClass, RegisterFrameShape, RegisterOperandEncoding, RegisterOperandWidth,
     SpecialRegisters, TemporaryLifetime, TemporaryRegister, ThisArgumentOffset, VirtualRegister,
-    FIRST_CONSTANT_REGISTER_INDEX, INVALID_VIRTUAL_REGISTER,
+    FIRST_CONSTANT_REGISTER_INDEX, FIRST_CONSTANT_REGISTER_INDEX16,
+    FIRST_CONSTANT_REGISTER_INDEX32, FIRST_CONSTANT_REGISTER_INDEX8, INVALID_VIRTUAL_REGISTER,
 };
 pub use speculated_type::{SpeculatedType, SPEC_NONE};

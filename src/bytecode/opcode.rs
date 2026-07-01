@@ -174,12 +174,16 @@ impl CoreOpcode {
         Opcode::RuntimeExtension(OpcodeId::from_generated_index(self.id()))
     }
 
-    pub const fn from_representative_packed_opcode_id(opcode_id: u8) -> Option<Self> {
-        match opcode_id {
-            crate::bytecode::instruction_stream::opcode_id::MOV => Some(Self::Move),
-            crate::bytecode::instruction_stream::opcode_id::RET => Some(Self::Return),
-            _ => None,
-        }
+    /// Resolve a representative packed opcode ID to its executable `CoreOpcode`.
+    ///
+    /// Delegates to the ONE canonical opcode table
+    /// (`instruction_stream::OPCODE_TABLE`, the `BytecodeList.rb` mirror) via
+    /// its `core` bridge field, so there is no second id->opcode mapping that
+    /// could drift from the table. `None` = the wedge does not execute this raw
+    /// opcode (everything except mov/ret).
+    pub fn from_representative_packed_opcode_id(opcode_id: u8) -> Option<Self> {
+        crate::bytecode::instruction_stream::descriptor_for(opcode_id)
+            .and_then(|descriptor| descriptor.core)
     }
 
     pub const fn from_opcode(opcode: Opcode) -> Option<Self> {

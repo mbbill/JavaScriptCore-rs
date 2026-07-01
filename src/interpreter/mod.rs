@@ -32,7 +32,7 @@ use crate::bytecode::code_block::{
 };
 use crate::bytecode::instruction::{
     InstructionDeclaration, InstructionDecodeError, Operand, OperandAccessError,
-    OwnedDecodedInstruction, TypedInstruction,
+    OwnedDecodedInstruction, PackedByteStorage, TypedInstruction,
 };
 use crate::bytecode::opcode::Opcode;
 use crate::bytecode::register::{
@@ -23680,7 +23680,6 @@ struct InstructionCursor<'a> {
     stream: &'a PackedInstructionStream,
     typed: &'a [TypedInstruction],
     declarations: &'a [InstructionDeclaration],
-    raw: Option<&'a [u8]>,
 }
 
 impl<'a> InstructionCursor<'a> {
@@ -23689,22 +23688,21 @@ impl<'a> InstructionCursor<'a> {
             stream,
             typed: stream.typed_placeholder(),
             declarations: stream.declarations(),
-            raw: stream.raw_bytes(),
         }
     }
 
-    fn len(self) -> usize {
-        if !self.typed.is_empty() {
-            self.typed.len()
-        } else if !self.declarations.is_empty() {
-            self.declarations.len()
-        } else {
-            self.raw.map_or(0, <[u8]>::len)
-        }
-    }
-
+    /// True only when the stream genuinely has no instructions. External byte
+    /// storage is PRESENT-but-unreadable, not empty: treating it as empty made
+    /// dispatch silently return `undefined`; instead `get` reports the loud
+    /// `RawBytesRequireGeneratedDecoder` rejection.
     fn is_empty(self) -> bool {
-        self.len() == 0
+        self.typed.is_empty()
+            && self.declarations.is_empty()
+            && match self.stream.raw() {
+                PackedByteStorage::Owned(bytes) => bytes.is_empty(),
+                PackedByteStorage::External(_) => false,
+                PackedByteStorage::Unencoded => true,
+            }
     }
 
     fn get(self, index: usize) -> Result<Option<InstructionView<'a>>, InstructionDecodeError> {
@@ -23715,12 +23713,32 @@ impl<'a> InstructionCursor<'a> {
                 .declarations
                 .get(index)
                 .map(InstructionView::Declaration))
-        } else if self.raw.is_some() {
-            let bytecode_index = BytecodeIndex::from_offset(index as u32);
-            self.stream
-                .decoded_raw_at(bytecode_index)
-                .map(InstructionView::Raw)
-                .map(Some)
+        } else if matches!(
+            self.stream.raw(),
+            PackedByteStorage::Owned(_) | PackedByteStorage::External(_)
+        ) {
+            // `BytecodeIndex` offsets pack into 30 bits (BytecodeIndex.h:88-93);
+            // anything larger cannot address an instruction.
+            let Some(offset) = u32::try_from(index)
+                .ok()
+                .filter(|offset| *offset <= u32::MAX >> 2)
+            else {
+                return Ok(None);
+            };
+            match self
+                .stream
+                .decoded_raw_at(BytecodeIndex::from_offset(offset))
+            {
+                Ok(instruction) => Ok(Some(InstructionView::Raw(instruction))),
+                // Not an instruction START (mid-instruction or out of bounds):
+                // "no instruction here", reported by callers as
+                // InvalidBytecodeIndex exactly like the ordinal paths' None —
+                // never decoded. C++ cannot observe such offsets at all
+                // (InstructionStream.h:154-161 iteration only advances by
+                // size()).
+                Err(InstructionDecodeError::InvalidBytecodeIndex { .. }) => Ok(None),
+                Err(error) => Err(error),
+            }
         } else {
             Ok(None)
         }
@@ -33640,21 +33658,42 @@ mod tests {
             source_representation: SourceCodeRepresentation::IntegerLiteral,
         });
 
-        let mut writer = InstructionStreamWriter::new();
-        let mov_at = writer.emit(
+        // JSC-derived byte FIXTURE, hand-encoded per the C++ layout so the
+        // dispatch test proves JSC's encoding, not the Rust writer's:
+        // narrow form `[opcode][operands...]` (Instruction.h:181-198), opcode
+        // always one byte (Opcode.h:86-87); Fits<VirtualRegister, Narrow>
+        // (Fits.h:118-156, band start FirstConstantRegisterIndex8 = 16 per
+        // BytecodeConventions.h:35): local(0) = -1 -> 0xff, constant(0) -> 0x10.
+        //   offset 0: mov local0, constant0 = [MOV, 0xff, 0x10]  (size 3)
+        //   offset 3: ret local0            = [RET, 0xff]        (size 2)
+        let (mov_at, ret_at) = (0usize, 3usize);
+        let raw_bytes = vec![
             raw_stream::opcode_id::MOV,
-            &[
-                raw_stream::OperandValue::VirtualRegister(local0.raw()),
-                raw_stream::OperandValue::VirtualRegister(constant0.raw()),
-            ],
-        );
-        let ret_at = writer.emit(
+            0xff,
+            0x10,
             raw_stream::opcode_id::RET,
-            &[raw_stream::OperandValue::VirtualRegister(local0.raw())],
+            0xff,
+        ];
+        // The writer must agree byte-for-byte with the hand encoding.
+        let mut writer = InstructionStreamWriter::new();
+        assert_eq!(
+            writer.emit(
+                raw_stream::opcode_id::MOV,
+                &[
+                    raw_stream::OperandValue::VirtualRegister(local0.raw()),
+                    raw_stream::OperandValue::VirtualRegister(constant0.raw()),
+                ],
+            ),
+            mov_at
         );
-        assert_eq!(mov_at, 0);
-        assert_eq!(ret_at, 3);
-        let raw_bytes = writer.finalize().bytes().to_vec();
+        assert_eq!(
+            writer.emit(
+                raw_stream::opcode_id::RET,
+                &[raw_stream::OperandValue::VirtualRegister(local0.raw())],
+            ),
+            ret_at
+        );
+        assert_eq!(writer.finalize().bytes(), raw_bytes.as_slice());
 
         let block = raw_code_block_with_constants(raw_bytes.clone(), constants.clone());
         let code_block_id = CodeBlockId(CellId(301));
@@ -33728,6 +33767,185 @@ mod tests {
         assert_eq!(
             stack.top_frame().unwrap().bytecode_index,
             Some(BytecodeIndex::from_offset(ret_at as u32))
+        );
+    }
+
+    /// CRITICAL regression: a dispatch request at a byte offset INSIDE an
+    /// instruction must fail with InvalidBytecodeIndex, never decode. The mov's
+    /// src operand byte is 0x08 == RET's opcode id, so a raw decode at offset 2
+    /// would conjure a bogus RET from inside the MOV's operands. C++ can never
+    /// observe such an offset: InstructionStream iteration only advances by
+    /// whole instruction sizes (InstructionStream.h:154-161).
+    #[test]
+    fn raw_packed_dispatch_rejects_mid_instruction_bytecode_index() {
+        let local0 = VirtualRegister::local(0);
+        // mov local0, argument_or_header(8); ret local0 — hand-encoded narrow
+        // form (Instruction.h:181-198): src byte 0x08 aliases RET's opcode id.
+        let raw_bytes = vec![
+            raw_stream::opcode_id::MOV,
+            0xff,
+            raw_stream::opcode_id::RET, // register 8, NOT an instruction start
+            raw_stream::opcode_id::RET,
+            0xff,
+        ];
+        let block = raw_code_block_with_constants(raw_bytes, UnlinkedConstantPool::default());
+        let code_block_id = CodeBlockId(CellId(303));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(
+            &mut stack,
+            &mut registers,
+            code_block_id,
+            &block,
+            Vec::new(),
+        );
+        let frame = stack.top_frame().unwrap().id;
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        for mid_offset in [1u32, 2, 4] {
+            let outcome = execute_single_dispatch(
+                InterpreterExecutionState {
+                    stack: &mut stack,
+                    registers: &mut registers,
+                    exceptions: &mut exceptions,
+                    heap: &mut heap,
+                },
+                SingleDispatchRequest::new(
+                    code_block_id,
+                    frame,
+                    BytecodeIndex::from_offset(mid_offset),
+                ),
+                &block,
+                &mut host,
+            );
+            assert_eq!(
+                outcome,
+                SingleDispatchOutcome::Failed(ExecutionError::InvalidBytecodeIndex(
+                    BytecodeIndex::from_offset(mid_offset)
+                )),
+                "offset {mid_offset}"
+            );
+        }
+        // No bogus RET executed: local0 still holds its frame-entry undefined,
+        // never a value moved by a mid-instruction decode.
+        assert_eq!(
+            registers
+                .read(window, local0, Some(block.constants()))
+                .unwrap(),
+            RuntimeValue::undefined()
+        );
+    }
+
+    /// CRITICAL regression: linked constants are placed at THEIR constant
+    /// index, mirroring CodeBlock::setConstantRegisters (CodeBlock.cpp:1044,
+    /// constants[i] -> m_constantRegisters[i]) with readers indexing by
+    /// VirtualRegister::toConstantIndex() (CodeBlock.h:203-206). A pool whose
+    /// only entry is constant(1) must serve `mov local0, constant1`.
+    #[test]
+    fn raw_packed_mov_reads_constant_placed_at_its_constant_index() {
+        let constant1 = VirtualRegister::constant(1);
+        let local0 = VirtualRegister::local(0);
+        let expected = RuntimeValue::from_i32(7);
+        let mut constants = UnlinkedConstantPool::default();
+        constants.constants.push(UnlinkedConstant {
+            register: constant1,
+            value: ConstantValue::Encoded(expected),
+            source_representation: SourceCodeRepresentation::IntegerLiteral,
+        });
+
+        // Hand-encoded narrow fixture: constant(1) -> band start 16 + 1 = 0x11
+        // (Fits.h:118-156 / BytecodeConventions.h:35).
+        let raw_bytes = vec![
+            raw_stream::opcode_id::MOV,
+            0xff,
+            0x11,
+            raw_stream::opcode_id::RET,
+            0xff,
+        ];
+        let block = raw_code_block_with_constants(raw_bytes, constants);
+        let code_block_id = CodeBlockId(CellId(304));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(
+            &mut stack,
+            &mut registers,
+            code_block_id,
+            &block,
+            Vec::new(),
+        );
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            code_block_id,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(completion, ExecutionCompletion::Returned(expected));
+    }
+
+    /// External packed byte storage is present-but-unreadable: dispatch must
+    /// fail loudly instead of treating the stream as empty and returning
+    /// undefined.
+    #[test]
+    fn external_packed_bytes_fail_loudly_instead_of_returning_undefined() {
+        use crate::bytecode::instruction::PackedInstructionBytesRef;
+
+        let stream =
+            PackedInstructionStream::from_external_packed_bytes(PackedInstructionBytesRef(1));
+        let unlinked =
+            UnlinkedCodeBlock::new(CodeKind::Program, stream).with_frame(RegisterFrameShape {
+                num_parameters_including_this: 1,
+                num_vars: 1,
+                num_callee_locals: 0,
+                num_temporaries: 1,
+                special: Default::default(),
+            });
+        let block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
+        let code_block_id = CodeBlockId(CellId(305));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(
+            &mut stack,
+            &mut registers,
+            code_block_id,
+            &block,
+            Vec::new(),
+        );
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            code_block_id,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Failed(ExecutionError::BytecodeDecode(
+                InstructionDecodeError::RawBytesRequireGeneratedDecoder
+            ))
         );
     }
 

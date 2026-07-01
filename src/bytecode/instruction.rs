@@ -538,6 +538,18 @@ impl PackedInstructionStream {
         }
     }
 
+    /// Encoded stream whose bytes live behind an external reference. No byte
+    /// access exists yet, so every decode surface reports
+    /// `RawBytesRequireGeneratedDecoder` (present-but-unreadable, never
+    /// silently empty).
+    pub fn from_external_packed_bytes(reference: PackedInstructionBytesRef) -> Self {
+        Self {
+            raw: PackedByteStorage::External(reference),
+            lifecycle: PackedInstructionLifecycle::Encoded,
+            ..Self::default()
+        }
+    }
+
     pub fn layout(&self) -> InstructionStreamLayout {
         self.layout
     }
@@ -573,6 +585,17 @@ impl PackedInstructionStream {
         self.lifecycle
     }
 
+    /// Number of INSTRUCTIONS in the stream (cardinality), never a byte size
+    /// and never a `BytecodeIndex` offset bound.
+    ///
+    /// C++ has no such accessor: `InstructionStream::size()` is a BYTE count
+    /// (`InstructionStream.h:183-186`) and instruction cardinality only exists
+    /// by iterating. For the ordinal-domain representations
+    /// (declarations/typed placeholder) this doubles as the exclusive bound of
+    /// the ordinal `decoded_at` domain; for raw packed streams it is obtained
+    /// by walking whole instructions (`size()` steps) and MUST NOT be compared
+    /// against byte offsets — the ordinal decode APIs reject raw streams with
+    /// `RawBytesRequireGeneratedDecoder` (see `decoded_at`).
     pub fn instruction_count(&self) -> usize {
         if !self.declarations.is_empty() {
             self.declarations.len()
@@ -609,6 +632,25 @@ impl PackedInstructionStream {
             .ok_or(InstructionDecodeError::RawBytesRequireGeneratedDecoder)?;
         let offset = usize::try_from(bytecode_index.offset())
             .map_err(|_| InstructionDecodeError::MissingInstruction { bytecode_index })?;
+        // C++ InstructionStream only ever yields instruction STARTS (iteration
+        // advances by size(), InstructionStream.h:154-161; at() ASSERTs bounds
+        // of a trusted offset, InstructionStream.h:177-181). This safe-Rust
+        // dispatch surface accepts arbitrary BytecodeIndex values, so it must
+        // reject any offset that is not an instruction start — otherwise an
+        // operand byte that happens to equal an opcode id would decode as a
+        // bogus instruction (e.g. a RET conjured from inside a MOV's operands).
+        match raw_stream::is_instruction_start(bytes, offset) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(InstructionDecodeError::InvalidBytecodeIndex { bytecode_index })
+            }
+            Err(error) => {
+                return Err(InstructionDecodeError::RawInstructionDecode {
+                    bytecode_index,
+                    error,
+                })
+            }
+        }
         let decoded = raw_stream::decode_raw_instruction(bytes, offset).map_err(|error| {
             InstructionDecodeError::RawInstructionDecode {
                 bytecode_index,
@@ -630,7 +672,7 @@ impl PackedInstructionStream {
             opcode,
             width: operand_width_for_raw(decoded.width),
             bytecode_index,
-            next_bytecode_index: next_raw_bytecode_index(offset, decoded.size, bytes.len()),
+            next_bytecode_index: next_raw_bytecode_index(offset, decoded.size, bytes.len())?,
             operands,
             source: DecodedInstructionSource::RawPackedBytes,
         })
@@ -686,11 +728,29 @@ impl PackedInstructionStream {
         })
     }
 
+    /// Iterate the ORDINAL decode domain (declarations / typed placeholder).
+    ///
+    /// Raw packed byte streams have no ordinal domain — their positions are
+    /// BYTE OFFSETS (`BytecodeIndex.h:48-90`) — so iterating one yields exactly
+    /// one `RawBytesRequireGeneratedDecoder` error instead of silently mixing
+    /// the two index domains (the same error `decoded_at` returns for raw
+    /// streams).
     pub fn decoded_instructions(&self) -> InstructionDecodeIter<'_> {
         InstructionDecodeIter {
             stream: self,
             next_ordinal: 0,
         }
+    }
+
+    /// True when the only representation is packed bytes (owned or external),
+    /// i.e. the ordinal decode APIs cannot serve this stream.
+    fn is_raw_bytes_only(&self) -> bool {
+        self.declarations.is_empty()
+            && self.typed_placeholder.is_empty()
+            && matches!(
+                self.raw,
+                PackedByteStorage::Owned(_) | PackedByteStorage::External(_)
+            )
     }
 }
 
@@ -702,9 +762,28 @@ fn operand_width_for_raw(width: raw_stream::OpcodeSize) -> OperandWidth {
     }
 }
 
-fn next_raw_bytecode_index(offset: usize, size: usize, len: usize) -> Option<BytecodeIndex> {
-    let next = offset.checked_add(size)?;
-    (next < len).then(|| BytecodeIndex::from_offset(next as u32))
+/// `BytecodeIndex` packs `offset << checkpointShift | checkpoint`
+/// (`BytecodeIndex.h:88-93`), so the largest representable offset is
+/// `u32::MAX >> 2`. C++ ASSERTs the pack round-trips
+/// (`ASSERT((bytecodeIndex << checkpointShift) >> checkpointShift ==
+/// bytecodeIndex)`); the safe-Rust port checks it and returns an error instead
+/// of silently truncating the offset.
+fn next_raw_bytecode_index(
+    offset: usize,
+    size: usize,
+    len: usize,
+) -> Result<Option<BytecodeIndex>, InstructionDecodeError> {
+    let next = offset
+        .checked_add(size)
+        .ok_or(InstructionDecodeError::BytecodeOffsetOverflow { offset })?;
+    if next >= len {
+        return Ok(None);
+    }
+    let next = u32::try_from(next)
+        .ok()
+        .filter(|next| *next <= u32::MAX >> 2)
+        .ok_or(InstructionDecodeError::BytecodeOffsetOverflow { offset: next })?;
+    Ok(Some(BytecodeIndex::from_offset(next)))
 }
 
 #[derive(Clone, Debug)]
@@ -717,6 +796,16 @@ impl<'a> Iterator for InstructionDecodeIter<'a> {
     type Item = Result<DecodedInstruction<'a>, InstructionDecodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.stream.is_raw_bytes_only() {
+            // Raw packed streams are byte-offset indexed, not ordinal indexed:
+            // report the ordinal API's raw-stream rejection ONCE and stop
+            // instead of repeating it `instruction_count()` times.
+            if self.next_ordinal == 0 {
+                self.next_ordinal = usize::MAX;
+                return Some(Err(InstructionDecodeError::RawBytesRequireGeneratedDecoder));
+            }
+            return None;
+        }
         if self.next_ordinal >= self.stream.instruction_count() {
             return None;
         }
@@ -743,6 +832,11 @@ pub enum InstructionDecodeError {
     UnsupportedRawOpcode {
         bytecode_index: BytecodeIndex,
         opcode_id: u8,
+    },
+    /// A byte offset that cannot be packed into a `BytecodeIndex`
+    /// (`BytecodeIndex.h:88-93` pack round-trip ASSERT).
+    BytecodeOffsetOverflow {
+        offset: usize,
     },
 }
 
@@ -1364,24 +1458,25 @@ mod tests {
         assert_eq!(stream.decoded_instructions().count(), 0);
     }
 
+    /// JSC-derived byte FIXTURE: hand-encoded per the C++ layout
+    /// (`Instruction.h:181-198` narrow form `[opcode][operands...]`, opcode
+    /// always one byte per `Opcode.h:86-87`; `Fits<VirtualRegister, Narrow>`
+    /// constant band start 16 per `Fits.h:118-156`/`BytecodeConventions.h:35`),
+    /// so this proves JSC's encoding rather than the Rust writer's:
+    ///   offset 0: mov local0, constant0 = [MOV, 0xff, 0x10]  (size 3)
+    ///   offset 3: ret local0            = [RET, 0xff]        (size 2)
     #[test]
     fn raw_decoder_bridge_decodes_only_mov_and_ret() {
         let constant0 = VirtualRegister::constant(0);
         let local0 = VirtualRegister::local(0);
-        let mut writer = raw_stream::InstructionStreamWriter::new();
-        let mov_at = writer.emit(
+        let (mov_at, ret_at) = (0usize, 3usize);
+        let stream = PackedInstructionStream::from_raw_packed_bytes(vec![
             raw_stream::opcode_id::MOV,
-            &[
-                raw_stream::OperandValue::VirtualRegister(local0.raw()),
-                raw_stream::OperandValue::VirtualRegister(constant0.raw()),
-            ],
-        );
-        let ret_at = writer.emit(
+            0xff, // local(0) = -1, two's complement
+            0x10, // constant(0) -> FirstConstantRegisterIndex8 (16) + 0
             raw_stream::opcode_id::RET,
-            &[raw_stream::OperandValue::VirtualRegister(local0.raw())],
-        );
-        let stream =
-            PackedInstructionStream::from_raw_packed_bytes(writer.finalize().bytes().to_vec());
+            0xff, // local(0)
+        ]);
 
         let mov = stream
             .decoded_raw_at(BytecodeIndex::from_offset(mov_at as u32))
@@ -1405,26 +1500,77 @@ mod tests {
         assert_eq!(ret.next_bytecode_index, None);
         assert_eq!(ret.operands, vec![Operand::Register(local0)]);
 
-        let mut unsupported_writer = raw_stream::InstructionStreamWriter::new();
-        unsupported_writer.emit(
+        // op_add fixture: [ADD, dst, lhs, rhs, profileIndex, operandTypes]
+        // (BytecodeList.rb:1276-1291) — decodes structurally but the wedge
+        // refuses to execute it.
+        let unsupported = PackedInstructionStream::from_raw_packed_bytes(vec![
             raw_stream::opcode_id::ADD,
-            &[
-                raw_stream::OperandValue::VirtualRegister(local0.raw()),
-                raw_stream::OperandValue::VirtualRegister(local0.raw()),
-                raw_stream::OperandValue::VirtualRegister(local0.raw()),
-                raw_stream::OperandValue::ProfileIndex(0),
-                raw_stream::OperandValue::OperandTypes(0),
-            ],
-        );
-        let unsupported = PackedInstructionStream::from_raw_packed_bytes(
-            unsupported_writer.finalize().bytes().to_vec(),
-        );
+            0xff,
+            0xff,
+            0xff,
+            0x00,
+            0x00,
+        ]);
         assert_eq!(
             unsupported.decoded_raw_at(BytecodeIndex::from_offset(0)),
             Err(InstructionDecodeError::UnsupportedRawOpcode {
                 bytecode_index: BytecodeIndex::from_offset(0),
                 opcode_id: raw_stream::opcode_id::ADD,
             })
+        );
+    }
+
+    /// CRITICAL: byte offsets that are not instruction STARTS must never
+    /// decode. Offset 1 inside `mov local0, ret-shaped-operand` points at an
+    /// operand byte whose value equals the RET opcode id; C++ can never observe
+    /// such an offset (InstructionStream iteration only advances by size(),
+    /// InstructionStream.h:154-161), so the safe-Rust surface must reject it
+    /// rather than conjure a bogus RET from inside the MOV's operands.
+    #[test]
+    fn raw_decoder_rejects_mid_instruction_offsets() {
+        // mov local0, argument_or_header(8): src byte 0x08 == RET's opcode id.
+        let bytes = vec![
+            raw_stream::opcode_id::MOV,
+            0xff,                       // local(0)
+            raw_stream::opcode_id::RET, // register 8 (argument namespace), NOT an opcode
+            raw_stream::opcode_id::RET,
+            0xff,
+        ];
+        let stream = PackedInstructionStream::from_raw_packed_bytes(bytes);
+
+        // The real instruction starts decode fine.
+        assert!(stream.decoded_raw_at(BytecodeIndex::from_offset(0)).is_ok());
+        assert!(stream.decoded_raw_at(BytecodeIndex::from_offset(3)).is_ok());
+
+        // Every non-start offset (1, 2 inside mov; 4 inside ret; past the end)
+        // is rejected as an invalid bytecode index, never decoded.
+        for offset in [1u32, 2, 4, 5, 6] {
+            let bytecode_index = BytecodeIndex::from_offset(offset);
+            assert_eq!(
+                stream.decoded_raw_at(bytecode_index),
+                Err(InstructionDecodeError::InvalidBytecodeIndex { bytecode_index }),
+                "offset {offset}"
+            );
+        }
+    }
+
+    /// Raw packed streams have no ordinal domain: the ordinal iterator reports
+    /// the same `RawBytesRequireGeneratedDecoder` rejection as `decoded_at`,
+    /// exactly once.
+    #[test]
+    fn ordinal_iterator_rejects_raw_packed_streams_once() {
+        let stream = PackedInstructionStream::from_raw_packed_bytes(vec![
+            raw_stream::opcode_id::MOV,
+            0xff,
+            0x10,
+            raw_stream::opcode_id::RET,
+            0xff,
+        ]);
+        assert_eq!(stream.instruction_count(), 2);
+        let decoded: Vec<_> = stream.decoded_instructions().collect();
+        assert_eq!(
+            decoded,
+            vec![Err(InstructionDecodeError::RawBytesRequireGeneratedDecoder)]
         );
     }
 }
