@@ -31,7 +31,8 @@ use crate::bytecode::code_block::{
     LLIntPutByIdCache, LinkedConstantPool,
 };
 use crate::bytecode::instruction::{
-    InstructionDeclaration, Operand, OperandAccessError, TypedInstruction,
+    InstructionDeclaration, InstructionDecodeError, Operand, OperandAccessError,
+    OwnedDecodedInstruction, TypedInstruction,
 };
 use crate::bytecode::opcode::Opcode;
 use crate::bytecode::register::{
@@ -2532,6 +2533,7 @@ pub enum ExecutionError {
     DeferredConstant,
     EmptyInstructionStream,
     InvalidBytecodeIndex(BytecodeIndex),
+    BytecodeDecode(InstructionDecodeError),
     DispatchStepLimitExceeded,
     UnsupportedOpcode(Opcode),
     OperandAccess(OperandAccessError),
@@ -23623,28 +23625,31 @@ impl DispatchBudget {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum InstructionView<'a> {
     Typed(&'a TypedInstruction),
     Declaration(&'a InstructionDeclaration),
+    Raw(OwnedDecodedInstruction),
 }
 
 impl<'a> InstructionView<'a> {
-    fn opcode(self) -> Opcode {
+    fn opcode(&self) -> Opcode {
         match self {
             Self::Typed(instruction) => instruction.opcode,
             Self::Declaration(instruction) => instruction.opcode,
+            Self::Raw(instruction) => instruction.opcode,
         }
     }
 
-    fn operands(self) -> &'a [Operand] {
+    fn operands(&self) -> &[Operand] {
         match self {
             Self::Typed(instruction) => &instruction.operands,
             Self::Declaration(instruction) => &instruction.operands,
+            Self::Raw(instruction) => &instruction.operands,
         }
     }
 
-    fn bytecode_index(self, fallback: usize) -> BytecodeIndex {
+    fn bytecode_index(&self, fallback: usize) -> BytecodeIndex {
         match self {
             Self::Typed(instruction) => instruction
                 .bytecode_index
@@ -23652,29 +23657,49 @@ impl<'a> InstructionView<'a> {
             Self::Declaration(instruction) => instruction
                 .bytecode_index
                 .unwrap_or_else(|| BytecodeIndex::from_offset(fallback as u32)),
+            Self::Raw(instruction) => instruction.bytecode_index,
+        }
+    }
+
+    fn next_bytecode_index(
+        &self,
+        cursor: InstructionCursor<'a>,
+        fallback: usize,
+    ) -> Result<Option<BytecodeIndex>, InstructionDecodeError> {
+        match self {
+            Self::Raw(instruction) => Ok(instruction.next_bytecode_index),
+            Self::Typed(_) | Self::Declaration(_) => Ok(cursor
+                .get(fallback.saturating_add(1))?
+                .map(|view| view.bytecode_index(fallback.saturating_add(1)))),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct InstructionCursor<'a> {
+    stream: &'a PackedInstructionStream,
     typed: &'a [TypedInstruction],
     declarations: &'a [InstructionDeclaration],
+    raw: Option<&'a [u8]>,
 }
 
 impl<'a> InstructionCursor<'a> {
     fn new(stream: &'a PackedInstructionStream) -> Self {
         Self {
+            stream,
             typed: stream.typed_placeholder(),
             declarations: stream.declarations(),
+            raw: stream.raw_bytes(),
         }
     }
 
     fn len(self) -> usize {
         if !self.typed.is_empty() {
             self.typed.len()
-        } else {
+        } else if !self.declarations.is_empty() {
             self.declarations.len()
+        } else {
+            self.raw.map_or(0, <[u8]>::len)
         }
     }
 
@@ -23682,14 +23707,27 @@ impl<'a> InstructionCursor<'a> {
         self.len() == 0
     }
 
-    fn get(self, index: usize) -> Option<InstructionView<'a>> {
+    fn get(self, index: usize) -> Result<Option<InstructionView<'a>>, InstructionDecodeError> {
         if !self.typed.is_empty() {
-            self.typed.get(index).map(InstructionView::Typed)
-        } else {
-            self.declarations
+            Ok(self.typed.get(index).map(InstructionView::Typed))
+        } else if !self.declarations.is_empty() {
+            Ok(self
+                .declarations
                 .get(index)
-                .map(InstructionView::Declaration)
+                .map(InstructionView::Declaration))
+        } else if self.raw.is_some() {
+            let bytecode_index = BytecodeIndex::from_offset(index as u32);
+            self.stream
+                .decoded_raw_at(bytecode_index)
+                .map(InstructionView::Raw)
+                .map(Some)
+        } else {
+            Ok(None)
         }
+    }
+
+    fn contains(self, index: BytecodeIndex) -> Result<bool, InstructionDecodeError> {
+        self.get(index.offset() as usize).map(|view| view.is_some())
     }
 }
 
@@ -23836,12 +23874,13 @@ fn execute_single_dispatch_with_ordinary_call_handling<H: DispatchHost>(
 
     let index = request.bytecode_index.offset() as usize;
     let view = match cursor.get(index) {
-        Some(view) => view,
-        None => {
+        Ok(Some(view)) => view,
+        Ok(None) => {
             return SingleDispatchOutcome::Failed(ExecutionError::InvalidBytecodeIndex(
                 request.bytecode_index,
             ));
         }
+        Err(error) => return SingleDispatchOutcome::Failed(ExecutionError::BytecodeDecode(error)),
     };
     let bytecode_index = view.bytecode_index(index);
     execution.stack.mark_top_bytecode_index(bytecode_index);
@@ -23850,9 +23889,12 @@ fn execute_single_dispatch_with_ordinary_call_handling<H: DispatchHost>(
         frame: frame.id,
         code_block: request.code_block,
         bytecode_index,
-        next_bytecode_index: cursor
-            .get(index.saturating_add(1))
-            .map(|view| view.bytecode_index(index.saturating_add(1))),
+        next_bytecode_index: match view.next_bytecode_index(cursor, index) {
+            Ok(next) => next,
+            Err(error) => {
+                return SingleDispatchOutcome::Failed(ExecutionError::BytecodeDecode(error))
+            }
+        },
         opcode: view.opcode(),
         operands: view.operands(),
     };
@@ -23987,19 +24029,29 @@ fn execute_code_block_with_resume<H: DispatchHost>(
         }
 
         let index = pc.offset() as usize;
-        let Some(view) = cursor.get(index) else {
-            return ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(pc));
+        let view = match cursor.get(index) {
+            Ok(Some(view)) => view,
+            Ok(None) => {
+                return ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(pc))
+            }
+            Err(error) => {
+                return ExecutionCompletion::Failed(ExecutionError::BytecodeDecode(error))
+            }
         };
         let bytecode_index = view.bytecode_index(index);
         execution.stack.mark_top_bytecode_index(bytecode_index);
 
+        let next_bytecode_index = match view.next_bytecode_index(cursor, index) {
+            Ok(next) => next,
+            Err(error) => {
+                return ExecutionCompletion::Failed(ExecutionError::BytecodeDecode(error));
+            }
+        };
         let instruction = DispatchInstruction {
             frame: frame.id,
             code_block: code_block_id,
             bytecode_index,
-            next_bytecode_index: cursor
-                .get(index.saturating_add(1))
-                .map(|view| view.bytecode_index(index.saturating_add(1))),
+            next_bytecode_index,
             opcode: view.opcode(),
             operands: view.operands(),
         };
@@ -24031,20 +24083,31 @@ fn execute_code_block_with_resume<H: DispatchHost>(
 
         match outcome {
             DispatchOutcome::Continue => {
-                let next = index.saturating_add(1);
-                if next >= cursor.len() {
+                let next = match view.next_bytecode_index(cursor, index) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        return ExecutionCompletion::Failed(ExecutionError::BytecodeDecode(error))
+                    }
+                };
+                let Some(next) = next else {
                     return ExecutionCompletion::Returned(RuntimeValue::undefined());
-                }
-                pc = BytecodeIndex::from_offset(next as u32);
+                };
+                pc = next;
             }
             DispatchOutcome::ContinueTo(target) => {
                 let Some(target) = target else {
                     return ExecutionCompletion::Returned(RuntimeValue::undefined());
                 };
-                if cursor.get(target.offset() as usize).is_none() {
-                    return ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(
-                        target,
-                    ));
+                match cursor.contains(target) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(
+                            target,
+                        ));
+                    }
+                    Err(error) => {
+                        return ExecutionCompletion::Failed(ExecutionError::BytecodeDecode(error));
+                    }
                 }
                 poll_register_root_safepoint_on_backedge(
                     index,
@@ -24071,10 +24134,16 @@ fn execute_code_block_with_resume<H: DispatchHost>(
                 pc = target;
             }
             DispatchOutcome::Jump(target) => {
-                if cursor.get(target.offset() as usize).is_none() {
-                    return ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(
-                        target,
-                    ));
+                match cursor.contains(target) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return ExecutionCompletion::Failed(ExecutionError::InvalidBytecodeIndex(
+                            target,
+                        ));
+                    }
+                    Err(error) => {
+                        return ExecutionCompletion::Failed(ExecutionError::BytecodeDecode(error));
+                    }
                 }
                 poll_register_root_safepoint_on_backedge(
                     index,
@@ -24167,9 +24236,9 @@ fn validate_baseline_fallback_request(
     }
 
     let (frame, _) = baseline_active_frame(stack, request.frame, request.code_block)?;
-    if cursor
-        .get(request.bytecode_index.offset() as usize)
-        .is_none()
+    if !cursor
+        .contains(request.bytecode_index)
+        .map_err(ExecutionError::BytecodeDecode)?
     {
         return Err(ExecutionError::InvalidBytecodeIndex(request.bytecode_index));
     }
@@ -24184,9 +24253,9 @@ fn validate_single_dispatch_request(
     request: SingleDispatchRequest,
 ) -> Result<InstalledCallFrame, ExecutionError> {
     let (frame, _) = baseline_active_frame(stack, request.frame, request.code_block)?;
-    if cursor
-        .get(request.bytecode_index.offset() as usize)
-        .is_none()
+    if !cursor
+        .contains(request.bytecode_index)
+        .map_err(ExecutionError::BytecodeDecode)?
     {
         return Err(ExecutionError::InvalidBytecodeIndex(request.bytecode_index));
     }
@@ -24212,27 +24281,33 @@ fn map_single_dispatch_outcome(
         bytecode_index,
         call_handling,
     } = context;
+    let next_bytecode_index = match cursor
+        .get(index)
+        .and_then(|view| view.map_or(Ok(None), |view| view.next_bytecode_index(cursor, index)))
+    {
+        Ok(next) => next,
+        Err(error) => return SingleDispatchOutcome::Failed(ExecutionError::BytecodeDecode(error)),
+    };
 
     match outcome {
-        DispatchOutcome::Continue => SingleDispatchOutcome::Continue(
-            cursor
-                .get(index.saturating_add(1))
-                .map(|view| view.bytecode_index(index.saturating_add(1))),
-        ),
-        DispatchOutcome::ContinueTo(target) => {
-            if target.is_some_and(|target| cursor.get(target.offset() as usize).is_none()) {
-                SingleDispatchOutcome::Failed(ExecutionError::InvalidBytecodeIndex(target.unwrap()))
-            } else {
-                SingleDispatchOutcome::Continue(target)
-            }
-        }
-        DispatchOutcome::Jump(target) => {
-            if cursor.get(target.offset() as usize).is_none() {
+        DispatchOutcome::Continue => SingleDispatchOutcome::Continue(next_bytecode_index),
+        DispatchOutcome::ContinueTo(target) => match target {
+            Some(target) => match cursor.contains(target) {
+                Ok(true) => SingleDispatchOutcome::Continue(Some(target)),
+                Ok(false) => {
+                    SingleDispatchOutcome::Failed(ExecutionError::InvalidBytecodeIndex(target))
+                }
+                Err(error) => SingleDispatchOutcome::Failed(ExecutionError::BytecodeDecode(error)),
+            },
+            None => SingleDispatchOutcome::Continue(None),
+        },
+        DispatchOutcome::Jump(target) => match cursor.contains(target) {
+            Ok(true) => SingleDispatchOutcome::Jump(target),
+            Ok(false) => {
                 SingleDispatchOutcome::Failed(ExecutionError::InvalidBytecodeIndex(target))
-            } else {
-                SingleDispatchOutcome::Jump(target)
             }
-        }
+            Err(error) => SingleDispatchOutcome::Failed(ExecutionError::BytecodeDecode(error)),
+        },
         DispatchOutcome::Return(value) => SingleDispatchOutcome::Return(value),
         DispatchOutcome::BaselineLoopHandoff(_) => {
             SingleDispatchOutcome::Failed(ExecutionError::BaselineGeneratedExecutionRejected)
@@ -24601,9 +24676,11 @@ fn validate_root_records(
 mod tests {
     use super::*;
     use crate::bytecode::code_block::{
-        CodeKind, CodeSpecialization, LinkContext, UnlinkedCodeBlock,
+        CodeKind, CodeSpecialization, LinkContext, SourceCodeRepresentation, UnlinkedCodeBlock,
+        UnlinkedConstant, UnlinkedConstantPool,
     };
     use crate::bytecode::instruction::PackedInstructionStream;
+    use crate::bytecode::instruction_stream::{self as raw_stream, InstructionStreamWriter};
     use crate::bytecode::opcode::Opcode;
     use crate::gc::{BarrierNotRequiredReason, CellId};
     use crate::jit::{
@@ -25465,6 +25542,20 @@ mod tests {
     ) -> CodeBlock {
         let stream = PackedInstructionStream::from_typed_placeholder(instructions);
         let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, stream).with_frame(shape);
+        CodeBlock::from_unlinked(unlinked, LinkContext::default())
+    }
+
+    fn raw_code_block_with_constants(bytes: Vec<u8>, constants: UnlinkedConstantPool) -> CodeBlock {
+        let stream = PackedInstructionStream::from_raw_packed_bytes(bytes);
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, stream)
+            .with_frame(RegisterFrameShape {
+                num_parameters_including_this: 1,
+                num_vars: 1,
+                num_callee_locals: 0,
+                num_temporaries: 1,
+                special: Default::default(),
+            })
+            .with_constants(constants);
         CodeBlock::from_unlinked(unlinked, LinkContext::default())
     }
 
@@ -33535,6 +33626,109 @@ mod tests {
             Some(BytecodeIndex::from_offset(0))
         );
         assert!(heap.targeted_roots().records().is_empty());
+    }
+
+    #[test]
+    fn raw_packed_mov_ret_executes_by_byte_offset_and_reads_constant() {
+        let constant0 = VirtualRegister::constant(0);
+        let local0 = VirtualRegister::local(0);
+        let expected = RuntimeValue::from_i32(42);
+        let mut constants = UnlinkedConstantPool::default();
+        constants.constants.push(UnlinkedConstant {
+            register: constant0,
+            value: ConstantValue::Encoded(expected),
+            source_representation: SourceCodeRepresentation::IntegerLiteral,
+        });
+
+        let mut writer = InstructionStreamWriter::new();
+        let mov_at = writer.emit(
+            raw_stream::opcode_id::MOV,
+            &[
+                raw_stream::OperandValue::VirtualRegister(local0.raw()),
+                raw_stream::OperandValue::VirtualRegister(constant0.raw()),
+            ],
+        );
+        let ret_at = writer.emit(
+            raw_stream::opcode_id::RET,
+            &[raw_stream::OperandValue::VirtualRegister(local0.raw())],
+        );
+        assert_eq!(mov_at, 0);
+        assert_eq!(ret_at, 3);
+        let raw_bytes = writer.finalize().bytes().to_vec();
+
+        let block = raw_code_block_with_constants(raw_bytes.clone(), constants.clone());
+        let code_block_id = CodeBlockId(CellId(301));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(
+            &mut stack,
+            &mut registers,
+            code_block_id,
+            &block,
+            Vec::new(),
+        );
+        let frame = stack.top_frame().unwrap().id;
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        let outcome = execute_single_dispatch(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            SingleDispatchRequest::new(code_block_id, frame, BytecodeIndex::from_offset(0)),
+            &block,
+            &mut host,
+        );
+
+        assert_eq!(
+            outcome,
+            SingleDispatchOutcome::Continue(Some(BytecodeIndex::from_offset(ret_at as u32)))
+        );
+        assert_eq!(
+            registers
+                .read(window, local0, Some(block.constants()))
+                .unwrap(),
+            expected
+        );
+
+        let block = raw_code_block_with_constants(raw_bytes, constants);
+        let code_block_id = CodeBlockId(CellId(302));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(
+            &mut stack,
+            &mut registers,
+            code_block_id,
+            &block,
+            Vec::new(),
+        );
+        let mut host = CoreOpcodeDispatchHost::new();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            code_block_id,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(completion, ExecutionCompletion::Returned(expected));
+        assert_eq!(
+            stack.top_frame().unwrap().bytecode_index,
+            Some(BytecodeIndex::from_offset(ret_at as u32))
+        );
     }
 
     #[test]

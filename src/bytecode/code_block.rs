@@ -605,12 +605,13 @@ impl CodeBlock {
     }
 
     pub fn from_shared_unlinked(unlinked: Arc<UnlinkedCodeBlock>, context: LinkContext) -> Self {
+        let constants = linked_constants_from_unlinked(&unlinked);
         let side_tables = linked_side_tables_from_unlinked(&unlinked);
         Self {
             unlinked,
             link_context: context,
             metadata: MetadataTable::default(),
-            constants: LinkedConstantPool::default(),
+            constants,
             side_tables,
             tier_state: CodeBlockTierState::default(),
             entrypoints: CodeBlockEntrypoints::default(),
@@ -3162,6 +3163,23 @@ fn structure_stub_info_for_property_inline_cache_request(
         code_origin: CodeOrigin::new(request.bytecode_index),
         access_cases: Vec::new(),
         reset_by_gc: false,
+    }
+}
+
+fn linked_constants_from_unlinked(unlinked: &UnlinkedCodeBlock) -> LinkedConstantPool {
+    LinkedConstantPool {
+        constants: unlinked
+            .constants()
+            .constants
+            .iter()
+            .map(|constant| LinkedConstant {
+                register: constant.register,
+                value: constant.value,
+                owner: ConstantOwner::SharedUnlinked,
+            })
+            .collect(),
+        function_declarations: Vec::new(),
+        function_expressions: Vec::new(),
     }
 }
 

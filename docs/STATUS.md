@@ -181,8 +181,8 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   The faithful native path (A1.x above: CallLinkInfo + native-stack bl) now BYPASSES it. Plan: broaden the
   faithful path → beats interp → flip default; then delete the dead generated-* cluster (STEP 5) + de-megafile
   35k tiering.rs (STEP 6, off-gate). STEP 1 (collapse the slow-path dispatch onto CallLinkInfo) = R-neutral cleanup.
-- [wip] DFG precursor set (docs/design/dfg-path.md): live packed-bytecode stream cutover (serial, #1
-  representation divergence), SpeculatedType canonicalization, profile population, and baseline-as-bailout audit.
+- [wip] DFG precursor set (docs/design/dfg-path.md): packed-bytecode cutover has first live raw mov/ret wedge
+  (byte-offset PC + Fits<VirtualRegister> constants); SpeculatedType + InByVal profiles + baseline frame headers landed.
 - [missing] DFG proper (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
 
 ## Structural fidelity

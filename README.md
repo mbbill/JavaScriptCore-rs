@@ -18,8 +18,9 @@ geomean and parity can't be measured or claimed until all 15 pass. The remaining
 1.086× the interpreter is still around the ~1e-3 floor. The post-win strategic assessment therefore
 pivots the critical path to the **DFG precursor set**. First slices have landed: ValueProfile now uses
 the canonical JSC `SpeculatedType` bitset, live `InByVal` ArrayProfile feedback now mutates linked
-`CodeBlock` storage, baseline frames now seed real `codeBlock@2`/`callee@3`, and the Octane parity
-reducer now enforces the 15/15 gate and computes all `r_i` + R. The default flip is deferred: it would
+`CodeBlock` storage, baseline frames now seed real `codeBlock@2`/`callee@3`, the first packed-bytecode
+raw `op_mov`/`op_ret` wedge executes by byte-offset PC with JSC `Fits<VirtualRegister>` constant remap,
+and the Octane parity reducer now enforces the 15/15 gate and computes all `r_i` + R. The default flip is deferred: it would
 only define R at the floor, and asm.js still does not tier up whole under execoff.
 
 ```

@@ -2,8 +2,9 @@ use crate::bytecode::code_block::{
     BytecodeIndex, CallSiteIndex, Checkpoint, ConstantCellIndex, IdentifierSetIndex,
     LinkTimeConstant, BYTECODE_INDEX_CHECKPOINTS,
 };
+use crate::bytecode::instruction_stream::{self as raw_stream, RawInstructionDecodeError};
 use crate::bytecode::opcode::{
-    Opcode, OpcodeSchemaVersion, OperandKind, OperandSpec, OperandWidth,
+    CoreOpcode, Opcode, OpcodeSchemaVersion, OperandKind, OperandSpec, OperandWidth,
 };
 use crate::bytecode::register::{RegisterOperandEncoding, VirtualRegister};
 
@@ -242,6 +243,16 @@ pub struct DecodedInstruction<'a> {
     pub source: DecodedInstructionSource,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedDecodedInstruction {
+    pub opcode: Opcode,
+    pub width: OperandWidth,
+    pub bytecode_index: BytecodeIndex,
+    pub next_bytecode_index: Option<BytecodeIndex>,
+    pub operands: Vec<Operand>,
+    pub source: DecodedInstructionSource,
+}
+
 impl<'a> DecodedInstruction<'a> {
     pub fn operand(&self, index: usize) -> Result<Operand, OperandAccessError> {
         self.operands
@@ -354,6 +365,7 @@ impl<'a> DecodedInstruction<'a> {
 pub enum DecodedInstructionSource {
     Declaration,
     TypedPlaceholder,
+    RawPackedBytes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -518,12 +530,27 @@ impl PackedInstructionStream {
         }
     }
 
+    pub fn from_raw_packed_bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            raw: PackedByteStorage::Owned(bytes),
+            lifecycle: PackedInstructionLifecycle::Encoded,
+            ..Self::default()
+        }
+    }
+
     pub fn layout(&self) -> InstructionStreamLayout {
         self.layout
     }
 
     pub fn raw(&self) -> &PackedByteStorage {
         &self.raw
+    }
+
+    pub fn raw_bytes(&self) -> Option<&[u8]> {
+        match &self.raw {
+            PackedByteStorage::Owned(bytes) => Some(bytes),
+            PackedByteStorage::External(_) | PackedByteStorage::Unencoded => None,
+        }
     }
 
     pub fn typed_placeholder(&self) -> &[TypedInstruction] {
@@ -549,9 +576,64 @@ impl PackedInstructionStream {
     pub fn instruction_count(&self) -> usize {
         if !self.declarations.is_empty() {
             self.declarations.len()
-        } else {
+        } else if !self.typed_placeholder.is_empty() {
             self.typed_placeholder.len()
+        } else if let Some(bytes) = self.raw_bytes() {
+            let mut count = 0usize;
+            let mut offset = 0usize;
+            while offset < bytes.len() {
+                let Ok(decoded) = raw_stream::decode_raw_instruction(bytes, offset) else {
+                    break;
+                };
+                count = count.saturating_add(1);
+                offset = offset.saturating_add(decoded.size);
+            }
+            count
+        } else {
+            0
         }
+    }
+
+    pub fn decoded_raw_at(
+        &self,
+        bytecode_index: BytecodeIndex,
+    ) -> Result<OwnedDecodedInstruction, InstructionDecodeError> {
+        if !bytecode_index.is_valid() {
+            return Err(InstructionDecodeError::InvalidBytecodeIndex { bytecode_index });
+        }
+        if !self.declarations.is_empty() || !self.typed_placeholder.is_empty() {
+            return Err(InstructionDecodeError::MixedInstructionRepresentations);
+        }
+        let bytes = self
+            .raw_bytes()
+            .ok_or(InstructionDecodeError::RawBytesRequireGeneratedDecoder)?;
+        let offset = usize::try_from(bytecode_index.offset())
+            .map_err(|_| InstructionDecodeError::MissingInstruction { bytecode_index })?;
+        let decoded = raw_stream::decode_raw_instruction(bytes, offset).map_err(|error| {
+            InstructionDecodeError::RawInstructionDecode {
+                bytecode_index,
+                error,
+            }
+        })?;
+        let opcode = CoreOpcode::from_representative_packed_opcode_id(decoded.opcode_id)
+            .map(CoreOpcode::opcode)
+            .ok_or(InstructionDecodeError::UnsupportedRawOpcode {
+                bytecode_index,
+                opcode_id: decoded.opcode_id,
+            })?;
+        let operands = decoded
+            .operands
+            .into_iter()
+            .map(|operand| Operand::Register(VirtualRegister::from_raw(operand as i32)))
+            .collect();
+        Ok(OwnedDecodedInstruction {
+            opcode,
+            width: operand_width_for_raw(decoded.width),
+            bytecode_index,
+            next_bytecode_index: next_raw_bytecode_index(offset, decoded.size, bytes.len()),
+            operands,
+            source: DecodedInstructionSource::RawPackedBytes,
+        })
     }
 
     pub fn decoded_at(
@@ -612,6 +694,19 @@ impl PackedInstructionStream {
     }
 }
 
+fn operand_width_for_raw(width: raw_stream::OpcodeSize) -> OperandWidth {
+    match width {
+        raw_stream::OpcodeSize::Narrow => OperandWidth::Narrow,
+        raw_stream::OpcodeSize::Wide16 => OperandWidth::Wide16,
+        raw_stream::OpcodeSize::Wide32 => OperandWidth::Wide32,
+    }
+}
+
+fn next_raw_bytecode_index(offset: usize, size: usize, len: usize) -> Option<BytecodeIndex> {
+    let next = offset.checked_add(size)?;
+    (next < len).then(|| BytecodeIndex::from_offset(next as u32))
+}
+
 #[derive(Clone, Debug)]
 pub struct InstructionDecodeIter<'a> {
     stream: &'a PackedInstructionStream,
@@ -633,10 +728,22 @@ impl<'a> Iterator for InstructionDecodeIter<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstructionDecodeError {
-    InvalidBytecodeIndex { bytecode_index: BytecodeIndex },
-    MissingInstruction { bytecode_index: BytecodeIndex },
+    InvalidBytecodeIndex {
+        bytecode_index: BytecodeIndex,
+    },
+    MissingInstruction {
+        bytecode_index: BytecodeIndex,
+    },
     MixedInstructionRepresentations,
     RawBytesRequireGeneratedDecoder,
+    RawInstructionDecode {
+        bytecode_index: BytecodeIndex,
+        error: RawInstructionDecodeError,
+    },
+    UnsupportedRawOpcode {
+        bytecode_index: BytecodeIndex,
+        opcode_id: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1255,5 +1362,69 @@ mod tests {
             })
         );
         assert_eq!(stream.decoded_instructions().count(), 0);
+    }
+
+    #[test]
+    fn raw_decoder_bridge_decodes_only_mov_and_ret() {
+        let constant0 = VirtualRegister::constant(0);
+        let local0 = VirtualRegister::local(0);
+        let mut writer = raw_stream::InstructionStreamWriter::new();
+        let mov_at = writer.emit(
+            raw_stream::opcode_id::MOV,
+            &[
+                raw_stream::OperandValue::VirtualRegister(local0.raw()),
+                raw_stream::OperandValue::VirtualRegister(constant0.raw()),
+            ],
+        );
+        let ret_at = writer.emit(
+            raw_stream::opcode_id::RET,
+            &[raw_stream::OperandValue::VirtualRegister(local0.raw())],
+        );
+        let stream =
+            PackedInstructionStream::from_raw_packed_bytes(writer.finalize().bytes().to_vec());
+
+        let mov = stream
+            .decoded_raw_at(BytecodeIndex::from_offset(mov_at as u32))
+            .expect("raw mov decodes");
+        assert_eq!(mov.opcode, CoreOpcode::Move.opcode());
+        assert_eq!(mov.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(
+            mov.next_bytecode_index,
+            Some(BytecodeIndex::from_offset(ret_at as u32))
+        );
+        assert_eq!(
+            mov.operands,
+            vec![Operand::Register(local0), Operand::Register(constant0)]
+        );
+        assert_eq!(mov.source, DecodedInstructionSource::RawPackedBytes);
+
+        let ret = stream
+            .decoded_raw_at(BytecodeIndex::from_offset(ret_at as u32))
+            .expect("raw ret decodes");
+        assert_eq!(ret.opcode, CoreOpcode::Return.opcode());
+        assert_eq!(ret.next_bytecode_index, None);
+        assert_eq!(ret.operands, vec![Operand::Register(local0)]);
+
+        let mut unsupported_writer = raw_stream::InstructionStreamWriter::new();
+        unsupported_writer.emit(
+            raw_stream::opcode_id::ADD,
+            &[
+                raw_stream::OperandValue::VirtualRegister(local0.raw()),
+                raw_stream::OperandValue::VirtualRegister(local0.raw()),
+                raw_stream::OperandValue::VirtualRegister(local0.raw()),
+                raw_stream::OperandValue::ProfileIndex(0),
+                raw_stream::OperandValue::OperandTypes(0),
+            ],
+        );
+        let unsupported = PackedInstructionStream::from_raw_packed_bytes(
+            unsupported_writer.finalize().bytes().to_vec(),
+        );
+        assert_eq!(
+            unsupported.decoded_raw_at(BytecodeIndex::from_offset(0)),
+            Err(InstructionDecodeError::UnsupportedRawOpcode {
+                bytecode_index: BytecodeIndex::from_offset(0),
+                opcode_id: raw_stream::opcode_id::ADD,
+            })
+        );
     }
 }

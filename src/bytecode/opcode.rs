@@ -174,6 +174,14 @@ impl CoreOpcode {
         Opcode::RuntimeExtension(OpcodeId::from_generated_index(self.id()))
     }
 
+    pub const fn from_representative_packed_opcode_id(opcode_id: u8) -> Option<Self> {
+        match opcode_id {
+            crate::bytecode::instruction_stream::opcode_id::MOV => Some(Self::Move),
+            crate::bytecode::instruction_stream::opcode_id::RET => Some(Self::Return),
+            _ => None,
+        }
+    }
+
     pub const fn from_opcode(opcode: Opcode) -> Option<Self> {
         let Opcode::RuntimeExtension(id) = opcode else {
             return None;

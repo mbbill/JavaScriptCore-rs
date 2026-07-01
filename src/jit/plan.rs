@@ -5668,6 +5668,7 @@ fn write_decoded_source_fingerprint(
     hasher.write_u32(match source {
         DecodedInstructionSource::Declaration => 1,
         DecodedInstructionSource::TypedPlaceholder => 2,
+        DecodedInstructionSource::RawPackedBytes => 3,
     });
 }
 

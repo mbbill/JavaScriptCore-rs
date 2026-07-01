@@ -27,12 +27,7 @@
 //! Serial couplings flagged for the orchestrator (NOT decided here):
 //!   1. Cut the live interpreter dispatch (`instruction.rs`/`opcode.rs`/LLInt)
 //!      over to this packed stream; freeze the type-specialized `CoreOpcode`.
-//!   2. VirtualRegister operand encoding: the real `Fits<VirtualRegister>`
-//!      (`Fits.h:118-156`) remaps constant registers into a per-width
-//!      `FirstConstantRegisterIndex{8,16}` band. This core stores a plain signed
-//!      offset (faithful for locals/arguments, the tested path) and flags the
-//!      constant remap as a shared decision.
-//!   3. The metadata table (`UnlinkedMetadataTable`/`MetadataTable`): opcodes
+//!   2. The metadata table (`UnlinkedMetadataTable`/`MetadataTable`): opcodes
 //!      with metadata add ONE operand slot to `opcodeLengths` (the metadataID).
 //!      The representative subset has no metadata; wiring it is shared work.
 #![allow(dead_code)]
@@ -45,7 +40,7 @@ use crate::bytecode::code_block::BytecodeIndex;
 /// `maxJSOpcodeIDWidth = OpcodeSize::Narrow`). This matches the rejected-alt
 /// `bytecode-wide-instruction-opcode-same-width` (move `24b088b7`): the opcode
 /// is narrow in every form so wide instructions only widen operand fields.
-const OPCODE_ID_BYTES: usize = 1;
+pub const OPCODE_ID_BYTES: usize = 1;
 
 /// Per-instruction operand width family.
 ///
@@ -130,7 +125,8 @@ pub mod opcode_id {
 /// (`Fits.h:66-85`, `Fits.h:118-156`, `Fits.h:355-379`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum OperandKind {
-    /// `VirtualRegister` arg: a signed frame/constant slot index.
+    /// `VirtualRegister` arg: a signed frame/constant slot index, encoded
+    /// through `Fits<VirtualRegister>` for constants in narrow/wide16 forms.
     VirtualRegister,
     /// `unsigned` profile-table index (e.g. `op_add`'s `profileIndex`).
     ProfileIndex,
@@ -291,14 +287,12 @@ impl OperandValue {
         }
     }
 
-    /// `Fits<T, size>::check` (`Fits.h:71-74`): does this operand fit the width?
-    ///
-    /// NOTE (serial coupling 2): the real `Fits<VirtualRegister>`
-    /// (`Fits.h:118-156`) additionally remaps constant registers into a
-    /// per-width constant band. This core checks the plain signed offset, which
-    /// is faithful for locals/arguments; the constant remap is flagged, not
-    /// ported.
+    /// `Fits<T, size>::check` (`Fits.h:71-74`) plus the `Fits<VirtualRegister>`
+    /// constant remap (`Fits.h:118-156`): does this operand fit the width?
     fn fits_check(self, width: OpcodeSize) -> bool {
+        if let Self::VirtualRegister(register) = self {
+            return virtual_register_fits_check(register, width);
+        }
         if self.kind().is_signed() {
             let value = self.as_i64();
             value >= width.signed_min() && value <= width.signed_max()
@@ -307,17 +301,80 @@ impl OperandValue {
         }
     }
 
-    /// `Fits<T, size>::convert` (`Fits.h:76-80`): the width-truncated bit pattern
-    /// stored little-endian into the stream. Asserts fit, mirroring the C++
-    /// `ASSERT(check(t))`.
+    /// `Fits<T, size>::convert` (`Fits.h:76-80`) plus the
+    /// `Fits<VirtualRegister>::convert` constant-band encoding. The result is the
+    /// width-truncated little-endian bit pattern stored into the stream.
     fn fits_convert(self, width: OpcodeSize) -> u64 {
         debug_assert!(
             self.fits_check(width),
             "operand does not fit selected width"
         );
+        let converted = match self {
+            Self::VirtualRegister(register) => virtual_register_fits_convert(register, width),
+            _ => self.as_i64(),
+        };
         let mask = width.unsigned_max();
-        (self.as_i64() as u64) & mask
+        (converted as u64) & mask
     }
+}
+
+/// JSC `FirstConstantRegisterIndex` used by `VirtualRegister::constant(0)`.
+/// Mirrors `bytecode/register.rs`; kept local to avoid coupling this packed core
+/// to the staging register module while it remains additive.
+pub const FIRST_CONSTANT_REGISTER_INDEX: i32 = 0x4000_0000;
+/// `Fits<VirtualRegister, Narrow>::s_firstConstantIndex` (`Fits.h:121-125`).
+pub const FIRST_CONSTANT_REGISTER_INDEX8: i32 = 16;
+/// `Fits<VirtualRegister, Wide16>::s_firstConstantIndex` (`Fits.h:126-129`).
+pub const FIRST_CONSTANT_REGISTER_INDEX16: i32 = 64;
+
+const fn is_constant_virtual_register(register: i32) -> bool {
+    register >= FIRST_CONSTANT_REGISTER_INDEX
+}
+
+const fn virtual_register_constant_index(register: i32) -> i32 {
+    register - FIRST_CONSTANT_REGISTER_INDEX
+}
+
+const fn first_constant_for_width(width: OpcodeSize) -> Option<i32> {
+    match width {
+        OpcodeSize::Narrow => Some(FIRST_CONSTANT_REGISTER_INDEX8),
+        OpcodeSize::Wide16 => Some(FIRST_CONSTANT_REGISTER_INDEX16),
+        // `Fits<VirtualRegister, Wide32>` is the ordinary integral fallback:
+        // wide32 stores the raw VirtualRegister namespace with constants at
+        // `FirstConstantRegisterIndex`.
+        OpcodeSize::Wide32 => None,
+    }
+}
+
+fn virtual_register_fits_check(register: i32, width: OpcodeSize) -> bool {
+    if let Some(first_constant) = first_constant_for_width(width) {
+        if is_constant_virtual_register(register) {
+            return first_constant.saturating_add(virtual_register_constant_index(register))
+                <= width.signed_max() as i32;
+        }
+        return (register as i64) >= width.signed_min() && register < first_constant;
+    }
+    (register as i64) >= width.signed_min() && (register as i64) <= width.signed_max()
+}
+
+fn virtual_register_fits_convert(register: i32, width: OpcodeSize) -> i64 {
+    if let Some(first_constant) = first_constant_for_width(width) {
+        if is_constant_virtual_register(register) {
+            return i64::from(first_constant + virtual_register_constant_index(register));
+        }
+    }
+    i64::from(register)
+}
+
+fn virtual_register_fits_decode(encoded: i64, width: OpcodeSize) -> i32 {
+    if let Some(first_constant) = first_constant_for_width(width) {
+        let encoded = encoded as i32;
+        if encoded >= first_constant {
+            return FIRST_CONSTANT_REGISTER_INDEX + (encoded - first_constant);
+        }
+        return encoded;
+    }
+    encoded as i32
 }
 
 /// Read `width` little-endian bytes from `bytes[start..]` as an unsigned value.
@@ -338,6 +395,38 @@ fn sign_extend(value: u64, width: usize) -> i64 {
     ((value << shift) as i64) >> shift
 }
 
+/// Safe decoded view of one representative packed instruction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawDecodedInstruction {
+    pub offset: usize,
+    pub opcode_id: u8,
+    pub name: &'static str,
+    pub width: OpcodeSize,
+    pub size: usize,
+    pub operands: Vec<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawInstructionDecodeError {
+    OffsetOutOfBounds {
+        offset: usize,
+        len: usize,
+    },
+    MissingWideOpcode {
+        offset: usize,
+        len: usize,
+    },
+    UnknownOpcode {
+        offset: usize,
+        opcode_id: u8,
+    },
+    TruncatedInstruction {
+        offset: usize,
+        size: usize,
+        len: usize,
+    },
+}
+
 /// Decode an instruction header at `offset`: the operand width, descriptor, and
 /// the byte offset where operands begin.
 ///
@@ -346,8 +435,16 @@ fn sign_extend(value: u64, width: usize) -> i64 {
 /// read the first byte; if it is the `wide32`/`wide16` prefix the real opcode is
 /// the NEXT byte and operands start after it, otherwise the first byte is the
 /// opcode and operands start immediately after.
-fn decode_header(bytes: &[u8], offset: usize) -> (OpcodeSize, &'static OpcodeDescriptor, usize) {
-    let first = bytes[offset];
+fn try_decode_header(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<(OpcodeSize, &'static OpcodeDescriptor, usize), RawInstructionDecodeError> {
+    let Some(&first) = bytes.get(offset) else {
+        return Err(RawInstructionDecodeError::OffsetOutOfBounds {
+            offset,
+            len: bytes.len(),
+        });
+    };
     let (width, opcode_byte_index) = if first == opcode_id::WIDE32 {
         (OpcodeSize::Wide32, offset + 1)
     } else if first == opcode_id::WIDE16 {
@@ -355,12 +452,62 @@ fn decode_header(bytes: &[u8], offset: usize) -> (OpcodeSize, &'static OpcodeDes
     } else {
         (OpcodeSize::Narrow, offset)
     };
-    let id = bytes[opcode_byte_index];
-    let descriptor = descriptor_for(id).expect("unknown opcode id in stream");
+    let Some(&id) = bytes.get(opcode_byte_index) else {
+        return Err(RawInstructionDecodeError::MissingWideOpcode {
+            offset,
+            len: bytes.len(),
+        });
+    };
+    let descriptor = descriptor_for(id).ok_or(RawInstructionDecodeError::UnknownOpcode {
+        offset,
+        opcode_id: id,
+    })?;
     // operands_start = opcode byte index + opcodeIDBytes(1). Equivalently
     // offset + prefixSize + 1 (Argument.rb setter/load_from_stream location).
     let operands_start = opcode_byte_index + OPCODE_ID_BYTES;
-    (width, descriptor, operands_start)
+    Ok((width, descriptor, operands_start))
+}
+
+fn decode_header(bytes: &[u8], offset: usize) -> (OpcodeSize, &'static OpcodeDescriptor, usize) {
+    try_decode_header(bytes, offset).expect("invalid opcode header in stream")
+}
+
+pub fn decode_raw_instruction(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<RawDecodedInstruction, RawInstructionDecodeError> {
+    let (width, descriptor, operands_start) = try_decode_header(bytes, offset)?;
+    let size =
+        OPCODE_ID_BYTES + descriptor.opcode_length() * width.operand_bytes() + width.prefix_bytes();
+    if offset.saturating_add(size) > bytes.len() {
+        return Err(RawInstructionDecodeError::TruncatedInstruction {
+            offset,
+            size,
+            len: bytes.len(),
+        });
+    }
+    let mut operands = Vec::with_capacity(descriptor.opcode_length());
+    for index in 0..descriptor.opcode_length() {
+        let at = operands_start + index * width.operand_bytes();
+        let raw = read_unsigned_le(bytes, at, width.operand_bytes());
+        let value = match descriptor.operands[index] {
+            OperandKind::VirtualRegister => i64::from(virtual_register_fits_decode(
+                sign_extend(raw, width.operand_bytes()),
+                width,
+            )),
+            kind if kind.is_signed() => sign_extend(raw, width.operand_bytes()),
+            _ => raw as i64,
+        };
+        operands.push(value);
+    }
+    Ok(RawDecodedInstruction {
+        offset,
+        opcode_id: descriptor.id,
+        name: descriptor.name,
+        width,
+        size,
+        operands,
+    })
 }
 
 /// Byte-stream writer.
@@ -655,10 +802,13 @@ impl<'a> Ref<'a> {
         assert!(i < descriptor.opcode_length());
         let at = operands_start + i * width.operand_bytes();
         let raw = read_unsigned_le(self.instructions, at, width.operand_bytes());
-        if descriptor.operands[i].is_signed() {
-            sign_extend(raw, width.operand_bytes())
-        } else {
-            raw as i64
+        match descriptor.operands[i] {
+            OperandKind::VirtualRegister => i64::from(virtual_register_fits_decode(
+                sign_extend(raw, width.operand_bytes()),
+                width,
+            )),
+            kind if kind.is_signed() => sign_extend(raw, width.operand_bytes()),
+            _ => raw as i64,
         }
     }
 
@@ -926,5 +1076,69 @@ mod tests {
         // The neighbouring ret is untouched.
         assert!(stream.at_offset(ret_at).is(RET));
         assert_eq!(stream.at_offset(ret_at).operand(0), -1);
+    }
+
+    #[test]
+    fn virtual_register_constant_remap_round_trips_per_width() {
+        let constant0 = FIRST_CONSTANT_REGISTER_INDEX;
+        let local0 = -1;
+
+        let mut narrow_writer = InstructionStreamWriter::new();
+        narrow_writer.emit(
+            MOV,
+            &[
+                OperandValue::VirtualRegister(local0),
+                OperandValue::VirtualRegister(constant0),
+            ],
+        );
+        let narrow = narrow_writer.finalize();
+        assert_eq!(
+            narrow.bytes(),
+            &[MOV, 0xff, FIRST_CONSTANT_REGISTER_INDEX8 as u8]
+        );
+        let narrow_mov = narrow.at_offset(0);
+        assert_eq!(narrow_mov.width(), OpcodeSize::Narrow);
+        assert_eq!(narrow_mov.operand(0), i64::from(local0));
+        assert_eq!(narrow_mov.operand(1), i64::from(constant0));
+
+        let wide16_local = -129;
+        let mut wide16_writer = InstructionStreamWriter::new();
+        wide16_writer.emit(
+            MOV,
+            &[
+                OperandValue::VirtualRegister(wide16_local),
+                OperandValue::VirtualRegister(constant0),
+            ],
+        );
+        let wide16 = wide16_writer.finalize();
+        assert_eq!(wide16.bytes()[0], WIDE16);
+        let wide16_mov = wide16.at_offset(0);
+        assert_eq!(wide16_mov.width(), OpcodeSize::Wide16);
+        assert_eq!(wide16_mov.operand(0), i64::from(wide16_local));
+        assert_eq!(wide16_mov.operand(1), i64::from(constant0));
+        assert_eq!(
+            read_unsigned_le(wide16.bytes(), 4, OpcodeSize::Wide16.operand_bytes()),
+            FIRST_CONSTANT_REGISTER_INDEX16 as u64
+        );
+
+        let wide32_local = -32_769;
+        let mut wide32_writer = InstructionStreamWriter::new();
+        wide32_writer.emit(
+            MOV,
+            &[
+                OperandValue::VirtualRegister(wide32_local),
+                OperandValue::VirtualRegister(constant0),
+            ],
+        );
+        let wide32 = wide32_writer.finalize();
+        assert_eq!(wide32.bytes()[0], WIDE32);
+        let wide32_mov = wide32.at_offset(0);
+        assert_eq!(wide32_mov.width(), OpcodeSize::Wide32);
+        assert_eq!(wide32_mov.operand(0), i64::from(wide32_local));
+        assert_eq!(wide32_mov.operand(1), i64::from(constant0));
+        assert_eq!(
+            read_unsigned_le(wide32.bytes(), 6, OpcodeSize::Wide32.operand_bytes()),
+            FIRST_CONSTANT_REGISTER_INDEX as u32 as u64
+        );
     }
 }
