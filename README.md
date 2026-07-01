@@ -11,14 +11,16 @@ octane-zlib — asm.js, can't finish under the interpreter) — so the suite sti
 geomean and parity can't be measured or claimed until all 15 pass. The remaining gap is the
 **optimizing JIT**, and the measured scoreboard proves it (below).
 
-**Latest (2026-06-30):** the native baseline JIT is now a measured **net win over the interpreter** on
+**Latest:** the native baseline JIT is now a measured **net win over the interpreter** on
 5 compute/call benches with the Rust-only generated shims disabled: geomean execoff/interp ≈ **1.086**
 (crypto, delta-blue, navier win; raytrace/richards still lose). That is a real milestone, but it is
 **not R parity progress yet**: the interpreter is still ~500–6000× slower than local C++ `jsc`, so
 1.086× the interpreter is still around the ~1e-3 floor. The post-win strategic assessment therefore
-pivots the critical path to the **DFG precursor set**: packed-bytecode-stream live cutover, SpeculatedType
-canonicalization, profile population, and baseline-as-bailout soundness. The default flip is deferred:
-it would only define R at the floor, and asm.js still does not tier up whole under execoff.
+pivots the critical path to the **DFG precursor set**. First slices have landed: ValueProfile now uses
+the canonical JSC `SpeculatedType` bitset, live `InByVal` ArrayProfile feedback now mutates linked
+`CodeBlock` storage, baseline frames now seed real `codeBlock@2`/`callee@3`, and the Octane parity
+reducer now enforces the 15/15 gate and computes all `r_i` + R. The default flip is deferred: it would
+only define R at the floor, and asm.js still does not tier up whole under execoff.
 
 ```
 Overall: ~48% by effort  █████████▌░░░░░░░░░░░  (but the parity-bearing JIT tiers are ~0%)
