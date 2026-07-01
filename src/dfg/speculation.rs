@@ -5,7 +5,7 @@
 //! decide whether a speculation is profitable.
 
 pub use crate::bytecode::speculated_type::SpeculatedType;
-use crate::dfg::{DfgEdgeId, DfgNodeId, DfgValueRep, OsrExitKind};
+use crate::dfg::{DfgEdgeId, DfgNodeId, OsrExitKind};
 use crate::gc::StructureId;
 use crate::runtime::{CodeBlockId, ObjectId};
 
@@ -13,6 +13,28 @@ use crate::runtime::{CodeBlockId, ObjectId};
 // SpeculatedType bitset from bytecode/SpeculatedType.h, while UseKind remains a
 // separate edge contract. This module still only records DFG speculation/check
 // descriptors; it does not implement DFG speculation semantics.
+
+/// Value representation expected at a speculation site.
+///
+/// Rust-only descriptor stand-in: C++ JSC expresses a checked value's machine
+/// representation with `DataFormat` (bytecode/DataFormat.h) and the DFG's
+/// `FlushFormat`. This enum survives only inside these speculation descriptors
+/// until that port lands; DFG nodes themselves carry the faithful `NodeFlags`
+/// result bits (dfg/DFGNodeFlags.h) instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DfgValueRep {
+    Untyped,
+    Cell,
+    Boolean,
+    Int32,
+    Int52,
+    Double,
+    String,
+    Object,
+    Storage,
+    BigInt,
+    Void,
+}
 
 /// Where a prediction came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

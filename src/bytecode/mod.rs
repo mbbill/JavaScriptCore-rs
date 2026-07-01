@@ -17,6 +17,7 @@ pub(crate) mod instruction_stream;
 pub(crate) mod integration;
 pub(crate) mod metadata;
 pub(crate) mod opcode;
+pub(crate) mod operands;
 pub(crate) mod origin;
 pub(crate) mod profiling;
 pub(crate) mod register;
@@ -118,6 +119,7 @@ pub use opcode::{
     StaticCheckpointShape, StaticMetadataShape, StaticOpcodeDescriptor, StaticOpcodeSchema,
     TemporaryKind, TemporarySpec,
 };
+pub use operands::Operands;
 pub use origin::{
     BytecodeSourceMapping, CodeOrigin, CodeOriginTable, ExecutionDiagnosticMapping, FullCodeOrigin,
     InlineCallFrameRecord, InlineCallFrameRef, ProgramCounterMappingWidth, ProgramCounterOrigin,

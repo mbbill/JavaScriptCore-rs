@@ -1,10 +1,20 @@
 //! DFG graph, node, and edge descriptors.
 //!
-//! These structures mirror the ownership boundaries of JSC's DFG graph. They
-//! describe graph shape, origin tracking, effects, and typed child edges without
-//! parsing bytecode, optimizing, lowering, or executing code.
+//! These structures mirror the ownership boundaries of JSC's DFG graph
+//! (`dfg/DFGGraph.h`): the graph owns its blocks, nodes, edges, and the
+//! `VariableAccessData` arena; nodes carry a faithful `NodeType` opcode plus
+//! `NodeFlags` (result bits included) as `DFG::Node` does. The bytecode parser
+//! (a later unit) owns a mutable working graph and appends through the `&mut`
+//! APIs below, exactly as `ByteCodeParser` mutates `Graph&`.
 
-use crate::bytecode::{Opcode, VirtualRegister};
+use crate::bytecode::{Operands, VirtualRegister};
+use crate::dfg::node_flags::{
+    NodeFlags, NODE_HAS_VAR_ARGS, NODE_MUST_GENERATE, NODE_RESULT_BOOLEAN, NODE_RESULT_DOUBLE,
+    NODE_RESULT_INT32, NODE_RESULT_INT52, NODE_RESULT_JS, NODE_RESULT_MASK, NODE_RESULT_NUMBER,
+    NODE_RESULT_STORAGE,
+};
+use crate::dfg::node_type::{default_flags, NodeType};
+use crate::dfg::variable_access_data::VariableAccessData;
 use crate::gc::StructureId;
 use crate::jit::{CodeOrigin, EffectSummary, JitCodeId, JitType, WatchpointDependency};
 use crate::object::PropertyOffset;
@@ -15,14 +25,16 @@ use crate::strings::AtomId;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DfgGraphId(pub u64);
 
-/// Stable identity for a node in a graph.
+/// Stable identity for a node in a graph: its index in the graph's node list.
+///
+/// JSC hands out `Node*` and gives each node an index (`Node::index()`); safe
+/// Rust uses the index alone. The node list is append-only during parsing, so
+/// ids stay stable while the parser builds the graph.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DfgNodeId(pub u32);
 
-/// Stable identity for a basic block in a DFG graph.
-///
-/// This is graph-local block identity, not bytecode source identity. It is
-/// valid only for snapshots with the same `DfgGraphId` generation.
+/// Stable identity for a basic block in a DFG graph: its index in the graph's
+/// block list, as assigned by `Graph::appendBlock` (dfg/DFGGraph.h:633-637).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DfgBasicBlockId(pub u32);
 
@@ -31,6 +43,9 @@ pub struct DfgBasicBlockId(pub u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DfgEdgeId(pub u32);
 
+/// Index into the graph-owned `VariableAccessData` arena. The safe-Rust
+/// stand-in for the stable `VariableAccessData*` JSC hands out from
+/// `Graph::m_variableAccessData` (dfg/DFGGraph.h:1413).
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DfgVariableAccessDataId(pub u32);
 
@@ -63,13 +78,16 @@ pub enum DfgGraphMutationAuthority {
 }
 
 /// Representation form of the graph.
+///
+/// Faithful to C++ `enum GraphForm` (dfg/DFGCommon.h:160-205): LoadStore has
+/// implicit data flow through GetLocal/SetLocal/Flush and is suitable for CFG
+/// transformations; ThreadedCPS threads explicit variablesAtHead/variablesAtTail
+/// liveness for data-flow analysis and codegen; SSA is the FTL input form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GraphForm {
-    Cps,
-    Ssa,
     LoadStore,
-    LoweredForDfgJit,
-    LoweredForFtl,
+    ThreadedCps,
+    Ssa,
 }
 
 /// Origin category used for diagnostics, OSR exits, and source mapping.
@@ -93,58 +111,6 @@ pub struct NodeOrigin {
     pub executable: Option<ExecutableId>,
     pub bytecode_index: Option<u32>,
     pub inline_depth: u16,
-}
-
-/// High-level node family. Concrete opcode-specific payloads stay in generated
-/// DFG tables later.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DfgNodeKind {
-    Phantom,
-    Constant,
-    Argument,
-    GetLocal,
-    SetLocal,
-    Phi,
-    Upsilon,
-    Check,
-    CheckStructure,
-    CheckCell,
-    Arith,
-    Compare,
-    Branch,
-    Switch,
-    Call,
-    Construct,
-    GetById,
-    PutById,
-    GetByVal,
-    PutByVal,
-    NewObject,
-    NewArray,
-    StructureTransition,
-    Watchpoint,
-    OsrEntry,
-    OsrExit,
-    Return,
-    Throw,
-    Unreachable,
-    Bytecode(Opcode),
-}
-
-/// Value representation selected or expected for a node.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DfgValueRep {
-    Untyped,
-    Cell,
-    Boolean,
-    Int32,
-    Int52,
-    Double,
-    String,
-    Object,
-    Storage,
-    BigInt,
-    Void,
 }
 
 /// Effect summary used by planning and lowering contracts.
@@ -194,7 +160,6 @@ pub struct InlineVariableData {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DfgCommonDataDescriptor {
     pub inline_call_frames: Vec<DfgInlineCallFrameId>,
-    pub variable_access_data: Vec<DfgVariableAccessDataId>,
     pub inline_variables: Vec<InlineVariableData>,
     pub watchpoint_count: u32,
     pub weak_reference_count: u32,
@@ -255,20 +220,127 @@ pub enum BranchTarget {
 }
 
 /// Data-only DFG node descriptor.
+///
+/// Mirrors C++ `DFG::Node` (dfg/DFGNode.h): `op` is the faithful `NodeType`
+/// opcode and `flags` the `NodeFlags` bitset whose low bits encode the result
+/// representation. Per-node operand/payload data stays here (JSC packs it into
+/// `m_opInfo`; the Rust descriptor uses typed optional fields).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfgNode {
     pub id: DfgNodeId,
-    pub kind: DfgNodeKind,
+    /// `m_op` (dfg/DFGNode.h).
+    pub op: NodeType,
+    /// `m_flags`, initialized from `defaultFlags(op)` exactly as
+    /// `setOpAndDefaultFlags` does (dfg/DFGNode.h:493-497).
+    pub flags: NodeFlags,
     pub origin: NodeOrigin,
-    pub result: DfgValueRep,
     pub children: Vec<DfgEdgeId>,
     pub effects: NodeEffects,
+    /// `variableAccessData()` payload for local-access nodes (GetLocal,
+    /// SetLocal, Flush, Phantom over locals, SetArgumentDefinitely); JSC stores
+    /// the pointer in `m_opInfo`.
+    pub variable_access_data: Option<DfgVariableAccessDataId>,
     pub virtual_register: Option<VirtualRegister>,
     pub structure: Option<StructureId>,
     pub property: Option<AtomId>,
     pub property_offset: Option<PropertyOffset>,
     pub object: Option<ObjectId>,
     pub watchpoints: Vec<WatchpointDependency>,
+}
+
+impl DfgNode {
+    /// Fresh node with the opcode's default flags, mirroring the C++ Node
+    /// constructors, which run `setOpAndDefaultFlags(op)`
+    /// (dfg/DFGNode.h:366-378). The id is assigned by `DfgGraph::add_node`.
+    pub fn new(op: NodeType, origin: NodeOrigin) -> Self {
+        Self {
+            id: DfgNodeId(0),
+            op,
+            flags: default_flags(op),
+            origin,
+            children: Vec::new(),
+            effects: NodeEffects::default(),
+            variable_access_data: None,
+            virtual_register: None,
+            structure: None,
+            property: None,
+            property_offset: None,
+            object: None,
+            watchpoints: Vec::new(),
+        }
+    }
+
+    /// `setOpAndDefaultFlags` (dfg/DFGNode.h:493-497).
+    pub fn set_op_and_default_flags(&mut self, op: NodeType) {
+        self.op = op;
+        self.flags = default_flags(op);
+    }
+
+    /// `result()` (dfg/DFGNode.h:488-491).
+    pub const fn result(&self) -> NodeFlags {
+        self.flags & NODE_RESULT_MASK
+    }
+
+    /// `setResult` (dfg/DFGNode.h:481-486).
+    pub fn set_result(&mut self, result: NodeFlags) {
+        debug_assert!(result & !NODE_RESULT_MASK == 0);
+        self.flags = (self.flags & !NODE_RESULT_MASK) | result;
+    }
+
+    /// `hasResult()` (dfg/DFGNode.h:1725-1728).
+    pub const fn has_result(&self) -> bool {
+        self.result() != 0
+    }
+
+    /// `hasInt32Result()` (dfg/DFGNode.h:1730-1733).
+    pub const fn has_int32_result(&self) -> bool {
+        self.result() == NODE_RESULT_INT32
+    }
+
+    /// `hasInt52Result()` (dfg/DFGNode.h:1735-1738).
+    pub const fn has_int52_result(&self) -> bool {
+        self.result() == NODE_RESULT_INT52
+    }
+
+    /// `hasNumberResult()` (dfg/DFGNode.h:1740-1743).
+    pub const fn has_number_result(&self) -> bool {
+        self.result() == NODE_RESULT_NUMBER
+    }
+
+    /// `hasNumberOrAnyIntResult()` (dfg/DFGNode.h:1745-1748).
+    pub const fn has_number_or_any_int_result(&self) -> bool {
+        self.has_number_result() || self.has_int32_result() || self.has_int52_result()
+    }
+
+    /// `hasDoubleResult()` (dfg/DFGNode.h:1770-1773).
+    pub const fn has_double_result(&self) -> bool {
+        self.result() == NODE_RESULT_DOUBLE
+    }
+
+    /// `hasJSResult()` (dfg/DFGNode.h:1775-1778).
+    pub const fn has_js_result(&self) -> bool {
+        self.result() == NODE_RESULT_JS
+    }
+
+    /// `hasBooleanResult()` (dfg/DFGNode.h:1780-1783).
+    pub const fn has_boolean_result(&self) -> bool {
+        self.result() == NODE_RESULT_BOOLEAN
+    }
+
+    /// `hasStorageResult()` (dfg/DFGNode.h:1785-1788).
+    pub const fn has_storage_result(&self) -> bool {
+        self.result() == NODE_RESULT_STORAGE
+    }
+
+    /// `mustGenerate()` — `NodeMustGenerate` set (dfg/DFGNodeFlags.h:46).
+    pub const fn must_generate(&self) -> bool {
+        self.flags & NODE_MUST_GENERATE != 0
+    }
+
+    /// `hasVarArgs()` — `NodeHasVarArgs` set (dfg/DFGNodeFlags.h:47).
+    pub const fn has_var_args(&self) -> bool {
+        self.flags & NODE_HAS_VAR_ARGS != 0
+    }
 }
 
 /// Basic block descriptor with control-flow edges.
@@ -278,6 +350,15 @@ pub struct DfgBasicBlock {
     pub nodes: Vec<DfgNodeId>,
     pub predecessors: Vec<DfgBasicBlockId>,
     pub successors: Vec<BranchTarget>,
+    /// Variable state at the block head, keyed by operand
+    /// (`Operands<Node*> variablesAtHead`, dfg/DFGBasicBlock.h:216). Safe Rust
+    /// holds node identity as `Option<DfgNodeId>` where JSC uses a nullable
+    /// `Node*`.
+    pub variables_at_head: Operands<Option<DfgNodeId>>,
+    /// Variable state at the block tail
+    /// (`Operands<Node*> variablesAtTail`, dfg/DFGBasicBlock.h:217). The
+    /// bytecode parser reads and updates this as it emits GetLocal/SetLocal.
+    pub variables_at_tail: Operands<Option<DfgNodeId>>,
     pub bytecode_begin: Option<u32>,
     pub bytecode_end: Option<u32>,
     pub execution_count: Option<u64>,
@@ -285,7 +366,7 @@ pub struct DfgBasicBlock {
     pub is_catch_entry: bool,
 }
 
-/// Complete graph snapshot reserved for a DFG or FTL compilation plan.
+/// Complete graph owned by a DFG or FTL compilation plan.
 ///
 /// The owner is a typed runtime wrapper around `gc::CellId`; graph consumers
 /// borrow that owner identity and must revalidate liveness before installation.
@@ -300,6 +381,12 @@ pub struct DfgGraph {
     pub blocks: Vec<DfgBasicBlock>,
     pub nodes: Vec<DfgNode>,
     pub edges: Vec<DfgEdge>,
+    /// Graph-owned `VariableAccessData` arena
+    /// (`SegmentedVector<VariableAccessData, 16> m_variableAccessData`,
+    /// dfg/DFGGraph.h:1413). Append-only during parsing, so
+    /// `DfgVariableAccessDataId` indices stay stable where JSC hands out
+    /// stable pointers.
+    pub variable_access_data: Vec<VariableAccessData>,
     pub watchpoints: Vec<WatchpointDependency>,
     pub common_data: DfgCommonDataDescriptor,
     pub generation: u64,
@@ -320,7 +407,7 @@ pub enum DfgValidationError {
     EmptyProvenance(&'static str),
     DuplicatePlanName(&'static str),
     EmptyPhases(&'static str),
-    EmptyAllowedNodeKinds(&'static str),
+    EmptyAllowedNodeTypes(&'static str),
     GraphHasNoBlocks,
     DuplicateBlockId(DfgBasicBlockId),
     DuplicateNodeId(DfgNodeId),
@@ -333,80 +420,78 @@ pub enum DfgValidationError {
     BlockSuccessorMissing(DfgBasicBlockId),
     BlockBytecodeRangeInvalid(DfgBasicBlockId),
     TerminatorMismatch(DfgBasicBlockId),
-    NodeKindNotAllowed(DfgNodeId),
+    NodeTypeNotAllowed(DfgNodeId),
     GraphFormMismatch,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DfgGraphBuilder {
-    graph: DfgGraph,
-}
-
-impl DfgGraphBuilder {
+impl DfgGraph {
+    /// Fresh, empty graph for one compilation plan. Mirrors the C++ Graph
+    /// constructor: bytecode parsing starts in LoadStore form
+    /// (`m_form(LoadStore)`, dfg/DFGGraph.cpp:87), and the parser is the first
+    /// mutation authority. The parser (a later unit) owns this graph mutably
+    /// and appends via the `add_*` APIs; there is no separate builder in JSC
+    /// and none here.
     pub fn new(id: DfgGraphId, owner: CodeBlockId) -> Self {
         Self {
-            graph: DfgGraph {
-                id,
-                owner,
-                executable: None,
-                phase: DfgPhase::BytecodeParsing,
-                form: GraphForm::Cps,
-                root_code: None,
-                blocks: Vec::new(),
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                watchpoints: Vec::new(),
-                common_data: DfgCommonDataDescriptor::default(),
-                generation: 0,
-                mutation_authority: DfgGraphMutationAuthority::BytecodeParser,
-            },
+            id,
+            owner,
+            executable: None,
+            phase: DfgPhase::BytecodeParsing,
+            form: GraphForm::LoadStore,
+            root_code: None,
+            blocks: Vec::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            variable_access_data: Vec::new(),
+            watchpoints: Vec::new(),
+            common_data: DfgCommonDataDescriptor::default(),
+            generation: 0,
+            mutation_authority: DfgGraphMutationAuthority::BytecodeParser,
         }
     }
 
-    pub fn executable(mut self, executable: ExecutableId) -> Self {
-        self.graph.executable = Some(executable);
-        self
+    /// Append a node; its identity is its index. Mirrors `Graph::addNode`
+    /// (dfg/DFGGraph.h:254-258), which allocates and returns the stable
+    /// `Node*`; safe Rust returns the index id instead.
+    pub fn add_node(&mut self, mut node: DfgNode) -> DfgNodeId {
+        let id = DfgNodeId(self.nodes.len() as u32);
+        node.id = id;
+        self.nodes.push(node);
+        id
     }
 
-    pub fn phase(mut self, phase: DfgPhase) -> Self {
-        self.graph.phase = phase;
-        self
+    /// Append a block; its identity is its index. Mirrors `Graph::appendBlock`,
+    /// which sets `basicBlock->index = m_blocks.size()` (dfg/DFGGraph.h:633-637).
+    pub fn add_block(&mut self, mut block: DfgBasicBlock) -> DfgBasicBlockId {
+        let id = DfgBasicBlockId(self.blocks.len() as u32);
+        block.id = id;
+        self.blocks.push(block);
+        id
     }
 
-    pub fn form(mut self, form: GraphForm) -> Self {
-        self.graph.form = form;
-        self
+    /// Append a child edge; its identity is its index. JSC embeds edges in the
+    /// node's `AdjacencyList`; the Rust descriptor keeps an edge table, so the
+    /// same append-assigns-identity rule applies.
+    pub fn add_edge(&mut self, mut edge: DfgEdge) -> DfgEdgeId {
+        let id = DfgEdgeId(self.edges.len() as u32);
+        edge.id = id;
+        self.edges.push(edge);
+        id
     }
 
-    pub fn authority(mut self, authority: DfgGraphMutationAuthority) -> Self {
-        self.graph.mutation_authority = authority;
-        self
-    }
-
-    pub fn block(mut self, block: DfgBasicBlock) -> Self {
-        self.graph.blocks.push(block);
-        self
-    }
-
-    pub fn node(mut self, node: DfgNode) -> Self {
-        self.graph.nodes.push(node);
-        self
-    }
-
-    pub fn edge(mut self, edge: DfgEdge) -> Self {
-        self.graph.edges.push(edge);
-        self
-    }
-
-    pub fn build(self) -> Result<DfgGraph, DfgValidationError> {
-        self.graph.validate()?;
-        Ok(self.graph)
-    }
-}
-
-impl DfgGraph {
-    pub fn builder(id: DfgGraphId, owner: CodeBlockId) -> DfgGraphBuilder {
-        DfgGraphBuilder::new(id, owner)
+    /// Allocate a fresh `VariableAccessData` in the graph-owned arena. Mirrors
+    /// `ByteCodeParser::newVariableAccessData`, which appends to
+    /// `m_graph.m_variableAccessData` (dfg/DFGByteCodeParser.cpp:368-372),
+    /// including its `ASSERT(!operand.isConstant())`.
+    pub fn new_variable_access_data(
+        &mut self,
+        operand: VirtualRegister,
+    ) -> DfgVariableAccessDataId {
+        debug_assert!(!operand.is_constant());
+        let id = DfgVariableAccessDataId(self.variable_access_data.len() as u32);
+        self.variable_access_data
+            .push(VariableAccessData::new(operand));
+        id
     }
 
     pub fn validate(&self) -> Result<(), DfgValidationError> {
@@ -627,7 +712,7 @@ impl DfgGraph {
             return Ok(());
         }
         if visiting.contains(&node_id) {
-            return Err(DfgValidationError::NodeKindNotAllowed(node_id));
+            return Err(DfgValidationError::NodeTypeNotAllowed(node_id));
         }
         visiting.push(node_id);
 
@@ -743,7 +828,7 @@ pub struct StaticDfgPlanDescriptor {
     pub input_form: GraphForm,
     pub output_form: GraphForm,
     pub phases: &'static [DfgPhase],
-    pub allowed_node_kinds: &'static [DfgNodeKind],
+    pub allowed_node_types: &'static [NodeType],
     pub mutation_authority: DfgGraphMutationAuthority,
     pub schema_owner: DfgPlanSchemaOwner,
     pub registry_authority: DfgPlanRegistryMutationAuthority,
@@ -796,8 +881,8 @@ impl StaticDfgPlanDescriptor {
         if self.phases.is_empty() {
             return Err(DfgValidationError::EmptyPhases(self.name));
         }
-        if self.allowed_node_kinds.is_empty() {
-            return Err(DfgValidationError::EmptyAllowedNodeKinds(self.name));
+        if self.allowed_node_types.is_empty() {
+            return Err(DfgValidationError::EmptyAllowedNodeTypes(self.name));
         }
         if self.input_form == self.output_form {
             return Err(DfgValidationError::GraphFormMismatch);
@@ -812,8 +897,8 @@ impl StaticDfgPlanDescriptor {
             return Err(DfgValidationError::GraphFormMismatch);
         }
         for node in &graph.nodes {
-            if !self.allowed_node_kinds.contains(&node.kind) {
-                return Err(DfgValidationError::NodeKindNotAllowed(node.id));
+            if !self.allowed_node_types.contains(&node.op) {
+                return Err(DfgValidationError::NodeTypeNotAllowed(node.id));
             }
         }
 
@@ -835,32 +920,52 @@ const DFG_FTL_HANDOFF_PHASES: &[DfgPhase] = &[
     DfgPhase::LoweringPreparation,
     DfgPhase::FtlHandoff,
 ];
-const DFG_CORE_NODE_KINDS: &[DfgNodeKind] = &[
-    DfgNodeKind::Argument,
-    DfgNodeKind::GetLocal,
-    DfgNodeKind::SetLocal,
-    DfgNodeKind::Phi,
-    DfgNodeKind::Check,
-    DfgNodeKind::Arith,
-    DfgNodeKind::Compare,
-    DfgNodeKind::Branch,
-    DfgNodeKind::Call,
-    DfgNodeKind::GetById,
-    DfgNodeKind::PutById,
-    DfgNodeKind::OsrEntry,
-    DfgNodeKind::OsrExit,
-    DfgNodeKind::Return,
-    DfgNodeKind::Throw,
+// The first-parser slice of faithful JSC node types (see node_type.rs for the
+// per-op DFGNodeType.h citations).
+const DFG_CORE_NODE_TYPES: &[NodeType] = &[
+    NodeType::JSConstant,
+    NodeType::DoubleConstant,
+    NodeType::GetLocal,
+    NodeType::SetLocal,
+    NodeType::MovHint,
+    NodeType::ExitOK,
+    NodeType::Phantom,
+    NodeType::Check,
+    NodeType::Upsilon,
+    NodeType::Phi,
+    NodeType::Flush,
+    NodeType::LoopHint,
+    NodeType::SetArgumentDefinitely,
+    NodeType::ArithAdd,
+    NodeType::ArithSub,
+    NodeType::ArithMul,
+    NodeType::ValueAdd,
+    NodeType::ValueSub,
+    NodeType::ValueMul,
+    NodeType::GetById,
+    NodeType::PutById,
+    NodeType::GetScope,
+    NodeType::CompareLess,
+    NodeType::Call,
+    NodeType::Jump,
+    NodeType::Branch,
+    NodeType::Return,
+    NodeType::Unreachable,
+    NodeType::Throw,
+    NodeType::ForceOSRExit,
+    NodeType::CheckTraps,
 ];
 
 pub const STATIC_DFG_PLAN_DESCRIPTORS: &[StaticDfgPlanDescriptor] = &[
     StaticDfgPlanDescriptor {
         name: "dfg-optimization-plan",
         target_tier: JitType::Dfg,
-        input_form: GraphForm::Cps,
-        output_form: GraphForm::LoweredForDfgJit,
+        // Parsing and CFG-rewriting phases run in LoadStore; the DFG backend
+        // consumes ThreadedCPS (dfg/DFGCommon.h:160-202).
+        input_form: GraphForm::LoadStore,
+        output_form: GraphForm::ThreadedCps,
         phases: DFG_OPTIMIZATION_PHASES,
-        allowed_node_kinds: DFG_CORE_NODE_KINDS,
+        allowed_node_types: DFG_CORE_NODE_TYPES,
         mutation_authority: DfgGraphMutationAuthority::GraphPhase,
         schema_owner: DfgPlanSchemaOwner::DfgGraphOwner,
         registry_authority: DfgPlanRegistryMutationAuthority::GeneratedStaticDataRefresh,
@@ -869,10 +974,12 @@ pub const STATIC_DFG_PLAN_DESCRIPTORS: &[StaticDfgPlanDescriptor] = &[
     StaticDfgPlanDescriptor {
         name: "dfg-to-ftl-handoff",
         target_tier: JitType::Ftl,
-        input_form: GraphForm::Ssa,
-        output_form: GraphForm::LoweredForFtl,
+        // SSAConversionPhase converts ThreadedCPS to SSA, the FTL input form
+        // (dfg/DFGCommon.h:203-205; DFGSSAConversionPhase.h).
+        input_form: GraphForm::ThreadedCps,
+        output_form: GraphForm::Ssa,
         phases: DFG_FTL_HANDOFF_PHASES,
-        allowed_node_kinds: DFG_CORE_NODE_KINDS,
+        allowed_node_types: DFG_CORE_NODE_TYPES,
         mutation_authority: DfgGraphMutationAuthority::FtlLowering,
         schema_owner: DfgPlanSchemaOwner::FtlHandoffOwner,
         registry_authority: DfgPlanRegistryMutationAuthority::GeneratedStaticDataRefresh,
@@ -886,6 +993,7 @@ pub const DFG_PLAN_DESCRIPTOR_REGISTRY: DfgPlanDescriptorRegistry =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytecode::speculated_type::{SPEC_INT32_ONLY, SPEC_NONE};
     use crate::gc::CellId;
     use crate::jit::{CodeOrigin, CodeOriginKind};
 
@@ -905,125 +1013,193 @@ mod tests {
         }
     }
 
+    fn block() -> DfgBasicBlock {
+        DfgBasicBlock {
+            id: DfgBasicBlockId(0),
+            nodes: Vec::new(),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+            variables_at_head: Operands::default(),
+            variables_at_tail: Operands::default(),
+            bytecode_begin: Some(0),
+            bytecode_end: Some(0),
+            execution_count: None,
+            is_osr_entry: false,
+            is_catch_entry: false,
+        }
+    }
+
     #[test]
     fn static_dfg_plan_registry_validates() {
         assert_eq!(DFG_PLAN_DESCRIPTOR_REGISTRY.validate(), Ok(()));
     }
 
     #[test]
-    fn graph_builder_rejects_edge_to_missing_node() {
-        let node = DfgNode {
-            id: DfgNodeId(0),
-            kind: DfgNodeKind::Return,
-            origin: origin(),
-            result: DfgValueRep::Void,
-            children: vec![DfgEdgeId(0)],
-            effects: NodeEffects {
-                terminates_block: true,
-                ..NodeEffects::default()
-            },
-            virtual_register: None,
-            structure: None,
-            property: None,
-            property_offset: None,
-            object: None,
-            watchpoints: Vec::new(),
-        };
-        let edge = DfgEdge {
+    fn graph_starts_in_load_store_form_for_bytecode_parsing() {
+        // DFGGraph.cpp:87: the Graph constructor starts in LoadStore form.
+        let graph = DfgGraph::new(DfgGraphId(1), CodeBlockId(CellId(1)));
+        assert_eq!(graph.form, GraphForm::LoadStore);
+        assert_eq!(graph.phase, DfgPhase::BytecodeParsing);
+        assert_eq!(
+            graph.mutation_authority,
+            DfgGraphMutationAuthority::BytecodeParser
+        );
+    }
+
+    #[test]
+    fn add_node_assigns_stable_index_identity() {
+        let mut graph = DfgGraph::new(DfgGraphId(1), CodeBlockId(CellId(1)));
+        let constant = graph.add_node(DfgNode::new(NodeType::JSConstant, origin()));
+        let arith = graph.add_node(DfgNode::new(NodeType::ArithAdd, origin()));
+        assert_eq!(constant, DfgNodeId(0));
+        assert_eq!(arith, DfgNodeId(1));
+
+        // Later appends do not disturb earlier identities.
+        let ret = graph.add_node(DfgNode::new(NodeType::Return, origin()));
+        assert_eq!(ret, DfgNodeId(2));
+        assert_eq!(graph.nodes[constant.0 as usize].op, NodeType::JSConstant);
+        assert_eq!(graph.nodes[arith.0 as usize].op, NodeType::ArithAdd);
+        assert_eq!(graph.nodes[arith.0 as usize].id, arith);
+    }
+
+    #[test]
+    fn node_result_bits_follow_default_flags() {
+        // ArithAdd is NodeResultNumber (DFGNodeType.h:163) so
+        // hasNumberResult() is true (DFGNode.h:1740-1743).
+        let arith = DfgNode::new(NodeType::ArithAdd, origin());
+        assert!(arith.has_number_result());
+        assert!(!arith.has_js_result());
+        assert!(arith.must_generate());
+
+        // ValueAdd is NodeResultJS (DFGNodeType.h:192): a JS result, not a
+        // number result.
+        let value = DfgNode::new(NodeType::ValueAdd, origin());
+        assert!(!value.has_number_result());
+        assert!(value.has_js_result());
+
+        // DoubleConstant is NodeResultDouble (DFGNodeType.h:40).
+        let double_constant = DfgNode::new(NodeType::DoubleConstant, origin());
+        assert!(double_constant.has_double_result());
+        assert!(double_constant.has_result());
+        assert!(!double_constant.has_number_or_any_int_result());
+
+        // SetLocal has no result bits (DFGNodeType.h:75).
+        let set_local = DfgNode::new(NodeType::SetLocal, origin());
+        assert!(!set_local.has_result());
+        assert!(!set_local.must_generate());
+
+        // Call carries NodeHasVarArgs (DFGNodeType.h:400).
+        assert!(DfgNode::new(NodeType::Call, origin()).has_var_args());
+    }
+
+    #[test]
+    fn variable_access_data_arena_appends_and_merges() {
+        // ByteCodeParser::newVariableAccessData appends to the graph-owned
+        // arena (DFGByteCodeParser.cpp:368-372).
+        let mut graph = DfgGraph::new(DfgGraphId(1), CodeBlockId(CellId(1)));
+        let local = VirtualRegister::local(0);
+        let argument = VirtualRegister::argument_or_header(5);
+        let first = graph.new_variable_access_data(local);
+        let second = graph.new_variable_access_data(argument);
+        assert_eq!(first, DfgVariableAccessDataId(0));
+        assert_eq!(second, DfgVariableAccessDataId(1));
+        assert_eq!(
+            graph.variable_access_data[first.0 as usize].operand(),
+            local
+        );
+        assert_eq!(
+            graph.variable_access_data[second.0 as usize].operand(),
+            argument
+        );
+
+        // Fresh entries mirror the C++ constructor: SpecNone prediction and
+        // zero flags (DFGVariableAccessData.cpp:47-59).
+        assert_eq!(
+            graph.variable_access_data[first.0 as usize].prediction(),
+            SPEC_NONE
+        );
+        assert_eq!(graph.variable_access_data[first.0 as usize].flags(), 0);
+
+        // The parser reuses one shared entry per variable by merging new
+        // speculations into it.
+        assert!(graph.variable_access_data[first.0 as usize].predict(SPEC_INT32_ONLY));
+        assert!(!graph.variable_access_data[first.0 as usize].predict(SPEC_INT32_ONLY));
+        assert_eq!(
+            graph.variable_access_data[first.0 as usize].prediction(),
+            SPEC_INT32_ONLY
+        );
+    }
+
+    #[test]
+    fn block_variables_at_tail_track_operand_to_node() {
+        // The parser records the most recent local access per operand in
+        // variablesAtTail (DFGBasicBlock.h:217).
+        let mut graph = DfgGraph::new(DfgGraphId(1), CodeBlockId(CellId(1)));
+        let mut set_local = DfgNode::new(NodeType::SetLocal, origin());
+        set_local.variable_access_data =
+            Some(graph.new_variable_access_data(VirtualRegister::local(0)));
+        let set_local_id = graph.add_node(set_local);
+
+        let mut entry = block();
+        entry.variables_at_head = Operands::new(1, 1, 0);
+        entry.variables_at_tail = Operands::new(1, 1, 0);
+        *entry.variables_at_tail.local_mut(0) = Some(set_local_id);
+        entry.nodes = vec![set_local_id];
+        entry.successors = vec![BranchTarget::Fallthrough];
+        let entry_id = graph.add_block(entry);
+
+        let stored = *graph.blocks[entry_id.0 as usize].variables_at_tail.local(0);
+        assert_eq!(stored, Some(set_local_id));
+        assert_eq!(
+            *graph.blocks[entry_id.0 as usize].variables_at_head.local(0),
+            None
+        );
+    }
+
+    #[test]
+    fn graph_rejects_edge_to_missing_node() {
+        let mut graph = DfgGraph::new(DfgGraphId(1), CodeBlockId(CellId(1)));
+        let mut return_node = DfgNode::new(NodeType::Return, origin());
+        return_node.effects.terminates_block = true;
+        return_node.children = vec![DfgEdgeId(0)];
+        let return_id = graph.add_node(return_node);
+        graph.add_edge(DfgEdge {
             id: DfgEdgeId(0),
-            from: DfgNodeId(0),
+            from: return_id,
             to: DfgNodeId(9),
             child_index: 0,
             use_kind: EdgeUseKind::Untyped,
             proof: EdgeProofStatus::NeedsCheck,
             kill: EdgeKillStatus::DoesNotKill,
-        };
-        let block = DfgBasicBlock {
-            id: DfgBasicBlockId(0),
-            nodes: vec![DfgNodeId(0)],
-            predecessors: Vec::new(),
-            successors: Vec::new(),
-            bytecode_begin: Some(0),
-            bytecode_end: Some(0),
-            execution_count: None,
-            is_osr_entry: false,
-            is_catch_entry: false,
-        };
-
-        let graph = DfgGraph::builder(DfgGraphId(1), CodeBlockId(CellId(1)))
-            .block(block)
-            .node(node)
-            .edge(edge)
-            .build();
+        });
+        let mut entry = block();
+        entry.nodes = vec![return_id];
+        graph.add_block(entry);
 
         assert_eq!(
-            graph,
+            graph.validate(),
             Err(DfgValidationError::EdgeEndpointMissing(DfgEdgeId(0)))
         );
     }
 
     #[test]
     fn graph_traversal_computes_reachability_and_dominance() {
-        let entry_node = DfgNode {
-            id: DfgNodeId(0),
-            kind: DfgNodeKind::Branch,
-            origin: origin(),
-            result: DfgValueRep::Void,
-            children: Vec::new(),
-            effects: NodeEffects::default(),
-            virtual_register: None,
-            structure: None,
-            property: None,
-            property_offset: None,
-            object: None,
-            watchpoints: Vec::new(),
-        };
-        let return_node = DfgNode {
-            id: DfgNodeId(1),
-            kind: DfgNodeKind::Return,
-            origin: origin(),
-            result: DfgValueRep::Void,
-            children: Vec::new(),
-            effects: NodeEffects {
-                terminates_block: true,
-                ..NodeEffects::default()
-            },
-            virtual_register: None,
-            structure: None,
-            property: None,
-            property_offset: None,
-            object: None,
-            watchpoints: Vec::new(),
-        };
-        let entry = DfgBasicBlock {
-            id: DfgBasicBlockId(0),
-            nodes: vec![DfgNodeId(0)],
-            predecessors: Vec::new(),
-            successors: vec![BranchTarget::Block(DfgBasicBlockId(1))],
-            bytecode_begin: Some(0),
-            bytecode_end: Some(0),
-            execution_count: None,
-            is_osr_entry: false,
-            is_catch_entry: false,
-        };
-        let exit = DfgBasicBlock {
-            id: DfgBasicBlockId(1),
-            nodes: vec![DfgNodeId(1)],
-            predecessors: vec![DfgBasicBlockId(0)],
-            successors: Vec::new(),
-            bytecode_begin: Some(1),
-            bytecode_end: Some(1),
-            execution_count: None,
-            is_osr_entry: false,
-            is_catch_entry: false,
-        };
-        let graph = DfgGraph::builder(DfgGraphId(2), CodeBlockId(CellId(2)))
-            .block(entry)
-            .block(exit)
-            .node(entry_node)
-            .node(return_node)
-            .build()
-            .unwrap();
+        let mut graph = DfgGraph::new(DfgGraphId(2), CodeBlockId(CellId(2)));
+        let branch = graph.add_node(DfgNode::new(NodeType::Branch, origin()));
+        let mut return_node = DfgNode::new(NodeType::Return, origin());
+        return_node.effects.terminates_block = true;
+        let ret = graph.add_node(return_node);
+
+        let mut entry = block();
+        entry.nodes = vec![branch];
+        entry.successors = vec![BranchTarget::Block(DfgBasicBlockId(1))];
+        graph.add_block(entry);
+        let mut exit = block();
+        exit.nodes = vec![ret];
+        exit.predecessors = vec![DfgBasicBlockId(0)];
+        exit.bytecode_begin = Some(1);
+        exit.bytecode_end = Some(1);
+        graph.add_block(exit);
 
         assert_eq!(
             graph.reachable_blocks(DfgBasicBlockId(0)),
@@ -1046,68 +1222,28 @@ mod tests {
 
     #[test]
     fn node_scheduler_places_children_before_parent() {
-        let child = DfgNode {
-            id: DfgNodeId(0),
-            kind: DfgNodeKind::Argument,
-            origin: origin(),
-            result: DfgValueRep::Untyped,
-            children: Vec::new(),
-            effects: NodeEffects::default(),
-            virtual_register: None,
-            structure: None,
-            property: None,
-            property_offset: None,
-            object: None,
-            watchpoints: Vec::new(),
-        };
-        let parent = DfgNode {
-            id: DfgNodeId(1),
-            kind: DfgNodeKind::Return,
-            origin: origin(),
-            result: DfgValueRep::Void,
-            children: vec![DfgEdgeId(0)],
-            effects: NodeEffects {
-                terminates_block: true,
-                ..NodeEffects::default()
-            },
-            virtual_register: None,
-            structure: None,
-            property: None,
-            property_offset: None,
-            object: None,
-            watchpoints: Vec::new(),
-        };
-        let edge = DfgEdge {
+        let mut graph = DfgGraph::new(DfgGraphId(3), CodeBlockId(CellId(3)));
+        let child = graph.add_node(DfgNode::new(NodeType::SetArgumentDefinitely, origin()));
+        let mut return_node = DfgNode::new(NodeType::Return, origin());
+        return_node.effects.terminates_block = true;
+        return_node.children = vec![DfgEdgeId(0)];
+        let parent = graph.add_node(return_node);
+        graph.add_edge(DfgEdge {
             id: DfgEdgeId(0),
-            from: DfgNodeId(1),
-            to: DfgNodeId(0),
+            from: parent,
+            to: child,
             child_index: 0,
             use_kind: EdgeUseKind::Untyped,
             proof: EdgeProofStatus::NeedsCheck,
             kill: EdgeKillStatus::DoesNotKill,
-        };
-        let block = DfgBasicBlock {
-            id: DfgBasicBlockId(0),
-            nodes: vec![DfgNodeId(0), DfgNodeId(1)],
-            predecessors: Vec::new(),
-            successors: Vec::new(),
-            bytecode_begin: Some(0),
-            bytecode_end: Some(0),
-            execution_count: None,
-            is_osr_entry: false,
-            is_catch_entry: false,
-        };
-        let graph = DfgGraph::builder(DfgGraphId(3), CodeBlockId(CellId(3)))
-            .block(block)
-            .node(child)
-            .node(parent)
-            .edge(edge)
-            .build()
-            .unwrap();
+        });
+        let mut entry = block();
+        entry.nodes = vec![child, parent];
+        graph.add_block(entry);
 
         assert_eq!(
             graph.scheduled_nodes_in_block(DfgBasicBlockId(0)),
-            Ok(vec![DfgNodeId(0), DfgNodeId(1)])
+            Ok(vec![child, parent])
         );
     }
 

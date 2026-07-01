@@ -800,20 +800,21 @@ mod tests {
             EffectSummary::pure(),
         )
         .unwrap();
-        let graph = DfgGraph::builder(DfgGraphId(5), owner())
-            .block(DfgBasicBlock {
-                id: crate::dfg::DfgBasicBlockId(0),
-                nodes: Vec::new(),
-                predecessors: Vec::new(),
-                successors: vec![BranchTarget::Fallthrough],
-                bytecode_begin: Some(0),
-                bytecode_end: Some(0),
-                execution_count: Some(1),
-                is_osr_entry: false,
-                is_catch_entry: false,
-            })
-            .build()
-            .unwrap();
+        let mut graph = DfgGraph::new(DfgGraphId(5), owner());
+        graph.add_block(DfgBasicBlock {
+            id: crate::dfg::DfgBasicBlockId(0),
+            nodes: Vec::new(),
+            predecessors: Vec::new(),
+            successors: vec![BranchTarget::Fallthrough],
+            variables_at_head: crate::bytecode::Operands::default(),
+            variables_at_tail: crate::bytecode::Operands::default(),
+            bytecode_begin: Some(0),
+            bytecode_end: Some(0),
+            execution_count: Some(1),
+            is_osr_entry: false,
+            is_catch_entry: false,
+        });
+        graph.validate().unwrap();
 
         record.attach_dfg_graph(&graph).unwrap();
 
