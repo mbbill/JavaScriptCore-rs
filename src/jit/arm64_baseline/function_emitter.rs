@@ -77,6 +77,7 @@ use crate::assembler::registers::RegisterID;
 use crate::bytecode::BytecodeIndex;
 use crate::bytecode::{CodeBlock, CoreOpcode, InstructionDecodeError, OperandAccessError};
 use crate::jit::assembly_helpers::{AssemblyHelpers, TagRegistersMode};
+use crate::jit::jit_code_map::{JitCodeMap, JitCodeMapBuilder};
 use crate::jit::operations::{
     operation_call, operation_call_with_this, operation_compare_eq, operation_compare_greater,
     operation_compare_greatereq, operation_compare_less, operation_compare_lesseq,
@@ -280,6 +281,12 @@ pub(crate) struct FunctionImage {
     /// Carries each call edge's `returnPC`/calleeFrame geometry for the R-lever proof;
     /// the install path does not consume it (it is verification metadata).
     pub(crate) linked_call_sites: Vec<LinkedCallSite>,
+    /// U1 (OSR-exit prerequisite): the bytecode-index -> machine-code landing map,
+    /// == `BaselineJITCode::m_jitCodeMap` (`JIT::link()` builds it from the
+    /// MAIN-pass `m_labels` and persists it, JIT.cpp:954-958 + :1017). Offsets are
+    /// relative to the image entry; the installed image adds its absolute base
+    /// (see the divergence note on [`crate::jit::jit_code_map::JitCodeMap`]).
+    pub(crate) jit_code_map: JitCodeMap,
 }
 
 /// A1.3 (first cut): a resolved native call target for ONE op_call site — the
@@ -3071,10 +3078,34 @@ pub(crate) fn emit_baseline_function_with_linked_calls(
         link_records.push(jump.to_link_record(stack_overflow_label));
     }
 
+    // == the `JITCodeMapBuilder` loop in `JIT::link()` (JIT.cpp:954-958): every
+    // bytecode index whose MAIN-pass label is set lands in the map, in ascending
+    // bci order. C++ appends `patchBuffer.locationOf(m_labels[bci])` — an ABSOLUTE
+    // CodeLocationLabel adjusted for LinkBuffer branch compaction; this LinkBuffer
+    // (`finalize_arm64_link_buffer` -> `copy_and_link`) copies the image VERBATIM
+    // (no compaction), so the assembler-buffer byte offset IS the final code
+    // offset, stored entry-relative (module divergence note on `JitCodeMap`).
+    // In JSC only bcis proven unreachable leave `m_labels[bci]` unset; this
+    // Stage-1 emitter labels EVERY bci it lowers (the fused compare+branch also
+    // labels the folded branch's bci, so the table stays fully populated) — the
+    // is-set filter is kept faithful to JIT.cpp:956 regardless.
+    let mut jit_code_map_builder = JitCodeMapBuilder::new();
+    for (bci, label) in emitter.labels.iter().enumerate() {
+        if let Some(label) = label {
+            if label.is_set() {
+                jit_code_map_builder.append(
+                    BytecodeIndex::from_offset(bci as u32),
+                    label.label().offset(),
+                );
+            }
+        }
+    }
+
     Ok(FunctionImage {
         code: emitter.h.code().to_vec(),
         link_records,
         linked_call_sites: emitter.linked_call_sites,
+        jit_code_map: jit_code_map_builder.finalize(),
     })
 }
 
@@ -3312,6 +3343,71 @@ mod tests {
         //   done jumps: op_ret 1, exception stub 1                              -> 2
         //   A1.4 stack-overflow guard: prologue softStackLimit -> overflow stub -> 1
         assert_eq!(image.link_records.len(), 32, "every branch is linked");
+    }
+
+    // ------------------------------------------------------------------------
+    // U1 JITCodeMap: the image's bci -> machine-offset landing map, built like
+    // `JIT::link()`'s JITCodeMapBuilder loop over the MAIN-pass labels
+    // (JIT.cpp:954-958 -> BaselineJITCode::m_jitCodeMap). The backward
+    // `jmp -> bci 3` link record is the independent oracle for the loop head's
+    // mapped offset: both were resolved from the SAME `m_labels[3]`.
+    // ------------------------------------------------------------------------
+    #[test]
+    fn int_sum_loop_jit_code_map_lands_on_every_bytecode_boundary() {
+        let instructions = int_sum_loop_instructions();
+        let bytecode_count = instructions.len();
+        let code_block = build_code_block(instructions);
+        let image = emit_baseline_function(&code_block, 0x1000, 0x2000).expect("emit loop");
+
+        let entries: Vec<(BytecodeIndex, u32)> = image.jit_code_map.entries().collect();
+        // Every emitted bytecode boundary is a landing point (JIT.cpp:200 labels
+        // every bci; the fused compare+branch labels the folded JumpIfFalse too).
+        assert!(!image.jit_code_map.is_empty());
+        assert_eq!(entries.len(), bytecode_count, "one landing point per bci");
+        // Keys strictly sorted; offsets monotonically non-decreasing in bci order.
+        assert!(
+            entries.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "keys strictly sorted"
+        );
+        assert!(
+            entries.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+            "offsets non-decreasing in bci order"
+        );
+        // Every offset lands inside the emitted image.
+        assert!(
+            entries
+                .iter()
+                .all(|&(_, offset)| (offset as usize) < image.code.len()),
+            "offsets within [0, code size)"
+        );
+        // The entry boundary (bci 0) sits AFTER the prologue + op_enter, as in
+        // JSC (privateCompileMainPass labels bci 0 after the prologue emission).
+        assert!(entries[0].1 > 0, "bci 0 lands after the prologue");
+
+        // Cross-oracle for a known bci: exactly one BACKWARD branch (the op_jmp
+        // at bci 7) was linked to the loop head's label, and its link-record
+        // target equals `find(bci 3)`.
+        let loop_head = image
+            .jit_code_map
+            .find(BytecodeIndex::from_offset(3))
+            .expect("loop head is a landing point");
+        let backward_to_head = image
+            .link_records
+            .iter()
+            .filter(|record| record.to() == loop_head as i64 && record.from() > record.to())
+            .count();
+        assert_eq!(
+            backward_to_head, 1,
+            "the backward loop branch targets the mapped loop-head offset"
+        );
+
+        // A bci past the labeled stream is a clean miss.
+        assert_eq!(
+            image
+                .jit_code_map
+                .find(BytecodeIndex::from_offset(bytecode_count as u32)),
+            None
+        );
     }
 
     #[test]

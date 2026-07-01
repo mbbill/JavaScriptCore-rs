@@ -200,10 +200,11 @@ pub(crate) fn install_baseline_function(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod platform {
     use super::{scan_frame_extent, BaselineInstallError};
-    use crate::bytecode::CodeBlock;
+    use crate::bytecode::{BytecodeIndex, CodeBlock};
     use crate::jit::executable_allocator::{
         finalize_arm64_link_buffer, ExecutableMemoryHandle, MapJitExecutableAllocator,
     };
+    use crate::jit::jit_code_map::JitCodeMap;
     use crate::value::JsValue;
     use crate::vm::entry::round_vm_entry_argument_count_to_align_frame;
     use crate::vm::jsstack::{
@@ -250,6 +251,12 @@ mod platform {
         /// release use-after-free. Stored as a raw address; NEVER dereferenced (only
         /// compared), so it carries no aliasing/provenance obligation.
         install_vm: *const Vm,
+        /// U1 (OSR-exit prerequisite): the persisted bytecode-index ->
+        /// machine-code landing map, == `BaselineJITCode::m_jitCodeMap`
+        /// (JITCodeMap.h; built by `JIT::link()`, JIT.cpp:954-958 + :1017).
+        /// Entry-relative offsets; [`Self::landing_address`] reconstitutes the
+        /// absolute label the C++ map stores directly.
+        jit_code_map: JitCodeMap,
     }
 
     impl InstalledBaselineFunction {
@@ -276,6 +283,27 @@ mod platform {
         /// for the image's lifetime.
         pub(crate) fn native_entry_address(&self) -> usize {
             self.handle.entry_address()
+        }
+
+        /// U1: the absolute machine-code landing address for `bytecode_index` —
+        /// the analog of `jitCode->m_jitCodeMap.find(bytecodeIndex)` returning
+        /// the absolute `CodeLocationLabel<JSEntryPtrTag>` an OSR transition
+        /// jumps to (LLInt loop OSR, `LLIntSlowPaths.cpp` `loop_osr`; a future
+        /// DFG exit landing mid-function). `entry + offset` because the Rust map
+        /// stores entry-relative offsets (see `JitCodeMap`'s divergence note);
+        /// the address is returned as `usize` like [`Self::native_entry_address`]
+        /// (the module's safe address currency). `None` when the bci was never
+        /// labeled/emitted.
+        pub(crate) fn landing_address(&self, bytecode_index: BytecodeIndex) -> Option<usize> {
+            self.jit_code_map
+                .find(bytecode_index)
+                .map(|offset| self.handle.entry_address() + offset as usize)
+        }
+
+        /// The persisted landing map itself (== reading `m_jitCodeMap` off the
+        /// `BaselineJITCode`), for the structural unit tests.
+        pub(crate) fn jit_code_map(&self) -> &JitCodeMap {
+            &self.jit_code_map
         }
         /// A1.4: the soft stack limit for THIS function's native stack — its
         /// `JsStack::stack_limit()` (low bound + soft-reserved zone). The driver
@@ -401,6 +429,9 @@ mod platform {
         let image =
             emit_baseline_function(code_block, jit_pending_address, soft_stack_limit_address)
                 .map_err(BaselineInstallError::Declined)?;
+        // Persist the landing map alongside the finalized code, as `JIT::link()`
+        // moves the builder's map onto the BaselineJITCode (JIT.cpp:1017).
+        let jit_code_map = image.jit_code_map;
         let mut records = image.link_records;
         let handle =
             finalize_arm64_link_buffer(&MapJitExecutableAllocator, &image.code, &mut records)
@@ -424,6 +455,113 @@ mod platform {
             // base matches so a Vm move (which would dangle the baked jit_pending
             // AbsoluteAddress) is caught in debug.
             install_vm,
+            jit_code_map,
         })
+    }
+}
+
+// U1 landing-map tests over the INSTALLED image, gated exactly like the
+// platform install path (installing relocates and seals real ARM64 code).
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod tests {
+    use super::super::function_emitter::emit_baseline_function;
+    use super::install_baseline_function;
+    use crate::bytecode::{
+        BytecodeIndex, CodeBlock, CodeKind, CoreOpcode, LinkContext, Operand, OperandWidth,
+        PackedInstructionStream, TypedInstruction, UnlinkedCodeBlock, UnlinkedCodeBlockPhase,
+        VirtualRegister,
+    };
+    use crate::vm::{Vm, VmConfig};
+
+    fn reg(raw: i32) -> Operand {
+        Operand::Register(VirtualRegister::from_raw(raw))
+    }
+
+    fn instr(op: CoreOpcode, operands: Vec<Operand>, bci: usize) -> TypedInstruction {
+        TypedInstruction {
+            opcode: op.opcode(),
+            width: OperandWidth::Narrow,
+            operands,
+            schema: None,
+            bytecode_index: Some(BytecodeIndex::from_offset(bci as u32)),
+        }
+    }
+
+    /// `(a, b) => { var tmp = a; return tmp + b; }` — the emitter's smoke shape
+    /// (args at positive slots 6/7, locals at -1/-2).
+    fn smoke_code_block() -> CodeBlock {
+        let instructions = vec![
+            instr(CoreOpcode::Move, vec![reg(-1), reg(6)], 0),
+            instr(CoreOpcode::AddInt32, vec![reg(-2), reg(-1), reg(7)], 1),
+            instr(CoreOpcode::Return, vec![reg(-2)], 2),
+        ];
+        let stream = PackedInstructionStream::from_typed_placeholder(instructions);
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Function, stream)
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+        CodeBlock::from_unlinked(unlinked, LinkContext::default())
+    }
+
+    // The installed image persists the SAME landing map the emitter's LINK pass
+    // built (`jitCode->m_jitCodeMap = jitCodeMapBuilder.finalize()`,
+    // JIT.cpp:1017), and `landing_address` reconstitutes the absolute
+    // CodeLocationLabel the C++ map stores directly: entry + offset, inside the
+    // installed image.
+    #[test]
+    fn installed_function_exposes_jit_code_map_landing_addresses() {
+        let vm = Vm::new(VmConfig::interpreter_only());
+        let jit_pending_address = vm.jit_pending_exception_address() as usize;
+        let soft_stack_limit_address = vm.jit_soft_stack_limit_address() as usize;
+
+        let code_block = smoke_code_block();
+        // Reference image: the map the emitter built plus the code size the
+        // offsets must land within (emission is deterministic for the same
+        // CodeBlock and baked addresses, so install produces the same bytes).
+        let reference =
+            emit_baseline_function(&code_block, jit_pending_address, soft_stack_limit_address)
+                .expect("emit smoke function");
+        let installed = install_baseline_function(
+            &code_block,
+            &code_block as *const CodeBlock,
+            jit_pending_address,
+            soft_stack_limit_address,
+            &vm as *const Vm,
+        )
+        .expect("install smoke function");
+
+        let map = installed.jit_code_map();
+        assert!(!map.is_empty(), "the landing map survives installation");
+        assert_eq!(map.len(), 3, "one landing point per bytecode index");
+        let entries: Vec<(BytecodeIndex, u32)> = map.entries().collect();
+        assert!(
+            entries.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "keys strictly sorted"
+        );
+        assert!(
+            entries.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+            "offsets non-decreasing in bci order"
+        );
+        assert_eq!(
+            entries,
+            reference.jit_code_map.entries().collect::<Vec<_>>(),
+            "installation persists the emitter's map unchanged"
+        );
+
+        // landing_address(bci) == entry + find(bci), inside the installed image.
+        let entry = installed.native_entry_address();
+        for &(bci, offset) in &entries {
+            let landing = installed
+                .landing_address(bci)
+                .expect("mapped bci has a landing address");
+            assert_eq!(landing, entry + offset as usize);
+            assert!(
+                landing > entry && landing < entry + reference.code.len(),
+                "landing address inside the installed image"
+            );
+        }
+        // An absent bci is a clean miss, not an approximate landing point.
+        assert_eq!(
+            installed.landing_address(BytecodeIndex::from_offset(99)),
+            None
+        );
     }
 }

@@ -39,6 +39,10 @@ pub mod executable_allocator;
 pub(crate) mod generated_metrics;
 pub(crate) mod ic;
 pub(crate) mod integration;
+// The baseline JIT's bytecode-index -> machine-code landing map (faithful port
+// of jit/JITCodeMap.h): the OSR landing table `JIT::link()` builds from the
+// per-bytecode MAIN-pass labels and persists on the BaselineJITCode.
+pub(crate) mod jit_code_map;
 pub(crate) mod machine;
 // The JIT↔runtime-call bridge (`JITOperations` analog): the `extern "C"`
 // slow-path shims emitted code calls back into. The SECOND (and only other)
