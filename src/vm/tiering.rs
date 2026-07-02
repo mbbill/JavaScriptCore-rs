@@ -116,6 +116,26 @@ use crate::vm::generated_metrics::{
 };
 
 const STRUCTURE_STUB_REPATCH_CODE_ID_BASE: u64 = 1 << 48;
+// C++ JSC keeps no VM-global per-call/per-observation event log at all: tiering
+// and IC state live in fixed-footprint per-CodeBlock counters/fields (e.g.
+// `CodeBlock::m_llintExecuteCounter`, `BaselineJITData`'s resident IC records).
+// Rust's `VmTieringIntegration` instead accumulates history in `Vec<Record>`
+// fields that are appended once per interpreter entry / property access / call,
+// which is unbounded in the number of dynamic executions -- a leak relative to
+// JSC's design (see e.g. the `plan_generation` field comment above, which notes
+// `next_ordinal` alone is bumped ~6M times on a single benchmark run).
+// This retain limit is a TRANSITIONAL cap-and-stop guard (stop appending once
+// the vec hits the limit; already-retained entries are kept, never evicted) for
+// diagnostic-only vecs -- fields no production decision logic reads, only
+// telemetry snapshots (`shell/octane.rs`) and tests. It intentionally does NOT
+// cover vecs that production tiering/IC logic searches for exact-ordinal or
+// "does this already exist" lookups (e.g. `call_link_attachment_plan_records`,
+// `property_load_access_case_plans`, `entry_decisions`): capping those would
+// silently freeze their content once the limit is hit, so lookups against
+// records created after the cap would wrongly see stale/missing state. Those
+// sites are load-bearing and are tracked separately, pending the faithful fix:
+// deleting the VM-global logs in favor of per-CodeBlock fixed-footprint
+// counters, matching JSC's shape.
 const HOT_TELEMETRY_RECORD_RETAIN_LIMIT: usize = 1024;
 const PROPERTY_IC_REPATCH_COUNT_FOR_COOLDOWN: u8 = 8;
 const PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE: u8 = 8;
@@ -2212,8 +2232,14 @@ impl VmTieringIntegration {
             linked_byte_evidence,
             outcome: BaselineMachineCodeEmissionProvenanceOutcome::Accepted,
         };
-        self.baseline_machine_code_emission_provenance_records
-            .push(record.clone());
+        // Transitional cap: diagnostic-only (no production consumer; see
+        // `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.baseline_machine_code_emission_provenance_records.len()
+            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        {
+            self.baseline_machine_code_emission_provenance_records
+                .push(record.clone());
+        }
         Ok(record)
     }
 
@@ -2401,7 +2427,13 @@ impl VmTieringIntegration {
             generated_code_entry_enabled: false,
             outcome,
         };
-        self.baseline_install_records.push(record.clone());
+        // Transitional cap: diagnostic-only (no production consumer reads this
+        // vec; live install state is looked up through `baseline_jit_slots` and
+        // `code_blocks`, not by scanning this history). See
+        // `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`.
+        if self.baseline_install_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.baseline_install_records.push(record.clone());
+        }
         if matches!(
             record.outcome,
             BaselineInstallOutcome::InstalledButEntryDisabled
@@ -2443,7 +2475,13 @@ impl VmTieringIntegration {
                 reason: request.reason,
             },
         };
-        self.baseline_install_records.push(record.clone());
+        // Transitional cap: diagnostic-only (no production consumer reads this
+        // vec; live install state is looked up through `baseline_jit_slots` and
+        // `code_blocks`, not by scanning this history). See
+        // `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`.
+        if self.baseline_install_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.baseline_install_records.push(record.clone());
+        }
         record
     }
 
@@ -3092,7 +3130,10 @@ impl VmTieringIntegration {
             generated_baseline: request.generated_baseline,
             boundary,
         };
-        self.fallback_records.push(record.clone());
+        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.fallback_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.fallback_records.push(record.clone());
+        }
         record
     }
 
@@ -3125,15 +3166,18 @@ impl VmTieringIntegration {
             .map(|state| state.tiering.counters)
             .unwrap_or_else(zero_tier_counters);
         let ordinal = self.next_record_ordinal();
-        self.diagnostics.push(ExecutionDiagnosticRecord {
-            ordinal,
-            owner,
-            entry_kind,
-            completion: CompletionDiagnostic::from_completion(completion),
-            frame_depth,
-            counters,
-            execution_path,
-        });
+        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.diagnostics.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.diagnostics.push(ExecutionDiagnosticRecord {
+                ordinal,
+                owner,
+                entry_kind,
+                completion: CompletionDiagnostic::from_completion(completion),
+                frame_depth,
+                counters,
+                execution_path,
+            });
+        }
     }
 
     pub(crate) fn record_property_load_observation(
@@ -3168,6 +3212,14 @@ impl VmTieringIntegration {
             bytecode_snapshot: request.bytecode_snapshot,
             descriptor: request.descriptor.clone(),
         };
+        // NOT capped: `record_property_load_megamorphic_cache_prototype_entry_from_materialization`
+        // (called from `record_property_load_guard_watchpoint_materialization`,
+        // a production safepoint path) looks up `property_load_observations` by
+        // exact `ordinal` to recover the original descriptor when a guarded
+        // prototype load's watchpoint materializes. A retain cap would silently
+        // drop that lookup for observations recorded after the cap. See the
+        // `HOT_TELEMETRY_RECORD_RETAIN_LIMIT` comment; this is an
+        // architecture-question site, not a safe transitional-cap site.
         self.property_load_observations.push(record.clone());
         let has_access_case_plan = plan.is_some();
         if let Some(plan) = plan {
@@ -3340,7 +3392,10 @@ impl VmTieringIntegration {
             bytecode_snapshot: request.bytecode_snapshot,
             descriptor: request.descriptor.clone(),
         };
-        self.property_has_observations.push(record.clone());
+        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.property_has_observations.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.property_has_observations.push(record.clone());
+        }
         if vm_property_has_descriptor_can_use_in_by_id_megamorphic(&request.descriptor) {
             let evolution =
                 self.consider_property_inline_cache_evolution_for_has_descriptor(&request, true);
@@ -3539,18 +3594,21 @@ impl VmTieringIntegration {
         };
         self.bump_property_megamorphic_projection_generation();
 
-        if self
-            .property_load_megamorphic_cache_records
-            .iter()
-            .any(|record| {
-                record.owner == request.owner
-                    && record.bytecode_snapshot == request.bytecode_snapshot
-                    && record.plan.as_ref().is_some_and(|record_plan| {
-                        vm_property_load_access_case_plan_table_key(record_plan)
-                            == vm_property_load_access_case_plan_table_key(plan)
-                            || vm_property_load_access_case_can_replace(record_plan, plan)
-                    })
-            })
+        // Transitional cap folded into the existing dedup guard (diagnostic-only
+        // vec; see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.property_load_megamorphic_cache_records.len() >= HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+            || self
+                .property_load_megamorphic_cache_records
+                .iter()
+                .any(|record| {
+                    record.owner == request.owner
+                        && record.bytecode_snapshot == request.bytecode_snapshot
+                        && record.plan.as_ref().is_some_and(|record_plan| {
+                            vm_property_load_access_case_plan_table_key(record_plan)
+                                == vm_property_load_access_case_plan_table_key(plan)
+                                || vm_property_load_access_case_can_replace(record_plan, plan)
+                        })
+                })
         {
             return;
         }
@@ -3603,18 +3661,22 @@ impl VmTieringIntegration {
         };
         self.bump_property_megamorphic_projection_generation();
 
-        if self
-            .property_load_megamorphic_cache_records
-            .iter()
-            .any(|record| {
-                record.owner == request.owner
-                    && record.bytecode_snapshot == request.bytecode_snapshot
-                    && record.slot == slot
-                    && record.bytecode_index == request.bytecode_index
-                    && record.base_structure == base_structure
-                    && record.entry_kind == GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing
-                    && record.plan.is_none()
-            })
+        // Transitional cap folded into the existing dedup guard (diagnostic-only
+        // vec; see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.property_load_megamorphic_cache_records.len() >= HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+            || self
+                .property_load_megamorphic_cache_records
+                .iter()
+                .any(|record| {
+                    record.owner == request.owner
+                        && record.bytecode_snapshot == request.bytecode_snapshot
+                        && record.slot == slot
+                        && record.bytecode_index == request.bytecode_index
+                        && record.base_structure == base_structure
+                        && record.entry_kind
+                            == GeneratedPropertyLoadMegamorphicCacheEntryKind::Missing
+                        && record.plan.is_none()
+                })
         {
             return;
         }
@@ -3677,18 +3739,21 @@ impl VmTieringIntegration {
         };
         self.bump_property_megamorphic_projection_generation();
 
-        if self
-            .property_load_megamorphic_cache_records
-            .iter()
-            .any(|record| {
-                record.owner == request.owner
-                    && record.bytecode_snapshot == request.bytecode_snapshot
-                    && record.slot == slot
-                    && record.bytecode_index == request.bytecode_index
-                    && record.base_structure == base_structure
-                    && record.entry_kind == entry_kind
-                    && record.plan.is_none()
-            })
+        // Transitional cap folded into the existing dedup guard (diagnostic-only
+        // vec; see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.property_load_megamorphic_cache_records.len() >= HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+            || self
+                .property_load_megamorphic_cache_records
+                .iter()
+                .any(|record| {
+                    record.owner == request.owner
+                        && record.bytecode_snapshot == request.bytecode_snapshot
+                        && record.slot == slot
+                        && record.bytecode_index == request.bytecode_index
+                        && record.base_structure == base_structure
+                        && record.entry_kind == entry_kind
+                        && record.plan.is_none()
+                })
         {
             return;
         }
@@ -3779,18 +3844,21 @@ impl VmTieringIntegration {
         };
         self.bump_property_megamorphic_projection_generation();
 
-        if self
-            .property_load_megamorphic_cache_records
-            .iter()
-            .any(|record| {
-                record.owner == guard_plan_record.owner
-                    && record.bytecode_snapshot == guard_plan_record.bytecode_snapshot
-                    && record.slot == guard_plan_record.plan.slot
-                    && record.bytecode_index == guard_plan_record.bytecode_index
-                    && record.base_structure == base_structure
-                    && record.entry_kind == entry_kind
-                    && record.plan.is_none()
-            })
+        // Transitional cap folded into the existing dedup guard (diagnostic-only
+        // vec; see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.property_load_megamorphic_cache_records.len() >= HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+            || self
+                .property_load_megamorphic_cache_records
+                .iter()
+                .any(|record| {
+                    record.owner == guard_plan_record.owner
+                        && record.bytecode_snapshot == guard_plan_record.bytecode_snapshot
+                        && record.slot == guard_plan_record.plan.slot
+                        && record.bytecode_index == guard_plan_record.bytecode_index
+                        && record.base_structure == base_structure
+                        && record.entry_kind == entry_kind
+                        && record.plan.is_none()
+                })
         {
             return;
         }
@@ -3886,8 +3954,17 @@ impl VmTieringIntegration {
                 .current_entry_count(epoch_after),
             full_collection,
         };
-        self.property_load_megamorphic_cache_aging_records
-            .push(record);
+        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        // `sequence` above is derived from this vec's `len()`, so it stops
+        // advancing once the cap is hit; nothing reads it back from the vec for
+        // decisions (it is only a diagnostic label on the returned record), so
+        // this does not affect production behavior.
+        if self.property_load_megamorphic_cache_aging_records.len()
+            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        {
+            self.property_load_megamorphic_cache_aging_records
+                .push(record);
+        }
         record
     }
 
@@ -4019,16 +4096,19 @@ impl VmTieringIntegration {
             | PropertyStoreAccessCasePlanKind::Unsupported => return,
         };
 
-        if self
-            .property_store_megamorphic_cache_records
-            .iter()
-            .any(|record| {
-                record.owner == request.owner
-                    && record.bytecode_snapshot == request.bytecode_snapshot
-                    && (vm_property_store_access_case_plan_table_key(&record.plan)
-                        == vm_property_store_access_case_plan_table_key(plan)
-                        || vm_property_store_access_case_can_replace(&record.plan, plan))
-            })
+        // Transitional cap folded into the existing dedup guard (diagnostic-only
+        // vec; see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.property_store_megamorphic_cache_records.len() >= HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+            || self
+                .property_store_megamorphic_cache_records
+                .iter()
+                .any(|record| {
+                    record.owner == request.owner
+                        && record.bytecode_snapshot == request.bytecode_snapshot
+                        && (vm_property_store_access_case_plan_table_key(&record.plan)
+                            == vm_property_store_access_case_plan_table_key(plan)
+                            || vm_property_store_access_case_can_replace(&record.plan, plan))
+                })
         {
             return;
         }
@@ -4118,18 +4198,21 @@ impl VmTieringIntegration {
         }?;
         self.bump_property_megamorphic_projection_generation();
 
-        if self
-            .property_has_megamorphic_cache_records
-            .iter()
-            .any(|record| {
-                record.owner == request.owner
-                    && record.bytecode_snapshot == request.bytecode_snapshot
-                    && record.slot == request.slot
-                    && record.bytecode_index == request.bytecode_index
-                    && record.key == request.key
-                    && record.base_structure == request.base_structure
-                    && record.result == request.result
-            })
+        // Transitional cap folded into the existing dedup guard (diagnostic-only
+        // vec; see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.property_has_megamorphic_cache_records.len() >= HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+            || self
+                .property_has_megamorphic_cache_records
+                .iter()
+                .any(|record| {
+                    record.owner == request.owner
+                        && record.bytecode_snapshot == request.bytecode_snapshot
+                        && record.slot == request.slot
+                        && record.bytecode_index == request.bytecode_index
+                        && record.key == request.key
+                        && record.base_structure == request.base_structure
+                        && record.result == request.result
+                })
         {
             return None;
         }
@@ -4484,8 +4567,15 @@ impl VmTieringIntegration {
             barrier_evidence,
             outcome,
         };
-        self.property_store_access_case_install_rechecks
-            .push(record.clone());
+        // Transitional cap: no production consumer reads this vec back (the
+        // caller uses the returned record directly). See
+        // `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`.
+        if self.property_store_access_case_install_rechecks.len()
+            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        {
+            self.property_store_access_case_install_rechecks
+                .push(record.clone());
+        }
         record
     }
 
@@ -4561,8 +4651,11 @@ impl VmTieringIntegration {
             expected_specialization: request.expected_specialization,
             outcome: request.outcome,
         };
-        self.vm_owned_call_target_validation_records
-            .push(record.clone());
+        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.vm_owned_call_target_validation_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.vm_owned_call_target_validation_records
+                .push(record.clone());
+        }
         record
     }
 
@@ -5021,8 +5114,13 @@ impl VmTieringIntegration {
             dependency_ordinals,
             outcome,
         };
-        self.property_load_guard_install_rechecks
-            .push(record.clone());
+        // Transitional cap: no production consumer reads this vec back (the
+        // caller uses the returned record directly). See
+        // `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`.
+        if self.property_load_guard_install_rechecks.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.property_load_guard_install_rechecks
+                .push(record.clone());
+        }
         record
     }
 
@@ -5167,8 +5265,13 @@ impl VmTieringIntegration {
             retires_guard,
             outcome,
         };
-        self.property_load_guard_watchpoint_invalidations
-            .push(record.clone());
+        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.property_load_guard_watchpoint_invalidations.len()
+            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        {
+            self.property_load_guard_watchpoint_invalidations
+                .push(record.clone());
+        }
         record
     }
 
@@ -5240,8 +5343,13 @@ impl VmTieringIntegration {
             invalidation_ordinals,
             outcome,
         };
-        self.property_load_guard_watchpoint_event_dispatches
-            .push(record.clone());
+        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.property_load_guard_watchpoint_event_dispatches.len()
+            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        {
+            self.property_load_guard_watchpoint_event_dispatches
+                .push(record.clone());
+        }
         record
     }
 
@@ -5400,8 +5508,13 @@ impl VmTieringIntegration {
             reason: request.reason,
             outcome,
         };
-        self.generated_property_store_mutation_rejections
-            .push(record.clone());
+        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.generated_property_store_mutation_rejections.len()
+            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        {
+            self.generated_property_store_mutation_rejections
+                .push(record.clone());
+        }
         record
     }
 
@@ -6203,7 +6316,10 @@ impl VmTieringIntegration {
             direct_call_status: request.direct_call_status,
             reason: request.reason,
         };
-        self.generated_call_link_probe_misses.push(record);
+        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.generated_call_link_probe_misses.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.generated_call_link_probe_misses.push(record);
+        }
         record
     }
 
@@ -6241,7 +6357,11 @@ impl VmTieringIntegration {
             direct_call_status: request.direct_call_status,
             reason: request.reason,
         };
-        self.generated_call_link_probe_blocked_records.push(record);
+        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
+        if self.generated_call_link_probe_blocked_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        {
+            self.generated_call_link_probe_blocked_records.push(record);
+        }
         Ok(record)
     }
 
@@ -6282,7 +6402,12 @@ impl VmTieringIntegration {
             bytecode_index: request.bytecode_index,
             boundary,
         };
-        self.osr_boundaries.push(record.clone());
+        // Transitional cap: diagnostic-only -- the actual OSR state transition
+        // above (`state.tiering.osr = ...`) is unconditional; this vec is only a
+        // history log. See `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`.
+        if self.osr_boundaries.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.osr_boundaries.push(record.clone());
+        }
         Ok(record)
     }
 
@@ -33156,6 +33281,36 @@ mod tests {
         assert_eq!(
             tiering.generated_property_store_probe_misses().len(),
             HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        );
+    }
+
+    // Leak-fix A#1 regression check (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`):
+    // before this fix, `property_has_observations` (and 17 sibling
+    // diagnostic-only vecs) had no retain-limit guard at all -- every
+    // `in`-operator property observation pushed unconditionally, so this vec
+    // (and its siblings) grew without bound for the life of the VM. This test
+    // fails on the pre-fix code (the final assert would see `observed`
+    // elements, not `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`) and passes after it.
+    #[test]
+    fn property_has_observations_stay_capped_after_thousands_of_in_operator_checks() {
+        let owner = CodeBlockId(CellId(9001));
+        let bytecode_index = BytecodeIndex::from_offset(8);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+        let observed = HOT_TELEMETRY_RECORD_RETAIN_LIMIT + 2_000;
+
+        for _ in 0..observed {
+            let descriptor =
+                property_has_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+            record_property_has_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        }
+
+        assert_eq!(
+            tiering.property_has_observations().len(),
+            HOT_TELEMETRY_RECORD_RETAIN_LIMIT,
+            "property_has_observations must stop growing at the retain limit \
+             instead of accumulating one record per `in`-operator check for the \
+             life of the VM"
         );
     }
 
