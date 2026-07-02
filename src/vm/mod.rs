@@ -1462,7 +1462,12 @@ struct SourceSessionLinkedEntry {
 #[derive(Clone, Debug)]
 struct SourceSessionExecutableEntry {
     code_block_id: CodeBlockId,
-    code_block: CodeBlock,
+    // C++ JSC divergence (one shared instance): `Rc<CodeBlock>`, shared by
+    // `Rc::clone` with the `CodeBlockRegistry` record for `code_block_id`,
+    // mirroring C++'s single stable `CodeBlock*` (ProgramExecutable /
+    // EvalExecutable `m_codeBlock`) referenced by both the registry and the
+    // interpreter. See `link_source_session_compiled_entry_with_kind`.
+    code_block: Rc<CodeBlock>,
     declared_global_bindings: BytecompilerGlobalBindingSet,
 }
 
@@ -17285,7 +17290,25 @@ impl Vm {
         self.executables
             .register_script(executable_id, executable_kind, compiled.shared_unlinked)
             .map_err(SourceExecutionError::ExecutableRegistration)?;
-        self.code_blocks.register(code_block_id, code_block.clone());
+        // C++ JSC divergence (one shared instance): build ONE `Rc<CodeBlock>` for
+        // this program/eval CodeBlock and share it by `Rc::clone` into BOTH the
+        // `CodeBlockRegistry` record AND the `SourceSessionExecutableEntry`
+        // returned below (what `execute_source_session_entry` /
+        // `run_eval_executable_entry` actually dispatch), mirroring C++'s single
+        // stable `CodeBlock*` referenced by both the registry and the
+        // interpreter. Previously this registered a DEEP CLONE
+        // (`code_block.clone()`) into `self.code_blocks` while the plain
+        // `code_block` returned to the caller (and actually interpreted) stayed a
+        // SEPARATE instance: synchronous direct-dispatch profile writes (e.g. a
+        // plain data-property GetByName, written through `state.code_block`)
+        // landed only on the interpreted instance and were lost once it dropped,
+        // invisible to any registry-side reader (`code_block_shared` /
+        // `code_blocks.get`) -- split feedback for the program's own bytecode.
+        // `install_source_function_blocks` below already does this correctly for
+        // function CodeBlocks; this makes the program/eval entry match.
+        let code_block = Rc::new(code_block);
+        self.code_blocks
+            .register(code_block_id, Rc::clone(&code_block));
         let install_record = self.executables.install_script_code(
             executable_id,
             code_block_id,
@@ -66771,6 +66794,73 @@ mod tests {
             .expect("GetByName value profile sample at the data-load site");
         assert_eq!(sample.value, RuntimeValue::from_i32(41));
         assert_eq!(sample.bucket.kind, ValueProfileBucketKind::Sample);
+    }
+
+    // Regression for the program/eval registry-split fix
+    // (`link_source_session_compiled_entry_with_kind`): unlike the low-level
+    // `register_test_code_block` harness above (which knowingly keeps a
+    // separate registry clone for top-level/test code blocks, see the comment
+    // on the previous test), the REAL top-level program-linking path must
+    // `Rc`-share ONE CodeBlock instance between `Vm::code_blocks` and the
+    // instance the interpreter actually dispatches
+    // (`SourceSessionExecutableEntry::code_block`), exactly like
+    // `install_source_function_blocks` already does for function CodeBlocks.
+    //
+    // A plain DATA property load (`o.p` where `p` is a data property, not a
+    // getter) profiles its own value SYNCHRONOUSLY through the dispatch arm's
+    // direct `&CodeBlock` reference (`state.code_block`, the exact instance
+    // `execute_source_session_entry` hands to `execute_code_block` --
+    // `SourceSessionExecutableEntry::code_block`), never through the
+    // `CodeBlockRegistry` API. Before this fix, `Vm::code_blocks` held a
+    // SEPARATE `code_block.clone()` deep copy made at link time, so this
+    // direct write landed on the dispatched instance while the registry kept
+    // serving stale (empty) side tables from its own copy -- the
+    // registry-resolved `CodeBlock` never observed the sample. This test
+    // proves the write IS visible when read back through the registry,
+    // proving the registry record and the actually-interpreted program
+    // CodeBlock are the SAME shared instance, not a split clone.
+    #[test]
+    fn vm_top_level_data_property_load_value_profile_visible_through_registry_resolved_code_block()
+    {
+        let mut vm = Vm::new(VmConfig::default());
+
+        let completion = vm
+            .execute_source(source("var o = { p: 42 }; var r = o.p; r;"))
+            .unwrap();
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+
+        // The top-level program's OWN `install_script_code` record is pushed
+        // first (`link_source_session_compiled_entry_with_kind`), before any
+        // function Call/Construct install records from
+        // `install_source_function_blocks` (none here -- this program
+        // declares no functions), so index 0 is the program's `CodeBlockId`
+        // for a fresh `Vm` whose first (and only) execution is this program.
+        let program_owner = vm.executable_registry().install_records()[0].code_block;
+        let registered_program_code_block = vm
+            .code_blocks
+            .get(program_owner)
+            .expect("registered top-level program code block")
+            .code_block();
+
+        let samples = registered_program_code_block
+            .side_tables()
+            .value_profiles()
+            .bucket_samples
+            .clone();
+        let sample = samples.iter().find(|sample| {
+            sample.value == RuntimeValue::from_i32(42)
+                && sample.bucket.kind == ValueProfileBucketKind::Sample
+        });
+        assert!(
+            sample.is_some(),
+            "the data property's own value (42), synchronously profiled by \
+             the dispatch arm through the actually-interpreted CodeBlock, \
+             must be visible in the REGISTRY-resolved program CodeBlock's \
+             value profiles (samples observed: {samples:?})"
+        );
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]
