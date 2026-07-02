@@ -630,10 +630,54 @@ impl ArrayProfile {
         }
     }
 
-    pub fn observe_indexed_read(&mut self, structure: StructureId, out_of_bounds: bool) {
+    /// `ArrayProfile::observeStructureID` (bytecode/ArrayProfile.h:244): the
+    /// every-execution structure-seen write. The LLInt `arrayProfile` macro
+    /// performs the same raw store of the base cell's structureID into
+    /// `m_lastSeenStructureID` (llint/LowLevelInterpreter.asm:1447-1450), and the
+    /// C++ slow paths route through `observeStructure` (ArrayProfile.h:245;
+    /// e.g. slow_path_get_length, llint/LLIntSlowPaths.cpp:982-983).
+    pub fn observe_structure_id(&mut self, structure: StructureId) {
         self.last_seen_structure = Some(structure);
+    }
+
+    /// `ArrayProfile::setOutOfBounds` (bytecode/ArrayProfile.h:242): adds
+    /// `ArrayProfileFlag::OutOfBounds` (ArrayProfile.h:206). Set on the
+    /// out-of-bounds access paths (get_by_val slow path,
+    /// llint/LLIntSlowPaths.cpp:1241/1257/1265; put_by_val
+    /// `.opPutByValOutOfBounds`, llint/LowLevelInterpreter64.asm:2112-2114).
+    pub fn set_out_of_bounds(&mut self) {
+        self.flags.out_of_bounds = true;
+    }
+
+    /// Adds `ArrayProfileFlag::MayStoreHole` (bytecode/ArrayProfile.h:205; read
+    /// back by `mayStoreToHole`, ArrayProfile.h:256). C++ has no named setter
+    /// member for this flag: the LLInt ORs the bit in place on the put hole
+    /// paths (contiguous beyond-publicLength extend,
+    /// llint/LowLevelInterpreter64.asm:2033-2038; ArrayStorage hole fill,
+    /// :2102-2104).
+    pub fn set_may_store_to_hole(&mut self) {
+        self.flags.may_store_hole = true;
+    }
+
+    /// `ArrayProfile::setMayBeLargeTypedArray` (bytecode/ArrayProfile.h:229; the
+    /// LLInt `setLargeTypedArray` callback, llint/LowLevelInterpreter64.asm:
+    /// 1845-1849, fired for typed-array lengths above
+    /// `s_smallTypedArrayMaxLength` == INT32_MAX, ArrayProfile.h:228). Storage
+    /// mutator only for now: the Rust typed-array model cannot yet observe a
+    /// > INT32_MAX view length, so no interpreter path calls it.
+    pub fn set_may_be_large_typed_array(&mut self) {
+        self.flags.may_be_large_typed_array = true;
+    }
+
+    /// `ArrayProfile::observeIndexedRead` (bytecode/ArrayProfile.cpp:157-172):
+    /// structure-seen plus the length-derived out-of-bounds marking. C++
+    /// computes the bound check from the cell (`index >= getArrayLength()` /
+    /// ArrayStorage vectorLength); the Rust caller passes the precomputed
+    /// verdict because cells live in the interpreter's object store.
+    pub fn observe_indexed_read(&mut self, structure: StructureId, out_of_bounds: bool) {
+        self.observe_structure_id(structure);
         if out_of_bounds {
-            self.flags.out_of_bounds = true;
+            self.set_out_of_bounds();
         }
     }
 }

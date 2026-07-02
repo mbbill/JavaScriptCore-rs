@@ -2345,6 +2345,13 @@ impl CoreObjectStore {
         self.butterflies[handle.0].elem_len()
     }
 
+    /// Allocated indexed element capacity of butterfly `handle` (the Butterfly
+    /// vectorLength analog, Butterfly.h:187); the put_by_val ArrayProfile
+    /// hole-vs-out-of-bounds boundary.
+    pub(crate) fn butterfly_elem_vector_len(&self, handle: ButterflyHandle) -> usize {
+        self.butterflies[handle.0].elem_vector_len()
+    }
+
     /// Append `value` to the indexed element side of butterfly `handle`
     /// (C++ contiguous append, Butterfly.h:186-189). Returns `true` if the butterfly
     /// REALLOCATED (the caller must `sync_butterfly_base`).

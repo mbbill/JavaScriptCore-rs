@@ -8680,6 +8680,20 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 };
                 self.last_property_lookup = None;
                 self.pending_property_lookup_site = None;
+                // C++ JSC op_get_by_val ArrayProfile: the arrayProfile macro
+                // records the base cell's structure BEFORE the shape dispatch
+                // (llint/LowLevelInterpreter64.asm:1857), and the slow path marks
+                // OOB indexed subscripts (llint/LLIntSlowPaths.cpp:1236-1265) —
+                // including a numeric subscript that is not a uint32 index
+                // (negative/fractional/>=2^32) on a cell base (:1262-1265).
+                let subscript_index = self.value_uint32_index(key_value);
+                self.record_by_val_array_profile(
+                    state.code_block,
+                    instruction.bytecode_index,
+                    object,
+                    subscript_index,
+                    subscript_index.is_none() && key_value.as_number().is_some(),
+                );
                 // C++ JSC get_by_val slow path: an undefined/null base coerces via
                 // toObject and throws a catchable TypeError (createNotAnObjectError)
                 // before any indexed/length fast path or the get_property funnel.
@@ -8701,6 +8715,11 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                             Err(error) => return DispatchOutcome::Fail(error),
                         };
                         self.record_property_lookup(record);
+                        self.record_value_profile(
+                            state.code_block,
+                            instruction.bytecode_index,
+                            value,
+                        );
                         return write_register(state, window, destination, value);
                     }
                 }
@@ -8753,7 +8772,20 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     )
                 };
                 match value {
-                    Ok(value) => write_register(state, window, destination, value),
+                    Ok(value) => {
+                        // C++ profiles the slow-path result too
+                        // (LLINT_RETURN_PROFILED, llint/LLIntSlowPaths.cpp:1286).
+                        // KNOWN GAP: a getter suspension (FunctionValueCall
+                        // outcome) writes dst on call return without a profile
+                        // write; C++ profiles it at the getter-return OSR point
+                        // (llint/LowLevelInterpreter64.asm:1909-1911).
+                        self.record_value_profile(
+                            state.code_block,
+                            instruction.bytecode_index,
+                            value,
+                        );
+                        write_register(state, window, destination, value)
+                    }
                     Err(outcome) => outcome,
                 }
             }
@@ -8782,6 +8814,19 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                // C++ JSC op_put_by_val ArrayProfile: the arrayProfile macro
+                // records the base cell's structure BEFORE the shape dispatch
+                // (llint/LowLevelInterpreter64.asm:2047; a non-cell base branches
+                // to the slow path first and records nothing). The hole/OOB flag
+                // writes live on the indexed store path
+                // (record_put_by_val_indexed_store_array_profile).
+                self.record_by_val_array_profile(
+                    state.code_block,
+                    instruction.bytecode_index,
+                    object,
+                    None,
+                    false,
+                );
                 if self.objects.is_array(object) {
                     if let Some(index) = self.value_array_index(key_value) {
                         return self.put_index_with_store_observation(
@@ -8791,6 +8836,23 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                             object,
                             index,
                             value,
+                        );
+                    }
+                    // C++ NEGATIVE int32 subscript on a writable array shape:
+                    // loadConstantOrVariableInt32 succeeds, then the UNSIGNED
+                    // bounds compares (biaeq, llint/LowLevelInterpreter64.asm:
+                    // 2027/:2033) treat it as huge and route it to
+                    // .opPutByValOutOfBounds (:2112-2114) -> OutOfBounds ->
+                    // slow-path store. The Rust routing sends it to the named
+                    // funnel below, so the flag is recorded here. (A fractional
+                    // subscript fails the int32 load and goes slow with NO flag,
+                    // llint/LLIntSlowPaths.cpp:1347-1369.)
+                    if let Some(NumberValue::Int32(index)) = key_value.as_number() {
+                        self.record_put_by_val_indexed_store_array_profile(
+                            state.code_block,
+                            instruction.bytecode_index,
+                            object,
+                            index,
                         );
                     }
                 }
@@ -8921,6 +8983,19 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 };
                 self.last_property_lookup = None;
                 self.pending_property_lookup_site = None;
+                // C++ JSC op_get_by_val ArrayProfile (GetByIndex is the Rust
+                // constant-index lowering): structure-seen + indexed OOB, as in
+                // the GetByValue arm (llint/LowLevelInterpreter64.asm:1857;
+                // llint/LLIntSlowPaths.cpp:1236-1265). A negative constant index
+                // is a numeric subscript that is not a uint32 index, which C++
+                // marks OutOfBounds on a cell base (:1262-1265).
+                self.record_by_val_array_profile(
+                    state.code_block,
+                    instruction.bytecode_index,
+                    object,
+                    u32::try_from(index).ok(),
+                    index < 0,
+                );
                 // C++ JSC get_by_val slow path: an undefined/null base coerces via
                 // toObject and throws a catchable TypeError (createNotAnObjectError),
                 // rather than the object-store fatal ExpectedObject below.
@@ -8940,6 +9015,7 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
                 self.record_property_lookup(record);
+                self.record_value_profile(state.code_block, instruction.bytecode_index, value);
                 write_register(state, window, destination, value)
             }
             CoreOpcode::PutByIndex => {
@@ -8963,6 +9039,19 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                // C++ JSC op_put_by_val ArrayProfile (PutByIndex is the Rust
+                // constant-index lowering): structure-seen for a cell base
+                // (llint/LowLevelInterpreter64.asm:2047); hole/OOB flags —
+                // including the negative-constant-index OutOfBounds
+                // (:2112-2114 via the unsigned bounds compares) — are recorded
+                // on the indexed store path below.
+                self.record_by_val_array_profile(
+                    state.code_block,
+                    instruction.bytecode_index,
+                    object,
+                    None,
+                    false,
+                );
                 // C++ JSC put_by_val slow path: an undefined/null base routes through
                 // putToPrimitive -> synthesizePrototype and throws a catchable
                 // TypeError (createNotAnObjectError), not a fatal abort.
@@ -9019,6 +9108,18 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(context) => context,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                // C++ JSC op_get_length ArrayProfile: the arrayProfile macro
+                // records the base cell's structure before the id-load helper
+                // (llint/LowLevelInterpreter64.asm:1715), and the slow path
+                // repeats the cell-guarded observeStructure
+                // (llint/LLIntSlowPaths.cpp:982-983). Named read: no OOB marking.
+                self.record_by_val_array_profile(
+                    state.code_block,
+                    instruction.bytecode_index,
+                    value,
+                    None,
+                    false,
+                );
                 // C++ JSC get_length slow path: `(undefined).length` coerces the base
                 // via toObject and throws a catchable TypeError (createNotAnObjectError)
                 // before reaching the array/length read below.
@@ -9041,7 +9142,18 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     }
                 };
                 match length {
-                    Ok(value) => write_register(state, window, destination, value),
+                    Ok(value) => {
+                        // C++ profiles the length result on every successful
+                        // execution (performGetByIDHelper's valueProfile,
+                        // llint/LowLevelInterpreter64.asm:1716/1724;
+                        // LLINT_RETURN_PROFILED, llint/LLIntSlowPaths.cpp:985-986).
+                        self.record_value_profile(
+                            state.code_block,
+                            instruction.bytecode_index,
+                            value,
+                        );
+                        write_register(state, window, destination, value)
+                    }
                     Err(outcome) => outcome,
                 }
             }
@@ -10375,6 +10487,160 @@ impl CoreOpcodeDispatchHost {
         }
     }
 
+    /// The length-derived out-of-bounds verdict for an indexed READ of a cell:
+    /// C++ marks `setOutOfBounds` in the by-val read slow paths when the fast
+    /// indexed access misses (llint/LLIntSlowPaths.cpp getByVal:1236-1265 —
+    /// string/array index past length, or a base with no quickly-accessible
+    /// indexed storage), and `ArrayProfile::observeIndexedRead`
+    /// (bytecode/ArrayProfile.cpp:157-172) derives the same verdict from
+    /// `index >= getArrayLength()` / the typed-array length. Non-indexed cell
+    /// kinds always mark (C++ `canAccessArgumentIndexQuickly` covers only the
+    /// Arguments kinds, CommonSlowPaths.h).
+    fn indexed_read_out_of_bounds(&self, cell: &CoreObjectCell, index: u32) -> bool {
+        let Ok(index) = usize::try_from(index) else {
+            return true;
+        };
+        match cell.kind {
+            CoreObjectKind::Array => index >= self.objects.butterfly_elem_len(cell.butterfly),
+            CoreObjectKind::Uint8Array => index >= cell.view_length,
+            _ => true,
+        }
+    }
+
+    /// The by-val/length family's base ArrayProfile write: the LLInt
+    /// `arrayProfile` macro stores the BASE cell's structureID on every
+    /// execution whose base is a cell (llint/LowLevelInterpreter.asm:1447-1450;
+    /// get_by_val LowLevelInterpreter64.asm:1857, get_length :1715, put_by_val
+    /// :2047 — a non-cell base branches to the slow path BEFORE the macro and
+    /// records nothing), and the READ slow paths add `setOutOfBounds` for an
+    /// out-of-bounds indexed subscript (llint/LLIntSlowPaths.cpp:1236-1265).
+    /// `index` is the uint32 subscript of an indexed READ;
+    /// `numeric_non_index_subscript` marks a READ whose subscript is a JS
+    /// number that is NOT a uint32 index (negative/fractional/>=2^32/NaN):
+    /// C++ marks those OutOfBounds on ANY cell base
+    /// (`subscript.isNumber() && baseValue.isCell()`,
+    /// llint/LLIntSlowPaths.cpp:1262-1265). Named/length reads and puts pass
+    /// `(None, false)` (a put's hole/OOB flags use the vectorLength boundary
+    /// and are recorded on the indexed store path instead).
+    ///
+    /// DIVERGENCE: C++ records the structureID for ANY cell base, including
+    /// JSString cells; the Rust value model keeps string/symbol/bigint
+    /// primitives outside the structured object store (no StructureId yet), so
+    /// only object-store cells record the structure-seen half. The OOB half
+    /// needs no StructureId and IS recorded for string bases (an index at or
+    /// past the string length misses `canGetIndex` and marks OOB,
+    /// llint/LLIntSlowPaths.cpp:1236-1241; an in-bounds char read does not).
+    fn record_by_val_array_profile(
+        &self,
+        code_block: &CodeBlock,
+        bytecode_index: BytecodeIndex,
+        base: RuntimeValue,
+        index: Option<u32>,
+        numeric_non_index_subscript: bool,
+    ) {
+        let cell = self.objects.find(base);
+        let out_of_bounds = match index {
+            Some(index) => match cell {
+                Some(cell) => self.indexed_read_out_of_bounds(cell, index),
+                // String base (a cell outside the object store): OOB iff the
+                // index misses `canGetIndex` (index >= length,
+                // llint/LLIntSlowPaths.cpp:1236-1241). Other non-object-store
+                // bases fall out of C++ getByVal's string/object arms with no
+                // marking (LLIntSlowPaths.cpp:1259-1261).
+                None => self
+                    .strings
+                    .text(base)
+                    .is_some_and(|text| index >= string_code_unit_len_i32(text) as u32),
+            },
+            // `baseValue.isCell()` (JSCJSValue.h:998-1001) — any heap cell,
+            // including string/symbol/bigint cells outside the object store.
+            None => numeric_non_index_subscript && base.is_cell(),
+        };
+        // Profiling never alters program behavior (the C++ macro is a raw
+        // store): a site without a derived slot (F0 derives only the profiled
+        // opcodes) or a non-linked lifecycle records nothing.
+        if let Some(cell) = cell {
+            let _ = code_block.record_array_profile_structure_seen(
+                crate::bytecode::code_block::CodeBlockMutationAuthority::default(),
+                bytecode_index,
+                cell.structure_id,
+            );
+        }
+        if out_of_bounds {
+            let _ = code_block.record_array_profile_out_of_bounds(
+                crate::bytecode::code_block::CodeBlockMutationAuthority::default(),
+                bytecode_index,
+            );
+        }
+    }
+
+    /// The put_by_val indexed-store ArrayProfile flag writes
+    /// (llint/LowLevelInterpreter64.asm putByValOp, computed BEFORE the store
+    /// mutates the lengths): an int32-subscripted store to a writable
+    /// array-shaped base marks
+    ///   - nothing when index < publicLength (:2027-2031, the in-bounds
+    ///     contiguous store),
+    ///   - MayStoreHole when publicLength <= index < vectorLength (the
+    ///     in-capacity extend/hole write, :2033-2041; the ArrayStorage hole
+    ///     fill, :2102-2104),
+    ///   - OutOfBounds when index >= vectorLength (:2112-2114) — INCLUDING a
+    ///     NEGATIVE int32 subscript, which the unsigned bounds compares (biaeq,
+    ///     :2027/:2033) treat as huge — after which the C++ slow-path store
+    ///     sets no further flags (llint/LLIntSlowPaths.cpp:1347-1369 routes
+    ///     methodTable putByIndex).
+    /// Non-array bases skip the shape dispatch entirely and set no flags
+    /// (blank indexing shape falls through to .opPutByValSlow). The
+    /// structure-seen write happens in the opcode arms (the arrayProfile
+    /// macro, :2047). Profile writes never alter the store.
+    fn record_put_by_val_indexed_store_array_profile(
+        &self,
+        code_block: &CodeBlock,
+        bytecode_index: BytecodeIndex,
+        object: RuntimeValue,
+        index: i32,
+    ) {
+        let Some(cell) = self.objects.find(object) else {
+            return;
+        };
+        if cell.kind != CoreObjectKind::Array {
+            return;
+        }
+        let public_len = self.objects.butterfly_elem_len(cell.butterfly);
+        let vector_len = self.objects.butterfly_elem_vector_len(cell.butterfly);
+        // C++ ArrayWithUndecided analog: a NEVER-STORED array (`[]`) takes the
+        // flag-free conversion slow path on its first store (the LLInt shape
+        // dispatch matches no writable shape -> .opPutByValSlow;
+        // JSArray::putByIndex converts the shape and sets no profile flags).
+        // The Rust single-shape butterfly has no Undecided tag; an empty
+        // never-grown vector is the analog. KNOWN DIVERGENCE: `new Array(n)` /
+        // `arr.length = n` stay ArrayWithUndecided (vectorLength n, no shape)
+        // in C++ — flag-free until the first store converts them — but the Rust
+        // `set_array_length` path materializes a dense hole-filled vector
+        // (butterfly_elem_resize -> grow_vector), so this gate no longer sees
+        // them as never-stored and their first out-of-range store marks a flag
+        // one store earlier than C++.
+        if vector_len == 0 && public_len == 0 {
+            return;
+        }
+        match usize::try_from(index) {
+            Ok(index) if index < vector_len => {
+                if index >= public_len {
+                    let _ = code_block.record_array_profile_may_store_to_hole(
+                        crate::bytecode::code_block::CodeBlockMutationAuthority::default(),
+                        bytecode_index,
+                    );
+                }
+            }
+            // index >= vectorLength, or negative (the unsigned biaeq compare).
+            _ => {
+                let _ = code_block.record_array_profile_out_of_bounds(
+                    crate::bytecode::code_block::CodeBlockMutationAuthority::default(),
+                    bytecode_index,
+                );
+            }
+        }
+    }
+
     fn record_in_by_val_array_profile_indexed_read(
         &mut self,
         code_block: &CodeBlock,
@@ -10386,14 +10652,7 @@ impl CoreOpcodeDispatchHost {
             return;
         };
         let structure = cell.structure_id;
-        let index_usize = usize::try_from(index).ok();
-        let out_of_bounds = match (cell.kind, index_usize) {
-            (CoreObjectKind::Array, Some(index)) => {
-                index >= self.objects.butterfly_elem_len(cell.butterfly)
-            }
-            (CoreObjectKind::Uint8Array, Some(index)) => index >= cell.view_length,
-            _ => true,
-        };
+        let out_of_bounds = self.indexed_read_out_of_bounds(cell, index);
         let Some(profile) = code_block
             .record_array_profile_indexed_read(
                 crate::bytecode::code_block::CodeBlockMutationAuthority::default(),
@@ -11964,6 +12223,12 @@ impl CoreOpcodeDispatchHost {
         index: i32,
         value: RuntimeValue,
     ) -> DispatchOutcome {
+        self.record_put_by_val_indexed_store_array_profile(
+            state.code_block,
+            bytecode_index,
+            object,
+            index,
+        );
         let key = array_index_property_key(index);
         let site = CorePropertyStoreSite {
             bytecode_index: Some(bytecode_index),
@@ -29396,6 +29661,787 @@ mod tests {
             profile.bits(),
             crate::bytecode::UnaryArithProfile::observed_number_bits()
         );
+    }
+
+    // C++ JSC op_get_by_val profiling: the arrayProfile macro records the base
+    // cell's structureID (llint/LowLevelInterpreter64.asm:1857) and the
+    // valueProfile macro records the loaded result (:1897-1899) on every
+    // successful execution; an in-bounds indexed read sets no OOB flag.
+    #[test]
+    fn get_by_val_indexed_populates_value_and_array_profiles() {
+        let destination = local(0);
+        let object_register = local(1);
+        let key_register = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByValue,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(231));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(9))
+            .unwrap();
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(0))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(9))
+        );
+        let array_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked GetByValue array profile");
+        assert_eq!(
+            array_profile.last_seen_structure,
+            Some(object_structure_id(&host.objects, array))
+        );
+        assert!(!array_profile.flags.out_of_bounds);
+        assert!(!array_profile.flags.may_store_hole);
+        let profiles = block.side_tables().value_profiles();
+        let sample = profiles
+            .bucket_samples
+            .iter()
+            .find(|sample| sample.bytecode_index == BytecodeIndex::from_offset(0))
+            .expect("GetByValue value profile sample");
+        assert_eq!(sample.value, RuntimeValue::from_i32(9));
+    }
+
+    // C++ JSC get_by_val slow path: an out-of-bounds indexed read sets
+    // ArrayProfileFlag::OutOfBounds (llint/LLIntSlowPaths.cpp:1236-1257) and the
+    // undefined result is still value-profiled (LLINT_RETURN_PROFILED, :1286).
+    #[test]
+    fn get_by_val_out_of_bounds_read_sets_array_profile_flag() {
+        let destination = local(0);
+        let object_register = local(1);
+        let key_register = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByValue,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(232));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(9))
+            .unwrap();
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(4))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+        let array_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked GetByValue array profile");
+        assert_eq!(
+            array_profile.last_seen_structure,
+            Some(object_structure_id(&host.objects, array))
+        );
+        assert!(array_profile.flags.out_of_bounds);
+        let profiles = block.side_tables().value_profiles();
+        let sample = profiles
+            .bucket_samples
+            .iter()
+            .find(|sample| sample.bytecode_index == BytecodeIndex::from_offset(0))
+            .expect("GetByValue value profile sample");
+        assert_eq!(sample.value, RuntimeValue::undefined());
+    }
+
+    // C++ JSC op_get_length profiling: arrayProfile structure-seen
+    // (llint/LowLevelInterpreter64.asm:1715) plus the value-profiled length
+    // result (:1716; llint/LLIntSlowPaths.cpp:985-986). A named length read
+    // never marks OOB.
+    #[test]
+    fn get_length_populates_value_and_array_profiles() {
+        let destination = local(0);
+        let object_register = local(1);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetLength,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::IdentifierIndex(0),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(233));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(9))
+            .unwrap();
+        registers.write(window, object_register, array).unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(1))
+        );
+        let array_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked GetLength array profile");
+        assert_eq!(
+            array_profile.last_seen_structure,
+            Some(object_structure_id(&host.objects, array))
+        );
+        assert!(!array_profile.flags.out_of_bounds);
+        let profiles = block.side_tables().value_profiles();
+        let sample = profiles
+            .bucket_samples
+            .iter()
+            .find(|sample| sample.bytecode_index == BytecodeIndex::from_offset(0))
+            .expect("GetLength value profile sample");
+        assert_eq!(sample.value, RuntimeValue::from_i32(1));
+    }
+
+    // C++ JSC op_put_by_val profiling: arrayProfile structure-seen
+    // (llint/LowLevelInterpreter64.asm:2047); an in-bounds contiguous store sets
+    // NO flags (:2027-2031) and op_put_by_val carries no valueProfile
+    // (bytecode/BytecodeList.rb:628).
+    #[test]
+    fn put_by_val_in_bounds_records_structure_without_flags() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let value_register = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::PutByValue,
+                vec![
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                    Operand::Register(value_register),
+                ],
+            ),
+            core_typed(
+                1,
+                CoreOpcode::Return,
+                vec![Operand::Register(value_register)],
+            ),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(234));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(9))
+            .unwrap();
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(0))
+            .unwrap();
+        registers
+            .write(window, value_register, RuntimeValue::from_i32(7))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(7))
+        );
+        let array_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked PutByValue array profile");
+        assert_eq!(
+            array_profile.last_seen_structure,
+            Some(object_structure_id(&host.objects, array))
+        );
+        assert!(!array_profile.flags.may_store_hole);
+        assert!(!array_profile.flags.out_of_bounds);
+        // op_put_by_val is not value-profiled; no slot may derive or record.
+        assert!(block
+            .side_tables()
+            .value_profiles()
+            .bucket_samples
+            .is_empty());
+    }
+
+    // C++ JSC put_by_val hole path: publicLength <= index < vectorLength ORs
+    // MayStoreHole (llint/LowLevelInterpreter64.asm:2033-2038) without marking
+    // OOB.
+    #[test]
+    fn put_by_val_store_beyond_length_within_capacity_sets_may_store_hole() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let value_register = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::PutByValue,
+                vec![
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                    Operand::Register(value_register),
+                ],
+            ),
+            core_typed(
+                1,
+                CoreOpcode::Return,
+                vec![Operand::Register(value_register)],
+            ),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(235));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(9))
+            .unwrap();
+        let butterfly = host.objects.find(array).expect("array cell").butterfly;
+        assert_eq!(host.objects.butterfly_elem_len(butterfly), 1);
+        assert!(
+            host.objects.butterfly_elem_vector_len(butterfly) > 2,
+            "precondition: spare vector capacity so index 2 is the hole store"
+        );
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(2))
+            .unwrap();
+        registers
+            .write(window, value_register, RuntimeValue::from_i32(7))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(7))
+        );
+        let array_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked PutByValue array profile");
+        assert_eq!(
+            array_profile.last_seen_structure,
+            Some(object_structure_id(&host.objects, array))
+        );
+        assert!(array_profile.flags.may_store_hole);
+        assert!(!array_profile.flags.out_of_bounds);
+    }
+
+    // C++ JSC put_by_val OOB path: index >= vectorLength ORs OutOfBounds before
+    // the slow-path store (llint/LowLevelInterpreter64.asm:2112-2114); the
+    // slow-path store itself sets no further flags
+    // (llint/LLIntSlowPaths.cpp:1347-1369).
+    #[test]
+    fn put_by_val_store_beyond_capacity_sets_out_of_bounds() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let value_register = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::PutByValue,
+                vec![
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                    Operand::Register(value_register),
+                ],
+            ),
+            core_typed(
+                1,
+                CoreOpcode::Return,
+                vec![Operand::Register(value_register)],
+            ),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(236));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(9))
+            .unwrap();
+        let butterfly = host.objects.find(array).expect("array cell").butterfly;
+        assert!(
+            host.objects.butterfly_elem_vector_len(butterfly) < 100,
+            "precondition: index 100 is beyond the vector capacity"
+        );
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(100))
+            .unwrap();
+        registers
+            .write(window, value_register, RuntimeValue::from_i32(7))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(7))
+        );
+        let array_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked PutByValue array profile");
+        assert_eq!(
+            array_profile.last_seen_structure,
+            Some(object_structure_id(&host.objects, array))
+        );
+        assert!(array_profile.flags.out_of_bounds);
+        assert!(!array_profile.flags.may_store_hole);
+    }
+
+    // C++ JSC getByVal: a numeric subscript that is not a uint32 index on a
+    // cell base sets OutOfBounds (subscript.isNumber() && baseValue.isCell(),
+    // llint/LLIntSlowPaths.cpp:1262-1265); fires for -1.
+    #[test]
+    fn get_by_val_negative_subscript_sets_out_of_bounds() {
+        let destination = local(0);
+        let object_register = local(1);
+        let key_register = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByValue,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(237));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(9))
+            .unwrap();
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(-1))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+        let array_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked GetByValue array profile");
+        assert_eq!(
+            array_profile.last_seen_structure,
+            Some(object_structure_id(&host.objects, array))
+        );
+        assert!(array_profile.flags.out_of_bounds);
+        assert!(!array_profile.flags.may_store_hole);
+    }
+
+    // Same C++ site (llint/LLIntSlowPaths.cpp:1262-1265) for a fractional
+    // subscript: 1.5 is a number but not a uint32 index -> OutOfBounds.
+    #[test]
+    fn get_by_val_fractional_subscript_sets_out_of_bounds() {
+        let destination = local(0);
+        let object_register = local(1);
+        let key_register = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByValue,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(238));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(9))
+            .unwrap();
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_double(1.5))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+        let array_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked GetByValue array profile");
+        assert_eq!(
+            array_profile.last_seen_structure,
+            Some(object_structure_id(&host.objects, array))
+        );
+        assert!(array_profile.flags.out_of_bounds);
+        assert!(!array_profile.flags.may_store_hole);
+    }
+
+    // C++ JSC put_by_val with a NEGATIVE int32 subscript on an array shape:
+    // the unsigned bounds compares (biaeq, llint/LowLevelInterpreter64.asm:
+    // 2027/:2033) route it to .opPutByValOutOfBounds (:2112-2114) ->
+    // OutOfBounds; no hole flag.
+    #[test]
+    fn put_by_val_negative_subscript_sets_out_of_bounds() {
+        let object_register = local(0);
+        let key_register = local(1);
+        let value_register = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::PutByValue,
+                vec![
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                    Operand::Register(value_register),
+                ],
+            ),
+            core_typed(
+                1,
+                CoreOpcode::Return,
+                vec![Operand::Register(value_register)],
+            ),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(239));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let array = host.objects.allocate_array();
+        host.objects
+            .put_array_element(array, 0, RuntimeValue::from_i32(9))
+            .unwrap();
+        // The named "-1" store transitions the array's structure; the profile
+        // holds the PRE-store structureID (the arrayProfile macro runs before
+        // the store, llint/LowLevelInterpreter64.asm:2047).
+        let structure_before_store = object_structure_id(&host.objects, array);
+        registers.write(window, object_register, array).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(-1))
+            .unwrap();
+        registers
+            .write(window, value_register, RuntimeValue::from_i32(7))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(7))
+        );
+        let array_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked PutByValue array profile");
+        assert_eq!(
+            array_profile.last_seen_structure,
+            Some(structure_before_store)
+        );
+        assert!(array_profile.flags.out_of_bounds);
+        assert!(!array_profile.flags.may_store_hole);
+    }
+
+    // C++ JSC getByVal on a string base: an in-bounds char read sets no flag
+    // (canGetIndex hit, llint/LLIntSlowPaths.cpp:1236-1239). The string cell's
+    // structure-seen half is a commented divergence (no StructureId in the
+    // Rust string store), so last_seen_structure stays empty.
+    #[test]
+    fn get_by_val_string_base_in_bounds_read_sets_no_out_of_bounds() {
+        let destination = local(0);
+        let object_register = local(1);
+        let key_register = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByValue,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(240));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let string = host.strings.allocate_untracked(&mut host.objects, "ab");
+        registers.write(window, object_register, string).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(0))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        let ExecutionCompletion::Returned(result) = completion else {
+            panic!("string index read should complete: {completion:?}");
+        };
+        assert_eq!(host.strings.text(result), Some("a"));
+        let array_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked GetByValue array profile");
+        assert_eq!(array_profile.last_seen_structure, None);
+        assert!(!array_profile.flags.out_of_bounds);
+    }
+
+    // C++ JSC getByVal on a string base: an index past the length misses
+    // canGetIndex and sets OutOfBounds (llint/LLIntSlowPaths.cpp:1236-1241);
+    // the OOB half needs no StructureId.
+    #[test]
+    fn get_by_val_string_base_index_miss_sets_out_of_bounds() {
+        let destination = local(0);
+        let object_register = local(1);
+        let key_register = local(2);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByValue,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::Register(key_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(241));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let string = host.strings.allocate_untracked(&mut host.objects, "ab");
+        registers.write(window, object_register, string).unwrap();
+        registers
+            .write(window, key_register, RuntimeValue::from_i32(5))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::undefined())
+        );
+        let array_profile = block
+            .array_profile_for_bytecode_index(BytecodeIndex::from_offset(0))
+            .expect("linked GetByValue array profile");
+        assert_eq!(array_profile.last_seen_structure, None);
+        assert!(array_profile.flags.out_of_bounds);
     }
 
     #[test]

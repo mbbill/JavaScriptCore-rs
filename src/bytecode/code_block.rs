@@ -1201,6 +1201,75 @@ impl CodeBlock {
         Ok(Some(*profile))
     }
 
+    // C++ JSC: the LLInt `arrayProfile` macro stores the base cell's structureID
+    // into the op's `ArrayProfile::m_lastSeenStructureID` on EVERY execution whose
+    // base is a cell (llint/LowLevelInterpreter.asm:1447-1450; get_by_val
+    // LowLevelInterpreter64.asm:1857, get_length :1715, put_by_val :2047), and the
+    // C++ slow paths do the same through `observeStructure`/`observeStructureID`
+    // (bytecode/ArrayProfile.h:244-245; llint/LLIntSlowPaths.cpp:982-983), all
+    // mutating the shared `CodeBlock*` metadata in place. Rust shares one
+    // `Rc<CodeBlock>`, so this mirrors `record_array_profile_indexed_read` and
+    // mutates the linked slot through `&self`.
+    pub fn record_array_profile_structure_seen(
+        &self,
+        authority: CodeBlockMutationAuthority,
+        bytecode_index: BytecodeIndex,
+        structure: StructureId,
+    ) -> Result<Option<ArrayProfile>, CodeBlockMutationError> {
+        self.check_profile_mutation_authority(authority)?;
+        let mut array_profiles = self.side_tables.array_profiles.borrow_mut();
+        let Some(profile) = array_profiles
+            .iter_mut()
+            .find(|profile| profile.bytecode_index == bytecode_index)
+        else {
+            return Ok(None);
+        };
+        profile.observe_structure_id(structure);
+        Ok(Some(*profile))
+    }
+
+    // C++ JSC: `ArrayProfile::setOutOfBounds` (bytecode/ArrayProfile.h:242) fires
+    // through the shared `CodeBlock*` metadata on the out-of-bounds access paths
+    // (get_by_val slow path, llint/LLIntSlowPaths.cpp:1241/1257/1265; put_by_val
+    // `.opPutByValOutOfBounds`, llint/LowLevelInterpreter64.asm:2112-2114).
+    pub fn record_array_profile_out_of_bounds(
+        &self,
+        authority: CodeBlockMutationAuthority,
+        bytecode_index: BytecodeIndex,
+    ) -> Result<Option<ArrayProfile>, CodeBlockMutationError> {
+        self.check_profile_mutation_authority(authority)?;
+        let mut array_profiles = self.side_tables.array_profiles.borrow_mut();
+        let Some(profile) = array_profiles
+            .iter_mut()
+            .find(|profile| profile.bytecode_index == bytecode_index)
+        else {
+            return Ok(None);
+        };
+        profile.set_out_of_bounds();
+        Ok(Some(*profile))
+    }
+
+    // C++ JSC: `ArrayProfileFlag::MayStoreHole` (bytecode/ArrayProfile.h:205) is
+    // ORed in place through the shared metadata on the put_by_val hole paths (the
+    // contiguous beyond-publicLength extend, llint/LowLevelInterpreter64.asm:
+    // 2033-2038; the ArrayStorage hole fill, :2102-2104).
+    pub fn record_array_profile_may_store_to_hole(
+        &self,
+        authority: CodeBlockMutationAuthority,
+        bytecode_index: BytecodeIndex,
+    ) -> Result<Option<ArrayProfile>, CodeBlockMutationError> {
+        self.check_profile_mutation_authority(authority)?;
+        let mut array_profiles = self.side_tables.array_profiles.borrow_mut();
+        let Some(profile) = array_profiles
+            .iter_mut()
+            .find(|profile| profile.bytecode_index == bytecode_index)
+        else {
+            return Ok(None);
+        };
+        profile.set_may_store_to_hole();
+        Ok(Some(*profile))
+    }
+
     // Shared authority/lifecycle gate for the runtime feedback-profile writes
     // (the checks every `record_*` profile mutation performs; see
     // `record_array_profile_indexed_read` for the C++ mutation-through-

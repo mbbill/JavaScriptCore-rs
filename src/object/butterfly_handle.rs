@@ -392,6 +392,13 @@ impl ButterflyAllocation {
         self.public_len
     }
 
+    /// Allocated indexed element capacity (C++ `Butterfly::vectorLength`,
+    /// Butterfly.h:187): the put fast path's hole-vs-out-of-bounds boundary
+    /// (llint/LowLevelInterpreter64.asm putByValOp `.outOfBounds`, :2033-2041).
+    pub fn elem_vector_len(&self) -> usize {
+        self.vector_cap
+    }
+
     /// Append a value to the indexed element side (C++ contiguous append; the
     /// `JSArray::push` fast path). Returns `true` if the buffer REALLOCATED.
     pub fn elem_push(&mut self, value: RuntimeValue) -> bool {
