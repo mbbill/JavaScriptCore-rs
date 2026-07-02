@@ -202,8 +202,10 @@ pub(crate) struct CoreObjectStore {
     // `AuxiliaryHandle` is an index into this Vec; only RegExp cells hold a real
     // one (every other cell carries `AuxiliaryHandle::INVALID`). Write-once at
     // `allocate_regexp` (a RegExp's pattern is immutable after creation, exactly as
-    // `m_patternString` is). NOT the R4 leak fix — like `butterflies`, this slab
-    // still needs its own Auxiliary-subspace trace+sweep at R4 (gc-r4 SD-4).
+    // `m_patternString` is). gc-r4 leak-fix C1: `allocate_regexp_source` now reports the
+    // pattern's byte length toward the GC-trigger counter (see its doc). That is ONLY
+    // the extra-memory-accounting fix, NOT the R4 arena migration — like `butterflies`,
+    // this slab still needs its own Auxiliary-subspace trace+sweep at R4 (gc-r4 SD-4).
     pub(crate) regexp_sources: Vec<String>,
     // gc-r4 R4 POD-ification (ArrayBuffer unit): the store-owned slab of
     // ArrayBuffer/typed-array byte backings. C++ JSC `ArrayBufferContents::m_data`
@@ -2234,6 +2236,25 @@ impl CoreObjectStore {
     /// arrives at R4. Append-only (a RegExp pattern is immutable), so the index is
     /// stable for the slab's lifetime.
     pub(crate) fn allocate_regexp_source(&mut self, source: String) -> AuxiliaryHandle {
+        // gc-r4 leak-fix C1: report the pattern text's bytes before `source` moves into
+        // the slab. DIVERGENCE (confirmed by inspection, not the first guess): unlike
+        // `JSString::finishCreation` (runtime/JSString.h:181, which DOES call
+        // `reportExtraMemoryAllocated`), C++ `RegExp::RegExp`/`finishCreation`
+        // (runtime/RegExp.cpp:152-184) never calls `reportExtraMemoryAllocated` for
+        // `m_patternString` — a grep of RegExp.cpp/RegExpCache.cpp finds zero such calls.
+        // That's because `m_patternString(patternString)` is a ref-counted `WTF::String`
+        // COPY (a `RefPtr<StringImpl>` bump, O(1)), not a fresh byte copy: C++ shares the
+        // caller's EXISTING StringImpl, whose bytes were already reported when THAT
+        // string was minted (e.g. `JSString::finishCreation`) or were never heap-tracked
+        // at all (a parser/bytecode constant-pool string). Rust's owned `String` has no
+        // such ref-counted sharing — every call site (interpreter/mod.rs `NewRegExp` and
+        // the dynamic-`RegExp()` path) hands in a FRESH owned copy (`.cloned()` /
+        // `primitive_to_string`) immediately before this call, so admitting it into the
+        // slab IS a genuine new off-arena allocation with no prior report anywhere. This
+        // is the faithful-EFFECT substitute for that real allocation (same rationale as
+        // the literal StringImpl-cost match in `CoreStringStore::allocate_untracked`, not
+        // the "first-class GC cell" rationale the butterfly/Map-Set sites use).
+        self.space.report_extra_memory_allocated(source.len());
         // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
         AuxiliaryHandle(slab_alloc(
             &mut self.regexp_sources,
@@ -2727,7 +2748,27 @@ impl CoreObjectStore {
         value: RuntimeValue,
     ) {
         if let Some(handle) = self.map_entries_handle(map) {
+            // gc-r4 leak-fix C1: report the growth DELTA on reallocation — the
+            // `PropertyTable.h:581` pattern (see `butterfly_prop_put` /
+            // `MarkedSpace::report_extra_memory_allocated`). DIVERGENCE: C++ JSC's
+            // `JSOrderedHashTable::Storage` is a `JSCellButterfly` (runtime/
+            // JSOrderedHashTable.h:39,164; `Storage::tryCreate`,
+            // JSOrderedHashTableHelper.h:247-293) — a first-class VARIABLE-SIZED GC cell
+            // allocated from its own `CompleteSubspace` (`JSCellButterfly::subspaceFor`,
+            // runtime/JSCellButterfly.h:181), so its bytes are counted for free by the
+            // block/large allocator's own `didAllocate` — never through
+            // `reportExtraMemoryAllocated` (zero such calls in JSMap.cpp/JSSet.cpp/
+            // JSOrderedHashTable.cpp). This arena admits only fixed-size POD cell blobs
+            // (SD-4), so the store-owned `map_entry_lists` slab is the faithful-EFFECT
+            // substitute — the SAME divergence class as the Butterfly/BigInt sites.
+            let before = self.map_entry_lists[handle.0].capacity();
             self.map_entry_lists[handle.0].push((key, value));
+            let after = self.map_entry_lists[handle.0].capacity();
+            if after > before {
+                self.space.report_extra_memory_allocated(
+                    (after - before) * std::mem::size_of::<(RuntimeValue, RuntimeValue)>(),
+                );
+            }
         }
     }
 
@@ -2781,7 +2822,17 @@ impl CoreObjectStore {
     /// Append `value` at the end (insertion order; a fresh-value add).
     pub(crate) fn set_values_push(&mut self, set: RuntimeValue, value: RuntimeValue) {
         if let Some(handle) = self.set_values_handle(set) {
+            // gc-r4 leak-fix C1: report the growth DELTA on reallocation — same
+            // `JSCellButterfly`-first-class-GC-cell divergence as `map_entries_push`
+            // (see its doc for the full C++ citation).
+            let before = self.set_value_lists[handle.0].capacity();
             self.set_value_lists[handle.0].push(value);
+            let after = self.set_value_lists[handle.0].capacity();
+            if after > before {
+                self.space.report_extra_memory_allocated(
+                    (after - before) * std::mem::size_of::<RuntimeValue>(),
+                );
+            }
         }
     }
 
@@ -8701,7 +8752,26 @@ impl CoreObjectStore {
         };
         // Warm path: this constructor already has an instance-field slab slot — push.
         if handle != AuxiliaryHandle::INVALID {
+            // gc-r4 leak-fix C1: report the growth DELTA on reallocation — the
+            // `PropertyTable.h:581` pattern (see `butterfly_prop_put` /
+            // `MarkedSpace::report_extra_memory_allocated`). DIVERGENCE: JSC has no
+            // literal analog for this slab AT ALL — a `class { x = e; ... }`'s
+            // `[[Fields]]` are not a runtime data structure in C++; each field
+            // initializer is compiled to BYTECODE that runs inline in the constructor
+            // (no separate GC-heap list is ever allocated). `instance_field_lists` is
+            // this port's own SD-2 POD-ification expedient standing in for that bytecode
+            // (see the field doc above and `allocate_instance_fields`'s doc); there is no
+            // C++ report call to mirror. Its `Vec` bytes are still a genuine off-arena
+            // Rust allocation `allocate_blob` cannot see, so it gets the same
+            // faithful-EFFECT accounting as every other slab here.
+            let before = self.instance_field_lists[handle.0].capacity();
             self.instance_field_lists[handle.0].push(record);
+            let after = self.instance_field_lists[handle.0].capacity();
+            if after > before {
+                self.space.report_extra_memory_allocated(
+                    (after - before) * std::mem::size_of::<CoreInstanceFieldRecord>(),
+                );
+            }
             return Ok(());
         }
         // Cold path (first field on this constructor): lazily allocate its slab slot
@@ -8718,7 +8788,17 @@ impl CoreObjectStore {
         {
             return Err(ExecutionError::ExpectedFunction);
         }
+        // gc-r4 leak-fix C1: same growth-delta report as the warm path above (the slab
+        // starts as a freshly-pushed `Vec::new()` — 0 capacity, 0 bytes, so only THIS
+        // push's own reallocation needs reporting).
+        let before = self.instance_field_lists[new_handle.0].capacity();
         self.instance_field_lists[new_handle.0].push(record);
+        let after = self.instance_field_lists[new_handle.0].capacity();
+        if after > before {
+            self.space.report_extra_memory_allocated(
+                (after - before) * std::mem::size_of::<CoreInstanceFieldRecord>(),
+            );
+        }
         Ok(())
     }
 
@@ -9817,7 +9897,29 @@ impl CoreObjectStore {
         };
         // Warm path: the promise already has a slab slot — push into it (single lookup).
         if handle != PromiseReactionsHandle::INVALID {
+            // gc-r4 leak-fix C1: report the growth DELTA on reallocation — the
+            // `PropertyTable.h:581` pattern (see `butterfly_prop_put` /
+            // `MarkedSpace::report_extra_memory_allocated`). DIVERGENCE: C++
+            // `JSPromiseReaction`/`JSSlimPromiseReaction`/`JSFullPromiseReaction`
+            // (runtime/JSPromiseReaction.h:39-143) are each their OWN first-class GC
+            // cell — allocated from a dedicated `IsoSubspace`
+            // (`slimPromiseReactionSpace`/`fullPromiseReactionSpace`) and linked into
+            // `[[..Reactions]]` via the intrusive `m_next` pointer, NOT stored in a
+            // Vector — so their bytes are counted for free by the block allocator's own
+            // `didAllocate`, never through `reportExtraMemoryAllocated` (zero such calls
+            // in JSPromise.cpp/JSPromiseReaction.cpp). This arena admits only
+            // fixed-size POD cell blobs (SD-4) and relocates the reaction list into this
+            // store-owned Vec slab instead of one GC cell per reaction, so the slab is
+            // the faithful-EFFECT substitute — the SAME divergence class as the
+            // Butterfly/BigInt/Map-Set sites.
+            let before = self.promise_reaction_lists[handle.0].capacity();
             self.promise_reaction_lists[handle.0].push(reaction);
+            let after = self.promise_reaction_lists[handle.0].capacity();
+            if after > before {
+                self.space.report_extra_memory_allocated(
+                    (after - before) * std::mem::size_of::<CorePromiseReaction>(),
+                );
+            }
             return Ok(());
         }
         // Cold path (first reaction on this pending promise): lazily allocate its slab
@@ -9833,7 +9935,15 @@ impl CoreObjectStore {
         {
             return Err(ExecutionError::ExpectedObject);
         }
+        // gc-r4 leak-fix C1: same growth-delta report as the warm path above.
+        let before = self.promise_reaction_lists[new_handle.0].capacity();
         self.promise_reaction_lists[new_handle.0].push(reaction);
+        let after = self.promise_reaction_lists[new_handle.0].capacity();
+        if after > before {
+            self.space.report_extra_memory_allocated(
+                (after - before) * std::mem::size_of::<CorePromiseReaction>(),
+            );
+        }
         Ok(())
     }
 
@@ -14239,6 +14349,181 @@ mod leak_fix_c1_extra_memory_accounting_tests {
             store.space.bytes_allocated_this_cycle(),
             0,
             "reset must zero the counter"
+        );
+    }
+
+    // --- C1 follow-up: the 5 off-arena slabs flagged (but not yet wired) at C1-landing
+    // time. Each test proves BOTH halves of the contract: a below-gate single op reports
+    // nothing (the 256-byte `MIN_EXTRA_MEMORY_TO_REPORT` gate), and a large fill (the
+    // pdfjs/Map/Set/class-heavy shape the audit is about) raises `bytes_allocated_this_cycle`
+    // by ~the real backing growth. Rust's `Vec` amortized-growth policy allocates capacity
+    // 4 (`RawVec::MIN_NON_ZERO_CAP` for element sizes in 2..=1024 bytes) on a first push from
+    // empty, which is well under 256 bytes for every record type below — the below-gate
+    // assertions rely on that (stable since Rust 1.0) growth floor.
+
+    // Map: C++ `JSOrderedHashTable::Storage` is a first-class `JSCellButterfly` GC cell (see
+    // `CoreObjectStore::map_entries_push`'s doc) — the store-owned `map_entry_lists` slab is
+    // the faithful-EFFECT substitute.
+    #[test]
+    fn map_entries_large_fill_reports_extra_memory_and_below_gate_reports_nothing() {
+        let mut store = CoreObjectStore::default();
+        let map = store.allocate_map();
+
+        let before_small = store.space.bytes_allocated_this_cycle();
+        store.map_entries_push(map, RuntimeValue::from_i32(1), RuntimeValue::from_i32(2));
+        let after_small = store.space.bytes_allocated_this_cycle();
+        assert_eq!(
+            before_small, after_small,
+            "a single small map-entry push must stay under the 256-byte report gate"
+        );
+
+        let before = store.space.bytes_allocated_this_cycle();
+        const N: usize = 20_000;
+        for i in 0..N {
+            store.map_entries_push(
+                map,
+                RuntimeValue::from_i32(i as i32),
+                RuntimeValue::from_i32(i as i32),
+            );
+        }
+        let after = store.space.bytes_allocated_this_cycle();
+        let expected_min = N * std::mem::size_of::<(RuntimeValue, RuntimeValue)>();
+        assert!(
+            after - before >= expected_min,
+            "bytes_allocated_this_cycle must rise by ~the map-entry slab's growth: \
+             before={before} after={after} expected_min={expected_min}"
+        );
+    }
+
+    // Set: same `JSCellButterfly`-first-class-GC-cell divergence as Map (see
+    // `CoreObjectStore::set_values_push`'s doc).
+    #[test]
+    fn set_values_large_fill_reports_extra_memory_and_below_gate_reports_nothing() {
+        let mut store = CoreObjectStore::default();
+        let set = store.allocate_set();
+
+        let before_small = store.space.bytes_allocated_this_cycle();
+        store.set_values_push(set, RuntimeValue::from_i32(1));
+        let after_small = store.space.bytes_allocated_this_cycle();
+        assert_eq!(
+            before_small, after_small,
+            "a single small set-value push must stay under the 256-byte report gate"
+        );
+
+        let before = store.space.bytes_allocated_this_cycle();
+        const N: usize = 20_000;
+        for i in 0..N {
+            store.set_values_push(set, RuntimeValue::from_i32(i as i32));
+        }
+        let after = store.space.bytes_allocated_this_cycle();
+        let expected_min = N * std::mem::size_of::<RuntimeValue>();
+        assert!(
+            after - before >= expected_min,
+            "bytes_allocated_this_cycle must rise by ~the set-value slab's growth: \
+             before={before} after={after} expected_min={expected_min}"
+        );
+    }
+
+    // Instance fields: JSC has no runtime `[[Fields]]` list at all (bytecode-compiled field
+    // initializers run inline in the constructor) — this slab is the port's own SD-2
+    // POD-ification expedient (see `CoreObjectStore::add_instance_field`'s doc); its `Vec`
+    // bytes are still a genuine off-arena Rust allocation that needs the same accounting.
+    #[test]
+    fn instance_field_heavy_object_reports_extra_memory_and_below_gate_reports_nothing() {
+        let mut store = CoreObjectStore::default();
+        let constructor = store.allocate_function(0, Vec::new(), None);
+
+        let before_small = store.space.bytes_allocated_this_cycle();
+        store
+            .add_instance_field(constructor, ident(0), RuntimeValue::undefined())
+            .expect("a Function constructor must accept an instance field");
+        let after_small = store.space.bytes_allocated_this_cycle();
+        assert_eq!(
+            before_small, after_small,
+            "a single small instance-field push must stay under the 256-byte report gate"
+        );
+
+        let before = store.space.bytes_allocated_this_cycle();
+        const N: usize = 5_000;
+        for i in 1..=N {
+            store
+                .add_instance_field(constructor, ident(i as u32), RuntimeValue::undefined())
+                .expect("a Function constructor must accept an instance field");
+        }
+        let after = store.space.bytes_allocated_this_cycle();
+        let expected_min = N * std::mem::size_of::<CoreInstanceFieldRecord>();
+        assert!(
+            after - before >= expected_min,
+            "bytes_allocated_this_cycle must rise by ~the instance-field slab's growth: \
+             before={before} after={after} expected_min={expected_min}"
+        );
+    }
+
+    // Promise reactions: C++ `JSPromiseReaction` (Slim/Full) is each its OWN first-class GC
+    // cell linked via `m_next` (see `CoreObjectStore::push_promise_reaction`'s doc) — the
+    // store-owned `promise_reaction_lists` slab is the faithful-EFFECT substitute.
+    #[test]
+    fn promise_many_reactions_reports_extra_memory_and_below_gate_reports_nothing() {
+        let mut store = CoreObjectStore::default();
+        let promise = store.allocate_promise();
+        let reaction = |i: i32| CorePromiseReaction {
+            kind: CorePromiseReactionKind::Then,
+            result_promise: RuntimeValue::from_i32(i),
+            on_fulfilled: RuntimeValue::from_i32(i),
+            on_rejected: RuntimeValue::from_i32(i),
+        };
+
+        let before_small = store.space.bytes_allocated_this_cycle();
+        store
+            .push_promise_reaction(promise, reaction(0))
+            .expect("a pending promise must accept a reaction");
+        let after_small = store.space.bytes_allocated_this_cycle();
+        assert_eq!(
+            before_small, after_small,
+            "a single small reaction push must stay under the 256-byte report gate"
+        );
+
+        let before = store.space.bytes_allocated_this_cycle();
+        const N: usize = 10_000;
+        for i in 1..=N {
+            store
+                .push_promise_reaction(promise, reaction(i as i32))
+                .expect("a pending promise must accept a reaction");
+        }
+        let after = store.space.bytes_allocated_this_cycle();
+        let expected_min = N * std::mem::size_of::<CorePromiseReaction>();
+        assert!(
+            after - before >= expected_min,
+            "bytes_allocated_this_cycle must rise by ~the promise-reaction slab's growth: \
+             before={before} after={after} expected_min={expected_min}"
+        );
+    }
+
+    // RegExp source: C++ `RegExp::m_patternString` is a ref-counted `WTF::String` SHARE, so
+    // `RegExp::create` never calls `reportExtraMemoryAllocated` (see
+    // `CoreObjectStore::allocate_regexp_source`'s doc) — Rust's owned `String` has no such
+    // sharing, so admitting it into the slab is a genuine new allocation this reports.
+    #[test]
+    fn regexp_large_source_reports_extra_memory_and_below_gate_reports_nothing() {
+        let mut store = CoreObjectStore::default();
+
+        let before_small = store.space.bytes_allocated_this_cycle();
+        let _ = store.allocate_regexp_source("ab+".to_string());
+        let after_small = store.space.bytes_allocated_this_cycle();
+        assert_eq!(
+            before_small, after_small,
+            "a short pattern string must stay under the 256-byte report gate"
+        );
+
+        let before = store.space.bytes_allocated_this_cycle();
+        let big_pattern = "a".repeat(1_500_000); // ~1.5MB, well past the report gate.
+        let _ = store.allocate_regexp_source(big_pattern.clone());
+        let after = store.space.bytes_allocated_this_cycle();
+        assert!(
+            after - before >= big_pattern.len(),
+            "bytes_allocated_this_cycle must rise by ~the pattern's byte length: \
+             before={before} after={after} len={}",
+            big_pattern.len()
         );
     }
 }
