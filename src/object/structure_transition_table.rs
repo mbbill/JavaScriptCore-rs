@@ -510,18 +510,39 @@ impl StructureTransitionTable {
     }
 
     /// `void finalizeUnconditionally(VM&, CollectionScope)`
-    /// (StructureInlines.h:611-616).
+    /// (StructureInlines.h:611-617): clear the inline single-slot transition when
+    /// its target structure is unmarked (`m_data = UsingSingleSlotFlag`).
     ///
-    /// Sweeps only the inline single-slot transition (clearing it when its
-    /// structure is unmarked). Once promoted, the map is a `WeakGCMap` in C++ that
-    /// finalizes its own entries via a separately-registered hook, not touched
-    /// here. `is_marked` is the caller-supplied analog of
+    /// MAP TIER (structures-as-cells Step 4, design §5): once promoted, the map
+    /// is a `WeakGCMap<Key, Structure>` in C++ (StructureTransitionTable.h:269)
+    /// whose dead entries are pruned by its OWN separately-registered end-of-cycle
+    /// hook — `WeakGCMap::pruneStaleEntries()` removes every entry whose weak
+    /// `Structure` died (WeakGCMapInlines.h:71-76), driven from
+    /// `Heap::pruneStaleEntriesFromWeakGCHashTables()` at the same
+    /// `Heap::runEndPhase` seam (heap/Heap.cpp:1751, one line before this
+    /// finalize's own driver at :1754). The port has no generic weak-map type
+    /// (the ratified GC-U7 precedent: minimal prune-on-finalize, no
+    /// `WeakGCMap` hierarchy), so the map arm is pruned HERE, in the one
+    /// finalize call, by the identical liveness predicate — observation-
+    /// equivalent to C++ (both prunes run between mark end and sweep, against
+    /// the same mark bits). `is_marked` is the caller-supplied analog of
     /// `vm.heap.isMarked(transition)`.
     pub fn finalize_unconditionally(&mut self, is_marked: impl Fn(StructureId) -> bool) {
-        if let Some(transition) = self.try_single_transition() {
-            if !is_marked(transition.structure) {
-                // m_data = UsingSingleSlotFlag
-                self.data = TransitionData::SingleSlot(None);
+        match &mut self.data {
+            TransitionData::SingleSlot(slot) => {
+                if let Some(transition) = slot {
+                    if !is_marked(transition.structure) {
+                        // m_data = UsingSingleSlotFlag
+                        *slot = None;
+                    }
+                }
+            }
+            TransitionData::Map(map) => {
+                // WeakGCMap::pruneStaleEntries (WeakGCMapInlines.h:71-76):
+                // `m_map.removeIf([](entry) { return !entry.value; })` — a dead
+                // weak value IS an unmarked Structure at this seam position.
+                map.map
+                    .retain(|_, transition| is_marked(transition.structure));
             }
         }
     }
@@ -695,6 +716,42 @@ mod tests {
             live.get(uid, 0, TransitionKind::PropertyAddition),
             Some(StructureId::new(5))
         );
+    }
+
+    // Structures-as-cells Step 4 (design §5): the promoted map tier is pruned
+    // the WeakGCMap way — dead-target entries removed, live ones kept
+    // (WeakGCMap::pruneStaleEntries, WeakGCMapInlines.h:71-76, driven at the
+    // same end-of-cycle seam, Heap.cpp:1751).
+    #[test]
+    fn finalize_prunes_dead_map_entries_and_keeps_live_ones() {
+        let uid_a = PointerKey::from_uid(0x1000);
+        let uid_b = PointerKey::from_uid(0x2000);
+        let uid_c = PointerKey::from_uid(0x3000);
+
+        let mut table = StructureTransitionTable::new();
+        table.add(ts(1, uid_a, 0, TransitionKind::PropertyAddition));
+        table.add(ts(2, uid_b, 0, TransitionKind::PropertyAddition)); // promotes to map
+        table.add(ts(3, uid_c, 0, TransitionKind::PropertyAddition));
+        assert!(table.try_single_transition().is_none()); // promoted
+
+        // Structures 1 and 3 survived the mark; 2 is dead.
+        table.finalize_unconditionally(|id| id != StructureId::new(2));
+
+        assert_eq!(
+            table.get(uid_a, 0, TransitionKind::PropertyAddition),
+            Some(StructureId::new(1)),
+            "a live entry must be kept"
+        );
+        assert_eq!(
+            table.get(uid_b, 0, TransitionKind::PropertyAddition),
+            None,
+            "a dead-target entry must be pruned (pruneStaleEntries)"
+        );
+        assert_eq!(
+            table.get(uid_c, 0, TransitionKind::PropertyAddition),
+            Some(StructureId::new(3))
+        );
+        assert!(!table.contains(uid_b, 0, TransitionKind::PropertyAddition));
     }
 
     #[test]

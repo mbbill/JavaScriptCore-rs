@@ -96,10 +96,20 @@ pub(crate) fn recommit_failure_count() -> usize {
 /// SAFETY: forwarded — `addr..addr+len` must satisfy the calling wrapper's
 /// ([`decommit`]/[`recommit`]) documented contract.
 unsafe fn madvise_with_retry(addr: *mut c_void, len: usize, advice: c_int, failures: &AtomicUsize) {
+    // Miri cannot interpret the madvise foreign call; the advice is purely a
+    // page-residency hint (contents are ALREADY treated as garbage by the
+    // callers), so skipping the syscall under miri preserves every memory-
+    // model property miri checks while keeping the bookkeeping identical.
+    #[cfg(miri)]
+    {
+        let _ = (addr, len, advice, failures);
+        return;
+    }
     #[cfg(target_os = "macos")]
     const EAGAIN: i32 = 35; // Darwin errno (sys/errno.h)
     #[cfg(not(target_os = "macos"))]
     const EAGAIN: i32 = 11; // Linux asm-generic errno
+    #[allow(unreachable_code)]
     loop {
         // SAFETY: per fn contract — advisory-only syscall on a caller-validated range.
         let rc = unsafe { madvise(addr, len, advice) };

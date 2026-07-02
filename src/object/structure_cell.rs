@@ -282,10 +282,12 @@ impl PrototypePointer {
 /// translation `StructureIdTable::arena_addrs`'s tracer will need once Step 2
 /// wires the base-class edge, design §2.1's "why own_handle" note).
 ///
-/// STEP 1 ONLY: this cell is allocated and tracked, but NEVER traced or swept
-/// (`StructureIdTable::space` has no mark/finalize wiring yet — Structures stay
-/// registry-rooted exactly as before this unit, design §6 Step 1: "no behavior
-/// change, only bookkeeping grows").
+/// LIFECYCLE (all four design §6 steps landed): traced by the combined marker
+/// (`CombinedGraphMarker` probe 2 → `trace_structure`, Steps 2-3) and, as of
+/// Step 4, actually COLLECTABLE — an unmarked cell's record is tombstoned by
+/// `StructureIdTable::reconcile_dead_structures_before_sweep` and its atom
+/// reclaimed by `sweep_dead_structure_cells` (handle never reissued — the
+/// ratified ABA deferral, design §8 item 1).
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub(crate) struct StructureArenaCell {
@@ -523,6 +525,46 @@ impl Structure {
         }
     }
 
+    /// Structures-as-cells Step 4 (design §6 Step 4): the inert TOMBSTONE record
+    /// a dead Structure's `structures[h - 1]` slot is `mem::replace`d with when
+    /// the collector reclaims it. C++ has no analog record — a dead C++
+    /// Structure's `StructureID` simply dangles into freed IsoSubspace memory
+    /// and nothing may decode it; the port's registry-handle model (R2) keeps
+    /// the Vec slot, so the slot must hold SOMETHING, and that something is
+    /// deliberately inert: no property table, no transitions, no previous, null
+    /// prototype, `INVALID` handle — every lookup through it misses (the
+    /// release-mode "miss safely" half of the stale-handle contract; see
+    /// [`StructureIdTable::structure`]). The slot is NEVER reallocated (the
+    /// ratified handle-reuse/ABA deferral, design §8 item 1).
+    fn tombstone_record() -> Self {
+        Self {
+            handle: StructureHandle::INVALID,
+            blob: TypeInfoBlob::new(super::indexing_type::NON_ARRAY, 0, 0),
+            inline_capacity: 0,
+            prototype: PrototypePointer::null(),
+            previous: None,
+            transition_property_name: None,
+            transition_property_attributes: 0,
+            transition_kind: TransitionKind::Unknown,
+            transition_offset: INVALID_OFFSET,
+            max_offset: INVALID_OFFSET,
+            property_hash: 0,
+            transition_table: StructureTransitionTable::new(),
+            property_table: None,
+            pinned_property_table: false,
+            did_transition: false,
+        }
+    }
+
+    /// TEST/ORACLE support (Structures-as-cells Step 4): direct read access to
+    /// the transition table so the finalize-prune oracles can assert an edge was
+    /// dropped (`try_single_transition() == None` / `get(..) == None`) rather
+    /// than inferring it only behaviorally.
+    #[cfg(test)]
+    pub(crate) fn transition_table_for_test(&self) -> &StructureTransitionTable {
+        &self.transition_table
+    }
+
     // --- public accessors (Structure.h) ---
 
     /// `StructureID id() const` (Structure.h:252): the encoded header word.
@@ -732,9 +774,14 @@ impl StructureIdTable {
     /// [`StructureArenaCell`] shadow cell into `space` (design §2.1) and records
     /// its address in `arena_addrs`. The two Vecs stay in lockstep by
     /// construction (both grow only here, from the same base) — see
-    /// `arena_cells_track_registered_structures` for the invariant test. **Structures
-    /// stay registry-rooted**: nothing sweeps `space` yet (design §6 Step 1), so
-    /// this is pure additive bookkeeping with no observable behavior change.
+    /// `arena_cells_track_registered_structures` for the invariant test.
+    /// STEP 4 UPDATE: registry-rooting is OFF — a registered Structure now lives
+    /// only as long as some strong edge (live instance's base-class edge, live
+    /// child's `previous`, or a pin root) marks it each cycle; dead ones are
+    /// tombstoned + swept (their `structures`/`arena_addrs` slots retired, never
+    /// reissued). The sweep's free-list may hand this `allocate_blob` a reclaimed
+    /// atom — safe, because every handle that ever mapped to it was tombstoned
+    /// first (see `arena_cell_for_handle`'s no-ABA note).
     fn register(&mut self, mut structure: Structure) -> StructureHandle {
         let handle = StructureHandle::new((self.structures.len() + 1) as u32);
         structure.handle = handle;
@@ -794,13 +841,14 @@ impl StructureIdTable {
         }
     }
 
-    /// TEST/ORACLE support (Structures-as-cells Step 2): the port's `vm.
-    /// structureStructure` analog every ordinary Structure's own header names
-    /// (design §4.1-4.2). Exposed so tests can assert the meta-structure's OWN
-    /// arena cell ends up marked whenever ANY Structure cell is marked (design §4
-    /// item 3, the meta-structure self-edge) without hardcoding which handle
-    /// bootstrap happened to pick.
-    #[cfg(test)]
+    /// The port's `vm.structureStructure` analog every ordinary Structure's own
+    /// header names (design §4.1-4.2). PRODUCTION as of Step 4 (was test-only):
+    /// `vm.structureStructure` is a `Strong`-held VM canonical in C++ — it can
+    /// never be collected while the VM lives — so the collector's structure-space
+    /// PIN-root gather (`CoreObjectStore::gather_structure_pin_root_cells`) reads
+    /// it here every cycle. Tests additionally use it to assert the meta-
+    /// structure's own cell ends up marked (design §4 item 3, the self-edge)
+    /// without hardcoding which handle bootstrap happened to pick.
     pub(crate) fn meta_structure_handle(&self) -> Option<StructureHandle> {
         self.meta_structure_handle
     }
@@ -848,6 +896,14 @@ impl StructureIdTable {
             return None;
         }
         let &addr = self.arena_addrs.get((handle.raw() - 1) as usize)?;
+        // Structures-as-cells Step 4: a TOMBSTONED handle (its cell reclaimed,
+        // the slot retired) resolves to no cell — load-bearing for no-ABA: the
+        // freed atom may since have been reused by a NEWER register(), and a
+        // retired handle must never alias it. (`is_arena_cell(0)` would reject
+        // the sentinel anyway; the explicit check documents the contract.)
+        if addr == Self::TOMBSTONE_ARENA_ADDR {
+            return None;
+        }
         self.space.is_arena_cell(addr)
     }
 
@@ -882,11 +938,36 @@ impl StructureIdTable {
 
     /// Borrow a structure by handle (the registry analog of `StructureID::
     /// decode`).
+    ///
+    /// Structures-as-cells Step 4 STALE-HANDLE CONTRACT (design §6 Step 4 + §8
+    /// item 1): a dead Structure's record is TOMBSTONED and its handle is never
+    /// reissued, but bare unrooted `StructureId`s survive in `bytecode/ic.rs`
+    /// stubs / watchpoint records (their `reset_by_gc` is deliberately inert
+    /// until R5/U6 wires IC clearing). Resolving such a stale handle here is a
+    /// caller bug — in C++ the analogous stale `StructureID` decode is a
+    /// use-after-free — so it FAILS LOUDLY in debug. In release it returns the
+    /// inert tombstone record (empty property table, no transitions, no
+    /// previous), so every property/transition lookup through it MISSES SAFELY
+    /// instead of resolving freed state. Gated callers (`CoreObjectStore::
+    /// is_live_structure`-style checks) should test [`Self::is_tombstoned`]
+    /// first and miss without ever resolving.
     pub fn structure(&self, handle: StructureHandle) -> &Structure {
+        debug_assert!(
+            !self.is_tombstoned(handle),
+            "structure(): resolving a tombstoned (collected) StructureId handle \
+             {handle:?} — a stale unrooted handle (IC stub / watchpoint record) \
+             must be liveness-gated by the caller, never resolved"
+        );
         &self.structures[(handle.raw() - 1) as usize]
     }
 
     fn structure_mut(&mut self, handle: StructureHandle) -> &mut Structure {
+        // Same stale-handle contract as `structure()` (fail loudly in debug;
+        // the release fallthrough mutates the inert tombstone, observably a no-op).
+        debug_assert!(
+            !self.is_tombstoned(handle),
+            "structure_mut(): resolving a tombstoned (collected) StructureId handle {handle:?}"
+        );
         &mut self.structures[(handle.raw() - 1) as usize]
     }
 
@@ -1205,6 +1286,158 @@ impl StructureIdTable {
         if let Some(table) = self.structure_mut(handle).property_table.as_mut() {
             table.update_attribute_if_exists(uid, attributes);
         }
+    }
+
+    // ============= Structures-as-cells Step 4: collectability (design §5/§6) =============
+
+    /// The `arena_addrs` sentinel for a TOMBSTONED handle (design §6 Step 4): the
+    /// handle's arena cell was reclaimed and the slot is never reallocated.
+    /// `0` can never be a real arena cell address (`allocate_blob` hands out
+    /// addresses inside mmap'd `MarkedBlock` pages; the null page is never one),
+    /// and `arena_cell_for_handle`/`structure_arena_cell` reject it through the
+    /// membership gate, so a tombstoned handle can never resolve to a (possibly
+    /// recycled) arena address — the no-ABA guarantee handle-no-reuse exists for.
+    const TOMBSTONE_ARENA_ADDR: usize = 0;
+
+    /// Structures-as-cells Step 4: has `handle`'s Structure been collected
+    /// (record tombstoned, arena cell reclaimed, handle permanently retired)?
+    /// `false` for a live handle, for `INVALID`, and for a never-issued handle.
+    /// This is the liveness gate release-mode stale-handle consumers miss
+    /// through (see [`Self::structure`]'s stale-handle contract).
+    pub(crate) fn is_tombstoned(&self, handle: StructureHandle) -> bool {
+        if handle == StructureHandle::INVALID {
+            return false;
+        }
+        match self.arena_addrs.get((handle.raw() - 1) as usize) {
+            Some(&addr) => addr == Self::TOMBSTONE_ARENA_ADDR,
+            None => false,
+        }
+    }
+
+    /// Live (non-tombstoned) Structure records. `registered - live` = tombstones;
+    /// the leak-closure oracle (design §6 Step 4) asserts this returns toward
+    /// baseline after churned shapes die, where the pre-Step-4 registry-rooted
+    /// tree could only grow.
+    pub(crate) fn live_structure_record_count(&self) -> usize {
+        self.arena_addrs
+            .iter()
+            .filter(|&&addr| addr != Self::TOMBSTONE_ARENA_ADDR)
+            .count()
+    }
+
+    /// Total handles ever issued (monotone: tombstoned slots are never reissued —
+    /// the ratified ABA deferral, design §8 item 1).
+    pub(crate) fn registered_structure_count(&self) -> usize {
+        self.arena_addrs.len()
+    }
+
+    /// `StructureTransitionTable::finalizeUnconditionally` over every MARKED
+    /// Structure (design §5.2) — the port of `Heap::finalizeUnconditionalFinalizers`'s
+    /// `finalizeMarkedUnconditionalFinalizers<Structure>(structureSpace, scope)`
+    /// step (heap/Heap.cpp:807 → Structure::finalizeUnconditionally,
+    /// Structure.cpp:1744-1746 → StructureTransitionTable::finalizeUnconditionally,
+    /// StructureInlines.h:611-617): for every structure that SURVIVED this cycle's
+    /// mark, drop each transition entry (single slot AND promoted map — see the
+    /// table's own finalize doc for the WeakGCMap map-tier mapping) whose CHILD
+    /// structure is unmarked. C++ runs the Structure finalizer only under
+    /// `collectionScope == Full` (Heap.cpp:806); this collector is unconditionally
+    /// a full STW collection (design §5.1), so the guard is always-true here —
+    /// evaluated, not skipped.
+    ///
+    /// A DEAD (unmarked) structure's table needs no finalize: its whole record is
+    /// tombstoned by [`Self::reconcile_dead_structures_before_sweep`] in the same
+    /// cycle (mirrors `forEachMarkedCell` only visiting marked cells).
+    ///
+    /// MUST run AFTER the mark fixpoint and BEFORE
+    /// [`Self::reconcile_dead_structures_before_sweep`] (liveness == this cycle's
+    /// mark bits; the reconcile consumes the same bits).
+    pub(crate) fn finalize_structure_transitions(&mut self) {
+        // Snapshot per-handle liveness first: the prune closure needs arbitrary-
+        // handle liveness lookups while `structures` is mutably iterated, so the
+        // bits are hoisted into a local (a disjoint borrow, and exactly the
+        // mark-bit read `forEachMarkedCell` performs per cell).
+        let live: Vec<bool> = self
+            .arena_addrs
+            .iter()
+            .map(|&addr| addr != Self::TOMBSTONE_ARENA_ADDR && self.space.is_addr_marked(addr))
+            .collect();
+        let handle_is_marked = |handle: StructureHandle| -> bool {
+            handle
+                .raw()
+                .checked_sub(1)
+                .and_then(|idx| live.get(idx as usize).copied())
+                .unwrap_or(false)
+        };
+        for (idx, structure) in self.structures.iter_mut().enumerate() {
+            if !live[idx] {
+                continue; // dead structure: nothing to finalize (it is tombstoned below)
+            }
+            structure
+                .transition_table
+                .finalize_unconditionally(handle_is_marked);
+        }
+    }
+
+    /// Structures-as-cells Step 4 (design §6 Step 4) — the structure-space
+    /// analog of `CoreObjectStore::reconcile_dead_cells_before_sweep`: for every
+    /// DEAD (unmarked-after-a-full-mark) Structure, drop its record NOW —
+    /// `mem::replace` the `structures[h - 1]` slot with the inert tombstone
+    /// (freeing the PropertyTable Vecs + transition HashMap, the record's owned
+    /// heap payload — the port's stand-in for C++ `~Structure` at sweep,
+    /// `destructibleCellHeapCellType`, since this arena's sweep runs NO
+    /// destructor, design §0.3) and retire the handle (`arena_addrs[h - 1] = 0`,
+    /// never reissued — the ratified ABA deferral, design §8 item 1). The cell's
+    /// ATOM is reclaimed by the following [`Self::sweep_dead_structure_cells`].
+    ///
+    /// Returns the number of structures tombstoned this cycle.
+    ///
+    /// ORDERING: MUST run AFTER [`Self::finalize_structure_transitions`] (which
+    /// needs live parents' records intact) and BEFORE the sweep (which clobbers
+    /// dead cells' bytes with FreeCell records — same invariant as the object
+    /// arena's reconcile).
+    pub(crate) fn reconcile_dead_structures_before_sweep(&mut self) -> usize {
+        let mut tombstoned = 0usize;
+        for idx in 0..self.arena_addrs.len() {
+            let addr = self.arena_addrs[idx];
+            if addr == Self::TOMBSTONE_ARENA_ADDR {
+                continue; // already tombstoned in an earlier cycle
+            }
+            if self.space.is_addr_marked(addr) {
+                continue; // survivor: record + cell untouched
+            }
+            // DEAD: no live instance (base-class edge), no live child (previous
+            // edge), no pin root reached it this cycle.
+            self.arena_addrs[idx] = Self::TOMBSTONE_ARENA_ADDR;
+            let _dead =
+                core::mem::replace(&mut self.structures[idx], Structure::tombstone_record());
+            tombstoned += 1;
+        }
+        tombstoned
+    }
+
+    /// Structures-as-cells Step 4 — sweep THIS table's own space: reclaim every
+    /// unmarked `StructureArenaCell`'s atom into the directories' free lists and
+    /// return now-empty blocks' pages to the OS, exactly the object arena's
+    /// `sweep_all_object_blocks(); shrink();` adjacency (`Heap::sweepSynchronously`,
+    /// heap/Heap.cpp:1250-1251 — the C3 decommit machinery is generic per
+    /// `MarkedSpace` instance, so this dedicated space gets the identical
+    /// treatment). Returns the number of cell atoms freed.
+    ///
+    /// Every unmarked cell was tombstoned by
+    /// [`Self::reconcile_dead_structures_before_sweep`] first, so no retired
+    /// handle can resolve a swept (recyclable) address afterwards.
+    pub(crate) fn sweep_dead_structure_cells(&mut self) -> usize {
+        let swept = self.space.sweep_all_object_blocks();
+        self.space.shrink();
+        swept.freed_cells
+    }
+
+    /// Structures-as-cells Step 4 — arm THIS space's C3 no-alloc-until-shrink
+    /// debug guard at mark-phase end (the structure-space half of what
+    /// `CoreObjectStore::force_collect` does for the object space; see
+    /// `MarkedSpace::note_mark_phase_end_for_shrink_guard`).
+    pub(crate) fn note_mark_phase_end_for_shrink_guard(&mut self) {
+        self.space.note_mark_phase_end_for_shrink_guard();
     }
 }
 

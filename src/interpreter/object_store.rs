@@ -3604,7 +3604,12 @@ impl CoreObjectStore {
         // the question rather than invent shared architecture). 3b is left
         // for a dedicated follow-up, most naturally as a POST-mark `&mut
         // self` pass mirroring `finalize_structure_transitions` (design
-        // §5.2)'s established shape, once Step 4 wires that seam.
+        // §5.2)'s established shape. STEP 4 UPDATE: that seam now EXISTS
+        // (`StructureIdTable::finalize_structure_transitions`, run from
+        // `force_collect`), so 3b is UNBLOCKED — but design §6 keeps it a
+        // separately-gated step (it observably changes rebuild frequency and
+        // wants its own perf probe before landing), so it is still NOT wired
+        // here.
 
         // ---- variant-specific children (Branded/WebAssemblyGC,
         // Structure.cpp:1436-1442): NOT MODELED — `StructureVariant` is not
@@ -3672,6 +3677,49 @@ impl CoreObjectStore {
         roots
     }
 
+    /// Structures-as-cells Step 4 — the STRUCTURE-SPACE PIN ROOTS, gathered every
+    /// mark phase now that registry-rooting is off (design §6 Step 4). Exactly
+    /// two families, each with a direct C++ strong-edge analog:
+    ///
+    ///  - the per-(kind, prototype) empty-shape SEED ROOTS
+    ///    (`structure_seed_roots`) — the transition-tree roots every fresh
+    ///    object's shape descends from. C++ analog: the global object's
+    ///    canonical structures + its prototype-keyed `StructureCache`, reached
+    ///    strongly through `JSGlobalObject::visitChildren` — a bare
+    ///    `StructureId` in this map has no cell edge pointing at it, so the
+    ///    collector must seed it here or a fresh `seed_structure_id` hit would
+    ///    hand out a tombstoned handle (a UAF-class miss).
+    ///  - the META-STRUCTURE (`vm.structureStructure`, a VM `Strong` canonical):
+    ///    its self-edge (design §4.1) only keeps it alive while SOME structure
+    ///    is marked; with zero other live structures it would otherwise die and
+    ///    the next `register()` would stamp a retired handle into a fresh cell.
+    ///
+    /// KNOWN OVER-PIN (reported, ratified to keep): a seed root pins its
+    /// prototype OBJECT transitively (the structure's own `m_prototype` edge),
+    /// so a (kind, prototype) pair used once keeps that prototype alive for the
+    /// store's lifetime. C++ bounds the same retention by the owning
+    /// JSGlobalObject's lifetime; a per-cycle seed-root eviction policy (the
+    /// `StructureCache` analog owning weak entries) is a separate follow-up.
+    ///
+    /// `gather_intrinsic_roots` (the OBJECT-space intrinsic prototypes) is
+    /// deliberately UNCHANGED by Step 4 — these are the structure-space
+    /// siblings, kept separate because the two spaces' roots are different
+    /// currencies (RuntimeValue vs StructureId handle).
+    fn gather_structure_pin_root_cells(&self) -> Vec<CellPtr> {
+        let mut cells = Vec::with_capacity(self.structure_seed_roots.len() + 1);
+        for &sid in self.structure_seed_roots.values() {
+            if let Some(cp) = self.structure_table.arena_cell_for_handle(sid) {
+                cells.push(cp);
+            }
+        }
+        if let Some(meta) = self.structure_table.meta_structure_handle() {
+            if let Some(cp) = self.structure_table.arena_cell_for_handle(meta) {
+                cells.push(cp);
+            }
+        }
+        cells
+    }
+
     /// gc-r4 R4b-mark — compute the live set from a set of RAW root candidate ADDRESSES
     /// (the universal currency: register-file `CellValue`s, frame-header `CellId`→addr,
     /// exception `cell_payload`, `jit_pending`, and intrinsic `RuntimeValue`s all reduce
@@ -3693,7 +3741,7 @@ impl CoreObjectStore {
         // clear; this is the structure-space half of the object-space clear above.
         self.structure_table.clear_all_marks();
         // Gate every root candidate through the MEMBERSHIP gate (NOT `find`).
-        let seeds: Vec<CellPtr> = root_addrs
+        let mut seeds: Vec<CellPtr> = root_addrs
             .iter()
             .filter_map(|&addr| {
                 let cp = self.space.is_arena_cell(addr)?;
@@ -3704,7 +3752,19 @@ impl CoreObjectStore {
                 Some(cp)
             })
             .collect();
+        // `seeded_roots` stays the OBJECT-root count (the pre-Step-4 meaning the
+        // existing oracles assert on); the structure pin roots below are a fixed
+        // per-store set, not caller-supplied candidates.
         let seeded_roots = seeds.len();
+        // Structures-as-cells Step 4 (design §6 Step 4): registry-rooting is OFF,
+        // so the structure space's PIN roots must be seeded explicitly each cycle
+        // — the canonical structures C++ reaches through strong VM/global-object
+        // edges (vm.structureStructure + JSGlobalObject's canonical Structure
+        // WriteBarriers, marked by their owners' visitChildren every collection).
+        // Everything else in the structure space lives or dies by real edges:
+        // a live instance's base-class `structure_id` edge (Step 2) or a live
+        // child's strong `previous` edge (Step 3).
+        seeds.extend(self.gather_structure_pin_root_cells());
         let marker = CombinedGraphMarker { store: self };
         let mut visitor = SlotVisitor::new();
         // SlotVisitor::append(ConservativeRoots) then drain (Heap::markToFixpoint).
@@ -4040,6 +4100,10 @@ pub(crate) struct CollectStats {
     /// Arena cell ATOMS the sweep reclaimed into the directories' free lists (includes
     /// already-free cells re-threaded, so generally >= `cells_reclaimed`).
     pub(crate) atoms_reclaimed: usize,
+    /// Structures-as-cells Step 4: DEAD Structures tombstoned this cycle (record
+    /// dropped, handle retired, arena cell atom reclaimed by the structure-space
+    /// sweep). The leak-closure oracle's per-cycle counter.
+    pub(crate) structures_tombstoned: usize,
 }
 
 // gc-r4 R4b-sweep authored-but-unwired (the live driver/safepoint is the follow-up unit):
@@ -4265,14 +4329,23 @@ impl CoreObjectStore {
     ///      the sweep, the C++ collector runs `reapWeakHandles()` :1750 and
     ///      `finalizeUnconditionalFinalizers()` :1754): drop each marked WeakMap/WeakSet's
     ///      dead-key entries while liveness == this cycle's marks.
+    ///   2b. (Structures-as-cells Step 4) `finalize_structure_transitions` — the
+    ///      Structure sibling at the SAME seam, run BEFORE the WeakMap/WeakSet
+    ///      finalize per Heap.cpp's own order (:807 Structure, :816-818 weak
+    ///      collections): prune every live Structure's dead transition targets.
     ///   3. `reconcile_dead_cells_before_sweep` frees dead cells' slabs + reverse-index
     ///      while their bytes are still intact — BEFORE step 4 clobbers them.
+    ///   3b. (Structures-as-cells Step 4) `reconcile_dead_structures_before_sweep` —
+    ///      tombstone dead Structures' records + retire their handles (no reuse).
     ///   4. `sweep_all_object_blocks` reclaims dead cells' atoms into the directories'
     ///      combined FreeLists (DoesNotHave; post-sweep liveness == marks alone).
     ///   5. `shrink` (gc-r4 leak-fix C3) returns any now-COMPLETELY-EMPTY block's
     ///      physical pages to the OS — mirrors `Heap::sweepSynchronously`'s
     ///      `sweepBlocks(); shrink();` adjacency (heap/Heap.cpp:1250-1251); MUST run
     ///      immediately after step 4 (see `MarkedSpace::shrink`'s doc).
+    ///   5b. (Structures-as-cells Step 4) `sweep_dead_structure_cells` — the
+    ///      structure space's own sweep + shrink, the identical adjacency on the
+    ///      second MarkedSpace instance.
     pub(crate) fn force_collect(&mut self, root_addrs: &[usize]) -> CollectStats {
         let mark = self.mark_live_set_from_addrs(root_addrs);
         // gc-r4 leak-fix C3 GUARD: from here until `shrink()` completes, the mark
@@ -4282,10 +4355,32 @@ impl CoreObjectStore {
         // `MarkedSpace::allocate/allocate_blob` trips if a future finalizer-callback
         // feature changes that — see `no_alloc_until_shrink_completes`).
         self.space.note_mark_phase_end_for_shrink_guard();
+        // Structures-as-cells Step 4: the STRUCTURE space's own C3 guard, armed at
+        // the same mark-phase-end point (two independent MarkedSpace instances,
+        // design R1, each with its own guard flag).
+        self.structure_table.note_mark_phase_end_for_shrink_guard();
+        // Structures-as-cells Step 4 (design §5.2): Structure's transition-table
+        // finalize is a SIBLING call at the SAME finalize seam, run BEFORE the
+        // WeakMap/WeakSet finalizers — matching Heap::finalizeUnconditionalFinalizers'
+        // intra-function order (heap/Heap.cpp:807 `finalizeMarkedUnconditionalFinalizers
+        // <Structure>(structureSpace, ..)` precedes :816-818 `<JSWeakSet>`/`<JSWeakMap>`).
+        // NOT folded into `finalize_unconditional_finalizers`' body — that method is
+        // scoped to `CoreObjectStore::space` and stays that way (design §5.2).
+        self.structure_table.finalize_structure_transitions();
         self.finalize_unconditional_finalizers();
         let reconcile = self.reconcile_dead_cells_before_sweep();
+        // Structures-as-cells Step 4 (design §6 Step 4, the collectability flip):
+        // tombstone every DEAD Structure's record + retire its handle while the
+        // mark bits are authoritative and its cell bytes are intact (the same
+        // reconcile-before-sweep invariant as the object arena above).
+        let structures_tombstoned = self
+            .structure_table
+            .reconcile_dead_structures_before_sweep();
         let sweep = self.space.sweep_all_object_blocks();
         self.space.shrink();
+        // Structures-as-cells Step 4: sweep + shrink the structure space too
+        // (dead Structures' atoms actually freed — the sweep half of the flip).
+        let _structure_atoms_freed = self.structure_table.sweep_dead_structure_cells();
         // Post-reconcile, the authoritative live set must be EXACTLY the marked survivors
         // (every dead entry was dropped). The side-effect-free check runs in debug only.
         debug_assert!(
@@ -4299,6 +4394,7 @@ impl CoreObjectStore {
             cells_reclaimed: reconcile.cells_reclaimed,
             slab_slots_freed: reconcile.slab_slots_freed,
             atoms_reclaimed: sweep.freed_cells,
+            structures_tombstoned,
         }
     }
 
@@ -6866,8 +6962,17 @@ impl CoreObjectStore {
     }
 
     /// True iff `sid` is a live registered structure handle.
+    ///
+    /// Structures-as-cells Step 4: also false for a TOMBSTONED handle (a
+    /// collected Structure whose slot is retired, never reissued) — this is the
+    /// release-mode "miss safely" gate of the stale-handle contract
+    /// (`StructureIdTable::structure`'s doc): a stale IC/watchpoint-held
+    /// `StructureId` probing through here misses cleanly instead of resolving a
+    /// tombstone.
     fn is_live_structure(&self, sid: StructureId) -> bool {
-        sid != StructureId::INVALID && sid.raw() < self.structure_table.peek_next_handle().raw()
+        sid != StructureId::INVALID
+            && sid.raw() < self.structure_table.peek_next_handle().raw()
+            && !self.structure_table.is_tombstoned(sid)
     }
 
     /// The (offset, attributes) structure `sid` assigns to `key` — read straight from
@@ -15138,30 +15243,28 @@ mod leak_fix_c1_extra_memory_accounting_tests {
     }
 }
 
-// Structures-as-cells Step 1 (docs/design/structures-as-cells.md) — cross-store
-// isolation proof. `StructureIdTable` owns its OWN dedicated `MarkedSpace`
-// (design R1), an instance entirely independent of `CoreObjectStore::space`.
-// This module proves design §6 Step 1's oracle (c) ("nothing is reclaimed")
-// end-to-end: registering structures, then running a REAL object-arena
-// collection (`force_collect`, the same production entry point every other GC
-// test in this file exercises) never RECLAIMS a Structure's shadow arena cell
-// or disturbs its record — Step 1 wires no finalize/sweep for the Structure
-// space, so its MEMBERSHIP (`arena_cell_is_admitted`) survives regardless of
-// what the object-arena cycle's mark/sweep does. UPDATED FOR STEP 2: `force_
-// collect` NOW does reach `structure_table` (via `mark_live_set_from_addrs`'s
-// `CombinedGraphMarker`, which marks/clears the structure space's mark BITS —
-// see `structures_as_cells_step2_tests` for that proof); what stays true here
-// is narrower and still Step-1-scoped: no RECLAMATION happens, because Step 2
-// wires tracing only, not sweep/finalize (design §6: that is Step 4).
+// Structures-as-cells Step 1 module, UPDATED FOR STEP 4 (docs/design/
+// structures-as-cells.md §6). The original Step 1 oracle here ("a force_collect
+// never reclaims a Structure cell — the space is never swept") is deliberately
+// RETIRED: Step 4 is precisely the flip that makes an unreferenced Structure
+// real garbage (see `structures_as_cells_step4_tests` for the full flip
+// oracles). What this module still owns is the part of Step 1 that remains
+// true forever: the table keeps FUNCTIONING across collection cycles —
+// registration works after a sweep, freed atoms are safely reusable, and no
+// unrelated bookkeeping is corrupted by a mid-lifetime cycle.
 #[cfg(test)]
 mod structures_as_cells_step1_tests {
     use super::*;
 
     #[test]
-    fn force_collect_on_the_object_arena_never_touches_the_structure_space() {
+    fn structure_table_keeps_functioning_across_collection_cycles() {
         let mut store = CoreObjectStore::default();
 
-        // Register a handful of structures BEFORE any object-arena collection.
+        // Bootstrap FIRST: the first-ever register() becomes the (pinned)
+        // meta-structure, so the orphans below must not be the first.
+        let _boot = store.allocate();
+
+        // Orphan structures (registered, referenced by nothing) BEFORE a cycle.
         let handles: Vec<StructureId> = (0..8).map(|_| store.allocate_structure_id()).collect();
         for &h in &handles {
             assert!(
@@ -15170,37 +15273,40 @@ mod structures_as_cells_step1_tests {
             );
         }
 
-        // Real object-arena traffic, then a REAL collection cycle
-        // (`force_collect`, the production entry point) with an EMPTY root set
-        // so every unrooted object cell is reclaimed — proving this is a real,
-        // effectful collection, not a no-op.
+        // Real object-arena traffic, then a REAL collection cycle with an EMPTY
+        // root set: unrooted object cells AND (Step 4) the orphan structures are
+        // both reclaimed now.
         for _ in 0..4 {
             let _ = store.allocate();
         }
         let stats = store.force_collect(&[]);
         assert!(
             stats.cells_reclaimed >= 4,
-            "the unrooted object cells must be reclaimed by the object-arena cycle \
-             (otherwise this test would not exercise a real collection)"
+            "the unrooted object cells must be reclaimed by the object-arena cycle"
         );
-
-        // The Structure space is UNTOUCHED: every handle registered before the
-        // collection still resolves through both the hot record-slab path AND
-        // the shadow arena.
+        assert!(
+            stats.structures_tombstoned >= 8,
+            "Step 4: the orphan structures are real garbage and must be tombstoned \
+             (the pre-Step-4 'never touched' oracle is retired by design §6 Step 4)"
+        );
         for &h in &handles {
             assert!(
-                store.structure_table.arena_cell_is_admitted(h),
-                "a real object-arena collection must not reclaim a Structure's \
-                 shadow cell (Step 1 wires no sweep for the Structure space)"
+                store.structure_table.is_tombstoned(h),
+                "an orphan structure's handle must be retired by the flip"
             );
-            let _ = store.structure_table.structure(h); // must not panic/index-fail
         }
 
-        // The table still functions after an object-arena cycle ran mid-lifetime
-        // (no corrupted bookkeeping from an unrelated collection).
+        // The table still functions after a full cycle ran mid-lifetime: new
+        // registrations get fresh handles (never a retired one) and admitted
+        // cells (possibly reusing swept atoms — safe, no handle maps to them).
         let more: Vec<StructureId> = (0..4).map(|_| store.allocate_structure_id()).collect();
         for &h in &more {
             assert!(store.structure_table.arena_cell_is_admitted(h));
+            assert!(!store.structure_table.is_tombstoned(h));
+            assert!(
+                !handles.contains(&h),
+                "a retired handle must never be reissued (the ratified ABA deferral)"
+            );
         }
     }
 }
@@ -15275,8 +15381,9 @@ mod structures_as_cells_step2_tests {
     }
 
     // (c): a Structure registered but reachable from NO live cell is left
-    // UNMARKED by the mark phase, yet still SURVIVES — Step 2 wires no sweep for
-    // the structure space (design §6: only Step 4 would flip that).
+    // UNMARKED by the mark phase, yet still SURVIVES a MARK-ONLY pass — the
+    // reclamation itself is force_collect's reconcile+sweep (Step 4), which
+    // `mark_live_set_from_addrs` alone never runs.
     #[test]
     fn unreferenced_structure_is_unmarked_but_still_survives() {
         let mut store = CoreObjectStore::default();
@@ -15299,19 +15406,19 @@ mod structures_as_cells_step2_tests {
         );
         assert!(
             store.structure_table.arena_cell_is_admitted(orphan),
-            "an unmarked Structure must still SURVIVE — Step 2 wires NO sweep for \
-             the structure space (Step 1's registry-rooting stays in force; \
-             design §6 Step 4 is what would reclaim it)"
+            "an unmarked Structure must still SURVIVE a mark-only pass — the \
+             reclamation is force_collect's reconcile+sweep (Step 4), never \
+             the mark phase itself"
         );
         let _ = store.structure_table.structure(orphan); // must not panic/index-fail
     }
 
-    // (c2): a FULL `force_collect` cycle (mark + the OBJECT-arena sweep + shrink)
-    // must behave identically — the orphan Structure survives regardless of its
-    // mark state, because Step 2 wires tracing only, never sweep/finalize, for
-    // the structure space.
+    // (c2), UPDATED FOR STEP 4: a FULL `force_collect` cycle now RECLAIMS the
+    // unmarked orphan Structure (the collectability flip, design §6 Step 4) —
+    // the pre-Step-4 assertion ("survives regardless of mark state") is retired.
+    // The live object's structure is untouched.
     #[test]
-    fn force_collect_leaves_an_unmarked_structure_intact() {
+    fn force_collect_reclaims_an_unmarked_structure() {
         let mut store = CoreObjectStore::default();
         let obj = store.allocate();
         let live_handle = store.find(obj).unwrap().structure_id;
@@ -15321,8 +15428,12 @@ mod structures_as_cells_step2_tests {
         assert!(stats.marked_cells >= 1);
 
         assert!(store.structure_table.arena_cell_is_marked(live_handle));
-        assert!(!store.structure_table.arena_cell_is_marked(orphan));
-        assert!(store.structure_table.arena_cell_is_admitted(orphan));
+        assert!(!store.structure_table.is_tombstoned(live_handle));
+        assert!(
+            store.structure_table.is_tombstoned(orphan),
+            "Step 4: the unreferenced orphan is real garbage now"
+        );
+        assert_eq!(stats.structures_tombstoned, 1);
     }
 
     // (d): design §4.3 — a leaf (String) cell's `structure_id` is INVALID today
@@ -15534,14 +15645,14 @@ mod structures_as_cells_step3_tests {
              forward transition edge (design §5.1: dead by evaluation, not a \
              shortcut)"
         );
-        // Both survive regardless of mark state — Step 1's registry-rooting
-        // stays in force this step (design §6: only a future Step 4 would
-        // flip that to real reclamation).
+        // Both survive a MARK-ONLY pass — reclamation is force_collect's
+        // reconcile+sweep (Step 4; see `structures_as_cells_step4_tests` for
+        // the full-cycle prune/reclaim oracles of exactly this shape).
         assert!(store.structure_table.arena_cell_is_admitted(parent));
         assert!(
             store.structure_table.arena_cell_is_admitted(child),
-            "an unmarked (always-weak) transition child still SURVIVES this \
-             step via registry-rooting, exactly like Step 2's orphan case"
+            "an unmarked (always-weak) transition child still SURVIVES a \
+             mark-only pass, exactly like Step 2's orphan case"
         );
     }
 
@@ -15864,6 +15975,375 @@ mod structures_as_cells_step3_ty_threading_tests {
              `obj` is still alive and its Structure still names it. This is the LIVE \
              UAF class this unit's fix (seed_structure_id/allocate_structure_id \
              threading a real per-kind/object-shaped ty) closes."
+        );
+    }
+}
+
+// Structures-as-cells Step 4 (docs/design/structures-as-cells.md §5 + §6 Step 4)
+// — THE COLLECTABILITY FLIP, proven end-to-end through the production
+// `force_collect` cycle:
+//   (a) THE LEAK CLOSES: churned object shapes (one transition child per
+//       distinct added property) are reclaimed once their instances die, and
+//       the live structure population returns EXACTLY to baseline — the
+//       migration's payoff proof; on the pre-Step-4 registry-rooted tree this
+//       count could only grow.
+//   (b) a live instance keeps its WHOLE structure ancestry (`previous` chain)
+//       alive across a cycle, and property lookups replay correctly after it.
+//   (c) transition-table pruning (design §5): a surviving parent's entry for a
+//       DEAD child is dropped at the finalize seam (single-slot AND map tier),
+//       re-transitioning the same property mints a FRESH child, and sibling
+//       convergence works both before and after the collection (the audit's
+//       oracle).
+//   (d) stale-handle safety (design §6 Step 4 + §8 item 1): a retained bare
+//       `StructureId` (the `bytecode/ic.rs` record shape) whose Structure died
+//       MISSES SAFELY through the liveness-gated path and FAILS LOUDLY on a
+//       direct debug resolve; the handle is never reissued (no ABA).
+//   (e) the pin roots survive an EMPTY-root collection: the per-(kind,
+//       prototype) seed roots, the meta-structure, and (transitively, via the
+//       seed roots' m_prototype edges) the canonical prototype objects.
+#[cfg(test)]
+mod structures_as_cells_step4_tests {
+    use super::*;
+
+    fn ident(n: u32) -> CorePropertyKey {
+        CorePropertyKey::Identifier(n)
+    }
+
+    fn addr(v: RuntimeValue) -> usize {
+        v.as_cell().unwrap().pointer_payload_bits()
+    }
+
+    fn sid_of(store: &CoreObjectStore, v: RuntimeValue) -> StructureId {
+        store.find(v).unwrap().structure_id
+    }
+
+    // (a) THE LEAK CLOSES.
+    #[test]
+    fn shape_churn_is_reclaimed_and_population_returns_to_baseline() {
+        let mut store = CoreObjectStore::default();
+        let anchor = store.allocate(); // pins the Ordinary seed root + bootstraps the meta
+                                       // Settle to a post-cycle baseline first, so the count below is not
+                                       // inflated by bootstrap-only structures that die on the first cycle.
+        let _ = store.force_collect(&[addr(anchor)]);
+        let baseline = store.structure_table.live_structure_record_count();
+
+        const N: usize = 64;
+        for i in 0..N {
+            let o = store.allocate();
+            // One DISTINCT property per object => one distinct transition child
+            // of the shared seed root per iteration (no sibling convergence).
+            store
+                .put_data_own(
+                    o,
+                    &ident(10_000 + i as u32),
+                    RuntimeValue::from_i32(i as i32),
+                )
+                .unwrap();
+            // `o` is dropped here: nothing roots it past this loop iteration.
+        }
+        assert_eq!(
+            store.structure_table.live_structure_record_count(),
+            baseline + N,
+            "churn must mint exactly one live transition child per distinct property"
+        );
+        let registered_after_churn = store.structure_table.registered_structure_count();
+
+        let s1 = store.force_collect(&[addr(anchor)]);
+        let s2 = store.force_collect(&[addr(anchor)]);
+
+        assert_eq!(
+            s1.structures_tombstoned, N,
+            "every churned shape is dead the moment its instances are: all N \
+             children tombstoned on the first cycle"
+        );
+        assert_eq!(
+            store.structure_table.live_structure_record_count(),
+            baseline,
+            "THE LEAK CLOSES: the live structure population returns to baseline \
+             (on the pre-Step-4 registry-rooted tree this could only grow)"
+        );
+        assert_eq!(
+            s2.structures_tombstoned, 0,
+            "a second cycle finds nothing new to reclaim (no over-collection of \
+             the pinned/live survivors either)"
+        );
+        // Handles are retired, never reissued: the registered count is monotone
+        // and unchanged by collection (tombstones bounded by deaths, design §6).
+        assert_eq!(
+            store.structure_table.registered_structure_count(),
+            registered_after_churn
+        );
+    }
+
+    // (b) a live instance's WHOLE ancestry chain survives, and lookups replay.
+    #[test]
+    fn live_instance_keeps_its_whole_structure_ancestry_alive() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let k1 = ident(1);
+        let k2 = ident(2);
+        store
+            .put_data_own(obj, &k1, RuntimeValue::from_i32(1))
+            .unwrap();
+        store
+            .put_data_own(obj, &k2, RuntimeValue::from_i32(2))
+            .unwrap();
+
+        let sid = sid_of(&store, obj);
+        let parent = store
+            .structure_table
+            .structure(sid)
+            .previous_id()
+            .expect("two transitions deep: sid has a parent");
+        let root = store
+            .structure_table
+            .structure(parent)
+            .previous_id()
+            .expect("… and a grandparent (the seed root)");
+
+        let _ = store.force_collect(&[addr(obj)]);
+
+        for h in [sid, parent, root] {
+            assert!(
+                !store.structure_table.is_tombstoned(h),
+                "the whole `previous` chain of a live instance must survive \
+                 (design §3.2: m_previousOrRareData is STRONG)"
+            );
+        }
+        assert_eq!(
+            store.structure_table.structure(sid).previous_id(),
+            Some(parent),
+            "the chain is intact, not merely un-tombstoned"
+        );
+        // Property lookups still resolve through the surviving structure — the
+        // materialize/replay machinery works over the post-GC chain.
+        let (off1, _) = store
+            .structure_property(sid, &k1)
+            .expect("k1 still resolves after the cycle");
+        let (off2, _) = store
+            .structure_property(sid, &k2)
+            .expect("k2 still resolves after the cycle");
+        assert_ne!(off1, off2);
+    }
+
+    // (c) single-slot tier: dead child pruned at the finalize seam; the same
+    // property re-mints FRESH; sibling convergence holds before AND after.
+    #[test]
+    fn dead_transition_child_is_pruned_and_a_fresh_child_is_minted() {
+        let mut store = CoreObjectStore::default();
+        let anchor = store.allocate(); // keeps the parent (seed root) marked
+        let parent = sid_of(&store, anchor);
+        let key = ident(7);
+
+        // Sibling convergence BEFORE the collection (the audit's oracle).
+        let o1 = store.allocate();
+        store
+            .put_data_own(o1, &key, RuntimeValue::from_i32(1))
+            .unwrap();
+        let c1 = sid_of(&store, o1);
+        let o2 = store.allocate();
+        store
+            .put_data_own(o2, &key, RuntimeValue::from_i32(2))
+            .unwrap();
+        assert_eq!(sid_of(&store, o2), c1, "pre-GC sibling convergence");
+        assert_ne!(c1, parent);
+
+        // Drop both instances; only `anchor` is rooted, so `c1` dies while its
+        // parent survives.
+        let _ = store.force_collect(&[addr(anchor)]);
+
+        assert!(
+            store.structure_table.is_tombstoned(c1),
+            "the dead child is reclaimed"
+        );
+        assert!(!store.structure_table.is_tombstoned(parent));
+        assert!(
+            store
+                .structure_table
+                .structure(parent)
+                .transition_table_for_test()
+                .try_single_transition()
+                .is_none(),
+            "finalize_structure_transitions pruned the surviving parent's entry \
+             for the dead child (StructureInlines.h:611-617: m_data = \
+             UsingSingleSlotFlag)"
+        );
+
+        // Re-transitioning the same property mints a FRESH child…
+        let o3 = store.allocate();
+        store
+            .put_data_own(o3, &key, RuntimeValue::from_i32(3))
+            .unwrap();
+        let c3 = sid_of(&store, o3);
+        assert_ne!(c3, c1, "a fresh child, never the retired handle (no ABA)");
+        assert!(!store.structure_table.is_tombstoned(c3));
+
+        // …and sibling convergence still works AFTER the collection.
+        let o4 = store.allocate();
+        store
+            .put_data_own(o4, &key, RuntimeValue::from_i32(4))
+            .unwrap();
+        assert_eq!(sid_of(&store, o4), c3, "post-GC sibling convergence");
+        assert!(
+            store.structure_property(c3, &key).is_some(),
+            "the re-minted shape resolves the property"
+        );
+    }
+
+    // (c) map tier: with the table promoted past the single slot, ONLY the
+    // dead child's entry is pruned; the live sibling's entry is kept and still
+    // converges (WeakGCMap::pruneStaleEntries semantics, design §5).
+    #[test]
+    fn map_tier_prunes_only_the_dead_childs_entry() {
+        let mut store = CoreObjectStore::default();
+        let anchor = store.allocate();
+        let parent = sid_of(&store, anchor);
+        let ka = ident(11);
+        let kb = ident(12);
+
+        let o_live = store.allocate();
+        store
+            .put_data_own(o_live, &ka, RuntimeValue::from_i32(1))
+            .unwrap();
+        let live_child = sid_of(&store, o_live);
+        let o_dead = store.allocate();
+        store
+            .put_data_own(o_dead, &kb, RuntimeValue::from_i32(2))
+            .unwrap();
+        let dead_child = sid_of(&store, o_dead);
+        // Two distinct transitions off one parent => the table is map-promoted.
+        assert!(
+            store
+                .structure_table
+                .structure(parent)
+                .transition_table_for_test()
+                .try_single_transition()
+                .is_none(),
+            "test setup: the parent's table must be promoted to the map tier"
+        );
+
+        // `o_dead` is unrooted; `o_live` stays alive.
+        let _ = store.force_collect(&[addr(anchor), addr(o_live)]);
+
+        assert!(!store.structure_table.is_tombstoned(live_child));
+        assert!(store.structure_table.is_tombstoned(dead_child));
+
+        // The live sibling's entry survived the prune: a new object adding `ka`
+        // converges on the SAME still-live child.
+        let o3 = store.allocate();
+        store
+            .put_data_own(o3, &ka, RuntimeValue::from_i32(3))
+            .unwrap();
+        assert_eq!(
+            sid_of(&store, o3),
+            live_child,
+            "the map prune must be per-entry: the live child's edge is kept"
+        );
+        // The dead sibling's entry is gone: `kb` re-mints fresh.
+        let o4 = store.allocate();
+        store
+            .put_data_own(o4, &kb, RuntimeValue::from_i32(4))
+            .unwrap();
+        let re_minted = sid_of(&store, o4);
+        assert_ne!(re_minted, dead_child);
+        assert!(!store.structure_table.is_tombstoned(re_minted));
+    }
+
+    // (d) stale-handle safety, the release half: a retained bare `StructureId`
+    // (exactly the `bytecode/ic.rs` stub-record shape — unrooted, no
+    // invalidation wired) misses SAFELY through the liveness-gated path once
+    // its Structure dies. It never resolves the tombstone.
+    #[test]
+    fn stale_structure_handle_misses_safely_through_the_gated_path() {
+        let mut store = CoreObjectStore::default();
+        let anchor = store.allocate();
+        let key = ident(3);
+
+        let o = store.allocate();
+        store
+            .put_data_own(o, &key, RuntimeValue::from_i32(9))
+            .unwrap();
+        let stale = sid_of(&store, o); // the retained bare handle
+        assert!(
+            store.structure_property(stale, &key).is_some(),
+            "pre-GC: the handle resolves normally"
+        );
+
+        // `o` dies; `stale` outlives its Structure, exactly like an IC record.
+        let _ = store.force_collect(&[addr(anchor)]);
+        assert!(store.structure_table.is_tombstoned(stale));
+        assert_eq!(
+            store.structure_property(stale, &key),
+            None,
+            "the gated path (is_live_structure) must MISS on a tombstoned \
+             handle — never resolve freed shape state (design §6 Step 4's \
+             stale-IC prescription)"
+        );
+    }
+
+    // (d) stale-handle safety, the debug half: DIRECTLY resolving a tombstoned
+    // handle (skipping the liveness gate) fails loudly. Debug builds only —
+    // in release the same call returns the inert tombstone record (every
+    // lookup through it misses), which the gated-path test above covers.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "tombstoned")]
+    fn stale_structure_handle_direct_resolution_fails_loudly_in_debug() {
+        let mut store = CoreObjectStore::default();
+        let anchor = store.allocate();
+        let o = store.allocate();
+        store
+            .put_data_own(o, &ident(4), RuntimeValue::from_i32(1))
+            .unwrap();
+        let stale = sid_of(&store, o);
+        let _ = store.force_collect(&[addr(anchor)]);
+        assert!(store.structure_table.is_tombstoned(stale)); // sanity, must not panic
+        let _ = store.structure_table.structure(stale); // MUST panic (debug_assert)
+    }
+
+    // (e) the pin roots survive an EMPTY-root collection: seed roots, the
+    // meta-structure, and (transitively) the canonical prototype objects — and
+    // a post-GC allocation converges on the SAME pinned seed root.
+    #[test]
+    fn seed_roots_meta_structure_and_prototypes_survive_an_empty_root_collection() {
+        let mut store = CoreObjectStore::default();
+        let proto = store.ensure_object_prototype();
+        let o = store.allocate(); // seeded from (Ordinary, Object.prototype)
+        let seed = sid_of(&store, o); // == the seed root (no transitions yet)
+        let meta = store
+            .structure_table
+            .meta_structure_handle()
+            .expect("bootstrap happened");
+
+        // NOTHING caller-rooted: `o` itself dies; only the store-owned pins hold.
+        let stats = store.force_collect(&[]);
+        assert!(stats.cells_reclaimed >= 1, "o itself was reclaimed");
+
+        assert!(
+            !store.structure_table.is_tombstoned(seed),
+            "the per-(kind, prototype) seed ROOT structure is pinned (the \
+             JSGlobalObject-canonical-structures analog)"
+        );
+        assert!(
+            !store.structure_table.is_tombstoned(meta),
+            "the meta-structure (vm.structureStructure analog) is pinned"
+        );
+        assert!(store.structure_table.arena_cell_is_marked(seed));
+        assert!(store.structure_table.arena_cell_is_marked(meta));
+        assert!(
+            store.find(proto).is_some(),
+            "the canonical prototype OBJECT survives transitively via the pinned \
+             seed root's own m_prototype edge (Structure.cpp:1420-1423)"
+        );
+
+        // A fresh allocation converges on the SAME pinned seed root — the
+        // shared-empty-shape contract (cross-instance IC hits) holds across GC.
+        let o2 = store.allocate();
+        assert_eq!(
+            sid_of(&store, o2),
+            seed,
+            "seed_structure_id must hand back the SAME pinned root after a \
+             collection, not mint a divergent one"
         );
     }
 }
