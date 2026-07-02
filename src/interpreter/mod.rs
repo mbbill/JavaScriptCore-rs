@@ -3881,6 +3881,35 @@ impl CoreOpcodeDispatchHost {
         self.strings.text(value)
     }
 
+    // Cross-module test support for the DFG FrozenValue keep-alive unit
+    // (dfg/frozen_value.rs, dfg/graph.rs's `gather_frozen_roots`): the store is
+    // private, so a DFG-side test needs a forwarding path to drive a REAL
+    // collection with a DFG graph's frozen roots folded in as `extra_roots`
+    // (the same `force_collect_values` a production `host_roots` fold would
+    // use, see `gather_code_block_constant_roots`'s doc above for the
+    // established pattern) and to check whether the result survived it. Also
+    // drains the leaf-store reclaim (`take_reclaimed_leaf_addrs` ->
+    // `reconcile_dead_string`/`reconcile_dead_symbol`/`reconcile_dead_bigint`)
+    // exactly as `poll_gc_collection_safepoint`'s tail does above, so a dead
+    // string's `string_text_for_test` correctly reads back `None` afterward
+    // (a bare `force_collect_values` only reclaims the ARENA cell; the leaf
+    // store's own record needs this second step, gc-r4-completion U1-U3).
+    #[cfg(test)]
+    pub(crate) fn force_collect_values_for_test(&mut self, extra_roots: &[RuntimeValue]) -> usize {
+        let stats = self.objects.force_collect_values(extra_roots);
+        for addr in self.objects.take_reclaimed_leaf_addrs() {
+            self.strings.reconcile_dead_string(addr);
+            self.symbols.reconcile_dead_symbol(addr);
+            self.bigints.reconcile_dead_bigint(addr);
+        }
+        stats.marked_cells
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_value_marked_for_test(&self, value: RuntimeValue) -> bool {
+        self.objects.is_value_marked(value)
+    }
+
     // Cross-module test support for the baseline-JIT typed-array get_by_val/put_by_val
     // bridge (jit/operations.rs + arm64_baseline/function_emitter.rs): allocate a
     // Uint8Array view in THIS host's real object store (its R4 cell + the store-owned

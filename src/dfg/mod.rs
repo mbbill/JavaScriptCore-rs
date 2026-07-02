@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod frozen_value;
 pub(crate) mod graph;
 pub(crate) mod node_flags;
 pub(crate) mod node_type;
@@ -16,6 +17,7 @@ pub(crate) mod speculation;
 pub(crate) mod variable_access_data;
 pub(crate) mod watchpoint;
 
+pub use frozen_value::{merge_strength, FrozenValue, FrozenValueId, ValueStrength};
 pub use graph::{
     BranchTarget, DfgBasicBlock, DfgBasicBlockId, DfgCommonDataDescriptor, DfgDominanceSet,
     DfgEdge, DfgEdgeId, DfgGraph, DfgGraphId, DfgGraphMutationAuthority, DfgInlineCallFrameId,

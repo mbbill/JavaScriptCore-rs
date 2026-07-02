@@ -7,7 +7,10 @@
 //! (a later unit) owns a mutable working graph and appends through the `&mut`
 //! APIs below, exactly as `ByteCodeParser` mutates `Graph&`.
 
+use std::collections::HashMap;
+
 use crate::bytecode::{ConstantValue, Operands, VirtualRegister};
+use crate::dfg::frozen_value::{FrozenValue, FrozenValueId, ValueStrength};
 use crate::dfg::node_flags::{
     NodeFlags, NODE_HAS_VAR_ARGS, NODE_MUST_GENERATE, NODE_RESULT_BOOLEAN, NODE_RESULT_DOUBLE,
     NODE_RESULT_INT32, NODE_RESULT_INT52, NODE_RESULT_JS, NODE_RESULT_MASK, NODE_RESULT_NUMBER,
@@ -20,6 +23,7 @@ use crate::jit::{CodeOrigin, EffectSummary, JitCodeId, JitType, WatchpointDepend
 use crate::object::PropertyOffset;
 use crate::runtime::{CodeBlockId, ExecutableId, ObjectId};
 use crate::strings::AtomId;
+use crate::value::JsValue;
 
 /// Stable identity for a graph produced for one compilation plan.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -254,8 +258,22 @@ pub struct DfgNode {
     /// `constant()` payload for JSConstant/DoubleConstant: C++ stores a
     /// `FrozenValue*` in `m_opInfo` (DFGNode.h `hasConstant()`/`constant()`);
     /// the safe-Rust descriptor carries the constant-pool value directly
-    /// (`ConstantValue` is the linked pool's value representation). Freezing/
-    /// weak-vs-strong marking is GC machinery that lands with the collector.
+    /// (`ConstantValue` is the linked pool's value representation).
+    ///
+    /// The frozen-value arena + `freeze`/`freeze_strong` GC machinery this
+    /// comment used to defer now exists (`FrozenValue`, `frozen_values`,
+    /// `frozen_value_map` below — dfg/frozen_value.rs), but this field is
+    /// NOT wired to it yet: the bytecode parser's `get()` builds `constant`
+    /// directly from the linked pool's `ConstantValue`
+    /// (dfg/parser.rs:391-455) without freezing, because no linked constant
+    /// pool carries a cell-valued constant today (f213265's finding — string
+    /// literals materialize via LoadString, not a pool cell) so there is
+    /// nothing unsafe to freeze yet. Once link-time constant interning can
+    /// produce a cell constant, `get()`'s `JSConstant`/`DoubleConstant`
+    /// construction should route through `DfgGraph::freeze_strong`
+    /// (mirroring `ByteCodeParser::get()`, DFGByteCodeParser.cpp:401-410) and
+    /// this field likely becomes a `FrozenValueId` — a cross-cutting change
+    /// deferred to that unit, not made here.
     pub constant: Option<ConstantValue>,
     pub structure: Option<StructureId>,
     pub property: Option<AtomId>,
@@ -427,6 +445,17 @@ pub struct DfgGraph {
     /// stable pointers.
     pub variable_access_data: Vec<VariableAccessData>,
     pub watchpoints: Vec<WatchpointDependency>,
+    /// `m_frozenValues` (`SegmentedVector<FrozenValue, 16>`,
+    /// dfg/DFGGraph.h:1376): the append-only frozen-value arena `freeze`/
+    /// `freeze_strong` allocate into. Index-is-identity, same idiom as
+    /// `nodes`/`blocks`/`edges` above; C++ hands out a stable `FrozenValue*`,
+    /// Rust hands out the stable `FrozenValueId` index instead.
+    pub frozen_values: Vec<FrozenValue>,
+    /// `m_frozenValueMap` (`UncheckedKeyHashMap<EncodedJSValue, FrozenValue*,
+    /// EncodedJSValueHash, EncodedJSValueHashTraits>`, dfg/DFGGraph.h:1375):
+    /// dedups `freeze`/`freeze_strong` by the value's raw encoded bits, keyed
+    /// the same way C++ keys by `EncodedJSValue` (a plain `uint64_t`).
+    pub frozen_value_map: HashMap<u64, FrozenValueId>,
     pub common_data: DfgCommonDataDescriptor,
     pub generation: u64,
     /// DFG graph mutation is phase-local. Consumers outside the active phase
@@ -483,6 +512,8 @@ impl DfgGraph {
             edges: Vec::new(),
             variable_access_data: Vec::new(),
             watchpoints: Vec::new(),
+            frozen_values: Vec::new(),
+            frozen_value_map: HashMap::new(),
             common_data: DfgCommonDataDescriptor::default(),
             generation: 0,
             mutation_authority: DfgGraphMutationAuthority::BytecodeParser,
@@ -531,6 +562,115 @@ impl DfgGraph {
         self.variable_access_data
             .push(VariableAccessData::new(operand));
         id
+    }
+
+    /// `Graph::freeze(JSValue)` (dfg/DFGGraph.cpp:1633-1657): "We use weak
+    /// freezing by default" (DFGGraph.h:276). Dedups by the value's raw
+    /// encoded bits through `frozen_value_map` into the append-only
+    /// `frozen_values` arena, mirroring `m_frozenValueMap`/`m_frozenValues`.
+    ///
+    /// This is the ONLY faithful path a heap constant may enter a DFG graph
+    /// through (GC-audit hard blocker #1 / divergence #3): a raw, un-frozen
+    /// cell reference must never appear in the graph.
+    ///
+    /// `structure` is the resolved `Structure*` C++ reads live off the cell
+    /// (`value.asCell()->structure()`, DFGFrozenValue.h:119) — see
+    /// `FrozenValue`'s struct doc for why `DfgGraph::freeze` takes it as an
+    /// explicit caller-supplied parameter instead (no heap access here) and
+    /// for the second, narrower divergence (leaf cells not yet carrying a
+    /// `StructureId` in this crate).
+    ///
+    /// C++ additionally special-cases `!value` by returning
+    /// `FrozenValue::emptySingleton()` without touching the map/arena
+    /// (DFGGraph.cpp:1636-1637) and `RELEASE_ASSERT`s the value is never a
+    /// `CodeBlock` (:1643 — "we don't want [an optimized CodeBlock] to be
+    /// part of the weak pointer set"). Neither applies here: this crate has
+    /// no `CodeBlock`-as-`JSValue` concept, and an empty value simply dedups
+    /// through the same map/arena as any other value (repeated freezes of
+    /// the empty value still collapse to one arena entry, matching
+    /// `emptySingleton`'s single shared instance in effect, just not in
+    /// storage).
+    pub fn freeze(&mut self, value: JsValue, structure: Option<StructureId>) -> FrozenValueId {
+        let encoded = value.encoded().0;
+        if let Some(&id) = self.frozen_value_map.get(&encoded) {
+            return id;
+        }
+        let frozen = FrozenValue::with_structure(value, structure, ValueStrength::WeakValue);
+        let id = FrozenValueId(self.frozen_values.len() as u32);
+        self.frozen_values.push(frozen);
+        self.frozen_value_map.insert(encoded, id);
+        id
+    }
+
+    /// `Graph::freezeStrong(JSValue)` (dfg/DFGGraph.cpp:1659-1664): "Shorthand
+    /// for freeze(value)->strengthenTo(StrongValue)" (DFGGraph.h:277). This is
+    /// the path `ByteCodeParser::jsConstant`/`get()` route every bytecode
+    /// constant operand through (DFGByteCodeParser.cpp:401-410, :807-810):
+    /// "Assumes that the constant should be strongly marked."
+    pub fn freeze_strong(
+        &mut self,
+        value: JsValue,
+        structure: Option<StructureId>,
+    ) -> FrozenValueId {
+        let id = self.freeze(value, structure);
+        self.frozen_values[id.0 as usize].strengthen_to(ValueStrength::StrongValue);
+        id
+    }
+
+    /// Read back an arena entry by its stable id.
+    pub fn frozen_value(&self, id: FrozenValueId) -> &FrozenValue {
+        &self.frozen_values[id.0 as usize]
+    }
+
+    /// KEEP-ALIVE root set for this graph's frozen arena — the
+    /// `Graph::visitChildren` analog (dfg/DFGGraph.cpp:1621-1628):
+    /// ```cpp
+    /// for (FrozenValue& value : m_frozenValues) {
+    ///     visitor.appendUnbarriered(value.value());
+    ///     visitor.appendUnbarriered(value.structure());
+    /// }
+    /// ```
+    /// C++ traces EVERY frozen entry — both `WeakValue` and `StrongValue` —
+    /// for as long as the owning `Plan`/`Graph` is reachable by the marker
+    /// (a DFG worklist thread's live plans are GC roots during compilation).
+    /// This is stronger than, and happens BEFORE, the one-time end-of-compile
+    /// `registerFrozenValues` split into CodeBlock-constant (`StrongValue`)
+    /// vs. `m_plan.weakReferences()` (`WeakValue`) (DFGGraph.cpp:1595-1619,
+    /// out of this unit's scope — no `DfgPlan` reaches that compile stage
+    /// yet). `value.structure()` is deliberately NOT included: this crate's
+    /// `StructureId` (the `gc::StructureId` newtype) is a `StructureIdTable`
+    /// registry handle (`object/structure_cell.rs`), not an arena `CellId`
+    /// this collector sweeps, so there is nothing to root for it (divergence:
+    /// C++ `Structure` is itself an ordinary swept `JSCell`, visited
+    /// alongside the value; this crate's structures are a separate
+    /// long-lived registry table outside the object-cell collector's sweep
+    /// set — already true of every other `StructureId` field in this module,
+    /// e.g. `DfgNode::structure`, none of which are rooted anywhere either).
+    ///
+    /// WIRING STATUS (the noted follow-up, not papered over): no live-plan
+    /// registry exists anywhere in this crate yet — `DfgPlan`
+    /// (dfg/plan.rs) is constructed ad hoc by each caller with no worklist or
+    /// registry field on `CoreOpcodeDispatchHost` or `Vm` (verified: nothing
+    /// outside dfg/plan.rs and its own tests references `DfgPlan`). C++'s
+    /// production analog is a worklist thread's live `Plan` set, walked by
+    /// the concurrent collector's root-marking pass. Until a live-plan owner
+    /// exists, this method cannot be folded into
+    /// `CoreOpcodeDispatchHost::poll_gc_collection_safepoint`'s `host_roots`
+    /// gather (the established root-provider pattern from the CodeBlock
+    /// constant-pool fold, `gather_code_block_constant_roots`,
+    /// interpreter/mod.rs) — there is no live set to iterate. A DFG
+    /// compilation MUST therefore run to completion without crossing a GC
+    /// safepoint until that wiring lands, or the caller crossing a safepoint
+    /// mid-compile must fold THIS method's output into its own roots itself.
+    /// Proven directly (this unit's tests): fold this method's output into
+    /// `force_collect_values`'s `extra_roots` and a frozen cell survives;
+    /// omitting it, the same cell is reclaimed.
+    pub fn gather_frozen_roots(&self) -> Vec<JsValue> {
+        self.frozen_values
+            .iter()
+            .filter(|frozen| frozen.points_to_heap())
+            .map(|frozen| frozen.value())
+            .collect()
     }
 
     pub fn validate(&self) -> Result<(), DfgValidationError> {
@@ -1317,5 +1457,214 @@ mod tests {
 
         assert!(effects.effect_summary().must_preserve_order());
         assert!(!effects.is_observably_pure());
+    }
+
+    // ---- FrozenValue keep-alive unit (dfg/frozen_value.rs; GC-audit hard
+    // blocker #1 / divergence #3): `Graph::freeze`/`freezeStrong` dedup
+    // (DFGGraph.cpp:1633-1664) and the `visitChildren`-analog keep-alive
+    // (`gather_frozen_roots`, DFGGraph.cpp:1621-1628). ----
+
+    use crate::interpreter::CoreOpcodeDispatchHost;
+
+    #[test]
+    fn freeze_dedups_by_encoded_value() {
+        // DFGGraph.cpp:1645-1647: `m_frozenValueMap.add(...)`; a repeated
+        // freeze of the identical encoded value returns the SAME
+        // `FrozenValue*` (here: the same `FrozenValueId`) instead of growing
+        // the arena.
+        let mut graph = DfgGraph::new(DfgGraphId(20), CodeBlockId(CellId(20)));
+        let a = graph.freeze(JsValue::from_i32(42), None);
+        let b = graph.freeze(JsValue::from_i32(42), None);
+        let c = graph.freeze(JsValue::from_i32(43), None);
+
+        assert_eq!(
+            a, b,
+            "freezing the same encoded value twice dedups to one id"
+        );
+        assert_ne!(a, c, "a different value gets a different id");
+        assert_eq!(
+            graph.frozen_values.len(),
+            2,
+            "the arena holds exactly one entry per DISTINCT value"
+        );
+    }
+
+    #[test]
+    fn freeze_strong_upgrades_the_deduped_entrys_strength_in_place() {
+        // DFGGraph.cpp:1659-1664: `freezeStrong` is `freeze(value)->strengthenTo(StrongValue)`
+        // — it does not allocate a second arena entry. Uses a CELL value: per
+        // `strengthenTo`'s `isCell()` guard (DFGFrozenValue.h:88-92), a
+        // non-cell value's strength never actually upgrades (see
+        // `strengthen_to_is_a_no_op_for_non_cell_values` in frozen_value.rs),
+        // so this test must exercise a cell to prove the upgrade happens.
+        let mut graph = DfgGraph::new(DfgGraphId(21), CodeBlockId(CellId(21)));
+        let cell_like = JsValue::from_encoded(crate::value::EncodedJsValue(0x3_0000_0020));
+        assert!(
+            cell_like.is_cell(),
+            "fixture must actually decode as a cell"
+        );
+
+        let weak_id = graph.freeze(cell_like, Some(StructureId::new(1)));
+        assert_eq!(
+            graph.frozen_value(weak_id).strength(),
+            ValueStrength::WeakValue
+        );
+
+        let strong_id = graph.freeze_strong(cell_like, Some(StructureId::new(1)));
+        assert_eq!(
+            strong_id, weak_id,
+            "freeze_strong dedups onto the same arena entry"
+        );
+        assert_eq!(
+            graph.frozen_value(weak_id).strength(),
+            ValueStrength::StrongValue,
+            "the existing entry's strength is upgraded in place"
+        );
+        assert_eq!(graph.frozen_values.len(), 1);
+    }
+
+    #[test]
+    fn gather_frozen_roots_includes_only_cell_valued_entries() {
+        // The root set only ever needs to protect HEAP values;
+        // DFGFrozenValue.h:94's `pointsToHeap()` gate is exactly what filters
+        // non-cell immediates out of `visitChildren`'s (and this method's)
+        // output.
+        let mut graph = DfgGraph::new(DfgGraphId(22), CodeBlockId(CellId(22)));
+        let immediate = JsValue::from_i32(9);
+        let cell_like = JsValue::from_encoded(crate::value::EncodedJsValue(0x2_0000_0020));
+        assert!(
+            cell_like.is_cell(),
+            "fixture must actually decode as a cell"
+        );
+
+        graph.freeze(immediate, None);
+        graph.freeze_strong(cell_like, Some(StructureId::new(1)));
+
+        assert_eq!(graph.gather_frozen_roots(), vec![cell_like]);
+    }
+
+    #[test]
+    fn frozen_string_cell_survives_collection_when_graph_roots_are_folded_in() {
+        // LOAD-BEARING: this is the keep-alive claim itself. A string cell
+        // referenced ONLY by a live DfgGraph's frozen arena (no register/
+        // stack/lexical binding) must survive a real collection when the
+        // graph's `gather_frozen_roots()` output is folded into the
+        // collection's root set — the production `host_roots` fold this unit
+        // could not wire (see `gather_frozen_roots`'s doc: no live-plan
+        // registry exists yet). The companion test right below proves the
+        // negative: the identical setup, minus the fold, reclaims the cell —
+        // so survival here comes from the fold, not from some other
+        // accidental root.
+        let mut host = CoreOpcodeDispatchHost::default();
+        let folded = host.allocate_untracked_string_for_test("dfg-frozen-constant");
+
+        let mut graph = DfgGraph::new(DfgGraphId(23), CodeBlockId(CellId(23)));
+        // Leaf string cells carry no `StructureId` in this crate yet (see
+        // `FrozenValue`'s struct doc) — `None` is the faithful adaptation,
+        // not a shortcut.
+        graph.freeze_strong(folded, None);
+
+        let roots = graph.gather_frozen_roots();
+        assert_eq!(roots, vec![folded]);
+        host.force_collect_values_for_test(&roots);
+
+        assert!(
+            host.is_value_marked_for_test(folded),
+            "the frozen constant is reachable from the folded root"
+        );
+        assert_eq!(
+            host.string_text_for_test(folded),
+            Some("dfg-frozen-constant"),
+            "the frozen constant reads back intact (the UAF read)"
+        );
+    }
+
+    #[test]
+    fn unfrozen_string_cell_is_reclaimed_without_the_root_fold() {
+        // Negative half of the load-bearing proof above: the SAME setup, but
+        // the collection runs with the frozen graph's roots deliberately NOT
+        // folded in (as if `gather_frozen_roots` were never wired). The cell
+        // — referenced by nothing else — is swept.
+        let mut host = CoreOpcodeDispatchHost::default();
+        let unrooted = host.allocate_untracked_string_for_test("dfg-unrooted-constant");
+
+        let mut graph = DfgGraph::new(DfgGraphId(24), CodeBlockId(CellId(24)));
+        graph.freeze_strong(unrooted, None); // frozen in the graph, but not folded into roots below
+
+        host.force_collect_values_for_test(&[]);
+
+        assert!(
+            !host.is_value_marked_for_test(unrooted),
+            "with the frozen-root fold omitted, nothing keeps this cell alive"
+        );
+        assert_eq!(
+            host.string_text_for_test(unrooted),
+            None,
+            "the unrooted cell is swept + its slot reconciled"
+        );
+    }
+
+    #[test]
+    fn frozen_cell_constant_coexists_with_a_parser_produced_graph() {
+        // The bytecode parser cannot yet PRODUCE a cell-valued constant node
+        // itself: no linked constant pool carries a cell today (the
+        // CodeBlock constant-pool root-fold commit f213265 found "NO
+        // cell-valued constant reaches any real pool today" — string
+        // literals materialize into registers via LoadString, not a pool
+        // cell). This freezes one directly into a REAL parser-produced graph
+        // instead, proving the frozen arena composes cleanly with parsing
+        // output rather than only a freshly-`DfgGraph::new()`'d empty graph.
+        use crate::bytecode::code_block::{
+            CodeBlock, CodeKind, LinkContext, UnlinkedCodeBlock, UnlinkedConstantPool,
+        };
+        use crate::bytecode::instruction_stream::{
+            opcode_id, InstructionStreamWriter, OperandValue,
+        };
+        use crate::bytecode::register::{RegisterFrameShape, SpecialRegisters};
+        use crate::bytecode::PackedInstructionStream;
+
+        const THIS_OFFSET: i32 = 5; // CallFrameSlot::thisArgument (CallFrame.h).
+        let argument_register = |argument: u32| THIS_OFFSET + argument as i32;
+
+        // `f(a) { return a; }` — the same identity-function fixture used by
+        // parser.rs's and plan.rs's own tests.
+        let mut writer = InstructionStreamWriter::new();
+        writer.emit(opcode_id::ENTER, &[]);
+        writer.emit(
+            opcode_id::RET,
+            &[OperandValue::VirtualRegister(argument_register(1))],
+        );
+        let bytes = writer.finalize().bytes().to_vec();
+
+        let unlinked = UnlinkedCodeBlock::new(
+            CodeKind::Function,
+            PackedInstructionStream::from_raw_packed_bytes(bytes),
+        )
+        .with_frame(RegisterFrameShape {
+            num_parameters_including_this: 2,
+            num_vars: 1,
+            num_callee_locals: 1 + 8,
+            num_temporaries: 0,
+            special: SpecialRegisters {
+                scope_register: VirtualRegister::local(0),
+                ..SpecialRegisters::default()
+            },
+        })
+        .with_constants(UnlinkedConstantPool::default());
+        let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
+
+        let mut graph = crate::dfg::parser::parse(&code_block).expect("identity function parses");
+        assert_eq!(graph.form, GraphForm::LoadStore);
+
+        let mut host = CoreOpcodeDispatchHost::default();
+        let cell = host.allocate_untracked_string_for_test("parser-graph-frozen-constant");
+        let id = graph.freeze_strong(cell, None);
+
+        assert_eq!(graph.frozen_value(id).value(), cell);
+        assert_eq!(
+            graph.frozen_value(id).strength(),
+            ValueStrength::StrongValue
+        );
+        assert_eq!(graph.gather_frozen_roots(), vec![cell]);
     }
 }
