@@ -28,20 +28,21 @@ effort, engine-from-scratch to R ≥ 1.0.
 | # | Workstream | % total | Done | Notes |
 |---|---|---|---|---|
 | 1 | Interpreter + parser + bytecompiler + runtime/builtins (run all 15 correctly) | 27% | ~90% | 13/15 validate; 2 asm.js DNF (JIT-gated); correctness tail remains |
-| 2 | Faithful foundation (value/GC-arena/Structure/strings/profiling/bytecode) + Phase E + throwers + call-link | 13% | ~95% | built, mostly unwired |
+| 2 | Faithful foundation (value/GC-arena/Structure/strings/profiling/bytecode) + Phase E + throwers + call-link | 13% | ~98% | built; profile population round COMPLETE (value+array+binary/unary arith all record live, `c650d48`/`8a2b5e7`/`1f53724`/`5f45ab9`); generated 193-opcode table IS `OPCODE_TABLE` (G1–G3, `833592d`/`ee174a7`/`7accf10`) |
 | 3 | Assembler codegen (operands→encoder→LinkBuffer→W^X execution) | 3% | 100% | emit→relocate→execute proven |
 | 4 | R scoreboard / measurement harness | 1% | 100% | local C++ `jsc` release build + Rust release, identical harness; C++ baseline is the measuring instrument and must be re-measured |
 | 5 | JSStack execution substrate (stack model + entry + frames) | 5% | ~70% | stack model DECIDED (Option A = native stack); B1–B4 + A1.0/A1.1 native-stack entry LANDED; A2 interp-migration + arity/varargs remain |
-| 6 | GC/value cutover: POD object model + R4 + running collector | 7% | ~65% | object + string R4a GC LIVE (arena/swept/auto-triggered); symbol/bigint leaf GC + visitWeak + conservative-scan remain |
+| 6 | GC/value cutover: POD object model + R4 + running collector | 7% | ~90% | **arena LEAK-FREE end-to-end**: object (R4b) + string (U0/U1) + bigint (`354cb89`) + symbol (`c9c3227`, the last leaking cell store) all reclaim; weak-finalization seam + faithful WeakMap/WeakSet ephemeron semantics (`3ad0ab7`); CodeBlock constant-pool rooting closed a latent UAF (`f213265`). Remaining: scoped native-stack conservative scan (GAP C), generational/incremental |
 | 7 | **Baseline JIT** (per-opcode machine code + native calls + profiling + tier-up) | 10% | ~35% | native path measured net-win over interpreter (LATE-5 geomean execoff/interp ~1.086, mixed); further baseline breadth is now local-win/deferred except bailout soundness (JITCodeMap OSR landing map landed) |
-| 8 | **DFG** (bytecode→SSA→speculation→SpeculativeJIT+OSR) | 18% | 0% | precursors landing: packed wedge live+hardened, SpeculatedType canonical, faithful NodeType/flags/VAD skeleton, profile storage+derivation (F0); W1 ids+sub/mul landed; population in flight; parser (P2) in flight |
+| 8 | **DFG** (bytecode→SSA→speculation→SpeculativeJIT+OSR) | 18% | ~4% | precursors landing: packed wedge live+hardened, SpeculatedType canonical, faithful NodeType/flags/VAD skeleton, profile storage+derivation+population all DONE; W1 ids+sub/mul landed; **first bytecode→DFG parser LANDED** (`src/dfg/parser.rs`, `c164345` — single-BB non-speculative slice, no plan/phases/codegen yet) |
 | 9 | **FTL + B3 + Air** (top tier + optimizer + register allocation) | 15% | 0% | — |
 | 10 | Final correctness + perf tuning to hit R ≥ 1.0 | 1% | 0% | the last mile |
 
-**≈ 40% by effort.** But by *measured R* we are near the start: rows 7–9 (43% of the
-whole project, still near 0% done for the optimizing tiers) are the only rows that lift R from
+**≈ 55% by effort.** But by *measured R* we are near the start: rows 7–9 (43% of the
+whole project, still ~2% done for the optimizing tiers) are the only rows that lift R from
 ~0.001 to ≥ 1.0. The baseline JIT now proves native execution can beat the interpreter, but
-DFG/FTL are what move R by orders of magnitude.
+DFG/FTL are what move R by orders of magnitude. R itself did not move this round — this closes
+foundational GC/profiling/bytecode dependencies the DFG/JIT need.
 
 ---
 
@@ -59,29 +60,38 @@ The baseline JIT now runs and is a net win over the interpreter, but R ≥ 1.0 l
    onto native CallFrames).
 2. **GC / cell identity (R4)** (row 6) — object-cell R4a GC is **LIVE/DONE** (POD `CoreObjectCell` in
    the arena, raw-address identity, real mark→reconcile→sweep→free-list, auto-triggered at a byte counter
-   polled at interpreter back-edges). **String-cell GC LANDED (U0/U0b/U1, b73d806): strings arena-managed
-   + swept + the string leak closed.** `docs/design/gc-r4.md` + `gc-r4-completion.md`. Remaining: symbol/
-   bigint leaf GC (U2/U3, share the landed U0b gate), `visitWeak` weak-processing (U7 — unblocks GC-safe
-   call-link callee caching), the scoped native-stack conservative scan (GAP C), generational/incremental.
+   polled at interpreter back-edges). **The GC round is now COMPLETE — the arena is LEAK-FREE
+   end-to-end**: string (U0/U0b/U1, b73d806), bigint (`354cb89`), and symbol (`c9c3227`, the LAST leaking
+   cell store) all reclaim; a faithful weak-finalization seam + WeakMap/WeakSet ephemeron semantics
+   landed (`3ad0ab7`, the `visitWeak` unit); CodeBlock constant-pool rooting closed a latent constant-cell
+   UAF (`f213265`). `docs/design/gc-r4.md` + `gc-r4-completion.md` (see the 2026-07-02 status-correction
+   header — the design doc's prose predates this arc). Remaining: the scoped native-stack conservative
+   scan (GAP C), generational/incremental collection — neither gates the DFG.
 3. **Packed bytecode stream LIVE cutover** (row 2/8 dependency) — JSC has one flat byte stream consumed
    by LLInt/Baseline/DFG/FTL. First live wedge LANDED (raw mov/ret: byte-offset PC +
    `Fits<VirtualRegister>` constants) and correctness-HARDENED (instruction-start gating — no
    mid-instruction decode, constants placed by constant index, canonical constant bands, ONE opcode
    table, JSC-derived byte fixtures). W1 landed: real generated opcode ids (5d455f1) + sub/mul rows.
-   See `docs/design/dfg-path.md`.
+   **The generator track is now COMPLETE (G1–G3): the OperandKind stream-operand set is the full
+   18-variant census (`833592d`), the JSC-generator-run table emits all 193 opcode rows (`ee174a7`),
+   and that generated table IS the crate's live `OPCODE_TABLE` (`7accf10`) — the packed stream can
+   DECODE every JSC bytecode.** G4 (the CoreOpcode identity cutover, ~8k refs, + per-opcode execution
+   admission) remains, as its own serial track. See `docs/design/dfg-path.md`.
 4. **Parallel DFG precursor set** — SpeculatedType canonicalization DONE (canonical u64 bitset in
-   DFG/DOMJIT descriptors). Profile STORAGE + derivation DONE (F0: slots derived for ALL profile-carrying
-   opcodes in program order + Binary/UnaryArithProfile storage/record APIs); POPULATION in flight as 4
-   parallel units (U1–U8: named-loads/scope, by-val+length, binary arith slow-path-only, unary arith) —
-   it hard-gates the DFG past the toy slice (empty profile → ForceOSRExit). Baseline-as-bailout:
-   JITCodeMap LANDED (bci→machine-code landing map persisted on baseline images, U1); exit-target
-   RATIFIED — the first OSR exit lands in the INTERPRETER (exitToLLInt analog), so the bailout hard gate
-   sits before SPECULATIVE DFG only.
-5. **First DFG parser** — single-basic-block, non-speculative, fallback-heavy (matching JSC's first DFG
-   scoping), lowering packed bytecode into `DfgGraph`. Skeleton LANDED: faithful NodeType/NodeFlags/
-   VariableAccessData/Operands (abstract Rust-only taxonomy DELETED; graph starts LoadStore).
-   `src/dfg/parser.rs` (P2) in flight; lowers type-agnostically (SpecNone), declining every
-   getPrediction opcode.
+   DFG/DOMJIT descriptors). Profile STORAGE + derivation + **POPULATION are now ALL DONE**: the four
+   parallel population units landed (`c650d48` unary arith, `8a2b5e7` named-loads/scope, `1f53724`
+   binary arith, `5f45ab9` by-val/length value+array) — value, array, and arith profiles record live at
+   every LLInt-faithful site, closing the `SpecNone→ForceOSRExit` hazard for the wired opcode set.
+   Remaining profile units (not hard-gating): U8 argument profiles, the getter-resume write,
+   construct-result profiles. Baseline-as-bailout: JITCodeMap LANDED (bci→machine-code landing map
+   persisted on baseline images, U1); exit-target RATIFIED — the first OSR exit lands in the
+   INTERPRETER (exitToLLInt analog), so the bailout hard gate sits before SPECULATIVE DFG only.
+5. **First DFG parser — LANDED** (`src/dfg/parser.rs`, `c164345`): single-basic-block, non-speculative,
+   fallback-heavy (matching JSC's first DFG scoping), lowering `op_enter {mov|add|sub|mul}* op_ret`
+   into a faithful `DfgBasicBlock` (`LoadStore` form, as JSC's does) over the faithful NodeType/
+   NodeFlags/VariableAccessData/Operands skeleton (abstract Rust-only taxonomy DELETED). Lowers
+   type-agnostically (SpecNone), declining every getPrediction opcode — no plan/phases/speculation/
+   codegen yet. Next: a DFGPlan analog owning graph creation + identity stamping.
 6. **DFG speculation + live OSR exit → FTL/B3** — the optimizing tiers that take R to ≥ 1.0.
 
 These can fan out where independent (the JSStack substrate and the GC/POD-cell work are

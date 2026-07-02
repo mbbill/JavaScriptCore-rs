@@ -1,5 +1,35 @@
 # Design — POD object model + R3 → R4 (arena cell identity)
 
+## STATUS CORRECTION (2026-07-02 — read this first)
+
+**This document's body below is a PLAN, written while R3/R4 were still unbuilt. It is now
+STALE prose: the plan it describes has LANDED.** An audit for the 2026-07-02 docs round found
+the body reads as if the POD-ification, the R4a identity flip, and the R4b collector were still
+future work, when in fact the collector RUNS LIVE and reclaims every cell kind today. Per the
+Status Tree rule (`CLAUDE.md`) this doc is NOT rewritten wholesale — the sections below are kept
+for their C++ evidence and the historical rationale behind each ratified decision, and are marked
+`[SUPERSEDED — landed]` at each section that describes now-completed work. For CURRENT status,
+see `docs/STATUS.md` ("GC / value cutover") and `docs/ROADMAP.md`; this file remains the keystone
+DESIGN record (why), not the status source (where things stand now).
+
+**The landed reality:**
+- **R3 → R4a → R4b arc** (the POD object model, the arena-address identity flip, and the
+  mark→reconcile→sweep collector) landed earlier this project: `a01d071` (R3 shadow oracle),
+  `243b89d` (R4a — the irreversible cell-identity flip), `4c17801` (R4b-mark — the collector's
+  marking half). The R4b LIVE DRIVER (the collector actually running, auto-triggered at
+  safepoints) followed and is `[done]` in `docs/STATUS.md`.
+- **This round (2026-07-01/02) closed the arena's remaining leaks and gaps on top of that arc:**
+  symbol cells collectable (`c9c3227` — the LAST leaking cell store; joins object/string/bigint),
+  bigint cells collectable (`354cb89`), a faithful weak-finalization seam + WeakMap/WeakSet
+  ephemeron semantics (`3ad0ab7`, closing the `visitWeak` gap this doc's "GAP" list below still
+  names as open), and CodeBlock constant-pool rooting that closed a latent constant-cell UAF
+  (`f213265`). **The arena is now leak-free end-to-end** — see `docs/STATUS.md` for the current
+  one-paragraph summary and `docs/design/gc-r4-completion.md` for the R4 completion record.
+- Still genuinely open (not superseded by this round): the scoped native-stack conservative scan
+  (GAP C below, gated on the JSStack B4b/B6 migration) and generational/incremental collection.
+
+---
+
 The GC/value track to a running JIT: the JIT emits raw cell pointers and assumes a
 sweeping GC, but the live object cell is a fat Drop-bearing Rust struct that cannot
 live in a sweep-freed MarkedBlock. This is the plan to make it POD and flip cell
@@ -18,7 +48,7 @@ calls no destructors, so the cell must be POD (no Rust `Drop`).
   elements grow right, IndexingHeader between. Per-kind payloads (Map/Set/Promise/
   ArrayBuffer/BoundFunction state) live in their own cells / auxiliary allocations.
 
-## The live divergence (the blocker)
+## The live divergence (the blocker) `[SUPERSEDED — landed; kept as historical rationale]`
 
 `CoreObjectCell` (object_store.rs:320-427) carries **~18 fat Drop-bearing fields** —
 making it non-POD and un-sweepable. Current workaround: `Vec<Pin<Box<CoreObjectCell>>>`
@@ -31,7 +61,7 @@ set_values → JSOrderedHashTable; regexp_source/flags → JSString cells; promi
 reaction cells; array_buffer_data → auxiliary u8 backing; bound_args/captures/instance_fields
 → separate array/function cells.
 
-## The gating hazard: `storage_ptr` self-reference (audit 2026-06-28)
+## The gating hazard: `storage_ptr` self-reference (audit 2026-06-28) `[SUPERSEDED — landed]`
 
 `storage_ptr: *const RuntimeValue` (object_store.rs:347, the butterfly slot @8) points
 into the cell's OWN `out_of_line_storage` Vec — a self-referential interior pointer. It
@@ -42,7 +72,7 @@ Eliminating it (point `storage_ptr` at a SEPARATE butterfly allocation) is a HAR
 precondition, and it lives inside the rank-1 Butterfly-values unit — so that unit is both
 highest-value and the R4 gate. **Lead the GC track with Butterfly-values.**
 
-## Rewrite plan — vertical slices, build green every commit (refined 2026-06-28)
+## Rewrite plan — vertical slices, build green every commit (refined 2026-06-28) `[SUPERSEDED — all units landed]`
 
 NOT the big-bang "delete all ~18 fat fields then refill" — that breaks the build across
 the 56 `find_mut` sites + every per-kind path until all units land, so the tree is never
@@ -109,7 +139,7 @@ the struct-def field-deletions + Default/Clone edits all touch object_store.rs:3
   arena butterfly pointer (so `storage_ptr@8` is a real `[base+8]→[ptr+off*8]` deref) lands at
   R4. A cross-cutting identity decision, settled this way to keep B1a/Butterfly-values reversible.
 
-## R4 POD-ification phase — integration order + rulings (2026-06-29, post B-iv + live-tier-up)
+## R4 POD-ification phase — integration order + rulings (2026-06-29, post B-iv + live-tier-up) `[SUPERSEDED — all 9 units landed, CoreObjectCell is POD]`
 
 Strategic-assessment + anti-anchor (HEAD f139350) confirmed the remaining **9 Drop fields** on
 `CoreObjectCell` (object_store.rs): `instance_fields`(376), `captures`(377), `map_entries`(398),
@@ -138,7 +168,7 @@ region). All others are already Copy/POD.
   Auxiliary-subspace home with its own trace+sweep, or it leaks exactly as today. The POD units
   are the sweepability PRECONDITION, not the leak fix.
 
-## R3 → R4 (refined by the readiness audit 2026-06-28)
+## R3 → R4 (refined by the readiness audit 2026-06-28) `[SUPERSEDED — R4a landed (243b89d), IRREVERSIBLE]`
 
 R4 is LOW-risk MECHANICALLY — the value ALREADY carries the raw cell pointer
 (`RuntimeValue::from_cell`, object_store.rs:3780; `find_mut` round-trips the index map ONLY
@@ -179,7 +209,7 @@ mechanical. The SHARP EDGE is below; the REAL work is the collector (next sectio
   preserved, every two-cell site provably copies out, `needs_drop::<CoreObjectCell>()==false`
   compiles; (d) all 15 Octane benches pass. Orchestrator verifies all four, then merges.
 
-### R4a ratified design (2026-06-29 — the flip audit's serial object-model decisions)
+### R4a ratified design (2026-06-29 — the flip audit's serial object-model decisions) `[SUPERSEDED — landed, decisions executed as ratified]`
 
 The flip audit turned "delete object_indices_by_payload" into THREE object-model
 decisions, now RATIFIED (all in-tree-supported, low-risk):
@@ -212,7 +242,7 @@ decisions, now RATIFIED (all in-tree-supported, low-risk):
   EDGE): the returning-find form makes most cases compile-enforced; the closure
   with_cell_mut sites copy out Copy data first, drop the borrow, re-deref.
 
-## The collector — the REAL gap (gated on POD-ness / Batch 1)
+## The collector — the REAL gap (gated on POD-ness / Batch 1) `[SUPERSEDED — GAP A/B/D landed; GAP C (JS-stack conservative scan) is the one item still open, see docs/STATUS.md]`
 
 The audit found the live cell has neither a trace nor a sweep; the only Trace impls are
 unwired no-op skeletons. "Make the collector run" = author these, all gated on the same
@@ -242,7 +272,7 @@ relocation-safety):
   impls target the wrong type and can't be reused as-is. Same reconciliation as the
   storage.rs↔butterfly_handle.rs Butterfly consolidation (B1a): consolidate onto `RuntimeValue`.
 
-### R4b ratified design (2026-06-29 — the collector-cycle audit)
+### R4b ratified design (2026-06-29 — the collector-cycle audit) `[SUPERSEDED — landed (4c17801 mark; live driver followed); this round added symbol/bigint leaf reclaim + the visitWeak seam on top]`
 
 R4b wires the live cycle: roots → mark → reconcile (free slabs + drop reverse-index)
 → sweep. **THE #1 UAF RISK (audit catch, a mass-UAF landmine):** the collector's
@@ -296,7 +326,7 @@ BOUNDED no-OOM micro-probe (NOT heavy benches) asserting arena + butterfly-slab 
 counts return to baseline; THEN the heavy Octane benches become runnable (gate them in via
 the micro-probe FIRST — the leak persists until R4b lands).
 
-### R4b live-driver root-completeness audit (2026-06-29)
+### R4b live-driver root-completeness audit (2026-06-29) `[SUPERSEDED — fixes landed; the driver runs live]`
 
 Closed three root-completeness risks the green unit suite did not exercise but a real
 Octane bench would (a missed root = a swept live cell = UAF). The intrinsic gather had
@@ -325,7 +355,7 @@ roots ONLY the prototypes, NOT the actual global object / its bindings:
 - **`allocate_blob` (#4, CONFIRMED).** Only ARMS the deferred request (bumps the byte counter);
   never collects inline (decision 5) — `gc/heap/marked_space.rs::allocate_blob`.
 
-## Dependency / ordering
+## Dependency / ordering `[SUPERSEDED — the described chain executed in full]`
 
 value-rep NaN-box (done) → Structure-wire (offset map → PropertyTable; in flight) → B1a
 (shared butterfly/aux infra, serial) → per-kind vertical slices integrated serially in rank

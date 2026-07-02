@@ -28,12 +28,17 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 - [done] Structure leaf ports + Structure cell (StructureID/StructureIdTable/TypeInfoBlob/PropertyTable).
 - [done] StringImpl Stage A (8/16-bit Latin-1/UTF-16, O(1) index).
 - [done] profiling: ArithProfile + ExecutionCounter (faithful bitfields) + SpeculatedType u64 bitset (canonical
-  in DFG/DOMJIT); profile-slot derivation for ALL profile-carrying opcodes + Binary/Unary ArithProfile
-  storage/record APIs (F0). [wip] population U1-U8 (4 parallel units: named-loads/scope, by-val+length,
-  binary arith slow-path-only, unary arith).
+  in DFG/DOMJIT); profile-slot derivation + **POPULATION ROUND COMPLETE** — value (named-loads/scope/by-val/
+  lengths/calls), array (by-val reads+writes/lengths/InByVal), and binary+unary arith profiles all record live
+  at LLInt-faithful sites (`c650d48`/`8a2b5e7`/`1f53724`/`5f45ab9`; closes the DFG `SpecNone→ForceOSRExit`
+  hazard for the wired set). [missing] U8 argument profiles; getter-resume value-profile write; construct-result
+  profiles.
 - [done] bytecode: faithful packed instruction-stream core (Vec<u8>, byte-offset index, width-aware); mov/ret
-  wedge LIVE + hardened (instruction-start gating, constant-index placement, canonical constant bands, ONE
-  opcode table, JSC byte fixtures). [done] W1: real generated opcode ids + sub/mul rows (5d455f1).
+  wedge LIVE + hardened (instruction-start gating, constant-index placement, canonical constant bands); W1 real
+  generated opcode ids + sub/mul rows (5d455f1). **GENERATOR TRACK COMPLETE (G1-G3):** OperandKind full
+  18-variant stream-operand census (`833592d`); JSC's own generator emits all 193 opcode rows (`ee174a7`); that
+  generated table IS the crate's live `OPCODE_TABLE` (`7accf10`) — the packed stream DECODES every JSC bytecode.
+  [deferred] G4: the CoreOpcode identity cutover (~8k refs) + per-opcode execution admission (separate track).
 
 ## Assembler / codegen (PROVEN end-to-end: emit → relocate → execute)
 - [done] AbstractMacroAssembler operands + RegisterID + ARM64 encoder (byte-oracle-proven).
@@ -56,82 +61,26 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
 - [wip] B4b/B6 drop the Vec oracle + retire CallFrameId (arena CallFrame* = identity); B5 prologue split;
   B7 wire the encoder to emit ldr/str [x29,#vreg*8] against the arena.
 
-## GC / value cutover (toward R4 — see docs/design, the arena cell identity the JIT emits)
-- [done] the arena + marking core (above), unwired.
-- [done] Structure-wire: the #1 divergence corrected — per-cell offset map → per-shape
-  Structure::PropertyTable (StructureIdTable is the offset authority; offsets flow from
-  transitions; inline_cap=6; delete-then-readd recycles faithfully via m_deletedOffsets).
-- [done] B1a butterfly infra (additive, dead_code): object/butterfly_handle.rs (ButterflyAllocation
-  over RuntimeValue + store slab + allocate/clone/prop/elem API) + object/auxiliary.rs scaffold;
-  ButterflyHandle moved out of storage.rs.
-- [done] Butterfly-values cutover (verified): storage/elements → the store slab; the offset-8 slot is
-  a ButterflyHandle (separate alloc) — **storage_ptr de-self-referenced (the R4 UB hazard, gone)**;
-  Clone-via-store; ~74 sites flipped (copy-out pattern). KEEPS the HashMap (cell NOT yet POD).
-- [done] GetterSetter infra B-i/ii/iii (Accessor attribute bit 1<<4, GetterSetter cell, symbol+accessor
-  keys get REAL Structure offsets) — dual-write stage, folded into the B-iv flip below.
-- [done] B-iv FLIP (irreversible, 66a860a): the per-cell properties HashMap (value authority) DELETED —
-  reads route structure offset → butterfly slot; accessors via the butterfly GetterSetter; property_order
-  folded into PropertyTable entry order; vestigial deleted_offsets dropped (recycle owned by m_deletedOffsets);
-  in-place data↔accessor conversion now offset-stable (corrects a pre-flip offset-vanish defect). Gated by a
-  randomized HashMap-oracle equivalence test (per-op get/enum/accessor diff). needs_drop POD assert still
-  waits for the OTHER per-kind units.
-- [done] per-kind POD-ification COMPLETE (all 6 units, cheapest-first, serial): bound_args /
-  promise_reactions / regexp_source / array_buffer_data / map_entries / set_values / captures /
-  instance_fields all relocated to store-owned aux slabs via POD Copy handles, regexp_flags_text deleted
-  (recompute from bits). **CoreObjectCell is now POD — `const _ = assert!(!needs_drop::<CoreObjectCell>())`
-  COMPILES (atomic sweepability proof).** Documented deferred-faithful deviations: Map/Set JSOrderedHashTable
-  (O(1)), captures JSLexicalEnvironment; instance_fields key interned to a POD AtomId. Each aux slab still
-  holds GC edges (except ArrayBuffer raw bytes) → the collector trace must visit them.
-- [done] collector TRACE (GAP A) authored (unwired, R4-gated): CoreObjectStore::trace_cell visits the 15
-  inline RuntimeValue edges + butterfly (props+elements) + the value aux slabs (bound_args/captures/
-  instance_fields/map/set/promise_reactions), skips the non-edge slabs (regexp String, ArrayBuffer bytes);
-  targets RuntimeValue via as_cell (GAP D honored, NOT the skeleton JsValue path), through a minimal
-  CellEdgeVisitor trait. R4's collector driver supplies the adapter (CellValue bits → arena addr → Tracer).
-- [done] collector SWEEP (GAP B) authored (unwired, R4-gated): FreeList::sweep_block mirrors
-  MarkedBlock::specializedSweep<DoesNotNeedDestruction> — scans the mark bitmap, threads unmarked atoms into
-  the FreeList (legal precisely because needs_drop==false → no destructors), retains marked + newly-allocated,
-  rebuilds the interval free-list. MIRI-CLEAN (Stacked + Tree Borrows, 0 UB) over the demo POD cell. R4 drives
-  it stopAllocating→sweep→resumeAllocating across the directories.
-- [done] R4a cell-identity FLIP (IRREVERSIBLE, verified sound-and-complete): CoreObjectCell identity = the
-  raw MarkedSpace arena address; DELETED the leaking Vec<Pin<Box>> object stores + object_indices_by_payload
-  + the R3 shadow. MarkedSpace::find (isPointerGCObjectJSCell port) is the object-vs-foreign TYPE GATE (leaf
-  String/Symbol/BigInt cells stay in their own Vec stores → Box addr ∉ arena block → None → no type-confusion
-  deref); cell_at(&self)/with_cell_mut(&mut self) deref islands; ~30 find_mut → with_cell_mut (find() stays,
-  132 read sites untouched); self-aliasing copy-out is COMPILER-ENFORCED by the safe API. Gate (TECHNICAL,
-  the leak forbids benches pre-R4b): 2750 tests + miri tree-borrows 0 UB (deref/butterfly/self-aliasing/
-  type-gate) + release round-trip + INDEPENDENT adversarial verify = sound-and-complete (7/7 refutations
-  failed). Decision D (ptr<<8 / ptr<2^41) confirmed in release; B: find_by_object_id uses a store-local
-  CellId→addr index (heap unreachable) — **R4b's sweep MUST invalidate stale entries**; C: CoreObjectStore::
-  clone deleted. NIT: vestigial shadow fns + dead CoreObjectCell Clone to prune.
-- [done] R4b-mark — the marking half (verified, unwired): the MEMBERSHIP-ONLY gate is_arena_cell (= find
-  MINUS is_live_cell — the #1 UAF landmine; a test proves it admits a post-sweep survivor that liveness-find
-  REJECTS) + clear_all_marks + the CellEdgeVisitor/VisitChildren mark adapter over trace_cell/SlotVisitor +
-  gather_all_gc_roots (register file + frame callee + exceptions + the ~25 CoreObjectStore intrinsic roots +
-  jit_pending; microtask queue not-yet-a-live-source, lexical_scope transitively rooted via the captures
-  slab — both with evidence). 2761 tests + miri TB 0 UB (incl. the ≥2-collection survivor test). MARK-ONLY →
-  nothing freed, no UAF surface yet.
-- [done] R4b-sweep MECHANISM (force_collect, verified, NOT yet live-wired): for_each_object_cell + a
-  store-driven PRE-SWEEP reconcile (reads each DEAD cell's handles via an AUTHORITATIVE live-set — needed
-  because a never-allocated zeroed slot decodes Handle(0) aliasing a LIVE slab — frees its butterfly+aux slots
-  via 9 per-slab free-lists [allocate_* reuse them], drops the reverse-index, BEFORE sweep_block clobbers it)
-  → FreeList::sweep_block (multi-block). force_collect = mark → reconcile → sweep. PROVEN: the bounded no-OOM
-  micro-probe returns to EXACTLY baseline (43 cells/43 slots) after every collection with the slab bounded
-  (the LEAK IS FIXED); ≥2-collection landmine (s2.reclaimed==0); free-list reuse; self-aliasing under
-  collection; miri TB 0 UB; whole suite 2766 green (force_collect explicit/unwired).
-- [done] R4b LIVE DRIVER — **the object-cell collector now RUNS**: byte-counter trigger in allocate_blob
-  (4MB prod / 16KB cfg(test)) arms a request; collected at the back-edge / VM-entry safepoint
-  (DeferToVm-gated; NO inline collection → re-entrancy foreclosed) via gather_all_gc_roots → force_collect,
-  STW-flagged. An adversarial verify caught + we FIXED a REAL mass-UAF: the global object (Program/Eval
-  this_value) + the host global lexical let/const/class bindings were NOT rooted → top-level functions/
-  constructors would be swept on the 2nd collection; now gathered (≥2-collection survival tests). #3 builtin
-  callbacks proven sound by construction (DirectInterpreter-inherited → poll suppressed, tested); #1 baseline
-  frames confirmed forward-only (arith-only/cell-free) + documented. 2770 tests + miri TB 0 UB on the live
-  cycle. **THE OBJECT-CELL LEAK IS FIXED LIVE** (micro-probe returns to baseline).
-- [done] STRING-cell GC (U0/U0b/U1) — the string leak CLOSED: U0 type-dispatched marker/reconcile by cell
-  js_type; U0b the mutator isObject() gate (the faithful isPointerGCObjectJSCell-then-isObject the port had
-  collapsed); U1 CoreStringCell→POD arena cell + string_texts slab + rope fiber edge + weak interning removal.
-- [missing] U2/U3 symbol+bigint leaf GC (share U0b); U7 visitWeak (CLEAR/RELINK phase); A1.5 scoped native-stack
-  JIT-frame scan (in flight). Heap cell-id table not cleaned for eager-bound strings (follow-up; arena leak fixed).
+## GC / value cutover (toward R4 — see docs/design/gc-r4.md, the arena cell identity the JIT emits)
+- [done] the arena + marking core (S4 blocks/free-list/SlotVisitor STW marking) + Structure-wire (the #1
+  divergence corrected — per-cell offset map → per-shape Structure::PropertyTable) + the full POD object
+  model (Butterfly + GetterSetter + all 9 per-kind Drop fields relocated to store-owned aux slabs —
+  `CoreObjectCell` is POD, `needs_drop::<CoreObjectCell>()==false` compiles) + collector trace/sweep authored
+  + the R4a cell-identity flip (IRREVERSIBLE: identity = raw MarkedSpace address) + R4b mark/reconcile/sweep +
+  the R4b LIVE DRIVER (byte-counter-triggered at back-edge/VM-entry safepoints). Each stage independently
+  verified (miri Stacked+Tree-Borrows 0 UB, adversarial VERIFIER, ≥2-collection survival tests). Full
+  R3→R4a→R4b history: `a01d071`/`243b89d`/`4c17801` + docs/design/gc-r4.md.
+- [done] **GC ROUND COMPLETE — THE ARENA IS LEAK-FREE END-TO-END.** All four cell kinds now reclaim: object
+  (R4b live driver, above), string (U0/U0b/U1), bigint (POD limb slab + weak intern, `354cb89`), symbol (POD
+  cell + Symbol.for-registry/well-known/property-key-only root classes, `c9c3227` — the LAST leaking cell
+  store). Plus: a faithful weak-finalization seam + WeakMap/WeakSet ephemeron semantics (mark → finalize-
+  unconditional → reconcile → sweep, mirroring `Heap::runEndPhase`; repeat-until-empty ephemeron fixpoint over
+  marked WeakMaps, `3ad0ab7` — the U7 `visitWeak` unit); CodeBlock constant-pool rooting closed a latent
+  constant-cell UAF (`f213265` — live CodeBlocks act as root providers via host_roots, CodeBlocks stay
+  non-arena). All independently adversarially verified; 2934 tests + miri TB 0 UB.
+- [missing] the scoped native-stack conservative scan (GAP C, gated on the JSStack B4b/B6 migration);
+  generational/incremental collection; heap cell-id table cleanup for eager-bound strings (bounded follow-up,
+  arena leak already fixed).
 
 ## Baseline JIT / DFG / FTL (parity lives here; baseline on the native stack + first native call; DFG/FTL 0%)
 - [done] JIT↔runtime bridge (D1+D5 reborrow shim, Miri-passed; Vm::operation_* split-borrow wrappers; D3
@@ -178,12 +127,15 @@ Legend: `[done]` implemented+verified for the stated scope · `[wip]` partial/ex
   The faithful native path (A1.x above: CallLinkInfo + native-stack bl) now BYPASSES it. Plan: broaden the
   faithful path → beats interp → flip default; then delete the dead generated-* cluster (STEP 5) + de-megafile
   35k tiering.rs (STEP 6, off-gate). STEP 1 (collapse the slow-path dispatch onto CallLinkInfo) = R-neutral cleanup.
-- [wip] DFG precursor set (docs/design/dfg-path.md): packed wedge + SpeculatedType + profile storage/derivation
-  LANDED (foundation section above); JITCodeMap persisted on baseline images (bci→machine-code OSR landing map,
-  U1); faithful NodeType/NodeFlags/VariableAccessData/Operands LANDED — abstract Rust-only DFG taxonomy DELETED,
-  graph starts LoadStore. Ratified: first OSR exit lands in the INTERPRETER (exitToLLInt analog) — bailout hard
-  gate before SPECULATIVE DFG only. [wip] P2 src/dfg/parser.rs (launched).
-- [missing] DFG proper (bytecode→SSA→speculation→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
+- [wip] DFG precursor set (docs/design/dfg-path.md): packed wedge + SpeculatedType + profile storage/derivation/
+  POPULATION all LANDED (foundation section above); JITCodeMap persisted on baseline images (bci→machine-code
+  OSR landing map, U1); faithful NodeType/NodeFlags/VariableAccessData/Operands LANDED — abstract Rust-only DFG
+  taxonomy DELETED, graph starts LoadStore. Ratified: first OSR exit lands in the INTERPRETER (exitToLLInt
+  analog) — bailout hard gate before SPECULATIVE DFG only. **FIRST DFG PARSER LANDED** (`src/dfg/parser.rs`,
+  `c164345`): single-BB non-speculative slice (`op_enter {mov|add|sub|mul}* op_ret`), type-agnostic (SpecNone),
+  declines every getPrediction opcode — no plan/phases/speculation/codegen yet.
+- [missing] DFGPlan analog (graph creation + identity stamping, in flight); DFG speculation
+  (bytecode→SSA→SpeculativeJIT+OSR); FTL + B3 + Air + register allocation.
 
 ## Structural fidelity
 - [done] Phase E: interpreter/mod.rs 41k→33k, all 4 runtime-class stores split to interpreter/*_store.rs.

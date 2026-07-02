@@ -143,7 +143,54 @@ one serial XL track (Prime Focus #3).
 - **Parser architecture:** faithful NodeType enum (landed d935dde); the parser
   owns a mutable working graph; MovHint/delayed-SetLocal ported faithfully.
 
+## Ratified 2026-07-02 (generator track + parser landing + population/GC rounds)
+
+- **Generator track: generate, don't hand-roll (DONE, G1-G3).** `BytecodeList.rb` (run through
+  JSC's own `generator/*.rb`) is the LITERAL source of truth for the opcode table, not a
+  hand-transcribed Rust table. G1 (`833592d`) grew `OperandKind` to the full faithful 18-variant
+  stream-operand set (VirtualRegister/UnsignedImmediate/BoundLabel/ECMAMode/OperandTypes/
+  SignedImmediate/GetPutInfo/IndexingType/SymbolTableOrScopeDepth/ResolveType/…) with each kind's
+  `Fits<T>` semantics ported from `Fits.h`. G2 (`ee174a7`) built `tools/bytecode-gen/generate.rb`,
+  which loads and runs the checkout's generator modules VERBATIM (zero WebKit files modified) and
+  emits all 193 opcode rows, verified 193/193 id/name/length + constants against the measuring
+  instrument's build artifact. G3 (`7accf10`) `include!`s the generated table into
+  `instruction_stream.rs` and makes it the crate's live `OPCODE_TABLE` — the packed stream now
+  DECODES every JSC bytecode; the hand-written 11-row table is gone. Remaining (G4, a separate
+  serial track): the `CoreOpcode` identity cutover (~8k refs) and per-opcode execution admission —
+  decode-only today except the mov/ret wedge.
+- **The parser LANDED** (`c164345`, `src/dfg/parser.rs`): the single-BB non-speculative slice
+  described above is real, not a plan. It mirrors `ByteCodeParser` fn-for-fn (parse/parseBlock,
+  get/getLocalOrTmp/getArgument with `variablesAtTail` reuse, the two-phase MovHint + delayed-
+  SetLocal queue, `flushForReturn`, `makeSafe`, `addToGraph` with `clobbersExitState`).
+  **The add-predicate question is RESOLVED** (settles the earlier scoping audit's claim): `op_add`
+  gates on `hasNumberResult()` being EXACT `NodeResultNumber` (`DFGNode.h:1741-1744`) —
+  `GetLocal`/`JSConstant` are `NodeResultJS` and `DoubleConstant` is `NodeResultDouble`, so this
+  slice can ONLY emit `ValueAdd`/`ValueSub`/`ValueMul`, never `ArithAdd`. The earlier audit's
+  "1.5+2.5 → ArithAdd" claim was WRONG; `Arith*` strengthening is FixupPhase's prediction-driven
+  job, out of scope for this slice. Adversarial verify fixed one MEDIUM finding in-batch: `makeSafe`
+  must NOT merge flags into `ValueSub` (C++'s Add-arm result-shape labels cover
+  ArithAdd/ArithSub/ValueAdd but ValueSub falls to `default: break`, DFGByteCodeParser.cpp:1204-1205).
+- **Population round COMPLETE — the `SpecNone→ForceOSRExit` gate is now CLOSED for the wired opcode
+  set.** Four parallel units landed: unary arith (`c650d48`), named-loads/scope value profiles
+  (`8a2b5e7`), binary arith (`1f53724`), by-val/length value+array profiles (`5f45ab9`). Value,
+  array, and arith profiles now record LIVE at LLInt-faithful sites — the hard finding from the
+  profiling audit (an empty profile poisons the whole function via `ForceOSRExit`) no longer
+  applies to this set. Two prompt-belief corrections proved from the LLInt asm and independently
+  verifier-confirmed: LLInt FAST paths for add/sub/mul DO OR arg-observed-type bits (only
+  RESULT-shape observation is slow-path-exclusive); `sub`/`mul`/`div` slow paths do NOT call
+  `observeLHSAndRHS` (only add/lshift/rshift/bitand/bitor/bitxor do). Remaining, non-hard-gating:
+  U8 argument profiles (separate arg-index-keyed model), the getter-resume value-profile write,
+  construct-result profiles.
+- **GC round COMPLETE — the frozen-value arena precondition moves.** The arena is now leak-free
+  end-to-end (object/string/bigint/symbol all reclaim, `354cb89`/`c9c3227`; weak-finalization seam
+  `3ad0ab7`; CodeBlock constant-pool rooting `f213265` — see docs/design/gc-r4.md's status-
+  correction header). The DFG-GC items that remain OPEN, co-sequenced with the plan/speculation
+  units rather than blocking the parser: a frozen-value arena (JSC freezes constants/structures
+  the DFG embeds so the GC can't move or collect them mid-compile) and `DfgCommonData` real handles
+  (today the parser stubs graph/owner identity, dfg-path.md "Supporting faithful edits" above).
+
 Authority: C++ JSC dfg/ (DFGByteCodeParser.cpp, DFGGraph.h, DFGOSRExit, DFGNodeType.h),
-bytecode/ (InstructionStream.h, Instruction.h, BytecodeIndex.h, Fits.h), profiler/;
-mcts_mem/javascriptcore/dfg.md. Builds on docs/design/scoreboard.md (LATE-5) +
+bytecode/ (InstructionStream.h, Instruction.h, BytecodeIndex.h, Fits.h, BytecodeList.rb,
+generator/*.rb), profiler/; mcts_mem/javascriptcore/dfg.md,
+mcts_mem/javascriptcore/instruction-format.md. Builds on docs/design/scoreboard.md (LATE-5) +
 gc-r4.md + baseline-property-ic.md.
