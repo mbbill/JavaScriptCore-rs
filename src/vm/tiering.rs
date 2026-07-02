@@ -4567,15 +4567,15 @@ impl VmTieringIntegration {
             barrier_evidence,
             outcome,
         };
-        // Transitional cap: no production consumer reads this vec back (the
-        // caller uses the returned record directly). See
-        // `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`.
-        if self.property_store_access_case_install_rechecks.len()
-            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
-        {
-            self.property_store_access_case_install_rechecks
-                .push(record.clone());
-        }
+        // UN-CAPPED (hotfix, redesign-audit Unit 0): 8ad6f87's cap comment was
+        // wrong — property_store_mutation_candidate_from_readiness_record_with_
+        // plan_lifecycle (:1228-1234) reads this vec back by exact ordinal from
+        // baseline-JIT codegen paths; a cap silently drops store-IC candidates
+        // past the limit (perf cliff). Unbounded growth is the pre-existing
+        // divergence; the permanent fix moves the barrier-evidence outcome onto
+        // the store plan's resident field (redesign Unit 5), retiring this log.
+        self.property_store_access_case_install_rechecks
+            .push(record.clone());
         record
     }
 
@@ -5265,13 +5265,16 @@ impl VmTieringIntegration {
             retires_guard,
             outcome,
         };
-        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
-        if self.property_load_guard_watchpoint_invalidations.len()
-            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
-        {
-            self.property_load_guard_watchpoint_invalidations
-                .push(record.clone());
-        }
+        // UN-CAPPED (hotfix, redesign-audit Unit 0): 8ad6f87 misclassified this
+        // field as diagnostic-only, but property_inline_cache_clear_requests_
+        // for_watchpoint_dispatch (below) does an exact-ordinal `.find()` on it
+        // from the per-call-frame IC safepoint — a cap means guarded ICs stop
+        // being CLEARED once VM-lifetime invalidations exceed the limit (stale
+        // Active attachments = wrong-code hazard). Unbounded growth is the
+        // known pre-existing divergence; the permanent fix is the watchpoint
+        // dependents-list unit (redesign Unit 6), which retires this log.
+        self.property_load_guard_watchpoint_invalidations
+            .push(record.clone());
         record
     }
 
