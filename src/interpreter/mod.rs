@@ -8791,10 +8791,14 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => {
                         // C++ profiles the slow-path result too
                         // (LLINT_RETURN_PROFILED, llint/LLIntSlowPaths.cpp:1286).
-                        // KNOWN GAP: a getter suspension (FunctionValueCall
-                        // outcome) writes dst on call return without a profile
-                        // write; C++ profiles it at the getter-return OSR point
-                        // (llint/LowLevelInterpreter64.asm:1909-1911).
+                        // A getter suspension (FunctionValueCall outcome) does
+                        // NOT reach this arm at all (the `Err` branch below
+                        // propagates the suspension outward); its own
+                        // getter-return profile write
+                        // (llint/LowLevelInterpreter64.asm:1909-1911) happens at
+                        // VM resume, in
+                        // `Vm::apply_function_value_return_transform` ->
+                        // `CodeBlockRegistry::record_property_load_result_value_profile_sample`.
                         self.record_value_profile(
                             state.code_block,
                             instruction.bytecode_index,

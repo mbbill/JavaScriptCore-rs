@@ -14878,6 +14878,7 @@ impl Vm {
         let Some(destination) = function_value_return_transform_destination(transform) else {
             return Ok(());
         };
+        let is_load_value = matches!(transform, FunctionValueReturnTransform::WriteValue { .. });
         let value = match transform {
             FunctionValueReturnTransform::WriteValue { .. } => value,
             FunctionValueReturnTransform::WriteTruthy { .. } => {
@@ -14890,7 +14891,30 @@ impl Vm {
             .registers
             .active_window_authority(resume.caller_frame, resume.caller_window)?;
         self.registers
-            .write(resume.caller_window, destination, value)
+            .write(resume.caller_window, destination, value)?;
+        // C++ JSC divergence (interpreter suspension) — see
+        // `CodeBlockRegistry::record_property_load_result_value_profile_sample`
+        // for the full mapping. `LLINT_RETURN_PROFILED` (LLIntSlowPaths.cpp:
+        // 155-165) writes the destination AND profiles the value together; the
+        // Rust resume mirrors that pairing here. Only `WriteValue` (a property
+        // LOAD) is JSC value-profiled: `WriteTruthy` backs delete/`in` (boolean
+        // results, no `m_valueProfile` in C++) and `WriteConstant` backs a fixed
+        // literal (e.g. `Reflect.set`'s `true`), neither of which is the
+        // getter's own return value flowing through a load site. Errors are
+        // swallowed like the synchronous `record_value_profile` helper: C++ has
+        // no failure mode for this raw metadata write, so a missing/rejected
+        // slot must not fail the (already-completed) getter call.
+        if is_load_value {
+            let _ = self
+                .code_blocks
+                .record_property_load_result_value_profile_sample(
+                    resume.owner,
+                    resume.call_bytecode_index,
+                    destination,
+                    value,
+                );
+        }
+        Ok(())
     }
 
     fn finish_function_value_call_throw<H: DispatchHost>(
@@ -66537,6 +66561,216 @@ mod tests {
         assert_eq!(vm.execution_context_stack().entry_depth(), 0);
         assert_eq!(vm.gc_execution_state().no_gc_scope_depth(), 0);
         assert_eq!(vm.heap().no_gc_scope_depth(), 0);
+    }
+
+    // U-getter: close the getter-routed value-profile gap. C++ JSC calls a
+    // JS-function getter SYNCHRONOUSLY inside the load's slow path and profiles
+    // the return value at the ORIGINATING instruction via LLINT_RETURN_PROFILED
+    // (llint/LLIntSlowPaths.cpp:155-165; slow_path_get_by_id ->
+    // LLINT_RETURN_PROFILED, :962-972). Rust's interpreter instead SUSPENDS the
+    // load (`DispatchOutcome::FunctionValueCall`) and resumes the getter's return
+    // value at the VM layer; these four tests prove the resume-time profile write
+    // (`Vm::apply_function_value_return_transform` ->
+    // `CodeBlockRegistry::record_property_load_result_value_profile_sample`)
+    // samples the GETTER'S OWN return value into the suspended load's bucket, not
+    // just the destination register.
+    #[test]
+    fn vm_getter_via_get_by_name_records_return_value_profile_at_load_site() {
+        let mut vm = Vm::new(VmConfig::default());
+        let (getter_owner, getter_code_block) =
+            register_vm_owned_function_code_block(&mut vm, multiply_getter_function_code_block());
+        let mut host = RecordingCoreHost::with_function_code_blocks_and_identifier_texts(
+            vec![InterpreterFunctionCodeBlock::new(
+                getter_owner,
+                getter_code_block,
+            )],
+            p17_function_value_identifier_texts(),
+        );
+        let object = create_getter_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let code_block = generated_property_get_by_name_return_consumed_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+
+        let completion = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), object],
+        );
+
+        // local(0)=1, local(1)=GetByName(obj.p)=42 (the getter's 6*7), local(2)=43.
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(43))
+        );
+        let samples = vm
+            .code_blocks
+            .get(owner)
+            .expect("registered GetByName caller owner")
+            .code_block()
+            .side_tables()
+            .value_profiles()
+            .bucket_samples
+            .clone();
+        let sample = samples
+            .iter()
+            .find(|sample| sample.bytecode_index == BytecodeIndex::from_offset(1))
+            .expect("GetByName value profile sample at the suspended load site");
+        assert_eq!(
+            sample.value,
+            RuntimeValue::from_i32(42),
+            "the profiled value must be the getter's OWN return (42), not the \
+             post-add destination value (43) written by the caller's next op"
+        );
+        assert_eq!(sample.bucket.kind, ValueProfileBucketKind::Sample);
+    }
+
+    #[test]
+    fn vm_getter_via_get_by_value_records_return_value_profile_at_load_site() {
+        let mut vm = Vm::new(VmConfig::default());
+        let (getter_owner, getter_code_block) =
+            register_vm_owned_function_code_block(&mut vm, multiply_getter_function_code_block());
+        let mut host = RecordingCoreHost::with_function_code_blocks_and_identifier_texts(
+            vec![InterpreterFunctionCodeBlock::new(
+                getter_owner,
+                getter_code_block,
+            )],
+            p17_function_value_identifier_texts(),
+        );
+        let object = create_getter_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        // A runtime string "p" in the SAME host's string store as the caller's
+        // GetByValue key operand, matching PROPERTY_HANDOFF_KEY's identifier text
+        // ("p", `p17_function_value_identifier_texts`) so the value-keyed lookup
+        // resolves to the same own-getter property `DefineGetter` installed.
+        let key = host.core.allocate_untracked_string_for_test("p");
+
+        let code_block = generated_property_get_by_value_argument_key_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+
+        let completion = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), object, key],
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        let samples = vm
+            .code_blocks
+            .get(owner)
+            .expect("registered GetByValue caller owner")
+            .code_block()
+            .side_tables()
+            .value_profiles()
+            .bucket_samples
+            .clone();
+        let sample = samples
+            .iter()
+            .find(|sample| sample.bytecode_index == BytecodeIndex::from_offset(0))
+            .expect("GetByValue value profile sample at the suspended load site");
+        assert_eq!(sample.value, RuntimeValue::from_i32(42));
+        assert_eq!(sample.bucket.kind, ValueProfileBucketKind::Sample);
+    }
+
+    #[test]
+    fn vm_throwing_getter_via_get_by_name_records_no_value_profile() {
+        let mut vm = Vm::new(VmConfig::default());
+        let mut host = RecordingCoreHost::with_function_blocks(vec![
+            getter_throw_capture_function_code_block(),
+        ]);
+        let thrown = RuntimeValue::from_i32(-77);
+        let object = create_throwing_getter_object_for_test(&mut vm, &mut host, thrown);
+        host.clear_observations();
+
+        let code_block = generated_property_get_by_name_throwing_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+
+        let completion = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), object],
+        );
+
+        let pending = if let ExecutionCompletion::Threw(pending) = completion {
+            pending
+        } else {
+            unreachable!("expected the getter's throw to propagate, got {completion:?}");
+        };
+        assert_eq!(pending.value, thrown);
+        // CHECK_EXCEPTION ordering (LLINT_CHECK_EXCEPTION runs BEFORE
+        // LLINT_PROFILE_VALUE in LLINT_RETURN_PROFILED, LLIntSlowPaths.cpp:
+        // 155-165): a throwing getter must not sample any value into the
+        // suspended load's own profile slot.
+        assert!(
+            vm.code_blocks
+                .get(owner)
+                .expect("registered GetByName caller owner")
+                .code_block()
+                .side_tables()
+                .value_profiles()
+                .bucket_samples
+                .is_empty(),
+            "a throwing getter resume must not record a value-profile sample"
+        );
+    }
+
+    // Regression: a PLAIN DATA property load (no getter, never suspends) keeps
+    // profiling its own value through the dispatch arm's synchronous
+    // `record_value_profile` call, unaffected by the resume-time getter fix.
+    #[test]
+    fn vm_data_property_get_by_name_value_profile_unaffected_by_getter_resume_fix() {
+        let mut vm = Vm::new(VmConfig::default());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+        let object = create_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let code_block = generated_property_get_by_name_return_consumed_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+
+        let completion = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), object],
+        );
+
+        // local(0)=1, local(1)=GetByName(obj.p)=41 (the data property's own
+        // value), local(2)=42.
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        // A synchronous (non-suspending) load profiles through
+        // `state.code_block` — the SAME `&CodeBlock` reference the test drives
+        // dispatch with — not through `vm.code_blocks`' separately-`clone()`d
+        // registry record (`register_test_code_block` registers a deep copy for
+        // top-level/test code blocks; only FUNCTION code blocks are `Rc`-shared
+        // with the registry, `install_source_function_blocks`,
+        // vm/mod.rs:17557-17569). So this checks the local `code_block` binding,
+        // matching the convention other synchronous-path tests use (e.g.
+        // `code_block.side_tables().inline_caches()`).
+        let samples = code_block
+            .side_tables()
+            .value_profiles()
+            .bucket_samples
+            .clone();
+        let sample = samples
+            .iter()
+            .find(|sample| sample.bytecode_index == BytecodeIndex::from_offset(1))
+            .expect("GetByName value profile sample at the data-load site");
+        assert_eq!(sample.value, RuntimeValue::from_i32(41));
+        assert_eq!(sample.bucket.kind, ValueProfileBucketKind::Sample);
     }
 
     #[cfg(all(unix, target_arch = "x86_64"))]

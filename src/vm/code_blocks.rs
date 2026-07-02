@@ -513,6 +513,76 @@ impl CodeBlockRegistry {
         }
     }
 
+    // C++ JSC divergence (interpreter suspension): a JS-function getter reached
+    // from a property-LOAD instruction (get_by_id/get_by_val/get_by_id_with_this/
+    // get_from_scope-global/get_by_val "length") runs SYNCHRONOUSLY in C++'s slow
+    // path, and `LLINT_RETURN_PROFILED` profiles the getter's return value into
+    // the ORIGINATING instruction's own `m_valueProfile` before returning
+    // (llint/LLIntSlowPaths.cpp:155-165, run by every `slow_path_get_by_*`; the
+    // baseline-JIT getter-return OSR point profiles the same per-instruction slot
+    // for get_by_val, llint/LowLevelInterpreter64.asm:1909-1911). Rust's
+    // interpreter instead SUSPENDS the load (`DispatchOutcome::FunctionValueCall`)
+    // and resumes the getter's return value at the VM layer
+    // (`Vm::apply_function_value_return_transform`), bypassing the dispatch arm's
+    // own `record_value_profile` call. This is the resume-time analog of
+    // `record_call_result_value_profile_sample` above (which profiles a suspended
+    // ORDINARY call's own value profile), scoped instead to the narrower set of
+    // property-LOAD opcodes that can suspend on a getter via
+    // `FunctionValueReturnTransform::WriteValue`.
+    //
+    // Unlike the ordinary-call sibling, an opcode/operand mismatch here is NOT
+    // necessarily an engine bug: `FunctionValuePropertyOperationResume` is also
+    // reused by native property helpers (e.g. `Reflect.get`) whose resume
+    // `call_bytecode_index` is the NATIVE CALL's own `op_call` site, not a
+    // property-load site — C++ profiles that case once, at the call's own
+    // `m_valueProfile`, via the ordinary call-result path, not here. So this
+    // tolerates "not a load site" as a no-op (`Ok(None)`) rather than erroring.
+    pub(crate) fn record_property_load_result_value_profile_sample(
+        &mut self,
+        owner: CodeBlockId,
+        bytecode_index: BytecodeIndex,
+        destination: VirtualRegister,
+        value: JsValue,
+    ) -> Result<Option<ValueProfileBucketSample>, CodeBlockMutationError> {
+        let Some(record) = self.records.get_mut(&owner) else {
+            return Ok(None);
+        };
+        let Ok(decoded) = record.code_block.decoded_instruction_at(bytecode_index) else {
+            return Ok(None);
+        };
+        let Some(opcode) = CoreOpcode::from_opcode(decoded.opcode) else {
+            return Ok(None);
+        };
+        if !matches!(
+            opcode,
+            CoreOpcode::GetByName
+                | CoreOpcode::GetSuperByName
+                | CoreOpcode::GetGlobalObjectProperty
+                | CoreOpcode::GetByValue
+                | CoreOpcode::GetLength
+        ) {
+            return Ok(None);
+        }
+        if decoded.register_operand(0).ok() != Some(destination) {
+            return Ok(None);
+        }
+
+        match record.code_block.record_value_profile_sample(
+            CodeBlockMutationAuthority::VmMainThread,
+            bytecode_index,
+            Checkpoint::NONE,
+            ValueProfileBucketKind::Sample,
+            value,
+        ) {
+            Ok(sample) => Ok(Some(sample)),
+            Err(CodeBlockMutationError::ValueProfileSample(
+                ValueProfileSampleError::MissingProfile { .. }
+                | ValueProfileSampleError::MissingBucket { .. },
+            )) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn call_result_value_profile_store_target(
         &self,
         owner: CodeBlockId,
