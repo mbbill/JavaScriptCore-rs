@@ -3164,17 +3164,31 @@ impl CoreObjectStore {
     /// on the cell (`CoreStringCell::base`, the `JSRopeString::m_fibers` analog); a flat/empty
     /// string carries the 0 sentinel, so `string_cell_rope_base` returns `None` (no edge).
     ///
-    /// Today EVERY arena leaf cell is a String (U1; Symbol/BigInt are U2/U3), so this reads the
-    /// string-cell layout directly; U2/U3 sub-dispatch by `js_type` before reading a rope edge.
+    /// U3: arena leaf cells are String OR HeapBigInt, so this sub-dispatches by the header
+    /// `js_type` BEFORE reading the string-only rope-fiber layout; a HeapBigInt cell appends
+    /// nothing (C++ JSBigInt declares NO visitChildren — runtime/JSBigInt.{h,cpp} — and the
+    /// base JSCell visit adds no cell edges).
     fn trace_leaf_cell(&self, cp: CellPtr, visitor: &mut SlotVisitor) {
         debug_assert!(
             // SAFETY: `cp` was membership-admitted + classified Leaf by the header read.
             unsafe { arena_cell_kind_at(cp.addr()) } == ArenaCellKind::Leaf,
             "trace_leaf_cell entered for a non-leaf cell"
         );
+        // gc-r4-completion U2/U3 — the LEAF half of the `methodTable()->visitChildren` type
+        // dispatch: only a String cell may carry the rope fiber edge; every other leaf kind
+        // is a pure leaf with NO outgoing edges.
         // SAFETY: `cp` is a byte-intact arena leaf cell (membership-gated + Leaf-classified);
-        // U1 admits only String leaf cells, so it is a `CoreStringCell` and its `base` fiber
-        // sits at the const-asserted offset. The read copies a `u64` and forms no reference.
+        // `js_type` sits at the fixed common offset on EVERY cell kind (const-asserted at
+        // each struct def). The read copies a `u8` and forms no reference.
+        let type_byte = unsafe {
+            core::ptr::with_exposed_provenance::<u8>(cp.addr() + ARENA_CELL_JS_TYPE_OFFSET).read()
+        };
+        if type_byte != JsType::String as u8 {
+            return; // HeapBigInt (U3) and future non-String leaves: no outgoing edges.
+        }
+        // SAFETY: the header just proved StringType, so it is a `CoreStringCell` and its
+        // `base` fiber sits at the const-asserted offset. The read copies a `u64` and forms
+        // no reference.
         let base = unsafe { super::string_store::string_cell_rope_base(cp.addr()) };
         if let Some(base_addr) = base {
             // Membership-gate the base fiber (NOT the liveness `find`) and append it — the rope
@@ -12813,5 +12827,250 @@ mod string_cell_gc_u1_tests {
         // Sanity: a real object cell still resolves.
         let o = objects.allocate();
         assert!(objects.find(o).is_some(), "an object value still resolves");
+    }
+}
+
+// gc-r4-completion U3 — BIGINT-CELL GC end-to-end on the SHARED arena (the string U1 template
+// applied to HeapBigInt): bigints allocate via the leaf-cell chokepoint (`CoreBigIntStore::
+// allocate -> admit_leaf_cell_blob`), are marked through roots / the object->bigint edge (a
+// bigint cell has NO outgoing edges — C++ JSBigInt declares no visitChildren, runtime/
+// JSBigInt.{h,cpp}), and dead bigints are swept + reconciled (slab freed + weak `by_value`
+// intern removed by identity). The `collect` helper replicates the host drain
+// (force_collect -> take_reclaimed_leaf_addrs -> reconcile_dead_bigint).
+#[cfg(test)]
+mod bigint_cell_gc_u3_tests {
+    use super::bigint_store::{CoreBigIntStore, CoreBigIntValue};
+    use super::*;
+
+    fn ident(n: u32) -> CorePropertyKey {
+        CorePropertyKey::Identifier(n)
+    }
+    fn addr(v: RuntimeValue) -> usize {
+        v.as_cell().unwrap().pointer_payload_bits()
+    }
+    /// Run ONE collection then drive the leaf-store reclaim exactly as the host safepoint does.
+    fn collect(
+        objects: &mut CoreObjectStore,
+        bigints: &mut CoreBigIntStore,
+        roots: &[RuntimeValue],
+    ) -> CollectStats {
+        let stats = objects.force_collect_values(roots);
+        for dead in objects.take_reclaimed_leaf_addrs() {
+            bigints.reconcile_dead_bigint(dead);
+        }
+        stats
+    }
+    /// A multi-limb value (2^100 + 9 needs four u32 limbs) so limb-slab integrity is
+    /// observable across collections.
+    fn multi_limb_value() -> CoreBigIntValue {
+        CoreBigIntValue::one()
+            .shift_left_bits(100)
+            .add(&CoreBigIntValue::from_i32(9))
+    }
+    const MULTI_LIMB_DECIMAL: &str = "1267650600228229401496703205385"; // 2^100 + 9
+
+    // (a) A bigint reachable ONLY from a live object SURVIVES >=2 collections (the
+    // object->bigint mark edge; the 2nd collection is the old-gen-survivor landmine).
+    #[test]
+    fn bigint_held_by_live_object_survives_two_collections() {
+        let mut objects = CoreObjectStore::default();
+        let mut bigints = CoreBigIntStore::default();
+        let mut heap = Heap::new();
+        let b = bigints
+            .allocate(&mut objects, &mut heap, multi_limb_value())
+            .unwrap();
+        let b_addr = addr(b);
+        let holder = objects.allocate();
+        objects.put_data_own(holder, &ident(0), b).unwrap(); // holder -> b (butterfly edge)
+
+        collect(&mut objects, &mut bigints, &[holder]);
+        assert!(
+            objects.is_value_marked(b),
+            "bigint marked via object edge (#1)"
+        );
+        assert!(
+            objects.live_object_addrs.contains(&b_addr),
+            "bigint retained in the live set (#1)"
+        );
+        assert_eq!(bigints.to_string(b), Some(MULTI_LIMB_DECIMAL.to_owned()));
+
+        collect(&mut objects, &mut bigints, &[holder]); // #2 — the survivor landmine
+        assert!(
+            objects.is_value_marked(b),
+            "bigint still marked via object edge (#2)"
+        );
+        assert_eq!(bigints.to_string(b), Some(MULTI_LIMB_DECIMAL.to_owned()));
+    }
+
+    // (b) A directly-rooted bigint (the live register-root analog) survives >=2 collections
+    // with its limbs INTACT (the off-cell slab payload is neither freed nor clobbered).
+    #[test]
+    fn rooted_bigint_survives_collections_with_intact_limbs() {
+        let mut objects = CoreObjectStore::default();
+        let mut bigints = CoreBigIntStore::default();
+        let mut heap = Heap::new();
+        let expected = multi_limb_value();
+        let b = bigints
+            .allocate(&mut objects, &mut heap, expected.clone())
+            .unwrap();
+
+        collect(&mut objects, &mut bigints, &[b]);
+        assert!(objects.is_value_marked(b), "rooted bigint is marked (#1)");
+        assert_eq!(
+            bigints.value(b),
+            Some(expected.clone()),
+            "limbs intact (#1)"
+        );
+
+        collect(&mut objects, &mut bigints, &[b]); // #2
+        assert_eq!(bigints.value(b), Some(expected), "limbs intact (#2)");
+        assert_eq!(bigints.to_string(b), Some(MULTI_LIMB_DECIMAL.to_owned()));
+    }
+
+    // (c) A DEAD bigint's slab slot is freed AND its `by_value` intern entry removed by
+    // identity; re-allocating the same value after collection returns a FRESH working cell
+    // (no dangle to the freed one).
+    #[test]
+    fn dead_bigint_frees_slab_and_weak_removes_interning() {
+        let mut objects = CoreObjectStore::default();
+        let mut bigints = CoreBigIntStore::default();
+        let mut heap = Heap::new();
+        let keep = objects.allocate(); // a rooted anchor (NOT holding the bigint)
+        let value = multi_limb_value();
+        let b = bigints
+            .allocate(&mut objects, &mut heap, value.clone())
+            .unwrap();
+        let b_addr = addr(b);
+        let slot = bigints.index_for_value(b).unwrap();
+        assert!(bigints.by_value.contains_key(&value));
+        assert_eq!(bigints.value(b), Some(value.clone()));
+
+        collect(&mut objects, &mut bigints, &[keep]); // b is unrooted -> dead
+
+        assert!(!objects.is_value_marked(b), "unrooted bigint is dead");
+        assert!(
+            !objects.live_object_addrs.contains(&b_addr),
+            "dead bigint dropped from the live set"
+        );
+        assert!(
+            !bigints.by_value.contains_key(&value),
+            "weak by_value intern entry removed on sweep (by identity)"
+        );
+        assert_eq!(
+            bigints.value(b),
+            None,
+            "dead bigint's resolution entry removed (no dangle)"
+        );
+        assert!(
+            bigints.bigint_record_free_list.contains(&slot),
+            "dead bigint's slab slot freed for reuse"
+        );
+
+        // Re-allocate the SAME value -> a FRESH record + fresh interning (not the freed one).
+        let b2 = bigints
+            .allocate(&mut objects, &mut heap, value.clone())
+            .unwrap();
+        assert_eq!(bigints.value(b2), Some(value.clone()));
+        assert!(
+            bigints.by_value.contains_key(&value),
+            "re-interning re-establishes the entry freshly"
+        );
+    }
+
+    // (d) Micro-probe: a batch of unrooted bigints returns the live-cell count to BASELINE
+    // after collection (no bigint leak), and reclaims their slab records.
+    #[test]
+    fn unrooted_bigint_batch_returns_to_baseline_no_leak() {
+        let mut objects = CoreObjectStore::default();
+        let mut bigints = CoreBigIntStore::default();
+        let mut heap = Heap::new();
+        let keep = objects.allocate();
+        collect(&mut objects, &mut bigints, &[keep]); // warm up to a stable baseline
+        let baseline = objects.live_object_addrs.len();
+        let live_records_baseline =
+            bigints.bigint_records.len() - bigints.bigint_record_free_list.len();
+
+        for i in 0..16 {
+            bigints
+                .allocate(&mut objects, &mut heap, CoreBigIntValue::from_i32(1000 + i))
+                .unwrap();
+        }
+        assert!(
+            objects.live_object_addrs.len() > baseline,
+            "bigint cells added to the live set"
+        );
+
+        collect(&mut objects, &mut bigints, &[keep]); // all 16 unrooted -> reclaimed
+        assert_eq!(
+            objects.live_object_addrs.len(),
+            baseline,
+            "bigint cells reclaimed back to baseline (no leak)"
+        );
+        let live_records_after =
+            bigints.bigint_records.len() - bigints.bigint_record_free_list.len();
+        assert_eq!(
+            live_records_after, live_records_baseline,
+            "bigint slab records reclaimed back to baseline"
+        );
+    }
+
+    // (e) A LIVE (rooted) interned bigint is NOT evicted — only UNMARKED cells are
+    // reconciled — and re-allocating the same value returns the SAME cell (the by-value
+    // dedup identity is preserved across collection).
+    #[test]
+    fn live_interned_bigint_is_not_evicted() {
+        let mut objects = CoreObjectStore::default();
+        let mut bigints = CoreBigIntStore::default();
+        let mut heap = Heap::new();
+        let value = CoreBigIntValue::from_i32(7777);
+        let b = bigints
+            .allocate(&mut objects, &mut heap, value.clone())
+            .unwrap();
+
+        // Root the bigint DIRECTLY (a live register-root analog).
+        collect(&mut objects, &mut bigints, &[b]);
+
+        assert!(
+            objects.is_value_marked(b),
+            "rooted interned bigint is marked"
+        );
+        assert!(
+            bigints.by_value.contains_key(&value),
+            "a live interned bigint is NOT evicted (only unmarked cells are reconciled)"
+        );
+        assert_eq!(bigints.value(b), Some(value.clone()));
+        let b2 = bigints.allocate(&mut objects, &mut heap, value).unwrap();
+        assert_eq!(
+            b2, b,
+            "by-value dedup returns the same live cell (identity preserved)"
+        );
+    }
+
+    // (U0b regression) A bigint value is NOT misclassified as an object: the mutator deref
+    // islands (`find` / `with_cell_mut`) apply the JSCell::isObject() gate and return None
+    // for a bigint cell, even though it shares the arena and `MarkedSpace::find` admits it.
+    #[test]
+    fn u0b_bigint_value_is_not_resolved_as_an_object() {
+        let mut objects = CoreObjectStore::default();
+        let mut bigints = CoreBigIntStore::default();
+        let mut heap = Heap::new();
+        let b = bigints
+            .allocate(&mut objects, &mut heap, CoreBigIntValue::from_i32(42))
+            .unwrap();
+
+        assert!(
+            objects.find(b).is_none(),
+            "U0b: a bigint value is NOT resolved as an object cell"
+        );
+        assert!(
+            objects.with_cell_mut(b, |_| ()).is_none(),
+            "U0b: with_cell_mut rejects a bigint (leaf) cell"
+        );
+        // The bigint DID enter the arena (membership admits it) — proving the gate is the
+        // isObject() discriminator, not mere non-membership.
+        assert!(
+            objects.space.is_arena_cell(addr(b)).is_some(),
+            "the bigint cell IS a member of the shared arena"
+        );
     }
 }

@@ -1,38 +1,113 @@
 //! `CoreBigIntStore` — the live heap-JSBigInt cell store.
 //!
-//! Phase E B2: extracted verbatim from `interpreter/mod.rs` by pure code-motion
-//! (no body changed; only module placement and `pub(crate)` visibility keywords).
-//! Faithful TARGET on the C++ side: Source/JavaScriptCore/runtime/JSBigInt.{h,cpp}.
+//! Phase E B2: extracted from `interpreter/mod.rs`. gc-r4-completion U3 (bigint-cell GC):
+//! the bigint CELL is now a POD `CoreObjectStore::space` arena cell (identity = arena
+//! address, R4a — faithful to JSC allocating JSBigInt in the GC'd `vm.heap.cellSpace`,
+//! runtime/JSBigInt.h:63-67 / heap/Heap.h:1131), so it is marked + swept + reclaimed like
+//! an object cell. The variable digit payload (sign + limbs) is relocated OUT of the cell
+//! into this store's `bigint_records` slab (gc-r4 SD-4 off-cell relocation, the SAME shape
+//! the string store applies to its StringImpl payload). The former leaking
+//! `Vec<Pin<Box<CoreBigIntCell>>>` is GONE; the arena IS the bigint-cell home.
+//!
+//! Faithful TARGET on the C++ side: Source/JavaScriptCore/runtime/JSBigInt.{h,cpp}. A
+//! JSBigInt is `DoesNotNeedDestruction` (it inherits JSCell's default, runtime/JSCell.h:105
+//! `static constexpr DestructionMode needsDestruction = DoesNotNeedDestruction;` — JSBigInt.h
+//! declares NO override) and declares NO visitChildren (none in JSBigInt.{h,cpp}; the base
+//! JSCell visit adds no cell edges), so the cell is a pure GC LEAF with no outgoing edges.
 
+use super::object_store::CoreObjectStore;
 use super::*;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoreBigIntStore {
-    pub(crate) bigints: Vec<Pin<Box<CoreBigIntCell>>>,
+    // gc-r4-completion U3 (SD-4) — the store-owned slab of out-of-line digit payloads, the
+    // home of each bigint cell's variable sign+limbs (the string store's `string_records`
+    // analog). A slot is reached from a cell's arena address through `indices_by_payload`;
+    // `bigint_record_free_list` recycles a DEAD bigint's slot index, filled by
+    // `reconcile_dead_bigint`.
+    pub(crate) bigint_records: Vec<BigIntRecord>,
+    pub(crate) bigint_record_free_list: Vec<usize>,
+    // value -> the canonical bigint CELL's ARENA ADDRESS, and it is WEAK: remove-on-sweep
+    // BY IDENTITY in `reconcile_dead_bigint`, the VERBATIM mirror of the string store's
+    // `by_text` (whose C++ shape is `~StringImpl -> AtomStringImpl::remove`, WTF/wtf/text/
+    // StringImpl.cpp:118-129). A MARKED (live) canonical bigint is never reconciled, so it
+    // is retained — never strong-rooted (a strong map would defeat the GC).
+    //
+    // DIVERGENCE NOTE: C++ JSC does NOT dedup JSBigInt cells (every tryCreateWithLength,
+    // runtime/JSBigInt.cpp, mints a fresh cell; `===` compares VALUES via JSBigInt::equals,
+    // so two equal heap cells are indistinguishable to JS). The port's pre-existing by-value
+    // dedup is therefore unobservable to JS; this unit keeps it in the ratified WEAK shape
+    // so it can never root a dead cell.
     pub(crate) by_value: HashMap<CoreBigIntValue, usize>,
+    // cell ARENA ADDRESS -> `bigint_records` slot index: the bigint-cell RESOLUTION index
+    // (the string store's `indices_by_payload` analog), letting `value(value)` resolve with
+    // a store-local map lookup and NO arena deref. The reconcile drops a dead cell's entry.
+    pub(crate) indices_by_payload: HashMap<usize, usize>,
 }
 
-// #[repr(C)] pins the header layout so offset_of!(js_type)==4 is stable. js_type is a
-// constant (always HeapBigInt) so its participation in the derived Eq/Hash/PartialEq
-// is behavior-neutral (the store keys on CoreBigIntValue, not the cell).
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// One bigint cell's out-of-line digit payload (gc-r4-completion U3 SD-4), held in the
+/// store's `bigint_records` slab: the sign+limbs value, the bound heap `CellId` (the
+/// `payload<->cell` bridge id) and the cell's own arena address (slot -> addr, for
+/// `value_for_index` + the by-identity intern removal). Freed by `reconcile_dead_bigint`
+/// when the cell is swept.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BigIntRecord {
+    /// The owning bigint cell's arena address (= identity).
+    pub(crate) addr: usize,
+    pub(crate) value: CoreBigIntValue,
+    /// Mirrors `StringRecord::cell_id`; bound eagerly at `allocate` (bigints always
+    /// allocate with a `&mut Heap` in hand).
+    pub(crate) cell_id: CellId,
+}
+
+/// The POD arena BIGINT CELL — the JSBigInt JSCell header.
+///
+/// DIVERGENCE (permanent, Rust-substrate): C++ JSBigInt stores its digits INLINE, trailing
+/// the cell — `allocationSize(length) = offsetOfData() + length * sizeof(Digit)`
+/// (runtime/JSBigInt.h:70-72), `dataStorage() = this + offsetOfData()` (JSBigInt.h:629),
+/// `m_length` on the cell (JSBigInt.h:635), sign as the per-cell header bit
+/// (JSBigInt.h:109-111). The port's arena admits fixed-size POD blobs only
+/// (`admit_leaf_cell_blob`; no variable trailing arrays), so the variable digit payload
+/// relocates to the store's `bigint_records` slab — the SAME SD-4 off-cell relocation the
+/// string store applies to JSString's StringImpl payload. The cell is therefore a pure
+/// header with NO edges (JSBigInt has no visitChildren; see the module doc).
+///
+/// `#[repr(C)]` pins the header layout so `js_type` sits at the kind-consistent offset 4
+/// (the fixed `JSCell::m_type` offset every arena cell kind carries — see
+/// `arena_cell_kind_at`).
+#[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub(crate) struct CoreBigIntCell {
-    pub(crate) cell_id: CellId,
+    // C++ JSC JSCell::m_structureID (runtime/JSCell.h, offset 0). JSBigInt uses the VM's
+    // shared bigint Structure (JSBigInt::createStructure); the port does not model one, so
+    // this is INVALID — the cell is a pure header whose payload lives in `bigint_records`.
+    pub(crate) structure_id: StructureId,
     // C++ JSC JSCell::m_type (runtime/JSCell.h:298) == HeapBigIntType
     // (runtime/JSType.h:38) for every heap JSBigInt cell; read via
-    // JSCell::isHeapBigInt() (runtime/JSCell.h:128). At offset 4 for kind-consistency.
+    // JSCell::isHeapBigInt() (runtime/JSCell.h:128). At the fixed common offset 4 read by
+    // the collector's type-dispatch + the U0b isObject gate.
     pub(crate) js_type: JsType,
-    pub(crate) value: CoreBigIntValue,
 }
 
-// Fixed, kind-consistent JSCell::m_type offset guard (mirrors CoreObjectCell's).
+// Fixed, kind-consistent JSCell header offsets (mirrors CoreStringCell's).
+const _: () = assert!(
+    std::mem::offset_of!(CoreBigIntCell, structure_id) == 0,
+    "CoreBigIntCell::structure_id must be at offset 0 (JSCell m_structureID)"
+);
 const _: () = assert!(
     std::mem::offset_of!(CoreBigIntCell, js_type) == 4,
     "CoreBigIntCell::js_type must be at offset 4 (fixed kind-consistent JSCell::m_type analog)"
 );
+// POD: the MarkedBlock sweep runs NO destructor — faithful to JSBigInt's
+// DoesNotNeedDestruction (runtime/JSCell.h:105, no override in JSBigInt.h). A Drop field
+// would leak (and break the blob copy in `admit_leaf_cell_blob`). The variable digit
+// payload lives in the slab, not here.
+const _: () = assert!(
+    !std::mem::needs_drop::<CoreBigIntCell>(),
+    "CoreBigIntCell must be POD (no Drop) for the R4 MarkedBlock sweep + the blob copy"
+);
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) struct CoreBigIntValue {
     pub(crate) sign: i8,
     pub(crate) limbs: Vec<u32>,
@@ -551,49 +626,126 @@ impl CoreBigIntValue {
     }
 }
 
+/// Build + admit a POD `CoreBigIntCell` into the SHARED arena (`CoreObjectStore::space`) via
+/// the leaf-cell admission chokepoint, returning its arena address (= identity). Mirrors
+/// `admit_string_cell`; a bigint cell carries no fiber/edge field (no visitChildren).
+fn admit_bigint_cell(objects: &mut CoreObjectStore) -> usize {
+    let cell = CoreBigIntCell {
+        structure_id: StructureId::INVALID,
+        js_type: JsType::HeapBigInt,
+    };
+    let len = core::mem::size_of::<CoreBigIntCell>();
+    let src = core::ptr::from_ref(&cell).cast::<u8>();
+    // SAFETY: `CoreBigIntCell` is POD (`needs_drop == false` asserted above) and `js_type`
+    // sits at the const-asserted common offset; the interpreter store is single-threaded.
+    // `admit_leaf_cell_blob` copies the bytes into a fresh arena slot + registers it live,
+    // returning the arena address.
+    unsafe { objects.admit_leaf_cell_blob(src, len) }
+}
+
+/// Rebuild the bigint `RuntimeValue` (identity) from a bigint cell's arena address — the
+/// leaf analog of `string_value_for_addr`.
+fn bigint_value_for_addr(addr: usize) -> RuntimeValue {
+    let ptr = core::ptr::with_exposed_provenance_mut::<CoreBigIntCell>(addr);
+    let ptr = NonNull::new(ptr).expect("bigint cell arena address is non-null");
+    // SAFETY: `addr` is a live arena bigint cell this store published; `from_cell` reads
+    // only the pointer's integer bits (it never dereferences here); no GC moves a cell
+    // pre-R4b.
+    RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
+}
+
 impl CoreBigIntStore {
+    /// Allocate a slab record, REUSING a freed slot if one exists (mirrors the string
+    /// store's `push_record`). Returns the slot index.
+    fn push_record(&mut self, record: BigIntRecord) -> usize {
+        if let Some(slot) = self.bigint_record_free_list.pop() {
+            self.bigint_records[slot] = record; // drops the empty placeholder
+            slot
+        } else {
+            let slot = self.bigint_records.len();
+            self.bigint_records.push(record);
+            slot
+        }
+    }
+
     pub(crate) fn allocate(
         &mut self,
+        objects: &mut CoreObjectStore,
         heap: &mut Heap,
         value: CoreBigIntValue,
     ) -> Result<RuntimeValue, ExecutionError> {
-        if let Some(index) = self.by_value.get(&value).copied() {
-            return Ok(self.value_for_index(index));
+        if let Some(&addr) = self.by_value.get(&value) {
+            let slot = self.indices_by_payload[&addr];
+            return self.bind_index_to_heap(heap, slot);
         }
-        let (bigint, runtime_value) =
-            allocate_primitive_interpreter_cell(heap, CellType::BigInt, |cell_id| {
-                CoreBigIntCell {
-                    cell_id,
-                    js_type: JsType::HeapBigInt,
-                    value: value.clone(),
-                }
-            })?;
-        let index = self.bigints.len();
-        self.bigints.push(bigint);
-        self.by_value.insert(value, index);
-        Ok(runtime_value)
+        let addr = admit_bigint_cell(objects);
+        let slot = self.push_record(BigIntRecord {
+            addr,
+            value: value.clone(),
+            cell_id: CellId::default(),
+        });
+        self.indices_by_payload.insert(addr, slot);
+        self.by_value.insert(value, addr);
+        self.bind_index_to_heap(heap, slot)
+    }
+
+    /// Bind (or rebind) a bigint cell to the heap `payload<->cell` bridge, mirroring
+    /// `CoreStringStore::bind_index_to_heap`: bind the heap `CellId` to the cell's ARENA
+    /// ADDRESS and stamp it into the slab record. Returns the bigint value.
+    pub(crate) fn bind_index_to_heap(
+        &mut self,
+        heap: &mut Heap,
+        slot: usize,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        let addr = self.bigint_records[slot].addr;
+        let cell_id = if let Some(cell_id) = heap.cell_for_payload(addr) {
+            heap.publish_cell(cell_id)?;
+            cell_id
+        } else {
+            let cell_id = allocate_primitive_interpreter_cell_id(
+                heap,
+                CellType::BigInt,
+                std::mem::size_of::<CoreBigIntCell>().max(1),
+            )?;
+            heap.bind_cell_payload(cell_id, addr)?;
+            heap.publish_cell(cell_id)?;
+            cell_id
+        };
+        self.bigint_records[slot].cell_id = cell_id;
+        Ok(bigint_value_for_addr(addr))
+    }
+
+    /// gc-r4-completion U3 — the LEAF reconcile for ONE dead (unmarked) bigint cell, driven
+    /// by the host from `CoreObjectStore::take_reclaimed_leaf_addrs` after a collection
+    /// (verbatim mirror of `CoreStringStore::reconcile_dead_string`). Frees the cell's
+    /// `bigint_records` slot and WEAK-removes its `by_value` intern entry BY IDENTITY: the
+    /// entry is evicted ONLY if it still names THIS dead address (a MARKED canonical bigint
+    /// is never reconciled — only unmarked cells reach here). A no-op if `addr` is not one
+    /// of this store's cells.
+    ///
+    /// KNOWN RESIDUAL (bounded, shared with strings — see b73d806): the heap's stale
+    /// `payload<->cell`-id entry for `addr` is NOT cleaned here (no `&mut Heap`); a recycled
+    /// arena address reuses it via `bind_index_to_heap`'s `cell_for_payload` hit.
+    pub(crate) fn reconcile_dead_bigint(&mut self, addr: usize) {
+        let Some(slot) = self.indices_by_payload.remove(&addr) else {
+            return;
+        };
+        // Free the slab slot (recycle the index); keep the record long enough to key the
+        // by-identity intern removal.
+        let record = std::mem::take(&mut self.bigint_records[slot]);
+        if self.by_value.get(&record.value).copied() == Some(addr) {
+            self.by_value.remove(&record.value);
+        }
+        self.bigint_record_free_list.push(slot);
     }
 
     pub(crate) fn is_bigint(&self, value: RuntimeValue) -> bool {
-        self.value(value).is_some()
+        self.index_for_value(value).is_some()
     }
 
     pub(crate) fn value(&self, value: RuntimeValue) -> Option<CoreBigIntValue> {
-        let payload = value.as_cell()?.pointer_payload_bits();
-        self.bigints
-            .iter()
-            .find(|bigint| core::ptr::from_ref(bigint.as_ref().get_ref()) as usize == payload)
-            .map(|bigint| {
-                let bigint = bigint.as_ref().get_ref();
-                // Cross-check the in-cell JSCell::m_type against the store gate: a cell
-                // owned by the bigint store MUST report HeapBigIntType
-                // (runtime/JSCell.h:128). Debug-only.
-                debug_assert!(
-                    bigint.js_type == JsType::HeapBigInt,
-                    "cell owned by CoreBigIntStore must carry JsType::HeapBigInt"
-                );
-                bigint.value.clone()
-            })
+        let slot = self.index_for_value(value)?;
+        Some(self.bigint_records[slot].value.clone())
     }
 
     pub(crate) fn to_string(&self, value: RuntimeValue) -> Option<String> {
@@ -608,11 +760,8 @@ impl CoreBigIntStore {
         }
     }
 
-    pub(crate) fn value_for_index(&self, index: usize) -> RuntimeValue {
-        let bigint = self.bigints[index].as_ref().get_ref();
-        let ptr = NonNull::from(bigint);
-        // SAFETY: The indexed bigint cell is owned by this store and remains
-        // pinned while the dispatch host is alive.
-        RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) })
+    pub(crate) fn index_for_value(&self, value: RuntimeValue) -> Option<usize> {
+        let addr = value.as_cell()?.pointer_payload_bits();
+        self.indices_by_payload.get(&addr).copied()
     }
 }

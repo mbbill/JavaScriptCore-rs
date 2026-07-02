@@ -6199,7 +6199,10 @@ impl DispatchHost for CoreOpcodeDispatchHost {
         // recycle a freed arena address, so reading the store's (sweep-surviving) slab is sound.
         if collected.is_some() {
             for addr in self.objects.take_reclaimed_leaf_addrs() {
+                // Each leaf store's reconcile is a no-op for a foreign address, so every
+                // dead leaf addr is offered to every leaf store (String U1, BigInt U3).
                 self.strings.reconcile_dead_string(addr);
+                self.bigints.reconcile_dead_bigint(addr);
             }
         }
     }
@@ -6610,10 +6613,12 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     return DispatchOutcome::Fail(ExecutionError::MissingStringLiteral(key));
                 };
                 let value = match parse_bigint_literal(text) {
-                    Ok(value) => match self.bigints.allocate(state.heap, value) {
-                        Ok(value) => value,
-                        Err(error) => return DispatchOutcome::Fail(error),
-                    },
+                    Ok(value) => {
+                        match self.bigints.allocate(&mut self.objects, state.heap, value) {
+                            Ok(value) => value,
+                            Err(error) => return DispatchOutcome::Fail(error),
+                        }
+                    }
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
                 write_register(state, window, destination, value)
@@ -9881,7 +9886,7 @@ impl CoreOpcodeDispatchHost {
         value: RuntimeValue,
     ) -> Result<RuntimeValue, ExecutionError> {
         if let Some(value) = self.bigints.value(value) {
-            return self.bigints.allocate(heap, value.neg());
+            return self.bigints.allocate(&mut self.objects, heap, value.neg());
         }
         // C++ JSC slow_path_negate computes -primValue.toNumber(globalObject):
         // after the BigInt check the primitive (object operands are already
@@ -9897,7 +9902,9 @@ impl CoreOpcodeDispatchHost {
         value: RuntimeValue,
     ) -> Result<RuntimeValue, ExecutionError> {
         if let Some(value) = self.bigints.value(value) {
-            return self.bigints.allocate(heap, value.bit_not());
+            return self
+                .bigints
+                .allocate(&mut self.objects, heap, value.bit_not());
         }
         // C++ JSC slow_path_bitnot uses toBigIntOrInt32 -> ToInt32, which after
         // the BigInt check reduces the primitive via ToNumber (parsing string
@@ -10055,7 +10062,7 @@ impl CoreOpcodeDispatchHost {
             _ => None,
         };
         match result {
-            Some(value) => self.bigints.allocate(heap, value),
+            Some(value) => self.bigints.allocate(&mut self.objects, heap, value),
             None => Err(ExecutionError::Int32ArithmeticOverflow),
         }
     }
@@ -16238,14 +16245,14 @@ impl CoreOpcodeDispatchHost {
         if let Some(value) = self.bigints.value(value) {
             return self
                 .bigints
-                .allocate(heap, value)
+                .allocate(&mut self.objects, heap, value)
                 .map_err(DispatchOutcome::Fail);
         }
         if let Some(text) = self.strings.text(value) {
             let value = parse_bigint_constructor_text(text).map_err(DispatchOutcome::Fail)?;
             return self
                 .bigints
-                .allocate(heap, value)
+                .allocate(&mut self.objects, heap, value)
                 .map_err(DispatchOutcome::Fail);
         }
         let value = match value.kind() {
@@ -16269,7 +16276,7 @@ impl CoreOpcodeDispatchHost {
             _ => return Err(DispatchOutcome::Fail(ExecutionError::ExpectedInt32)),
         };
         self.bigints
-            .allocate(heap, value)
+            .allocate(&mut self.objects, heap, value)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -27378,18 +27385,20 @@ mod tests {
         assert!(!symbol.js_type.is_object());
         assert_eq!(symbol.js_type.cell_type(), CellType::Symbol);
 
-        // BigInt: allocate through the heap-backed store, resolve via value()
-        // (which itself debug-asserts the header), then read the owned cell's tag.
+        // BigInt: allocate through the heap-backed store, resolve via value().
+        // U3: the cell is now a SHARED-arena HeapBigInt cell (CoreObjectStore::space). It
+        // resolves via the bigint store's gate, carries its value, and the U0b `isObject()`
+        // gate rejects it as an object (HeapBigIntType < ObjectType) — proving leaf/object
+        // discrimination.
         let mut heap = Heap::new();
         let mut bigints = CoreBigIntStore::default();
         let bigint_value = bigints
-            .allocate(&mut heap, CoreBigIntValue::from_i32(7))
+            .allocate(&mut objects, &mut heap, CoreBigIntValue::from_i32(7))
             .expect("bigint allocation");
         assert!(bigints.value(bigint_value).is_some());
-        let bigint = bigints.bigints[0].as_ref().get_ref();
-        assert_eq!(bigint.js_type, JsType::HeapBigInt);
-        assert!(!bigint.js_type.is_object());
-        assert_eq!(bigint.js_type.cell_type(), CellType::BigInt);
+        assert!(objects.find(bigint_value).is_none());
+        assert!(!JsType::HeapBigInt.is_object());
+        assert_eq!(JsType::HeapBigInt.cell_type(), CellType::BigInt);
     }
 
     #[test]
