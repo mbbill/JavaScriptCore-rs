@@ -28,13 +28,15 @@ use crate::bytecode::ic::{
     PropertyInlineCacheAttachedMetadataResult, PropertyInlineCacheAttachmentError,
     PropertyInlineCacheAttachmentKind, PropertyInlineCacheAttachmentOutcome,
     PropertyInlineCacheAttachmentRequest, PropertyInlineCacheAttachmentResult,
-    PropertyInlineCacheClearError, PropertyInlineCacheClearMetadataMismatchField,
-    PropertyInlineCacheClearOutcome, PropertyInlineCacheClearRequest,
-    PropertyInlineCacheClearResult, PropertyInlineCacheDispatch, PropertyInlineCacheStubMode,
-    PutByIdMode, PutByIdModeMetadata, StructureStubAccessCaseLinkError,
-    StructureStubAccessCaseLinkOutcome, StructureStubAccessCaseLinkRequest,
-    StructureStubAccessCaseLinkResult, StructureStubInfo, StructureStubKind,
-    StructureStubMetadataMismatchField,
+    PropertyInlineCacheBufferedStructures, PropertyInlineCacheClearError,
+    PropertyInlineCacheClearMetadataMismatchField, PropertyInlineCacheClearOutcome,
+    PropertyInlineCacheClearRequest, PropertyInlineCacheClearResult, PropertyInlineCacheDispatch,
+    PropertyInlineCacheStubMode, PutByIdMode, PutByIdModeMetadata,
+    StructureStubAccessCaseLinkError, StructureStubAccessCaseLinkOutcome,
+    StructureStubAccessCaseLinkRequest, StructureStubAccessCaseLinkResult, StructureStubInfo,
+    StructureStubKind, StructureStubMetadataMismatchField,
+    STRUCTURE_STUB_INITIAL_BUFFERING_COUNTDOWN, STRUCTURE_STUB_INITIAL_COUNTDOWN,
+    STRUCTURE_STUB_INITIAL_NUMBER_OF_COOL_DOWNS, STRUCTURE_STUB_INITIAL_REPATCH_COUNT,
 };
 use crate::bytecode::instruction::{
     DecodedInstruction, InstructionDecodeError, Operand, PackedInstructionStream,
@@ -3531,6 +3533,13 @@ fn structure_stub_info_for_property_inline_cache_request(
         code_origin: CodeOrigin::new(request.bytecode_index),
         access_cases: Vec::new(),
         reset_by_gc: false,
+        countdown: STRUCTURE_STUB_INITIAL_COUNTDOWN,
+        repatch_count: STRUCTURE_STUB_INITIAL_REPATCH_COUNT,
+        number_of_cool_downs: STRUCTURE_STUB_INITIAL_NUMBER_OF_COOL_DOWNS,
+        buffering_countdown: STRUCTURE_STUB_INITIAL_BUFFERING_COUNTDOWN,
+        buffered_structures: PropertyInlineCacheBufferedStructures::Unset,
+        ever_considered: false,
+        took_slow_path: false,
     }
 }
 

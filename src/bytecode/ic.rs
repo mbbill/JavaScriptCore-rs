@@ -6,7 +6,13 @@ use crate::bytecode::opcode::CoreOpcode;
 use crate::bytecode::origin::CodeOrigin;
 use crate::bytecode::register::VirtualRegister;
 use crate::gc::StructureId;
-use crate::jit::CallBoundaryId;
+// `CallLinkAttachmentPlan` lives in `crate::jit::ic` (jit/ic.rs:3779-3798) and
+// is re-exported at `crate::jit` (jit/mod.rs:170-173). `bytecode/ic.rs`
+// already depends on `crate::jit` for `CallBoundaryId` (below), so pulling in
+// this second jit-owned IC-descriptor type via the same top-level path is the
+// SAME dependency direction already established here, not a new inversion —
+// see docs/design/ic-resident-provenance.md, "Open question 2".
+use crate::jit::{CallBoundaryId, CallLinkAttachmentPlan};
 use crate::runtime::{CodeBlockId, ExecutableId, ObjectId};
 use crate::strings::PropertyKey;
 
@@ -923,6 +929,17 @@ pub enum PutByIdMode {
 pub struct PropertyOffset(pub i32);
 
 /// Patchable structure stub metadata used by property inline caches.
+///
+/// R0 of `docs/design/ic-resident-provenance.md` ("§B. Property-IC
+/// attachment cluster") adds the `countdown`/`repatch_count`/
+/// `number_of_cool_downs`/`buffering_countdown`/`buffered_structures`/
+/// `ever_considered`/`took_slow_path` fields below, field-for-field from C++
+/// `PropertyInlineCache` (`bytecode/PropertyInlineCache.h:463-478`, read in
+/// full). They are the resident "should we even try to repatch" gate that
+/// C++'s `considerRepatchingCacheImpl` (`PropertyInlineCache.h:248-342`)
+/// reads/mutates in place; this unit only ADDS the fields (unwired,
+/// `#[allow(dead_code)]`) so Unit R2 can port `consider_repatching`'s exact
+/// arithmetic against them. Zero behavior change in this commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StructureStubInfo {
     pub bytecode_index: BytecodeIndex,
@@ -939,6 +956,93 @@ pub struct StructureStubInfo {
     pub code_origin: CodeOrigin,
     pub access_cases: Vec<AccessCaseRef>,
     pub reset_by_gc: bool,
+
+    /// C++ `PropertyInlineCache::countdown` (`PropertyInlineCache.h:468`,
+    /// init `{ 1 }`): repatch is considered once this hits 0; C++ patches
+    /// after the first execution. Unread until Unit R2 wires
+    /// `consider_repatching`.
+    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    pub countdown: u8,
+    /// C++ `repatchCount` (`:469`, init `{ 0 }`): saturating count of
+    /// consecutive countdown-expirations, compared against
+    /// `Options::repatchCountForCoolDown()` to detect over-frequent
+    /// repatching. Unread until Unit R2.
+    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    pub repatch_count: u8,
+    /// C++ `numberOfCoolDowns` (`:470`, init `{ 0 }`): exponential-backoff
+    /// generation counter — each time repatching is throttled, `countdown`
+    /// is reseeded via `leftShiftWithSaturation(initialCoolDownCount,
+    /// numberOfCoolDowns++)`. Unread until Unit R2.
+    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    pub number_of_cool_downs: u8,
+    /// C++ `bufferingCountdown` (`:471`, init
+    /// `Options::initialRepatchBufferingCountdown()` — default `6`,
+    /// `runtime/OptionsList.h:109`). Decremented once per buffered (but not
+    /// yet regenerated) access-case attempt; hitting 0 forces a repatch
+    /// rather than buffering indefinitely. Unread until Unit R2.
+    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    pub buffering_countdown: u8,
+    /// C++ `m_bufferedStructures` (`:438`, guarded by
+    /// `m_bufferedStructuresLock`): a BOUNDED, per-regeneration-cycle dedup
+    /// set, NOT a permanent rejection memo — cleared every successful stub
+    /// regeneration (`clearBufferedStructures`, `:346-357`). See
+    /// docs/design/ic-resident-provenance.md, "the crux finding": JSC does
+    /// not memoize permanently-rejected access-case attempts. Unread until
+    /// Unit R2.
+    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    pub buffered_structures: PropertyInlineCacheBufferedStructures,
+    /// C++ `everConsidered : 1` (`:477`, init `{ false }`): set once
+    /// `considerRepatchingCacheImpl` has been called at all for this site.
+    /// Unread until Unit R2.
+    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    pub ever_considered: bool,
+    /// C++ `tookSlowPath : 1` (`:478`, init `{ false }`). Unread until Unit
+    /// R2/R3 (property-IC slow-path bookkeeping).
+    #[allow(dead_code)] // wired by Unit R2/R3
+    pub took_slow_path: bool,
+}
+
+/// C++ `PropertyInlineCache::countdown`'s initial value
+/// (`PropertyInlineCache.h:468`, `uint8_t countdown { 1 }`).
+pub const STRUCTURE_STUB_INITIAL_COUNTDOWN: u8 = 1;
+/// C++ `PropertyInlineCache::repatchCount`'s initial value (`:469`,
+/// `uint8_t repatchCount { 0 }`).
+pub const STRUCTURE_STUB_INITIAL_REPATCH_COUNT: u8 = 0;
+/// C++ `PropertyInlineCache::numberOfCoolDowns`'s initial value (`:470`,
+/// `uint8_t numberOfCoolDowns { 0 }`).
+pub const STRUCTURE_STUB_INITIAL_NUMBER_OF_COOL_DOWNS: u8 = 0;
+/// C++ `Options::initialRepatchBufferingCountdown()`'s default
+/// (`runtime/OptionsList.h:109`: `v(Unsigned, initialRepatchBufferingCountdown,
+/// 6, Normal, nullptr)`), which seeds `PropertyInlineCache::bufferingCountdown`
+/// in its constructor (`PropertyInlineCache.h:363`).
+pub const STRUCTURE_STUB_INITIAL_BUFFERING_COUNTDOWN: u8 = 6;
+/// C++ `Options::repatchCountForCoolDown()`'s default (`runtime/OptionsList.h:106`:
+/// `v(Unsigned, repatchCountForCoolDown, 8, Normal, nullptr)`), compared
+/// against `repatchCount` by `considerRepatchingCacheImpl` (`:267`). Unread
+/// until Unit R2 (consider_repatching).
+#[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+pub const STRUCTURE_STUB_REPATCH_COUNT_FOR_COOL_DOWN: u8 = 8;
+/// C++ `Options::initialCoolDownCount()`'s default (`runtime/OptionsList.h:107`:
+/// `v(Unsigned, initialCoolDownCount, 20, Normal, nullptr)`), the base value
+/// left-shifted by `numberOfCoolDowns` to reseed `countdown` (`:274-277`).
+/// Unread until Unit R2 (consider_repatching).
+#[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+pub const STRUCTURE_STUB_INITIAL_COOL_DOWN_COUNT: u8 = 20;
+
+/// C++ `PropertyInlineCache::m_bufferedStructures`
+/// (`PropertyInlineCache.h:438`): `Variant<monostate, Vector<StructureID>,
+/// Vector<tuple<StructureID, CacheableIdentifier>>>`. Structure-only when the
+/// site has no identifier component (`m_identifier` is null, `:312-314`);
+/// `(StructureId, PropertyKey)` pairs otherwise. A BOUNDED per-cycle dedup
+/// set — cleared on every regeneration (`clearBufferedStructures`,
+/// `:346-357`) — not a permanent rejection log; see
+/// docs/design/ic-resident-provenance.md §B.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PropertyInlineCacheBufferedStructures {
+    #[default]
+    Unset,
+    Structures(Vec<StructureId>),
+    StructuresWithKey(Vec<(StructureId, PropertyKey)>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -957,6 +1061,12 @@ pub enum StructureStubKind {
 pub struct AccessCaseRef(pub u64);
 
 /// Call link metadata for data ICs, direct calls, and optimizing tiers.
+///
+/// R0 of `docs/design/ic-resident-provenance.md` ("§A. Call-link pipeline",
+/// "Open question 2") adds `attachment_plan` and `polymorphic_variants`
+/// below, additive and unwired (`#[allow(dead_code)]`) so Unit R1 can port
+/// `linkFor`'s atomic attempt function against them. Zero behavior change in
+/// this commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallLinkInfo {
     pub call_site: CallSiteIndex,
@@ -970,7 +1080,44 @@ pub struct CallLinkInfo {
     pub slow_path_count: u32,
     pub max_argument_count_including_this_for_varargs: u8,
     pub flags: CallLinkFlags,
+
+    /// Ratified by the orchestrator (design doc "Open question 2", reading
+    /// (a)): a plain `Option<CallLinkAttachmentPlan>` field on `CallLinkInfo`
+    /// itself. C++ `CallLinkInfo` (`bytecode/CallLinkInfo.h:58+`) has no
+    /// separate plan object at all — `linkFor` (`bytecode/RepatchInlines.h`)
+    /// computes-and-commits in one atomic function — so this field's
+    /// long-term shape is "the plan computed and consumed within the SAME
+    /// attempt call," matching JSC; it is added now, additive-only, so Unit
+    /// R1 can land the atomic fold against a stable field instead of
+    /// changing `CallLinkInfo`'s shape mid-fold. Unread until Unit R1.
+    #[allow(dead_code)] // wired by Unit R1 (attempt_call_link)
+    pub attachment_plan: Option<CallLinkAttachmentPlan>,
+    /// Bounded polymorphic-callee-variant list skeleton (design doc §A,
+    /// "the generated-call-link sidecar's legitimate multi-candidate need",
+    /// Open question 5, ratified recommendation): mirrors C++
+    /// `PolymorphicCallStubRoutine::variants()` (a `CallVariantList` built by
+    /// `linkPolymorphicCall`, `bytecode/Repatch.cpp`), which is capped —
+    /// not logged — at `MAX_POLYMORPHIC_CALL_VARIANT_LIST_SIZE`. Held as a
+    /// plain `Vec` (like JSC's own `Vector`, itself not statically bounded
+    /// at the type level — `Repatch.cpp:181` enforces the cap at the call
+    /// site, falling back to `setVirtualCall` when exceeded); Unit R1 is
+    /// responsible for enforcing the cap when it wires
+    /// `linkPolymorphicCall`'s equivalent. Unread until Unit R1.
+    #[allow(dead_code)] // wired by Unit R1 (attempt_call_link)
+    pub polymorphic_variants: Vec<ObjectId>,
 }
+
+/// C++ `Options::maxPolymorphicCallVariantListSize()`'s default
+/// (`runtime/OptionsList.h:272`: `v(Unsigned, maxPolymorphicCallVariantListSize,
+/// 8, Normal, nullptr)`), the general (non-top-tier, non-Wasm-to-JS) cap
+/// `linkPolymorphicCall` (`bytecode/Repatch.cpp:172-182`) applies before
+/// falling back to a virtual call. Distinct top-tier
+/// (`maxPolymorphicCallVariantListSizeForTopTier`, default 5) and
+/// Wasm-to-JS (`maxPolymorphicCallVariantListSizeForWasmToJS`, default 5)
+/// caps exist in C++ but are out of this unit's additive scope. Unread until
+/// Unit R1 (attempt_call_link).
+#[allow(dead_code)] // wired by Unit R1 (attempt_call_link)
+pub const MAX_POLYMORPHIC_CALL_VARIANT_LIST_SIZE: usize = 8;
 
 impl CallLinkInfo {
     fn metadata_only_unlinked(
@@ -992,6 +1139,8 @@ impl CallLinkInfo {
             slow_path_count: 0,
             max_argument_count_including_this_for_varargs: 0,
             flags: CallLinkFlags::default(),
+            attachment_plan: None,
+            polymorphic_variants: Vec::new(),
         }
     }
 
@@ -1724,6 +1873,29 @@ mod call_link_info_tests {
         assert_eq!(call.target, CallTarget::Unlinked);
     }
 
+    // R0 of docs/design/ic-resident-provenance.md ("§A. Call-link pipeline",
+    // "Open question 2"/"5"): the new `attachment_plan`/`polymorphic_variants`
+    // fields are additive-only in this unit -- C++ `CallLinkInfo` has no plan
+    // object and no cached-variant list until a call has actually been seen
+    // (`CallLinkInfo.h:58+`), so a freshly constructed, never-linked site must
+    // start with both empty, matching every other freshly-constructed field
+    // above.
+    #[test]
+    fn fresh_call_link_info_has_no_attachment_plan_or_polymorphic_variants() {
+        let call = unlinked_call(10, 10);
+        assert_eq!(call.attachment_plan, None);
+        assert!(call.polymorphic_variants.is_empty());
+    }
+
+    // C++ `Options::maxPolymorphicCallVariantListSize()`'s default
+    // (`runtime/OptionsList.h:272`), the general (non-top-tier,
+    // non-Wasm-to-JS) polymorphic-call-variant cap `linkPolymorphicCall`
+    // (`bytecode/Repatch.cpp:172-182`) enforces.
+    #[test]
+    fn max_polymorphic_call_variant_list_size_matches_cxx_default() {
+        assert_eq!(MAX_POLYMORPHIC_CALL_VARIANT_LIST_SIZE, 8);
+    }
+
     // C++ `setMonomorphicCallee` (CallLinkInfo.cpp:134-141): caches the callee
     // and flips `m_mode` to Monomorphic in place; `isLinked()` then true.
     #[test]
@@ -1831,5 +2003,102 @@ mod call_link_info_tests {
             .call_for_bytecode_index_mut(BytecodeIndex::from_offset(20))
             .expect("mutable single-site lookup");
         assert!(direct.is_linked());
+    }
+}
+
+// R0 of docs/design/ic-resident-provenance.md ("§B. Property-IC attachment
+// cluster"): construction/default-value pinning tests for the new
+// countdown/buffering/considered fields, proving they mirror C++
+// `PropertyInlineCache`'s field initializers (`PropertyInlineCache.h:363,
+// 468-478`) and `Options` defaults (`runtime/OptionsList.h:106-109`), not an
+// accidental Rust value. These fields are unwired in this unit (Unit R2
+// wires `consider_repatching`), so the tests only pin construction/defaults,
+// not the countdown arithmetic itself.
+#[cfg(test)]
+mod structure_stub_info_tests {
+    use super::*;
+    use crate::strings::PropertyIndex;
+
+    fn fresh_structure_stub() -> StructureStubInfo {
+        StructureStubInfo {
+            bytecode_index: BytecodeIndex::from_offset(10),
+            inline_cache_slot: 0,
+            attachment_kind: PropertyInlineCacheAttachmentKind::GetByNameOwnDataLoad,
+            key: PropertyKey::Index(PropertyIndex::from_canonical_index(0)),
+            base_structure: StructureId::new(1),
+            holder_structure: None,
+            new_structure: None,
+            offset: None,
+            requirements: PropertyInlineCacheAttachmentRequirements::default(),
+            kind: StructureStubKind::GetById,
+            cache_state: InlineCacheState::Unset,
+            code_origin: CodeOrigin::new(BytecodeIndex::from_offset(10)),
+            access_cases: Vec::new(),
+            reset_by_gc: false,
+            countdown: STRUCTURE_STUB_INITIAL_COUNTDOWN,
+            repatch_count: STRUCTURE_STUB_INITIAL_REPATCH_COUNT,
+            number_of_cool_downs: STRUCTURE_STUB_INITIAL_NUMBER_OF_COOL_DOWNS,
+            buffering_countdown: STRUCTURE_STUB_INITIAL_BUFFERING_COUNTDOWN,
+            buffered_structures: PropertyInlineCacheBufferedStructures::Unset,
+            ever_considered: false,
+            took_slow_path: false,
+        }
+    }
+
+    // C++ `PropertyInlineCache::countdown { 1 }` (`PropertyInlineCache.h:468`):
+    // a fresh site patches after its first execution, not its zeroth.
+    #[test]
+    fn fresh_structure_stub_countdown_starts_at_one() {
+        assert_eq!(fresh_structure_stub().countdown, 1);
+    }
+
+    // C++ `repatchCount { 0 }` / `numberOfCoolDowns { 0 }`
+    // (`PropertyInlineCache.h:469-470`): no repatches and no cool-downs have
+    // happened yet on a fresh site.
+    #[test]
+    fn fresh_structure_stub_repatch_and_cool_down_counters_start_at_zero() {
+        let stub = fresh_structure_stub();
+        assert_eq!(stub.repatch_count, 0);
+        assert_eq!(stub.number_of_cool_downs, 0);
+    }
+
+    // C++ `PropertyInlineCache(...)` constructor
+    // (`PropertyInlineCache.h:361-364`): `bufferingCountdown(Options::
+    // initialRepatchBufferingCountdown())`, default 6
+    // (`runtime/OptionsList.h:109`).
+    #[test]
+    fn fresh_structure_stub_buffering_countdown_matches_cxx_options_default() {
+        assert_eq!(fresh_structure_stub().buffering_countdown, 6);
+        assert_eq!(STRUCTURE_STUB_INITIAL_BUFFERING_COUNTDOWN, 6);
+    }
+
+    // C++ `Options::repatchCountForCoolDown()` (default 8,
+    // `runtime/OptionsList.h:106`) and `Options::initialCoolDownCount()`
+    // (default 20, `runtime/OptionsList.h:107`) -- the two thresholds Unit
+    // R2's `consider_repatching` arithmetic will read.
+    #[test]
+    fn repatch_cool_down_thresholds_match_cxx_options_defaults() {
+        assert_eq!(STRUCTURE_STUB_REPATCH_COUNT_FOR_COOL_DOWN, 8);
+        assert_eq!(STRUCTURE_STUB_INITIAL_COOL_DOWN_COUNT, 20);
+    }
+
+    // C++ `everConsidered : 1 { false }` / `tookSlowPath : 1 { false }`
+    // (`PropertyInlineCache.h:477-478`) and `m_bufferedStructures` defaulting
+    // to `std::monostate` (the `Variant`'s default alternative,
+    // `PropertyInlineCache.h:438`, mirrored by
+    // `PropertyInlineCacheBufferedStructures::Unset`).
+    #[test]
+    fn fresh_structure_stub_considered_flags_and_buffered_structures_are_unset() {
+        let stub = fresh_structure_stub();
+        assert!(!stub.ever_considered);
+        assert!(!stub.took_slow_path);
+        assert_eq!(
+            stub.buffered_structures,
+            PropertyInlineCacheBufferedStructures::Unset
+        );
+        assert_eq!(
+            PropertyInlineCacheBufferedStructures::default(),
+            PropertyInlineCacheBufferedStructures::Unset
+        );
     }
 }

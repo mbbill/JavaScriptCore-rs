@@ -6658,6 +6658,10 @@ impl VmTieringIntegration {
                 counters: zero_tier_counters(),
             },
             last_entry_decision: None,
+            materialization_ring: [const { None }; MATERIALIZATION_RING_CAPACITY],
+            materialization_ring_cursor: 0,
+            last_disabled_readiness: None,
+            last_enabled_readiness: None,
         });
         &mut self.states[index]
     }
@@ -7060,12 +7064,73 @@ impl VmTieringIntegration {
 // no longer derive `Copy`; all production access is through
 // `state_for`/`state_for_mut`, which already hand out references, so this is
 // not a behavioral change for any caller.
+// R0 of docs/design/ic-resident-provenance.md ("§C. Materialization/readiness
+// split", Unit R4) adds `materialization_ring`/`materialization_ring_cursor`/
+// `last_disabled_readiness`/`last_enabled_readiness` below, to the SAME
+// owner-keyed state host Unit 1 (`6170b4c`) already established for
+// `last_entry_decision`. Additive only, unwired (`#[allow(dead_code)]`); Unit
+// R4 ports `validate_baseline_executable_materialization_for_install` and
+// `p6_semantic_install_side_effect_counts` (vm/mod.rs) against these fields
+// and deletes the VM-global `baseline_executable_materializations`/
+// `baseline_native_entry_readiness_records` Vecs (see the SCOPE NOTE comments
+// at this file's `record_baseline_executable_materialization`/
+// `record_baseline_native_entry_readiness`). Zero behavior change in this
+// commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTierState {
     pub owner: CodeBlockId,
     pub tiering: TieringState,
     pub last_entry_decision: Option<TierEntryDecisionRecord>,
+
+    /// Port machinery, NO C++ analog: C++ never needs a per-owner history of
+    /// rejected materialization attempts, because a rejected attempt is
+    /// identity-checked by a live pointer (a `CodeBlock*`/`JITCode*`) that
+    /// survives on its own once handed back to the caller -- pointer identity
+    /// IS the check. Rust attempts are values, not pointers, so
+    /// `validate_baseline_executable_materialization_for_install` (this file,
+    /// SCOPE NOTE at `record_baseline_executable_materialization`) needs SOME
+    /// bounded, per-owner window in which an EARLIER, non-latest attempt (not
+    /// just "the current one") stays checkable by identity/equality -- see
+    /// `baseline_materialization_rejects_descriptor_mismatches`, the test
+    /// that forced the `6170b4c` revert of the naive latest-wins fold. Ring
+    /// capacity RATIFIED at `MATERIALIZATION_RING_CAPACITY` by the
+    /// orchestrator (design doc "Open question 4"). Unread until Unit R4.
+    #[allow(dead_code)] // wired by Unit R4
+    pub materialization_ring:
+        [Option<BaselineExecutableMaterializationRecord>; MATERIALIZATION_RING_CAPACITY],
+    /// Next `materialization_ring` slot to overwrite (wraps modulo
+    /// `MATERIALIZATION_RING_CAPACITY`); port machinery for
+    /// `materialization_ring`, no C++ analog. Unread until Unit R4.
+    #[allow(dead_code)] // wired by Unit R4
+    pub materialization_ring_cursor: usize,
+    /// C++ never logs native-entry readiness either: JSC checks "has this
+    /// been compiled and is it callable" by identity, e.g.
+    /// `CallLinkInfo::m_codeBlock`/`m_monomorphicCallDestination` being null
+    /// vs. set (`bytecode/CallLinkInfo.h:310-311`). The P6
+    /// baseline-native-entry install path
+    /// (`install_p6_x86_64_semantic_baseline_native_entry`, `vm/mod.rs`)
+    /// legitimately produces exactly two readiness results per call -- a
+    /// disabled probe, then an enabled one -- so this is modeled as two named
+    /// slots (design doc §C item 2) rather than a sliceable Vec. P6 itself is
+    /// a confirmed, already-scheduled-for-deletion divergence
+    /// (`docs/design/baseline-call-tier-divergence.md`, STEP 5); when it
+    /// goes, this degrades to "one slot instead of two," not a second
+    /// redesign. Unread until Unit R4.
+    #[allow(dead_code)] // wired by Unit R4
+    pub last_disabled_readiness: Option<BaselineNativeEntryReadinessRecord>,
+    /// See `last_disabled_readiness`: the paired "execution enabled" probe
+    /// result from the same P6 install call. Unread until Unit R4.
+    #[allow(dead_code)] // wired by Unit R4
+    pub last_enabled_readiness: Option<BaselineNativeEntryReadinessRecord>,
 }
+
+/// Port machinery, no C++ analog (see `RuntimeTierState::materialization_ring`
+/// above): RATIFIED by the orchestrator at 8 (design doc "Open question 4"),
+/// sized to the realistic in-flight rejected-attempt count
+/// `baseline_materialization_rejects_descriptor_mismatches` exercises plus
+/// headroom -- not derived from a C++ constant, since JSC has none (pointer
+/// identity needs no bound).
+pub const MATERIALIZATION_RING_CAPACITY: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TierEntryRequest {
@@ -20720,6 +20785,35 @@ mod tests {
         assert_eq!(tiering.baseline_generated_code_invalidations().len(), 1);
     }
 
+    // R0 of docs/design/ic-resident-provenance.md ("§C. Materialization/
+    // readiness split", Unit R4): pins a freshly created `RuntimeTierState`'s
+    // new materialization-ring/readiness fields to their C++-derived initial
+    // "no history yet" values. C++ never logs either (see the design doc);
+    // both `baseline_executable_materializations`/
+    // `baseline_native_entry_readiness_records` (the VM-global logs these
+    // fields will eventually replace, Unit R4) still exist unmodified in this
+    // unit, so this test only proves the NEW fields' construction, not any
+    // wiring.
+    #[test]
+    fn fresh_runtime_tier_state_has_no_materialization_or_readiness_history() {
+        let mut tiering = VmTieringIntegration::default();
+        let owner = CodeBlockId(CellId(77));
+        let state = tiering.state_for_mut(owner, TieringPolicy::InterpreterOnly);
+
+        assert!(state.materialization_ring.iter().all(Option::is_none));
+        assert_eq!(state.materialization_ring_cursor, 0);
+        assert_eq!(state.last_disabled_readiness, None);
+        assert_eq!(state.last_enabled_readiness, None);
+    }
+
+    // Ring capacity RATIFIED by the orchestrator at 8 (design doc "Open
+    // question 4"); pinned here so a future resize is a deliberate,
+    // reviewed change to this test, not a silent drift.
+    #[test]
+    fn materialization_ring_capacity_is_ratified_at_eight() {
+        assert_eq!(MATERIALIZATION_RING_CAPACITY, 8);
+    }
+
     fn baseline_artifact(owner: CodeBlockId, id: u64) -> JitCodeArtifact {
         let code = JitCodeId(id);
         let native_code = NativeCodeId(id as u32 + 100);
@@ -23709,6 +23803,13 @@ mod tests {
             code_origin: crate::bytecode::origin::CodeOrigin::new(plan.bytecode_index),
             access_cases: Vec::new(),
             reset_by_gc: false,
+            countdown: crate::bytecode::ic::STRUCTURE_STUB_INITIAL_COUNTDOWN,
+            repatch_count: crate::bytecode::ic::STRUCTURE_STUB_INITIAL_REPATCH_COUNT,
+            number_of_cool_downs: crate::bytecode::ic::STRUCTURE_STUB_INITIAL_NUMBER_OF_COOL_DOWNS,
+            buffering_countdown: crate::bytecode::ic::STRUCTURE_STUB_INITIAL_BUFFERING_COUNTDOWN,
+            buffered_structures: crate::bytecode::ic::PropertyInlineCacheBufferedStructures::Unset,
+            ever_considered: false,
+            took_slow_path: false,
         }
     }
 
