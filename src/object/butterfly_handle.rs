@@ -181,6 +181,16 @@ impl ButterflyAllocation {
         self.named_len
     }
 
+    /// Total buffer capacity in bytes (named + element sides) — the `Butterfly::totalSize`
+    /// analog (runtime/Butterfly.h:140-150). gc-r4 leak-fix C1: the store
+    /// (`CoreObjectStore`, which owns the arena's `MarkedSpace`) reads this before/after a
+    /// growth call and reports the DELTA into `MarkedSpace::report_extra_memory_allocated`
+    /// — the C++ `PropertyTable.h:581` `newDataSize - oldDataSize` pattern, since a
+    /// Butterfly itself has no such report (see that fn's DIVERGENCE note).
+    pub fn total_capacity_bytes(&self) -> usize {
+        (self.named_len + self.vector_cap) * SLOT_SIZE
+    }
+
     /// Re-EXPOSE the (re)allocated buffer and cache its start address. `expose_provenance`
     /// publishes the buffer's mutable provenance so every value-slot access (this module
     /// AND the cell's raw cell+8 deref) recovers it with `with_exposed_provenance`. `0`

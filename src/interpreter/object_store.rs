@@ -2182,6 +2182,12 @@ impl CoreObjectStore {
     /// (Butterfly.h:172-179) out of the GC Auxiliary subspace; the real arena
     /// allocation is deferred to R4. Here: push a default (empty)
     /// `ButterflyAllocation` and return its slab index.
+    ///
+    /// gc-r4 leak-fix C1: NO `report_extra_memory_allocated` call here — a fresh
+    /// `ButterflyAllocation::default()` is a 0-byte buffer (`total_capacity_bytes() == 0`;
+    /// C++ `m_butterfly` likewise starts null, JSObject.h:1167). Real growth is reported at
+    /// the `grow_named`/`grow_vector` call sites below (`butterfly_prop_put`/
+    /// `butterfly_elem_put`/`butterfly_elem_resize`/`butterfly_elem_push`).
     pub(crate) fn allocate_butterfly(&mut self) -> ButterflyHandle {
         // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
         ButterflyHandle(slab_alloc(
@@ -2208,6 +2214,12 @@ impl CoreObjectStore {
     #[allow(dead_code)]
     pub(crate) fn clone_butterfly(&mut self, handle: ButterflyHandle) -> ButterflyHandle {
         let copy = self.butterflies[handle.0].clone();
+        // gc-r4 leak-fix C1: the clone is a FRESH buffer of the source's full capacity (a
+        // real allocation, not a delta — there is no "before" for a brand-new handle). See
+        // `MarkedSpace::report_extra_memory_allocated`'s DIVERGENCE note (a Butterfly is a
+        // first-class C++ Aux allocation; this is the off-arena-slab substitute).
+        self.space
+            .report_extra_memory_allocated(copy.total_capacity_bytes());
         let index = self.butterflies.len();
         self.butterflies.push(copy);
         ButterflyHandle(index)
@@ -2299,7 +2311,17 @@ impl CoreObjectStore {
         if crate::object::property_offset::is_inline_offset(offset.raw()) {
             return false;
         }
-        self.butterflies[handle.0].prop_put(offset.raw(), value)
+        // gc-r4 leak-fix C1: report the growth DELTA on reallocation (C++ `PropertyTable.h:581`
+        // `if (oldDataSize < newDataSize) reportExtraMemoryAllocated(this, newDataSize -
+        // oldDataSize)` pattern — see `MarkedSpace::report_extra_memory_allocated`).
+        let before = self.butterflies[handle.0].total_capacity_bytes();
+        let moved = self.butterflies[handle.0].prop_put(offset.raw(), value);
+        if moved {
+            let after = self.butterflies[handle.0].total_capacity_bytes();
+            self.space
+                .report_extra_memory_allocated(after.saturating_sub(before));
+        }
+        moved
     }
 
     /// Clear the property slot for `offset` in butterfly `handle` back to
@@ -2354,7 +2376,16 @@ impl CoreObjectStore {
         index: usize,
         value: RuntimeValue,
     ) -> bool {
-        self.butterflies[handle.0].elem_put(index, value)
+        // gc-r4 leak-fix C1: report the growth DELTA on reallocation — see
+        // `butterfly_prop_put` / `MarkedSpace::report_extra_memory_allocated`.
+        let before = self.butterflies[handle.0].total_capacity_bytes();
+        let moved = self.butterflies[handle.0].elem_put(index, value);
+        if moved {
+            let after = self.butterflies[handle.0].total_capacity_bytes();
+            self.space
+                .report_extra_memory_allocated(after.saturating_sub(before));
+        }
+        moved
     }
 
     /// Resize the indexed element side of butterfly `handle` to `len`
@@ -2362,7 +2393,18 @@ impl CoreObjectStore {
     /// butterfly REALLOCATED (growth past capacity; the caller must `sync_butterfly_base`).
     #[must_use]
     pub(crate) fn butterfly_elem_resize(&mut self, handle: ButterflyHandle, len: usize) -> bool {
-        self.butterflies[handle.0].elem_resize(len)
+        // gc-r4 leak-fix C1: report the growth DELTA on reallocation (the #1 audit lever —
+        // a large `arr.length = N` / hole-fill grow is exactly the pdfjs-class 1MB-butterfly
+        // case that used to count ~0 bytes toward GC). See `butterfly_prop_put` /
+        // `MarkedSpace::report_extra_memory_allocated`.
+        let before = self.butterflies[handle.0].total_capacity_bytes();
+        let moved = self.butterflies[handle.0].elem_resize(len);
+        if moved {
+            let after = self.butterflies[handle.0].total_capacity_bytes();
+            self.space
+                .report_extra_memory_allocated(after.saturating_sub(before));
+        }
+        moved
     }
 
     /// Number of indexed element slots in butterfly `handle` (the Butterfly
@@ -2387,7 +2429,18 @@ impl CoreObjectStore {
         handle: ButterflyHandle,
         value: RuntimeValue,
     ) -> bool {
-        self.butterflies[handle.0].elem_push(value)
+        // gc-r4 leak-fix C1: report the growth DELTA on reallocation — `elem_push` calls
+        // `elem_put` INTERNALLY (object/butterfly_handle.rs), not through the wrapped
+        // `butterfly_elem_put` above, so it needs its own before/after. See
+        // `MarkedSpace::report_extra_memory_allocated`.
+        let before = self.butterflies[handle.0].total_capacity_bytes();
+        let moved = self.butterflies[handle.0].elem_push(value);
+        if moved {
+            let after = self.butterflies[handle.0].total_capacity_bytes();
+            self.space
+                .report_extra_memory_allocated(after.saturating_sub(before));
+        }
+        moved
     }
 
     /// Clear the indexed element at `index` in butterfly `handle` to a hole
@@ -2484,6 +2537,12 @@ impl CoreObjectStore {
     /// arena allocation is deferred to R4. Here: push the value array and return its slab
     /// index. Mirrors `allocate_butterfly`.
     pub(crate) fn allocate_bound_args(&mut self, args: Vec<RuntimeValue>) -> AuxiliaryHandle {
+        // gc-r4 leak-fix C1: report the value array's bytes into the GC-trigger counter
+        // before it moves into the slab (see `MarkedSpace::report_extra_memory_allocated`'s
+        // DIVERGENCE note — C++ allocates `m_boundArgs` from the GC Auxiliary subspace, a
+        // first-class heap allocation; this off-arena slab is the pre-R4 substitute).
+        self.space
+            .report_extra_memory_allocated(args.len() * std::mem::size_of::<RuntimeValue>());
         // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
         AuxiliaryHandle(slab_alloc(
             &mut self.bound_args_backings,
@@ -2511,6 +2570,10 @@ impl CoreObjectStore {
     /// is deferred); this mirrors `allocate_bound_args`. Called for EVERY function at
     /// creation (even an empty capture set) so a Function cell's handle is always real.
     pub(crate) fn allocate_captures(&mut self, captures: Vec<RuntimeValue>) -> AuxiliaryHandle {
+        // gc-r4 leak-fix C1: report the captured-value array's bytes — same substitute
+        // mechanism as `allocate_bound_args` (see `MarkedSpace::report_extra_memory_allocated`).
+        self.space
+            .report_extra_memory_allocated(captures.len() * std::mem::size_of::<RuntimeValue>());
         // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
         AuxiliaryHandle(slab_alloc(
             &mut self.captures_backings,
@@ -2544,6 +2607,11 @@ impl CoreObjectStore {
     /// store-owned slab index, like `allocate_bound_args`; the raw arena allocation
     /// arrives at R4.
     pub(crate) fn allocate_array_buffer_backing(&mut self, byte_length: usize) -> AuxiliaryHandle {
+        // gc-r4 leak-fix C1: report the raw byte backing — a DIRECT match to C++
+        // `ArrayBuffer.cpp:552` (`vm.heap.reportExtraMemoryAllocated(nullptr,
+        // result.value())` on a freshly `tryAllocate`d `ArrayBufferContents`); see
+        // `MarkedSpace::report_extra_memory_allocated`.
+        self.space.report_extra_memory_allocated(byte_length);
         // gc-r4 R4b-sweep: reuse a reclaimed slot index (`slab_alloc`) before appending.
         AuxiliaryHandle(slab_alloc(
             &mut self.array_buffer_backings,
@@ -13985,5 +14053,192 @@ mod symbol_cell_gc_u2_tests {
             "the symbol cell IS a member of the shared arena"
         );
         assert!(symbols.is_symbol(s), "the symbol store's gate resolves it");
+    }
+}
+
+// gc-r4 leak-fix C1 — the GC collection trigger counted ONLY arena-cell header bytes
+// (`allocate_blob`'s `len`, `MarkedSpace::bytes_allocated_this_cycle`); an off-arena payload
+// (a butterfly, a String's text, a BigInt's limbs) contributed ~0, so a string/array/bigint
+// -heavy workload (the pdfjs-class 16GB footprint) under-counted allocation by orders of
+// magnitude and collections almost never armed. These tests are LOAD-BEARING: each FAILS
+// against the pre-fix `MarkedSpace` (no `report_extra_memory_allocated` calls) because the
+// counter would rise by only the tiny fixed POD-header size, not the real payload size.
+#[cfg(test)]
+mod leak_fix_c1_extra_memory_accounting_tests {
+    use super::string_store::CoreStringStore;
+    use super::*;
+
+    fn ident(n: u32) -> CorePropertyKey {
+        CorePropertyKey::Identifier(n)
+    }
+
+    // (a) A large indexed-element grow (the Array.prototype fast-path / `arr.length = N`
+    // shape) on a butterfly must raise `bytes_allocated_this_cycle` by ~the backing size.
+    // Exercises the `butterfly_elem_resize` -> `ButterflyAllocation::grow_vector` path.
+    #[test]
+    fn butterfly_large_elem_grow_reports_extra_memory() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let handle = store.find(obj).unwrap().butterfly;
+        let before = store.space.bytes_allocated_this_cycle();
+
+        const LEN: usize = 200_000; // 200_000 * 8 bytes ~= 1.6MB — the "1MB butterfly" shape.
+        let moved = store.butterfly_elem_resize(handle, LEN);
+        assert!(
+            moved,
+            "growing past the initial (0) capacity must reallocate"
+        );
+
+        let after = store.space.bytes_allocated_this_cycle();
+        let expected_min = LEN * std::mem::size_of::<RuntimeValue>();
+        assert!(
+            after - before >= expected_min,
+            "bytes_allocated_this_cycle must rise by ~the backing size: \
+             before={before} after={after} expected_min={expected_min}"
+        );
+    }
+
+    // Same shape via `Array.prototype.push`'s fast path (`butterfly_elem_push` calls
+    // `ButterflyAllocation::elem_put` INTERNALLY, bypassing the `butterfly_elem_put` wrapper —
+    // it needs its own before/after wiring; this proves that wiring is live).
+    #[test]
+    fn butterfly_elem_push_growth_reports_extra_memory() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let handle = store.find(obj).unwrap().butterfly;
+        let before = store.space.bytes_allocated_this_cycle();
+
+        for i in 0..5_000 {
+            let _ = store.butterfly_elem_push(handle, RuntimeValue::from_i32(i));
+        }
+
+        let after = store.space.bytes_allocated_this_cycle();
+        assert!(
+            after - before >= 5_000 * std::mem::size_of::<RuntimeValue>(),
+            "repeated push growth must accumulate into bytes_allocated_this_cycle: \
+             before={before} after={after}"
+        );
+    }
+
+    // Out-of-line NAMED property growth (`butterfly_prop_put` -> `grow_named`) — the other
+    // Butterfly reallocation path (distinct from the indexed-element side above).
+    #[test]
+    fn butterfly_named_prop_growth_reports_extra_memory() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+        let handle = store.find(obj).unwrap().butterfly;
+        let before = store.space.bytes_allocated_this_cycle();
+
+        // A single OOL `prop_put` at a JUMPED offset forces one `grow_named` call that grows
+        // the named side by many slots at once (`grow_named` "tolerates a larger jump" — the
+        // intermediate fresh slots read `undefined`, see object/butterfly_handle.rs
+        // `prop_put`'s doc), well past the 256-byte `MIN_EXTRA_MEMORY_TO_REPORT` gate in ONE
+        // reallocation. (The Structure-driven `put_data_own` path instead grows the named
+        // side ONE slot per newly assigned offset — each such delta is individually below the
+        // report gate, matching C++'s own `minExtraMemory` per-call gate; that granularity is
+        // pre-existing Rust `grow_named` behavior, out of this batch's scope.)
+        const JUMP: i32 = 100; // 101 slots * 8 bytes = 808 bytes > the 256-byte report gate.
+        let moved = store.butterfly_prop_put(
+            handle,
+            PropertyOffset::new(FIRST_OUT_OF_LINE_OFFSET + JUMP),
+            RuntimeValue::from_i32(0x42),
+        );
+        assert!(moved, "growing the named side from 0 must reallocate");
+
+        let after = store.space.bytes_allocated_this_cycle();
+        let expected_min = (JUMP as usize + 1) * std::mem::size_of::<RuntimeValue>();
+        assert!(
+            after - before >= expected_min,
+            "a large named-side jump must report ~its full growth: \
+             before={before} after={after} expected_min={expected_min}"
+        );
+    }
+
+    // (b) A large flat string allocation must raise `bytes_allocated_this_cycle` by ~its byte
+    // length. Exercises `CoreStringStore::allocate_untracked`.
+    #[test]
+    fn large_string_allocation_reports_extra_memory() {
+        let mut objects = CoreObjectStore::default();
+        let mut strings = CoreStringStore::default();
+        let before = objects.space.bytes_allocated_this_cycle();
+
+        let big_text = "x".repeat(1_500_000); // ~1.5MB, well past MIN_EXTRA_MEMORY_TO_REPORT.
+        let _ = strings.allocate_untracked(&mut objects, &big_text);
+
+        let after = objects.space.bytes_allocated_this_cycle();
+        assert!(
+            after - before >= big_text.len(),
+            "bytes_allocated_this_cycle must rise by ~the string's byte length: \
+             before={before} after={after} len={}",
+            big_text.len()
+        );
+    }
+
+    // A cache-hit re-allocation of an ALREADY-INTERNED string must NOT double-report (no new
+    // StringImpl is created; C++ never calls finishCreation/reportExtraMemoryAllocated again).
+    #[test]
+    fn interned_string_cache_hit_does_not_double_report() {
+        let mut objects = CoreObjectStore::default();
+        let mut strings = CoreStringStore::default();
+        let big_text = "y".repeat(1_500_000);
+        let _ = strings.allocate_untracked(&mut objects, &big_text);
+        let after_first = objects.space.bytes_allocated_this_cycle();
+
+        let _ = strings.allocate_untracked(&mut objects, &big_text); // cache hit
+        let after_second = objects.space.bytes_allocated_this_cycle();
+
+        assert_eq!(
+            after_first, after_second,
+            "an interned-string cache hit allocates no new StringImpl, so it must not report \
+             extra memory again"
+        );
+    }
+
+    // (c) Allocating a mix of small cells (tiny POD headers) and large off-arena backings —
+    // the exact pdfjs-class shape the audit flagged (a 1MB butterfly counting ~16 bytes
+    // toward GC) — must ARM `collection_request_armed`. 5MB clears BOTH the production
+    // (4MB, `not(cfg(test))`) and the `#[cfg(test)]` (16KB) `BYTES_ALLOCATED_GC_THRESHOLD`,
+    // so this is threshold-config-independent.
+    #[test]
+    fn large_payload_allocations_arm_collection_request() {
+        let mut store = CoreObjectStore::default();
+        assert!(
+            !store.space.collection_request_armed(),
+            "a fresh store starts disarmed"
+        );
+
+        // Several tiny object cells (the "small cells" half of the audit's shape)...
+        for _ in 0..8 {
+            let _ = store.allocate();
+        }
+        // ...each carrying a large off-arena backing (the "big backings" half).
+        for _ in 0..5 {
+            let _ = store.allocate_array_buffer_backing(1024 * 1024); // 1MB each, 5MB total.
+        }
+
+        assert!(
+            store.space.collection_request_armed(),
+            "a >4MB off-arena payload (small cells + big backings) must arm a deferred \
+             collection request — the leak-fix C1 GC-trigger correction"
+        );
+    }
+
+    // (d) `reset_bytes_allocated_this_cycle` still disarms + zeroes the counter after an
+    // extra-memory-driven arm (not just an `allocate_blob`-driven one) — the collection-cycle
+    // boundary reset must cover BOTH funnels into the SAME counter.
+    #[test]
+    fn reset_disarms_after_extra_memory_driven_arm() {
+        let mut store = CoreObjectStore::default();
+        let _ = store.allocate_array_buffer_backing(5 * 1024 * 1024);
+        assert!(store.space.collection_request_armed());
+
+        store.space.reset_bytes_allocated_this_cycle();
+
+        assert!(!store.space.collection_request_armed(), "reset must disarm");
+        assert_eq!(
+            store.space.bytes_allocated_this_cycle(),
+            0,
+            "reset must zero the counter"
+        );
     }
 }

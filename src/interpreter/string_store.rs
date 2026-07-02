@@ -197,6 +197,13 @@ impl CoreStringStore {
             return self.value_for_index(self.indices_by_payload[&addr]);
         }
         let addr = admit_string_cell(objects, 0);
+        // gc-r4 leak-fix C1: report the StringImpl payload's byte length — a DIRECT match to
+        // C++ `JSString::finishCreation(vm, length, cost)` (runtime/JSString.h:181,
+        // `vm.heap.reportExtraMemoryAllocated(this, cost)`; `cost` = `StringImpl::cost()`,
+        // the buffer's byte size). Unlike the butterfly/bigint sites, a WTF `StringImpl` IS a
+        // genuine off-heap allocation in C++ too — see
+        // `MarkedSpace::report_extra_memory_allocated`'s doc.
+        objects.space.report_extra_memory_allocated(text.len());
         let slot = self.push_record(StringRecord {
             addr,
             text: CoreStringCellText::Flat(text.to_owned()),
@@ -219,6 +226,9 @@ impl CoreStringStore {
             return self.bind_index_to_heap(heap, slot);
         }
         let addr = admit_string_cell(objects, 0);
+        // gc-r4 leak-fix C1: see `allocate_untracked` — same direct match to C++
+        // `JSString::finishCreation`'s `reportExtraMemoryAllocated(this, cost)`.
+        objects.space.report_extra_memory_allocated(text.len());
         let slot = self.push_record(StringRecord {
             addr,
             text: CoreStringCellText::Flat(text.to_owned()),
@@ -298,6 +308,12 @@ impl CoreStringStore {
             CoreStringCellText::Substring { base, .. } => *base as u64,
             _ => 0,
         };
+        // gc-r4 leak-fix C1: NO `report_extra_memory_allocated` call for this shared-substring
+        // (rope) case — it stores a `{base, start_byte, end_byte}` fiber over the EXISTING
+        // base cell's text, allocating no new text bytes (faithful to C++
+        // `StringImpl::createSubstringSharingImpl`, which shares the base's buffer). The other
+        // three arms above (`start >= end`, `substring_len < SHARED_SUBSTRING_MIN_CODE_UNITS`,
+        // non-ASCII) fall through to `allocate_with_heap`, which DOES report (see its doc).
         let addr = admit_string_cell(objects, base_fiber);
         let slot = self.push_record(StringRecord {
             addr,

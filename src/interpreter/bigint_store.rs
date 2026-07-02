@@ -679,6 +679,15 @@ impl CoreBigIntStore {
             return self.bind_index_to_heap(heap, slot);
         }
         let addr = admit_bigint_cell(objects);
+        // gc-r4 leak-fix C1: report the limb slab's bytes into the GC-trigger counter (see
+        // `MarkedSpace::report_extra_memory_allocated`'s DIVERGENCE note — C++ allocates a
+        // JSBigInt's digits AS PART of the cell's own variable-sized `tryAllocateCell`
+        // (runtime/JSBigInt.cpp:109 / `allocationSize`, runtime/JSBigInt.h:70-72), so they are
+        // counted for free by the block/large allocator's `didAllocate`, not through
+        // `reportExtraMemoryAllocated`; this off-arena limb slab is the pre-R4 substitute).
+        objects
+            .space
+            .report_extra_memory_allocated(value.limbs.len() * std::mem::size_of::<u32>());
         let slot = self.push_record(BigIntRecord {
             addr,
             value: value.clone(),

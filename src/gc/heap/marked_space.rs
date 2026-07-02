@@ -346,6 +346,13 @@ const BYTES_ALLOCATED_GC_THRESHOLD: usize = 4 * 1024 * 1024;
 #[cfg(test)]
 const BYTES_ALLOCATED_GC_THRESHOLD: usize = 16 * 1024;
 
+/// gc-r4 leak-fix C1 — the `reportExtraMemoryAllocated`/`deprecatedReportExtraMemory` inline
+/// gate: C++ JSC only bumps its counter and re-checks `collectIfNecessaryOrDefer` for a
+/// report LARGER than `minExtraMemory` (heap/Heap.h:434-457, threshold at heap/Heap.h:681
+/// `static constexpr size_t minExtraMemory = 256;`), so a flood of tiny reports (a short
+/// string, a 4-element array) doesn't pay the bump/threshold-check cost every time.
+const MIN_EXTRA_MEMORY_TO_REPORT: usize = 256;
+
 impl Default for MarkedSpace {
     fn default() -> Self {
         Self::new()
@@ -440,10 +447,7 @@ impl MarkedSpace {
         // `allocate_*` / `with_cell_mut` window (forecloses re-entrancy by
         // construction). Mirrors JSC bumping `m_bytesAllocatedThisCycle` in the
         // allocation slow path and deferring the actual collect to a safepoint.
-        self.bytes_allocated_this_cycle = self.bytes_allocated_this_cycle.saturating_add(len);
-        if self.bytes_allocated_this_cycle >= BYTES_ALLOCATED_GC_THRESHOLD {
-            self.collection_request_armed = true;
-        }
+        self.bump_bytes_allocated_this_cycle(len);
         match size_route(len) {
             SizeRoute::Marked(sz) => {
                 let atoms = sz / ATOM_SIZE;
@@ -533,6 +537,64 @@ impl MarkedSpace {
     pub(crate) fn reset_bytes_allocated_this_cycle(&mut self) {
         self.bytes_allocated_this_cycle = 0;
         self.collection_request_armed = false;
+    }
+
+    /// Shared bump-and-arm step for `bytes_allocated_this_cycle`, the JSC `Heap::didAllocate`
+    /// analog (heap/Heap.cpp:2639-2648): the ONE funnel a cell's own arena bytes
+    /// (`allocate_blob`) and an off-arena extra-memory report (`report_extra_memory_allocated`
+    /// below) both bump before `collectIfNecessaryOrDefer` reads the total
+    /// (`totalBytesAllocatedThisCycle()`, heap/Heap.h:697, read at heap/Heap.cpp:2887/2901).
+    /// MONOTONIC within a cycle by construction (`saturating_add`, never subtracted) — see
+    /// `report_extra_memory_allocated`'s doc for the C++ citation proving this is faithful.
+    fn bump_bytes_allocated_this_cycle(&mut self, bytes: usize) {
+        self.bytes_allocated_this_cycle = self.bytes_allocated_this_cycle.saturating_add(bytes);
+        if self.bytes_allocated_this_cycle >= BYTES_ALLOCATED_GC_THRESHOLD {
+            self.collection_request_armed = true;
+        }
+    }
+
+    /// gc-r4 leak-fix C1 — the accounting entry point for OFF-ARENA payload bytes an arena
+    /// cell owns: a butterfly (out-of-line property/element storage), an ArrayBuffer/
+    /// BoundArgs/Captures backing, a String's StringImpl text, or a BigInt's digit limbs.
+    /// Named for, and funneling into the SAME `bytes_allocated_this_cycle` trigger as, C++
+    /// JSC `Heap::reportExtraMemoryAllocated`/`Heap::deprecatedReportExtraMemory`
+    /// (heap/Heap.h:434-457), which both bottom out in `Heap::didAllocate`
+    /// (heap/Heap.cpp:689-696 `reportExtraMemoryAllocatedSlowCase`, :699-709
+    /// `deprecatedReportExtraMemorySlowCase`, :2639-2648 `didAllocate`) and then call
+    /// `collectIfNecessaryOrDefer` (heap/Heap.cpp:2852-2918), exactly like `allocate_blob`
+    /// does here. Mirrors the `size > minExtraMemory` gate every C++ call site inlines
+    /// (heap/Heap.h:434-457) via `MIN_EXTRA_MEMORY_TO_REPORT`.
+    ///
+    /// MONOTONIC / no decrement on free: C++ `m_extraMemorySize`/`m_deprecatedExtraMemorySize`
+    /// (heap/Heap.h:879-880) are only ever `+=`'d (`reportExtraMemoryVisited`,
+    /// heap/Heap.cpp:2821-2833; `deprecatedReportExtraMemorySlowCase`, :699-709) and are reset
+    /// to 0 ONLY at a collection boundary (heap/Heap.cpp:2419-2420, inside `updateAllocationLimits`
+    /// after a full collection) — never decremented when the owning object dies mid-cycle. This
+    /// port matches that: `reset_bytes_allocated_this_cycle` (the collection-boundary reset) is
+    /// the ONLY place `bytes_allocated_this_cycle` goes down; the sweep-time slab frees
+    /// (`CoreObjectStore::free_dead_cell_slabs`) do NOT call back into this counter.
+    ///
+    /// DIVERGENCE: in C++ most of these payload KINDS are NOT "extra memory" at all — a
+    /// Butterfly is allocated from `Heap::auxiliarySpace` (heap/Heap.h:1109, a first-class GC
+    /// `CompleteSubspace`) and a JSBigInt's digits are allocated AS PART of the cell's own
+    /// variable-sized `tryAllocateCell` (runtime/JSBigInt.cpp:109, `JSBigInt::allocationSize`,
+    /// runtime/JSBigInt.h:70-72) — both are counted for free by the SAME `didAllocate` the
+    /// block/large allocator already calls for any GC cell (heap/Heap.cpp:2508-2513), never
+    /// through `reportExtraMemoryAllocated`. This port's arena admits only FIXED-SIZE POD cell
+    /// blobs (`allocate_blob`) and relocates every variable payload OFF-CELL into a store-owned
+    /// slab (gc-r4 SD-4: `object_store.rs` butterflies/bound_args_backings/captures_backings/
+    /// array_buffer_backings, `bigint_store.rs` digit limbs), so those bytes are invisible to
+    /// `allocate_blob`'s `len`. Funneling them through this API is the faithful-EFFECT
+    /// substitute (same counter, same `collectIfNecessaryOrDefer`-style trigger) for a payload
+    /// shape C++ never treats as "extra" — commented at each call site. Only a `String`'s
+    /// StringImpl text is a LITERAL 1:1 match: WTF `StringImpl` is a genuine separate
+    /// (fastMalloc) heap allocation in C++ too (`JSString::finishCreation`, runtime/
+    /// JSString.h:181, `vm.heap.reportExtraMemoryAllocated(this, cost)`).
+    pub(crate) fn report_extra_memory_allocated(&mut self, bytes: usize) {
+        if bytes <= MIN_EXTRA_MEMORY_TO_REPORT {
+            return;
+        }
+        self.bump_bytes_allocated_this_cycle(bytes);
     }
 
     /// Force-route through PreciseAllocation regardless of size (to exercise the
