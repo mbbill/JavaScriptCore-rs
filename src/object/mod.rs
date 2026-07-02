@@ -75,10 +75,16 @@ pub use storage::{
     TypedArrayBufferEdge, TypedArrayContentType, TypedArrayElementType, TypedArrayMode,
     TypedArrayStorageContract, TypedArrayStorageContractBuilder, TypedArrayViewLength,
 };
+// Structures-as-cells Step 1 fork retirement (docs/design/structures-as-cells.md
+// §7.3): `Structure` is no longer re-exported here — the dead GC-cell-shaped
+// fork in `structure.rs` was deleted; `structure_cell::Structure` (re-exported
+// below as `StructureCell`) is the one live Structure type. Every other name
+// here is the still-live descriptor/validation surface `structure.rs` keeps
+// (see that file's module doc for the survey that found these load-bearing).
 pub use structure::{
     plan_structure_transition, transition_invalidates_watchpoints, validate_structure_descriptor,
     validate_structure_descriptor_table, validate_structure_transition_plan, IndexingMode,
-    Structure, StructureDescriptor, StructureDescriptorBuilder, StructureDescriptorTable,
+    StructureDescriptor, StructureDescriptorBuilder, StructureDescriptorTable,
     StructureDescriptorValidationError, StructureDictionaryKind, StructureLifecycle,
     StructureMutationAuthority, StructurePropertyCacheability, StructurePrototypeStorage,
     StructureRareDataId, StructureSchemaOwner, StructureSchemaProvenance, StructureTransition,

@@ -30,6 +30,11 @@ use crate::gc::CellType;
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Default)]
 pub enum JsType {
+    /// JSC `StructureType` (runtime/JSType.h:33, second entry in
+    /// `FOR_EACH_JS_TYPE` after `CellType` == 0, so `StructureType` == 1).
+    /// docs/design/structures-as-cells.md §1.3: every `Structure` arena cell
+    /// (`object::structure_cell::StructureArenaCell`) carries this tag.
+    Structure = 1,
     /// JSC `StringType` (runtime/JSType.h:37). `JSCell::isString()`.
     String = 2,
     /// JSC `HeapBigIntType` (runtime/JSType.h:38). `JSCell::isHeapBigInt()`.
@@ -65,6 +70,7 @@ impl JsType {
     /// reconciling them is deferred.
     pub fn cell_type(self) -> CellType {
         match self {
+            JsType::Structure => CellType::Structure,
             JsType::String => CellType::String,
             JsType::Symbol => CellType::Symbol,
             JsType::HeapBigInt => CellType::BigInt,

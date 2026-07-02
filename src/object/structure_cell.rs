@@ -41,7 +41,12 @@
 //! `StructureID` from the structure's heap address (`StructureID::encode`,
 //! StructureID.h:90-97) because Structures live in a dedicated aligned heap;
 //! its low bit is free *because of that alignment* and is reused as the nuke
-//! flag. The Structure cells are not arena-resident in this port yet, so:
+//! flag. Structures-as-cells Step 1 (docs/design/structures-as-cells.md) gives
+//! every registered `Structure` a companion arena-resident shadow cell
+//! (`StructureArenaCell`, in `StructureIdTable`'s own dedicated `MarkedSpace`),
+//! but the RECORD stays the `Vec` below — the shadow cell carries no payload
+//! and Structures stay registry-rooted (unconditionally alive) through Step 1;
+//! only later steps (design §6 Steps 2-4) route liveness through the arena. So:
 //!   - [`StructureIdTable`] owns the `Structure` cells in a `Vec` and hands out
 //!     1-based [`gc::StructureId`] handles (slot 0 is the null/invalid handle,
 //!     matching `gc::StructureId::INVALID` and C++ `StructureID(0)`).
@@ -75,7 +80,9 @@ use super::structure_transition_table::{
     PointerKey, StructureTransitionTable, TransitionKind, TransitionPropertyAttributes,
     TransitionStructure,
 };
+use crate::gc::MarkedSpace;
 use crate::gc::StructureId as StructureHandle;
+use crate::runtime::JsType;
 use crate::strings::AtomId;
 
 // =============================== StructureID ===============================
@@ -254,6 +261,81 @@ impl PrototypePointer {
     }
 }
 
+// ============================ StructureArenaCell ===========================
+
+/// Structures-as-cells keystone, Step 1 (docs/design/structures-as-cells.md §1.1):
+/// the fixed 16-byte POD shadow cell that lives in [`StructureIdTable`]'s OWN
+/// [`MarkedSpace`] (design R1 — a dedicated `structureSpace` analog, distinct
+/// from `CoreObjectStore::space`). This is a direct copy of the established
+/// arena-cell convention `CoreObjectCell`/`CoreStringCell` already use
+/// (`structure_id@0` / `js_type@4` / byte-7-reserved-for-the-marker,
+/// `interpreter/string_store.rs` `CoreStringCell`), mirroring the real C++
+/// `JSCell` prefix (`m_structureID@0`, `m_type@4`/`m_cellState@7`,
+/// `runtime/JSCell.h:293-302`).
+///
+/// The *record* (property table, transitions, prototype, ...) stays in
+/// [`StructureIdTable::structures`] — this cell carries NO payload beyond the
+/// two identity words the design's §1/§2 need: the base-class `structure_id`
+/// edge (design §4 — every Structure's OWN header names the one meta-structure
+/// handle) and `own_handle` (the shadow index back to the record slab, the
+/// translation `StructureIdTable::arena_addrs`'s tracer will need once Step 2
+/// wires the base-class edge, design §2.1's "why own_handle" note).
+///
+/// STEP 1 ONLY: this cell is allocated and tracked, but NEVER traced or swept
+/// (`StructureIdTable::space` has no mark/finalize wiring yet — Structures stay
+/// registry-rooted exactly as before this unit, design §6 Step 1: "no behavior
+/// change, only bookkeeping grows").
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub(crate) struct StructureArenaCell {
+    /// The base-class `JSCell::m_structureID` edge (design §4): every ordinary
+    /// Structure's own header names the single meta-structure handle
+    /// (`StructureIdTable::meta_structure_handle`); the meta-structure's own
+    /// cell is self-referential (design §4.1-4.2, mirroring C++
+    /// `Structure::createStructure`'s two-phase "allocate, then point at
+    /// self," `runtime/StructureCreateInlines.h:82-88`).
+    structure_id: StructureHandle,
+    /// `JsType::Structure` (runtime/JSType.h:33 `StructureType`) for every
+    /// Structure cell — the fixed common-offset tag the collector's
+    /// `arena_cell_kind_at`-style dispatch would read, at the SAME offset 4
+    /// every other arena cell kind uses.
+    js_type: JsType,
+    // bytes 5,6: reserved (mirrors CoreObjectCell/CoreStringCell padding).
+    // byte 7: MARKER-OWNED — `SlotVisitor::set_cell_state` writes `m_cellState`
+    // here once this space is traced (Step 2+); no cell struct may claim it
+    // (see `CoreStringCell::js_type`'s identical note,
+    // interpreter/string_store.rs).
+    /// This Structure's OWN 1-based registry handle — the shadow index back to
+    /// `StructureIdTable::structures[own_handle - 1]`. NOT the base-class edge
+    /// above (design §1.1 "why own_handle and not nothing": two independent
+    /// numbering schemes — the arena address and the registry handle — need an
+    /// explicit translation, unlike every other single-identity arena cell
+    /// kind).
+    own_handle: u32,
+    /// Padding to the 16-byte (1-atom) size class (design §1.1: "bytes 12..16:
+    /// padding").
+    _reserved: [u8; 4],
+}
+
+impl StructureArenaCell {
+    fn new(structure_id: StructureHandle, own_handle: StructureHandle) -> Self {
+        Self {
+            structure_id,
+            js_type: JsType::Structure,
+            own_handle: own_handle.raw(),
+            _reserved: [0; 4],
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<StructureArenaCell>() == 16);
+const _: () = assert!(std::mem::offset_of!(StructureArenaCell, structure_id) == 0);
+const _: () = assert!(std::mem::offset_of!(StructureArenaCell, js_type) == 4);
+const _: () = assert!(std::mem::offset_of!(StructureArenaCell, own_handle) == 8);
+// POD: the arena sweep (once wired, Step 4) runs NO destructor — a Drop field
+// here would leak, and the `allocate_blob` byte copy below requires it.
+const _: () = assert!(!std::mem::needs_drop::<StructureArenaCell>());
+
 // ================================ Structure ===============================
 
 /// Faithful port of `class Structure : public JSCell` (Structure.h:197-1101),
@@ -276,10 +358,14 @@ impl PrototypePointer {
 /// the impl reports whether a table is materialized rather than its contents.
 ///
 /// `Clone` is derived (now that `PropertyTable`/`StructureTransitionTable` are
-/// `Clone`) so the [`StructureIdTable`] can be cloned wholesale — the interpreter's
-/// `CoreObjectStore` snapshot/test path deep-clones the structure registry, and
-/// every cell's `StructureID` handle stays valid because the clone preserves slot
-/// order.
+/// `Clone`) for the transition/dictionary paths that clone one structure's
+/// materialized table (`take_property_table_or_clone_if_pinned`,
+/// `copy_property_table_for_pinning`). NOTE: this does NOT make
+/// [`StructureIdTable`] itself `Clone` — Structures-as-cells Step 1 (docs/design/
+/// structures-as-cells.md §7.4) gives that table a `MarkedSpace`, which is
+/// `!Clone` by construction, so `StructureIdTable`'s own `#[derive(Clone)]` was
+/// dropped (the identical fix `CoreObjectStore` already applied for the same
+/// reason, gc-r4 R4a decision C, `interpreter/object_store.rs:481-487`).
 #[derive(Clone)]
 pub struct Structure {
     /// `StructureID id()` is `StructureID::encode(this)` in C++ (Structure.h:252).
@@ -584,9 +670,38 @@ impl Structure {
 /// addresses `structures[n - 1]`. Because the cells live here and reference each
 /// other by handle, the `static Structure*` transition/materialization methods of
 /// C++ are ported as methods on this table.
-#[derive(Clone, Debug, Default)]
+///
+/// Structures-as-cells Step 1 (docs/design/structures-as-cells.md §2.1): `space`
+/// is this table's OWN, dedicated [`MarkedSpace`] (design R1 — mirrors JSC's
+/// `structureSpace` `IsoSubspace`, `heap/Heap.h:160` — NOT
+/// `CoreObjectStore::space`, the object arena; the two are independent
+/// `MarkedSpace` instances, sound per §0.1 because marking is address-global,
+/// not space-scoped). `arena_addrs` is the handle-indexed (parallel to
+/// `structures`) shadow map from a handle to its [`StructureArenaCell`]'s arena
+/// address. **`structures` stays the record slab and its hot-path index
+/// (`Self::structure`/`Self::structure_mut`) is UNCHANGED** — `arena_addrs`/
+/// `space` are written by `register` and read only by future GC code (design
+/// §2.2's "zero added indirection on the read path" guarantee).
+#[derive(Debug, Default)]
 pub struct StructureIdTable {
     structures: Vec<Structure>,
+    /// NEW (Step 1): handle-indexed shadow map, handle `n` -> `arena_addrs[n - 1]`,
+    /// the [`StructureArenaCell`] address `register` allocated for that handle.
+    arena_addrs: Vec<usize>,
+    /// NEW (Step 1): this table's dedicated Structure arena (design R1). Owning a
+    /// `MarkedSpace` makes `StructureIdTable` `!Clone` (a `MarkedSpace` is `!Clone`
+    /// by construction, one set of exposed raw pages) — the identical situation
+    /// `CoreObjectStore` already resolved by deleting its own `impl Clone`
+    /// (gc-r4 R4a decision C, `interpreter/object_store.rs:481-487`); this table's
+    /// `#[derive(Clone)]` is dropped for the same reason (design §7.4).
+    space: MarkedSpace,
+    /// NEW (Step 1, design §4.2): the port's analog of `vm.structureStructure` —
+    /// the ONE meta-structure handle every ordinary Structure's arena-cell header
+    /// `structure_id` names. Set once, self-referentially, by the first
+    /// `register()` call (mirroring C++'s bootstrap two-phase "allocate, then
+    /// point at self," `runtime/StructureCreateInlines.h:82-88`), reused by every
+    /// later call.
+    meta_structure_handle: Option<StructureHandle>,
 }
 
 impl StructureIdTable {
@@ -597,11 +712,57 @@ impl StructureIdTable {
     /// Insert a structure, assign its 1-based handle, and return it. The handle
     /// is the registry analog of `StructureID::encode(this)` being fixed by the
     /// structure's heap address at allocation.
+    ///
+    /// Structures-as-cells Step 1: additionally allocates this handle's
+    /// [`StructureArenaCell`] shadow cell into `space` (design §2.1) and records
+    /// its address in `arena_addrs`. The two Vecs stay in lockstep by
+    /// construction (both grow only here, from the same base) — see
+    /// `arena_cells_track_registered_structures` for the invariant test. **Structures
+    /// stay registry-rooted**: nothing sweeps `space` yet (design §6 Step 1), so
+    /// this is pure additive bookkeeping with no observable behavior change.
     fn register(&mut self, mut structure: Structure) -> StructureHandle {
         let handle = StructureHandle::new((self.structures.len() + 1) as u32);
         structure.handle = handle;
         self.structures.push(structure);
+
+        // design §4.2 bootstrap: the FIRST Structure ever registered becomes the
+        // port's `vm.structureStructure` analog, self-referentially (C++ does the
+        // same two-phase "allocate, then point at self" for its own bootstrap
+        // meta-structure, `StructureCreateInlines.h:82-88`). Every Structure's own
+        // arena-cell header `structure_id` names that one handle.
+        let meta = *self.meta_structure_handle.get_or_insert(handle);
+
+        let cell = StructureArenaCell::new(meta, handle);
+        let len = core::mem::size_of::<StructureArenaCell>();
+        let src = core::ptr::from_ref(&cell).cast::<u8>();
+        // SAFETY: `cell` is a fully-initialized POD `StructureArenaCell`
+        // (`needs_drop::<StructureArenaCell>() == false`, asserted at the struct
+        // def); the interpreter is single-threaded (`!Send`/`!Sync`, matching
+        // every other `allocate_blob` call site). `allocate_blob` copies the
+        // bytes into a fresh, atom-aligned slot of THIS table's own `space` —
+        // never `CoreObjectStore::space` (design R1).
+        let cp = unsafe { self.space.allocate_blob(src, len) };
+        self.arena_addrs.push(cp.addr());
+        debug_assert_eq!(
+            self.arena_addrs.len(),
+            self.structures.len(),
+            "arena_addrs must stay 1:1 with structures (both grow only in register)"
+        );
+
         handle
+    }
+
+    /// TEST/ORACLE support (Structures-as-cells Step 1): is `handle`'s shadow
+    /// arena cell still admitted by THIS table's own `space`? Used by
+    /// cross-store tests proving a collection on a DIFFERENT space (e.g.
+    /// `CoreObjectStore::force_collect`) never touches this one (design §6 Step
+    /// 1's "nothing is reclaimed" oracle). Not part of the production API: no
+    /// production code queries Structure liveness through the arena yet (that is
+    /// Step 4).
+    #[cfg(test)]
+    pub(crate) fn arena_cell_is_admitted(&self, handle: StructureHandle) -> bool {
+        let addr = self.arena_addrs[(handle.raw() - 1) as usize];
+        self.space.is_arena_cell(addr).is_some()
     }
 
     /// Borrow a structure by handle (the registry analog of `StructureID::
@@ -1140,5 +1301,139 @@ mod tests {
         let kept = table2.structure(sb).property_table_or_null();
         assert!(kept.is_some(), "a pinned base keeps its table");
         assert_eq!(kept.unwrap().get(atom(1)), (off_b, 0));
+    }
+
+    // ===================== Structures-as-cells Step 1 (docs/design/structures-as-cells.md) =====================
+
+    /// TEST-ONLY: read a `StructureArenaCell`'s bytes back from a live arena
+    /// address — the same raw-read shape `string_cell_fibers`/`arena_cell_kind_at`
+    /// use elsewhere (`interpreter/object_store.rs`, `interpreter/string_store.rs`),
+    /// scoped to this unit's design §6 Step 1 oracle ("own_handle round-trips
+    /// address -> handle").
+    ///
+    /// SAFETY: `addr` MUST be a byte-intact `StructureArenaCell` this table's
+    /// `space` handed out via `allocate_blob` (the caller proves membership via
+    /// `arena_cell_is_admitted`/`register`'s own bookkeeping).
+    unsafe fn read_structure_arena_cell(addr: usize) -> StructureArenaCell {
+        // SAFETY: forwarded — see the fn contract above.
+        unsafe { core::ptr::with_exposed_provenance::<StructureArenaCell>(addr).read() }
+    }
+
+    // design §6 Step 1 oracle (a): "registering N structures admits N arena cells
+    // in the dedicated space with correct header bytes (own_handle round-trips
+    // address -> handle)."
+    #[test]
+    fn arena_cells_track_registered_structures() {
+        let mut table = StructureIdTable::new();
+
+        // A root plus a chain of property-addition transitions: every register()
+        // call (create_root AND add_property_transition's new-child path) must
+        // grow arena_addrs in lockstep with structures.
+        let root = fresh_root(&mut table, 6);
+        let (s1, _) = table.add_property_transition(root, atom(1), 0);
+        let (s2, _) = table.add_property_transition(s1, atom(2), 0);
+        let handles = [root, s1, s2];
+
+        assert_eq!(table.arena_addrs.len(), table.structures.len());
+        assert_eq!(table.arena_addrs.len(), handles.len());
+
+        for &h in &handles {
+            assert!(
+                table.arena_cell_is_admitted(h),
+                "every registered handle's shadow cell must be admitted by this \
+                 table's OWN space (design R1: a dedicated space, distinct from \
+                 CoreObjectStore::space)"
+            );
+
+            let addr = table.arena_addrs[(h.raw() - 1) as usize];
+            // SAFETY: `addr` was just proven admitted (membership-gated) by
+            // `arena_cell_is_admitted` above, and is a byte-intact cell this
+            // table's own `register()` wrote via `allocate_blob`.
+            let cell = unsafe { read_structure_arena_cell(addr) };
+
+            // own_handle round-trips address -> handle (design §1.1's "why
+            // own_handle" — the translation the future tracer needs).
+            assert_eq!(
+                cell.own_handle,
+                h.raw(),
+                "StructureArenaCell::own_handle must round-trip to the handle \
+                 that owns this shadow cell"
+            );
+            assert_eq!(cell.js_type, JsType::Structure);
+
+            // design §4.2: every Structure's own header structure_id names the
+            // ONE meta-structure handle (self-referential for the meta-structure
+            // itself, i.e. the very first handle registered here == root).
+            assert_eq!(
+                cell.structure_id, root,
+                "every arena cell's base-class \
+                structure_id edge must name the meta-structure handle"
+            );
+        }
+
+        // design §4.1/§4.2 bootstrap: the meta-structure is self-referential —
+        // the first-ever registered handle's own header names itself.
+        assert_eq!(table.meta_structure_handle, Some(root));
+    }
+
+    // design §6 Step 1 oracle (b), restated as an explicit invariant: the hot
+    // property-lookup path (`structure`/`structure_mut`) is UNTOUCHED by this
+    // unit — it indexes the plain `structures` Vec directly, with zero added
+    // indirection through `arena_addrs`/`space`. The pre-existing tests above
+    // (`transition_adds_an_offset`, `sibling_transitions_converge`,
+    // `materialize_replays`, `steal_moves_the_table_and_pinned_clones`) already
+    // exercise that path end-to-end and are UNCHANGED by this batch — they are
+    // the oracle proving behavior did not move (design §6: "bit-for-bit
+    // identical program behavior").
+    #[test]
+    fn hot_path_structure_lookup_is_a_plain_vec_index() {
+        let mut table = StructureIdTable::new();
+        let root = fresh_root(&mut table, 6);
+        let (s1, _) = table.add_property_transition(root, atom(1), 0);
+
+        // `structure()`/`structure_mut()` never touch `space`/`arena_addrs` —
+        // this is a structural fact (see their bodies), reconfirmed here by
+        // simply proving the lookup still works after registrations that grew
+        // the arena side too.
+        assert_eq!(table.structure(s1).previous_id(), Some(root));
+        assert_eq!(table.structure(root).previous_id(), None);
+    }
+
+    // design §6 Step 1 oracle (c): "nothing is reclaimed" — registering more
+    // structures (the only mutation this unit's `register()` performs) never
+    // invalidates an earlier handle's shadow cell or its record. Step 1 wires no
+    // sweep for `space` at all, so this is provable purely from repeated
+    // registration; the cross-store proof that a REAL collection (on the
+    // separate object arena) also leaves this space untouched lives in
+    // `interpreter/object_store.rs`'s `structures_as_cells_step1_tests`.
+    #[test]
+    fn repeated_registration_never_reclaims_earlier_handles() {
+        let mut table = StructureIdTable::new();
+        let root = fresh_root(&mut table, 6);
+        let first_addr = table.arena_addrs[0];
+
+        // Register many more structures (siblings off the root, so each is a
+        // genuinely new handle/cell, not a converged transition).
+        let mut handles = vec![root];
+        for slot in 0..64u32 {
+            let (h, _) = table.add_property_transition(root, atom(1000 + slot), 0);
+            handles.push(h);
+        }
+
+        // The root's shadow cell is untouched: same address, still admitted,
+        // still resolves to the same record.
+        assert_eq!(table.arena_addrs[0], first_addr);
+        assert!(table.arena_cell_is_admitted(root));
+        assert_eq!(table.structure(root).previous_id(), None);
+
+        // Every handle registered along the way still resolves both through the
+        // record slab (the hot path) and the shadow arena.
+        for &h in &handles {
+            assert!(table.arena_cell_is_admitted(h));
+            // SAFETY: membership just proved above.
+            let cell =
+                unsafe { read_structure_arena_cell(table.arena_addrs[(h.raw() - 1) as usize]) };
+            assert_eq!(cell.own_handle, h.raw());
+        }
     }
 }

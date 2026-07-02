@@ -14864,3 +14864,66 @@ mod leak_fix_c1_extra_memory_accounting_tests {
         );
     }
 }
+
+// Structures-as-cells Step 1 (docs/design/structures-as-cells.md) — cross-store
+// isolation proof. `StructureIdTable` owns its OWN dedicated `MarkedSpace`
+// (design R1), an instance entirely independent of `CoreObjectStore::space`.
+// This module proves design §6 Step 1's oracle (c) ("nothing is reclaimed")
+// end-to-end: registering structures, then running a REAL object-arena
+// collection (`force_collect`, the same production entry point every other GC
+// test in this file exercises) never reclaims a Structure's shadow arena cell
+// or disturbs its record — because `force_collect`'s body never references
+// `structure_table` at all (Step 1 wires no trace/finalize/sweep for the
+// Structure space; grep `force_collect`'s body: it touches only `self.space`,
+// `self.live_object_addrs`, and the weak-collection slabs).
+#[cfg(test)]
+mod structures_as_cells_step1_tests {
+    use super::*;
+
+    #[test]
+    fn force_collect_on_the_object_arena_never_touches_the_structure_space() {
+        let mut store = CoreObjectStore::default();
+
+        // Register a handful of structures BEFORE any object-arena collection.
+        let handles: Vec<StructureId> = (0..8).map(|_| store.allocate_structure_id()).collect();
+        for &h in &handles {
+            assert!(
+                store.structure_table.arena_cell_is_admitted(h),
+                "freshly registered structure must have an admitted shadow cell"
+            );
+        }
+
+        // Real object-arena traffic, then a REAL collection cycle
+        // (`force_collect`, the production entry point) with an EMPTY root set
+        // so every unrooted object cell is reclaimed — proving this is a real,
+        // effectful collection, not a no-op.
+        for _ in 0..4 {
+            let _ = store.allocate();
+        }
+        let stats = store.force_collect(&[]);
+        assert!(
+            stats.cells_reclaimed >= 4,
+            "the unrooted object cells must be reclaimed by the object-arena cycle \
+             (otherwise this test would not exercise a real collection)"
+        );
+
+        // The Structure space is UNTOUCHED: every handle registered before the
+        // collection still resolves through both the hot record-slab path AND
+        // the shadow arena.
+        for &h in &handles {
+            assert!(
+                store.structure_table.arena_cell_is_admitted(h),
+                "a real object-arena collection must not reclaim a Structure's \
+                 shadow cell (Step 1 wires no sweep for the Structure space)"
+            );
+            let _ = store.structure_table.structure(h); // must not panic/index-fail
+        }
+
+        // The table still functions after an object-arena cycle ran mid-lifetime
+        // (no corrupted bookkeeping from an unrelated collection).
+        let more: Vec<StructureId> = (0..4).map(|_| store.allocate_structure_id()).collect();
+        for &h in &more {
+            assert!(store.structure_table.arena_cell_is_admitted(h));
+        }
+    }
+}

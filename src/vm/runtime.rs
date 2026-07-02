@@ -1,10 +1,10 @@
 //! VM-wide runtime structures, caches, and host services.
 
 use crate::gc::{
-    CellId, HeapId, Root, RootId, RootKind, RootRecord, RootSetSemanticError, TargetedRootRecord,
+    CellId, HeapId, RootId, RootKind, RootRecord, RootSetSemanticError, TargetedRootRecord,
     TargetedRootSet,
 };
-use crate::object::{Structure, StructureDescriptorTable, StructureDescriptorValidationError};
+use crate::object::{StructureDescriptorTable, StructureDescriptorValidationError};
 use crate::runtime::ObjectId;
 pub use crate::runtime::{GlobalObjectId, HostHookId, ScriptExecutionStatus};
 use crate::value::JsValue;
@@ -43,37 +43,29 @@ pub enum VmMutationAuthority {
 }
 
 /// Canonical structures shared by the VM.
+///
+/// Structures-as-cells Step 1 fork retirement (docs/design/structures-as-cells.md
+/// §7.3): this used to also carry `object_structure`/`function_structure`/
+/// `global_object_structure: Option<Root<Structure>>` fields (`Root<T>` from
+/// `gc/refs.rs`, another pre-arena rooting abstraction) plus five accessors.
+/// Grepping the crate for every one of those field/accessor names found ZERO
+/// readers or writers outside this file (confirmed again in this batch) — they
+/// were dead accessors for a dead `Structure` fork (`object::structure::
+/// Structure`, deleted alongside this edit). The LIVE equivalents are already
+/// wired elsewhere: `runtime::state::RuntimeStructures::function_structure`
+/// and `runtime::realm::RealmIntrinsics`'s `object_structure`/
+/// `function_structure`/`host_function_structure`, all `Option<
+/// crate::gc::StructureId>` (the real, load-bearing registry handle) — this
+/// removal does not touch those. `structure_epoch` stays: it IS read
+/// (`vm/mod.rs`'s `default_structure_epoch: self.structures.structure_epoch()`
+/// seeds `GlobalObjectRecord`), so it is independent, still-live state, not
+/// part of the dead fork.
 #[derive(Debug, Default)]
 pub struct RuntimeStructures {
-    object_structure: Option<Root<Structure>>,
-    function_structure: Option<Root<Structure>>,
-    global_object_structure: Option<Root<Structure>>,
     structure_epoch: u64,
 }
 
 impl RuntimeStructures {
-    pub fn object_structure(&self) -> Option<&Root<Structure>> {
-        self.object_structure.as_ref()
-    }
-
-    pub fn set_object_structure(&mut self, structure: Root<Structure>) {
-        self.object_structure = Some(structure);
-        self.structure_epoch = self.structure_epoch.saturating_add(1);
-    }
-
-    pub fn function_structure(&self) -> Option<&Root<Structure>> {
-        self.function_structure.as_ref()
-    }
-
-    pub fn set_function_structure(&mut self, structure: Root<Structure>) {
-        self.function_structure = Some(structure);
-        self.structure_epoch = self.structure_epoch.saturating_add(1);
-    }
-
-    pub fn global_object_structure(&self) -> Option<&Root<Structure>> {
-        self.global_object_structure.as_ref()
-    }
-
     pub fn structure_epoch(&self) -> u64 {
         self.structure_epoch
     }

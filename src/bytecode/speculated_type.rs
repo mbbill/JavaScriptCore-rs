@@ -659,7 +659,13 @@ pub fn speculation_from_js_type(ty: JsType) -> Option<SpeculatedType> {
         JsType::String => Some(SPEC_STRING),
         JsType::Symbol => Some(SPEC_SYMBOL),
         JsType::HeapBigInt => Some(SPEC_HEAP_BIG_INT),
-        JsType::Object | JsType::FinalObject => None,
+        // C++'s `speculationFromJSType` switch (SpeculatedType.cpp:699-737) has
+        // no `case StructureType:` — it falls to `default: return
+        // std::nullopt;`, exactly like `ObjectType`/`FinalObjectType` below.
+        // Structures-as-cells Step 1 (docs/design/structures-as-cells.md §1.3)
+        // added the `JsType::Structure` variant; this arm keeps that addition
+        // observation-neutral for the DFG speculation surface.
+        JsType::Object | JsType::FinalObject | JsType::Structure => None,
     }
 }
 
@@ -674,7 +680,8 @@ pub fn speculation_from_js_type(ty: JsType) -> Option<SpeculatedType> {
 /// is reachable, but the documented fallthrough remains `SpecObjectOther`.
 pub fn speculated_type_from_js_type_mapping(ty: JsType) -> SpeculatedType {
     match ty {
-        // FOR_EACH_JS_TYPE rows (JSType.h:37,38,40,77,78).
+        // FOR_EACH_JS_TYPE rows (JSType.h:33,37,38,40,77,78).
+        JsType::Structure => SPEC_CELL_OTHER, // macro(StructureType, SpecCellOther)
         JsType::String => SPEC_STRING,
         JsType::HeapBigInt => SPEC_HEAP_BIG_INT,
         JsType::Symbol => SPEC_SYMBOL,

@@ -1,13 +1,40 @@
-//! Structure and shape-transition contracts.
+//! Structure descriptor/shape-transition VALIDATION contracts (static schema
+//! tables + transition-plan validators), plus the [`IndexingMode`] vocabulary
+//! they carry.
+//!
+//! Structures-as-cells Step 1 fork retirement (docs/design/structures-as-cells.md
+//! §7): this file used to ALSO define a second, disconnected, GC-cell-shaped
+//! `Structure` (`header: JsCellHeader` / `Trace`/`TraceCell` impls against the
+//! pre-S4-arena `gc::cell`/`gc::trace`/`gc::barrier` generation) — a dead fork
+//! of the live, arena-integrated `object::structure_cell::Structure`, with
+//! exactly one (dead) external consumer (`vm::runtime::RuntimeStructures`'s
+//! three `Option<Root<Structure>>` fields). That struct and its `Trace`/
+//! `TraceCell` impls are DELETED per §7.2/§7.3.
+//!
+//! SCOPE-NOTE (design gap found during retirement, not present in §7's own
+//! survey): §7.1 describes reading "object/structure.rs:1-181 for the
+//! cell-shaped part" and §7.2 characterizes the file's OTHER types
+//! (`StructureDictionaryKind`, `StructurePrototypeStorage`, `IndexingMode`) as
+//! "deleted with it" — but this survey found `IndexingMode` is a REAL, live
+//! import of `object::indexing_type` (`use super::structure::IndexingMode;`,
+//! `indexing_type.rs:30`, feeding its `indexing_shape_and_writability_for_mode`
+//! bridge + tests), and `StructureDescriptorTable`/`StructureDescriptorValidationError`/
+//! `StructureSchemaOwner` are live, load-bearing types for `vm::runtime`'s
+//! SEPARATE `VmStructureTableDescriptor`/`VmStaticDescriptorTables` validation
+//! system (`vm/runtime.rs`, both its main body and its own test module).
+//! `IndexingMode`/`StructureDictionaryKind`/`StructurePrototypeStorage` are
+//! fields of the STILL-LIVE `StructureDescriptor`, not exclusively of the dead
+//! `Structure` cell struct. Deleting the whole file (as §7's text reads at a
+//! glance) would have broken those live consumers, so ONLY the dead cell-shaped
+//! part (the former lines ~52-181: the `Structure` struct + `impl Structure` +
+//! `impl Trace for Structure` + `impl TraceCell for Structure`) is removed
+//! here; the descriptor/validation machinery below is retained unmodified.
 
-use crate::gc::{
-    CellType, GcRef, JsCell, JsCellHeader, StructureId, Trace, TraceCell, Tracer, TypeInfo,
-    WriteBarrier,
-};
+use crate::gc::StructureId;
 
 use crate::object::{
     PropertyAttributes, PropertyDescriptorValidationError, PropertyKey, PropertyLocation,
-    PropertyOffset, PropertyTable, StaticPropertyTableDescriptor, WatchpointKind, WatchpointSet,
+    PropertyOffset, StaticPropertyTableDescriptor,
 };
 use std::collections::HashSet;
 
@@ -49,136 +76,28 @@ impl IndexingMode {
     }
 }
 
-/// Shape, prototype, class info, transitions, and watchpoint state.
-#[derive(Debug)]
-#[repr(C)]
-pub struct Structure {
-    header: JsCellHeader,
-    prototype: WriteBarrier<JsCell>,
-    property_table: PropertyTable,
-    indexing_mode: IndexingMode,
-    dictionary_kind: StructureDictionaryKind,
-    prototype_storage: StructurePrototypeStorage,
-    transition_metadata: StructureTransitionMetadata,
-    watchpoints: WatchpointSet,
-    inline_capacity: u16,
-    out_of_line_capacity: u16,
-    transition_epoch: u64,
-    type_info: TypeInfo,
-}
-
-impl Structure {
-    pub fn new_unpublished(id: StructureId) -> Self {
-        Self {
-            header: JsCellHeader {
-                structure_id: id,
-                cell_type: CellType::Structure,
-                ..JsCellHeader::default()
-            },
-            prototype: WriteBarrier::empty(),
-            property_table: PropertyTable::new(),
-            indexing_mode: IndexingMode::None,
-            dictionary_kind: StructureDictionaryKind::None,
-            prototype_storage: StructurePrototypeStorage::Mono,
-            transition_metadata: StructureTransitionMetadata::new_unpublished(id),
-            watchpoints: WatchpointSet::default(),
-            inline_capacity: 0,
-            out_of_line_capacity: 0,
-            transition_epoch: 0,
-            type_info: TypeInfo {
-                cell_type: CellType::Object,
-                ..TypeInfo::default()
-            },
-        }
-    }
-
-    pub fn id(&self) -> StructureId {
-        self.header.structure_id
-    }
-
-    pub fn property_table(&self) -> &PropertyTable {
-        &self.property_table
-    }
-
-    pub fn watchpoints(&self) -> &WatchpointSet {
-        &self.watchpoints
-    }
-
-    pub fn indexing_mode(&self) -> IndexingMode {
-        self.indexing_mode
-    }
-
-    pub fn dictionary_kind(&self) -> StructureDictionaryKind {
-        self.dictionary_kind
-    }
-
-    pub fn prototype_storage(&self) -> StructurePrototypeStorage {
-        self.prototype_storage
-    }
-
-    pub fn transition_metadata(&self) -> StructureTransitionMetadata {
-        self.transition_metadata
-    }
-
-    pub fn inline_capacity(&self) -> u16 {
-        self.inline_capacity
-    }
-
-    pub fn out_of_line_capacity(&self) -> u16 {
-        self.out_of_line_capacity
-    }
-
-    pub fn transition_epoch(&self) -> u64 {
-        self.transition_epoch
-    }
-
-    pub fn type_info(&self) -> TypeInfo {
-        self.type_info
-    }
-
-    pub fn set_prototype<O: ?Sized>(&mut self, owner: GcRef<O>, prototype: Option<GcRef<JsCell>>) {
-        let _edge = self.prototype.set(owner, prototype);
-        self.watchpoints.invalidate("prototype changed");
-        self.transition_epoch = self.transition_epoch.saturating_add(1);
-    }
-
-    pub fn reserve_property_transition(
-        &mut self,
-        key: PropertyKey,
-        attributes: PropertyAttributes,
-    ) -> PropertyOffset {
-        let offset = self.property_table.reserve_transition_slot(key, attributes);
-        self.transition_epoch = self.transition_epoch.saturating_add(1);
-        self.watchpoints.invalidate("property transition");
-        offset
-    }
-
-    pub fn describe_transition(&self, transition: StructureTransition) -> StructureTransitionPlan {
-        StructureTransitionPlan {
-            base: self.id(),
-            transition,
-            invalidates_watchpoints: transition_invalidates_watchpoints(transition),
-        }
-    }
-
-    pub fn start_watchpoints(&mut self, kind: WatchpointKind) {
-        self.watchpoints.start_watching(kind);
-    }
-}
-
-impl Trace for Structure {
-    fn trace(&self, tracer: &mut dyn Tracer) {
-        if let Some(prototype) = self.prototype.get() {
-            tracer.visit_cell(prototype);
-        }
-    }
-}
-
-impl TraceCell for Structure {
-    fn cell_header(&self) -> &JsCellHeader {
-        &self.header
-    }
-}
+// Structures-as-cells Step 1 (docs/design/structures-as-cells.md §7.2/§7.3):
+// the dead, disconnected GC-cell-shaped `Structure` struct (`header:
+// JsCellHeader`, a `WriteBarrier<JsCell>` prototype edge, an owned
+// `PropertyTable`/`StructureTransitionMetadata`/`WatchpointSet`) plus its
+// `impl Trace for Structure` / `impl TraceCell for Structure` were DELETED
+// here. It targeted the pre-S4-arena `gc::cell`/`gc::trace`/`gc::barrier`
+// header/visitor generation (`JsCellHeader` there has no fixed C++ offset
+// layout, unlike the live arena's `marked_block::JsCellHeader`) and was never
+// wired to `marked_block.rs`/`slot_visitor.rs`/`interpreter::object_store`.
+// Its one external consumer (`vm::runtime::RuntimeStructures`'s three
+// `Option<Root<Structure>>` fields) was itself dead — zero readers/writers
+// anywhere in the crate — and was removed in the same batch. The live
+// replacement is `object::structure_cell::Structure` (re-exported as
+// `StructureCell`), the arena-integrated Structure this whole module's
+// descriptor/validation types (below) describe metadata FOR, not duplicate.
+//
+// Harvested from the deleted code (design §7.2, as REQUIREMENTS, not literal
+// code — the concrete types below target the live `structure_cell::Structure`
+// instead): "a cell has a fixed header prefix, the rest is payload" (already
+// the live arena convention); "the prototype must be a real traced
+// write-barrier edge, not a bare pointer" (a Structures-as-cells Step 3 item,
+// docs/design/structures-as-cells.md §3.3, not yet wired).
 
 /// Add/delete/attribute/prototype transition descriptor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
