@@ -3273,18 +3273,15 @@ impl VisitChildren for CombinedGraphMarker<'_> {
             }
             return;
         }
-        // ---- PROBE 2 (NEW, Structures-as-cells Step 2, design §2.3): the
+        // ---- PROBE 2 (Structures-as-cells Step 2, design §2.3): the
         // structure space, tried only after the object space rejected `cell`.
         if let Some(structure_cell) = self.store.structure_table.structure_arena_cell(cell.addr()) {
-            // `Structure::visitChildrenImpl`'s OWN `Base::visitChildren` call
-            // (Structure.cpp:1406): a Structure cell traces its OWN structure_id
-            // too — design §4 item 3, the meta-structure self-edge (every ordinary
-            // Structure's header names the ONE meta-structure handle; the meta
-            // cell's own header is self-referential, so marking it is idempotent).
-            // Step 3 (design §6) adds this Structure's INSTANCE edges (prototype/
-            // previous/property table); Step 2 is ONLY the base-class edge.
-            self.store
-                .trace_structure_base_edge(structure_cell, visitor);
+            // `Structure::visitChildrenImpl` (Structure.cpp:1401-1458), the FULL
+            // faithful port: the base-class `structure_id` edge (design §4 item
+            // 3, the meta-structure self-edge — Step 2) PLUS this Structure's
+            // OWN instance edges (prototype/previous chain/property table —
+            // design §3, Step 3).
+            self.store.trace_structure(structure_cell, visitor);
         }
         // else: neither space admits `cell` — a foreign/non-arena address, silently
         // rejected (matches the pre-Step-2 object-space-only dispatch's behavior).
@@ -3489,24 +3486,29 @@ impl CoreObjectStore {
         }
     }
 
-    /// Structures-as-cells Step 2 (docs/design/structures-as-cells.md §4, item 3 —
-    /// "the meta-structure self-edge"). `Structure::visitChildrenImpl` calls
-    /// `Base::visitChildren` first, exactly like every other `JSCell` subtype
-    /// (`Structure.cpp:1406`) — so a Structure's OWN header `structure_id` (naming
-    /// the ONE meta-structure handle, design §4.1-4.2; self-referential for the
-    /// meta cell itself) is a real GC edge too, the `StructureArenaCell` sibling of
-    /// `trace_cell`/`trace_leaf_cell`'s base-class edge. Step 3 (design §6) adds
-    /// this Structure's INSTANCE edges (prototype/previous/property table); this
-    /// is ONLY the base-class edge, called from `CombinedGraphMarker`'s structure-
-    /// space dispatch arm (probe 2).
+    /// Structures-as-cells Step 3 (docs/design/structures-as-cells.md §3): the
+    /// FULL faithful port of `Structure::visitChildrenImpl` (Structure.cpp:
+    /// 1401-1458) — the base-class `structure_id` edge (design §4, item 3, "the
+    /// meta-structure self-edge" — landed Step 2, unchanged here) PLUS this
+    /// Structure's OWN instance edges (design §3.2's field-by-field map:
+    /// prototype, the transition-PARENT chain, the PropertyTable §3.4
+    /// reduction). Called from `CombinedGraphMarker`'s structure-space dispatch
+    /// arm (probe 2) whenever a `StructureArenaCell` is popped off the mark
+    /// worklist.
     ///
     /// SAFETY: `structure_cell` was just membership-gated by `StructureIdTable::
-    /// structure_arena_cell` in the caller; `structure_id` sits at offset 0 on
-    /// every `StructureArenaCell` (const-asserted, design §1.1 — the same fixed
-    /// common offset `trace_leaf_cell` reads via `STRUCTURE_ID_OFFSET`). The read
-    /// copies a `StructureId` (`#[repr(transparent)]` `u32`) and forms no
-    /// reference.
-    fn trace_structure_base_edge(&self, structure_cell: CellPtr, visitor: &mut SlotVisitor) {
+    /// structure_arena_cell` in the caller. The base-class edge read
+    /// (`structure_id` at offset 0) is const-asserted (design §1.1 — the same
+    /// fixed common offset `trace_leaf_cell` reads via `STRUCTURE_ID_OFFSET`);
+    /// the instance-edge read (`own_handle`, via `StructureIdTable::
+    /// structure_for_arena_addr`) is similarly const-asserted there. Both reads
+    /// copy POD words and form no lasting reference; every edge past that one
+    /// read is ordinary safe `&Structure` field access (design §3.5).
+    fn trace_structure(&self, structure_cell: CellPtr, visitor: &mut SlotVisitor) {
+        // ---- base-class edge (Structure.cpp:1406, `Base::visitChildren`;
+        // design §4, Step 2 — UNCHANGED): every Structure's own header names
+        // the ONE meta-structure handle (design §4.1-4.2; self-referential for
+        // the meta cell itself, so marking it is idempotent).
         let structure_id = unsafe {
             core::ptr::with_exposed_provenance::<StructureId>(
                 structure_cell.addr() + STRUCTURE_ID_OFFSET,
@@ -3516,6 +3518,113 @@ impl CoreObjectStore {
         if let Some(meta_cell) = self.structure_table.arena_cell_for_handle(structure_id) {
             visitor.append_unbarriered(meta_cell);
         }
+
+        // ---- Step 3: this Structure's OWN instance edges. Translate the
+        // already-gated arena address to the record it shadows (design §1.1's
+        // `own_handle` back-pointer — NOT the `structure_id` just read above,
+        // which names the META-structure, not this structure's own identity)
+        // so the rest of the trace walks ordinary safe `&Structure` field
+        // access (design §3.5).
+        let Some(structure) = self
+            .structure_table
+            .structure_for_arena_addr(structure_cell.addr())
+        else {
+            // Membership-gated by the caller; a miss here would mean a corrupt
+            // `own_handle` shadow index, not a legitimate absence — defensive
+            // only (mirrors `structure_for_arena_addr`'s own defensive `None`).
+            debug_assert!(
+                false,
+                "trace_structure: a membership-gated cell's own_handle did not \
+                 resolve to a record"
+            );
+            return;
+        };
+
+        // ---- m_realm (Structure.cpp:1411): NOT MODELED (design §3.2 table —
+        // `structure_cell::Structure` carries no realm/globalObject field yet,
+        // per its own doc: "Fields not modeled here... m_realm/
+        // m_cachedPrototypeChain (need JSGlobalObject/StructureChain cells)").
+        // No-op today, not invented here; flagged as a future-unit dependency
+        // (design §8 item 3).
+
+        // ---- m_prototype / m_cachedPrototypeChain (Structure.cpp:1420-1429),
+        // object-shaped structures only (design §3.3): `isObject()` is
+        // `typeInfoBlob().ty() >= JsType::Object`, the same raw-byte umbrella
+        // compare `ArenaCellKind::from_header_type_byte` already uses. A
+        // non-object structure has `m_cachedPrototypeChain.clear()`'d in C++;
+        // the port models no such field, so that arm is also a no-op — the
+        // `if` below covers both C++ arms (traced when object-shaped, no-op
+        // otherwise) with nothing left over.
+        if structure.type_info_blob().ty() >= JsType::Object as u8 {
+            let proto_addr = structure.prototype().raw();
+            // `PrototypePointer::null()` (raw() == 0) is `jsNull()` — no edge,
+            // matching C++ (a `WriteBarrier<Unknown>::append` on jsNull only
+            // marks a CELL, and jsNull is not one). The target is an OBJECT,
+            // never a Structure, so it is routed through `self.space` (the
+            // object arena), not `structure_table`'s space — the cross-space
+            // edge design §3.3 names ("routes to whichever store owns addr").
+            if proto_addr != 0 {
+                if let Some(cp) = self.space.is_arena_cell(proto_addr) {
+                    visitor.append_unbarriered(cp);
+                }
+            }
+            // m_cachedPrototypeChain: NOT MODELED (see the m_realm note above)
+            // — a second no-op, same reason.
+        }
+
+        // ---- m_previousOrRareData (Structure.cpp:1424), STRONG,
+        // UNCONDITIONAL: the transition PARENT chain edge. `StructureRareData`
+        // is out of scope (design table; `structure_cell.rs`'s own doc), so
+        // this is just the `previous` handle, translated exactly like the
+        // base-class edge above (handle -> structure-space address via
+        // `arena_cell_for_handle`).
+        if let Some(previous) = structure.previous_id() {
+            if let Some(parent_cell) = self.structure_table.arena_cell_for_handle(previous) {
+                visitor.append_unbarriered(parent_cell);
+            }
+        }
+
+        // ---- m_propertyTableUnsafe (Structure.cpp:1426-1433), design §3.4:
+        // NOT a cell edge in this port — `PropertyTable` is owned INLINE by
+        // value (`Option<PropertyTable>`), never a `WriteBarrier<PropertyTable>`
+        // pointer to its own JSCell, so there is nothing to `visitor.append`
+        // regardless of pin state (satisfies design §3.4's "no cell edge
+        // today"). The OTHER half of §3.4 — clearing an UNPINNED table every
+        // mark cycle (the C++-measured 14MB-class optimization) — is
+        // DEFERRED (the design's explicit 3a/3b split, §6 Step 3: "split into
+        // 3a (edges only) / 3b (the clear), whichever the implementer finds
+        // easier to gate independently"). This function is `&self` — the
+        // WHOLE mark phase is (`mark_live_set_from_addrs(&self, ..)`,
+        // `CombinedGraphMarker::visit_children(&self, ..)`), matching
+        // `trace_cell`'s own "read-only, never mutates the store" contract —
+        // so it cannot drop `structure.property_table` in place without a
+        // shared mark-phase-wide `&mut` architecture change. That is a
+        // genuine SERIAL decision out of scope for this bounded unit, not
+        // silently improvised here (a PAUSE per the rewrite contract: return
+        // the question rather than invent shared architecture). 3b is left
+        // for a dedicated follow-up, most naturally as a POST-mark `&mut
+        // self` pass mirroring `finalize_structure_transitions` (design
+        // §5.2)'s established shape, once Step 4 wires that seam.
+
+        // ---- variant-specific children (Branded/WebAssemblyGC,
+        // Structure.cpp:1436-1442): NOT MODELED — `StructureVariant` is not
+        // ported (design §3.2 table cites `structure_cell.rs`'s own "variants
+        // not modeled" doc). No-op, not invented here.
+
+        // ---- m_transitionTable.trySingleTransition() (Structure.cpp:
+        // 1449-1455): eden-only in C++ (`!(collectionScope() == Full)`). This
+        // collector has NO eden — `force_collect` is unconditionally a full
+        // STW collection (design §5.1, verified by grep: `CollectionScope`
+        // appears nowhere in the live mark/sweep path) — so the C++ guard
+        // evaluates UNCONDITIONALLY FALSE here: this arm is dead BY
+        // EVALUATION, not by a convenience shortcut. The always-weak
+        // divergence this produces is RATIFIED (design §5, the two-tier weak
+        // transition table): the single-slot transition child is pruned by a
+        // future Step 4's `finalize_structure_transitions` if its target
+        // didn't survive some OTHER strong edge (design §5.2), never kept
+        // alive by ITS OWN forward transition pointer. Correctly: NO CODE
+        // HERE — the child is reached only via ITS OWN `previous` edge above,
+        // never from this direction.
     }
 
     /// gc-r4 R4b-mark ROOT GAP #1 — the intrinsic root set: every `CoreObjectStore`
@@ -15229,6 +15338,216 @@ mod structures_as_cells_step2_tests {
             "the leaf cell's INVALID structure_id must not spuriously mark ANY \
              Structure (arena_cell_for_handle(INVALID) is None: a clean no-op, \
              not a garbage handle that happens to decode to `orphan`)"
+        );
+    }
+}
+
+// Structures-as-cells Step 3 (docs/design/structures-as-cells.md §3) — this
+// Structure's OWN instance edges (prototype, transition-parent chain, the
+// PropertyTable §3.4 reduction), proven end-to-end via the SAME production
+// mark entry point (`mark_live_set_from_addrs`) Step 2's tests exercise:
+//   (a) marking a child Structure transitively marks its WHOLE `previous`
+//       chain (design §3.2's `m_previousOrRareData`, STRONG, unconditional) —
+//       not just one hop;
+//   (b) a structure's prototype OBJECT is marked purely via the structure's
+//       OWN `m_prototype` edge — the cross-space proof in the OTHER
+//       direction from Step 2 (there: object -> structure; here: structure
+//       -> object);
+//   (c) the single-slot transition CHILD is never marked THROUGH its parent
+//       (design §5's ratified always-weak divergence — dead by evaluation,
+//       not a shortcut) — both survive regardless via Step 1's still-active
+//       registry-rooting;
+//   (d) design §3.4: PropertyTable is not a cell edge in this port (nothing
+//       to `visitor.append`) and this unit lands ONLY the edge half (3a) —
+//       the conditional clear (3b) is a documented, deferred follow-up (see
+//       `trace_structure`'s doc comment).
+#[cfg(test)]
+mod structures_as_cells_step3_tests {
+    use super::*;
+
+    fn ident(n: u32) -> CorePropertyKey {
+        CorePropertyKey::Identifier(n)
+    }
+
+    fn addr(v: RuntimeValue) -> usize {
+        v.as_cell().unwrap().pointer_payload_bits()
+    }
+
+    // (a): a 2-hop transition chain (root -> child -> grandchild) marks EVERY
+    // ancestor transitively when only the grandchild is reachable (via a live
+    // object's `structure_id`) — proving `trace_structure`'s `previous_id`
+    // edge chains, not merely a 1-hop base case.
+    #[test]
+    fn marking_a_child_structure_marks_its_whole_previous_chain() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate(); // bootstraps the meta-structure
+
+        let root = store.allocate_structure_id();
+        let uid1 = store.intern_property_uid(&ident(1));
+        let uid2 = store.intern_property_uid(&ident(2));
+        let (child, _) = store.structure_table.add_property_transition(root, uid1, 0);
+        let (grandchild, _) = store
+            .structure_table
+            .add_property_transition(child, uid2, 0);
+
+        // Only the grandchild is reachable, via the object's own structure_id.
+        store
+            .with_cell_mut(obj, |cell| cell.structure_id = grandchild)
+            .expect("obj is a live arena object cell");
+
+        let _ = store.mark_live_set_from_addrs(&[addr(obj)]);
+
+        assert!(
+            store.structure_table.arena_cell_is_marked(grandchild),
+            "sanity: the object's own structure marks directly"
+        );
+        assert!(
+            store.structure_table.arena_cell_is_marked(child),
+            "the PARENT of the reachable structure must be marked transitively \
+             (design §3.2 `previous_id`, STRONG, Structure.cpp:1424)"
+        );
+        assert!(
+            store.structure_table.arena_cell_is_marked(root),
+            "the chain must be marked ALL the way to the root, two hops away \
+             — proves `trace_structure` re-fires on each newly-marked parent, \
+             not just the immediate one"
+        );
+    }
+
+    // (b): the structure -> prototype OBJECT edge, the cross-space proof
+    // running the OTHER direction from Step 2 (which proved object ->
+    // structure). The prototype object is reachable from NO root except
+    // through the structure's own `m_prototype` edge.
+    //
+    // Production `create_root`/`seed_structure_id` callers pass `ty == 0`
+    // today (a PRE-EXISTING gap this unit does not fix — the port does not
+    // yet wire a faithful per-kind `JSType` into structure creation; see the
+    // returned report's finding). This test constructs the structure
+    // directly with a real object `JSType`, exactly as `structure_cell.rs`'s
+    // own leaf unit tests do (`FINAL_OBJECT_TYPE`), to exercise the TRUE
+    // positive path `trace_structure`'s `isObject()` gate implements.
+    #[test]
+    fn structure_marks_its_prototype_object_across_spaces() {
+        let mut store = CoreObjectStore::default();
+        let holder = store.allocate(); // bootstraps the meta-structure first
+        let proto = store.allocate(); // NOT referenced by `holder`'s own value slots or any root
+        let proto_pointer = store.prototype_pointer(Some(proto));
+
+        let structure = store.structure_table.create_root(
+            proto_pointer,
+            NON_ARRAY,
+            JsType::FinalObject as u8,
+            0,
+            0,
+        );
+
+        store
+            .with_cell_mut(holder, |cell| cell.structure_id = structure)
+            .expect("holder is a live arena object cell");
+
+        // Mark from `holder` ONLY.
+        let _ = store.mark_live_set_from_addrs(&[addr(holder)]);
+
+        assert!(
+            store.structure_table.arena_cell_is_marked(structure),
+            "sanity: holder's own structure marks directly"
+        );
+        assert!(
+            store.is_value_marked(proto),
+            "the structure's OWN `m_prototype` edge must mark the prototype \
+             OBJECT — the structure-space -> object-space cross-space edge \
+             (design §3.3, Structure.cpp:1420-1423)"
+        );
+    }
+
+    // (c): the single-slot transition CHILD is never marked THROUGH its
+    // parent (design §5, the ratified always-weak divergence: this
+    // collector's `collectionScope()` is always Full, so C++'s eden-only
+    // strong-mark arm evaluates unconditionally false — dead by evaluation,
+    // Structure.cpp:1449-1455).
+    #[test]
+    fn transition_child_is_not_marked_through_its_parent() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+
+        let parent = store.allocate_structure_id();
+        let uid = store.intern_property_uid(&ident(1));
+        let (child, _) = store
+            .structure_table
+            .add_property_transition(parent, uid, 0);
+
+        // Only the PARENT is reachable.
+        store
+            .with_cell_mut(obj, |cell| cell.structure_id = parent)
+            .expect("obj is a live arena object cell");
+
+        let _ = store.mark_live_set_from_addrs(&[addr(obj)]);
+
+        assert!(
+            store.structure_table.arena_cell_is_marked(parent),
+            "sanity: the reachable parent marks directly"
+        );
+        assert!(
+            !store.structure_table.arena_cell_is_marked(child),
+            "the transition CHILD must NOT be marked through its parent's \
+             forward transition edge (design §5.1: dead by evaluation, not a \
+             shortcut)"
+        );
+        // Both survive regardless of mark state — Step 1's registry-rooting
+        // stays in force this step (design §6: only a future Step 4 would
+        // flip that to real reclamation).
+        assert!(store.structure_table.arena_cell_is_admitted(parent));
+        assert!(
+            store.structure_table.arena_cell_is_admitted(child),
+            "an unmarked (always-weak) transition child still SURVIVES this \
+             step via registry-rooting, exactly like Step 2's orphan case"
+        );
+    }
+
+    // (d): design §3.4 — `PropertyTable` is owned INLINE
+    // (`Option<PropertyTable>`), never a `WriteBarrier<PropertyTable>`
+    // pointer to its own cell, so there is NO cell edge to append for it in
+    // this port, pinned or not. This unit lands ONLY the edge-tracing half
+    // (3a); the conditional CLEAR (3b, the C++-measured 14MB-class win) is a
+    // documented, deferred follow-up (see `trace_structure`'s doc) because it
+    // needs a mutable mark-phase pass this bounded unit does not introduce.
+    // This test pins down TODAY's behavior precisely: a materialized table
+    // survives a real mark cycle untouched (not yet cleared).
+    #[test]
+    fn property_table_is_not_a_cell_edge_and_not_yet_cleared() {
+        let mut store = CoreObjectStore::default();
+        let obj = store.allocate();
+
+        let root = store.allocate_structure_id();
+        let uid = store.intern_property_uid(&ident(1));
+        // `add_property_transition`'s new-child path always materializes/moves
+        // a table onto the child (`take_property_table_or_clone_if_pinned`).
+        let (child, _) = store.structure_table.add_property_transition(root, uid, 0);
+        assert!(
+            store
+                .structure_table
+                .structure(child)
+                .property_table_or_null()
+                .is_some(),
+            "test setup: the child must own a materialized property table"
+        );
+
+        store
+            .with_cell_mut(obj, |cell| cell.structure_id = child)
+            .expect("obj is a live arena object cell");
+        let _ = store.mark_live_set_from_addrs(&[addr(obj)]);
+
+        assert!(store.structure_table.arena_cell_is_marked(child));
+        assert!(
+            store
+                .structure_table
+                .structure(child)
+                .property_table_or_null()
+                .is_some(),
+            "3b (the conditional clear) is DEFERRED this step — a mark cycle \
+             must not yet drop an unpinned table (see `trace_structure`'s doc \
+             comment for why: it requires a mutable mark-phase pass this unit \
+             does not introduce)"
         );
     }
 }

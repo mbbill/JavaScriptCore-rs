@@ -327,6 +327,12 @@ impl StructureArenaCell {
             _reserved: [0; 4],
         }
     }
+
+    /// Structures-as-cells Step 3 (design §3.5): the byte offset of `own_handle`
+    /// within this cell — the shadow index [`StructureIdTable::
+    /// structure_for_arena_addr`] reads to translate an already
+    /// membership-gated arena address to the record it shadows.
+    const OWN_HANDLE_OFFSET: usize = std::mem::offset_of!(Self, own_handle);
 }
 
 const _: () = assert!(std::mem::size_of::<StructureArenaCell>() == 16);
@@ -579,6 +585,14 @@ impl Structure {
     /// `Structure* previousID() const` (Structure.h:1129-1138), as a handle.
     pub fn previous_id(&self) -> Option<StructureHandle> {
         self.previous
+    }
+
+    /// `JSValue storedPrototype() const` (Structure.h:558-561): the raw
+    /// `m_prototype` pointer rep this structure stores (design §3.3's
+    /// prototype edge target; `PrototypePointer::null()` is `jsNull()` — no
+    /// live cell to trace).
+    pub fn prototype(&self) -> PrototypePointer {
+        self.prototype
     }
 
     /// `PropertyTable* propertyTableOrNull() const` (Structure.h:1003-1006).
@@ -835,6 +849,35 @@ impl StructureIdTable {
         }
         let &addr = self.arena_addrs.get((handle.raw() - 1) as usize)?;
         self.space.is_arena_cell(addr)
+    }
+
+    /// Structures-as-cells Step 3 (design §3.5): translate an ALREADY
+    /// membership-gated `StructureArenaCell` address to the `Structure` record
+    /// it shadows, via the `own_handle` back-pointer `register` wrote into the
+    /// cell (design §1.1's "why own_handle" note — the arena address and the
+    /// registry handle are two independent numbering schemes needing this one
+    /// explicit translation). This is what lets the tracer
+    /// (`interpreter/object_store.rs::trace_structure`) walk this Structure's
+    /// OWN instance edges (prototype/previous/property-table) through
+    /// ordinary safe `&Structure` field access — "no further unsafe past that
+    /// one read" (design §3.5).
+    ///
+    /// SAFETY (of the internal read): `addr` MUST be a byte-intact
+    /// `StructureArenaCell` — proved by the caller's [`Self::
+    /// structure_arena_cell`] membership gate (`CombinedGraphMarker`'s
+    /// structure-space probe, design §2.3) before this is called. The read
+    /// copies one `u32` word at the const-asserted `OWN_HANDLE_OFFSET` and
+    /// forms no lasting reference. `own_handle.checked_sub(1)` guards the slab
+    /// index defensively (every `register`-assigned handle is >= 1 by
+    /// construction, so this never fires in practice — mirrors
+    /// `arena_cell_for_handle`'s own defensive out-of-range `None`).
+    pub(crate) fn structure_for_arena_addr(&self, addr: usize) -> Option<&Structure> {
+        // SAFETY: see the method contract above.
+        let own_handle = unsafe {
+            core::ptr::with_exposed_provenance::<u32>(addr + StructureArenaCell::OWN_HANDLE_OFFSET)
+                .read()
+        };
+        self.structures.get(own_handle.checked_sub(1)? as usize)
     }
 
     /// Borrow a structure by handle (the registry analog of `StructureID::
