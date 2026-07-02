@@ -125,11 +125,15 @@ struct DelayedSetLocal {
 /// null `InlineCallFrame`, DFGByteCodeParser.cpp:12640-12642), so
 /// `remapOperand` is the identity and the inline-frame branches are statically
 /// dead. The stack lands with the inlining port.
-struct ByteCodeParser<'a> {
+struct ByteCodeParser<'a, 'g> {
     /// `m_codeBlock` / `m_profiledBlock` (:131-132): one linked block serves
     /// both roles until DFG plans carry a baseline alternative.
     code_block: &'a CodeBlock,
-    graph: DfgGraph,
+    /// `Graph& m_graph` (DFGByteCodeParser.cpp:133): C++'s `ByteCodeParser`
+    /// BORROWS the plan-owned `Graph`, it does not construct or own one.
+    /// `dfg::plan::DfgPlan` is the owner now (`DfgPlan::compile_parse_only`);
+    /// this mirrors that by borrowing instead of holding a `DfgGraph` value.
+    graph: &'g mut DfgGraph,
     /// `m_currentBlock` (:1262).
     current_block: DfgBasicBlockId,
     /// `m_currentIndex` (:1264).
@@ -161,13 +165,18 @@ struct ByteCodeParser<'a> {
     this_offset: ThisArgumentOffset,
 }
 
-/// `DFG::parse(Graph&)` (DFGByteCodeParser.cpp:12682-12685) +
+/// `bool parse(Graph& graph)` (DFGByteCodeParser.cpp:12682-12685) +
 /// `ByteCodeParser::parse` (:12633-12680), minus the post-parse analysis
-/// phases (module doc). C++ receives the plan-owned `Graph`
-/// (DFGPlan.cpp:198 `Graph dfg(*m_vm, *this)`); until the plan unit lands,
-/// parse() creates the working graph itself — the plan will stamp real
-/// graph/owner identities.
-pub fn parse(code_block: &CodeBlock) -> Result<DfgGraph, DeclineReason> {
+/// phases (module doc). Parses directly INTO a plan-owned `Graph`, exactly
+/// like C++: `DFG::Plan::compileInThreadImpl` constructs `Graph dfg(*m_vm,
+/// *this)` (DFGPlan.cpp:198, reading `m_codeBlock`/graph id off the Plan,
+/// dfg/DFGGraph.cpp:78-82) and then calls `parse(dfg)` (DFGPlan.cpp:203);
+/// `dfg::plan::DfgPlan::compile_parse_only` is that call site here
+/// (dfg/plan.rs). A decline can still leave the graph partially mutated
+/// (e.g. a mid-block `ConstantIndexOutOfRange`) — that matches C++, whose
+/// `CancelPath` discards the whole `Graph` rather than repairing it; callers
+/// MUST treat any `Err` as "discard this graph/plan", never resume it.
+pub fn parse_into(graph: &mut DfgGraph, code_block: &CodeBlock) -> Result<(), DeclineReason> {
     let instructions = code_block.unlinked().instructions();
     let Some(bytes) = instructions.raw_bytes() else {
         return Err(DeclineReason::NoRawPackedInstructionStream);
@@ -178,9 +187,21 @@ pub fn parse(code_block: &CodeBlock) -> Result<DfgGraph, DeclineReason> {
         return Err(DeclineReason::EvalCodeOutOfSlice);
     }
 
-    let mut parser = ByteCodeParser::new(code_block);
-    parser.parse_block(bytes)?;
-    Ok(parser.graph)
+    let mut parser = ByteCodeParser::new(code_block, graph);
+    parser.parse_block(bytes)
+}
+
+/// Rust-only convenience wrapper with no C++ counterpart: C++ never calls
+/// `ByteCodeParser`/`parse(Graph&)` without a `Plan`-owned `Graph` already in
+/// hand, so there is no standalone-graph entry point to port. This one exists
+/// for callers with no `DfgPlan` yet (chiefly this module's own unit tests
+/// below), and stamps the same null placeholder identities the parser used
+/// before the plan unit landed (`DfgGraphId(0)`/`CodeBlockId(CellId(0))`);
+/// real identities come only from `dfg::plan::DfgPlan::compile_parse_only`.
+pub fn parse(code_block: &CodeBlock) -> Result<DfgGraph, DeclineReason> {
+    let mut graph = DfgGraph::new(DfgGraphId(0), CodeBlockId(CellId(0)));
+    parse_into(&mut graph, code_block)?;
+    Ok(graph)
 }
 
 /// The per-opcode admission gate, mirroring how `DFG::capabilityLevel` keeps
@@ -252,21 +273,20 @@ fn js_double_number(value: ConstantValue) -> ConstantValue {
     }
 }
 
-impl<'a> ByteCodeParser<'a> {
+impl<'a, 'g> ByteCodeParser<'a, 'g> {
     /// Constructor state (DFGByteCodeParser.cpp:129-150) + the first-block
     /// allocation from `parseCodeBlock` (:10929-10937): the entry block is
     /// targetable at bytecode 0, sized by (numArguments, numLocals, numTmps)
     /// like the `BasicBlock` constructor (:1410), and is "definitely an OSR
-    /// target" (:10932-10936).
-    fn new(code_block: &'a CodeBlock) -> Self {
+    /// target" (:10932-10936). `graph` is the plan-owned `Graph&` C++'s ctor
+    /// borrows (:133); the caller (`parse_into`) is the one who owns/creates
+    /// it, matching `ByteCodeParser(Graph& graph)` taking an existing graph
+    /// rather than building one.
+    fn new(code_block: &'a CodeBlock, graph: &'g mut DfgGraph) -> Self {
         let frame = code_block.unlinked().frame();
         let num_arguments = frame.num_parameters_including_this as usize;
         let num_locals = frame.num_callee_locals as usize;
         let num_tmps = 0usize;
-        // C++ Graph carries the owning CodeBlock*; the Rust linked CodeBlock
-        // has no cell-identity surface on itself, so the ids stay null until
-        // the DFG plan unit stamps them.
-        let mut graph = DfgGraph::new(DfgGraphId(0), CodeBlockId(CellId(0)));
         let block = DfgBasicBlock {
             id: DfgBasicBlockId(0),
             nodes: Vec::new(),

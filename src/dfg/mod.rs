@@ -11,6 +11,7 @@ pub(crate) mod node_flags;
 pub(crate) mod node_type;
 pub(crate) mod osr;
 pub(crate) mod parser;
+pub(crate) mod plan;
 pub(crate) mod speculation;
 pub(crate) mod variable_access_data;
 pub(crate) mod watchpoint;
@@ -45,7 +46,8 @@ pub use osr::{
     MaterializationKind, OsrEntryAvailability, OsrEntryKind, OsrExitKind, OsrExitOutcomeKind,
     OsrExitOutcomeRecord, OsrExitRecovery, RecoverySource,
 };
-pub use parser::{parse, DeclineReason};
+pub use parser::{parse, parse_into, DeclineReason};
+pub use plan::{DfgCompilationMode, DfgPlan};
 pub use speculation::{
     AbstractValueSource, DfgValueRep, PredictionSource, SpeculatedType, SpeculationCheck,
     SpeculationCheckId, SpeculationCheckKind, SpeculationDirection, SpeculationFailureSemantics,
