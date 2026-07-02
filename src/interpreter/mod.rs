@@ -7267,8 +7267,33 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 // pays the ToPrimitive cost when an operand is a non-primitive
                 // object; number/number, string/string, int/int stay on the
                 // existing fast path.
+                //
+                // Runtime BinaryArithProfile observation brackets the
+                // evaluation on the RAW register operands, exactly where C++
+                // records: the pre-op half covers the observations JSC makes
+                // before the operation can throw, the post-op half covers the
+                // fast-path operand constants and the slow-path result shape
+                // and runs only on success (see the helpers next to
+                // arithmetic_binary_result for the per-family C++ evidence).
+                self.record_binary_arith_profile_pre_op(
+                    state.code_block,
+                    instruction.bytecode_index,
+                    opcode,
+                    left,
+                    right,
+                );
                 match self.arithmetic_binary_result(state, left, right, opcode) {
-                    Ok(result) => write_register(state, window, destination, result),
+                    Ok(result) => {
+                        self.record_binary_arith_profile_post_op(
+                            state.code_block,
+                            instruction.bytecode_index,
+                            opcode,
+                            left,
+                            right,
+                            result,
+                        );
+                        write_register(state, window, destination, result)
+                    }
                     Err(outcome) => outcome,
                 }
             }
@@ -9927,6 +9952,208 @@ impl CoreOpcodeDispatchHost {
             })
         };
         result.map_err(DispatchOutcome::Fail)
+    }
+
+    // --- Runtime BinaryArithProfile observation (op_add/op_sub/op_mul/op_div/
+    //     op_bitand/op_bitor/op_bitxor/op_lshift/op_rshift — the profiled set,
+    //     FOR_EACH_OPCODE_WITH_BINARY_ARITH_PROFILE, Opcode.h:158-167) --------
+    //
+    // C++ splits each site's observation between the LLInt fast paths and the
+    // common slow path, and the split is load-bearing for the DFG: the
+    // int32&int32 bit-op fast path writes NOTHING, the int32 arith fast path
+    // ORs only ArithProfileIntInt (LowLevelInterpreter64.asm:1220), and the
+    // LLInt double fast paths OR only the operand-type constants — result
+    // shape (overflow/neg-zero/non-int32 bits) is recorded EXCLUSIVELY by the
+    // slow path's `updateArithProfileForBinaryArithOp`
+    // (CommonSlowPaths.cpp:470-502). The Rust interpreter evaluates every type
+    // combination through the one generic `arithmetic_binary_result`, so these
+    // two helpers re-derive WHICH C++ path a given execution would have taken
+    // from the operand/result shapes and record exactly what that path
+    // records. A naive observe-every-execution port would let the DFG read
+    // "saw a double result" out of sites C++ keeps result-clean.
+    fn record_binary_arith_profile_pre_op(
+        &self,
+        code_block: &CodeBlock,
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+        lhs: RuntimeValue,
+        rhs: RuntimeValue,
+    ) {
+        let observe_operands = match opcode {
+            // slow_path_add observes the RAW operand values before jsAdd runs
+            // (CommonSlowPaths.cpp:556-557), so a throwing ToPrimitive still
+            // leaves them observed. On the non-throwing LLInt fast paths the
+            // OR'd constants (ArithProfileIntInt / NumberNumber / NumberInt /
+            // IntNumber, LowLevelInterpreter64.asm:1220/1230/1233/1248) equal
+            // `observeLHSAndRHS` on the same operand values bit for bit, so
+            // op_add observes unconditionally here.
+            CoreOpcode::AddInt32 => true,
+            // The shift/bit slow paths observe operands before the operation
+            // (slow_path_lshift/rshift/bitand/bitor/bitxor,
+            // CommonSlowPaths.cpp:639/655/709/725/741); the int32&int32 LLInt
+            // fast path (commonBitOp, LowLevelInterpreter64.asm:1406-1422)
+            // never touches the profile.
+            CoreOpcode::LeftShiftInt32
+            | CoreOpcode::RightShiftInt32
+            | CoreOpcode::BitAndInt32
+            | CoreOpcode::BitOrInt32
+            | CoreOpcode::BitXorInt32 => !(lhs.is_int32() && rhs.is_int32()),
+            // slow_path_sub/mul/div observe NO operands
+            // (CommonSlowPaths.cpp:584-606); sub/mul operand bits come only
+            // from the LLInt fast-path constants (recorded post-op, which
+            // those non-throwing paths make unobservable), and div has no
+            // LLInt fast path at all on arm64 (see post-op). mod/pow/urshift
+            // sit in the unprofiled BinaryOp group: no profile slot
+            // (Opcode.h:158-167) and no profiling in their slow paths
+            // (CommonSlowPaths.cpp:609-628, 749-758).
+            _ => false,
+        };
+        if !observe_operands {
+            return;
+        }
+        let _ = code_block.record_binary_arith_profile_operands(
+            crate::bytecode::code_block::CodeBlockMutationAuthority::default(),
+            bytecode_index,
+            lhs,
+            rhs,
+        );
+    }
+
+    // The observations C++ makes on or after the operation's success: the
+    // LLInt fast-path operand constants for sub/mul, and the slow-path result
+    // half. C++ skips result profiling when the operation throws
+    // (`RETURN_WITH_PROFILING` runs CHECK_EXCEPTION before the profiling
+    // action, CommonSlowPaths.cpp:134-140), which the dispatch site mirrors by
+    // only calling this on `Ok`.
+    fn record_binary_arith_profile_post_op(
+        &self,
+        code_block: &CodeBlock,
+        bytecode_index: BytecodeIndex,
+        opcode: CoreOpcode,
+        lhs: RuntimeValue,
+        rhs: RuntimeValue,
+        result: RuntimeValue,
+    ) {
+        let authority = crate::bytecode::code_block::CodeBlockMutationAuthority::default;
+        let both_int32 = lhs.is_int32() && rhs.is_int32();
+        let both_numbers = lhs.is_number() && rhs.is_number();
+        match opcode {
+            // binaryOpCustomStore families (LowLevelInterpreter64.asm:
+            // 1209-1263; mul at 1289-1301, add at 1314-1317, sub at 1319-1322).
+            CoreOpcode::AddInt32 | CoreOpcode::SubInt32 | CoreOpcode::MulInt32 => {
+                if both_int32 {
+                    // `integerOperationAndStore` either stores an int32 result
+                    // and ORs ArithProfileIntInt (asm:1218-1221) or bails to
+                    // the common slow path: add/sub on overflow (baddio/
+                    // bsubio), mul on overflow OR a zero product with a
+                    // negative operand — the -0.0 case (asm:1290-1297).
+                    //
+                    // KNOWN upstream value divergence: `numeric_binary_result`
+                    // evaluates that mul -0.0 case to Int32(0) via checked_mul
+                    // where C++ jsMul yields the double -0.0. The explicit
+                    // zero/negative test below still classifies it as the
+                    // slow path (so the profile never claims the int fast
+                    // path), and the result-shape bits self-correct once the
+                    // value divergence is fixed.
+                    let mul_neg_zero_bail = opcode == CoreOpcode::MulInt32
+                        && result == RuntimeValue::from_i32(0)
+                        && (matches!(lhs.as_number(), Some(NumberValue::Int32(l)) if l < 0)
+                            || matches!(rhs.as_number(), Some(NumberValue::Int32(r)) if r < 0));
+                    if result.is_int32() && !mul_neg_zero_bail {
+                        // op_add already OR'd the equivalent operand bits
+                        // pre-op; sub/mul record ArithProfileIntInt here.
+                        if opcode != CoreOpcode::AddInt32 {
+                            let _ = code_block.record_binary_arith_profile_operands(
+                                authority(),
+                                bytecode_index,
+                                lhs,
+                                rhs,
+                            );
+                        }
+                    } else {
+                        // Common slow path (slow_path_add/sub/mul,
+                        // CommonSlowPaths.cpp:559-563/577-579/590-592):
+                        // result half only — sub/mul observe no operands and
+                        // add's operand half already ran pre-op.
+                        let _ = code_block.record_binary_arith_profile_binary_op_result(
+                            authority(),
+                            bytecode_index,
+                            result,
+                            lhs,
+                            rhs,
+                            self.bigints.is_bigint(result),
+                        );
+                    }
+                } else if both_numbers {
+                    // LLInt double fast paths OR only the operand-type
+                    // constants and never record the result shape
+                    // (LowLevelInterpreter64.asm:1223-1257). op_add covered
+                    // pre-op.
+                    if opcode != CoreOpcode::AddInt32 {
+                        let _ = code_block.record_binary_arith_profile_operands(
+                            authority(),
+                            bytecode_index,
+                            lhs,
+                            rhs,
+                        );
+                    }
+                } else {
+                    // A non-number operand forces the common slow path:
+                    // result half (CommonSlowPaths.cpp:559-563/577-579/
+                    // 590-592).
+                    let _ = code_block.record_binary_arith_profile_binary_op_result(
+                        authority(),
+                        bytecode_index,
+                        result,
+                        lhs,
+                        rhs,
+                        self.bigints.is_bigint(result),
+                    );
+                }
+            }
+            CoreOpcode::DivNumber => {
+                // op_div has an LLInt fast path only on X86_64; every other
+                // target — including the arm64 C++ baseline this port
+                // measures against — compiles `slowPathOp(div)`
+                // (LowLevelInterpreter64.asm:1265-1282), so every div
+                // execution runs slow_path_div (CommonSlowPaths.cpp:595-606):
+                // no operand observation, result half always.
+                let _ = code_block.record_binary_arith_profile_binary_op_result(
+                    authority(),
+                    bytecode_index,
+                    result,
+                    lhs,
+                    rhs,
+                    self.bigints.is_bigint(result),
+                );
+            }
+            CoreOpcode::LeftShiftInt32
+            | CoreOpcode::RightShiftInt32
+            | CoreOpcode::BitAndInt32
+            | CoreOpcode::BitOrInt32
+            | CoreOpcode::BitXorInt32 => {
+                // int32&int32 stays on the LLInt fast path and never touches
+                // the profile (commonBitOp, LowLevelInterpreter64.asm:
+                // 1406-1422); anything else ran the slow path, whose operand
+                // half ran pre-op and whose result half runs here
+                // (CommonSlowPaths.cpp:642-644, 658-660, 712-714, 728-730,
+                // 744-746).
+                if !both_int32 {
+                    let _ = code_block.record_binary_arith_profile_binary_op_result(
+                        authority(),
+                        bytecode_index,
+                        result,
+                        lhs,
+                        rhs,
+                        self.bigints.is_bigint(result),
+                    );
+                }
+            }
+            // mod/pow/urshift: no BinaryArithProfile slot and no profiling in
+            // their slow paths (Opcode.h:158-167; CommonSlowPaths.cpp:609-628,
+            // 749-758).
+            _ => {}
+        }
     }
 
     pub(crate) fn numeric_compare(
@@ -28504,6 +28731,274 @@ mod tests {
             profiles.jit_storage.raw_value_for_slot(sample.bucket.slot),
             Some(RuntimeValue::from_i32(5).encoded())
         );
+    }
+
+    // Runtime BinaryArithProfile observation probes (the interpreter wiring of
+    // the FOR_EACH_OPCODE_WITH_BINARY_ARITH_PROFILE sites, Opcode.h:158-167;
+    // see record_binary_arith_profile_pre_op/_post_op for the per-family C++
+    // evidence). Each probe runs one binary op over pre-seeded registers and
+    // returns the linked profile slot through the CodeBlock accessor.
+    fn run_binary_arith_profile_probe(
+        opcode: CoreOpcode,
+        lhs: RuntimeValue,
+        rhs: RuntimeValue,
+    ) -> (
+        ExecutionCompletion,
+        Option<crate::bytecode::BinaryArithProfile>,
+    ) {
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                opcode,
+                vec![
+                    Operand::Register(local(2)),
+                    Operand::Register(local(0)),
+                    Operand::Register(local(1)),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(2))]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(230));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        registers.write(window, local(0), lhs).unwrap();
+        registers.write(window, local(1), rhs).unwrap();
+        let mut host = CoreOpcodeDispatchHost::new();
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+        let profile = block.binary_arith_profile_for_bytecode_index(BytecodeIndex::from_offset(0));
+        (completion, profile)
+    }
+
+    // C++ LLInt op_add int32 fast path: `integerOperationAndStore` stores the
+    // int32 sum and ORs ArithProfileIntInt — operand-observed bits ONLY
+    // (LowLevelInterpreter64.asm:1218-1221). Result-shape bits are recorded
+    // exclusively by the slow path, which int32+int32 without overflow never
+    // reaches. (This corrects the earlier audit belief that the int fast path
+    // leaves the whole profile default: the asm DOES OR the int-int operand
+    // constant; only the RESULT half stays untouched.)
+    #[test]
+    fn binary_arith_profile_add_int32_fast_path_records_int_int_operands_only() {
+        let (completion, profile) = run_binary_arith_profile_probe(
+            CoreOpcode::AddInt32,
+            RuntimeValue::from_i32(2),
+            RuntimeValue::from_i32(3),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(5))
+        );
+        let profile = profile.expect("op_add derives a BinaryArithProfile slot");
+        assert_eq!(
+            profile.bits(),
+            crate::bytecode::BinaryArithProfile::observed_int_int_bits()
+        );
+        assert!(profile.lhs_observed_type().is_only_int32());
+        assert!(profile.rhs_observed_type().is_only_int32());
+        assert_eq!(profile.arith().observed_results().bits(), 0);
+    }
+
+    // C++ LLInt op_add double fast paths OR only the operand-type constant
+    // (lhs double / rhs int32 -> ArithProfileNumberInt,
+    // LowLevelInterpreter64.asm:1232-1233) and store the double sum WITHOUT
+    // result-shape observation. The load-bearing C2 rule: a naive port that
+    // observed the 3.5 result would wrongly set NonNegZeroDouble on a site the
+    // C++ profile keeps result-clean.
+    #[test]
+    fn binary_arith_profile_add_double_int_records_operand_types_without_result() {
+        let (completion, profile) = run_binary_arith_profile_probe(
+            CoreOpcode::AddInt32,
+            RuntimeValue::from_double(2.5),
+            RuntimeValue::from_i32(1),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(3.5))
+        );
+        let profile = profile.expect("op_add derives a BinaryArithProfile slot");
+        assert!(profile.lhs_observed_type().is_only_number());
+        assert!(profile.rhs_observed_type().is_only_int32());
+        assert_eq!(profile.arith().observed_results().bits(), 0);
+        assert!(!profile.arith().did_observe_double());
+    }
+
+    // int32+int32 overflow bails from the LLInt integer path (`baddio ..., .slow`,
+    // LowLevelInterpreter64.asm:1314-1316) into slow_path_add, which observes
+    // the operands (CommonSlowPaths.cpp:556-557) and then records the double
+    // sum through updateArithProfileForBinaryArithOp: Int32Overflow because
+    // both operands were int32 with a non-int32 result, plus NonNegZeroDouble
+    // (CommonSlowPaths.cpp:476-489).
+    #[test]
+    fn binary_arith_profile_add_int32_overflow_records_overflow_result() {
+        let (completion, profile) = run_binary_arith_profile_probe(
+            CoreOpcode::AddInt32,
+            RuntimeValue::from_i32(i32::MAX),
+            RuntimeValue::from_i32(1),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(2_147_483_648.0))
+        );
+        let profile = profile.expect("op_add derives a BinaryArithProfile slot");
+        assert!(profile.lhs_observed_type().is_only_int32());
+        assert!(profile.rhs_observed_type().is_only_int32());
+        assert!(profile.arith().did_observe_int32_overflow());
+        assert!(profile.arith().did_observe_non_neg_zero_double());
+        assert!(!profile.arith().did_observe_neg_zero_double());
+        assert!(!profile.arith().did_observe_int52_overflow());
+        assert!(!profile.arith().did_observe_non_numeric());
+    }
+
+    // C++ LLInt bit ops have NO profile update anywhere on their int32&int32
+    // fast path (commonBitOp, LowLevelInterpreter64.asm:1406-1422): unlike
+    // add/sub/mul, an all-int32 bitand site keeps a fully DEFAULT profile.
+    #[test]
+    fn binary_arith_profile_bitand_int32_fast_path_leaves_profile_default() {
+        let (completion, profile) = run_binary_arith_profile_probe(
+            CoreOpcode::BitAndInt32,
+            RuntimeValue::from_i32(0b110),
+            RuntimeValue::from_i32(0b011),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(0b010))
+        );
+        let profile = profile.expect("op_bitand derives a BinaryArithProfile slot");
+        assert_eq!(profile.bits(), 0);
+    }
+
+    // A non-int32 operand forces slow_path_bitand: observeLHSAndRHS records
+    // lhs Number / rhs Int32 (CommonSlowPaths.cpp:705-709) and the int32
+    // result of the bit op records no result-shape bits
+    // (updateArithProfileForBinaryArithOp, CommonSlowPaths.cpp:474-475).
+    #[test]
+    fn binary_arith_profile_bitand_double_operand_records_operand_types() {
+        let (completion, profile) = run_binary_arith_profile_probe(
+            CoreOpcode::BitAndInt32,
+            RuntimeValue::from_double(6.5),
+            RuntimeValue::from_i32(3),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(2))
+        );
+        let profile = profile.expect("op_bitand derives a BinaryArithProfile slot");
+        assert!(profile.lhs_observed_type().is_only_number());
+        assert!(profile.rhs_observed_type().is_only_int32());
+        assert_eq!(profile.arith().observed_results().bits(), 0);
+    }
+
+    // Shift family member of the same slow-path rule: slow_path_rshift
+    // observes the operands (CommonSlowPaths.cpp:721-725) and the int32 shift
+    // result records no result-shape bits.
+    #[test]
+    fn binary_arith_profile_rshift_double_operand_records_operand_types() {
+        let (completion, profile) = run_binary_arith_profile_probe(
+            CoreOpcode::RightShiftInt32,
+            RuntimeValue::from_double(9.5),
+            RuntimeValue::from_i32(1),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(4))
+        );
+        let profile = profile.expect("op_rshift derives a BinaryArithProfile slot");
+        assert!(profile.lhs_observed_type().is_only_number());
+        assert!(profile.rhs_observed_type().is_only_int32());
+        assert_eq!(profile.arith().observed_results().bits(), 0);
+    }
+
+    // op_mod sits in the unprofiled BinaryOp group (Opcode.h:158-167;
+    // BytecodeList.rb:1254-1274): no BinaryArithProfile slot derives and
+    // slow_path_mod records nothing (CommonSlowPaths.cpp:609-618).
+    #[test]
+    fn binary_arith_profile_mod_derives_no_slot_and_records_nothing() {
+        let (completion, profile) = run_binary_arith_profile_probe(
+            CoreOpcode::ModNumber,
+            RuntimeValue::from_i32(7),
+            RuntimeValue::from_i32(4),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(3))
+        );
+        assert!(profile.is_none());
+    }
+
+    // op_div has an LLInt fast path only on X86_64; the arm64 C++ baseline
+    // compiles `slowPathOp(div)` (LowLevelInterpreter64.asm:1265-1282), so
+    // every division runs slow_path_div (CommonSlowPaths.cpp:595-606): NO
+    // operand observation ever at this tier, and only a non-int32 quotient
+    // records result bits (Int32Overflow because both operands were int32,
+    // plus NonNegZeroDouble). An exact int32 quotient records nothing at all
+    // (jsNumber canonicalizes 2.0 to int32, so isInt32 short-circuits
+    // updateArithProfileForBinaryArithOp).
+    #[test]
+    fn binary_arith_profile_div_slow_path_records_result_shape_without_operands() {
+        let (completion, profile) = run_binary_arith_profile_probe(
+            CoreOpcode::DivNumber,
+            RuntimeValue::from_i32(6),
+            RuntimeValue::from_i32(4),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(1.5))
+        );
+        let profile = profile.expect("op_div derives a BinaryArithProfile slot");
+        assert!(profile.lhs_observed_type().is_empty());
+        assert!(profile.rhs_observed_type().is_empty());
+        assert!(profile.arith().did_observe_int32_overflow());
+        assert!(profile.arith().did_observe_non_neg_zero_double());
+
+        let (completion, profile) = run_binary_arith_profile_probe(
+            CoreOpcode::DivNumber,
+            RuntimeValue::from_i32(6),
+            RuntimeValue::from_i32(3),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(2))
+        );
+        let profile = profile.expect("op_div derives a BinaryArithProfile slot");
+        assert_eq!(profile.bits(), 0);
+    }
+
+    // slow_path_mul has NO observeLHSAndRHS (CommonSlowPaths.cpp:568-580) —
+    // sub/mul operand bits come only from the LLInt fast-path constants — so
+    // an int32 overflow product records the result shape while leaving the
+    // operand-observed types EMPTY.
+    #[test]
+    fn binary_arith_profile_mul_int32_overflow_records_result_without_operands() {
+        let (completion, profile) = run_binary_arith_profile_probe(
+            CoreOpcode::MulInt32,
+            RuntimeValue::from_i32(65_536),
+            RuntimeValue::from_i32(65_536),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(4_294_967_296.0))
+        );
+        let profile = profile.expect("op_mul derives a BinaryArithProfile slot");
+        assert!(profile.lhs_observed_type().is_empty());
+        assert!(profile.rhs_observed_type().is_empty());
+        assert!(profile.arith().did_observe_int32_overflow());
+        assert!(profile.arith().did_observe_non_neg_zero_double());
+        assert!(!profile.arith().did_observe_int52_overflow());
     }
 
     #[test]

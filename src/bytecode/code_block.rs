@@ -8,7 +8,7 @@ use crate::gc::StructureId;
 use crate::jit::plan::BaselineBytecodeSnapshotFingerprint;
 use crate::runtime::{CodeBlockId, ExecutableId, GlobalObjectId, ScopeId};
 use crate::strings::{AtomId, Identifier, PropertyKey};
-use crate::value::JsValue;
+use crate::value::{JsValue, NumberValue};
 
 use crate::bytecode::debug::{BytecodeHookTable, ExceptionHandlerTable};
 use crate::bytecode::gc::BytecodeRootMap;
@@ -1278,6 +1278,80 @@ impl CodeBlock {
             return Ok(None);
         };
         slot.profile.arith_mut().observe_result(result);
+        Ok(Some(slot.profile))
+    }
+
+    // C++ JSC: `updateArithProfileForBinaryArithOp` (CommonSlowPaths.cpp:470-502)
+    // — the RESULT half of the interpreter binary-arith slow paths. Unlike the
+    // coarse `ArithProfile::observeResult` (ArithProfile.h:128-145, kept above as
+    // `record_binary_arith_profile_result` — that is what the baseline-JIT
+    // profiled operations call), the interpreter slow path distinguishes
+    // Int32Overflow (only when BOTH operands were int32), NegZero vs NonNegZero
+    // doubles, and the 2^51 Int52 overflow point.
+    //
+    // `result_is_heap_big_int`: C++ tests `result.isHeapBigInt()`
+    // (CommonSlowPaths.cpp:494). The Rust value model does not yet classify
+    // BigInt cells on `JsValue` (same transitional gap commented at
+    // `ArithProfile::observe_result`, profiling.rs), so the interpreter host —
+    // which owns the BigInt store — passes the classification in. The
+    // `#if USE(BIGINT32)` arm (CommonSlowPaths.cpp:496-499) is omitted: the
+    // local C++ baseline builds with USE(BIGINT32) off and the Rust engine has
+    // no BigInt32 inline representation.
+    pub fn record_binary_arith_profile_binary_op_result(
+        &self,
+        authority: CodeBlockMutationAuthority,
+        bytecode_index: BytecodeIndex,
+        result: JsValue,
+        left: JsValue,
+        right: JsValue,
+        result_is_heap_big_int: bool,
+    ) -> Result<Option<BinaryArithProfile>, CodeBlockMutationError> {
+        self.check_profile_mutation_authority(authority)?;
+        let mut slots = self.side_tables.binary_arith_profiles.borrow_mut();
+        let Some(slot) = slots
+            .iter_mut()
+            .find(|slot| slot.bytecode_index == bytecode_index)
+        else {
+            return Ok(None);
+        };
+        let profile = slot.profile.arith_mut();
+        match result.as_number() {
+            Some(number) => {
+                // CommonSlowPaths.cpp:474-475: an int32 result records nothing.
+                if !result.is_int32() {
+                    // CommonSlowPaths.cpp:476-477.
+                    if left.is_int32() && right.is_int32() {
+                        profile.set_observed_int32_overflow();
+                    }
+                    let double_val = match number {
+                        NumberValue::DoubleBits(bits) => bits.to_f64(),
+                        // Unreachable: the `!result.is_int32()` guard above
+                        // filtered the Int32 arm.
+                        NumberValue::Int32(value) => f64::from(value),
+                    };
+                    // CommonSlowPaths.cpp:480-481
+                    // (`!doubleVal && std::signbit(doubleVal)`).
+                    if double_val == 0.0 && double_val.is_sign_negative() {
+                        profile.set_observed_neg_zero_double();
+                    } else {
+                        profile.set_observed_non_neg_zero_double();
+                        // CommonSlowPaths.cpp:483-491. C++ `truncateDoubleToInt64`
+                        // compiles to a saturating fcvtzs on the arm64 baseline
+                        // (NaN -> 0); Rust's `as i64` has the same saturating
+                        // semantics.
+                        const INT52_OVERFLOW_POINT: i64 = 1i64 << 51;
+                        let int64_val = double_val.abs() as i64;
+                        if int64_val >= INT52_OVERFLOW_POINT {
+                            profile.set_observed_int52_overflow();
+                        }
+                    }
+                }
+            }
+            // CommonSlowPaths.cpp:493-494.
+            None if result_is_heap_big_int => profile.set_observed_heap_big_int(),
+            // CommonSlowPaths.cpp:500-501.
+            None => profile.set_observed_non_numeric(),
+        }
         Ok(Some(slot.profile))
     }
 
